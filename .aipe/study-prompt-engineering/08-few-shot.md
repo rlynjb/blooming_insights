@@ -1,390 +1,294 @@
-# Few-shot prompting
+# 08 — Few-shot prompting
 
-**Industry name(s):** few-shot prompting, in-context examples, example-driven prompting, k-shot
-**Type:** Industry standard · Language-agnostic
-
-> blooming insights is example-driven for *format* — the EQL reminders, the worked query plan, and the JSON output blocks are syntax exemplars that shape what the model emits — but its actual classifier (`classifyIntent`) is *zero-shot*: query.md lists the three intent label definitions, not labeled input→output examples. Format-shaping few-shot: yes. Classifier few-shot: no.
-
-
----
+*In-context examples · Industry standard*
 
 ## Zoom out, then zoom in
 
-**Zoom out — the bigger picture.** Few-shot examples in this codebase live in two distinct sub-regions of the Per-agent definitions band. The format exemplars — `## EQL reminders`, the suggested query plan, the JSON output block — sit inside each agent's `.md` file, shaping what the model emits before any consumer ever sees it. The one true classifier decision (`classifyIntent`) sits one step outside, in `lib/agents/intent.ts`, with its system prompt declared inline in code — and it uses *no* examples at all. So the diagram marks two sub-regions of the same band: where examples are shown (format) and where they are deliberately absent (classification).
+Pull up the system prompt for any of the agents in this codebase. Few-shot examples — when there are any — live inside the system message, embedded in the "Output" section.
 
 ```
-  Zoom out — where few-shot lives
+  Where few-shot examples sit in the prompt
 
-  ┌─ Pipeline coordinator ──────────────────────────┐
-  │  classify → monitoring/diagnostic/recommendation │
-  └─────────────────────────┬────────────────────────┘
-                            │
-  ┌─ Per-agent definitions ─▼────────────────────────┐  ← we are here
-  │                                                  │
-  │  ★ FORMAT exemplars (shown, imitated) ★          │
-  │   EQL reminders   monitoring.md L49–54           │
-  │                   diagnostic.md L27–37           │
-  │   query plan      monitoring.md L39–47           │
-  │   JSON output     monitoring.md L73–85 (one-shot)│
-  │                                                  │
-  │  ★ CLASSIFIER decision (ZERO-shot) ★             │
-  │   classifyIntent  intent.ts L17–31                │
-  │   label DEFINITIONS, no query→label examples     │
-  │                                                  │
-  └─────────────────────────┬────────────────────────┘
-                            │
-  ┌─ Shared agent loop / Provider ──▼────────────────┐
-  │  the model imitates demonstrated shapes here     │
-  └──────────────────────────────────────────────────┘
+  ┌─ system prompt (assembled from monitoring.md) ──────────────────┐
+  │  ## Role                                                          │
+  │  ## Hard rules                                                    │
+  │  ## Period-over-period method                                     │
+  │  ## Suggested query plan                                          │
+  │  ## Tool catalog reminders                                        │
+  │  ## Common errors to avoid                                         │
+  │  ## Output                                                         │
+  │    ┌──────────────────────────────────────────────────────────┐  │
+  │    │ ★ FEW-SHOT EXAMPLE — one worked JSON output ★             │  │ ← we are here
+  │    │ [                                                          │  │
+  │    │   { "metric": "purchase_revenue",                          │  │
+  │    │     "category": "revenue_drop",                            │  │
+  │    │     "change": { "value": 30.0, "direction": "down", ... },│  │
+  │    │     "severity": "critical", ... }                          │  │
+  │    │ ]                                                          │  │
+  │    └──────────────────────────────────────────────────────────┘  │
+  │  ## Workspace schema                                              │
+  └───────────────────────────────────────────────────────────────────┘
 ```
 
-**Zoom in — narrow to the concept.** The question this file answers: when blooming insights wants the model to emit a specific shape — an EQL query, a JSON object, an intent label — does it *show* the shape (few-shot) or *describe* it (zero-shot), and which choice did it make where? Format exemplars are everywhere the codebase wants shape-imitation; the JSON output block doubles as the request side of the structured-output contract (→ 02). The classifier is zero-shot by choice — three distinct categories, `max_tokens: 16`, definitions plausibly suffice. Below, you'll see why showing six correct EQL shapes plus one forbidden one constrains syntax (not judgment), and why the one place few-shot would measurably help is the buildable experiment, not a settled answer.
-
----
+Few-shot is the cheapest reliability lever in prompt engineering, and the one most early-career prompt work skips. Concept 01 named the four sections; this concept is what goes in section 3 (examples) when "describe the shape in prose" isn't enough.
 
 ## Structure pass
 
-**Layers.** Few-shot sits in four layers, and you have to name them or "where do we use few-shot?" becomes an unfalsifiable question. Layer A is the *prompt's exemplar block* — the worked EQL lines, the filled JSON output block, the suggested-query-plan sequence. Layer B is the *prompt's descriptive block* — field-rules prose, label definitions, "Reply with ONLY the one word." Layer C is the *model's emission* — the actual EQL it writes, the actual JSON it returns, the actual intent label. Layer D is the *consumer / next link* — the parser that reads the JSON, the loop that executes the EQL, the route handler that branches on the intent.
+**Layers.** Outer: the prompt as a whole. Middle: the examples section. Innermost: each individual example.
 
-**Axis: control.** *How* is the model being told what to emit at each layer — by demonstration (an example to imitate) or by description (a rule to parse)? Control via demonstration vs control via description — that's the lens that distinguishes a few-shot exemplar from a zero-shot definition. The wrong axis here would be "guarantees" (Layer D enforces the guarantee for JSON paths regardless of whether the request came from an exemplar or a rule); the right axis is which form of control the prompt uses, because that decides what the model *actually does* on the path.
-
-**Seams.** Two seams, and the load-bearing one is where the codebase's design choice lives. Seam 1 (A↔B) — within the prompt, control flips from *demonstrated shapes* (filled JSON, worked queries) to *described rules* (field rules, label defs). Both exist in the same `.md`, and the model attends to demonstration more reliably than description — which is why the output exemplar is the request side of the structured-output contract and the field-rules prose is the also-ran. The load-bearing seam is Seam 2 — between the *format-shaping use* and the *classification-decision use*. Control via demonstration is used pervasively for *format* (the model copies the JSON exemplar's shape, the EQL one-liners' syntax); control via description is used for *the actual classification* (`classifyIntent` gives three label definitions, zero query→label examples). The codebase made one of these choices for shape (demonstrate) and the other for the discrete decision (describe), and whether the second choice is *correct* is the project exercise — a measured question, not a settled one.
+**Axis — how strongly does each prompt element constrain the output?** Walk it down:
 
 ```
-  Structure pass — few-shot prompting
+  one axis — "how much does this part of the prompt constrain output?"
 
-  ┌─ 1. LAYERS ───────────────────────────────────┐
-  │  A: exemplar block (filled JSON, worked EQL)   │
-  │  B: descriptive block (field rules, defs)       │
-  │  C: model emission (what comes out)             │
-  │  D: consumer / next link (parser, executor)     │
-  └────────────────────────┬───────────────────────┘
-                           │  pick the axis
-  ┌─ 2. AXIS ─────────────▼────────────────────────┐
-  │  control: demonstration (example to imitate)   │
-  │  vs description (rule to parse)?                │
-  └────────────────────────┬───────────────────────┘
-                           │  trace A→D, find flips
-  ┌─ 3. SEAMS ────────────▼────────────────────────┐
-  │  S1 (A↔B): demonstrated shapes → described     │
-  │            rules in the same prompt             │
-  │  S2 (format use ↔ classification use):         │
-  │            format → demonstrate (used)         │
-  │            decision → describe (chosen here)   │
-  │            (LOAD-BEARING — the codebase's      │
-  │             measured-question split)            │
-  └────────────────────────┬───────────────────────┘
-                           ▼
-                   Block 4 — How it works
+  ┌─ prose rule ───────────────────────┐
+  │  "Return JSON in a code fence."     │  WEAK — model can drift
+  └────────────────────────────────────┘
+       ┌─ schema spec ──────────────────┐
+       │  "Fields: name (string),        │  MEDIUM — constrains type,
+       │   change.value (number)..."     │  doesn't constrain style
+       └────────────────────────────────┘
+            ┌─ worked example ───────────┐
+            │  [{ "name": "purchase_revenue",│ STRONG — model copies the shape
+            │     "change": {...} }]        │ AND the field-naming style AND
+            └────────────────────────────┘   the value-formatting style
 ```
 
-```
-  A seam — "how is the model told what to emit?" answered two ways
-
-  ┌─ format-shaping ─┐    seam     ┌─ classification ─────┐
-  │  DEMONSTRATE:    │ ═════╪═════► │  DESCRIBE:           │
-  │  filled JSON,    │  (the split │  three label defs,   │
-  │  worked EQL      │   chosen    │  no labeled pairs    │
-  │                  │   here)     │                      │
-  └──────────────────┘             └──────────────────────┘
-         ▲                                   ▲
-         └────── same axis, two answers ─────┘
-                 → format wants demonstration; the classification
-                   decision was given description — defensible,
-                   measurable, not yet measured
-```
-
-The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+**Seams.** The boundary between "describing the shape in prose" and "showing a worked example" is a real engineering decision. Cheap to add an example — costs ~50–300 tokens. Pays back every call.
 
 ## How it works
 
-**Mental model.** Few-shot is showing the model k worked examples of the task *inside the prompt* so it infers the pattern from the demonstrations rather than from a description. There is a spectrum: zero-shot (describe the task, no examples), few-shot (show 1–5 examples), and the in-between blooming insights actually occupies most — *format exemplars*, where you show the shape of the output without showing labeled input→output pairs for the actual decision.
+### Move 1 — the mental model
+
+You know how when you onboard onto a new codebase and you read the README first, then you read *the code* — and the code shows you a hundred conventions the README didn't name? Few-shot examples are the *code* version of prompt instructions. The prose says "return JSON"; the example shows the model what JSON looks like in *your* shape.
 
 ```
-the spectrum, and where blooming insights sits
-─────────────────────────────────────────────────────────────
- ZERO-SHOT          describe the task           "classify as one word"
-   │                                            ← intent classifier lives here
- FORMAT EXEMPLAR    show the output SHAPE        a worked EQL line, a JSON block
-   │                (not labeled in→out pairs)   ← the four prompts live here
- FEW-SHOT (k-shot)  show k labeled in→out pairs  "Q: ... → billing"  ×3–5
-                    for the actual decision      ← NOT used anywhere here
+  Pattern — few-shot, the kernel
+
+  prose instruction       worked example          model output
+  ─────────────────       ──────────────         ─────────────
+  "Return JSON in        [{                       [{
+   this shape:            "metric": "...",         "metric": "purchase_revenue",
+   metric (string),       "change": {              "change": {
+   change.value           "value": 30.0,           "value": 23.4,
+   (number), ..."         "direction": "down" }    "direction": "down" }
+                         }]                       }]
+
+  the prose tells the rule       the example shows the SHAPE
+                                  → output mirrors the example
 ```
 
-The distinction matters: a format exemplar shapes *how the answer looks*; a true few-shot example shapes *what the answer is*. blooming insights uses the first heavily and the second nowhere.
+The mechanism: language models are trained on *next-token prediction*. When you show one worked example, the model is *much* more likely to emit tokens that look like that example than to invent a new style. This is the strongest constraint cheap money can buy.
 
----
+### Move 2 — the walkthrough
 
-### Format exemplars for EQL — showing the supported syntax
+**Step 1 — when to use few-shot.** Three situations where it earns its place:
 
-The prompts do not describe EQL grammar; they show it. The `## EQL reminders` blocks are worked one-liners:
+  → **Classifiers.** The intent classifier in `lib/agents/intent.ts` is a good candidate (it doesn't have examples today; it could). One-word output with three valid values is exactly where a few examples lock in the shape.
+  → **Format-sensitive output.** Anywhere you need a specific JSON shape, a specific date format, a specific punctuation convention. The monitoring prompt's worked example at `legacy-prompts/monitoring.md:72-85` is exactly this.
+  → **Style-sensitive output.** When the model needs to write *in a specific tone* — the recommendation agent's `rationale` field benefits from an example because "good rationale" is a *style* the model has to copy.
 
-```
-diagnostic prompt — EQL reminders
-─────────────────────────────────────────────────────────────
- Count one event:   select count event purchase in last 7 days
- Sum a property:    select sum event purchase.total_price ...
- Segment by dim:    select count event purchase by customer.country...
- Segment by device: ... by customer.device_type grouping top 5 ...
- Multiple metrics:  select count event view_item, count event ...
- NEGATIVE example:  Do NOT use a `customers matching ...` clause
- Funnels:           funnel view_item followed by purchase ... end
-```
+Three situations where you skip it:
 
-These are exemplars, not grammar. The model is shown six *correct* query shapes and one *forbidden* one (a negative example — the scar tissue of the model repeatedly inventing an unsupported clause). The model copies the demonstrated forms. This is few-shot applied to format: the examples constrain the *syntax* of the queries the model writes, without being labeled examples of "given anomaly X, write query Y."
+  → **Open-ended generation.** The query agent returns prose; if you showed an example, the model would copy the *content style* of that example, narrowing the range of valid answers. Free-form prose wants *no* anchoring example.
+  → **Outputs where the shape is enforced by tools.** If you use Anthropic tool-calling for structured output, the schema is the contract; no need for an example.
+  → **Outputs the model already does perfectly with prose rules alone.** Add examples when you measure a quality lift, not preemptively.
+
+**Step 2 — what's in this codebase today.** Walk the four prompts:
 
 ```
-six correct shapes shown  →  model emits queries matching them
-one forbidden shape shown →  model avoids `customers matching`
+  Examples in this codebase, by prompt
+
+  ┌──────────────────┬───────────────────────────────────────────┐
+  │ prompt           │ examples present?                          │
+  ├──────────────────┼───────────────────────────────────────────┤
+  │ monitoring.md    │ YES — 1 worked JSON output (lines 72-85)   │
+  │ diagnostic.md    │ YES — 1 worked JSON output (lines 58-82)   │
+  │                  │ + 1 "insufficient data" fallback example    │
+  │                  │   (lines 91-98)                              │
+  │ recommendation.md│ YES — 1 worked JSON output (lines 49-74)    │
+  │ query.md         │ NO — open-ended prose; no example needed    │
+  │ intent.ts        │ NO — system message is too short to embed    │
+  │                  │   examples; one-word output, model handles   │
+  └──────────────────┴───────────────────────────────────────────┘
 ```
 
-**Code in this codebase — format exemplars (EQL reminders).** `lib/agents/prompts/monitoring.md`, `lib/agents/prompts/diagnostic.md` — the `## EQL reminders` blocks (prompt text) at `monitoring.md` L49–L54; `diagnostic.md` L27–L37 (negative example at L35). Worked query one-liners that demonstrate supported EQL syntax (and one forbidden clause), so the model copies the shapes instead of inventing grammar.
+The pattern: structured-output chains have one canonical worked example. The open-ended prose chain has none. The intent classifier could have examples but doesn't — that's a real opportunity (see Project Exercise below).
 
----
-
-### A worked end-to-end exemplar — the monitoring query plan
-
-The monitoring prompt goes further: it shows a worked *sequence* of calls, not just isolated lines. The `## Suggested query plan` section is a five-step exemplar of an entire investigation:
+**Step 3 — the anatomy of a good worked example.** Look at `legacy-prompts/monitoring.md:72-85`:
 
 ```
-monitoring prompt — Suggested query plan
-─────────────────────────────────────────────────────────────
- 1. select count event purchase, sum ...total_price in last 90 days
- 2. select ... in last 180 days
- 3. select count event view_item, cart_update, checkout, purchase...
- 4. select ... in last 180 days
- 5. select count event session_start in last 90 days
- "Derive: purchase count & revenue change, the conversion-rate ..."
+[
+  {
+    "metric": "purchase_revenue",
+    "category": "revenue_drop",
+    "scope": ["global"],
+    "change": { "value": 30.0, "direction": "down", "baseline": "90d" },
+    "severity": "critical",
+    "impact": "Revenue down 30% versus the prior 90 days on a baseline of ...",
+    "evidence": [
+      { "tool": "execute_analytics_eql",
+        "result": { "metric": "purchase_revenue", "current": 4200000,
+                    "prior": 6000000 } }
+    ]
+  }
+]
 ```
 
-This is the strongest exemplar in the codebase — a full worked example of *which queries to run in what order to produce a briefing*. It shapes the agent's whole exploration trajectory, not just one query's syntax. It is still format/process-shaping, not a labeled "input anomaly → output anomaly-array" pair, but it is the closest the prompts get to demonstrating the task end to end.
+Three things this example does right:
 
-**Code in this codebase — the worked query plan (end-to-end process exemplar).** `lib/agents/prompts/monitoring.md`, the `## Suggested query plan` section at L39–L47. A five-step worked sequence that shapes the agent's whole exploration trajectory — the closest the prompts get to demonstrating the task end to end.
+  → **Realistic content.** `purchase_revenue`, `revenue_drop`, `critical` are *plausible* values the model would emit for a real workspace. Not `"metric": "FOO"`.
+  → **Demonstrates the harder fields.** `impact` is a written sentence — the example shows it as a *full sentence with numbers and business framing*, which is exactly the style the model is supposed to copy. Just saying "impact: a sentence describing impact" wouldn't lock in the style.
+  → **Demonstrates `evidence` shape.** The nested `{ tool, result }` structure is non-trivial to describe in prose; the example *shows* it.
 
----
+**Step 4 — when to add a second example.** Default: one good example. Reach for a second when:
 
-### The JSON output block IS a few-shot of the output form
-
-The single clearest few-shot pattern is the output example block in each prompt. The model is handed a fully-populated instance of the exact shape it must return:
-
-```
-monitoring prompt — output exemplar
-─────────────────────────────────────────────────────────────
- [
-   {
-     "metric": "purchase_revenue",
-     "scope": ["global"],
-     "change": { "value": 18.5, "direction": "down", "baseline": "90d" },
-     "severity": "critical",
-     "evidence": [ { "tool": "...", "result": { "current": 42000, ... } } ]
-   }
- ]
-```
-
-This is a one-shot example of the output. The model sees a real, filled-in object — `18.5`, `"down"`, `"critical"` — and produces the same shape with its own values. This interacts directly with structured outputs (→ 02-structured-outputs.md): the example *is* the contract's request side. The agent-JSON parser + the anomaly-array guard enforce the shape, but the output exemplar is what makes the model *emit* the shape in the first place. The recommendation prompt even shapes a field through the example plus a prose rule: the exemplar shows no `id` and a sibling rule says "Do NOT include an `id` field — the system assigns it" — the example demonstrates the id-less shape the recommendation guard expects.
+  → **The output has two distinct shapes** the model should emit in different situations. The diagnostic prompt does this — the main shape (`legacy-prompts/diagnostic.md:58-82`) AND the empty-data fallback shape (lines 91-98):
 
 ```
-output exemplar (the request)  →  model emits matching shape
-parser + type guard (the guarantee)  →  shape enforced
-the example and the validator describe the SAME shape from two sides
+If you cannot determine a cause, return:
+```json
+{
+  "conclusion": "Insufficient data to determine a cause for this change.",
+  "evidence": [],
+  "hypothesesConsidered": []
+}
+```
 ```
 
-**Code in this codebase — output exemplars (few-shot of the output form).** The three JSON prompts — the `## Output` example blocks at `monitoring.md` L73–L85; `diagnostic.md` L63–L85; `recommendation.md` L49–L74 (id-less; reinforced by L82 "Do NOT include an `id` field"). A filled instance of the exact return shape — the request side of the structured-output contract (`parseAgentJson` + type guards in `validate.ts` are the guarantee side).
+This is the *graceful failure* example. Without it, the model might emit a half-formed diagnosis when the data was empty; with it, the model has a sanctioned escape valve.
 
----
+  → **The model is regressing on a specific edge case.** Add an example targeting that case. The eval suite (concept 05) catches the regression; the second example fixes it.
 
-### The classifier is zero-shot, not few-shot
+**Step 5 — when to stop.** *Three to five good examples beats twenty mediocre ones.* This is the empirical rule. Marginal examples beyond ~5 cost tokens (each example is in the system prompt every call) without much quality lift. The exception is *evaluation*-driven addition — if your eval set shows the model regressing on a specific edge case and an example fixes it, add the example. If the eval doesn't show a lift, don't add it.
 
-Here is the honest split. The component whose *whole job* is classification — the intent classifier — uses **no examples at all**. Its system prompt is a description, inline in the code, of the three labels:
+**The interaction with structured output (concept 02).** A few-shot example *is* the structured output's shape, demonstrated. If you use tool-calling for structured output (Anthropic's `tool_use` pattern), the tool schema serves the same role and you don't need a separate example. If you use the prose-and-validate pattern (this codebase), the example *is* the contract — concept 07 walks how the example, the type guard, and the consumer must agree.
 
-```
-  system:
-    "Classify the user query as exactly one word: monitoring (what changed / what is new), "
-    "diagnostic (why did something happen), or recommendation (what should I do). "
-    "Reply with ONLY the one word."
-```
+**The cost.** Examples are in the system prompt every call. Concept 04 (token budgeting) is the discipline that decides if you can afford them. The monitoring example is ~250 tokens; that's 250 tokens × every call × forever. Worth it for reliability; not free.
 
-That is a zero-shot prompt: label *definitions*, no labeled query→label pairs. The query prompt's `## Framing` section mirrors the same three definitions for the answering agent — again definitions, not examples:
+### Move 3 — the principle
 
-```
-query prompt — Framing
-─────────────────────────────────────────────────────────────
- monitoring     = what changed / what's new
- diagnostic     = why did something happen
- recommendation = what should I do
-```
+Examples constrain output more than rules do because language models are next-token predictors. Showing the shape locks the model into reproducing it; describing the shape leaves it to interpretation. The principle is the same as showing a junior engineer a worked code review instead of just describing the style guide — the worked example carries an order of magnitude more signal per token than the rules document.
 
-So the classifier defines its labels and trusts the model to map a query onto one. There is no `"refund status?" → monitoring` exemplar anywhere. This is a deliberate-by-omission choice: zero-shot is cheaper (the classifier's `max_tokens` is 16, → 04-token-budgeting.md) and the three categories are distinct enough that a capable model handles them from definitions. Whether it would be *more accurate* with three labeled examples is an open, measurable question — and the project exercise below is exactly that experiment.
+## Primary diagram — few-shot in this codebase
 
 ```
-classifier today:   [label definitions] + query  →  one word   (ZERO-shot)
-classifier could:   [label defs] + [3 query→label examples] + query  (FEW-shot)
-                    ← measurable: does accuracy improve enough to pay the tokens?
+  ┌─ legacy-prompts/monitoring.md ────────────────────────────────────────┐
+  │  ## Output                                                              │
+  │                                                                          │
+  │  Return ONLY a JSON array of anomaly objects, ... wrapped in a ```json │
+  │  fenced block:                                                          │
+  │                                                                          │
+  │  [                                                                       │
+  │    {                                                                     │
+  │      "metric": "purchase_revenue",      ← realistic content              │
+  │      "category": "revenue_drop",                                          │
+  │      "scope": ["global"],                                                │
+  │      "change": { "value": 30.0, "direction": "down", "baseline": "90d" },│
+  │      "severity": "critical",                                              │
+  │      "impact": "Revenue down 30%..."  ← demonstrates the HARD field     │
+  │      "evidence": [{ "tool": "..." }]   ← demonstrates nested shape       │
+  │    }                                                                     │
+  │  ]                                                                       │
+  │                                                                          │
+  │  Field rules:                                                            │
+  │  - category — REQUIRED. the checklist `id` ...                           │
+  │  - metric — short snake_case name ...                                    │
+  │  ...                                                                     │
+  └────────────────────────────────────────────────────────────────────────┘
+                                  │
+                                  │  model attends to the example
+                                  │  more strongly than the field rules
+                                  ▼
+  ┌─ model output (next call) ────────────────────────────────────────────┐
+  │  [                                                                     │
+  │    {                                                                   │
+  │      "metric": "conversion_rate",   ← copied the snake_case            │
+  │      "category": "conversion_drop", ← copied the category id style    │
+  │      "scope": ["country:US"],                                          │
+  │      "change": { "value": 14.2, "direction": "down", "baseline": "90d" }│
+  │      "severity": "warning",                                            │
+  │      "impact": "Conversion rate fell 14%..."  ← copied the sentence    │
+  │      "evidence": [{ "tool": "execute_analytics_eql", ... }]            │
+  │    }                                                                   │
+  │  ]                                                                     │
+  └──────────────────────────────────────────────────────────────────────┘
 ```
-
-**Code in this codebase — the classifier (zero-shot, the absence).** `lib/agents/intent.ts` + `lib/agents/prompts/query.md`, `classifyIntent` (label definitions, no examples) at `intent.ts` L17–L31 (system at L21–L23); query.md Framing L15–L21. Classifies via label *definitions*, not labeled query→label pairs — the one true classification decision is demonstrated nowhere.
-
-**Why this split is defensible.** Format wants demonstration: showing a JSON block or an EQL line pins a shape that prose cannot. The classifier wants cheap, decisive output: three distinct categories, `max_tokens: 16`, a capable model — definitions suffice without paying for examples on every call. The codebase put examples exactly where shape-imitation is the goal and withheld them where definitions plausibly suffice. Whether the classifier would be *more accurate* with examples is left open and measurable.
-
----
-
-### The principle
-
-Examples constrain output more reliably than instructions, but *what* they constrain depends on whether they are format exemplars or labeled decision examples. blooming insights uses format exemplars pervasively — EQL one-liners, a worked query plan, JSON output blocks — to pin the *shape* of what the model emits, and the output block doubles as the request side of the structured-output contract. But its one true classifier is zero-shot: it defines the labels and shows no examples. The split is honest and defensible — format wants demonstration, the classifier's three distinct categories survive on definitions — and the one place where adding few-shot might measurably help (the intent classifier) is the buildable experiment, not a settled answer.
-
----
-
-## Few-shot prompting — diagram
-
-This diagram spans the prompt's example use. The Format-exemplar layer shows shapes the model imitates; the Output-exemplar layer is the request side of the structured contract; the Classifier layer shows where examples are *absent* and definitions stand in. A reader who sees only this should grasp that the codebase demonstrates format heavily and the classification decision not at all.
-
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│  FORMAT EXEMPLARS (syntax/process shaping)                           │
-│                                                                       │
-│  EQL reminders        monitoring + diagnostic prompts                 │
-│    6 correct query shapes + 1 forbidden (customers matching clause)   │
-│  Suggested query plan monitoring prompt                               │
-│    5-step worked investigation (shapes the whole trajectory)          │
-│           │ model imitates the demonstrated shapes                    │
-└───────────┼───────────────────────────────────────────────────────────┘
-            ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│  OUTPUT EXEMPLARS = few-shot of the OUTPUT FORM                      │
-│                                                                       │
-│  filled JSON block   monitoring · diagnostic · recommendation prompts │
-│                      (recommendation: id-less + "Do NOT include id")  │
-│    ── this is the REQUEST side of the structured-output contract ──   │
-│       (parser + type guard = the GUARANTEE side, → 02)                │
-└──────────────────────────────────────────────────────────────────────┘
-┌──────────────────────────────────────────────────────────────────────┐
-│  CLASSIFIER = ZERO-SHOT (no examples)                                │
-│                                                                       │
-│  intent classifier   system = label DEFINITIONS                       │
-│  query prompt Framing   same three definitions, no pairs              │
-│    ← few-shot would add "query → label" examples here (the exercise)  │
-└──────────────────────────────────────────────────────────────────────┘
-
-  Format: shown and imitated.  Output form: shown (one-shot).
-  The classification decision: described, never demonstrated.
-```
-
-The codebase demonstrates shapes pervasively and the actual classification decision not at all — an honest, measurable split.
-
----
 
 ## Elaborate
 
-### Where this comes from
+The few-shot pattern dates back to GPT-3's debut paper (Brown et al., 2020) — the original "in-context learning" demonstration. The mechanism the paper named — that examples in the prompt steer the model *without retraining* — is what every prompt-engineering technique downstream of it is built on. The paper's other contribution: *more examples diminish in return after the first few*. The 3–5-good-beats-20-mediocre rule traces back here.
 
-Few-shot prompting was the headline result of the GPT-3 paper (Brown et al., 2020, "Language Models are Few-Shot Learners") — the model performed tasks from a handful of in-context examples with no fine-tuning. The practical refinements came later: the OpenAI cookbook and Anthropic's prompt guide both teach that 3–5 *well-chosen* examples beat 20 mediocre ones, that example *diversity* matters more than count, and that examples should be formatted exactly as you want the output. The format-exemplar pattern blooming insights uses — show a filled JSON block, show worked query lines — is the version that survives in production code, because it constrains structure without the token cost of many full input→output pairs.
+Three nuances worth knowing:
 
-### The deeper principle
+- **Example ORDER matters.** Recent models attend more strongly to *the most recent* example in a prompt. If you have multiple, put the most-canonical-example last. This codebase only has one example per prompt, so order doesn't bite.
+- **Bad examples are worse than no examples.** If you put a broken example in the prompt, the model copies the brokenness. This is a real bug — a deprecated field that lingers in a worked example gets emitted by every call until someone notices. The discipline: when you change the output schema, update the example *first*.
+- **Examples interact with structured-output mode.** Provider-native structured outputs (OpenAI's `response_format: json_schema`) have the schema as the contract; the example becomes redundant. If you're using prose-and-validate (this codebase), examples carry their full weight.
 
-```
-instruction                          example
-──────────────────────────────      ──────────────────────────────
-"return a JSON array of anomalies"   [{ "metric": "...", "change": {...} }]
-parsed semantically                  imitated structurally
-model fills gaps with guesses        model fills gaps by analogy
-3–5 good > 20 mediocre               (diversity beats count)
-```
+Where to read next: the original GPT-3 paper for the foundational result. Anthropic's prompt-engineering docs on multi-shot prompting. Simon Willison has a running thread on when examples help vs hurt.
 
-An instruction is parsed; an example is imitated. The model's strongest behavior is pattern-completion, so a demonstrated shape recruits exactly that strength. This is why the JSON output block is more reliable than the field-rules prose beside it (`monitoring.md` L66–L71): the prose describes, the block demonstrates, and the model anchors on the block. The cost is tokens — every example sits in the prefix on every call (→ 04-token-budgeting.md) — so the discipline is "few, diverse, exactly-formatted," not "many."
-
-### Where this breaks down
-
-1. **Examples can over-constrain.** The monitoring output exemplar shows `"metric": "purchase_revenue"` and `"baseline": "90d"`. A model anchored on the example can echo those literal values even when the real metric is `conversion_rate` — imitating the example's *content*, not just its *shape*. Diverse examples mitigate this; a single exemplar risks it.
-
-2. **Format exemplars do not teach the decision.** Showing six EQL shapes teaches *syntax*, not *which query answers this anomaly*. The model can write a perfectly-shaped query that tests the wrong hypothesis. Format few-shot improves form, not judgment.
-
-3. **Zero-shot classification has no calibration anchor.** Because `classifyIntent` shows no examples, there is no in-context signal for the *boundary* cases — a query like "is my refund rate climbing?" sits between monitoring and diagnostic, and the model decides from definitions alone with nothing to imitate. The `parseIntent` fallback to `'diagnostic'` (`intent.ts` L11) catches misses but does not improve accuracy.
-
-4. **Dual-adapter format exemplars carry double the cost.** Since Phase 2 the monitoring prompt has to work against TWO data backends — Bloomreach (EQL syntax) and Olist (SQL-backed domain tools: `get_metric_timeseries`, `get_segments`, `get_anomaly_context`). The prompt now carries an EQL example block AND a parallel "Olist (SQL-backed tools)" example block, both in the prefix on every call regardless of which adapter is live. This is the unavoidable token cost of one prompt serving two contracts. The mitigation in the codebase is structural rather than few-shot: the prompt opens with "The available tools you receive at runtime reveal which adapter is live — use whichever set you actually see," so the model uses the tool catalog to decide which exemplar applies. Few-shot demonstrating shapes for two grammars at once is a real prompt-engineering bound — there is no way to demonstrate the SQL tool shape *and* the EQL string shape without paying for both.
-
-5. **Enumerated-step exemplars survive eval pressure better than prose plans.** The Phase 2.5 monitoring fix replaced a generic "scan globally then pick a dimension if interesting" prose plan with a *numbered 3-dimension scan plan* — call 1 against `state`, call 2 against `category`, call 3 against `payment_type`, each shown as a literal `get_metric_timeseries({...})` call with the exact argument shape. That is exemplars-as-checklist few-shot: the agent imitates the call shape AND walks the list. The detection eval scored that change with a 5x loose-recall lift (→ 05-eval-driven-iteration.md). The takeaway for few-shot: when the failure mode is *missed-coverage* (the agent skipped a dimension entirely), enumerated worked examples are a stronger fix than instruction-prose — the model imitates the count.
-
-### What to explore next
-
-- **Add 3–5 labeled examples to `classifyIntent`** and measure accuracy on a held-out set (the exercise below).
-- **Diversify the output exemplar** — show two anomaly objects with different metrics/directions to reduce content-echo.
-- **Dynamic few-shot** — retrieve the k most similar past queries as examples per call, instead of a fixed set (the production frontier for classifiers).
-
----
+In this codebase, concept 01 (anatomy) is where section 3 (examples) lives. Concept 02 (structured outputs) is what the example is *demonstrating*. Concept 04 (token budgeting) is why you don't add 20 examples.
 
 ## Project exercises
 
-### Add few-shot exemplars to the intent classifier and measure accuracy
+### Exercise — Add few-shot examples to the intent classifier
 
-- **Exercise ID:** B1.8 (adapted) — few-shot classification.
-- **What to build:** assemble a held-out set of ~30 real-shaped queries labeled `monitoring` / `diagnostic` / `recommendation`, measure `classifyIntent`'s zero-shot accuracy on it, then add 3–5 diverse labeled `query → label` examples to the system prompt (`intent.ts` L21–L23) and re-measure. Keep `max_tokens: 16`.
-- **Why it earns its place:** turns "should the classifier be few-shot?" from a hunch into a measured comparison, and exercises the few-shot-meets-evals seam (→ 05-eval-driven-iteration.md).
-- **Files to touch:** `lib/agents/intent.ts` (add examples to the system string), new `test/agents/intent.eval.test.ts` (the labeled set + accuracy harness).
-- **Done when:** the eval reports zero-shot and few-shot accuracy side by side, and the decision to keep or drop the examples is made on the number, not the vibe.
-- **Estimated effort:** 1–4hr
+  → **Exercise ID:** FEWSHOT-INTENT
+  → **What to build:** Modify `lib/agents/intent.ts` (and the active path through `@aptkit/core`'s intent classifier if exposed) to include 3 few-shot examples in the system message — one example per Intent class (monitoring / diagnostic / recommendation). Each example is a one-line user query followed by the one-word answer.
+  → **Why it earns its place:** The intent classifier is the *exact* case where few-shot is highest-leverage — one-word output with three valid values is what examples lock in. Today the prompt is rule-only (`"Classify ... as exactly one word: monitoring, diagnostic, or recommendation. Reply with ONLY the one word."`). Three examples would measurably improve reliability and bring the prompt in line with the other agents' patterns.
+  → **Files to touch:** `lib/agents/intent-legacy.ts` (the legacy path, for prototype), then push the change into the AptKit prompt if the upstream supports it.
+  → **Done when:** the classifier's system message includes "Examples:" followed by 3 lines like `"What's changed this week?" → monitoring`. A short eval (10 ambiguous queries) shows ≥0.9 agreement with hand-labelled answers.
+  → **Estimated effort:** ~1 hour for the change; ~2 hours if also writing the 10-case eval.
 
-### Diversify the monitoring output exemplar to reduce content-echo
+### Exercise — Add an edge-case example to the recommendation prompt
 
-- **Exercise ID:** B1.8 (adapted) — example diversity over count.
-- **What to build:** replace the single `purchase_revenue` output exemplar (`monitoring.md` L73–L85) with two objects of different metrics, directions, and severities (e.g. a `conversion_rate` "up"/"positive" alongside the revenue "down"/"critical"), so the model imitates the *shape* without anchoring on one metric's literal values.
-- **Why it earns its place:** demonstrates the "diverse beats numerous" rule and addresses the over-constraint failure where the model echoes the exemplar's content.
-- **Files to touch:** `lib/agents/prompts/monitoring.md` (the output block), `test/agents/monitoring.test.ts` (assert the agent still parses both shapes).
-- **Done when:** monitoring runs still parse via `isAnomalyArray`, and a manual check shows the model varying metric names rather than echoing `purchase_revenue`.
-- **Estimated effort:** <1hr
-
----
+  → **Exercise ID:** FEWSHOT-RECCO-EDGE
+  → **What to build:** Add a second worked example to `lib/agents/legacy-prompts/recommendation.md` showing what to emit when the diagnosis is *inconclusive* (the diagnostic chain returned the FALLBACK Diagnosis). Today the recommendation agent has one example showing a confident, dollar-quantified recommendation; it's silent on what to do when there's nothing to act on.
+  → **Why it earns its place:** Concept 02's empty-state escape valve is missing from this prompt. Without the example, the model invents recommendations or returns an empty array silently — neither is great. With an example showing "given inconclusive diagnosis, propose ONE low-effort investigative action with explicit `confidence: low`," the model has a sanctioned shape for the edge case.
+  → **Files to touch:** `lib/agents/legacy-prompts/recommendation.md`.
+  → **Done when:** the prompt has a clearly-labelled second example (`"If the diagnosis was inconclusive, return:"`) and a run against a fallback Diagnosis produces a low-confidence investigative recommendation rather than `[]`.
+  → **Estimated effort:** ~30 minutes.
 
 ## Interview defense
 
-### What an interviewer is really asking
+**Q: "When do you reach for few-shot?"**
 
-"Where do you use few-shot?" tests whether you can distinguish a format exemplar from a labeled decision example, and whether you know your own codebase well enough to say "format yes, classifier no." The senior signal is naming that the JSON output block is itself a one-shot, and that the classifier is zero-shot *by choice*, with a measurable condition for changing it.
-
-### Likely questions
-
-**[mid] "Show me a few-shot example in this codebase."**
-
-The clearest one is the output block — `monitoring.md` L73–L85 hands the model a fully-filled anomaly object (`18.5`, `"down"`, `"critical"`) and the model returns the same shape with its own values. That is a one-shot of the output form. The EQL reminders (`diagnostic.md` L27–L37) are format exemplars too — worked query shapes the model copies.
+Three cases. *(List them.)* Classifiers — where the output is short and the valid range is small. Format-sensitive output — JSON shapes, date formats, anywhere the model needs to produce *exactly* a structure. Style-sensitive output — when the model needs to *write* in a specific tone, the example carries the style. Three cases to skip: open-ended generation (don't anchor it), tool-calling-as-output (the schema is the contract), outputs the model already nails with rules alone (don't pay for what you don't need).
 
 ```
-filled JSON exemplar  →  model emits same shape, own values
-worked EQL lines      →  model copies supported syntax
+  use few-shot:                   skip few-shot:
+  ─────────────                   ─────────────
+  classifiers                      open-ended generation
+  format-sensitive output          tool-calling-as-output
+  style-sensitive output           outputs already nailed by rules
 ```
 
-**[senior] "Your classifier handles intent. Is it few-shot? Should it be?"**
+Anchor: *"examples constrain output more than rules do, because models are next-token predictors. Show the shape, don't describe it."*
 
-It is zero-shot — `classifyIntent` (`intent.ts` L17–L31) gives label *definitions* (L21–L23), no labeled query→label examples. That is defensible: three distinct categories, a capable model, `max_tokens: 16`, definitions are cheaper per call. Should it be few-shot? That is a *measured* question — if a held-out eval shows boundary cases (refund/return queries) landing on the wrong agent above tolerance, 3–5 diverse examples become worth the prefix tokens. I would not add them on a hunch.
+**Q: "How many examples?"**
+
+Three to five good examples beats twenty mediocre ones. Default to one — this codebase's monitoring, diagnostic, and recommendation prompts all use exactly one worked example. Add a second when the output has two distinct shapes (success and graceful failure — the diagnostic prompt has both). Add a third when an eval shows the model regressing on a specific edge case the third example targets. Stop when adding more doesn't lift the score.
+
+Anchor: *"one good example wins. Add the second when there's a second valid shape. After that, only add what the eval set proves earns its place."*
+
+**Q: "What's the failure mode?"**
+
+Bad examples are *worse* than no examples. If a deprecated field lives in your worked example, the model copies the deprecation. The discipline: when you change the output schema, update the example *first*, before the type guard, before the consumer. The example IS the contract; if it's wrong, the contract is wrong.
 
 ```
-now:    [definitions] + query → label              (zero-shot, cheap)
-if eval shows boundary misses → add [3–5 query→label examples]  (few-shot)
+  schema change checklist:
+  1. update the worked example in the .md prompt
+  2. update the type guard in lib/mcp/validate.ts
+  3. update the consumer(s)
+  4. ship
 ```
 
-**[arch] "Why not just write better instructions instead of examples?"**
-
-Because the model imitates shapes more reliably than it parses rules. The field-rules prose (`monitoring.md` L66–L71) *describes* the output; the JSON block *demonstrates* it — and the model anchors on the block. An instruction is parsed and the model fills gaps with guesses; an example is imitated and the model fills gaps by analogy. The trade is tokens — every example rides the prefix on every call — so the rule is "few, diverse, exactly-formatted," not "many."
-
-```
-instruction → parsed → gaps filled by guess
-example     → imitated → gaps filled by analogy   ← stronger structural constraint
-```
-
-### The question candidates always dodge
-
-**"Does showing the model six correct EQL shapes make it write the *right* query?"** No — it makes it write a *well-formed* query. Format exemplars constrain syntax, not judgment; the model can emit a perfectly-shaped EQL line that tests the wrong hypothesis (`diagnostic.md` L27–L37 teaches form, not which dimension to segment by). Conflating "the output is shaped right" with "the decision is right" is the dodge — and it is why format few-shot needs evals on top.
-
-### One-line anchors
-
-- `monitoring.md` L73–L85 — the output exemplar: a one-shot of the return shape.
-- `diagnostic.md` L27–L37 — EQL format exemplars, with a negative example at L35.
-- `monitoring.md` L39–L47 — the five-step worked query plan (process exemplar).
-- `intent.ts` L21–L23 — the classifier system prompt: definitions, zero-shot.
-- `query.md` L15–L21 — Framing: the same three label definitions, no examples.
-
----
+Anchor: *"the example is the contract. Bad examples are worse than no examples — the model copies the brokenness."*
 
 ## See also
 
-→ 01-anatomy.md · → 02-structured-outputs.md · → 09-chain-of-thought.md · → 04-token-budgeting.md
-
----
+- `01-anatomy.md` — section 3 (examples) is exactly this concept; the four-section anatomy is where few-shot lives.
+- `02-structured-outputs.md` — the example shows the JSON shape; the type guard enforces it; together they're the contract.
+- `04-token-budgeting.md` — examples are in the system prompt every call; concept 04 is the discipline that decides if you can afford them.
+- `05-eval-driven-iteration.md` — when to add a second/third example is an eval-driven decision; not by vibes.
+- `07-output-mode-mismatch.md` — when the example, the type guard, and the consumer disagree, that's a mismatch.

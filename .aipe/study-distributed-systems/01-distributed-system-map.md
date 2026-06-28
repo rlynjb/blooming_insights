@@ -1,346 +1,323 @@
-# 01 — the distributed system map
+# Distributed system map
 
-**Industry name(s):** coordination map · trust + failure topology · ownership boundaries
-**Type:** Industry standard · Language-agnostic
-
-> **Verdict-first:** blooming insights has *three* real distributed boundaries and *one* coordination gap pretending not to exist. All three boundaries are over the internet (Bloomreach MCP, Anthropic, Bloomreach IdP). The gap is the assumption that one Vercel instance's in-memory `Map` is the same `Map` the next request will hit — it isn't, and the app has no mechanism that would notice when it isn't. `makeDataSource(mode, sid)` picks one of two adapters — `BloomreachDataSource` (the one distributed adapter, HTTP+SSE) or `SyntheticDataSource` (in-process fake; does NOT cross a hop). The earlier stdio subprocess adapter (`OlistDataSource`) that briefly added a fourth boundary was removed in PR #8 (2026-06-18). Every other distributed-systems concept in this guide attaches to one of those four spots (three boundaries + the gap).
-
----
+**Industry name:** system diagram / coordination map · **Type:** Language-agnostic
 
 ## Zoom out, then zoom in
 
-The map is the orientation. Every other file in this guide picks one of the boxes below and walks one axis through it.
+Before any mechanism, let's put the whole distributed surface of this repo on one picture. The verdict first: **there is exactly one upstream wire surface that does interesting distributed-systems work** — Bloomreach. Anthropic is a second wire but it's well-behaved (no rate limit at this volume, just latency). Everything else lives inside one Node process.
 
 ```
-  Zoom out — the whole distributed surface
+  Zoom out — the entire distributed surface
 
-  ┌─ UI layer (browser) ─────────────────────────────────┐
-  │  React state + sessionStorage                         │
-  │  ★ THIS CONCEPT — the system map ★                    │ ← we are here
-  └─────────────────────────┬────────────────────────────┘
-                            │  HTTPS (cookies)
-  ┌─ Service layer ─────────▼────────────────────────────┐
-  │  Vercel instance(s) · in-memory Maps                  │
-  │  makeDataSource(mode, sid) → BloomreachDataSource     │
-  │                            OR SyntheticDataSource     │
-  │                              (in-process fake)        │
-  └────────────┬─────────────────────────────────────────┘
-               │ HTTPS (3 partners)
-  ┌─ Provider layer ───────▼──────────┐
-  │  Bloomreach MCP                    │
-  │  Anthropic API                     │
-  │  Bloomreach IdP                    │
-  └────────────────────────────────────┘
+  ┌─ Browser / UI layer ────────────────────────────────────────┐
+  │  React 19 client                                            │
+  │  app/page.tsx, app/investigate/[id]/page.tsx,               │
+  │  lib/hooks/{useBriefingStream,useInvestigation,             │
+  │             useReconnectPolicy}.ts                          │
+  └────────────┬──────────────────────────────┬─────────────────┘
+               │ HTTPS same-origin             │ HTTPS cross-site
+               │ fetch + NDJSON reader          │ (OAuth IdP round-trip)
+               ▼                               ▼
+  ┌─ Service layer — Vercel serverless (ephemeral) ─────────────┐
+  │  app/api/briefing · app/api/agent ·                         │
+  │  app/api/mcp/{callback, reset, call, tools, capture}        │
+  │                                                             │
+  │  per-instance in-memory state:                              │
+  │  • lib/state/insights.ts  (session-scoped Map)              │
+  │  • lib/state/investigations.ts                              │
+  │  • lib/mcp/schema.ts `cached`  (schema memoization)         │
+  │  • bi_auth cookie  (encrypted, cross-instance state)        │ ◄── here be dragons
+  └────────────┬──────────────────────────────┬─────────────────┘
+               │ HTTPS Bearer                  │ HTTPS Bearer
+               │ @modelcontextprotocol/sdk     │ @anthropic-ai/sdk
+               │ StreamableHTTPClientTransport │
+               ▼                               ▼
+  ┌─ Provider layer ────────────┐   ┌─ Provider layer ─────────┐
+  │  Bloomreach loomi-MCP        │   │  Anthropic API           │
+  │  https://loomi-mcp-alpha…    │   │                          │
+  │  rate limit ~1 req/s         │   │  no rate limit hit       │
+  │  tokens revoked ~minutes     │   │  latency variance only   │
+  │  alpha-grade behavior        │   │  the "boring" upstream   │
+  └──────────────────────────────┘   └──────────────────────────┘
 ```
 
-**Zoom in.** The map answers: *what coordinates with what, who owns what, and where can the answer go wrong?* This file names the boxes and arrows. The other files in the guide pick one boundary or one ownership flip and walk the mechanism.
-
----
+The dragon icon is where the only genuinely *distributed* state lives — see `07-clocks-coordination-and-leadership.md`.
 
 ## Structure pass
 
-**Layers.** Three. Client · Service (your Vercel instance) · Providers (Bloomreach MCP, Anthropic, Bloomreach IdP). Multi-instance is implicit at the service layer — Vercel scales horizontally, but the code treats each instance as if it were the only one.
+Three layers (Browser → Vercel function → external providers), one axis worth tracing across them, and the boundary where the axis-answer flips is the load-bearing seam.
 
-**Axis: ownership.** Hold one question across every layer: *who owns this piece of state, and how long does it survive?* This is the right axis because the most consequential bug-shapes in this codebase come from ownership confusion — the server thinks it owns the diagnosis between steps 2 and 3 (it doesn't; the client does), and any new feature that assumes the in-memory `Map` is durable is wrong.
-
-**Seams.** Four boundaries; the ownership answer flips at three of them.
-
-- **Seam A — browser ↔ Vercel instance.** Ownership flips from "client React state + tab-local sessionStorage" to "request-scoped variables + (sometimes) process-local `Map`." Cookies cross both directions.
-- **Seam B — instance ↔ instance.** Implicit and uncrossed. There IS no mechanism that crosses this seam. Two concurrent requests on two instances each see their own `Map`. This is the gap.
-- **Seam C — instance ↔ Bloomreach MCP.** Ownership flips from "ours (cache, lastCallAt counter, spacing budget)" to "theirs (rate-limit window, workspace data, the truth)." Transport: HTTPS+SSE.
-- **Seam D — instance ↔ Anthropic.** Ownership flips from "ours (the prompt + tool schemas we built)" to "theirs (the model's output, their rate limits)." Transport: HTTPS.
-- **Seam E — instance ↔ Bloomreach IdP.** Ownership flips from "ours (the PKCE verifier, the redirect_uri we registered)" to "theirs (the auth code, the access + refresh tokens)." Transport: HTTPS (OAuth).
-
-Seams C, D, E are the three real distributed boundaries. Seam B is the gap. Seam A is the workaround for Seam B (the client carries state precisely because the server can't be trusted to remember it). The previous Seam F (instance ↔ mcp-server-olist subprocess, stdio transport) was removed when the Olist adapter was deleted in PR #8 (2026-06-18); the `SyntheticDataSource` adapter that replaced it lives entirely inside the Vercel instance and never crosses a seam.
+### Axis: who can fail and how loudly?
 
 ```
-  Structure pass — ownership flips at three boundaries, one gap
+  Trace the "failure" axis down the stack
 
-  ┌─ client ────────────────────────────────────────────┐
-  │  owns: React state, sessionStorage (per tab)         │
-  └─────────────────┬──────── A ────────────────────────┘
-                    │  (cookies cross + back)
-  ┌─ Vercel inst1 ──▼───────┐  ┌─ Vercel inst2 ───────┐
-  │  owns: req-scoped vars,  │  │  owns: req-scoped     │
-  │        in-memory Map(s)  │  │        vars, OWN Map  │
-  └────────┬─────────────────┘  └───────────────────────┘
-           │  no seam B — these never coordinate
-           │
-   ┌───────┼──────────┬──────────┐
-   │   C   │      D   │      E   │
-   ▼       ▼          ▼          ▼
-  MCP   Anthropic   IdP            (each owns its own truth)
-  HTTPS HTTPS       HTTPS          (Seam C carries MCP/JSON-RPC 2.0
-                                    over HTTPS+SSE)
+  ┌─ Browser ──────────────────────────────────┐
+  │  fails by: tab closed, fetch aborted        │   → silent on server
+  │           (we honor it with req.signal)     │
+  └────────────────────┬───────────────────────┘
+                       │
+  ┌─ Vercel function ──▼───────────────────────┐
+  │  fails by: 300s deadline (maxDuration),     │   → loud (route returns 500)
+  │           cold start, process restart       │
+  │           — all per-instance, never replicated
+  └────────────────────┬───────────────────────┘
+                       │
+  ┌─ Bloomreach ───────▼───────────────────────┐
+  │  fails by: 429 rate-limited, 401 invalid_   │   → loud + structured
+  │           token, request timeout, alpha     │     (error envelope w/ hint)
+  │           "fetch failed" intermittents      │
+  └────────────────────────────────────────────┘
 ```
 
----
+The axis-answer changes at every layer. That makes each boundary a **seam** worth studying.
+
+### Seams (the boundaries where contracts live)
+
+```
+  Three seams, each with a contract
+
+  Browser ◄── seam 1: NDJSON stream + signal.aborted ──► Vercel function
+                       contract: server checks aborted
+                       at every phase boundary; client
+                       can hang up any time
+
+  Vercel function ◄── seam 2: encrypted cookie ──► Vercel function (different instance)
+                       contract: state survives the
+                       per-instance boundary by riding
+                       the user's cookie
+
+  Vercel function ◄── seam 3: MCP Bearer + JSON-RPC ──► Bloomreach
+                       contract: ~1 req/s, 60s cache
+                       absorbs repeats, retry honors
+                       the stated penalty window
+```
+
+Seam 2 is the surprising one. Without it (i.e. if state lived in the process), the OAuth `callback` request would land on an instance that had never seen the PKCE verifier and the flow would silently break. The encrypted cookie is the only thing making this distributed-systems problem disappear.
+
+### The layered decomposition
+
+```
+  Layer · who owns state? · how does failure travel?
+
+  Browser           — owns: route, sessionStorage stash, UI state
+                    — failure: aborts the fetch (cooperative)
+
+  Vercel instance   — owns: in-mem maps (per session), schema cache
+                    — failure: 500 + log line; next request gets fresh instance
+
+  Vercel cohort     — owns: NOTHING coherent across instances
+                    — except the bi_auth cookie, which is what makes the
+                      cohort look like a single backend to the user
+
+  Bloomreach MCP    — owns: per-user rate-limit window, OAuth tokens
+                    — failure: error envelope + structured retry hint
+```
+
+Hand off to How it works.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-A distributed-systems map is the picture you draw when someone asks *"what happens if this part is slow / dead / lying?"* You point at each box and answer for that box. The shape is just: nodes + arrows + ownership labels + a marker on each arrow that says what guarantee crosses it.
+You know how when you `fetch('/api/data')` from a React component the browser doesn't care which server instance answers? Same thing here, with one twist: there's an OAuth round-trip that takes the browser **away** from your server (to Bloomreach's IdP) and brings it back to a `/callback` URL, and that callback request **might** land on a different Vercel instance than the one that started the flow. So state has to ride the cookie, not the process.
+
+The map you're learning to read has three bands — browser, your serverless functions, external providers — and four seams (NDJSON streams, OAuth, MCP-over-HTTPS, Anthropic API). The shape of the system fits on one page because there's only one interesting upstream and no internal services.
 
 ```
-  The pattern of a distributed-systems map
+  Coordination map — the kernel
 
-  ┌─ node A ─┐  guarantee crosses here  ┌─ node B ─┐
-  │ owns: X  │ ────────────────────────► │ owns: Y  │
-  └──────────┘  (can be late / partial /  └──────────┘
-                lost / duplicated / lied
-                about — the question is
-                which of those, and how
-                does node A respond when
-                it happens)
+       ┌──────────┐   stream    ┌──────────────┐  bearer  ┌────────────┐
+       │ browser  │ ◄──────────► │ Vercel fn    │ ◄──────► │ Bloomreach │
+       │ (1 tab)  │              │ (N instances)│          │ (1 server) │
+       └──────────┘              └──────┬───────┘          └────────────┘
+                                        │ bearer
+                                        ▼
+                                 ┌────────────┐
+                                 │ Anthropic  │
+                                 └────────────┘
+
+  state that crosses an instance boundary: ONLY the bi_auth cookie
+  state in process memory: insights, investigations, schema cache
 ```
 
-The map isn't decoration. It's the artifact you use to predict failure. If you can't draw the map, you can't predict what breaks first.
+### Move 2 — walk the seams
 
-### Move 2 — the boxes and arrows
+#### Seam 1: browser ↔ Vercel function (NDJSON + abort)
 
-**Use cases.** This map is the artifact you reach for when:
-- you find that an investigation works locally but fails on a cold-started Vercel deployment ("the insight isn't in the `Map`") — Seam B is the culprit
-- you add a new external service (a new model provider, a feature-flag service, an analytics sink) and need to predict its failure mode — you add a new box and ask "what does the response carry that lets me retry intelligently?"
-- you debug an OAuth callback that succeeds in dev but fails in production with "no PKCE code_verifier stored" — Seam E with the wrong backend chosen
-
-#### The client box
-
-You already know `useState`. The client owns React state for the current page and `sessionStorage` for the current tab. `sessionStorage` is its own ownership domain — survives reloads, dies with the tab, never crosses tabs. It carries three keys for this app: `bi:diag:<id>` (the diagnosis handed to step 3), `bi:insight:<id>` (the insight handed to the agent route when in live mode), `bi:inv:<step>:<id>` (the trace stash for instant rehydrate on back-nav).
+The contract is asymmetric: the **server** opens a `ReadableStream`, the **client** reads NDJSON lines one at a time. When the user navigates away, the fetch is aborted and `req.signal.aborted` flips on the server.
 
 ```
-  Client ownership — what survives what
+  Layers-and-hops — what travels in each direction
 
-  this render        ───  React state
-  this tab           ───  sessionStorage
-  this browser       ───  localStorage (mode toggle)
-  this site, signed  ───  cookies (bi_session + bi_auth)
-                          (sent on every request)
-
-  bridges what otherwise dies: bi:diag:<id> is how
-  step 2's diagnosis reaches step 3 across two
-  independent server requests
+  ┌─ Browser ──────┐   hop 1: GET /api/briefing?mode=… (open stream)
+  │  fetch().body  │ ────────────────────────────────────────────────►
+  │  reader        │                                            ┌─ Vercel fn ─────┐
+  │                │   hop 2: NDJSON lines (workspace, coverage_item, │ ReadableStream  │
+  │                │           reasoning_step, tool_call_*, insight…  │ controller      │
+  │                │ ◄──────────────────────────────────────────────── │                 │
+  │                │   hop 3 (anytime): tab closed → fetch abort       │ req.signal      │
+  │                │ ────────────────────────────────────────────────► │ .throwIfAborted │
+  └────────────────┘                                            └─────────────────┘
 ```
 
-The bridge is the load-bearing detail. Without `sessionStorage`, you'd need a server-side store keyed by `insightId` that both step 2 and step 3 can read — and that store would need to be cross-instance-readable, which is exactly the problem you're avoiding.
+The server does the right thing here: `req.signal.throwIfAborted()` is called at every phase boundary in `/api/briefing` (`app/api/briefing/route.ts:215, 248, 259, 283`) and `/api/agent` (`app/api/agent/route.ts:226, 237, 248, 274, 290`). Every async layer below threads the signal down — `bootstrap(req.signal)`, `dataSource.listTools({signal})`, agent.scan({signal}), and eventually `BloomreachDataSource.callTool(..., {signal})`. **First signal to fire wins.**
+
+#### Seam 2: Vercel instance ↔ Vercel instance (cookie-backed state)
+
+This is the load-bearing one. Vercel's serverless functions are *ephemeral and horizontally scaled*. The `/api/mcp/connect`-equivalent (the call that triggers OAuth) and the `/api/mcp/callback` (the IdP's return) **may land on different instances**.
 
 ```
-  lib/hooks/useInvestigation.ts  (lines 18-19, 137-140)
+  Layers-and-hops — the OAuth round-trip across instances
 
-  const stashKey = (step, id) => `bi:inv:${step}:${id}`;
-  const diagHandoffKey = (id) => `bi:diag:${id}`;
-                                                              ← these two keys ARE
-                                                                the cross-request
-                                                                state carriers
-  // on 'done' event for the diagnose step:
-  if (step === 'diagnose' && cDiag) {
-    sessionStorage.setItem(
-      diagHandoffKey(id),
-      JSON.stringify({ diagnosis: cDiag }),
-    );  ← step 3 will read this — the SERVER does not remember it
+  ┌─ Browser ──────┐   hop 1: GET /api/briefing
+  │                │ ──────────────────────────────────► ┌─ Vercel inst A ─┐
+  │                │                                     │ DCR: register   │
+  │                │                                     │ PKCE: gen verif │
+  │                │                                     │ saveCodeVerif() │
+  │                │                                     │ saveClientInfo()│
+  │                │   hop 2: 401 + authUrl + Set-Cookie │  → bi_auth cookie
+  │                │ ◄────────────────────────────────── │    (encrypted)  │
+  │                │                                     └─────────────────┘
+  │                │   hop 3: redirect to Bloomreach IdP
+  │                │ ──────────────────────────────────► (external)
+  │                │   hop 4: IdP → /api/mcp/callback?code=…
+  │                │ ──────────────────────────────────► ┌─ Vercel inst B ─┐ (different!)
+  │                │                                     │ read bi_auth    │
+  │                │                                     │ AsyncLocalStor… │
+  │                │                                     │ → has verifier  │
+  │                │                                     │ exchange code   │
+  │                │                                     │ saveTokens()    │
+  │                │                                     │ → cookie updated │
+  └────────────────┘                                     └─────────────────┘
+```
+
+Real code lives in `lib/mcp/auth.ts:86`:
+
+```ts
+export async function withAuthCookies<T>(fn: () => Promise<T>): Promise<T> {
+  if (process.env.NODE_ENV !== 'production') return fn();   // dev/test: file/memory
+  const { cookies } = await import('next/headers');
+  const raw = (await cookies()).get(AUTH_COOKIE)?.value;
+  const ctx: RequestStore = { store: raw ? decryptStore(raw) : {}, dirty: false };
+  const result = await requestStore.run(ctx, fn);            // ALS scope for the request
+  if (ctx.dirty) {
+    (await cookies()).set(AUTH_COOKIE, encryptStore(ctx.store), {…});
   }
-       │
-       └─ this is the stateless-server / stateful-client pattern, made
-          load-bearing: the diagnosis hops client→server→client→server
-          across two route invocations. file 04 walks the consistency.
+  return result;
+}
 ```
 
-#### The Vercel instance box
+The `AsyncLocalStorage` is the load-bearing detail. Without it, every `provider.saveCodeVerifier(v)` / `provider.tokens()` call inside the SDK's auth flow would re-read the cookie and Next's request-vs-response cookie split would hand back the *old* value mid-request. The ALS-scoped store reads the cookie **once** at request start and flushes **once** at request end.
 
-You already know a Node process. Each Vercel invocation is a Node process. Whether two requests land on the same process is a coin flip controlled by Vercel — and even if they do, the process can be recycled between them. The code holds three pieces of state at this layer: the `insights` and `investigations` `Map`s in `lib/state/`, the module-level `cached` schema variable, and the AsyncLocalStorage-scoped auth store that wraps the cookie. **None of those survive across two different instances.**
+#### Seam 3: Vercel function ↔ Bloomreach (rate-limited HTTPS)
 
-```
-  Vercel instance — what survives what (in-process)
-
-  this request    ───  request-scoped vars + ALS context
-  this process    ───  module-level Map / cached schema
-  across instances ──  NOTHING in this app
-                      (cookies cross via the client; nothing
-                       on the server reaches sideways)
-```
-
-The boundary condition is silent. When the `Map` is empty because the request landed on a cold instance, no error fires; the lookup just returns `null` and the caller falls through to whatever fallback exists. The `resolveAnomaly` function in `app/api/agent/route.ts:37` is exactly that fallback — try in-memory, then try the demo snapshot, then 404. The fact that the in-memory path *silently misses* on a recycled instance is the load-bearing risk.
+The interesting one. Lives in `lib/data-source/bloomreach-data-source.ts` and `lib/mcp/transport.ts`.
 
 ```
-  lib/state/insights.ts  (lines 4-6, 30-42)
+  Layers-and-hops — one tool call
 
-  const insights = new Map<string, Insight>();             ← process-local;
-  const investigations = new Map<string, Investigation>();    no cross-instance
-  const anomalies = new Map<string, Anomaly>();              link exists
-
-  export function putInsights(items, rawAnomalies?) {
-    insights.clear();                  ← each briefing replaces the feed;
-    anomalies.clear();                    deliberate, but doubles down on
-    items.forEach((i, idx) => {           the "one process, one truth" model
-      insights.set(i.id, i);
-      if (rawAnomalies?.[idx]) anomalies.set(i.id, rawAnomalies[idx]);
-    });
-  }
-       │
-       └─ this Map IS the gap. Two concurrent users on two Vercel
-          instances each get a different Map. Neither knows the other
-          exists. There's no error — the lookup just returns null.
+  ┌─ Vercel fn ────────┐  hop 1: callTool(name, args, {signal})
+  │ agent loop         │ ─────────────────────────────────────►  ┌─ BloomreachDataSource ─┐
+  │                    │                                          │ cache.get(key)?         │
+  │                    │  hop 2: cache hit → {result, fromCache}  │ ── yes → return         │
+  │                    │ ◄─────────────────────────────────────── │ ── no  → liveCall       │
+  │                    │                                          └────────────┬────────────┘
+  │                    │                                                       │ wait until lastCallAt + 1100ms
+  │                    │                                                       ▼
+  │                    │                                          ┌─ SdkTransport ─────────┐
+  │                    │                                          │ AbortSignal.any(        │
+  │                    │                                          │   route signal,         │
+  │                    │                                          │   timeout(30_000))      │
+  │                    │                                          └────────────┬────────────┘
+  │                    │                                                       │
+  │                    │                                                       │ HTTPS / Bearer
+  │                    │                                                       ▼
+  │                    │                                          ┌─ Bloomreach loomi-MCP ─┐
+  │                    │                                          │ 200 OK or 429 or 401   │
+  │                    │                                          │ envelope w/ retry hint │
+  │                    │                                          └─────────────────────────┘
 ```
 
-#### The Bloomreach MCP box
-
-You already know an HTTP API with rate limits and a Bearer token. MCP is one of those, dressed up with a JSON-RPC envelope. The server enforces a **global** ~1 req/s/user limit — meaning "global per user, not per connection," so two parallel investigations for the same user share the same budget. The 429 response carries the window in the error text ("Retry after ~10 seconds" or "rate limit reached (1 per 10 second)"), which `BloomreachDataSource` parses (`lib/data-source/bloomreach-data-source.ts:64-77`).
-
-```
-  MCP boundary — what crosses, what fails
-
-  ┌─ McpClient ──────┐  POST + Bearer + JSON-RPC  ┌─ Bloomreach MCP ─┐
-  │ owns: cache,     │ ──────────────────────────► │ owns: workspace   │
-  │ lastCallAt,      │ ◄────────────────────────── │ data, rate limit  │
-  │ retry budget     │  200 (with isError?) or 429 │ window            │
-  └──────────────────┘  with retry hint in text     └──────────────────┘
-
-  failure modes:
-   • 429 (rate-limited)        → parsed window, retry, bounded
-   • isError: true in 200 body → surfaced to caller, NOT retried
-   • transport error (e.g. 401) → thrown as McpToolError, NOT retried
-   • timeout (network hang)    → NO explicit timeout; route's 300s
-                                 is the only ceiling
-```
-
-The third bullet is a real distributed-systems gap — no per-call timeout means a hung MCP connection consumes the route's whole 300s budget. File 02 walks this.
-
-#### The Anthropic box
-
-Same shape as the MCP box: HTTPS, Bearer token, can rate-limit, can latency-spike. The code calls it inside `runAgentLoop` (`lib/agents/base.ts:102`) with no retry, no per-call timeout, no fallback model. The boundary is real but the failure handling is minimal: any error from `anthropic.messages.create()` bubbles up as the agent loop throwing, which the route catches and surfaces as `{ type: 'error' }` in the NDJSON stream. **Inferred:** Anthropic's SDK may do its own retry internally; the codebase does not configure or override it.
-
-#### The Bloomreach IdP box
-
-OAuth + PKCE + Dynamic Client Registration. The interesting part is that the *connect* request and the *callback* request are two separate HTTP requests, possibly landing on two different Vercel instances. The PKCE code verifier is generated during connect and must be readable during callback. The encrypted `bi_auth` cookie (`lib/mcp/auth.ts:86-104`) is what bridges Seam D — without it, callback fails with "no PKCE code_verifier stored for this session" because the instance that ran connect already recycled or never ran callback.
-
-```
-  lib/mcp/auth.ts  (lines 86-104)
-
-  export async function withAuthCookies<T>(fn: () => Promise<T>): Promise<T> {
-    if (process.env.NODE_ENV !== 'production') return fn();   ← dev passes through
-    const { cookies } = await import('next/headers');
-    const raw = (await cookies()).get(AUTH_COOKIE)?.value;
-    const ctx: RequestStore = {                               ← seed ONCE from cookie
-      store: raw ? decryptStore(raw) : {},
-      dirty: false,
-    };
-    const result = await requestStore.run(ctx, fn);           ← all reads/writes hit ALS
-    if (ctx.dirty) {
-      (await cookies()).set(AUTH_COOKIE, encryptStore(ctx.store), {
-        httpOnly: true, secure: true, sameSite: 'none',       ← cross-site so the
-        path: '/', maxAge: AUTH_COOKIE_MAX_AGE,                 IdP return preserves it
-      });
-    }
-    return result;
-  }
-       │
-       └─ this IS the mechanism that crosses Seam E (instance↔instance) —
-          the cookie is the carrier; the server is stateless across
-          instances by design. Without this, callback would fail because
-          the PKCE verifier lives on whichever instance ran connect.
-```
-
-#### The SyntheticDataSource (in-process; NOT a distributed box)
-
-Worth naming what's NOT a distributed boundary. The `SyntheticDataSource` adapter (`lib/data-source/synthetic-data-source.ts:314-331`) implements the same `DataSource` interface as `BloomreachDataSource` and is picked by `makeDataSource('live-synthetic', sid)`. But it lives entirely inside the Vercel JS process — no IPC, no subprocess, no network. `callTool` is a synchronous dispatch over a giant `switch` returning deterministic fixture data. There is no Seam F here; the synthetic adapter is hidden behind Seam B (the cosmetic in-process boundary). It's listed here so future readers don't draw it as an external box.
-
----
+This seam carries every distributed-systems concern in this repo: timeouts, retries, deduplication, backpressure, partial-failure containment. The deep walk is in `02-partial-failure-timeouts-and-retries.md`.
 
 ### Move 3 — the principle
 
-A distributed-systems map isn't a diagram; it's a *prediction tool*. Every box on it is a thing that can be slow, dead, or lying. Every arrow is a guarantee that can fail. The work of distributed-systems engineering is making each arrow's failure mode survivable for the boxes on either side. blooming insights does this well for Seam C (`BloomreachDataSource`'s parsed-retry), well for Seam E (the encrypted cookie), badly for Seam B (no mechanism at all), and not yet for Anthropic-the-box (no retry, no timeout, no fallback). The earlier Phase-2 expansion to two distributed transports was reverted in PR #8 (2026-06-18); the `DataSource` interface still demonstrates the adapter pattern, but only Bloomreach actually crosses a process boundary now.
+**Most "distributed systems" advice assumes you have a topology to defend.** This repo has a topology you can fit in one diagram. The lesson isn't "we don't need distributed systems thinking" — it's that the load-bearing concerns collapse onto exactly the boundaries where the topology *does* fan out: the per-instance ephemeral memory inside Vercel's cohort, and the per-user rate limit on the upstream. Everything else is single-process and stays that way.
 
----
+The map is the contract. Once you can draw it, every later file is a slice of one boundary on it.
 
 ## Primary diagram
 
 ```
-  blooming insights — the distributed map, every arrow labelled
+  The full coordination map — every box, every arrow, every layer
 
-  ┌─ Client (browser) ──────────────────────────────────────────────────┐
-  │   React state (this render)                                           │
-  │   sessionStorage:  bi:diag:<id>   bi:insight:<id>   bi:inv:<step>:<id>│
-  │   localStorage:    bi:mode  (demo / live-synthetic / live-bloomreach) │
-  │   cookies:         bi_session  bi_auth (encrypted)                    │
-  └──────────────────┬────────────────────────────┬──────────────────────┘
-                     │  HTTPS + cookies            │  HTTPS + cookies
-                     ▼                             ▼
-  ┌─ Vercel instance N ───────────┐   ┌─ Vercel instance M ────────────┐
-  │   request-scoped variables     │   │   request-scoped variables      │
-  │   ALS context (auth store)     │   │   ALS context (auth store)      │
-  │   Map<id, Insight>             │   │   Map<id, Insight>  ← DIFFERENT │
-  │   Map<id, AgentEvent[]>        │   │   Map<id, AgentEvent[]>         │
-  │   cached: WorkspaceSchema      │   │   cached: WorkspaceSchema       │
-  │   makeDataSource(mode, sid)    │   │   makeDataSource(mode, sid)     │
-  │   (live-synthetic stays in-    │   │                                 │
-  │    process; not drawn)         │   │                                 │
-  └─────┬───────┬───────┬──────────┘   └────── (no link between them) ───┘
-        │       │       │
-        │ MCP   │ Anthr.│ IdP
-        ▼       ▼       ▼
-  ┌─ Bloomreach ─┐  ┌─ Anthropic ─┐  ┌─ IdP ──┐
-  │  MCP server   │  │  API         │  │ OAuth   │
-  │  1 req/s/user │  │  rate-       │  │ +DCR    │
-  │  GLOBAL       │  │  limited     │  │ +PKCE   │
-  │  429 carries  │  │  + variable  │  │         │
-  │  retry hint   │  │  latency     │  │         │
-  │  HTTP+SSE     │  │              │  │         │
-  │  JSON-RPC 2.0 │  │              │  │         │
-  └───────────────┘  └──────────────┘  └─────────┘
-
-  guarantees that cross:
-    Seam A (client↔inst):  cookies (auth, session), JSON request body
-    Seam B (inst↔inst):    NOTHING — no shared store
-    Seam C (inst↔MCP):     Bearer token, project_id, tool args
-                           (transport: HTTPS+SSE)
-    Seam D (inst↔Anthr):   API key, prompt + tool schemas
-    Seam E (inst↔IdP):     PKCE verifier (saved in cookie at connect,
-                           read from cookie at callback)
+  ┌─ UI layer ────────────────────────────────────────────────────────┐
+  │  React 19 client                                                  │
+  │  app/page.tsx · app/investigate/[id]/page.tsx                     │
+  │  hooks: useBriefingStream, useInvestigation, useReconnectPolicy   │
+  └────────┬─────────────────────────────────┬────────────────────────┘
+           │ HTTPS NDJSON                     │ HTTPS (OAuth IdP redirect, cross-site)
+           │ fetch().body + reader            │
+           ▼                                  ▼
+  ┌─ Service layer — Vercel serverless cohort (N ephemeral instances) ─┐
+  │                                                                    │
+  │  /api/briefing             /api/agent           /api/mcp/callback  │
+  │     │                         │                     │              │
+  │     └─── ReadableStream ──────┴────── (NDJSON) ─────┤              │
+  │                                                     │              │
+  │  per-instance memory:                       cross-instance state:  │
+  │  • insights/investigations Maps             • bi_auth cookie       │
+  │  • schema cache (lib/mcp/schema.ts:190)       (AES-256-GCM)        │
+  │  • BloomreachDataSource cache (60s TTL)     • bi_session cookie    │
+  │                                                                    │
+  └────────┬───────────────────────────────────────┬───────────────────┘
+           │ MCP-over-HTTPS                          │ HTTPS
+           │ ~1 req/s spacing                        │
+           │ retry honors stated penalty             │
+           ▼                                         ▼
+  ┌─ Bloomreach loomi-MCP ─────────────┐   ┌─ Anthropic API ────────────┐
+  │  alpha — rate limit + token revoke │   │  Sonnet 4-6 + Haiku 4-5    │
+  └────────────────────────────────────┘   └────────────────────────────┘
 ```
-
----
 
 ## Elaborate
 
-The map's value isn't completeness; it's the questions it makes obvious. "What if Bloomreach is down for 5 minutes?" → look at Seam C, find that `McpClient` retries 3 times at ~10s each, then bubbles the error up; the agent loop will throw; the route will emit `{ type: 'error' }`; the UI will show it. "What if Anthropic is slow today?" → Seam D, no retry, no timeout; the route's 300s budget is the only ceiling; if Anthropic takes 60s per turn, an 8-turn agent loop hits the wall. "What if Vercel recycles the instance mid-investigation?" → Seam B; the in-memory `Map` is gone; the next request lands on a different instance and `getCachedInvestigation` returns null; the demo snapshot is the fallback for replays, nothing exists for live runs.
+The shape comes from three deliberate choices:
 
-The strongest signal a map is correct: each box names what it owns, each arrow names what crosses, and you can predict the failure mode without re-reading the code.
+1. **Stateless serverless instead of a long-running server.** Vercel's model. Cheap, scales without thought, but ephemeral memory means any state that has to span requests either rides a cookie or doesn't exist. The encrypted-cookie OAuth store is the *only* place in this repo that solves a real distributed-systems problem.
 
----
+2. **One upstream of record (Bloomreach).** No microservices, no fan-out, no internal queues. This is honest — adding a second backend you also call would multiply the boundary count.
+
+3. **In-process synthetic source as a fallback.** `SyntheticDataSource` (`lib/data-source/synthetic-data-source.ts:314`) is *not* a wire — it's a class implementing the same `DataSource` interface. Calls have `fromCache: false` and a small `durationMs` because they're function calls, not network calls. This is the "what would change if we swapped upstreams" answer.
+
+Useful adjacent reading: Werner Vogels on eventual consistency, AWS Lambda's cold-start lifecycle, the MCP spec for the JSON-RPC envelope shape.
 
 ## Interview defense
 
-**Q: What's distributed about this app?**
-The boundaries, not the topology. Inside one Vercel invocation it's a single Node process. But every meaningful piece of state crosses a network into a partner I don't control — Bloomreach MCP for data, Anthropic for reasoning, the Bloomreach IdP for tokens. Each of those is a hop that can be slow, rate-limited, or unreachable. The distributed-systems lens is about *how the in-process code behaves when one of those hops fails*.
+**Q: "Walk me through your system's distributed surface."**
+
+> "One real wire surface — HTTPS to Bloomreach's loomi-MCP server, which is rate-limited at ~1 request per second per user and revokes OAuth tokens after a few minutes. A second wire to Anthropic for model calls, but that one's well-behaved at our volume. Everything else is single-process inside Vercel serverless functions. The interesting distributed-systems work is in three places: the rate-limit retry ladder against Bloomreach, the NDJSON streaming with cooperative cancellation, and an encrypted cookie that carries OAuth state across Vercel instances because the connect-request and the callback-request can land on different ephemeral instances."
+
+Diagram you sketch:
 
 ```
-  the 3 real boundaries
-
-  in-process code ──► Bloomreach MCP   (rate-limited, parsed-retry)
-                  ──► Anthropic API    (no retry, no timeout)
-                  ──► Bloomreach IdP   (PKCE verifier via cookie)
+  Browser ──► Vercel fn (N) ──► Bloomreach (rate-limited, alpha)
+                  │
+                  └──► Anthropic
 ```
 
-**Q: What's the gap in the map?**
-Cross-instance coordination. The `Map` in `lib/state/insights.ts` is per-process. Vercel scales horizontally, so two requests can land on two different processes, and the app has no mechanism — no Redis, no KV, no broadcast — to reconcile them. It works at hackathon scale because the briefing runs maybe once per session per user, but the moment two users want a shared feed or one user wants persistence across deploys, the gap shows up.
+**Q: "What is the load-bearing seam?"**
 
-```
-  inst1 Map  ✕  inst2 Map     ← no link; the gap
-              │
-              └─ workaround: client carries state via sessionStorage
-                 (bi:diag:<id>) — works for one-user single-session
-                 flows; doesn't generalize
-```
+> "Cookie-backed cross-instance state. Without it, the OAuth callback could land on an instance that never saw the PKCE verifier. The fix is `AsyncLocalStorage` plus an AES-256-GCM encrypted cookie — see `lib/mcp/auth.ts:86`. Drop that and the prod auth flow silently breaks on any cold start that lands callback on a fresh instance."
 
----
+**Q: "What's NOT distributed in this codebase?"**
 
----
+> "Almost everything. The synthetic data source is in-process. The insights and investigations maps are per-instance per-session. There's no message queue, no worker pool, no replica set, no leader election. I deliberately scoped the surface tight — the only distributed bit is the one our upstream actually forces us to handle."
 
 ## See also
 
-- `02-partial-failure-timeouts-and-retries.md` — Seam C in depth: how `BloomreachDataSource` handles the 429
-- `04-consistency-models-and-staleness.md` — Seam A: what the client carries that the server can't remember
-- `05-replication-partitioning-and-quorums.md` — Seam B (the gap): why NOT YET EXERCISED is honest
-- `09-distributed-systems-red-flags-audit.md` — ranked risks across all four seams
-- `10-transport-agnostic-protocol-design.md` — RETIRED; preserved as a record of the Phase-2 two-transport design (Olist subprocess) that was reverted in PR #8
-- `.aipe/study-system-design/00-overview.md` — the architectural map (shape + storage); this file is its distributed-systems sibling
+- `02-partial-failure-timeouts-and-retries.md` — the deep walk of seam 3.
+- `06-queues-streams-ordering-and-backpressure.md` — the deep walk of seam 1's NDJSON contract.
+- `07-clocks-coordination-and-leadership.md` — the deep walk of seam 2's cookie-backed state.
+- `09-distributed-systems-red-flags-audit.md` — ranked risks across all three seams.

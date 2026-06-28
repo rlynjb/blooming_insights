@@ -1,430 +1,365 @@
-# Three-rung mem-file-seed store
+# Three-rung mem/file/seed store
 
-**Industry name(s):** tiered cache, write-through cache, fixture store, fallback chain, layered persistence
-**Type:** Industry standard · Project-specific (the 3 specific rungs are this repo's choice)
+**Industry name(s):** tiered storage / read-through cache hierarchy; a fallback chain (lookup-chain) of three sources. Closest precedent: the gem/npm package resolution chain, Maven's local→remote-cache→central. **Type:** Project-specific application of an industry pattern.
 
----
+## Zoom out — where this concept lives
 
-## Zoom out, then zoom in
-
-**Zoom out — the bigger picture.** A snapshot is only as useful as the *scopes* it survives. blooming insights' snapshot store has three rungs, each surviving a different scope: mem survives the process, the dev file survives the dev machine, and the committed seed survives across deploys and machines. Reads check all three in priority order (first non-null wins); writes always go to mem and conditionally to the dev file (production's serverless filesystem is read-only). The committed seed is a `git add`-ed artifact written by an offline workflow — never at runtime.
+When the route asks "do we already have this investigation's events?", it walks three storage tiers in order. The same pattern shows up twice in this codebase — for cached investigations (`lib/state/investigations.ts`) and for OAuth state (`lib/mcp/auth.ts`). Each tier has a different *lifetime* and a different *recovery story*.
 
 ```
-  Zoom out — where the 3 rungs sit
+  Zoom out — three rungs at the storage layer, queried in order
 
-  ┌─ Process (Vercel function instance) ────────────┐
-  │  mem: Map<insightId, AgentEvent[]>               │
-  │  rung 1 — fastest, freshest, dies on process exit│
-  └─────────────────────────▲────────────────────────┘
-                            │  writeFileSync (dev only)
-  ┌─ Dev machine filesystem ┴────────────────────────┐
-  │  .investigation-cache.json                        │
-  │  rung 2 — survives server restarts in dev         │
-  │  (Vercel prod FS is read-only → write skipped)    │
-  └─────────────────────────▲────────────────────────┘
-                            │  offline capture workflow (git add)
-  ┌─ Committed in repo ─────┴────────────────────────┐  ← we are here
-  │  lib/state/demo-investigations.json               │
-  │  rung 3 — crosses deploys, crosses machines       │
-  │  (the only rung that survives a fresh clone)      │
-  └──────────────────────────────────────────────────┘
+  ┌─ Service layer ─────────────────────────────────────────────┐
+  │  /api/agent · getCachedInvestigation(insightId) → AgentEvent[]?│
+  └────────────────────┬────────────────────────────────────────┘
+                       │ walks ↓
+  ┌─ Storage layer ────▼────────────────────────────────────────┐
+  │                                                              │
+  │   rung 1: in-memory  Map<insightId, AgentEvent[]>            │
+  │   ────────────────  process-local, dies on restart           │
+  │                                                              │
+  │             ↓ miss                                            │
+  │                                                              │
+  │   rung 2: dev file  .investigation-cache.json                │
+  │   ────────────────  gitignored, dev-only, survives restart   │
+  │                                                              │
+  │             ↓ miss                                            │
+  │                                                              │
+  │   ╔══════════════════════════════════════════╗               │
+  │   ║ rung 3: seed file lib/state/demo-*.json  ║ ← we are here │
+  │   ║ ─────────  committed, ships with the repo║   for the     │
+  │   ╚══════════════════════════════════════════╝   demo path   │
+  │                                                              │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-**Zoom in — narrow to the concept.** A 3-rung store is a *fallback chain over scopes*, not just over latencies. The canonical multi-tier cache (CPU L1/L2/L3 cache, CDN edge/regional/origin) has rungs that differ by *latency*. Here, the rungs differ by *durability scope* — each rung serves a different reproducibility need: mem for same-process speed, dev file for between-restart continuity in development, committed seed for portability across machines and deploys. The read priority (mem → dev file → seed) gives the freshest data at every layer of durability with no extra plumbing.
+**Zoom in.** Three rungs, one read path. The lookup function walks them top-to-bottom and returns the first hit. Writes go to rung 1 always, rung 2 only in development; rung 3 is committed via a manual capture flow (not via the request path). Each rung has a different *survives-what* story — restart, instance, repo.
 
----
+The question this pattern answers: *"how do we get a sensible default for a fresh user (the demo seed), keep dev iteration fast (the file), and serve a warm prod request cheaply (the Map) — all from one lookup site?"*
 
 ## Structure pass
 
-**Layers.** Three rungs (mem map, dev JSON file, committed JSON seed) and two operations (read with fallback, write with gating).
+**Layers.** Three storage tiers + one read-through function. The function is the structural unit; the tiers are interchangeable backends in priority order.
 
-**Axis: state (who owns it, where does it live, how long does it survive?).** This is the right axis because the store's *whole job* is state ownership at different scopes. Mem: process-scoped, dies on process exit or function-instance migration. Dev file: machine-scoped *in dev only* — `PERSIST = process.env.NODE_ENV === 'development'` gates the write; Vercel's prod runtime has a read-only filesystem so the rung is dev-exclusive. Committed seed: repo-scoped, eternal until someone re-runs the capture workflow.
-
-**Seams.** Three load-bearing:
-
-- **Mem ↔ dev file.** Crossed only in development. `saveInvestigation` writes mem unconditionally and the dev file behind `PERSIST`. The seam is the `NODE_ENV` check; cross it the wrong way in prod and `writeFileSync` throws `EROFS` (caught and swallowed — best-effort).
-- **Dev file ↔ committed seed.** Never crossed at runtime. The seed is built by an *offline* workflow — run a live combined investigation in dev, let mem+dev-file capture it, copy/merge `.investigation-cache.json` into `lib/state/demo-investigations.json`, commit. The seam between the two files is *human discipline + git*, not code.
-- **Process ↔ deploy.** Crossed only by the committed seed. Mem dies on process exit; the dev file is local to one machine. Only the seed survives a fresh clone or a Vercel cold start. Without it, replay would require live re-capture every deploy.
+**Axis: lifetime.** Hold one question constant — *"how long does data at this rung survive?"*
 
 ```
-  Structure pass — 3-rung store
+  Trace "what survives X?" across the three rungs
 
-  ┌─ 1. LAYERS ───────────────────────────────────┐
-  │  mem map · dev file · committed seed           │
-  └────────────────────────┬───────────────────────┘
-                           │  pick the axis
-  ┌─ 2. AXIS ─────────────▼────────────────────────┐
-  │  state: who owns it, where does it live,       │
-  │  how long does it survive?                     │
-  └────────────────────────┬───────────────────────┘
-                           │  trace, find flips
-  ┌─ 3. SEAMS ────────────▼────────────────────────┐
-  │  mem ↔ dev file: gated by PERSIST (LOAD)       │
-  │  dev file ↔ seed: offline workflow (LOAD)      │
-  │  process ↔ deploy: only seed crosses (LOAD)    │
-  └────────────────────────┬───────────────────────┘
-                           ▼
-                   Block 4 — How it works
+  rung           lifetime answer                  recovers from
+  ────           ───────────────                  ─────────────
+  1: in-memory   this process / this warm         a single request
+                 Vercel instance                  (free, fastest)
+  2: dev file    this machine's filesystem        a dev-server restart
+                 (gitignored)                     (cheap, requires NODE_ENV=development)
+  3: demo seed   the git repo                     a fresh checkout
+                 (committed)                      (the ground truth fallback)
+
+  the lifetime answer extends with each rung — shorter→longer
 ```
 
-Skeleton mapped. Now walk the read chain, the write chain, and the offline seed workflow.
+The state-survival axis is what makes the rungs meaningful: each rung answers "I survive X" with a strictly bigger X than the rung above. Restart? Rung 2+. New machine? Rung 3. Fresh demo user with no auth? Rung 3.
 
----
+**Seams.**
+
+1. **rung 1 ↔ rung 2: the dev/prod boundary.** `PERSIST = process.env.NODE_ENV === 'development'` at `lib/state/investigations.ts:7` decides whether rung 2 exists. In production the file system is read-only on Vercel, so the rung is *gated by env*, not just by presence.
+2. **rung 2 ↔ rung 3: the writability boundary.** Rung 2 is written by the request path (`saveInvestigation`); rung 3 is written by a *manual capture flow* (the dev-only "capture this as demo snapshot" button in `app/page.tsx`). Different write triggers, different intentions: rung 2 says "I saw this just now," rung 3 says "freeze this as the canonical example."
+3. **Read seam: the function itself.** `getCachedInvestigation` at `lib/state/investigations.ts:22-28` walks all three; callers see one return value. Drop the function and every consumer would have to implement the cascade itself → drift, missed rungs, inconsistent priority.
+
+Skeleton mapped.
 
 ## How it works
 
-**Mental model.** A 3-rung store is a *fallback chain*: try the fastest/freshest rung first, fall through on miss, return the first non-null. The reverse, the write side, is a *write-through-with-gates*: write to every rung you legally can, gated by environment constraints. The two sides aren't symmetric — that's the *point*. Reading should prefer freshness; writing should only persist where it's legal.
+### Move 1 — the mental model
+
+You've used `localStorage.getItem('x') ?? fetch('/api/x')` — local first, network as fallback. That's a two-rung cascade. The three-rung version adds *one more level* for the ground-truth case (a committed default that ships with the repo).
+
+Another anchor you've already coded: variable scope lookup in Python/JavaScript — local → enclosing → global → built-in. Same pattern. First match wins; later scopes are ignored. The three-rung store is "variable scope" for cached AgentEvent arrays.
 
 ```
-  Pattern — read fallback and write-through-with-gates
+  The pattern — read-through fallback chain (3 rungs)
 
-  READ (getCachedInvestigation)              WRITE (saveInvestigation)
-  ──────────────────────────────             ──────────────────────────────
-  rung 1: mem.get(id)                        rung 1: mem.set(id, events)  ← always
-       │ miss                                rung 2: writeFileSync(file)  ← if PERSIST
-       ▼                                              ↑
-  rung 2: dev-file[id] (if PERSIST)                   └─ best-effort
-       │ miss                                            (EROFS in prod is OK)
-       ▼                                     rung 3: NEVER written at runtime
-  rung 3: seed-file[id]                              ↑
-       │ miss                                        └─ git-add'd artifact;
-       ▼                                                 offline workflow only
-  null → live run path
+  query: get(key)
+              │
+              ▼
+       ┌────────────────┐    hit
+       │ rung 1 (mem)   │ ─────────► return value
+       └───────┬────────┘
+               │ miss
+               ▼
+       ┌────────────────┐    hit
+       │ rung 2 (file)  │ ─────────► return value
+       └───────┬────────┘
+               │ miss (or rung gated off in prod)
+               ▼
+       ┌────────────────┐    hit
+       │ rung 3 (seed)  │ ─────────► return value
+       └───────┬────────┘
+               │ miss
+               ▼
+             null
 ```
 
-### Move 2 — walk the parts
+### Move 2.1 — the read function
 
-**Use cases.** Three real moments the 3-rung structure earns its keep:
+The whole pattern in 7 lines at **`lib/state/investigations.ts:22-28`**:
 
-- **Demoing without creds.** Clone the repo, `npm run dev`, open the app, click a seeded insight. The replay path hits rung 3 (the committed seed), short-circuits before any auth/key check, and the UI animates the captured run at 180ms ticks. No Anthropic key, no Bloomreach OAuth, no network. This is the *whole point* of rung 3 — no other rung survives a fresh clone.
-
-- **Iterating on a captured bug in dev.** A captured `insightId` produced a bad diagnosis. You replay it (rung 1 or rung 2 hits depending on whether you've restarted the server), scrub the trace, change one thing (prompt, tool description), re-run live (`?live=1`) which captures a new snapshot to rung 1+2. Next page load reads rung 1 (the fresh one) without going to the seed. The priority order is what makes "live run shadows seed" the natural behavior — no cache invalidation needed.
-
-- **Capturing the demo seed itself.** No script, no automation — the workflow is: run dev, trigger a combined-run investigation, let `saveInvestigation` write `.investigation-cache.json`, copy/merge into `lib/state/demo-investigations.json`, commit. The seed becomes the canonical *capture* artifact for cross-machine replay. The lack of automation is a real gap (the workflow lives in muscle memory) but the rung structure makes the artifact small and portable.
-
-**Code in this codebase — module setup.** Paths, gates, and the mem map:
-
-```
-  lib/state/investigations.ts  (lines 1-11)
-
-  import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-  import { join } from 'node:path';
-  import type { AgentEvent } from '../mcp/events';
-
-  // Sources (in order): in-memory (this process) → dev file → committed demo seed.
-  // Writes go to in-memory always, and to the dev file in development only.
-  const PERSIST = process.env.NODE_ENV === 'development';                      ← write gate for rung 2
-  const CACHE_FILE = join(process.cwd(), '.investigation-cache.json');         ← rung 2 path (dev only)
-  const DEMO_FILE = join(process.cwd(), 'lib/state/demo-investigations.json'); ← rung 3 path (committed)
-
-  const mem = new Map<string, AgentEvent[]>();                                 ← rung 1 (per-process)
-        │
-        └─ four lines of constants, one Map. The whole rung topology is
-           visible in 11 lines. The comment IS the documentation — the
-           ordering ("in order: in-memory → dev file → committed seed") is
-           the read priority, named in plain English at the top of the file.
+```typescript
+export function getCachedInvestigation(insightId: string): AgentEvent[] | null {
+  if (mem.has(insightId)) return mem.get(insightId)!;                  // ← rung 1: process-local Map
+  const fromFile = PERSIST ? readJson(CACHE_FILE)[insightId] : undefined; // ← rung 2: dev-only file (gated by env)
+  if (fromFile) return fromFile;
+  const fromDemo = readJson(DEMO_FILE)[insightId];                     // ← rung 3: committed seed (always tried)
+  return fromDemo ?? null;
+}
 ```
 
-**Code in this codebase — the defensive read.** `existsSync` first, malformed-JSON-tolerant:
+**Line-by-line read.**
 
-```
-  lib/state/investigations.ts  (lines 13-20)
+- Line 1 — `mem.has(insightId)`. Rung 1. In-memory `Map<string, AgentEvent[]>` declared at `lib/state/investigations.ts:11`. Process-local: dies on serverless cold-start, dev-server restart, or HMR. Warm-cache speed: O(1), no I/O.
+- Line 2 — `PERSIST ? readJson(CACHE_FILE) : undefined`. Rung 2. Gated by `NODE_ENV === 'development'` at line 7. In production this *never* runs — the gate is the env check, not a file existence check. The comment at line 9 names why: "serverless FS is read-only." So rung 2 is literally a different shape per environment.
+- Line 4 — `readJson(DEMO_FILE)`. Rung 3. Always tried (no env gate). This is what makes the demo path work for an unauthenticated fresh user on Vercel prod: even with rung 1 cold and rung 2 absent, the committed seed answers.
+- Line 5 — `fromDemo ?? null`. Nullish coalesce: the caller distinguishes "not in any rung" from any cached value (including, hypothetically, an empty array — which would be a valid replay of zero events).
 
-  function readJson(path: string): Record<string, AgentEvent[]> {
+The function is a *strict* fallback chain — it doesn't *merge* rungs (no "demo seed + dev overlay"). First hit wins, and the rungs are checked in survives-less → survives-more order so the freshest data shines through.
+
+### Move 2.2 — the write path (asymmetric with read)
+
+Writes don't traverse the chain — they're explicit per rung.
+
+**Rung 1 + rung 2 write, in one function at `lib/state/investigations.ts:30-41`:**
+
+```typescript
+export function saveInvestigation(insightId: string, events: AgentEvent[]): void {
+  mem.set(insightId, events);                          // ← rung 1: always
+  if (PERSIST) {                                       // ← rung 2: dev-only
+    const all = readJson(CACHE_FILE);
+    all[insightId] = events;
     try {
-      if (existsSync(path)) return JSON.parse(readFileSync(path, 'utf8'));     ← guarded read
+      writeFileSync(CACHE_FILE, JSON.stringify(all));  // ← read-modify-write; ok for single-writer dev
     } catch {
-      /* ignore */                                                              ← malformed → empty
-    }
-    return {};                                                                  ← absent → empty
-  }
-        │
-        └─ a missing file or malformed JSON returns {} — the read chain
-           falls through cleanly. No process crash, no surfaced error.
-           This is what makes a fresh clone work even before the first
-           snapshot is captured: rung 3 reads empty, returns null, falls
-           through to the live path. No "first-run" special case needed.
-```
-
-#### Rung 1 — in-memory Map (per-process)
-
-The reader anchor: you've used a `Map` as an in-memory cache (`const cache = new Map(); cache.set(key, value)`). Same shape. The mem rung is a module-level `Map<string, AgentEvent[]>` — one entry per cached investigation, scoped to whatever process is currently serving the request.
-
-What happens on read: `mem.has(insightId)` returns true if this process has seen the run before. On hit, `mem.get(insightId)!` returns the captured events. On miss, the read falls through to rung 2.
-
-What happens on write: `mem.set(insightId, events)` runs unconditionally — every snapshot lands in mem first. There's no eviction, no TTL, no LRU. The mem map grows unboundedly *within* a process; that's acceptable here because Vercel function instances are short-lived and the worst case is "the instance dies and the mem dies with it."
-
-Boundary: Vercel's serverless model has multiple function instances. A request landing on instance A doesn't see instance B's mem. So the *effective* persistence across requests in prod is rung 3 only — mem is a per-request-pile optimization, not a cross-request store. In dev (one process), mem behaves like a real cache.
-
-```
-  Rung 1 — mem map
-
-  declaration:     const mem = new Map<string, AgentEvent[]>()  ← module-level
-  read:            mem.has(id) ? mem.get(id)! : fallthrough
-  write:           mem.set(id, events)                          ← unconditional
-  lifetime:        until process exit / instance migration
-  effective scope: per-process (dev: one process; prod: one instance)
-```
-
-#### Rung 2 — `.investigation-cache.json` (dev-only file)
-
-The reader anchor: you've used `localStorage` to persist app state across page reloads. Same idea — but here the scope is "the dev machine's filesystem," persisted across server restarts during development. The dev file is local to one machine; it's `.gitignore`'d (not committed) and only touched when `NODE_ENV === 'development'`.
-
-What happens on read: `PERSIST ? readJson(CACHE_FILE)[insightId] : undefined`. In prod, the read is short-circuited to `undefined` — saves the disk hit and respects the read-only FS. In dev, `readJson` defensively wraps `existsSync` + `readFileSync` + `JSON.parse` in try/catch; a malformed file returns `{}` and the read falls through.
-
-What happens on write: `saveInvestigation` reads the file, sets `all[insightId] = events`, writes the whole JSON back. The write is wrapped in try/catch so an `EROFS` (read-only filesystem in prod) or `EACCES` (permissions) doesn't crash the route — it's best-effort. The `PERSIST` gate means the try/catch never even runs in prod.
-
-Boundary: the dev file is a *full rewrite per save*. If two requests in the same dev process race the write, the last one wins for any insightIds the other touched. Acceptable here because dev has one developer's traffic; in a concurrent prod scenario this would be a real race. The dev-only scope makes that moot.
-
-```
-  Rung 2 — dev file
-
-  gate:        PERSIST = process.env.NODE_ENV === 'development'
-  read:        if PERSIST: try { readJson(CACHE_FILE)[id] } catch { {} }
-  write:       if PERSIST: read whole file, mutate map, writeFileSync whole file
-  lifetime:    until rm -f .investigation-cache.json
-  failure:     EROFS in prod (impossible because PERSIST=false there)
-               malformed JSON: caught, returns {} (read falls through)
-  effective scope: one dev machine
-```
-
-#### Rung 3 — `demo-investigations.json` (committed seed)
-
-The reader anchor: you've shipped a test fixture as a JSON file in the repo. Same shape — but here the fixture *is* a captured live run, written by running the system and copying the dev file's contents. It's the only rung that's *committed* to git, and the only rung that survives a fresh clone, a Vercel cold start, or a new function instance.
-
-What happens on read: `readJson(DEMO_FILE)[insightId]`. No gate — both prod and dev try to read the seed. The seed is always present in deployed builds because it's in the repo.
-
-What happens on write: nothing at runtime. There's no `saveInvestigation` code path that writes to `DEMO_FILE`. The seed is written *offline* — by hand or by an unwritten capture script — by taking the dev file's contents and merging them in. The seam is human discipline + `git add`, not code.
-
-Boundary: the seed is *static*. If `AgentEvent`'s union grows a new required field, the seed becomes stale and the consumer reads `undefined` for the new field. The TypeScript compiler can't catch this (the cache shape is trusted, not validated at runtime). The defensive move is either keeping new fields optional or adding a per-snapshot version envelope (the cache provenance envelope from `audit.md` Top-3 finding 3).
-
-```
-  Rung 3 — committed seed
-
-  path:        lib/state/demo-investigations.json
-  read:        readJson(DEMO_FILE)[id]  ← no gate, always tried
-  write:       ─ never at runtime ─
-               offline: run live → copy dev file → git add → commit
-  lifetime:    until git revert or manual deletion
-  effective scope: every machine, every deploy, every fresh clone
-```
-
-#### Read chain — first non-null wins
-
-The reader anchor: you've used `localStorage || sessionStorage || defaultValue` for a tiered fallback. Same shape, but with three rungs and the explicit `null` return.
-
-What happens: `getCachedInvestigation(insightId)` walks the rungs in order. Each rung returns the cached events on hit, undefined/null on miss. The function returns the first non-null hit, or `null` if all three miss. The `null` return is what lets the route's cache-first gate fall through to the live setup.
-
-Boundary: the priority order (mem → dev file → seed) means a stale dev-file entry can shadow a fresh seed entry. Restarting the dev server clears mem but not the dev file; if the seed was updated to fix a bug, the dev file's old entry would still be served. The escape hatch is `?live=1` on the request — force a fresh live run regardless of cache state — or `rm .investigation-cache.json`.
-
-```
-  Read chain — getCachedInvestigation(insightId)
-
-  if mem.has(id)         → return mem.get(id)!
-  else if PERSIST &&     → return fromFile      ← rung 2 (dev only)
-       fromFile defined
-  else if fromDemo       → return fromDemo      ← rung 3 (always)
-       defined
-  else                   → return null          ← live run required
-
-  priority = mem > dev file > seed
-            ↑
-            └─ freshness preference: a recent live run shadows an older seed
-```
-
-**Code in this codebase — the read chain.** First non-null wins:
-
-```
-  lib/state/investigations.ts  (lines 22-28)
-
-  export function getCachedInvestigation(insightId: string): AgentEvent[] | null {
-    if (mem.has(insightId)) return mem.get(insightId)!;                        ← rung 1: process mem
-    const fromFile = PERSIST ? readJson(CACHE_FILE)[insightId] : undefined;    ← rung 2: dev only
-    if (fromFile) return fromFile;
-    const fromDemo = readJson(DEMO_FILE)[insightId];                           ← rung 3: always tried
-    return fromDemo ?? null;                                                    ← null → live run
-  }
-        │
-        └─ priority: mem > dev file > seed. First non-null wins. The
-           `??` operator returns null only if BOTH `fromDemo` and the
-           short-circuit chain hit nothing — the explicit `null` is
-           what the caller's `if (cached)` gate looks for.
-```
-
-#### Write chain — every rung you legally can
-
-The reader anchor: you've used a write-through cache (write to cache AND to source-of-truth). Here it's write to two rungs, gated by environment.
-
-What happens: `saveInvestigation` writes to mem always (rung 1) and to the dev file in development only (rung 2). The dev-file write reads the whole file, sets the new entry, writes the whole file back — full rewrite per save. The seed (rung 3) is never written at runtime — it's a `git add`-ed artifact.
-
-Boundary: the write is *not transactional*. If the route process crashes between the mem.set and the writeFileSync, the mem rung has the new entry but the dev file doesn't. Next process restart loses the new entry (mem dies, dev file is stale). For the demo workflow this doesn't matter (a captured run can be re-captured); for any production workflow it would.
-
-```
-  Write chain — saveInvestigation(insightId, events)
-
-  mem.set(id, events)                ← always
-  if PERSIST:
-    all = readJson(CACHE_FILE)       ← read whole
-    all[id] = events
-    try:
-      writeFileSync(CACHE_FILE,      ← write whole
-                    JSON.stringify(all))
-    except:
-      ─ best effort, ignore ─        ← EROFS in prod is harmless
-                                       (gate prevents it anyway)
-```
-
-**Code in this codebase — the write chain.** Every rung you legally can:
-
-```
-  lib/state/investigations.ts  (lines 30-41)
-
-  export function saveInvestigation(insightId: string, events: AgentEvent[]): void {
-    mem.set(insightId, events);                                                ← rung 1: always
-    if (PERSIST) {                                                              ← gate for rung 2
-      const all = readJson(CACHE_FILE);                                         ← read whole
-      all[insightId] = events;
-      try {
-        writeFileSync(CACHE_FILE, JSON.stringify(all));                        ← write whole
-      } catch {
-        /* best effort */                                                       ← EROFS in prod = ok
-      }
+      /* best effort */                                // ← never let a disk error tank the request
     }
   }
-        │
-        └─ never writes rung 3 (the seed) — that's a git-add'd artifact.
-           The PERSIST gate is the load-bearing safety net: if it weren't
-           there, prod would attempt writeFileSync and the catch would
-           swallow EROFS silently on every save. Gate first, catch second,
-           defense in depth.
+}
 ```
 
-**Code in this codebase — the test-only escape hatch.** Proves the mem rung is the test scope:
+**Rung 3 write is a different flow entirely** — the dev-only "capture this as demo snapshot" button (`app/page.tsx`, when in dev) hits dedicated routes (`app/api/mcp/capture-demo/`) that re-run the live briefing + each investigation and write `lib/state/demo-*.json` directly. The request path never touches rung 3.
+
+**Why the asymmetry.** Rung 3 is *ground truth* — committed to git, reviewed in PRs. If `saveInvestigation` wrote to it on every request, every dev would have unintended diff churn. The capture flow gates the rung-3 write behind an explicit human action: "I want THIS run to become the canonical demo."
+
+### Move 2.3 — load-bearing skeleton
+
+This is a kernel-shaped concept. Three parts; drop any one and a specific named capability disappears.
+
+**1. Isolate the kernel.** Three rungs queried in priority order, write-through to rung 1 (and rung 2 in dev) only.
 
 ```
-  lib/state/investigations.ts  (lines 43-46)
+  kernel (pseudocode):
 
-  /** test-only */
-  export function _clearInvestigationCache(): void {
-    mem.clear();
+    read(key) :=
+      if rung1[key] exists then return rung1[key]
+      if rung2 is active and rung2[key] exists then return rung2[key]
+      if rung3[key] exists then return rung3[key]
+      return null
+
+    write(key, value) :=
+      rung1[key] := value
+      if rung2 is active then persist({key: value, ...readJson(rung2_file)})
+      (rung3 is never written by this path)
+```
+
+**2. Name each part by what BREAKS when it is missing.**
+
+| Part | What breaks if removed |
+| --- | --- |
+| rung 1 (in-memory Map) | every replay re-reads the JSON file → ~200KB parse + disk I/O per request; warm Vercel instance gains nothing |
+| rung 2 (dev file) | dev-server restart loses every saved investigation; reproducing a bug means re-running the live agent every time |
+| rung 3 (committed seed) | fresh checkout / new contributor has empty demo path → cannot run the product without auth + Anthropic key |
+| the read priority order | swap rungs 1 and 3 and a stale demo seed shadows fresh in-memory captures forever |
+| the `PERSIST` gate on rung 2 | prod tries to `writeFileSync` the read-only Vercel FS → throws repeatedly (caught best-effort, but pollutes logs) |
+| the write asymmetry (request doesn't write rung 3) | every dev's runs would auto-commit demo snapshots → uncontrolled git churn |
+
+**3. Separate skeleton from optional hardening.**
+
+The kernel is "three sources, ordered lookup, first hit wins." Optional hardening (all of which is currently present): the env gate on rung 2; the try/catch around `writeFileSync`; the empty-object fallback in `readJson` for missing/corrupt files. Each of these can be removed without breaking the *concept* — they're each handling a specific failure mode (read-only FS, disk error, malformed JSON).
+
+The concept itself is the three rungs queried in order. Everything else is "what happens at each rung when something goes wrong."
+
+### Move 2.4 — the parallel auth implementation
+
+The same pattern appears at `lib/mcp/auth.ts` for OAuth state. Three rungs, slightly different shapes.
+
+```
+  lib/mcp/auth.ts — auth store, three rungs
+
+  rung 1 (process):  memStore: Map<sessionId, SessionAuthState>   ← always
+  rung 2 (dev):      .auth-cache.json                              ← PERSIST gate
+  rung 3 (prod):     encrypted httpOnly cookie (bi_auth)           ← ALS-scoped, AES-256-GCM
+```
+
+The third rung is *not* a committed seed — it's the AsyncLocalStorage-scoped cookie store. Same three-rung *structure*; the rung-3 backend differs because the use case differs. Demo events ship with the repo (committed seed makes sense); OAuth tokens are per-user secrets (cookie makes sense).
+
+The read function at `lib/mcp/auth.ts:113-123` mirrors the same shape:
+
+```typescript
+function readAll(): Store {
+  const ctx = requestStore.getStore();
+  if (ctx) return ctx.store;                                         // ← rung 3 (prod): ALS-scoped, cookie-backed
+  if (!PERSIST) return Object.fromEntries(memStore);                 // ← rung 1 (test): isolated in-memory
+  try {
+    if (existsSync(CACHE_FILE)) return JSON.parse(readFileSync(CACHE_FILE, 'utf8')) as Store;  // ← rung 2 (dev): file
+  } catch {
+    /* corrupt/unreadable cache — treat as empty */
   }
-        │
-        └─ tests reset rung 1 between cases. They never touch rung 2 or
-           rung 3 — vitest runs with NODE_ENV=test so PERSIST=false and
-           the dev file is untouched; the seed is read-only fixture data.
-           The underscore prefix is the convention for "internal, not
-           public API."
+  return {};
+}
 ```
 
-#### Move 3 — the principle
+**The order is different.** Auth checks prod-cookie first (because in prod that's the only thing that works); investigations check process-mem first (because warm-cache wins). The *primitive* (three rungs, ordered, first hit wins) is identical; the *priorities* are per-domain.
 
-A 3-rung store works because each rung serves a *different scope*, not just a different latency. The lesson generalises: when you're designing a snapshot or fixture store, ask "what scopes do I need to survive?" and write one rung per scope. Mem alone is too volatile (dies on process exit). A dev file alone is too local (doesn't cross machines). A committed seed alone is too static (can't capture new runs). Three rungs — process, machine-in-dev, repo-everywhere — give you fresh-where-possible, durable-where-needed, portable-across-deploys. Collapsing to fewer rungs costs you a specific reproducibility property at each step.
+This duplication is worth naming as a **convention, not a coincidence**. If a fourth subsystem needs the same shape, a shared `tieredStore<T>` utility is the next refactor — but with N=2 instances the duplication is cheap and the per-instance shape (different gates, different backends) wants to vary.
 
----
+### Move 2.5 — layers-and-hops
+
+How one cache lookup travels through the rungs, in time, with each hop labeled.
+
+```
+  Layers-and-hops — one getCachedInvestigation call
+
+  ┌─ Service layer ─────────────────────────────────────────────────┐
+  │  GET /api/agent?insightId=X (no live=1)                          │
+  │      │ hop 1: getCachedInvestigation(X)                          │
+  │      ▼                                                            │
+  ├─ Storage layer (in-process) ─────────────────────────────────────┤
+  │  ╔ rung 1: mem.has(X) ═════════════════╗                         │
+  │  ║   yes → return mem.get(X)            ║ ── hop 2a: hit, return │
+  │  ╚════════════════════════════════════ ╝                         │
+  │      │ no                                                         │
+  │      ▼ hop 2b: env gate check                                    │
+  │  ╔ rung 2 (dev only): PERSIST=true ═════╗                         │
+  │  ║   readJson('.investigation-cache')   ║                         │
+  │  ║   if X in file → return file[X]      ║ ── hop 3a: hit, return │
+  │  ╚════════════════════════════════════ ╝                         │
+  │      │ no (or prod)                                               │
+  │      ▼ hop 3b                                                     │
+  │  ╔ rung 3: readJson('demo-investigations.json') ═════════════╗   │
+  │  ║   if X in file → return file[X]                            ║   │
+  │  ║   else → null                                              ║   │
+  │  ╚════════════════════════════════════════════════════════════╝   │
+  │      │                                                            │
+  │      ▼ hop 4: result (events or null)                            │
+  ├─ Service layer ───────────────────────────────────────────────────┤
+  │  if events: filterByStep + paced replay (see 02-replay-…)         │
+  │  if null: continue to live agent run                              │
+  └──────────────────────────────────────────────────────────────────┘
+```
+
+Every hop is labeled. The env gate at hop 2b is the part that genuinely *changes the shape of the diagram* between dev and prod — dev has 3 hops to lookup, prod has 2.
+
+### Move 3 — the principle
+
+Tiered caches are a textbook pattern (L1/L2/L3 in CPUs, browser cache → CDN → origin, Memcached → DB). The lesson hidden in *this* instance is that **the rungs aren't all the same kind of thing**. Rung 1 is RAM, rung 2 is local disk, rung 3 is the git repo. They have different *write authorities* (request, request, human) and different *survival domains* (process, machine, repo).
+
+The general principle: when a system has a "default that ships with the product," a "user-edited working state," and a "warm cache for performance," they're tiers of the same lookup. Don't model them as three different APIs — model them as one lookup function with a priority order. The priority IS the policy: freshest-survives-most-recent at the top, ground-truth-fallback at the bottom.
+
+The corollary: **writes don't have to mirror the read chain.** Reads cascade by priority; writes go where they belong. Writing to a committed seed on every request would be insane; reading from one as a fallback is exactly right.
 
 ## Primary diagram
 
-The full store, with the read priority and write gates marked.
+The full picture — three rungs, asymmetric writes, two parallel instances of the same pattern.
 
 ```
-  3-rung mem-file-seed store — full picture
+  Three-rung mem/file/seed store — used twice in this codebase
 
-  ┌─ Module-level state (lib/state/investigations.ts:7-11) ──────────────┐
-  │  const PERSIST = process.env.NODE_ENV === 'development'                │
-  │  const CACHE_FILE = .investigation-cache.json                          │
-  │  const DEMO_FILE  = lib/state/demo-investigations.json                 │
-  │  const mem        = new Map<string, AgentEvent[]>()                    │
-  └──────────────────────────────────────────────────────────────────────┘
+  READS (cascading, first hit wins)              WRITES (per rung, asymmetric)
+  ───────────────────────────────────            ──────────────────────────────
 
-  READ — getCachedInvestigation (lines 22-28):                              WRITE — saveInvestigation (lines 30-41):
-  ─────────────────────────────────                                        ─────────────────────────────────
-                                                                            mem.set(id, events)             ← always
-  rung 1: mem.get(id)             ← fastest                                       │
-       │ hit → return                                                             ▼
-       │ miss                                                              if PERSIST:
-       ▼                                                                     all = readJson(CACHE_FILE)
-  rung 2: if PERSIST:                                                        all[id] = events
-            readJson(CACHE_FILE)  ← dev only                                 try { writeFileSync(...) }
-       │ hit → return                                                            catch { /* best effort */ }
-       │ miss                                                                   │
-       ▼                                                                        ▼
-  rung 3: readJson(DEMO_FILE)     ← always tried                          (seed never written at runtime)
-       │ hit → return
+  getCachedInvestigation(id):                    saveInvestigation(id, events):
+                                                   mem.set(id, events)        ← always
+    rung 1: mem.has(id)?           ─►hit          if (PERSIST):
+                                                    writeFileSync('.investigation-cache.json')
+       │ miss                                       (best-effort, try/catch)
+       ▼
+    rung 2: PERSIST?
+       readJson('.investigation-cache.json')      capture flow (separate route):
+         id in file? ─►hit                          /api/mcp/capture-demo →
+                                                     writeFileSync('lib/state/demo-investigations.json')
+       │ miss (or prod)                              (gitignored cache is dropped from prod;
+       ▼                                              this seed is committed)
+    rung 3: readJson('demo-investigations.json')
+       id in file? ─►hit
        │ miss
        ▼
-  return null                     ← live run required
+       null
 
-  OFFLINE seed workflow (no code):
-  ─────────────────────────────────
-  1. NODE_ENV=development npm run dev
-  2. trigger a live combined-run investigation
-  3. let mem+dev-file capture it
-  4. copy/merge .investigation-cache.json → lib/state/demo-investigations.json
-  5. git add lib/state/demo-investigations.json && git commit
-  6. ship → seed is now portable across deploys
+
+  Same shape, second instance — readAll() for OAuth at lib/mcp/auth.ts:113-123:
+
+    rung 1 (test): memStore Map                ← _clearAuthStore() resets it
+    rung 2 (dev):  .auth-cache.json            ← PERSIST gate, writeFileSync on patchState
+    rung 3 (prod): bi_auth cookie (AES-GCM)    ← ALS-scoped, withAuthCookies seeds + flushes per request
 ```
-
----
 
 ## Elaborate
 
-The 3-rung structure here is the same shape as Django's settings fallback (`local_settings.py > production_settings.py > base_settings.py`), Rails' credentials (`config/credentials/<env>.yml.enc` overrides `config/credentials.yml.enc`), or the XDG base directory spec (`$XDG_CONFIG_HOME` overrides `/etc/<app>`). The common thread: a layered fallback where each layer serves a different *scope of authority* (local override, environment-specific default, base default). What's unusual here is that the layers serve *durability scopes*, not authority scopes — that's why the read priority is freshness-preferring rather than override-respecting.
+Tiered storage shows up everywhere because it solves a tension everyone has: you want fast, you want durable, and you want a ground-truth default — and no single backend gives all three. The classic CPU cache hierarchy (L1: SRAM, fast/small/expensive; L2: bigger/slower; L3: bigger again; main memory: huge/slow/cheap) is the model. Application-level cache hierarchies (browser→CDN→origin, Memcached→Postgres, ActiveRecord query cache→DB) are the same shape.
 
-What this pattern gets right that flat fixture stores miss: the *graceful degradation* property. A fresh clone with no `.investigation-cache.json` and a deploy with no warm mem still serves the seed. The rungs don't fight; they fall through. Most layered systems require an explicit "is the override present?" check at every read site; here the `readJson` helper returns `{}` for any failure mode and the chain naturally falls through. The defensive coding lives in one helper, not at every callsite.
+The wrinkle here is the *committed seed* — rung 3 isn't a slower cache, it's a default that ships with the product. The closest precedent is **rails fixtures** + the dev DB seed file, or **storybook stories** that ship hand-rolled state for the component browser. Both have the "humans curate this, request paths read it" asymmetry this code has.
 
-What's missing — and worth naming — is the *capture script*. The seed is built by an ad-hoc workflow (run dev, copy file, commit). A `scripts/capture-investigation.ts` that takes an `insightId`, runs the combined investigation live, and writes the resulting events directly to `demo-investigations.json` would close the gap between "I want a new seed" and "the seed is updated." Today the workflow is muscle memory; a 30-line script would automate it. The pattern doesn't need this to work — but adding it would make the seed less prone to bit-rot as the agent prompts evolve.
+The AsyncLocalStorage backend at `lib/mcp/auth.ts:47` is a small masterpiece worth reading separately. It exists because Next.js's request-vs-response cookie split returns the *old* value after a `set` within the same request — so the OAuth provider's many synchronous read/write calls would each fight that. ALS scopes a per-request store seeded once from the cookie and flushed once at the end. The pattern is "**load on entry, mutate freely, persist on exit**" — also a kind of three-rung pattern in time (cookie → ALS → cookie) instead of in space.
 
-Worth a note on cross-instance limitation: in production on Vercel, every request can land on a different function instance, so mem (rung 1) is effectively per-instance. The first request after a cold start hits rung 3 (the seed). Subsequent requests *to the same instance* hit rung 1. There's no cross-instance coherence — if instance A captures a fresh live run, instance B doesn't see it until the *seed* is re-committed and deployed. This is fine for the demo (the seed has the runs that matter) but it means runtime-captured runs don't survive past the instance that captured them. A real prod cache would need a centralized store (Redis, Vercel KV, a DB row) as a 2.5-th rung. Not built.
+**Adjacent concepts:**
+- **Read-through cache** — same pattern, two rungs (typically cache→DB).
+- **Cache-aside** — caller is responsible for the lookup cascade, not the storage layer.
+- **Write-through vs write-back** — this code is write-through on rungs 1+2 (sync write to both), and write-skipping on rung 3 (never written by request path).
+- **Loader chains in Webpack / Babel** — different domain (transformation pipeline), same "ordered cascade" primitive.
 
----
+**Read next:**
+- `02-replay-from-snapshot-with-paced-emission.md` — what the cache feeds into.
+- `04-dual-write-send-to-stream-and-store.md` — where rung 1 gets populated.
+- `05-auth-secret-flake-postmortem.md` — the auth-store instance bit us in production.
 
 ## Interview defense
 
-**Q1. Why three rungs? Couldn't this be one file?**
+**Q: Why three rungs and not two?**
+A: Two rungs (in-memory + disk) covers fast-vs-durable but misses the "fresh user, no auth, no saved runs" case. The committed seed at rung 3 is the ground-truth default that ships with the product — it's what makes `/api/briefing?demo=cached` work for a stranger hitting the deployed Vercel URL with no cookies. The third rung isn't a slower cache, it's a different *kind of thing*: human-curated, committed to git, never written by request paths. The asymmetry between read (all three cascade) and write (rungs 1+2 from requests, rung 3 from a deliberate capture flow) is the load-bearing detail.
 
-Each rung survives a different scope. Mem is per-process — fastest, but dies on process exit or function-instance migration. The dev file is per-machine in dev only — survives server restarts during development, but Vercel's prod runtime has a read-only filesystem so this rung is dev-exclusive (gated by `PERSIST = NODE_ENV === 'development'`). The committed seed is the only rung that crosses deploys and machines — it's a `git add`-ed fixture that the demo path relies on. Collapsing to one file would force a choice: lose the per-process speed (skip mem), lose the cross-deploy durability (skip seed), or break prod (try to write the seed at runtime when the FS is read-only). The 3-rung priority (mem → file → seed) gives the freshest data possible at each durability tier.
+> *Sketch:* the three-rungs diagram with the survives-what column.
 
-```
-  rung     │  scope               │  what kills it
-  ─────────┼─────────────────────┼─────────────────────────────────
-  mem      │  process             │  process exit, instance migration
-  dev file │  machine, dev only   │  rm .investigation-cache.json
-  seed     │  repo, all deploys   │  only a git revert
-```
+**Anchor:** "Rung 3 is product default, not slow cache."
 
-**Anchor:** "name the scope each rung serves — collapsing loses something specific at each rung."
+**Q: Why the `PERSIST` env gate on rung 2 instead of "try to write, ignore if it fails"?**
+A: Vercel's serverless filesystem is read-only — `writeFileSync` *would* throw on every request. The catch swallows it, but the logs pile up and the attempt itself isn't free (the read-modify-write on rung 2 reads the file too, and there is no file). The env gate makes the intent explicit: rung 2 is a *dev-only* tier. Production has rung 1 (warm-instance Map) + rung 3 (committed seed). Two-rung in prod, three-rung in dev. Naming the env is the documentation that this shape change is deliberate.
 
-**Q2. The seed has no provenance metadata. What's the risk and what's the fix?**
+> *Sketch:* dev path with 3 rungs vs prod path with rung 2 grayed out, both feeding the same reader.
 
-The captured `AgentEvent[]` in `lib/state/demo-investigations.json` has the events but not the metadata about the run — no timestamp, no `modelVersion`, no `promptHash`, no MCP server version. So you can't tell *when* a snapshot was captured, *which model* produced it, or *which prompt version* the agent was running. The risk: if you change the diagnostic agent's prompt and notice a regression, you can't diff today's run against the seed to see what changed — because the seed has no version info. The fix is a per-snapshot envelope: extend the cache shape to `{capturedAt, modelVersion, promptHash?, events: AgentEvent[]}`. `AGENT_MODEL = 'claude-sonnet-4-6'` is already a constant in `lib/agents/base.ts:9` — easy to capture. Prompt hash requires hashing the prompt strings at startup. ~1 hour, plus a one-time re-capture of the seed. Today the seed is a *replay* fixture; the envelope would make it a *regression* fixture.
+**Anchor:** "Rung 2 is dev-only; prod is two-tier."
 
-```
-  current:    { insightId: AgentEvent[] }
-  proposed:   { insightId: {
-                  capturedAt:   number,
-                  modelVersion: string,
-                  promptHash?:  string,
-                  events:       AgentEvent[]
-                }
-              }
-                  ▲
-                  └─ replay fixture → regression fixture
-                     (you can diff snapshots across model/prompt versions)
-```
+**Q: Why doesn't `saveInvestigation` write rung 3?**
+A: Rung 3 is committed to git. If every live run wrote it, every developer would have unintended `lib/state/demo-investigations.json` diffs in every PR. The capture flow is the deliberate "I want THIS to be the canonical demo" gesture — it's a dev-only button (`app/page.tsx`) that hits dedicated routes (`/api/mcp/capture-demo`) and writes the seed explicitly. Read-cascades cheaply; writes are intentional and per-rung.
 
-**Anchor:** "replay fixture vs regression fixture — the envelope is what makes the seed useful for the latter."
+> *Sketch:* the reads-vs-writes side-by-side from the primary diagram.
 
----
+**Anchor:** "Writes go where they belong; reads cascade."
 
----
+**Q: The same pattern appears in `lib/mcp/auth.ts` — is that duplication?**
+A: It's a convention with two instances. The kernel is identical (three rungs, ordered lookup, first hit wins). The per-instance details differ on purpose: investigation rung 3 is a committed seed (ground-truth default), auth rung 3 is the encrypted cookie (per-user secret); investigation cascade prioritises mem first (warm-cache wins), auth cascade prioritises cookie first (prod constraint). At N=2 the duplication is cheap and the variation is meaningful. At N=3 I'd extract a `tieredStore<T>` utility; the cost of the extraction equals the cost of one more copy.
+
+> *Sketch:* the two read functions side by side.
+
+**Anchor:** "Convention not coincidence; abstract when N=3."
+
+**Q: How do you reproduce a production bug with this store?**
+A: Production hit, user reports a bad investigation. Locally: `git pull` (in case the seed has the same bug), reproduce against the live alpha — when the bug fires, `saveInvestigation` has already written `.investigation-cache.json`. Now I can refresh the page indefinitely, the cache-first branch in `/api/agent` replays the saved events deterministically, and I have a stable fixture to step-debug through. If the bug is worth keeping, I hit "capture this as demo snapshot" and the seed becomes a regression artifact in the next PR.
+
+> *Sketch:* "live failure → rung 2 auto-save → replay → manual capture → rung 3 commit."
+
+**Anchor:** "The cache is the bug report."
 
 ## See also
 
-- `audit.md` — the broader lens audit; this pattern is named in state-snapshots-and-debugging-boundaries and reproduction-and-evidence.
-- `01-ndjson-agentevent-discriminated-union.md` — the typed shape the store persists.
-- `02-replay-from-snapshot-with-paced-emission.md` — the consumer of this store (the cache-first replay path).
-- `04-dual-write-send-to-stream-and-store.md` — the upstream that captures into this store.
-- `06-eval-result-paper-trail.md` (RETIRED) — once the offline cousin of this store. Both persisted `AgentEvent`-shaped evidence; this store served single-request replay, `eval/results/<date>[-<tag>]/` served K-iteration measurement. The eval surface is gone from this repo (PR #8 / 62c24d7); the pattern still teaches the offline-fixture discipline.
-- `.aipe/study-system-design/04-caching-and-rate-limiting.md` — the broader caching pattern (system-design angle).
-
----
+- `02-replay-from-snapshot-with-paced-emission.md` — what reads from these rungs.
+- `04-dual-write-send-to-stream-and-store.md` — where the writes originate.
+- `05-auth-secret-flake-postmortem.md` — the parallel auth-store instance, broken by missing AUTH_SECRET.
+- `audit.md` § 2 (reproduction-and-evidence), § 6 (state-snapshots-and-debugging-boundaries).

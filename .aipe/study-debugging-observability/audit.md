@@ -1,132 +1,175 @@
-# Debugging & Observability — audit
+# Audit — Debugging & Observability
 
-> **Verdict-first.** Three observability surfaces. The trace IS the product (surface 1) — blooming insights emits a typed NDJSON `AgentEvent` stream (`lib/mcp/events.ts:4-17`) that every online layer speaks; the cache snapshots it; the replay re-emits at 180ms ticks so the consumer can't tell live from replay. AptKit's traces now flow into the same surface via `BloomingTraceSinkAdapter` (`lib/agents/aptkit-adapters.ts:100`) — one trace shape, multiple producers. The 221-test Vitest suite is surface 2; the dev cache files are surface 3. The fourth offline surface (committed eval result paper trail) was removed with the Olist pipeline in PR #8 / commit 62c24d7; `06-eval-result-paper-trail.md` is kept as a RETIRED historical record because the pattern still teaches even though the code anchors are gone. The strongest pattern is the 8-line discriminated union; the load-bearing runtime-metrics gap is the aggregator (`durationMs` measured per call, never rolled up); the highest-priority finding is still the asymmetry between the rigorously typed happy path (AgentEvent) and the freeform exception path (4× `console.error`) — closing it is a 30-line `lib/log.ts` and four single-line swaps.
+Pass 1. Eight lenses walked against the repo. Each section names what the codebase actually does, with `file:line` grounding, or emits `not yet exercised` honestly.
 
----
+## 1. observability-map
 
-## observability-map
+The evidence map. What can be observed at each boundary in this system?
 
-The evidence map has **three observability surfaces** — all online (live, request-scoped). Honest about what each one catches:
+**Three observability surfaces are live today.** A fourth (the `eval/results/<date>/` paper trail) existed briefly and was retired with the Olist work — don't claim it.
 
-```
-  surface           │  layer           │  evidence shape                  │  lifetime
-  ──────────────────┼─────────────────┼─────────────────────────────────┼──────────────────
-  1. live trace     │  UI              │  rendered TraceItem[] + devtools │  page mount
-                    │  Route handler   │  NDJSON wire + 2× console.error  │  request
-                    │  Agent loop      │  AgentEvent[] (the spine)        │  request
-                    │  AptKit adapter  │  CapabilityEvent → AgentEvent    │  request
-                    │  MCP client      │  durationMs · fromCache · error  │  per call
-                    │  Provider        │  ─ (their logs, not ours)        │  not owned
-  ──────────────────┼─────────────────┼─────────────────────────────────┼──────────────────
-  2. unit tests     │  Vitest          │  221 tests, exit code + report   │  CI run
-  ──────────────────┼─────────────────┼─────────────────────────────────┼──────────────────
-  3. dev cache      │  filesystem      │  .auth-cache.json,               │  dev machine
-                    │  (gitignored)    │  .investigation-cache.json       │
-```
+| Boundary | What's observable | Where |
+| --- | --- | --- |
+| browser ↔ Next.js route | NDJSON event stream (8 variants) | `lib/mcp/events.ts:4-12`; produced by `app/api/briefing/route.ts`, `app/api/agent/route.ts`; consumed by `useBriefingStream.ts`, `useInvestigation.ts`, `useDemoCapture.ts`, `StreamingResponse.tsx` via `lib/streaming/ndjson.ts:17-64` |
+| Next.js route ↔ Anthropic | `res.usage` cost log + per-phase timings | `lib/agents/aptkit-adapters.ts:57-61` (per model call); `app/api/briefing/route.ts:317-324` and `app/api/agent/route.ts:331-338` (per request) |
+| Next.js route ↔ Bloomreach MCP | tool name + durationMs + truncated result on the NDJSON wire; raw error body via the capturing fetch | `app/api/briefing/route.ts:264-275` (live emit); `lib/mcp/transport.ts:99-114` (raw body capture) |
+| in-process state | per-session feed maps; cached investigations | `lib/state/insights.ts:14-23` (sessionState); `lib/state/investigations.ts:11` (mem Map) |
+| disk (dev-only) | `.auth-cache.json`, `.investigation-cache.json` | `lib/mcp/auth.ts:34-35`; `lib/state/investigations.ts:7-9` |
+| committed seed | `lib/state/demo-insights.json`, `lib/state/demo-investigations.json` | the replay fixture |
+| Vercel logs (prod) | per-request summary line + per-error stack | `app/api/briefing/route.ts:298-324`; `app/api/agent/route.ts:312-338` |
+| Vitest output (dev/CI) | 24 files / 221 tests | `test/` tree |
 
-A previous refresh of this guide named a fourth surface — `eval/results/<date>[-<tag>]/`, the offline eval result paper trail with `EVAL_RUN_TAG` as the bisect primitive. That surface is **GONE.** PR #8 (commit 62c24d7) removed the Olist pipeline and the eval flywheel that wrote into it. The pattern is real and still teachable (preserved in `06-eval-result-paper-trail.md` with a RETIRED banner); the code anchors no longer exist.
+→ see `01-ndjson-agent-event-discriminated-union.md` for the wire contract,
+→ see `03-three-rung-mem-file-seed-store.md` for the storage tier.
 
-Two seams are load-bearing in the map. **agent loop ↔ route handler** — in-process hooks flip to framed NDJSON line; this is where the trace becomes a transport-able artifact. **route handler ↔ cache snapshot** — `saveInvestigation` lifts the request-scoped `collected[]` into a persistent replayable artifact.
+**Blind spots:** no APM/Sentry, no metrics endpoint, no distributed trace tree, no client-side error surface (browser exceptions in `useBriefingStream` set local error state but don't ship anywhere). The platform-level observability is what Vercel gives you out of the box plus the per-request log line.
 
-A third seam worth naming: **AptKit ↔ existing NDJSON surface.** `BloomingTraceSinkAdapter` (`lib/agents/aptkit-adapters.ts:100`) maps AptKit's `CapabilityEvent` (`step` / `tool_call_start` / `tool_call_end`) back into Blooming's `onText`/`onToolCall`/`onToolResult` hooks. The hooks emit the same `AgentEvent` variants. Same NDJSON contract, multiple producers. The system grew a new agent runtime; the observability map did not grow a new surface — which is what you want.
+## 2. reproduction-and-evidence
 
-A *missing* seam, named for honesty: **agent loop ↔ external sink** — no OpenTelemetry/Langfuse/Datadog export anywhere. The trace lives only in the UI and the cache. Nothing aggregates *runtime* metrics across investigations.
+Can we reproduce a failure cheaply? Yes, by design.
 
-→ see `01-ndjson-agentevent-discriminated-union.md` for the 8-line contract every online layer speaks
-→ see `04-dual-write-send-to-stream-and-store.md` for the agent↔route seam mechanics
-→ see `06-eval-result-paper-trail.md` (RETIRED) for what the fourth surface looked like when the Olist pipeline was live
+**The committed demo snapshot is the reproduction fixture.** `lib/state/demo-insights.json` (28KB) and `lib/state/demo-investigations.json` (200KB) hold a complete real run — the workspace, the coverage grid, the monitoring trace, every insight, and every investigation's full event stream. Hitting `/api/briefing?demo=cached` replays it (no auth, no LLM, no MCP) at a paced 140ms/event. Hitting `/api/agent?insightId=…` *without* `live=1` triggers the cache-first branch at `app/api/agent/route.ts:125-142`, which replays the saved events at 180ms each.
 
-## reproduction-and-evidence
+**Dev runs add to the evidence library automatically.** Every live combined run writes to `.investigation-cache.json` via `saveInvestigation` at `app/api/agent/route.ts:302`. If a live investigation hits an interesting bug, the bug *is already saved*; refresh and the cached events replay deterministically.
 
-One reproduction primitive, online only.
+**Per-step replay filter at `app/api/agent/route.ts:64-82`.** The combined-run snapshot is filtered by agent tag (`step.agent`, `tc.agent`) so step 2 (diagnose) and step 3 (recommend) replay the correct slice. The filter is the seam — it's what makes one captured run usable as two separate fixtures.
 
-**The captured `AgentEvent[]` snapshot.** A captured investigation replays from `lib/state/demo-investigations.json` deterministically, with no MCP/Anthropic credentials needed, paced at 180ms per event so the UI animates identically to a live run. That collapses the canonical "same data, same auth, same browser, same network" reproduction problem to "load the right `insightId` and watch the cache replay."
+→ see `02-replay-from-snapshot-with-paced-emission.md`.
 
-The offline reproduction primitive named in a previous refresh — `eval/results/<date>[-<tag>]/` with `EVAL_RUN_TAG` for sibling-dir bisecting — is gone. PR #8 removed the Olist pipeline that produced those dirs. Model-level reproduction across K iterations is *not yet exercised* in this repo today.
+**What's missing:** no minimal-repro extraction tool. To narrow a 200KB snapshot to just the failing tool call, you edit JSON by hand. Vitest fixtures live in `test/fixtures/` but they're hand-rolled, not derived from cached failures.
 
-Two real gaps in what remains. (a) The route saves only on the `done` path (`app/api/agent/route.ts:254`) gated on `step == null`, so a thrown error short-circuits the snapshot — broken runs aren't replayable. (b) Split-step runs hand off via `sessionStorage` instead of caching server-side. The briefing flow and the free-form query flow don't use this cache at all; their own replay paths are structurally similar but unshared.
+## 3. structured-logs-and-correlation
 
-→ see `02-replay-from-snapshot-with-paced-emission.md` for the cache-first replay path and why 180ms is load-bearing
-→ see `03-three-rung-mem-file-seed-store.md` for the mem→file→seed chain that makes the seed portable across deploys
-→ see `06-eval-result-paper-trail.md` (RETIRED) for the pattern the repo used to instantiate — committed result dirs, `EVAL_RUN_TAG`, and the measure → fix → re-measure flywheel
+Events, levels, context, correlation IDs, redaction.
 
-## structured-logs-and-correlation
-
-Honest verdict: there is almost no traditional log surface. Four `console.error` calls total — `app/api/agent/route.ts:160,256` and `app/api/briefing/route.ts:166,248` — is the entire backend log. No logger module, no log levels, no correlation IDs, no redaction. None of `pino`/`winston`/`bunyan`/`lib/log.ts` exists.
-
-The *substitute* — and it's genuinely a substitute, not a workaround — is that the AgentEvent stream gives you what correlation IDs are usually for. Every event in a stream belongs to one investigation; the array IS the correlation envelope. You don't need to `grep "requestId=abc"` because you're already inside the request's typed event array. This is the same insight as Go's `context.Context` or Node's `AsyncLocalStorage` — except the events ARE the context. The gap that remains is at the route catch sites: when an exception escapes, all you get is `[agent] error: <message>` in Vercel's stdout with no `insightId`, no level, no redaction.
-
-The asymmetry — typed happy path (`AgentEvent`), freeform exception path (`console.error`) — is the single most surprising shape in this repo's observability story. Closing it is ~30 lines of `lib/log.ts` + four single-line edits at the catches. Top-3 finding below.
-
-## metrics-slis-slos-and-alerts
-
-`not yet exercised` past the per-call primitive. `durationMs` is measured wall-clock around every MCP call (`lib/mcp/client.ts:112,134`) and rides on every `tool_call_end` event in the trace. That's rung 1 of the 4-rung metrics pipeline; rungs 2–4 don't exist. No `lib/metrics.ts`, no histogram, no time-series store, no SLO definition (no `docs/slos.md`), no PagerDuty, no on-call rotation, no SLA. The only quantitative time constraint anywhere is `maxDuration = 300` (`app/api/agent/route.ts:20`), which is a Vercel hard kill, not an SLO target.
-
-The gap is acceptable today (the user watches the trace live — aggregated metrics matter when nobody is watching in real time). The trigger that makes it urgent: customer #1 or any case where you need to answer "is this getting slower week-over-week?" The smallest first move is a `lib/metrics.ts` with an in-memory histogram per `toolName`, wired next to `send({type:'tool_call_end', …})` in both routes — ~2 hours, turns rung 1 into rung 1+2.
-
-## traces-and-request-lifecycles
-
-The trace is the strongest layer. The `AgentEvent` discriminated union (`lib/mcp/events.ts:4-12`) defines the entire span vocabulary in 8 lines: `tool_call_start` opens a span, `tool_call_end` closes it with `durationMs`, `reasoning_step` annotates the timeline between spans. NDJSON over HTTP is the carrier (`route.ts:174` — `controller.enqueue(encoder.encode(encodeEvent(e)))`). Cache-first replay re-emits the captured events identically at 180ms ticks (`route.ts:127–141`), so the UI's `useInvestigation` hook can't tell live from replay.
-
-One latent risk worth flagging: span pairing is positional. `replaceRunningTool` in `lib/hooks/useInvestigation.ts:86–95` scans backwards for the most recent `running` tool with the same `toolName`. This works because today's `runAgentLoop` dispatches tools sequentially. If parallel tool dispatch ever lands, the pairing ambiguates; the fix is a `spanId` field. Latent today, not active.
-
-For the LLM-telemetry angle on this same stream (token usage, model versions, prompt drift), cross-link to `.aipe/study-ai-engineering/05-evals-and-observability/04-llm-observability.md` rather than re-teaching it.
-
-→ see `01-ndjson-agentevent-discriminated-union.md` for the union as contract
-→ see `02-replay-from-snapshot-with-paced-emission.md` for the replay carrier
-
-## state-snapshots-and-debugging-boundaries
-
-The snapshot is `saveInvestigation(insightId, events[])` in `lib/state/investigations.ts:30-41`. It writes the captured `AgentEvent[]` to a 3-rung store: mem (per-process, fastest), `.investigation-cache.json` (dev-only — Vercel FS is read-only in prod), and `lib/state/demo-investigations.json` (committed seed, crosses deploys). `getCachedInvestigation` reads in priority order — mem → dev file → seed, first non-null wins.
-
-The boundary is "the agent finished cleanly" — `send({type:'done'})` is the contract that triggers the save, gated on `step == null` (combined run only). Errors don't snapshot, by design: half-runs would corrupt the replay path. The snapshot captures `AgentEvent[]` and nothing else — no provenance envelope, no `capturedAt`, no `modelVersion`, no `promptHash`. That makes it a replay fixture, not a regression fixture; the difference is whether you can diff two snapshots across model/prompt versions.
-
-→ see `03-three-rung-mem-file-seed-store.md` for the read/write chain and the scopes each rung serves
-
-## incident-analysis-and-prevention
-
-One documented incident, at the test level.
-
-**Test-level: the AUTH_SECRET flake (`e83a8e0`).** Canonical worked example of `reproduce → isolate → verify → prevent` in this repo: `process.env.AUTH_SECRET` was mutated directly inside `test/mcp/auth.test.ts`, vitest's parallel workers leaked the variable across files, so the crypto round-trip test passed in isolation and flaked ~1-in-N in a full run. The fix is `vi.stubEnv` + `vi.unstubAllEnvs` in `beforeEach`/`afterEach`. 12 lines added, 3 removed, one file, production code unchanged. The commit message IS the post-mortem.
-
-A previous refresh of this guide named two additional incidents — the BRL cents-vs-Reais bug (surfaced by the eval flywheel at K=10 run 8) and the parallel-run race between two `npm run eval:recommendation` processes. Both were **RESOLVED-BY-DELETION**: PR #8 removed the Olist pipeline along with the eval flywheel, the OlistDataSource, and the `EVAL_RUN_TAG`-based result dirs. The BRL bug can no longer recur in this repo because the code that exhibited it is gone; the parallel-run race can no longer happen because there are no eval processes to race. Both incidents remain useful as anecdotes (the BRL bug is a clean example of LLM-as-judge as a debug signal; the parallel-run race is a clean example of `ps aux` + `kill PID` as the observability tool when no in-app race detection exists), but neither is a *current* finding in this repo.
-
-Past the single live incident, broader incident tooling is absent. No Sentry, no error tracker, no on-call rotation, no PagerDuty/Opsgenie, no `docs/runbooks/`, no SLO definitions, no incident-management workflow. The detect layer for prod is "the user reports it" or "the developer reads Vercel logs." This is rationally deferred (solo repo, no SLA, no rotation to wake) — naming it explicitly is the point.
-
-→ see `05-auth-secret-flake-postmortem.md` for the test-level incident walked end-to-end as a reusable template
-→ see `06-eval-result-paper-trail.md` (RETIRED) for the eval flywheel methodology and the model/process-level incidents it once surfaced — preserved as historical record
-
-## debugging-observability-red-flags-audit
-
-Ranked by *consequence in this repo* — not by what's industry-standard. Read top-down, stop at your remediation budget.
+**Logs are JSON, single-line, with a shared shape across routes** (`app/api/briefing/route.ts:317-324`, `app/api/agent/route.ts:331-338`):
 
 ```
-  rank  gap                                     cost     blast radius  primitive
-  ────  ──────────────────────────────────────  ───────  ────────────  ──────────────
-  P0    no metrics aggregator (rung 2)          low      high          yes (durationMs)
-  P0    no structured logger (lib/log.ts)       low      high          no (4× console.error)
-  P1    no Sentry / error tracker               medium   medium        no (depends on P0)
-  P1    no upstream request-ID correlation      low      medium        yes (response objects)
-  P1    no offline model-behavior surface       medium   medium        no (RESOLVED-BY-DELETION
-        (was: eval result paper trail)                                   — Olist pipeline gone)
-  P2    no snapshot provenance envelope         low      medium        yes (events[] exists)
-  P2    parallel-span pairing is positional     low      low/latent    yes (toolName + running)
-  P3    no on-call rotation/runbooks/SLOs       high     low           no (no SLA today)
-  P3    no backend trace sink (OTel/Langfuse)   high     low           yes (AgentEvent stream)
+{"route":"/api/briefing","sessionId":"…","mode":"live-bloomreach",
+ "totalMs":118433,"phases":[…],"aborted":false}
 ```
 
-The split that drives the ranking: gaps where the *primitive is already measured* are cheap to close (the work is wiring); gaps with no primitive need code from zero. P0 rows are dominated by primitive-in-place items because those are highest leverage per dollar. P3 rows are correctly deferred — adding OTel without a backend that queries the traces is performative; adding rotation without an SLA is theatre.
+The shared shape is deliberate — one Vercel filter (`phases.phase = "schema_bootstrap"`) reads both routes. **No leveling** (no info/warn/error tier); every non-error log is a `console.log`, every error is a `console.error`.
 
-The leading indicators that flip P3 → P1: "we have a customer with an SLA" (rotation), "we want regression analysis across snapshots" (OTel + provenance envelope), "we hit our first prod outage that took >1 hour to root-cause" (Sentry + runbooks).
+**The session ID is the only correlation thread.** Created by `getOrCreateSessionId` at `lib/mcp/session.ts`, stored in the `bi_session` cookie, threaded through every Vercel log and into the Anthropic call log (`lib/agents/aptkit-adapters.ts:60`). It does NOT propagate to Bloomreach (no header is added; the MCP SDK doesn't expose one). It does NOT propagate to the client logs. Cross-service correlation = grep by session ID, accepted limitation.
 
----
+**Redaction is auth-token shaped, not PII shaped.** `redactSecrets` at `lib/mcp/transport.ts:55-76` scrubs `Bearer …`, `access_token`, `refresh_token`, `id_token`, `code_verifier` — comprehensive on credentials. EQL query results (which can contain customer emails, IDs, country breakdowns) are **not** redacted before being logged in `console.error` paths or written to `.investigation-cache.json`. For a real production deployment with real customer data this is a gap; for the alpha+demo workspace it's fine.
 
-## Top 3 ranked findings
+**Cause-chain walking.** `formatError` at `lib/mcp/transport.ts:82-97` walks up to 5 levels of `e.cause` before redacting, so a token tucked inside `e.cause.cause` doesn't survive. This is a real lesson — `String(e)` doesn't follow cause chains; you'd lose the redaction without it.
 
-1. **No metrics aggregator (rung 2 of the pipeline) — `lib/mcp/client.ts:112,134` measures `durationMs` per call; nothing rolls it up.** Fix shape: write a `lib/metrics.ts` with an in-memory histogram per `toolName`. Wire `metrics.observe(toolName, durationMs)` next to `send({type:'tool_call_end', …})` in both routes. Expose `/api/metrics` in Prometheus exposition format. ~2 hours of work; turns rung 1 into rung 1+2; makes cross-run regressions visible.
+## 4. metrics-slis-slos-and-alerts
 
-2. **No structured logger — `app/api/agent/route.ts:160,256` + `app/api/briefing/route.ts:166,248` are 4× `console.error` with no level, no fields, no correlation, no redaction.** Fix shape: a ~30-line `lib/log.ts` exposing `log.error({event, ...fields}, err)`, serializing to NDJSON, with a redaction list. Swap the 4 catches. No new dependency required. ~30 minutes; closes a high-blast-radius gap and is the prerequisite for any meaningful incident tooling (Sentry inherits the same lossy strings without structured fields).
+`not yet exercised` — at the metrics/alerting tier. The phase log line is *almost* an SLI ("did the route finish under 300s") but nothing aggregates or alerts on it. There's no `/api/metrics`, no Prometheus, no Sentry, no PagerDuty, no synthetic uptime monitor.
 
-3. **Cache snapshot lacks provenance envelope — `lib/state/investigations.ts:30-41` writes `events: AgentEvent[]` directly, no `capturedAt`/`modelVersion`/`promptHash`.** Fix shape: extend the snapshot to `{capturedAt, modelVersion, promptHash?, events: AgentEvent[]}`. `AGENT_MODEL = 'claude-sonnet-4-6'` is already a constant in `lib/agents/base.ts:9`. Update both write paths and read paths; re-capture the seed. ~1 hour; converts the seed from a replay fixture into a regression fixture (you can diff snapshots across model/prompt versions).
+The closest thing to an alert is the in-route 300s ceiling: `maxDuration = 300` at `app/api/briefing/route.ts:19` and `app/api/agent/route.ts:22`. When Vercel kills the function, the `finally` block still fires the phase log so you can see how much of the budget burned. That's *graceful timeout* (a runtime concern) more than an alert (an observability concern).
 
----
+When this matters: the next deployment to a real Bloomreach customer with non-demo traffic needs at least a healthcheck endpoint + Vercel monitoring on 5xx rate. For the alpha + demo path it doesn't.
+
+## 5. traces-and-request-lifecycles
+
+Per-request, in-app trace exists. Cross-service, no.
+
+**The per-request phase log IS the trace.** `phases: Array<{phase, durationMs}>` accumulated through the request and emitted at end in `finally`:
+
+```
+phases: [
+  {phase:"schema_bootstrap", durationMs:2104},
+  {phase:"coverage_gate",    durationMs:3},
+  {phase:"list_tools",       durationMs:611},
+  {phase:"monitoring_scan",  durationMs:115714}
+]
+```
+
+This tells you what part of a 300s budget burned where — the only structured latency-attribution surface in the repo.
+
+**Per-tool latency rides the NDJSON stream.** `tool_call_end` carries `durationMs` (the time inside `dataSource.callTool`), surfaced in the UI's tool block. So the trace is *two-tier*: phases (coarse, server log) + per-tool calls (fine, NDJSON wire). Both observable, neither stitched into a unified trace tree.
+
+**No spans, no trace IDs.** No OpenTelemetry, no W3C `traceparent` header on outbound Anthropic / Bloomreach calls. If a Bloomreach 500 lands during `monitoring_scan`, you have the route's phase log and the tool's `tool_call_end` error string; you do NOT have a unified trace that connects the user's click to that Bloomreach call to that downstream IdP redirect.
+
+→ relevant code: `app/api/briefing/route.ts:204-281`, `app/api/agent/route.ts:216-295`.
+
+## 6. state-snapshots-and-debugging-boundaries
+
+Strong — this is the surface the product itself produces.
+
+**Three layers of state, each independently inspectable:**
+
+1. **The NDJSON event stream** — every reasoning step, tool call, and result on the wire. Open DevTools → Network → Response of `/api/agent?…` → you have the full event list as text, one per line. No proprietary format.
+2. **In-process Maps** — `lib/state/insights.ts:14` holds `state: Map<sessionId, SessionFeed>`. In dev, attach a debugger and inspect. Not observable in prod (warm Vercel instance, no introspection endpoint).
+3. **The dev cache files** — `.auth-cache.json` and `.investigation-cache.json` are gitignored JSON, written via `writeFileSync`. Open them in any editor; the schema is the same `AgentEvent[]` the wire uses.
+
+**The capture button is the manual snapshot mechanism.** Dev-only one-click "capture this as the demo snapshot" in `app/page.tsx` runs the live briefing + each investigation and writes the result to `lib/state/demo-*.json`. The captured artifact is committable and replayable — the snapshot IS the bug report.
+
+**The `dataSource.callTool` boundary is the API-debugging seam.** `lib/mcp/transport.ts:99-114` wraps `fetch` so the raw body of any non-OK response is stored in an `HttpErrorHolder`, then attached to the thrown `McpToolError` — surfacing the *real* Bloomreach error message instead of the SDK's generic "Unauthorized." This is the most expensive lesson in the file: the SDK's default error eats the diagnostic detail.
+
+→ see `03-three-rung-mem-file-seed-store.md` for the storage tier.
+
+## 7. incident-analysis-and-prevention
+
+One real incident is preserved as a postmortem in code (the comment trail).
+
+**The `AUTH_SECRET` flake.** Production-only 500 with no error message. Root cause: `aesKey()` at `lib/mcp/auth.ts:51-60` throws when `AUTH_SECRET` is unset, and the production cookie codepath calls it on every auth-store read. The throw escaped before the route could JSON-encode a response, so Vercel returned a bare 500. Prevention: wrap the setup phase in try/catch and surface `e.message` as a JSON body, at `app/api/briefing/route.ts:170-179` and `app/api/agent/route.ts:166-174`. The comment at line 167-168 explicitly names the lesson:
+
+> "Wrapped so a setup throw (e.g. missing AUTH_SECRET breaking cookie encryption in production) returns the real message instead of a bare 500."
+
+The same pattern (catch-setup-and-return-real-message) is the prevention guard for the *next* env-var flake. → see `05-auth-secret-flake-postmortem.md`.
+
+**Other safety guards in the same family:**
+
+- `DOMException` `AbortError` swallowed at `app/api/briefing/route.ts:294-296` and `app/api/agent/route.ts:308-310` — a client-cancelled stream is not an incident; the `finally` still records phase data.
+- Best-effort dispose at `app/api/briefing/route.ts:308-312` and `app/api/agent/route.ts:322-326` — a teardown error must NOT swallow the route-level error.
+- The retry ladder + ceiling in `BloomreachDataSource` — rate-limit responses are retried with parsed-hint backoff, capped at `retryCeilingMs: 20_000`, with `TOOL_TIMEOUT_MS = 30_000` at `lib/mcp/transport.ts:38` as a hard per-call bound. Comment names the lesson: "A hung Bloomreach connection would otherwise burn the entire 300s route budget on one stuck call."
+
+**No runbook directory.** The lessons live as `// because …` comments next to the guards. Discoverable if you read the code; not discoverable from a `/runbooks` index.
+
+## 8. debugging-observability-red-flags-audit
+
+Ranked by consequence. Verdict + evidence for each.
+
+### Rank 1 — no cross-service trace propagation
+
+**Verdict:** when a Bloomreach call fails, you cannot connect the user's session ID to that specific HTTP call to that specific IdP redirect from logs alone.
+
+**Evidence:** no `traceparent` header is set on the MCP SDK transport (`lib/mcp/transport.ts:99-114` shows the fetch wrapper — it captures error bodies but does NOT inject a trace header). The session ID does not propagate. Cross-service correlation is `grep "<session id>"` across two systems' logs, and Bloomreach is a third-party server whose logs you don't have.
+
+**Why it's #1:** the next class of incident (intermittent Bloomreach 5xx, OAuth flake, IdP latency) requires precisely this stitch to diagnose without re-running.
+
+### Rank 2 — no client-side error reporting
+
+**Verdict:** browser-side exceptions are lost. The hook catches and sets local state; no error gets shipped off the client.
+
+**Evidence:** `useBriefingStream.ts:289-294` catches with `setErrorMessage(String(e))` and `setStatus('error')` — that's the end of the trail. No Sentry, no `window.onerror`, no `/api/log/client` endpoint. A `JSON.parse` failure inside `readNdjson` is silently dropped by default (`opts.onMalformed` is opt-in at `lib/streaming/ndjson.ts:24`).
+
+**Why it's #2:** the live-stream UI is the entire product surface. A silent failure there is invisible until the user reports it — and the product has no users.
+
+### Rank 3 — PII redaction is auth-only, not content-shaped
+
+**Verdict:** EQL results landing in `console.error` or in `.investigation-cache.json` are not scrubbed. Demo data is non-real; live customer data on a Bloomreach prod workspace would not be.
+
+**Evidence:** `redactSecrets` at `lib/mcp/transport.ts:55-76` lists 5 patterns, all credential-shaped. The error path at `app/api/agent/route.ts:312-315` calls `formatError(e)` (which walks cause chains) and `redactSecrets` (which catches creds) — but a Bloomreach 500 whose body includes `{"customer":"alice@…"}` would survive both and reach Vercel logs.
+
+**Why it's #3:** harmless today (demo workspace, no real customers); blocking the moment a real Bloomreach prod workspace is wired in.
+
+### Rank 4 — no SLI/SLO/alert tier
+
+**Verdict:** nobody is paged when `/api/briefing` 500s in production. You find out by reloading the page.
+
+**Evidence:** no `/api/metrics`, no synthetic monitor, no Vercel alert rule wired. The 300s ceiling at `maxDuration = 300` is a runtime cap, not an alert.
+
+**Why it's #4:** appropriate for the current stage; explicit gap to call out when the project graduates from demo.
+
+### Rank 5 — the dev-cache file is plaintext
+
+**Verdict:** `.auth-cache.json` holds OAuth access tokens in plaintext on disk in development.
+
+**Evidence:** `lib/mcp/auth.ts:32-34` and the `writeAll` path at `lib/mcp/auth.ts:125-142` write the full token store to disk unencrypted. The comment names the constraint: "the dev cache holds OAuth tokens in plaintext; it is local-only and gitignored."
+
+**Why it's #5:** the file is gitignored, the cost of theft is one developer's Bloomreach alpha session, the production codepath uses the AES-encrypted cookie at `auth.ts:62-67` instead. Accepted tradeoff; named explicitly so the next developer doesn't ship it.
+
+### Rank 6 — `readNdjson` silently drops malformed lines by default
+
+**Verdict:** a producer that emits a malformed JSON line vanishes from the trace with no signal at the consumer.
+
+**Evidence:** `lib/streaming/ndjson.ts:44-49` calls `opts?.onMalformed?.(line, err)` — the optional chaining means a consumer that doesn't pass `onMalformed` simply skips the line. None of the four real consumers pass it (`useBriefingStream.ts:288`, `useInvestigation.ts:194`, `useDemoCapture.ts`, `StreamingResponse.tsx`).
+
+**Why it's #6:** producers are all internal (your own routes encoding via `encodeEvent`) so the failure mode is theoretical; named for the post-mortem when someone adds a new producer that occasionally emits a half-buffered chunk.

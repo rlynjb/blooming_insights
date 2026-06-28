@@ -1,386 +1,276 @@
-# Tool routing
+# 04 — tool routing
 
-**Industry name(s):** tool scoping / least-privilege tool exposure, intent routing / request classification, routing-by-construction
-**Type:** Industry standard · Language-agnostic
-
-> blooming insights routes at two levels: each agent is handed only its relevant tool SUBSET (`monitoringTools` / `diagnosticTools` / `recommendationTools`) so the model cannot reach for the wrong tool, and free-form `?q=` queries are routed by a heuristic-first, LLM-second intent classifier (`parseIntent` then `classifyIntent`) to the right agent surface.
-
-
----
+**Subtitle:** Heuristic-vs-LLM tool picking · Industry standard (this codebase: heuristic)
 
 ## Zoom out, then zoom in
 
-**Zoom out — the bigger picture.** Tool routing is two decisions at two different layers. The Intent-parsing band routes a free-form `?q=` to the right agent (`parseIntent` first, `classifyIntent` second — see → ../01-llm-foundations/07-heuristic-before-llm.md). The Per-agent definitions band routes the *tool menu* per agent — each agent receives only its filtered subset (e.g. `diagnosticTools` of ~17 instead of the full ~40), so the wrong tool is never on the menu when the model picks.
+blooming insights uses **heuristic tool routing** — per-agent allowlists in
+`lib/mcp/tools.ts` filter the set of tools each agent can see. The model
+then picks from its filtered set; that picking is LLM routing inside the
+allowlist. Both patterns layered: hard gate first, model choice second.
 
 ```
-  Zoom out — the two routing decisions
+  Zoom out — routing at two layers
 
-  ┌─ Route ──────────────────────────────────────────┐
-  │  ?q=... or ?insightId=...                          │
-  └─────────────────────────┬────────────────────────┘
-                            │
-  ┌─ Intent parsing (cross-cutting) ─────────────────┐  ← we are here (decision 1)
-  │  ★ parseIntent (free) → classifyIntent (haiku) ★  │
-  │    → which agent handles this?                     │
-  │  lib/agents/intent.ts                              │
-  └─────────────────────────┬────────────────────────┘
-                            │ chosen agent
-  ┌─ Per-agent definitions ─▼────────────────────────┐  ← we are here (decision 2)
-  │  ★ filterToolSchemas(allTools, agentToolNames) ★  │
-  │    monitoring → monitoringTools                    │
-  │    diagnostic → diagnosticTools (~17)              │
-  │    recommendation → recommendationTools            │
-  │  lib/mcp/tools.ts                                  │
-  └─────────────────────────┬────────────────────────┘
-                            │  curated menu
-  ┌─ Agent loop + Tools ────▼────────────────────────┐
-  │  model picks from the SUBSET only                 │
-  └──────────────────────────────────────────────────┘
+  ┌─ Heuristic layer (Blooming) ────────────────────────┐
+  │  per-agent allowlist filter:                        │
+  │    monitoringTools (13)                             │  ← we are here
+  │    diagnosticTools (17)                             │   (the gate)
+  │    recommendationTools (8)                          │
+  │    queryTools (union)                               │
+  └────────────────────┬────────────────────────────────┘
+                       │ filtered tool list
+                       ▼
+  ┌─ LLM layer (model picks from filtered list) ────────┐
+  │  model emits tool_use block selecting one tool      │  ← the choice
+  └─────────────────────────────────────────────────────┘
 ```
-
-**Zoom in — narrow to the concept.** The question is: how do you stop a model from reaching for the wrong tool, and how do you send a free-form question to the right specialist? The failure mode is silent and expensive — show a model 40 tools and it sometimes calls one with nothing to do with the question, burning a budget slot and polluting the context. The fix is *routing by construction*: hand the model a small curated subset (decision 2) and route the request to the right specialist first (decision 1). How it works walks both decisions and the rule that subset-scoping beats prompt-discipline.
-
----
 
 ## Structure pass
 
-**Layers.** Four layers stage two routing decisions: the route handler receives `?q=` or `?insightId=`, the intent-parsing band picks an agent (`parseIntent` → `classifyIntent`), the per-agent definitions hand the chosen agent a filtered tool subset (`filterToolSchemas`), and the agent loop runs the model against only that subset. Two routers, two decisions, one combined effect.
-
-**Axis: control.** Who decides which tool fires — and is that decision made at *build/config time* (the static tool subset) or at *request time* (the dynamic intent classifier and then the model's tool pick)? This axis is the right lens because tool routing is a *layered narrowing of choices*: each layer removes options the next layer can't pick from. The recurring sub-section axis (CODE vs MODEL) shows up here as two CODE-side gates that fence the MODEL's options.
-
-**Seams.** The cosmetic seam is between the route handler and the intent parser — both are URL parsing. The load-bearing seam is between the intent-parsing band (chose agent) and the per-agent definitions (filtered subset): control flips here from "request-time dynamic pick" to "build-time static allow-list." A second load-bearing seam: between the curated tool menu and the agent loop — once the menu is filtered, the model's choice is *within a safe set by construction*, not by prompt discipline. Subset-scoping beats prompt instructions every time.
-
-```
-  Structure pass — tool routing
-
-  ┌─ 1. LAYERS ───────────────────────────────────┐
-  │  route handler (q vs insightId)                │
-  │  intent parsing (parseIntent → classifyIntent) │
-  │  per-agent definitions (filterToolSchemas)     │
-  │  agent loop (model picks within subset)        │
-  └────────────────────────┬───────────────────────┘
-                           │  pick the axis
-  ┌─ 2. AXIS ─────────────▼────────────────────────┐
-  │  control: build-time static vs request-time    │
-  │  dynamic — at each layer who decides?          │
-  └────────────────────────┬───────────────────────┘
-                           │  trace across layers, find flips
-  ┌─ 3. SEAMS ────────────▼────────────────────────┐
-  │  route↔intent: cosmetic                        │
-  │  intent↔subset: LOAD-BEARING                   │
-  │    request-time → build-time control           │
-  │  subset↔agent loop: LOAD-BEARING               │
-  │    fenced choice → MODEL picks within it       │
-  │    by-construction beats by-prompt             │
-  └────────────────────────┬───────────────────────┘
-                           ▼
-                   Block 4 — How it works
-```
-
-The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+  → **One axis to trace — who picks which tools are even available.**
+    Above the seam (allowlist), Blooming picks. Below the seam, the LLM
+    picks (from what's available). The axis flips at the boundary
+    between `lib/mcp/tools.ts` (Blooming's hand-curated lists) and
+    AptKit's tool-passing (the model sees only filtered tools).
 
 ## How it works
 
-**Mental model.** Two routers with opposite mechanisms. The first is a *static allow-list* applied before the model runs — like rendering only the buttons a role may click, the agent is built with only the tools it may use. The second is a *dynamic classifier* applied per request — like a `switch` that first tries a fast `string.includes` check and only falls back to an expensive lookup when the fast path is inconclusive.
+### Move 1 — the mental model
+
+Same shape as IAM role permissions: the role defines what a user *can*
+do; the user picks within that. Here the role is the agent allowlist;
+the user is the model.
 
 ```
-ROUTING 1 — tool subset (static, by construction)    ROUTING 2 — intent (dynamic, per request)
-──────────────────────────────────────────────       ──────────────────────────────────────────
-allTools (~40) ──filterToolSchemas(allowed)──→        q="what changed?"
-  monitoring  → monitoringTools  (~13)                  parseIntent(q)  ← heuristic, free, sync
-  diagnostic  → diagnosticTools  (~17)                    includes('monitoring')? → 'monitoring'
-  recommend.  → recommendationTools (~10)                 (in route.ts: classifyIntent → haiku)
-  query       → queryTools (union of all three)         → QueryAgent.answer(q, intent)
-the model only ever SEES its subset                   wrong tool impossible because subset-scoped
+  Two routing strategies, layered
+
+  Heuristic routing (Blooming — deterministic):
+    if agent === 'monitoring': tools = monitoringTools
+    elif agent === 'diagnostic': tools = diagnosticTools
+    elif agent === 'recommendation': tools = recommendationTools
+    elif agent === 'query': tools = queryTools (union)
+
+  LLM routing (model — within allowlist):
+    model sees its agent's tool list
+    model emits tool_use block with name + input
+    AptKit dispatches; result goes back as observation
+
+  Combined: heuristic filters; LLM picks within filter
 ```
 
-The first router decides *what the model can do*; the second decides *which agent does it*. The subset-scoping makes the wrong-tool failure structurally impossible for the specialist agents; the intent classifier picks the surface for the free-form path.
+### Move 2 — the step-by-step walkthrough
 
----
-
-### Routing 1 — per-agent tool subsets (routing by construction)
-
-The tool catalog declares one `const` array of tool *names* per agent. The monitoring subset lists the dashboard / trend / funnel / EQL tools a monitor needs; the diagnostic subset lists the investigation tools; the recommendation subset lists the scenario / segment / campaign tools a recommender needs.
-
-```
-per-agent name subsets
-─────────────────────────────────────────────────────────────
- monitoringTools       list_dashboards, get_dashboard, list_trends,
-                       ... execute_analytics_eql, get_customer_prediction_score
- diagnosticTools       execute_analytics_eql, get_funnel, get_event_segmentation,
-                       ... list_customers, list_scenarios, get_catalog_item
- recommendationTools   list_scenarios, get_scenario, list_initiatives,
-                       ... list_voucher_pools, get_frequency_policies
- queryTools            [...new Set([...monitoring, ...diagnostic, ...recommendation])]
-```
-
-Each agent passes its subset into the tool-schema filter when building the `toolSchemas` argument to the shared agent loop. The filter keeps only the tools whose names are in the subset and maps them to the provider SDK's `Tool[]` shape.
-
-```
-the tool-schema filter as a router
-─────────────────────────────────────────────────────────────
- all (~40 McpToolDef) ──filter(allowed.has(name))──→ subset Tool[] ──→ params.tools
- the model's tool menu THIS turn = exactly the subset, nothing more
-```
-
-The consequence: when the diagnostic agent runs, `params.tools` contains only `diagnosticTools`. The model physically cannot emit a `tool_use` for `list_voucher_pools` because that tool is not in the array it was shown. This is routing by construction — the wrong choice is not blocked at runtime, it is *absent*. `queryTools` is the deliberate exception: the free-form agent gets the de-duplicated union of all three subsets because it must answer anything.
-
----
-
-### Routing 2 — intent classification (heuristic-first, LLM-second)
-
-The free-form `?q=` path needs to know whether a question is a monitoring ("what changed?"), diagnostic ("why?"), or recommendation ("what should I do?") request. The intent module provides two functions, layered.
-
-The intent parser is a pure, synchronous heuristic: lowercase the string and substring-check for `'monitoring'`, `'recommendation'`, `'diagnostic'`, defaulting to `'diagnostic'`:
-
-```
-  function parse_intent(raw) -> Intent:
-      t = lower(trim(raw))
-      if t contains "monitoring":     return 'monitoring'
-      if t contains "recommendation": return 'recommendation'
-      if t contains "diagnostic":     return 'diagnostic'
-      return 'diagnostic'   ← default
-```
-
-The intent classifier is the LLM fallback: a single cheap-tier call with `max_tokens: 16` and a system prompt that forces a one-word answer, then passed *back through the intent parser* to coerce the model's word into an `Intent`:
-
-```
-  async function classify_intent(provider_sdk, query):
-      response = await provider_sdk.messages.create({
-          model:      CLASSIFIER_MODEL,   # cheap tier
-          max_tokens: 16,                  ← caps to one word
-          system:     "Classify as exactly one word: monitoring|diagnostic|recommendation",
-          messages:   [{ role: "user", content: query }],
-      })
-      return parse_intent(text_of(response))   ← heuristic coerces the model word
-```
-
-The ordering is the lesson. The intent parser is the heuristic layer (free, instant, no network); the intent classifier is the LLM layer (a real model call, but the cheapest/fastest model with a 16-token cap). In the route, the query path calls the intent classifier — and the classifier's output still flows through the intent parser, so the heuristic is the *normalizer* even on the LLM path. Heuristic at the front (and at the back, coercing the model's word), LLM in the middle for the hard cases the substring check cannot resolve.
-
----
-
-### Where the two routers meet
-
-The route wires both. The investigation path (`insightId`) does not classify — the chain order is fixed and `step`-gated (01-agents-vs-chains.md), so diagnostic (on `step=diagnose`) and recommendation (on `step=recommend`) each get their subset directly. The query path (`q && !insightId`) runs the intent classifier to pick the framing, then constructs a query agent whose tools are `queryTools` (the union). The intent does not change the tool set on the query path — the query agent always gets the union — it changes the *prompt framing* (the intent is injected into the system prompt). So the two routers compose: intent routing picks the surface and framing; subset-scoping bounds what each surface can do.
-
-```
-both routers, in the route handler
-─────────────────────────────────────────────────────────────
- q only:        classify_intent(provider_sdk, q)        ← Router 2 (intent)
-                QueryAgent.answer(q, intent)              tools = queryTools (union)
- step=diagnose: DiagnosticAgent.investigate(inv)         ← Router 1 (subset)
- step=recommend:RecommendationAgent.propose(inv, diag)     diag tools / rec tools
-```
-
----
-
-### The principle
-
-**Narrow the decision space before the model decides.** Both routers do the same thing at different layers: they shrink the set of possibilities the model must choose among, so the model's choice is constrained to be correct-by-construction or routed to the right specialist. Subset-scoping removes wrong tools from existence rather than hoping the prompt discourages them; intent routing tries the free heuristic before paying for a model call. The unifying rule: the cheapest, most reliable way to prevent a wrong choice is to make the wrong choice unavailable — and the cheapest way to make a choice is to not use a model when a substring check suffices.
-
----
-
----
-
-### Code in this codebase
-
-**Case A — implemented.**
-
-#### Per-agent tool subsets (Router 1)
-
-- **File:** `lib/mcp/tools.ts`
-- **Function / class:** `monitoringTools` / `diagnosticTools` / `recommendationTools` / `queryTools`
-- **Line range:** L5–L13, L15–L25, L27–L34, L38–L40 (`queryTools` = de-duplicated union of all three)
-- **Role:** The allow-list of tool names each agent may use; `bootstrapTools` (L50–L54) is the separate session-start discovery set.
-
-#### The filter that applies the subset
-
-- **File:** `lib/agents/tool-schemas.ts`
-- **Function / class:** `filterToolSchemas`
-- **Line range:** L9–L21; the filter at L15 (`set.has(t.name)`)
-- **Role:** Keeps only allowed tools and maps them to `Anthropic.Messages.Tool[]`; the result becomes `params.tools` at `base.ts` L101.
-
-#### Subset selection per agent
-
-- **File:** `lib/agents/diagnostic.ts` L57 · `recommendation.ts` L52 · `monitoring.ts` L79 · `query.ts` L36
-- **Function / class:** the `toolSchemas: filterToolSchemas(this.allTools, <subset>)` argument to `runAgentLoop`
-- **Line range:** one line per agent
-- **Role:** Binds each agent to its subset at the call site.
-
-#### Intent classification (Router 2)
-
-- **File:** `lib/agents/intent.ts`
-- **Function / class:** `parseIntent` (heuristic) + `classifyIntent` (LLM)
-- **Line range:** `parseIntent` L6–L12; `CLASSIFIER_MODEL` L14; `classifyIntent` L17–L31 (`max_tokens: 16` at L20; coerced through `parseIntent` at L30)
-- **Role:** Maps a free-form query to one of `monitoring | diagnostic | recommendation`; heuristic first, haiku fallback, heuristic-as-normalizer at the end.
-
-#### Where intent is consumed
-
-- **File:** `app/api/agent/route.ts`
-- **Function / class:** `GET` → query branch
-- **Line range:** L210–L218 (`classifyIntent` at L211; `QueryAgent.answer(q, intent, ...)` at L214)
-- **Role:** Calls the classifier, then runs the query agent with the chosen intent as prompt framing (intent injected at `query.ts` L28).
-
-**Pseudocode — both routers** (`tools.ts` + `intent.ts` + `route.ts`):
+**The allowlists** live in `lib/mcp/tools.ts`:
 
 ```typescript
-// ROUTER 1 — subset by construction (diagnostic.ts L57)
-toolSchemas: filterToolSchemas(this.allTools, diagnosticTools)  // model sees only these
+// Bloomreach (EQL-shaped) ↓
+const monitoringToolsBloomreach = [
+  'list_dashboards', 'get_dashboard',
+  'list_trends', 'get_trend',
+  'list_funnels', 'get_funnel',
+  'list_running_aggregates', 'get_running_aggregate',
+  'list_reports', 'get_report',
+  'execute_analytics', 'execute_analytics_eql',
+  'get_customer_prediction_score',
+] as const;
 
-// ROUTER 2 — intent, heuristic-first (intent.ts)
-function parseIntent(raw) {                                     // L6 — free heuristic
-  const t = raw.trim().toLowerCase();
-  if (t.includes('monitoring'))     return 'monitoring';
-  if (t.includes('recommendation')) return 'recommendation';
-  return 'diagnostic';                                          // default
-}
-async function classifyIntent(anthropic, query) {              // L17 — haiku fallback
-  const res = await anthropic.messages.create({
-    model: 'claude-haiku-4-5-...', max_tokens: 16, system: '...one word...' });
-  return parseIntent(textOf(res));                             // L30 — heuristic normalizes
-}
-// route.ts L211: const intent = await classifyIntent(anthropic, q);
+const diagnosticToolsBloomreach = [
+  'execute_analytics', 'execute_analytics_eql',
+  'get_funnel', 'get_event_segmentation',
+  'list_customers', 'list_customer_events',
+  'list_customers_in_segment', 'list_segmentations',
+  'list_email_campaigns', 'list_sms_campaigns',
+  'list_in_app_messages', 'list_banners',
+  'list_experiments', 'list_scenarios',
+  'list_catalog_items', 'get_catalog_item',
+  'get_customer_prediction_score',
+] as const;
+
+const recommendationToolsBloomreach = [
+  'list_scenarios', 'get_scenario',
+  'list_initiatives', 'get_initiative_items',
+  'list_recommendations', 'get_recommendation',
+  'list_segmentations', 'list_email_campaigns',
+  'list_voucher_pools',
+  'get_frequency_policies',
+] as const;
 ```
 
----
+The pattern:
+  - **monitoring** = read-only analytics tools (dashboards, trends,
+    funnels, ad-hoc EQL). Cannot list campaigns or scenarios.
+  - **diagnostic** = analytics + customer/campaign lookups. Can list
+    campaigns (to test the hypothesis "did campaign X cause this?")
+    but cannot list scenarios (out of scope).
+  - **recommendation** = feature-discovery tools (existing scenarios,
+    segments, vouchers). Cannot run ad-hoc analytics — already has the
+    diagnosis as input.
+  - **query** = union of all three. Free-form Q&A can need anything.
 
-## Tool routing — diagram
+**Why these specific subsets.** Each agent's job determines what data it
+needs:
 
-The diagram spans three layers. The Route layer holds the intent classifier (Router 2). The Agent layer holds the subset selection (Router 1) per agent. The Provider boundary is where the curated tool array reaches the model. Both routers narrow the space before the model acts.
+  → Monitoring detects anomalies → needs analytics queries.
+  → Diagnostic tests hypotheses → needs analytics + the customer / campaign
+    surface to localize causes.
+  → Recommendation proposes actions → needs to see what features already
+    exist (so it doesn't propose duplicate scenarios).
 
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│  ROUTE LAYER   app/api/agent/route.ts                                 │
-│                                                                       │
-│  q only ──→ ROUTER 2 (intent):                                       │
-│              parseIntent(q)  ← heuristic (free)   intent.ts L6–12     │
-│              classifyIntent  ← haiku, 16 tok      intent.ts           │
-│              → QueryAgent.answer(q, intent)                           │
-│  insightId ─→ fixed chain (no intent classify), step-gated:          │
-│              step=diagnose → diagnostic · step=recommend → recommend  │
-└───────────────────────────────┬───────────────────────────────────────┘
-                                │ each agent selects its subset
-┌───────────────────────────────▼───────────────────────────────────────┐
-│  AGENT LAYER   lib/agents/  +  lib/mcp/tools.ts                       │
-│                                                                       │
-│  ROUTER 1 (subset, by construction):                                 │
-│    allTools (~40) ──filterToolSchemas(all, <subset>)──→ scoped Tool[] │
-│      monitoring  → monitoringTools     (~13)   tools.ts L5–13         │
-│      diagnostic  → diagnosticTools      (~17)  tools.ts               │
-│      recommend.  → recommendationTools  (~10)  tools.ts               │
-│      query       → queryTools (union)          tools.ts               │
-│                            │ params.tools = scoped subset│
-└───────────────────────────────┬───────────────────────────────────────┘
-                                │ the model sees ONLY its subset
-┌───────────────────────────────▼───────────────────────────────────────┐
-│  PROVIDER BOUNDARY   @anthropic-ai/sdk  ·  Bloomreach MCP             │
-│  model can only emit tool_use for tools in the array it was shown     │
-└──────────────────────────────────────────────────────────────────────┘
+**The bootstrap tools** (`lib/mcp/tools.ts:55-59`) are a separate list:
+
+```typescript
+export const bootstrapTools = [
+  'list_cloud_organizations', 'list_projects',
+  'get_event_schema', 'get_customer_property_schema',
+  'list_catalogs', 'get_project_overview',
+] as const;
 ```
 
-A reader who sees only this diagram should grasp: intent routing picks the surface, subset-scoping bounds what each surface can do, and the model never sees a tool outside its subset.
+These are called BEFORE any agent runs (deterministic, no LLM
+involvement). No agent's allowlist includes them — the LLM never picks
+them.
 
----
+**The synthetic data source uses the same lists.** Looking at
+`lib/data-source/synthetic-data-source.ts`, the per-agent tool lists
+are mirrored — the SyntheticDataSource exposes only the tools each
+agent should see, matching the Bloomreach allowlist structure. The
+heuristic gating works identically across data sources.
+
+**Coverage gating as a second heuristic.** Inside the monitoring agent
+specifically, `runnableCategories(available)` from
+`lib/agents/categories.ts` filters the *category checklist* (not the
+tools) down to ones whose required signals are in the schema. See
+`01-llm-foundations/07-heuristic-before-llm.md` for the full
+walkthrough. This is heuristic routing one level deeper — the model
+sees not just allowed tools but allowed *targets* for those tools.
+
+**The LLM-routing layer.** Within the filtered set, the model picks
+freely. It can emit `tool_use` for any tool in its allowlist; it can
+chain tool calls; it can decide not to call any tools and just emit
+its final answer. The prompts shape its preferences ("use
+`execute_analytics_eql` first to check volume…") but don't enforce
+choices.
+
+### Move 3 — the principle
+
+**Layer heuristic routing over LLM routing: hard gate what the model can
+even see, then let the model pick within that.** The heuristic gate is
+your defense in depth — if a prompt-injection attempt tells the model
+to call an unexpected tool, the allowlist prevents it. The LLM layer
+is your flexibility — the model can pick the right tool for the
+specific query without you having to enumerate every case in code.
+
+## Primary diagram
+
+```
+  Per-agent allowlists + LLM picking — the full routing pipeline
+
+  request arrives at /api/agent
+       │
+       ▼  agent shape determined by step / classifyIntent
+  ┌─ Heuristic gate: which agent? ───────────┐
+  │   step === 'diagnose'  → DiagnosticAgent  │
+  │   step === 'recommend' → RecommendationAgent│
+  │   q && !insightId      → QueryAgent       │
+  │   /api/briefing        → MonitoringAgent  │
+  └────────────────────┬─────────────────────┘
+                       │
+                       ▼  agent passes its allowlist
+  ┌─ Allowlist filter (lib/mcp/tools.ts) ────┐
+  │   monitoringTools  /  diagnosticTools     │
+  │   recommendationTools  /  queryTools      │
+  └────────────────────┬─────────────────────┘
+                       │  filtered tool list
+                       ▼
+  ┌─ Tool definitions passed to model ───────┐
+  │   each: { name, description, inputSchema }│
+  └────────────────────┬─────────────────────┘
+                       │
+                       ▼  model picks freely within allowlist
+  ┌─ Model emits tool_use blocks ────────────┐
+  │   selects from its visible tool list      │
+  │   (cannot pick a tool it can't see)       │
+  └───────────────────────────────────────────┘
+```
 
 ## Elaborate
 
-### Where this pattern comes from
+The "narrow per-agent allowlists" pattern is what makes a multi-agent
+system tractable. Without per-agent narrowing, every agent sees every
+tool (~30+ for this codebase), and the prompts have to explicitly say
+"don't use list_email_campaigns even though you can." Inevitably the
+model occasionally ignores the negative constraint and picks the wrong
+tool. With narrowing, the wrong tool isn't visible — the model can't
+pick it.
 
-Tool scoping is the **principle of least privilege** applied to an agent: grant only the capabilities the task requires. It maps directly onto Anthropic's "Building effective agents" routing workflow, where an input is classified and directed to a specialized follow-up — except here the classification happens twice, once for tools (static) and once for intent (dynamic). The heuristic-before-LLM ordering is a long-standing systems instinct: do the cheap deterministic check first, escalate to the expensive probabilistic one only when needed. It is the same reason you validate a form field with a regex before calling a verification API.
-
-### The deeper principle
-
-There are two ways to prevent a wrong choice: *block it at decision time* (validate the model's tool call against a policy after it picks) or *remove it from the choice set* (never show the tool). The second is strictly more robust because it has no runtime path to fail — there is no "the validator had a bug" failure mode if the tool was never on the menu. blooming insights chooses removal (subset-scoping) over blocking. The same logic governs the intent router: rather than always paying for a model call, the cheap heuristic resolves the common, unambiguous cases, and the model is reserved for genuine ambiguity. Constrain first, compute second.
-
-### Where this breaks down
-
-Subset-scoping is a static partition — it cannot adapt if a diagnosis genuinely needs a tool that lives in `recommendationTools`. The partitions overlap deliberately (`execute_analytics_eql` is in both monitoring and diagnostic, `list_scenarios` in both diagnostic and recommendation) to soften this, but a query that needs a tool outside its agent's subset simply cannot run it; the agent must work around the gap or fail. The intent heuristic is brittle in the opposite way: `parseIntent` matches the literal substring `'monitoring'`, so a real user question like "what changed this week?" contains none of the keywords and falls through to the `'diagnostic'` default — which is why `classifyIntent` exists, but the haiku call adds latency and can still misclassify ambiguous questions.
-
-### What to explore next
-
-- **Semantic tool retrieval** — instead of static subsets, embed tool descriptions and retrieve the top-k relevant tools per query (a RAG-over-tools approach); the dynamic alternative to static partitioning (cross-link to ../03-retrieval-and-rag/).
-- **Anthropic "Building effective agents" — Routing** — read the routing workflow and map blooming insights' two routers onto it.
-- **Confidence-aware classification** — having `classifyIntent` return a confidence and only escalating to the model when the heuristic is low-confidence; tightens the heuristic-first ordering.
-
----
+This is also a token-economics move (see
+`01-llm-foundations/06-token-economics.md`). Tool definitions are
+re-shipped every turn; 8 recommendation tools vs 22 union tools is
+~1.4k saved tokens per turn. Across a 4-turn recommendation loop,
+that's ~5.6k tokens saved, or ~$0.017 per investigation. Small but
+real.
 
 ## Project exercises
 
-### Confidence-gate the intent classifier to skip the haiku call
+### Exercise — measure per-tool usage per agent + prune unused tools
 
-- **Exercise ID:** C1.9 (adapted to blooming insights)
-- **What to build:** Make the query path call `parseIntent(q)` first; only fall through to `classifyIntent` (the haiku call) when the heuristic hits its `'diagnostic'` *default* (i.e., no keyword matched), so unambiguous keyworded queries skip the model call entirely.
-- **Why it earns its place:** Demonstrates the heuristic-before-LLM ordering as a latency/cost optimization — a clean token-economics signal.
-- **Files to touch:** `app/api/agent/route.ts` (L210–L214); optionally a `parseIntentConfident` helper in `lib/agents/intent.ts`.
-- **Done when:** A query containing a keyword (e.g., "recommendation ideas") routes with zero model calls, and a keyword-free query still falls through to `classifyIntent`.
-- **Estimated effort:** <1hr
-
-### Route the query agent's tool subset by intent instead of always-union
-
-- **Exercise ID:** C4.6 (adapted to blooming insights)
-- **What to build:** Today `QueryAgent` always gets `queryTools` (the full union, `query.ts` L36). Use the classified `intent` to narrow the subset — a `'monitoring'` query gets `monitoringTools`, etc. — so intent routing controls *both* framing and the tool menu, not just framing.
-- **Why it earns its place:** Shows you can compose the two routers — intent routing now drives subset-scoping — improving tool-selection accuracy on the free-form path.
-- **Files to touch:** `lib/agents/query.ts` (L24, L36 — accept and apply the subset for the intent); `app/api/agent/route.ts` (pass intent through, L214); `test/agents/query.test.ts`.
-- **Done when:** A `'monitoring'` query's `runAgentLoop` is handed only `monitoringTools`, verified by a unit test with a fake MCP, and a `'diagnostic'` query gets `diagnosticTools`.
-- **Estimated effort:** 1–4hr
-
----
+  → **Exercise ID:** `study-ai-eng-04-04.1`
+  → **What to build:** Add a per-tool counter to `BloomingTraceSinkAdapter`
+    that accumulates calls per (agent, toolName) pair. Emit a daily
+    summary log line. After a week of usage, identify tools that no
+    agent has called — remove them from the relevant allowlist.
+  → **Why it earns its place:** Data-driven tool pruning. Today the
+    allowlists are hand-curated; usage data tells you which entries
+    are dead weight.
+  → **Files to touch:** `lib/agents/aptkit-adapters.ts:100-141`,
+    `lib/mcp/tools.ts` (after analysis, prune unused).
+  → **Done when:** Per-tool usage stats are logged; allowlists trimmed
+    by ≥1 tool with no behavior change.
+  → **Estimated effort:** `1–4hr` (plus a week of waiting on data).
 
 ## Interview defense
 
-### What an interviewer is really asking
+**Q: How does blooming insights decide which tools each agent gets?**
 
-"How do you keep the model from calling the wrong tool?" tests whether you reach for a prompt ("I tell it not to") or for construction ("the tool is not in the menu"). The senior answer is the latter. "How do you route a free-form query?" tests whether you default to a model call or know to try a cheap deterministic check first.
+Hand-curated per-agent allowlists in `lib/mcp/tools.ts`. Four lists:
+  - `monitoringTools` (13) — analytics only
+  - `diagnosticTools` (17) — analytics + customer/campaign lookups
+  - `recommendationTools` (8) — feature discovery
+  - `queryTools` (union of all)
 
-### Likely questions
-
-**[mid] "How does the diagnostic agent avoid calling a recommendation-only tool?"**
-
-It cannot call one — `diagnostic.ts` L57 passes `filterToolSchemas(this.allTools, diagnosticTools)`, so `params.tools` (`base.ts` L101) contains only diagnostic tools. A recommendation-only tool like `list_voucher_pools` is not in the array the model is shown, so there is no `tool_use` block it could emit for it. The prevention is structural, not prompt-based.
-
-```
-allTools (~40) ──filter(diagnosticTools)──→ ~17 tools shown
-list_voucher_pools ∉ shown set → model cannot request it
-```
-
-**[senior] "Why try `parseIntent` before `classifyIntent` — isn't the model more accurate?"**
-
-Because most queries are resolvable without a model. `parseIntent` is free, synchronous, and deterministic; `classifyIntent` is a network round-trip to haiku. For the cases the substring check resolves, paying for a model call is pure waste — added latency and tokens for no accuracy gain. The model is reserved for genuine ambiguity. And even on the model path, the output flows back through `parseIntent` (L30) to coerce a possibly-noisy word into a valid `Intent` — the heuristic is also the normalizer.
+The list is the heuristic gate. The model picks from the filtered list;
+the LLM-routing happens within the gate. Defense in depth:
+prompt-injection can't make a monitoring agent call
+`list_email_campaigns` because it's not in `monitoringTools`.
 
 ```
-q ──parseIntent (free)──→ resolved?  ──yes──→ done (no model call)
-                              │no
-                              ▼
-                          classifyIntent (haiku) ──parseIntent(normalize)──→ Intent
+  layered routing:
+
+   1. heuristic: which agent for this request?
+      → step='diagnose' → DiagnosticAgent (Blooming code decides)
+
+   2. heuristic: which tools does that agent see?
+      → diagnosticTools (Blooming allowlist filters)
+
+   3. LLM: which tool to call now?
+      → model picks from filtered list (within allowlist)
 ```
 
-**[arch] "Your tool subsets are hand-maintained `const` arrays. When does that stop scaling?"**
+**Anchor line:** "Allowlist gate + model pick. The gate makes
+prompt-injection impossible to exfiltrate beyond the agent's scope."
 
-When the catalog grows past a few dozen tools or the cross-subset needs become frequent. Hand-partitioning ~40 tools into three overlapping subsets is tractable; partitioning 300 tools is not, and a static partition cannot adapt when a diagnosis genuinely needs a tool from another subset. The migration is semantic tool retrieval: embed each tool's description, and per query retrieve the top-k relevant tools dynamically. The subset arrays become a fallback or a coarse pre-filter, not the whole router.
+**Q: What would change if you wanted to let one agent call any tool?**
 
-```
-today:  static const arrays (3 overlapping subsets, ~40 tools)
-scale:  embed tool descriptions → retrieve top-k per query (dynamic subset)
-```
-
-### The question candidates always dodge
-
-**"What happens to 'what changed this week?' — does your intent router get it right?"**
-
-Honestly: `parseIntent` gets it *wrong* on the heuristic path. The string contains none of `'monitoring'`/`'recommendation'`/`'diagnostic'`, so it hits the `'diagnostic'` default (`intent.ts` L11) — even though "what changed" is a monitoring question. That is exactly why `classifyIntent` exists: the haiku call reads the semantics, not the literal keywords, and returns `'monitoring'`. Candidates dodge this because admitting the heuristic misses real phrasing feels like a flaw; it is actually why the two-layer design exists — the heuristic is fast but literal, the model is the semantic backstop.
-
-### One-line anchors
-
-- `lib/mcp/tools.ts` L5–L34 — the three per-agent subsets; `queryTools` L38–L40 is their union.
-- `lib/agents/tool-schemas.ts` L15 — `set.has(t.name)` — the filter that enforces the subset.
-- `lib/agents/diagnostic.ts` L57 — `filterToolSchemas(this.allTools, diagnosticTools)` — subset binding.
-- `lib/agents/intent.ts` L6–L12 — `parseIntent` — the free heuristic and the normalizer.
-- `lib/agents/intent.ts` L17–L31 — `classifyIntent` — haiku fallback, `max_tokens: 16`.
-
----
+The query agent already does — `queryTools` is the union. The pattern
+is: when intent is genuinely flexible (free-form Q&A), union allowlist;
+when intent is bounded (specific role), narrow allowlist. The downside
+of union is the model has more options to pick badly from, so the
+prompt has to work harder to steer.
 
 ## See also
 
-→ 02-tool-calling.md · → 01-agents-vs-chains.md · → 06-error-recovery.md · → ../01-llm-foundations/ · → ../../study-system-design/06-multi-agent-orchestration.md
-
----
+  → `02-tool-calling.md` — how the picked tool actually runs
+  → `01-llm-foundations/07-heuristic-before-llm.md` — heuristic-before-LLM
+    pattern at multiple layers
+  → `01-llm-foundations/06-token-economics.md` — what narrow allowlists save

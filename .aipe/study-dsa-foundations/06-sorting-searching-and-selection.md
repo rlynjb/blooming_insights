@@ -1,561 +1,484 @@
 # Sorting, searching, and selection
 
-**Industry name(s):** comparator-based sort (Timsort, merge sort, quicksort), linear search, binary search, selection (quickselect, partitioning), top-K, bucket / radix sort
-**Type:** Industry standard · Language-agnostic
+*Comparator-based sort, binary search, partitioning, top-K — Industry standard · sort ★★★ exercised, binary search Case B*
 
-> The three operations on ordered data: **sort** (put everything in order), **search** (find one specific thing), **select** (find the K-th smallest or the top K). This codebase exercises comparator sort with a rank-table, linear search via `Array.prototype.find`/`reduce`, and substring scan as a non-classical search. **Binary search is not yet exercised** because no data here is pre-sorted in a way that demands O(log N) lookup.
-
----
-
-## Zoom out, then zoom in
-
-**Zoom out — the bigger picture.** Sort and linear search are everywhere in this codebase. `[...parsed].sort((a, b) => SEV_RANK[b.severity] - SEV_RANK[a.severity]).slice(0, 10)` in `lib/agents/monitoring.ts` L119 is the canonical sort-and-truncate pattern — rank table converts string enum to integers, V8 Timsort handles the comparator in O(N log N), `.slice(0, 10)` does a fixed top-K. The substring scan in `lib/mcp/validate.ts` L7–L9 (`candidate.search(/[[{]/)` + `candidate.lastIndexOf(']')`) is a *search* — find the bracket positions in the prose text. Linear searches show up in derivation (`lib/insights/derive.ts` L12–L20 `findCurrentPrior`) and reconciliation (`lib/hooks/useInvestigation.ts` L86–L95 `replaceRunningTool`'s reverse scan). **Binary search is not yet exercised** — no sorted-array-with-O(log N)-lookup pattern shows up, because nothing here is large enough or pre-sorted enough to need it.
+## Zoom out — sorting and searching in this repo
 
 ```
-Zoom out — sorting/searching/selection in this codebase
+  Where sort and search live in this codebase
+  ───────────────────────────────────────────
 
-┌─ Agent layer ──────────────────────────────────────────────┐
-│  ★ comparator sort + top-N (monitoring.ts L119) ★         │
-│    [...parsed].sort((a,b) => SEV_RANK[b.s] - SEV_RANK[a.s])│
-│    .slice(0, 10)                                           │
-│                                                             │
-│  ★ linear search / find-first (derive.ts L12–L20) ★        │
-│    findCurrentPrior — for-loop with typeof narrow          │
-│                                                             │
-│  ★ argmin reduce (InsightCard.tsx L159–L161) ★             │
-│    funnelStages.reduce((a, b) => b.v < a.v ? b : a)        │
-└─────────────────────────────────────────────────────────────┘
-                             │
-┌─ Validation layer ─────────▼─────────────────────────────┐
-│  ★ substring scan (validate.ts L7–L9) ★                   │
-│    candidate.search(/[[{]/);                              │
-│    candidate.lastIndexOf(']')                              │
-│  → find the outermost bracket positions                   │
-└─────────────────────────────────────────────────────────────┘
-                             │
-┌─ Reconciliation ───────────▼─────────────────────────────┐
-│  ★ reverse linear scan (useInvestigation.ts L86–L95) ★    │
-│    for (i = arr.length-1; i >= 0; i--)                   │
-│  → find latest running tool by name (LIFO match)          │
-└─────────────────────────────────────────────────────────────┘
-                             │
-┌─ Not yet exercised ────────▼─────────────────────────────┐
-│  • binary search (no pre-sorted data needing O(log N))    │
-│  • quickselect (no K-th-smallest problem at scale)        │
-│  • radix / bucket sort (no integer-keyed data at scale)   │
-└──────────────────────────────────────────────────────────┘
+  ┌─ UI layer ────────────────────────────────────┐
+  │  funnel.reduce(argmin)  — single-pass min      │
+  │    components/feed/InsightCard.tsx:160         │
+  └────────────────────────┬──────────────────────┘
+                           │
+  ┌─ Service layer ────────▼──────────────────────┐
+  │  ★ SORT BY COMPARATOR + SLICE TOP-K            │
+  │    [...parsed].sort(SEV_RANK cmp).slice(0, 10) │
+  │    lib/agents/monitoring-legacy.ts:136         │
+  │                                                │
+  │  ★ SORT BY ASCENDING (Set → sorted array)      │
+  │    [...server].sort()                          │
+  │    lib/mcp/tool-coverage.ts:58, 61             │
+  │                                                │
+  │  ★ SORT BY NUMERIC FIELD DESC                  │
+  │    events.sort((a,b) => b.eventCount - a.eventCount)│
+  │    lib/mcp/schema.ts:107                       │
+  │                                                │
+  │  NO BINARY SEARCH (every lookup is hash-keyed) │
+  └────────────────────────┬──────────────────────┘
+                           │
+  ┌─ Provider boundary ────▼──────────────────────┐
+  │  Bloomreach sorts on the server (EQL ORDER BY) │
+  │  → search algorithms live there, opaque to us  │
+  └───────────────────────────────────────────────┘
 ```
 
-**Zoom in — narrow to the concept.** The question is: when do you reach for which of the three operations, and how do they compose? **Sort** is what you do when downstream code wants ordered output — you pay O(N log N) once. **Search** is what you do when you want one specific item — O(N) linear if unsorted, O(log N) binary if sorted. **Select** is what you do when you want "the K best" — you can sort and take top K (O(N log N)), or you can use quickselect + partition for O(N) average. The codebase uses (a) sort + slice for top-K because N is small enough that the O(N log N) is invisible, and (b) linear search everywhere else because the arrays are small (10 categories, single-digit evidence entries, double-digit items in the reasoning trace). The next sections walk each operation, anchor to the load-bearing repo example, and name the binary-search gap.
+Verdict-first: this repo uses **`Array.prototype.sort`
+with a comparator three times** and **never reaches
+for binary search**. The reason for the asymmetry:
+every lookup in this codebase is *keyed* (Map.get) or
+*short-scan* (filter over a ≤ 30 element array), so
+the O(log N) win of binary search never pays for the
+"keep the array sorted" cost. If a workload changed
+— say, you started looking up event names in a
+10,000-item alphabetical list — binary search would
+suddenly be the right move. It isn't, today.
 
----
+## Structure pass — sort and search seams
 
-## Structure pass
-
-**Layers.** Each of the three operations has the same three-layer stack: the **abstract goal** (ordering, lookup, selection), the **algorithm** (Timsort, linear scan, quickselect), and the **cost shape** (O(N log N) sort, O(N) or O(log N) search, O(N) average for select). The abstract goal is what you pick by; the algorithm is the engineering layer; the cost is the proof you picked right.
-
-**Axis: cost.** Same as Chapter 1 — cost is the lens. The interesting sub-question here is *cost as a function of N's distribution*: a sort is O(N log N) regardless of N's contents; a linear search is O(N) worst-case but O(N/2) average (and O(1) best-case when the target is first); a binary search is O(log N) but requires O(N log N) pre-sorting; selection (quickselect) is O(N) average but O(N²) worst-case unless you randomize the pivot. The codebase lives in the world where N is small, distributions are uniform, and these distinctions don't matter — but the moment N grows, picking the right algorithm for the actual distribution is worth real money.
-
-**Seams.** Two seams matter; one is load-bearing in this codebase. **Seam 1 (load-bearing, present): "sort once, then access many times" vs "search once, no order needed."** This is the seam where you decide whether to pay O(N log N) up-front. For N=30 anomalies sorted once per briefing, paying is cheap. For N=10K queried once, linear search wins. **Seam 2 (load-bearing, absent): "is the data pre-sorted?"** This is the seam that *would* enable binary search. The codebase has no pre-sorted data structures (the cache `Map` is hash-ordered, the registry arrays are insertion-ordered, the anomaly array is one-shot sorted right before slice — no subsequent lookup against it).
-
-```
-Structure pass — sorting, searching, selection
-
-┌─ 1. LAYERS ─────────────────────────────────────────┐
-│  Abstract goal (order/lookup/select) · Algorithm     │
-│  (Timsort/linear/binary/quickselect) · Cost shape    │
-│  (O(N log N) / O(N) / O(log N) / O(N) avg)           │
-└────────────────────────┬─────────────────────────────┘
-                         │  pick the axis
-┌─ 2. AXIS ─────────────▼──────────────────────────────┐
-│  cost: ops per element, sensitivity to N's           │
-│  distribution and pre-sort status                    │
-└────────────────────────┬─────────────────────────────┘
-                         │  trace across layers, find flips
-┌─ 3. SEAMS ────────────▼──────────────────────────────┐
-│  S1: sort-once-many-access vs search-once ★present   │
-│      (pay O(N log N) up-front vs linear per access)  │
-│  S2: pre-sorted data → binary search ★absent         │
-│      (would buy O(log N) lookup; not used here)      │
-└────────────────────────┬─────────────────────────────┘
-                         ▼
-                 Block 4 — How it works
-```
+Two operations, one question held constant: *"what
+property of the input does the algorithm exploit?"*
 
 ```
-S1 seam — "do I sort, or scan?" answered two ways
+  One question, two algorithms, two property answers
+  ──────────────────────────────────────────────────
 
-┌─ Sort once ────────┐    seam     ┌─ Scan per access ─────┐
-│  pay O(N log N)    │ ═════╪═════►│  O(N) per lookup       │
-│  once, get ordered │  (it flips) │  no pre-cost           │
-│  output            │             │  good when only 1-2    │
-│                    │             │  lookups happen        │
-└────────────────────┘             └────────────────────────┘
-        ▲                                       ▲
-        └────── same axis (cost), two answers ─┘
-                → the codebase sorts when it needs ordered output
-                  (top-K severity), scans when it needs one match
-                  (findCurrentPrior)
+  "what input property does this algorithm exploit?"
+
+  ┌─ Sorting ──────────────────────┐
+  │ exploits: a TOTAL ORDER on     │
+  │   elements (comparator)        │
+  │ produces: arr in that order    │
+  │ cost: O(N log N) comparator    │
+  │       O(N) for special cases   │
+  │       (counting/radix sort)    │
+  └────────────────────────────────┘
+
+  ┌─ Binary search ────────────────┐
+  │ exploits: array IS ALREADY     │
+  │   sorted                       │
+  │ produces: index (or -1)        │
+  │ cost: O(log N)                 │
+  │ break case: array not sorted   │
+  │   → returns garbage silently   │
+  └────────────────────────────────┘
 ```
 
-The skeleton is mapped — the rest of this file walks each operation in turn.
+The seam these share: **a total order on elements**.
+Sort builds the order; binary search exploits it. The
+two compose: if you binary-search the same array many
+times, the O(N log N) sort cost amortises over the
+many O(log N) lookups, beating Map.get's O(1) only
+when... never, in JavaScript. (Maps are always
+cheaper for single-key lookup. Binary search shines
+for *range queries* — "all elements between X and Y" —
+which Maps can't answer in sub-O(N).)
 
----
+Hand off to How it works.
 
 ## How it works
 
-### Mental model
+#### Move 1 — the mental model
 
-Three operations, three questions:
-
-```
-  SORT         — "give me everything in order"             O(N log N) best general
-  SEARCH       — "find me this one thing"                  O(N) linear, O(log N) binary
-  SELECT       — "give me the K best (or the K-th best)"   O(N log N) by sort,
-                                                            O(N) average by quickselect
-```
-
-The choice between them depends on (a) what downstream wants (sorted output, one match, top K?) and (b) what you already know about the data (sorted? indexed? distributed how?).
-
-### Move 1 — Sorting
-
-Sorting puts the elements of a collection in some order. JavaScript's `Array.prototype.sort` uses **Timsort** in V8 (since Chrome 70 / Node 11) — a hybrid of merge sort and insertion sort, **stable**, O(N log N) worst-case, near-O(N) on partially-sorted input.
+You know `Array.prototype.sort` already, but probably
+not what it does under the hood. The mental model:
+**sort with a comparator is a "give me a total order
+function, I'll return the array in that order"
+contract.** The comparator returns negative (a
+before b), zero (tie), or positive (b before a).
+V8's implementation is TimSort — a hybrid of merge
+sort and insertion sort, stable, O(N log N).
 
 ```
-arr.sort(comparator)
-  comparator(a, b) returns:
-    negative  → a sorts before b   (ascending if you compute a - b)
-    positive  → b sorts before a   (descending if you compute b - a)
-    zero      → stable: a and b stay in original relative order
+  Comparator — three return values, three meanings
+  ────────────────────────────────────────────────
 
-  cost:   O(N log N) comparisons
-  space:  O(N) auxiliary (Timsort uses a merge buffer)
-  stable: yes (V8 since 7.0 / Node 11; mandated by ES2019)
+  cmp(a, b) returns:
+    < 0    → a should come before b
+    = 0    → order doesn't matter (stable sort
+                  preserves original order)
+    > 0    → b should come before a
+
+  examples:
+    ascending numbers:  (a, b) => a - b
+    descending numbers: (a, b) => b - a
+    by string field:    (a, b) => a.name.localeCompare(b.name)
+    by severity rank:   (a, b) => SEV_RANK[b.sev] - SEV_RANK[a.sev]
+                                      ↑
+                              note: b first → descending
 ```
 
-**The load-bearing sort in this codebase** is in `lib/agents/monitoring.ts` L119:
+The interview tell: people who write `(a, b) => true`
+or `(a, b) => a > b` are returning booleans, which
+coerce wrong. The comparator MUST be numeric.
+
+Binary search's mental model: **eliminate half the
+remaining space per step**. You start with [0, N),
+check the middle, narrow to [lo, mid) or [mid+1, hi).
+After log N steps, the range is empty (not found) or
+one element (found).
+
+```
+  Binary search — halving the search space
+  ────────────────────────────────────────
+
+  sorted array (10 elements):
+    [1, 3, 5, 7, 9, 11, 13, 15, 17, 19]
+     ▲                                ▲
+     lo = 0                          hi = 10
+                  ↓
+              mid = 5                  ← arr[5] = 11
+                  ↓
+  search for 7:  7 < 11 → discard right half
+    [1, 3, 5, 7, 9]                    hi = 5
+     ▲           ▲
+     lo = 0     hi = 5
+              ↓
+              mid = 2                  ← arr[2] = 5
+                  ↓
+                7 > 5 → discard left half
+            [7, 9]                     lo = 3
+             ▲   ▲
+             lo = 3  hi = 5
+                  ↓
+              mid = 4                  ← arr[4] = 9
+                  ↓
+                7 < 9 → discard right half
+              [7]                      hi = 4
+               ▲ ▲
+               lo = 3
+                  ↓
+              mid = 3                  ← arr[3] = 7  ✓
+```
+
+Three comparisons for a 10-element array. For
+1,000,000 elements: 20 comparisons. That's the win,
+and it's why binary search is the canonical "log N
+algorithm" everyone has to know.
+
+#### Move 2 — the operations, anchored to your code
+
+**Comparator-based sort — three live examples**
 
 ```ts
-return [...parsed].sort((a, b) => SEV_RANK[b.severity] - SEV_RANK[a.severity]).slice(0, 10);
+// lib/mcp/schema.ts:99-107
+const events = (eventPayload?.events ?? [])
+  .map((e) => ({
+    name: e.type,
+    properties: (e.properties?.default_group?.properties ?? []).map((p) => p.property),
+    eventCount: eventTypesOverview[e.type]?.event_count ?? 0,
+  }))
+  .sort((a, b) => b.eventCount - a.eventCount);
+//                ▲      ▲
+//                │      └── b first → descending
+//                └── numeric subtraction is the comparator idiom
+//                    (also works for floats; for strings use localeCompare)
 ```
 
-Three operations composed: (a) `[...parsed]` makes a copy because `sort` mutates; (b) `.sort(comparator)` does the O(N log N) Timsort; (c) `.slice(0, 10)` takes top-N. The comparator subtracts integers from a rank table (`SEV_RANK`) because string enums have no native order — see the full case study in `.aipe/study-dsa-foundations/06-sorting-searching-and-selection.md`.
-
-```
-trace for input [{s:"info"}, {s:"critical"}, {s:"warning"}, {s:"positive"}]:
-
-  comparator(a, b) = SEV_RANK[b] - SEV_RANK[a]
-                   = (descending by SEV_RANK)
-
-  SEV_RANK = {critical: 3, warning: 2, info: 1, positive: 0}
-
-  V8 Timsort runs O(N log N) comparisons; final order:
-  [{s:"critical"}, {s:"warning"}, {s:"info"}, {s:"positive"}]
-
-  .slice(0, 10) returns all 4 (fewer than 10).
-```
-
-**Code in this codebase — the SEV_RANK comparator inline + a second sort by event count.**
+**Why descending by eventCount:** the schema summary
+takes `slice(0, 20)` — top 20 events by activity.
+Sorting first and slicing is the simplest "top-K"
+move. The cost is O(N log N) over typically 50-200
+events; the slice is O(K). For the actual N here, the
+sort is invisible.
 
 ```ts
-// lib/agents/monitoring.ts L51
-const SEV_RANK: Record<Severity, number> = { critical: 3, warning: 2, info: 1, positive: 0 };
-
-// lib/agents/monitoring.ts L119
-return [...parsed].sort((a, b) => SEV_RANK[b.severity] - SEV_RANK[a.severity]).slice(0, 10);
+// lib/agents/monitoring-legacy.ts:136
+return [...parsed]
+  .sort((a, b) => SEV_RANK[b.severity] - SEV_RANK[a.severity])
+  .slice(0, 10);
+//                ▲      ▲
+//                b      a     ← descending by rank
+//                              (critical > warning > info > positive)
 ```
 
-The whole sort idiom in one line. `[...parsed]` is a copy (because `.sort()` mutates). The comparator subtracts integers from a rank table — `b - a` is descending, so critical sorts first. `.slice(0, 10)` is the top-N cap. The TypeScript type `Record<Severity, number>` is the compile-time guarantee that every severity has a rank; missing one is a build error, not a runtime NaN.
+The `SEV_RANK` is a `Map<Severity, number>` (or a
+plain object indexed by string). The comparator reads
+both ranks and subtracts. **The pattern to internalise:**
+when sorting by a categorical field, build a rank
+table once, then compare *ranks* in the comparator.
+Comparing strings directly with `localeCompare` would
+give alphabetical order ("critical, info, positive,
+warning"), not severity order.
 
 ```ts
-// lib/mcp/schema.ts L100
-.sort((a, b) => b.eventCount - a.eventCount);
-```
-
-A second sort in the codebase: events ordered by event count, descending. Same idiom (`b - a` for descending), no rank table needed because `eventCount` is already a number. Used so downstream code (agents, UI) sees most-active events first.
-
-**Other sorts worth knowing about** (none used here):
-
-```
-  algorithm        cost (avg)    cost (worst)   stable?   in-place?   notes
-  ──────────────   ───────────   ─────────────  ────────  ──────────  ────────────────
-  Timsort (V8)     O(N log N)    O(N log N)     yes       no          hybrid merge+insertion
-  merge sort       O(N log N)    O(N log N)     yes       no          divide and conquer
-  quicksort        O(N log N)    O(N²)*         no        yes         randomized pivot
-                                                                       for avg O(N log N)
-  heapsort         O(N log N)    O(N log N)     no        yes         in-place via heap
-  insertion sort   O(N²)         O(N²)          yes       yes         O(N) on nearly sorted
-  radix sort       O(N·k)        O(N·k)         yes       depends     integers only,
-                                                                       k = key length
-  counting sort    O(N + K)      O(N + K)       yes       no          integers in [0, K)
-
-  *worst case for naive quicksort; with randomized pivot, expected O(N log N)
-```
-
-### Move 2 — Searching
-
-Searching finds one specific element. Two main strategies: linear (walk every element) and binary (split-and-narrow over sorted data).
-
-**Linear search:**
-
-```
-linear_search(arr, target):
-  for i from 0 to arr.length - 1:
-    if arr[i] == target: return i
-  return -1
-
-  cost: O(N) worst case, O(N/2) average, O(1) best
-  no precondition on arr (unsorted is fine)
-```
-
-**Binary search** (requires sorted input):
-
-```
-binary_search(arr, target):
-  // PRECONDITION: arr is sorted ascending
-  low = 0
-  high = arr.length - 1
-  while low <= high:
-    mid = (low + high) // 2
-    if arr[mid] == target:    return mid
-    if arr[mid] < target:     low = mid + 1
-    else:                     high = mid - 1
-  return -1
-
-  cost:    O(log N) — halve the search space each iteration
-  precon:  arr must be sorted
-```
-
-```
-binary search trace — find 7 in [1, 3, 5, 7, 9, 11, 13]:
-
-  low=0, high=6, mid=3 → arr[3]=7 → found! return 3
-  (one comparison)
-
-  trace — find 8:
-
-  low=0, high=6, mid=3 → arr[3]=7  < 8 → low=4
-  low=4, high=6, mid=5 → arr[5]=11 > 8 → high=4
-  low=4, high=4, mid=4 → arr[4]=9  > 8 → high=3
-  low=4, high=3 → loop ends → return -1
-  (three comparisons for N=7; log₂(7) ≈ 2.8 → checks out)
-```
-
-**The load-bearing searches in this codebase are all linear:**
-
-- **`findCurrentPrior` in `lib/insights/derive.ts` L12–L20** — find-first scan over evidence:
-
-```ts
-// lib/insights/derive.ts L12–L20
-export function findCurrentPrior(evidence): {current: number; prior: number} | null {
-  for (const e of evidence) {
-    const r = e.result;
-    if (typeof r?.current === 'number' && typeof r?.prior === 'number') {
-      return { current: r.current, prior: r.prior };
-    }
-  }
-  return null;
-}
-```
-
-Hand-rolled `Array.prototype.find` with a `typeof` narrow inside. Linear scan; first match wins. N is single-digit (evidence entries per anomaly) so O(N) is fine.
-
-- **`replaceRunningTool` in `lib/hooks/useInvestigation.ts` L86–L95** — reverse linear scan for LIFO match:
-
-```ts
-// lib/hooks/useInvestigation.ts L86–L95
-const replaceRunningTool = (arr, e) => {
-  for (let i = arr.length - 1; i >= 0; i--) {
-    const it = arr[i];
-    if (it.kind === 'tool' && it.toolName === e.toolName && it.status === 'running') {
-      arr[i] = { ...it, status: 'done', durationMs: e.durationMs, result: e.result, error: e.error };
-      break;
-    }
-  }
-  return arr;
+// lib/mcp/tool-coverage.ts:58, 61
+return {
+  serverTools: [...server].sort(),                        // ← default lexicographic
+  // ...
+  unusedOnServer: serverToolNames.filter((n) => !configured.has(n)).sort(),
 };
 ```
 
-Reverse scan (highest index first) to pair `tool_call_end` with the most recent matching `tool_call_start`. O(N) worst case (N = items in the trace so far); short-circuits on first match.
+**The default `Array.prototype.sort()` (no comparator)
+sorts by Unicode code-point, treating elements as
+strings.** That's fine here because tool names are
+strings. **The break case:** `[10, 2, 1].sort()`
+returns `[1, 10, 2]`, not `[1, 2, 10]`, because "10"
+< "2" lexicographically. Numbers always need an
+explicit comparator. This is the most common JS
+interview gotcha around sort.
 
-- **Substring scan in `lib/mcp/validate.ts` L7–L9** — a *content* search inside a string:
-
-```ts
-// lib/mcp/validate.ts L7–L9
-const start = candidate.search(/[[{]/);
-const end = Math.max(candidate.lastIndexOf(']'), candidate.lastIndexOf('}'));
-if (start >= 0 && end > start) {
-  return JSON.parse(candidate.slice(start, end + 1));
-}
-```
-
-Two specialized searches: `search(regex)` returns the first index matching the character class, `lastIndexOf` returns the last index of a character. Together they bracket the JSON-looking substring inside arbitrary prose. This is the JSON extraction ladder's third fallback — see the case study in `.aipe/study-dsa-foundations/06-sorting-searching-and-selection.md`.
-
-**Binary search is not yet exercised.** No sorted array has many subsequent lookups against it. The `SEV_RANK` table is a `Record<Severity, number>`, accessed by key (Map-like, O(1)), not by index. The `CATEGORIES` registry is iterated with `.map`, never searched. The TTL cache is a `Map`, hash-keyed, not binary-searched.
-
-### Move 3 — Selection (top-K, K-th smallest)
-
-Selection answers "give me the K-th smallest" or "give me the K smallest" without sorting the whole array. Two main strategies:
-
-**Sort and slice** (the codebase's choice):
-
-```
-top_k(arr, k):
-  return arr.sort(comparator).slice(0, k)
-
-  cost: O(N log N) — pay full sort cost regardless of K
-```
-
-**Quickselect** (the asymptotically better choice for huge N):
-
-```
-quickselect(arr, k):
-  // partitions the array around a pivot; recurses into the side containing k
-  if arr.length <= 1: return arr
-  pivot = random element of arr
-  less    = elements < pivot
-  equal   = elements == pivot
-  greater = elements > pivot
-  if k < less.length:           return quickselect(less, k)
-  if k < less.length + equal.length: return arr[k] (in the equal partition)
-  return quickselect(greater, k - less.length - equal.length)
-
-  cost: O(N) average, O(N²) worst case (mitigated by random pivot)
-```
-
-**Heap-based top-K** (the streaming choice):
-
-```
-top_k_stream(arr, k):
-  // maintain a min-heap of size k
-  heap = MinHeap()
-  for x in arr:
-    if heap.size < k:
-      heap.insert(x)
-    elif x > heap.peek():
-      heap.extractMin()
-      heap.insert(x)
-  return heap.toArray()
-
-  cost: O(N log K) — better than O(N log N) when K << N
-  space: O(K)
-```
-
-**The load-bearing selection in this codebase** is `.sort().slice(0, 10)` — the sort-and-slice variant — in `lib/agents/monitoring.ts` L119. This is the right choice at N=30, where O(N log N) = ~150 ops is invisible. For N=1M with K=10 (a streaming top-K problem), heap-based would beat sort-and-slice by ~6 orders of magnitude.
-
-**Code in this codebase — argmin reduce: the K=1 case of top-K (`components/feed/InsightCard.tsx` L155–L161).**
+**Argmin via reduce — single-pass selection**
 
 ```ts
-// components/feed/InsightCard.tsx L155–L161
-const funnel = insight.funnel;
+// components/feed/InsightCard.tsx:155-161
 const funnelStages = funnel
-  ? (['view','cart','checkout','purchase'] as const).map(k => ({ k, v: funnel[k] }))
+  ? (['view', 'cart', 'checkout', 'purchase'] as const).map((k) => ({ k, v: funnel[k] }))
   : [];
 const leakKey = funnelStages.length
-  ? funnelStages.reduce((a, b) => b.v < a.v ? b : a).k
+  ? funnelStages.reduce((a, b) => (b.v < a.v ? b : a)).k
   : null;
 ```
 
-A *selection* in disguise — find the `k` of the element with the smallest `v` (argmin). This is the K=1 case of top-K. The reduce traverses once (O(N) where N=4 funnel stages), keeping the running min. The `.k` extracts the *key* of the minimum, not the value. This is the most common selection pattern in the codebase.
-
-**Quickselect and heap-based top-K are not yet exercised.** No million-element selection problem. No use of `Array.prototype.findIndex` against sorted data, no manual binary-search implementation, no `bisect`-like utility either — the CATEGORIES array is fixed (10 entries; `coverageReport` does `.map` over all 10), the TTL cache is hash-keyed, and the anomalies array is sorted once then sliced. The plausible trigger for binary search: a sorted index — say, cached MCP results sorted by `expiresAt` so you could binary-search for "the first one that's still valid." Today the Map's `.get` + inline `expiresAt > Date.now()` check makes this unnecessary; the lazy-expiry pattern beats maintaining a sorted index.
-
-### Move 2 variant — the irreducible kernel of each operation
-
-**Sort kernel** (Timsort, the V8 default):
-
 ```
-  isolate: split into "runs" (already-sorted subarrays), merge them
-  what breaks if missing:
-    - stability:    ties lose their original order; downstream filters break
-    - O(N log N) guarantee:  worst-case input degrades to O(N²)
-                            (Timsort hybridizes to avoid this)
-    - merge buffer: in-place merging is O(N²); the O(N) extra space buys
-                    you O(N log N) total time
-```
+  Argmin via reduce — one pass over 4 elements
+  ────────────────────────────────────────────
 
-**Binary search kernel** (when applicable):
+  funnelStages = [
+    {k: 'view',     v: 1000},   ← step 1
+    {k: 'cart',     v:  300},   ← step 2
+    {k: 'checkout', v:  150},   ← step 3
+    {k: 'purchase', v:  100},   ← step 4
+  ]
 
-```
-  isolate: precondition (sorted) + halve search space each step
-  what breaks if missing:
-    - sorted precondition: bisecting unsorted data gives garbage
-    - mid = low + (high - low) / 2: naive (low + high)/2 can overflow
-      in fixed-int languages (not JS, but the habit matters)
-    - low <= high loop condition: off-by-one bug, infinite loop or
-                                  missed target
+  reduce trace:
+    init:   a = {k: 'view', v: 1000}
+    step 1: b = {k: 'cart', v: 300}      → 300 < 1000 → a = b
+            a = {k: 'cart', v: 300}
+    step 2: b = {k: 'checkout', v: 150}  → 150 < 300  → a = b
+            a = {k: 'checkout', v: 150}
+    step 3: b = {k: 'purchase', v: 100}  → 100 < 150  → a = b
+            a = {k: 'purchase', v: 100}
+
+  result: leakKey = 'purchase'
+                    ↑ the funnel stage with the smallest count
+                    → "where the funnel leaks the most"
 ```
 
-**Linear search kernel:**
+This is the *correct* O(N) algorithm for "find the
+minimum element." Sorting and taking `[0]` is O(N
+log N) — wasteful. The `reduce` does it in one pass.
+**The skeleton:** keep a running best, compare each
+new element, update if better. Generalises to argmax,
+min-with-tiebreak, top-K (using a small heap).
+
+**The selection problem — what this *would* use a
+heap for**
+
+If the question changed from "single argmin" to
+"three lowest funnel stages," the comparable approach
+is `sort(asc).slice(0, 3)` for small N, or a max-heap
+of size 3 for streaming/large N. (The full top-K
+heap walk lives in `03-stacks-queues-deques-and-
+heaps.md`.)
+
+**Binary search — not used, but here's when you'd
+reach for it**
 
 ```
-  isolate: scan, compare, return on match
-  what breaks if missing:
-    - early return on match: scans the full array even after finding it
-                             (wasted cost, especially on long arrays)
-    - boundary check: walking off the end → undefined access
+  PSEUDOCODE — binary search on a sorted array
+  ────────────────────────────────────────────
+
+  function binarySearch(arr, target):
+    lo = 0
+    hi = arr.length
+    while lo < hi:                      // ← half-open interval [lo, hi)
+      mid = lo + (hi - lo) >> 1         // ← avoid (lo+hi) overflow in
+                                        //   languages where int wraps
+      if arr[mid] == target:
+        return mid
+      elif arr[mid] < target:
+        lo = mid + 1
+      else:
+        hi = mid
+    return -1                           // ← not found
+
+  load-bearing parts (what breaks if you remove each):
+    - the interval invariant (half-open vs closed) ← gets off-by-one wrong
+    - lo + (hi - lo) >> 1                          ← Java/C++ overflow bug
+    - the equality check                          ← infinite loop if missing
+    - the < vs > direction                        ← wrong half discarded
 ```
 
-**Selection (quickselect) kernel:**
+This repo doesn't reach for binary search because
+every lookup target is hash-keyed (Map) or short-
+scanned. Where binary search comes back: range
+queries on sorted arrays ("all elements between X
+and Y"), binary search on the *answer* (parametric
+search, e.g. "smallest K such that ..."), and the
+canonical "first/last occurrence" variants that show
+up in interviews constantly.
 
-```
-  isolate: partition + recurse on the side containing K
-  what breaks if missing:
-    - partition: without it you're sorting, not selecting (O(N log N))
-    - random pivot: adversarial input degrades to O(N²)
-                    (worst case = always picking the smallest/largest)
-    - recurse only on relevant side: O(N²) if you recurse on both sides
-```
+#### Move 3 — the principle
 
-### Move 3 — the principle
-
-**The right operation depends on what you'll do with the result.** If you need ordered output, sort. If you need one match, search (linear if unsorted, binary if sorted). If you need top-K and N is huge, heap-based selection. If you need top-K and N is small, sort-and-slice — it's simple and asymptotically fine. The codebase makes the small-N choice consistently because N is small; the kernels above are what to reach for when N grows.
-
----
+Sort is the operation that *creates* a total order;
+binary search is the operation that *exploits* one.
+Reach for sort when you need ranked output or a top-K
+slice. Reach for binary search when the same sorted
+array is queried many times *and* hash-keyed lookup
+doesn't fit (e.g. range queries). For single-key
+lookups in JavaScript, a Map always wins — binary
+search shines for ranges, not points.
 
 ## Primary diagram
 
-The three operations, their algorithms, cost, and where each lives (or doesn't) in this codebase.
-
 ```
-                  SORTING, SEARCHING, SELECTION
+  The sort/search decision tree for this repo
+  ───────────────────────────────────────────
 
-  ┌─────────────────────┬──────────────────────────┬──────────────────────┐
-  │ SORT                │ SEARCH                   │ SELECT (top-K)       │
-  ├─────────────────────┼──────────────────────────┼──────────────────────┤
-  │ goal: ordered all   │ goal: find ONE element   │ goal: K best,        │
-  │                     │                          │       not all sorted │
-  ├─────────────────────┼──────────────────────────┼──────────────────────┤
-  │ algorithms:         │ algorithms:              │ algorithms:          │
-  │ • Timsort (V8)      │ • linear        O(N)     │ • sort+slice O(N logN)│
-  │   O(N log N) stable │ • binary        O(log N) │ • quickselect O(N) avg│
-  │ • merge sort        │   (sorted only)          │ • min-heap   O(N logK)│
-  │ • quicksort         │ • hash lookup   O(1) avg │   for streaming      │
-  │ • radix (integers)  │ • substring     O(N·M)   │                      │
-  ├─────────────────────┼──────────────────────────┼──────────────────────┤
-  │ in repo:            │ in repo:                 │ in repo:             │
-  │ • monitoring.ts L119│ • findCurrentPrior       │ • monitoring.ts L119 │
-  │   .sort + slice     │   derive.ts L12–L20      │   .sort().slice(0,10)│
-  │   (comparator + rank│ • replaceRunningTool     │   (sort-and-slice    │
-  │    table)           │   useInvestigation L86–95│    variant; right for│
-  │                     │ • substring scan         │    N=30)             │
-  │                     │   validate.ts L7–L9      │                      │
-  │                     │                          │ NOT YET:             │
-  │                     │ NOT YET:                 │ • quickselect        │
-  │                     │ • binary search          │ • heap-based         │
-  │                     │   (nothing pre-sorted)   │   streaming top-K    │
-  └─────────────────────┴──────────────────────────┴──────────────────────┘
+  ┌─ what are you trying to do? ──────────────────────────┐
+  │                                                        │
+  │  rank N items by score?                                │
+  │    N small (≤ 100):    arr.sort(cmp).slice(0, K)       │
+  │    N large/streaming:  min-heap of size K              │
+  │                                                        │
+  │  find the min / max / argmin?                          │
+  │    arr.reduce((best, x) => cmp(x, best) ? x : best)    │
+  │    → O(N), one pass, no sort needed                    │
+  │                                                        │
+  │  lookup one item by key?                               │
+  │    Map.get(key)  → O(1)                                │
+  │    arr.find / .filter → O(N), only fine for tiny N     │
+  │                                                        │
+  │  lookup range of items?                                │
+  │    sort array, then binary search bounds → O(log N)    │
+  │    (or use a sorted structure: TreeMap, B-tree)        │
+  │                                                        │
+  │  check membership?                                     │
+  │    Set.has(key) → O(1)                                 │
+  │    arr.includes → O(N), break-even at N ≈ 5-10         │
+  └────────────────────────────────────────────────────────┘
 ```
-
----
 
 ## Elaborate
 
-### Where it comes from
+JavaScript's `Array.prototype.sort` is required by
+the spec to be stable as of ES2019 (V8's TimSort
+already was). Stability means "elements that compare
+equal preserve their original order." That matters
+when you sort by one key first, then by another to
+break ties — the first sort's order survives where
+the second sort says "equal."
 
-**Quicksort** was invented by Tony Hoare in 1959 (he was trying to sort Russian-to-English translation dictionaries). **Merge sort** is older — John von Neumann described it in 1945 in one of the first formal algorithm descriptions for a stored-program computer. **Timsort** is younger (Tim Peters, 2002, for Python's `list.sort`); it became Java's `Arrays.sort` in 2009 and JavaScript's `Array.prototype.sort` in V8 7.0 (2018).
+The comparison-based lower bound for sort is O(N log
+N): any algorithm that sorts by comparing pairs of
+elements cannot beat it. The way to beat it: don't
+compare. Counting sort (O(N + K) for K distinct
+values), radix sort (O(N × W) for W-character keys)
+both beat O(N log N) by exploiting structure in the
+keys. Not exercised here; worth knowing for the
+"sort 1 billion integers in O(N)" interview question.
 
-**Binary search** predates computers — it's how you find a word in a dictionary or a name in a phone book. Knuth's TAOCP volume 3 (1973) gives the canonical computer-science treatment, including the famous note that *most* binary search implementations are subtly buggy.
+Binary search has *families*: lower-bound (first
+index ≥ target), upper-bound (first index > target),
+exact match. Each has subtle invariant differences;
+the C++ STL exposes `lower_bound` / `upper_bound`
+exactly for this reason. The "binary search on the
+answer" pattern (parametric search) shows up in
+"capacity to ship within D days" and "minimum number
+of x's such that condition Y holds" problems.
 
-**Quickselect** (Hoare, 1961) is quicksort minus one recursive call — once you've partitioned, you only recurse into the side containing the K-th element.
+The selection problem (find the K-th smallest in O(N)
+average) is solved by Quickselect — partition like
+QuickSort but recurse into only the side containing
+K. Average O(N), worst O(N²); the median-of-medians
+trick makes it O(N) worst-case at the cost of bigger
+constants. Not reached for in this repo, on the
+practice list.
 
-### The deeper principle
-
-**The three operations form a hierarchy.** Sort is "select everything in order" — strictly more work than selecting just the top K. Search is "find one specific element" — strictly less work than sorting, since you can stop as soon as you've found it. Selection is in between: more work than search (you have to compare K elements against each other), less than sort (you don't need the order of the K-1 you didn't pick).
-
-```
-  cost ordering (best case, N elements):
-
-    linear search        O(N)
-    binary search        O(log N)   (precondition: sorted)
-    quickselect (top-K)  O(N) avg
-    heap top-K           O(N log K)
-    full sort            O(N log N)
-```
-
-The choice between them is "what's the least work that gets me what I need?" Sorting when you only need top 10 of 1M is paying for 999,990 ordered positions you'll never look at.
-
-### Where it breaks down
-
-- **Binary search requires a sorted array.** Sorting is O(N log N), so binary-searching once on freshly-sorted data is *worse* than linear search on the original (O(N log N) + O(log N) > O(N)). Binary search pays off when you do many searches against the same sorted data.
-
-- **Quickselect's worst case is O(N²).** Naive pivot choice (always pick the first element) degrades on already-sorted input. Random pivot mitigates this; "median of medians" pivot guarantees O(N) worst-case but with worse constants.
-
-- **Comparator-based sort is bounded by O(N log N).** No comparison sort can be better than O(N log N) in the worst case (information-theoretic bound). To beat it, you need *non-comparison* sorts that exploit structure in the keys: radix sort (O(N·k) for k-digit integers), counting sort (O(N + K) for keys in a small range).
-
-- **JavaScript's `sort` is in-place** — it mutates the array. The `[...parsed]` copy in `monitoring.ts` L119 isn't decoration; it's correctness. Without it, the original parsed array would be reordered, surprising any caller that held a reference.
-
-### What to explore next
-
-- **Heap-based streaming top-K** — when you have N arriving live and you want the K largest seen so far. Min-heap of size K, push if larger than root. Used in real-time analytics, online recommendation systems.
-
-- **Bisect / `lower_bound` / `upper_bound`** — variants of binary search that find the insertion point for a value in a sorted array. `bisect_left` returns the leftmost index where you could insert to keep the array sorted; `bisect_right` returns the rightmost. Useful for sliding-window problems and counting elements in a range.
-
-- **External sort** — sorting data too big to fit in memory. Merge sort variants that read and write in chunks; used in databases and big-data pipelines.
-
-- **Radix sort and bucket sort** — non-comparison sorts that beat the O(N log N) lower bound for integer keys. Used in string sorting (radix sort on each character), histogram building, and database hash joins.
-
----
+For deep grounding: CLRS Chapter 8 (sorting in linear
+time), Chapter 9 (medians and order statistics).
+Sedgewick *Algorithms 4th Ed* §2.1-2.5.
 
 ## Interview defense
 
-**What they are really asking.** Whether you can name the right operation for the goal, defend the cost model, and recognize when the cheap operation (linear search, sort-and-slice) is right vs when you'd reach for the fancier one (binary search, quickselect, heap-based top-K). Senior signal: knowing why `[...parsed]` is in front of `.sort()` (it mutates). Architect signal: explaining when O(N log N) is fine and when you'd insist on O(N) selection.
-
----
-
-**[mid] "Why does `monitoring.ts` L119 do `[...parsed].sort(...).slice(0, 10)` instead of just `parsed.sort(...).slice(0, 10)`?"**
-
-Because `Array.prototype.sort` mutates the array in-place. If `parsed` was passed by reference from a caller (it is — `parsed` is the result of `parseAgentJson`), reordering it would surprise the caller. The spread `[...parsed]` copies into a new array before sorting; the copy is the throwaway. The cost is one extra O(N) allocation, which is invisible at N=30. For N=1M you'd weigh that copy against the in-place mutation; here the safety matters more than the allocation.
-
----
-
-**[senior] "When would you reach for binary search in this codebase?"**
-
-Not today, because nothing here is pre-sorted in a way that makes binary search pay off. The CATEGORIES array is small (10 entries — linear is fine and `.map`'d over anyway). The cache is a hash map (O(1) lookup, no array). The anomalies array is sorted once then sliced — no subsequent searches. Binary search becomes the right answer when you have a *long-lived sorted index* with *many subsequent lookups*. The plausible scenario: if the cache grew an "expires-by-time" sorted index (a TreeMap or a sorted-by-`expiresAt` array), you'd binary-search for "first entry expiring after now" in O(log N) instead of scanning all entries in O(N). Today the lazy-expiry pattern in `lib/mcp/client.ts` L107–L108 makes this unnecessary — the `expiresAt > Date.now()` check happens inline on lookup, no separate index needed.
+**Q: Walk me through `[10, 2, 1].sort()`. What does
+it return?**
 
 ```
-  scenario triggering binary search:
-    long-lived array sorted by some key
-    + many subsequent lookups against it
-    + N large enough that O(N) per lookup is real cost (~10K+)
+  Default sort gotcha
+  ───────────────────
 
-  none of these hold in this codebase today.
+  [10, 2, 1].sort()                returns [1, 10, 2]
+                                            ↑
+  why: default sort treats elements as STRINGS
+       "1" < "10" < "2" by Unicode code point
+
+  [10, 2, 1].sort((a, b) => a - b) returns [1, 2, 10]
+                          ▲
+                          numeric comparator: ALWAYS use
+                          one for numbers
 ```
 
----
+Model answer: "Returns `[1, 10, 2]`, not `[1, 2, 10]`
+— default sort treats elements as strings and
+compares Unicode code points. '10' < '2' < '1' is
+false; '1' < '10' < '2' lexicographically because '1'
+comes before '2'. The fix is always pass a numeric
+comparator: `.sort((a, b) => a - b)`. This is the JS
+sort gotcha — biting it is a one-second tell that
+someone hasn't actually used sort in production."
 
-**[arch] "The monitoring agent sorts 30 anomalies and slices the top 10. Wouldn't quickselect be asymptotically better?"**
+**Q: How would you find the top-10 anomalies by
+severity?**
 
-Asymptotically yes, but irrelevantly so at N=30. Sort-and-slice is O(N log N) = ~150 comparisons. Quickselect is O(N) average = ~30 comparisons. The difference is ~120 microseconds; the network call to Bloomreach took ~500ms. Quickselect would matter if N were 10M and K=10 — that's the order of magnitude where O(N) vs O(N log N) is visible (10M vs 230M ops). Until N gets there, sort-and-slice wins on *simplicity* (one line, no custom partition logic, stable, predictable). The right answer is `.sort().slice()` for now; the trigger to switch is N growing 5+ orders of magnitude.
+Model answer: "Build a severity rank table — `SEV_RANK
+= {critical:4, warning:3, info:2, positive:1}` — then
+`[...arr].sort((a, b) => SEV_RANK[b.severity] -
+SEV_RANK[a.severity]).slice(0, 10)`. Note `b` first
+for descending. For N ≤ 30 this is one line and O(N
+log N); for streaming or N >> 10, switch to a min-
+heap of size K at O(N log K). Anchor:
+`lib/agents/monitoring-legacy.ts:136`."
 
-```
-  N      sort + slice O(N log N)   quickselect O(N) avg
-  ────   ─────────────────────     ────────────────────
-  30     ~150 ops                  ~30 ops          ← invisible diff
-  10K    ~130K ops                 ~10K ops         ← noticeable
-  10M    ~230M ops                 ~10M ops         ← real cost
-```
+**Q: What does binary search need that this codebase
+doesn't have?**
 
----
+Model answer: "A sorted array of meaningful size
+that's queried many times. Every lookup here is
+hash-keyed (Map.get) or short-scanned (≤ 30 element
+arrays), so binary search's O(log N) win never pays
+the 'keep sorted' cost. Binary search comes back when
+the question is *range*: 'all elements between X and
+Y', or 'first occurrence of K', or parametric search
+('smallest D such that ...'). Maps can't answer
+range questions in sub-O(N); binary search on a
+sorted array can. Different shapes, different
+algorithms."
 
-**The dodge: "but `Array.prototype.sort` is O(N log N) — isn't that slow for any non-trivial N?"**
+**Q: How does `arr.reduce` find the minimum, and why
+not just `arr.sort()[0]`?**
 
-O(N log N) is the *information-theoretic lower bound* for comparison-based sorting. You can't do better than O(N log N) when the only thing you can do is compare two elements pairwise (proven by counting decision-tree leaves). To beat it, you need to exploit *structure* in the keys: radix sort on integers (O(N·k) where k is the number of digits), counting sort on small-range integers (O(N + K)), or bucket sort on uniformly distributed data. None of those apply to severity strings or generic anomaly objects. So O(N log N) is the right cost — accept it and pick the sort with good constants and stability (Timsort). Cite the V8 default in `lib/agents/monitoring.ts` L119.
-
----
-
-**Anchors (cite these in your answer)**
-
-- `lib/agents/monitoring.ts` L51 — `SEV_RANK` rank table for the comparator
-- `lib/agents/monitoring.ts` L119 — sort + slice (top-K via sort-and-slice)
-- `lib/mcp/schema.ts` L100 — second sort, by `eventCount` descending
-- `lib/insights/derive.ts` L12–L20 — linear search with typeof narrow
-- `lib/hooks/useInvestigation.ts` L86–L95 — reverse linear scan (LIFO match)
-- `lib/mcp/validate.ts` L4, L7–L9 — substring search via regex + `lastIndexOf`
-- `components/feed/InsightCard.tsx` L159–L161 — argmin selection (K=1 top-K via reduce)
-
----
+Model answer: "Reduce is O(N) — one pass, comparing
+each element against the running best. Sort is O(N
+log N) — does a lot of work you throw away. For
+single-min, reduce is strictly better; for sorted
+output, sort wins. The funnel-leak code uses reduce
+because it only needs the single minimum stage:
+`funnelStages.reduce((a, b) => b.v < a.v ? b : a).k`.
+That's the textbook 'argmin in one pass.' Anchor:
+`components/feed/InsightCard.tsx:160`."
 
 ## See also
 
-→ `01-complexity-and-cost-models.md` (where the O(N log N) cost of sort and O(log N) of binary search live) · → `02-arrays-strings-and-hash-maps.md` (the primitives these operations work on) · → `03-stacks-queues-deques-and-heaps.md` (heaps as the streaming top-K data structure) · → `.aipe/study-dsa-foundations/06-sorting-searching-and-selection.md` (full case study of the SEV_RANK sort) · → `.aipe/study-dsa-foundations/06-sorting-searching-and-selection.md` (full case study of the substring scan)
+- `01-complexity-and-cost-models.md` — when O(N log
+  N) is invisible and when it isn't
+- `02-arrays-strings-and-hash-maps.md` — Map for
+  point lookup vs binary search for range
+- `03-stacks-queues-deques-and-heaps.md` — heap for
+  top-K when N is large or streaming
+- `08-dsa-foundations-practice-map.md` — Quickselect,
+  parametric binary search on the practice plan

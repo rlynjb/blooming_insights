@@ -1,306 +1,208 @@
-# Vector databases (where the vectors live and how nearest-neighbor scales)
+# 04 — vector databases
 
-**Industry name(s):** vector database, vector index, approximate nearest neighbor (ANN), similarity search engine
-**Type:** Industry standard · Language-agnostic
-
-> A vector database stores embeddings and answers "give me the k nearest to this query vector" — by brute-force scan at small scale and by an approximate index (HNSW/IVF) at large scale; blooming insights stores no vectors, but its in-memory `Map` cache and module-level state are exactly the "in-memory, <1k items" tier where you do not need a vector DB at all.
-
-
----
+**Subtitle:** Storage options for embeddings · Industry standard (Case B)
 
 ## Zoom out, then zoom in
 
-**Zoom out — the bigger picture.** A vector database is the *storage tier* of a retrieval pipeline that blooming insights does not yet have. Where embeddings define what goes in and chunking defines what counts as one row, the vector store decides how those rows are held and scanned: an in-memory `Map`, a SQLite extension, or a managed service like Pinecone. The codebase already uses the same shape of in-memory `Map` for caches (`McpClient` TTL cache at `lib/mcp/client.ts` L18, schema cache at `lib/mcp/schema.ts` L130) — same primitive, different payload.
+**Case B.** Where the embeddings live for fast lookup. For blooming
+insights' scale (~100s of investigations), the choice is between
+`sqlite-vec` (stay file-based) and `pgvector` (introduce Postgres).
 
 ```
-  Zoom out — where the vector store sits (WOULD BE)
+  Zoom out — vector store sits next to the corpus
 
-  ┌─ Indexer (embed + chunk) ────────────────────────┐
-  │  produces (id, vector, metadata) rows             │
-  └─────────────────────────┬────────────────────────┘
-                            │  write
-  ┌─ Vector store ──────────▼────────────────────────┐  ← we are here
-  │  ★ THE TIER DECISION ★                            │
-  │  <1k:   Map<id, vector>        (scan-all)          │
-  │  ~10k:  SQLite + sqlite-vss     (B-tree + ANN ext) │
-  │  >100k: managed (Pinecone, etc.) (HNSW/IVF)        │
-  └─────────────────────────┬────────────────────────┘
-                            │  read (top-k)
-  ┌─ Retriever ─────────────▼────────────────────────┐
-  │  embed(query) → nearest-k → feed to LLM context   │
+  ┌─ Corpus (file-based today: lib/state/*.json) ───┐
+  │                                                  │
+  │  ┌─ NEW: vector store ─────────────────────────┐ │  ← we are here
+  │  │  sqlite-vec  → keep file-based              │ │   (Case B)
+  │  │  pgvector    → introduce Postgres           │ │
+  │  │  Pinecone    → introduce managed service    │ │
+  │  └──────────────────────────────────────────────┘ │
   └──────────────────────────────────────────────────┘
-
-  In this codebase: Not yet implemented — String.includes
-  intent matching in lib/agents/intent.ts is what exists
-  instead; the in-memory Map pattern is already used for
-  caches (mcp/client.ts L18, mcp/schema.ts L130).
 ```
-
-**Zoom in — narrow to the concept.** The question is: how do you find the k nearest vectors to a query among millions, fast enough to serve a request? At small scale this is a `for` loop over an array — microseconds for 80 schema terms. At large scale the loop is too slow, and the entire reason vector databases exist is to make it *approximate-but-fast* via HNSW or IVF indices. How it works walks the tier ladder (Map → SQLite → managed), the exact-vs-approximate tradeoff, and the engineering rule of not adopting a vector DB before the scan stops being microseconds.
-
----
 
 ## Structure pass
 
-**Layers.** Three WOULD-BE storage tiers stacked by scale: in-memory `Map` (<1k vectors, brute-force scan), SQLite + sqlite-vss (~10k, B-tree + ANN extension), and managed service like Pinecone (>100k, HNSW/IVF). Above all three sits the indexer that writes; below all three sits the retriever that reads top-k. blooming insights already uses the in-memory `Map` pattern for caches — different payload, same primitive.
-
-**Axis: cost.** What does each tier pay per query as the corpus grows? This axis is the right lens because the entire file is a *cost-vs-scale* tier ladder — each tier earns its place at a different N. Lifecycle is constant (everything is per-query at the retriever); the only variable is "how much does a query cost at this corpus size."
-
-**Seams.** The cosmetic seam is between the indexer and any one tier — write is the same shape everywhere. The load-bearing WOULD-BE seams are *between tiers*: scaling from Map to SQLite to managed each represents a cost-vs-precision flip (brute-force exact → approximate-but-fast). The most consequential is Map → ANN: cost flips from O(N) per query (acceptable below 1k) to O(log N) — and *exact* answers flip to *approximate* answers. blooming insights sits firmly in the "Map tier you don't need a vector DB at all" zone.
-
-```
-  Structure pass — vector databases (WOULD BE)
-
-  ┌─ 1. LAYERS ───────────────────────────────────┐
-  │  Map<id, vector> (<1k, brute-force)            │
-  │  SQLite + sqlite-vss (~10k, ANN ext)           │
-  │  managed (Pinecone, >100k, HNSW/IVF)           │
-  │  (above: indexer; below: retriever top-k)      │
-  └────────────────────────┬───────────────────────┘
-                           │  pick the axis
-  ┌─ 2. AXIS ─────────────▼────────────────────────┐
-  │  cost: what does each tier pay per query as    │
-  │  the corpus grows?                             │
-  └────────────────────────┬───────────────────────┘
-                           │  trace across layers, find flips
-  ┌─ 3. SEAMS ────────────▼────────────────────────┐
-  │  indexer↔any tier: cosmetic                    │
-  │  Map↔ANN: LOAD-BEARING                         │
-  │    O(N) exact → O(log N) approximate           │
-  │    don't cross until microseconds stop working │
-  └────────────────────────┬───────────────────────┘
-                           ▼
-                   Block 4 — How it works
-```
-
-The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+  → **One axis to trace — operational weight.** sqlite-vec adds zero infra
+    (single file); pgvector adds a database; Pinecone adds a network hop +
+    a managed service. The order is "least new infra → most new infra";
+    pick the lightest that scales to your foreseeable corpus.
 
 ## How it works
 
-**Mental model.** A vector database is two things bolted together: a place to *store* float arrays (like a `Map` or a JSON file in the state layer) and an *index* that answers nearest-neighbor queries without scanning everything. At small scale the storage is a `Map` and the "index" is sorting computed cosines. At large scale the storage is on disk and the index is an approximate graph.
+### Move 1 — the mental model
+
+Same as picking a database: SQLite for "one file, no server, simple ops";
+Postgres for "real database, joins, transactions"; managed service for
+"someone else handles scale." For vectors specifically:
 
 ```
-  scale          storage              nearest-neighbor method
-  ────────────   ──────────────────   ───────────────────────────
-  < 1k vectors   Map / JSON file      brute force: cosine all, sort
-  < 1M           SQLite + extension   brute force or simple index
-  > 1M           vector DB            ANN index (HNSW / IVF), approx
+  Storage options (by corpus size)
+
+  ┌────────────────────────┬─────────────────────────────┐
+  │ Storage                │ When to use                 │
+  ├────────────────────────┼─────────────────────────────┤
+  │ in-memory + JSON       │ <1000 chunks, prototype     │
+  │ sqlite-vec             │ local-first, single-tenant  │
+  │  (SQLite extension)    │ no server needed            │
+  │ pgvector               │ already on Postgres;        │
+  │  (Postgres ext)        │ unifies relational + vector │
+  │ Pinecone / Weaviate /  │ massive scale; multi-tenant │
+  │  Qdrant / Chroma       │ managed infra OK            │
+  └────────────────────────┴─────────────────────────────┘
 ```
 
-The body walks from the tier blooming insights already lives in up to the tier that needs a real DB.
+### Move 2 — the step-by-step walkthrough
 
----
+**For blooming insights, sqlite-vec is the right choice.** Reasoning:
 
-### Tier 0: the in-memory `Map` (where this system already lives)
+  → No database server exists in this codebase today. Adding one is real
+    operational complexity (Vercel doesn't host Postgres natively; you'd
+    need Supabase, Neon, or similar — and authentication, connection
+    pooling, migrations).
+  → Corpus is tiny (~100s of investigations even after a year of use).
+    sqlite-vec handles up to ~1M vectors comfortably on a laptop.
+  → The existing state files are JSON; the codebase already treats
+    file-based state as primary in dev (`.investigation-cache.json`).
+    sqlite-vec slots into the same shape.
+  → Vercel deployment quirk: serverless functions don't have persistent
+    file storage. The vector index has to live somewhere durable. Options
+    for sqlite-vec on Vercel: commit the .sqlite file to git (works for
+    read-mostly, demo-friendly); or migrate to Turso (sqlite-as-a-service,
+    edge-friendly). For pure local dev + portfolio demo, committing is
+    fine.
 
-For tens to low-thousands of vectors, store them in a `Map<id, Float32Array>` and answer a query by computing cosine against every entry and sorting. This is exact (it checks all of them) and needs zero new infrastructure. This codebase already runs this pattern for non-vector data: the MCP client wrapper's TTL cache and the schema cache are both in-memory `Map`-backed stores.
+**The interface.** Whichever store you pick, the shape your app code sees
+should be the same — adapter pattern again:
 
-```
-  vectors: Map<id, Float32Array>          (lives in the process, same shape as the TTL cache)
-  query q:
-    for each [id, v] in vectors:          ← brute-force scan
-        score[id] = cosine(q, v)
-    sort by score desc, take top-k
-```
+```typescript
+// hypothetical lib/rag/store.ts
+interface VectorStore {
+  upsert(id: string, embedding: number[], metadata: Record<string, unknown>): Promise<void>;
+  cosineSearch(query: number[], opts: { topK: number }): Promise<Array<{ id: string; score: number; metadata: Record<string, unknown> }>>;
+  count(): Promise<number>;
+}
 
-The cost is O(N·d) per query — N vectors times d dimensions. At N=80, d=1536 that is ~123k multiply-adds: instant. This tier is correct and you should resist leaving it.
-
-### Tier 1: persistence (JSON file / SQLite)
-
-The `Map` dies on process restart and on a serverless cold start (the exact limitation called out for the TTL cache). To survive restarts you persist the vectors — a JSON file (like the dev-mode investigation snapshot file) or SQLite with a vector extension (`sqlite-vss`, `sqlite-vec`). Storage survives; the query is still a brute-force scan loaded into memory.
-
-```
-  STATE LAYER (same dev-file persistence pattern the in-process state map already uses)
-  vectors.json ──load──▶ Map ──scan──▶ top-k
-       │ survives restart
-```
-
-This is where the "search past investigations" feature would start: a JSON file of chunk vectors, loaded and scanned. No vector DB yet.
-
-### Tier 2: the approximate index (HNSW / IVF)
-
-Past ~1M vectors the brute-force scan is too slow per query. The fix is an *approximate* nearest-neighbor index that searches a structure instead of every vector:
-
-```
-  HNSW (graph)                          IVF (clustering)
-  ──────────────────────────            ──────────────────────────────
-  vectors are nodes in a layered        vectors grouped into clusters;
-  graph; a query walks greedily         query checks only the nearest
-  toward nearer neighbors               few clusters, not all vectors
-       │                                     │
-       └── O(log N) hops, approximate        └── scan a fraction, approximate
+class SqliteVecStore implements VectorStore { /* … */ }
+class PgvectorStore implements VectorStore { /* … */ }
 ```
 
-Both return *probably* the true top-k, not certainly — that is the trade for sub-linear speed. "Recall@k" measures how often the approximate result matches the exact one; you tune index parameters to hold recall while gaining speed.
+Swap the implementation; app code doesn't change.
 
-### Tier 3: the full vector database
+**Why ANN matters at scale.** For ~1000 vectors, brute-force cosine is
+fine — compute similarity vs every vector, sort, take top-k. For ~1M
+vectors, this is too slow per query. Approximate Nearest Neighbor
+algorithms (HNSW, IVF) build an index that trades a small accuracy
+penalty (~1-5%) for ~100x faster queries. sqlite-vec uses HNSW; pgvector
+uses IVF or HNSW depending on configuration. Both Pinecone and Weaviate
+use ANN under the hood.
 
-A vector database (Pinecone, Weaviate, Qdrant, pgvector) is the ANN index *plus* the operational layer: persistence, horizontal scaling, metadata filtering (retrieve nearest vectors *where* `insightId = X`), hybrid scoring (`06-hybrid-retrieval-rrf.md`), and incremental upserts (`10-incremental-indexing.md`).
+For blooming insights at current scale, brute-force is genuinely fine.
+The ANN question matters past ~10k vectors.
 
-```
-┌──────────────────────────────────────────────┐
-│  vector database                              │
-│   ANN index (HNSW/IVF)   ← speed              │
-│   metadata store         ← filter by field    │
-│   persistence + scaling  ← survive + grow     │
-│   upsert / delete        ← incremental index  │
-└──────────────────────────────────────────────┘
-```
+### Move 3 — the principle
 
-This is the right tier only when scale and operational needs justify it — millions of vectors, multi-tenant filtering, continuous updates.
+**Pick the lightest store that scales to your foreseeable corpus.
+Operational complexity costs more than per-query latency at small scale.**
+sqlite-vec gives you 80% of what Pinecone gives you, with zero added
+infra. Reach for pgvector when you genuinely need joins between vector
+and relational data; reach for managed when you genuinely need multi-
+tenant scale.
 
-### The principle
-
-Nearest-neighbor is a `for` loop until the `for` loop is too slow, and the entire vector-database industry exists to replace that loop with an approximate index once it is. The corollary is the one engineers most often miss: at small scale you do not need a vector database, you need the `Map` you already have — the same judgment the MCP client wrapper made by caching in memory instead of standing up Redis.
-
----
-
-### Code in this codebase
-
-**Not yet implemented.** blooming insights retrieves live via MCP tool calls + EQL against Bloomreach, not by querying a vector store — there are no vectors and no nearest-neighbor index anywhere.
-
-The honest analog is that the codebase already runs the *storage tier* a small vector index would use. `McpClient`'s cache is an in-memory `Map<string, {result, expiresAt}>` (`lib/mcp/client.ts` L18); the schema is held in a module-level `let cached: WorkspaceSchema | null` (`lib/mcp/schema.ts` L130); past investigations persist to JSON (`lib/state/investigations.ts` reads `demo-investigations.json` and a dev cache file). That is precisely the "in-memory / JSON, <1k items, brute-force scan" tier where a vector database is unnecessary — you store in a `Map` or a JSON file and scan. A vector store would live in `lib/state/` (the file tier) graduating to a managed DB only at scale. The `Project exercises` block below is the primary buildable target.
-
----
-
-## Vector databases — diagram
-
-This diagram spans the Service layer (the query) and the State layer (where vectors live across tiers). A reader who sees only this should grasp that storage and the nearest-neighbor method change with scale, and that blooming insights already lives in Tier 0.
+## Primary diagram
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│  SERVICE LAYER  (would live in lib/mcp/, like schema.ts)            │
-│   query term ──▶ embed ──▶ q ──▶ nearest-neighbor(q, k)            │
-└──────────────────────────┬───────────────────────────────────────────┘
-                           │ method depends on tier
-┌──────────────────────────▼───────────────────────────────────────────┐
-│  STATE LAYER  (lib/state/, lib/mcp/)                                │
-│                                                                      │
-│  TIER 0  Map<id, vec>          ← blooming insights ALREADY here     │
-│                   │
-│          brute-force scan, exact, zero infra                       │
-│                                                                      │
-│  TIER 1  JSON / SQLite         ← survives restart                  │
-│          (like demo-investigations.json)                           │
-│          brute-force scan loaded into memory                       │
-│                                                                      │
-│  TIER 2  ANN index (HNSW/IVF)  ← > 1M vectors                      │
-│          approximate, sub-linear                                    │
-│                                                                      │
-│  TIER 3  vector DB             ← + filtering, scaling, upserts      │
-│          (Pinecone/Qdrant/pgvector)                                │
-└──────────────────────────────────────────────────────────────────────┘
+  Vector store decision tree for blooming insights
+
+  ┌─ corpus size? ──────────────────────────────────┐
+  │                                                  │
+  │  < 1000 vectors                                  │
+  │    └─► in-memory + JSON or sqlite-vec            │
+  │                                                  │
+  │  1k - 1M vectors                                 │
+  │    ├─► sqlite-vec (no db server)                 │
+  │    └─► pgvector (if you already have postgres)   │
+  │                                                  │
+  │  > 1M vectors                                    │
+  │    └─► Pinecone / Weaviate / Qdrant / pgvector   │
+  │        with ANN tuning                           │
+  │                                                  │
+  └──────────────────────────────────────────────────┘
+
+  blooming insights ─── sqlite-vec
+   (current state)      (corpus <1k for years)
 ```
-
-The arrow down the State layer is the upgrade path; you climb it only when the tier above runs out, not by default.
-
----
 
 ## Elaborate
 
-### Where this pattern comes from
+The sqlite-vec extension (formerly sqlite-vss) hit v0 in 2023 and has
+become the canonical "vectors in SQLite" answer. It supports cosine, L2,
+and dot-product similarity, ANN via HNSW, and integrates with regular
+SQLite tables for joins. The deployment story on Vercel is the awkward
+part — serverless functions don't have writable file storage — but
+read-mostly workloads (build a static index, query at runtime) work fine
+when the .sqlite file is committed to git or hosted on edge storage.
 
-Approximate nearest neighbor predates LLMs by decades — it powered image search, recommendation, and deduplication (FAISS from Meta, 2017; Annoy from Spotify). The RAG wave turned ANN into a product category: Pinecone, Weaviate, Qdrant, Milvus, and Chroma packaged the index with persistence and APIs. The countertrend matters too: pgvector (Postgres extension) and SQLite vector extensions let teams keep vectors in the database they already run, and the "you might not need a vector DB" argument — scan in-memory until you cannot — became the standard cost-discipline advice.
+For blooming insights' diagnosis-grounding case the access pattern is:
+write-rarely (on each new investigation), read-on-every-diagnose. The
+index is built incrementally, queried frequently. sqlite-vec's HNSW
+update cost is acceptable for write-rarely workloads.
 
-### The deeper principle
-
-```
-  data size        right tool              why
-  ──────────────   ────────────────────    ───────────────────────────
-  fits in a Map    Map + brute-force scan   exact, zero infra
-  fits on disk     SQLite/pgvector          one store, transactional
-  millions+        dedicated vector DB      ANN index + scaling
-```
-
-The progression mirrors every storage decision: a `Map` before a file, a file before a database, a single DB before a distributed one. Reaching for the top tier first is the recurring over-engineering mistake — and the codebase already avoids it for its cache by choosing a `Map` over Redis.
-
-### Where this breaks down
-
-1. **In-memory dies on cold start.** Tier 0's `Map` (and `McpClient`'s cache) is empty after a serverless cold start or restart — every vector must be re-loaded or re-embedded. The same limitation the caching guide notes for `McpClient` applies to an in-memory vector index.
-
-2. **Brute force is O(N) — fine until it is not.** The scan is invisible at thousands and a request-killer at millions. There is no warning; latency just climbs with N until a query misses its budget.
-
-3. **Approximate means *approximate*.** An ANN index can miss the true nearest neighbor. For most retrieval that is fine (recall@k near 1.0), but for correctness-critical lookups the approximation is a silent error you must measure (recall), not assume.
-
-### What to explore next
-
-- **Incremental indexing** (`10-incremental-indexing.md`): how vectors get added/updated/deleted in the store without a full rebuild.
-- **Hybrid retrieval** (`06-hybrid-retrieval-rrf.md`): combining the vector index with keyword scoring — what real vector DBs do internally.
-- **Chunking** (`03-chunking-strategies.md`): chunk count is the N that decides which tier you need.
-
----
+If the product ever grew to be multi-tenant SaaS with thousands of
+workspaces and hundreds of millions of vectors, the migration target is
+pgvector on a managed Postgres (Supabase, Neon, RDS). The adapter
+interface above is what makes that migration a one-class swap.
 
 ## Project exercises
 
-### Build a Tier-0 in-memory vector index for schema terms
+### Exercise — implement `SqliteVecStore` for the local index
 
-- **Exercise ID:** B2A.1 / B2A.2 (adapted) — the primary buildable target.
-- **What to build:** a `VectorStore` class backed by a `Map<id, Float32Array>` (mirroring `McpClient`'s cache shape) with `add(id, vec, metadata)` and `nearest(q, k)` that brute-force scans cosine and returns the top-k with metadata. Use it to index the embedded schema terms from `01-embeddings.md`. Deliberately stay at Tier 0 and document why no vector DB is warranted.
-- **Why it earns its place:** demonstrates you know nearest-neighbor is a `for` loop at small scale and that you resist provisioning infrastructure you do not need — the cost-discipline interview signal.
-- **Files to touch:** new `lib/mcp/vector-store.ts` (the `Map`-backed store), `lib/mcp/embeddings.ts` (feeds it), new `test/mcp/vector-store.test.ts` (nearest returns correct top-k).
-- **Done when:** `store.nearest(embed("sales"), 3)` returns `purchase` first against the real schema, the store holds all schema terms in memory, and a comment justifies the Tier-0 choice for current scale.
-- **Estimated effort:** 1–4hr
-
-### Add Tier-1 persistence so the index survives a restart
-
-- **Exercise ID:** B2A.2 (adapted) — persistence tier.
-- **What to build:** persist the `VectorStore` to a JSON file on the same dev-file pattern as `lib/state/investigations.ts` (write in development, load on boot), so the index survives a restart without re-embedding. Keep the query a brute-force in-memory scan after load.
-- **Why it earns its place:** shows you understand the cold-start limitation of in-memory state (the same one `McpClient`'s cache has) and the minimal persistence fix before any vector DB.
-- **Files to touch:** `lib/mcp/vector-store.ts` (load/save), `lib/state/` (the JSON file), `test/mcp/vector-store.test.ts` (round-trip persistence).
-- **Done when:** vectors written once are loaded from disk on a fresh process and `nearest` returns identical results without re-embedding.
-- **Estimated effort:** 1–4hr
-
----
+  → **Exercise ID:** `study-ai-eng-03-04.1`
+  → **What to build:** `lib/rag/store.ts` with a `VectorStore` interface
+    and a `SqliteVecStore` implementation. Use `better-sqlite3` +
+    `sqlite-vec`. Persist to `.rag-cache.sqlite` (gitignored in dev,
+    committed for demo). Methods: `upsert`, `cosineSearch`, `count`.
+    Wire from `lib/state/investigations.ts` to upsert on save.
+  → **Why it earns its place:** Lands the storage layer for the
+    diagnosis-grounding feature. Single file, no infra.
+  → **Files to touch:** new `lib/rag/store.ts`, `lib/state/investigations.ts`
+    (call upsert), `package.json` (`better-sqlite3`, `sqlite-vec`),
+    `.gitignore` (add `.rag-cache.sqlite` for dev),
+    `test/rag/store.test.ts`.
+  → **Done when:** Saving an investigation upserts its vector;
+    `cosineSearch` returns the most-similar prior investigation as top-1
+    on a fixture.
+  → **Estimated effort:** `1–2 days`
 
 ## Interview defense
 
-### What an interviewer is really asking
+**Q: Which vector database would you use for this codebase?**
 
-"What vector database would you use?" is often a trap — the senior answer starts with "do I need one yet?" It tests whether you know nearest-neighbor is a brute-force scan at small scale and that vector DBs earn their cost only past a real scale threshold. The signal is naming the tiers, citing the in-memory-then-disk-then-DB progression, and connecting it to the `Map`-not-Redis judgment.
+`sqlite-vec`. Three reasons:
 
-### Likely questions
+  1. No database server exists today; adding Postgres for ~100 vectors is
+     operational overkill.
+  2. The codebase already treats file-based state as primary
+     (`.investigation-cache.json`, `lib/state/demo-*.json`). sqlite-vec
+     slots into the same shape.
+  3. The corpus stays small for years (one new investigation per
+     anomaly-click). Brute-force or HNSW in SQLite handles it.
 
-**[mid] How does nearest-neighbor search actually work at small scale?**
+The adapter pattern (a `VectorStore` interface with a `SqliteVecStore`
+impl) keeps pgvector / Pinecone as a future swap.
 
-Brute force: store vectors in a `Map` or array, and for each query compute cosine against every stored vector and sort descending for the top-k. It is O(N·d) — exact, simple, instant at thousands of vectors. No index, no database needed.
+**Anchor line:** "sqlite-vec for the local store, adapter interface so
+pgvector is a one-class swap when the corpus outgrows it."
 
-```
-for each [id, v] in store: score[id] = cosine(q, v)
-sort desc → top-k     (exact, O(N·d))
-```
+**Q: When would you actually reach for Pinecone?**
 
-**[senior] When does the brute-force scan stop working, and what replaces it?**
-
-When N grows past roughly a million, the O(N) scan exceeds the request latency budget. The replacement is an approximate nearest-neighbor index — HNSW (a navigable graph, O(log N) hops) or IVF (cluster-then-scan-a-few) — which returns *probably* the top-k for sub-linear speed. You measure the trade as recall@k.
-
-```
-N small  → brute force (exact)
-N huge   → HNSW/IVF (approximate, sub-linear, measure recall)
-```
-
-**[arch] You're adding "search past investigations." Do you provision a vector DB?**
-
-No — not for dozens to hundreds of investigations. That fits the tier the codebase already uses: a `Map` in memory (like `McpClient.cache`, `lib/mcp/client.ts` L18) or a JSON file (like `lib/state/demo-investigations.json`), scanned exhaustively. Provision a vector DB only when the corpus outgrows memory or the scan misses its latency budget. Reaching for one now is the Redis-for-a-`Map` mistake.
-
-```
-~100 investigations → Map/JSON scan (Tier 0/1)
-millions of chunks  → vector DB (Tier 3)
-```
-
-### The question candidates always dodge
-
-**"Do you actually need a vector database?"** Most candidates assume RAG implies a vector DB and skip the question. The senior answer is "usually not at first" — at <1k vectors a brute-force `Map` scan is exact, instant, and zero-infrastructure, and you climb to SQLite/pgvector and then a dedicated DB only as scale forces it. Naming the threshold (≈10⁵–10⁶ vectors) is the signal.
-
-### One-line anchors
-
-- `lib/mcp/client.ts` L18 — `McpClient.cache`: the in-memory `Map` tier a small vector index would use.
-- `lib/mcp/schema.ts` L130 — `let cached: WorkspaceSchema`: module-level in-memory state.
-- `lib/state/investigations.ts` — JSON-file persistence: the Tier-1 storage shape already in use.
-- Nearest-neighbor is a `for` loop until it is too slow; then ANN.
-- <1k vectors needs a `Map`, not a vector DB — the Redis-for-a-`Map` judgment.
-
----
+When the corpus crosses ~1M vectors per tenant AND there's enough
+multi-tenant traffic that the managed indexing pays for itself. For most
+single-tenant apps and most internal tools, sqlite-vec or pgvector is
+sufficient through several years of growth.
 
 ## See also
 
-→ 01-embeddings.md · → 03-chunking-strategies.md · → 10-incremental-indexing.md · → 11-rag.md
+  → `01-embeddings.md` — what's being stored
+  → `05-dense-vs-sparse.md` — what kind of search the store enables
+  → `10-incremental-indexing.md` — how the store stays fresh

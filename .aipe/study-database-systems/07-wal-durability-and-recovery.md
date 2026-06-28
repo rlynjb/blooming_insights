@@ -1,222 +1,301 @@
-# WAL, Durability, and Recovery
+# WAL, durability, and recovery
 
-## Subtitle
+Industry standard · Crash recovery internals
 
-How a database survives a crash and how it gets restored when it doesn't · Industry standard.
+## Zoom out — where durability would live, and what's there
 
-## Zoom out, then zoom in
-
-```
-  Zoom out — where durability sits in a normal app
-
-  ┌─ App ──────────────────────────────────────────┐
-  │  COMMIT — caller expects "it's safe now"       │
-  └────────────────────┬───────────────────────────┘
-                       │
-  ┌─ Database ─────────▼───────────────────────────┐
-  │  ★ WAL + DURABILITY + RECOVERY ★               │
-  │  write-ahead log (fsync to disk, before commit) │
-  │  buffer pool (in-memory pages, dirty + clean)   │
-  │  checkpointer (flush dirty pages periodically)  │
-  │  recovery (replay WAL after crash)              │
-  │  backup + PITR                                  │
-  └────────────────────┬───────────────────────────┘
-                       │
-  ┌─ Disk ─────────────▼───────────────────────────┐
-  │  WAL files + data files + backup snapshots     │
-  └────────────────────────────────────────────────┘
-```
-
-### Verdict for this codebase
-
-**Not yet exercised — no WAL, no fsync, no backup story.** The state hierarchy here is:
-
-- **In-memory Maps** — wiped on every cold start and every deploy. No durability claim, none expected.
-- **`.investigation-cache.json` and `.auth-cache.json`** — dev-only JSON files, no fsync, no atomic rename. Tear-on-crash caught by `JSON.parse` try/catch (`lib/state/investigations.ts` L17 / `lib/mcp/auth.ts` L120).
-- **`bi_auth` cookie** — durable for ~10 days, AES-GCM encrypted. The "WAL" is the browser's cookie jar. Recovery is "user re-authenticates."
-- **Committed JSON fixtures** (`lib/state/demo-*.json`) — durable via git. The "backup" is `git reflog`. The "PITR" is `git checkout <sha>`.
-
-### When this becomes load-bearing
-
-The moment user data lives in our process and a process crash would lose work. Until then, every write is either ephemeral (Maps) or browser-side (cookie) or human-managed (committed fixtures).
+A write-ahead log is the mechanism that makes a database survive crashes: every change is appended to an on-disk log *before* the change is applied to the actual data pages, so a crash mid-write can be replayed (REDO) or unwound (UNDO) from the log on restart. Backups, point-in-time recovery, and replication all build on the WAL. This codebase has **no WAL, no durability of any kind, and no recovery path** — because there's no on-disk data of record to recover.
 
 ```
-  features that would force a real durability story
+  Zoom out — where durability would live (and what's there)
 
-  any user-generated content (saved insights, comments, notes)
-     → can't lose it on a deploy. needs durable storage with fsync.
-
-  any audit log of agent actions
-     → loss is a compliance failure. needs durable append-only log.
-
-  long-running async jobs (batch briefings, exports)
-     → state must survive the function instance dying mid-job.
-       needs durable queue with at-least-once delivery.
-
-  paid-tier customer data
-     → SLA implies recovery time objective (RTO) and recovery point
-       objective (RPO). that means: backups, PITR, tested restore.
+  ┌─ Service layer ──────────────────────────────────────────────┐
+  │  putInsights · saveInvestigation                              │
+  └───────────────────────────────┬──────────────────────────────┘
+                                  │ writes
+  ┌─ "Durability" layer ───────────▼──────────────────────────────┐
+  │  ★ THIS CONCEPT ★                                              │
+  │                                                                │
+  │  PRODUCTION:                                                   │
+  │    in-memory Map only — no disk, no WAL, no backup             │
+  │    process restart → all session state LOST                    │
+  │    no recovery path (none needed; data of record is upstream)  │
+  │                                                                │
+  │  DEVELOPMENT:                                                  │
+  │    in-memory Map + best-effort JSON file write                 │
+  │    .investigation-cache.json (whole-file rewrite per save)     │
+  │    no fsync, no atomic rename — last writer wins               │
+  └────────────────────────────────────────────────────────────────┘
+                                  │ (durability owned by provider)
+                                  ▼
+                       Bloomreach Engagement
 ```
 
-## Structure pass
+## Zoom in — the question this concept answers
 
-Skipped — no codebase instance.
+In a real DB: "if the process dies right now, what survives, and how do we get back to a consistent state?" Here: "what's lost on restart, and does it matter?" Answer in one line: **everything in the local Map is lost; nothing of record is lost; the recovery path is 'run the briefing again.'**
+
+## Structure pass — the skeleton
+
+### The four moves of crash-safe durability — and which ones we do
+
+```
+  move                        what it is                       this repo
+  ────                        ─────────────────                ─────────
+  append to log (WAL)         every write → log entry first    NOT DONE
+  flush log to disk (fsync)   sync the log before ack          NOT DONE
+  apply to data pages         lazy; can happen later           NOT APPLICABLE
+  replay on restart           re-do log from last checkpoint   NOT APPLICABLE
+```
+
+The chain is sequential: skipping any link breaks the durability story. We skip the first one — there is no log — so the rest is moot.
+
+### What we DO have, by environment
+
+  - **Production (Vercel).** In-memory Map only. Process restart → all state lost. No recovery; the briefing is re-runnable.
+  - **Development (Next dev server).** In-memory Map + JSON file. The dev server hot-reloads modules constantly; the file is the only thing that survives a module re-eval. No fsync, no transactional file write.
+  - **Auth state in production.** Encrypted httpOnly cookie. The browser IS the durable store for the OAuth tokens. Survives instance death, survives deployment, because it lives outside the server.
+
+### Axis: where does the data of record live?
+
+```
+  The "data of record" axis
+
+  ┌─ Bloomreach ──────────────────────────────┐
+  │  durable, owned, recoverable — by THEM    │   ← everything that matters
+  └───────────────────────────────────────────┘
+       ┌─ this repo (production) ──────────────┐
+       │  derivative only; loss = re-compute   │   ← nothing to recover
+       └───────────────────────────────────────┘
+            ┌─ this repo (dev) ──────────────────┐
+            │  derivative + a few cached helpers │   ← convenience, not record
+            └────────────────────────────────────┘
+```
+
+The provider owns durability for the only data that needs durability. Everything in this repo is derivative — losing it costs computation, not information.
+
+### Seams
+
+The seam that matters most: **production vs development.** In production, there is no file persistence at all (`PERSIST = process.env.NODE_ENV === 'development'`). In development, the JSON files exist *only to survive Next's hot-reload* — which would otherwise blow away the in-memory Map every time a `.ts` file is saved. The dev file persistence is a developer-experience tool, not a durability feature.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-A database has two storage tiers: the **buffer pool** (in-memory, fast, lossy on crash) and the **disk** (slow, durable). The write path is:
-
-1. App calls `UPDATE`
-2. Engine modifies the in-memory page (dirty)
-3. Engine appends an entry to the **write-ahead log** describing the change
-4. WAL gets `fsync`'d to disk
-5. ONLY NOW does COMMIT return
-
-The dirty page can wait — it'll be flushed by the checkpointer later, or never at all. The WAL entry on disk is the durability promise. If the process crashes before the dirty page is written, recovery replays the WAL and rebuilds the page from the log.
+If you've ever run a Node process locally, hit Ctrl-C, restarted it, and watched all your in-memory state vanish — that's the durability story here, in production. The "fix" in normal apps is to back the state with a database; the fix here is to make the state cheaply regeneratable so the user doesn't notice when it's gone.
 
 ```
-  the pattern — write path, with WAL
+  The shape — durability by NOT needing it
 
-       App:    UPDATE x SET v = 5
-
-       Engine:
-         buffer pool [page]   modify v: 4 → 5   ← in-memory only
-              │
-              ▼
-         WAL append           "page P: v 4→5"
-              │
-              ▼
-         fsync(WAL)           ← this is the durability fence
-              │
-              ▼
-       COMMIT returns           ← from here, even a crash recovers
-
-       (much later)
-         checkpointer         flush page P to data file
-         (asynchronous, batched, much cheaper than per-commit)
+  ┌─ provider (Bloomreach) ─┐
+  │  data of record         │  ← survives forever (their problem)
+  └─────────────────────────┘
+            │
+            │  query
+            ▼
+  ┌─ this process ──────────┐
+  │  in-memory Map          │
+  │  ──────────             │
+  │  ✗ dies on restart      │
+  │  ✓ rebuilt by re-query  │  ← the recovery path
+  └─────────────────────────┘
 ```
 
-The whole reason WAL exists is **the sync write to the WAL is small and sequential**, while a sync write of the data page is large and random. WAL converts random writes into sequential ones — that's the entire performance trick.
+The recovery path isn't "replay a log." It's "ask Bloomreach again." That works because the local state is *derived* from upstream data; nothing's been computed that can't be re-computed.
 
-### Move 2 — the moving parts
+### Move 2 — the walkthrough
 
-**Move 2a — the WAL itself.** Append-only file. Every change goes on the end. Bounded in size by rotation (Postgres: 16MB segments). Replayed on crash. Streamed to replicas (see 08).
+#### Production: zero durability, by design
 
-**Move 2b — checkpointing.** The background process that flushes dirty pages to disk so the WAL can be truncated. Too frequent: I/O storm. Too rare: long recovery time.
+The state files (`lib/state/insights.ts`, `lib/state/investigations.ts`) gate file writes behind `PERSIST = process.env.NODE_ENV === 'development'`:
 
-**Move 2c — `fsync` and its lies.** `fsync(fd)` is supposed to mean "the OS has confirmed this is on disk." In practice, hardware can lie — disks cache writes in their own RAM. Postgres's `synchronous_commit=off` accepts this risk explicitly; the default (`on`) does not. The classic "Postgres fsync bug" of 2018 was about how the kernel handles fsync errors, and it cost reputable companies real data.
-
-**Move 2d — backups + PITR.** Periodic full backups + the WAL stream between them lets you restore to any point in time. RPO (recovery POINT objective — how much data you can lose) is set by backup + WAL ship cadence. RTO (recovery TIME objective — how long restore takes) is set by backup size and WAL replay speed.
-
-```
-  bridge: think of git as a primitive WAL. every commit is an append to a
-          log of changes. you can `git checkout <sha>` to recover any prior
-          state. you can `git push` to ship the WAL to another replica.
-          this is the same shape; databases just do it on hot data.
+```ts
+// lib/state/investigations.ts:7
+const PERSIST = process.env.NODE_ENV === 'development';
 ```
 
-### Code in this codebase
-
-- **Auth cookie** is the only piece of state with a real durability claim — durable for 10 days, encrypted, owned by the browser.
-- **Dev write paths** (`writeFileSync` in `lib/state/investigations.ts` and `lib/mcp/auth.ts`) are best-effort, no fsync, no atomic rename. Tear-on-crash recoverable by re-authenticating.
-- **Committed demo fixtures** are durable via git; the "backup" is git history.
-
-The closest cousins, ranked:
-
-```
-  lib/mcp/auth.ts — the closest thing to a WAL
-
-  prod path:
-    fn() mutates an in-memory store
-    on exit: encryptStore(store) → cookies().set(AUTH_COOKIE, ...)
-              │
-              └─ the browser now persists the encrypted blob for 10 days.
-                 the "WAL" is the cookie jar. recovery on session loss is
-                 "user re-authenticates" — i.e. start over, not log replay.
-
-  dev path:
-    patchState(...) → writeAll(...) → writeFileSync(CACHE_FILE, json)
-              │
-              └─ no fsync. node's writeFileSync calls write(2) on the FD,
-                 which OS-buffers the data. a crash between the write and
-                 the OS flush loses the change. acceptable here because
-                 the cache is reconstructible by re-authenticating.
-```
-
-```
-  lib/state/investigations.ts  (lines 30–41)
-
-  export function saveInvestigation(insightId, events) {
-    mem.set(insightId, events);                ← in-memory write, dies on crash
-    if (PERSIST) {
-      const all = readJson(CACHE_FILE);
-      all[insightId] = events;
-      try {
-        writeFileSync(CACHE_FILE, JSON.stringify(all));   ← read-modify-write
-      } catch { /* best effort */ }                       ← writes can SILENTLY
-                                                            fail; no rollback,
-                                                            no retry, no alert
-      }
+```ts
+// lib/state/investigations.ts:30-41
+export function saveInvestigation(insightId: string, events: AgentEvent[]): void {
+  mem.set(insightId, events);
+  if (PERSIST) {
+    const all = readJson(CACHE_FILE);
+    all[insightId] = events;
+    try {
+      writeFileSync(CACHE_FILE, JSON.stringify(all));
+    } catch {
+      /* best effort */
+    }
   }
-       │
-       └─ this is the OPPOSITE of WAL. it's a read-the-whole-file, modify-in-
-          memory, write-the-whole-file-back pattern. on dev, with one writer,
-          fine. if two writers raced, one would clobber the other entirely.
-          no atomic-rename (write to tmp + rename) and no fsync — a power loss
-          mid-write leaves a torn file. caught by the JSON.parse try/catch in
-          readJson L13-19, which treats a corrupt cache as empty.
+}
 ```
 
-```
-  lib/state/demo-*.json — git as backup
+Annotation:
+  - **Line 31** — always write to the in-memory Map. This is the only durable write in production (and "durable" here means "lives until the process dies").
+  - **Line 32** — `if (PERSIST)` — in production, this branch never runs. Vercel's filesystem is read-only at runtime; even if we wanted to write, we couldn't.
+  - **Lines 33-39** — dev-only path. Read the entire file, splat the new entry on top, write the entire file back. There's no append, no journal, no fsync. The `try/catch` makes a write failure silently best-effort — "if disk is full or the file is locked, just skip the write and the in-memory copy is still good."
 
-  /Users/rein/Public/blooming_insights/lib/state/demo-insights.json
-  /Users/rein/Public/blooming_insights/lib/state/demo-investigations.json
-       │
-       └─ the only "durable" data in the repo. backed up by git, recoverable
-          by checkout, ship-stream is `git push`. for committed read-only
-          fixtures this is fine; for live data it would be absurd.
+The `insights.ts` state file has no file persistence at all, not even in dev — its data is per-briefing-run and replaced wholesale each time. There's nothing to persist between runs.
+
+#### The recovery path: re-run the briefing
+
+If a production instance dies, the next request from the same session lands on a fresh instance with an empty Map. The user clicks "refresh" (or it auto-refreshes), the briefing re-runs, and the state rebuilds in ~10-30 seconds. The recovery operator is the user.
+
 ```
+  Recovery flow on cold start
+
+  user clicks → briefing API → monitoring agent → Bloomreach queries
+                                                       ↓
+                                              insights rebuilt
+                                                       ↓
+                                              putInsights() → fresh Map
+                                                       ↓
+                                              UI renders normally
+```
+
+There is no concept of "recovering to a specific point in time." There's only "recompute the latest." The briefing is idempotent at the run level: same Bloomreach data → same anomalies (modulo the LLM's nondeterminism on borderline cases).
+
+#### Why no WAL — what a WAL would even protect
+
+A WAL exists to convert *partial writes* into *durable atomic writes*. The classic shape:
+
+```
+  WAL discipline in a real engine
+
+  1. write [{insert insight 1, insert insight 2, ...}] to log file
+  2. fsync the log file (now it's durable)
+  3. ack the client: "committed"
+  4. lazily apply the writes to data pages
+  5. on crash: replay the log from the last checkpoint
+```
+
+We skip step 1 because we have no log file. We skip step 2 because we have no fsync to do. We never ack a "commit" because there's no commit boundary — `putInsights` returns when the in-memory Map is updated, and that's all it claims. We don't replay on restart because we don't restart from a checkpointed state; we restart from empty.
+
+The reason this works: **nothing has been written that someone else committed to.** The user never gets a "your briefing is saved" message. The product surface doesn't promise durability, so the engine doesn't need to provide it.
+
+#### The dev-mode JSON files — convenience persistence, not durability
+
+```ts
+// lib/state/investigations.ts:9
+const DEMO_FILE = join(process.cwd(), 'lib/state/demo-investigations.json');
+```
+
+```ts
+// lib/state/investigations.ts:13-20
+function readJson(path: string): Record<string, AgentEvent[]> {
+  try {
+    if (existsSync(path)) return JSON.parse(readFileSync(path, 'utf8'));
+  } catch {
+    /* ignore */
+  }
+  return {};
+}
+```
+
+Annotation:
+  - The `try/catch/return {}` shape is the dev file's "recovery": if the file is missing or corrupt (e.g., truncated by a crash mid-write), treat it as empty. There's no log to replay; we just start fresh.
+  - This is the right shape for a *cache* (which is all the file is) and the wrong shape for a system of record. A real database would never silently swallow a corrupt data file.
+  - In production this code path is unreachable because `PERSIST` is false. The file would not exist on Vercel anyway.
+
+#### The auth cookie — the one production durability story
+
+The OAuth/PKCE state in production is encrypted into an httpOnly cookie:
+
+```ts
+// lib/mcp/auth.ts:46-49
+interface RequestStore { store: Store; dirty: boolean }
+const requestStore = new AsyncLocalStorage<RequestStore>();
+const AUTH_COOKIE = 'bi_auth';
+const AUTH_COOKIE_MAX_AGE = 60 * 60 * 24 * 10; // 10 days, matches token lifetime
+```
+
+Annotation:
+  - The browser is the durable substrate. It survives instance death, deployments, even browser restarts (until the cookie max-age expires).
+  - This is the only production state that crosses instance boundaries. It works because the durable medium (the cookie) is *outside the server*.
+  - It's not a WAL, not a backup, not replication — it's a single durable copy with the client. Equivalent to writing to a single replicated KV store from the server's perspective.
+
+This is the architectural escape hatch: when you genuinely need state to survive across instances, you move it *out of the server* — to the browser, to a managed service, or eventually to a real datastore.
 
 ### Move 3 — the principle
 
-**Durability is what `COMMIT` actually means.** Without a WAL, `COMMIT` is a lie — the engine has to flush a whole page to disk on every commit, which is unacceptably slow, or it has to defer the write, which means a crash loses committed data. The WAL is the trick that makes "fast" and "durable" compatible: the cost of commit is one sequential append, not many random writes. Get this contract right and the rest of the database can be optimized freely; get it wrong and committed data isn't actually committed.
+Durability is a contract: "after I ack your write, the data survives a crash." The cost of providing it is real — a WAL, fsync overhead, recovery logic, backup tooling. When the product makes no durability promise (every operation is re-runnable, every fact lives upstream), all of that cost is wasted weight. The right move is to be honest about which writes need durability and which don't. Most of this codebase's writes don't; the one that does (OAuth) gets its durability from a place that already has it (the browser cookie). Pulling more state into the "needs durability" category is a product decision that should justify its cost.
 
 ## Primary diagram
 
-Skipped — no codebase instance to recap.
+```
+  Durability and recovery — the complete picture
+
+  ┌─ writes by environment ───────────────────────────────────────┐
+  │                                                                 │
+  │   PRODUCTION                          DEVELOPMENT               │
+  │   ──────────                          ───────────               │
+  │   putInsights        → Map only       Map + (no file)           │
+  │   saveInvestigation  → Map only       Map + .investigation-     │
+  │                                              cache.json         │
+  │   auth state         → cookie         Map + .auth-cache.json    │
+  │                                                                 │
+  └────────────────────────────────────────────────────────────────┘
+
+  ┌─ recovery paths ──────────────────────────────────────────────┐
+  │                                                                 │
+  │   instance dies                                                 │
+  │      ↓                                                          │
+  │   next request hits fresh instance                              │
+  │      ↓                                                          │
+  │   Maps are empty                                                │
+  │      ↓                                                          │
+  │   client re-supplies (sessionStorage stash) where it can        │
+  │   client re-runs briefing where it must                         │
+  │   cookie restores auth automatically                            │
+  │      ↓                                                          │
+  │   system back to working in seconds                             │
+  │                                                                 │
+  │   the recovery operator: THE USER (or the client re-fetch)      │
+  └────────────────────────────────────────────────────────────────┘
+```
 
 ## Elaborate
 
-The WAL is one of the foundational ideas in storage engineering — predates relational databases (System R, IBM, late 1970s). Every modern engine has one: Postgres WAL, MySQL InnoDB redo log, SQLite WAL mode, RocksDB WAL, Kafka commit log. The pattern is so general that Kafka took it and built an entire messaging system on the same primitive ("the log is the source of truth, consumers replay").
+The classical WAL design comes from System R and ARIES (Mohan et al., 1992). The five properties — atomicity, durability, repeated history, logical undo, and steal/no-force buffer policy — are what every major engine's recovery system descends from. PostgreSQL, MySQL InnoDB, Oracle all implement variants. Modern systems extend it: distributed WALs (Kafka, replicated logs), append-only log-structured stores (LSM trees in RocksDB, Cassandra, ScyllaDB), shared-disk recovery (Aurora). The shape is remarkably stable across forty years.
 
-For blooming insights, the day persistence enters the picture, the lift is small: pick Postgres, get WAL for free, configure backup cadence, document RPO/RTO, test the restore. None of this is novel — it's table stakes for any serious data layer. The reason it's absent today is the reason "we don't have a database" is fine today: nothing is at stake.
+This codebase opts out of that lineage entirely, and that's correct *for this product*. It's worth noting where the opt-out would NOT be correct:
+  - **System of record.** Any app where losing the user's data is the bug. The "we don't promise durability" line stops working.
+  - **Audit log.** Any app where "what happened and when" is itself the artifact. The reasoning trace today is per-request and lost on instance death; turning that into an audit log requires durability.
+  - **Long-running computation.** Any app where a multi-minute job produces a result the user expects to retrieve later. Today the briefing fits in one request and the answer comes back synchronously; the day it doesn't, a job table with durable rows lands.
 
-Cross-link: `08-replication-and-read-consistency` — the WAL is also how replication ships. `study-distributed-systems` for the broader log-as-truth pattern.
+Each of those is a *product* trigger. None are present today.
 
 ## Interview defense
 
-**Q: "How do you handle durability today?"**
-We don't, because nothing here needs to be durable. Application state lives in `Map`s that wipe on deploy. The auth cookie is the one piece of state that survives — durable for 10 days, encrypted, owned by the browser not by us. The dev-only JSON files are best-effort, no fsync, recoverable by re-authenticating. The committed demo fixtures are durable via git. There's no WAL, no backups, no recovery procedure — because there's no data we'd be sad to lose.
+> Q: "What's the durability story for this app?"
 
-Diagram: the lifetime hierarchy from section 01, with each layer's durability annotated.
+Verdict: in production, there's no on-disk persistence at all — every Map dies with the process. There's no WAL, no backup, no replication, no recovery procedure. The product doesn't promise durability, so the engine doesn't provide it. The recovery path is "the user clicks refresh and the briefing re-runs against Bloomreach," which works because everything stored locally is derived from upstream data.
 
-Anchor: `lib/state/investigations.ts` L30-41 — the closest write-path in the repo; explicitly best-effort.
+```
+  the picture you draw — derivative everywhere, durable upstream
 
-**Q: "If you added user data, what's your minimum durability story?"**
-Postgres. Daily snapshot backups, WAL streamed to S3, target RPO 1 hour and RTO 4 hours for a side project. Test the restore once a quarter — an untested backup is a hope, not a backup. I wouldn't build any of this myself; I'd use Neon or Supabase, which give you WAL-shipped backups out of the box.
+   provider ──► (durable, theirs)
+        │
+        ▼
+   in-memory Map ──► (dies on restart, fine because derivable)
+        ▲
+        │ recovery = re-run briefing
+        │
+   user clicks refresh
+```
 
-Diagram: the WAL + checkpoint + backup picture.
+The load-bearing point: durability has a cost (WAL, fsync, backups, recovery code). That cost is only worth paying when the data lives only in your system. Nothing canonical lives only here, so nothing here needs durability.
 
-Anchor: today, no DB; this is hypothetical and I'd flag it.
+> Q: "What about the dev-mode JSON files?"
+
+Convenience, not durability. Next's dev server hot-reloads modules on every save, which would blow away the in-memory Map and force OAuth re-authentication mid-development. The dev files survive hot-reload. They use whole-file rewrites with `writeFileSync` and no fsync — if the process crashes mid-write, the file is truncated, and the read path treats a corrupt JSON file the same as a missing one. That's fine for a dev cache; it would be unacceptable for a system of record.
+
+> Q: "When would you add a WAL?"
+
+When the product owns canonical data of its own. The two likely triggers are saved investigations (user wants to retrieve them later) and audit logging (compliance or trust requires "what did the agent do, exactly"). Both move state from derivative to authoritative; both make the recovery path "run the briefing again" insufficient. At that point, the decision is which datastore — and whatever you pick, you inherit its WAL. You don't build one.
 
 ## See also
 
-- `08-replication-and-read-consistency` — replication is WAL shipping
-- `05-transactions-isolation-and-anomalies` — COMMIT is what WAL backs
-- `01-database-systems-map` — what little durability we do have
-- `study-distributed-systems` — log-as-truth pattern at a higher altitude
-
----
+  - [`05-transactions-isolation-and-anomalies.md`](./05-transactions-isolation-and-anomalies.md) — the "D" of ACID belongs here
+  - [`08-replication-and-read-consistency.md`](./08-replication-and-read-consistency.md) — durability across nodes
+  - [`audit.md`](./audit.md) — F2 (state wiped on cold start)

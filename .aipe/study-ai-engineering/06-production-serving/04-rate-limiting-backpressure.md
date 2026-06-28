@@ -1,371 +1,359 @@
-# Rate limiting + backpressure
+# 04 — rate limiting and backpressure
 
-**Industry name(s):** client-side throttling / request spacing, fixed-interval rate limiting, backpressure, load shedding, concurrency-bounded queue
-**Type:** Industry standard · Language-agnostic
-
-> `McpClient.liveCall` enforces a fixed minimum interval between outbound calls — set to 1100 ms in `connectMcp` to satisfy Bloomreach's ~1 req/s/user limit — but this is serial spacing for ONE user's call chain, not a real request queue with backpressure or load-shedding when many users share the limit. (The routes do wrap the pre-stream setup — `getOrCreateSessionId` + `connectMcp` — in a try/catch that returns the real error JSON instead of a bare 500.)
-
-
----
+**Subtitle:** Provider-side rate limit + retry · Industry standard (load-bearing)
 
 ## Zoom out, then zoom in
 
-**Zoom out — the bigger picture.** Rate limiting + backpressure is the Provider wrappers band — the spacing logic between the Agent loop's outbound tool calls and the Tools + MCP transport that hits Bloomreach. blooming insights' `McpClient.liveCall` enforces a per-instance ~1100 ms minimum gap on every live call, so a single agent's 6–13 sequential EQL queries never bunch up at the upstream's ~1 req/s ceiling. There is no shared queue, no backpressure signal, no load-shedding — concurrent users in the same process share only the spacer.
+**Load-bearing for live mode.** The Bloomreach alpha MCP server enforces
+"1 per 10 seconds" globally per user. Without explicit rate-limit
+handling, the live mode hits 429 (or its MCP equivalent) on the second
+tool call. `BloomreachDataSource` parses the server's stated penalty
+window, sleeps, and retries up to 3 times — this is what makes
+multi-tool-call agent loops work at all.
 
 ```
-  Zoom out — where the spacer sits
+  Zoom out — rate-limit handling sits at the data-source layer
 
-  ┌─ Agent loop ─────────────────────────────────────┐
-  │  6–13 sequential tool calls per run               │
-  └─────────────────────────┬────────────────────────┘
-                            │
-  ┌─ Provider wrappers ─────▼────────────────────────┐  ← we are here
-  │  ★ liveCall: minIntervalMs = 1100ms spacer ★     │
-  │  per-instance; serial; no queue                   │
-  │                                                   │
-  │  ABSENT here:                                     │
-  │    - shared queue across concurrent runs          │
-  │    - backpressure signal to upstream              │
-  │    - load shedding under burst                    │
-  └─────────────────────────┬────────────────────────┘
-                            │  ~1 req/s
-  ┌─ Tools + MCP transport ─▼────────────────────────┐
-  │  HTTPS → Bloomreach (~1 req/s per-user quota)     │
-  │  429 = Too many requests = run killed             │
-  └──────────────────────────────────────────────────┘
+  ┌─ AptKit agent loop ────────────────────────────────┐
+  │  model picks tool_use → BloomingToolRegistryAdapter│
+  │                          .callTool()               │
+  └──────────────────────┬─────────────────────────────┘
+                         │
+                         ▼
+  ┌─ BloomreachDataSource.callTool ────────────────────┐
+  │  ★ rate-limit retry ladder ★                        │  ← we are here
+  │  - detect rate limit (isError + text match)         │
+  │  - parse Retry-After hint                           │
+  │  - sleep parsed_hint OR exponential backoff         │
+  │  - retry up to maxRetries (3)                       │
+  │  - cap each wait at retryCeilingMs (20s)            │
+  └──────────────────────┬─────────────────────────────┘
+                         │
+                         ▼
+  ┌─ MCP transport → Bloomreach loomi connect ──────────┐
+  │  server returns rate-limit error envelope            │
+  └──────────────────────────────────────────────────────┘
 ```
-
-**Zoom in — narrow to the concept.** The question is: how does one client stay under a hard upstream limit, and what happens when many clients share that one limit at once? Spacing one caller's calls is easy — a timestamp and a sleep. Coordinating *many* callers against a shared limit (queue? reject? shed?) is the hard part most implementations skip. blooming insights solves the first half well via `liveCall`'s minimum-gap spacer; the second half is honest gap. How it works walks the spacer, why minimum-gap differs from a token bucket, and what changes when "concurrent users" arrives.
-
----
 
 ## Structure pass
 
-**Layers.** Three layers: the agent loop (emits 6–13 sequential tool calls per run), the provider wrappers (`McpClient.liveCall` enforces a 1100 ms minimum-gap spacer per instance — no shared queue, no backpressure signal), and the MCP transport to Bloomreach (~1 req/s per-user quota, 429 = run killed). The spacer is solo; concurrent users share only the spacer per instance, not a global limiter.
-
-**Axis: failure.** When upstream demand exceeds capacity, where does the failure originate, propagate, and get contained — or not? This axis is the right lens because the file's whole frame is "one user's spacing works; many users sharing the limit doesn't." Failure originates at the upstream limit, would propagate as 429s, and is *partially* contained by spacing for solo flows. The gaps (shared queue, backpressure, load-shedding) are where failure-containment is absent.
-
-**Seams.** The cosmetic seam is between the agent loop and `liveCall` — both are CODE on the same side. The load-bearing seam is between `liveCall`'s spacer and the MCP transport: failure containment flips here from "I control my pacing" to "the upstream enforces theirs (and 429 will kill the run)." The would-be seams that don't exist: between concurrent users and a shared queue (no coordination), and between burst load and a load-shedding policy (no signal). The spacer solves the solo case; the rest is gap.
-
-```
-  Structure pass — rate limiting + backpressure
-
-  ┌─ 1. LAYERS ───────────────────────────────────┐
-  │  agent loop (6–13 sequential tool calls)       │
-  │  provider wrappers (liveCall — 1100ms spacer)  │
-  │  MCP transport (Bloomreach, ~1 req/s, 429s)    │
-  └────────────────────────┬───────────────────────┘
-                           │  pick the axis
-  ┌─ 2. AXIS ─────────────▼────────────────────────┐
-  │  failure: where does over-capacity originate,  │
-  │  propagate, and get contained?                 │
-  └────────────────────────┬───────────────────────┘
-                           │  trace across layers, find flips
-  ┌─ 3. SEAMS ────────────▼────────────────────────┐
-  │  agent loop↔spacer: cosmetic                   │
-  │  spacer↔upstream: LOAD-BEARING                 │
-  │    "I pace myself" → "they enforce theirs"     │
-  │  GAPS: no shared queue across concurrent runs, │
-  │   no backpressure, no load-shedding            │
-  └────────────────────────┬───────────────────────┘
-                           ▼
-                   Block 4 — How it works
-```
-
-The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+  → **One axis to trace — retry strategy.** Parse the server's stated
+    wait (preferred) → exponential backoff (fallback) → cap at
+    ceiling. Each decision optimizes for "land just AFTER the
+    penalty clears, not before, not way after."
 
 ## How it works
 
-**Mental model.** Rate limiting is "don't send faster than X." There are two sub-problems. **Spacing** answers "how do I slow one caller down?" — track the last send time, wait until enough has passed. **Backpressure** answers "what do I do when more demand arrives than the limit allows?" — queue it (with a bound), reject it (load-shed), or block the producer. You implement spacing and skip backpressure, because the deployment target is one user at a time.
+### Move 1 — the mental model
+
+Same shape as a typed-rate-limit-aware HTTP client (axios with
+retry-after support, Cloudflare's auto-retry). The provider tells you
+when to come back; honor it.
 
 ```
- spacing (built)                     backpressure (absent)
- ──────────────────────────         ────────────────────────────────
- one caller, serial calls            many callers, shared limit
- wait until lastCallAt + interval    queue / shed / block under burst
- timestamp + sleep                   bounded queue + rejection policy
+  Retry ladder
+
+  call tool → ok? → return
+       │ no, rate limit
+       ▼
+  parse Retry-After from error envelope
+       │
+  ┌────┴────┐
+  │         │
+  ▼ found   ▼ not found
+   sleep    exponential backoff
+   (hint+   (retryDelayMs *
+    buffer) 2^retry_count)
+       │         │
+       ▼         ▼
+       cap at retryCeilingMs
+       │
+       ▼
+  retry call
+       │
+   retry count < maxRetries?
+   ┌──┴──┐
+   │     │
+   ▼ yes ▼ no
+   loop  return error result
 ```
 
-The gap matters because spacing assumes calls arrive *one at a time*. The instant two call chains run concurrently against the same per-user limit, spacing alone is insufficient — and there is no queue to serialize them.
+### Move 2 — the step-by-step walkthrough
 
----
+**Detection — `isRateLimited`** (`lib/data-source/bloomreach-data-source.ts:51-55`):
 
-### Fixed-interval spacing (the spacing gate)
-
-Every live MCP call goes through the spacing gate, which is the single place the transport is touched. Before each call it measures how long since the last one and sleeps the remainder of the minimum interval.
-
-```
-  function live_call(name, args):
-      elapsed = Date.now() - lastCallAt
-      if elapsed < minIntervalMs:
-          await sleep(minIntervalMs - elapsed)
-      result      = transport.callTool(name, args)
-      lastCallAt  = Date.now()
-      return result
+```typescript
+function isRateLimited(result: unknown): boolean {
+  if (!result || typeof result !== 'object' || (result as any).isError !== true) return false;
+  const text = JSON.stringify((result as any).content ?? result);
+  return /rate limit|too many requests/i.test(text);
+}
 ```
 
-`lastCallAt` is a single instance field on the MCP client wrapper. Every live call — whether a cache miss or a retry — updates it after the transport returns, so two back-to-back calls always have at least `minIntervalMs` between their network hits.
+The MCP server returns rate limits as error results (not HTTP 429 —
+the tool-call wrapper hides the transport). `isError: true` plus text
+matching "rate limit" or "too many requests" is the detection.
 
-```
-time ─────────────────────────────────────────────────────────────▶
-  call A                          call B
-    │                               │
-    ▼                               ▼
-  liveCall A                      liveCall B
-  elapsed = ∞ → no wait           elapsed = 300ms < 1100
-  network @ T₀                    wait 800ms ─────────┐
-  lastCallAt = T₀                 network @ T₀+1100 ◀─┘
-    │◀──────── 1100 ms minimum ──────────▶│  lastCallAt = T₁
-```
+**Parsing the wait hint — `parseRetryAfterMs`**
+(`lib/data-source/bloomreach-data-source.ts:64-71`):
 
-This is a *strict* throttle: at most one call per `minIntervalMs`. Unlike a token bucket, it never lets an idle client accumulate credit to burst — every call waits its full gap.
-
----
-
-### The interval — 1100 ms for the backend's ~1 req/s
-
-The interval is set where the client is constructed. The default in the wrapper is 200 ms, but the connect-MCP helper overrides it to 1100 ms for the real backend connection.
-
-```
-  function connect_mcp_inner(sessionId):
-      ...
-      # Bloomreach rate-limits per user GLOBALLY
-      return {
-          ok:  true,
-          mcp: new McpClient(
-              new SdkTransport(client, httpErrors),
-              { minIntervalMs: 1100, retryDelayMs: 10_000,
-                retryCeilingMs: 20_000, maxRetries: 3 },
-          ),
-      }
+```typescript
+function parseRetryAfterMs(result: unknown): number | null {
+  const text = JSON.stringify((result as any)?.content ?? result);
+  const after = text.match(/retry[\s-]*after[^0-9]*(\d+)\s*second/i);
+  if (after) return parseInt(after[1], 10) * 1000;
+  const perWindow = text.match(/per\s*(\d+)\s*second/i);
+  if (perWindow) return parseInt(perWindow[1], 10) * 1000;
+  return null;
+}
 ```
 
-The 1100 ms (just over one second) is deliberate headroom over the documented ~1 req/s/user ceiling. Combined with the 60s tool cache (`01-llm-caching.md`), this keeps a single user's agent run under the limit: even a 13-call briefing spaces out to ~14 seconds of network time, comfortably inside the route's `maxDuration = 300` budget.
+Two regex patterns matching the two observed shapes:
+  - `"Retry after ~12 second(s)"` → 12000
+  - `"rate limit reached (1 per 10 second)"` → 10000
 
-```
-  Bloomreach limit:  ~1 req / 1 sec / user
-  spacing chosen:    1100 ms  (10% headroom)
-  13-call run:       ~14.3 sec of spaced network calls < 300s budget
-```
+Returns null when neither matches; the caller falls back to backoff.
 
----
+**The retry loop — `callTool`**
+(`lib/data-source/bloomreach-data-source.ts:163-174`):
 
-### What spacing does NOT do — no queue, no backpressure
-
-Spacing assumes a *serial* caller. The agent loop is serial within one run — it awaits each tool call before issuing the next — so within a single investigation, `lastCallAt` correctly gaps every call. But there are two scenarios spacing alone does not cover.
-
-```
- SERIAL (covered):                  CONCURRENT (NOT covered):
- run 1: A→B→C→D                     run 1: A → C → ...
-   each awaits the prior            run 2:   B → D → ...
-   lastCallAt gaps them             both share one McpClient.lastCallAt?
-                                     → they interleave, but there is NO
-                                       queue ordering them; whoever calls
-                                       liveCall first wins the slot,
-                                       the other waits — no fairness,
-                                       no bound on how many wait
+```typescript
+let retries = 0;
+while (isRateLimited(result) && retries < this.maxRetries) {
+  retries++;
+  const hintMs = parseRetryAfterMs(result);
+  const backoffMs = this.retryDelayMs * 2 ** (retries - 1);
+  const waitMs = Math.min(
+    hintMs != null ? hintMs + RETRY_BUFFER_MS : backoffMs,
+    this.retryCeilingMs,
+  );
+  await sleep(waitMs);
+  result = await this.liveCall(name, args, options.signal);
+}
 ```
 
-There is no request queue. If N call chains run concurrently against one MCP client wrapper, they all contend on the same `lastCallAt` field — each spacing-gate call waits, but there is no ordering, no fairness, and no bound on how many can pile up waiting. Worse, each `connect_mcp` call creates a *new* wrapper with its own `lastCallAt`, so two concurrent users get two independent spacers and can both hit the backend at once — 2 req/s against a 1 req/s per-user limit if they share a quota, or simply uncoordinated load.
+The breakdown:
 
-And there is no **load shedding**: under a burst, the system does not reject excess work or signal backpressure to the producer. It just makes everyone wait, unbounded.
+  → **`retryDelayMs = 10_000`** (default, line 135). The comment says:
+    *"Bloomreach's observed penalty window is ~10s ('1 per 10 second'),
+    so a fixed sub-second retry just burns the attempt inside the same
+    window. Default the fallback base to that window."*
 
----
+  → **`RETRY_BUFFER_MS = 500`** (line 49). Added to the parsed hint so
+    the retry lands *just after* the penalty clears rather than on the
+    boundary. Small cushion against clock skew between client and
+    server.
 
-### Current state vs future state
+  → **`retryCeilingMs = 20_000`** (default, line 136). Cap on any single
+    retry wait. Without this, an exponential backoff at retry 3 would
+    be 40s, blowing the route's 60s budget.
 
-```
-            built                          absent
-            ──────────────────────         ────────────────────────────
-spacing     fixed 1100ms interval           —
-            (liveCall, one serial caller)
-queue       —                              concurrency-bounded queue
-backpressure —                             reject / block when full
-shedding    —                              drop excess under burst
-coordination per-instance lastCallAt        shared limiter across users
-```
+  → **`maxRetries = 3`** (default, line 131). Bounded. The comment
+    notes: *"Latency note: against the 60s route budget (app/api/agent),
+    maxRetries=3 at ~10s each can cost ~30s on a single call, so the
+    cap stays low by default."*
 
-The absent pieces are all about *contention*: a queue to serialize concurrent callers fairly, a bound on queue depth, a backpressure signal when the bound is hit, and cross-instance coordination so N users sharing a limit do not collectively exceed it.
+**Proactive spacing** (line 130, 190-194). Separately from retry, the
+data source enforces a `minIntervalMs` between calls (default 200ms,
+not the 10s server-side window — that's a different budget):
 
----
-
-### The principle
-
-Spacing controls one caller's rate; backpressure controls a *system's* behavior under contention. A timestamp-and-sleep throttle is the right tool when calls are serial and single-tenant — which is exactly this system's deployment shape. It stops being sufficient the moment multiple callers share one limit: then you need a queue (to order them), a bound (to cap pending work), and a shedding policy (to fail fast instead of letting latency grow unbounded). The lesson generalizes: rate limiting is easy for one; the engineering is in what happens to the (N-1)th caller.
-
----
-
-### Code in this codebase
-
-Partially implemented — fixed-interval spacing is built; queueing, backpressure, and load-shedding are not.
-
-#### Fixed-interval inter-call spacing (Case A)
-
-**File:** `lib/mcp/client.ts`
-**Function / class:** `McpClient.liveCall`
-**Line range:** L148–L163 (`elapsed` L149, sleep gate L150–L151, transport call L154, `lastCallAt = Date.now()` L155). State field `lastCallAt` at L81; default `minIntervalMs = 200` at L88.
-
-#### The 1100 ms interval for Bloomreach (Case A)
-
-**File:** `lib/mcp/connect.ts`
-**Function / class:** `connectMcpInner`
-**Line range:** L66–L107; the rate-limit comment at L81–L88 and the `{ minIntervalMs: 1100, retryDelayMs: 10_000, retryCeilingMs: 20_000, maxRetries: 3 }` construction at L91–L96. The route's `maxDuration = 300` budget that this spacing must fit inside is at `app/api/agent/route.ts` L20.
-
-Note: both routes now guard the pre-stream setup. In `app/api/agent/route.ts` L155–L165 (and the parallel `app/api/briefing/route.ts` L62–L72), `getOrCreateSessionId()` + `connectMcp()` run inside a `try/catch` that returns the real error JSON (`/api/agent setup · <message>`, status 500) instead of a bare 500 — so a setup throw (e.g. a missing `AUTH_SECRET` breaking cookie encryption in production) surfaces the actual cause. The 401 `needsAuth`/`authUrl` response follows a successful connect.
-
-#### Request queue + backpressure + load shedding (Case B — Not yet implemented)
-
-**Not yet implemented.** blooming insights spaces a single serial caller with a timestamp-and-sleep (`liveCall`) but has no request queue, no depth bound, no backpressure signal, and no load-shedding — concurrent call chains contend on `lastCallAt` with no ordering, and each `connectMcp` builds a fresh per-instance spacer (`lib/mcp/connect.ts` L91–L96) so multiple users are uncoordinated.
-
-Where it would live: a concurrency-bounded queue would wrap `liveCall` inside `McpClient` (`lib/mcp/client.ts` L148), serializing all callers through one ordered queue with a max depth that triggers backpressure (reject or block) when full. Cross-user coordination would require a shared limiter (a Redis/Upstash sliding window keyed per Bloomreach user) constructed in `connectMcp` (`lib/mcp/connect.ts` L91) instead of a per-instance field.
-
----
-
-## Rate limiting + backpressure — diagram
-
-This diagram spans the Agent, Service (McpClient), and Provider layers. The spacing gate is built (solid); the queue/backpressure layer is the gap (dashed).
-
-```
-  ┌────────────────────────────────────────────────────────────────────┐
-  │  AGENT LAYER   lib/agents/  — serial within one run                  │
-  │                                                                     │
-  │  run 1: callTool A → (await) → callTool B → (await) → callTool C    │
-  │  run 2 (concurrent): callTool D → ...                               │
-  │       │                                                             │
-  │  ╎ GAP  no queue ordering concurrent runs; no depth bound ╎          │
-  └───────┼──────────────────────────────────────────────────────────────┘
-          │
-  ┌───────▼──────────────────────────────────────────────────────────────┐
-  │  SERVICE LAYER   lib/mcp/client.ts                                    │
-  │                                                                       │
-  │  ┌──────────────────────────────────────────────────┐               │
-  │  │  liveCall — spacing gate  (BUILT)                  │               │
-  │  │  elapsed = now - lastCallAt                        │               │
-  │  │  elapsed < 1100 ? await (1100 - elapsed)           │               │
-  │  │  lastCallAt = now                                  │               │
-  │  └──────────────────────────────────────────────────┘               │
-  │       │ minIntervalMs = 1100 set in connectMcp                       │
-  │                                                                       │
-  │  ╎ GAP  no backpressure: under burst everyone waits, unbounded ╎      │
-  │  ╎ GAP  lastCallAt is per-instance — concurrent users uncoordinated ╎ │
-  └───────┼──────────────────────────────────────────────────────────────┘
-          │  NETWORK / PROVIDER BOUNDARY
-  ┌───────▼──────────────────────────────────────────────────────────────┐
-  │  PROVIDER   Bloomreach MCP server                                     │
-  │  limit: ~1 req / 1 sec / user GLOBALLY  │
-  └───────────────────────────────────────────────────────────────────────┘
+```typescript
+private async liveCall(name, args, signal): Promise<unknown> {
+  const elapsed = Date.now() - this.lastCallAt;
+  if (elapsed < this.minIntervalMs) {
+    await new Promise((r) => setTimeout(r, this.minIntervalMs - elapsed));
+  }
+  // ... transport call
+}
 ```
 
-A reader who sees only this diagram should grasp: one serial caller is correctly spaced at 1100 ms; concurrent callers and burst load have no queue, bound, or shedding.
+This is *proactive* — it ensures calls are spread, not bursty — but
+not enough on its own to stay under the server's 1-per-10s limit.
+The retry ladder absorbs the actual rate-limit events.
 
----
+**Cache** (lines 122, 144-152, 185-186). 60-second TTL on every
+successful tool-call result. Repeat calls within 60s return from
+cache without hitting the server. This is the single biggest reducer
+of rate-limit pressure — the agent often re-queries during a loop
+(checking volume, then re-checking after a breakdown query), and
+cache absorbs the repeats.
+
+**The whole ladder in motion** for a hypothetical scenario where the
+model burst-calls 3 tools in 1 second:
+
+  1. Call 1 — fresh — runs → cached, lastCallAt = T.
+  2. Call 2 — fresh, 200ms after T → liveCall waits 0ms (200ms
+     elapsed), runs → rate-limit error.
+  3. Retry 1 for call 2 — parsed hint says "1 per 10 second" → wait
+     10s + 500ms → call succeeds, cached.
+  4. Call 3 — happens after call 2's 10s wait → 10.2s after T,
+     `minIntervalMs` elapsed → runs immediately → maybe rate-limited
+     again (depends on server state).
+
+In practice, the cache absorbs most repeats, so the rate-limit pressure
+is much lower than the worst case. A typical 6-call investigation has
+maybe 1-2 rate-limit retries; the route lands in 60-90s instead of
+the worst-case 180s+.
+
+### Move 3 — the principle
+
+**Honor the server's stated wait. Fall back to exponential backoff
+only when the server didn't say. Cap every wait at a ceiling that
+keeps you inside your overall budget. Add small buffers for clock
+skew.** The pattern is universal across rate-limited HTTP APIs (Stripe,
+GitHub, Twitter); MCP servers happen to encode the wait inline in the
+error text instead of in a `Retry-After` header.
+
+## Primary diagram
+
+```
+  The full retry ladder for one tool call
+
+  callTool(name, args, options)
+       │
+       ▼
+  cache hit?
+       │
+  ┌────┴────┐
+  │ yes     │ no
+  ▼         ▼
+  return    enforce minIntervalMs spacing
+  cached    │
+            ▼
+         liveCall → transport → MCP server
+            │
+            ▼
+         result. isRateLimited?
+            │
+       ┌────┴────┐
+       │ no      │ yes, retries < maxRetries
+       ▼         ▼
+       cache    parse Retry-After hint
+       result    │
+       return    ▼
+                hint? hint + 500ms : retryDelayMs * 2^retry
+                    │
+                    ▼
+                cap at retryCeilingMs (20s)
+                    │
+                    ▼
+                sleep
+                    │
+                    ▼
+                liveCall again → loop
+                    │
+                    ▼
+                if retries == maxRetries:
+                    return last result (still error)
+
+       finally: errors NOT cached
+       (line 179-181 — don't poison the cache)
+```
 
 ## Elaborate
 
-### Where this pattern comes from
+The "parse Retry-After from error text" pattern is specific to MCP-
+shaped servers that wrap errors in tool-call envelopes. For standard
+HTTP APIs, `Retry-After` is a header and parsing is trivial. The
+choice here is forced by the protocol shape.
 
-**Client-side rate limiting** enforces the limit at the caller before the server has to reject — the `debounce`/`throttle` family from frontend land, applied to backend calls. **Fixed-interval throttling** is the strictest variant: at most one call per interval, no bursts. It contrasts with the **token bucket** (allows bursts up to a bucket size, refilling at a steady rate) and the **leaky bucket** (smooths a burst into a steady output). **Backpressure** comes from flow-control theory and Reactive Streams: when a consumer cannot keep up, it signals the producer to slow or stop, rather than letting an unbounded buffer grow. **Load shedding** is the failure-mode sibling: when you cannot serve all demand, reject some of it fast rather than degrade everyone.
+The decision to NOT cache errors (line 179-181) is important. Without
+it, a single rate-limit response would be cached for 60s, locking out
+the tool for that period. By skipping the cache on `isError: true`,
+the retry-after sleep is the only blocker, and the next call (after
+the wait) hits the server fresh.
 
-### The deeper principle
-
-```
-  one caller                         many callers
-  ──────────────────────────         ──────────────────────────────
-  spacing: timestamp + sleep         queue: order + bound the contention
-  strict throttle (no burst)         backpressure: reject/block when full
-  per-instance state ok              shared limiter required
-  blooming insights: BUILT           blooming insights: ABSENT
-```
-
-The transition from "one" to "many" is where rate limiting becomes a systems problem. For one serial caller, a field and a sleep are provably correct. For many, you need an ordering structure (queue), a resource bound (max depth), a policy for exceeding it (shed/block), and shared state (so independent instances do not each think they are compliant while collectively violating the limit).
-
-### Where this breaks down
-
-Per-instance `lastCallAt` does not coordinate across instances. Each `connectMcp` builds a new `McpClient` (`lib/mcp/connect.ts` L91–L96); on serverless, each cold-started function instance has its own `lastCallAt = 0` and can fire immediately, so two instances serving one user can send 2 req/s against a 1 req/s quota. Even within one process, concurrent call chains contend on `lastCallAt` with no fairness — a later caller can win the slot a earlier one was waiting for. And there is no bound: under a burst, the number of callers parked in `await sleep(...)` grows without limit, so latency climbs unboundedly instead of the system shedding excess work and failing fast.
-
-### What to explore next
-
-- `p-queue` / `p-limit` — a concurrency-bounded queue that orders callers and caps in-flight work, replacing the bare `lastCallAt` field
-- `Bottleneck` — a Node rate limiter with reservoir, priority, and clustering (Redis-backed) support for multi-instance coordination
-- Backpressure policies — reject-when-full (429 to the caller) vs block-the-producer vs drop-oldest
-- Upstash Rate Limit — a Redis sliding-window limiter keyed per Bloomreach user for cross-instance correctness
-
----
+`maxRetries = 3` is conservative. Could be raised to 5 if the route
+budget allowed — currently `300s` Vercel Pro budget, the diagnostic
+loop typically uses ~60-90s, so there's headroom. The cap is
+specifically conservative because *each* retry could burn 10s, and
+six retries across a multi-tool-call agent loop could add 60s to a
+single investigation.
 
 ## Project exercises
 
-### Concurrency-bounded queue with backpressure
+### Exercise — surface retry events on the trace wire
 
-- **Exercise ID:** B5.1 (adapted) — provenance C5.4 (rate-limiting).
-- **What to build:** Replace the bare `lastCallAt` spacing in `McpClient` with a concurrency-bounded queue (e.g. `p-queue` with `concurrency: 1` + `interval`/`intervalCap`) that serializes ALL callers through one ordered queue, caps queue depth, and applies backpressure — rejecting (or signaling) excess work when the depth bound is hit instead of letting waiters pile up unbounded.
-- **Why it earns its place:** it shows you understand the difference between spacing one caller and coordinating many, and that you have a load-shedding policy rather than unbounded latency growth.
-- **Files to touch:** `lib/mcp/client.ts` (wrap `liveCall` at L148 in the queue; the `callTool` path at L113/L131 routes through it), `test/mcp/client.test.ts` (extend the spacing tests to cover concurrent callers and a full queue).
-- **Done when:** N concurrent `callTool` invocations on one `McpClient` are ordered and spaced at ≥1100 ms with a bounded number in flight, and exceeding the depth bound triggers the chosen backpressure policy — verified by a test firing a burst.
-- **Estimated effort:** 1–2 days.
+  → **Exercise ID:** `study-ai-eng-06-04.1`
+  → **What to build:** Add a `{ type: 'retry', toolName, attemptN,
+    waitMs, hintMs }` event emitted from `BloomreachDataSource.callTool`
+    via the trace sink. UI shows a "rate limited, waiting Ns" indicator
+    inline in the tool call row.
+  → **Why it earns its place:** Today rate-limit retries are invisible
+    — the tool just takes longer. Surfacing them tells the user "this
+    isn't broken, the alpha server is slow."
+  → **Files to touch:** `lib/data-source/bloomreach-data-source.ts`
+    (accept a trace callback option), `lib/agents/aptkit-adapters.ts`
+    (pass it through), `lib/mcp/events.ts`, route's `hooksFor`,
+    `components/investigation/ToolCallBlock.tsx`.
+  → **Done when:** A live investigation that hits rate-limit retries
+    shows "retrying in 10s..." inline in the tool call row.
+  → **Estimated effort:** `1–4hr`
 
-### Cross-instance shared limiter for concurrent users
+### Exercise — add backpressure on the route's parallel request handling
 
-- **Exercise ID:** B5.1 (adapted) — provenance C5.4 (rate-limiting, distributed).
-- **What to build:** Construct a shared limiter (Upstash/Redis sliding window keyed per Bloomreach user) in `connectMcp` so that two serverless instances serving the same user collectively stay under ~1 req/s, instead of each running an independent per-instance spacer.
-- **Why it earns its place:** demonstrates you recognized that per-instance state is the failure mode under horizontal scaling and chose the correct distributed fix.
-- **Files to touch:** `lib/mcp/connect.ts` (construct the shared limiter at L91 instead of the per-instance `minIntervalMs`), `lib/mcp/client.ts` (consult the shared limiter in `liveCall` L148).
-- **Done when:** two `McpClient` instances for the same user, sharing the limiter, collectively respect the ~1 req/s ceiling — verified with a fake shared store in a test.
-- **Estimated effort:** 1–2 days.
-
----
+  → **Exercise ID:** `study-ai-eng-06-04.2`
+  → **What to build:** Vercel scales horizontally — concurrent requests
+    from the same user could each hit the BloomreachDataSource's
+    per-instance rate-limit handling, but they don't coordinate
+    across instances. Add a per-user concurrency semaphore (e.g. via
+    Vercel KV or Upstash Redis) that limits one user to N concurrent
+    `/api/agent` calls at a time. Excess requests get 429'd at the
+    route with a hint to retry.
+  → **Why it earns its place:** Cross-instance coordination is what
+    real backpressure looks like in serverless. Demonstrates "I know
+    how to bound concurrency at the platform layer, not just the
+    process layer."
+  → **Files to touch:** new `lib/middleware/backpressure.ts`,
+    `app/api/agent/route.ts` (apply middleware), env vars for KV
+    connection.
+  → **Done when:** Three concurrent `/api/agent` requests from the
+    same session — two run, one gets 429 with a retry-after.
+  → **Estimated effort:** `1–2 days`
 
 ## Interview defense
 
-### What an interviewer is really asking
+**Q: How does this codebase handle rate limits?**
 
-"How do you rate-limit calls to an upstream?" tests whether you know the difference between throttling one caller and coordinating many under a shared limit. The weak answer is "I add a delay between calls." The strong answer names spacing as the easy half, then identifies the queue, the bound, the shedding policy, and cross-instance coordination as the parts that make it a systems problem.
-
-### Likely questions
-
-**[mid] How does blooming insights stay under Bloomreach's ~1 req/s limit?**
-
-`liveCall` (`lib/mcp/client.ts` L148–L163) measures `Date.now() - lastCallAt` and sleeps the remainder of `minIntervalMs` (1100 ms, set in `connectMcp` L91–L96) before each network call, updating `lastCallAt` after. A serial call chain is gapped at ≥1100 ms.
+Bloomreach's alpha MCP server enforces "1 per 10s" globally per user.
+`BloomreachDataSource.callTool` has explicit handling: detect the
+rate-limit error (regex on the result text), parse the server's
+stated wait (`Retry-After ~X second(s)` or `per X second`), sleep,
+retry. Up to 3 retries, each capped at 20s.
 
 ```
-  call ─► liveCall ─► wait until lastCallAt+1100 ─► network ─► lastCallAt = now
+  detect → parse hint → wait (hint+500ms or backoff) → retry
+  cap retries at 3
+  cap each wait at 20s
+  parallel: 60s cache absorbs repeats
+  parallel: 200ms proactive spacing between calls
 ```
 
-**[senior] Two users run investigations at the same time. Is the limit still respected?**
+Cache is the load-bearing reducer of pressure: most agent loops
+re-query data within 60s of the previous query, so the cache absorbs
+the bulk of would-be repeat calls.
 
-Not reliably. Each `connectMcp` builds a separate `McpClient` with its own `lastCallAt` (`lib/mcp/connect.ts` L91–L96), so the two spacers are independent and can both fire — 2 req/s if they share a per-user quota. And there is no queue ordering them.
+**Anchor line:** "Parse the server's stated wait first; exponential
+backoff is the fallback. Cap each wait at 20s to keep the route
+budget."
 
-```
-  user A: McpClient.lastCallAt = 0 ─► fire @ T₀
-  user B: McpClient.lastCallAt = 0 ─► fire @ T₀   ← uncoordinated
-```
+**Q: Why not cache errors?**
 
-**[arch] Under a burst of concurrent callers, what happens, and what should happen?**
+If an error result gets cached, every subsequent call sees the cached
+error for 60s — locks out the tool. By skipping cache on
+`isError: true`, the retry-after sleep is the only blocker, and the
+next call after the wait hits the server fresh and (probably)
+succeeds. The comment in code at line 179-181 calls this out
+explicitly.
 
-What happens: callers all park in `await sleep(...)` contending on one `lastCallAt` — latency grows unbounded, no fairness, no rejection. What should happen: a bounded queue orders them and, when depth is exceeded, sheds load (reject/429) so the system fails fast instead of degrading everyone.
-
-```
-  current:  burst → N waiters, unbounded latency
-  desired:  burst → queue(bound) → shed excess (fail fast)
-```
-
-### The question candidates always dodge
-
-**"Why a fixed delay instead of a token bucket?"**
-
-For one serial caller they are functionally identical — the caller never accumulates burst credit because the agent loop awaits each call. The honest answer is that the fixed delay is the simplest thing that is correct for the deployment shape (single serial caller), and the *real* missing piece is not the bucket algorithm but the absence of a queue and backpressure for the multi-caller case. Reaching for a token bucket would be optimizing the wrong axis.
-
-### One-line anchors
-
-- `lib/mcp/client.ts` L148–L163 — `liveCall`, the spacing gate
-- `lib/mcp/client.ts` L81 — `lastCallAt`, the per-instance spacing state
-- `lib/mcp/connect.ts` L91–L96 — `minIntervalMs: 1100` for Bloomreach's ~1 req/s
-- `lib/mcp/connect.ts` L81–L88 — the rate-limit comment documenting the ceiling
-- `app/api/agent/route.ts` L20 — `maxDuration = 300`, the budget spacing must fit inside
-
----
+**Anchor line:** "Errors poison the cache. Skipping them is what
+makes the retry ladder actually recover."
 
 ## See also
 
-→ 05-retry-circuit-breaker.md · → 01-llm-caching.md · → ../04-agents-and-tool-use/README.md
-
----
+  → `04-agents-and-tool-use/02-tool-calling.md` — the layer ABOVE this
+    (how tool calls get dispatched)
+  → `04-agents-and-tool-use/06-error-recovery.md` — the layer that
+    catches what slips through the retry ladder
+  → `05-retry-circuit-breaker.md` — the next pattern (circuit breaker
+    on top of retry — Case B in this codebase)

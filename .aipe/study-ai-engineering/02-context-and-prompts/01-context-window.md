@@ -1,353 +1,272 @@
-# The context window (and the character budgets that keep work inside it)
+# 01 — context window
 
-**Industry name(s):** context window, context-window budgeting, prompt packing, output reservation
-**Type:** Industry standard · Language-agnostic
-
-> The context window is one fixed-size array every part of a request shares — system prompt, message history, tool results, and the room reserved for the answer all compete for the same slots; blooming insights keeps the request inside it by *character* budgeting at every inflow (`truncate`/`MAX_TOOL_RESULT_CHARS = 16_000`, route `TRUNC = 4000`, `schemaSummary` caps) and by a forced tool-less final turn that stops the transcript growing so the model has room to synthesize.
-
-
----
+**Subtitle:** Fixed token budget per call · Industry standard
 
 ## Zoom out, then zoom in
 
-**Zoom out — the bigger picture.** The context window is the fixed-size array every model call shares — system prompt, message history, tool results, and the answer all compete for the same slots. Defending it spans two bands: the Per-agent definitions build the prefix (`schemaSummary` caps in `lib/agents/monitoring.ts` L15–L48), and the Agent loop grows the transcript turn by turn (`truncate` at `lib/agents/base.ts` L31–L34, `forceFinal` at L90–L91 / L101). The Provider is where the bounded array meets the model.
+Every model call has a finite token budget — input plus output combined. For
+`claude-sonnet-4-6` that's 200,000 tokens. The model sees ONLY what's in that
+window. Everything Blooming does to manage prompts, summaries, and turn
+counts is in service of staying inside it.
 
 ```
-  Zoom out — where the window is defended
+  Zoom out — the window is one config of one call
 
-  ┌─ Per-agent (builds the prefix) ──────────────────┐
-  │  schemaSummary caps  monitoring.ts L15–48        │
-  │    20 events / 10 props / 30 cprops              │
-  └─────────────────────────┬────────────────────────┘
-                            │  system prefix
-  ┌─ Agent loop (grows the transcript) ──────────────┐  ← we are here
-  │  ★ MAX_TOOL_RESULT_CHARS = 16_000 ★ base.ts L29  │
-  │  truncate per tool_result   L31–34, applied L150 │
-  │  forceFinal → omit tools    L90–91, L101         │
-  │    → transcript STOPS growing                    │
-  └─────────────────────────┬────────────────────────┘
-                            │  bounded array
-  ┌─ Provider ──────────────▼────────────────────────┐
-  │  anthropic.messages.create({system, messages,    │
-  │     max_tokens })   ← reserves output room       │
-  │  one shared array: input slots + output slots    │
-  └──────────────────────────────────────────────────┘
+  ┌─ Agent adapter (lib/agents/aptkit-adapters.ts:42) ─────┐
+  │  anthropic.messages.create({                           │
+  │    model: 'claude-sonnet-4-6',  ← 200k token window   │
+  │    max_tokens: 4096,            ← OUTPUT cap          │  ← we are here
+  │    messages: [...history],      ← INPUT eats the rest │
+  │    system: '...',                                      │
+  │    tools: [...],                                       │
+  │  })                                                    │
+  └────────────────────────────────────────────────────────┘
 ```
-
-**Zoom out — narrow to the concept.** The question is: the window is a fixed number of slots, and each tool call you feed back consumes more of them — so how do you keep a six-call investigation inside it while leaving the model enough room to actually answer? Two disciplines: bound every inflow at the door (`truncate`, `schemaSummary`) and stop the loop filling it before the model synthesizes (the forced tool-less final turn). How it works walks each budget and the tool-omission move that protects the answer's room.
-
----
 
 ## Structure pass
 
-**Layers.** Three layers compete for the same fixed-size slot array: the per-agent prefix construction (the system prompt + `schemaSummary`), the agent loop (which grows the transcript turn by turn and runs `truncate` on each tool result), and the provider's call where `max_tokens` reserves room for the answer at the end. The window is the *shared resource* every layer writes into.
+  → **One axis to trace — utilization.** The window contains five
+    competing things: system prompt, conversation history (grows per turn),
+    tool definitions, current tool results, and reserved output space
+    (`max_tokens`). Hold "what fraction of 200k is each?" as the question:
+    in this codebase the answer per turn is roughly 0.5% / 5-15% / 1% /
+    1-10% / 2%, totaling well under 30%. The cap is comfortable.
 
-**Axis: state.** What's in the message array, how big is it, and when does it stop growing? This axis is the right lens because the context window is fundamentally a state-quantity problem: every layer either adds to it (prefix, transcript, tool results) or constrains it (`truncate`, `forceFinal`, `max_tokens`). Cost is downstream of state size; control is downstream of state size; state-occupancy is the upstream measurement.
-
-**Seams.** The cosmetic seam is between the per-agent prefix and the agent loop's first turn — both are state-additions. The load-bearing seam is between the agent loop's turn growth and the forced-final-turn moment: state-growth flips here from "transcript can grow another tool-call cycle" to "tools are omitted; the model must synthesize from what's already here." This is where the loop yields the remaining window back to the model for output. A second cosmetic seam exists between agent loop and provider — the array crosses unchanged.
-
-```
-  Structure pass — context window
-
-  ┌─ 1. LAYERS ───────────────────────────────────┐
-  │  per-agent prefix (system + schemaSummary)     │
-  │  agent loop (transcript growth + truncate)     │
-  │  provider call (max_tokens reserves answer)    │
-  └────────────────────────┬───────────────────────┘
-                           │  pick the axis
-  ┌─ 2. AXIS ─────────────▼────────────────────────┐
-  │  state: what's in the array, how big, when     │
-  │  does it stop growing?                         │
-  └────────────────────────┬───────────────────────┘
-                           │  trace across layers, find flips
-  ┌─ 3. SEAMS ────────────▼────────────────────────┐
-  │  prefix↔loop: cosmetic (both add state)        │
-  │  loop-grow↔forceFinal: LOAD-BEARING            │
-  │    "can still grow" → "tools off; must answer" │
-  │    yields the rest of the window to output     │
-  └────────────────────────┬───────────────────────┘
-                           ▼
-                   Block 4 — How it works
-```
-
-The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+  → **The seam:** between "what you ship" (`AnthropicModelProviderAdapter.complete()`)
+    and "what the model sees" (the assembled prompt). The seam is where
+    truncation must happen — once you've shipped, you've paid.
 
 ## How it works
 
-**Mental model.** Picture the request as one fixed-length array the model reads top to bottom. Each entry — system prompt, user turn, assistant turn, tool result — occupies real slots. The model's *output* needs free slots at the end. If the input entries fill the array, there is nowhere for the answer to go.
+### Move 1 — the mental model
+
+Same as RAM in a process: fixed size, multiple consumers, OOM if you exceed
+it. The fix is the same too: budget per consumer, cap each, monitor
+utilization.
 
 ```
-context window = one fixed-size array (≈200k tokens for the model used)
-┌──────────────────────────────────────────────────────────────────┐
-│ system prompt │ user │ asst │ tool_result │ asst │ tool_result │ … │  ← input
-└──────────────────────────────────────────────────────────────────┘
-                                                          ▲
-                                                          │ must leave
-                                                          │ room here
-                                              ┌───────────┴──────────┐
-                                              │  output (max_tokens) │  ← answer
-                                              └──────────────────────┘
-   if input fills the array → output has no room → truncated/empty answer
+  The context window — competing consumers
+
+  ┌─────────────── 200,000 tokens (claude-sonnet-4-6) ───────────────┐
+  │                                                                  │
+  │  ┌─ system prompt (the agent's role) ───────┐                   │
+  │  │  ~500 tokens · monitoring.md / etc.       │                   │
+  │  └───────────────────────────────────────────┘                   │
+  │                                                                  │
+  │  ┌─ schema summary (workspace context) ─────┐                   │
+  │  │  ~1500 tokens · schemaSummary() trims    │                   │
+  │  │  from ~30k full schema                   │                   │
+  │  └───────────────────────────────────────────┘                   │
+  │                                                                  │
+  │  ┌─ tool definitions (per-agent allowlist) ──┐                  │
+  │  │  ~1000 tokens · 8-17 tools with schemas   │                  │
+  │  └────────────────────────────────────────────┘                  │
+  │                                                                  │
+  │  ┌─ conversation history (grows per turn) ──────────┐           │
+  │  │  turn 1: ~3-5k                                    │           │
+  │  │  turn 6: ~10-15k (prior turns + tool results)    │           │
+  │  └───────────────────────────────────────────────────┘           │
+  │                                                                  │
+  │  ┌─ reserved output (max_tokens=4096) ──┐                       │
+  │  └───────────────────────────────────────┘                       │
+  │                                                                  │
+  │  ┌─ unused (huge cushion) ──────────────────────────────────────┐│
+  │  │  ~180k tokens left                                           ││
+  │  └───────────────────────────────────────────────────────────────┘│
+  └──────────────────────────────────────────────────────────────────┘
 ```
 
-This system never measures this array in tokens (see → ../01-llm-foundations/02-tokenization.md — it bounds by characters as a coarse proxy). What matters here is the *shape*: the window is shared, the answer competes with the inputs, and the system has to actively defend the answer's room.
+### Move 2 — the step-by-step walkthrough
 
----
+**The cap is set per call, not per loop.** Look at `complete()` again
+(`lib/agents/aptkit-adapters.ts:43-46`):
 
-### Inflow budget 1 — tool results (the tool-result cap)
-
-The biggest single consumer of window space is a raw query tool result. The shared agent loop caps it before it re-enters the conversation:
-
-```
-  MAX_TOOL_RESULT_CHARS = 16_000
-
-  function truncate(s):
-      if length(s) <= MAX_TOOL_RESULT_CHARS:
-          return s
-      return slice(s, 0, MAX_TOOL_RESULT_CHARS) + "\n…[truncated]"
+```typescript
+const params: Anthropic.Messages.MessageCreateParamsNonStreaming = {
+  model: this.defaultModel,
+  max_tokens: request.maxTokens ?? 4096,
+  messages: request.messages.map(toAnthropicMessage),
+};
 ```
 
-Every tool result is JSON-serialized and passed through `truncate` before being pushed back as a tool-result block. A 60,000-char query response becomes 16,000 chars plus a marker. Across the diagnostic agent's six-call budget, this caps the *cumulative* tool-result contribution to ~96,000 characters — the load-bearing defense against the transcript outgrowing the window.
+  → **`max_tokens: 4096`** is the *output* cap. The model will stop after
+    4096 tokens regardless. This bounds individual call cost and prevents
+    runaway generation. It does NOT bound input.
+
+  → **`messages: …`** is the input — the *whole* conversation history. On
+    turn 1 it's just the user message + tool results so far (~empty). On
+    turn 6 it's the user + 5 prior assistant turns + 5 sets of tool
+    results. The model re-reads everything every time.
+
+**Where the budget pressure comes from.** Three growers, in order of
+significance:
+
+  → **Tool results.** Bloomreach EQL queries can return large payloads
+    (event lists, customer counts, segmentation tables). The route
+    truncates results to 4000 chars before they ride the NDJSON wire
+    (`app/api/agent/route.ts:97-101` — `trunc(tc.result)`), but the
+    *agent loop itself* sends the full result to the next turn. A 10kb
+    EQL result is roughly 2.5k tokens — manageable per turn, but six of
+    them stack to 15k.
+
+  → **Schema summary.** `schemaSummary(schema)` (`lib/agents/monitoring.ts:19-60`)
+    truncates aggressively: top 20 events, 10 properties each, 30 customer
+    properties. Output is ~1.5k tokens; full schema would be ~30k. Without
+    this truncation, a 6-turn loop would carry 180k tokens of repeated
+    schema. See `01-llm-foundations/02-tokenization.md` for the numbers.
+
+  → **Tool definitions.** Per-agent allowlists from `lib/mcp/tools.ts` — 8
+    tools for recommendation, 13 for monitoring, 17 for diagnostic, ~20 for
+    query. Each tool definition is ~50-100 tokens (name + description +
+    inputSchema). The diagnostic agent's 17 tools take ~1.5k tokens, repeated
+    every turn.
+
+**The current health check.** Run a typical 6-turn diagnostic investigation:
+
+  ```
+  turn 1:  system 500  + schema 1500 + tools 1500 + messages 1000   ≈ 4.5k
+  turn 2:  system 500  + schema 1500 + tools 1500 + messages 2500   ≈ 6k
+  turn 3:  system 500  + schema 1500 + tools 1500 + messages 4500   ≈ 8k
+  turn 4:  system 500  + schema 1500 + tools 1500 + messages 7000   ≈ 10.5k
+  turn 5:  system 500  + schema 1500 + tools 1500 + messages 10000  ≈ 13.5k
+  turn 6:  system 500  + schema 1500 + tools 1500 + messages 14000  ≈ 17.5k
+  ```
+
+That's well under the 200k cap. The 6-tool-call hard limit in the prompt
+(monitoring/diagnostic) and 4-tool-call limit (recommendation) bound the
+turn count. Even with the largest tool results coming back, the loop has
+~10x headroom.
+
+**Where pressure could grow.** If you removed the schema truncation OR
+removed the per-prompt tool-call cap OR introduced RAG (which would add
+retrieved-doc chunks to context), pressure would climb fast. The current
+configuration is conservative on purpose — it has to work against an alpha
+MCP server that can return arbitrary-sized EQL payloads.
+
+**What happens if you exceed.** The Anthropic API returns a 400 with a
+`max_tokens_exceeded` error. The error doesn't naturally retry; it surfaces
+as a thrown exception in `complete()`, propagates up through AptKit's loop,
+and the route layer catches it and emits `{ type: 'error', message: ... }`
+on the NDJSON stream. The user sees a "something went wrong" panel.
+
+### Move 3 — the principle
+
+**Budget every consumer, cap each, monitor utilization.** Three numbers
+matter: (1) the model's hard cap, (2) the per-turn growers (schema, tool
+results), (3) the turn count multiplier. Multiply (2) by (3) and confirm
+it's well under (1). Add headroom for tool results to grow unexpectedly.
+
+This codebase has a generous cap (200k) and aggressive defaults (20/10/30
+schema truncation, 6-call loop, 4096 output cap). The conservative
+defaults make context overflow effectively impossible on the current data
+shape — which is why nothing in the code path actively monitors
+utilization. Once RAG or longer histories enter the system, that has to
+change. See the exercise.
+
+## Primary diagram
 
 ```
-query result: 60,000 chars
-      │  truncate()   (the agent-loop cap)
-      ▼
-16,000 chars + "\n…[truncated]"
-      │  fed back (stringify + truncate) → tool_result block
-      ▼
-each of 6 calls ≤ 16,000 chars → transcript stays bounded
+  Context window over a 6-turn diagnostic loop
+
+  utilization:
+
+  turn 1:  ██░░░░░░░░░░░░░░░░░░  4.5k / 200k  (2.3%)
+  turn 2:  ███░░░░░░░░░░░░░░░░░  6k   / 200k  (3.0%)
+  turn 3:  ████░░░░░░░░░░░░░░░░  8k   / 200k  (4.0%)
+  turn 4:  █████░░░░░░░░░░░░░░░ 10.5k / 200k  (5.3%)
+  turn 5:  ███████░░░░░░░░░░░░░ 13.5k / 200k  (6.8%)
+  turn 6:  █████████░░░░░░░░░░░ 17.5k / 200k  (8.8%)
+
+  growers per turn:
+    + tool result          ← biggest, unpredictable size
+    + agent text / tool_use
+    + (schema, tools, system: STATIC per turn)
 ```
-
-### Inflow budget 2 — the UI stream (the route stream cap)
-
-A *separate, smaller* budget governs what is streamed to the browser — this one does not protect the window, it protects the wire. The route handler runs a different cap:
-
-```
-  TRUNC = 4000
-
-  function trunc(v):
-      s = JSON.serialize(v)
-      if s and length(s) > TRUNC:
-          return slice(s, 0, TRUNC) + "…"
-      return v
-```
-
-The route applies `trunc` to each tool-call result before it goes into a `tool_call_end` streaming event. It is unrelated to the model's window. Two budgets, two purposes: 16,000 defends the model's context array; 4,000 defends the streaming payload size to the UI.
-
-```
-tool result ──┬── truncate(16_000) ──▶ tool_result block ──▶ model window
-              └── trunc(4000)      ──▶ tool_call_end event ──▶ browser
-   same source, two different ceilings, two different reasons
-```
-
-### Inflow budget 3 — the schema prefix (schema-summary caps)
-
-The system prompt's static prefix is the workspace schema, which is ~112KB raw. The monitoring agent builds a compact summary instead of inlining the whole thing, with three hard caps:
-
-```
-schemaSummary caps
-  MAX_EVENTS          = 20   ← top 20 events only
-  MAX_PROPS_PER_EVENT = 10   ← 10 properties per event
-  MAX_CPROPS          = 30   ← 30 customer properties
-```
-
-The comment alongside is explicit: "Compact, token-bounded schema summary for the prompt (NOT the full 112KB schema)." This prefix is shared by every agent (diagnostic and recommendation both reuse the same summary helper), so capping it once shrinks the fixed cost of *every* agent turn. Inlining the full 112KB schema would consume the window before a single tool result arrived.
-
-### Reserving room for the answer — the forced tool-less final turn
-
-Bounding inflow is half the problem. The other half: the loop keeps *adding* turns, and each added turn shrinks the room left for the answer. The agent loop stops that growth deliberately. A `budgetSpent` check is true once tool calls reach the agent's budget; a `forceFinal` flag is true on that turn or the last allowed turn; and the loop withholds the tool schemas on a `forceFinal` turn:
-
-```
-  budgetSpent = (maxToolCalls is set) and (count(toolCalls) >= maxToolCalls)
-  forceFinal  = (turn == maxTurns - 1) or budgetSpent
-  ...
-  if not forceFinal:
-      params.tools = toolSchemas
-```
-
-With no tool schemas in the request, the model *cannot* emit a `tool_use` block, so it cannot trigger another `tool_result` to be appended. The transcript stops growing. The model is now forced to spend its remaining `max_tokens` writing the answer rather than asking for more data — exactly the room the inflow budgets reserved.
-
-```
-turn  toolCalls  forceFinal  tools sent?  transcript
-────  ─────────  ──────────  ───────────  ───────────────────────────
-  0       0        false        yes        + asst + tool_result (grows)
-  1       2        false        yes        + asst + tool_result (grows)
-  2       4        false        yes        + asst + tool_result (grows)
-  3       6         true         NO        + asst (text only — STOPS)
-                                            ↑ no tool_result appended;
-                                              room left = answer budget
-```
-
-### The principle
-
-A finite shared buffer demands two disciplines, not one: bound every inflow at the door, and stop filling it before the consumer needs room. You bound inflow with character caps (16,000 tool results, 30/20/10 schema, separately 4,000 for the UI) and reserve the answer's room by withholding tools on the final turn so the transcript cannot grow past the point where the model still has space to respond. The window is shared; the answer is what you are protecting.
-
----
-
-### Code in this codebase
-
-#### Files, functions, and line ranges
-
-- **Tool-result inflow cap:** `MAX_TOOL_RESULT_CHARS = 16_000` (`lib/agents/base.ts` L29) and `truncate(s)` (L31–L34). Applied at L150 before each `tool_result` block (pushed L161–L171).
-- **UI-stream cap (separate):** `TRUNC = 4000` and `trunc(v)` — `app/api/agent/route.ts` L99–L103. Applied at L192 to the `tool_call_end` event payload only — not the window.
-- **Schema-prefix caps:** `MAX_EVENTS = 20` (`lib/agents/monitoring.ts` L21), `MAX_PROPS_PER_EVENT = 10` (L22), `MAX_CPROPS = 30` (L33); whole `schemaSummary` L15–L48; intent comment at L14. Imported and reused by `lib/agents/diagnostic.ts` L6 and `lib/agents/recommendation.ts` L6.
-- **Answer-room reservation:** `budgetSpent`/`forceFinal` (`lib/agents/base.ts` L90–L91), tools withheld on the final turn at L101, the create call at L102. Per-agent tool budgets: monitoring 6 (`monitoring.ts` L74), diagnostic 6 (`diagnostic.ts` L61), recommendation 4 (`recommendation.ts` L57).
-- **Output cap (the one real token control):** `max_tokens` default `4096` (`lib/agents/base.ts` L74), synthesis `2048` (`diagnostic.ts` L99 / `recommendation.ts` L98), classifier `16` (`lib/agents/intent.ts` L20).
-
-The codebase bounds the *input* by characters and reserves the *output* with `max_tokens` and the forced-final turn. It never reads `res.usage` to learn how full the window actually got — that gap is named in → ../01-llm-foundations/06-token-economics.md.
-
----
-
-## The context window — diagram
-
-This diagram spans the layers a request crosses and where each budget is applied. The Service layer enforces every inflow cap in characters; the Provider boundary is where the bounded array meets the model and `max_tokens` reserves the output room.
-
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│  SERVICE LAYER — inflow bounded in CHARACTERS                         │
-│                                                                       │
-│  schema (112KB)                                                       │
-│     │ schemaSummary  monitoring.ts (20 events/10 props/30)    │
-│     ▼                                                                 │
-│  compact schema string ──┐                                           │
-│                          │ system prefix (shared by all agents)      │
-│  EQL tool result (60KB)  │                                           │
-│     │ truncate  base.ts (16_000)                              │
-│     ▼                    │                                           │
-│  16,000-char result ─────┤                                           │
-│                          ▼                                           │
-│        messages[]  (system + turns + tool_results — grows per turn)  │
-│                          │                                           │
-│  forced-final turn  base.ts                                          │
-│     forceFinal? → omit tools → transcript STOPS growing       │
-└───────────────────────────┬───────────────────────────────────────────┘
-                            │  the bounded array crosses to the model;
-                            │  max_tokens reserves the OUTPUT slots
-┌───────────────────────────▼───────────────────────────────────────────┐
-│  PROVIDER BOUNDARY — the fixed-size context window                   │
-│                                                                       │
-│  anthropic.messages.create({ system, messages, max_tokens })         │
-│     input slots = bounded transcript │ output slots = max_tokens     │
-└────────────────────────────────────────────────────────────────────────┘
-
-  (separate, parallel)  route.ts TRUNC=4000  bounds the UI stream payload,
-  NOT the window — different budget, different layer, different purpose.
-```
-
-Inflow is capped in the Service layer; the answer's room is reserved by withholding tools on the final turn and by `max_tokens` at the boundary. The UI-stream budget runs alongside and never touches the window.
-
----
 
 ## Elaborate
 
-### Where this pattern comes from
+The 200k Sonnet context window is generous by 2026 standards but not
+infinite. Earlier Claude models had 100k; even earlier ones had 8k. The
+20/10/30 schema truncation budgets were sized for the 100k era and survive
+into the 200k era as conservative defaults. If the truncation budgets were
+re-derived today, the schema summary could be ~5k without trouble — but
+nothing's broken at 1.5k, and the smaller summary means cheaper turns (see
+`06-token-economics.md`).
 
-The context window is a hard architectural limit of the transformer: self-attention is computed over a fixed maximum number of positions, so a model has a fixed maximum sequence length it can attend to in one forward pass. Everything in a request — system prompt, history, tool results, output — is the same sequence, so they all draw from the same budget. "Context-window budgeting" or "prompt packing" is the engineering discipline of deciding what goes into that finite sequence and what gets summarized, truncated, or dropped.
+The reason there's no in-app context-pressure monitor: the data shape this
+codebase sees doesn't push the limits. EQL tool results are mostly
+aggregates (counts, sums) — small. The schema summary is bounded by
+construction. The agent prompts cap tool calls hard. There's nothing in the
+hot path that *can* explode. The moment that changes (RAG, larger schemas,
+multi-tenant deep histories), `02-tokenization.md`'s exercise 2 — the
+context-pressure warning at 100k — becomes relevant.
 
-Reserving output room is the LLM analog of leaving headroom in any fixed buffer. You never fill a fixed-size array to its last slot when a consumer downstream still needs to write into it. blooming insights' forced-final turn is the explicit "stop appending, the consumer needs the rest of the array" move.
-
-### The deeper principle
-
-```
-total window = input slots + output slots   (one shared array)
-─────────────────────────────────────────────────────────────
-unbounded inflow      → input grows → output room shrinks → bad answer
-bounded inflow        → input capped → output room protected → good answer
-forced-final turn     → input STOPS  → output gets the remainder
-```
-
-The window is zero-sum between input and output. Every character you let into the input is a character of output room you gave up. The three inflow caps and the forced-final turn are all the same bet: spend the window on the *minimum* evidence needed and protect the room the answer requires.
-
-### Where this breaks down
-
-1. **Character caps do not adapt to content.** `truncate` slices at a byte offset, not a token or syntactic boundary, and the same 16,000-char cap is used regardless of how the payload tokenizes. JSON tokenizes richer than prose, so 16,000 chars of JSON is more tokens than 16,000 chars of prose — the cap is conservative for JSON but blind to the difference.
-
-2. **No visibility into how full the window got.** Because nothing reads `res.usage`, the system trusts that six 16,000-char results plus the schema prefix stays comfortably inside the window. That is true at current scale but unverified — it is a budget without a meter (→ ../01-llm-foundations/06-token-economics.md).
-
-3. **Truncation is lossy and silent to the model.** A tool result cut at char 16,000 may end mid-object. The model receives `…{"y":` and the appended `…[truncated]` marker — recoverable as a signal, but the dropped data is simply gone from the window. If the answer needed the truncated tail, the diagnosis degrades and nothing flags it.
-
-### What to explore next
-
-- **`res.usage` (input/output tokens):** the SDK returns exact per-call counts — the cheapest way to turn the character budget into a measured one and see how close each call ran to the window.
-- **Sliding-window / summarization compaction:** when a conversation must exceed the window, summarize the oldest turns into a compact note instead of dropping them — the standard fix when a single run's evidence genuinely cannot fit.
-- **Structure-aware truncation:** slice JSON at the nearest valid boundary so the model never sees a half-object.
-
----
+The 4096 `max_tokens` default deserves a note: Sonnet 4.6's hard `max_tokens`
+ceiling per call is 8192. Bumping the default would let longer JSON synthesis
+fit (e.g. monitoring's `Anomaly[]` with all 10 categories' impact prose), but
+also let runaway generation eat more budget. 4096 is the conservative
+default; the recommendation agent's typical final-turn output is ~1500
+tokens, so it's not currently constrained.
 
 ## Project exercises
 
-### Add `res.usage` window-fullness logging to the agent loop
+### Exercise — emit context utilization with each agent turn
 
-- **Exercise ID:** B1.2 (adapted) — context-window instrumentation, the cheap half.
-- **What to build:** after each `anthropic.messages.create` in `runAgentLoop`, read `res.usage.input_tokens` / `output_tokens`, accumulate them per agent, and log the input total as a fraction of the model's window so a run reports how close it came to the edge.
-- **Why it earns its place:** turns an unmeasured character budget into a measured one — the single highest-value step toward knowing whether the inflow caps are actually keeping runs safe.
-- **Files to touch:** `lib/agents/base.ts` (`runAgentLoop`, `AgentRunResult` — add a usage field), and the synthesis calls in `lib/agents/diagnostic.ts` / `lib/agents/recommendation.ts`.
-- **Done when:** a single investigation reports total input tokens and the % of the window consumed per agent, and the number moves when you raise `MAX_TOOL_RESULT_CHARS` or the `schemaSummary` caps.
-- **Estimated effort:** 1–4hr
-
-### Replace fixed character caps with a token-aware inflow budget
-
-- **Exercise ID:** C1.2 (adapted) — context-window budgeting in the real unit.
-- **What to build:** add `lib/mcp/tokens.ts` wrapping `@anthropic-ai/tokenizer`, then rewrite `truncate` and the `schemaSummary` caps to budget against a token ceiling that maps to a fraction of the context window, preferring a valid JSON boundary when cutting.
-- **Why it earns its place:** demonstrates you understand the window is shared and measured in tokens, that char caps cut mid-structure, and that the bound should track the real unit near the edge.
-- **Files to touch:** `lib/agents/base.ts` (`truncate`, `MAX_TOOL_RESULT_CHARS` → a token budget), `lib/agents/monitoring.ts` (`schemaSummary` caps), new `lib/mcp/tokens.ts`, `test/agents/base.test.ts`.
-- **Done when:** a 60KB JSON tool result is truncated to a configured token budget at a valid boundary and the schema prefix respects a token cap, both verified against the tokenizer.
-- **Estimated effort:** 1–4hr
-
----
+  → **Exercise ID:** `study-ai-eng-02-01.1`
+  → **What to build:** In `AnthropicModelProviderAdapter.complete()`,
+    compute `(input_tokens / 200_000) * 100` and emit a
+    `{ type: 'context_utilization', percent }` trace event before the
+    response is returned. Surface in the StatusLog as a small bar.
+  → **Why it earns its place:** Visibility before the limit matters.
+    Today there's nothing in the UI that tells you a long investigation
+    is approaching the wall.
+  → **Files to touch:** `lib/agents/aptkit-adapters.ts:63-71`,
+    `lib/mcp/events.ts` (new type), `components/investigation/ReasoningTrace.tsx`
+    (render).
+  → **Done when:** Each agent turn surfaces a utilization percent in the
+    status panel during live runs.
+  → **Estimated effort:** `1–4hr`
 
 ## Interview defense
 
-### What an interviewer is really asking
+**Q: How big is the context window blooming insights uses, and how much of
+it do you actually consume?**
 
-"How do you keep a multi-tool-call agent inside the context window?" tests whether you know the window is one shared array, whether you bound the inflows that grow it, and whether you protect the output's room. The senior signal is naming that input and output are zero-sum and pointing to the *specific* mechanism that stops the transcript growing — not just "I truncate."
-
-### Likely questions
-
-**[mid] What competes for space in a single model call, and how does this codebase bound it?**
-
-The system prompt, every prior turn, every tool result fed back, and the reserved output room all share one fixed array. The codebase bounds the inflows by characters: `truncate` caps each tool result at 16,000 (`lib/agents/base.ts` L31–L34) and `schemaSummary` caps the prefix (L15–L48). Output room is reserved by `max_tokens` and the forced-final turn.
-
-```
-[ system │ turns │ tool_results │ … │  OUTPUT ]   one shared array
-   ▲caps    grows per turn          ▲ reserved (max_tokens + forced-final)
-```
-
-**[senior] How do you guarantee the model has room left to answer after six tool calls?**
-
-Two mechanisms. The inflow caps keep each of the six results ≤ 16,000 chars so the transcript stays bounded. Then on the final turn `forceFinal` (`base.ts` L91) is true and L101 withholds the tool schemas — with no tools, the model cannot emit a `tool_use` block, so no further `tool_result` is appended and the transcript stops growing. The model spends its remaining `max_tokens` on the answer instead of asking for more data.
+Sonnet 4.6's context window is 200k tokens. A typical 6-turn diagnostic
+investigation peaks at ~17.5k tokens — under 9% of the window. Three things
+keep utilization low: the schema is hand-truncated from ~30k to ~1.5k by
+`schemaSummary()` (`lib/agents/monitoring.ts:19-60`), per-agent tool
+allowlists keep tool definitions to ~1.5k, and the prompt enforces a
+6-tool-call cap so turn count is bounded.
 
 ```
-loop turns: append tool_result each time → transcript grows
-final turn: no tools → no tool_use → no append → transcript STOPS
-            → remaining window = answer's room
+  Budget breakdown per turn (turn 6 of a diagnostic):
+    system prompt           500   tok    ← static
+    schema summary         1500   tok    ← static
+    tool definitions       1500   tok    ← static
+    conversation history  14000   tok    ← grows
+                          ─────
+                         17500   tok / 200000 = 8.8% utilization
 ```
 
-**[arch] The `16_000` and `4000` caps — same purpose?**
+**Anchor line:** "Plenty of headroom. The 20/10/30 schema truncation in
+`schemaSummary` is what keeps history growth slow."
 
-No. `16_000` (`base.ts` L29) bounds what re-enters the *model's* window, defending the shared context array. `4000` (`route.ts` L99) bounds the result payload streamed to the *browser*, defending wire size. They live in different layers and protect different limits; conflating them would couple the UI's payload size to the model's context budget.
+**Q: What would push you close to the cap?**
 
-```
-16_000 ──▶ model window (base.ts)      4000 ──▶ NDJSON to UI (route.ts)
-```
+Three things: (1) RAG (currently not implemented; would add retrieved chunks
+per turn), (2) longer conversation histories (the current cap is per
+investigation; a persistent chat would accumulate), (3) un-truncated EQL
+tool results (currently bounded by the model's tool-call patterns, not by
+explicit truncation in the loop). None of those exist today; they're the
+refactors that would trigger building real context monitoring.
 
-### The question candidates always dodge
-
-**"How close to the window does a real investigation actually run?"** The honest answer in this codebase is "unknown — nothing reads `res.usage`." The caps are a budget without a meter. A candidate who invents a percentage is bluffing; the strong answer points at the absence and names the cheap fix (read `res.usage`, the exercise above).
-
-### One-line anchors
-
-- `lib/agents/base.ts` L29, L31–L34 — `MAX_TOOL_RESULT_CHARS = 16_000`, tool-result inflow cap.
-- `lib/agents/base.ts` L90–L91, L101 — `forceFinal` withholds tools so the transcript stops growing.
-- `app/api/agent/route.ts` L99 — `TRUNC = 4000`, UI-stream budget (different layer/purpose).
-- `lib/agents/monitoring.ts` L15–L48 — `schemaSummary` caps the 112KB schema to a small prefix.
-- Input and output share one fixed array; bounding inflow protects the answer's room.
-
----
+**Anchor line:** "Conservative defaults today, but the *pressure model* —
+schema + tools + history per turn × turn count — is the right shape to
+reason about it."
 
 ## See also
 
-→ 02-lost-in-the-middle.md · → 03-prompt-chaining.md · → ../01-llm-foundations/02-tokenization.md · → ../04-agents-and-tool-use/02-tool-calling.md
-
----
+  → `01-llm-foundations/02-tokenization.md` — what `input_tokens` measures
+  → `01-llm-foundations/06-token-economics.md` — what utilization costs in dollars
+  → `02-lost-in-the-middle.md` — when window position matters

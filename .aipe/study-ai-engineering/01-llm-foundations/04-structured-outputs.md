@@ -1,403 +1,362 @@
-# Structured outputs (extracting a typed contract from prose)
+# 04 — structured outputs
 
-**Industry name(s):** structured output extraction, JSON-from-prose parsing, schema validation / output contracts
-**Type:** Industry standard · Language-agnostic
-
-> The model is asked to emit JSON in a markdown fence; `parseAgentJson` extracts it through three escalating strategies, a `v is T` type guard proves the shape, and a dedicated tool-less `synthesize()` call is the clean-context retry — together a contract that turns a prose string into a validated `Diagnosis`, `Anomaly[]`, or `Recommendation[]`.
-
-
----
+**Subtitle:** Lenient extract + runtime type guard · Project-specific (load-bearing)
 
 ## Zoom out, then zoom in
 
-**Zoom out — the bigger picture.** Structured outputs span two layers: the Per-agent definitions ask for JSON (via `synthesisInstruction` appended in `lib/agents/base.ts` L96–L98), and the trust boundary lives one layer up where each agent runs `parseAgentJson` → type guard → `synthesize()` → `FALLBACK`. The model itself sits in the Provider band and emits prose-with-JSON; the contract that turns that prose into a typed `Diagnosis` / `Anomaly[]` / `Recommendation[]` lives in `lib/mcp/validate.ts` and the per-agent fallback chains.
+Every agent's *final* answer comes back as JSON. The model is asked to emit a
+JSON array or object; Blooming extracts it leniently and then validates the
+shape with a hand-written type guard. No schema mode, no JSON-mode flag, no
+Zod, no tool-call-as-output trick — just `parseAgentJson` + `isAnomalyArray` /
+`isDiagnosis` / `isRecommendationArray`.
 
 ```
-  Zoom out — where the output contract lives
+  Zoom out — where the structured-output contract lives
 
-  ┌─ Per-agent (asks for JSON, parses, repairs) ─────┐  ← we are here
-  │  synthesisInstruction       base.ts L96–98       │
-  │  tryParseDiagnosis ?? synthesize ?? FALLBACK     │
-  │    diagnostic.ts L74–75                          │
-  │  ★ parseAgentJson + type guards ★  validate.ts   │
-  └─────────────────────────┬────────────────────────┘
-                            │  call
-  ┌─ Provider ──────────────▼────────────────────────┐
-  │  anthropic.messages.create  (text out)           │
-  │  finalText = "...```json {...}```..."            │
-  └─────────────────────────┬────────────────────────┘
-                            │  (input side uses native tool-use; output does NOT)
-  ┌─ Tools (input side, contrast) ──────────────────┐
-  │  toolSchemas: native tool-use enforced by SDK   │
-  └─────────────────────────────────────────────────┘
+  ┌─ Prompt (lib/agents/legacy-prompts/*.md) ─────────────┐
+  │  "Return ONLY a JSON array … wrapped in a ```json     │
+  │   fenced block"                                       │
+  └────────────────────────┬──────────────────────────────┘
+                           │
+  ┌─ Agent loop (AptKit) ──▼──────────────────────────────┐
+  │  final turn → content[0].text = "```json\n[…]\n```"   │
+  └────────────────────────┬──────────────────────────────┘
+                           │
+  ┌─ ★ THIS CONCEPT ★  lib/mcp/validate.ts ───────────────┐ ← we are here
+  │  parseAgentJson(text)  →  unknown                     │
+  │  isAnomalyArray(v)    →  v is Anomaly[]               │
+  │  isDiagnosis(v)       →  v is Diagnosis               │
+  │  isRecommendationArray(v) → v is Omit<Recommendation,'id'>[]│
+  └────────────────────────┬──────────────────────────────┘
+                           │
+  ┌─ NDJSON stream to UI ──▼──────────────────────────────┐
+  │  { type: 'insight', insight } · { type: 'diagnosis' } │
+  │  { type: 'recommendation', recommendation }           │
+  └───────────────────────────────────────────────────────┘
 ```
-
-**Zoom in — narrow to the concept.** The question is: how do you guarantee a typed value when the model's "API" is a probabilistic text generator that wraps JSON in prose? The contract is three jobs — extract the JSON (`parseAgentJson`), validate the shape (`isDiagnosis` etc.), repair on failure (`synthesize()` in clean context, then a hand-written `FALLBACK`). How it works walks each stage and the deliberate split between native tool-use for input and parse-from-prose for output.
-
----
 
 ## Structure pass
 
-**Layers.** Four layers from prompt to typed value: the per-agent prompt that asks for JSON (the `synthesisInstruction` plus the agent's system prompt), the provider call that returns `finalText: string` (possibly prose-with-fenced-JSON), the parse step (`parseAgentJson` with its three escalating strategies), and the validate step (`v is T` type guard) — followed by the repair tier (`synthesize()` clean-context retry) and the floor (`FALLBACK`).
+  → **One axis to trace — trust.** From the prompt's POV, the contract is
+    *the model emits JSON in a fenced block*. From the route handler's POV,
+    the contract is *parsed JSON that matches one of three shapes*. The
+    boundary that converts "model said something" into "validated typed
+    object" is `lib/mcp/validate.ts`. Everything above the seam trusts the
+    type; everything below the seam trusts the string.
 
-**Axis: trust.** What can the layer above trust about the bytes coming from the layer below? This axis is the right lens because the entire contract exists to convert "untrusted prose" into "typed value or hand-written floor" — each layer earns a stronger guarantee than the one below. Control would flatten things (the model always decides the prose; the parser always decides the typed value); cost is downstream; trust is what makes each tier's job distinct.
+  → **Layers above and below:** above is the typed UI (`Insight[]`,
+    `Diagnosis`, `Recommendation[]`); below is the model's free-form text
+    output. The 58-line `validate.ts` file is the entire bridge.
 
-**Seams.** Three seams in a row, each upgrading the guarantee. Prompt → provider is cosmetic (a string goes out, a string comes back). The load-bearing seam is provider → parse + validate: trust flips from "probabilistic prose" to "either a typed value or `null`." A second load-bearing seam is parse/validate → repair-or-fallback: trust flips from "best effort" to "always a valid typed value, by construction." The contract is the *composition* of these flips.
-
-```
-  Structure pass — structured outputs
-
-  ┌─ 1. LAYERS ───────────────────────────────────┐
-  │  per-agent prompt (asks for JSON)              │
-  │  provider call (finalText: string)             │
-  │  parse + validate (extract + shape-prove)      │
-  │  repair (synthesize) + floor (FALLBACK)        │
-  └────────────────────────┬───────────────────────┘
-                           │  pick the axis
-  ┌─ 2. AXIS ─────────────▼────────────────────────┐
-  │  trust: what can each layer trust about the    │
-  │  bytes from below?                             │
-  └────────────────────────┬───────────────────────┘
-                           │  trace across layers, find flips
-  ┌─ 3. SEAMS ────────────▼────────────────────────┐
-  │  prompt↔provider: cosmetic                     │
-  │  provider↔parse+validate: LOAD-BEARING         │
-  │    prose → typed or null                       │
-  │  parse+validate↔repair/fallback: LOAD-BEARING  │
-  │    null → always a valid typed value           │
-  └────────────────────────┬───────────────────────┘
-                           ▼
-                   Block 4 — How it works
-```
-
-The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+  → **The load-bearing part:** the *lenient extract* in `parseAgentJson`.
+    Most candidates write `JSON.parse(text)` and call it a day. The model
+    sometimes wraps in fences, sometimes adds prose around the JSON,
+    sometimes emits trailing whitespace. Lenient parse saves a retry every
+    time the model deviates from the exact format.
 
 ## How it works
 
-**Mental model.** Think of the model's output as an HTTP response body you must parse defensively, except the body is `string` and the JSON may be embedded in prose. The contract is a three-stage funnel: *extract* the JSON from the prose, *validate* its shape against a type guard, and *repair* via a clean-context retry when extraction or validation fails. Only output that clears all three becomes a typed value.
+### Move 1 — the mental model
+
+You know how `JSON.parse()` will throw on the slightest deviation? The
+extractor here is a two-stage parse: try the strict version first, fall back
+to "find the first `[` or `{` and the last `]` or `}` and parse what's
+between them." It's the same shape as `try-narrow-then-broad` parsing in any
+robust ingest pipeline.
 
 ```
-finalText: "Here's the diagnosis:\n```json\n{...}\n```\nHope this helps!"
-      │
-  (1) EXTRACT     the JSON parser
-      │  fenced → bare JSON.parse → first-bracket-to-last-bracket scan
-      ▼
-  parsed: unknown
-      │
-  (2) VALIDATE    the type guard
-      │  every required field present & correct type?
-      ▼
-  typed Diagnosis ✓        ─── or ───▶ null
-                                         │
-  (3) REPAIR      synthesize()  (clean-context retry)
-                                         │
-                                         ▼  OR FALLBACK
-                                   always a valid Diagnosis
+  The two-stage parse
+
+  text from model
+       │
+       ▼
+  fence match?  ── yes ──►  parse fence contents
+       │ no                       │
+       ▼                          │
+  parse whole text                │
+       │                          │
+       ├─── ok ──────────► unknown (return)
+       │                          ▲
+       ├─── throw                 │
+       ▼                          │
+  scan for [ or { and ] or }      │
+       │                          │
+       ▼                          │
+  parse the substring  ───────────┘
+       │
+       ├─── ok ──► unknown (return)
+       └─── throw  ──► "no parseable json"
 ```
 
-The model's job is to *try* to emit JSON; the contract's job is to *guarantee* a typed result regardless of how well the model tried.
+Then the unknown gets handed to a type guard, which returns `v is Anomaly[]`
+(etc.) — TypeScript's `is` narrowing means everything downstream is typed.
 
----
+### Move 2 — the step-by-step walkthrough
 
-### Stage 1 — extract: the JSON parser
+**Stage 1 — extract.** `parseAgentJson` (`lib/mcp/validate.ts:3-13`):
 
-The JSON parser handles the three ways the model presents JSON, in order of likelihood:
-
-```
-  function parse_agent_json(text):
-      fence = match(text, regex(```` ``` ````json + body + ```` ``` ````))
-      candidate = trim(fence.body if fence else text)
-
-      try:                                     # (a) bare attempt on the candidate
-          return JSON.parse(candidate)
-      except: pass
-
-      start = index_of_first(candidate, "[" or "{")    # (c) substring scan
-      end   = last_index_of(candidate, "]" or "}")
-      if start >= 0 and end > start:
-          return JSON.parse(slice(candidate, start, end + 1))
-
-      throw "no parseable json in agent output"
+```typescript
+export function parseAgentJson(text: string): unknown {
+  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = (fence ? fence[1] : text).trim();
+  try { return JSON.parse(candidate); } catch { /* fall through to substring scan */ }
+  const start = candidate.search(/[[{]/);
+  const end = Math.max(candidate.lastIndexOf(']'), candidate.lastIndexOf('}'));
+  if (start >= 0 && end > start) {
+    return JSON.parse(candidate.slice(start, end + 1));
+  }
+  throw new Error('no parseable json in agent output');
+}
 ```
 
-```
-(a) fenced     ```json\n{...}\n```        ← regex captures the fence body
-(b) bare       {...}                       ← JSON.parse the whole thing
-(c) substring  "...prose... {...} ...prose" ← grab first [/{ to last ]/}
-(else) throw   no brackets at all          ← caller catches → null/[]
-```
+The walkthrough:
 
-Each strategy is a fallback for the previous. The synthesis instruction *asks* for a `json` fence, so (a) is the common path; (b) and (c) recover the cases where the model forgot the fence or wrapped it in prose. The function returns `unknown` — it has parsed *syntax*, not *shape*. That is the next stage's job.
+  → **Line 4:** match a ```` ```json ... ``` ```` fenced block. The `(?:json)?`
+    makes the language tag optional — the prompt asks for `json` but the
+    model sometimes drops it.
 
----
+  → **Line 5:** if a fence matched, take its contents; otherwise take the
+    whole text. `trim()` handles trailing whitespace which `JSON.parse` is
+    fine with anyway but doesn't hurt.
 
-### Stage 2 — validate: the type guards
+  → **Line 6:** try `JSON.parse(candidate)` first — the happy path. When
+    the model is well-behaved this is what runs.
 
-Three `v is T` predicates prove the parsed object matches the expected shape, field by field. The diagnosis guard:
+  → **Lines 7-11:** the fallback. Scan for the first opening bracket or
+    brace; find the last closing one; parse what's between. This catches
+    cases like `Here is the JSON:\n[…]\n\nLet me know if you need…` —
+    pure prose wrapping a JSON array.
 
-```
-  function is_diagnosis(v) -> v is Diagnosis:
-      if not v or type_of(v) != "object":
-          return false
-      return type_of(v.conclusion)             == "string"
-         AND is_array(v.evidence)
-         AND is_array(v.hypothesesConsidered)
-```
+  → **Line 12:** if nothing parsed, throw. The error message is what the
+    route surfaces.
 
-The anomaly-array guard is stricter — it walks every element and checks nested fields (the change value is a number, the change direction is `'up'|'down'`, the severity is in the allowed set). The recommendation-array guard validates the *id-less* shape, because the agent emits recommendations without an `id` and the code assigns it after validation:
+**Stage 2 — validate.** `isAnomalyArray` (`lib/mcp/validate.ts:17-27`):
 
-```
-agent emits:   { title, rationale, bloomreachFeature, steps, ... }   ← no id
-guard validates THIS shape
-code assigns:  { id: random_uuid(), ...r }
-```
+```typescript
+const SEVERITIES: Severity[] = ['critical', 'warning', 'info', 'positive'];
 
-This is a deliberate split: the validator checks what the *model* controls; the system owns identity. Letting the model invent ids would risk collisions and non-UUID strings.
-
-```
-anomaly-array guard       ── every item: metric, scope[], change{value,direction,baseline}, severity∈SET
-diagnosis guard           ── conclusion:string, evidence:[], hypothesesConsidered:[]
-recommendation-array guard── every item: title, rationale, bloomreachFeature∈SET, steps[], estimatedImpact, confidence∈SET
-                             (id intentionally NOT validated — assigned post-hoc)
+export function isAnomalyArray(v: unknown): v is Anomaly[] {
+  return Array.isArray(v) && v.every((a) =>
+    !!a && typeof a === 'object' &&
+    typeof (a as any).metric === 'string' &&
+    Array.isArray((a as any).scope) &&
+    !!(a as any).change && typeof (a as any).change.value === 'number' &&
+    ((a as any).change.direction === 'up' || (a as any).change.direction === 'down') &&
+    typeof (a as any).change.baseline === 'string' &&
+    SEVERITIES.includes((a as any).severity)
+  );
+}
 ```
 
-The recommendation guard was deliberately *loosened* as the output contract grew. `estimatedImpact` is now a union — a legacy `string` OR a `{ range, rangeUsd?, assumption }` object — and the guard accepts either shape via an `impactOk` check: `type_of(x.estimatedImpact) == "string"` OR an object whose `range` is a string. The richer enrichment fields the agent may emit (`effort`, `timeToSetUpMinutes`, `readResultInDays`, `prerequisites`, `successMetric`) are all *optional*, so the guard does not check them; only the load-bearing fields (`title`, `rationale`, `bloomreachFeature`, `steps`, `estimatedImpact`, `confidence`) are validated. Accepting both impact shapes is what lets a legacy snapshot and a fresh dollar-range recommendation pass the *same* guard.
+What's being checked:
 
-```
-estimatedImpact accepted:
-  "string"                                   ← legacy snapshots
-  { range, rangeUsd?: {low,high}, assumption } ← current agent output
-  impactOk = string OR object-with-string-`range`
-```
+  → It's an array.
+  → Every element is an object with a `metric` string.
+  → `scope` is an array (contents not type-checked — they're string-shaped
+    by convention but the guard is permissive).
+  → `change` has `value: number`, `direction: 'up'|'down'`, `baseline: string`.
+  → `severity` is one of the four enum values.
 
----
+What's *not* checked:
 
-### Stage 3 — repair: the synthesis nudge, then the dedicated call
+  → `evidence[]` shape (optional in the type).
+  → `impact` (optional, agent-emitted, runs through unchecked).
+  → `history`, `category` (optional).
 
-The contract has two repair mechanisms before the final fallback.
+This is permissive on purpose. New optional fields land in `Anomaly` without
+needing a guard update; older snapshots without the field still validate.
 
-**The synthesis instruction** (the in-loop nudge) is appended to the system prompt on the forced-final turn. For the diagnostic agent it reads, in spirit: "You have NO more tool calls available... Respond with ONLY a single JSON object in a ```json fence matching the diagnosis shape." This tells the model exactly what to emit and prohibits further exploration — so the loop's final turn usually produces fence-wrapped JSON that clears stages 1 and 2 directly.
+**The same shape repeats for `isDiagnosis` (line 29-35) and
+`isRecommendationArray` (line 42-57).** The recommendation guard has one extra
+wrinkle — `estimatedImpact` can be a legacy string OR the richer
+`{ range, rangeUsd?, assumption }` object:
 
-**The dedicated `synthesize()` call** is the clean-context retry when the nudge fails. It is a *separate* model call — no tools, no loop history. It formats the gathered tool calls as evidence text and asks for only the JSON:
-
-```
-  response = provider_sdk.messages.create({
-    model:       AGENT_MODEL,
-    max_tokens:  2048,
-    system:      "You are concluding a completed investigation. "
-                 "Output ONLY a JSON diagnosis. Never ask for more data.",
-    messages:    [{ role: "user", content:
-      "Anomaly...\n\nQueries run...\n" + evidence +
-      "\n\n...output ... {\"conclusion\": string, \"evidence\": string[], "
-      "\"hypothesesConsidered\": [...]}"
-    }],
-  })
-  return try_parse_diagnosis(response.text)
+```typescript
+const impactOk =
+  typeof x.estimatedImpact === 'string' ||
+  (!!x.estimatedImpact && typeof x.estimatedImpact === 'object' &&
+   typeof x.estimatedImpact.range === 'string');
 ```
 
-Why a fresh call instead of one more loop turn: the loop's message history is full of tool-use / tool-result pairs and partial reasoning — the model has momentum toward "I should query more." A clean single-turn call with no tools and no history breaks that momentum; it sees only evidence + schema + "output JSON" and reliably complies. The recommendation agent has the identical structure.
+This is the "older snapshots still validate" rule made concrete. A demo
+snapshot captured before the richer shape existed has `estimatedImpact: "30%
+uplift"` — string. A new one has `{ range, rangeUsd, assumption }` — object.
+Both pass.
 
-The whole contract assembles in the fallback chain:
+**Where these get called.** Inside `@aptkit/core`. Blooming exports the type
+guards from `lib/mcp/validate.ts`; AptKit's agent classes use them as the
+final-turn validation gate. If the guard returns false, AptKit either retries
+the model or throws — depending on the agent.
 
-```
-try_parse_diagnosis(finalText)            ← stages 1+2 on the loop's output
-  OR (await synthesize(...))               ← stages 1+2 on a clean-context retry
-  OR FALLBACK                              ← model-independent floor
-```
+**Why not a schema-mode flag (Anthropic tool-use as output)?** Sonnet supports
+forcing tool-call output as a structuring mechanism. Blooming doesn't use it
+because:
 
----
+  1. The agents *also* use tools for actual side effects (calling MCP). Mixing
+     "tools as schema enforcement" with "tools as side-effects" in the same
+     loop is muddier than just trusting the validator at the end.
+  2. The output shapes already differ per agent. Each agent would need its
+     own schema-tool definition; the validator is one file, three guards.
+  3. The lenient extract is a strict superset of "JSON mode" — it handles
+     fenced blocks, prose-wrapped JSON, and pure JSON without changing the
+     model contract.
 
-### Why extract-from-prose instead of native JSON mode
+The tradeoff: when the model genuinely fails to emit valid JSON, we get a
+runtime error instead of a guaranteed-shape response. In practice that's been
+a parse error logged + retry, not a user-visible failure.
 
-This is the key design decision worth defending. The system *does* use the provider's native tool-use (the `tools` parameter) for **data retrieval** — every tool call is a structured invocation with a JSON-schema'd input. But the **final structured artifact** (the `Diagnosis`, the `Recommendation[]`) is *parsed from the model's text*, not produced by a native JSON / structured-output mode.
+### Move 3 — the principle
 
-```
-DATA retrieval        → native tool-use (provider tools param)   ← structured IN
-FINAL artifact        → prose → parse + type guard                ← structured OUT (parsed)
-```
+**The validator is the contract, not the prompt.** Prompts drift; models
+change; sampling adds variance. A runtime type guard at the seam between
+"model output" and "typed application code" is what makes the rest of the
+system durable. The prompt asks for a shape; the validator verifies it. When
+the two disagree, the validator wins.
 
-The reason is the same provider-agnosticism that drives the testability seam (→ 08-provider-abstraction.md): prose-extraction works against *any* text model, and the synthesis-instruction + JSON parser + guard pipeline is fully under the codebase's control and fully unit-testable with injected fakes. A native JSON mode would couple the *final-artifact* contract to one provider's feature surface. The trade is real — native modes guarantee validity at the token level — but the team chose portability and testability for the output contract while still using native tool-use for input.
-
----
-
-### The principle
-
-A structured-output contract is three jobs, not one: extract the JSON from prose, validate its shape against a type guard, and repair via a clean-context retry before falling back. Asking the model for JSON is the *request*; the contract is the *guarantee*. You guarantee a typed output for the final artifact in application code (portable, testable) while using native tool-use only for the structured *input* side — a deliberate split between where you trust the provider and where you trust your own parser.
-
----
-
-### Code in this codebase
-
-#### Files, functions, and line ranges
-
-- **Extract:** `parseAgentJson(text)` — `lib/mcp/validate.ts` L3–L13. Three strategies: fence regex, bare `JSON.parse`, first-bracket-to-last-bracket substring scan; throws if none.
-- **Validate (type guards):** `isAnomalyArray` L17–L27, `isDiagnosis` L29–L35, `isRecommendationArray` L42–L57 — all in `lib/mcp/validate.ts`. The recommendation guard validates the id-less shape and accepts *either* `estimatedImpact` shape via the `impactOk` check (L46–L48); `SEVERITIES` (L15) and `FEATURES`/`CONFIDENCE` (L37–L38) back the enum checks.
-- **The grown contracts (`lib/mcp/types.ts`):** `Insight` (L7–L32) gained optional `impact`, `revenueImpact`, `aov`, `funnel`, `affectedCustomers`, `history`, `downstreamReady`. `Diagnosis` (L64–L73) gained optional `confidence` ('high'|'medium'|'low', usually *derived*, not parsed) and `timeSeries`. `Recommendation` (L85–L99) gained `effort`, `timeToSetUpMinutes`, `readResultInDays`, `prerequisites`, `successMetric`, and `estimatedImpact` is now the `EstimatedImpact` union (L77–L79). Every addition is optional, so older snapshots still validate.
-- **Post-validation derivation:** `anomalyToInsight` (`lib/state/insights.ts` L8–L27) spreads `deriveInsightFields(a)` (L25) to compute business-owner fields (e.g. `revenueImpact`) from the anomaly's existing evidence — `lib/insights/derive.ts` L27–L39. `Diagnosis.confidence` is post-derived by `diagnosisConfidence` in `DiagnosticAgent.investigate` (`lib/agents/diagnostic.ts` L80, downgraded `high`→`medium` on tool errors at L81–L82) — `derive.ts` L54–L63. These fields are *manufactured after parse/validate*, not extracted from the model's JSON.
-- **In-loop repair nudge:** `synthesisInstruction` appended on the forced-final turn — `lib/agents/base.ts` L96–L98; the diagnostic instruction text — `lib/agents/diagnostic.ts` L62–L66.
-- **Dedicated repair call (diagnostic):** `DiagnosticAgent.synthesize(anomaly, toolCalls)` — `lib/agents/diagnostic.ts` L87–L126; tool-less `create` at L97, `max_tokens: 2048` at L99.
-- **Dedicated repair call (recommendation):** `RecommendationAgent.synthesize(anomaly, diagnosis, toolCalls)` — `lib/agents/recommendation.ts` L82–L132; `create` at L96, `max_tokens: 2048` at L98; its prompt now asks for the full enriched shape (the `EstimatedImpact` object, `effort`, `prerequisites`, `successMetric`) at L109–L119. Ids assigned post-validation via `crypto.randomUUID()` at L76, capped to 3.
-- **The contract chains:** diagnostic `tryParseDiagnosis ?? synthesize ?? FALLBACK` — `lib/agents/diagnostic.ts` L74–L75 (`FALLBACK` constant L16–L20); recommendation `tryParseRecommendations ?? synthesize` then `[]` — `lib/agents/recommendation.ts` L69–L73; monitoring `parseAgentJson` + `isAnomalyArray` else `[]` — `lib/agents/monitoring.ts` L95–L101.
-- **Native tool-use (the input side):** `params.tools = toolSchemas` on non-final turns — `lib/agents/base.ts` L101; schemas built by `filterToolSchemas`.
-
-#### Why this is a codebase strength
-
-Three things make the output contract robust rather than hopeful: the parser handles all three presentation modes the model uses; the guards prove shape field-by-field (not a cast); and the repair path is a *clean-context* retry rather than "ask again in the same conversation." The id-assignment-after-validation detail shows the team thought about the boundary precisely — validate what the model controls, own what the system controls.
-
----
-
-## Structured outputs — diagram
-
-This diagram spans the full contract. The Provider layer emits prose-with-JSON; the Service layer extracts, validates, and repairs it into a typed value. A reader who sees only this should grasp that the model returns prose and the type is manufactured by a three-stage funnel with a guaranteed floor.
+## Primary diagram
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│  PROVIDER LAYER (Anthropic)                                           │
-│                                                                       │
-│  forced-final turn: system + synthesisInstruction  base.ts           │
-│  "Respond with ONLY a JSON object in a ```json fence"                │
-│           │                                                          │
-│           ▼                                                          │
-│  finalText = "Here's the diagnosis:\n```json {...} ```\n..."         │
-└───────────────────────────┬───────────────────────────────────────────┘
-                            │  string
-┌───────────────────────────▼───────────────────────────────────────────┐
-│  SERVICE LAYER (the contract)                                        │
-│                                                                       │
-│  (1) EXTRACT  parseAgentJson  validate.ts L3–13                      │
-│       fenced → bare → first-bracket-to-last-bracket → throw          │
-│           │ unknown                                                  │
-│  (2) VALIDATE isDiagnosis / isAnomalyArray / isRecommendationArray   │
-│       validate.ts   (id NOT validated; impact union accepted) │
-│           │ valid              │ null / threw                        │
-│           ▼                    ▼                                     │
-│      typed value         (3) REPAIR  synthesize()  diagnostic        │
-│                              fresh call, NO tools, NO history        │
-│                              evidence text → ONLY JSON                │
-│                                   │ valid        │ null              │
-│                                   ▼              ▼                   │
-│                              typed value      FALLBACK / []          │
-│                                                diagnostic.ts         │
-│                                                                       │
-│  chain: tryParse(finalText) ?? synthesize() ?? FALLBACK    │
-└────────────────────────────────────────────────────────────────────────┘
+  The full extract + validate pipeline
 
-  (separate) DATA retrieval uses native tool-use (tools param) — structured IN.
-  The FINAL artifact above is parsed from prose — structured OUT.
+  ┌─ Prompt asks for ```json [...] ``` ───────────────────┐
+  │  (e.g. monitoring.md, recommendation.md)              │
+  └──────────────────────┬────────────────────────────────┘
+                         │ model emits content[0].text
+                         ▼
+  ┌─ parseAgentJson(text) — validate.ts:3-13 ─────────────┐
+  │  1. match fenced block (optional 'json' tag)          │
+  │  2. JSON.parse(fence or whole text)                   │
+  │  3. on throw: scan [ or { … ] or }                    │
+  │  4. JSON.parse(substring)                             │
+  │  5. on throw: 'no parseable json in agent output'     │
+  └──────────────────────┬────────────────────────────────┘
+                         │ unknown
+                         ▼
+  ┌─ Type guard ──────────────────────────────────────────┐
+  │  isAnomalyArray(v)        for MonitoringAgent.scan()   │
+  │  isDiagnosis(v)           for DiagnosticAgent.invest()│
+  │  isRecommendationArray(v) for RecommendationAgent     │
+  │                                                       │
+  │  PERMISSIVE: optional fields not checked              │
+  │  STRICT: required scalar types + enum values checked  │
+  └──────────────────────┬────────────────────────────────┘
+                         │ v is Anomaly[] / Diagnosis / Recommendation[]
+                         ▼
+  ┌─ Typed UI / NDJSON wire ──────────────────────────────┐
+  │  Insight (derived from Anomaly + UI metadata)         │
+  │  Diagnosis (passes through)                           │
+  │  Recommendation (id assigned post-validation)         │
+  └───────────────────────────────────────────────────────┘
 ```
-
-The model emits prose; the Service layer manufactures the type through extract → validate → repair, with a model-independent `FALLBACK` so the contract's return is always honest.
-
----
 
 ## Elaborate
 
-### Where this pattern comes from
+The choice between "schema-mode at the API" vs "validator at the boundary" is
+one of the recurring tension points in LLM application engineering.
+Schema-mode buys you a hard guarantee (the API returns a parse-error or a
+schema-conforming object); validator-at-boundary buys you flexibility (you can
+ship new optional fields without ratcheting both ends).
 
-Extracting structured data from generated prose predates dedicated JSON modes. Early LLM tooling (LangChain's `OutputParser`s, the `instructor` library's retry loops, Pydantic-backed extraction) all converged on the same shape: prompt for a format, parse leniently, validate against a schema, retry on failure. The markdown-fence convention (`` ```json ``) emerged because models trained on developer text reliably reach for code fences when asked for code-shaped output, making the fence a high-signal anchor for extraction.
+Blooming picked validator-at-boundary because the data shapes were going to
+evolve fast (Tier 1 enrichments in `Insight`: `revenueImpact`, `aov`,
+`funnel`, `affectedCustomers`, `history`, `downstreamReady`, `category` — all
+added incrementally, all optional). Schema-mode would have meant updating the
+schema tool definition every time, plus rejecting older snapshots that don't
+have the new field.
 
-Native structured outputs (OpenAI's response_format / structured outputs, Anthropic tool-use JSON, constrained decoding via Outlines/SGLang) are the newer answer: constrain the *decoding* so invalid JSON is impossible. They are strictly better for the parse step where available — but they couple the contract to a provider and are harder to exercise in unit tests without the live API.
-
-### The deeper principle
-
-```
-request                              guarantee
-──────────────────────────────      ──────────────────────────────
-"respond with JSON" (prompt)         parse + validate + repair (code)
-honored statistically                honored always
-breaks silently on prose             surfaces as null → repair → fallback
-```
-
-The model's adherence to a format request is probabilistic; the contract's adherence to its return type is absolute. The whole point of the three-stage funnel is to move the guarantee from the model (where it is statistical) into the code (where it is enforced). The `FALLBACK` is the line that makes the return type honest even when every other stage fails.
-
-### Where this breaks down
-
-1. **The substring scan can mis-recover.** `parseAgentJson`'s stage (c) grabs first-bracket-to-last-bracket. A response with prose containing stray brackets, or two JSON blocks, can yield a wrong-but-parseable object that then *passes* the type guard. Pragmatic recovery, not a correctness guarantee (also noted in → 01-what-an-llm-is.md).
-
-2. **Shape is not correctness.** `isDiagnosis` confirms `conclusion` is a string — not that it is true. A hallucinated diagnosis with the right shape passes the contract entirely. Catching wrong-but-well-formed output is the job of evals, not validation.
-
-3. **The repair call doubles cost on failure.** When `tryParse` returns `null`, `synthesize()` is a second full API call (up to 2048 output tokens). Cheap on the happy path (never invoked), expensive on the unlucky path (→ 06-token-economics.md). If the parse-failure rate climbs, the repair becomes a meaningful line item.
-
-### What to explore next
-
-- **Native tool-use for the final artifact:** define the `Diagnosis` shape as a "done" tool the model must call, so the SDK enforces valid arguments — eliminating stages 1 and 2 for the final output at the cost of provider coupling.
-- **Zod schemas:** replace the hand-written guards with one Zod schema per shape, generating both the validator and the static type and gaining structured error messages.
-- **Constrained decoding (Outlines, SGLang):** force valid JSON at the token level — the strongest form of the parse guarantee.
-
----
+The `parseAgentJson` lenient-extract pattern is reusable across any
+LLM-produces-JSON product. The exact regex (`/[[{]/` and `lastIndexOf`) is
+naive but covers the failure modes that actually appear: prose prefix, prose
+suffix, missing or extra fenced block, language tag dropped.
 
 ## Project exercises
 
-### Promote the final artifact to native tool-use JSON
+### Exercise — add `tool_choice: { type: 'tool', name }` as an alternative path
 
-- **Exercise ID:** B1.1 (adapted) — structured outputs via the provider's contract.
-- **What to build:** define the `Diagnosis` shape as a `submit_diagnosis` tool and require the diagnostic agent to terminate by calling it, so the SDK enforces valid arguments; keep `parseAgentJson` + `synthesize()` as the fallback path for portability.
-- **Why it earns its place:** demonstrates you know the difference between requesting JSON and guaranteeing it at the decode level, and that the codebase already uses native tool-use for input but not output.
-- **Files to touch:** `lib/agents/diagnostic.ts` (terminate via tool call), `lib/agents/base.ts` (surface the tool's input), `lib/mcp/validate.ts` (reuse `isDiagnosis` on the tool args), `test/agents/diagnostic.test.ts`.
-- **Done when:** a normal run produces a `Diagnosis` from the tool-call arguments (no `parseAgentJson` needed), and a forced tool-call failure still degrades through `synthesize() ?? FALLBACK`.
-- **Estimated effort:** 1–2 days
+  → **Exercise ID:** `study-ai-eng-04.1`
+  → **What to build:** For the monitoring agent's final synthesis turn, define
+    a `report_anomalies` tool whose `input_schema` matches `Anomaly[]`, and
+    force the model to call it via `tool_choice: { type: 'tool', name:
+    'report_anomalies' }`. The tool body is a no-op; the schema-constrained
+    input *is* the validated output.
+  → **Why it earns its place:** Demonstrates fluency with both patterns —
+    you can speak to lenient-extract OR schema-tool, and have an opinion on
+    when each wins. The interview answer "I tried both, here's the tradeoff"
+    beats either standalone.
+  → **Files to touch:** `lib/agents/monitoring.ts` (new branch), the AptKit
+    `AnomalyMonitoringAgent` (would need a config flag upstream), test
+    coverage in `test/agents/monitoring.test.ts`.
+  → **Done when:** A feature-flagged code path runs the monitoring agent with
+    schema-tool output, parsed as a tool call's input arg instead of via
+    `parseAgentJson`. Both paths produce equivalent results on the demo
+    fixtures.
+  → **Estimated effort:** `1–2 days` (most of it is the AptKit upstream
+    contribution).
 
-### Replace the hand-written guards with Zod schemas
+### Exercise — add a Zod schema per validator and emit JSON Schema for the prompts
 
-- **Exercise ID:** B1.1 (adapted) — schema-driven validation.
-- **What to build:** define `DiagnosisSchema`, `AnomalyArraySchema`, `RecommendationArraySchema` in Zod (id-less for recommendations), and rewrite `isDiagnosis` / `isAnomalyArray` / `isRecommendationArray` as `schema.safeParse` wrappers that preserve the existing `v is T` signatures.
-- **Why it earns its place:** shows you can collapse type + validator into one source of truth and surface field-level errors the hand-written guards swallow.
-- **Files to touch:** `lib/mcp/validate.ts`, `lib/mcp/types.ts` (derive types from schemas), `test/mcp/validate.test.ts`.
-- **Done when:** all existing validation tests pass against the Zod-backed guards, and a malformed object yields a field-level error path instead of a bare `false`.
-- **Estimated effort:** 1–4hr
-
----
+  → **Exercise ID:** `study-ai-eng-04.2`
+  → **What to build:** Replace the hand-written type guards in
+    `lib/mcp/validate.ts` with Zod schemas (`AnomalySchema.array()`,
+    `DiagnosisSchema`, `RecommendationSchema.omit({id:true}).array()`).
+    Generate JSON Schema from them and inject into the prompts so the model
+    sees a machine-readable contract.
+  → **Why it earns its place:** "How do you keep the prompt's contract in
+    sync with the validator?" — the answer today is "by hand." Generated
+    schema closes the gap.
+  → **Files to touch:** `lib/mcp/validate.ts` (rewrite), `lib/mcp/types.ts`
+    (Zod types), `lib/agents/legacy-prompts/*.md` (inject schema), tests.
+  → **Done when:** `parseAgentJson` is followed by `schema.parse()` instead
+    of an `is*` guard. Prompts include a JSON-Schema block derived from the
+    same source.
+  → **Estimated effort:** `1–2 days`
 
 ## Interview defense
 
-### What an interviewer is really asking
-
-"How do you get structured output from an LLM?" tests whether you stop at "I prompt it for JSON" or go to "I prompt, extract, validate, and repair." The senior signal is naming the three stages and defending the choice to parse-from-prose *for the output* while using native tool-use *for the input* — and knowing where each is in the code.
-
-### Likely questions
-
-**[mid] The model returns `"Here's the diagnosis:\n```json\n{...}\n```"`. How do you get a typed `Diagnosis` out of it?**
-
-`parseAgentJson` (`lib/mcp/validate.ts` L3–L13) tries the fence regex first, capturing the body inside ```json``` — that's the common case. Then `isDiagnosis` (L29–L35) proves the shape. If both succeed, `tryParseDiagnosis` (`lib/agents/diagnostic.ts` L22–L29) returns a typed `Diagnosis`; otherwise `null`.
+**Q: How does blooming insights get reliable JSON out of Claude?**
 
 ```
-prose + fence → fence regex → JSON.parse → isDiagnosis → Diagnosis ✓
+  Two stages — extract leniently, validate strictly.
+
+  model text
+   │
+   ▼
+  parseAgentJson(text)     ← lib/mcp/validate.ts:3-13
+   │  1. try fenced block parse
+   │  2. fall back to whole-text parse
+   │  3. fall back to substring-between-brackets parse
+   ▼
+  unknown
+   │
+   ▼
+  isAnomalyArray(v)        ← lib/mcp/validate.ts:17-27
+   │  type guard returns `v is Anomaly[]`
+   ▼
+  typed Anomaly[]
 ```
 
-**[senior] Why parse JSON from prose instead of using a native structured-output mode for the final artifact?**
+**Anchor line:** "Extract is permissive, validate is strict — that's how the
+prompts stay loose without the application code seeing junk."
 
-Portability and testability. The codebase uses native tool-use for *input* (every MCP call), but keeps the *output* contract — `parseAgentJson` + guards + `synthesize()` — in application code so it works against any text model and is fully unit-testable with injected fakes against no network. A native mode guarantees validity at the token level but couples the output contract to one provider. The trade is deliberate and reversible.
+**Q: Why not schema-mode (tool-call as structured output)?**
 
-```
-input  → native tool-use (provider-enforced)
-output → parse-from-prose (portable, testable)  ← chosen, not forced
-```
+Mainly because the shapes evolve fast and optional fields land monthly
+(`Insight` gained `revenueImpact`, `aov`, `funnel`, `affectedCustomers`,
+`history`, `downstreamReady`, `category` over the last few iterations). The
+hand-written guards check what's *required* and ignore what's optional, so
+older demo snapshots still validate. Schema-mode would mean ratcheting both
+ends every time.
 
-**[arch] `tryParse` returns null. Why a fresh `synthesize()` call instead of one more loop turn?**
+**Q: What's the load-bearing part of the validator?**
 
-The loop's history is full of `tool_use`/`tool_result` pairs and partial reasoning; the model has momentum toward "query more." A same-conversation retry inherits that momentum. `synthesize()` (`lib/agents/diagnostic.ts` L87–L126) is a fresh `create` with no tools and no history — it sees only evidence + schema + "output JSON," which reliably produces the artifact. The cost is one extra call, paid only on the failure path.
-
-```
-loop retry:   [tool_use][tool_result]...[synth instr] → still wants to query
-clean call:   [evidence + "output JSON"]               → emits JSON
-```
-
-### The question candidates always dodge
-
-**"What does your validation actually guarantee?"** Shape, not truth. `isDiagnosis` proves `conclusion` is a string — not that the conclusion is correct. A hallucinated-but-well-shaped diagnosis passes the entire contract. Catching that is the job of evals, which this codebase does not yet have. Conflating shape with correctness is the trap.
-
-### One-line anchors
-
-- `lib/mcp/validate.ts` L3–L13 — `parseAgentJson`: fenced → bare → substring scan.
-- `lib/mcp/validate.ts` L17–L57 — the three type guards; recommendation validates the id-less shape and accepts either `estimatedImpact` shape (`impactOk`, L46–L48).
-- `lib/agents/base.ts` L96–L98 — `synthesisInstruction` appended on the forced-final turn.
-- `lib/agents/diagnostic.ts` L87–L126 — `synthesize()`: clean-context, tool-less repair.
-- `lib/agents/diagnostic.ts` L74–L75 — the contract chain: `tryParse ?? synthesize ?? FALLBACK`.
-
----
+The fallback in `parseAgentJson` — the substring scan (`candidate.search(/[[{]/)`)
+that runs when both the fenced-block parse and the whole-text parse throw.
+That's the line that converts "model added a friendly intro and outro to the
+JSON" from a hard failure into a successful parse. Drop it and the model gets
+an entire retry every time it editorializes.
 
 ## See also
 
-→ 01-what-an-llm-is.md · → 05-streaming.md · → 02-tokenization.md · → 07-heuristic-before-llm.md
-
----
+  → `01-what-an-llm-is.md` — the I/O model that produces the text
+  → `03-sampling-parameters.md` — why default temperature is OK with this validator
+  → `04-agents-and-tool-use/02-tool-calling.md` — the OTHER place JSON contracts live (input schemas, not output)

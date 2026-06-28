@@ -1,433 +1,410 @@
-# AUTH_SECRET flake post-mortem
+# Auth-secret flake postmortem
 
-**Industry name(s):** parallel-worker test flake, shared-mutable-state leak, env-stubbing discipline, post-mortem template
-**Type:** Industry standard (the post-mortem template) · Project-specific (this incident's diff)
+**Industry name(s):** environment-coupling bug / config-drift incident; the fix is the *catch-setup-and-surface-the-real-message* pattern (sometimes called *fail loudly, not silently*). **Type:** Project-specific incident, industry-standard fix pattern.
 
----
+## Zoom out — where this concept lives
 
-## Zoom out, then zoom in
-
-**Zoom out — the bigger picture.** This is the only documented incident in the repo with a clean root cause, a one-file fix, and a regression guard. Commit `e83a8e0` (the flake-fix) walks the canonical incident lifecycle — detect → diagnose → fix → prevent → verify — at a granularity small enough that the whole story fits in a commit message. The reason this gets its own pattern file: the *shape* of the post-mortem is reusable beyond this specific incident. Every flake with the fingerprint "isolated pass, parallel flake" is the same kind of bug (shared mutable state), and the discipline that fixes it (tracked-mutation primitives) generalises to any test framework, any global, any fixture.
+A real production-only incident. The dev environment worked fine; production returned 500 with no body. Root cause: a missing env var (`AUTH_SECRET`) tripped a throw inside the cookie-encryption codepath *before* the route could send a JSON response. The fix is the smallest possible try/catch at the setup boundary — surface the real message instead of letting it bubble into Vercel's bare 500 handler.
 
 ```
-  Zoom out — where the post-mortem sits across the layers
+  Zoom out — the fix lives at the request-entry of the service layer
 
-  ┌─ User / observation surface ────────────────────┐
-  │  no Sentry, no PagerDuty, no error-tracker       │
-  │  detection: test runner exit code                │
-  └─────────────────────────▲───────────────────────┘
-                            │ vitest run flaked
-  ┌─ Diagnosis ─────────────┴───────────────────────┐
-  │  fingerprint: "isolated pass + parallel flake"   │
-  │  → always points to shared mutable state         │
-  │  read test/mcp/auth.test.ts:                     │
-  │    process.env.AUTH_SECRET = '…'  ← the leak     │
-  └─────────────────────────▲───────────────────────┘
-                            │
-  ┌─ Fix + prevent ─────────┴───────────────────────┐  ← we are here
-  │  vi.stubEnv('AUTH_SECRET', '…') in beforeEach    │
-  │  vi.unstubAllEnvs() in afterEach                 │
-  │  the afterEach IS the regression guard           │
-  │  (test/mcp/auth.test.ts:117-122)                 │
-  └─────────────────────────────────────────────────┘
+  ┌─ UI layer ─────────────────────────────────────────────────┐
+  │  feed sees 500 with no body → "something went wrong"        │
+  │  (no diagnosis, no reconnect, no recovery)                  │
+  └────────────────────▲────────────────────────────────────────┘
+                       │ HTTP 500 (Vercel default error page)
+  ┌─ Service layer ────┼─────────────────────────────────────────┐
+  │  GET /api/briefing                                            │
+  │  ┌──────────────── BEFORE FIX ────────────────────────┐       │
+  │  │  await getOrCreateSessionId()    ──► reads cookies │       │
+  │  │  await makeDataSource(mode, sid) ──► aesKey() throws│ ←── BARE 500
+  │  │                                       (no try/catch) │      │
+  │  └─────────────────────────────────────────────────────┘       │
+  │                                                                │
+  │  ┌──────────────── AFTER FIX (briefing/route.ts:170-179) ──┐  │
+  │  │  try {                                                   │  │
+  │  │    sid = await getOrCreateSessionId();                  │  │
+  │  │    dsResult = await makeDataSource(mode, sid);          │  │
+  │  │  } catch (e) {                                          │  │
+  │  │    console.error('[briefing] setup error:',             │  │
+  │  │       redactSecrets(formatError(e)));                   │  │
+  │  │    return NextResponse.json(                            │  │
+  │  │       { error: `/api/briefing setup · ${e.message}` },  │  │
+  │  │       { status: 500 });                                 │  │
+  │  │  }                                                      │  │
+  │  └─────────────────────────────────────────────────────────┘  │
+  │                                                                │
+  └────────────────────┬───────────────────────────────────────────┘
+                       │
+  ┌─ Storage layer ────▼───────────────────────────────────────────┐
+  │  lib/mcp/auth.ts:51-60                                          │
+  │  aesKey() — throws when AUTH_SECRET is unset                    │
+  │                                                                 │
+  │  this throw is the *real* failure source; the route's catch     │
+  │  surfaces it instead of letting it become a bare 500            │
+  └─────────────────────────────────────────────────────────────────┘
 ```
 
-**Zoom in — narrow to the concept.** A post-mortem is a *layered cause analysis* — root cause, contributing conditions, fix, prevention, verification — written down so the next person hitting the same symptom can short-circuit to the answer. The discipline of writing one is what converts "we fixed it" into "this kind of bug won't happen again here." The repo's one post-mortem is the commit message on `e83a8e0`: it names the root cause (`process.env.AUTH_SECRET` mutated directly), the fix (`vi.stubEnv` + `vi.unstubAllEnvs`), the verification ("157 tests pass across repeated runs"), and the contributing condition (parallel workers + shared global state). Five lines, all four parts. The fingerprint sentence — *"isolated pass, parallel flake is always shared mutable state"* — is the reusable lesson; it generalises to any framework with parallel workers and any test that mutates anything process-global.
+**Zoom in.** The bug was an env-coupling — code that *only* runs in production (the cookie-encryption path at `lib/mcp/auth.ts:62-104`) depended on an env var that wasn't set. The dev environment used the file-cache path that doesn't need `AUTH_SECRET`, so tests passed. The fix is structural: every route's setup phase is now wrapped in try/catch that returns the real message as JSON, so future env-shaped failures degrade with a readable error.
 
----
+The question this postmortem answers: *"how do we make the next env-coupling bug visible in 30 seconds instead of an hour?"*
 
 ## Structure pass
 
-**Layers.** Four phases of the incident lifecycle: detect (how you find out), diagnose (how you understand it), fix (the change that resolves it), prevent (the change that stops it from happening again).
+**Layers.** Three: the env (where `AUTH_SECRET` lives or doesn't); the auth-store layer (where the throw originates); the route layer (where the throw should be caught and surfaced).
 
-**Axis: failure (where does the failure originate, propagate, and get contained?).** The flake-fix tells a clean story along this axis.
-- **Originate.** The auth crypto test file set `process.env.AUTH_SECRET = '…'` directly. That single mutation was the root cause.
-- **Propagate.** Vitest's parallel workers share the `process.env` global at the OS-process level. The variable leaked into other test files' processes — sometimes overwritten, sometimes cleared, sometimes never set when this worker ran first.
-- **Contain.** Nowhere — that's why it flaked. The fix shifts containment into the test framework (`vi.stubEnv` tracks the change and restores it via `vi.unstubAllEnvs` in `afterEach`). After the fix, the mutation is contained to one test's lifetime, regardless of which worker any test runs in.
-
-**Seams.** Two load-bearing:
-
-- **Test ↔ test (parallel worker boundary).** Vitest's default is parallel files. The boundary is where state *should* be isolated but wasn't. The flake lived at this seam. Crossing it the wrong way (direct `process.env` mutation) leaks; crossing it the right way (`vi.stubEnv` with `afterEach` cleanup) doesn't.
-- **Code ↔ test framework.** The fix doesn't change the production code at all — `_authCookieCrypto` is untouched. It changes the *test discipline* around it. The seam between "what you're testing" and "how you're testing" is where the prevention lives. Knowing which side of that seam your fix lands on is half the post-mortem's value.
-
-A *missing* seam, named for honesty: there's no detect↔mitigate seam in this repo. No automated alert, no on-call rotation, no runbook to grab. When the test went red, a human noticed. The repo has no automation around incident detection past the test runner exit code.
+**Axis: failure containment.** Hold *"who handles a setup error?"* constant.
 
 ```
-  Structure pass — the post-mortem
+  Trace "who handles a setup throw?" across before/after
 
-  ┌─ 1. LAYERS ───────────────────────────────────┐
-  │  detect · diagnose · fix · prevent             │
-  └────────────────────────┬───────────────────────┘
-                           │  pick the axis
-  ┌─ 2. AXIS ─────────────▼────────────────────────┐
-  │  failure: origin · propagation · containment   │
-  └────────────────────────┬───────────────────────┘
-                           │  trace, find flips
-  ┌─ 3. SEAMS ────────────▼────────────────────────┐
-  │  test↔test (parallel): LOAD (where flake lives)│
-  │  code↔test framework: LOAD (fix lives here,    │
-  │                              not in prod code) │
-  │  detect↔mitigate: ABSENT (no tooling)          │
-  └────────────────────────┬───────────────────────┘
-                           ▼
-                   Block 4 — How it works
+  layer                  before fix                      after fix
+  ─────                  ──────────                      ─────────
+  env (process.env)      missing AUTH_SECRET             missing AUTH_SECRET
+  auth-store (aesKey)    throws unguarded                throws unguarded
+                                                          ── (unchanged; throw is correct)
+  setup (sid + dataSrc)  throws propagate up             throws propagate up
+                                                          ── (unchanged; let it throw)
+  route entry            ╳ throw escapes the route ╳     ✓ try/catch returns JSON
+                         → Vercel's default 500           → 500 with { error: real msg }
+  client (feed)          opaque "something went wrong"   readable message in error panel
 ```
 
-Skeleton mapped. Now walk the four phases against the real diff.
+The failure-containment axis flips at one seam — the route entry. Before the fix, the route had no boundary; the throw walked past it into Vercel's default handler. After the fix, the boundary is explicit: "anything that throws in setup gets caught and surfaced as JSON with `status: 500`."
 
----
+**Seams.**
+
+1. **env ↔ aesKey.** Contract: `AUTH_SECRET` is non-empty. Broken in prod. The throw at `lib/mcp/auth.ts:53-58` is the *right* behavior — fail closed when crypto can't run. Don't fix it here.
+2. **aesKey ↔ withAuthCookies.** The cookie codepath calls aesKey synchronously inside the ALS scope; the throw propagates through the await boundary cleanly.
+3. **withAuthCookies ↔ route entry.** This is where the fix lives. The throw arrives at the route's `await makeDataSource(mode, sid)` line, and BEFORE the fix there was no catch. AFTER the fix, the catch surfaces the real message.
+
+The seam that needed hardening was the *route entry*, not the auth layer or the env layer. Identifying the right seam to harden is most of incident response.
+
+Skeleton mapped.
 
 ## How it works
 
-**Mental model.** A post-mortem is a *layered cause analysis*. You don't stop at "the test failed" — you ask "why did it fail?" (root cause: shared global state), then "why did that go undetected for so long?" (contributing condition: passes in isolation hide the problem), then "what would have caught it earlier?" (prevention: stricter test isolation discipline). Each layer names a different change you could make; the fix usually touches one of them, the prevention usually touches another.
+### Move 1 — the mental model
+
+You've shipped code where a missing env var crashed the deploy with a stack trace that didn't say which env var. The fix is always the same shape: detect the missing config *at the failing site* and throw a message that names the var. This is that, plus a route-level wrapper that turns the throw into a JSON response instead of a bare 500.
+
+The deeper pattern: **a throw that escapes a request boundary becomes a 500.** It doesn't matter how clean the throw message is — if it escapes the route, the user gets the platform's default error page (Vercel's case: blank with status 500). The throw has to be *contained inside* the request boundary to land as a useful response.
 
 ```
-  Pattern — the layered post-mortem
+  The pattern — catch setup throws, surface the real message
 
-  symptom              "the auth crypto test flakes ~1-in-N"
-        ↓ why?
-  root cause           process.env.AUTH_SECRET mutated directly;
-                       vitest's parallel workers share process.env
-        ↓ why undetected?
-  contributing         (a) parallel workers — default vitest behavior
-  conditions           (b) the test passed in isolation, hiding the leak
-                       (c) no afterEach cleanup convention
-        ↓ change that resolves?
-  fix                  swap to vi.stubEnv (tracked) + vi.unstubAllEnvs in
-                       afterEach — restores the env after each test
-        ↓ change that prevents?
-  prevention           (a) the afterEach itself IS the regression guard
-                       (b) the lesson: any test mutating a global must
-                           use a tracked-mutation API
-        ↓ proof?
-  verification         157 tests pass across repeated runs; tsc clean
-                       (the same pattern that detected the flake now
-                        passes N for N runs)
+  BEFORE:                            AFTER:
+
+  GET /api/route                     GET /api/route
+    │                                  │
+    setup()    ── throws ──┐           try { setup() }
+    │                       │          catch (e) {
+    │                       │            console.error(redact(format(e)));
+    │                       ▼            return NextResponse.json(
+    handler()             escape           { error: `route setup · ${e.message}` },
+                                            { status: 500 }
+                                          );
+                          ▼              }
+                       Vercel
+                       bare 500          handler() runs only if setup succeeded
+                       no body
+                                          response is JSON with the real message,
+                                          client sees it in the error panel
 ```
 
-### Move 2 — walk the four phases
+### Move 2.1 — the auth throw (the originating site)
 
-**Use cases.** Three real moments the post-mortem template gets exercised:
+The throw lives in `aesKey()` at **`lib/mcp/auth.ts:51-60`**:
 
-- **A flaky test reappears.** First move: run the suite repeatedly. If it's the "isolated pass, parallel flake" pattern, look for shared mutable state. The `e83a8e0` template is now a reusable recipe — `vi.stubEnv`/`vi.unstubAllEnvs` for env vars, `vi.spyOn` + `mockRestore` for module-level functions, fixture rollback for DB state. The diagnostic shortcut is fingerprint-first.
-
-- **A user reports a bad investigation result.** Different shape — this is a *runtime* incident, not a *test* incident. The diagnostic loop uses the trace and snapshot machinery (load the `insightId`, the cache replays, scrub the trace looking for the failing event). The phases (detect → diagnose → fix → prevent) are the same; the tooling at each phase is different. This file's lesson — *write the four-phase post-mortem* — applies to both incident kinds.
-
-- **The route catches an exception in prod.** Today, the only detect signal is the `console.error` line in Vercel's stdout plus the `{type:'error',message}` event in the trace. There's no incident tooling past that — no Sentry to dedupe, no PagerDuty to page, no Slack to notify. The repo is in "manual log review" mode for prod incidents. When the first prod incident lands that needs a post-mortem, this file is the template for writing it.
-
-#### Detect — the test runner went red
-
-The reader anchor: you've had a CI build fail and wondered what changed. Same shape. The first signal here was vitest's exit code: `npm run test` flaked. Critically, the test *passed in isolation* — running `test/mcp/auth.test.ts` alone always passed. The flake only appeared in a full `vitest run` where parallel workers exercised other test files concurrently.
-
-This pattern ("isolated pass, parallel flake") is the diagnostic *fingerprint* — it always means shared global state. Recognizing the fingerprint cuts the diagnostic loop from "spend an hour staring at the test" to "find the global the test mutates."
-
-Boundary: in this repo, the detection layer is the test runner. There's no Sentry, no production error tracking, no synthetic check — the dev would have to *run the suite* to see the flake. CI presumably runs `npm run test`, so a CI run that flakes catches it eventually, but the detection latency is "next CI run after the bug lands," not "real time."
-
-```
-  Detect — what the signal looked like
-
-  developer runs:    npm run test
-  vitest output:     ✓ 156 passed
-                     ✗ 1 failed (intermittent)
-                       auth.test.ts > round-trips an encrypted store
-
-  re-run isolated:   npx vitest run test/mcp/auth.test.ts
-                     ✓ 157 passed (always)
-
-  re-run full:       npx vitest run
-                     ~ sometimes passes, sometimes fails
-                       ▲
-                       └─ fingerprint: "isolated pass, parallel flake"
-                          → diagnostic shortcut: find the shared global
-```
-
-**Code in this codebase — what's available in production today for incident *detection*:**
-
-```
-  app/api/agent/route.ts  (lines 255-260)
-
-  } catch (e) {
-    console.error('[agent] error:', e); // full stack/cause in Vercel logs   ← only prod detection signal
-    send({
-      type: 'error',
-      message: `/api/agent · ${e instanceof Error ? e.message : String(e)}`, ← surfaces to UI
-    });
+```typescript
+function aesKey(): Buffer {
+  const secret = process.env.AUTH_SECRET;
+  if (!secret) {
+    throw new Error(
+      'AUTH_SECRET is required in production to encrypt the auth cookie. ' +
+        'Set it in your Vercel project environment variables.',
+    );                                                              // ← message tells you the var name AND where to set it
   }
-        │
-        └─ this is the whole detection layer for prod incidents on /api/agent.
-           Vercel's log explorer is the dashboard. No aggregation, no
-           paging, no rotation. Incident response = "developer notices the
-           user's error message and digs in." When a real prod incident
-           lands, the post-mortem template from THIS file is what to write.
+  return createHash('sha256').update(secret).digest();              // ← 32 bytes → AES-256
+}
 ```
 
-#### Diagnose — name the shared global
+**This is the right place for the throw.** Fail closed when crypto can't run — encrypting a cookie with a zero key is worse than refusing. The message names the var AND tells the operator where to set it. This part of the system is doing its job.
 
-The reader anchor: you've debugged a "works on my machine" bug and the answer was an environment variable. Same shape — but the environment variable was being set *inside the test*, not outside it. The mutation `process.env.AUTH_SECRET = 'test-secret-please-ignore'` was the original code (visible in the diff). Vitest runs test files in parallel workers, and `process.env` is shared at the OS-process level.
+**Why it only fires in production.** `withAuthCookies` at `lib/mcp/auth.ts:86-104` is gated by `process.env.NODE_ENV === 'production'`:
 
-The diagnostic move is: read the test code and ask "what does this mutate that escapes the test's scope?" Direct `process.env.X = …` is the textbook answer. The leak isn't between test *cases* within a file (those run sequentially); it's between test *files* (those run in parallel workers). The crypto round-trip test depends on `process.env.AUTH_SECRET` being set; a different test file's worker might run first, find no `AUTH_SECRET`, fail. Or might overwrite the value mid-test. Either way: shared mutable state, racing.
-
-Boundary: the diagnosis here used the *test* trace, i.e. vitest's reporter output — not the repo's own observability stack. The trace/snapshot/`console.error` machinery played zero role in finding this bug because the failure was test-time, not runtime. The test runner's structured output was sufficient.
-
-```
-  Diagnose — what the parallel-worker leak looks like
-
-  worker A (file 1: auth.test.ts)        worker B (file 2: other.test.ts)
-  ─────────────────────────────────       ─────────────────────────────────
-  process.env.AUTH_SECRET = 'test'        runs first; no AUTH_SECRET set
-  encrypt(store) — needs AUTH_SECRET
-  ✓ pass
-
-       (next run, race goes the other way)
-
-  worker A starts; reads process.env      worker B does process.env.X = '…'
-  AUTH_SECRET → undefined (overwritten   process.env.AUTH_SECRET → cleared
-  or never set in this order)             by another test's cleanup
-  encrypt() throws / decrypts garbage
-  ✗ flake
-                                                          ▲
-                                                          └─ shared mutable state,
-                                                             racing, no isolation
+```typescript
+export async function withAuthCookies<T>(fn: () => Promise<T>): Promise<T> {
+  if (process.env.NODE_ENV !== 'production') return fn();          // ← dev/test: skip cookie codepath entirely
+  const { cookies } = await import('next/headers');
+  const raw = (await cookies()).get(AUTH_COOKIE)?.value;
+  const ctx: RequestStore = { store: raw ? decryptStore(raw) : {}, dirty: false };  // ← decryptStore calls aesKey()
+  // ...
+}
 ```
 
-**Code in this codebase — the reproduction primitive for *runtime* incident diagnosis:**
+In dev/test, `withAuthCookies` is a pass-through — `aesKey` is never called, so the throw never fires. The dev environment is *systematically incapable of reproducing* this bug. Local tests, dev server, every Vitest run — all fine. The bug appeared the moment the code hit Vercel prod, and only then.
 
-```
-  lib/state/investigations.ts  (lines 22-28)
+### Move 2.2 — the fix (the catch at the route entry)
 
-  export function getCachedInvestigation(insightId: string): AgentEvent[] | null {
-    if (mem.has(insightId)) return mem.get(insightId)!;                        ← rung 1
-    const fromFile = PERSIST ? readJson(CACHE_FILE)[insightId] : undefined;    ← rung 2 (dev)
-    if (fromFile) return fromFile;
-    const fromDemo = readJson(DEMO_FILE)[insightId];                           ← rung 3 (committed)
-    return fromDemo ?? null;
-  }
-        │
-        └─ for a captured runtime incident, this is the time-machine. Load
-           the insightId, replay the run, scrub the trace. The snapshot
-           machinery IS the incident-diagnosis tool for runtime bugs (when
-           the bug was on the captured path). Different tooling from the
-           flake-fix story; same four-phase shape.
-```
+The fix at **`app/api/briefing/route.ts:168-179`**:
 
-#### Fix — switch to a tracked mutation API
-
-The reader anchor: you've used a setup/teardown pattern in a test framework (Jest's `beforeEach`/`afterEach`, RSpec's `before(:each)`/`after(:each)`). The fix is exactly this — but using vitest's *tracked* env-stubbing primitive, which knows what was changed and how to undo it.
-
-The diff:
-
-```
-  - import { describe, it, expect, beforeEach } from 'vitest';
-  + import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-
-    describe('auth cookie crypto (production backend)', () => {
-  +   beforeEach(() => {
-  +     vi.stubEnv('AUTH_SECRET', 'test-secret-please-ignore');
-  +   });
-  +   afterEach(() => {
-  +     vi.unstubAllEnvs();
-  +   });
-
-      it('round-trips an encrypted store under AUTH_SECRET', () => {
-  -     process.env.AUTH_SECRET = 'test-secret-please-ignore';
-        ...
+```typescript
+// Construct the DataSource via the factory BEFORE committing to a stream so
+// a Bloomreach auth-gate can return 401 JSON the feed redirects on. Wrapped
+// so a setup throw (e.g. missing AUTH_SECRET breaking cookie encryption in
+// production) returns the real message instead of a bare 500.
+let sid: string;
+let dsResult: Awaited<ReturnType<typeof makeDataSource>>;
+try {
+  sid = await getOrCreateSessionId();
+  dsResult = await makeDataSource(mode, sid);
+} catch (e) {
+  console.error('[briefing] setup error:', redactSecrets(formatError(e)));
+  return NextResponse.json(
+    { error: `/api/briefing setup · ${e instanceof Error ? e.message : String(e)}` },
+    { status: 500 },
+  );
+}
 ```
 
-12 lines added, 3 removed, one file. The mechanism: `vi.stubEnv` writes to `process.env` *and* records the prior value; `vi.unstubAllEnvs` restores everything `stubEnv` changed during the test, including for env vars that didn't previously exist (they get *removed*, not left set to `''`).
+**Line-by-line read.**
 
-Boundary: the fix is *test-only*. The production code is unchanged. The original `process.env.AUTH_SECRET = '…'` was never in production — it was test setup that leaked into prod-test interleaving. This matters: the fix doesn't change behavior of the system being tested; it changes the discipline of the test framework's use.
+- The try block contains ONLY the setup phase — session ID creation and data-source construction. Both of these are pre-stream (the route hasn't committed to a `ReadableStream` yet), so returning a JSON 500 here is still safe.
+- `console.error('[briefing] setup error:', …)` — the route name is the prefix so a Vercel log filter can grep `[briefing] setup error` and see exactly these incidents.
+- `redactSecrets(formatError(e))` — `formatError` walks the cause chain up to 5 levels (`lib/mcp/transport.ts:82-97`), `redactSecrets` scrubs any bearer/access_token shapes (`lib/mcp/transport.ts:55-76`). Comment at `formatError` line 79-81: "we assemble the chain ourselves before redacting, otherwise a token nested inside `e.cause.cause` would survive the redaction."
+- `return NextResponse.json({ error: … }, { status: 500 })` — JSON body with the real message. The client's `readBody` helper at `lib/hooks/useBriefingStream.ts:63-72` will parse this and display it in the error panel.
+- The route-name prefix in the error message (`/api/briefing setup · …`) tells the operator which route failed — important when both briefing and agent routes can hit the same setup throw.
 
-```
-  Fix — the tracked-mutation discipline
+**Identical pattern at `app/api/agent/route.ts:165-174`** for the agent route. Two routes, one fix shape, deliberate sibling.
 
-  before (untracked):                     after (tracked):
-  ─────────────────────────               ──────────────────────────────────
-  process.env.AUTH_SECRET = '…'           vi.stubEnv('AUTH_SECRET', '…')
-            ▲                                       ▲
-            │                                       │
-            └─ writes the global                   └─ writes the global
-            └─ NOT tracked by the framework        └─ TRACKED: vitest knows
-            └─ NO cleanup pairing                       what it changed and
-                                                        how to undo it
-                                                   └─ vi.unstubAllEnvs() in
-                                                        afterEach restores
-```
+### Move 2.3 — the comment is the postmortem
 
-**Code in this codebase — the fix in place.** The comment IS the post-mortem:
+The comment at `briefing/route.ts:167-168` (and the matching `agent/route.ts:162-164`) is preserved as the *in-code postmortem*:
 
 ```
-  test/mcp/auth.test.ts  (lines 112-122, after the fix)
-
-  describe('auth cookie crypto (production backend)', () => {
-    // Isolate AUTH_SECRET with vitest's tracked env stubbing: set it before each
-    // test and restore the prior environment after. Mutating process.env directly
-    // (as before) leaked the var across files running in parallel workers, which
-    // made this block flaky. stubEnv/unstubAllEnvs keeps it self-contained.
-    beforeEach(() => {
-      vi.stubEnv('AUTH_SECRET', 'test-secret-please-ignore');                  ← tracked write
-    });
-    afterEach(() => {
-      vi.unstubAllEnvs();                                                       ← tracked restore
-    });
-
-    it('round-trips an encrypted store under AUTH_SECRET', () => {
-      // (the original process.env.AUTH_SECRET = '…' line removed here)        ← was: untracked write
-      const store = { 'sid-1': { tokens, codeVerifier: 'v', state: 's' } };
-      const token = _authCookieCrypto.encrypt(store);
-      ...
+"Wrapped so a setup throw (e.g. missing AUTH_SECRET breaking cookie
+ encryption in production) returns the real message instead of a bare 500."
 ```
 
-The comment names the root cause ("leaked across files running in parallel workers"), the fix ("stubEnv/unstubAllEnvs"), and the prevention ("keeps it self-contained"). Future readers find the lesson next to the code — no separate post-mortem doc to look up.
+This is the smallest possible incident artifact. No `runbooks/` directory, no Notion page, no postmortem doc — just the comment next to the guard. **The next developer who reads this code learns the lesson by reading the line above the try.** That's the lowest-friction documentation that survives — no link to follow, no separate file to discover.
 
-#### Prevent — the afterEach IS the regression guard
+The pattern is named explicitly in the code: *setup throw → real message → JSON 500*. Three concepts, one comment. Any future env-coupling bug in either route inherits the same shape because the pattern is already in the file.
 
-The reader anchor: you've added a lint rule to prevent a class of mistake. Same shape — but here the "rule" is a convention enforced by the test framework's API. Once the `beforeEach`/`afterEach` pattern is in place, any future test in that `describe` block is automatically isolated. The pattern *itself* is the prevention.
+### Move 2.4 — load-bearing skeleton
 
-What's the leading indicator that the prevention works? The commit message says it: "157 tests pass across repeated runs; tsc clean." That's verification of the fix; the prevention is the structural change (the convention is now in the file). Future tests in `describe('auth cookie crypto (production backend)', …)` will inherit the cleanup.
+This is a four-part pattern. Drop any one and a specific named capability disappears.
 
-Boundary: the prevention is *scoped to one describe block*. If a different test file mutates `process.env.OTHER_VAR` directly, it'll have the same flake potential. There's no project-wide lint rule, no `eslint-plugin-no-process-env-mutate`, no test-runner-level enforcement. The lesson generalises ("any test mutating a global must use a tracked-mutation API") but the prevention is local. Adding a project-wide rule would be a follow-up — not done in this incident.
+**1. Isolate the kernel.**
 
 ```
-  Prevent — the afterEach itself is the guard
+  catch-setup-and-surface (pseudocode)
 
-  before (the bug):                       after (the fix):
-  ─────────────────────────────────       ─────────────────────────────────
-  describe('crypto', () => {              describe('crypto', () => {
-    it('round-trips', () => {               beforeEach(() => {
-      process.env.AUTH_SECRET = '…'           vi.stubEnv('AUTH_SECRET', '…')
-      ...                                  });
-    });                                    afterEach(() => {
-                                             vi.unstubAllEnvs()
-                                           });
-                                           it('round-trips', () => { ... });
-  })                                      })
-                ▲                                          ▲
-                │ leaks across files                       │ restored after each test,
-                │                                          │ regardless of which file
-                                                            │ runs concurrently
+  route(req):
+    try:
+      partial_state_1 := await setup_call_1()      // anything that could throw on bad config
+      partial_state_2 := await setup_call_2()
+    catch e:
+      log_with_route_prefix_and_redacted_cause(e)
+      return JSON({error: routeName + ' setup · ' + e.message}, status=500)
+    // setup succeeded — commit to the response shape (stream, JSON, etc.)
+    return handler(partial_state_1, partial_state_2, req)
 ```
 
-#### Move 3 — the principle
+**2. Name each part by what BREAKS when it is missing.**
 
-A flake whose fingerprint is "passes in isolation, fails in parallel" is *always* shared mutable state. The state can be process env, the filesystem, a singleton in a shared module, a database — but the shape of the failure is the same. The discipline that catches this class of bug is *tracked mutation*: any mutation that escapes the test's scope must be done through an API that knows how to undo it. `vi.stubEnv` is one example; `vi.spyOn`, `mockFn.mockReset`, fixture rollback in DB tests are the same idea. The lesson generalises far beyond this repo: when you see the fingerprint, look for `process.env`, `global.X`, module-level mutable state, or filesystem writes. The fix is almost always "swap to a tracked-mutation primitive and add a teardown."
+| Part | What breaks if removed |
+| --- | --- |
+| try/catch around setup | unhandled throw escapes → Vercel default 500 with no body → user sees opaque error |
+| `redactSecrets(formatError(e))` in the log | token nested in `e.cause.cause` reaches Vercel logs → credential leak |
+| route-name prefix in `console.error('[briefing] setup error:', …)` | log filter can't distinguish briefing-setup errors from agent-setup errors |
+| route-name prefix in the JSON error message | client sees error but can't tell which route failed when both might fire on a single page load |
+| `e instanceof Error ? e.message : String(e)` | a thrown string or object (non-Error) crashes the `.message` access → second throw inside the catch → bare 500 again |
+| return BEFORE committing to a stream | catching after `new ReadableStream(...)` has been returned to the caller means you can't change the status code — too late, response headers already sent |
 
----
+**3. Separate skeleton from optional hardening.**
+
+The kernel is "try around setup → catch → log + return JSON." Optional hardening: `redactSecrets` (security), `formatError` (cause-chain walking), the route prefix (operational), the `e instanceof Error` guard (resilience to weird throws). All present, all earn their place by closing a specific failure path.
+
+### Move 2.5 — Phase A / Phase B (current state vs incident state)
+
+This concept is in *current-state-as-fix* shape. Phase A is the broken state (the incident); Phase B is the current state (the fix). The comparison teaches what changed.
+
+```
+  Comparison — before fix vs after fix
+
+  before (the incident)                          after (current state)
+  ─────────────────────                          ─────────────────────
+  // app/api/briefing/route.ts                   // app/api/briefing/route.ts:168-179
+                                                 
+  const sid = await getOrCreateSessionId();      let sid: string;
+  const dsResult = await makeDataSource(mode,    let dsResult: ...;
+                                          sid);  try {
+                                                   sid = await getOrCreateSessionId();
+  //                                               dsResult = await makeDataSource(mode, sid);
+  // aesKey() throws on missing AUTH_SECRET      } catch (e) {
+  //  → throw escapes route                         console.error('[briefing] setup error:',
+  //  → Vercel default 500 with no body              redactSecrets(formatError(e)));
+                                                   return NextResponse.json(
+  // client sees:                                    { error: `/api/briefing setup · ${...e.message}` },
+  //   status: 500, body: <blank>                    { status: 500 },
+  //   "something went wrong"                      );
+                                                 }
+                                                 
+  // (continues with stream construction)        // (continues with stream construction
+                                                 //  ONLY if setup succeeded)
+                                                 
+                                                 // client sees:
+                                                 //   status: 500, body: { error: real message }
+                                                 //   error panel: "AUTH_SECRET is required in production..."
+```
+
+The change is small (10 added lines, no removed lines) and structural (a new boundary, not a new behavior). The route's success path is unchanged. The only difference is that failure now lands as JSON instead of as a Vercel default page.
+
+### Move 3 — the principle
+
+The general principle: **a throw that escapes the request boundary is a debugging cost paid by the user.** Setup phases (env-shaped, config-shaped, init-shaped) are the most common place for unguarded throws because they happen once per request, feel like "framework code," and are easy to leave bare. Wrap them. The cost of the wrap is 10 lines and a try keyword. The benefit is that the next env-coupling bug is diagnosed in the time it takes to read the error message.
+
+The corollary: **fail loudly at the source, contain at the boundary.** `aesKey()` throws with a message that names the var. The boundary catches that throw and turns it into a transport-appropriate response (JSON for an API route, an error page for an SSR route, etc.). The two responsibilities are different: the source knows *what* failed; the boundary knows *how to report a failure for this transport*.
+
+The third lesson: **environment parity is partial; expect the env-only path to bite.** The dev path used the file cache; the prod path used the encrypted cookie. The throw lived in code only the prod path runs. Tests passed because tests took the dev path. The fix here isn't "add a test for prod" (no env to run it against locally without mocking AUTH_SECRET); the fix is to make the failure mode *legible when it happens*. The next env-coupling bug has the same shape and the same wrapper catches it.
 
 ## Primary diagram
 
-The full incident lifecycle for `e83a8e0`, with each phase's evidence.
+The full picture — the incident, the cause, the fix, the lesson.
 
 ```
-  e83a8e0 flake-fix — full incident lifecycle
+  Auth-secret postmortem — the incident and its fix
 
-  ┌─ Detect ─────────────────────────────────────────────────┐
-  │  signal: vitest run, ~1-in-N failure on                    │
-  │          auth.test.ts > 'round-trips an encrypted store'   │
-  │  tooling: test runner exit code (no Sentry, no PagerDuty)  │
-  │  fingerprint: "isolated pass + parallel flake"             │
-  └─────────────────────────▲───────────────────────────────┘
-                            │
-  ┌─ Diagnose ──────────────┴───────────────────────────────┐
-  │  reading test/mcp/auth.test.ts (pre-diff):                │
-  │    process.env.AUTH_SECRET = 'test-secret-please-ignore'  │
-  │  ↑ direct mutation of process-level shared state          │
-  │  fingerprint applied: shared global → parallel race        │
-  │  conclusion: vitest parallel workers race process.env     │
-  └─────────────────────────▲───────────────────────────────┘
-                            │
-  ┌─ Fix ───────────────────┴───────────────────────────────┐
-  │  diff: test/mcp/auth.test.ts (12 added, 3 removed)         │
-  │    + import { afterEach, vi }                              │
-  │    + beforeEach(() => vi.stubEnv('AUTH_SECRET', '…'))      │
-  │    + afterEach(() => vi.unstubAllEnvs())                   │
-  │    - process.env.AUTH_SECRET = '…'  (× 2)                  │
-  │  one file, one describe block, NO production change        │
-  └─────────────────────────▲───────────────────────────────┘
-                            │
-  ┌─ Prevent ───────────────┴───────────────────────────────┐
-  │  the afterEach IS the regression guard — env is restored  │
-  │  after each test, regardless of which file the worker     │
-  │  runs concurrently with                                   │
-  │  scope: local to this describe block                      │
-  │  lesson generalises (any tracked-mutation primitive);     │
-  │  prevention doesn't (no project-wide lint rule)            │
-  └─────────────────────────▲───────────────────────────────┘
-                            │
-  ┌─ Verify ────────────────┴───────────────────────────────┐
-  │  commit message: "157 tests pass across repeated runs;    │
-  │                   tsc clean."                              │
-  │  proof: the same pattern (run the suite N times) that      │
-  │  detected the flake now passes N for N runs                │
-  └─────────────────────────────────────────────────────────┘
+  ┌─ env (the trigger) ────────────────────────────────────────────────┐
+  │  AUTH_SECRET not set in Vercel project env vars                     │
+  │  (worked locally because dev uses a different codepath)             │
+  └─────────────────────────┬───────────────────────────────────────────┘
+                            │ in production only
+  ┌─ storage layer (the source) ───▼───────────────────────────────────┐
+  │  lib/mcp/auth.ts                                                    │
+  │    aesKey() at line 51-60                                           │
+  │      throw new Error('AUTH_SECRET is required ...')                 │
+  │                                                                     │
+  │    called from withAuthCookies (line 86-104), prod-only             │
+  │      decryptStore(raw) at line 90 → aesKey() throws                 │
+  └─────────────────────────┬───────────────────────────────────────────┘
+                            │ throw propagates up the awaits
+                            ▼
+  ┌─ service layer (where it landed) ──────────────────────────────────┐
+  │  app/api/briefing/route.ts  app/api/agent/route.ts                  │
+  │                                                                     │
+  │  BEFORE: no boundary; throw escapes to Vercel; bare 500             │
+  │                                                                     │
+  │  AFTER (briefing/route.ts:168-179, agent/route.ts:165-174):         │
+  │    try { setup() }                                                  │
+  │    catch (e) {                                                      │
+  │      console.error('[route] setup error:',                          │
+  │        redactSecrets(formatError(e)));    ← Vercel logs, redacted   │
+  │      return NextResponse.json({ error: routeName + ' setup · ' +    │
+  │        e.message }, { status: 500 });    ← client sees real message │
+  │    }                                                                │
+  │                                                                     │
+  │  THE COMMENT (briefing/route.ts:167-168) IS THE POSTMORTEM:         │
+  │    "Wrapped so a setup throw (e.g. missing AUTH_SECRET breaking     │
+  │     cookie encryption in production) returns the real message       │
+  │     instead of a bare 500."                                         │
+  └─────────────────────────┬───────────────────────────────────────────┘
+                            │ JSON 500 with real message
+                            ▼
+  ┌─ UI layer (the recovery) ──────────────────────────────────────────┐
+  │  useBriefingStream.ts:63-72 readBody helper                         │
+  │    parses JSON or falls back to __raw text                          │
+  │  useBriefingStream.ts:172-183                                       │
+  │    setErrorMessage(body.error) → error panel renders the real text  │
+  │  user sees: "AUTH_SECRET is required in production..."              │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  THE PATTERN INSTALLED (applies to all future env-shaped failures):
+
+    catch-setup-and-surface
+      ────────────────────────
+      try { all-the-can-throw-on-bad-config }
+      catch (e) {
+        log_with_route_prefix(redactSecrets(formatError(e)));
+        return JSON({error: routePrefix + ' setup · ' + (e?.message ?? String(e))},
+                    { status: 500 });
+      }
 ```
-
----
 
 ## Elaborate
 
-The post-mortem discipline this repo demonstrates — naming the root cause, the fix, the contributing conditions, and the verification in the commit message — is the SRE-book template scaled to a one-developer codebase. Google's SRE Book emphasizes the *blameless* post-mortem: focus on systemic causes (shared mutable state, lack of teardown convention) rather than human ones ("the developer forgot afterEach"). The `e83a8e0` commit message does this implicitly — it names the framework default (parallel workers) and the missing API (tracked mutation) without finger-pointing.
+The "production-only because of env-coupling" failure mode is one of the most common 12-factor app gotchas. The Twelve-Factor App's third factor ("Store config in the environment") sets the expectation; the *failure* it doesn't prepare you for is that env-shaped failures happen at request time, in production, and your local dev path may not exercise the code that touches the env. Every team that ships to a serverless platform learns this lesson at least once.
 
-What this incident *missed* — and worth naming for honesty: there's no automated regression suite that runs N parallel iterations of the test to confirm the flake is fixed. The verification ("157 tests pass across repeated runs") is manual. A more rigorous prevention would add a CI job that runs the test suite K times in parallel and fails if any of the runs flake. That's not built; the commit message claim is the verification. Adding it would close the loop between "we fixed it" and "the fix can't silently regress" — a separate small project, ~1 hour.
+The deeper principle is **boundary-shaped error handling**. Each request boundary in a system needs a "catch and surface" at its edge — a "what's the right shape of error for *this* transport?" handler. For an HTTP API route, JSON with a status code. For an SSR page, a `<NoBoundary error={…}/>` element. For a background worker, a dead-letter queue entry. The transport differs; the *boundary discipline* is the same: don't let a throw escape the request scope unhandled.
 
-What this kind of incident doesn't teach you: production-incident response. The flake-fix lived entirely in the test loop — no users were affected, no rollback was needed, no on-call was paged. Real prod incidents involve mitigation (rollback, feature flag), customer communication, post-incident review with multiple stakeholders, and runbook updates. None of those rungs are exercised in this repo. Naming this explicitly is the point — the one example is good; the absence of others is honest.
+The codebase has at least three other examples of the same discipline applied in the same files:
 
-The closest related pattern in this codebase: the cache snapshot. If the agent route ever has a regression (e.g. a prompt change degrades the diagnostic agent's accuracy), the snapshot lets you replay pre-regression runs and compare. That's a *regression-diagnosis* tool — different from a runtime-incident tool, but adjacent. The snapshot machinery would slot directly into a regression-suite if someone built one ("for each captured insightId, replay and assert the diagnosis matches the captured one"). Not built; one-week-of-work away. The four-phase post-mortem template generalises to any incident the repo eventually has — runtime, regression, security, performance.
+- `DOMException` `AbortError` is *intentionally* not surfaced (`app/api/briefing/route.ts:294-296`, `app/api/agent/route.ts:308-310`) — the client cancelled, there's no consumer to read the error, so the boundary swallows the throw and the `finally` records the phase log anyway. This is the *same pattern, opposite policy*: catch and decide on a per-shape basis.
+- `disposeDataSource` errors are caught and logged but not surfaced (`briefing/route.ts:308-312`, `agent/route.ts:322-326`) — a teardown error must NOT swallow the route-level error above. The order matters: teardown's catch sits inside `finally`, *after* the main response is already committed.
+- The retry ladder + ceiling in `BloomreachDataSource.callTool` — a hung MCP connection would burn the 300s budget; the per-call `TOOL_TIMEOUT_MS = 30_000` at `lib/mcp/transport.ts:38` catches it and throws fast. Comment: "a retry would just risk another 30s wait inside the same route budget."
 
-The fingerprint sentence ("isolated pass, parallel flake = shared mutable state") is the reusable distillation. Once you internalise it, every future flake with that fingerprint takes minutes to diagnose instead of hours. The class of bugs is the same shape every time; what changes is *which global* was mutated. Env vars, filesystem entries, singletons, in-process registries, DB rows — all are candidates.
+All three are the same pattern in different costumes: identify the boundary, decide the right shape of error for *this* boundary, install the catch.
 
----
+**Adjacent concepts:**
+- **The 12-factor app** — config in environment, named here as the system that creates the conditions.
+- **Sentry / Rollbar / Datadog error tracking** — what you'd install to NOTICE this kind of bug if you didn't already have a JSON error body that shows up in the UI.
+- **Health checks / readiness probes** — what you'd install to FAIL FAST on a missing env at startup time instead of first-request time. Vercel doesn't run these the way Kubernetes does, so this codebase relies on the first request to discover the failure.
+- **Defensive try/catch** — the antipattern this *isn't* (which catches too much, hides bugs, and ends up logging-and-continuing instead of failing properly).
+- **Boundary error handling in Erlang/Elixir** — let it crash inside, supervisor catches at the boundary. Same shape, language-level.
+
+**Read next:**
+- `01-ndjson-agent-event-discriminated-union.md` — the *successful* path; this postmortem is the failure-mode complement.
+- `03-three-rung-mem-file-seed-store.md` — the auth store is one instance of the same three-rung pattern; the production rung is where AUTH_SECRET lives.
+- `audit.md` § 7 (incident-analysis-and-prevention).
 
 ## Interview defense
 
-**Q1. Walk me through your one incident in detail.**
+**Q: Walk me through the bug.**
+A: Production hit returned a bare 500 with no body. Dev was fine, tests were fine, no errors in CI. The 500 had no Vercel function logs because the throw escaped before any `console.log` ran. Tracking it down: hit the route locally with `NODE_ENV=production npm run start` (simulating the prod codepath), reproduced. The throw was `aesKey()` at `lib/mcp/auth.ts:51-60` — `AUTH_SECRET` env var wasn't set in the Vercel project. Set it; bug went away. The fix: wrap the setup phase of both routes (briefing and agent) in try/catch that returns JSON with the real message. Now any future env-coupling bug surfaces immediately in the UI instead of as a blank 500.
 
-The bug: `auth.test.ts > 'round-trips an encrypted store under AUTH_SECRET'` flaked ~1-in-N in full `vitest run`, passed every time in isolation. Detection: a developer ran the suite, saw the failure, noticed the "isolated pass, parallel flake" fingerprint — that's the diagnostic shortcut to "shared mutable state." Diagnosis: read the test, found `process.env.AUTH_SECRET = '…'` — an untracked mutation of process-global state. Vitest's parallel workers share `process.env`, so other test files raced the cleanup. Fix: replace the direct assignment with `vi.stubEnv('AUTH_SECRET', '…')` in `beforeEach` and `vi.unstubAllEnvs()` in `afterEach`. Verification: 157 tests pass across repeated runs, per the commit message. Prevention: the `beforeEach`/`afterEach` pair IS the regression guard for that describe block; the generalisable lesson is "any test mutating a global must use a tracked-mutation API." File touched: `test/mcp/auth.test.ts` only. Production code: unchanged. Commit: `e83a8e0`.
+> *Sketch:* the before/after comparison from Move 2.5.
 
-```
-  fingerprint  → isolated pass + parallel flake = shared mutable state
-  root cause   → process.env mutated directly
-  fix          → vi.stubEnv + vi.unstubAllEnvs (tracked mutation)
-  prevent      → afterEach is the guard (scoped to describe block)
-  verify       → suite passes N for N runs
-```
+**Anchor:** "Env-only codepath, dev never ran it, the boundary catch makes it legible."
 
-**Anchor:** the fingerprint sentence — "isolated pass, parallel flake is always shared mutable state."
+**Q: Why catch at the route entry instead of fixing `aesKey()` to not throw?**
+A: `aesKey()` *should* throw — encrypting a cookie with a zero key is worse than refusing. The bug isn't that `aesKey` threw; the bug is that the throw had nowhere to land before becoming a 500. Fixing `aesKey` to "return a default key on missing env" would silently degrade prod security. The right move is to let the source throw with a useful message, and catch at the request boundary where the appropriate response shape is JSON. **Fail loudly at the source, contain at the boundary.**
 
-**Q2. What's the smallest move that would turn this incident's lessons into project-wide prevention?**
+> *Sketch:* the two seams diagram — source (aesKey throw, unchanged) and boundary (route catch, added).
 
-Three layers, ordered by leverage:
+**Anchor:** "Source fails loudly; boundary decides the response shape."
 
-1. **A `tests/setup.ts` that runs `vi.unstubAllEnvs()` in a project-wide `afterEach`.** Vitest supports a global setup file referenced from `vitest.config.ts`. One line in the setup, every test in every file gets the cleanup automatically. Zero adoption cost for future tests.
+**Q: Why didn't tests catch this?**
+A: Tests run with `NODE_ENV` ≠ `production`, so `withAuthCookies` at `lib/mcp/auth.ts:86-87` short-circuits and `aesKey` is never called. Dev runs the file-cache path; tests run the memory-cache path; prod runs the cookie path. Three rungs, three code paths, only one calls `aesKey`. There's no env to test the cookie path against locally without mocking `AUTH_SECRET` — possible, but every test that touches auth would need to fork (with-secret / without-secret). The chosen tradeoff: don't test the prod-only code path; make the failure mode *legible* when it happens. That's the catch at the route entry — first-request diagnosis instead of a stack trace search.
 
-2. **An ESLint rule banning `process.env.X = …` in `test/**` files.** Either a custom rule or `eslint-plugin-no-restricted-syntax` with a selector matching assignment expressions on `process.env`. Prevents the mistake at lint time, before it reaches CI.
+> *Sketch:* the dev/test/prod codepath split from `lib/mcp/auth.ts:86-104`.
 
-3. **A CI job that runs `vitest run` K times in a row (e.g. K=5).** If any iteration flakes, the job fails. Catches not just env leaks but any shared-state flake. Adds K× test time to CI — acceptable for K=5 if total test time is short.
+**Anchor:** "Three codepaths, tests run two; prod-only path is legible by design."
 
-The first move is the smallest and highest-leverage. The second is preventive (catches the mistake before commit). The third is verification (catches it before deploy). Doing all three is overkill for a solo repo today; the first one alone closes the gap from "this one describe block is safe" to "every describe block in the project is safe by default."
+**Q: How does redaction work in the catch?**
+A: `redactSecrets(formatError(e))`. `formatError` at `lib/mcp/transport.ts:82-97` walks the cause chain up to 5 levels (`e.cause`, `e.cause.cause`, …) and concatenates them into one string. This is necessary because `String(e)` doesn't follow `cause` — so a token tucked inside `e.cause.cause` would survive `String(e)` and reach the logs. After the chain is built, `redactSecrets` runs 5 regex patterns (`Bearer …`, `access_token`, `refresh_token`, `id_token`, `code_verifier`) over the string and replaces matches with `[redacted]`. The order matters: walk first, redact second — otherwise the redaction misses tokens that get pulled in from nested causes during the walk.
 
-```
-  layer 1: tests/setup.ts        → 1 line, all tests inherit cleanup
-  layer 2: ESLint rule           → preventive, blocks the mistake
-  layer 3: CI ×K flake guard     → verification, catches drift
-                                          ▲
-                                          └─ today: none of the three is built
-                                             smallest valuable add: layer 1
-```
+> *Sketch:* the chain of `e → e.cause → e.cause.cause`, then the redaction step.
 
-**Anchor:** name the three layers by *what they prevent* — automatic cleanup, banned syntax, drift detection. Each closes a different failure mode.
+**Anchor:** "Walk the cause chain, then redact."
 
----
+**Q: What's the next env-coupling bug this catches?**
+A: Any prod-only env var. `ANTHROPIC_API_KEY` is already check earlier in the route (line 155, returns 401-style JSON, separate guard). But a future `MCP_CLIENT_ID` or `OAUTH_REDIRECT_URI` or rotated AES key would all throw inside `makeDataSource` and land in the same try/catch — JSON with the real message, route-name prefix, redacted cause chain. The pattern installed is *generic*; this incident's specific var name is incidental. The skeleton at Move 2.4 — try setup, catch, log with prefix, return JSON 500 — handles the whole class.
 
----
+> *Sketch:* the catch kernel from Move 2.4 with arrows showing it catches "any setup throw."
+
+**Anchor:** "Pattern is general; AUTH_SECRET was the first instance."
+
+**Q: What's missing that would prevent it instead of catching it?**
+A: A startup-time env check. Something like Zod-parsing `process.env` at module load — `MCP_CLIENT_ID: z.string().min(1)`, etc. — so the *deploy* fails when an env var is missing, not the first request. Vercel doesn't run readiness probes (the way Kubernetes does), so the deploy-time check would have to be a build-time or import-time assertion. This codebase doesn't have one. Adding it is one possible follow-up; in the meantime, the catch at the boundary is the safety net.
+
+> *Sketch:* a "startup env check" box upstream of the route, currently empty.
+
+**Anchor:** "Startup parsing would prevent; boundary catch is what we have."
 
 ## See also
 
-- `audit.md` — the broader lens audit; this incident is named in incident-analysis-and-prevention as the only documented incident in the repo.
-- `01-ndjson-agentevent-discriminated-union.md` — the typed-event discipline that's the runtime-incident analog of "tracked mutation."
-- `03-three-rung-mem-file-seed-store.md` — the snapshot machinery as a regression-diagnosis substrate for runtime incidents.
-- `04-dual-write-send-to-stream-and-store.md` — the dual-write that captures runtime evidence (the analog of the test runner's reporter output for runtime bugs).
-- `06-eval-result-paper-trail.md` (RETIRED) — once held two additional incident anecdotes (the BRL cents-vs-Reais model-level bug surfaced by the judge, and the parallel-run K=10 race detected via `ps aux`). Both incidents were RESOLVED-BY-DELETION when PR #8 removed the Olist pipeline. The anecdotes remain instructive in the historical file; they no longer describe a live system.
-- `.aipe/study-testing/` — the testing discipline that this flake-fix exemplifies; that guide owns the testing lessons, this one owns the incident lessons.
-- `.aipe/study-security/` — the auth/crypto layer the test was exercising (`_authCookieCrypto`).
-
----
+- `01-ndjson-agent-event-discriminated-union.md` — the success-path the catch protects.
+- `03-three-rung-mem-file-seed-store.md` — the auth-store instance of the three-rung pattern that the cookie rung depends on.
+- `audit.md` § 7 (incident-analysis-and-prevention) — the lens this postmortem fulfills.

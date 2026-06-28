@@ -1,391 +1,271 @@
-# Anatomy of a production prompt
+# 01 — Anatomy of a production prompt
 
-**Industry name(s):** prompt anatomy, system-prompt structure, prompt templating, role/instruction/output decomposition
-**Type:** Industry standard · Language-agnostic
-
-> All four blooming insights prompts share one skeleton — Role → Hard rules → method → EQL reminders → Output → `{schema}` — where the `.md` file is a constant system prompt and the per-call payload (`{project_id}`, `{anomaly}`, `{diagnosis}`, `{intent}`, the `userPrompt`) is injected at runtime, and the `synthesisInstruction` is appended dead last on the forced-final turn.
-
-
----
+*Four-section prompt structure · Industry standard*
 
 ## Zoom out, then zoom in
 
-**Zoom out — the bigger picture.** Prompt anatomy lives squarely inside the Per-agent definitions band — the layer where each agent's system prompt is assembled before `runAgentLoop` ever sees it. The `.md` file is loaded at module import in the agent class; the per-call `.replace` chain runs right above the loop; the synthesis append happens one band lower, inside `base.ts`. So when you ask "what does the model actually read this turn?" you are looking at three sites that span the boundary between Per-agent definitions and the Shared agent loop.
+Pull up the agent layer. This is where every prompt lives in `blooming_insights`.
 
 ```
-  Zoom out — where prompt anatomy lives
+  Where the four sections of a prompt sit in the system
 
-  ┌─ Pipeline coordinator ──────────────────────────┐
-  │  monitoring → diagnostic → recommendation        │
-  └─────────────────────────┬────────────────────────┘
-                            │  per-agent
-  ┌─ Per-agent definitions ─▼────────────────────────┐  ← we are here
-  │  ★ .md file (Layer 1) + .replace (Layer 2) ★    │
-  │  lib/agents/prompts/*.md   monitoring.ts L12     │
-  └─────────────────────────┬────────────────────────┘
-                            │  system string
-  ┌─ Shared agent loop ─────▼────────────────────────┐
-  │  ★ synthesis append (Layer 3) ★  base.ts L96–98 │
-  └─────────────────────────┬────────────────────────┘
-                            │
-  ┌─ Provider ──────────────▼────────────────────────┐
-  │  anthropic.messages.create  (sees assembled bytes)│
-  └──────────────────────────────────────────────────┘
+  ┌─ Route (/api/briefing) ───────────────────────────────────────┐
+  │  bootstrap schema, build agent, stream events                  │
+  └────────────────────┬───────────────────────────────────────────┘
+                       │
+  ┌─ Agent adapter (lib/agents/monitoring.ts) ────────────────────┐
+  │  builds system prompt by interpolating into a .md template     │
+  │     ┌──────────────────────────────────────────────────────┐   │
+  │     │ ★ THE PROMPT — four sections ★                       │   │ ← we are here
+  │     │   1. system  (role + rules + schema + checklist)     │   │
+  │     │   2. context (workspace schema, project_id)           │   │
+  │     │   3. examples (few-shot output shape)                 │   │
+  │     │   4. user    ("work through the checklist...")        │   │
+  │     └──────────────────────────────────────────────────────┘   │
+  └────────────────────┬───────────────────────────────────────────┘
+                       │
+  ┌─ Anthropic SDK call ───────────────────────────────────────────┐
+  │  system = sections 1+2+3 · messages[0].user = section 4         │
+  └─────────────────────────────────────────────────────────────────┘
 ```
 
-**Zoom in — narrow to the concept.** The question is: when you open `diagnostic.md`, which lines are the same on every call, which get stamped in at runtime, and which only show up on the final turn? Anatomy answers that by naming three time-layers — the constant `.md` file, per-call `.replace` injection, and the synthesis append on the forced-final turn — so every line you can point at traces to exactly one layer. Below, you'll see the six shared sections, the closed placeholder set, and why the synthesis string lives in code rather than in the `.md`.
-
----
+A production prompt is not "the thing you type into the chat box." It's an *assembled artifact* with four named sections, each with a different job, each going to a different SDK parameter. Get the boundaries wrong and the prompt drifts under you — every later concept file in this guide is downstream of getting the boundaries right.
 
 ## Structure pass
 
-**Layers.** Prompt anatomy is a four-layer stack and you have to keep them straight or you'll spend an hour staring at the wrong file. Layer A is the *constant markdown* (`monitoring.md` etc.) — bytes committed once, loaded at import, never mutated. Layer B is the *per-call `.replace` chain* in each agent class — the stamping that turns `{schema}` / `{project_id}` / `{anomaly}` into real values. Layer C is the *forced-final-turn synthesis append* inside the shared loop — a string glued onto the system on exactly one turn. Layer D is the *assembled bytes the model reads* — what `anthropic.messages.create` actually sees. A → B → C → D, and "the prompt" is a different thing at each layer.
+Three layers, one axis held constant down through them.
 
-**Axis: control.** Who decides what goes into the system string at each layer? This is the right axis because the bug class this concept exists to make legible is "a value showed up in the model's context that I didn't expect, and I can't tell who put it there." Cost is irrelevant (these layers cost nothing to assemble); state-ownership is downstream of control. Trace control across A→D and the seams pop: an author decides the constant, code decides the injection, the loop decides the synthesis append, the model decides nothing about its own system prompt.
+**Layers.** Outer: the prompt as a single blob of text the SDK receives. Middle: the four named sections that *compose* the blob. Innermost: the fields inside each section (rules, examples, schema).
 
-**Seams.** Two seams matter, one load-bearing. Seam 1 is between A and B — control flips from *human-at-PR-review-time* to *code-at-request-time*. That's where `{project_id}` becomes the real id; if the `.replace` is wrong (single-replace where global was needed) the model reads a literal `{project_id}` brace string and dutifully passes it as a tool argument. I've watched that exact bug ship. Seam 2 is the load-bearing one: between B and C — control flips from *per-call stamping* (happens every turn) to *forced-final-turn appending* (happens on exactly one turn, with tools removed). This is the seam where the model's instructions change *mid-loop*, and it's why "the prompt" answered for a normal turn is a different string than "the prompt" answered for the synthesis turn. Get this seam wrong (e.g. always-appending the synthesis) and the model stops querying after turn one.
-
-```
-  Structure pass — prompt anatomy
-
-  ┌─ 1. LAYERS ───────────────────────────────────┐
-  │  A: constant .md (Role/Hard rules/Output/…)    │
-  │  B: per-call .replace chain (agent class)      │
-  │  C: forced-final-turn synthesis append (loop)  │
-  │  D: assembled bytes (provider.create sees)     │
-  └────────────────────────┬───────────────────────┘
-                           │  pick the axis
-  ┌─ 2. AXIS ─────────────▼────────────────────────┐
-  │  control: who decides what enters the system   │
-  │  string at each layer?                          │
-  └────────────────────────┬───────────────────────┘
-                           │  trace A→D, find flips
-  ┌─ 3. SEAMS ────────────▼────────────────────────┐
-  │  S1 (A↔B): author-at-review → code-at-request  │
-  │  S2 (B↔C): every-turn stamping → one-turn      │
-  │            append (load-bearing)                │
-  └────────────────────────┬───────────────────────┘
-                           ▼
-                   Block 4 — How it works
-```
+**Axis — change frequency.** Walk "how often does this part change?" down the layers:
 
 ```
-  A seam — "who decides what's in the system string THIS turn?" answered two ways
+  one axis — "how often does this part change?" — three answers
 
-  ┌─ Layer B ────────┐    seam     ┌─ Layer C ────────────┐
-  │  stamping runs   │ ═════╪═════► │  synthesis append    │
-  │  on EVERY turn   │  (it flips) │  runs on ONE turn,   │
-  │  with tools on   │             │  tools REMOVED       │
-  └──────────────────┘             └──────────────────────┘
-         ▲                                   ▲
-         └────── same axis, two answers ─────┘
-                 → this boundary changes what the model reads mid-loop
+  ┌─ section 1 — system role + rules ─┐
+  │  CHANGES RARELY                    │   committed to git, reviewed
+  └────────────────────────────────────┘   in PRs, surveys outlast model
+       ┌─ section 2 — context ─────────┐
+       │  CHANGES PER REQUEST          │   workspace schema, project_id,
+       └───────────────────────────────┘   diagnosis to investigate
+            ┌─ section 3 — examples ───┐
+            │  CHANGES RARELY          │   few-shot examples committed
+            └──────────────────────────┘   with the prompt
+                 ┌─ section 4 — user ──┐
+                 │  CHANGES PER CALL   │   "go investigate this anomaly"
+                 └─────────────────────┘   the trigger, not the content
 ```
 
-The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+**Seams.** The system/user boundary is load-bearing: it flips who's in control (system = author; user = caller). The context-vs-rules boundary inside the system block is the other seam — mixing them is how prompts drift, and concept 13 is downstream of policing it.
 
 ## How it works
 
-**Mental model.** Three layers stacked in time. Layer 1 is the versioned markdown prompt file — loaded once at module load, never mutated, the same bytes for every investigation. Layer 2 is per-call injection — a string-replace chain stamps the runtime values into the placeholders right before the call. Layer 3 is the forced-final-turn append — a synthesis instruction glued onto the end of the system string only on the turn where the model must stop and answer. Read top to bottom, the model sees one coherent system prompt; read by *origin*, every line traces to exactly one of those three layers.
+### Move 1 — the mental model
+
+You know how a `fetch()` call has four things: a method, a URL, headers, and a body? An LLM call has four things too: a system message, context, examples, and a user message. Each goes to a different parameter on the SDK call, and each one answers a different question:
 
 ```
-LAYER 1  constant markdown file   loaded once at import
-   ## Role · ## Hard rules · method · ## EQL reminders · ## Output · {schema}
-            │
-LAYER 2  per-call replace chain   stamped per investigation
-   {project_id} → real id   {anomaly} → JSON   {schema} → schema summary
-            │
-LAYER 3  synthesis append         forced-final turn ONLY
-   system + "\n\n" + synthesis_instruction
-            │
-            ▼
-   the system prompt the model actually receives this turn
+  The four-section prompt — one shape for every agent in the codebase
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │ 1. SYSTEM       │ WHO am I and WHAT are my rules?           │
+  │    (system)     │ "You are the monitoring agent. Hard rule  │
+  │                 │  1: pass project_id to every tool call."  │
+  ├─────────────────┼───────────────────────────────────────────┤
+  │ 2. CONTEXT      │ WHAT does the world look like RIGHT NOW?  │
+  │    (system,     │ "Project: wobbly-ukulele. Total customers │
+  │     injected)   │  3,427. Events: purchase, view_item, ..." │
+  ├─────────────────┼───────────────────────────────────────────┤
+  │ 3. EXAMPLES     │ WHAT does a good answer LOOK LIKE?         │
+  │    (system,     │ A canonical JSON shape inside the prompt   │
+  │     few-shot)   │  text, shown verbatim.                    │
+  ├─────────────────┼───────────────────────────────────────────┤
+  │ 4. USER         │ WHAT specifically do I want NOW?           │
+  │    (user msg)   │ "Work through your checklist and return    │
+  │                 │  the JSON array."                          │
+  └─────────────────────────────────────────────────────────────┘
 ```
 
-The first two layers are stable across the run; the third changes the system prompt on exactly one turn. That time-layering is the whole anatomy.
+That's the kernel. Any prompt missing one of these four is either underspecified (no rules, model wanders), under-grounded (no context, model invents), under-shaped (no examples, output mode drifts), or undertriggered (no user message, model doesn't know which task to do *now*).
 
----
+### Move 2 — the walkthrough
 
-### The six shared sections
-
-Every prompt file is the same six blocks in the same order. This is not a coincidence — it is a template the team holds in its head, and it makes a new agent prompt a fill-in-the-blanks exercise.
+**Section 1 — the system role.** Two things only: identity ("you are the X agent") and hard rules ("make at most N tool calls, then conclude"). Rules go at the top because the model attends to early-system content more strongly than late-context content (this is lost-in-the-middle in concept 04). Look at `legacy-prompts/monitoring.md:1-22`:
 
 ```
-## Role               who you are, ONE job, disclaimers of the others' jobs
-## Hard rules         non-negotiables: project_id on every call, ≤N calls
-<method section>      how to do the job ("Period-over-period method",
-                      "Investigation approach", "How to propose", "Framing")
-## EQL reminders      worked query syntax exemplars (format few-shot)
-## Output             exact shape + field rules + a concrete example
-## Workspace schema   {schema}   ← the injected data dictionary
+You are the monitoring agent in blooming insights, an AI analyst for an
+ecommerce workspace running on Bloomreach Engagement (EQL-shaped tools).
+
+## Role
+You run a fixed checklist of ecommerce anomaly categories ...
+
+## Hard rules
+1. Pass `project_id: {project_id}` to every tool call.
+2. Compute everything ad-hoc with `execute_analytics_eql`.
+3. Make at most 6 tool calls total, then stop and return your JSON answer.
+4. Work globally (no breakdown) by default. ...
 ```
 
-You can lay the four prompt files side by side and the headings line up. The monitoring prompt is Role / Hard rules / method / EQL reminders / Output / schema — note it carries an extra section the other three don't: `## Your category checklist`, with a `{categories}` slot (covered below). The diagnostic prompt is the same six-section skeleton. The recommendation prompt swaps EQL reminders for an "Available tools" list. The query prompt has the same six, with its Output section saying the opposite of the other three (more on that in → 07-output-mode-mismatch.md).
+Identity in one sentence, then numbered hard rules. The numbered rules are scannable — when the model regresses, you can point at "rule 3" and tighten the language. Prose rules buried in paragraphs are unmaintainable.
 
----
-
-### The one structural exception: monitoring's `## Your category checklist`
-
-The monitoring prompt is not a clean instance of the six-section skeleton. Between `## Role` and `## Hard rules` it has a seventh section the other three prompts don't:
+**Section 2 — the context, injected per call.** Two interpolations: `{project_id}` (one string) and `{schema}` (the compacted workspace schema). `lib/agents/legacy-prompts/monitoring.md:99-101`:
 
 ```
-## Your category checklist
-  "Check each of these — and only these…"
-  {categories}                       ← per-call injection slot
+## Workspace schema
+
+{schema}
 ```
 
-This matters for two reasons. First, it is a *fourth* per-call injection placeholder, sitting alongside `{schema}`, `{project_id}`, and the per-agent anomaly/diagnosis/intent injections — bringing the monitoring agent's runtime-stamped slots to `{schema}` + `{project_id}` + `{categories}`. Second, `{categories}` is unlike the others: `{schema}` is the same data dictionary for every agent and `{project_id}` is a single id, but `{categories}` is a *runtime-assembled checklist string* — the monitoring agent builds it from the anomaly-category list passed into its scan method and stamps it in with a string replace, right next to the existing `{schema}` and `{project_id}` replacements. The categories it receives are the schema-runnable subset: the briefing route handler computes the runnable categories from schema capabilities and passes that list into the scan call. So the section's *body* is data — only the anomaly categories this workspace's events can support — assembled at call time and dropped into a fixed slot. (The gate that decides which categories are runnable is its own topic — → ../study-ai-engineering/04-agents-and-tool-use/07-capability-gating.md.)
+`{schema}` lands at the *end* of the system prompt because it's variable-length and we want stable rules at the top (better lost-in-the-middle behaviour, better prefix caching). The interpolation itself happens in `lib/agents/monitoring-legacy.ts:95-98`:
 
-The takeaway for anatomy: do not assume all four prompts are the identical six-section shape. Three are; monitoring is six sections **plus** a checklist section whose content is injected per call. When you grep the placeholder set, `{categories}` is the one that's monitoring-only and the one whose value is computed, not constant.
-
----
-
-### The decomposition rule: every Role disclaims the others
-
-Here is the part that separates this from a generic template. Each `## Role` does not just say what the agent does — it explicitly says what it does *not* do, naming the other agents' jobs:
-
-```
-monitoring prompt      "You do not diagnose causes. You do not propose actions."
-diagnostic prompt      "You do not propose remediation — you diagnose causes only."
-recommendation prompt  "you do NOT execute anything"
-query prompt           "Never invent numbers — only cite figures you genuinely observed"
+```typescript
+const system = PROMPT
+  .replace('{schema}', schemaSummary(this.schema))
+  .replace(/\{project_id\}/g, this.schema.projectId)
+  .replace('{categories}', checklist);
 ```
 
-This is decomposition encoded *in prose*. The model has no view of the orchestration in the route handler — it cannot know that a separate recommendation agent runs after it. So the monitoring prompt tells it directly: stay in your lane, someone else handles causes. Without the disclaimer, the monitoring agent helpfully diagnoses and recommends in one breath, and now two agents produce overlapping output and the chain's clean handoff (→ 06-single-purpose-chains.md) collapses. I have shipped multi-agent systems where exactly this happened: the "detect" agent started proposing fixes because nothing told it not to, and the downstream "fix" agent's output became redundant noise. The one-line disclaimer is the fix, and it lives in the prompt because that is the only place the model can read it.
+Three named placeholders, three named values. No string concatenation. No conditional sub-templates. The template is whole text; substitution is the *only* dynamic part.
 
----
-
-### Layer 2 — per-call injection via string replace
-
-The injection is mechanically dumb and that is a feature. Each agent runs a short chain of replace calls right before the loop:
+**Section 3 — the examples.** The monitoring prompt embeds a worked JSON example in the Output section (`legacy-prompts/monitoring.md:72-85`):
 
 ```
-  system = PROMPT
-    .replace("{schema}",     schema_summary(schema))
-    .replace(/{project_id}/g, schema.project_id)   # global — appears many times
-    .replace("{anomaly}",    serialize(anomaly))
+[
+  {
+    "metric": "purchase_revenue",
+    "category": "revenue_drop",
+    "scope": ["global"],
+    "change": { "value": 30.0, "direction": "down", "baseline": "90d" },
+    "severity": "critical",
+    ...
+  }
+]
 ```
 
-```
-placeholder      injected by                  appears in
-─────────────    ──────────────────────────   ────────────────────────────
-{schema}         schema summary                all four
-{project_id}     project id (global replace)   all four (every Hard rules block)
-{anomaly}        serialized anomaly object     diagnostic only
-{diagnosis}      serialized diagnosis object   recommendation only
-{intent}         the classified label          query only
-{categories}     runtime-built checklist str   monitoring only
-user prompt      a fixed per-agent string      passed separately, NOT in the markdown
+This is a single-shot example, embedded in the system prompt's "Output" section. It's there to demonstrate *shape*, not content — the model isn't supposed to return this revenue drop, it's supposed to return *its own* findings *in this shape*. Concept 08 walks when to add more examples and when one is enough.
+
+**Section 4 — the user message.** The trigger. Look at the call site at `lib/agents/monitoring-legacy.ts:105-107`:
+
+```typescript
+userPrompt:
+  'Work through your category checklist (each as 90d vs prior 90d) and ' +
+  'return the anomaly JSON array — stamp each flagged anomaly with its `category`.',
 ```
 
-Two details worth internalizing. First, `{project_id}` uses a global-replace regex because "Pass `project_id` to every tool call" appears once but the value must replace every literal occurrence — the team got bitten by single-replace leaving a stray `{project_id}` in the text, which the model then dutifully passed *as a literal string* to a tool. Second, the user prompt is **not** in the markdown file at all. It is a separate argument to the shared agent loop and becomes the first user message. System = the constant markdown; user = the per-call task. That is the system-vs-user boundary made concrete: constant-vs-per-call.
+Two sentences. The system message did all the heavy lifting; the user message is *the call to action*. This is the most common anti-pattern in early-career prompt work — stuffing rules into the user message because it "feels more direct." It isn't. The system message is where rules go because the model treats it as authoritative; the user message is what the model treats as the immediate ask.
 
----
-
-### Layer 3 — the synthesis instruction, appended last
-
-The `## Output` section already tells the model what shape to emit. So why a second instruction? Because the model, mid-investigation, keeps wanting to query — it reads "Output" as "eventually" not "now." On the forced-final turn the loop appends a hard stop:
+Here's the layers-and-hops view of how these four sections actually reach the model:
 
 ```
-  if force_final AND synthesis_instruction:
-      system = system + "\n\n" + synthesis_instruction   # ← appended, last thing read
-  else:
-      system = system
+  Layers-and-hops — four sections → two SDK parameters
+
+  ┌─ Agent code (lib/agents/monitoring.ts) ──────────────────┐
+  │  reads template → interpolates → assembles {system, user} │
+  └──────────┬─────────────────────────┬──────────────────────┘
+             │ section 1+2+3            │ section 4
+             │ joined as one string     │ as a single string
+             ▼                          ▼
+  ┌─ Anthropic SDK call ─────────────────────────────────────┐
+  │  params.system = "You are the monitoring agent..."         │
+  │  params.messages = [{ role: 'user', content: '...trigger' }]│
+  └──────────────────────────────────────────────────────────┘
 ```
 
-```
-normal turn:        [ Role … Output … {schema} ]                tools available
-forced-final turn:  [ Role … Output … {schema} ] + [ synthesis ] tools REMOVED
-```
+The four-section discipline is conceptual; the SDK only has two parameters (`system` and `messages`). The conceptual sections collapse onto the SDK shape — sections 1+2+3 all go to `system`, section 4 goes to `messages[0]`. The conceptual separation matters because *you* need to know which section to edit when the prompt regresses.
 
-The synthesis text is defined per agent inside the per-agent definitions and says, in effect, "You have NO more tool calls. Output ONLY the JSON now." Appending it *last* exploits recency — the final instruction the model reads is the one it weights hardest. This is a fourth structural slot, but it only exists on one turn, which is why it is not a section in the markdown file.
+**The decomposition rule — one job per section, named explicitly.** When you find yourself wanting to put a rule in the user message, stop. Find the section it belongs to:
 
----
+  → New rule? → section 1 (system role)
+  → New per-call data? → section 2 (context)
+  → New output shape clarification? → section 3 (examples)
+  → New trigger phrasing? → section 4 (user)
 
-### The principle
+This is the discipline. Violating it is how prompts drift.
 
-A production prompt is layered in time, not just in sections. The markdown file is a constant you can version and diff; the placeholders are a closed set you can grep; the synthesis nudge is a single appended string you can change in one place. The discipline is: keep the constant constant, keep the variable visibly injected, and never let a runtime value hide inside the markdown. When all three layers are legible, "the prompt broke" becomes a question with a fast answer — which layer.
+### Move 3 — the principle
 
----
+A production prompt is composed, not written. The composition rule — *one job per section, named explicitly* — survives every model upgrade because it isn't about prompting tricks; it's about separating what's stable from what's variable. The same discipline applies to a Lambda handler (route vs. handler vs. model) or a React component (props vs. state vs. effects): keep what changes at different rates in different places.
 
-## Anatomy of a production prompt — diagram
-
-This diagram spans three time-layers. Layer 1 is the constant file (shared shape, four instances). Layer 2 is the per-call stamping. Layer 3 is the forced-final append. A reader who sees only this should grasp that the system prompt is assembled, not authored, and that each line traces to exactly one layer.
+## Primary diagram — the full anatomy
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│  LAYER 1 — CONSTANT MARKDOWN FILE   (loaded at module import)         │
-│                                                                       │
-│   ## Role          ← ONE job + disclaims the other agents' jobs       │
-│   ## Hard rules    ← project_id every call · ≤N tool calls            │
-│   <method>         ← Period-over-period / Investigation / How to      │
-│   ## EQL reminders ← worked query syntax (format exemplars)           │
-│   ## Output        ← exact JSON shape + field rules + example         │
-│   ## Workspace schema                                                 │
-│       {schema}  {project_id}  {anomaly}/{diagnosis}/{intent}          │
-└───────────────────────────┬───────────────────────────────────────────┘
-                            │  string replace per call
-┌───────────────────────────▼───────────────────────────────────────────┐
-│  LAYER 2 — PER-CALL INJECTION                                         │
-│   {schema}→schema_summary  {project_id}→id (global)  {anomaly}→JSON   │
-│   user prompt → SEPARATE first user message                           │
-│   = the run-stable system string                                      │
-└───────────────────────────┬───────────────────────────────────────────┘
-                            │  forced-final turn only
-┌───────────────────────────▼───────────────────────────────────────────┐
-│  LAYER 3 — SYNTHESIS APPEND                                           │
-│   system + "\n\n" + synthesis_instruction    + tools removed          │
-│   = the system prompt the model receives THIS turn                    │
-└──────────────────────────────────────────────────────────────────────┘
-
-  system = constant (markdown) + per-call injection.  user = the per-call task.
-  Constant-vs-per-call IS the system-vs-user split.
+  ┌─ Section 1: SYSTEM ROLE (stable across calls, committed to git) ───────┐
+  │  "You are the monitoring agent in blooming insights..."                  │
+  │  ## Role                                                                  │
+  │  ## Hard rules (numbered, scannable)                                     │
+  └────────────────────────────────────────────────────────────────────────┘
+  ┌─ Section 2: CONTEXT (per-call, interpolated) ──────────────────────────┐
+  │  {project_id}     → "8b3a2..."                                           │
+  │  {categories}     → runnable category checklist                           │
+  │  {schema}         → schemaSummary(workspace) — compact, token-bounded    │
+  └────────────────────────────────────────────────────────────────────────┘
+  ┌─ Section 3: EXAMPLES (stable, demonstrates output shape) ──────────────┐
+  │  ## Output                                                               │
+  │  Return ONLY a JSON array of anomaly objects, ... in a ```json fence:    │
+  │  [ { "metric": ..., "category": ..., "change": {...}, ... } ]            │
+  └────────────────────────────────────────────────────────────────────────┘
+  ┌─ Section 4: USER (the per-call trigger) ───────────────────────────────┐
+  │  "Work through your category checklist (each as 90d vs prior 90d) and    │
+  │   return the anomaly JSON array..."                                       │
+  └────────────────────────────────────────────────────────────────────────┘
+       │
+       ▼  Anthropic SDK call: params.system = (1+2+3), messages[0] = (4)
 ```
-
-The shape is authored once; the bytes the model receives are assembled per turn from three layers, and every line you can point at belongs to exactly one of them.
-
----
-
-### Code in this codebase
-
-**Case A — implemented (richly).** Two paths share the same anatomy. The **active** path imports prompts from `@aptkit/prompts` (npm, via `@aptkit/core@0.3.0`); the **legacy** path keeps the prior markdown under `lib/agents/legacy-prompts/` and is loaded by the `*-legacy.ts` agents. The anatomy concept reads the same on both; only the source location moves.
-
-#### The shared anatomy (legacy markdown — still in-repo for the *-legacy agents)
-
-- **File:** `lib/agents/legacy-prompts/{monitoring,diagnostic,recommendation,query}.md`
-- **Function / class:** the prompt source itself (the constant Layer 1) for the legacy path
-- **Line range:** Role at L3–5 in all four; Hard rules at `monitoring.md` L13 (pushed down by its `## Your category checklist` section at L7) / L7 in the other three. (Olist-specific sections — `## DATA HORIZON`, the 3-dim scan plan, dual-adapter examples — were removed in commit 03fba57; the legacy prompts are Bloomreach-only.)
-- **Role:** the constant system prompt for the legacy agents, one job per file, each Role disclaiming the others. `monitoring.md` alone carries a seventh section — `## Your category checklist` (L7) with a `{categories}` injection slot (L11) — making it the one prompt that isn't a clean six-section instance.
-
-#### The shared anatomy (active path — imported from @aptkit/prompts)
-
-- **File:** `node_modules/@aptkit/core/node_modules/@aptkit/prompts/dist/src/{monitoring,diagnostic,recommendation,query}.js`
-- **Function / class:** prompt strings exported by the package; consumed by `lib/agents/{monitoring,diagnostic,recommendation,query}.ts` via the `@aptkit/core` adapters
-- **Role:** the same six-section anatomy, sourced from a versioned npm package instead of the repo's `prompts/` folder. The seam moved from `readFileSync` to package import; the anatomy did not. See file 14 for what shipping the prompts as a package actually changes.
-
-#### Layer 2 — per-call injection (legacy path)
-
-- **File:** `lib/agents/{monitoring-legacy,diagnostic-legacy,recommendation-legacy,query-legacy}.ts`
-- **Function / class:** the `.replace` chain that builds `system` before `runAgentLoop`
-- **Role:** stamps runtime values into the closed placeholder set on the legacy path; `userPrompt` passed separately so it stays out of the `.md`. On the active path, the AptKit adapter performs the equivalent injection inside the package boundary.
-
-#### Layer 3 — synthesis append
-
-- **File:** `lib/agents/base-legacy.ts` (legacy loop) / `lib/agents/base.ts` (active adapter wiring)
-- **Function / class:** the forced-final-turn system assembly — `${system}\n\n${synthesisInstruction}` with tools removed on the one turn
-- **Role:** appends the hard-stop instruction last, on the one turn the model must answer. Identical mechanic on both paths.
-
-#### Why this is a codebase strength
-
-The anatomy is uniform enough that adding an agent is mechanical: copy the six sections, write the disclaimer, add the placeholder, wire one `.replace`. On the legacy path the placeholder set is closed and greppable (`grep -rn '{[a-z_]*}' lib/agents/legacy-prompts`); on the active path the same closed-set property is enforced inside the AptKit package. The system-vs-user boundary is enforced by code, not convention: the constant is a file or a package export, the per-call task is a function argument.
-
----
 
 ## Elaborate
 
-### Where this comes from
+The four-section shape isn't an Anthropic-ism — it's universal across the major LLM APIs (OpenAI's `system` / `messages`, Google's `systemInstruction` / `contents`). The convergence is real: every production prompt eventually grows toward this shape because the underlying need — separate stable rules from per-call data — is real.
 
-The Role / instructions / output / context layout is the spine of every published prompt guide — Anthropic's prompt-engineering docs lead with "give Claude a role" and "be clear and direct," and the OpenAI cookbook's structured-prompt examples follow the same Role→Task→Format→Context order. The placeholder-injection-into-a-constant idea is older than LLMs: it is server-side templating (a constant template, per-request data) re-pointed at a string a model reads. What blooming insights adds is the third time-layer — the synthesis append — which is specific to agentic loops where the model otherwise never stops to produce the final artifact.
+The thing that varies across vendors is *where* tool schemas and examples can live. OpenAI lets you put function-calling examples in the `messages` array as previous turns; Anthropic's strong recommendation is to put few-shot examples inside the system message text (which is what this codebase does at `legacy-prompts/monitoring.md:72-85`). That divergence is vendor-specific surface; the four-section *shape* survives.
 
-### The deeper principle
+Where to read next: Anthropic's prompt engineering guide (anthropic.com/news/prompt-engineering-for-business-performance) is good on the system/user split. Simon Willison's blog has a running thread on the discipline of *not* stuffing rules into the user message.
 
-```
-authored once          assembled per turn
-─────────────────      ─────────────────────────────
-the .md skeleton       constant + injection + synthesis
-human reads/diffs it   the model reads the assembly
-1 file, 6 sections     3 layers, traceable per line
-```
-
-The skeleton is for humans (review, diff, reuse); the assembly is for the model. Keeping them separate — never hand-editing the assembled string, always editing the `.md` — is what makes the prompt a maintainable artifact instead of a string literal someone is afraid to touch.
-
-### Where this breaks down
-
-1. **`String.replace` is positional and silent.** `.replace('{anomaly}', …)` replaces the first occurrence only (non-regex). If `{anomaly}` ever appeared twice, the second would survive as a literal and the model would read the brace text. The `/g` flag on `{project_id}` exists precisely because that bug bit once.
-2. **The disclaimer is advisory, not enforced.** "You do not propose actions" is a request the model honors statistically. A model upgrade can soften that adherence; nothing in the code stops the monitoring agent from emitting a recommendation if the model decides to. Enforcement happens later, at the validator boundary (→ 02-structured-outputs.md).
-3. **The synthesis append duplicates the Output section.** The shape is now stated twice — once in `## Output`, once in the synthesis string. Drift between them (you update one, forget the other) produces a model that gets conflicting format instructions on the final turn.
-
-### What to explore next
-
-- **Typed templating:** replace the `.replace` chain with a function that takes a typed payload and fails loudly on a missing placeholder, so a stray `{intent}` can never reach the model.
-- **A single shared header:** factor the identical Hard-rules lines (`project_id` every call, ≤N tool calls) into one included fragment so the four files can't drift on the non-negotiables.
-- **Prompt linting:** a test that asserts every `{placeholder}` in each `.md` has a matching `.replace` in its agent (→ 03-prompts-as-code.md).
-
----
-
-## Project exercises
-
-### Add a placeholder-coverage test
-
-- **Exercise ID:** C1.7 (adapted) — prompt anatomy / template integrity.
-- **What to build:** a Vitest test that reads each `lib/agents/prompts/*.md`, extracts every `{placeholder}`, and asserts each one is replaced by its agent's `.replace` chain — so a new prompt with an un-injected `{foo}` fails CI instead of reaching the model.
-- **Why it earns its place:** turns the closed-placeholder-set property from a convention into an enforced invariant; catches the literal-brace bug class.
-- **Files to touch:** new `test/agents/prompt-anatomy.test.ts`; reads `lib/agents/prompts/*.md` and imports the four agent modules.
-- **Done when:** the test passes for all four current prompts and fails if you add `{unfilled}` to any `.md`.
-- **Estimated effort:** 1–4hr
-
-### Factor the shared Hard-rules header into one fragment
-
-- **Exercise ID:** C1.7 (adapted) — DRY the constant layer.
-- **What to build:** extract the identical Hard-rules lines ("Pass `project_id` to every tool call", the ≤N-tool-calls stop) into a single `lib/agents/prompts/_hard-rules.md` fragment and compose it into each prompt at load time, so the non-negotiables can't drift between the four files.
-- **Why it earns its place:** removes the highest-risk drift surface (the rules that bound blast radius) while keeping per-agent specifics in their own files.
-- **Files to touch:** new `lib/agents/prompts/_hard-rules.md`; the four agent `.ts` files (compose at `readFileSync`); the four prompt `.md` files (remove the duplicated lines).
-- **Done when:** changing the `project_id` rule in one place changes it for all four agents, and existing agent tests still pass.
-- **Estimated effort:** 1–4hr
-
----
+In this codebase, concept 02 (structured outputs) and concept 04 (token budgeting) both depend on the four-section anatomy being right. Concept 03 (prompts as code) depends on the system role being in a `.md` file you can version-control rather than in a Python string literal.
 
 ## Interview defense
 
-### What an interviewer is really asking
+**Q: "Walk me through the structure of one of your prompts."**
 
-"Walk me through how a prompt is structured in your system" tests whether you see a prompt as one blob or as layered, traceable artifact. The senior signal is naming the constant-vs-per-call split, pointing at the closed placeholder set, and explaining the third time-layer (the synthesis append) that agentic loops need and single-shot prompts don't.
+Pull up `lib/agents/legacy-prompts/monitoring.md`. Sketch the four-section diagram from Move 1. Say: "Sections 1 through 3 land in the SDK's `system` parameter; section 4 lands as the first `user` message. The discipline is one job per section — identity in section 1, per-call data in section 2, output shape in section 3, the trigger in section 4. When the prompt regresses, that's where I look — which section is doing too much."
 
-### Likely questions
-
-**[mid] "Which parts of `diagnostic.md` are the same on every call, and which change?"**
-
-The whole `.md` body is constant — Role, Hard rules, Investigation approach, EQL reminders, Output, schema heading. What changes is what gets stamped into the placeholders: `{schema}` (the workspace summary), `{project_id}`, and `{anomaly}` (the specific anomaly as JSON), all via `.replace` at `diagnostic.ts` L45–48.
+The diagram you draw:
 
 ```
-constant: ## Role … ## Output           (file bytes)
-per-call: {schema} {project_id} {anomaly}  (.replace L45–48)
+  system role · context · examples  │  user trigger
+  ─────────────────────────────────  │  ─────────────
+  three sections                     │  one sentence
+  one SDK parameter (system)         │  one SDK message
 ```
 
-**[senior] "How does the system-vs-user message boundary map to your prompt anatomy?"**
+Anchor: *"one job per section, named explicitly."*
 
-System is the constant `.md` (`base.ts` L98); user is the per-call task string (`base.ts` L80). They are the same distinction viewed two ways: constant-vs-per-call and system-vs-user. The `.md` carries the stable instructions and the injected data dictionary; the user message carries the specific request ("Investigate the anomaly…"). Keeping the constant in `system` is also what would make prefix caching possible.
+**Q: "Why not just put everything in the user message?"**
 
-```
-system  = constant .md  (+ injected values)   ← stable across the run
-user    = "Investigate the anomaly…"          ← the per-call task
-```
-
-**[arch] "You already have an `## Output` section. Why append a second format instruction at the end?"**
-
-Because in an agentic loop the model reads `## Output` as "eventually" and keeps querying. On the forced-final turn `base.ts` L96–98 appends `synthesisInstruction` last and removes tools (L101), so the final thing the model reads is "no more tools, output ONLY the JSON now." Recency weighting makes the last instruction dominant. It is a fourth structural slot that exists on exactly one turn, which is why it's in code, not the `.md`.
+Two reasons. One, the model attends to the system message as more authoritative — instructions there hold up better across long conversations. Two, the user message gets *interleaved* with tool results across turns in an agent loop; if you put rules there, they get pushed out of attention by the time you're three turns deep. The system message stays at the top of the context every turn.
 
 ```
-## Output (in .md)      = "this is the shape"     (read mid-loop as "later")
-synthesis append (L98)  = "emit it NOW, no tools" (last thing read → wins)
+  Turn 1                Turn 5
+  ──────                ──────
+  system: rules         system: rules    (still at the top)
+  user: trigger         user: trigger
+                        assistant: tool_use
+                        user: tool_result   ← rules-in-user-msg would be way back here
+                        assistant: tool_use
+                        user: tool_result
+                        assistant: text
 ```
 
-### The question candidates always dodge
+Anchor: *"the system message stays load-bearing across turns; the user message doesn't."*
 
-**"What stops the monitoring agent from also diagnosing and recommending?"** Only a sentence — "You do not diagnose causes. You do not propose actions." (`monitoring.md` L5). It is a prose disclaimer the model honors statistically, not an enforced boundary. Candidates dodge because admitting it concedes the decomposition is advisory. The honest answer: the disclaimer keeps roles separate *most* of the time; the actual enforcement that the monitoring output stays in-shape is the `isAnomalyArray` validator downstream, not the prompt.
+**Q: "What's the part of the prompt anatomy people forget?"**
 
-### One-line anchors
+Section 3 — the examples. Most early-career prompts have sections 1, 2, and 4 but no example output. The model then produces *something*, you tune the rules to fix it, you push, it works for a week, the model upgrade lands and the output drifts because the rules in section 1 were the only constraint on shape and they're not as strong as a worked example. Adding one canonical example output to the system prompt is the cheapest reliability improvement in the codebase.
 
-- `lib/agents/prompts/monitoring.md` L5 — Role disclaims the other agents' jobs.
-- `lib/agents/diagnostic.ts` L45–48 — per-call `.replace` injection, `/g` on `{project_id}`.
-- `lib/agents/base.ts` L80 — `userPrompt` becomes the first user message (per-call task).
-- `lib/agents/base.ts` L96–98 — `synthesisInstruction` appended last on the forced-final turn.
-- placeholder set: `{schema}` `{project_id}` `{anomaly}` `{diagnosis}` `{intent}` `{categories}` — closed and greppable (`{categories}` is monitoring-only, injected as a runtime-built checklist).
-
----
+Anchor: *"the load-bearing part everyone forgets is the example. Without it, the output shape is governed only by prose rules — and prose rules drift across model upgrades."*
 
 ## See also
 
-→ 02-structured-outputs.md · → 03-prompts-as-code.md · → 06-single-purpose-chains.md · → 07-output-mode-mismatch.md
-
----
+- `02-structured-outputs.md` — section 3 (examples) is where the structured-output shape gets demonstrated; section 1 (rules) is where you say "return ONLY a JSON array."
+- `03-prompts-as-code.md` — keeping the four sections in a `.md` file is what makes the prompt versionable.
+- `04-token-budgeting.md` — section 2 (context, injected per call) is where the token budget gets blown.
+- `13-forbidden-patterns.md` — section 1 (rules) is where forbidden patterns get enumerated.

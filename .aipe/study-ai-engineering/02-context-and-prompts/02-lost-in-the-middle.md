@@ -1,354 +1,244 @@
-# Lost in the middle (and the recency placement this codebase leans on)
+# 02 — lost in the middle
 
-**Industry name(s):** lost-in-the-middle, positional attention bias, context ordering, recency placement
-**Type:** Industry standard · Language-agnostic
-
-> Models attend most reliably to content at the *start* and *end* of the context and least reliably to the middle; blooming insights has no retrieval to reorder, but it deliberately places its load-bearing content at the end — the `synthesisInstruction` is appended LAST to the system prompt on the final turn (`lib/agents/base.ts` L98), and tool results arrive as the MOST RECENT user turn (L171) — keeping what matters where attention is strongest. The real fix (retrieval + reranking) is absent here.
-
-
----
+**Subtitle:** Attention bias toward start/end of context · Industry standard (partial in this codebase)
 
 ## Zoom out, then zoom in
 
-**Zoom out — the bigger picture.** Lost-in-the-middle is a property of the model itself in the Provider band, but the levers that fight it sit one layer up in the Per-agent definitions and the Agent loop: the `synthesisInstruction` concatenated last to the system prompt (`lib/agents/base.ts` L98), tool results pushed as the most-recent user turn (L171), and the dedicated `synthesize()` call that collapses the whole context into a short flat message. The retrieval/rerank layer that *curates* what sits in the middle is absent — blooming insights only does placement, not curation.
+Empirical pattern across all LLMs: the model pays more attention to the start
+and end of a long context than to the middle. Bury something important in
+the middle of a 20-doc retrieval and the model may miss it; put the same
+thing at position 1 or 20 and the model finds it.
 
 ```
-  Zoom out — where placement happens (and where curation would)
+  Zoom out — where this matters in blooming insights
 
-  ┌─ Per-agent + Agent loop (placement decisions) ───┐  ← we are here
-  │  ★ synthesisInstruction appended LAST ★          │
-  │    base.ts L95–98                                │
-  │  tool results = MOST RECENT turn   base.ts L171  │
-  │  synthesize() collapses context  diagnostic.ts   │
-  │    L87–126                                       │
-  └─────────────────────────┬────────────────────────┘
-                            │
-  ┌─ (would-be Retrieval/Rerank) — NOT PRESENT ─────┐
-  │  would surface only relevant evidence and       │
-  │  rerank so top hits land at the ends            │
-  │  see → ../03-retrieval-and-rag/07-reranking.md  │
-  └─────────────────────────┬────────────────────────┘
-                            │
-  ┌─ Provider (U-shaped attention) ─▼───────────────┐
-  │  front (strong)  ─  middle (sag)  ─  end (strong)│
-  │  anthropic.messages.create({system, messages})   │
-  └──────────────────────────────────────────────────┘
+  ┌─ Long prompts in this codebase ──────────────────────────┐
+  │  - monitoring system prompt + checklist of 10 categories │  ← we are here
+  │  - diagnostic prompt + 6-turn history with tool results  │
+  │  - recommendation prompt + diagnosis JSON                │
+  │  (no RAG — no big lists of retrieved docs)               │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-**Zoom in — narrow to the concept.** The question is: position determines how reliably the model uses a fact, so *where in the context* do you put the thing the answer most depends on? Two strategies — primacy (front) and recency (back) — and blooming insights consistently uses recency: the must-obey directive at the end of the system prompt, the freshest evidence as the most recent turn. How it works walks each placement and names the ceiling: only retrieval + reranking can curate what sits in the middle.
-
----
+The codebase doesn't stuff long lists of retrieved chunks into context (no
+RAG; see `03-retrieval-and-rag/`). But the *category checklist* the
+monitoring agent gets IS a list — 10 categories — and ordering matters.
 
 ## Structure pass
 
-**Layers.** Three layers, each making a placement decision: the per-agent prefix construction (where the `synthesisInstruction` is *appended last* to the system prompt on the final turn), the agent loop's transcript management (tool results enter as the most-recent user turn), and the dedicated `synthesize()` call (which collapses the whole context into a short flat message to defeat the middle entirely). A would-be retrieval/rerank layer is absent.
+  → **One axis to trace — attention.** Where in the prompt does each piece
+    of information live? For the monitoring agent: system at the top,
+    schema in the middle, category checklist toward the end, hard rules
+    interspersed. The category checklist sits *late* in the prompt —
+    which is actually good for attention. The schema sits in the middle —
+    which is the weak position.
 
-**Axis: state.** Where in the message array does each piece of content land, and is that position in the "attention-strong" or "attention-sag" zone? This axis is the right lens because lost-in-the-middle is fundamentally a position-of-state problem — content's *value* is constant, but the model's *use* of it depends on its slot. Cost doesn't move here; trust doesn't move; the load-bearing question is "where does this piece sit in the array."
-
-**Seams.** The cosmetic seam is between per-agent prefix construction and the agent loop — both push state to the "ends" (start of system, end of messages). The load-bearing seam is between the agent loop's growing-transcript state and the `synthesize()` call's flat fresh state: the entire middle is *thrown away* across this seam, replaced by a short message where every piece sits at an end. Position-state flips from "many pieces, some in the sag" to "few pieces, all in the strong zone."
-
-```
-  Structure pass — lost in the middle
-
-  ┌─ 1. LAYERS ───────────────────────────────────┐
-  │  per-agent prefix (instructions, schema)       │
-  │  agent loop (transcript with tool results)     │
-  │  synthesize() (flat, fresh context)            │
-  │  (would-be: retrieval + rerank — absent)       │
-  └────────────────────────┬───────────────────────┘
-                           │  pick the axis
-  ┌─ 2. AXIS ─────────────▼────────────────────────┐
-  │  state (position): where in the array does     │
-  │  each piece sit — strong zone or sag?          │
-  └────────────────────────┬───────────────────────┘
-                           │  trace across layers, find flips
-  ┌─ 3. SEAMS ────────────▼────────────────────────┐
-  │  prefix↔loop: cosmetic (both place at ends)    │
-  │  loop↔synthesize(): LOAD-BEARING               │
-  │    many pieces (some in sag) → few pieces      │
-  │    (all at ends); middle is discarded          │
-  └────────────────────────┬───────────────────────┘
-                           ▼
-                   Block 4 — How it works
-```
-
-The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+  → **The seam (which doesn't exist yet):** ordering control. The prompts
+    are markdown files (`lib/agents/legacy-prompts/monitoring.md`) loaded
+    and template-substituted; there's no ordering knob that says "put X at
+    position N." Reordering means editing the markdown.
 
 ## How it works
 
-**Mental model.** Treat the model's attention over a long context like a U-shaped curve: high at the front, high at the back, sagging in the middle. Anything you place in the sag risks being underweighted regardless of how relevant it is.
+### Move 1 — the mental model
+
+Imagine you're proofreading a long doc: you read the first paragraph
+carefully, you read the last paragraph carefully, and the middle paragraphs
+get a quick skim. The model behaves similarly. Position in the prompt
+correlates with attention.
 
 ```
-attention reliability across context position
- high │█                                              █
-      │██                                            ██
-      │ ██                                          ██
-      │  ███                                      ███
-      │    ████        the "middle"            ████
-  low │       ██████████████████████████████████
-      └────────────────────────────────────────────────▶ position
-        start              middle                 end
-        ▲                    ▲                      ▲
-        system prompt     buried evidence      most-recent turn
-        (strong)          (weak — lost)        (strong)
+  Attention by position (cartoon — actual curve varies by model)
+
+  attention
+  ▲
+  │ ██                                                  ██
+  │ ██ █                                              █ ██
+  │ ██ ██                                            ██ ██
+  │ ██ ███                                          ███ ██
+  │ ██ ████        ────────────  weakest  ────────  ████ ██
+  │ ██ █████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░██████ ██
+  │                                                          │
+  └──────────────────────────────────────────────────────────►  position
+  start                       middle                        end
 ```
 
-The lever you have is *where* each piece lands on this curve. Two clean strategies exist: put critical content at the front (primacy) or at the back (recency). This system consistently uses recency — the last thing the model reads is the thing it most needs to act on.
+### Move 2 — the step-by-step walkthrough
 
-This is a *thin* surface, and it is worth saying plainly: ordering the conversation is a real but small mitigation. The substantial fix for lost-in-the-middle is retrieval that surfaces only the relevant content plus a reranker that orders it by relevance so nothing important lands in the sag — and this system has neither (see → ../03-retrieval-and-rag/07-reranking.md). What follows is the recency discipline you *do* practice.
-
----
-
-### Recency lever 1 — the synthesis instruction is appended LAST
-
-On the forced-final turn, the instruction that must dominate the model's behavior is concatenated to the *end* of the system prompt:
+**Where this codebase puts things in the prompt.** Look at the monitoring
+prompt structure (`lib/agents/legacy-prompts/monitoring.md`, top of file):
 
 ```
-  system_prompt = (forceFinal AND synthesisInstruction)
-                    ? base_system + "\n\n" + synthesisInstruction   # appended LAST
-                    : base_system
+  POSITION                                 WEIGHT
+  ────────                                 ──────
+  1. Role description                     HIGH (start)
+  2. "You run a FIXED CHECKLIST of …"     HIGH-ish
+  3. {categories} interpolation            MIDDLE-ish — the 10 categories
+  4. Hard rules (numbered list)            MIDDLE-LATE
+  5. Period-over-period method             MIDDLE
+  6. CRITICAL: verify windows              LATE (attention bias bonus)
+  7. Suggested query plan                  LATE
+  8. Tool catalog reminders                LATE
+  9. Common errors to avoid                LATE
+  10. Output format spec                   END (highest attention)
 ```
 
-The base system prompt — the persona, the schema summary, the task framing — comes first. The instruction "you have NO more tool calls available, stop and emit ONLY JSON" comes last (its text lives in each of the per-agent definitions). On the final turn this is the single most important directive, and it sits at the high-attention tail of the system block rather than buried above the schema.
+The prompt author understood the bias. The "**CRITICAL: verify your windows
+actually contain data**" section is positioned LATE, where attention is
+high. The output format spec — the part the model has to follow precisely —
+is at the very END.
+
+**Where the bias bites in this codebase.** The `{categories}` interpolation
+sits at position 3 — in the middle. Each category has an id, label,
+requires, recipe, threshold, plus a `whyItMatters` blurb. That's 10
+multi-line entries; the longest take 5-10 lines each. The model's
+attention to category 5 (in the middle of a 10-list) is measurably less
+than to category 1 or category 10.
+
+Concretely: if the monitoring agent more often skips testing for `fraud`
+(usually listed near the middle) than for `revenue_drop` (near the start)
+or `customer_churn` (near the end), this attention bias is part of why.
+There's no audit data in repo today to confirm this — would be a useful
+eval (see `05-evals-and-observability/01-eval-set-types.md`).
+
+**The mitigation Blooming uses implicitly.** Two patterns:
+
+  1. **Severity sort at output.** The prompt requires anomalies sorted
+     `critical → warning → info → positive`. Even if attention biases the
+     *detection* order, the *reporting* order is deterministic.
+
+  2. **Hard rules listed early AND repeated.** "Pass `project_id` to every
+     tool call" appears at position 4 AND is also part of the tool
+     definitions the model sees. Critical instructions get redundancy.
+
+**Where it'd bite if RAG landed.** If you added a RAG step that retrieved 20
+relevant docs and stuffed them in the prompt, the doc at position 10 would
+get less attention than positions 1, 2, 19, 20. The mitigation pattern
+there is reranking: get the top 20 from a fast retriever, score them with a
+cross-encoder, put the top 3 at position 1 and the next 3 at the end. See
+`03-retrieval-and-rag/07-reranking.md` for the full pattern.
+
+### Move 3 — the principle
+
+**Position matters. Treat the prompt as a layered structure with strong
+positions and weak positions, not a flat document.** When you have to put
+something in the middle, make it short and self-contained — and consider
+restating the critical bits at the end. When the order is configurable
+(retrieved docs, list of options), put the most important first and last.
+
+## Primary diagram
 
 ```
-system prompt on the forced-final turn
-┌──────────────────────────────────────────────────┐
-│ persona + task framing            (front — strong)│
-│ schema summary (20 events…)       (middle — weak) │
-│ {anomaly} JSON                    (middle — weak) │
-│ ─────────────────────────────────                 │
-│ synthesisInstruction: "stop, emit  (END — strong) │  ← appended here
-│   ONLY JSON in a ```json fence"                    │
-└──────────────────────────────────────────────────┘
-   the must-obey directive lands at the strongest position
+  Monitoring prompt structure — what sits where
+
+  ┌─ START (high attention) ─────────────────────────────┐
+  │  role description                                    │
+  │  "you run a fixed checklist…"                        │
+  ├──────────────────────────────────────────────────────┤
+  │  ┌─ MIDDLE (lower attention) ─────────────────────┐  │
+  │  │  {categories} — 10 categories interpolated     │  │
+  │  │  hard rules (numbered 1-4)                     │  │
+  │  │  period-over-period method explanation         │  │
+  │  └────────────────────────────────────────────────┘  │
+  ├──────────────────────────────────────────────────────┤
+  │  CRITICAL: verify windows ← restated for attention   │
+  │  suggested query plan (5 calls)                      │
+  │  tool catalog reminders (EQL syntax)                 │
+  │  common errors to avoid                              │
+  ├──────────────────────────────────────────────────────┤
+  │  OUTPUT format spec  ← always at the end             │
+  └──────────────────────────────────────────────────────┘
+                                       ↑ high attention again
+
+  Future RAG: top-3 retrieved at position 1, next-3 at end,
+  middle docs become "padding"
 ```
-
-Putting the directive last is why the forced-final turn reliably produces JSON: the instruction the model must follow is the freshest thing in its system context.
-
-### Recency lever 2 — tool results arrive as the MOST RECENT turn
-
-Inside the loop, every batch of tool results is pushed as a new user turn at the *end* of the message array:
-
-```
-  # Feed all tool results back as the next user turn
-  messages.append({ role: "user", content: toolResults })
-```
-
-The model always makes its next decision immediately after reading the freshest evidence. The newest tool results are the most recent thing in the conversation, so the content the model should weight most for its *next* action sits at the recency end, not somewhere in the middle of the accumulated transcript.
-
-```
-messages array growth
-[0] user      initial prompt
-[1] assistant tool_use blocks         turn 0
-[2] user      tool_result …           turn 0 results
-[3] assistant tool_use blocks         turn 1
-[4] user      tool_result …  ◀── MOST RECENT — freshest evidence
-                                  the next decision is made right after this
-```
-
-The accumulated middle (turns 1…N-1) is the sag; the latest tool result is at the high-attention tail by construction, because the loop always appends.
-
-### The dedicated synthesize() call sidesteps the middle entirely
-
-When the loop's final turn still fails to produce JSON, the dedicated `synthesize()` call makes a *fresh* single-turn call with no accumulated transcript at all — just the anomaly, the formatted evidence, and the instruction. There is no middle to get lost in: the whole context is short, and the directive ("output ONLY JSON") sits at the end of a compact message. Collapsing the context is the most direct lost-in-the-middle mitigation available without retrieval — if there is no long middle, nothing can be lost in it.
-
-```
-loop context (long)                synthesize() context (short, flat)
-[user] investigate                 [user] anomaly + evidence + "ONLY JSON"
-[asst] tool_use                          ↑ no middle to lose anything in
-[user] tool_result   ← middle
-[asst] tool_use      ← middle
-[user] tool_result
-[asst] final (system: …+instr)
-```
-
-### Current state vs. future state
-
-```
-CURRENT (recency placement only)        FUTURE (retrieval + reranking)
-────────────────────────────────       ────────────────────────────────
-instruction appended last               retrieve only relevant evidence
-tool results = most recent turn         rerank so top hits land at the ends
-synthesize() collapses the context      pack reranked results, drop the rest
-no control over what's in the middle    nothing irrelevant is in the context
-```
-
-Recency placement is a real lever but it only controls *where* content sits, not *what* is there. The substantive fix is to never put irrelevant content in the window in the first place (retrieval) and to order what remains by relevance so the strongest evidence occupies the high-attention ends (reranking) — both Case B for this codebase, covered in → ../03-retrieval-and-rag/07-reranking.md.
-
-### The principle
-
-When you cannot control *what* is in the context, control *where* it sits. Position is a correctness lever because attention is U-shaped: put the directive the model must obey and the evidence it must use at the recency end, and collapse the context to nothing when you can. But recognize the ceiling — placement cannot rescue a context stuffed with irrelevant content; only retrieval and reranking do that, and they are the real fix this codebase has not yet needed.
-
----
-
-### Code in this codebase
-
-**Not yet mitigated by retrieval.** blooming insights has no RAG, no embeddings, and no reranker, so there is no retrieval-ordering step to push the most relevant content to the high-attention ends — it gathers evidence live via MCP tool calls and relies purely on *conversation* recency for placement. What it does, deliberately, is keep its load-bearing content at the end of the context.
-
-#### Files, functions, and line ranges
-
-- **`synthesisInstruction` appended last:** `lib/agents/base.ts` L95–L98 — the directive is concatenated to the end of the system prompt on the `forceFinal` turn. Per-agent instruction text: `lib/agents/diagnostic.ts` L63–L67, `lib/agents/recommendation.ts` L58–L62, `lib/agents/monitoring.ts` L85–L89.
-- **Tool results as the most-recent turn:** `lib/agents/base.ts` L171 — `messages.push({ role: 'user', content: toolResults })`; the array starts at L79–L81 and grows with each assistant turn (L105) and each result batch (L171).
-- **Context-collapsing escape hatch:** `lib/agents/diagnostic.ts` L87–L126 (`synthesize()`) and `lib/agents/recommendation.ts` L82–L132 — a fresh single-turn call with a short flat context and the directive at the end (e.g. `diagnostic.ts` L105–L113).
-
-#### Where retrieval reordering would live
-
-A reranking step would sit in a new `lib/mcp/` module (e.g. `rerank.ts`) called *between* gathering tool results and feeding them back at `lib/agents/base.ts` L171 — it would score each result against the anomaly/diagnosis and reorder the batch so the most relevant payloads land at the head and tail of what is fed back, rather than in whatever order the model happened to call the tools. The retrieval that would precede it is the broader Case B in → ../03-retrieval-and-rag/.
-
----
-
-## Lost in the middle — diagram
-
-This diagram spans the layers where positional placement is decided. The Service layer constructs the message order and the system-prompt order; the Provider boundary is where the ordered context meets the model's U-shaped attention. There is no retrieval/rerank layer — its absence is the point.
-
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│  SERVICE LAYER — placement decisions (the lever this codebase has)    │
-│                                                                       │
-│  system prompt assembly  base.ts                                      │
-│    [ persona │ schema │ anomaly │ synthesisInstruction ]              │
-│                                          ▲ appended LAST (strong)     │
-│                                                                       │
-│  message array growth   (init, asst-turn, tool-results)               │
-│    [ user │ asst │ tool_result │ … │ tool_result ]                   │
-│                                        ▲ most-recent turn (strong)    │
-│                                                                       │
-│  synthesize() escape hatch  diagnostic.ts                             │
-│    short flat context → no middle to lose anything in                 │
-│                                                                       │
-│  ┌─ RETRIEVAL + RERANK LAYER ─ NOT PRESENT ─────────────────┐        │
-│  │ would surface only relevant evidence and order it so the │        │
-│  │ strongest hits land at the ends → see 03-retrieval-and-  │        │
-│  │ rag/07-reranking.md                                       │        │
-│  └──────────────────────────────────────────────────────────┘        │
-└───────────────────────────┬───────────────────────────────────────────┘
-                            │  ordered context crosses to the model
-┌───────────────────────────▼───────────────────────────────────────────┐
-│  PROVIDER BOUNDARY — U-shaped attention over position                │
-│    front (strong) ── middle (weak/sag) ── end (strong)               │
-│    anthropic.messages.create({ system, messages })   base.ts         │
-└────────────────────────────────────────────────────────────────────────┘
-```
-
-The Service layer places the must-obey directive and the freshest evidence at the strong ends. The retrieval/rerank layer that would govern *what* sits in the middle does not exist — recency placement is the whole mitigation here.
-
----
 
 ## Elaborate
 
-### Where this pattern comes from
+The "lost in the middle" finding traces to a 2023 paper by Liu et al.
+(*"Lost in the Middle: How Language Models Use Long Contexts"*). It tested
+several models on document QA where the answer-bearing doc was placed at
+varying positions across a 20-doc context; accuracy was U-shaped with
+position. The finding has held up across newer models, including Claude
+generations.
 
-"Lost in the Middle: How Language Models Use Long Contexts" (Liu et al., 2023) measured retrieval accuracy as a function of where a relevant document sat in a long context and found a pronounced U-curve: accuracy was highest when the relevant content was at the very start or very end and dropped sharply in the middle. The effect holds across model families and grows with context length. It is a property of how attention distributes over position, not a quirk of any one model.
+Practical implications differ by application:
 
-Primacy and recency as placement strategies long predate LLMs — they are the same effects studied in human serial-position memory. The engineering response is identical in both cases: put what matters at the edges.
+  → **Q&A over retrieved docs (RAG):** big deal. Reranking + putting the
+    top results at the edges of the context is the canonical fix.
 
-### The deeper principle
+  → **Long conversations:** medium deal. Recent turns are at the end (good);
+    old turns get pushed toward the middle (bad). Summarization of old
+    turns is the fix.
 
-```
-two ways to fight the U-curve
-─────────────────────────────────────────────────────────────
-placement  (this codebase)   move the important content to an edge
-                              cheap, no infra, but only reorders
-                              what's already there
+  → **Structured prompts with mixed content:** small but real deal. Put
+    the load-bearing instructions at the start and end; let definitions
+    and recipes ride the middle.
 
-curation   (retrieval+rerank) remove the irrelevant content entirely,
-                              then order the rest by relevance so the
-                              best hits occupy the edges
-                              the real fix; needs infra
-```
-
-Placement and curation are complementary, not competing. Placement is what you do when you cannot remove content; curation is what you do when you can. blooming insights does only placement because its contexts are short enough (bounded by the character budgets in → 01-context-window.md) that the sag is shallow. The day a context is long and full of mixed-relevance evidence, placement alone stops being enough and curation earns its cost.
-
-### Where this breaks down
-
-1. **Placement cannot help if the important content is the *quantity*, not a single item.** Recency favors the latest tool result, but a diagnosis that depends on *all six* results equally has five of them sitting in the middle no matter how you order the batch. Placement helps one item; it cannot pull six items all to the edges.
-
-2. **A long accumulated transcript has a real sag.** As the loop runs, turns 1…N-1 pile up in the middle. The synthesisInstruction and the latest result are at the edges, but evidence from early turns sits in the dead zone. `synthesize()`'s context-collapse is the only thing in the codebase that addresses this, and only on the fallback path.
-
-3. **No measurement.** Nothing in the codebase tests whether reordering the context changes the answer. The recency placement is a reasoned bet, not a verified one — there is no position-sensitivity probe (the exercise below).
-
-### What to explore next
-
-- **Reranking (cross-encoder, Cohere Rerank, BGE-reranker):** score candidates by relevance and place the top hits at the context edges — the direct fix, covered in → ../03-retrieval-and-rag/07-reranking.md.
-- **Context compaction / summarization:** collapse the middle turns into a short summary so there is less sag to lose anything in — generalizes `synthesize()`'s context-collapse to the main path.
-- **"Needle in a haystack" eval:** the standard probe for position sensitivity — plant a fact at varying positions and measure recall (the basis of the exercise below).
-
----
+blooming insights is the third case. The prompts are well-structured
+already (output spec at the end, critical rules late). The category
+checklist in the middle is the one place a small reordering audit would
+help.
 
 ## Project exercises
 
-### Measure the synthesis call's position sensitivity
+### Exercise — reorder the monitoring prompt to put high-priority categories first
 
-- **Exercise ID:** C1.2 (adapted) — position sensitivity probe for the synthesis call.
-- **What to build:** a test harness that runs `DiagnosticAgent.synthesize()` (or the forced-final turn) with the evidence ordered three ways — most-relevant-first, most-relevant-last, and most-relevant-in-the-middle — over a fixed anomaly + tool-call fixture, and compares the resulting diagnoses for whether the buried evidence still surfaces in the conclusion.
-- **Why it earns its place:** turns the recency placement from a reasoned bet into a measured one and shows you can probe lost-in-the-middle empirically rather than asserting it.
-- **Files to touch:** `lib/agents/diagnostic.ts` (expose evidence ordering in `synthesize()` for the test), new `test/agents/position-sensitivity.test.ts`.
-- **Done when:** the harness reports, for the same evidence, whether middle-placed evidence is cited in the conclusion less often than edge-placed evidence over repeated runs.
-- **Estimated effort:** 1–4hr
-
-### Add a relevance reorder before tool results are fed back
-
-- **Exercise ID:** B2A.11 (adapted) — reranking the tool-result batch.
-- **What to build:** add a `lib/mcp/rerank.ts` that scores each tool result in a batch against the anomaly/diagnosis (start with a cheap heuristic — keyword overlap with the metric/scope — before any model), and reorder the batch in `runAgentLoop` so the most relevant results sit at the head and tail before they are pushed at `lib/agents/base.ts` L171.
-- **Why it earns its place:** demonstrates you understand the U-curve and the difference between placement and curation, and lays the seam where a real reranker would later drop in.
-- **Files to touch:** `lib/agents/base.ts` (`runAgentLoop`, reorder before L171), new `lib/mcp/rerank.ts`, `test/agents/base.test.ts`.
-- **Done when:** the batch fed back at L171 is verifiably reordered by relevance score, with the lowest-relevance results placed in the middle by design.
-- **Estimated effort:** 1–4hr
-
----
+  → **Exercise ID:** `study-ai-eng-02-02.1`
+  → **What to build:** In `lib/agents/categories.ts`, add a `priority`
+    field to `AnomalyCategory` (e.g. 'high' | 'medium' | 'low'). When
+    `runnableCategories` returns the list, sort by priority descending.
+    Verify the prompt template renders them in that order. Then add a
+    test that captures the prompt sent to the model and asserts category
+    ordering.
+  → **Why it earns its place:** Demonstrates "I'm aware of attention bias
+    and I order prompts accordingly." Tiny change, real signal in
+    interview.
+  → **Files to touch:** `lib/agents/categories.ts` (priority field +
+    sort), AptKit `ECOMMERCE_ANOMALY_CATEGORIES` if priority lives
+    upstream, `test/agents/monitoring.test.ts` (assert order).
+  → **Done when:** Categories appear in the prompt in priority order
+    (highest first); test passes.
+  → **Estimated effort:** `1–4hr`
 
 ## Interview defense
 
-### What an interviewer is really asking
+**Q: Are you aware of "lost in the middle" and where does it bite this
+codebase?**
 
-"How do you handle lost-in-the-middle?" tests whether you know position affects recall, whether you distinguish placement (reorder what's there) from curation (remove what shouldn't be there), and whether you are honest about which one your system actually does. The senior signal is naming the U-curve, pointing to the *specific* recency placements, and admitting that placement is the thin lever while retrieval+reranking is the real fix.
-
-### Likely questions
-
-**[mid] What is lost-in-the-middle, and where does this codebase place its most important content?**
-
-Models recall content at the start and end of a context far better than the middle (Liu et al. 2023). The codebase places its must-obey directive last in the system prompt (`lib/agents/base.ts` L98) and the freshest evidence as the most-recent turn (L171), both at the strong ends.
-
-```
-[ system… │ synthesisInstruction ]   [ … │ latest tool_result ]
-  front       ▲END (strong)            middle    ▲END (strong)
-```
-
-**[senior] Why is the dedicated `synthesize()` call more reliable than fixing the prompt inside the loop?**
-
-Two reasons compound. The loop context is long — six tool-call pairs pile up in the middle, the sag. `synthesize()` (`lib/agents/diagnostic.ts` L87–L126) makes a fresh single-turn call with a short flat context: there is no middle for evidence to get lost in, and the directive sits at the end of a compact message. Collapsing the context is the most direct lost-in-the-middle fix available without retrieval.
+Yes — the empirical finding that LLM attention is U-shaped over context
+position. In this codebase the place it could bite is the `{categories}`
+interpolation in the monitoring prompt — a 10-category checklist that
+sits mid-prompt. The mitigation today is implicit: hard rules are
+restated near the end ("CRITICAL: verify your windows"), and the output
+spec is always at the very end where attention is highest.
 
 ```
-long loop context: evidence in the sag → underweighted
-short synthesize() context: no sag → directive + evidence both at edges
+  Strong positions: start, end
+  Weak position:    middle
+
+  Mitigation in this codebase:
+    - critical instructions restated late
+    - output format ALWAYS at end
+    - severity sort enforced at output (compensates for middle-bias
+      during detection)
 ```
 
-**[arch] You have no reranker. When does recency placement stop being enough?**
+**Anchor line:** "The prompts are well-structured for it already. The
+category-priority sort is the one tactical move I'd make."
 
-When a run accumulates many mixed-relevance results — a query agent calling a dozen tools where most return noise. Then the middle is both long and full of distractors; placement can pull one item to an edge but not all the signal out of the sag, and the irrelevant results are still occupying the window. That is where retrieval (drop the noise) plus reranking (order the rest so top hits hit the edges) becomes necessary — the Case B path in → ../03-retrieval-and-rag/07-reranking.md.
+**Q: When would lost-in-the-middle become a serious problem here?**
 
-```
-short, all-relevant context  → placement enough
-long, low-signal context     → need retrieval + rerank (absent)
-```
+When RAG lands. Right now nothing in the prompt is a long list of retrieved
+chunks. If you added "retrieve top-20 relevant docs and stuff in context,"
+docs 8-12 would get under-attended. The fix is reranking + edge placement
+— top 3 at position 1, next 3 at the end, middle ones become padding.
 
-### The question candidates always dodge
-
-**"Have you measured that reordering actually changes the answer?"** The honest answer here is no — there is no position-sensitivity probe; the recency placement is a reasoned bet grounded in the literature, not a result verified against this codebase. A candidate who claims a measured improvement is bluffing; the strong answer points at the absence and names the probe (the exercise above).
-
-### One-line anchors
-
-- `lib/agents/base.ts` L98 — `synthesisInstruction` appended last to the system prompt (strong-end placement).
-- `lib/agents/base.ts` L171 — tool results pushed as the most-recent turn (recency edge).
-- `lib/agents/diagnostic.ts` L87–L126 — `synthesize()` collapses the context so there is no middle.
-- Attention is U-shaped; placement reorders, retrieval+reranking curates — only the second cures the middle.
-- The real fix (reranking) is absent — → ../03-retrieval-and-rag/07-reranking.md.
-
----
+**Anchor line:** "No RAG yet, so no doc-list to bury. The reranking pattern
+is the canonical fix when it does land."
 
 ## See also
 
-→ 01-context-window.md · → 03-prompt-chaining.md · → ../03-retrieval-and-rag/07-reranking.md · → ../04-agents-and-tool-use/02-tool-calling.md
-
----
+  → `01-context-window.md` — the budget the long-list sits inside
+  → `03-retrieval-and-rag/07-reranking.md` — the canonical fix for RAG-shaped lost-in-the-middle

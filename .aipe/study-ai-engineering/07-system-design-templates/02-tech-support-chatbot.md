@@ -1,101 +1,166 @@
-# Tech Support Chatbot
+# 02 — tech support chatbot system design
 
-**Industry name(s):** Support chatbot, RAG assistant, deflection bot, agent-assist
-**Type:** Industry standard
+- **The prompt:** "Design a tech support chatbot for a product. It must
+  answer customer questions, escalate when it can't, and learn from
+  agent corrections."
 
-> Answer customer questions from a knowledge base, escalate to a human when confidence is low, and feed agent corrections back into the system so it improves.
+- **Standard architecture:**
 
-**See also:** [01-search-ranking.md](01-search-ranking.md) · [../03-retrieval-and-rag/11-rag.md](../03-retrieval-and-rag/11-rag.md) · [../04-agents-and-tool-use/05-agent-memory.md](../04-agents-and-tool-use/05-agent-memory.md) · [../05-evals-and-observability/01-eval-set-types.md](../05-evals-and-observability/01-eval-set-types.md)
+  ```
+  User message
+    │
+    ▼
+  ┌──────────────────────────────────┐
+  │ Intent classification            │
+  │  (heuristic + LLM)               │
+  └──────────────┬───────────────────┘
+                 │
+                 ▼
+  ┌──────────────────────────────────┐
+  │ RAG over knowledge base          │
+  │  (docs, past tickets, runbooks)  │
+  └──────────────┬───────────────────┘
+                 │
+                 ▼
+  ┌──────────────────────────────────┐
+  │ LLM response generation          │
+  │  (constrained to retrieved KB)   │
+  └──────────────┬───────────────────┘
+                 │
+            ┌────┴─────┐
+            │          │
+            ▼ confident ▼ unsure / out-of-scope
+       Respond     ┌──────────────────┐
+                   │ Escalate to      │
+                   │ human agent      │
+                   └──────────────────┘
+                            │
+                            ▼
+                   Agent answers; answer
+                   logged for KB update
+  ```
 
-This file is a **system-design-template** reframe, not a per-concept study file. It is the verbatim IK-style interview prompt answered with the canonical architecture, then honestly mapped onto blooming insights. The first seven bullets are generic — they hold for any support chatbot. Only the last two are blooming-insights-specific. Provenance: curriculum **C5.14** (build family B5.14, adapted).
+- **Data model:**
+  - Knowledge base: docs, FAQs, past ticket resolutions. Each chunked,
+    embedded, indexed.
+  - Conversation history per user with `{turn, role, content,
+    tools_called, confidence_score, escalated, ts}`.
+  - Escalation log linking bot conversations to human-resolved
+    outcomes (the training signal for future improvement).
+  - Feedback log: thumbs-up/down per response, free-text corrections
+    from agents.
 
----
+- **Key components:**
+  - *Intent classification*: detect category (billing, technical,
+    account, out-of-scope) before retrieval. Decision: heuristic
+    regex/keyword first, LLM classifier on ambiguous cases (see
+    `01-llm-foundations/07-heuristic-before-llm.md`).
+  - *RAG retrieval*: hybrid retrieval over the knowledge base, scoped
+    by intent category to reduce noise. Decision: chunk by section
+    not by token, so retrieved chunks are semantically coherent (see
+    `03-retrieval-and-rag/03-chunking-strategies.md`).
+  - *Response generation*: LLM constrained to cite retrieved KB chunks.
+    Decision: refuse to answer if no chunk above relevance threshold —
+    better to escalate than hallucinate.
+  - *Escalation*: rule-based gate (intent = out-of-scope, OR confidence
+    < threshold, OR user types "agent please") triggers handoff with
+    full conversation context.
+  - *Feedback loop*: agent corrections logged as gold-standard
+    responses, fed back into eval set (see
+    `05-evals-and-observability/01-eval-set-types.md`), used to
+    identify KB gaps.
 
-**The prompt:** Design a tech support chatbot that answers customer questions, escalates when it can't, and learns from agent corrections.
+- **Scale concerns:**
+  - At ~10k conversations/day: LLM cost dominates. Solution: cache
+    common question-answer pairs (semantic cache,
+    `06-production-serving/01-llm-caching.md`), route easy questions to
+    cheaper model.
+  - At ~100 escalations/day: human agents become bottleneck. Solution:
+    prioritize escalation queue by user value, surface bot's draft
+    response so agent edits instead of types from scratch.
+  - At ~1M KB chunks: retrieval latency grows. Solution: tiered
+    retrieval (intent-scoped first, full corpus only on miss),
+    pre-compute embeddings for hot KB entries.
 
-**Standard architecture:**
+- **Eval framing:**
+  - Offline: golden set of resolved tickets (LLM answer vs human agent
+    answer, rubric scored — see
+    `05-evals-and-observability/02-eval-methods.md`).
+  - Online: resolution rate without escalation, time to resolution,
+    CSAT (customer satisfaction).
+  - Adversarial set: prompt injection attempts ("ignore previous
+    instructions"), out-of-scope questions, hostile users (see
+    `06-production-serving/03-prompt-injection.md`).
 
-```
-  user message
-      │
-      ▼
-  ┌────────────────────────┐
-  │  INTENT CLASSIFICATION  │  cheap model / classifier
-  │  bug · billing · how-to │  → route + pull conversation history
-  │  chitchat · escalate    │
-  └───────────┬─────────────┘
-              │
-              ▼
-  ┌────────────────────────┐        ┌─────────────────────┐
-  │  RAG OVER KNOWLEDGE BASE│◀──────▶│ KB index (vector +  │
-  │  retrieve top-k docs    │        │ keyword) + docs     │
-  │  for the question       │        └─────────────────────┘
-  └───────────┬─────────────┘
-              │ grounded context
-              ▼
-  ┌────────────────────────┐
-  │  CONSTRAINED GENERATION │  answer ONLY from retrieved docs
-  │  cite sources · refuse  │  + emit a confidence score
-  │  when context is thin   │
-  └───────────┬─────────────┘
-              │
-        confident? ──── yes ──▶ ┌──────────────────┐
-              │                 │ RESPOND + cite    │
-              no                └────────┬──────────┘
-              ▼                          │
-  ┌────────────────────────┐            │  thumbs up/down,
-  │  ESCALATE TO HUMAN      │            │  agent edit
-  │  handoff + transcript   │            ▼
-  └───────────┬─────────────┘   ┌──────────────────┐
-              │                 │  FEEDBACK LOOP    │
-              └────────────────▶│  log corrections  │
-                                │  → eval set + KB  │
-                                │     refresh       │
-                                └──────────────────┘
-```
+- **Common failure modes:**
+  - Hallucinated answers when KB has nothing relevant. Mitigation:
+    relevance threshold gates response, refuse + escalate.
+  - Prompt injection in user messages. Mitigation: sanitize, never let
+    LLM emit free-form privileged actions (passwords, refunds).
+  - Stale knowledge base — bot tells users about a feature that was
+    deprecated last week. Mitigation: KB freshness SLA, doc change
+    → re-embed within 24h (see
+    `03-retrieval-and-rag/09-stale-embeddings.md`).
+  - Tone drift — bot sounds inconsistent across conversations.
+    Mitigation: system prompt defines persona, eval rubric scores tone
+    adherence per response.
 
-The spine is **classify → retrieve → ground → gate → learn**. The gate (confident-respond vs unsure-escalate) is what separates a support bot from a demo: a bot that always answers is a liability; the value is knowing when *not* to.
+- **Applies to this codebase:** **Partially.** blooming insights is
+  *not* a support chatbot — it's a multi-agent analyst for a marketing
+  workspace. But several patterns from the support-chatbot template
+  ARE exercised here in different shapes:
 
-**Data model:**
+  - **Intent classification (heuristic + LLM):** done. The free-form
+    QueryBox uses `classifyIntent` (haiku) to route to
+    monitoring/diagnostic/recommendation shapes. See
+    `01-llm-foundations/07-heuristic-before-llm.md`.
 
-- **Knowledge base** — `doc ID → {content, product area, version, last_updated}`, chunked and indexed (vector + keyword) for RAG. The grounding source; the bot must not answer outside it.
-- **Conversation state** — `conversation ID → ordered messages[] + resolved intent + retrieved doc IDs`. Multi-turn memory so "and what about the second one?" resolves against prior turns.
-- **Escalation record** — `ticket → {transcript, bot's last answer, confidence, reason, assigned agent}`. The handoff payload and the audit trail.
-- **Feedback log** — append-only `(conversation, question, bot answer, retrieved docs, thumbs/edit, agent correction, timestamp)`. The raw material for both the eval set and KB gaps.
-- **Eval set** — curated `(question → expected answer / expected behavior)` pairs distilled from the feedback log; the regression guard before any prompt or KB change ships.
+  - **Multi-step agent loops with tool calls (instead of "RAG over
+    KB"):** done. The diagnostic agent runs hypothesis testing via
+    EQL queries — structurally similar to RAG retrieval but
+    structured-query-shaped instead of semantic-retrieval-shaped.
 
-**Key components:**
+  - **LLM response generation constrained to data:** done. The
+    diagnostic agent's conclusion cites specific evidence from tool
+    results.
 
-- **Intent classifier** — a cheap fast model up front. Choice: classify before retrieving so chitchat and clear escalations (angry user, account-specific request) skip the RAG+generation cost entirely, and the retriever gets a clean routed query.
-- **Retriever (RAG)** — hybrid search over the KB. Choice: retrieve-then-ground rather than fine-tuning answers into the model, because the KB changes weekly and a fine-tune cannot be edited by updating a doc.
-- **Constrained generator** — an LLM instructed to answer *only* from retrieved context and to cite. Choice: force grounding + citation so hallucinations are catchable (an uncited claim is a red flag) and the user can verify.
-- **Confidence / escalation gate** — a decision step on retrieval score, generation self-report, or a separate classifier. Choice: a calibrated threshold, because the cost of a confidently-wrong support answer (user breaks production, files a complaint) dwarfs the cost of an unnecessary handoff.
-- **Feedback loop** — thumbs and agent edits flow back. Choice: route corrections to *both* the eval set (regression guard) and a KB-gap queue (content fix), because a wrong answer is usually a missing doc, not a bad model.
+  - **Escalation:** *not exercised.* No fallback path to a human
+    analyst. Errors surface as UI error panels, but there's no
+    "escalate to human" flow.
 
-**Scale concerns:**
+  - **Feedback loop:** *not exercised.* No thumbs-up/down on
+    diagnoses or recommendations; no path for the user to correct a
+    diagnosis and have it stored as a golden answer.
 
-- **KB staleness (hits first, at any nontrivial product velocity):** the KB drifts behind the product within days of a release. Past a weekly release cadence, the bot confidently cites deprecated docs. Mitigation: version docs, attach freshness to retrieval, and reindex on doc publish (cross-link [../03-retrieval-and-rag/09-stale-embeddings.md](../03-retrieval-and-rag/09-stale-embeddings.md)).
-- **Escalation overload (at ~30% escalation rate):** a too-conservative gate dumps everything on humans and the bot deflects nothing — negative ROI. A too-loose gate ships wrong answers. Mitigation: tune the threshold against measured human-agreement, monitor deflection rate as a first-class metric.
-- **Conversation context growth (at ~20+ turns):** full-history prompting blows the context window and cost per turn climbs linearly. Mitigation: summarize old turns, keep a rolling window, pin only the resolved intent + active doc IDs (cross-link [../04-agents-and-tool-use/05-agent-memory.md](../04-agents-and-tool-use/05-agent-memory.md)).
-- **Feedback volume vs label quality (at ~10k feedback events/week):** raw thumbs are noisy and sparse; most users never rate. Mitigation: sample for human review, weight agent edits over user thumbs, and never auto-promote raw feedback into the KB without review.
+  So this template doesn't apply as a *whole* (blooming insights is
+  the wrong product shape) but several of its *components* DO apply
+  and ARE built.
 
-**Eval framing:**
+- **How to make it apply:** Two paths.
 
-- **Offline:** answer accuracy and faithfulness (is the answer supported by retrieved docs?) on the curated eval set; retrieval recall@k (did the right doc get retrieved at all?); escalation precision/recall (did it escalate the questions it *should* have?).
-- **Online:** deflection rate (resolved without a human), escalation rate, customer satisfaction (CSAT) on bot-handled conversations, and reopen rate (did the "resolved" answer actually stick?).
-- **The trap:** measuring only deflection rewards a bot that confidently answers everything wrong. Pair deflection with CSAT and reopen rate, and gate every change on the offline faithfulness set (cross-link [../05-evals-and-observability/01-eval-set-types.md](../05-evals-and-observability/01-eval-set-types.md)).
+  **Path A (extend blooming insights as a Bloomreach support
+  chatbot):** Add a "ask the docs" surface where users can type
+  questions about Bloomreach features ("how do scenarios work?"),
+  retrieve from a corpus of Bloomreach docs (would need to import +
+  embed), and answer with citations. Same intent classify + RAG +
+  generation + escalate-on-low-confidence pattern. Would require:
+  building the doc corpus (one-time crawl), embeddings + vector
+  store (`03-retrieval-and-rag/04-vector-databases.md`'s exercise),
+  the new UI surface, and an escalation hook (Slack or email
+  notification).
 
-**Common failure modes:**
+  **Path B (illustrative walk-through for interview):** Walk this
+  template as "I've built the agent-loop / intent classify / tool
+  use components, but the *product* I shipped is an analyst, not a
+  support chatbot. Here's how I'd adapt the same components to a
+  support chatbot if I were building one — what stays the same
+  (intent classify, agent loops, tool allowlists), what would need
+  to change (RAG over docs vs EQL queries, escalation path, KB
+  freshness tracking)." This is the honest defense path when the
+  interviewer wants to see your thinking on a system you haven't
+  built.
 
-- **Confident hallucination** — the bot answers from parametric memory when retrieval returned nothing useful. Probe: "what does it do when the KB has no answer?" Mitigation: instruct refusal on thin context, surface retrieval scores to the gate, require citations.
-- **Wrong-or-no escalation** — it answers questions it should hand off (account-specific, legal, angry user) or escalates trivially. Mitigation: route high-risk intents straight to escalation at classification time, before generation.
-- **Feedback loop poisoning** — auto-ingesting raw user corrections lets a few bad signals degrade answers. Mitigation: human-in-the-loop review before any correction reaches the KB or training set.
-- **Context bleed across turns** — stale retrieved docs or a misclassified intent from turn 1 contaminates later turns. Mitigation: re-retrieve per turn, re-evaluate intent on topic shift, scope memory to the active thread.
-
-**Applies to this codebase:** **Partially.** The structural skeleton is real and recognizable; three of the five canonical components are missing. What exists: the ask-anything `QueryAgent.answer(query, intent, hooks)` (`lib/agents/query.ts:24`) is genuinely "a chatbot over your Bloomreach workspace" — a free-text question goes in, a grounded natural-language answer comes out. It is fronted by real intent routing: `parseIntent` does a heuristic substring pass (`lib/agents/intent.ts:6`) and `classifyIntent` does the LLM classification on the cheap `claude-haiku-4-5-20251001` model with `max_tokens: 16` to force a one-word label (`lib/agents/intent.ts:17`); inside the agent stream, `app/api/agent/route.ts:211` calls `classifyIntent` then dispatches to `QueryAgent.answer`. The query path is taken when only `q` is provided (`route.ts:210`); the answer is *tool-grounded* — the agent loop fetches live data via MCP tools before answering — and the whole thing streams back as NDJSON reasoning steps (`app/api/agent/route.ts:210–216`). That is classify→ground→respond, three of the five stages. (Note: the *investigation* path is a separate two-step flow — `?step=diagnose` then `?step=recommend`, `route.ts:117–118` — not the chatbot surface.)
-
-What is missing: (1) **KB-RAG** — there is no knowledge base and no retrieval index; grounding comes from *live MCP tool calls*, not retrieved documents (the deliberate "live tools over embedding-RAG" choice — cross-link [../03-retrieval-and-rag/11-rag.md](../03-retrieval-and-rag/11-rag.md)). (2) **Escalation gate** — `QueryAgent.answer` always answers; on failure it returns the string `'I was unable to find enough data to answer that question.'` (`lib/agents/query.ts:47`) rather than handing off, and there is no confidence score anywhere. (3) **Feedback / correction loop** — query results are explicitly never cached (`app/api/agent/route.ts:126` comment) and no thumbs/edit/correction is logged. (4) **Multi-turn memory** — each `?q=` is one-shot: the query string becomes `userPrompt: query` (`lib/agents/query.ts:35`) with no conversation history threaded in (cross-link [../04-agents-and-tool-use/05-agent-memory.md](../04-agents-and-tool-use/05-agent-memory.md)).
-
-**How to make it apply:** Close the three gaps against the parts that already exist. (1) **Multi-turn memory:** thread a conversation ID through `app/api/agent/route.ts` and persist the message history in `lib/state/` (mirror the keyed-store pattern in `lib/state/investigations.ts`), then pass prior turns into `QueryAgent.answer` so the second question resolves against the first. (2) **Escalation gate:** add a confidence/escalation decision on the query answer — replace the bare fallback string at `lib/agents/query.ts:47` with a typed `{answer, confident}` result and have `route.ts` emit an escalation event when `confident` is false instead of silently returning thin prose. (3) **Feedback loop:** add a thumbs-up/down endpoint and log `(query, answer, rating)` to a new `lib/state/feedback.ts` store, then distill those into an eval set that gates prompt changes (cross-link [../05-evals-and-observability/01-eval-set-types.md](../05-evals-and-observability/01-eval-set-types.md)). KB-RAG stays deliberately deferred: live tool-call grounding is the right call until a feature needs offline document recall.
-
----
+  For interview, Path B is usually the right framing — blooming
+  insights' agent-loop architecture transfers directly to chatbot
+  shapes; explicitly walking the transfer demonstrates that you
+  understand the patterns at the right level of abstraction.

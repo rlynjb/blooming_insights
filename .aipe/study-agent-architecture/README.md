@@ -1,69 +1,59 @@
-# blooming insights — agent architecture study guide
+# study-agent-architecture · blooming insights
 
-A topic-focused companion to [`../study-ai-engineering/`](../study-ai-engineering/). Same staff-engineer voice, same per-concept template — but the lens is **what happens above one agent**: reasoning patterns beyond ReAct, retrieval as a control loop, multi-agent orchestration topologies, agent infrastructure, and serving for an autonomous loop.
+A per-codebase study guide for the agent architecture that ships in this repo. The shape: **minimal multi-agent**. Five agents (monitoring, diagnostic, recommendation, query, intent), all thin wrappers over `@aptkit/core@0.3.0`, wired together by *deterministic route code* — not an LLM supervisor. The orchestration topology is a sequential pipeline (monitoring → diagnostic → recommendation) plus a one-shot intent router for free-form queries.
 
-## Codebase shape: multi-agent (minimal topology) + adapter-switchable
-
-blooming insights is a **multi-agent** codebase, but deliberately the *minimal* form — a deterministic sequential pipeline (monitoring → diagnostic → recommendation) plus an intent router, with the typed `Diagnosis` as the inter-stage message. The orchestration is **deterministic route code, not an LLM supervisor** — the route picks the next agent from `?step=`, and the user gates each transition by navigating. This is the architectural opinion at the heart of the guide: split work into specialists, keep coordination in code, escalate to an autonomous supervisor only when the coordination decision itself needs the model. See `03-multi-agent-orchestration/01-when-not-to-go-multi-agent.md` for the full defense.
-
-A second axis landed in Phase 2: **the topology is adapter-switchable.** Every agent's tool-registry adapter holds a `DataSource` (`lib/data-source/types.ts`). Two adapters implement it today: `BloomreachDataSource` (live OAuth MCP) and `SyntheticDataSource` (in-process, 516 LOC of deterministic fakes at `lib/data-source/synthetic-data-source.ts`). The `bi:mode` localStorage key holds `'demo' | 'live-bloomreach' | 'live-synthetic'`. The previously-documented Olist subprocess adapter and its sibling `mcp-server-olist/` package — plus the four-pillar eval/ pipeline that ran against them — were removed in PR #8 (commit 62c24d7); the in-repo measurement story is back to "structural unit tests + the streamed `AgentEvent` trajectory as the inspectable artifact."
-
-**A third axis landed after Phase 2: the active ReAct spine is `@aptkit/core` v0.3.0, not Blooming's `runAgentLoop`.** The four agent classes in `lib/agents/` are thin wrappers (30–100 LOC each) that construct an `@aptkit/core` agent and hand it three Blooming-owned adapter objects from `lib/agents/aptkit-adapters.ts` (206 LOC): `AnthropicModelProviderAdapter`, `BloomingToolRegistryAdapter`, `BloomingTraceSinkAdapter`. The Blooming-side `runAgentLoop` is preserved at `lib/agents/base-legacy.ts`; sibling `*-legacy.ts` files keep the legacy path intact for revertibility. See `04-agent-infrastructure/06-aptkit-runtime-layer.md` for the "own your domain + adapter layer, defer reusable agent behavior to a library" pattern as a concept.
-
-Start with [`00-overview.md`](00-overview.md) for the system map, then [`agent-patterns-in-this-codebase.md`](agent-patterns-in-this-codebase.md) for the feature-by-feature breakdown.
-
-## Sub-sections
-
-- **[01-reasoning-patterns/](01-reasoning-patterns/README.md)** (6 files) — chains-vs-agents (the boundary), ReAct (the baseline), plan-and-execute, reflexion / self-critique, tree of thoughts, routing (the bridge to multi-agent).
-- **[02-agentic-retrieval/](02-agentic-retrieval/README.md)** (3 files) — agentic RAG, self-corrective RAG, retrieval routing. Intentionally thin: retrieval here is *live agentic EQL*, not embedding-RAG (the design rationale is cross-referenced to `../study-ai-engineering/03-retrieval-and-rag/11-rag.md`).
-- **[03-multi-agent-orchestration/](03-multi-agent-orchestration/README.md)** (9 files) — when-not-to-go-multi-agent, supervisor-worker, sequential pipeline, parallel fan-out, debate / verifier-critic, swarm / handoff, graph orchestration, shared state and message passing, coordination failure modes. **The load-bearing section** for a multi-agent codebase.
-- **[04-agent-infrastructure/](04-agent-infrastructure/README.md)** (6 files) — context engineering, agent memory tiers, tool calling and MCP (with the `DataSource` seam above it), agent evaluation (structural unit tests + the inspectable trajectory — the automated harness is gone with `eval/`), guardrails and control, **AptKit runtime layer** (the senior pattern: own your domain + adapter layer, defer reusable agent behavior to a library). The cross-cutting disciplines that separate a demo from a shipped system.
-- **[05-production-serving/](05-production-serving/README.md)** (3 files) — cross-turn caching, fan-out backpressure, per-tool circuit breaking. These cover what `../study-ai-engineering/06-production-serving/` becomes once the unit is a loop or a topology.
-- **[06-orchestration-system-design-templates/](06-orchestration-system-design-templates/README.md)** (3 files) — IK-style 9-bullet templates: multi-agent research assistant, agentic support system, agentic coding system. Mapped against this codebase's actual shape.
+If you only read one file, read [`agent-patterns-in-this-codebase.md`](./agent-patterns-in-this-codebase.md). It enumerates every agent loop in the repo with the pattern it instantiates and the control envelope it ships.
 
 ## Reading order
 
-The cross-sub-section order is **A → B → C → D → E → F**, but no file requires another — each is self-contained with `See also` cross-links. The path that tracks this codebase's strengths:
-
-1. **`03-multi-agent-orchestration/01-when-not-to-go-multi-agent.md`** first — it grounds the architectural opinion the rest of the guide leans on. Then `03/03-sequential-pipeline.md`, `03/08-shared-state-and-message-passing.md`, `03/09-coordination-failure-modes.md` — the three Case-A files for this codebase's actual topology.
-2. **`01-reasoning-patterns/02-react.md` and `06-routing.md`** — the baseline every agent runs, and the router that bridges single-agent into multi-agent.
-3. **`04-agent-infrastructure/`** — read in directory order; the discipline is what holds it all together.
-4. **`02-agentic-retrieval/01-agentic-rag.md`** — for why retrieval here is live EQL inside the loop and not a vector pipeline.
-5. **`05-production-serving/`** — what the McpClient does inside a loop vs a single call.
-6. **`06-orchestration-system-design-templates/`** — the same code reframed as an interview answer.
-
-## Case A vs Case B
-
-**Case A** (implemented — cited to real `file:line`):
-- The whole of SECTION A's chains-vs-agents boundary, ReAct, and routing (the four agents on AptKit's spine; the intent classifier re-exported from AptKit).
-- SECTION B's agentic-RAG (reframed: agentic, but the tool is `execute_analytics_eql` under Bloomreach, or synthetic equivalents in-process — not embeddings).
-- SECTION C's sequential pipeline, shared-state-and-message-passing (the `bi:diag:<id>` handoff), and coordination-failure-modes (this codebase's *deterministic* orchestration structurally avoids whole classes of multi-agent failures).
-- Most of SECTION D — context engineering, memory tiers (working + ephemeral persistence), tool calling and MCP (with the `DataSource` seam above MCP and the AptKit runtime layer above the seam), guardrails (AptKit-owned budgets, read-only tools, validators, coverage gate, auto-reconnect), **AptKit runtime layer (own your domain + adapter layer, defer reusable agent behavior to a library)**.
-- SECTION E's cross-turn caching (the 60s TTL on the Bloomreach adapter + demo replay).
-
-**Case B** (not yet implemented in this repo): SECTION A's plan-and-execute, reflexion, tree of thoughts. SECTION B's self-corrective-RAG and retrieval-routing. SECTION C's supervisor-worker (would replace the deterministic route), parallel fan-out, debate/critic, swarm/handoff, graph orchestration. SECTION D's agent evaluation as an *automated harness with portfolio numbers* — the structural unit tests + inspectable trajectory are still Case A, but the trajectory-eval harness with seeded ground truth was removed when `eval/` and `mcp-server-olist/` were deleted in PR #8. SECTION E's fan-out backpressure (no fan-out exists) and per-tool circuit breaking.
-
-## How this guide composes with the rest of the family
+The sub-sections walk wide-to-narrow: a single-agent loop is the substrate, retrieval and orchestration sit on top, infrastructure and serving wrap around. Read A → B → C → D → E → F.
 
 ```
-study-system-design/        the systems-level view of the same orchestration
-                                (request flow, multi-agent-orchestration, schema-gated
-                                 coverage, NDJSON streaming, client stream handoff)
-study-ai-engineering/           single-agent mechanics + retrieval mechanics
-                                (ReAct mechanics, tool calling, agent memory two-layer
-                                 split, RAG / why-no-embeddings, LLM-as-judge, single-
-                                 call caching/cost/rate-limit/retry-and-circuit-breaker)
-study-prompt-engineering/       prompt-craft mechanics (self-critique, structured
-                                 outputs, anatomy of the production prompts the agents
-                                 use, the {categories} runtime interpolation)
-rehearse-interview-defense/     the wide-opener interview book — defending the project
-                                 above the concept level
-THIS GUIDE                      everything ABOVE one agent — reasoning patterns,
-                                 agentic retrieval as a control loop, multi-agent
-                                 orchestration topologies, agent infrastructure,
-                                 production serving for a loop or a topology
+  How to read this guide
+
+  ┌─ A. Reasoning patterns ──────────────┐  what one agent does
+  │   01-reasoning-patterns/             │  ReAct, plan-execute, the loop kernel
+  └────────────────┬─────────────────────┘
+                   │  pull in retrieval as a control loop
+  ┌─ B. Agentic retrieval ───────────────┐
+  │   02-agentic-retrieval/              │  not in this repo (workspace-as-tool, not RAG)
+  └────────────────┬─────────────────────┘
+                   │  compose many agents
+  ┌─ C. Multi-agent orchestration ───────┐  ← THE LOAD-BEARING SECTION
+  │   03-multi-agent-orchestration/      │  for this repo's "what's above one agent"
+  └────────────────┬─────────────────────┘
+                   │  cross-cutting infrastructure
+  ┌─ D. Agent infrastructure ────────────┐
+  │   04-agent-infrastructure/           │  context, memory, tools, evals, guardrails
+  └────────────────┬─────────────────────┘
+                   │  serving concerns once the unit is a loop
+  ┌─ E. Production serving for agents ───┐
+  │   05-production-serving/             │  cross-turn cache, fan-out, per-tool breaker
+  └────────────────┬─────────────────────┘
+                   │  put it all together as design templates
+  ┌─ F. Orchestration system design ─────┐
+  │   06-orchestration-system-design-templates/
+  └──────────────────────────────────────┘
 ```
 
-The boundary with `study-ai-engineering/`: that guide stops at the single-agent surface and covers retrieval mechanics deeply. Everything above one agent — the reasoning patterns past ReAct, the agentic retrieval *loop*, the multi-agent topologies — lives here. Where a mechanic is already taught in `study-ai-engineering/`, this guide cites it in `See also` rather than re-teaching.
+## What's in this repo (the honest framing)
 
----
+- **Shape:** minimal multi-agent — three agents in a sequential pipeline plus an intent router. No supervisor LLM, no fan-out, no debate, no RAG.
+- **Runtime:** every agent loop is `runAgentLoop()` inside `@aptkit/core@0.3.0`. The Blooming-owned code is a 206-LOC 3-class adapter at `lib/agents/aptkit-adapters.ts` (provider + tool registry + trace sink) and 5 thin wrapper classes in `lib/agents/{monitoring,diagnostic,recommendation,query}.ts` plus `intent.ts`.
+- **Orchestration is route code.** `app/api/agent/route.ts` decides what runs next based on `?step=diagnose|recommend`. The model never picks the next agent — the route does.
+- **Control envelope:** every loop has `maxTurns` + `maxToolCalls` + a forced-final synthesis turn. AptKit owns this discipline; the wrapper classes don't even configure it.
+- **DataSource seam:** two adapters — `BloomreachDataSource` (live MCP over OAuth + ~1 req/s spacing + retry + 60s cache) and `SyntheticDataSource` (in-process Blooming-owned synthetic ecommerce). `bi:mode` = `demo` | `live-bloomreach` | `live-synthetic`.
+- **Schema-gated coverage:** `lib/agents/categories.ts` runs `schemaCapabilities → coverageReport → runnableCategories` and feeds only the categories this workspace can answer into the monitoring prompt's `{categories}` slot.
+- **The trace is the trajectory.** The streamed `AgentEvent` NDJSON contract IS the inspectable trajectory. There is no automated trajectory-eval harness in this repo.
+- **Legacy is preserved.** `lib/agents/base-legacy.ts` still holds Blooming's hand-rolled `runAgentLoop` for revertibility. The active path does not call it.
+
+## File index
+
+- [`00-overview.md`](./00-overview.md) — one-page system orientation
+- [`agent-patterns-in-this-codebase.md`](./agent-patterns-in-this-codebase.md) — every loop in the repo, named
+- [`01-reasoning-patterns/`](./01-reasoning-patterns/) — chains vs agents, the loop kernel, ReAct, plan-execute, reflexion, ToT, routing
+- [`02-agentic-retrieval/`](./02-agentic-retrieval/) — agentic RAG, self-corrective RAG, retrieval routing (all not-yet-implemented; the repo retrieves via tools, not via embeddings)
+- [`03-multi-agent-orchestration/`](./03-multi-agent-orchestration/) — when not to go multi-agent, supervisor-worker, sequential pipeline (THIS repo's pattern), fan-out, debate, swarm, graph, shared state, failure modes
+- [`04-agent-infrastructure/`](./04-agent-infrastructure/) — context engineering, memory tiers, tool calling and MCP, agent evaluation, guardrails
+- [`05-production-serving/`](./05-production-serving/) — cross-turn caching, fan-out backpressure, per-tool circuit breaking
+- [`06-orchestration-system-design-templates/`](./06-orchestration-system-design-templates/) — multi-agent research assistant, agentic support, agentic coding

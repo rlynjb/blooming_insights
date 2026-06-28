@@ -1,33 +1,25 @@
-# 02 — Agentic retrieval
+# 02 · Agentic retrieval
 
-How retrieval stops being a one-shot pipeline step and starts being a loop the agent drives. Three files, intentionally a thin sub-section in this codebase — because blooming insights does live-tool retrieval (`execute_analytics_eql` against Bloomreach via MCP) rather than the textbook embedding-index RAG. The agentic-RAG loop is real here; the rest of the embedding-RAG mechanics (chunking, vector stores, dense/sparse, reranking) live in the AI engineering guide and are cited rather than re-taught.
+How a model uses retrieval as a control loop rather than a one-shot pipeline step.
 
-> If you're looking for *why no embedding-RAG*, that's covered in detail in `../../study-ai-engineering/03-retrieval-and-rag/11-rag.md` — read that first if you're trying to understand the choice. This sub-section covers the *agent-architecture angle*: retrieval as a control loop, the relevance gate that isn't here, and routing between sources when there's more than one.
+**None of the patterns in this sub-section are in this repo.** This codebase does not use RAG. It has no embeddings, no vector store, no chunking, no similarity search. Retrieval is via MCP tool calls (Bloomreach EQL) — the model writes a query, the harness runs it, the result comes back as a `tool_result` block. That's tool-use, not retrieval.
 
-## Reading order
+These files are included for completeness and to make the "where would RAG go" question answerable. Each one names what would change in this repo to adopt the pattern.
 
-| # | File | What it covers | Case |
-|---|------|----------------|------|
-| 1 | [01-agentic-rag.md](01-agentic-rag.md) | Retrieval as a tool the model calls inside a ReAct loop; the model writes the query sequence at runtime. The retriever is an interface — vector index, SQL, web, or live API all fill the slot. This codebase fills it with `execute_analytics_eql` against Bloomreach. | A (live agentic retrieval) |
-| 2 | [02-self-corrective-rag.md](02-self-corrective-rag.md) | A relevance/groundedness grader between retrieve and generate, with a fallback ladder (rewrite, widen, escalate). Not implemented on the retrieval path here; two adjacent checks live in the prompts — the monitoring volume-check (premise side) and the diagnostic hypothesis-test (answer side). | B (not yet implemented) |
-| 3 | [03-retrieval-routing.md](03-retrieval-routing.md) | Routing a query to the right knowledge source before retrieving. One source here (Bloomreach MCP), so source routing doesn't apply; the capability gate in `lib/agents/categories.ts` is the adjacent pattern — pre-retrieval *capability* routing rather than source routing. | B (mostly — source routing absent; capability gate adjacent) |
+## Files
 
-## Why this sub-section is thin
+1. [`01-agentic-rag.md`](./01-agentic-rag.md) — ReAct whose primary tool is retrieval
+2. [`02-self-corrective-rag.md`](./02-self-corrective-rag.md) — grade retrieved chunks before generating
+3. [`03-retrieval-routing.md`](./03-retrieval-routing.md) — pick the source before retrieving
 
-This codebase makes a deliberate retrieval choice: live tool calls instead of an embedding index. That choice is the load-bearing decision the AI engineering guide walks (`../../study-ai-engineering/03-retrieval-and-rag/11-rag.md` covers the threshold rule end-to-end). Everything downstream of that choice — chunking, embedding model selection, vector DB choice, dense/sparse split, hybrid retrieval, reranking, query rewriting/HyDE, stale-embedding handling, incremental indexing — is moot here, because the snapshot the embeddings would index doesn't exist.
+## How this maps to the codebase
 
-What *does* matter, and what this sub-section covers, is the agent-architecture surface of retrieval:
+| File | In this codebase? |
+|---|---|
+| Agentic RAG | **No** — retrieval is via MCP tools, not embeddings. The agent loop drives tool calls; "agentic RAG" would mean the tools were similarity-search backed. |
+| Self-corrective RAG | **No** — there's no retrieved-chunk grading step because there are no retrieved chunks. |
+| Retrieval routing | **Partial** — the URL router + intent classifier already do *tool routing* (`07-routing.md`). Real retrieval routing would mean picking between, say, Bloomreach EQL vs a vector store vs live web search — none of which exist here. |
 
-- **The control loop.** Static RAG fixes the retrieval plan in code; agentic RAG hands it to the model. blooming insights is the agentic shape with a live API as the retriever (`01`).
-- **The validity gate.** Retrieval-success is not answer-success; a relevance grader is the gate between them. Not in this codebase, with honest naming of the adjacent checks that are (`02`).
-- **The dispatch layer.** Multiple sources need a router before retrieval. One source here, so the source router doesn't apply — the capability gate in `lib/agents/categories.ts` is what's here instead, and it routes the question space at the capability layer rather than the source layer (`03`).
+## Cross-reference
 
-## Cross-references
-
-- `../../study-ai-engineering/03-retrieval-and-rag/11-rag.md` — why no embedding-RAG; the live-tool-vs-vector-index decision, walked
-- `../../study-ai-engineering/04-agents-and-tool-use/07-capability-gating.md` — the broader capability-gating pattern the coverage gate instantiates
-- `../01-reasoning-patterns/02-react.md` — the ReAct loop shape agentic RAG sits on
-- `../01-reasoning-patterns/06-routing.md` — routing as a single-agent pattern (this file's sibling at the reasoning layer)
-- `../01-reasoning-patterns/04-reflexion-self-critique.md` — self-critique as a loop on the answer, not on retrieval
-
----
+For retrieval mechanics in general (embeddings, chunking, vector DBs, dense/sparse, RRF, reranking, classic RAG, GraphRAG), see ai-engineering's `03-retrieval-and-rag/` if generated. This sub-section assumes you know those mechanics and covers only the *control loop* angle — retrieval driven by an agent.

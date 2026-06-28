@@ -1,22 +1,38 @@
-# 04 — Agents and tool use
+# 04 — agents and tool use
 
-This is the codebase's strongest sub-section. The four specialist agents (monitoring, diagnostic, recommendation, query) all share one loop — `runAgentLoop` in `lib/agents/base.ts` — and every concept in this directory is a different lens on that single ~130-line function and the route that orchestrates it. The route now runs the investigation as two `?step`-gated calls (`step=diagnose` then `step=recommend`, with the diagnosis handed between them), and the trace consumer lives in `lib/hooks/useInvestigation.ts`. If you understand `base.ts` L48–L176, `lib/mcp/tools.ts`, and `app/api/agent/route.ts`, you understand the heart of blooming insights.
+**The load-bearing section for this codebase.** Every feature in blooming
+insights runs through an agent loop. AptKit owns the loop; Blooming wraps
+it in three adapters. Five agents (monitoring, diagnostic, recommendation,
+query, intent) compose into the product.
 
 ## Files
 
-- **[01-agents-vs-chains.md](01-agents-vs-chains.md)** — The defining architecture: a deterministic CHAIN of agents at the top (`route.ts` runs diagnostic→recommendation as two `?step`-gated calls with a diagnosis handoff), a bounded AGENT loop at each node (`base.ts` — model owns control flow), and a 2-step micro-chain inside an agent (`runAgentLoop` then `synthesize`). Both shapes coexist by design.
-- **[02-tool-calling.md](02-tool-calling.md)** — The brain/hands split: the model emits `tool_use`, your loop runs it and feeds back `tool_result` (`base.ts` L129–L171). `filterToolSchemas` maps MCP defs → Anthropic `Tool[]`; the model never runs the tool, the loop does.
-- **[03-react-pattern.md](03-react-pattern.md)** — Thought→Action→Observation made literal and STREAMED: `onText` → reasoning_step, `tool_call_start`, `tool_call_end` + result-as-next-user-turn. The trace is a live product surface (`events.ts`, NDJSON over `fetch`), consumed by the StrictMode-safe `useInvestigation` hook.
-- **[04-tool-routing.md](04-tool-routing.md)** — Two routings: per-agent tool SUBSETS (routing by construction — the wrong tool is never offered, `tools.ts`) and heuristic-first / LLM-second intent routing for `?q=` (`parseIntent` then `classifyIntent`, `intent.ts`).
-- **[05-agent-memory.md](05-agent-memory.md)** — Short-term = the per-run `messages` array (`base.ts`); long-term = exact-keyed snapshot replay (`state/investigations.ts`), now `step`-filtered on replay and saved only on the combined capture run. No semantic/vector recall — that is the RAG-inside-an-agent pattern, deliberately deferred (cross-link `../03-retrieval-and-rag/`).
-- **[06-error-recovery.md](06-error-recovery.md)** — Every failure has a coded recovery: forced-final tool-less turn caps the loop, `synthesize()` rescues unparseable output, `FALLBACK`/`[]` are the safe defaults, exponential-backoff rate-limit retry + no-cache-on-error, the route's pre-stream setup `try/catch`, and a one-time client auto-reconnect on a revoked alpha token. The budget IS the loop protection.
-- **[07-capability-gating.md](07-capability-gating.md)** — Scope before spend: a cheap in-memory check (`schemaCapabilities` → `coverageReport` → `runnableCategories`, `lib/agents/categories.ts`) classifies a 10-category anomaly checklist against the live schema BEFORE the rate-limited monitoring agent runs, so `agent.scan(hooks, runnable)` never queries data the workspace can't support. One computation feeds both the agent's scope and the coverage grid.
-- **[08-authoring-mcp-server.md](08-authoring-mcp-server.md)** — Authoring your own MCP server: the sibling `mcp-server-olist/` package (~1800 LOC) exposes **three domain tools** (`get_metric_timeseries` / `get_segments` / `get_anomaly_context`) over synthetic SQLite, NOT a raw `execute_sql` surface. The model picks tools + passes typed args; query authoring lives in TypeScript. The `seeded_anomalies` table is the ground truth that makes the detection eval possible at all.
+```
+01-agents-vs-chains.md     ← the loop-vs-pipeline distinction (LOAD-BEARING)
+02-tool-calling.md         ← tool_use / tool_result message shape + adapter
+03-react-pattern.md        ← Thought / Action / Observation trace
+04-tool-routing.md         ← heuristic-vs-LLM tool picking; per-agent allowlists
+05-agent-memory.md         ← in-context history (no long-term yet)
+06-error-recovery.md       ← rate-limit retry, tool errors, hard caps
+```
 
-## Reading order
+## What's load-bearing in this section
 
-Read in order: **02 (the round-trip) → 03 (streamed as ReAct) → 04 (which tools, which agent) → 07 (which checks the schema even allows) → 01 (how the agents compose) → 05 (what they remember) → 06 (how each fails safely) → 08 (when you own the backend, author the tool surface yourself).**
+  → **`01-agents-vs-chains.md`** — explains why blooming insights is BOTH:
+    a *chain* at the top (monitoring → diagnostic → recommendation) and
+    a *loop* inside each agent. The chain is in Blooming's route handler;
+    the loop is in AptKit.
 
-This guide is the AI-engineering lens on the same loop the system-design guide covers in `../../study-system-design/06-multi-agent-orchestration.md` — read that file for the orchestration/streaming systems view; read this directory for the agent-design view. They are consistent, not duplicative.
+  → **`02-tool-calling.md`** — the `BloomingToolRegistryAdapter` is the
+    seam where AptKit's agent loop calls Blooming's data sources. Without
+    this seam, AptKit wouldn't know how to call Bloomreach MCP tools.
 
----
+  → **`04-tool-routing.md`** — per-agent allowlists in `lib/mcp/tools.ts`
+    are how Blooming controls which tools each agent can pick. Coverage
+    gating via `categories.ts` is the heuristic-before-LLM routing.
+
+## What's pattern-only (Case B)
+
+  → **`05-agent-memory.md`** — only short-term (in-context) memory exists
+    today. Long-term memory across sessions would land in
+    `03-retrieval-and-rag/11-rag.md`-style RAG over past investigations.

@@ -1,504 +1,476 @@
-# ALS-scoped request store
+# 02 · als-scoped-request-store
 
-**Industry name(s):** AsyncLocalStorage context, per-request store, request-scoped state, async context propagation
-**Type:** Industry standard · Language-agnostic (the ThreadLocal-for-async pattern); Project-specific (the `RequestStore` that backs the `bi_auth` cookie)
+**AsyncLocalStorage-scoped request context** · Industry standard
+(per-request scoping, Node.js `async_hooks`)
 
-> The auth pattern that runs the OAuth flow on Vercel needs a place to hold per-request state that's visible to *every function* in the request's call tree — without passing it explicitly. The MCP SDK's `OAuthClientProvider` calls a dozen `state()` / `saveTokens()` / `codeVerifier()` methods during one OAuth round-trip; threading a context object through all of them would force a fork of the SDK. AsyncLocalStorage solves it: `withAuthCookies` runs the handler inside an ALS context that holds the decrypted store, every async hop preserves that context automatically, concurrent requests on the same instance get separate contexts. Strip it out and either the cookie gets touched on every provider-method call (breaks Next's request/response split) or the in-memory state has to be passed by hand through every SDK seam (forks the SDK).
+## Zoom out — where this lives
 
----
-
-## Zoom out, then zoom in
-
-**Zoom out — the bigger picture.** AsyncLocalStorage is *thread-local storage for async code* — like a backpack the request carries through every `await`, every callback, every `setTimeout`, where any function inside that request's call tree can reach in and pull out the same context. Without it you'd either pass a context object explicitly through every function (forking any SDK that doesn't know about it) or fall back to a module global (which two concurrent requests on the same instance would clobber). This sits inside the bigger encrypted-cookie pattern as the *synchronization primitive*. The cookie is the durable state; ALS is what makes the cookie usable in a server runtime where multiple requests may run concurrently on one V8 isolate (Vercel Edge / Node runtime both have this) and where the OAuth provider's many calls all need to see the same view of the state.
+The encrypted-cookie store from `01-encrypted-cookie-oauth-state.md`
+solves *persistence across requests*. This file is about the *other*
+half: how that store works *within* one request, when the MCP SDK calls
+`state()`, `saveCodeVerifier()`, `saveClientInformation()`, and
+`saveTokens()` half a dozen times each before the response is sent.
 
 ```
-  Zoom out — where ALS sits in the auth layer
+  Zoom out — where ALS sits
 
-  ┌─ Browser ────────────────────────────────────┐
-  │  bi_auth cookie (encrypted)                   │
-  └────────────────────┬──────────────────────────┘
-                       │ HTTPS
-  ┌─ Route handler ────▼──────────────────────────┐
-  │  withAuthCookies(fn)                           │
-  │   ┌──────────────────────────────────────────┐ │
-  │   │ ★ requestStore.run(ctx, fn) ★            │ │ ← we are here
-  │   │   ALS context holds {store, dirty}        │ │
-  │   │                                            │ │
-  │   │   fn = the route's actual work             │ │
-  │   │     calls into MCP SDK                     │ │
-  │   │     SDK calls provider many times          │ │
-  │   │     each provider call reads ctx.store     │ │
-  │   │     or writes ctx.store and sets dirty     │ │
-  │   └──────────────────────────────────────────┘ │
-  └────────────────────────────────────────────────┘
+  ┌─ Service ─────────────────────────────────────────────────────┐
+  │ Next.js route handler                                          │
+  │                                                                │
+  │   withAuthCookies(() => connectMcp(sid))                       │
+  │       │                                                        │
+  │       │  read cookie once                                      │
+  │       ▼                                                        │
+  │   ┌───────────────────────────────────────────────────────┐    │
+  │   │  ★ ALS context: { store, dirty } ★                    │    │ ← we are here
+  │   │  (one per request, visible to all awaits inside)      │    │
+  │   └───────────────────────────────────────────────────────┘    │
+  │       │                                                        │
+  │       │  MCP SDK runs                                          │
+  │       │  ├─ provider.state()                                   │
+  │       │  ├─ provider.saveClientInformation(…)                  │
+  │       │  ├─ provider.saveCodeVerifier(…)                       │
+  │       │  └─ provider.saveTokens(…)                             │
+  │       ▼                                                        │
+  │   write cookie once (if dirty) at the end                      │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
-**Zoom in — narrow to the concept.** AsyncLocalStorage is "ThreadLocal for the async-await world." You call `storage.run(value, fn)` once; every async hop inside `fn` — every `await`, every `setTimeout`, every Promise callback — can call `storage.getStore()` and get the same `value` back. Concurrent invocations of `storage.run` produce separate contexts that never mix. The pattern is "context propagation without explicit threading."
-
----
+The pattern: **read once, mutate in memory, flush once.** ALS is the
+substrate that makes "in memory" mean "this request's memory, not
+another request's, even on the same Node process."
 
 ## Structure pass
 
-**Layers.** Two altitudes that matter. The **runtime primitive** (`AsyncLocalStorage` from `node:async_hooks` — V8's continuation hook tracks the active context across await boundaries). The **wrapper** (`withAuthCookies` — the function that owns the ALS context's lifecycle and reconciles its content to the cookie).
+  → **Layers.** Two: the *request layer* (one cookie read, one cookie
+    write, one Node call stack) and the *SDK layer* (synchronous-looking
+    provider methods, called many times during the OAuth flow).
 
-**Axis: state ownership.** Hold one question constant across the layers: *what's the scope of this state, and what guarantees that scope?* The runtime gives you "the active async chain rooted at this `.run()` call." The wrapper turns that into "the lifecycle of this request handler." The seams between async work all preserve the context automatically — that's the load-bearing property.
+  → **Axis to hold constant: "who owns the Store, and when does it
+    change?"**
 
-**Seams.** One load-bearing seam, several invisible. The load-bearing one is `requestStore.run(ctx, fn)` — that's where a context gets minted and bound to the entire async call tree rooted at `fn`. The invisible seams are every `await` inside `fn` — under the hood, V8 tracks the active context per microtask, and every promise continuation re-enters the same context. The user-visible API hides all of that.
+    ```
+      altitude            who owns? when does it change?
+      ───────────         ─────────────────────────────────────────
+      request boundary    cookie owns; changes only on Set-Cookie
+      ALS context         this request owns; ctx.store mutates
+                          on every patchState
+      provider method     the SDK reads/writes named fields
+                          (tokens, codeVerifier, state, …)
+    ```
 
-```
-  Structure pass — ALS architecture
+    The same axis answer flips at every altitude, which is the
+    skeleton of why ALS is here at all.
 
-  ┌─ 1. LAYERS ───────────────────────────────────────┐
-  │  runtime: AsyncLocalStorage (node:async_hooks)     │
-  │  wrapper: withAuthCookies (lifecycle owner)        │
-  └────────────────────────┬──────────────────────────┘
-                           │  hold the scope question
-  ┌─ 2. AXIS ─────────────▼───────────────────────────┐
-  │  state ownership: what's the scope, guaranteed by? │
-  │  runtime: active async chain rooted at .run()      │
-  │  wrapper: one request handler's lifetime           │
-  └────────────────────────┬──────────────────────────┘
-                           │  trace, find the binding point
-  ┌─ 3. SEAMS ────────────▼───────────────────────────┐
-  │  requestStore.run(ctx, fn)   LOAD-BEARING          │
-  │      binds ctx to entire async tree rooted at fn   │
-  │  every `await` inside fn     INVISIBLE             │
-  │      V8 preserves context across microtasks        │
-  │  concurrent requests          SEPARATED            │
-  │      each .run() call gets its own context         │
-  └────────────────────────┬──────────────────────────┘
-                           ▼
-                   Block 4 — How it works
-```
+  → **Seams.** Two load-bearing joints:
+    - **request ↔ ALS** (`withAuthCookies` at `lib/mcp/auth.ts:86-104`,
+      `requestStore.run(ctx, fn)`). The seam where "the request's
+      ephemeral memory" gets named.
+    - **ALS ↔ provider** (`readAll` / `writeAll` at
+      `lib/mcp/auth.ts:113-142`, `BloomreachAuthProvider` at
+      `:160-218`). The seam where the SDK's synchronous getter calls
+      see the ALS-scoped Store instead of the cookie directly.
 
-The skeleton is mapped. Next we walk the mechanics.
-
----
+  → **Why this matters.** Without ALS, the only place to put the
+    decrypted Store is a module-scoped variable. That's *shared
+    across all concurrent requests on the warm instance.* Two users
+    OAuth'ing at the same time would race for the same Store and one
+    would overwrite the other's PKCE verifier.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know how `try`/`catch` works — `throw` inside a function bubbles up to the nearest `catch` on the call stack? ALS is the *async-aware* version of that "find the nearest enclosing context" idea, but for *values you want to read* instead of errors you want to handle. Call `storage.run(value, fn)` once; from anywhere inside `fn` (including inside callbacks, awaited promises, microtasks), `storage.getStore()` returns that `value`. Different `storage.run()` calls produce separate contexts, like separate `try` blocks have separate error handlers.
+If you've used React Context to pass a value to deeply nested
+components without prop-drilling, ALS is the same shape for async
+function calls. You wrap a function in `als.run(value, fn)`; anything
+that `fn` calls (sync, async, awaited, scheduled on the microtask
+queue, anywhere) can call `als.getStore()` and see that value. Nothing
+else outside that wrap sees it.
 
 ```
-  ALS — the pattern's shape
+  the pattern — ALS as a per-async-tree context
 
-   outside any .run() context
-   ┌──────────────────────────┐
-   │  storage.getStore() ───── │ ─▶  undefined
-   └──────────────────────────┘
+                     module scope (shared, bad)
+                            ▲
+                            │  module-level let store: Store
+                            │  (every request mutates it — race!)
+                            │
+   request A ───────────────┴─────────────► response A
+   request B ───────────────┴─────────────► response B
+              (both see the same `store`)
 
-   inside storage.run({a:1}, fn)
-   ┌──────────────────────────────────────────────────┐
-   │ fn() {                                             │
-   │   storage.getStore()  ─────▶ {a:1}                │
-   │   await someAsyncThing()                          │
-   │   storage.getStore()  ─────▶ {a:1}    ← preserved │
-   │   setTimeout(() => {                              │
-   │     storage.getStore() ─▶ {a:1}        ← preserved│
-   │   }, 100)                                         │
-   │ }                                                  │
-   └──────────────────────────────────────────────────┘
+                     ALS scope (per-request, good)
+                            ▲
+                            │  AsyncLocalStorage<RequestStore>
+                            │
+   request A ──[ als.run(ctxA, …) ]────► response A
+                  ├─ saveTokens → ctxA.store mutates
+                  └─ getStore() → ctxA
 
-   concurrently in another request
-   ┌──────────────────────────────────────────────────┐
-   │ storage.run({a:2}, fn) — same fn, different ctx  │
-   │   storage.getStore() ─▶ {a:2}                     │
-   └──────────────────────────────────────────────────┘
+   request B ──[ als.run(ctxB, …) ]────► response B
+                  ├─ saveTokens → ctxB.store mutates
+                  └─ getStore() → ctxB
+              (each request sees its own ctx)
 ```
 
-The two `.run()` calls never see each other's values — even though they're calling the same `fn` on the same `storage` instance in the same process. ALS is the synchronization primitive that makes this work.
+The ALS API ships in Node 14+. Vercel's Node runtime (the route
+handlers here run on the Node runtime, not edge) supports it natively.
 
 ### Move 2 — the step-by-step walkthrough
 
-#### Step 1 — declare the storage as a module-level singleton
+#### a · `withAuthCookies` — the request envelope
+
+The route never decrypts/encrypts the cookie directly. It hands a
+callback to `withAuthCookies`, which sets up the ALS context, runs the
+callback, and flushes back to the cookie *once* at the end.
 
 ```
-  module-level singleton — pseudocode
+  the envelope — one read, N writes, one flush
 
-  // imported from node:async_hooks
-  const requestStore = new AsyncLocalStorage<RequestStore>()
+  request in
+     │
+     ▼
+  ┌─ withAuthCookies(fn) ────────────────────────────┐
+  │  1. read bi_auth cookie                           │
+  │  2. ctx = { store: decrypt(cookie), dirty: false }│
+  │  3. await requestStore.run(ctx, fn) ─────────────┐│
+  │                                                  ││
+  │     ├─ fn calls provider.saveTokens(t) ◄─── reads/writes ctx.store
+  │     ├─ fn calls provider.state() ◄────────────  via readAll/writeAll
+  │     ├─ fn calls SDK that calls provider.… ◄───  (which check ALS first)
+  │     └─ … many more provider calls …             ││
+  │                                                  ││
+  │  4. ctx.dirty ? cookies().set(encrypt(ctx.store))││
+  │  5. return result                                ││
+  └──────────────────────────────────────────────────┘│
+                                                      │
+  response out                                        │
 ```
 
-The storage itself is shared across the whole process — there's one `requestStore` for the entire `lib/mcp/auth.ts` module. What's *not* shared is the value inside it; that's what `.run()` sets up per invocation.
+Real code (`lib/mcp/auth.ts:86-104`):
 
-What breaks if you create the storage per-request: you'd have to pass the storage instance into every function that wants to call `getStore()` on it. The module-level singleton is what makes ALS feel like "global variable that's actually request-scoped" — the API surface is the same as a global, but the values are scoped.
-
-#### Step 2 — `.run(value, fn)` binds the value to the async chain rooted at `fn`
-
-```
-  requestStore.run — what binds when
-
-  requestStore.run(ctx, fn)
-        │
-        │  V8 internally: push ctx onto the "active context" stack
-        │  for this microtask. Run fn synchronously.
-        ▼
-   fn() {
-        │  every storage.getStore() call inside ─▶ ctx
-        │
-        await externalThing()         ← microtask boundary
-        │  V8 internally: when the awaited promise resolves,
-        │  re-enter the SAME context for the continuation
-        ▼
-        another storage.getStore()    ─▶ still ctx (preserved)
-   }
-        │
-        │  when fn's returned promise resolves: pop ctx from
-        │  the active-context stack (cleanup)
-        ▼
-   .run returns whatever fn resolved to
-```
-
-The magic is `await`'s interaction with V8's async-context tracking. Every await schedules a continuation as a microtask; V8's async-hooks subsystem ensures that microtask runs with the same active ALS context as the one that scheduled it. Same for `setTimeout`, `setImmediate`, Promise callbacks, `process.nextTick` — all of them propagate the context.
-
-What breaks if you skip `.run()` and just set a module variable: concurrent requests overwrite each other. Request A sets `currentStore = a`, then awaits. Request B comes in, sets `currentStore = b`, awaits. Request A's continuation reads `currentStore` and gets `b`. Cross-request bleed, very subtle to debug. ALS is what prevents this without forcing you to pass `ctx` through every function call.
-
-#### Step 3 — `.getStore()` reads the active context
-
-```
-  getStore — pseudocode
-
-  getStore():
-    return V8.asyncContext.active.get(this)
-            │
-            │  this = the AsyncLocalStorage instance
-            │  active = whatever the .run() at the
-            │           innermost enclosing scope set
-            ▼
-    → returns ctx (or undefined if not inside any .run)
-```
-
-This is the read path the provider methods use. `readState(sessionId)` calls `requestStore.getStore()`, gets back the `RequestStore`, returns `ctx.store[sessionId] ?? {}`. `patchState(sessionId, patch)` calls `getStore()` similarly, mutates `ctx.store[sessionId]`, sets `ctx.dirty = true`.
-
-#### Step 4 — the wrapper owns the lifecycle
-
-```
-  withAuthCookies — the lifecycle
-
-   request enters
-        │
-        │ raw = cookies.get('bi_auth').value
-        │ ctx = { store: decryptStore(raw), dirty: false }
-        ▼
-   requestStore.run(ctx, async () => {
-        │
-        │ ★ from now until fn returns, every getStore()
-        │   in any awaited code returns ctx ★
-        │
-        ▼
-        // handler does its work
-        // provider methods read/write ctx.store
-        // each write also sets ctx.dirty = true
-        │
-        ▼
-        return result;
-   })
-        │
-        │ at this point, fn has resolved.
-        │ ctx is captured in the closure of the outer
-        │ withAuthCookies — we can still read ctx.dirty.
-        ▼
-   if (ctx.dirty) {
-     cookies.set('bi_auth', encryptStore(ctx.store), opts);
-   }
-   return result;
-```
-
-The clever bit: `ctx` is referenced both inside the `.run()` closure (read by `getStore`) and outside it (read by the wrapper to check `dirty`). It's the same object. ALS gives async-tree-wide visibility *during* the run; lexical closure gives the wrapper visibility *after*.
-
-What breaks if you put the dirty-check inside the `.run()` callback: nothing. It works either way. The choice to put it outside is cleaner — the wrapper's job is request-level (decrypt, run, flush), the handler's job is request-internal.
-
-#### Step 5 — concurrent requests get separate contexts
-
-```
-  Concurrency — two requests, same instance
-
-   t=0   Request A enters
-         requestStore.run({store: storeA, dirty: false}, fnA)
-            ↓
-            fnA() begins...
-                                       t=1   Request B enters
-                                             requestStore.run({store: storeB, dirty: false}, fnB)
-                                                ↓
-                                                fnB() begins...
-            await someThing()
-            ◀────resumes               
-            getStore() ─▶ {store: storeA, ...}   ★
-                                                await otherThing()
-                                                ◀────resumes
-                                                getStore() ─▶ {store: storeB, ...} ★
-                                                                                    │
-   ★ never confused: V8 tracks which run() each microtask belongs to ★
-```
-
-Two requests can interleave their awaits arbitrarily. Each `getStore()` call returns the value bound at the *enclosing* `.run()`. The V8 async-context subsystem is what enforces this — it's not a library-level convention.
-
-#### Code in this codebase
-
-Three blocks tell the whole story in `lib/mcp/auth.ts`: the module-level singleton declaration, the wrapper that owns the lifecycle, and the read/write helpers the provider methods call. Read them with the annotation, then the three use-cases below show how they compose across one request, two concurrent requests, and dev mode.
-
-```
-  lib/mcp/auth.ts  (lines 3, 41–47)
-
-  import { AsyncLocalStorage } from 'node:async_hooks';
-  // ...
-  // To avoid Next's request-vs-response cookie split (a read *after* a set in the
-  // same request returns the OLD value), we never touch the cookie per
-  // provider-method call. `withAuthCookies` seeds an AsyncLocalStorage-scoped store
-  // from the cookie ONCE at the start of the request and flushes it back ONCE at
-  // the end; the provider's many synchronous read/write calls hit that store in
-  // between. Each request gets its own ALS context, so concurrent requests on one
-  // instance never share state.
-  interface RequestStore { store: Store; dirty: boolean }
-  const requestStore = new AsyncLocalStorage<RequestStore>();
-       │
-       └─ module-level singleton; one for the entire process. the per-request value
-          lives in the .run() closure, never on this object.
-```
-
-```
-  lib/mcp/auth.ts  (lines 86–104, abridged for the ALS lens)
-
-  export async function withAuthCookies<T>(fn: () => Promise<T>): Promise<T> {
-    if (process.env.NODE_ENV !== 'production') return fn();      ← dev short-circuit
-    const { cookies } = await import('next/headers');
-    const raw = (await cookies()).get(AUTH_COOKIE)?.value;
-    const ctx: RequestStore = {                                  ← per-request value
-      store: raw ? decryptStore(raw) : {},
-      dirty: false,
-    };
-    const result = await requestStore.run(ctx, fn);              ★ THE BINDING POINT
-    if (ctx.dirty) {                                             ← lexical capture
-      (await cookies()).set(AUTH_COOKIE, encryptStore(ctx.store), {...});
-    }
-    return result;
+```ts
+export async function withAuthCookies<T>(fn: () => Promise<T>): Promise<T> {
+  if (process.env.NODE_ENV !== 'production') return fn();         // ← passthrough in dev/test
+  const { cookies } = await import('next/headers');
+  const raw = (await cookies()).get(AUTH_COOKIE)?.value;
+  const ctx: RequestStore = { store: raw ? decryptStore(raw) : {}, dirty: false };
+  const result = await requestStore.run(ctx, fn);                 // ← the ALS scope
+  if (ctx.dirty) {
+    (await cookies()).set(AUTH_COOKIE, encryptStore(ctx.store), {  // ← single flush
+      httpOnly: true, secure: true, sameSite: 'none',
+      path: '/', maxAge: AUTH_COOKIE_MAX_AGE,
+    });
   }
-       │
-       └─ ctx lives in two places: inside the .run() (visible via getStore())
-          and in this closure (visible to the dirty check). same object.
+  return result;
+}
 ```
 
-```
-  lib/mcp/auth.ts  (lines 114–142, the read/write helpers)
+What breaks if removed: drop the ALS wrap → the only places to put the
+Store are module scope (concurrent request race) or function scope
+(invisible to the SDK's provider methods, which are called by code we
+don't own). Drop the `ctx.dirty` check → write the cookie even when
+nothing changed, which costs one Set-Cookie per request and pushes
+the `bi_auth` cookie back to the browser unnecessarily.
 
-  function readAll(): Store {
-    const ctx = requestStore.getStore();              ← reads active ALS context
-    if (ctx) return ctx.store;                        ← production: cookie-backed
-    if (!PERSIST) return Object.fromEntries(memStore);← test: in-memory Map
-    // ... dev: file backend ...
+#### b · `readAll` / `writeAll` — the ALS-first store accessors
+
+These two functions are the *only* place the provider talks to storage.
+They check the ALS context first; if present, that's the source of
+truth. Outside ALS (dev/test), they fall through to file or in-memory
+Map.
+
+```
+  the indirection — readAll prefers ALS over the per-environment backend
+
+  readAll() called
+        │
+        ▼
+   als.getStore()? ─── yes ──► return ctx.store        (production)
+        │
+        no
+        │
+        ▼
+   PERSIST (dev)? ──── yes ──► JSON.parse(file)         (development)
+        │
+        no
+        │
+        ▼
+   Object.fromEntries(memStore)                          (test)
+```
+
+Real code (`lib/mcp/auth.ts:113-142`):
+
+```ts
+function readAll(): Store {
+  const ctx = requestStore.getStore();
+  if (ctx) return ctx.store;                                   // ← production: ALS-scoped
+  if (!PERSIST) return Object.fromEntries(memStore);            // ← test: in-memory
+  try {
+    if (existsSync(CACHE_FILE)) return JSON.parse(readFileSync(CACHE_FILE, 'utf8')) as Store;
+  } catch { /* corrupt/unreadable cache — treat as empty */ }
+  return {};
+}
+
+function writeAll(store: Store): void {
+  const ctx = requestStore.getStore();
+  if (ctx) {
+    ctx.store = store;
+    ctx.dirty = true;                                           // ← mark for flush
+    return;
+  }
+  if (!PERSIST) {
+    memStore.clear();
+    for (const [k, v] of Object.entries(store)) memStore.set(k, v);
+    return;
+  }
+  try {
+    writeFileSync(CACHE_FILE, JSON.stringify(store));
+  } catch { /* best-effort */ }
+}
+```
+
+What breaks if removed: drop the `ctx.dirty = true` in `writeAll` →
+the cookie never gets the new tokens, the next request decrypts an
+empty Store and the user appears logged out *immediately after* a
+successful auth.
+
+#### c · why ALS instead of just passing `ctx` as a parameter
+
+We don't own the SDK's `OAuthClientProvider` interface. It defines
+methods like `tokens(): OAuthTokens | undefined` and
+`saveTokens(t: OAuthTokens): void` with *no* extra parameters. There's
+nowhere to thread a `ctx` argument.
+
+```
+  the constraint — provider methods are signatureless
+
+  interface OAuthClientProvider {
+    tokens(): OAuthTokens | undefined        ← no params
+    saveTokens(t: OAuthTokens): void          ← only the new tokens
+    state(): string                           ← no params
+    saveCodeVerifier(v: string): void         ← only the verifier
+    …
   }
 
-  function writeAll(store: Store): void {
-    const ctx = requestStore.getStore();
-    if (ctx) {
-      ctx.store = store;                              ← mutates the ALS-scoped object
-      ctx.dirty = true;                               ← signals flush in wrapper
-      return;
-    }
-    // ... other backends ...
-  }
-       │
-       └─ the three-backend dispatch is itself elegant: ALS for prod, file for dev,
-          Map for test. each is selected by side-conditions, never by config flag.
+  the SDK calls these MANY times per flow:
+    connect() →
+      provider.clientInformation() / saveClientInformation()
+      provider.state()         (more than once!)
+      provider.saveCodeVerifier()
+      provider.redirectToAuthorization()
+    finishAuth(code) →
+      provider.codeVerifier()
+      provider.saveTokens()
 ```
 
-**Use case 1 — MCP SDK calls the provider many times within one request.** Route enters `withAuthCookies(async () => { ... connectMcp(sid) ... })`. Inside, `connectMcp` constructs `new BloomreachAuthProvider(sid, redirectUri)` and hands it to the SDK. The SDK calls `provider.clientInformation()` — that calls `readState(sid)` → `requestStore.getStore()` → returns `ctx.store[sid]`. Empty → SDK triggers DCR. SDK calls `provider.saveClientInformation(info)` → `patchState(sid, {clientInformation: info})` → `ctx.store[sid].clientInformation = info; ctx.dirty = true`. SDK calls `provider.state()` → generates UUID, calls `patchState(sid, {state: v})`. SDK calls `provider.saveCodeVerifier(v)`. SDK calls `provider.redirectToAuthorization(url)` — captured into `provider.lastAuthorizeUrl`. SDK throws `UnauthorizedError`. The route catches, returns `{ needsAuth: true, authUrl: provider.lastAuthorizeUrl }`. **`withAuthCookies` sees `ctx.dirty === true` and flushes the now-populated store to the cookie.** Net result: one decrypt, one encrypt, and inside dozens of synchronous provider-method calls that all saw a consistent in-memory store.
+ALS is how a method with no context parameter still reads
+"per-request" state. The `BloomreachAuthProvider` constructor takes
+`sessionId` (which doesn't change per request), but the *Store* it
+reads from has to be per-request — that's the ALS context.
 
-**Use case 2 — two requests arrive on the same warm Vercel instance simultaneously.** Request A enters `withAuthCookies` with `sessionId=alpha`, ctxA gets `store: {alpha: {...}}`. Before A's handler completes, Request B enters `withAuthCookies` with `sessionId=beta`, ctxB gets `store: {beta: {...}}`. Both run their async work — A awaits a network call, B starts its DCR registration. When A's `await` resolves, V8 re-enters ctxA for the continuation; A's `readState('alpha')` returns A's data, not B's. They flush independently. No state bleed despite shared process.
+Real provider code (`lib/mcp/auth.ts:197-203`):
 
-**Use case 3 — dev mode, no cookie.** `withAuthCookies` sees `NODE_ENV !== 'production'` and short-circuits: `return fn()`. No `.run()` call. Inside `fn`, `requestStore.getStore()` returns `undefined`. The `readAll` function handles this: `if (ctx) return ctx.store` — falsey → falls through to the file-backed branch (`.auth-cache.json`). Dev path doesn't use ALS at all; it uses the filesystem because Next's dev server hot-reloads, which would wipe an in-memory Map mid-OAuth-flow.
+```ts
+tokens(): OAuthTokens | undefined {
+  return readState(this.sessionId).tokens;  // ← reads ALS-scoped Store
+}
+
+saveTokens(t: OAuthTokens): void {
+  patchState(this.sessionId, { tokens: t });  // ← writes ALS-scoped Store, dirty=true
+}
+```
+
+What breaks if removed: replace ALS with a module-level Map and two
+users authenticating at the same time can race. User A's
+`provider.saveCodeVerifier('A_verifier')` runs; user B's
+`provider.saveCodeVerifier('B_verifier')` runs; user A's `/callback`
+calls `provider.codeVerifier()` and gets B's verifier → token
+exchange fails. The whole pattern exists to make that race
+impossible.
+
+#### d · the Next.js read-after-write split
+
+There's a second reason ALS is here: Next 16's `cookies()` API
+returns a request-scoped jar, but **reads after a `.set()` in the
+same request return the OLD value**. The comment at
+`lib/mcp/auth.ts:39-44` calls this out:
+
+```
+  the Next.js cookie split — without ALS this bites you
+
+  request handler                                cookie jar
+  ───────────────                                ──────────
+  jar.set('bi_auth', encrypt(stateAfterTokens))   ← writes for the response
+  jar.get('bi_auth')                              ← reads the REQUEST's
+                                                    incoming cookie (OLD)
+```
+
+If the SDK saved tokens via `cookies().set()` and then re-read them
+via `cookies().get()` in the same request (which it would, several
+times across `connect()` and `finishAuth()`), it would read the *old*
+encrypted blob every time. ALS sidesteps this entirely by never
+touching the cookie API in the middle — `cookies().get()` is called
+once at the start, `cookies().set()` is called once at the end, and
+everything in between reads/writes `ctx.store`.
 
 ### Move 3 — the principle
 
-**Context propagation without explicit threading is what makes "stateful work inside library calls you don't own" feasible.** You can't fork the MCP SDK to thread a context object through every `OAuthClientProvider` method. You can wrap the SDK's call site in `.run()` and have the provider methods read the active context. That's the load-bearing trick: ALS turns "context I need everywhere" from "thread it through every function" into "set it once at the top."
-
----
+When you can't change a third-party interface to accept a context
+parameter, but you need per-request state visible to every call that
+interface makes, **AsyncLocalStorage is the substrate.** Same shape
+as Python's `contextvars`, Java's thread-locals (per-thread), or Go's
+`context.Context` (passed explicitly because Go won't give you
+implicit per-goroutine storage). The implicit version trades the
+verbosity of passing a parameter for the visibility cost of "where
+does this value come from?" In this code the trade pays off: the SDK
+contract is non-negotiable, and the ALS scope is hard-bounded to one
+`withAuthCookies` call.
 
 ## Primary diagram
 
-The full ALS pattern in one frame.
-
 ```
-  ALS-scoped request store — full mechanics
+  the full envelope — one request, many provider calls, one flush
 
-  ┌─ Module load (once per process) ───────────────────────────────┐
-  │                                                                  │
-  │   const requestStore = new AsyncLocalStorage<RequestStore>()    │
-  │                       (shared across all requests on instance)   │
-  │                                                                  │
-  └─────────────────────────────────┬──────────────────────────────┘
-                                    │
-                                    ▼  per request
-  ┌─ Request A ───────────────────────────────────────────────────┐
-  │                                                                 │
-  │  withAuthCookies(fnA):                                          │
-  │    raw = cookies.get('bi_auth')                                 │
-  │    ctxA = { store: decryptStore(raw), dirty: false }            │
-  │                                                                 │
-  │    requestStore.run(ctxA, async () => {                          │
-  │      // fnA's code runs here                                    │
-  │      // any awaited code preserves ctxA as active               │
-  │                                                                 │
-  │      readState(sid):                                            │
-  │        return requestStore.getStore().store[sid]  → ctxA.store  │
-  │                                                                 │
-  │      patchState(sid, patch):                                    │
-  │        ctx = requestStore.getStore()                            │
-  │        ctx.store[sid] = { ...ctx.store[sid], ...patch }         │
-  │        ctx.dirty = true   ← signals flush needed                │
-  │                                                                 │
-  │      provider.saveTokens(t)  ← MCP SDK call                     │
-  │        → patchState(sid, { tokens: t })  → ctxA.dirty = true    │
-  │                                                                 │
-  │      ... many more SDK calls ...                                │
-  │    })                                                            │
-  │                                                                 │
-  │    if (ctxA.dirty) {                                             │
-  │      cookies.set('bi_auth', encryptStore(ctxA.store), opts)     │
-  │    }                                                             │
-  │                                                                 │
-  └─────────────────────────────────────────────────────────────────┘
-
-  ┌─ Concurrent Request B (same instance, separate ctxB) ──────────┐
-  │  requestStore.run(ctxB, fnB) — never sees ctxA                 │
-  │  V8 async-context tracking keeps them isolated                 │
-  └─────────────────────────────────────────────────────────────────┘
+  ┌─ POST /api/mcp/connect ─────────────────────────────────────┐
+  │                                                              │
+  │  withAuthCookies(() => connectMcp(sid))                      │
+  │  ─────────────────────────────────────                       │
+  │   1. ctx = { store: decrypt(bi_auth cookie), dirty:false }   │
+  │   2. requestStore.run(ctx, async () => {                     │
+  │                                                              │
+  │       provider = new BloomreachAuthProvider(sid, redirect)   │
+  │       transport = new StreamableHTTPClientTransport(…)       │
+  │       client.connect(transport)                              │
+  │           │                                                  │
+  │           ├─ provider.clientInformation()  → readAll → ctx   │
+  │           ├─ provider.saveClientInformation(info)            │
+  │           │     → patchState → writeAll → ctx, dirty=true    │
+  │           ├─ provider.state()              → patch ctx, …    │
+  │           ├─ provider.saveCodeVerifier(v)  → patch ctx, …    │
+  │           ├─ provider.redirectToAuthorization(url)           │
+  │           └─ throws UnauthorizedError                        │
+  │                                                              │
+  │   })  ← await resolves                                       │
+  │   3. ctx.dirty? yes                                          │
+  │   4. cookies().set('bi_auth', encrypt(ctx.store), {…})       │
+  │   5. return { ok:false, authUrl: provider.lastAuthorizeUrl } │
+  │                                                              │
+  └──────────────────────────────────────────────────────────────┘
 ```
-
-The structural property worth memorizing: **one module-level `AsyncLocalStorage` instance, one `.run()` per request, every awaited call inside `.run()` sees the same `ctx`, concurrent `.run()`s are isolated.**
-
----
 
 ## Elaborate
 
-### Where this pattern comes from
+Node's `async_hooks` module (the substrate ALS sits on) tracks the
+"async context" — the chain of `await`s, Promise callbacks, timers,
+microtasks — that descend from `als.run(ctx, fn)`. Anything in that
+descendant chain sees `ctx`. Sibling requests are sibling chains;
+they each have their own root.
 
-**AsyncLocalStorage** was added to Node 13.10 (2020), stabilized in 16. The motivation came from frameworks needing per-request context — distributed tracing (OpenTelemetry), request IDs, scoped database transactions, per-request loggers. Before ALS, the JS world used `cls-hooked` (continuation-local storage) which monkey-patched Node internals; ALS is the official replacement with proper V8 async-hooks support.
+ALS has a cost: every async hop pays a small overhead to thread the
+context. For high-throughput HTTP servers (>10k rps) this shows up in
+benchmarks. For an OAuth callback handler that runs once per login,
+it's invisible. The cost calculus is "fix the bug or save the
+nanoseconds" and this app picks the bug fix.
 
-The conceptual ancestor is **Java's `ThreadLocal`** — a value stored per thread, invisible to other threads, automatically cleaned up when the thread terminates. In single-threaded async-JavaScript-land, "per thread" doesn't apply; "per async call chain" does. ALS is "per async call chain" implemented as a runtime primitive.
-
-The deeper ancestor is **dynamic scoping** in Lisp dialects — a variable lookup walks up the call stack instead of the lexical scope chain. `(let ((*x* 5)) (foo))` makes `*x*` bound to 5 *for any call reachable from `foo`*, even though those calls weren't lexically inside the `let`. ALS is dynamic scoping for async-await.
-
-### The deeper principle
-
-**Implicit context vs explicit context** is the trade-off ALS makes. Explicit-context APIs require you to thread a `ctx` parameter through every function call (Go's `context.Context` is the canonical example). Implicit-context APIs let you set the context once and read it from anywhere. Explicit is easier to follow when reading code; implicit is the only option when you can't change the intermediate code (the MCP SDK's provider methods).
-
-```
-  Explicit context — Go style              Implicit context — ALS style
-  ─────                                    ─────
-  func handler(ctx context.Context):       function handler():
-    doWork(ctx)                              doWork()
-                                             // ctx is "ambient"
-  func doWork(ctx context.Context):
-    callSDK(ctx)                           function doWork():
-                                             callSDK()
-  func callSDK(ctx context.Context):
-    ...                                    function callSDK():
-                                             ctx = storage.getStore()
-                                             ...
-
-  trade-off: explicit makes the           trade-off: implicit lets you wrap
-  dependency visible; you can't            third-party code without forking it,
-  forget to pass ctx                       but the dependency is invisible at
-                                           the call site
-```
-
-We use ALS specifically because we *can't* modify the MCP SDK's `OAuthClientProvider` interface. The SDK calls `provider.tokens()` with no parameters; the only way to give it context is to make context ambient. That's the load-bearing reason.
-
-### Where it could improve in this codebase
-
-1. **No tests around concurrent requests on the same instance.** The current test suite (`test/mcp/auth.test.ts`) tests sequential flows. A focused test would spawn two concurrent `withAuthCookies` calls with different session IDs and assert they don't bleed. The ALS guarantee is structural so the test would always pass, but the test would document the invariant.
-
-2. **The `dirty` flag is binary, not per-session.** If two sessions' state lives in the same `ctx.store` simultaneously and only one was modified, both get re-encrypted. Today the cookie is per-session anyway (each browser has its own `bi_auth` carrying only its `sessionId` key), so this is moot — but a multi-user-per-browser design would need finer dirty-tracking.
-
-3. **No request-id propagation alongside the auth context.** Adding a second ALS context for request-scoped logging (every `console.log` gets the request ID prepended) would be a natural sibling. Not present.
-
-### Connection to adjacent patterns
-
-ALS is the synchronization primitive that makes the encrypted-cookie pattern (`01-encrypted-cookie-oauth-state.md`) work on a stateless serverless host. Without ALS, `withAuthCookies` would have to thread the store through every function call manually — possible for our own code, impossible across the MCP SDK boundary.
-
-The same `requestStore` pattern would generalize to other per-request needs: a request-scoped Anthropic client (so streaming hooks see the right one), a per-request cache, per-request tracing. Today only auth uses it; the pattern is ready to be reached for again.
-
----
+Adjacent shapes:
+  → React Context — same idea, sync tree (component tree) instead of
+    async tree.
+  → OpenTelemetry's `Context` API — same shape, used for trace
+    propagation. Same primitive, same problem (correlate per-request
+    state across async hops you don't own).
+  → Pino's request logger — uses ALS to attach a per-request
+    `requestId` to every log call without threading it through every
+    function.
 
 ## Interview defense
 
-**What they are really asking:** can you explain why ALS exists, what specifically breaks without it in your auth flow, and how it guarantees isolation under concurrent requests?
-
----
-
-**[mid] — What is AsyncLocalStorage and why is it in the auth code?**
-
-ALS is "ThreadLocal for async-await." You declare a `new AsyncLocalStorage()` once per module — that's the storage instance. You call `storage.run(value, fn)` and inside `fn` (including across every `await`, callback, microtask) `storage.getStore()` returns that `value`. Concurrent `.run()` calls get isolated values.
-
-In `lib/mcp/auth.ts` it backs the per-request auth store. The MCP SDK's `OAuthClientProvider` interface has a dozen methods — `state()`, `saveTokens()`, `codeVerifier()`, `clientInformation()`, etc. — that get called many times during one OAuth flow. Each one needs to read or write some shared per-request state. We can't thread a context object through them (would mean forking the SDK), so we put the state in ALS: `withAuthCookies` wraps the handler in `requestStore.run(ctx, fn)`, and every provider method reads `requestStore.getStore()` to find the active `ctx`.
+### Q1. "Why not a module-level Map keyed by sessionId?"
 
 ```
-  storage.run binds ctx           getStore reads it
-  ──────────────────             ─────────────────
-  requestStore.run(ctx, fn)       requestStore.getStore() → ctx
-       │                          (from anywhere inside fn,
-       │ fn runs;                  even across awaits)
-       │ all awaits inside
-       │ preserve ctx
+  module-level Map vs ALS — the concurrency picture
+
+  module Map                            ALS context
+  ───────────                            ───────────
+  one process, many requests             one process, many requests
+       │                                      │
+       ▼                                      ▼
+   ┌─────────────────┐                  ┌──────────────┐ ┌──────────────┐
+   │ store[sidA] = … │ ← request A      │ ctxA.store=… │ │ ctxB.store=… │
+   │ store[sidB] = … │ ← request B      └──────────────┘ └──────────────┘
+   └─────────────────┘                  request A         request B
+                                         (isolated)        (isolated)
+   reads/writes interleave              reads/writes
+   across requests                      stay scoped
 ```
 
----
+A module-level Map *would* work if every method on the provider
+included `sessionId` as a key — which they do. The problem isn't
+isolation by key, it's the **Next.js cookie read-after-write split**:
+the cookie store is the durable backing, and we can't write to it in
+the middle and re-read it in the same request. ALS is the
+"intermediate buffer" — we read the cookie once, write once, and ALS
+holds the working copy in between.
 
-**[senior] — What specifically breaks if you remove the AsyncLocalStorage and use a module-level variable instead?**
+**One-line anchor:** "ALS isn't for isolation — sessionId already
+isolates. It's for the read-after-write buffer between the one cookie
+read at request entry and the one cookie write at request exit."
 
-Cross-request state bleed under concurrency. Say two requests come in to the same warm Vercel instance simultaneously. Request A enters `withAuthCookies`, sets `currentStore = storeA`, calls the SDK, awaits Bloomreach's authorize redirect URL. Before that await resolves, Request B enters `withAuthCookies`, sets `currentStore = storeB` (overwriting A's), runs its own SDK calls. Request A's await resolves; its continuation reads `currentStore` — but it now holds Request B's data. Request A's provider sees B's tokens.
-
-This is the classic "shared mutable state under concurrent async" bug. It's not theoretical — Node serverless functions on Vercel routinely serve multiple concurrent requests on a warm instance. Without ALS, the only safe options are: (1) fork the MCP SDK to take an explicit `ctx` parameter on every provider call, or (2) accept that the auth flow only works under single-request-at-a-time, which on serverless is basically luck.
+### Q2. "What happens with two concurrent requests for the same session?"
 
 ```
-  the bug without ALS
+  two requests, one session — ALS gives each its own ctx
 
-  t=0  A: currentStore = storeA; await foo()
-  t=1                            B: currentStore = storeB; await bar()
-  t=2  A's foo() resolves
-       A: currentStore.tokens   ★ reads storeB.tokens ★
-
-  ALS prevents this: each .run() pins the value to its own
-  async tree; A's getStore() always returns storeA.
+  request 1                               request 2
+  ─────────                               ─────────
+  decrypt cookie A                        decrypt cookie A
+  ctxA1.store = {…tokens A}               ctxA2.store = {…tokens A}
+  saveTokens(B) → ctxA1.store updated     saveTokens(C) → ctxA2.store updated
+  encrypt + Set-Cookie B                  encrypt + Set-Cookie C
+                                          ── browser keeps the LAST one ──
 ```
 
----
+Whichever response sets the cookie last wins from the browser's
+perspective. The token-rotation update from the loser is lost. For
+this app that's fine: the loser's tokens are still valid (the MCP
+server hasn't rotated them yet), and the next request will exchange
+them again if needed. For a more sensitive use case you'd want a
+shared store (Redis) with an optimistic-lock version field on the
+Store.
 
-**[arch] — Why not just use Go's explicit context pattern and thread a ctx parameter everywhere?**
+**One-line anchor:** "Last write wins at the cookie; both requests
+succeed. Real concurrent-token-rotation would need a shared store
+with versioning — out of scope here."
 
-Because the MCP SDK's `OAuthClientProvider` is fixed — it calls `provider.tokens()`, not `provider.tokens(ctx)`. We don't own that interface. Our two options for getting per-request state into a method we don't control are:
+### Q3. "How do you test code that depends on ALS?"
 
-1. **Capture state in the closure when constructing the provider.** Works for *immutable* state ("which sessionId is this provider for?") but breaks for *shared mutable* state ("which decrypted store should this provider read/write?") because the provider lives for one request and a closure-captured store would either be created fresh per request (correct, but means a new provider per request) or shared across requests (broken).
+The test backend (`memStore`, the in-memory Map) is the trick. In test
+runs, `process.env.NODE_ENV === 'test'`, `withAuthCookies` is a
+passthrough, and `readAll` / `writeAll` skip the ALS check and use
+the Map directly. `_clearAuthStore()` is exposed as a test-only
+escape hatch (`lib/mcp/auth.ts:250-258`). The provider methods all
+work the same way; ALS is invisible to the tests because there's
+nothing to scope.
 
-2. **Use ALS.** The provider methods do `readState(sid)` which calls `requestStore.getStore()`. The handler wraps everything in `.run(ctx, fn)`. The provider doesn't need to know about ctx; it just needs to know its sessionId, which IS closure-captured.
+```
+  three backends, one provider — tests use the simplest one
 
-Option 2 is what we picked because option 1 still requires constructing a new provider per request (fine) AND threading the decrypted store into the construction (fine, but more boilerplate at every call site). ALS lets the construction site be ignorant of the store.
+  prod  → ALS ctx (per-request)
+  dev   → file (.auth-cache.json, survives hot-reload)
+  test  → Map (isolated per run, _clearAuthStore between tests)
+```
 
-The trade-off ALS makes: the dependency on per-request state is invisible at the call site (`provider.tokens()` doesn't look like it depends on anything). That's a readability cost. For our use case — wrapping an external SDK — it's the only viable choice.
-
----
-
-**The dodge — "is AsyncLocalStorage performance OK at scale?"**
-
-For Node's `async_hooks`-based implementation, yes — overhead is in the single-digit microseconds per async hop. The V8 async-context tracking is implemented in C++ and is roughly a per-microtask pointer copy. Vercel's Node runtime supports it natively. Edge runtime (V8 isolate–based) historically had spotty support; for this codebase we're on Node serverless so it's fully supported.
-
-The honest perf concern would be: if we used ALS in a hot path that fires thousands of times per request, the overhead would add up. Here it's two reads and a handful of writes per request — invisible compared to the network calls to Bloomreach and Anthropic.
-
----
-
-**One-line anchors:**
-- ALS is ThreadLocal for async — context propagates across every await, callback, microtask.
-- `withAuthCookies` wraps the handler in `requestStore.run(ctx, fn)`; the MCP SDK's provider methods read `getStore()` to find the active `ctx`.
-- Concurrent requests get isolated contexts — no cross-request state bleed.
-- We use ALS because we can't modify the MCP SDK's provider interface to thread context explicitly.
-
----
-
----
+**One-line anchor:** "Test backend is an in-memory Map with a
+`_clearAuthStore` escape hatch; ALS is bypassed because there's
+nothing to scope when there's one test running at a time."
 
 ## See also
 
-→ [audit.md](./audit.md) · [01-encrypted-cookie-oauth-state.md](./01-encrypted-cookie-oauth-state.md) · [03-type-guard-trust-boundary.md](./03-type-guard-trust-boundary.md)
+  → `01-encrypted-cookie-oauth-state.md` — what's in the Store
+    (encrypted) and why the cookie is the durable backing.
+  → `audit.md` § lens 2 (authentication-and-authorization) — the
+    OAuth state-validation decision (the SDK calls `state()` multiple
+    times; naive re-check broke valid flows).
+  → `study-runtime-systems/` — the async-hooks substrate; this is one
+    application of it.

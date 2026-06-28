@@ -1,385 +1,339 @@
-# Token budgeting and context window management
+# 04 — Token budgeting and context window management
 
-**Industry name(s):** token budgeting, context-window management, prompt compaction, context engineering
-**Type:** Industry standard · Language-agnostic
-
-> Every call has a finite context window and a per-call output ceiling; blooming insights spends its budget deliberately — `schemaSummary` caps the injected `{schema}` (20 events / 10 props / 30 customer-props), `MAX_TOOL_RESULT_CHARS=16_000` caps each observation, per-agent `maxToolCalls` (6/6/4/6) caps transcript growth, and `max_tokens` (4096 / 2048 / 16) caps output — but the static system+schema prefix sits in the wrong place for prefix caching, which the codebase does not use at all.
-
-
----
+*Context budget hygiene · Industry standard*
 
 ## Zoom out, then zoom in
 
-**Zoom out — the bigger picture.** Token budgeting spans three bands. The prefix cap (`schemaSummary`) lives at the Per-agent definitions band, where each agent assembles its system prompt. The transcript caps (`truncate`, `maxToolCalls`) live one layer down in the Shared agent loop, where every Observation gets clipped and the turn count gets gated. The output cap (`max_tokens`) is what every call hands to the Provider band, sized to the job — 4096 for the agents, 16 for the classifier. Four caps on three bands, all aimed at keeping the sum under the practical window — and the one optimization left on the table (prefix caching) sits at the Provider boundary where `cache_control` would go.
+Pull up where tokens get spent in this codebase. Every box in this diagram is a place where the budget can be blown.
 
 ```
-  Zoom out — where token budgeting lives
+  Where the token budget gets spent — one diagram, one window
 
-  ┌─ Per-agent definitions ─────────────────────────┐  ← we are here (prefix cap)
-  │  ★ schemaSummary 20/10/30  monitoring.ts L16–49 ★│
-  │  PROMPT.replace('{schema}', bounded summary)     │
-  └─────────────────────────┬────────────────────────┘
-                            │  system + userPrompt
-  ┌─ Shared agent loop ─────▼────────────────────────┐  ← we are here (transcript caps)
-  │  ★ truncate() ≤16k chars  base.ts L29–34 ★       │
-  │  ★ maxToolCalls 6/6/4/6  base.ts L90–101 ★       │
-  └─────────────────────────┬────────────────────────┘
-                            │  max_tokens reserved
-  ┌─ Provider ──────────────▼────────────────────────┐  ← we are here (output cap)
-  │  ★ max_tokens: 4096 / 2048 / 16 ★                │
-  │  anthropic.messages.create  base.ts L92–102      │
-  │  ✗ no cache_control — prefix re-sent every turn │
-  └──────────────────────────────────────────────────┘
+  ┌─ Anthropic API call: 200K token context window ────────────────┐
+  │                                                                 │
+  │  ┌─ system prompt (stable) ─────┐                                │
+  │  │  monitoring.md text:           │ ~1.2K tokens                │
+  │  │   role + rules + output spec   │                              │
+  │  └────────────────────────────────┘                              │
+  │  ┌─ context (injected per call) ┐                                │
+  │  │  ★ schemaSummary(workspace) ★  │ ~500–1,500 tokens (BUDGETED) │ ← we are here
+  │  │  capped: 20 events × 10 props  │                              │
+  │  │  capped: 30 customer properties│                              │
+  │  └────────────────────────────────┘                              │
+  │  ┌─ user message (trigger) ─────┐                                │
+  │  │  "Work through your checklist."│ ~30 tokens                  │
+  │  └────────────────────────────────┘                              │
+  │  ┌─ tool results (grow per turn) ┐                               │
+  │  │  EQL query results: 16K char    │ up to ~5K tokens per result │
+  │  │  cap per result (base-legacy)   │ ×6 max tool calls            │
+  │  └────────────────────────────────┘                              │
+  │  ┌─ response budget (output) ────┐                                │
+  │  │  max_tokens: 4096               │ ~4K tokens                   │
+  │  └────────────────────────────────┘                              │
+  │                                                                 │
+  └─────────────────────────────────────────────────────────────────┘
 ```
 
-**Zoom in — narrow to the concept.** The question this file answers: where does blooming insights spend its token budget, what bounds each line item, and what is it leaving on the table? The answer is four independent caps on three layers — prefix, transcript-per-observation, transcript-turn-count, output — plus one named omission: prefix caching is unused and `{schema}` is appended *last* in every prompt, which is the wrong place for the cacheable-prefix rule. Below, you'll see how each cap targets one source, why the classifier's 16-token ceiling enforces a one-word format through the budget itself, and what the `{schema}-last` layout costs every multi-turn run.
-
----
+The 200K window looks infinite. It isn't. By the time you've put a workspace schema, a category checklist, six tool results, and a 4K response budget into the call, you're at 30–40K tokens for what looks like a "small" agent loop. Budget that wrong and the chain that worked fine in dev starts truncating or timing out at scale because nobody counted. This is the operational concept that separates amateur from professional prompt work.
 
 ## Structure pass
 
-**Layers.** The context window has four fill sources and you have to cap each one independently or any single one of them blows the call. Layer A is the *static prefix* — the system prompt plus the injected `{schema}`, identical on every turn of a loop. Layer B is the *growing transcript* — user prompt plus each turn's Thought/Action/Observation, accreting turn by turn. Layer C is the *output reservation* — `max_tokens`, which the provider subtracts from the window *before* generation. Layer D is the *unbounded variable* — the raw tool result that gets clipped on its way back into Layer B. Same window, four different fill sources, four different caps.
+**Layers.** Outer: the 200K context window. Middle: the named slots (system, context, user, tool results, response). Innermost: the per-slot caps you set in code.
 
-**Axis: cost.** How many tokens does each layer cost per call, and how does that cost scale (per workspace? per turn? per call?)? Cost is the right axis because the failure this concept defends against is the call that "fits" in the hard window but degrades in the practical one — and degradation tracks token consumption, not turn count. State is too generic (everything is "in the window"); guarantees doesn't bite (the window is sized in tokens, not promises). Trace cost across A→D and the seams pop: the prefix is paid in full every turn (and uncached), the transcript grows quadratically without caps, the output reservation is paid up front, and Layer D is the one that gets clipped at the seam.
-
-**Seams.** Three seams; the load-bearing one is the prefix-caching seam that isn't there. Seam 1 (D↔B) — the cost flips from *unbounded* to *capped-at-16k-chars*; `truncate()` is the gate, and the bug it defends against is one chatty tool call flooding the transcript. Seam 2 (B's per-turn boundary) — cost flips from *paying for one turn* to *paying for N turns*; `maxToolCalls` (6/6/4/6) caps N. The load-bearing seam is Seam 3, which is hypothetical and aspirational: between the *cacheable prefix* and the *volatile placeholders* inside Layer A — cost would flip from *full-rate input tokens* to *fraction-rate cache reads* on turns 2-7. Today this seam doesn't exist because `{schema}` is appended *last*, behind the volatile `{anomaly}` / `{intent}` placeholders, so the cacheable prefix breaks at the first volatile token. Get this layout fixed (schema in front, `cache_control` on the boundary) and the dominant input-token line item on multi-turn runs drops sharply.
+**Axis — what bounds each slot.** Walk it:
 
 ```
-  Structure pass — token budgeting
+  one axis — "what stops this slot from growing forever?" — four layers, four answers
 
-  ┌─ 1. LAYERS ───────────────────────────────────┐
-  │  A: static prefix (system + {schema})          │
-  │  B: growing transcript (turns accreted)         │
-  │  C: output reservation (max_tokens)             │
-  │  D: raw tool result (unbounded → clipped)       │
-  └────────────────────────┬───────────────────────┘
-                           │  pick the axis
-  ┌─ 2. AXIS ─────────────▼────────────────────────┐
-  │  cost: tokens per layer per call; how does it  │
-  │  scale (per workspace, per turn, per call)?     │
-  └────────────────────────┬───────────────────────┘
-                           │  trace A→D, find flips
-  ┌─ 3. SEAMS ────────────▼────────────────────────┐
-  │  S1 (D↔B): unbounded → capped 16k chars         │
-  │            (truncate gate)                      │
-  │  S2 (B per-turn): 1× → N× (maxToolCalls 6/6/4/6)│
-  │  S3 (within A): full-rate → cache-rate          │
-  │            (LOAD-BEARING — and NOT BUILT;       │
-  │             {schema} placed last blocks it)     │
-  └────────────────────────┬───────────────────────┘
-                           ▼
-                   Block 4 — How it works
+  ┌─ window: 200K tokens total ─────────┐
+  │  HARD CAP from the model             │  no override possible
+  └─────────────────────────────────────┘
+       ┌─ system prompt slot ────────────┐
+       │  ENFORCED by template + caps    │  schemaSummary caps event/prop count
+       └─────────────────────────────────┘
+            ┌─ tool result slot ─────────┐
+            │  ENFORCED by truncate()    │  16K chars/result hard cap
+            └────────────────────────────┘
+                 ┌─ response slot ───────┐
+                 │  ENFORCED by max_tokens│ params.max_tokens = 4096
+                 └────────────────────────┘
 ```
 
-```
-  A seam — "what does the prefix cost on turn N?" answered two ways
+Each slot has its own enforcement mechanism. If even one of them is unbounded, the rest of the budget doesn't matter — you'll blow the window the first time that slot grows.
 
-  ┌─ today ──────────┐    seam     ┌─ with cache + reorder┐
-  │  full-rate input │ ═════╪═════► │  fraction-rate cache │
-  │  tokens × every  │  (would flip│  reads × turns 2..N  │
-  │  turn (no cache) │   if built) │                      │
-  └──────────────────┘             └──────────────────────┘
-         ▲                                   ▲
-         └────── same axis, two answers ─────┘
-                 → this boundary is the optimization left on the table
-```
-
-The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+**Seams.** The biggest seam is between *static prefix* (system prompt, stable across calls) and *dynamic content* (context, tool results, user message). Provider caching depends on this seam being clean — concept covered below.
 
 ## How it works
 
-**Mental model.** A context window is a fixed-size buffer, and every call fills it from four sources you control independently: the static prefix (system prompt + injected schema), the growing transcript (each Thought / Action / Observation appended turn over turn), the per-call output reservation (`max_tokens`, which is *subtracted* from the window before generation), and the unbounded variable — the tool results the model pulls in. Budgeting is deciding a cap for each source so their sum stays inside the *practical* window, not the hard one.
+### Move 1 — the mental model
+
+You know how a `<form>` with `enctype="multipart/form-data"` has an implicit size limit on the whole payload, and individual fields share that budget? An LLM call is exactly that — one envelope, several fields, shared budget.
 
 ```
-context window (fixed buffer)
-┌───────────────────────────────────────────────────────────────┐
-│ STATIC PREFIX          system prompt + {schema}                │  ← schemaSummary caps this
-│ ─────────────────────────────────────────────────────────────│
-│ TRANSCRIPT (grows)     userPrompt                              │
-│                        ├─ Thought / Action (turn 1)            │  ← maxToolCalls caps
-│                        ├─ Observation (turn 1)  ≤16k chars     │     turn count
-│                        ├─ Thought / Action (turn 2)            │  ← truncate() caps
-│                        └─ Observation (turn 2)  ≤16k chars     │     each observation
-│ ─────────────────────────────────────────────────────────────│
-│ OUTPUT RESERVATION     max_tokens (reserved, not yet used)     │  ← 4096 / 2048 / 16
-└───────────────────────────────────────────────────────────────┘
-          │
-   sum must stay under the PRACTICAL window (~80% of hard), not the hard ceiling
+  The budget — one envelope, four named slots, shared total
+
+  ┌────────────────────────────────────────────────────────────────┐
+  │  TOTAL: 200K tokens                                              │
+  │                                                                  │
+  │  ┌── system ──┬── tool results ──┬── response ──┬── user ───┐  │
+  │  │  ~1.5K     │  ~30K (6 results) │  ~4K         │  ~30      │  │
+  │  └────────────┴───────────────────┴──────────────┴───────────┘  │
+  │                                                                  │
+  │  used: ~35K · headroom: ~165K · still: BUDGET EVERYTHING        │
+  └────────────────────────────────────────────────────────────────┘
+
+  the 80% rule: if you're over ~160K used, you're one model change
+  away from breaking. Aim to live well under that line.
 ```
 
-Each cap targets one source. None of them is optional — remove any one and a single large input can blow the whole call.
+The 80% rule is the operational one: if you're using more than 80% of the context window today, you're one minor tokenizer change or one schema expansion away from breaking in production. The headroom is the *insurance* — and you only need it the day you don't have it.
 
----
+### Move 2 — the walkthrough
 
-### The static prefix — the schema summarizer bounds the biggest variable
+**Slot 1 — the system prompt, budgeted at template time.** The `monitoring.md` template is ~1.2K tokens of stable content. It's fixed at build time. The budget here is "keep the rules dense and don't pad with examples you don't need." Concept 01 walks the four-section anatomy that makes this slot survivable.
 
-The four prompt files end with `## Workspace schema\n{schema}`. That `{schema}` placeholder is the single largest variable input to every agent call, and it is *not* injected raw. A shared schema-summarizer function compacts the full workspace schema — roughly 112KB raw — into a hard-bounded summary:
+**Slot 2 — the context injection. This is the one that drifts.** `lib/agents/monitoring.ts:19-60` does the budgeting for you in code:
 
-```
-schema summarizer caps
-─────────────────────────────────────────────────────────────
- MAX_EVENTS           = 20    events.slice(0, 20)
- MAX_PROPS_PER_EVENT  = 10    properties.slice(0, 10)
- MAX_CPROPS           = 30    customer_properties.slice(0, 30)
-```
+```typescript
+export function schemaSummary(schema: WorkspaceSchema): string {
+  const oldestDate = ...;
 
-The function is shared: all four agents import the same summarizer and run the raw schema through it before stamping it into `{schema}`. So they all pay the *same* bounded prefix cost regardless of how large the underlying workspace is. A workspace with 400 event types still injects 20. This is the line item that, left uncapped, would dwarf everything else — a 112KB blob is roughly 28,000 tokens, and it would sit in *every* turn of *every* agent call.
+  // Top 20 events, each capped at 10 properties
+  const MAX_EVENTS = 20;
+  const MAX_PROPS_PER_EVENT = 10;
 
-```
-raw schema (112KB, ~28k tok)  ──schema summarizer──▶  bounded summary (20/10/30)
-   grows with workspace size                            constant regardless of workspace
-```
+  const eventsText = schema.events
+    .slice(0, MAX_EVENTS)
+    .map((e) => {
+      const props = e.properties.slice(0, MAX_PROPS_PER_EVENT).join(', ');
+      return `  - ${e.name} (${e.eventCount}): ${props || '(no properties)'}`;
+    })
+    .join('\n');
 
-**Code in this codebase — prefix cap `schemaSummary`.** `lib/agents/monitoring.ts`, function `schemaSummary(schema: WorkspaceSchema): string`, L16–L57 (caps at L22 `MAX_EVENTS=20`, L23 `MAX_PROPS_PER_EVENT=10`, L34 `MAX_CPROPS=30`); the one-liner `Data horizon: <from> → <to>` appended at L40–L49 when the live adapter is Olist (synthetic, fixed-horizon) and omitted under Bloomreach. Compacts the ~112KB raw workspace schema (noted at L15) into a bounded summary injected as `{schema}`; imported and reused by `query.ts` L7/L26 and the diagnostic/recommendation agents. The horizon line is the cheapest possible date anchor — one line in the prefix that earns a 5x loose-recall lift on detection eval (→ 01-anatomy.md for the structural framing, → 05-eval-driven-iteration.md for the measured before/after).
-
----
-
-### The transcript — `truncate()` and `maxToolCalls` bound growth
-
-The transcript grows two ways: each observation can be arbitrarily large, and the number of turns can be arbitrarily many. blooming insights caps both.
-
-**Per-observation cap.** Every tool result is run through a truncate helper before it re-enters the conversation. The cap is 16,000 characters:
-
-```
-  MAX_TOOL_RESULT_CHARS = 16_000
-
-  truncate(s):
-    if s.length <= MAX_TOOL_RESULT_CHARS:
-        return s
-    return s.slice(0, MAX_TOOL_RESULT_CHARS) + "\n…[truncated]"
+  // Customer properties, cap at 30
+  const MAX_CPROPS = 30;
+  const customerPropsText = schema.customerProperties.slice(0, MAX_CPROPS).join(', ');
+  ...
+}
 ```
 
-An MCP query that returns 80KB of rows is clipped to 16,000 chars before the loop pushes it back as the next user turn. Without this, one chatty tool call floods the window and pushes the original instructions and anomaly toward the middle — where the model attends to them least.
+Step by step:
 
-**Code in this codebase — per-observation cap `truncate`.** `lib/agents/base.ts`, function `truncate(s)` + `MAX_TOOL_RESULT_CHARS`, L29–L34; applied at L150 (success) and L155 (error) before `messages.push` at L171. Clips every tool result to 16,000 chars so one large observation cannot flood the transcript.
+  → **Cap at 20 events.** The real workspace schema can have hundreds of event types. Top 20 by count is enough for the agent to reason about; the rest are noise.
+  → **Cap at 10 properties per event.** Same logic — most events have a long tail of low-signal props.
+  → **Cap at 30 customer properties.** Same.
+  → **Comment in the source: "the full schema is 112KB."** A raw `JSON.stringify(schema)` would be ~30K tokens just on its own. The compacted summary is ~1K tokens. That's *the* token-budgeting move in this codebase.
 
-**Turn-count cap.** A per-agent `max_tool_calls` setting is the hard ceiling on how many Observation blocks ever get appended. Once the tool-call count reaches the cap, a `budget_spent` flag flips true, the loop sets `force_final`, and tools are dropped from the next call:
-
-```
-  the budget gate
-  ─────────────────────────────────────────────────────────────
-  budget_spent = max_tool_calls is set
-                 AND tool_calls.length >= max_tool_calls
-  force_final  = (turn == max_turns - 1) OR budget_spent
-  if NOT force_final:
-      params.tools = tool_schemas             # ← tools dropped when spent
-```
-
-Each agent sets its own cap: monitoring 6, diagnostic 6, recommendation 4, query 6. The recommendation agent gets fewer because its prompt says it "mostly reasons from the diagnosis" — it does not need the exploration budget the others do. The prompts reinforce the same number in prose: "Make at most 6 tool calls" (monitoring, diagnostic), "at most 4 tool calls" (recommendation). The cap lives in two places — the code enforces it, the prompt tells the model so it spends its budget wisely instead of being cut off mid-exploration.
+The compaction shape:
 
 ```
-each Observation ≤ 16k chars   AND   at most N Observations
-        │                                    │
-   truncate (per result)              max_tool_calls (per-agent: 6/6/4/6)
-        └────────────── together bound transcript size ──────────────┘
+  Pattern — schema compaction, raw vs compacted
+
+  raw workspace schema (full)            compacted summary
+  ─────────────────────────              ────────────────
+  events: 287 entries                    events: top 20 by count
+    each: { name, eventCount,            each: "  - name (count): prop1, ..."
+            properties: 1–60 strings,    (max 10 props per event)
+            ... }
+  customerProperties: 120 strings        customerProperties: top 30, joined
+
+  ~112KB / ~30K tokens                   ~3KB / ~1K tokens
 ```
 
-**Code in this codebase — turn-count cap `maxToolCalls`.** `lib/agents/base.ts` (gate) + each agent (value). `budgetSpent` / `forceFinal` in `runAgentLoop`: gate `base.ts` L90–L91, L101; values monitoring `monitoring.ts` L101 (6), diagnostic `diagnostic.ts` L61 (6), recommendation `recommendation.ts` L57 (4), query `query.ts` L41 (6). Bounds how many Observation blocks ever enter the transcript; recommendation uses 4 because it reasons from the diagnosis rather than exploring.
+The compacted shape preserves the *signal* (which events exist, roughly how often, what properties they carry) and drops the *noise* (long tails, rarely-used properties). Concept 06 walks why one summary serves all five agents — they're all asking the same compacted question.
 
----
+**Slot 3 — tool results. Every turn adds another one.** `lib/agents/base-legacy.ts:32-37`:
 
-### The output reservation — `max_tokens` per call
+```typescript
+const MAX_TOOL_RESULT_CHARS = 16_000;
 
-`max_tokens` is not a quality knob; it is a hard cap on output that the provider *subtracts from the window before generating*. blooming insights sizes it to the job:
-
-```
-max_tokens by call site
-─────────────────────────────────────────────────────────────
- agent loop (default)   4096    ← full structured answer
- synthesize retry       2048    ← diagnostic + recommendation
- intent classifier        16    ← one word
+function truncate(s: string): string {
+  if (s.length <= MAX_TOOL_RESULT_CHARS) return s;
+  return s.slice(0, MAX_TOOL_RESULT_CHARS) + '\n…[truncated]';
+}
 ```
 
-The classifier's `16` is the sharpest example of budgeting as design. The intent classifier asks for "ONLY the one word" and reserves exactly enough tokens to return one — `monitoring`, `diagnostic`, or `recommendation`. There is no room for the model to ramble even if it wanted to; the budget enforces the format. The synthesis retry uses 2048 because a single diagnosis or recommendation array is smaller than a full exploratory turn. The default 4096 covers the agent's normal structured output. Notably, the query agent passes no `max_tokens` of its own — its prose answer rides the 4096 default.
+16K characters per result, hard cap. EQL queries can return a *lot* of data — a `by customer.country grouping top 5` returns five rows; a `by day in last 365 days` returns 365 rows; a malformed query can dump a giant error response. 16K chars works out to roughly 5K tokens worst case. With a budget of 6 tool calls, the worst case is ~30K tokens of tool results. That's the bound the budget is sized against.
+
+The execution trace, one call:
 
 ```
-"reply with ONLY one word"  +  max_tokens: 16   →  format enforced by the budget,
-                                                    not just requested in prose
+  Execution trace — one tool call, one result, growing the conversation
+
+  state before call:
+    messages: [
+      { role: 'user', content: 'Work through your checklist.' },
+      { role: 'assistant', content: [TextBlock + ToolUseBlock(EQL)] }
+    ]
+    tokens used: ~3K
+
+  tool runs, returns ~18K char JSON result
+  truncate(result) → 16K chars + '…[truncated]' suffix
+
+  state after:
+    messages: [
+      { role: 'user', content: 'Work through your checklist.' },
+      { role: 'assistant', content: [TextBlock + ToolUseBlock(EQL)] },
+      { role: 'user', content: [{ type: 'tool_result', content: '[16K chars]…[truncated]' }] }
+    ]
+    tokens used: ~8K  (added ~5K for the truncated result)
 ```
 
-**Code in this codebase — output cap `max_tokens`.** `lib/agents/base.ts` + `intent.ts` + synthesize calls. `maxTokens` default; classifier and synthesis call sites: default 4096 `base.ts` L74; classifier 16 `intent.ts` L20; synthesize 2048 `diagnostic.ts` L94, `recommendation.ts` L98; query rides the 4096 default (no `maxTokens` passed, `query.ts` L30–L45). Reserves output space sized to the job; the classifier's 16 enforces the one-word format through the budget itself.
+The truncation isn't just "save tokens." It's *bounded growth*. Without `truncate`, one runaway EQL result blows the budget for the entire conversation.
 
----
+**Slot 4 — the response. `max_tokens` enforces.** `lib/agents/base-legacy.ts:126`:
 
-### Move 2.5 — current state vs. the prefix-caching gap
-
-Here is what blooming insights does *not* do, and it is the most consequential omission in its token economics: it uses no prompt caching. Anthropic's prefix caching (`cache_control` on a content block) lets you mark a stable prefix so repeated calls reuse it at a fraction of the input-token cost. blooming insights never sets it — there is no `cache_control` anywhere in the shared agent loop, the intent classifier, or the agent classes.
-
-The static prefix is the *ideal* cache target: the same system prompt and schema are re-sent on every turn of every loop, and the schema is identical across the diagnostic and recommendation calls of a single investigation (both inject the same bounded schema summary). That prefix is exactly the "stable content kept at the front" that caching rewards.
-
-But there is a structural anti-pattern even before caching is added. The canonical rule is *keep the most stable content at the front of the prompt so the cacheable prefix is as long as possible.* blooming insights does the opposite for its largest stable input: `{schema}` is appended **last** in all four prompt files, *after* the volatile placeholders. The schema varies *less* than `{anomaly}` (diagnostic) or `{intent}` (query) — it changes per workspace, not per call — yet it sits behind them.
-
-```
-current prompt layout (anti-pattern for prefix caching)
-─────────────────────────────────────────────────────────────
- [Role / Hard rules]        ← static across calls
- [{anomaly} / {intent}]     ← VOLATILE (changes every call)
- [EQL reminders / Output]   ← static across calls
- [{schema}]                 ← stable per workspace, but placed LAST
-
- a long cacheable prefix needs:  static → stable → volatile
- this layout interleaves them, so the cacheable prefix is short
+```typescript
+const params: Anthropic.Messages.MessageCreateParamsNonStreaming = {
+  model: AGENT_MODEL,
+  max_tokens: maxTokens,  // default 4096
+  ...
+};
 ```
 
-If caching were turned on against this layout, the cache would break at the first volatile token. To actually benefit, the schema (stable) belongs *in front of* the per-call placeholders (volatile), with `cache_control` on the boundary. The current order makes the static prefix shorter than it could be — a real cost the moment call volume rises.
+4K tokens for the response is plenty for a structured JSON output (an Anomaly array is rarely more than ~500 tokens). Setting it higher would let the model ramble; setting it lower would risk truncating a valid response mid-JSON. 4K is the deliberate ceiling.
 
-**Code in this codebase — the gap: no prefix caching, `{schema}` placed last.** The four prompt files + `base.ts`; prompt layout; absence of `cache_control`. `{schema}` last at `monitoring.md` L99–L101, `diagnostic.md` L83–L85, `recommendation.md` L73–L75, `query.md` L38–L40; no `cache_control` in `base.ts` L92–L102. The largest stable input sits behind volatile placeholders, and no call marks a cacheable prefix — the prefix is re-billed in full on every turn.
-
-**Why this is a codebase strength (with one honest weakness).** Three of the four sources are capped at the seam where they enter the window, not patched after a blow-up: the prefix is bounded before injection, observations before they re-enter the transcript, output before generation. The weakness is real and specific: the schema is the biggest stable input and it is placed last, and no call sets `cache_control`, so the prefix is paid in full on every one of the (up to) 7 turns per investigation.
-
----
-
-### The principle
-
-Budget every source that fills the window — the prefix, the transcript, the output reservation — and place the most stable content first so it stays cacheable. blooming insights caps the prefix (schema summarizer), the per-observation size (truncate), the turn count (`max_tool_calls`), and the output (`max_tokens`) — four independent caps, each on one source. It leaves two things on the table: no prefix caching at all, and a prompt layout that puts its largest stable input (`{schema}`) last, where it cannot anchor a long cacheable prefix. The caps are the hygiene that ships; the caching is the optimization not yet taken.
-
----
-
-## Token budgeting — diagram
-
-This diagram spans the full budget. The Service layer assembles a bounded prefix and a per-call cap; the Loop layer grows a capped transcript; the Provider layer enforces the output reservation. A reader who sees only this should grasp that four independent caps keep the call inside the practical window, and that the prefix is in the wrong order for caching.
+**Lost-in-the-middle — even when context fits, position matters.** This is the operational thing every prompt engineer learns the hard way. Models attend more strongly to content at the *start* and *end* of the prompt; content in the middle is poorly recalled. Look at `legacy-prompts/monitoring.md`:
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│  SERVICE LAYER (agent classes)                                       │
-│                                                                       │
-│  PROMPT.replace("{schema}", schema_summary(schema))                   │
-│     summarizer caps 20 events / 10 props / 30 cprops                  │
-│     {schema} appended LAST in the markdown  (anti-pattern for caching)│
-│  run_agent_loop({ max_tool_calls: 6|6|4|6, max_tokens: 4096 })        │
-└───────────────────────────┬───────────────────────────────────────────┘
-                            │  system + user prompt
-┌───────────────────────────▼───────────────────────────────────────────┐
-│  LOOP LAYER (shared agent loop)                                       │
-│                                                                       │
-│  per turn: append Thought/Action, run tool, append Observation        │
-│    Observation = truncate(serialize(result))   ≤16k chars             │
-│    budget_spent = tool_calls.length >= max_tool_calls                 │
-│    force_final → drop tools, append synthesis_instruction             │
-└───────────────────────────┬───────────────────────────────────────────┘
-                            │  max_tokens reserved from window
-┌───────────────────────────▼───────────────────────────────────────────┐
-│  PROVIDER LAYER                                                       │
-│                                                                       │
-│  provider.messages.create({ max_tokens })                             │
-│    agent 4096 · synthesize 2048 · classifier 16                       │
-│    NO cache_control anywhere — prefix re-sent in full every turn      │
-└────────────────────────────────────────────────────────────────────────┘
+  Position matters — what goes where in the monitoring prompt
 
-  Four caps (prefix · per-observation · turn-count · output) keep the call
-  under the practical window. Prefix caching is unused; {schema} is last.
+  ┌─ start (strong attention) ──────────────────┐
+  │  ## Role                                      │
+  │  ## Hard rules (1–4)                          │
+  │  ## Your category checklist                    │
+  └──────────────────────────────────────────────┘
+  ┌─ middle (weak attention) ───────────────────┐
+  │  Period-over-period method                    │
+  │  CRITICAL: verify your windows...             │
+  │  Suggested query plan                          │
+  │  Tool catalog reminders                        │
+  │  Common errors to avoid                        │
+  └──────────────────────────────────────────────┘
+  ┌─ end (strong attention) ────────────────────┐
+  │  ## Output  (the JSON shape spec + example)   │
+  │  ## Workspace schema  ({schema} interpolation)│
+  └──────────────────────────────────────────────┘
 ```
 
-The window is finite; four caps keep the sum under the practical fraction, and the one optimization left on the table is the cacheable prefix.
+The most load-bearing content — rules at the top, output shape + schema at the bottom. The middle holds *useful but recoverable* context (query examples, error guidance). If the model loses fidelity in the middle, the rules at the top and the output shape at the bottom still steer it. This is intentional placement.
 
----
+**Prefix caching — keep what's stable at the front.** Anthropic and OpenAI both cache static prompt prefixes across calls. The cache hit is enormous — 90% cost reduction on the cached portion. The discipline:
+
+```
+  Prefix caching — what gets cached, what doesn't
+
+  ┌─ STABLE (cacheable across calls) ──────────┐
+  │  monitoring.md prose                         │
+  │  Hard rules                                  │
+  │  Output shape + JSON example                  │
+  │  Tool catalog reminders                       │
+  └──────────────────────────────────────────────┘
+  ┌─ VARIABLE (cache invalidates here) ────────┐
+  │  {project_id} interpolation                   │ ← cache breaks at first var
+  │  {categories} interpolation                   │
+  │  {schema} interpolation (workspace-specific)  │
+  │  user message                                 │
+  └──────────────────────────────────────────────┘
+```
+
+In this codebase the variable interpolations happen *throughout* the prompt (project_id is mentioned in rule 1 at the top; categories list comes after rules; schema comes last). That hurts cache utilization — the first variable substitution invalidates everything after it. The improvement would be: hoist all stable content to the top, push all variable content to the bottom in one contiguous block. Concept 03 (prompts as code) is the prerequisite to this refactor — you can only restructure a prompt you can version.
+
+**The specific failure — small inputs work, scale breaks.** This is the classic. A chain works fine in dev with a tiny test workspace, you push it, the first customer with a real-sized schema lands, and you see the agent timeout or — worse — silently truncate its response mid-JSON because `max_tokens` was too low for the new context. The fix:
+
+1. `schemaSummary` instead of raw schema (this codebase already does this).
+2. `truncate` on every tool result (this codebase already does this).
+3. A logged token count per call so you can see budget usage in production (this codebase logs `usage` but doesn't aggregate it — concept 03's gap).
+4. An eval set that includes a *large workspace* scenario (this codebase doesn't have evals — concept 05's gap).
+
+### Move 3 — the principle
+
+Token budgeting is the same problem as memory budgeting in any constrained system: name your slots, cap each one, leave headroom, measure usage. The 80% rule is the same shape as a 70% disk usage alert — the headroom isn't waste, it's the insurance you need the day you don't have it.
+
+## Primary diagram — the full token budget
+
+```
+  ┌─ 200K context window ────────────────────────────────────────────────┐
+  │                                                                       │
+  │  ┌─ STABLE PREFIX (cacheable) ────────────────────────────────────┐  │
+  │  │  monitoring.md prose (~1.2K tokens)                              │  │
+  │  │   - role + identity                                              │  │
+  │  │   - hard rules (numbered)                                        │  │
+  │  │   - period-over-period method                                    │  │
+  │  │   - tool catalog reminders                                       │  │
+  │  │   - output shape + JSON example                                  │  │
+  │  └────────────────────────────────────────────────────────────────┘  │
+  │  ┌─ VARIABLE (per call, cache breaks) ───────────────────────────┐  │
+  │  │  {project_id}                          ~30 tokens               │  │
+  │  │  {categories} (checklist)              ~500–1K tokens           │  │
+  │  │  {schema} ← schemaSummary, capped       ~500–1.5K tokens         │  │
+  │  └────────────────────────────────────────────────────────────────┘  │
+  │  ┌─ USER message ──────────────────────────────────────────────┐    │
+  │  │  trigger sentence                       ~30 tokens             │    │
+  │  └──────────────────────────────────────────────────────────────┘    │
+  │  ┌─ TOOL RESULTS (grow per turn, capped) ─────────────────────────┐  │
+  │  │  truncate to 16K chars/result            ≤5K tokens × 6 calls   │  │
+  │  │   = ≤30K tokens worst case                                       │  │
+  │  └────────────────────────────────────────────────────────────────┘  │
+  │  ┌─ RESPONSE BUDGET ─────────────────────────────────────────────┐   │
+  │  │  max_tokens: 4096                        ~4K tokens             │   │
+  │  └─────────────────────────────────────────────────────────────────┘  │
+  │                                                                       │
+  │  total worst case: ~38K used · headroom: ~162K (well under 80%)        │
+  └───────────────────────────────────────────────────────────────────────┘
+```
 
 ## Elaborate
 
-### Where this comes from
+The numbers in this guide are Anthropic-specific. Tokenizer ratios vary across providers — Claude's tokenizer averages ~3.5 chars/token for English; OpenAI's GPT-4 tokenizer is ~4 chars/token. For non-English content the ratios shift further. You can use Anthropic's `count_tokens` endpoint or `tiktoken` (OpenAI) to get exact counts during development; the rule "measure, don't estimate" is the right one.
 
-Token budgeting predates context windows getting large. Early GPT-3 work lived inside 2K–4K tokens, so "what fits" was a daily constraint and libraries shipped token counters (`tiktoken`, Anthropic's count-tokens endpoint) as first-class tools. The discipline did not relax when windows grew to 200K — it shifted from "will it fit" to "what is the *practical* fraction before quality degrades." Anthropic's own prompt guidance and the OpenAI cookbook both teach: count tokens before you send, cap variable inputs, and keep stable content first for caching. Prefix caching (`cache_control`) arrived as the reward for that last rule.
+Three places to deepen this:
 
-### The deeper principle
+- **The lost-in-the-middle paper (Liu et al., 2023).** The empirical demonstration that middle-of-context recall is significantly worse than start/end recall. Has held up across model upgrades; informs every prompt layout decision in this codebase.
+- **Anthropic's prompt caching docs.** Walks the exact rules — what counts as the "stable prefix," how cache breakpoints work, the cost/latency math. The 90%-cost-reduction figure is real but only applies to the *prefix portion* that hits the cache.
+- **Compression techniques beyond truncation.** When you genuinely can't compact further with cropping, summarization of earlier turns (an LLM call to compress, fed back as a single message) is the next step. This codebase doesn't do this because the conversation is short (max 6 turns per agent); for a longer-running chat agent it would be load-bearing.
 
-```
-hard window                          practical window
-──────────────────────────────      ──────────────────────────────
-the provider's max (e.g. 200K)       the fraction you should use (~80%)
-output reservation subtracted        quality degrades before the ceiling
-"it fits" = no error                 "it works" = model still attends to it all
-```
-
-The hard window is where the call *errors*. The practical window is where the call still *works* — where the model attends to the whole input instead of skimming. The 80% heuristic exists because a full window degrades before it overflows: instructions placed in the middle of a packed window get attended to least (the "lost-in-the-middle" effect — Liu et al., 2023). blooming insights' caps keep the practical window from filling, but the `{schema}-last` layout pushes a large stable block into exactly the position where lost-in-the-middle bites — and it is the position caching can't reach either.
-
-### Where this breaks down
-
-1. **`truncate()` clips by character, not by token, and not by structure.** Cutting a 16,000-char slice of `JSON.stringify(result)` can sever a row mid-object — the model reads `…"total_price": 4` and never sees the rest. The cap bounds size; it does not preserve meaning. A structured-aware truncation (keep N whole rows) would lose less signal per byte.
-
-2. **The caps are static, not measured.** `MAX_EVENTS=20`, `16_000` chars, `maxToolCalls: 6` are constants chosen by hand, not derived from a measured token count of the assembled prompt. There is no `tiktoken`-style count anywhere — the code never asks "how many tokens did this call actually use." Budgeting by character count and item count is a proxy for the thing that is actually billed.
-
-3. **No caching means the prefix is re-billed every turn.** A 6-tool diagnostic run is ~7 `create` calls, each re-sending the full system prompt + schema as fresh input tokens. With caching, turns 2–7 would read the prefix from cache at a fraction of the cost. Without it, the prefix is the dominant input-token line item on every multi-turn run.
-
-### What to explore next
-
-- **Turn on prefix caching:** reorder the prompts to `static → schema (stable) → volatile placeholders`, then set `cache_control` on the schema boundary so turns 2–N read it from cache.
-- **Token-count the assembled prompt:** add Anthropic's count-tokens (or `tiktoken`) before `create`, log it per call, and replace the character/item caps with token-derived ones.
-- **Structured truncation:** replace the raw `slice(0, 16_000)` with a row-aware truncation that keeps whole JSON objects up to the budget.
-
----
-
-## Project exercises
-
-### Turn on prefix caching for the static system+schema prefix
-
-- **Exercise ID:** C1.7 (adapted) — context-window management.
-- **What to build:** reorder the four prompt files so `{schema}` sits *before* the volatile placeholders (`{anomaly}`, `{intent}`), split the system prompt into a stable block and a volatile block, and set `cache_control: { type: 'ephemeral' }` on the stable block in `runAgentLoop`'s `create` params so turns 2–N of a loop read the prefix from cache.
-- **Why it earns its place:** demonstrates you know the rule "stable content first" and that the current `{schema}-last` layout is a prefix-caching anti-pattern, and that you can fix both the layout and the call.
-- **Files to touch:** `lib/agents/prompts/{monitoring,diagnostic,recommendation,query}.md` (reorder `{schema}`), `lib/agents/base.ts` (split `system` into cached + volatile, set `cache_control`), `test/agents/base.test.ts`.
-- **Done when:** a multi-turn diagnostic run reports cache reads on turns after the first (visible in the API usage fields), and the structured output is unchanged.
-- **Estimated effort:** 1–4hr
-
-### Count tokens before every call and replace character caps with token caps
-
-- **Exercise ID:** C1.7 (adapted) — measure the budget instead of proxying it.
-- **What to build:** add a token count (Anthropic count-tokens or `tiktoken`) of the assembled `system + messages` before each `anthropic.messages.create` in `runAgentLoop`, log it per call alongside the agent name, and replace `MAX_TOOL_RESULT_CHARS` with a token-budget-derived truncation.
-- **Why it earns its place:** shows you treat token counting as hygiene — the code currently never measures what it bills — and that you can convert hand-tuned char/item caps into measured token caps.
-- **Files to touch:** `lib/agents/base.ts` (count + log + token-aware `truncate`), `lib/mcp/types.ts` (a usage field on `ToolCall` or a new event), `test/agents/base.test.ts`.
-- **Done when:** every agent call logs an actual token count, and `truncate` clips by token budget rather than a fixed 16,000 chars without severing a JSON row mid-object.
-- **Estimated effort:** 1–4hr
-
----
+In this codebase, concept 06 (single-purpose chains) is the architectural answer to "why is the budget manageable?" — each chain is one job, so each chain's budget is tractable. A monolithic agent that did monitoring + diagnostic + recommendation in one prompt would blow the budget on the first complex workspace.
 
 ## Interview defense
 
-### What an interviewer is really asking
+**Q: "How do you keep your prompts inside the context window?"**
 
-"How do you manage the context window?" tests whether you stop at "the window is big, it fits" or go to "I cap every source that fills it and I count what I bill." The senior signal is naming the four sources, pointing to the cap on each in code, and *volunteering* the gap — no caching, schema placed last — rather than presenting the budget as complete.
-
-### Likely questions
-
-**[mid] "The workspace schema is 112KB. How does it not blow the context window on every call?"**
-
-`schemaSummary` (`monitoring.ts` L16–L49) compacts it before injection — top 20 events, 10 properties each, 30 customer properties — so the `{schema}` placeholder always carries a bounded summary, not the raw blob. The cap is constant regardless of workspace size.
+Four-slot budget: system prompt, injected context, tool results, response. *(Draw the diagram.)* The biggest lever in this codebase is `schemaSummary` at `lib/agents/monitoring.ts:19-60` — the full workspace schema is 112KB / ~30K tokens; the compacted summary is ~1K. Caps at 20 events × 10 properties + 30 customer properties. Tool results get a separate 16K-char-per-result cap at `lib/agents/base-legacy.ts:32-37`. Response is capped with `max_tokens: 4096`. Each slot has its own enforcement.
 
 ```
-raw 112KB ──schemaSummary (20/10/30)──▶ bounded ──.replace('{schema}',…)──▶ system prompt
+  worst case sum: ~38K tokens, well under the 200K window's 80% line
 ```
 
-**[senior] "What bounds the transcript, and what bounds the output, and why are those different problems?"**
+Anchor: *"every slot has a cap. The full schema would blow the budget alone."*
 
-The transcript is bounded two ways: `truncate()` caps each observation at 16,000 chars (`base.ts` L29) so no single result floods it, and `maxToolCalls` (6/6/4/6) caps how many observations ever get appended (`base.ts` L90). Output is bounded by `max_tokens`, which is *reserved from the window before generation* — 4096 for agents, 16 for the classifier. They are different problems because the transcript is input you accumulate and the output is space you reserve; capping one does nothing for the other.
+**Q: "What's the 80% rule?"**
+
+If you're using more than 80% of the context window today, you're one tokenizer change or one schema expansion from breaking. The headroom is the insurance you only need the day you don't have it. In this repo I'm at ~20% usage worst case, so the 80% rule doesn't bite — but the *discipline* of measuring against it is what keeps it from biting.
+
+Anchor: *"the headroom is the insurance you need the day you don't have it."*
+
+**Q: "What's lost-in-the-middle?"**
+
+Models attend more strongly to the start and end of the prompt; content in the middle is poorly recalled. *(Draw the position diagram.)* In `monitoring.md`, hard rules go at the top, the output schema and the workspace context interpolation go at the bottom. The middle holds useful-but-recoverable context — query examples, error guidance. If the model loses fidelity there, the rules at the top and the output shape at the bottom still steer it. Intentional layout.
 
 ```
-transcript:  truncate (per-obs)  +  maxToolCalls (count)   ← input you grow
-output:      max_tokens (reserved before generation)        ← space you hold back
+  start:   rules + checklist           (strong attention)
+  middle:  query examples + reminders  (weak — recoverable)
+  end:     output spec + schema        (strong attention)
 ```
 
-**[arch] "The static prefix is identical across turns. What is this codebase leaving on the table, and why can't it just turn caching on?"**
+Anchor: *"start and end are load-bearing. Put the rules and the output spec there. Put recoverable content in the middle."*
 
-Prefix caching. The system prompt + schema are re-sent on every one of the ~7 turns per investigation, un-cached, so the prefix is the dominant input-token cost. It cannot "just turn it on" because `{schema}` is appended *last* in all four prompts, behind the volatile `{anomaly}` / `{intent}` placeholders — the cacheable prefix breaks at the first volatile token. Fixing it requires reordering (schema to the front, as the most stable input) *then* setting `cache_control`. The layout is the blocker, not the feature.
+**Q: "What about prefix caching?"**
 
-```
-now:   [static][VOLATILE][static][{schema}]   ← cache breaks at VOLATILE, prefix short
-fixed: [static][{schema}][cache_control][VOLATILE]  ← long cacheable prefix
-```
+This is the gap in this codebase. Variable interpolations (`{project_id}`, `{categories}`, `{schema}`) happen *throughout* the prompt, so cache utilization is poor — the first variable invalidates everything after it. The fix would be: hoist all stable content to the top, push all variables to a contiguous block at the bottom. I haven't done it because the agents aren't latency-sensitive enough to justify the refactor, but the cost savings would be real at scale.
 
-### The question candidates always dodge
-
-**"How many tokens does one of your agent calls actually use?"** The honest answer is: the code does not know. There is no token counter anywhere — the caps are character counts (`16_000`) and item counts (`20`, `6`), which are *proxies* for tokens, not measurements. Budgeting by proxy works until it doesn't, and you cannot tune a prefix you never measured. Conflating "I capped the inputs" with "I counted the tokens" is the dodge.
-
-### One-line anchors
-
-- `lib/agents/monitoring.ts` L16–L49 — `schemaSummary`: caps the prefix to 20/10/30.
-- `lib/agents/base.ts` L29–L34 — `truncate` + `MAX_TOOL_RESULT_CHARS=16_000`: per-observation cap.
-- `lib/agents/base.ts` L90–L91 — `budgetSpent` / `forceFinal`: the `maxToolCalls` gate.
-- `lib/agents/intent.ts` L20 — `max_tokens: 16`: output budget enforcing a one-word format.
-- `monitoring.md` L99–L101 — `{schema}` appended last: the prefix-caching anti-pattern.
-
----
+Anchor: *"caching wants stable-prefix-first. This codebase's prompt layout fights that. It's the refactor I'd do for cost."*
 
 ## See also
 
-→ 01-anatomy.md · → 02-structured-outputs.md · → 03-prompts-as-code.md · → 08-few-shot.md
-
----
+- `01-anatomy.md` — the four-section structure is the *spatial* discipline that token budgeting depends on.
+- `02-structured-outputs.md` — `max_tokens: 4096` for the response is sized for structured JSON, not for prose.
+- `03-prompts-as-code.md` — you can only refactor the prompt for caching if it lives in version control.
+- `06-single-purpose-chains.md` — single-purpose chains keep per-chain budgets tractable; a monolithic agent would blow the budget.

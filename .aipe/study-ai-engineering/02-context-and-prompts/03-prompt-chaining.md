@@ -1,389 +1,396 @@
-# Prompt chaining (one job per step, output feeds the next)
+# 03 — prompt chaining
 
-**Industry name(s):** prompt chaining, sequential LLM pipeline, decomposed prompting, fixed-workflow orchestration
-**Type:** Industry standard · Language-agnostic
-
-> The morning briefing is a fixed three-step chain — monitoring → diagnostic → recommendation — where each step does one job and its typed output is the next step's input. The investigation half is split across TWO HTTP requests: `/api/agent?step=diagnose` runs the diagnostic agent, the client stashes the resulting `Diagnosis` in sessionStorage (`bi:diag:<id>`), then `/api/agent?step=recommend` runs the recommendation agent with that diagnosis handed back via the `?diagnosis=` param — not a single in-process `await` chain. (The legacy combined-capture run, `step == null`, still sequences both with `await` in one request.) Inside each step a smaller chain runs: the tool-use loop gathers evidence, then a separate `synthesize()` call turns it into JSON.
-
-
----
+**Subtitle:** Multi-agent pipeline as the product · Project-specific (load-bearing)
 
 ## Zoom out, then zoom in
 
-**Zoom out — the bigger picture.** Prompt chaining is the shape of the *whole request flow*: the Pipeline coordinator (the Route + client) owns the order, and each link is a separate Per-agent invocation running its own focused model call. The chain spans Route → Per-agent → Agent loop → Provider, and the seams between links are HTTP requests (for the live diagnose→recommend split, with the `Diagnosis` handed over via sessionStorage `bi:diag:<id>`) or `await` calls (for the legacy combined-capture run).
+The whole product is a chain: **monitoring → diagnostic → recommendation**.
+Three separate agent loops, each with its own prompt, tools, and validator.
+The diagnostic's output becomes the recommendation's input; the recommendation
+gets the diagnosis JSON pasted into its prompt context.
+
+The investigate UI further splits the diagnose step from the recommend step
+into two separate `/api/agent` calls — so the user can stop after step 2 if
+they only wanted the diagnosis.
 
 ```
-  Zoom out — where the chain sits
+  Zoom out — the chain is the product
 
-  ┌─ Route + client (own the order) ─────────────────┐  ← we are here
-  │  ?step=diagnose  ──[bi:diag:<id> handoff]──▶     │
-  │                                ?step=recommend    │
-  │  app/api/agent/route.ts L224–249                  │
-  └─────────────────────────┬────────────────────────┘
-                            │ one job per link
-  ┌─ Per-agent (each link is its own focused call) ──┐
-  │  ★ link 1: MonitoringAgent.scan      (briefing)   │
-  │  ★ link 2: DiagnosticAgent.investigate ★          │
-  │  ★ link 3: RecommendationAgent.propose ★          │
-  │   each: own prompt + tool subset + validator     │
-  │   each: gather→synthesize micro-chain inside    │
-  └─────────────────────────┬────────────────────────┘
-                            │
-  ┌─ Provider ──────────────▼────────────────────────┐
-  │  every link → its own anthropic.messages.create  │
-  │  (all on AGENT_MODEL — per-step tiering not wired)│
-  └──────────────────────────────────────────────────┘
+  ┌─ Feed (/api/briefing) ─────────────────────────────────┐
+  │  monitoring agent (one loop)                           │
+  │  → Anomaly[] → derived to Insight[] → render cards    │
+  └──────────────────────┬─────────────────────────────────┘
+                         │ user clicks an insight
+                         ▼
+  ┌─ /api/agent?step=diagnose ─────────────────────────────┐  ← step 2
+  │  diagnostic agent (one loop)                           │
+  │  → Diagnosis → emit { type: 'diagnosis', diagnosis }   │
+  │  → emit { type: 'done' }                               │
+  │  (recommendation NOT run yet)                          │
+  └──────────────────────┬─────────────────────────────────┘
+                         │ user clicks "see recommendations"
+                         ▼
+  ┌─ /api/agent?step=recommend&diagnosis=… ────────────────┐  ← step 3
+  │  recommendation agent (one loop)                       │
+  │  → Recommendation[] → emit per-rec                     │
+  └────────────────────────────────────────────────────────┘
 ```
-
-**Zoom in — narrow to the concept.** The question is: when a task has distinct stages — detect, explain, act — do you hand the whole thing to one model call and hope, or split it into separate calls each with one job and a clean handoff? A chain wins on focus (each prompt is small), isolation (each link has its own fallback), and observability (each seam is a streaming/validation point). How it works walks the briefing chain, the gather→synthesize micro-chain inside each link, and the un-taken per-step model optimization the chain already enables.
-
----
 
 ## Structure pass
 
-**Layers.** Four layers form the chain: the route + client (own the order between links — via `await` for legacy combined-capture or via the `step`-gated HTTP handoff for the live diagnose→recommend split), each per-agent invocation (one link's focused model call with its own prompt + tool subset + validator), the agent loop inside each link (gather→synthesize micro-chain), and the provider call that fires per link.
+  → **One axis to trace — handoff.** Each chain step takes typed input from
+    the previous step and produces typed output for the next. Monitoring
+    produces `Anomaly`; diagnostic takes `Anomaly` + produces `Diagnosis`;
+    recommendation takes `Anomaly` + `Diagnosis` and produces
+    `Recommendation[]`. The handoff carries through the NDJSON wire and
+    sessionStorage (across browser navigations).
 
-**Axis: control.** Who decides the next step at each layer — CODE (the route/client/agent runs a fixed sequence) or MODEL (the agent loop picks tools within its stage)? This axis is the right lens because prompt chaining IS a control-structure decision: the chain says "CODE owns the order between links." That's what makes it a chain and not an agent. State is downstream (state flows from link to link), but the load-bearing question is whose control decides the next step.
-
-**Seams.** The cosmetic seam is between the provider call and the agent loop inside one link — both are part of one link's execution. The load-bearing seam is between the per-agent invocations (link N → link N+1): control flips here from "MODEL was deciding what to do within link N" to "CODE is deciding what link comes next." This is the chain's defining seam — the moment when the model's autonomy ends and the route/client's hard-coded order picks up. A second load-bearing variant: in the live path this same seam is *also* an HTTP boundary (sessionStorage `bi:diag:<id>` handoff), which means failure-containment also flips across it.
-
-```
-  Structure pass — prompt chaining
-
-  ┌─ 1. LAYERS ───────────────────────────────────┐
-  │  route + client (own the order)                │
-  │  per-agent invocations (one link each)         │
-  │  agent loop (gather→synthesize micro-chain)    │
-  │  provider call (per-link create)               │
-  └────────────────────────┬───────────────────────┘
-                           │  pick the axis
-  ┌─ 2. AXIS ─────────────▼────────────────────────┐
-  │  control: CODE owns order between links;       │
-  │  MODEL owns step choice within a link          │
-  └────────────────────────┬───────────────────────┘
-                           │  trace across layers, find flips
-  ┌─ 3. SEAMS ────────────▼────────────────────────┐
-  │  provider↔agent loop: cosmetic                 │
-  │  link N↔link N+1: LOAD-BEARING                 │
-  │    MODEL control → CODE control                │
-  │    (live path: also an HTTP boundary)          │
-  └────────────────────────┬───────────────────────┘
-                           ▼
-                   Block 4 — How it works
-```
-
-```
-  A seam — "who picks the next step?" answered two ways
-
-  ┌─ inside link ──┐  seam   ┌─ between links ─┐
-  │ MODEL          │ ══╪═══► │ CODE            │
-  │ (picks tool)   │  flips  │ (fixed order)   │
-  └────────────────┘         └─────────────────┘
-         ▲                              ▲
-         └────── same axis, two answers ─┘
-                 → this is what defines a chain
-```
-
-The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+  → **Two seams to name:**
+    1. Diagnostic → recommendation handoff via the wire. The
+       `diagnosisParam` URL parameter carries the JSON across the page
+       transition (`app/api/agent/route.ts:267-272` shows the parse).
+    2. Monitoring → diagnostic handoff via the `insightParam` URL
+       parameter (`app/api/agent/route.ts:35-60` resolves the anomaly).
+       Both use the browser's sessionStorage as the *durable* layer because
+       Vercel's per-instance memory doesn't survive across requests.
 
 ## How it works
 
-**Mental model.** A prompt chain is a fixed sequence of model calls wired by ordinary control flow — `await` within a request, or (in this codebase's live path) the client firing two `step`-gated requests in order — where step N's typed output is step N+1's input. The path is *predetermined*: the code decides the order (detect → diagnose → recommend), not the model. That distinction is the whole difference between a chain and an agent (→ ../04-agents-and-tool-use/01-agents-vs-chains.md): a chain's control flow is yours; an agent's control flow is the model's.
+### Move 1 — the mental model
+
+You've written this pattern as a Promise chain: `f(x).then(g).then(h)`.
+Same shape here, except `f`, `g`, `h` are each multi-turn LLM loops, and
+the chain is split across multiple HTTP requests so the user can interrupt
+between steps.
 
 ```
-fixed chain — the code owns the order
-┌──────────────┐   Anomaly   ┌──────────────┐  Diagnosis  ┌──────────────────┐
-│ monitoring   │────────────▶│ diagnostic   │────────────▶│ recommendation   │
-│ .scan()      │             │ .investigate │             │ .propose()       │
-│ → Anomaly[]  │             │ → Diagnosis  │             │ → Recommendation[]│
-└──────────────┘             └──────────────┘             └──────────────────┘
-   one job: detect              one job: explain             one job: act
-   tools: monitoring            tools: diagnostic            tools: recommendation
-   each link: focused prompt + small tool set + own validator + isolated failure
+  The chain — three loops, two handoffs
+
+       monitoring loop
+            │
+            ▼  emits Anomaly[]
+       ┌────────────────────┐
+       │ snapshot / wire    │  ← handoff 1
+       │ (sessionStorage)   │
+       └─────────┬──────────┘
+                 │  user click
+                 ▼
+       diagnostic loop
+            │
+            ▼  emits Diagnosis
+       ┌────────────────────┐
+       │ snapshot / wire    │  ← handoff 2
+       │ (sessionStorage)   │
+       └─────────┬──────────┘
+                 │  user click
+                 ▼
+       recommendation loop
+            │
+            ▼  emits Recommendation[]
 ```
 
-Each link is independently the simplest possible call: a focused system prompt, a small tool subset, a validator, and a safe fallback. The chain's order is owned by the code — the route's step gating plus the client's request sequencing — never by the model.
+The big design choice: **handoffs are explicit, durable, and parsed at the
+seam, not held in agent memory.** Each step is a fresh agent loop with its
+own conversation. The previous step's output gets pasted into the next
+step's prompt as text. No shared model state.
 
----
+### Move 2 — the step-by-step walkthrough
 
-### The briefing chain across two requests (monitoring → diagnostic → recommendation)
+**Step 1 — monitoring.** Runs in `/api/briefing` (`app/api/briefing/route.ts`,
+not shown here in full). Output: `Anomaly[]` → derived to `Insight[]` via
+`lib/insights/derive.ts` → streamed as `{ type: 'insight', insight }`
+events. Each insight is stashed in `sessionStorage` by `stashInsights()`
+(`lib/hooks/useBriefingStream.ts:53-60`):
 
-The investigation half of the chain is no longer one in-process `await` sequence — it is **split across two HTTP requests** driven by the client, with the `Diagnosis` handed over through sessionStorage. The route reads a `step` param (`'diagnose' | 'recommend' | null`) and a step-filter helper keeps only that step's events on the cached-replay path. The live branch runs each step's agent guarded by `step` checks:
-
-```
-  # STEP 2 (diagnose): run the diagnostic agent; emit the diagnosis event.
-  if step == "recommend":
-      diagnosis = parse_diagnosis(diagnosisParam)         # step 3 gets it from ?diagnosis=
-      if not diagnosis:
-          throw "no diagnosis was handed over…"
-  else:
-      diagAgent  = new DiagnosticAgent(provider_sdk, mcp, schema, allTools)
-      diagnosis  = await diagAgent.investigate(inv, hooksFor("diagnostic"))
-      send({ type: "diagnosis", diagnosis })
-
-  # STEP 3 (recommend) — skipped on the diagnose step:
-  if step != "diagnose":
-      recAgent       = new RecommendationAgent(provider_sdk, mcp, schema, allTools)
-      recommendations = await recAgent.propose(inv, diagnosis, hooksFor("recommendation"))
-      for r in recommendations:
-          send({ type: "recommendation", recommendation: r })
+```typescript
+function stashInsights(list: Insight[]): void {
+  if (typeof window === 'undefined') return;
+  try {
+    for (const i of list) sessionStorage.setItem(`bi:insight:${i.id}`, JSON.stringify(i));
+  } catch { /* sessionStorage full/blocked */ }
+}
 ```
 
-The handoff is now *across the wire*, not in a local variable. After step 2 finishes, the investigation hook stashes the streamed `Diagnosis` in sessionStorage under `bi:diag:<id>`; when the user opens step 3, the hook reads it back and sends it to the route as `&diagnosis=<json>`, where a small parser re-validates it before `propose` runs. The order is still fixed and still the *code's* (the model never chooses what runs next) — but the seam between the two links is now an HTTP boundary plus a sessionStorage handoff, so each step is its own request with its own `maxDuration` budget and its own live stream.
+This is handoff #1 in flight. The insight survives across browser
+navigations because sessionStorage is the most-trusted store on the
+client; Vercel's per-instance memory can't be relied on across
+serverless invocations.
 
-```
-client-driven two-step chain (the live path)
- ┌─ /api/agent?step=diagnose ──────────┐        ┌─ /api/agent?step=recommend ───────┐
- │  investigate(anomaly) → Diagnosis    │        │  parse_diagnosis(?diagnosis=)      │
- │  send 'diagnosis'                    │        │  propose(anomaly, diagnosis)       │
- └───────────────┬──────────────────────┘        └────────────▲──────────────────────┘
-                 │ hook stashes Diagnosis                      │ hook reads bi:diag:<id>
-                 ▼  sessionStorage  bi:diag:<id>  ─────────────┘  → &diagnosis=<json>
-```
+**Step 2 — diagnostic.** When the user clicks an insight in the feed, the
+client navigates to `/investigate/[id]` and the page hits
+`/api/agent?insightId=…&insight=<json>&step=diagnose`. The route resolves
+the anomaly (preferring `insight` URL param > in-memory > demo snapshot;
+see `01-llm-foundations/07-heuristic-before-llm.md`) and runs only the
+diagnostic agent:
 
-The monitoring step — step 1 — runs in the separate briefing path; the agent route enters at the diagnostic step because the anomaly is already resolved from the insight id. The **legacy combined-capture run** (`step == null`, used by the demo-snapshot capture) still sequences both agents with two `await`s in *one* request (the `else` + `step != "diagnose"` branches both fire) and caches the full stream.
+```typescript
+// app/api/agent/route.ts:267-285
+if (step === 'recommend') {
+  diagnosis = parseDiagnosis(diagnosisParam);
+  if (!diagnosis) throw new Error('no diagnosis was handed over…');
+} else {
+  // step === 'diagnose' OR combined run
+  stepFor('diagnostic', 'thought', `investigating "${inv.metric}"…`);
+  const diagAgent = new DiagnosticAgent(anthropic, dataSource, schema, allTools, sid);
+  diagnosis = await diagAgent.investigate(inv, { ...hooksFor('diagnostic'), signal: req.signal });
+  send({ type: 'diagnosis', diagnosis });
+}
 
-### One job, one prompt, one tool set per step
-
-Each step is a class that loads its own prompt file and selects its own tool subset, so the link is focused and small:
-
-```
-step            prompt file                tool subset        validator             budget
-─────────────   ────────────────────────   ────────────────   ───────────────────   ──────────────
-monitoring      prompts/monitoring.md      monitoringTools    isAnomalyArray        maxToolCalls 6
-diagnostic      prompts/diagnostic.md      diagnosticTools    isDiagnosis           maxToolCalls 6
-recommendation  prompts/recommendation.md  recommendationTools isRecommendationArray maxToolCalls 4
-```
-
-The diagnostic step never sees the recommendation catalog; the recommendation step never sees the detection rules. Each prompt is scoped to its single job, which keeps the context small (→ 01-context-window.md) and the behavior testable in isolation.
-
-### The monitoring link is gated to the workspace's runnable categories
-
-The first link — monitoring detection — does not run a fixed 10-category sweep. The briefing route gates the anomaly checklist against the live schema *before* the agent call, then injects only the supported categories into the prompt, so the link never spends query budget on a category this workspace's events cannot support. The monitoring agent's `scan` takes the runnable categories as a parameter and builds a per-category checklist (one bullet per category: its rationale, its suggested query recipe, and its delta thresholds) that it interpolates into the prompt through a `{categories}` slot. The route computes the runnable set with a `runnableCategories` helper that drops any category missing a hard dependency, and hands it to `scan`.
-
-```
-schemaCapabilities(schema) → runnableCategories(…) → checklist → {categories} slot → scan
+if (step !== 'diagnose') {
+  // step === 'recommend' OR combined: run the recommendation agent
+  // …
+}
 ```
 
-This is the prompt-chaining payoff applied to a single link: the detection step's prompt is sized to exactly the categories the data can answer, so the link is both cheaper (no wasted queries on unsupported categories) and more focused (the model is told precisely what to check). The gate itself — schema capabilities → coverage → runnable set — is the subject of → ../04-agents-and-tool-use/07-capability-gating.md.
+The branching on `step` is what makes the chain *splittable*. When `step ===
+'diagnose'`, the route emits the diagnosis and stops — `done` fires without
+running the recommendation. The user gets to read the diagnosis,
+chart the time series, decide whether to invest in the recommendation, and
+optionally click forward.
 
-### Errors are isolated per link
+**The handoff back to the client.** The diagnosis is captured in the
+streamed `{ type: 'diagnosis', diagnosis }` event. The
+`useInvestigation` hook stashes the result in `sessionStorage` so the
+recommend step can read it without re-running diagnostic.
 
-Each step degrades to a safe default for *that step* rather than failing the chain. The monitoring scan returns `[]` on any parse failure; the diagnostic investigation falls through to `FALLBACK`; the recommendation proposer falls through to `[]`. And the whole route body is wrapped in `try/catch` that emits an `error` event and still closes the stream cleanly in `finally`.
+**Step 3 — recommendation.** When the user clicks "see recommendations →"
+the page navigates to `/investigate/[id]/recommend` and that page hits
+`/api/agent?insightId=…&step=recommend&diagnosis=<json>`. The route
+reads the diagnosis from the URL param via `parseDiagnosis`
+(`app/api/agent/route.ts:84-95`):
 
-```
-each link's failure boundary
-monitoring  parse fail  → []          (briefing has no anomalies, not a crash)
-diagnostic  parse fail  → FALLBACK    (recommendation still runs on a hollow diagnosis)
-recommend.  parse fail  → []          (UI shows diagnosis, no actions)
-route       any throw   → 'error' event + finally{ controller.close() }
-```
-
-A failure at one link does not corrupt the others: a `[]` from monitoring is a clean "nothing to report," a `FALLBACK` diagnosis still flows into recommendation as valid input. The seam between steps is exactly where the failure is caught.
-
-### The micro-chain inside each step (loop → synthesize)
-
-Two of the three steps are *themselves* a small two-link chain. Inside the diagnostic investigation and the recommendation proposer, the first link is the tool-use loop that gathers evidence, and the second link is a separate `synthesize()` call that turns that evidence into validated JSON:
-
-```
-  return (
-    try_parse_diagnosis(finalText)             # loop's own final turn produced JSON?
-    OR (await synthesize(anomaly, toolCalls))   # micro-chain: gather → synthesize
-    OR FALLBACK                                 # safe default
-  )
-```
-
-The `synthesize()` call is a distinct model call — `max_tokens: 2048`, no tools, a clean context built only from the formatted tool-call evidence. It is a separate prompt with one job (evidence → JSON), chained after the gather loop. So the briefing is a chain of steps, and the gather/synthesize split is a chain within a step.
-
-```
-inside one step (diagnostic)
-runAgentLoop (gather)  ──toolCalls──▶  synthesize() (extract JSON)  ──▶  Diagnosis
-   link 1: explore                       link 2: one job, clean context
+```typescript
+function parseDiagnosis(param: string | null): Diagnosis | null {
+  if (!param) return null;
+  try {
+    const d = JSON.parse(param);
+    if (d && typeof d.conclusion === 'string'
+        && Array.isArray(d.evidence)
+        && Array.isArray(d.hypothesesConsidered)) {
+      return d as Diagnosis;
+    }
+  } catch { /* ignore */ }
+  return null;
+}
 ```
 
-### Current state vs. future state
+If the diagnosis isn't present (e.g. user deep-linked to step 3 directly),
+the route throws `"no diagnosis was handed over — open the diagnosis step
+first"`. The chain enforces ordering: you can't get a recommendation
+without a diagnosis.
+
+**Where the diagnosis enters the recommendation prompt.** Inside AptKit's
+`RecommendationAgent.propose(anomaly, diagnosis, hooks)`, the diagnosis JSON
+gets interpolated into the recommendation prompt at the `{diagnosis}`
+placeholder (see `lib/agents/legacy-prompts/recommendation.md` — the prompt
+text is in repo for reference, even though AptKit owns the live prompt
+template). The recommendation agent then has the full context: the original
+anomaly, the diagnostic's conclusion + evidence, the hypotheses considered,
+the affected-customers segment.
+
+**The combined-run path.** For the demo-capture flow (`/api/mcp/capture`),
+the route runs both agents back-to-back in one stream (`step == null`
+branch). The output is saved to disk for replay. This is the only path that
+runs the full chain in one HTTP request.
+
+**Why split into two HTTP requests for the UI?** Three reasons:
+
+  1. **User control.** Diagnosis takes ~30-60s; the user might be satisfied
+     with just the diagnosis. Splitting saves the recommendation's cost
+     (~$0.12 + ~30s) when they aren't going to look at it.
+
+  2. **Latency budget.** Vercel Pro's `maxDuration = 300s` is generous but
+     not infinite. Two ~60s steps each have their own 300s budget; one
+     combined step has one budget for both.
+
+  3. **Recovery.** If the recommendation step errors (auth expired, etc.),
+     the diagnosis is preserved in sessionStorage. The user can retry just
+     the recommend step without re-running diagnostic.
+
+### Move 3 — the principle
+
+**Chain explicitly across HTTP requests when each step is independently
+useful, expensive, and the handoff is small.** Each step has its own prompt,
+own tool allowlist, own validator. The handoff is JSON that fits in a URL
+param (a few KB at most). The user sees the intermediate result and
+decides whether to continue.
+
+The opposite shape — one giant agent with all the tools and one big prompt —
+is what most agent demos do. It works in toy form. In production it
+collapses: the prompts get unmanageable, the eval surface explodes (you
+can't measure diagnosis quality independent of recommendation quality), and
+the user has no point of intervention. The chain is what makes the surface
+shippable.
+
+## Primary diagram
 
 ```
-CURRENT (one model, every step)         FUTURE (cheaper model on early steps)
-────────────────────────────────       ────────────────────────────────────
-one shared AGENT_MODEL for all three    monitoring/synthesize on cheap tier,
-                                        diagnostic/recommendation on dear tier
-no per-step model selection             model chosen per chain link by difficulty
+  The chain end-to-end, with handoff mechanism per seam
+
+  ┌─ Server: monitoring agent (briefing) ──────────────────┐
+  │  prompt: lib/agents/legacy-prompts/monitoring.md       │
+  │  tools:  monitoringTools (13)                          │
+  │  output: Anomaly[]                                     │
+  └──────────────────────┬─────────────────────────────────┘
+                         │ Anomaly stream events
+                         ▼
+  ┌─ Wire: NDJSON ─────────────────────────────────────────┐
+  │  { type: 'insight', insight } per anomaly              │
+  └──────────────────────┬─────────────────────────────────┘
+                         │
+                         ▼
+  ┌─ Client: useBriefingStream → stashInsights ────────────┐
+  │  sessionStorage[`bi:insight:${id}`] = JSON.stringify(i)│  ← HANDOFF 1
+  └──────────────────────┬─────────────────────────────────┘
+                         │ user clicks card
+                         ▼
+  ┌─ Client navigation ────────────────────────────────────┐
+  │  router.push(`/investigate/${id}?insight=${encoded}`)  │
+  └──────────────────────┬─────────────────────────────────┘
+                         │
+                         ▼
+  ┌─ Server: diagnostic agent (step=diagnose) ─────────────┐
+  │  resolves anomaly from ?insight= param                 │
+  │  prompt: lib/agents/legacy-prompts/diagnostic.md       │
+  │  tools:  diagnosticTools (17)                          │
+  │  output: Diagnosis                                     │
+  │  emits  { type: 'diagnosis', diagnosis }, then done    │
+  └──────────────────────┬─────────────────────────────────┘
+                         │
+                         ▼
+  ┌─ Client: useInvestigation → sessionStorage stash ──────┐
+  │  sessionStorage[`bi:diagnosis:${id}`] = JSON.stringify │  ← HANDOFF 2
+  └──────────────────────┬─────────────────────────────────┘
+                         │ user clicks "see recommendations →"
+                         ▼
+  ┌─ Client navigation ────────────────────────────────────┐
+  │  router.push(`/investigate/${id}/recommend                  │
+  │              ?diagnosis=${encoded}`)                   │
+  └──────────────────────┬─────────────────────────────────┘
+                         │
+                         ▼
+  ┌─ Server: recommendation agent (step=recommend) ────────┐
+  │  parses diagnosis from ?diagnosis= param               │
+  │  prompt: lib/agents/legacy-prompts/recommendation.md   │
+  │  tools:  recommendationTools (8)                       │
+  │  output: Recommendation[]                              │
+  │  emits  { type: 'recommendation' } per rec, then done  │
+  └────────────────────────────────────────────────────────┘
 ```
-
-The chain *enables* an optimization the codebase has not taken: every step runs on the same shared agent-model constant. Because each link is a separate call with a known difficulty, the earlier or simpler links (monitoring detection, the synthesis extraction) could run on a cheaper model (the same cheap tier already used for intent classification) while the reasoning-heavy links stay on the dear tier. The seam exists — the shared agent loop reads the model name from one constant — but the per-step selection is not wired. This is a real, un-taken cost optimization, and it is honest to name it as not done.
-
-### The principle
-
-Decompose a multi-stage task into a fixed sequence of single-job model calls wired by ordinary control flow, with a typed handoff and an isolated failure boundary at each seam. The payoff is the same as any `.then().then()` pipeline: each step is simple, testable, and bounded; failures are contained at the link; and the seams are natural places to validate, log, stream, and later optimize (per-step model choice). Reach for a chain when the path is known in advance — and for an agent only when the model must choose the path (→ ../04-agents-and-tool-use/01-agents-vs-chains.md).
-
----
-
-### Code in this codebase
-
-#### Files, functions, and line ranges
-
-- **The chain orchestration (two-step split):** `app/api/agent/route.ts` reads the `step` param (L117–L118), runs the diagnostic agent on `step !== 'recommend'` (`await diagAgent.investigate(...)` at L238, `send 'diagnosis'` at L239) and the recommendation agent on `step !== 'diagnose'` (`await recAgent.propose(inv, diagnosis!, ...)` at L247). On `step === 'recommend'` the diagnosis comes from the `?diagnosis=` param via `parseDiagnosis` (L227, parser L86–L97). The client (`lib/hooks/useInvestigation.ts`) drives the order: stash `bi:diag:<id>` after step 2 (L138–L139), read + forward it as `&diagnosis=` on step 3 (L72–L84, L162–L164). The combined-capture run (`step == null`) runs both `await`s in one request and caches via `saveInvestigation` (L254). `filterByStep` (L66–L84) keeps one step's events on cached replay. The whole stream body is wrapped in `try/catch` at L196–L263 (`finally { controller.close() }` at L261–L262).
-- **Link 1 (detect):** `MonitoringAgent.scan` — `lib/agents/monitoring.ts` L68–L103; prompt `lib/agents/prompts/monitoring.md`; tools `monitoringTools`; validator `isAnomalyArray`; `maxToolCalls: 6` (L84); degrades to `[]` (L95–L101). Runs in the briefing path `app/api/briefing/route.ts`.
-- **Link 2 (explain):** `DiagnosticAgent.investigate` — `lib/agents/diagnostic.ts` L45–L83; prompt `prompts/diagnostic.md`; tools `diagnosticTools`; validator `isDiagnosis`; `maxToolCalls: 6` (L62); fallback chain `tryParseDiagnosis ?? synthesize ?? FALLBACK` (L74–L75); confidence post-derived at L80–L82.
-- **Link 3 (act):** `RecommendationAgent.propose` — `lib/agents/recommendation.ts` L36–L77; prompt `prompts/recommendation.md`; tools `recommendationTools`; validator `isRecommendationArray`; `maxToolCalls: 4` (L57); fallback chain `tryParseRecommendations ?? synthesize ?? []` (L69–L73); ids assigned and capped at 3 (L76).
-- **The gather→synthesize micro-chain:** `synthesize()` at `lib/agents/diagnostic.ts` L87–L126 and `lib/agents/recommendation.ts` L82–L132 — separate tool-less `anthropic.messages.create` calls (`max_tokens: 2048`) chained after the gather loop in `runAgentLoop` (`lib/agents/base.ts` L48–L176).
-- **The un-taken model optimization:** every link reads `AGENT_MODEL = 'claude-sonnet-4-6'` from `lib/agents/base.ts` L9; the cheaper-model-on-early-steps optimization is not wired (haiku is used only for intent at `lib/agents/intent.ts` L14).
-
----
-
-## Prompt chaining — diagram
-
-This diagram spans the layers. The Route layer owns the chain order — across two `step`-gated HTTP requests for the live path (the `Diagnosis` handed over via the client's sessionStorage), or a single `await` sequence for the legacy combined-capture run; the Agent layer is the three single-job links, each running its own focused call (and a gather→synthesize micro-chain inside two of them); the Provider boundary is where each link's model call goes out.
-
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│  ROUTE LAYER   app/api/agent/route.ts   (owns the order; step-gated)   │
-│                                                                       │
-│  GET ?step=diagnose          GET ?step=recommend            │
-│     resolve anomaly                       parseDiagnosis(?diagnosis=)  │
-│     investigate(anomaly) → Diagnosis      propose(anomaly, diagnosis)  │
-│     send 'diagnosis'                send each 'recommendation'   │
-│              │ hook stash bi:diag:<id>             ▲ hook → &diagnosis= │
-│              └────── sessionStorage handoff ───────┘                   │
-│  body wrapped in try/catch → 'error' + finally{ close }   │
-└───────────────┬───────────────────────────────┬───────────────────────┘
-                │ one job each                   │
-┌───────────────▼───────────────┐ ┌─────────────▼─────────────────────────┐
-│  AGENT LAYER (link 2)          │ │  AGENT LAYER (link 3)                  │
-│  DiagnosticAgent.investigate   │ │  RecommendationAgent.propose           │
-│  prompt: diagnostic.md         │ │  prompt: recommendation.md             │
-│  tools: diagnosticTools (6)    │ │  tools: recommendationTools (4)        │
-│  validator: isDiagnosis        │ │  validator: isRecommendationArray      │
-│  fallback: FALLBACK            │ │  fallback: []                          │
-│                                │ │                                        │
-│  micro-chain:                  │ │  micro-chain:                          │
-│   runAgentLoop (gather)        │ │   runAgentLoop (gather)                │
-│      │ toolCalls               │ │      │ toolCalls                       │
-│      ▼                         │ │      ▼                                 │
-│   synthesize() (→ JSON)        │ │   synthesize() (→ JSON)                │
-└───────────────┬────────────────┘ └─────────────┬──────────────────────────┘
-                │ anthropic.messages.create        │  (all on AGENT_MODEL, base.ts L9)
-┌───────────────▼───────────────────────────────────▼──────────────────────┐
-│  PROVIDER BOUNDARY   Anthropic Messages API                              │
-│  every link is a separate call — focused prompt, small tool set          │
-└────────────────────────────────────────────────────────────────────────────┘
-```
-
-The route owns the order — two `step`-gated requests live, one `await` sequence for capture; each agent is one focused link with its own prompt, tools, validator, and fallback; two links contain a gather→synthesize micro-chain. All links currently share one model — the seam for per-step model choice is open but unused.
-
----
 
 ## Elaborate
 
-### Where this pattern comes from
+The two-handoff split was a deliberate UX decision motivated by the
+diagnostic step being the highest-value individual step. Many users (in
+demo scripts and feedback) get what they need from the diagnosis alone —
+"oh, the conversion drop was in Brazil" — and don't always want to go
+through the recommendation flow. Splitting the route lets the chain
+*stop early* without wasting recommendation cost.
 
-Prompt chaining is the LLM specialization of a decades-old idea: pipeline decomposition. A complex transformation is split into a sequence of simple stages, each with one responsibility, where the output of one is the input of the next — Unix pipes, ETL stages, middleware chains, promise chains. Anthropic's "Building effective agents" (2024) names *prompt chaining* as the first and simplest agentic workflow pattern: decompose a task into fixed steps, optionally gate between them, and only graduate to an autonomous agent when the path cannot be fixed in advance.
+A consequence: the combined run only happens during demo capture
+(`/api/mcp/capture`). The demo replay can fake the user "always continuing"
+because the snapshot has both diagnosis and recommendations. Live flow lets
+users choose.
 
-The reason it is the default starting point is the same reason you split a god-function into small functions: smaller units are easier to prompt, test, validate, and reason about than one monolith.
-
-### The deeper principle
-
-```
-chain (fixed path)                    agent (model-chosen path)
-────────────────────────────────     ────────────────────────────────
-code decides the order                model decides what runs next
-detect → diagnose → recommend         "figure out what to do"
-each step: one prompt, small tools    one loop, all tools, dynamic
-errors isolated per link              errors recovered in-loop
-predictable cost & latency            variable cost & latency
-```
-
-The chain trades flexibility for predictability and isolation. When the stages are known — and a morning briefing always detects, then explains, then acts — the fixed path is strictly better: it is cheaper to reason about, easier to test, and the seams are where validation and streaming live. blooming insights uses a chain at the top level (the briefing) and an agent loop *inside* each link (the tool-use loop), which is the standard hybrid: chain the known stages, give each stage a bounded agent for the part where the model must choose its queries (→ ../04-agents-and-tool-use/01-agents-vs-chains.md).
-
-### Where this breaks down
-
-1. **Sequential `await` cannot branch or parallelize.** The chain is a straight line. A workflow that needs "if diagnosis confidence is low, re-investigate with a different tool set; if high, skip a step" cannot be expressed in `if/await/if/await` without the route becoming a hand-rolled state machine. That is the point to reach for a graph runner (LangGraph).
-
-2. **Latency compounds per link.** Each step is up to `maxToolCalls` round-trips plus a possible `synthesize()` call. The two-step split now gives *each* step its own `maxDuration = 300` route budget (`app/api/agent/route.ts` L20), so diagnose and recommend no longer share one timeout — but within a step the loop + `synthesize()` still compound. Adding a fourth sequential link inside one step is risky without trimming per-link budgets.
-
-3. **One weak link sets the floor.** A `FALLBACK` diagnosis (`lib/agents/diagnostic.ts` L16–L20) is valid input to `propose`, so the chain keeps running — but it runs on hollow evidence and produces hollow recommendations. Error isolation prevents a crash; it does not guarantee a *good* result when an upstream link degrades.
-
-### What to explore next
-
-- **Per-step model selection:** route the simpler links (monitoring, `synthesize()`) to haiku and the reasoning-heavy links to sonnet — the un-taken cost optimization the chain already enables.
-- **Gating between links:** add a check on `diagnosis.confidence` between investigate and propose to skip or re-run a step (Anthropic's "gated chain" pattern).
-- **LangGraph / a graph runner:** when the path needs branching, cycles, or parallel links, replace the route's `await` sequence with a typed graph (→ ../04-agents-and-tool-use/01-agents-vs-chains.md).
-
----
+The choice to handoff via URL params (sessionStorage backing) rather than
+server-side persistence reflects the stateless serverless constraint.
+Storing the diagnosis in a server-side map keyed by sessionId works on
+dev (where Next reuses the same Node process) and breaks on Vercel (where
+the same session can land on different Lambda instances per request).
+sessionStorage on the client is the most-trusted store that survives both.
 
 ## Project exercises
 
-### Route simpler chain links to a cheaper model
+### Exercise — add a "redo diagnostic" affordance that re-runs only step 2
 
-- **Exercise ID:** B1.8 (adapted) — per-step model tiering across the chain.
-- **What to build:** thread a `model` option through `runAgentLoop` (defaulting to `AGENT_MODEL`) and the `synthesize()` calls, then set the monitoring step and both `synthesize()` extractions to haiku (`'claude-haiku-4-5-20251001'`, already used at `lib/agents/intent.ts` L14) while diagnostic and recommendation reasoning stay on sonnet.
-- **Why it earns its place:** demonstrates you understand a chain's seams are where per-step cost optimization lives, and that you can pick the cheapest model that clears each link's difficulty bar.
-- **Files to touch:** `lib/agents/base.ts` (`runAgentLoop` model option), `lib/agents/monitoring.ts`, `lib/agents/diagnostic.ts` (`synthesize`), `lib/agents/recommendation.ts` (`synthesize`).
-- **Done when:** the monitoring scan and both synthesis calls run on haiku, the reasoning steps run on sonnet, and the full briefing still produces valid `Anomaly[]` / `Diagnosis` / `Recommendation[]`.
-- **Estimated effort:** 1–4hr
+  → **Exercise ID:** `study-ai-eng-02-03.1`
+  → **What to build:** Add a "redo with new prompt"-style button on the
+    diagnosis panel that re-runs the diagnostic agent (perhaps with a
+    user-supplied hypothesis hint as additional input) without re-running
+    the monitoring agent. Demonstrates that each chain step is
+    independently re-runnable.
+  → **Why it earns its place:** Highlights the chain's separability. An
+    interviewer asking "how would you let the user steer the diagnostic?"
+    has a clean answer: it's already a separate route call, just add a
+    hint param.
+  → **Files to touch:** `app/api/agent/route.ts` (accept `hint` param),
+    `lib/agents/diagnostic.ts` (thread the hint into AptKit options),
+    AptKit may need a `userHint` field on `DiagnosticInvestigationAgent`,
+    `app/investigate/[id]/page.tsx` (UI).
+  → **Done when:** User enters a hint ("focus on mobile users"), the
+    diagnostic re-runs with that bias, the diagnosis JSON returns with
+    the hint reflected in `evidence` or `hypothesesConsidered`.
+  → **Estimated effort:** `1–2 days`
 
-### Add a confidence gate between diagnostic and recommendation
+### Exercise — add a deep-link guard
 
-- **Exercise ID:** C1.10 (adapted) — gated chain link.
-- **What to build:** in the route, between `investigate` and `propose`, branch on `diagnosis.confidence` (or a derived signal from the `Diagnosis` shape): if the diagnosis is the `FALLBACK` / low-confidence shape, skip `propose` and emit a "no actionable recommendations — diagnosis inconclusive" step instead of running the recommendation link on hollow input.
-- **Why it earns its place:** shows you understand error isolation alone does not guarantee a good result, and that a gate between links prevents a weak upstream result from wasting a downstream call.
-- **Files to touch:** `app/api/agent/route.ts` (the step-3 branch at L244–L249, where the handed-over diagnosis is already parsed at L227), `lib/mcp/types.ts` (`Diagnosis.confidence` already exists at L71 — derived by `diagnosisConfidence`, `lib/insights/derive.ts` L54–L63).
-- **Done when:** a `FALLBACK` diagnosis short-circuits the recommendation link and the stream emits a clear inconclusive message instead of an empty `Recommendation[]`.
-- **Estimated effort:** 1–4hr
-
----
+  → **Exercise ID:** `study-ai-eng-02-03.2`
+  → **What to build:** When the user deep-links to
+    `/investigate/[id]/recommend` without going through diagnosis first,
+    detect missing diagnosis in sessionStorage and either (a) redirect to
+    `/investigate/[id]` (the diagnose step) or (b) auto-run the
+    diagnostic in the background. Today the route throws an error.
+  → **Why it earns its place:** The chain enforces ordering at the server
+    (good); the UI doesn't *help* the user respect the ordering (bad).
+  → **Files to touch:** `app/investigate/[id]/recommend/page.tsx`,
+    `lib/hooks/useInvestigation.ts`.
+  → **Done when:** Deep-linking to step 3 without a stashed diagnosis no
+    longer surfaces an error panel; either auto-runs step 2 or routes the
+    user there.
+  → **Estimated effort:** `1–4hr`
 
 ## Interview defense
 
-### What an interviewer is really asking
+**Q: How is blooming insights structured — is it one agent or many?**
 
-"Why a chain instead of one big prompt — or instead of an agent?" tests whether you can decompose a task into single-job steps, whether you know a chain's control flow is yours while an agent's is the model's, and whether you can name what the seams between steps buy you (validation, streaming, isolation, per-step optimization). The senior signal is the hybrid: a chain at the top, a bounded agent inside each link.
-
-### Likely questions
-
-**[mid] What are the steps of the briefing chain and how is the order decided?**
-
-Monitoring (detect) → diagnostic (explain) → recommendation (act). The order is decided by code, not the model. On the live path the investigation half is two `step`-gated requests (`app/api/agent/route.ts` L224–L249): `?step=diagnose` produces the `Diagnosis`, the client stashes it (`bi:diag:<id>`) and hands it to `?step=recommend` via `?diagnosis=`. (The combined-capture run does both `await`s in one request.)
+A chain of three: **monitoring → diagnostic → recommendation**, plus the
+free-form QueryAgent and the intent classifier. Each is a separate AptKit
+agent class with its own prompt, tools, and validator. The investigate UI
+splits the diagnose and recommend steps into separate `/api/agent` HTTP
+requests so users can stop after the diagnosis.
 
 ```
-?step=diagnose → Diagnosis ──[sessionStorage bi:diag:<id> → ?diagnosis=]──▶ ?step=recommend → propose
-   code owns the arrow; the model never picks the next step
+  Why splittable:
+   - diagnostic alone is the highest-value step
+   - splitting saves ~$0.12 + ~30s when user doesn't want recs
+   - each step has its own 300s Vercel budget
+   - failure in step 3 doesn't lose step 2's work
 ```
 
-**[senior] Why split each step's gather from its synthesize into a micro-chain?**
+**Anchor line:** "Three agents, two HTTP-bounded handoffs. The
+diagnosis-to-recommendation handoff is a URL param, backed by
+sessionStorage on the client."
 
-The gather loop (`runAgentLoop`) accumulates a long, tangled context — tool_use/tool_result pairs, partial reasoning. Parsing JSON out of its final turn is unreliable. So when the final turn fails, a separate `synthesize()` call (`lib/agents/diagnostic.ts` L87–L126) runs with a clean context built only from the formatted evidence and one job: emit JSON. It is a chain within a step — gather, then extract — and the extract link has a focused prompt and no tools.
+**Q: What's the load-bearing part of the chaining?**
 
-```
-runAgentLoop (gather, long context) ──toolCalls──▶ synthesize (extract, clean context) → JSON
-```
+The two handoffs being **explicit and durable**. The diagnosis JSON survives
+the page navigation because it's stashed in sessionStorage AND passed
+through the URL param to the next route call. The route refuses to run the
+recommendation step without a diagnosis. The chain enforces ordering by
+construction — `/api/agent?step=recommend` without a diagnosis param throws,
+not 500s on a missing field deep in the agent loop.
 
-**[arch] When would you replace this chain with a graph, and what does it cost you today?**
+**Anchor line:** "The handoff is JSON in a URL param backed by
+sessionStorage. The server validates the JSON before running the next agent.
+That's what makes the chain composable instead of brittle."
 
-When the workflow needs to branch on an intermediate result or run links in parallel — e.g. skip recommendation if the diagnosis is low-confidence, or run two diagnostic hypotheses at once. The current step-gating (`if (step === …)`) is a coarse two-way split, not a graph; expressing conditional or parallel edges would turn the route + client handoff into a hand-rolled state machine. Today each step gets its own `maxDuration = 300` budget (route.ts L20), so the timeout pressure is lower than a single combined request — but per-step model selection still isn't wired and adding real branching is the trigger to reach for a graph runner.
+**Q: Why not one giant agent with all the tools?**
 
-```
-fixed path → await chain (now)      branching/parallel → graph runner (later)
-```
+Three reasons that show up immediately:
+- The prompt gets unmanageable (28 tools, four output shapes, three intents).
+- Eval surface explodes — you can't measure diagnosis quality without
+  measuring recommendation quality at the same time.
+- The user has no point of intervention — they have to commit to the full
+  chain or nothing.
 
-### The question candidates always dodge
-
-**"You run every step on the same expensive model — why?"** The honest answer is that the chain *enables* per-step model tiering but the codebase has not wired it: every link reads `AGENT_MODEL` (`lib/agents/base.ts` L9), and haiku is used only for intent classification (`lib/agents/intent.ts` L14). A candidate who claims it is already optimized is wrong; the strong answer names the un-taken optimization and where it would go (the exercise above).
-
-### One-line anchors
-
-- `app/api/agent/route.ts` L224–L249 — the step-gated diagnostic→recommendation chain; `step` param at L117–L118, diagnosis re-parsed at L227.
-- `lib/hooks/useInvestigation.ts` L138–L139, L162–L164 — the `bi:diag:<id>` sessionStorage handoff between the two steps.
-- `lib/agents/diagnostic.ts` L74–L75 — the gather→synthesize→FALLBACK micro-chain inside a link.
-- `lib/agents/diagnostic.ts` L87–L126 — `synthesize()`, the clean-context extract link.
-- `lib/agents/base.ts` L9 — `AGENT_MODEL`, the single constant that makes per-step model tiering un-wired.
-- A chain's order is the code's; an agent's order is the model's (→ ../04-agents-and-tool-use/01-agents-vs-chains.md).
-
----
+The chain trades a slightly more complex orchestration layer (handoff
+parsing, state stashing) for cleaner per-agent prompts, independent eval
+surface, and user control.
 
 ## See also
 
-→ 01-context-window.md · → 02-lost-in-the-middle.md · → ../04-agents-and-tool-use/01-agents-vs-chains.md · → ../01-llm-foundations/04-structured-outputs.md
-
----
+  → `01-context-window.md` — the budget *per chain step* (not summed)
+  → `04-agents-and-tool-use/01-agents-vs-chains.md` — the chain-vs-loop distinction
+    at the level WITHIN one step
+  → `01-llm-foundations/07-heuristic-before-llm.md` — the gates that run BEFORE
+    each chain step's LLM

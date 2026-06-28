@@ -1,443 +1,223 @@
-# When NOT to go multi-agent (the escalation gate)
+# When NOT to go multi-agent
 
-**Industry name(s):** Escalation gate, single-agent baseline, deterministic-orchestration-first, "do not auto-route what you can hand-route"
-**Type:** Industry standard · Language-agnostic
+*Industry name: the multi-agent decision gate — Industry standard.*
 
-> The architectural-opinion file: blooming insights IS multi-agent but deliberately MINIMAL — a deterministic pipeline + a router + single-purpose agents — and AVOIDS an autonomous LLM supervisor and its 2–5x coordination tax. The escalation gate names when the next step earns its overhead.
+The single most important decision in this whole section. Most teams reach for multi-agent before single-agent has hit a ceiling. This repo chose *minimal multi-agent* and the choice is the load-bearing one — read this file before reading the topology files.
 
+## Zoom out — where this decision lives
 
----
-
-## Zoom out, then zoom in
-
-**Zoom out — the bigger picture.** The "when not to go multi-agent" question sits at the Pipeline coordinator band — the place where blooming insights decided to use a deterministic `if`-ladder instead of promoting orchestration to an LLM supervisor. It's a *decision about the band itself*: keep the supervisor as code (`lib/agents/pipeline.ts`) or promote it to a model. blooming insights chose code, and this file is the gate that justified it. The Per-agent definitions and Shared agent loop below are unchanged either way — only the Pipeline band's owner moves between "engineer" and "model."
+Before any agent is instantiated, at design time. It's not a runtime decision — it's the architecture choice that shapes everything else.
 
 ```
-  Zoom out — where the "do we go multi-agent?" gate lives
+  The escalation gate — at design time, before any code
 
-  ┌─ Route handler ─────────────────────────────────┐
-  │  app/api/agent/route.ts                          │
-  └─────────────────────────┬────────────────────────┘
-                            │
-  ┌─ Pipeline coordinator ──▼────────────────────────┐  ← we are here
-  │  ★ THE GATE ★                                     │
-  │  Today (CODE owns coordination):                  │
-  │    lib/agents/pipeline.ts — sequential, fixed     │
-  │    order: monitoring → diagnostic → recommendation│
-  │  Alternative (MODEL owns coordination):           │
-  │    a supervisor agent reasons each next stage     │
-  │    +1 LLM call per stage, ~2–5x cost tax          │
-  └─────────────────────────┬────────────────────────┘
-                            │  (same below either way)
-  ┌─ Per-agent definitions ─▼────────────────────────┐
-  │  monitoring | diagnostic | recommendation | query │
-  └─────────────────────────┬────────────────────────┘
-  ┌─ Shared agent loop ─────▼────────────────────────┐
-  │  runAgentLoop (lib/agents/loop.ts)               │
-  └──────────────────────────────────────────────────┘
+  ┌─ "I need an agent" ──────────────────────────────────────┐
+  │                                                            │
+  │  → start with ONE ReAct loop. Measure.                    │
+  │                                                            │
+  │  → identify the SPECIFIC failure single-agent cannot fix  │
+  │     - is the task genuinely decomposable into specialties?│
+  │     - is there a quality ceiling the prompt can't lift?    │
+  │                                                            │
+  │  → only then escalate to a SPECIFIC topology               │
+  │     - and pick the cheapest one that addresses the failure │
+  └────────────────────────────────────────────────────────────┘
 ```
-
-**Zoom in — narrow to the concept.** The question is: when do you *not* promote the parent `if`-ladder to an LLM supervisor — and when do you? It's not "do you have multiple agents" (blooming insights has four). It's "does control flow between them live in code or in a model?" The escalation gate is the test that decides; blooming insights walked through it once and chose code. Below, you'll see the gate's criteria and how this codebase passes them.
-
----
 
 ## Structure pass
 
-**Layers.** This file is a *decision about the Pipeline coordinator band*, so the layers it weighs are the three bands the decision spans: the **Pipeline coordinator** (today: `lib/agents/pipeline.ts`, an engineer-written sequential `if`-ladder; alternative: an LLM supervisor agent that reasons about the next stage), the **Per-agent definitions** (monitoring, diagnostic, recommendation, query — these stay the same either way), and the **Shared agent loop** (`runAgentLoop` — also unchanged either way). Only the top band's owner is at stake.
-
-**Axis: control.** Who decides the order in which the four agents run — engineer-written code or a model? This is the right axis because the entire gate is asking *should I move control of the inter-agent step from CODE to MODEL?* — and that's a yes/no on a single seam. Cost is a real concern (the supervisor variant costs +1 LLM call per stage, roughly a 2–5x coordination tax) but cost is the *consequence* of the control choice. State doesn't flip across the gate (every variant passes the same data shapes). Control is what the gate tests.
-
-**Seams.** One seam is load-bearing: the seam between the Pipeline coordinator and the per-agent loops. Today control sits in CODE on the Pipeline side (the `if`-ladder fixes the order, no model is consulted about it) and flips to MODEL inside each per-agent loop (the agent decides its tool calls). Promoting to a supervisor would move the Pipeline side itself to MODEL — the flip would happen one boundary earlier, and the supervisor would re-decide what code already knew. The gate is the test for whether that move pays for itself.
+The axis: **what does multi-agent cost, and what does it buy?**
 
 ```
-  Structure pass — When NOT to go multi-agent (the gate)
+  The cost of crossing the gate
 
-  ┌─ 1. LAYERS ───────────────────────────────────┐
-  │  Pipeline coordinator (CODE today / MODEL?)    │
-  │  Per-agent definitions (unchanged either way)  │
-  │  Shared agent loop (unchanged either way)      │
-  └────────────────────────┬───────────────────────┘
-                           │  pick the axis
-  ┌─ 2. AXIS ─────────────▼────────────────────────┐
-  │  control: who decides which agent runs next?   │
-  └────────────────────────┬───────────────────────┘
-                           │  trace across layers, find flips
-  ┌─ 3. SEAMS ────────────▼────────────────────────┐
-  │  Seam: Pipeline coord ↔ per-agent loops        │
-  │        (CODE → MODEL today)                    │
-  │        ★ load-bearing — the gate is asking     │
-  │        "should this seam move one band up?"    │
-  └────────────────────────┬───────────────────────┘
-                           ▼
-                   Block 4 — How it works
+  ┌─ Cost (you pay this no matter what) ────────────────────┐
+  │  ~2-5x coordination overhead (tokens spent on how       │
+  │    agents talk to each other, not on the actual task)   │
+  │  much larger debugging surface (you now debug the        │
+  │    conversation between agents, not just one agent's loop)│
+  │  per-agent context juggling (which agent sees what)      │
+  └──────────────────────────────────────────────────────────┘
+
+  ┌─ Buy (you only get this if the task genuinely splits) ──┐
+  │  decomposed specialties (each agent has a narrower prompt│
+  │    and a narrower tool grant — focused, faster)          │
+  │  parallel work (if the subtasks are independent)         │
+  │  isolated failure surface (one agent's bug doesn't taint │
+  │    the others)                                            │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-```
-  The seam — "who decides the next stage?" answered two ways
-
-  ┌─ Today (chosen) ─┐   gate    ┌─ Supervisor (alt) ┐
-  │ CODE: if-ladder, │ ═══╪═════►│ MODEL: supervisor │
-  │ fixed order,     │ (would    │ reasons each next │
-  │ 0 extra LLM/run  │  flip)    │ stage, +1 LLM/run │
-  └──────────────────┘           └───────────────────┘
-         ▲                                     ▲
-         └───── same axis (control), two answers ─┘
-                → the gate decides if the flip earns it
-```
-
-The skeleton is mapped — the rest of this file walks the gate's criteria and how blooming insights passes them.
-
----
+The buy column only delivers if the task decomposes naturally. If the task is "answer a question about ecommerce data," the decomposition is forced — and forced decomposition pays the cost without the buy.
 
 ## How it works
 
-**The mental model: a one-way gate you cross once you've earned it.** Single-agent on one side, multi-agent on the other. You don't walk through it because you read a blog post; you walk through it because the single-agent baseline measurably failed in a way only decomposition can fix.
+### Move 1 — the mental model
+
+Microservices have the same gate. You don't split a monolith into 12 microservices because microservices are cool — you split it when service boundaries are load-bearing for team velocity, deploy independence, or scaling. Multi-agent is the same: you split into N agents when the agent boundaries are load-bearing for the *task*. Most of the time they aren't, and you've added a coordination tax for nothing.
 
 ```
-The escalation gate
+  The escalation ladder — only step up when a SPECIFIC failure justifies it
 
-  ┌────────────────────────────┐
-  │ 1. single-agent (ReAct)    │  start here, always
-  │    baseline                │
-  └─────────────┬──────────────┘
-                ▼
-  ┌────────────────────────────┐
-  │ 2. measure                 │  success rate, tool-call accuracy,
-  │    (real workload)         │  latency, cost, failure mode
-  └─────────────┬──────────────┘
-                ▼
-  ┌────────────────────────────┐
-  │ 3. is the failure          │
-  │    decomposable into       │
-  │    independent specialties? │
-  └─────────────┬──────────────┘
-        no ◄────┤────► yes
-        │              │
-        ▼              ▼
-   stay single   pick the SPECIFIC topology
-   agent —       that addresses the failure
-   fix prompt,   (not "multi-agent" as a vibe)
-   tools,
-   retrieval
+  ┌─ Step 0: prompt + tools ──────────────────────┐
+  │  if the failure can be fixed by a better       │
+  │  prompt or a better tool grant, do that        │
+  └───────────────┬────────────────────────────────┘
+                  │ failure persists
+                  ▼
+  ┌─ Step 1: single-agent ReAct ──────────────────┐
+  │  if a measurable failure mode remains and      │
+  │  isn't fixable by prompt/tools, escalate       │
+  └───────────────┬────────────────────────────────┘
+                  │ failure persists
+                  │ AND task genuinely decomposable
+                  ▼
+  ┌─ Step 2: multi-agent (pick the cheapest        │
+  │           topology that addresses the failure) │
+  │  sequential pipeline (if steps are linear)     │
+  │  supervisor-worker (if work is decomposable)   │
+  │  fan-out (if subtasks are independent)         │
+  │  debate (if quality > cost on high-stakes ops) │
+  └────────────────────────────────────────────────┘
 ```
 
-The strategy in plain English: **don't auto-route what you can hand-route.** Code is cheaper, more predictable, and easier to debug than a model. Promote control flow to a model only where the path genuinely depends on runtime data.
+### Move 2 — how this repo crossed the gate (or didn't)
 
-### Layer 1 — the single-agent baseline
+This repo went *minimal* multi-agent: three agents in a sequential pipeline, with a fourth for free-form Q&A and a fifth for intent classification. The supervisor is `app/api/agent/route.ts` — TypeScript code, not an LLM.
 
-The technical thing: a *ReAct loop* (reason → act → observe → repeat) inside one process, one prompt, one tool budget. The whole problem in one agent.
-
-If you're coming from frontend, this is the parent component owning all state — every transition is a `setState` you wrote, every branch is an `if` you can grep for. You'd never reach for state machines, Redux, or XState until you'd felt the pain a `setState` ladder couldn't carry. Same instinct here.
+The decision rationale:
 
 ```
-single-agent baseline
+  Why minimal multi-agent for blooming insights
 
-  user → [ one agent ] → answer
-              │
-              ▼
-       reason → tool → observe → reason → … → final
+  Question to answer:                Decision:
+  ───────────────────                ─────────
+  "Is the task decomposable          Yes — the product workflow IS
+   into specialties?"                 three named steps (what changed
+                                      → why → what to do). Each step
+                                      has a different output shape,
+                                      a different tool grant, a
+                                      different cost profile.
+                                      → split into three agents
 
-  one prompt, one tool budget, one trajectory
-  one thing to debug
+  "Does the supervisor need          NO — the steps run in a fixed
+   to decide which agent next?"       order. The URL `?step=` carries
+                                      the decision. Burning an LLM
+                                      call to re-derive "run the
+                                      diagnostic agent next" is waste.
+                                      → supervisor stays as code
+
+  "Do the agents need to             NO — each agent's input is the
+   share state across each other?"    previous agent's output, passed
+                                      as a plain JSON arg. Vercel's
+                                      ephemeral instances FORCE this
+                                      anyway (no shared memory
+                                      between requests).
+                                      → message passing, no blackboard
+
+  "Do subtasks fan out?"             NO — the monitoring agent runs
+                                      categories sequentially; no
+                                      worker agents. Bloomreach's
+                                      ~1 req/s rate limit also
+                                      forbids parallel calls.
+                                      → no fan-out
+
+  "Do we need a critic agent?"       NOT YET — the StatusLog UI shows
+                                      every hypothesis + tool call;
+                                      the user is the critic. Adding
+                                      an LLM critic now would double-
+                                      pay for the same check.
+                                      → no debate / verifier-critic
 ```
 
-The practical consequence: every failure is in one place. You replay one trajectory. You tune one prompt. You don't pay for coordination because there isn't any. The catch is that one prompt has to cover the whole task — and if the task has genuinely distinct sub-jobs with different tool needs, the prompt gets long, the tool budget gets contested, and the model starts mixing concerns.
+The pattern: every "yes" added a piece of multi-agent infrastructure; every "no" stayed minimal. The result is the cheapest topology that still composes specialized agents — which is also the most debuggable.
 
-The condition under which it works: the task fits in one budget and one prompt without bleeding responsibilities. If it does, you're done — most "agentic" projects could stop here.
+### Move 3 — the principle
 
-### Layer 2 — measure before you decompose
+Multi-agent is microservices for LLM systems. The cost is real and compounds with the number of agents; the gain is conditional on the task genuinely splitting. The senior move is "I considered multi-agent and chose [this minimal version] because [the failure single-agent couldn't fix]." Not "I went multi-agent because that's the modern shape."
 
-The technical thing: a *trajectory eval* — record real runs of the baseline, label the failures by type, and identify the failure mode the single-agent shape *can't* fix with more prompt tuning.
+This repo's specific senior move: **the supervisor is code, not an LLM.** When the orchestration decision is "what does the URL say," you don't need an agent to decide; you need an `if` statement. Coordination cost: zero tokens, zero latency, zero debugging burden. Cost saved by NOT having an LLM supervisor: probably 30-40% of total tokens, plus the entire surface of "why did the supervisor pick the wrong agent" bugs.
 
-If you're coming from frontend, this is profiling before optimizing. You don't `useMemo` everything; you profile, find the one component that re-renders 200 times, fix that. Same here — you don't decompose by reflex, you decompose by evidence.
+## Primary diagram
 
-```
-measure ⇒ classify failures ⇒ pick the fix layer
-
-  failure type           fix layer
-  ─────────────────      ──────────────────────────
-  wrong tool chosen      prompt + tool descriptions
-  tool succeeded but     prompt (output format) +
-   output not used        retrieval (better context)
-  budget blown on a      iteration cap + summary
-   sub-task               step
-  sub-tasks contend       ──► DECOMPOSE
-   for the same budget
-   AND have different
-   tool needs
-```
-
-The practical consequence: if the failure is "the model picked the wrong tool," decomposing won't help — you have a prompt problem. If the failure is "the diagnostic sub-task starves the recommendation sub-task because they share a 12-tool budget," decomposing *does* help — that's a structural problem one prompt cannot fix.
-
-The condition under which decomposition is the right answer: the failure is *structural*, not *propositional*. Structural = one loop physically cannot do the job (budget contention, tool subset conflict, prompt length). Propositional = the prompt told the model the wrong thing.
-
-### Layer 3 — pick the SPECIFIC topology, not "multi-agent" as a vibe
-
-The technical thing: once you've earned decomposition, you pick the topology that addresses the *specific* failure, not the most-blogged-about one.
-
-If you're coming from frontend, this is choosing the state-management library by the problem it solves, not by which one HN voted for last week. Forms? React Hook Form. Cross-cutting cache? React Query. Don't import all three because "state management is good."
+The four shapes, ranked by overhead, with this repo's place marked:
 
 ```
-decomposable failure         topology that addresses it
-──────────────────────       ─────────────────────────
-shared budget contention     sequential pipeline (each stage
-                              gets its own budget; output of one
-                              feeds the next)         → see 03
+  Multi-agent topologies — ranked by overhead
 
-independent sub-questions    parallel fan-out (Promise.all over
-in a known set                workers; latency = max, not sum)
-                                                      → see 04
+  ┌─ NONE: single-agent ReAct ──────────────────────────────┐ ★ where most teams should stop ★
+  │  one loop, one model, one tool grant                     │
+  │  cost: baseline                                          │
+  └──────────────────────────────────────────────────────────┘
 
-high-stakes output where     debate / verifier-critic (second
-errors are expensive          model reviews the first)
-                                                      → see 05
+  ┌─ MINIMAL: sequential pipeline + code supervisor ────────┐ ★ ← BLOOMING INSIGHTS LIVES HERE ★
+  │  N agents in a fixed order, dispatch by `if (step===X)` │
+  │  cost: ~Nx single-agent (because N agent calls in series)│
+  │  buy: specialization, isolated failure surface           │
+  └──────────────────────────────────────────────────────────┘
 
-peer specialists where the   swarm / handoff (peer-to-peer,
-ORDER must depend on what    model-decided control transfer)
-the data shows                                        → see 06
+  ┌─ MID: supervisor-worker (LLM supervisor) ───────────────┐
+  │  supervisor LLM decides which worker, then synthesizes  │
+  │  cost: ~2-3x single-agent                               │
+  │  buy: dynamic dispatch (workers chosen per request)      │
+  └──────────────────────────────────────────────────────────┘
 
-needs human-in-the-loop      graph orchestration (explicit
-pause/resume                  state machine, checkpointing)
-                                                      → see 07
-
-ORDER of stages is fixed     deterministic route + sequential
-(the blooming insights case) pipeline (no LLM supervisor)
-                                                      → see 03 + 02
+  ┌─ HEAVY: fan-out + supervisor + debate ──────────────────┐
+  │  parallel workers + critic agents + multi-round arguing  │
+  │  cost: 5-10x single-agent                                │
+  │  buy: only when quality > cost on high-stakes ops        │
+  └──────────────────────────────────────────────────────────┘
 ```
-
-The practical consequence: blooming insights' specific failure was "one prompt cannot carry detect + diagnose + recommend with three different tool subsets and three different output schemas, in one tool budget." The topology that addresses *that* is the sequential pipeline with per-stage tool subsets — not a supervisor agent that reasons about ordering, because the order was already known. So the code stays deterministic. The four agents earn their decomposition; the route stays code.
-
-The condition under which "deterministic route + pipeline" is enough: the stage *order* is knowable up front AND the workers are single-purpose AND no peer handoff is needed. All three are true here.
-
-**Where this lives in the repo.** The deterministic supervisor sits in `app/api/agent/route.ts`'s `GET` stream `start()` body at L199–L249 — lead-agent select (L199–L200), query branch (L210–L218), diagnostic→recommendation (L224–L249). This is the `if`-ladder that picks the next agent. No model is consulted. If you imagine the LLM-supervisor alternative, this is the file you'd replace.
-
-Each stage's per-agent specialisation lives in `lib/agents/base.ts` `runAgentLoop()` at L48–L176 — loop at L85, natural stop on zero `tool_use` at L121, observation fed back at L171, forced-final on budget spent at L90. All four agents share this loop; the per-agent tool subset comes from `lib/mcp/tools.ts` and the per-agent `maxToolCalls` cap is 6/6/6/4. The decomposition is real; the orchestration on top of it is deterministic.
-
-The same "don't pay for capability the job doesn't need" principle runs one layer down at the per-call level: `classifyIntent()` in `lib/agents/intent.ts` uses `CLASSIFIER_MODEL = 'claude-haiku-4-5-20251001'` at L14 — Haiku, not Sonnet — because classification doesn't need Sonnet-grade reasoning. Sonnet 4.6 is everywhere else (see `base.ts` L9).
-
-```
-shape (not full impl):
-
-  // The "supervisor" is THIS — an if-ladder in code, not an agent
-  const leadAgent: AgentName =
-    q && !insightId      ? 'coordinator'    // query flow
-    : step === 'recommend' ? 'recommendation'
-                           : 'diagnostic';   // pipeline default
-
-  // The pipeline order is fixed; the route hands diagnosis to recommendation
-  const diagnosis = await diagAgent.investigate(inv, hooks);
-  const recs     = await recAgent.propose(inv, diagnosis, hooks);
-```
-
-### Phase A vs Phase B — what would force the gate to move
-
-```
-        Now (this codebase)              If quality forced it later
-┌─────────────────────────────────┐  ┌─────────────────────────────────┐
-│ deterministic route             │  │ LLM supervisor agent            │ ←
-│  (if-ladder picks next stage)   │  │  (reasons about which stage     │
-│   ▼                             │  │   should run next, run-to-run)  │
-│ sequential pipeline:            │  │   ▼                             │
-│  monitoring → diagnostic →      │  │ same four agents — but the      │
-│  recommendation                 │  │  supervisor may skip/loop/      │
-│   ▼                             │  │  reorder them                   │
-│ each stage = a ReAct loop       │  │   ▼                             │
-│  (model-driven WORK, code-      │  │ each stage = a ReAct loop       │
-│   driven ORDER)                 │  │  (unchanged)                    │
-└─────────────────────────────────┘  └─────────────────────────────────┘
-  the inner loops are identical — only the OUTER control owner
-  moves from code to model
-```
-
-*Now:* the order is fixed (`monitoring → diagnostic → recommendation`) and the route file enforces it. The cost is zero extra LLM calls for ordering; the constraint is "this only works because the order is genuinely fixed."
-
-*If quality forced it:* the day a stage's *output* has to change which stage runs next — e.g. "if the diagnosis is inconclusive, route to a deep-dive specialist instead of recommendation" — the route's `if`-ladder can't express that without becoming a switchboard. At that point the supervisor agent earns its overhead. Until then, it doesn't.
-
-This is what people mean by "use the simplest orchestration that fits." The gate isn't a permission to never go multi-agent — it's a discipline to *measure first*. blooming insights is multi-agent. It's just multi-agent in the deterministic way, because the failure that forced decomposition didn't also force LLM-decided routing.
-
-The full picture is below.
-
----
-
-## The escalation gate — diagram
-
-```
-The escalation gate — full picture
-
-  ┌─ SINGLE-AGENT BASELINE (always start here) ─────────────────┐
-  │                                                              │
-  │   user task                                                  │
-  │      │                                                       │
-  │      ▼                                                       │
-  │   ┌──────────────────────┐                                   │
-  │   │ one ReAct agent      │  one prompt, one tool budget,     │
-  │   │ (reason → act → obs) │  one trajectory                   │
-  │   └──────────────────────┘                                   │
-  │      │                                                       │
-  │      ▼  PRODUCTION measurement                               │
-  │   success rate / tool-call accuracy / latency / cost         │
-  │                                                              │
-  └──────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-  ┌─ DIAGNOSIS GATE ─────────────────────────────────────────────┐
-  │                                                              │
-  │   what kind of failure is this?                              │
-  │                                                              │
-  │   ┌─ propositional ──┐    ┌─ structural ──────────────────┐  │
-  │   │ wrong prompt /   │    │ budget contention / mixed     │  │
-  │   │ wrong tool desc /│    │ tool subsets / responsibilities│  │
-  │   │ wrong retrieval  │    │ bleeding into each other      │  │
-  │   └────────┬─────────┘    └────────────┬──────────────────┘  │
-  │            ▼                           ▼                     │
-  │   fix at the prompt /          DECOMPOSE                     │
-  │   tool / retrieval layer       (and pick the topology that   │
-  │   (stay single-agent)          addresses the specific failure)│
-  │                                                              │
-  └──────────────────────────────────────────────────────────────┘
-                                          │
-                                          ▼
-  ┌─ MULTI-AGENT (pick by failure, not by vibe) ─────────────────┐
-  │                                                              │
-  │   blooming insights' answer: sequential pipeline +           │
-  │   deterministic route (NO LLM supervisor)                    │
-  │                                                              │
-  │   monitoring  ──►  diagnostic  ──►  recommendation           │
-  │      (ReAct)         (ReAct)            (ReAct)              │
-  │                                                              │
-  │   each stage: its own prompt, its own tool subset, its own   │
-  │   budget cap, its own forced-synthesis turn                  │
-  │                                                              │
-  │   the route file (app/api/agent/route.ts) is the supervisor  │
-  │   — written in code, not as an agent.                        │
-  │                                                              │
-  └──────────────────────────────────────────────────────────────┘
-```
-
----
 
 ## Elaborate
 
-### Where this pattern comes from
+The "2-5x coordination overhead" number isn't a guess — it's the rough consensus from teams who shipped multi-agent and went back to single-agent (or, like this repo, minimal multi-agent). The token overhead breaks down as:
 
-The gate got its current framing from Anthropic's 2024 "Building Effective Agents" essay, which insisted that "agentic" was being claimed by systems that were workflows in disguise — and that workflows were not a worse version of agents, they were a *better* fit for problems where the path was knowable. The same essay coined the now-standard escalation order: start with a single LLM call; if it fails, add tools; if it fails, add a workflow; only at the end, if the workflow fails, escalate to autonomous agents.
+- **Supervisor calls** to dispatch and synthesize — each is a full LLM turn over the running context
+- **Per-worker context setup** — each worker needs the task description, sometimes the shared state, often the prior workers' outputs
+- **Synthesis on the way out** — combining N workers' outputs into one answer is another full call
 
-The "2–5x coordination tax" number is empirical, reported across multiple agent-framework write-ups in 2024–2025: a multi-agent supervisor + workers typically costs 2–5x the tokens of a well-tuned single agent, with most of the spend going to the supervisor re-explaining context to each worker and synthesizing their outputs.
+The debugging cost is harder to quantify but worse in practice. A single-agent loop has one trajectory you can read top-to-bottom. A 4-agent supervisor-worker has a tree of trajectories where the supervisor's decision logic lives in *prompts*, not code — so "why did it pick worker B" is a prompt-engineering question, not a stepping-through-code question. Production teams routinely report 3-5x debugging time vs single-agent.
 
-### The deeper principle
+The honest framing for when multi-agent earns its overhead: when one of these is true and *measurable*, not theorized:
+- The single-agent loop's success rate plateaus and the failure mode is "the model can't hold context across roles" (split into specialized agents helps)
+- The latency is dominated by sequential dependencies that aren't actually sequential (split into parallel agents helps)
+- The output quality benefits from a different model's perspective (debate / critic helps)
 
-**Don't auto-route what you can hand-route.** Control flow is a thing you can place. Code is the cheapest, most predictable, most debuggable place to put it. Models earn their cost only where the path genuinely depends on runtime data the engineer can't know up front.
-
-```
-   path knowable up front  ─► code owns control flow
-                              (chain, route, state machine)
-   path depends on data    ─► model owns control flow
-                              (ReAct loop, LLM supervisor,
-                               swarm handoff)
-```
-
-This is the same instinct as choosing static rendering over client-side rendering for marketing pages: don't pay for runtime computation when the answer is the same every time.
-
-### Where this breaks down
-
-The gate becomes wrong when the codebase grows a *family* of stage orderings that can't be expressed as an `if`-ladder without exploding combinatorially — at that point the route file becomes a switchboard, and an LLM supervisor's reasoning over the same decision is cheaper to maintain. Also when the system has to interact with peer specialists where the *next specialist* is genuinely unknowable (a triage system that may need any of 20 sub-specialists, picked by the data) — that's swarm territory, and a route file is the wrong shape for it.
-
-### What to explore next
-- `./02-supervisor-worker.md` → the topology this file says no to, and the honest nuance about the route being a "hard-coded supervisor"
-- `./03-sequential-pipeline.md` → the topology this codebase says yes to
-- `./09-coordination-failure-modes.md` → the failures the deterministic shape *prevents*, not just controls
-- `../01-reasoning-patterns/01-chains-vs-agents.md` → the chain/agent boundary at the per-loop level
-- `../../study-ai-engineering/04-agents-and-tool-use/01-agents-vs-chains.md` → the mechanics of the boundary at the per-call level
-
----
+If none of these are measured failures of single-agent in your system, you don't have justification for multi-agent yet. Build single-agent, measure, escalate on evidence.
 
 ## Interview defense
 
-### What an interviewer is really asking
+**Q: "Why is your system multi-agent?"**
 
-When an interviewer asks "why didn't you make this multi-agent" or "why didn't you use [framework] for the orchestration," they're testing whether you can defend an absence — whether you chose the simpler shape deliberately, or didn't know the complex one existed. The strong signal is showing you considered the autonomous-supervisor path and named the specific reason you didn't take it. The weak signal is calling deterministic orchestration "less advanced" — it's not. It's a different point on the cost ledger that this problem doesn't need to leave.
+A: It's *minimal* multi-agent — three agents in a sequential pipeline, plus a free-form QueryAgent and an intent classifier. The supervisor is route code, not an LLM. The decomposition is the product workflow: what changed (monitoring) → why (diagnostic) → what to do (recommendation). Each step has a different output shape, a different tool grant, a different cost profile — those are real specializations, not forced ones. What I deliberately *didn't* add: an LLM supervisor (the URL knows which agent runs; an LLM picking would be ~30-40% token waste), fan-out (Bloomreach's ~1 req/s rate limit makes parallel infeasible without a concurrency cap), debate (the StatusLog UI already shows every tool call to the user — they're the critic).
 
-### Likely questions
+Diagram I'd sketch:
 
-[mid] Q: Is blooming insights multi-agent?
-
-A: Yes — four agents (monitoring, diagnostic, recommendation, query), each with its own prompt and tool subset, each running the shared `runAgentLoop` in `base.ts`. But the orchestration on top is deterministic: the route file `app/api/agent/route.ts` L199–L249 is an `if`-ladder that picks which agent runs next. There's no LLM supervisor. So it's multi-agent in workers, single-process in coordination.
-
-Diagram:
 ```
-  route.ts (CODE supervisor, not an agent)
-   ┌─────────────────────────────────┐
-   │ if q && !insightId → query      │
-   │ else step==='recommend'         │
-   │      → recommendation           │
-   │ else                            │
-   │      → diagnostic → recommend   │
-   └────────────┬────────────────────┘
-                ▼
-      one of four AGENTS runs
-       (each a ReAct loop)
+  ┌─ minimal multi-agent ─────────────────────┐
+  │                                            │
+  │  /api/briefing → MonitoringAgent (ReAct)  │
+  │                       │                    │
+  │  /api/agent?step=  →  DiagnosticAgent     │
+  │   diagnose           (ReAct)               │
+  │                       │ (diagnosis via URL)│
+  │  /api/agent?step=  →  RecommendationAgent │
+  │   recommend          (ReAct)               │
+  │                                            │
+  │  supervisor = `if (step === X)` in TS     │
+  └────────────────────────────────────────────┘
 ```
 
-[senior] Q: Why didn't you let an LLM supervisor decide which agent runs?
+Anchor: "the supervisor is code because the dispatch is deterministic. Burning an LLM call to decide 'which agent for the recommend URL' would be pure waste."
 
-A: Because the order is knowable up front — you always detect before diagnosing, diagnose before recommending; there's no anomaly you'd recommend-before-you-diagnose. A supervisor would pay 1–3 extra seconds per investigation under our ~1 req/s MCP limit to be told something I already know, and add a third suspect when something comes back wrong (supervisor mis-routed? worker mis-executed? synthesis mis-merged?). I kept ordering in code and freedom inside the loops, where the path genuinely is unknowable. The day a stage's output has to change which stage runs next, I'd promote the route to a supervisor — but not before.
+**Q: "What did you NOT do, and why?"**
 
-Diagram:
-```
-  Chosen: code orders        Alternative: model orders
-  ──────────────────         ──────────────────────────
-  if-ladder picks stage      supervisor reasons each time
-  0 extra LLM calls          +1 LLM call / decision
-  order can't drift          order can drift
-  2 suspects to debug        3 suspects to debug
-```
-
-[arch] Q: At 10x the user volume, would you still keep the route as the supervisor?
-
-A: Yes for ordering, but I'd add layers around it. The `if`-ladder is stateless and free — it scales fine. The pressure points are the per-stage tool budgets against the shared ~1 req/s MCP rate limit (10x concurrent investigations means 10x concurrent agent loops hitting the same MCP server), and the model spend per run. I'd add fan-out backpressure (a concurrency limiter on the agent layer, see `../05-production-serving/02-fan-out-backpressure.md`), cross-run caching of repeated EQL sub-steps (`../05-production-serving/01-cross-turn-caching.md`), and per-tool circuit breakers. None of those add an LLM supervisor — they're all serving-layer controls on top of the same deterministic orchestration.
-
-Diagram:
-```
-  ┌ Route layer (if-ladder) ──── fine, stateless ─────────┐
-  ┌ Agent layer (4 ReAct loops) ◄─ ADD: concurrency cap,  │
-  │                                cross-run cache         │
-  ┌ MCP layer (1 req/s) ◄────────── ADD: circuit breakers, │
-  │                                  per-tool backoff       │
-  └ Supervisor: NOT NEEDED — order is still knowable        │
-```
-
-### The question candidates always dodge
-
-Q: If you were starting today and the latest agent framework (LangGraph / OpenAI Agents SDK / etc.) makes supervisor + handoffs trivial to ship, would you still pick a deterministic route?
-
-A: Yes, for this problem. The cost of "trivial to ship" is the same coordination tax — fewer lines of my code, but the same model calls, the same latency under the MCP rate limit, the same three-suspect debugging surface. Frameworks make the *expression* of autonomous orchestration easier; they don't change the *cost* of running it. The reason to stay deterministic isn't that the framework is hard; it's that the problem doesn't need a model to reason about ordering. I'd reach for the framework's graph orchestration the day I needed checkpointing or human-in-the-loop pauses (covered in `./07-graph-orchestration.md`) — that's a real win the framework gives you that my route file doesn't. But "easier to write a supervisor" isn't a reason to write a supervisor.
-
-Diagram:
-```
-What's easy           What's still expensive
-────────────────      ──────────────────────────────
-  framework code:     coordination cost on EVERY run:
-   one decorator,      +1 LLM call per ordering decision
-   a Graph class       +token spend (2–5x)
-   def of nodes        +debug surface (3 suspects)
-                       +latency under shared MCP limit
-
-The framework is sugar over the same coordination
-tax. The tax doesn't get cheaper because the syntax did.
-```
-
-### One-line anchors
-
-- "It's multi-agent in workers and single-process in coordination — that's deliberate, not a half-measure."
-- "I split into specialists but kept orchestration deterministic, because the coordination didn't need an LLM to decide it."
-- "The route file is the supervisor — written in code, with zero extra latency and one less suspect to debug."
-- "Single-agent baseline → measure → decompose only on structural failure → pick the SPECIFIC topology. I didn't reach for multi-agent because it sounded good; I reached for it because one prompt couldn't carry three tool subsets."
-- "The day a stage's output has to change which stage runs next, the gate moves. Not before."
-
----
+A: Three big ones. No LLM supervisor (the orchestration is deterministic; an LLM would just re-derive what the URL already encodes). No fan-out (Bloomreach's rate limit forbids concurrent calls without a per-tool concurrency cap, which is its own refactor — see `../05-production-serving/02-fan-out-backpressure.md`). No debate / critic (the StatusLog streams every reasoning step and tool call to the user — the human is the critic; adding an LLM critic now would double-pay). Each "no" maps to a specific cost we're not paying yet. The senior-grade move is naming when we *would* cross each gate: critic when the product moves to autonomous-analyst mode with no human review; fan-out if the monitoring agent's 6-call sequential budget becomes the latency bottleneck; LLM supervisor when the workflow becomes too dynamic for a fixed URL routing table.
 
 ## See also
 
-→ `./02-supervisor-worker.md` · → `./03-sequential-pipeline.md` · → `./09-coordination-failure-modes.md` · → `../01-reasoning-patterns/01-chains-vs-agents.md` · → systems view: `../../study-system-design/06-multi-agent-orchestration.md` · → mechanics: `../../study-ai-engineering/04-agents-and-tool-use/01-agents-vs-chains.md`
-
----
+- [`03-sequential-pipeline.md`](./03-sequential-pipeline.md) — the topology this repo did pick
+- [`02-supervisor-worker.md`](./02-supervisor-worker.md) — the next step up that this repo deliberately avoided
+- [`09-coordination-failure-modes.md`](./09-coordination-failure-modes.md) — what crossing the gate exposes you to
+- [`../01-reasoning-patterns/01-chains-vs-agents.md`](../01-reasoning-patterns/01-chains-vs-agents.md) — the outer-shape decision that frames this one

@@ -1,373 +1,188 @@
 # Agentic RAG
 
-**Industry name(s):** Agentic RAG, retrieval-as-a-tool, ReAct-with-retrieval, dynamic retrieval loop
-**Type:** Industry standard · Language-agnostic
+*Industry name: agentic RAG / iterative RAG — Industry standard.*
 
-> When the retriever is a tool the model calls inside a loop — and the model decides which query to run next based on what the last one returned — RAG stops being a pipeline step and becomes a control flow. blooming insights is the live-API form of this: every `execute_analytics_eql` call is the agent retrieving on-the-fly, and the next query depends on the last result.
+ReAct whose primary tool is retrieval. Static RAG is one shot — retrieve top-k, stuff, generate. Agentic RAG is a loop — decompose the question, retrieve per sub-question, evaluate sufficiency, re-retrieve if needed, then generate.
 
+**Not in this repo.** This codebase has no vector store, no embeddings, no chunking. The closest cousin pattern is its tool-use loop over Bloomreach EQL queries — same loop shape, different tool semantics.
 
----
+## Zoom out — where this concept would live
 
-## Zoom out, then zoom in
-
-**Zoom out — the bigger picture.** Agentic RAG would sit at the Shared agent loop band — a ReAct loop whose primary tool is a retriever (vector index, search API, or live query API). In blooming insights there is no retriever in the classic sense; what fills the same architectural slot is the live EQL/event tools wired through the MCP transport. So the loop shape (model decides each next retrieval call) is exactly what `runAgentLoop` already does — but the retrieval target is a live analytics API, not a vector index. The diagram below shows the would-be vector-RAG retrieval shape on top and blooming insights' live-tool shape on the bottom.
+If adopted, it'd be a refactor inside an existing agent — most likely the QueryAgent or a new corpus-grounded agent that retrieved from blog posts / product docs / past investigations rather than from live Bloomreach data.
 
 ```
-  Zoom out — where agentic RAG WOULD live
+  Where agentic RAG WOULD live (not yet implemented)
 
-  ┌─ Pipeline coordinator ──────────────────────────┐
-  │  lib/agents/pipeline.ts                          │
-  └─────────────────────────┬────────────────────────┘
-                            │
-  ┌─ Shared agent loop ─────▼────────────────────────┐  ← we are here
-  │  ★ agentic RAG (★ THIS ★, vector-RAG flavor):     │
-  │    runAgentLoop with tools = [vector_search,     │
-  │      rerank, fetch_chunk] — model decides each   │
-  │      next retrieval call from the prior result   │
-  │  ── absent in blooming insights ──                │
-  │                                                   │
-  │  blooming insights' actual shape:                 │
-  │    runAgentLoop with tools = [execute_eql,        │
-  │      get_event_segmentation, …]                   │
-  │    same LOOP shape, retrieval target is live MCP  │
-  └─────────────────────────┬────────────────────────┘
-                            │  every tool call
-  ┌─ Tools + MCP transport ─▼────────────────────────┐
-  │  lib/tools/* | lib/mcp/client.ts                 │
-  │  Not yet implemented: vector store / embeddings   │
-  └──────────────────────────────────────────────────┘
+  ┌─ Service layer ──────────────────────────────────────────┐
+  │  /api/agent?q=...                                         │
+  └─────────────────────┬────────────────────────────────────┘
+                        ▼
+  ┌─ Agent layer ───────────────────────────────────────────┐
+  │  Today:   QueryAgent (tools = Bloomreach EQL + others)  │
+  │  Future:  + KnowledgeAgent (tool = vector_search)       │ ← would live here
+  │           over a corpus of marketer docs, past investigations
+  └──────────────────────────────────────────────────────────┘
 ```
-
-**Zoom in — narrow to the concept.** The question is: when does retrieval stop being a one-shot pipeline step (static RAG) and start being a loop the model drives? The line is who decides the *next* retrieval call — your code (one query, one top-k, done) or the model (each call shaped by the prior result). blooming insights does NOT implement vector RAG; surface-level intent matching via `String.includes` in `lib/agents/intent.ts` is what exists instead. Below, you'll see the agentic-RAG loop shape — and why blooming insights' live-tool agents are the closest architectural analog.
-
----
 
 ## Structure pass
 
-**Layers.** Three layers carry agentic RAG: the **Agent loop** (`runAgentLoop` — the bounded `for` that drives turns), the **Retriever tool surface** (the schemas the model picks from — in classic RAG this is `vector_search` / `rerank` / `fetch_chunk`; in this codebase it's `execute_analytics_eql` / `get_event_segmentation` and the rest of the MCP tool set), and the **Retrieval target** (a vector store + embedder in classic RAG, a live analytics API behind MCP here). The Pipeline coordinator hands work in at the top; tool results come back as observations the loop pushes into the next turn.
-
-**Axis: control.** Who decides which retrieval call to make next — your code (one fixed retrieve-then-generate pipeline) or the model (each call shaped by the prior result)? This is the right axis because the entire definition of "agentic" RAG vs static RAG is *who writes the retrieval chain's length and shape*. Cost is a real concern (each retrieval is a model call + a tool call) but cost is downstream of who's authoring the calls. State (the query history, the retrieved chunks) is an interesting alternate but it's just the trail of what control produced.
-
-**Seams.** Two seams matter, and the second is load-bearing. Seam 1 sits between the Agent loop and the Retriever tool surface — control flips from MODEL (decides "I want to retrieve about X") to CODE (resolves the tool schema, calls the right tool). This is the standard tool-call seam — present in any ReAct loop with tools. Seam 2 sits between the Retriever tool surface and the Retrieval target — and in classic agentic RAG, control stays in CODE on both sides (the tool just queries the vector store, no further decision). In blooming insights' live-API variant, this seam carries extra weight because the retrieval target is a *live* MCP server with rate limits, errors, and project-scoped bootstrapping — the contract is fatter than a vector lookup. The model-driven loop is the same; the target is what's different.
+The axis: **how many times does the model retrieve before generating?**
 
 ```
-  Structure pass — Agentic RAG
+  Static RAG (one shot):
+  ──────────────────────
+  query → embed → top-k → stuff → generate
+  no evaluation, no second try, no decomposition
 
-  ┌─ 1. LAYERS ───────────────────────────────────┐
-  │  Agent loop (runAgentLoop)                     │
-  │  Retriever tool surface (schemas)              │
-  │  Retrieval target (vector store OR live API)   │
-  └────────────────────────┬───────────────────────┘
-                           │  pick the axis
-  ┌─ 2. AXIS ─────────────▼────────────────────────┐
-  │  control: who decides the next retrieval call? │
-  └────────────────────────┬───────────────────────┘
-                           │  trace across layers, find flips
-  ┌─ 3. SEAMS ────────────▼────────────────────────┐
-  │  Seam 1: Agent loop ↔ Retriever tool surface   │
-  │          (MODEL → CODE) tool-call boundary     │
-  │  Seam 2: Retriever surface ↔ Retrieval target  │
-  │          (CODE → CODE in classic; CODE → live  │
-  │          MCP here) ★ load-bearing variant —    │
-  │          target shape changes the contract     │
-  └────────────────────────┬───────────────────────┘
-                           ▼
-                   Block 4 — How it works
+  Agentic RAG (a loop):
+  ──────────────────────
+  query → decompose → per sub-question:
+            retrieve → evaluate sufficiency → re-retrieve or generate
+  loop is bounded by maxToolCalls (the same kernel from 01-reasoning-patterns)
 ```
-
-The skeleton is mapped — the rest of this file walks the mechanics that hang off it (and how the live-tool variant occupies the same architectural slot as a vector store would).
-
----
 
 ## How it works
 
-**The mental model: a `.then()` chain whose length you don't know, where each link is a query.** Static RAG is `embed(q).then(topK).then(stuff).then(generate)` — four links, fixed. Agentic RAG is a `while` loop where each iteration reads the prior result, decides the next query, and either runs it or stops. The model writes the chain's length and shape at runtime — the same shape this codebase's chains-vs-agents file calls "the model writing the steps."
+### Move 1 — the mental model
+
+You know the loop kernel from `../01-reasoning-patterns/02-agent-loop-skeleton.md`. Agentic RAG is that kernel where the model's tool grant is mostly retrieval tools, and the model's prompt encourages "decompose, retrieve per sub-question, evaluate." It's not a new pattern — it's the loop kernel pointed at retrieval.
 
 ```
-Two retrieval shapes side by side
+  Agentic RAG — kernel pointed at retrieval
 
-  STATIC RAG (one shot)
-  ──────────────────────────────────────────────────
-  query → embed → top-k → stuff prompt → generate
-            (code wrote each step; one round trip)
-
-  AGENTIC RAG (a loop)
-  ──────────────────────────────────────────────────
-  query
-    │
-    ▼
-  ┌─────────────────────────────┐
-  │ model: pick next retrieval  │ ◄────────────┐
-  └────────┬────────────────────┘              │
-           ▼                                    │
-  ┌─────────────────────────────┐               │
-  │ retriever (tool call)       │               │
-  └────────┬────────────────────┘               │
-           ▼                                    │
-  ┌─────────────────────────────┐               │
-  │ model: enough to answer?    │               │
-  └────┬───────────────┬────────┘               │
-       ▼ no            ▼ yes                    │
-   refine query     emit final answer           │
-       └─────────────────────────────────────────┘
+  ┌───────────────────────────────────────────────┐
+  │  decompose query into sub-questions           │
+  └────────────────────┬──────────────────────────┘
+                       ▼
+  ┌───────────────────────────────────────────────┐
+  │  retrieve for each (route to the right source)│
+  └────────────────────┬──────────────────────────┘
+                       ▼
+  ┌───────────────────────────────────────────────┐
+  │  evaluate: is this enough to answer?          │
+  └──────────┬─────────────────────┬──────────────┘
+             ▼ no                  ▼ yes
+        re-retrieve            generate answer
+        (refine query)
+             │
+             └──── loop (cap iterations — maxToolCalls)
 ```
 
-The strategy in plain English: **let the model write the query plan instead of writing it yourself.** When you know the query plan up front (one nearest-neighbor search, top-k), static RAG is correct and cheaper. When you don't — when the right query depends on what the last one returned — you hand the wheel to the model and pay the loop tax for the adaptability.
+### Move 2 — what it would look like in this repo
 
-### The two shapes, side by side
+A hypothetical `KnowledgeAgent` could retrieve from a corpus of:
+- Past investigation reports stored as markdown
+- Bloomreach product documentation
+- Marketer best-practice guides
 
-The technical distinction: static RAG is one tool call; agentic RAG is many, chosen at runtime.
+The tool grant would be `vector_search(query, top_k, source)`. The agent would behave like the QueryAgent today, just with `vector_search` as the primary tool instead of `execute_analytics_eql`.
 
-If you're coming from frontend, static RAG is `fetch('/search?q=' + q).then(render)`. Agentic RAG is `while (notDone) { const q = decideNext(prior); const r = await fetch('/search?q=' + q); prior.push(r); }` — except `decideNext` isn't your code, it's a model reading the prior results and emitting the next query string.
+Skeleton of the refactor:
 
-```
-                Static RAG                       Agentic RAG
-            ┌──────────────────┐             ┌──────────────────────┐
-turns:      │ exactly 1        │             │ N (model decides)    │
-retriever:  │ vector index     │             │ any tool: vector,    │
-            │ (nearest chunks) │             │ SQL, web, live API   │
-who picks   │ your code        │             │ the model            │
-next call:  │ (top-k, k=10)    │             │ (each turn)          │
-stop rule:  │ implicit (1 try) │             │ model emits no tool  │
-cost:       │ 1× retriever +    │            │ N× retriever +       │
-            │ 1× LLM           │             │ N× LLM (3-10× tokens)│
-            └──────────────────┘             └──────────────────────┘
-```
-
-The practical consequence: the same user question can take a different number of retrievals on two different runs of an agentic system, because the model re-decides after every observation. That's the win (it adapts to multi-step questions) and the cost (variable latency, variable cost, a trajectory to replay when debugging).
-
-The condition under which it works: the loop has to have a stop rule and a budget. Without one, "model decides" means "model can loop forever" — the same unbounded-`while` problem you'd never ship on the frontend. Every agentic-RAG implementation needs a tool-call cap, a turn cap, or both.
-
-### The retriever is an interface, not an index
-
-The reframe that matters: in agentic RAG, *retriever* is a slot. Anything that returns context for a query fills the slot. A vector index fills it (classic). A SQL query fills it (exact lookups). A web search fills it (freshness). **A live tool call against an analytics API fills it.** The agentic-RAG loop doesn't care which — it cares that the model can call a retriever and observe the result.
-
-```
-The retriever slot — anything that grounds a query goes here
-
-    ┌─ retriever interface ─┐
-    │  query → context      │
-    └──────────────────────┘
-        ▲       ▲      ▲       ▲
-        │       │      │       │
-    vector  SQL DB   web   live API
-    index             search (this codebase)
-```
-
-If you're coming from frontend, this is the same shape as "the data layer is an interface" — your component doesn't care if `useUser()` reads localStorage, a cookie, or a `/api/me` fetch, as long as it returns a user. The agent loop doesn't care what `execute_analytics_eql` is under the hood, as long as it returns rows the model can reason on.
-
-The practical consequence: the agentic loop shape generalizes across retriever types. You can drop a vector index in beside a live API and the model can route between them (covered in the retrieval-routing note). The loop's structure — reason, retrieve, observe, repeat — doesn't change.
-
-**Where the loop and the retriever live in the repo.** The agentic-RAG engine is `runAgentLoop()` in `lib/agents/base.ts` L48–L176 — loop body at L85, `tool_use` detection at L116–L124, observation fed back at L171, budget/forced-final at L90–L101. All four agents (`monitoring.ts`, `diagnostic.ts`, `recommendation.ts`, `query.ts`) call this one function. The retriever isn't named in `base.ts` — it's whichever tool the model chooses, hidden behind the `McpCaller` interface (L16–L22). The actual retriever-as-tool is the `execute_analytics_eql` schema in `lib/mcp/tools.ts`: the model emits `tool_use` with `name: "execute_analytics_eql"` and `input: { eql: "..." }`; the loop runs it via `mcp.callTool` (`base.ts` L144) and feeds the JSON result back as the next observation. No vector index sits behind this — it's a live HTTP call into Bloomreach.
-
-### The "no embedding-RAG" case — why this codebase skipped the vector index
-
-The technical thing: blooming insights does agentic retrieval without ever building an embedding index. The retriever is a live analytics tool call against Bloomreach — not a nearest-neighbor lookup over chunked documents.
-
-If you're coming from frontend, this is the difference between caching `/api/users` in localStorage at build time (snapshot, ages immediately) and just calling `/api/users` fresh every time (slower per call, always current). The codebase chose the second: no snapshot, no chunker, no vector store. The retriever is the live source.
-
-```
-Three things make the live retriever the right choice here
-
-  property of the data       live tool        vector index
-  ────────────────────       ──────────       ──────────────────
-  freshness                  always current   stale until re-embed
-  exactness (counts, $)      exact aggregate  fuzzy nearest-neighbor
-  source IS an API           read directly    a lossy copy to maintain
-```
-
-The practical consequence: the agentic loop here is pure — every observation is fresh data, not a snapshot. The cost is per-call latency (an HTTP round trip to Bloomreach, ~1.1s spaced + execution time) instead of the millisecond reads of a local vector index. The codebase pays that cost on purpose because the alternative (a stale embedding of "42,000 purchases") would silently poison every downstream turn.
-
-The condition under which this stays right: the data has to be a queryable API returning exact results. The day a feature needs to *search free-text narratives* (e.g. "find past investigations similar to this one"), the live-tool retriever is the wrong shape and an embedding index earns its place. The ai-engineering RAG note walks that threshold rule end-to-end.
-
-### The loop is a budget, not a freeway
-
-The technical thing: the agentic-RAG loop has caps. The shared agent loop enforces a per-loop turn ceiling (default 8) and a per-loop tool-call budget (6 for monitoring/diagnostic/query, 4 for recommendation), and once the budget is spent the loop strips the tools from the next request, forcing the model to answer.
-
-If you're coming from frontend, this is `useEffect` with a dependency array and an abort controller — a loop with an off-switch. Without it, you've shipped an infinite render loop the model drives.
-
-```
-shared agent loop — the loop has two off-switches
-
-  turn N:
-    if (budget spent OR last allowed turn):
-      strip tools from request   ← model MUST answer (no tool_use possible)
-    call model with messages
-    if (no tool_use blocks):     ← model decided to stop
-      return finalText
-    run each tool, append result as next user turn
-```
-
-The practical consequence: an agentic investigation never spends more than ~6 tool calls. If the diagnostic agent can't reach a conclusion in 6 queries it's forced to synthesize from what it has — including "I couldn't establish a populated window" if that's the honest answer. The cost is occasional truncation; the win is a bounded latency budget the route handler's per-investigation ceiling (300s) can sit on top of.
-
-**Where the budget lives in the repo.** Each agent declares its cap in its `runAgentLoop` invocation — `maxToolCalls` is 6 for monitoring/diagnostic/query and 4 for recommendation. The per-agent cap files are `lib/agents/monitoring.ts`, `lib/agents/diagnostic.ts`, `lib/agents/query.ts`, `lib/agents/recommendation.ts`. The cap is what turns adaptability from "unbounded" into "bounded."
-
-```
-shape (not full impl):
-  // base.ts L85 — the agentic-RAG loop
-  for (let turn = 0; turn < maxTurns; turn++) {
-    const res = await anthropic.messages.create({ tools, messages });
-    const toolUses = res.content.filter(b => b.type === 'tool_use');
-    if (toolUses.length === 0) return { finalText, toolCalls };  // model stops
-    for (const tu of toolUses) {
-      const { result } = await mcp.callTool(tu.name, tu.input); // RETRIEVE
-      toolResults.push({ type: 'tool_result', tool_use_id: tu.id, content: ... });
-    }
-    messages.push({ role: 'user', content: toolResults });       // observe
+```typescript
+// hypothetical lib/agents/knowledge.ts
+export class KnowledgeAgent {
+  async answer(question: string, hooks: AgentHooks = {}): Promise<string> {
+    const agent = new AptKitKnowledgeAgent({
+      model: new AnthropicModelProviderAdapter(this.anthropic, 'coordinator', this.sessionId),
+      tools: new BloomingToolRegistryAdapter(this.dataSource, [
+        // tool: vector_search(query, top_k, source: 'docs' | 'investigations' | 'guides')
+      ]),
+      // ... uses runAgentLoop the same as everything else
+    });
+    return agent.answer(question, { signal: hooks.signal });
   }
+}
 ```
 
-The principle: an agentic loop without a cap is a runaway. The cap is what makes the adaptability cost-controlled instead of unbounded.
+The mechanism is identical to ReAct; only the tool implementation differs. The tool would wrap pgvector or a hosted vector store; the agent doesn't care which.
 
-The full picture is below.
+### Move 3 — the principle
 
----
+Agentic RAG is not a new pattern — it's the loop kernel pointed at retrieval. The reframe to hand the reader: *all agentic RAG is agentic AI; not all agentic AI does retrieval.* This repo is the second case — agentic AI without retrieval — because the data is live operational state queried via SQL-shaped tools, not a corpus indexed for similarity search.
 
-## Agentic RAG — diagram
+The tradeoff is steep when you do reach for it. Agentic RAG runs roughly 3-10x the tokens of static RAG and 2-5x the latency, so the above-threshold rule applies hard: use the loop only when one-shot retrieval measurably fails on multi-step or cross-source queries.
+
+## In this codebase
+
+**Not yet implemented. Not planned.** The retrieval surface in this repo is Bloomreach's analytics API via MCP tools — there is no corpus of unstructured text to retrieve from. Adding agentic RAG would require:
+
+1. **Choosing a corpus.** Past investigation reports stored to disk? Bloomreach product docs scraped? Marketer guides curated by the team? None of these exist as a maintained corpus today.
+2. **Adding a vector store.** No vector store in the codebase. Adding pgvector would mean adding Postgres (currently no DB at all — state lives in in-memory maps).
+3. **An embedding pipeline.** A maintenance liability: every corpus update needs re-embedding.
+4. **A new agent class** wrapping `vector_search` as a tool — the cheap part. The first three are the real cost.
+
+The natural opportunity: if a "what should I do about this kind of anomaly" feature got added, a corpus of past resolved-similar-anomalies retrievable by semantic similarity would be the high-leverage place to add it. That's the system-design template in `../06-orchestration-system-design-templates/01-multi-agent-research-assistant.md`.
+
+## Primary diagram
+
+The contrast — what this repo does today (tool-use over EQL) vs what agentic RAG would add (tool-use over a vector store):
 
 ```
-blooming insights: agentic retrieval over a live API
+  Comparison — today's tool-use loop vs hypothetical agentic RAG
 
-  user question
-       │
-       ▼
-  ┌─────────────────────────────────────────────────────────────────┐
-  │                       AGENT LAYER                                │
-  │                  (the shared agent loop)                         │
-  │                                                                  │
-  │   turn 0  ┌───────────────────┐                                  │
-  │           │ model reasons      │                                 │
-  │           │ "check volume"     │                                 │
-  │           └────────┬───────────┘                                 │
-  │                    ▼ tool_use                                    │
-  │           ┌───────────────────────────────────────┐              │
-  │           │ analytics tool call                   │              │
-  │           └────────┬──────────────────────────────┘              │
-  │                    ▼  observation fed back                       │
-  │   turn 1  ┌───────────────────┐                                  │
-  │           │ model: "purchases  │  ◄── result of turn 0 in        │
-  │           │ down 18%; compare  │      context window             │
-  │           │ revenue too"       │                                 │
-  │           └────────┬───────────┘                                 │
-  │                    ▼ tool_use                                    │
-  │           ┌───────────────────────────────────────┐              │
-  │           │ analytics tool call                   │              │
-  │           └────────┬──────────────────────────────┘              │
-  │                    ▼                                              │
-  │   turn 2  ┌───────────────────┐                                  │
-  │           │ model: no tool_use │ ──► natural stop                │
-  │           │ → emits JSON       │                                 │
-  │           └───────────────────┘                                  │
-  │                                                                  │
-  │   BUDGET: turn cap + tool-call budget → forced final             │
-  └─────────────────────────┬───────────────────────────────────────┘
-                            │
-                            ▼
-  ┌─────────────────────────────────────────────────────────────────┐
-  │                       RETRIEVER LAYER                            │
-  │   MCP client wrapper → analytics tool → Bloomreach               │
-  │   (live API; no vector index, no chunks, no embeddings)          │
-  └─────────────────────────────────────────────────────────────────┘
+  TODAY (QueryAgent, ReAct over EQL):
+  ┌────────────────────────────────────────────────────┐
+  │  while not done {                                  │
+  │    pick EQL query   → execute_analytics_eql({eql}) │
+  │    read result      → live ecommerce data          │
+  │  }                                                  │
+  │  source: Bloomreach (operational state)            │
+  └────────────────────────────────────────────────────┘
 
-  The loop length is variable — the model writes it. The retriever
-  is a live API call. The cap is a budget the route's per-investigation
-  window sits on.
+  HYPOTHETICAL (KnowledgeAgent, agentic RAG):
+  ┌────────────────────────────────────────────────────┐
+  │  while not done {                                  │
+  │    pick search query → vector_search({q, source})  │
+  │    read result       → top-k chunks                │
+  │    decide: enough?                                 │
+  │     yes → generate                                  │
+  │     no  → refine query, retrieve again             │
+  │  }                                                  │
+  │  source: corpus (docs, past reports, guides)       │
+  └────────────────────────────────────────────────────┘
 ```
-
----
 
 ## Elaborate
 
-### Where this pattern comes from
+Agentic RAG crystallized around 2024 as the answer to static RAG's two failure modes: multi-step questions (the answer needs information from three sources, but top-k only returns the most similar chunks) and ambiguous queries (the model's first retrieval brings back the wrong thing, and there's no second try). LangChain's LCEL chains and LangGraph's state machines both bundled patterns for it. The shape is always the loop kernel pointed at retrieval — the contribution is the prompt design and the per-step grader.
 
-The "retrieval as a tool inside a loop" idea grew out of two lines: the ReAct paper (2022) framed reasoning and acting as an interleaved loop where one of the acts could be search, and the early Self-RAG (2023) and FLARE (2023) papers added per-step retrieval triggers to the generation. The synthesis — *agentic RAG* — came with the wider adoption of tool-use APIs (OpenAI functions, Anthropic tool_use), which made "the model calls the retriever" a first-class API shape instead of a parsing exercise.
+The token-cost honesty: agentic RAG isn't free. A 4-iteration loop with 2 retrievals each = 8 vector searches + 4 LLM calls + 1 generation. Compared to static RAG's 1 vector search + 1 LLM call, that's roughly 10x the cost. The above-threshold rule applies — measure static RAG first, escalate only when a specific failure mode justifies the tax.
 
-### The deeper principle
-
-Retrieval-augmented generation has two layers worth seeing separately: the *augmentation* (the model is grounded in external context) and the *control* (who decides what to retrieve). Static RAG fixes the control in code; agentic RAG hands it to the model. Neither is "more advanced" — they're a tradeoff between predictability (static) and adaptability (agentic), and the right choice depends on whether the query plan is knowable up front.
-
-```
-  knowable query plan ──► code owns retrieval (static) ──► cheaper, predictable
-  unknowable plan     ──► model owns retrieval (agentic)──► adaptive, variable cost
-```
-
-### Where this breaks down
-
-The agentic loop breaks in three places. **No stop rule** → the model loops until budget exhaustion on questions it could have answered in one query. **Bad retriever** → adaptability can't fix a tool that returns wrong answers; the model just makes wrong follow-up queries faster. **Trajectory non-determinism** → two runs of the same question can take different paths and produce different answers, which is fine for users but painful for evals; you need trajectory-level eval, not just answer eval.
-
-### What to explore next
-- Self-corrective RAG (`02-self-corrective-rag.md`) → adding a relevance grader between retrieve and generate
-- Retrieval routing (`03-retrieval-routing.md`) → multiple retrievers and the model picks
-- ReAct mechanics (`../01-reasoning-patterns/02-react.md`) → the loop shape this sits on
-- Why no embedding-RAG here: `../../study-ai-engineering/03-retrieval-and-rag/11-rag.md` → the live-tool vs vector-index decision walked end-to-end
-
----
+The pattern that connects best to this repo: the agent loop primitive is the same. The thing that's different in agentic RAG is the *tool* (vector search) and the *prompt's grader step* (is this chunk enough). If you understand the loop kernel from `01-reasoning-patterns`, you already understand the structure of agentic RAG; you just substitute the tool.
 
 ## Interview defense
 
-### What an interviewer is really asking
-When an interviewer asks "do you use RAG," they're testing whether you can distinguish the *augmentation* (the model is grounded in external context) from the *retriever* (the thing that returns the context). The strong signal is naming what fills the retriever slot in your system and why, not reciting the vector-index pipeline as if it's the only option. The weak signal is saying "we use RAG" or "we don't use RAG" without naming what the retriever actually is.
+**Q: "Do you use RAG?"**
 
-### Likely questions
+A: No. The data this product analyzes is live operational state — ecommerce events, revenue, funnel metrics — accessed via the Bloomreach MCP server's EQL tools. There's no corpus to retrieve from; the model writes a query, the tool runs it against live data, the result comes back as a tool_result block. That's tool-use, not retrieval — same loop kernel, different tool semantics.
 
-[mid] Q: Does blooming insights use RAG?
+If we added a corpus (past investigation reports, Bloomreach docs, marketer best-practice guides), agentic RAG would be the right shape — a vector search tool inside the same ReAct loop the QueryAgent already uses. The refactor is small in the agent layer (~50 lines of a new wrapper class); the real cost is the corpus pipeline (embedding, indexing, freshness, maintenance) and choosing the vector store.
 
-A: Yes, in the agentic form — every agent loop in this codebase is RAG where the retriever is a live tool call (`execute_analytics_eql`) instead of a vector index. The model emits a `tool_use` block, the loop runs the EQL against Bloomreach, the result comes back as `tool_result` in the next turn, and the model reasons on it. That's retrieval-augmented generation; we just skipped the embedding index because the data is a queryable analytics API where exact aggregates matter and embeddings would be lossy and stale.
+Diagram I'd sketch:
 
-Diagram:
 ```
-  query → model picks EQL → execute_analytics_eql → result
-            (tool_use)        (live API, no index)   (tool_result)
-                  └─────── loop until model stops ────────┘
-```
-
-[senior] Q: Why not build an embedding index over the analytics data?
-
-A: Three reasons. **Freshness** — Bloomreach data changes; an index would be stale until re-embedded and we'd need an incremental indexing pipeline to keep up with a source we can just query. **Exactness** — an embedding of "42,000 purchases" is a fuzzy nearest-neighbor point, not the number. Analytics answers need counts and sums, not vibes. **Burden** — building chunker + embedder + vector store + incremental indexing solves a problem we don't have, because the source IS a queryable API. The threshold that would flip this is a feature that searches free-text narratives — past investigations, past chats — where exact aggregates don't apply and semantic match does. We don't have that feature; the day we do, an embedding index goes in beside the live tool.
-
-Diagram:
-```
-  property of the data    live tool          embedding index
-  freshness               always current     stale until re-embed
-  exactness               exact aggregate    fuzzy nearest-neighbor
-  source IS an API        read directly      a lossy copy to maintain
+  what this repo does:       what RAG would add:
+  ┌──────────────┐           ┌──────────────┐
+  │ agent loop   │           │ agent loop   │
+  │ tool:        │           │ tool:        │
+  │  execute_    │           │  vector_     │
+  │  analytics_  │           │  search(q)   │
+  │  eql(query)  │           │              │
+  └──────────────┘           └──────────────┘
+   live data, no              static corpus,
+   embeddings                 embeddings
 ```
 
-[arch] Q: At 10x the question volume, what changes in this retrieval loop?
+Anchor: "the loop kernel doesn't change; only the tool semantics do. Today the tool is SQL-shaped EQL against live data; agentic RAG would point it at top-k chunks from a vector store."
 
-A: The retriever, not the loop. The agentic loop scales horizontally — each user's investigation is its own `runAgentLoop`. The bottleneck is Bloomreach's per-user rate limit (~1 req/s, the `minIntervalMs: 1100` in `lib/mcp/connect.ts` L92). At 10x volume, two things compound: same user investigating in parallel hits the limit harder (the rate-limit retry in `client.ts` L122 burns budget), and many users sharing the limit means I'd need a real backpressure queue (cross-ref: `../05-production-serving/02-fan-out-backpressure.md`) instead of per-instance spacing. The loop itself doesn't change; the layer beneath it does. If exactness ever stopped mattering — analytics dashboards instead of investigations — I might pre-compute common queries into a cache and the agent retrieves from the cache, which starts to look like an index.
+**Q: "Why isn't tool-use over EQL just 'agentic RAG with one tool'?"**
 
-Diagram:
-```
-  ┌ Agent layer (runAgentLoop ×N) ── fine, horizontal ──────┐
-  ┌ Retriever layer (MCP → Bloomreach) ◄── BOTTLENECK:      │
-  │                                       ~1 req/s/user      │
-  └ Fix: cross-run cache + real backpressure queue ──────────┘
-```
-
-### The question candidates always dodge
-Q: If retrieval is a live API call and there's no index, in what sense is this "RAG" at all? Isn't this just tool-calling?
-
-A: The honest answer is that *RAG and tool-calling overlap once the tool is a retriever*. The textbook RAG diagram (chunk → embed → top-k → stuff) is one *implementation* of retrieval-augmented generation, not the definition. The definition is "ground the answer in retrieved context"; the retriever is anything that returns context for a query. When the tool is a retriever (an EQL query, a SQL query, a web search), the loop IS agentic RAG — it just happens to share its shape with tool-calling because they're the same shape. What this codebase doesn't do is the *embedding-index* part of classic RAG. It still does the *retrieve-then-ground* part on every turn. The reason I won't call it "just tool-calling" is that the tool's job is specifically retrieval, the retrieval grounds the answer, and the loop adapts the next retrieval to the prior result — that's the agentic-RAG control loop, regardless of what fills the retriever slot.
-
-Diagram:
-```
-  classic RAG     │ vector index + top-k + stuff + generate
-  agentic RAG     │ a LOOP whose tool happens to be a retriever
-  this codebase   │ agentic RAG, retriever = live API call
-  "just tools"    │ same shape; agentic RAG is a NAMED USE of it
-```
-
-### One-line anchors
-- "Agentic RAG is a ReAct loop whose primary tool is the retriever — the model writes the query plan."
-- "The retriever is an interface; vector indexes, SQL, web search, and live APIs all fill it."
-- "We retrieve live because the source is a queryable API with exact aggregates and freshness mattering — embeddings would be lossy and stale."
-- "The loop's stop rule is the budget (`maxToolCalls`); without it, 'model decides' means 'model loops forever.'"
-
----
+A: Because the tool returns *current operational state* — a count, a revenue number, a segmented funnel — not retrieved chunks of pre-indexed text. The agent doesn't have to evaluate "is this chunk relevant to my question"; the EQL tool either returned the metric or it didn't. The classic RAG failure mode (the top-k chunks are off-topic) doesn't exist when the "retrieval" is "select sum event purchase.total_price in last 90 days." It's the difference between asking a database vs asking a search engine — both are retrieval in a loose sense; only one has the relevance problem RAG was invented to solve.
 
 ## See also
 
-→ 02-self-corrective-rag.md · → 03-retrieval-routing.md · → `../01-reasoning-patterns/02-react.md` · → why no embedding-RAG here: `../../study-ai-engineering/03-retrieval-and-rag/11-rag.md`
-
----
+- [`02-self-corrective-rag.md`](./02-self-corrective-rag.md) — the grader-step variant
+- [`03-retrieval-routing.md`](./03-retrieval-routing.md) — when there's more than one source
+- [`../01-reasoning-patterns/02-agent-loop-skeleton.md`](../01-reasoning-patterns/02-agent-loop-skeleton.md) — the kernel both this and tool-use over EQL share
+- ai-engineering's `03-retrieval-and-rag/` (cross-ref) — retrieval mechanics, if generated

@@ -1,36 +1,54 @@
-# Study — frontend engineering
+# Study — Frontend Engineering (blooming_insights)
 
-This guide takes the **current blooming insights repo** and walks its frontend layer in two passes:
+The frontend layer of this repo: how the framework renders, where state lives, how server-state crosses into client state, how the design system scales, what platform APIs the repo touches, how routes compose, and how the bundle is built.
 
-- **Pass 1 — `audit.md`.** One section per lens in the 8-lens inventory (rendering-and-reactivity, state-architecture, component-architecture, data-fetching-and-cache, routing-and-navigation, styling-and-design-system, browser-platform-and-build, frontend-red-flags-audit). Verdict-first, every claim grounded in a `file:line` reference. Cross-links to each pattern file when a finding warrants the deeper walk.
-- **Pass 2 — 2 discovered-pattern files.** Named after the frontend-specific patterns this codebase actually exercises. Each uses the full per-concept template — Zoom out → Structure pass → How it works → Primary diagram → Implementation in codebase → Elaborate → Interview defense → Validate → See also.
-
-Two patterns, not five. The other findings that earn pattern-file treatment in this repo (the formerly-817-LOC `app/page.tsx` — now 462 LOC after the three-hook extraction; the `sessionStorage` cross-step handoff) already live in neighboring audits — they're called out in `audit.md` with a cross-link rather than re-derived through the frontend lens.
+This is **your home turf** (7+ years frontend, Vue/React). The guide leans on that — no on-ramp for what a component or hook is. Lead with what THIS repo does differently from the React you wrote at FedEx, Amazon, or CoreWeave.
 
 ## Reading order
 
-1. **[audit.md](./audit.md)** — the lens-by-lens audit (Pass 1). Skim this first; it tells you which pattern files to open next.
-2. **Pattern files (Pass 2).** Open the ones whose names match what you're trying to understand:
-   - [01-ndjson-stream-reader-hook.md](./01-ndjson-stream-reader-hook.md) — `useInvestigation` as the load-bearing data-fetch primitive: a `fetch` + `ReadableStream` reader loop driving five `useState` slots, line-buffered NDJSON dispatched to event handlers.
-   - [02-progressive-skeleton-with-stepper.md](./02-progressive-skeleton-with-stepper.md) — the skeleton + stepper + coverage-grid composition that turns a 30-60s agent run into a UI that animates from the first 100ms.
+| step | file | what you get |
+|------|------|--------------|
+| 1 | [`00-overview.md`](./00-overview.md) | One-page orientation: rendering mode in one sentence, state architecture in one diagram, network seam in one diagram, the three highest-leverage patterns named |
+| 2 | [`audit.md`](./audit.md) | The 8-lens frontend audit, every claim grounded in `file:line`. The final lens ranks frontend risks by user-visible consequence |
+| 3 | [`01-ndjson-stream-reader-hook.md`](./01-ndjson-stream-reader-hook.md) | Deep walk on the load-bearing primitive: `lib/streaming/ndjson.ts` (64 LOC kernel) + `useInvestigation` (the data-fetch hook 4 consumers reuse the shape of) |
+| 4 | [`02-progressive-skeleton-with-stepper.md`](./02-progressive-skeleton-with-stepper.md) | Deep walk on the 4-tier progressive composition: `Skeleton` + `ProcessStepper` + `CoverageGrid` + `StatusLog` — how a 30-90s wait becomes a UI that animates from the first 100ms |
+
+Skim order if you only have 10 minutes: `00-overview.md` → the diagrams in `01` and `02`.
+
+## What the two pattern files cover (and why they earn a file)
+
+This is an audit-style topic. Pass 1 (`audit.md`) walks the 8 lenses; Pass 2 (these pattern files) deep-walks the patterns this repo actually exercises. Two patterns made the cut:
+
+**`01-ndjson-stream-reader-hook`** — passes the load-bearing test ("if you stripped this pattern out, what specifically would the UI lose?") with: streaming agent reasoning as a first-class surface. Without the kernel, the product can't "show its work" — the whole `coordinator → monitoring → diagnostic → recommendation` pipeline becomes a 30-90s blank screen. Passes the recognition test: any senior engineer reads `readNdjson + useInvestigation` and sees the shape.
+
+**`02-progressive-skeleton-with-stepper`** — passes the load-bearing test: the perceived-instant feel during the long agent run. Without the 4-tier composition (skeleton sized like the diagnosis, stepper-as-router, coverage tiles streaming individually, status log animating), the user stares at a spinner. Passes the recognition test: the pattern has a name in the field (progressive disclosure / shape-mirroring skeletons + status stepper).
+
+Patterns that DIDN'T earn a file (deliberately):
+
+- **Three-ring state ownership** — covered as the diagram in `00-overview.md` and lens 2 of `audit.md`. It's a structural choice rather than a self-contained pattern.
+- **OAuth reconnect policy** — `useReconnectPolicy` (123 LOC) is real, but it's a recovery mechanism for one external dependency's quirk (the alpha Bloomreach server revoking tokens after minutes), not a generalizable frontend pattern. Lens 4 + lens 8 of `audit.md` cover it.
+- **Demo / live mode toggle** — covered in lens 2 of `audit.md` as the only `localStorage` key. It's a switch, not a pattern.
+- **Page decomposition (817 → 461 LOC + 3 hooks)** — this is the refactor that *enabled* the patterns above, not a pattern to study. The history is in `.aipe/audit-refactor-page-decomposition/`.
 
 ## Cross-links to neighboring guides
 
-Frontend engineering owns the framework-and-platform layer. The other axes live elsewhere:
+The frontend partition is sharp on purpose — these concerns belong elsewhere:
 
-- **Module depth in the page component** (was 817 LOC; **RESOLVED** — now 462 LOC after `useBriefingStream` + `useReconnectPolicy` + `useDemoCapture` extracted to `lib/hooks/`) → `study-software-design/02-shallow-module-page-component.md`. Historical worked example of the AOSD shallow-module verdict and how the refactor played out.
-- **The `sessionStorage` cross-step handoff + StrictMode started-guard** → `study-system-design/07-client-stream-handoff.md`. The hook in this guide is the *data-fetch primitive*; the cross-step state ownership is the *system-level seam*.
-- **NDJSON wire format + cache-replay producer side** → `study-system-design/05-streaming-ndjson.md`. The producer lives in the route layer; the consumer lives here.
-- **Accessibility surface** → `.aipe/audits/a11y-2026-06-02.md`. The semantic-HTML / ARIA / focus posture is described there in detail; the styling-and-design-system lens here references the headline gaps without restating them.
-- **Performance measurement** (FCP / LCP / TTI / bundle size as numbers) → `study-performance-engineering`. This guide names the *patterns* that drive perceived performance; the *numbers* belong there.
-- **XSS / CSP / token storage / output sanitization** → `study-security`. The QueryBox + StreamingResponse path is described here as a UI flow; the trust-boundary analysis lives there.
-- **Event loop, async tasks, AbortController, ALS** → `study-runtime-systems`.
-- **HTTP / fetch / NDJSON on the wire** → `study-networking`.
+- **`study-system-design`** — where state lives at the system level (auth cookies, in-memory caches on the route side, the multi-agent orchestration that produces the events these hooks consume)
+- **`study-software-design`** — module depth, interface design, complexity primitives (Ousterhout applied to `useInvestigation` as a deep module; the 64-LOC kernel as an info-hiding boundary)
+- **`study-runtime-systems`** — the event loop, microtask scheduling, async cancellation semantics under `fetch` + `ReadableStream` + `useEffect` cleanup
+- **`study-networking`** — HTTP chunked transfer, `EventSource` vs `fetch+ReadableStream` tradeoffs, the wire-format choice that made NDJSON the answer
+- **`study-performance-engineering`** — FCP / LCP / TTI / bundle size as numbers; the streaming UI's perceived-vs-measured performance
+- **`study-security`** — XSS surfaces (the `TraceContent` markdown-ish renderer at `components/investigation/TraceContent.tsx`), CSP, token storage (sessionStorage vs cookies), the cross-instance handoff via URL params and what it exposes
+- **`study-testing`** — the integration-test harness that pins the NDJSON event contract these hooks consume (`test/api/briefing.integration.test.ts`, `test/api/agent.integration.test.ts`)
+- **`study-debugging-observability`** — how the `StatusLog` doubles as in-product observability (every tool call's duration + result is visible to the user)
 
-## The verdict, in one paragraph
+## What's NOT here, on purpose
 
-The frontend layer is small, deliberately framework-light, and shaped by one constraint that doesn't fit React's defaults: a 30-60s NDJSON stream that IS the product. The codebase reaches for Next.js 16 App Router + React 19 + Tailwind 4 and uses almost none of what each one offers — no Server Components in the routed surface (every page is `'use client'`), no Suspense boundaries, no `loading.tsx` / `error.tsx`, no React Query / SWR, no global store, no design-token layer beyond the CSS variables on `:root`. State is plain `useState`, and the data-fetching kernel was extracted in the page-decomposition refactor — it now lives in `lib/streaming/ndjson.ts` (one `readNdjson` consumed by all four streaming surfaces: `useBriefingStream`, `useInvestigation`, `useDemoCapture`, `StreamingResponse`), and the feed page's prior 14-`useState` mass was split across three hooks (`useBriefingStream` 313 LOC, `useDemoCapture` 146 LOC, `useReconnectPolicy` 123 LOC), bringing `app/page.tsx` from 817 LOC down to 462. Styling stays Tailwind-on-the-page-shell + inline `style={{}}` with CSS variables on every leaf (the inline-vs-Tailwind drift is accepted). Two patterns earn pattern-file treatment because they're load-bearing for what users see: the **NDJSON reader hook** (`useInvestigation` over the shared `readNdjson` kernel) that drives the live agent trace, and the **progressive skeleton + stepper composition** that turns a 30-60s wait into a UI that animates from the first event. Everything else is a stretch of Next.js / React 19 surface area the repo simply hasn't exercised yet — `<Suspense>`, `use(promise)`, server actions, `loading.tsx` / `error.tsx`, RSC streaming, none of it appears in the routed surface.
+- No "best practices" recap of React. You know React.
+- No vendor-anchored framing ("Tailwind does X, Next.js does Y"). The patterns survive if you swap the framework.
+- No before/after refactor stories — that's `.aipe/audit-refactor-page-decomposition/` and `.aipe/audit-refactor-eval-substrate/`.
 
----
+## On UPDATE
 
-Generated: 2026-06-03 — initial generation as v1.62.0 audit-style frontend-engineering guide.
+Per `me.md` → AUDIT-STYLE GENERATORS → On UPDATE: regenerate `audit.md` against current evidence (all 8 lenses re-walked, `file:line` references refreshed), add a Pass 2 pattern file when the codebase grows a new frontend pattern that passes the load-bearing + recognition tests, update existing pattern files when implementations change, and remove pattern files only when the pattern is genuinely gone from the codebase.

@@ -1,25 +1,51 @@
 # 01 — LLM foundations
 
-Phase 1 of the blooming insights AI-engineering study guide: the load-bearing facts about what a language model *is* and how the codebase wraps it. Each file is a full per-concept study sheet (Why care → How it works → primary diagram → In this codebase → Elaborate → Tradeoffs → Tech reference → Project exercises → Summary → Interview defense → Validate).
+The model is a function. Input tokens → output tokens. Everything in this section
+is about the I/O contract at that boundary — what travels in, what comes back, how
+much it costs, and where the seams sit that let you swap providers, count tokens,
+or constrain shapes.
 
-## Index
+## Files in reading order
 
-- **[01-what-an-llm-is.md](01-what-an-llm-is.md)** — An LLM is a next-token *function* returning a `string`, never a typed object; the codebase earns the type at the boundary with `parseAgentJson` + type guards + a hard-coded `FALLBACK`. (foundational — C1.13/C1.14 context)
-- **[02-tokenization.md](02-tokenization.md)** — Models bound and bill in tokens; blooming insights does no token counting and bounds prompts with *character* budgets (`MAX_TOOL_RESULT_CHARS=16_000`, route `TRUNC=4000`, `schemaSummary` caps) plus `max_tokens` — a coarse ≈4-chars/token proxy. (C1.1, learn-only)
-- **[03-sampling-parameters.md](03-sampling-parameters.md)** — No `temperature`/`top_p`/`top_k` set anywhere (Claude defaults); only `max_tokens` is tuned, including a deliberate `16` on the intent classifier. Why defaults are fine for the analysts and a small gap for the classifier/synthesis. (C1.3, B1.3)
-- **[04-structured-outputs.md](04-structured-outputs.md)** — The output contract: extract JSON from prose, validate the shape, repair via a clean-context `synthesize()` before `FALLBACK`. Native tool-use for *input*, parse-from-prose for the *final artifact*. (C1.4, B1.1) — **codebase strength.**
-- **[05-streaming.md](05-streaming.md)** — NDJSON over a `ReadableStream` (schema bootstrap now happens *inside* the stream; `maxDuration = 300`), consumed by `fetch`+`getReader()`+`TextDecoder` in the StrictMode-safe `useInvestigation` hook, deliberately *not* `EventSource` (reconnect would re-fire the run). Streaming is the product surface, not a spinner. (C1.5, Case A here) — **codebase strength.**
-- **[06-token-economics.md](06-token-economics.md)** — Cost *bounds* present (`maxToolCalls` budgets, truncation, haiku-vs-sonnet tiering); cost *meter* absent (nothing reads `res.usage`, no `ai_call_log`). Bounded but blind. (C1.6, B1.2/B1.8)
-- **[07-heuristic-before-llm.md](07-heuristic-before-llm.md)** — The free path before the paid path: `parseIntent` substring heuristic before the `classifyIntent` haiku call, and the route's parameter-presence branch before either. (C1.9, B1.5/B1.8)
-- **[08-provider-abstraction.md](08-provider-abstraction.md)** — A *testability* seam (`McpCaller`/`McpTransport` + injected `anthropic` param → fakes in tests, no network), **not** multi-LLM-provider switching (one provider, concrete SDK type, no factory). (C1.8, B1.6)
-- **[09-user-override-locks.md](09-user-override-locks.md)** — Read-only analyst: no user-editable persisted fields, so no `_overridden_at`. If recommendations became dismissible/editable, a re-run must not clobber the human's edit. (C1.11, B1.9)
+```
+01-what-an-llm-is.md          ← the I/O model — start here
+02-tokenization.md             ← why tokens, not characters
+03-sampling-parameters.md      ← temperature / top-p / top-k
+04-structured-outputs.md       ← typed contracts at the LLM boundary (LOAD-BEARING)
+05-streaming.md                ← NOT exercised inside the agent loop; IS exercised on the wire
+06-token-economics.md          ← how much each briefing/investigation costs
+07-heuristic-before-llm.md     ← where deterministic logic guards the LLM
+08-provider-abstraction.md     ← the ModelProvider seam (this is the BIG one)
+09-user-override-locks.md      ← NOT exercised — explained as a pattern
+```
 
-## How to read this section
+## What's load-bearing in this section for THIS codebase
 
-- **Strengths (read first to see the codebase at its best):** `05-streaming.md` and `04-structured-outputs.md` are where blooming insights does the hard thing well — a real "show its work" stream and a robust extract/validate/repair output contract.
-- **Case B (study material + buildable target):** `09-user-override-locks.md` is fully Case B — the concept is real interview knowledge, the codebase has no analog (read-only data), and the `Project exercises` block is the thing to build. `02-tokenization.md` is Case-B-adjacent: the real tokenizer is absent, but the honest character-budget analog is present and the exercises add real token accounting.
-- **Honest gaps named, not hidden:** `06` (cost meter absent), `08` (provider portability absent), `03` (temperature unset) each state the absence plainly and name the fix — the gap *is* the interview signal.
+  → **`04-structured-outputs.md`** — every agent's final answer is JSON
+    extracted by `parseAgentJson` + checked by a hand-written type guard
+    (`isAnomalyArray`, `isDiagnosis`, `isRecommendationArray`). No JSON
+    schema mode, no tool-call schema as output, no Zod. Read this to
+    understand the "lenient parse + runtime validate" choice.
 
-All citations are to blooming insights files (verified line numbers) and curriculum IDs for provenance only.
+  → **`08-provider-abstraction.md`** — `ModelProvider` is AptKit's seam.
+    Blooming implements it with `AnthropicModelProviderAdapter` so AptKit
+    can run agent loops without knowing about Anthropic specifically. This
+    is the *entire* reason AptKit code is reusable across projects.
 
----
+  → **`07-heuristic-before-llm.md`** — the bootstrap chain
+    (`list_cloud_organizations` → `list_projects` → `get_event_schema`) is
+    deterministic; only AFTER it runs does the LLM see anything. The
+    schema summary is hand-truncated (`schemaSummary()` in
+    `lib/agents/monitoring.ts:19-60`) to bound input tokens.
+
+## What's pattern-only (Case B) in this codebase
+
+  → **`05-streaming.md`** — the agent loop itself uses non-streaming
+    `messages.create()` (`lib/agents/aptkit-adapters.ts:52-55`), but the
+    NDJSON wire format streams individual agent events to the UI. Two
+    different streams, both called "streaming."
+
+  → **`09-user-override-locks.md`** — the codebase has no user-editable
+    LLM-generated fields. Taught as a pattern with a concrete refactor
+    target (the recommendation card's title/rationale would be the natural
+    place to add it).

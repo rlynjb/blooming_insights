@@ -1,403 +1,292 @@
-# LLM caching
+# 01 — LLM caching
 
-**Industry name(s):** response caching, prompt caching (`cache_control` / KV-cache reuse), semantic caching, exact-match cache
-**Type:** Industry standard · Language-agnostic
-
-> blooming insights caches at two layers it controls — a 60s exact-match `Map` over MCP tool results keyed `name:JSON.stringify(args)`, and a coarse whole-investigation replay cache — but does NOT cache the one thing that dominates the bill: the long static system prompts re-sent to Claude on every turn.
-
-
----
+**Subtitle:** Prompt cache / semantic cache / exact match · Industry standard (Case B)
 
 ## Zoom out, then zoom in
 
-**Zoom out — the bigger picture.** LLM caching is the wrappers band — same shape as the TTL cache example in the format brief, but the *layer* is what matters. Three caches sit at three different layers, and each protects a different cost: the MCP tool cache (`McpClient` `Map<key, {result, expiresAt}>` at `lib/mcp/client.ts` L18) protects rate-limited network calls; the investigation replay cache (`saveInvestigation`/`getCachedInvestigation` in `lib/state/investigations.ts`) protects whole agent runs; and the *prompt prefix cache* — which would sit at the Provider call alongside `anthropic.messages.create` — is the one this codebase has not built.
+**Case B.** Three cache layers, none currently active in this codebase.
+The most impactful one — **Anthropic prompt caching** — is one config
+flag away and would cut input cost on multi-turn agent loops by ~50%.
 
 ```
-  Zoom out — three cache layers, three different costs
+  Zoom out — three caches, three places
 
-  ┌─ Pipeline + Per-agent ───────────────────────────┐
-  │  Investigation replay cache  saveInvestigation/   │
-  │   getCachedInvestigation     lib/state/           │
-  │   keyed by insightId  → whole agent run skipped   │
-  └─────────────────────────┬────────────────────────┘
-                            │
-  ┌─ Agent loop ────────────▼────────────────────────┐
-  │                                                   │
-  │  ┌─ Provider wrappers ─────────────────────────┐ │  ← we are here
-  │  │  ★ THE THREE LAYERS ★                        │ │
-  │  │  (would-be) PROMPT PREFIX CACHE  ← ABSENT    │ │
-  │  │     cache_control on system + tools          │ │
-  │  │     (Anthropic native, ~90% prefix discount) │ │
-  │  │  TOOL CACHE  mcp/client.ts L18 (TTL 60s)    │ │
-  │  │     keyed by (toolName, JSON.stringify(args))│ │
-  │  │     no-cache-on-error  L58–60                │ │
+  ┌─ Browser ───────────────────────────────────────┐
+  │  (no LLM cache here)                            │
+  └──────────────────────┬──────────────────────────┘
+                         │
+  ┌─ Blooming server ────▼──────────────────────────┐
+  │  ┌─ semantic cache: NOT EXERCISED ────────────┐ │  ← Case B
+  │  │  (would embed query, look up similar)      │ │
   │  └─────────────────────────────────────────────┘ │
-  └─────────────────────────┬────────────────────────┘
-                            │
-  ┌─ Tools + MCP transport ─▼────────────────────────┐
-  │  rate-limited (~1 req/s); the tool cache makes   │
-  │  identical EQL return in 0ms                     │
-  └──────────────────────────────────────────────────┘
+  │  ┌─ exact-match cache: NOT EXERCISED ─────────┐ │  ← Case B
+  │  │  (would hash input, return cached output)  │ │
+  │  └─────────────────────────────────────────────┘ │
+  └──────────────────────┬──────────────────────────┘
+                         │ HTTPS messages.create
+                         ▼
+  ┌─ Anthropic ─────────────────────────────────────┐
+  │  ┌─ prompt cache: NOT EXERCISED ──────────────┐ │  ← Case B
+  │  │  cache_control: {type: 'ephemeral'} on     │ │   (biggest lever)
+  │  │  system block → ~90% cost reduction on     │ │
+  │  │  cached prefix tokens on turn 2+           │ │
+  │  └─────────────────────────────────────────────┘ │
+  └─────────────────────────────────────────────────┘
 ```
-
-**Zoom in — narrow to the concept.** The question is: which layer are you caching at, and is it the layer where the cost actually lives? Caching the wrong layer wastes effort and leaves the bill untouched. blooming insights re-sends a multi-thousand-token system prompt on every turn — the expensive repeated layer — and caches none of it. It does cache MCP tool results (cheap to re-fetch but slow + rate-limited) and finished investigations (so a demo replays without burning a key). How it works walks all three `Map`-shaped ideas, the keys, the TTLs, and the one gap.
-
----
 
 ## Structure pass
 
-**Layers.** Four layers, three of which can be cached: the pipeline / per-agent (where a whole investigation can be replayed via the investigation cache), the agent loop (where the prompt prefix WOULD be cached via Anthropic `cache_control` — but isn't), the tool layer (where MCP tool results sit behind the 60s TTL `Map`), and the MCP transport (rate-limited live calls). Three caches sit at three different layers and protect three different costs.
-
-**Axis: cost.** What does each cache layer skip — a whole agent run, a model-prefix re-charge, or a rate-limited network call? This axis is the right lens because the file is structured as "right cache at the right layer" — cache the wrong layer and the bill stays untouched. Lifecycle is downstream (each cache has its own TTL/key shape); the upstream question is which cost is being avoided.
-
-**Seams.** The cosmetic seam is within the agent loop's call layer (provider call and prompt construction are both "make the request"). The load-bearing seams are *between cache layers*: investigation cache skips everything; tool cache skips one network hop; prompt prefix cache would skip input-token re-charge. Each one targets a different *kind* of cost — wrong-layer caching has zero effect on the dominant line item. The most pointed gap-seam: the would-be prompt prefix cache sits at the provider call, and the file's whole insight is that this is the unbuilt cache that would move the bill the most.
-
-```
-  Structure pass — LLM caching
-
-  ┌─ 1. LAYERS ───────────────────────────────────┐
-  │  pipeline (investigation cache — whole run)    │
-  │  agent loop (prompt prefix cache — ABSENT)     │
-  │  tool layer (TTL Map — 60s tool results)       │
-  │  MCP transport (rate-limited live)             │
-  └────────────────────────┬───────────────────────┘
-                           │  pick the axis
-  ┌─ 2. AXIS ─────────────▼────────────────────────┐
-  │  cost: which cost does each cache skip — run,  │
-  │  re-charge, or network call?                   │
-  └────────────────────────┬───────────────────────┘
-                           │  trace across layers, find flips
-  ┌─ 3. SEAMS ────────────▼────────────────────────┐
-  │  within agent loop call: cosmetic              │
-  │  between cache layers: LOAD-BEARING            │
-  │    each layer targets a different cost         │
-  │    GAP: prompt prefix cache (the dominant cost)│
-  └────────────────────────┬───────────────────────┘
-                           ▼
-                   Block 4 — How it works
-```
-
-The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+  → **One axis to trace — staleness tolerance.** Prompt cache is safe
+    (cached prefix is identical text, same model behavior). Semantic
+    cache is risky (similar-but-not-identical queries get the same
+    answer, may return stale data). Exact-match is medium (safe if
+    nothing relevant changed since the cache write).
 
 ## How it works
 
-**Mental model.** An LLM request is `(static_prefix + dynamic_suffix) → tokens → response`. There are three places to short-circuit that pipeline, and they nest from coarse to fine. The outermost cache returns the whole *response* (skip everything). The middle cache returns a *tool result* the response needed (skip one network hop). The innermost cache reuses the *tokenized prefix* (skip re-charging the input you already sent). You own the outer two and leave the inner one on the table.
+### Move 1 — the mental model
 
 ```
- request pipeline                          cache layer that short-circuits it
- ─────────────────────────────────────     ──────────────────────────────────────
- view investigation                    ◀──  L0  whole-response replay (built)
-   └─ run agent loop
-        └─ Claude call
-             ├─ tokenize (prefix+suffix) ◀── L2  prompt cache  (cache_control) ABSENT
-             └─ tool_use → MCP call     ◀──  L1  exact-match tool cache (built)
-                  └─ Bloomreach network
+  Three layers, each with different tradeoffs
+
+  ┌─ Prompt cache (provider-side) ────────────────┐
+  │  Anthropic / OpenAI cache common system        │
+  │  prompts and prefix messages between your      │
+  │  calls. You pay ~10% of normal input cost      │
+  │  for cached prefix tokens.                     │
+  │                                                │
+  │  RISK: none — same exact tokens, same          │
+  │  behavior                                       │
+  │  BIGGEST LEVER for agent loops                  │
+  └────────────────────────────────────────────────┘
+
+  ┌─ Semantic cache (your side) ──────────────────┐
+  │  Embed the query; if a similar query was       │
+  │  answered recently, return the cached answer.  │
+  │                                                │
+  │  RISK: stale answers if data changed; tuning  │
+  │  the similarity threshold is the whole game    │
+  └────────────────────────────────────────────────┘
+
+  ┌─ Exact-match cache (your side) ───────────────┐
+  │  Hash the input; return cached output if      │
+  │  identical input.                              │
+  │                                                │
+  │  RISK: low — only fires on exact repeat;      │
+  │  hit rate is low because most LLM calls aren't │
+  │  exact repeats                                  │
+  └────────────────────────────────────────────────┘
 ```
 
-L0 and L1 are application-level caches the codebase implements as plain `Map`s. L2 is a provider-side cache toggled by a field on the API request — blooming insights never sets that field.
+### Move 2 — the step-by-step walkthrough
 
----
+**Layer 1 — Anthropic prompt caching is the biggest lever and it's
+one config flag away.** Today the adapter sends `system` as a plain
+string (`lib/agents/aptkit-adapters.ts:49`):
 
-### L1 — exact-match tool cache (the TTL cache)
-
-This is the cache the codebase leans on hardest. Every MCP tool call passes through the wrapper's `callTool`, which keys a `Map` on the tool name plus a deterministic JSON serialization of every argument.
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│  Map<string, { result: unknown; expiresAt: number }>          │
-│                                                               │
-│  key:  "execute_analytics_eql:{\"eql\":\"top 10 keywords\"}" │
-│  value: { result: <raw MCP response>,                         │
-│           expiresAt: Date.now() + 60_000 }                    │
-└──────────────────────────────────────────────────────────────┘
+```typescript
+if (request.system) params.system = request.system;
 ```
 
-The cache key is `` `${name}:${JSON.stringify(args)}` ``. The TTL defaults to 60,000 ms. The read returns `{ result, durationMs: 0, fromCache: true }` when an entry exists and its `expiresAt > Date.now()`, without touching the network. The write happens on success only:
+To enable caching, send it as a structured array with `cache_control`:
 
-```
-callTool("execute_analytics_eql", { eql })
-   │
-   ├─ key = "execute_analytics_eql:{...}"
-   ├─ cache.get(key)?.expiresAt > now ?
-   │     │ yes → return { result, durationMs: 0, fromCache: true }
-   │     │ no
-   ├─ liveCall (network)
-   ├─ result.isError ? return WITHOUT caching
-   └─ cache.set(key, { result, expiresAt: now + 60s })
+```typescript
+if (request.system) {
+  params.system = [
+    { type: 'text', text: request.system, cache_control: { type: 'ephemeral' } },
+  ];
+}
 ```
 
-The critical guard is no-cache-on-error: an `isError` result is returned without a cache write, so a transient failure never poisons the cache for 60 seconds. This is the same rule React Query applies — queries cache, errors do not.
+That's the whole change. The first call seeds the cache
+(`cache_creation_input_tokens > 0`); every subsequent call within the
+TTL (5 minutes for ephemeral) reads from cache
+(`cache_read_input_tokens > 0`, ~90% cheaper).
 
-Within a single investigation, the diagnostic and recommendation agents frequently issue overlapping EQL queries. The 60s TTL means the second agent's identical query returns instantly from L1 instead of re-spending a network round-trip against the source's ~1 req/s ceiling.
+**For blooming insights, the cacheable parts are:**
+  - The system prompt (~500 tokens, identical across all turns of one
+    agent's loop).
+  - The schema summary (~1500 tokens, identical within a session).
+  - The tool definitions (~1500 tokens, identical per agent).
 
----
+Total cacheable prefix per turn: ~3.5k tokens. At Sonnet rates:
+  - Normal cost: 3500 × $3/M = $0.0105 per turn
+  - Cached cost: 3500 × $0.30/M = $0.00105 per turn (cache_read)
+  - Savings per turn: $0.0094
+  - Across a 6-turn diagnostic loop: ~$0.056 saved per investigation
 
-### L0 — investigation replay cache (the investigation snapshot store)
+At ~5 investigations per session, that's ~$0.28 saved per session.
+For a heavily-used product, that compounds quickly.
 
-This is a coarse, whole-response cache: instead of caching one tool result, it caches the *entire NDJSON event stream* a finished investigation produced. Viewing an already-run investigation replays the recorded events rather than re-running three agents.
+**The `cache_creation_input_tokens` field is already being logged**
+(`lib/agents/aptkit-adapters.ts:60` includes `usage` in the log, which
+contains these fields per Anthropic's API). They're always zero today
+because nothing's been marked as cacheable.
 
-```
-get_cached_investigation(insightId)
-   │
-   ├─ mem.has(insightId)        ? return mem.get(insightId)   ← in-process
-   ├─ dev file (PERSIST only)   ? return fromFile             ← .investigation-cache.json
-   └─ demo seed                 ? return fromDemo ?? null     ← committed JSON
-```
+**Layer 2 — semantic cache (Case B).** For blooming insights, the
+useful semantic-cache surface would be the QueryBox. If two users (or
+the same user in two sessions) asked semantically-equivalent questions
+("what's our purchase trend?" vs "show me purchase numbers"), a
+semantic cache could return the same answer without re-running the
+agent.
 
-The lookup chain is three-tier: in-memory `Map` first, then a dev-only on-disk file, then a committed demo seed. The save call is invoked from the route after a live run completes.
+Implementation: embed the query, check vector store for similar past
+queries with cached answers, return if similarity > threshold.
+Tradeoff: tuning the threshold is the whole game. Too high (0.95+) and
+hit rate is near zero. Too low (0.7-) and you return stale or
+inappropriate answers.
 
-The route wires this in: when an `insightId` is requested and `live !== 1`, it pulls the cached event array and re-emits it through a `ReadableStream`, sleeping `REPLAY_DELAY_MS = 180` between events so the replay *feels* like a live run.
+For analytics queries where data changes (today's purchase numbers
+differ from yesterday's), semantic cache is risky — even an exact-text
+repeat should NOT use a cached answer past some TTL. Better to skip
+semantic caching for time-sensitive answers and only apply it to
+truly evergreen questions ("how does cart_update work?").
 
-```
-GET /api/agent?insightId=X            GET /api/agent?insightId=X&live=1
-   │                                     │
-   ├─ get_cached_investigation(X)        ├─ skip cache (live=1)
-   │     │ hit                           └─ run 3 agents, ~15 Claude calls,
-   │     └─ replay NDJSON @ 180ms/event        then save_investigation(X)
-   │        ZERO Claude calls
-```
+**Layer 3 — exact-match cache (Case B).** Hash the request (system +
+messages + tools), return cached response if identical. Low hit rate
+in practice — most agent calls have at least slightly different
+context turn-to-turn. Useful for idempotent classifier calls (intent
+classify on the same query repeats often) but the gain is small.
 
-This is a response cache in the strict sense: the unit cached is the final user-visible output, not an intermediate. It is what makes a demo runnable without an API key — the most expensive possible operation (a full multi-agent run) collapses to a file read.
+**Why these aren't built yet.** Demo mode (which is the default) hits
+no LLM at all — it replays the snapshot. Live mode is rate-limited by
+the Bloomreach side, not the Anthropic side. So today's *bottleneck*
+is the MCP server, not the model. Caching would be a cost reduction,
+not a latency reduction. Worth doing when (a) live becomes a real
+user-facing path, or (b) cost grows past "casual single-user."
 
----
+### Move 3 — the principle
 
-### L2 — prompt caching (`cache_control`) — ABSENT
+**Cache where it's safe and where the win is biggest. For agent loops,
+that's the provider-side prompt cache — same exact tokens, same
+behavior, ~90% discount. Semantic cache buys you cross-query reuse
+but at correctness risk. Exact-match cache is the safest but the
+hit-rate is too low to matter much.**
 
-This is the layer this system does not implement, and it is the one that maps directly to the dominant cost. Every agent loads a static system prompt from disk and re-sends it as the `system` field on *every* model call. A diagnostic run with `maxToolCalls: 6` makes up to 7 such calls, each re-paying full input price for the identical multi-thousand-token prefix.
-
-Anthropic's prompt caching lets you mark a stable prefix with `cache_control: { type: 'ephemeral' }`. The provider tokenizes that prefix once, stores the KV-cache server-side for ~5 minutes, and on subsequent calls within the window charges a cache *read* rate (~10% of input price) instead of full input.
-
-```
-Without cache_control (current):
-  turn 0  [system 2000 tok @ full] + [messages] → response
-  turn 1  [system 2000 tok @ full] + [messages] → response   ← re-charged
-  turn 2  [system 2000 tok @ full] + [messages] → response   ← re-charged
-          ...                                                    7× full price
-
-With cache_control on the static system prefix:
-  turn 0  [system 2000 tok @ full, WRITE cache] + [messages] → response
-  turn 1  [system 2000 tok @ ~10%, READ cache]  + [messages] → response
-  turn 2  [system 2000 tok @ ~10%, READ cache]  + [messages] → response
-          ...                                                    6× at ~10%
-```
-
-The semantic cache — "this question is close enough to a cached one, return the stored answer" — is also absent. The L1 cache is strictly exact-match: `JSON.stringify(args)` must be byte-identical. A query of "top keywords last week" and "top 10 keywords last week" miss each other entirely. A semantic cache would embed the query and serve a neighbor above a similarity threshold; the codebase has no embeddings anywhere, so this is a deeper gap (see `03-retrieval-and-rag`).
-
----
-
-### Current state vs future state
-
-```
-            cached today            absent
-            ──────────────          ──────────────────────
-L0 response  investigation replay    —
-L1 tool      exact-match Map (60s)   —
-L2 prompt    —                       cache_control prefix
-L2.5 semantic —                      embedding-keyed neighbor cache
-```
-
-The two implemented layers attack *latency and rate-limit pressure* (re-fetching is slow and quota-bound). The absent layer attacks *cost* (re-tokenizing is what you pay for). They are orthogonal — implementing L2 would not change a single L1 hit, and vice versa.
-
----
-
-### The principle
-
-Cache at the layer where the cost lives. For a network-bound, rate-limited data source the cost is the round-trip, so you cache the *result* (L1). For a replayable demo the cost is the whole multi-agent run, so you cache the *response* (L0). For a model that re-tokenizes a fixed prefix every turn the cost is the *input tokens*, so you cache the *prefix* (L2). Each layer is a `Map` with a different key and a different thing stored; choosing the right one is choosing the right key.
-
----
-
----
-
-### Code in this codebase
-
-This is partially implemented — two of the three layers exist.
-
-#### L1 exact-match tool cache (Case A)
-
-**File:** `lib/mcp/client.ts`
-**Function / class:** `McpClient.callTool`
-**Line range:** L97–L146 (key L102, ttl L103, read L105–L110, no-cache-on-error L137–L139, write L143–L144)
-
-The cache field is `private cache = new Map<string, { result; expiresAt }>()` at L80. Default TTL `60_000` ms. Key format `` `${name}:${JSON.stringify(args)}` ``. A `skipCache` option (L105) bypasses the read but still writes through (L141–L142 comment), serving the `/debug` force-refresh path.
-
-#### L0 investigation replay cache (Case A)
-
-**File:** `lib/state/investigations.ts`
-**Function / class:** `getCachedInvestigation` (read), `saveInvestigation` (write)
-**Line range:** read L22–L28, write L30–L41
-
-Three-tier lookup: in-memory `Map` (L23) → dev file `.investigation-cache.json` (L24, dev only) → committed demo seed (L26). Wired into the route at `app/api/agent/route.ts` L127–L141 (replay branch, `REPLAY_DELAY_MS = 180` at L105) and L254 (`saveInvestigation` after a live run).
-
-#### L2 prompt caching (Case B — Not yet implemented)
-
-**Not yet implemented.** blooming insights re-sends each agent's static system prompt at full input price on every turn — the `system` field at `lib/agents/base.ts` L98 carries the multi-thousand-token prefix loaded by `readFileSync` in each agent (e.g. `lib/agents/query.ts` L13), with no `cache_control` marker anywhere.
-
-Where it would live: the `params` object constructed at `lib/agents/base.ts` L92–L100. The static prefix would move into a structured `system` array with a `cache_control: { type: 'ephemeral' }` block on the stable portion, leaving the per-run variable text (anomaly JSON, schema summary) outside the cached span. The semantic cache would live as a new module beside `lib/mcp/client.ts`, keyed on an embedding of the `?q=` query — but the codebase has no embedding infrastructure today (see `03-retrieval-and-rag`).
-
----
-
-## LLM caching — diagram
-
-This diagram spans all four layers across the UI, Route, Agent, and Provider boundaries. The two solid boxes are built; the two dashed boxes are the gaps.
+## Primary diagram
 
 ```
-  ┌────────────────────────────────────────────────────────────────────┐
-  │  UI / ROUTE LAYER   app/api/agent/route.ts                          │
-  │                                                                     │
-  │  GET /api/agent?insightId=X                                         │
-  │       │                                                             │
-  │  ┌────▼─────────────────────────────────────────────┐              │
-  │  │  L0  investigation replay cache  (BUILT)          │              │
-  │  │  getCachedInvestigation(X)                        │              │
-  │  │   hit → replay NDJSON @ 180ms, 0 Claude calls     │              │
-  │  └────┬─────────────────────────────────────────────┘              │
-  │       │ miss / live=1                                               │
-  └───────┼──────────────────────────────────────────────────────────────┘
-          │
-  ┌───────▼──────────────────────────────────────────────────────────────┐
-  │  AGENT LAYER   lib/agents/                                            │
-  │                                                                       │
-  │  runAgentLoop → anthropic.messages.create({ system, messages })      │
-  │       │                                                               │
-  │  ┌────┴───────────────────────────────────────────────┐             │
-  │  ╎  L2  prompt cache  (ABSENT)                          ╎             │
-  │  ╎  static system prefix re-sent at full price/turn     ╎             │
-  │  ╎  would set cache_control: { type:'ephemeral' }       ╎             │
-  │  └────────────────────────────────────────────────────┘             │
-  │       │ tool_use block                                                │
-  └───────┼──────────────────────────────────────────────────────────────┘
-          │  mcp.callTool(name, args)
-  ┌───────▼──────────────────────────────────────────────────────────────┐
-  │  PROVIDER / MCP LAYER   lib/mcp/client.ts                             │
-  │                                                                       │
-  │  ┌────────────────────────────────────────────────────┐             │
-  │  │  L1  exact-match tool cache  (BUILT)                │             │
-  │  │  key = name:JSON.stringify(args)                    │             │
-  │  │  ttl = 60_000                                       │             │
-  │  │  hit → durationMs:0, fromCache:true                 │             │
-  │  │  no-cache-on-error                                  │             │
-  │  └────────────────────────────────────────────────────┘             │
-  │       │ miss → liveCall → Bloomreach MCP                              │
-  └───────────────────────────────────────────────────────────────────────┘
+  Caching opportunity per agent loop (today vs prompt-cached)
+
+  Today (one diagnostic investigation, 6 turns):
+    turn 1: 4500 input + 200 output  = $0.0165
+    turn 2: 6000 input + 300 output  = $0.0225
+    turn 3: 8000 input + 300 output  = $0.0285
+    turn 4: 10500 input + 500 output = $0.0390
+    turn 5: 13500 input + 1000 output= $0.0555
+    turn 6: 17500 input + 2000 output= $0.0825
+                                       ──────
+                                      $0.2445
+
+  With Anthropic prompt cache on system + schema + tools
+  (~3500 cacheable per turn):
+    turn 1: 4500 input + cache_creation 3500 + 200 output ≈ $0.018
+    turn 2: 6000 input - 3500 cached + 300 output  ≈ $0.014
+    turn 3: 8000 - 3500 + 300                       ≈ $0.018
+    turn 4: 10500 - 3500 + 500                      ≈ $0.029
+    turn 5: 13500 - 3500 + 1000                     ≈ $0.045
+    turn 6: 17500 - 3500 + 2000                     ≈ $0.072
+                                                    ──────
+                                                   $0.196
+
+  Savings: ~$0.05 per investigation (~20%)
+  At scale: $5/100 investigations
 ```
-
-A reader who sees only this diagram should grasp: two caches are built and protect latency/quota; the cost-bearing prompt layer is the dashed gap.
-
----
 
 ## Elaborate
 
-### Where this pattern comes from
+Anthropic introduced prompt caching in August 2024. Adoption is one
+config flag (set `cache_control` on the message you want cached).
+The TTL is 5 minutes for `ephemeral` cache; persisting longer would
+require their as-yet-unreleased "persistent" cache. For agent loops
+(which complete in <60s typically), the 5-minute TTL is comfortably
+long.
 
-Response caching predates LLMs by decades — it is HTTP `Cache-Control` and the `staleTime` of every data-fetching library. Exact-match request caching (L1) is the cache-aside pattern: the application owns the cache, populates on miss, returns on hit. **Prompt caching** (L2) is newer and provider-specific: Anthropic shipped `cache_control` in 2024 to amortize the cost of long, stable prefixes (system prompts, few-shot examples, large documents) across a conversation. **Semantic caching** comes from the RAG world — embed the query, retrieve the nearest cached answer, serve it if similarity clears a threshold (GPTCache popularized this in 2023).
+OpenAI's equivalent is implicit prompt caching (no flag needed — they
+auto-cache prefixes >1024 tokens). Adoption is automatic on supported
+models. Both providers are converging on "cache the prefix, charge
+less for re-reads."
 
-### The deeper principle
-
-```
-  what you cache        keyed by             cost it removes
-  ──────────────────    ─────────────────    ───────────────────
-  whole response (L0)   investigation id     entire agent run
-  tool result   (L1)    name + args hash     network round-trip
-  prompt prefix (L2)    the prefix itself    input tokenization
-  semantic      (L2.5)  query embedding      a near-duplicate call
-```
-
-Caches are not interchangeable. Each removes a *different* cost, so the right question is never "do we cache?" but "which cost is dominant and which cache removes it?" blooming insights correctly identified that network round-trips against a 1 req/s source are painful, and cached those. It has not yet acted on the input-token cost.
-
-### Where this breaks down
-
-The L1 `Map` is per-process and unbounded. On a Vercel serverless cold start the cache is empty — every cold-start request is a guaranteed miss. The `Map` never evicts on size, so a long-lived process accumulating many distinct queries grows without bound (in practice the tool-call set is small, so this has not bitten). Exact-match keying means cosmetically different but semantically identical queries miss each other entirely.
-
-Prompt caching has its own sharp edge: the cached prefix must be byte-stable. If the system prompt interpolates anything per-call (a timestamp, the anomaly JSON) *before* the `cache_control` boundary, every call invalidates the cache and you pay the write rate every time with zero hits. The cache also expires ~5 minutes after last use, so it helps within a burst, not across cold spells.
-
-### What to explore next
-
-- Anthropic prompt caching (`cache_control`) — the primary cost lever this codebase has not pulled; see `02-llm-cost-optimization.md`
-- `lru-cache` / `node-cache` — bounded eviction for the L1 `Map` to cap memory under high query cardinality
-- Stale-while-revalidate — return the cached tool result immediately while refreshing in the background, extending L1's benefit without lengthening staleness
-- GPTCache / semantic caching — embedding-keyed neighbor lookup for the `?q=` query path, once embeddings exist
-
----
+The semantic cache idea was popularized by GPTCache (2023) — embed
+query, vector-search prior queries+answers, return cached if similarity
+> threshold. Works well for narrow Q&A domains where queries cluster;
+works badly for analytics domains where data shifts.
 
 ## Project exercises
 
-### Add `cache_control` to the static system-prompt prefix
+### Exercise — enable Anthropic prompt caching on the system block
 
-- **Exercise ID:** B5.2 (adapted) — provenance C5.1 (caching).
-- **What to build:** Split each agent's `system` prompt into a byte-stable cached prefix and a per-run variable suffix, then attach `cache_control: { type: 'ephemeral' }` to the prefix block in the `params` constructed by `runAgentLoop`. Move per-run interpolation (anomaly JSON, schema summary) into the uncached suffix so the prefix stays identical across turns.
-- **Why it earns its place:** it is the single highest-ROI cost change in the codebase and demonstrates you can identify *where the cost actually lives* (input tokens), not just where caching is easy.
-- **Files to touch:** `lib/agents/base.ts` (the `params` build at L92–L100), each agent's prompt assembly (`lib/agents/diagnostic.ts`, `lib/agents/recommendation.ts`, `lib/agents/query.ts`, `lib/agents/monitoring.ts`).
-- **Done when:** a live diagnostic run shows `cache_creation_input_tokens` on turn 0 and `cache_read_input_tokens` (not full `input_tokens`) on turns 1–6 in `res.usage`, proving the prefix is being read from cache.
-- **Estimated effort:** 1–4hr.
+  → **Exercise ID:** `study-ai-eng-06-01.1`
+  → **What to build:** In `AnthropicModelProviderAdapter.complete()`,
+    when `request.system` is present, send it as `[{type: 'text', text:
+    request.system, cache_control: {type: 'ephemeral'}}]` instead of as
+    a plain string. Verify the next turn's
+    `usage.cache_read_input_tokens` is > 0 in the logs.
+  → **Why it earns its place:** Biggest cost-reduction move on the
+    table. Config flag, immediate ~20% savings on 6-turn loops.
+  → **Files to touch:** `lib/agents/aptkit-adapters.ts:49`,
+    possibly AptKit `ModelRequest` if `system` needs to be structured
+    upstream.
+  → **Done when:** Logs show `cache_read_input_tokens > 0` on the
+    second turn of any agent loop. A back-of-envelope check shows
+    measurable input-cost reduction.
+  → **Estimated effort:** `1–4hr` (AptKit upstream may add half a day).
 
-### Bound the L1 tool cache with LRU eviction
+### Exercise — add semantic cache to the QueryBox surface only
 
-- **Exercise ID:** C5.1 (caching) — fresh, no clean Build map.
-- **What to build:** Replace the raw `Map` in `McpClient` with an `lru-cache` instance capped at a max entry count, preserving the `name:JSON.stringify(args)` key and 60s TTL.
-- **Why it earns its place:** shows you spotted the unbounded-growth failure mode and chose a bounded cache without changing the cache-aside contract.
-- **Files to touch:** `lib/mcp/client.ts` (the `cache` field L80 and `callTool` read/write at L105–L110, L143–L144).
-- **Done when:** the existing `test/mcp/client.test.ts` suite still passes and a new test proves the cache evicts the least-recently-used entry past the cap.
-- **Estimated effort:** <1hr.
-
----
+  → **Exercise ID:** `study-ai-eng-06-01.2`
+  → **What to build:** Add a small semantic cache for the
+    `QueryAgent.answer()` flow. Embed the query; check
+    `lib/state/query-cache.ts` (a new sqlite-vec-backed store) for past
+    queries with similarity > 0.95 AND timestamp within last 5
+    minutes; return the cached answer if hit. Otherwise run the agent
+    and cache the result.
+  → **Why it earns its place:** The QueryBox is the only surface where
+    semantic cache buys real wins (repeat questions are common). The
+    5-min TTL bounds staleness on time-sensitive answers.
+  → **Files to touch:** new `lib/state/query-cache.ts`,
+    `app/api/agent/route.ts` (free-form branch), `lib/agents/query.ts`.
+  → **Done when:** Two consecutive identical queries to QueryBox return
+    in <100ms on the second one (cache hit).
+  → **Estimated effort:** `1–2 days`
 
 ## Interview defense
 
-### What an interviewer is really asking
+**Q: Does this codebase cache LLM calls?**
 
-"How do you cache an LLM app?" is testing whether you know that an LLM request has *multiple* cacheable layers and that the cheap-to-build layer is rarely the cost-bearing one. The weak answer is "I put responses in Redis." The strong answer names the layers, says which cost each removes, and points at the one that moves the bill — prompt caching of the repeated prefix.
+Not yet. Three caching layers are possible:
 
-### Likely questions
+  1. **Anthropic prompt caching** (provider-side) — one config flag
+     away (`cache_control: {type: 'ephemeral'}` on the system block).
+     Cuts input cost on multi-turn loops by ~20% per investigation.
+     Biggest lever still on the table.
 
-**[mid] What does blooming insights' tool cache key on, and why does it never cache errors?**
+  2. **Semantic cache** (your side) — embed query, return cached
+     answer if similar enough. Risky for time-sensitive data; best
+     for QueryBox-style repeated questions with a short TTL.
 
-It keys on `` `${name}:${JSON.stringify(args)}` `` (`lib/mcp/client.ts` L102) — tool name plus deterministic arg serialization. It skips the cache write when `result.isError === true` (L137–L139) because caching a 429 or a failure for 60s would serve that failure to every caller for a full minute with no retry.
+  3. **Exact-match cache** (your side) — hash input, return cached
+     output. Safe but low hit rate.
 
-```
-  result.isError ?
-   ┌── true  → return, NO cache write  (L137–L139)
-   └── false → cache.set(key, {result, expiresAt: now+60s})  (L143–L144)
-```
+`response.usage.cache_creation_input_tokens` and
+`cache_read_input_tokens` are already being logged
+(`lib/agents/aptkit-adapters.ts:60`) — they're just always zero today.
 
-**[senior] You re-send a 2,000-token system prompt every turn. What does that cost and how do you fix it?**
+**Anchor line:** "Caching is one config flag away on the provider side.
+The usage object already has the cache fields; they're just always
+zero."
 
-Every turn re-charges the full prefix at input price. A diagnostic run (`maxToolCalls: 6`) makes up to 7 calls — 7× full prefix. The fix is `cache_control: { type: 'ephemeral' }` on the stable prefix: turn 0 writes the cache, turns 1–6 read it at ~10% input price.
+**Q: Why hasn't caching been enabled?**
 
-```
-  turn 0  prefix @ full (cache WRITE)
-  turn 1  prefix @ ~10% (cache READ)
-   ...
-  turn 6  prefix @ ~10% (cache READ)
-```
-
-**[arch] Your L1 cache is an in-memory Map. What breaks at scale, and what replaces it?**
-
-Per-process state. On serverless, each cold start gets an empty `Map` — every cold-start request is a forced miss. Two concurrent instances also can't share hits. The replacement is a shared store (Redis/Upstash) keyed identically, surviving cold starts and coordinating across instances.
-
-```
-  Instance A: Map{ } ── miss ── Bloomreach
-  Instance B: Map{ } ── miss ── Bloomreach   ← no shared hit
-                                              fix: one Redis key both read
-```
-
-### The question candidates always dodge
-
-**"Why not just cache the final LLM response and call it done?"**
-
-Because blooming insights *does* (L0 replay) — and that only helps when the exact same investigation is re-viewed. It does nothing for a *new* investigation that re-sends the same system prompt, and nothing for two near-identical free-form queries. Response caching, tool caching, and prompt caching are not substitutes; each covers a path the others miss. Naming that is the signal.
-
-### One-line anchors
-
-- `lib/mcp/client.ts` L102 — cache key `name:JSON.stringify(args)`
-- `lib/mcp/client.ts` L137–L139 — no-cache-on-error guard
-- `lib/state/investigations.ts` L22–L28 — three-tier replay lookup
-- `app/api/agent/route.ts` L127–L141 — replay branch, `REPLAY_DELAY_MS = 180`
-- `lib/agents/base.ts` L98 — the un-cached static `system` prefix (the gap)
-
----
+Today the bottleneck is the Bloomreach MCP server's "1 per 10s" rate
+limit, not the Anthropic side. Demo mode hits no LLM at all. So caching
+is a cost reduction, not a latency reduction — worth doing when live
+becomes a real user-facing path. The 30-min PR is shovel-ready;
+priority is just below "make live actually scale."
 
 ## See also
 
-→ 02-llm-cost-optimization.md · → 04-rate-limiting-backpressure.md · → 05-retry-circuit-breaker.md · → ../04-agents-and-tool-use/README.md
-
----
+  → `01-llm-foundations/06-token-economics.md` — what the cache saves in $
+  → `02-llm-cost-optimization.md` — model routing as the parallel lever
+  → `05-evals-and-observability/04-llm-observability.md` — what the
+    cache metrics look like once enabled

@@ -1,310 +1,206 @@
-# Dense vs. sparse retrieval (meaning vs. exact terms)
+# 05 — dense vs sparse retrieval
 
-**Industry name(s):** dense retrieval (embeddings), sparse retrieval (BM25 / keyword / lexical), lexical vs. semantic search
-**Type:** Industry standard · Language-agnostic
-
-> Dense retrieval matches on *meaning* (embedding cosine) and sparse retrieval matches on *exact terms* (keyword/BM25 over a structured field); each fails where the other wins, and blooming insights' EQL queries are pure structured/keyword retrieval — the sparse end of the spectrum, with no dense side at all.
-
-
----
+**Subtitle:** Cosine on embeddings vs BM25 on terms · Industry standard (Case B)
 
 ## Zoom out, then zoom in
 
-**Zoom out — the bigger picture.** Dense vs sparse is the *retriever's matching strategy* — the kind of index that sits between the query and the candidate set. blooming insights only does the sparse end today: every EQL query (`execute_analytics_eql` at `lib/mcp/tools.ts` L16) and every intent check (`parseIntent` in `lib/agents/intent.ts` L6–L12) is exact-term matching. The dense end — vector cosine over embeddings — would sit alongside as a second retriever, and the two would feed a hybrid combiner (next file).
+**Case B.** Dense retrieval uses embeddings + cosine similarity. Sparse
+retrieval uses term frequency (BM25). They catch different things; the
+best production systems combine both (see `06-hybrid-retrieval-rrf.md`).
 
 ```
-  Zoom out — where dense and sparse retrievers sit (WOULD BE)
+  Zoom out — two parallel paths to top-k
 
-  ┌─ Query ──────────────────────────────────────────┐
-  │  "abandoned purchases"   or   event_4471          │
-  └─────────────────────────┬────────────────────────┘
-                            │
-            ┌───────────────┴────────────────┐
-            ▼                                ▼
-  ┌─ Sparse retriever ─┐         ┌─ Dense retriever ─┐  ← we are here
-  │  exact-term match   │         │  ★ embed → cosine ★│
-  │  BM25 / EQL filters │         │  vector nearest-k  │
-  │  IDs & exact names  │         │  synonyms / meaning│
-  └─────────┬──────────┘         └─────────┬─────────┘
-            │ top-k                          │ top-k
-            └───────────────┬────────────────┘
-                            ▼
-  ┌─ (hybrid combiner → next file) ──────────────────┐
-  │  fuse the two lists → final ranking → LLM context │
+  ┌─ query ─────────────────────────────────────────┐
+  │                                                 │
+  │  ┌─ dense ──────────┐    ┌─ sparse ──────────┐  │  ← we are here
+  │  │  embed(query)    │    │  tokenize         │  │   (Case B)
+  │  │  cosine search   │    │  BM25 term lookup │  │
+  │  └────────┬─────────┘    └────────┬──────────┘  │
+  │           ▼                       ▼              │
+  │   top-k by semantic         top-k by keyword     │
+  │   similarity                overlap              │
   └──────────────────────────────────────────────────┘
-
-  In this codebase: Not yet implemented — String.includes
-  intent matching in lib/agents/intent.ts is what exists
-  instead; EQL is sparse-only and there is no dense side.
 ```
-
-**Zoom in — narrow to the concept.** The question is: when you look something up, do you match on exact terms or on meaning — and which one does your query actually need? Exact-term matching nails identifiers (`event_4471`) and fails synonyms; meaning matching nails synonyms (`"abandoned purchases"` → `checkout_started` without `purchase`) and blurs identifiers. Choosing wrong silently returns the unhelpful neighbor. How it works walks the two strengths, the failure modes, and the rule that most real queries need both — the case the next file (hybrid + RRF) answers.
-
----
 
 ## Structure pass
 
-**Layers.** Two parallel WOULD-BE retrieval branches sit between the query and the LLM context: the sparse branch (exact-term: BM25 / EQL / `String.includes`) and the dense branch (embed → cosine). They run independently, each emitting a ranked list; a hybrid combiner (next file) merges them. blooming insights has only the sparse branch today.
-
-**Axis: control.** Who decides what a "match" means — the index (exact tokens present?) or the embedding model (vectors close in meaning?)? This axis is the right lens because dense vs sparse is fundamentally a *matching-policy* split: each side has a different definition of relevance, and they fail in complementary places. Cost is similar across both; control over the matching predicate is what flips.
-
-**Seams.** The cosmetic seam is within each branch (sparse index → sparse retriever, dense embedder → dense retriever) — neither flips. The load-bearing WOULD-BE seam is *between the two branches at the same level*: sparse asks "do tokens overlap?" and dense asks "are vectors close?" — same query, two definitions of match. This is the seam the next file (hybrid + RRF) has to fuse. In blooming insights only one side of the seam exists, so there's nothing to fuse.
-
-```
-  Structure pass — dense vs sparse (WOULD BE)
-
-  ┌─ 1. LAYERS ───────────────────────────────────┐
-  │  sparse branch (exact tokens → BM25/EQL)       │
-  │  dense branch (embed → cosine)                 │
-  │  (downstream: hybrid combiner → next file)     │
-  └────────────────────────┬───────────────────────┘
-                           │  pick the axis
-  ┌─ 2. AXIS ─────────────▼────────────────────────┐
-  │  control: who decides what counts as a match — │
-  │  the token index or the embedding model?       │
-  └────────────────────────┬───────────────────────┘
-                           │  trace across layers, find flips
-  ┌─ 3. SEAMS ────────────▼────────────────────────┐
-  │  within a branch: cosmetic                     │
-  │  sparse↔dense (same level): LOAD-BEARING       │
-  │    "tokens overlap" vs "vectors close"         │
-  │    same query, two definitions of match        │
-  │    today: only sparse exists                   │
-  └────────────────────────┬───────────────────────┘
-                           ▼
-                   Block 4 — How it works
-```
-
-The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+  → **One axis to trace — query intent.** "find docs that *mean* what I
+    asked" → dense. "find docs that *contain* the terms I asked" →
+    sparse. The two answer different questions; combining them is what
+    production needs.
 
 ## How it works
 
-**Mental model.** Think of two index shapes. A *sparse* index maps each term to the documents containing it — a `Map<term, docId[]>`, mostly empty per document (a document "contains" only a few hundred of the millions of possible terms, so its term-vector is almost all zeros: *sparse*). A *dense* index maps each document to a short float array where nearly every entry is non-zero (*dense*). Sparse matches by shared terms; dense matches by vector closeness.
+### Move 1 — the mental model
+
+Dense is paraphrase-tolerant: searching for "auth bug" finds "login
+broken." Sparse is term-strict: searching for "CVE-2024-1234" finds the
+single doc that mentions exactly that string. They're complements.
 
 ```
-  sparse (keyword / EQL)              dense (embedding)
-  ──────────────────────────         ──────────────────────────
-  "checkout_started" → [doc 3, 7]    doc 3 → [0.2, -0.1, 0.5, ...]
-  match = shares the exact term       match = small cosine angle
-  "checkout" ≠ "purchase" (no match)  "checkout" ≈ "purchase" (close)
-  exact, explainable                  fuzzy, opaque
+  Dense (embeddings)             Sparse (BM25)
+  ─────────────────              ──────────────
+  query → embed → vector         query → tokens → ["fix", "auth"]
+                                            │
+                                            ▼
+  cosine similarity in           term frequency × inverse
+  high-dim space                 document frequency
+
+  great at: paraphrases,         great at: exact terms,
+  semantic match                 rare words, identifiers,
+                                 product codes
+  weak at:  rare identifiers,    weak at:  synonyms,
+            exact term matches              paraphrases
 ```
 
-The body walks each side and where each breaks.
+### Move 2 — the step-by-step walkthrough
 
----
+**Dense retrieval — what we've been building up to.** Already covered in
+`01-embeddings.md`, `04-vector-databases.md`, `11-rag.md`:
 
-### Sparse retrieval: exact terms (EQL, BM25, keyword)
-
-Sparse retrieval scores documents by the query terms they contain, classically with BM25 (term frequency, weighted by how rare the term is across the corpus). Its structured cousin — and the only retrieval this system does — is a query language that filters by exact field values. The analytics query tool (`execute_analytics_eql`) is exactly this: you name the event, the properties, the window, and the engine returns the rows that *exactly* match.
-
-```
-  EQL-style sparse query
-  ──────────────────────────────────────────────
-  SELECT count() WHERE event = 'checkout_started'
-                   AND  device = 'mobile'
-                   AND  ts > now() - 90d
-  ──────────────────────────────────────────────
-  returns: EXACTLY the matching rows (no "similar" rows)
+```typescript
+const queryVec = await embed(query);
+const top10 = await store.cosineSearch(queryVec, { topK: 10 });
 ```
 
-Sparse retrieval is exact, fast, explainable (you can read why a row matched), and perfect for identifiers, enums, and filters. It is blind to meaning: ask for `purchase` and it will never volunteer `sale` or `transaction_completed`.
+**Sparse retrieval — BM25.** Built on classic information-retrieval math
+(TF-IDF generalized). For each query term, compute how often it appears
+in each document, weighted by how rare the term is overall. Sum across
+terms. Top-k by score.
 
-### Dense retrieval: meaning (embeddings)
-
-Dense retrieval embeds the query and the documents and ranks by cosine similarity (`01-embeddings.md`). It matches paraphrases and synonyms because closeness is in meaning-space, not term-space.
-
-```
-  dense query
-  ──────────────────────────────────────────────
-  embed("abandoned purchases") = q
-  rank docs by cosine(q, doc_vec)
-  ──────────────────────────────────────────────
-  returns: docs ABOUT cart abandonment, even with no shared words
+```typescript
+// hypothetical lib/rag/sparse.ts
+interface SparseIndex {
+  index(id: string, text: string): void;
+  search(query: string, opts: { topK: number }): Array<{ id: string; score: number }>;
+}
 ```
 
-Dense retrieval is fuzzy, captures intent, and survives spelling/vocabulary mismatch. It is bad at exact identity (blurs near-identical IDs) and opaque (no readable reason for a match).
+Implementations: SQLite's `FTS5` (Full-Text Search) ships with most
+SQLite distributions and supports BM25 ranking. For larger corpora,
+Elasticsearch or Tantivy.
 
-### The strengths are mirror images
+**For blooming insights' hypothetical RAG, sparse adds value on**:
+specific metric names ("purchase_revenue", "customer.country"), error
+strings, brand names, currency codes, country names — anything that's
+literally repeated across investigations.
 
-```
-  query type                  sparse (EQL/BM25)   dense (embedding)
-  ────────────────────────    ─────────────────   ─────────────────
-  exact event name            ✓ exact             ~ may drift
-  exact ID / enum             ✓ exact             ✗ blurs neighbors
-  numeric/time filter         ✓ native            ✗ not its job
-  synonym / paraphrase        ✗ misses            ✓ matches
-  "things like X"             ✗ no notion          ✓ native
-  rare exact keyword          ✓ BM25 weights it   ~ may underweight
-```
+Concrete example: user asks "investigate the BRL drop." Dense embedding
+might rank: investigations about Brazilian currency (loose semantic match
+to "BRL") AND investigations about other currency drops. Sparse on BM25
+would rank: investigations whose text contains "BRL" — exact-match wins,
+much higher precision for the specific term.
 
-Where one column has a ✓ the other tends to have an ✗. This mirror-image property is the entire motivation for hybrid retrieval (`06-hybrid-retrieval-rrf.md`): run both and fuse, so a query gets the exact-term hits *and* the meaning hits.
+**When dense alone fails.** "Show me past investigations of CVE-2024-1234"
+— if the embedding model never saw that CVE during training (it's recent),
+the vector for "CVE-2024-1234" is near-random. Cosine search returns
+unrelated investigations. Sparse on the literal term lands it instantly.
 
-### Why EQL alone is the right call for this data
+**When sparse alone fails.** "Show me past investigations where users
+struggled to checkout" — no investigation literally says "users struggled
+to checkout"; they say "conversion dropped" or "cart abandonment rose."
+BM25 finds nothing meaningful; dense finds the semantically related ones.
 
-This system queries *analytics* — counts, conversion rates, funnels over named events in a known schema. Those questions are exact by nature: "how many `checkout_started` on mobile in the last 90 days" has one correct answer, retrievable only by exact-term filtering. There is no "documents similar to this count." Dense retrieval has nothing to add to an exact aggregate, and would *hurt* (a "close" event is the wrong event). Sparse/structured EQL is not a limitation here — it is the correct match for the data.
+### Move 3 — the principle
 
-```
-  analytics question          retrieval that fits
-  ──────────────────────────  ──────────────────────────────
-  "count of event X"          EQL exact filter (sparse) ✓
-  "conversion on mobile"      EQL exact filter (sparse) ✓
-  "investigations LIKE this"  embedding (dense) — a DIFFERENT feature
-```
+**Dense matches meaning; sparse matches terms. Real corpora need both
+because real queries mix both.** A query like "fix the BRL drop" has a
+semantic part ("fix the X drop" — paraphrase tolerant) AND a literal part
+("BRL" — exact-term sensitive). One retrieval method handles one half.
+The hybrid pattern (next file) handles both.
 
-The dense side only becomes relevant for a *different* feature — semantic search over past investigation narratives — which is the deferred RAG decision in `11-rag.md`.
-
-### The principle
-
-Retrieval has two axes — exact terms and meaning — and they fail on opposite inputs, so the method must match the query's nature: identifiers, enums, and filters want exact (sparse) matching; synonyms and paraphrase want meaning (dense) matching. Analytics questions are exact, so sparse EQL is not a gap to fill but the correct tool; the dense side is reserved for the genuinely fuzzy question — "what past work resembles this?" — and added only when that feature exists.
-
----
-
-### Code in this codebase
-
-**Not yet implemented (dense side).** blooming insights retrieves live via MCP tool calls + EQL against Bloomreach — pure structured/keyword (sparse-like) querying — and has no embedding/dense retrieval at all.
-
-The honest analog is that EQL *is* the sparse end of the spectrum, fully present and correct. The diagnostic and monitoring agents call `execute_analytics_eql` (`lib/mcp/tools.ts` L11 for monitoring, L16 for diagnostic) and `execute_analytics` to ask exact, structured questions — named events, property filters, time windows — and receive exactly the matching aggregates. That is sparse/lexical retrieval by another name: matching on exact terms, not meaning. There is deliberately no dense counterpart, because analytics questions have exact answers and a "similar" event is the wrong event. A dense retrieval path would only appear for a semantic-search-over-past-investigations feature, living alongside `lib/state/investigations.ts`. The `Project exercises` block below is the primary buildable target for that dense side.
-
----
-
-## Dense vs. sparse — diagram
-
-This diagram spans the Service layer (the two retrieval paths) and shows where blooming insights sits (sparse only). A reader who sees only this should grasp that the two methods have mirror-image strengths and that EQL is pure sparse.
+## Primary diagram
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│  SERVICE LAYER  (retrieval methods)                                  │
-│                                                                      │
-│   query                                                              │
-│     ├──────────────────────────┬─────────────────────────────────┐  │
-│     ▼                          ▼                                  │  │
-│  SPARSE (exact terms)       DENSE (meaning)                       │  │
-│  EQL / BM25 / keyword       embedding cosine                      │  │
-│  ┌────────────────────┐     ┌────────────────────┐               │  │
-│  │ event = 'purchase' │     │ embed(q) · doc_vec │               │  │
-│  │ device = 'mobile'  │     │ rank by closeness  │               │  │
-│  │ exact, explainable │     │ fuzzy, opaque      │               │  │
-│  └─────────┬──────────┘     └─────────┬──────────┘               │  │
-│            │                          │                          │  │
-│   ✓ IDs/enums/filters         ✓ synonyms/paraphrase             │  │
-│   ✗ synonyms                  ✗ exact IDs (blurs)               │  │
-│     │                                                            │  │
-│     └── blooming insights uses ONLY this side (execute_analytics_eql)│
-│         the analytics questions are exact by nature              │  │
-└──────────────────────────────────────────────────────────────────────┘
+  When each retrieval type wins
+
+  ┌─ Query: "fix the auth bug" ─────────────────────┐
+  │                                                  │
+  │  dense:  finds "Debugging JWT verification"     │ ✓ win
+  │          finds "Login issues with OAuth"        │ ✓ win
+  │  sparse: finds nothing (no literal "auth bug"   │ ✗
+  │          string in corpus)                       │
+  │                                                  │
+  ├─ Query: "CVE-2024-1234" ────────────────────────┤
+  │                                                  │
+  │  dense:  finds random unrelated investigations  │ ✗
+  │          (model never saw this CVE)             │
+  │  sparse: finds the ONE doc with this CVE        │ ✓ win
+  │                                                  │
+  ├─ Query: "BRL revenue drop" ─────────────────────┤
+  │                                                  │
+  │  dense:  finds currency drops in general        │ ½
+  │          + Brazilian investigations              │
+  │  sparse: finds docs with "BRL" literally        │ ½
+  │                                                  │
+  │  → hybrid wins clearly (see 06-hybrid-...)       │
+  └──────────────────────────────────────────────────┘
 ```
-
-The two columns are mirror images; blooming insights lives entirely in the left column because its data demands exact answers.
-
----
 
 ## Elaborate
 
-### Where this pattern comes from
+The dense-vs-sparse debate was contentious in the 2020-2022 era when
+dense embeddings were ascendant and people declared sparse dead. The
+production reality, settled by 2023, is that hybrid systems consistently
+beat either alone on most retrieval benchmarks (BEIR, MTEB-retrieval).
+Modern production search infrastructure (Elasticsearch's "neural search,"
+Vespa, Weaviate's hybrid mode) ships both side by side.
 
-Sparse retrieval is the older discipline — the inverted index (term → document list) is the foundation of every search engine since the 1960s, refined into TF-IDF and then BM25 (Robertson & Walker, 1994), still the strongest pure-lexical ranker. Dense retrieval arrived with learned embeddings: DPR (Dense Passage Retrieval, 2020) showed embeddings could beat BM25 on open-domain QA, and the RAG wave made dense the default. The field then rediscovered that BM25 still wins on exact-term and rare-term queries, producing the now-standard hybrid (`06`). Learned-sparse models (SPLADE) sit in between — sparse vectors with learned term weights.
-
-### The deeper principle
-
-```
-  axis                what it matches        fails on
-  ─────────────────   ────────────────────   ─────────────────────
-  sparse (lexical)    exact terms            synonyms, paraphrase
-  dense (semantic)    meaning / intent       exact IDs, rare terms
-  hybrid              both (fused)           more compute, tuning
-```
-
-Neither axis dominates; they are complementary because their failure modes do not overlap. The mature retrieval system runs both and fuses — but only after confirming the data actually has a meaning-axis to exploit, which analytics aggregates do not.
-
-### Where this breaks down
-
-1. **Sparse misses vocabulary mismatch.** EQL cannot answer "abandoned purchases" if the schema names it `checkout_started` without `purchase` — the words do not match. For analytics this is fine (the agent knows the schema names); for free-text it is a real gap dense fills.
-
-2. **Dense blurs exact identity.** An embedding ranks `event_4471` and `event_4472` as near-identical. For ID lookup this is a correctness bug, not a fuzziness feature. Never use dense alone where exactness is required.
-
-3. **Sparse over rare terms can be brittle, dense over rare terms can be weak.** A rare but critical keyword (a specific error code) is BM25's strength (rare = high weight) but a weak embedding signal (under-represented in training). This is a classic hybrid-wins case.
-
-### What to explore next
-
-- **Hybrid retrieval + RRF** (`06-hybrid-retrieval-rrf.md`): run both and fuse the rankings — the production default when a corpus has both exact and fuzzy queries.
-- **Reranking** (`07-reranking.md`): a second-stage scorer over the merged candidates.
-- **Embeddings** (`01-embeddings.md`): the mechanism behind the dense side.
-
----
+For small corpora, sparse alone can be surprisingly strong because exact
+terms dominate. For large corpora with diverse query intents, hybrid is
+the move.
 
 ## Project exercises
 
-### Add a dense retrieval path for past investigations (alongside sparse EQL)
+### Exercise — add a `SqliteFtsStore` for sparse retrieval
 
-- **Exercise ID:** B2A.6 / B2A.10 (adapted) — the primary buildable target.
-- **What to build:** embed past-investigation chunks (`03-chunking-strategies.md`) and expose `searchInvestigations(query, k)` that ranks by cosine — the dense complement to the agents' sparse EQL. Keep the analytics path purely sparse; the dense path serves only the free-text "similar past work" question.
-- **Why it earns its place:** demonstrates you place dense retrieval only where meaning-matching is needed (free text) and keep exact analytics on sparse EQL — the discriminating judgment.
-- **Files to touch:** new `lib/mcp/retrieval.ts` (`searchInvestigations`), `lib/mcp/embeddings.ts` + `lib/mcp/vector-store.ts` (from earlier files), `lib/state/investigations.ts` (source documents), new `test/mcp/retrieval.test.ts`.
-- **Done when:** a paraphrased query ("mobile cart issues") retrieves a past investigation about `checkout_started` drops on mobile that shares no exact keyword, while the analytics agents still use only `execute_analytics_eql`.
-- **Estimated effort:** 1–2 days
-
-### Demonstrate the mirror-image failure modes with a side-by-side harness
-
-- **Exercise ID:** C2.4 (adapted) — dense-vs-sparse contrast.
-- **What to build:** a small harness that runs the same query set through both a sparse (keyword over investigation text) and a dense (embedding) retriever and tabulates which queries each gets right — exact-ID/event-name queries (sparse wins) vs. synonym/paraphrase queries (dense wins).
-- **Why it earns its place:** shows you can articulate and *measure* the complementary failure modes, the prerequisite for justifying hybrid (`06`).
-- **Files to touch:** new `scripts/dense-vs-sparse.ts` (the harness), `lib/mcp/retrieval.ts` (both retrievers), `test/mcp/retrieval.test.ts`.
-- **Done when:** the table shows an exact-event-name query where sparse wins and dense drifts, and a paraphrase query where dense wins and sparse returns nothing.
-- **Estimated effort:** 1–4hr
-
----
+  → **Exercise ID:** `study-ai-eng-03-05.1`
+  → **What to build:** Add a `SparseIndex` interface alongside the
+    `VectorStore` interface from `04-vector-databases.md`'s exercise.
+    Implement `SqliteFtsStore` using SQLite FTS5 + BM25 ranking. Index
+    the same investigations the vector store indexes. Add a separate
+    query method `searchSparse(query, {topK})`.
+  → **Why it earns its place:** Sets up the hybrid pattern in
+    `06-hybrid-retrieval-rrf.md`. SQLite FTS is free with the existing
+    SQLite dependency.
+  → **Files to touch:** new `lib/rag/sparse.ts`, `lib/rag/store.ts`
+    (parallel `SparseIndex`), `lib/state/investigations.ts` (upsert to
+    both indices), tests.
+  → **Done when:** Searching for a literal term (e.g. "BRL") returns
+    investigations whose text contains it; searching for a paraphrase
+    returns nothing useful (which is the expected weakness — dense
+    handles those).
+  → **Estimated effort:** `1–4hr`
 
 ## Interview defense
 
-### What an interviewer is really asking
+**Q: Why have both dense and sparse in a RAG system?**
 
-"Dense or sparse retrieval?" tests whether you match the method to the query's nature rather than reflexively reaching for embeddings. The senior signal is naming the mirror-image failure modes, recognizing structured/keyword querying (EQL) as the sparse end, and defending sparse-only as *correct* for exact analytics rather than as a missing feature.
-
-### Likely questions
-
-**[mid] What's the difference between dense and sparse retrieval?**
-
-Sparse matches exact terms — keyword/BM25 or a structured filter like EQL; a row matches if it contains the query's terms. Dense embeds query and documents and matches by cosine closeness in meaning-space, so synonyms and paraphrase match even with no shared words. Sparse is exact and explainable; dense is fuzzy and opaque.
+They catch different things. Dense (embeddings) handles paraphrases —
+"auth bug" finds "login broken." Sparse (BM25) handles exact terms —
+"CVE-2024-1234" finds the one doc with that string. Production queries
+mix both intents, so production systems combine both.
 
 ```
-sparse: event='purchase' → exact rows
-dense:  embed("sales") ≈ "purchase" → close docs
+  Query "fix the BRL drop":
+    dense:  Brazilian investigations (good semantic match) ½
+    sparse: docs literally containing "BRL"               ½
+    hybrid: both → top-k from each → fuse via RRF         ✓
 ```
 
-**[senior] Why is blooming insights sparse-only, and is that a gap?**
+**Anchor line:** "Dense matches meaning, sparse matches terms. Real queries
+mix both; real systems combine both."
 
-Not a gap — a fit. Every retrieval is an exact analytics question (count of an event, conversion on mobile) answerable only by exact-term filtering via `execute_analytics_eql` (`lib/mcp/tools.ts` L16). A dense "close" event is the wrong event for an exact aggregate, so dense would introduce errors, not improve recall. Dense earns its place only on a free-text corpus.
+**Q: For this codebase's hypothetical RAG, would sparse add real value?**
 
-```
-analytics aggregate → exact answer → sparse EQL (correct)
-"similar past work" → fuzzy → dense (a different feature)
-```
-
-**[arch] When would you add the dense side, and how would the two coexist?**
-
-When the product retrieves over natural language — "find past investigations like this." Then run dense (embedding cosine over investigation narratives) for the fuzzy question and keep sparse EQL for exact analytics; they serve different queries, not the same one. If a single query needs both exact and fuzzy matching, fuse them with RRF (`06`).
-
-```
-exact analytics  → EQL (sparse)
-free-text recall → embeddings (dense)
-both in one query → hybrid + RRF
-```
-
-### The question candidates always dodge
-
-**"Isn't sparse-only just a limitation you haven't fixed yet?"** No — and treating every sparse-only system as deficient is the tell. For exact analytics, sparse is not the floor, it is the ceiling: a meaning-based "close" answer to "how many checkouts" is simply wrong. The senior move is defending sparse-only as the correct tool for exact data and naming the specific (free-text) case where dense would add value.
-
-### One-line anchors
-
-- `lib/mcp/tools.ts` L11/L16 — `execute_analytics_eql`: exact structured querying, the sparse end.
-- Sparse matches exact terms; dense matches meaning; failure modes are mirror images.
-- EQL is sparse and *correct* for analytics — a "similar" event is the wrong event.
-- Dense blurs exact IDs — a correctness bug, not a fuzziness feature.
-- The dense axis earns its place only on a free-text corpus (past investigations).
-
----
+Yes. The corpus contains specific metric names (`purchase_revenue`,
+`customer.country`), currency codes, country names, event types — exactly
+the things sparse handles well. A user asking "show me past BRL revenue
+drops" wants the literal term match. SQLite FTS5 is free with the
+existing SQLite dependency, so adding sparse alongside dense is cheap.
 
 ## See also
 
-→ 01-embeddings.md · → 06-hybrid-retrieval-rrf.md · → 07-reranking.md · → 11-rag.md
+  → `06-hybrid-retrieval-rrf.md` — how to combine the two top-k lists
+  → `01-embeddings.md` — the dense side's substrate

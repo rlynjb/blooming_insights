@@ -1,514 +1,454 @@
 # Stacks, queues, deques, and heaps
 
-**Industry name(s):** stack (LIFO), queue (FIFO), deque (double-ended queue), heap / priority queue (min-heap, max-heap, binary heap)
-**Type:** Industry standard · Language-agnostic
+*Ordering disciplines and priority queues — Industry standard · Case B (heaps not exercised; sort+slice substitutes)*
 
-> Four ordering disciplines built on top of arrays/linked lists. Stack = last-in-first-out. Queue = first-in-first-out. Deque = both ends, O(1). Heap = always-extract-the-min-or-max in O(log N). This codebase exercises one of them implicitly (the NDJSON buffer is shaped like a single-slot queue) and `not yet exercised` for the other three.
-
----
-
-## Zoom out, then zoom in
-
-**Zoom out — the bigger picture.** Of the four ordering disciplines in this chapter, this codebase exercises **one implicitly** and **three not at all**. The NDJSON reader's `buf` string (`lib/hooks/useInvestigation.ts` L184–L208) behaves like a one-element queue — bytes arrive, get framed into records, get dequeued for processing. There's no explicit `Queue` class, no `enqueue`/`dequeue` method, but the *discipline* is there: first byte in is the first byte processed. **Stacks, deques, and heaps are not yet exercised** — the codebase has no recursion deep enough to need a manual stack, no producer/consumer that needs both-end access, and no scheduling-by-priority logic. The four primitives still belong in this guide because they're the next things you reach for when a flat array stops being enough.
+## Zoom out — what ordering this repo actually has
 
 ```
-Zoom out — what this chapter teaches vs what the repo uses
+  Ordering disciplines, where they live (and don't)
+  ─────────────────────────────────────────────────
 
-┌─ UI band ────────────────────────────────────────────────┐
-│  NDJSON reader: buf string                                │
-│  ★ behaves like a 1-slot queue (FIFO by chunk arrival) ★ │  ← we are here
-│    (implicit — no Queue class, just the buf invariant)    │
-└────────────────────────────┬─────────────────────────────┘
-                             │
-┌─ Everywhere else ──────────▼─────────────────────────────┐
-│  flat arrays, hash maps                                   │
-│  • no stack (no manual recursion)                         │  ← not yet exercised
-│  • no deque (no double-ended pipeline)                    │  ← not yet exercised
-│  • no heap / priority queue (no priority scheduling)      │  ← not yet exercised
-└──────────────────────────────────────────────────────────┘
+  ┌─ UI layer ─────────────────────────────────────┐
+  │  insertion order via Map iteration (FIFO-ish)  │
+  └────────────────────────┬───────────────────────┘
+                           │
+  ┌─ Service layer ────────▼───────────────────────┐
+  │  ★ "top-K by severity" via SORT + SLICE        │
+  │    lib/agents/monitoring-legacy.ts:136         │
+  │  active tool-calls per name (FIFO shift)       │
+  │    lib/agents/aptkit-adapters.ts:101,124       │
+  └────────────────────────┬───────────────────────┘
+                           │
+  ┌─ NOT IN THIS REPO ─────▼───────────────────────┐
+  │  no priority queue (no scheduler)              │
+  │  no real stack (recursion is one level deep)   │
+  │  no deque (no sliding window)                  │
+  └────────────────────────────────────────────────┘
 ```
 
-**Zoom in — narrow to the concept.** The question is: when do you stop treating an array as "just a list" and start picking an *ordering discipline* on top of it? The answer is when one of four constraints starts to matter: **stack** (you need to undo the most recent action — recursion call frames, undo/redo, backtracking); **queue** (you need to process items in arrival order — message queues, BFS frontiers, NDJSON chunks); **deque** (you need both ends — sliding-window algorithms, work-stealing schedulers); **heap** (you need the best item, repeatedly — Dijkstra's algorithm, top-K, event scheduling by ETA). The codebase has the *queue* constraint implicitly (chunks must be processed in arrival order to maintain framing). The other three constraints don't show up here — which is why you don't see those structures. The next sections walk all four kernels and pin the queue one to the NDJSON reader.
+Verdict-first: this repo has **no priority queue, no
+stack, no deque**. The one queue-like thing is a
+`Map<string, ToolCall[]>` where `.push` / `.shift`
+maintains FIFO order per tool name. The one "top-K"
+operation in the codebase uses `sort + slice` instead
+of a heap — a deliberate tradeoff for N ≤ 30.
 
----
+So this file does two things:
 
-## Structure pass
+1. Teach the *exercised* sliver: FIFO via array
+   `push/shift`, and the sort+slice substitute for a
+   heap.
+2. Teach **heaps from fundamentals**, anchored to
+   your `BinaryHeap.ts` / `PriorityQueue.ts` in the
+   reincodes repo — so the missing primitive is still
+   on the table.
 
-**Layers.** Each ordering discipline has the same three-layer stack: the **abstract ordering rule** (LIFO / FIFO / both / by-priority), the **concrete implementation** (array with push/pop, array with push/shift, doubly-linked list, binary heap array), and the **observed cost** (push and pop in O(1) for stack/queue/deque if implemented right; insert and extract-min in O(log N) for heap). The abstract rule is what you pick when reasoning about the problem; the implementation is the cost-engineering that makes it cheap.
+## Structure pass — the four disciplines compared
 
-**Axis: control.** Who decides what comes out next? **Stack: the most recent push.** **Queue: the oldest insert.** **Deque: the caller, on each operation.** **Heap: the comparator** (the smallest by some ordering). Picking the wrong axis is the whole bug class — using a stack when you needed a queue (BFS becomes DFS, frontier behaves wrong) or a queue when you needed a heap (the "next job" is whatever inserted first, not whatever's most urgent).
-
-**Seams.** Two seams matter; both load-bearing in the *abstract*, but only one is present in this codebase. **Seam 1 (load-bearing, present): "what determines extract order?"** — for the NDJSON reader, the answer is "arrival order" (FIFO), and that answer is what makes the framing correct. Use a stack here (LIFO) and the second chunk would get processed before the first, corrupting every multi-chunk record. **Seam 2 (load-bearing, absent): "do I extract by insertion order or by priority?"** — the codebase never makes this choice because it never has priority-extraction logic. If it did (say, processing anomalies by severity instead of by arrival), the choice would be heap.
-
-```
-Structure pass — stacks, queues, deques, heaps
-
-┌─ 1. LAYERS ─────────────────────────────────────────┐
-│  Abstract ordering rule · Concrete impl (array      │
-│  push/pop, ring buffer, doubly-linked list, binary   │
-│  heap) · Observed cost (mostly O(1) or O(log N))    │
-└────────────────────────┬─────────────────────────────┘
-                         │  pick the axis
-┌─ 2. AXIS ─────────────▼──────────────────────────────┐
-│  control: who decides what comes out next            │
-│  (stack: latest, queue: oldest, deque: caller,      │
-│   heap: comparator)                                  │
-└────────────────────────┬─────────────────────────────┘
-                         │  trace across layers, find flips
-┌─ 3. SEAMS ────────────▼──────────────────────────────┐
-│  S1: extract order = arrival ★present (NDJSON buf)   │
-│  S2: extract order = priority ☆absent                │
-│      (would mean: heap; this codebase has no such    │
-│       need yet)                                      │
-└────────────────────────┬─────────────────────────────┘
-                         ▼
-                 Block 4 — How it works
-```
+Four primitives, one question held constant: *"which
+element comes out next?"*
 
 ```
-S1 seam — "which chunk gets processed first?" answered two ways
+  One question, four answers
+  ──────────────────────────
 
-┌─ Queue (FIFO) ──────┐   seam      ┌─ Stack (LIFO) ─────────┐
-│  bytes arrive,      │ ═════╪═════►│  bytes arrive,          │
-│  framed in arrival  │  (it could │  framed in REVERSE      │
-│  order              │   flip but │  arrival order          │
-│                     │   doesn't) │                          │
-│  → NDJSON works     │             │  → NDJSON corrupts      │
-└─────────────────────┘             └─────────────────────────┘
-        ▲                                       ▲
-        └────── same axis (control), two answers ─┘
-                → the queue discipline is the load-bearer; the codebase
-                  chose right (implicitly)
+  "which element comes out next?"
+
+  ┌─ Stack (LIFO) ─────────────┐  → the most recent
+  │ push/pop at one end        │     pushed
+  └────────────────────────────┘
+
+  ┌─ Queue (FIFO) ─────────────┐  → the oldest
+  │ enqueue at back, dequeue   │     in line
+  │  at front                  │
+  └────────────────────────────┘
+
+  ┌─ Deque ────────────────────┐  → either end —
+  │ push/pop at BOTH ends      │     "you choose"
+  └────────────────────────────┘
+
+  ┌─ Heap / Priority Queue ────┐  → the highest-priority
+  │ insert anywhere, extract   │     element (not the oldest,
+  │  by PRIORITY               │     not the newest)
+  └────────────────────────────┘
 ```
 
-The skeleton is mapped — the rest of this file walks all four kernels, and ends with an honest map of which are exercised.
+The seam where these flip: **how `extract-next` is
+defined**. Same shape (collection of elements, one
+operation that takes one out), but the contract
+shifts — and once it shifts, the underlying data
+structure has to change. A queue can't answer "give
+me the highest priority" in O(log N); for that you
+need a heap.
 
----
+Hand off to How it works.
 
 ## How it works
 
-### Mental model
+#### Move 1 — the mental model
 
-Four disciplines, four pictures.
-
-```
-   STACK (LIFO)               QUEUE (FIFO)
-   ────────────               ────────────
-        push                       push
-         ↓                          ↓
-   ┌───────────┐              ┌───────────┐
-   │     D     │ ← top         │ A B C D   │
-   │     C     │               │           │
-   │     B     │              ─┘
-   │     A     │
-   └───────────┘              dequeue from the LEFT
-   pop from the TOP            push to the RIGHT
-
-   "the most recent push       "the oldest insert
-    comes out first"            comes out first"
-
-   DEQUE                       HEAP (min-heap)
-   ────────────                ────────────
-   push/pop both ends           min always at top
-   ↕                            tree shape:
-   ┌─────────────┐                    1
-   │ A B C D E F │              ┌─────┴─────┐
-   │             │              3           5
-   └─────────────┘            ┌─┴─┐       ┌─┴─┐
-   left      right            7   9      8   12
-
-   "the caller decides         extract-min: O(log N)
-    which end on each op"     insert:      O(log N)
-                               (heapified up/down)
-```
-
-The four are *family* — all "extract one element, by some rule" — but the rule and the cost differ. Pick the discipline that matches the problem; the data structure follows.
-
-### Move 1 — stack (LIFO)
-
-A stack is the simplest ordering discipline: last in, first out. Push to the top, pop from the top, peek at the top. That's it.
+You already use a stack every time you click "back"
+in the browser. You already use a queue every time
+you stand in a line. The third primitive — the heap —
+is the one most engineers haven't built from scratch
+once. The right anchor: **a heap is a "self-sorting
+bin"** — you toss elements in any order, and the next
+one out is always the smallest (min-heap) or largest
+(max-heap), in O(log N).
 
 ```
-push(x):    arr.push(x)     // O(1)
-pop():      return arr.pop() // O(1)
-peek():     return arr[arr.length - 1] // O(1)
-isEmpty():  return arr.length === 0
-size():     return arr.length
+  The four disciplines as shapes
+  ──────────────────────────────
+
+  STACK (LIFO)
+    │
+    │  push →  3 ─► [3]
+    │  push →  7 ─► [3, 7]
+    │  push →  1 ─► [3, 7, 1]
+    │  pop  ←  1                ← last in, first out
+
+  QUEUE (FIFO)
+    │
+    │  enq →   3 ─► [3]
+    │  enq →   7 ─► [3, 7]
+    │  enq →   1 ─► [3, 7, 1]
+    │  deq ←   3                ← first in, first out
+
+  HEAP (priority)
+    │  insert 3 ─►       3
+    │  insert 7 ─►      / \
+    │                  3   7
+    │  insert 1 ─►       1
+    │                   / \         ← parent ≤ children
+    │                  3   7              (min-heap)
+    │  extract-min ← 1
 ```
 
-**Where stacks show up:**
+The heap's "shape" is a *binary tree stored in an
+array* — index 0 is root, index `2i+1` and `2i+2`
+are children. The tree always stays balanced because
+inserts fill left-to-right. **The break case if you
+skip this:** if you used a sorted array, every insert
+is O(N) (you shift everything to keep it sorted). The
+heap trades "fully sorted" for "the min/max is always
+findable" in exchange for O(log N) inserts.
 
-- **Function call stack** — every recursive call pushes a frame; every return pops one. JavaScript's runtime does this for you; you don't see it until you blow it (stack overflow).
-- **Undo/redo** — push every change onto an undo stack; pop on Ctrl-Z; push the inverse onto a redo stack.
-- **Expression evaluation** — parsing `3 + 4 * (2 - 1)` uses a stack for operators and one for operands (the shunting-yard algorithm).
-- **Iterative DFS** — replace the recursive call with an explicit `stack.push(child)` to avoid stack-overflow on deep graphs.
+#### Move 2 — the operations, anchored to your code
 
-**In this codebase:** `not yet exercised`. There's no recursion deep enough to need a manual stack (the deepest recursion is `mkdir({recursive: true})` in `app/api/mcp/capture/route.ts`, which is in the standard library). There's no undo/redo. There's no expression evaluator. The closest thing is the JavaScript call stack itself, which doesn't count as the codebase exercising the structure — every program has that.
-
-**What would trigger reaching for a stack here?** An interactive query builder that supports undo. A markdown export that needs to balance nested fences. A recursive walk of the schema deep enough to risk stack overflow (currently the schema is two levels deep, fine for runtime recursion).
-
-**Code in this codebase — `not yet exercised`.** No file path. The trigger conditions: if the schema grew deep enough (10+ levels), runtime recursion could overflow and you'd convert to an explicit stack. If the UI added "undo last investigation" you'd push the previous state. If you wrote a query parser for the agent intent (`lib/agents/intent.ts`), the shunting-yard algorithm uses two stacks.
-
-### Move 2 — queue (FIFO)
-
-A queue is first in, first out. Enqueue at one end, dequeue from the other. The naive array implementation is `arr.push` to enqueue and `arr.shift` to dequeue — but `shift` is O(N) because it has to move every other element. The right implementations are a ring buffer (fixed-size array with a head pointer) or a doubly-linked list, both giving O(1) enqueue and dequeue.
-
-```
-enqueue(x):  arr.push(x)        // O(1)
-dequeue():   return arr.shift() // O(N) ← naive; AVOID in hot paths
-peek():      return arr[0]      // O(1)
-size():      return arr.length
-
-// proper O(1) dequeue requires:
-//   - ring buffer (array + head index + tail index), OR
-//   - linked list (head pointer + tail pointer)
-```
-
-**Where queues show up:**
-
-- **BFS frontier** — the queue holds nodes to visit; dequeue oldest, enqueue children.
-- **Message queues** — process events in arrival order (Kafka, RabbitMQ, Redis Streams).
-- **Event loops** — JavaScript's task queue is FIFO; macrotasks are processed in insertion order.
-- **Producer/consumer** — one thread produces, another consumes; the queue decouples them.
-- **NDJSON streaming** — this codebase's implicit case (see below).
-
-**In this codebase: applies implicitly.** The NDJSON reader's `buf` string (`lib/hooks/useInvestigation.ts` L184–L208) is a *single-slot* queue with a different shape: bytes arrive, get accumulated, get framed at delimiters, and the framed records are processed in arrival order. There's no `Queue` class; the queue discipline is *enforced by the loop structure*. Every chunk that arrives is appended to `buf` after the previous one. Every record extracted by `buf.split('\n')` is processed before the next chunk is read. The framing invariant *requires* FIFO — process the second chunk's records before the first chunk's and the multi-chunk record reconstruction breaks.
-
-```
-buf as an implicit FIFO queue (one-slot variant)
-─────────────────────────────────────────────────
-
-  network chunk 1 arrives    ──►  buf = "...partial"
-                                   │ split + pop
-                                   ▼
-                              [complete records]  ──► processed FIRST
-                              "partial"  ──► saved in buf
-
-  network chunk 2 arrives    ──►  buf = "partial" + chunk2
-                                   │ split + pop
-                                   ▼
-                              [more complete records]  ──► processed AFTER
-                              "...partial"  ──► saved in buf
-
-  FIFO discipline: chunk N's records always processed before chunk N+1's.
-  No explicit queue, but the discipline is what makes it correct.
-```
-
-The "implicit queue" framing is honest: there's no data structure called `Queue` in the code, but the *behavior* is FIFO, and reasoning about it as a queue is what makes the framing invariant defensible.
-
-**Code in this codebase — Queue (implicit FIFO): the NDJSON reader's `buf` (`lib/hooks/useInvestigation.ts` L184–L208).**
+**FIFO via `Array.push` + `Array.shift` — the only
+queue-like discipline in this repo**
 
 ```ts
-// lib/hooks/useInvestigation.ts L184–L208 (excerpt)
-const reader = res.body.getReader();
-const dec = new TextDecoder();
-let buf = '';
-for (;;) {
-  const { done, value } = await reader.read();
-  if (done) break;
-  buf += dec.decode(value, { stream: true });   // ← "enqueue" decoded bytes
-  const lines = buf.split('\n');
-  buf = lines.pop() ?? '';                      // ← save trailing partial
-  for (const line of lines) {                   // ← "dequeue" complete records
-    if (!line.trim()) continue;
-    try {
-      handle(JSON.parse(line) as AgentEvent);
-    } catch { /* ignore */ }
-  }
+// lib/agents/aptkit-adapters.ts:101
+private readonly activeToolCalls = new Map<string, ToolCall[]>();
+// ...:114-119  (a tool_call_start event)
+const existing = this.activeToolCalls.get(event.toolName) ?? [];
+existing.push(toolCall);                              // ← enqueue at back
+this.activeToolCalls.set(event.toolName, existing);
+// ...:123-124  (a tool_call_end event)
+const toolCall = this.activeToolCalls.get(event.toolName)?.shift()
+  ?? this.toBloomingToolCall(event);                  // ← dequeue at front
+```
+
+This is a real FIFO use-case: the agent may have
+multiple in-flight calls to the same tool name, and
+the result events have to be matched to the *oldest
+unmatched start event*. `push` + `shift` gives that
+in two lines.
+
+```
+  FIFO trace — two parallel calls to the same tool
+  ────────────────────────────────────────────────
+
+  state                          event
+  ─────                          ─────
+  []                             tool_call_start  toolA  (#1)
+  [#1]                           tool_call_start  toolA  (#2)
+  [#1, #2]                       tool_call_end    toolA  ← matches #1
+  [#2]                            (toolCall.result = first end's payload)
+  [#2]                           tool_call_end    toolA  ← matches #2
+  []
+```
+
+The honest call-out: `Array.prototype.shift` is
+**O(N)** in JavaScript (it re-indexes everything).
+For tiny arrays (≤ 5 in-flight calls per tool) this
+is fine; for a real production queue with thousands
+of items, you'd use a linked list or a circular
+buffer. This repo's N is bounded by parallelism per
+agent step, which is small.
+
+**Top-K via `sort + slice` — the heap substitute**
+
+This is the one place a heap would classically live,
+and the repo deliberately doesn't reach for it:
+
+```ts
+// lib/agents/monitoring-legacy.ts:136
+return [...parsed]
+  .sort((a, b) => SEV_RANK[b.severity] - SEV_RANK[a.severity])
+  .slice(0, 10);
+```
+
+The classical heap-of-size-K algorithm for "top-K
+from N items":
+
+```
+  Top-K via min-heap of size K
+  ────────────────────────────
+
+  PSEUDOCODE                              cost
+  ──────────                              ────
+  let heap = MinHeap()                    O(1)
+  for each item in input:                 ┐
+    if heap.size < K:                     │
+      heap.insert(item)                   │ N iterations,
+    elif item > heap.peek():              │ each O(log K)
+      heap.extractMin()                   │
+      heap.insert(item)                   │ → O(N log K)
+  return heap.toArray().sort()            ┘
+
+  vs. sort+slice:                         O(N log N)
+```
+
+The verdict: **for N = 10–30 and K = 10, sort+slice
+wins on constant factors and reads in one line.** If
+N grew to thousands, or this became a streaming top-K
+(can't see all of N at once), the heap would win.
+That decision is recorded in the cost-model file.
+
+You've actually *built* the heap version. Anchor to
+the reincodes repo:
+
+```ts
+// reincodes — BinaryHeap.ts
+class MinHeap {
+  insert(value): void          // O(log N) — heapifyUp
+  getMin(): T                  // O(1)     — root is min
+  extractMin(): T              // O(log N) — heapifyDown
 }
+
+// reincodes — PriorityQueue.ts
+class PriorityQueue {
+  enqueue(value, priority)     // O(log N) via heap.insert
+  dequeue()                    // O(log N) via heap.extractMin
+  updatePriority(value, p)     // O(log N) via value→index lookup
+}                              //          (the index Map is the key
+                               //           insight — without it
+                               //           updatePriority is O(N))
 ```
 
-The `buf` is not a `Queue<string>` — it's a `string`. But it *behaves* like a one-slot queue: bytes go in (appended), records come out (in arrival order), and the discipline is FIFO. The `for (const line of lines)` loop processes records in their arrival order; the saved `buf` between iterations is the queue's "next item to be completed." Walk through what breaks if the discipline were LIFO: chunk 2's records would be processed before chunk 1's tail, so a multi-chunk `tool_call_start` would either be missed or paired with the wrong `tool_call_end`. The reverse-scan reconciliation in `replaceRunningTool` (`useInvestigation.ts` L86–L95) assumes "the running tool I'm closing started before me in the items array" — that assumption depends on the queue discipline up the pipeline.
+**The load-bearing skeleton — heap's irreducible
+kernel:**
 
-This is the codebase's only exercise of an ordering discipline beyond raw array order.
+1. **Array-backed tree** — parent at `i`, children at
+   `2i+1` and `2i+2`. Without this, you'd need real
+   pointers and you'd pay O(N) per operation chasing
+   them.
 
-### Move 3 — deque (double-ended queue)
+2. **Heap invariant** — parent ≤ both children
+   (min-heap) or parent ≥ both (max-heap). **What
+   breaks without it:** the root is no longer
+   guaranteed to be min/max, so `getMin` lies.
 
-A deque (pronounced "deck") supports push and pop at *both* ends, all in O(1). It's the most flexible of the four — strictly more powerful than a stack or a queue. The implementation is usually a doubly-linked list, a circular buffer, or two stacks glued back-to-back.
+3. **heapifyUp on insert** — after appending at end,
+   swap with parent until the invariant holds. **What
+   breaks without it:** a new small element stays at
+   the bottom and the invariant is violated.
 
-```
-pushFront(x):  // O(1)
-pushBack(x):   // O(1)
-popFront():    // O(1)
-popBack():     // O(1)
-```
+4. **heapifyDown on extract** — after replacing root
+   with the last element, swap with the smaller child
+   until the invariant holds. **What breaks without
+   it:** the new root is wrong (it was the last
+   element, probably not the next-smallest).
 
-**Where deques show up:**
-
-- **Sliding window maximum** — the classic "find max in every K-element window" problem; the deque holds candidates for the current window max.
-- **Work-stealing schedulers** — each worker has its own deque; pushes/pops its own end, steals from another worker's far end.
-- **Browser history** — back goes one way, forward goes the other; new pages truncate the forward stack.
-- **Palindrome check** — push all chars, then compare popFront vs popBack until they meet.
-
-**In this codebase:** `not yet exercised`. There's no algorithm that needs both-end access. The NDJSON buffer is single-end (FIFO). The recommendation pipeline is single-direction (anomaly → diagnosis → recommendation, no back-and-forth).
-
-**What would trigger reaching for a deque here?** A sliding-window analysis over the live monitoring stream — e.g. "max severity in the last 60 seconds" updated as events arrive. A back-and-forth UI like a swipeable insight carousel where prefetching happens on both ends.
-
-**Code in this codebase — `not yet exercised`.** No file path. The canonical trigger: a "max severity in last N seconds" live indicator on the monitoring stream — the standard solution is a monotonic deque (push new values at the back, pop from the back while they're smaller than the new value, pop from the front when they fall out of the window). That's the canonical "sliding window max" pattern.
-
-### Move 4 — heap (priority queue)
-
-A heap is a *partially-ordered* binary tree where the parent is always ≤ (min-heap) or ≥ (max-heap) its children. The root is always the min (or max). Insert is O(log N); extract-min is O(log N). Peek at the min is O(1).
-
-**Binary heap kernel:** stored as a flat array. For index `i`:
-- Parent is at `(i - 1) / 2`
-- Left child is at `2i + 1`
-- Right child is at `2i + 2`
+5. **value→index Map (PriorityQueue only)** — when
+   you support `updatePriority(value, newP)`, you
+   need O(1) lookup of *where* that value lives in the
+   heap. Without it, `updatePriority` is O(N) scan
+   then O(log N) sift — defeating the purpose.
 
 ```
-insert(x):
-  arr.push(x)              // add to the end
-  heapifyUp(arr.length-1)  // bubble up until parent ≤ x (min-heap)
-                           // O(log N)
+  Heap operation traces — three inserts then one extract
+  ──────────────────────────────────────────────────────
 
-extractMin():
-  min = arr[0]             // root is the min
-  last = arr.pop()
-  if arr.length > 0:
-    arr[0] = last
-    heapifyDown(0)         // sift down until arr[i] ≤ children
-                           // O(log N)
-  return min
+  insert 7:    [7]
+                ▲
+                └ no parent, done
 
-peek():  return arr[0]    // O(1)
+  insert 3:    [7, 3]
+                ▲   ▲
+                │   └ parent is 7; 3 < 7 → swap
+                ▼
+               [3, 7]
+
+  insert 5:    [3, 7, 5]
+                       ▲
+                       └ parent is 3; 5 > 3 → done
+
+  extractMin: pop 3, move last to root
+               [5, 7]                ← 5 was at index 2
+                ▲
+                └ heapifyDown: 5 < 7, done
+              → returns 3
 ```
 
-```
-A min-heap (numbers smaller = higher priority):
+#### Move 2.5 — when this repo *would* grow a heap
 
-  index:  0    1    2    3    4    5    6
-  array: [1,   3,   5,   7,   9,   8,   12]
+The honest line: if blooming-insights started
+*streaming* anomalies from multiple agents in parallel
+and you couldn't see the full set before emitting
+top-10, the sort+slice would have to become a heap.
+Specifically: if the `MonitoringAgent.scan` returned
+an async iterator instead of an array, you'd hold a
+min-heap of size K and pop the smallest as each new
+candidate arrives. That refactor is not on the
+roadmap; the *recognition* of when to do it is.
 
-  drawn as a tree:
-                 1                    ← root = min
-            ┌────┴────┐
-            3         5
-          ┌─┴─┐     ┌─┴─┐
-          7   9     8   12
+#### Move 3 — the principle
 
-  invariant: every node ≤ both children (min-heap)
-  NOT sorted: 7 > 5 across siblings, that's OK
-```
-
-**Where heaps show up:**
-
-- **Dijkstra's shortest path** — extract-min pops the node with the smallest tentative distance.
-- **Top-K** — keep a min-heap of size K; for every new element, if it's bigger than the root, pop and push.
-- **Event scheduling** — events sorted by ETA; extract-min always gives "what fires next."
-- **Median maintenance** — two heaps (max-heap of lower half, min-heap of upper half) gives the running median.
-- **Huffman coding** — build the optimal-prefix tree by repeatedly extracting the two smallest counts.
-
-**In this codebase:** `not yet exercised`. The codebase never needs "the next-highest-priority thing." Anomalies are sorted *once* with `.sort()` (O(N log N) for a one-shot sort) and then `.slice(0, 10)` — that's all the prioritization needed. No streaming priority logic, no scheduling.
-
-**What would trigger reaching for a heap here?** A live monitoring stream where you want to emit "top 5 most severe anomalies seen so far" in real time as new ones arrive. A retry scheduler that fires retries by their wake-up time. A job queue that processes diagnostic investigations in severity order.
-
-**Code in this codebase — `not yet exercised`.** No file path. The anomaly sort (`lib/agents/monitoring.ts` L119) is `.sort()` + `.slice(0, 10)` — O(N log N) for a one-shot sort over N=30. A heap would be O(N + K log N) for top-K, which is marginally faster but completely irrelevant at this N. The user's own portfolio has `reincodes/BinaryHeap.ts` and `PriorityQueue.ts` from scratch, so the *implementation knowledge* exists; the *trigger* hasn't shown up in this codebase yet. The canonical trigger: top-K over a *stream* (anomalies arriving live, always show top 10) — the right data structure is a min-heap of size K, for each incoming item, if it's larger than the root, pop the root and push the item. That's O(log K) per item, O(K) space.
-
-### Move 2 variant — the queue kernel (the one this codebase exercises)
-
-Even though the queue is implicit here, name its kernel because the NDJSON reader's correctness depends on it.
-
-```
-QUEUE kernel
-─────────────────────────────────
-  enqueue (add at one end)
-  dequeue (remove from the other end)
-  FIFO discipline (enqueue order = dequeue order)
-```
-
-**Name each part by what breaks when missing (applied to NDJSON):**
-
-```
-Removed                       What breaks
-──────────────────────────    ─────────────────────────────────────
-FIFO discipline                Chunks processed out of arrival order;
-                               multi-chunk records reassemble wrong.
-                               Buffer's "trailing partial" assumption
-                               (held in buf across iterations) collapses
-                               because the "trailing" piece might come
-                               from an earlier chunk than what's already
-                               framed.
-
-separate enqueue/dequeue       Without a clear "what's in the buffer
-ends                           waiting" vs "what's been processed,"
-                               you reprocess records or skip them.
-                               The split/pop separation IS this seam.
-
-bounded enqueue rate           Unbounded queue grows without limit if
-(in general; not in NDJSON)    consumer is slower than producer. The
-                               NDJSON buffer dodges this because the
-                               network has its own backpressure, but
-                               for a general queue this is the failure
-                               mode you must guard against.
-```
-
-**Skeleton vs hardening:**
-
-```
-SKELETON (the queue kernel)        HARDENING
-─────────────────────────────      ─────────────────────────────────
-enqueue at one end                 bounded capacity (drop oldest /
-dequeue at other end               reject newest on full)
-FIFO discipline                    backpressure signal to producer
-                                   priority extraction (becomes a heap)
-                                   double-ended access (becomes a deque)
-```
-
-The NDJSON reader ships the kernel and one piece of accidental hardening (TCP-layer backpressure from the network).
-
-### Move 3 — the principle
-
-**Pick the ordering discipline that matches the problem, not the data structure.** Stack vs queue vs deque vs heap are *abstract specifications* — they describe what comes out and in what order. The concrete data structure (array, linked list, binary heap) is the engineering layer underneath. Reasoning at the abstract layer is what lets you say "I need a queue" before you've decided whether it's a ring buffer or a linked list.
-
----
+The four disciplines (stack, queue, deque, heap) all
+answer the same question — "which element comes out
+next?" — with different contracts. Pick the
+discipline by the contract: most recent (stack),
+oldest (queue), either-end (deque), highest priority
+(heap). The data structure follows from the choice.
+And if N is tiny, *no* data structure beats `sort +
+slice` for readability; if N is large or streaming,
+*only* the heap gives you the right asymptotic.
 
 ## Primary diagram
 
-All four ordering disciplines, with their kernel ops, cost, and the codebase's use (or lack of use).
-
 ```
-                  THE FOUR ORDERING DISCIPLINES
+  The four disciplines — pick by contract, then by N
+  ──────────────────────────────────────────────────
 
-  ┌────────────┬────────────────┬────────────────┬────────────────────┐
-  │  STACK     │  QUEUE         │  DEQUE         │  HEAP / PQ         │
-  │  (LIFO)    │  (FIFO)        │  (both ends)   │  (by priority)     │
-  ├────────────┼────────────────┼────────────────┼────────────────────┤
-  │ push  O(1) │ enqueue  O(1)  │ pushFront O(1) │ insert    O(log N) │
-  │ pop   O(1) │ dequeue  O(1)* │ pushBack  O(1) │ extractMin O(log N)│
-  │ peek  O(1) │ peek     O(1)  │ popFront  O(1) │ peek      O(1)     │
-  │            │ *with ring     │ popBack   O(1) │                    │
-  │            │  buffer/LL     │                │                    │
-  ├────────────┼────────────────┼────────────────┼────────────────────┤
-  │ extract:   │ extract:       │ extract:       │ extract:           │
-  │ most       │ oldest         │ caller picks   │ smallest/largest   │
-  │ recent     │ insert         │ end per call   │ by comparator      │
-  │ push       │                │                │                    │
-  ├────────────┼────────────────┼────────────────┼────────────────────┤
-  │ in repo:   │ in repo:       │ in repo:       │ in repo:           │
-  │ NOT YET    │ APPLIES        │ NOT YET        │ NOT YET            │
-  │ EXERCISED  │ (implicit:     │ EXERCISED      │ EXERCISED          │
-  │            │ NDJSON buf)    │                │                    │
-  └────────────┴────────────────┴────────────────┴────────────────────┘
-
-  trigger to start using:
-  • stack: need to undo most recent action; iterative DFS
-  • queue: need to process in arrival order; BFS frontier
-  • deque: need both-end access; sliding window
-  • heap:  need "the best one" repeatedly; Dijkstra; top-K stream
+  ┌────────────────────────────────────────────────────────────┐
+  │ contract                  data structure        cost       │
+  ├────────────────────────────────────────────────────────────┤
+  │ "most recent out"         Array.push/pop        O(1)       │
+  │ "oldest out"              Array.push/shift      O(N) shift │
+  │                           (or linked list)      O(1) both  │
+  │ "either end out"          Deque                 O(1) both  │
+  │ "highest priority out"    BinaryHeap            O(log N)   │
+  │                                                            │
+  │ "top-K from a small N"    Array.sort.slice      O(N log N) │
+  │                            ← simpler, wins for N small     │
+  │                                                            │
+  │ "top-K from a large/      Min-heap of size K    O(N log K) │
+  │  streaming N"              ← only option for stream        │
+  └────────────────────────────────────────────────────────────┘
 ```
-
----
 
 ## Elaborate
 
-### Where each comes from
+Stacks come from compiler/interpreter design — the
+call stack is itself a stack of frames, and recursion
+is just "let the language manage the stack for you."
+Queues come from scheduling — operating systems run
+ready-to-execute processes as FIFO (in their
+simplest form). Heaps were invented for heapsort
+(Williams, 1964) and immediately found use in
+Dijkstra's shortest-path algorithm — which is
+exactly what you implemented in reincodes.
 
-**Stack** — fundamental to expression evaluation (Łukasiewicz, 1920s, reverse Polish notation); built into hardware as the function call stack since the late 1950s.
+The most common interview confusion: "priority
+queue" is the abstract type, "binary heap" is the
+implementation. Other implementations exist (Fibonacci
+heap, pairing heap, leftist tree) with better
+asymptotic constants on `decrease-key`, but in
+practice every working priority queue you'll write is
+backed by a binary heap.
 
-**Queue** — operations research origin (waiting lines, queuing theory, Erlang 1909). The data structure formalized for OS scheduling in the 1960s.
+The deque shows up in two real production places:
+sliding-window algorithms (max in a window — keep
+indices in a monotone deque) and double-ended caches
+(LRU done with a hash map + doubly-linked list).
+Neither is exercised here, but both belong in your
+practice plan.
 
-**Deque** — Knuth uses the term in TAOCP volume 1 (1968). The implementation as "two stacks glued back-to-back" comes from functional-programming research; the array-circular-buffer version is the standard imperative implementation.
-
-**Heap** — invented by J. W. J. Williams (1964) for heapsort. The "binary heap = flat array with index arithmetic" trick is what makes it small enough to teach in one sitting.
-
-### The deeper principle
-
-**Every ordering discipline is a *contract about extraction*.** It tells you what comes out next without telling you how the inside is implemented. That separation is the value:
-
-- A `Queue<T>` is anything that promises FIFO. It might be a `T[]` with `.shift` (bad, O(N) dequeue), a ring buffer (good), a linked list (good), or a distributed Kafka topic (fine, same contract).
-- A `PriorityQueue<T>` is anything that promises "extract by lowest comparator value." Binary heap is one implementation; Fibonacci heap is another; a skip list is another. Same contract, different cost profiles.
-
-When you reach for one of these, you're reaching for the *contract*. The data structure is the engineering follow-up.
-
-### Where it breaks down
-
-- **`Array.prototype.shift` is O(N).** Naively implementing a queue as an array with `.push`/`.shift` works correctly but degrades to O(N) per dequeue because every other element shifts down. For small N this is invisible; for N > ~1000 it dominates. The fix is a ring buffer (head pointer + tail pointer in a fixed array) or `Array<T>` with a separate head index that gets reset periodically.
-
-- **Heaps are stable only by accident.** Unlike a stable sort, two items with the same priority will not necessarily come out in insertion order. If you need stability, append a sequence number to the priority key (`{priority: p, seq: n}` compared lexicographically).
-
-- **Deques are easy to implement wrong.** The naive "circular buffer with head and tail indices" has off-by-one errors at the wrap-around. Most languages provide one in the standard library (`collections.deque` in Python, `ArrayDeque` in Java); JavaScript does not, which is why you usually just use an array with the understanding that one end is slow.
-
-### What to explore next
-
-- **Monotonic stacks and deques** — a specialized variant where you maintain an invariant (always increasing, always decreasing) by popping elements that violate it before pushing. The "next greater element" problem and "sliding window max" both use this.
-
-- **Fibonacci heap** — a heap with O(1) amortized insert and decrease-key, used inside the *theoretically* fastest Dijkstra implementations. In practice the constants are bad and a binary heap usually wins, but the data structure is a beautiful exercise in amortized analysis.
-
-- **Treaps and skip lists** — randomized balanced structures that get you O(log N) heap-like ops without the rigid binary-heap shape. Useful when you also need order-by-key, which a heap doesn't support.
-
-- **Your own `reincodes/BinaryHeap.ts` and `PriorityQueue.ts`** — you've already built these from scratch. The trigger to use them in this codebase hasn't fired yet, but the implementations are sitting there.
-
----
+For deep grounding: CLRS Chapter 6 (heapsort and
+priority queues), and Sedgewick *Algorithms 4th Ed*
+§2.4 (priority queues).
 
 ## Interview defense
 
-**What they are really asking.** Whether you can name the four ordering disciplines, name what each is good at, and *pick the right one for a scenario*. Senior signal: knowing that `Array.shift` is O(N) (so a "queue" built that way isn't really a queue at scale). Architect signal: explaining when to reach for a heap over a sorted array (when extracts are streamed, not batched).
-
----
-
-**[mid] "What's the difference between a stack and a queue?"**
-
-LIFO vs FIFO — the most recent push comes out of a stack first, the oldest insert comes out of a queue first. Both have O(1) push/pop if you implement them right. The picture: a stack is a vertical pile (push on top, pop from top); a queue is a horizontal line (push on the back, pop from the front). The interesting bit is what they enable: a stack lets you undo or recurse (the most recent context is on top); a queue lets you process in arrival order (the oldest is fairest).
+**Q: Why don't you use a priority queue for the
+monitoring agent's top-10?**
 
 ```
-  stack:   push 1, push 2, push 3, pop → 3
-  queue:   enqueue 1, enqueue 2, enqueue 3, dequeue → 1
+  The decision — when sort+slice beats a heap
+  ───────────────────────────────────────────
+
+  sort+slice          heap of size K
+  ──────────          ──────────────
+  O(N log N)          O(N log K)
+  1 line              ~30 lines (BinaryHeap class)
+  wins N ≤ 30         wins N >> K, streaming N
+  WHAT WE SHIP        WHAT I'D SWITCH TO IF N GREW
 ```
 
----
+Model answer: "The LLM returns 10-30 anomalies. At
+that N, the constant factors of TimSort dominate the
+log K savings of a heap-of-size-K, and the one-liner
+is honest about what it's doing. The heap version
+only wins when N grows to thousands, or when I can't
+see all of N at once — like if scan became a stream
+of anomalies. I've built the heap from scratch in
+reincodes (BinaryHeap.ts, PriorityQueue.ts with the
+value→index Map for updatePriority); the recognition
+that this repo doesn't need it is part of the
+tradeoff." Anchor: `lib/agents/monitoring-legacy.ts:136`.
 
-**[senior] "When would you use a heap instead of just sorting an array?"**
+**Q: Name a load-bearing piece of a heap most people
+forget.**
 
-Two cases. First, when you're doing **top-K over a stream**: items arrive one at a time, and you always want the K smallest (or largest). A min-heap of size K is O(log K) per arrival; re-sorting is O(N log N) per arrival. For K small and N large the heap dominates. Second, when you need **repeated extract-min during a longer algorithm** — Dijkstra's pulls the next-shortest-tentative-distance node O(V) times; each pull is O(log V) with a heap. Sorting once doesn't help because the priorities update mid-algorithm.
+Model answer: "Two of them. First, `heapifyDown` on
+extract — after you remove the root, you replace it
+with the *last* element of the array and sift down.
+People remember `heapifyUp` for insert and forget
+that extract has its own sift-down. Second, the
+value→index Map inside PriorityQueue. Without it,
+`updatePriority(value, newP)` is O(N) to find the
+value, defeating the heap's purpose. The Map keeps
+it O(log N). Skip either and the heap is broken or
+slow. Anchors in reincodes: `BinaryHeap.ts`
+`PriorityQueue.ts`."
 
-```
-  scenario                       sort an array     heap
-  ─────────────────────────────  ────────────────  ─────────────
-  one-shot "give me top 10"      O(N log N)        O(N + K log N) ≈ same
-  streaming "always show top 10" O(N log N) per    O(log K) per item
-                                  item — bad
-  Dijkstra (V extracts, E ops)   doesn't work —    O((V+E) log V)
-                                  priorities change
-```
+**Q: Where do you use a FIFO in blooming-insights?**
 
-In this codebase, `lib/agents/monitoring.ts` L119 uses `.sort().slice(0,10)` — case 1, batched, N=30. A heap would be marginally faster but wouldn't change anything practical. The trigger for a heap would be if anomalies streamed in live and the UI had to always show top 10 as they arrived.
+Model answer: "One place: `activeToolCalls:
+Map<string, ToolCall[]>` in the AptKit trace
+adapter. The agent may have multiple in-flight calls
+to the same tool name, and the `tool_call_end` event
+has to match the *oldest unmatched start*. So I
+`push` on start, `shift` on end. `shift` is O(N) in
+JavaScript because the array re-indexes — for N ≤ 5
+parallel calls per tool, that's invisible; for a
+real production queue I'd use a linked list or a
+ring buffer. Anchor: `lib/agents/aptkit-adapters.ts:101,124`."
 
----
+**Q: What's a deque, and where would you use one?**
 
-**[arch] "The NDJSON reader uses a string `buf` instead of a `Queue<Chunk>`. Why?"**
-
-Because at the byte level there's no useful boundary between "chunks" until you've found a `\n`. A `Queue<Chunk>` would force you to either (a) reassemble across chunks before enqueueing (which is what the current code does inline) or (b) enqueue raw chunks and reassemble at dequeue (which adds latency and another buffer). The FIFO discipline is still load-bearing — `buf` is a *flat* queue of bytes waiting to be framed — but the right data structure for "bytes waiting to be framed" is a string with append + split + pop, not a `Queue<Chunk>`. The decision is "match the data structure to the unit of work": records, not chunks. Cite `lib/hooks/useInvestigation.ts` L184–L208.
-
-```
-  Queue<Chunk> (alternative)        string buf (current)
-  ────────────────────────────      ──────────────────────
-  unit: arbitrary chunk             unit: complete record
-  reassembly: per dequeue           reassembly: inline at split
-  framing: deferred                  framing: as records appear
-  + ordered                          + ordered (implicit FIFO)
-  - extra buffer + latency           - has to track partial state
-                                      in buf
-```
-
-The current design is the right one for this problem; a Queue would be over-engineering.
-
----
-
-**The dodge: "this codebase has no real ordering disciplines beyond raw arrays — is that a red flag?"**
-
-No, and here's why. Ordering disciplines are a response to *constraints*: undo (stack), arrival-order processing (queue), both-end access (deque), priority extraction (heap). This codebase doesn't have those constraints — the pipeline is linear (anomaly → diagnosis → recommendation), the streaming is single-direction, there's no priority logic. Adding any of those structures preemptively would be ceremony without payoff. The right time to reach for them is when the constraint shows up; until then, raw arrays are the right answer. The skill is *recognizing the constraint when it arrives*. The four kernels in this chapter are what you reach for at that moment.
-
----
-
-**Anchors (cite these in your answer)**
-
-- `lib/hooks/useInvestigation.ts` L184–L208 — implicit FIFO queue (string buf)
-- `lib/hooks/useInvestigation.ts` L86–L95 — `replaceRunningTool` reverse scan (depends on queue ordering up the pipeline)
-- `lib/agents/monitoring.ts` L119 — `.sort().slice(0,10)` instead of a heap, justified by N=30 batched
-- (No file path for stack/deque/heap — these are `not yet exercised`.)
-
----
+Model answer: "A deque (double-ended queue) is push/
+pop at both ends, both O(1). The canonical use is
+the sliding-window maximum problem: keep a deque of
+*indices* in decreasing order of their values, pop
+the front when it falls out of the window, pop the
+back while it's smaller than the new element. Result
+front is always the window's max. The repo doesn't
+exercise it — but it's the right shape for any
+'rolling max/min over a moving window' problem, which
+shows up in rate-limiting and anomaly detection. On
+my practice list."
 
 ## See also
 
-→ `02-arrays-strings-and-hash-maps.md` (the primitives these are built from) · → `04-trees-tries-and-balanced-indexes.md` (heap is technically a tree-shaped structure; this chapter teaches the array-backed variant) · → `05-graphs-and-traversals.md` (BFS uses a queue, DFS uses a stack — both `not yet exercised` here) · → `.aipe/study-dsa-foundations/02-arrays-strings-and-hash-maps.md` (the full case study of the implicit queue)
+- `01-complexity-and-cost-models.md` — the
+  sort+slice vs heap cost tradeoff worked end-to-end
+- `02-arrays-strings-and-hash-maps.md` — `Map<key,
+  T[]>` as the queue-per-key pattern
+- `06-sorting-searching-and-selection.md` — why
+  comparator-based sort is good enough here
+- `08-dsa-foundations-practice-map.md` — deque
+  (sliding window) is on the practice plan

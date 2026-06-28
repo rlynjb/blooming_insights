@@ -1,408 +1,322 @@
-# 04 — consistency models, staleness, read-your-writes
+# Consistency models and staleness
 
-**Industry name(s):** consistency models · stale reads · read-your-writes · stateless server / stateful client
-**Type:** Industry standard · Language-agnostic
-
-> **Verdict-first:** blooming insights has no shared store, so the classical consistency models (strong, eventual, causal, read-your-writes) mostly do not apply at the storage layer — there's nothing to be consistent *with*. Where consistency DOES bite is at three specific spots: **(1) the 60s TTL cache in `BloomreachDataSource`** is a deliberate staleness window — any data the briefing or investigation surfaces from the Bloomreach backend is up to 60 seconds behind reality (the Olist adapter has no cache, so its data is always fresh — this is an **asymmetric staleness contract across the two backends**); **(2) the cross-request handoff for investigations** uses the *client's* sessionStorage to carry state because the server has no cross-instance consistency mechanism; and **(3) the module-cached `WorkspaceSchema`** is strong-within-process for the process's lifetime. The stateless-server / stateful-client pattern in `useInvestigation` (`lib/hooks/useInvestigation.ts:18-19, 137-140`) is the actual consistency story — *the client is the source of truth between two route invocations*. Classical multi-replica consistency (file 05) is NOT YET EXERCISED.
-
----
+**Industry name:** read-your-writes consistency, TTL-bounded staleness, monotonic reads · **Type:** Industry standard vocabulary, applied minimally
 
 ## Zoom out, then zoom in
 
+Verdict first: there are exactly two places staleness can bite this repo, and one of them is per-instance memory.
+
 ```
-  Zoom out — where staleness and consistency live
+  Zoom out — where staleness lives
 
   ┌─ UI layer ───────────────────────────────────────────────┐
-  │  sessionStorage carries diagnosis  step 2 → step 3        │
-  │  ★ STATEFUL CLIENT pattern ★                              │ ← we are here
-  │  (this is the read-your-writes mechanism)                 │
-  └─────────────────────────┬────────────────────────────────┘
-                            │
-  ┌─ Service layer ─────────▼────────────────────────────────┐
-  │  McpClient 60s TTL cache  ◄── staleness window            │
-  │  module schema cache       ◄── per-process lifetime       │
-  │  in-memory Maps            ◄── per-instance "consistency" │
-  └─────────────────────────┬────────────────────────────────┘
-                            │
-  ┌─ Provider layer ────────▼────────────────────────────────┐
-  │  Bloomreach is the source of truth (eventually consistent │
-  │  with itself — opaque to us)                              │
-  └───────────────────────────────────────────────────────────┘
+  │  insights feed, investigation pages                       │
+  └──────────────────────────────────────────────────────────┘
+
+  ┌─ Service layer — Vercel serverless ──────────────────────┐
+  │                                                           │
+  │  per-instance state:                                      │
+  │    • insights/investigations Maps  ← session-scoped       │
+  │    • schema cache (`cached`)        ← process-scoped      │ ← staleness lives here too
+  │    • BloomreachDataSource cache     ← 60s TTL             │ ← AND here
+  │                                                           │
+  └──────────────────────────────────────────────────────────┘
+                              │
+  ┌─ Provider layer ─────────▼───────────────────────────────┐
+  │  Bloomreach loomi-MCP — single source of truth            │
+  │  No replication on our side; no eventual consistency       │
+  │  concerns from a replica lag                              │
+  └──────────────────────────────────────────────────────────-┘
 ```
 
-**Zoom in.** The question this file answers: *when the user clicks something and then sees a result, was the result based on data that's actually current?* For most things in this app the answer is "within 60 seconds, yes" because of the TTL cache; for the cross-step investigation flow, the answer is "yes because the client carried the data itself" — the server didn't have to be consistent because the client was the source.
+The two stale-data risks:
 
----
+1. **The 60s response cache.** A metric you just queried, then queried again 30s later, returns the *first* answer. Bounded staleness — capped at 60s — but real.
+2. **The per-instance memory split.** Two Vercel instances see different `insights` Maps. A briefing run on instance A leaves an investigation lookup on instance B with no anomaly to investigate. That's where the `?insight=` URL param exists — it's the workaround.
+
+Most of the heavy distributed-systems consistency vocabulary (linearizability, causal consistency, eventual consistency with conflict resolution, CRDTs) is **Case B — not exercised**. There's no replica, no second writer, no concurrent update path. The vocabulary is here so you can defend the absence.
 
 ## Structure pass
 
-**Layers.** Three. Client (sessionStorage as cross-request memory) · Server (per-instance caches with TTL) · Provider (Bloomreach's own internals — eventually consistent, but opaque).
-
-**Axis: who-is-the-source-of-truth across two reads.** Hold one question: *if you read X twice in quick succession, what guarantees them being the same?* On the client, the sessionStorage stash guarantees identical reads until the tab closes — strong consistency within one tab. On the server, the in-memory Map gives strong consistency within one process for the process's lifetime; **no consistency at all** across processes. At the provider, Bloomreach is the source — but the 60s TTL cache means our view of Bloomreach is stale by up to 60s, which is "bounded staleness" with a fixed bound.
-
-**Seams.** Two real, one absent.
-
-- **Seam: live data ↔ cached view.** The TTL cache trades freshness for rate-limit headroom. The window is fixed (60s) and the same across all tool calls — there's no "this insight needs fresher data than the schema does."
-- **Seam: server request N ↔ server request N+1.** No mechanism guarantees these two requests see the same server state. The instance can be different. The cache can have expired. The Map can have been GC'd by a recycle.
-- **Seam: per-replica consistency** — *does not exist*. There's no replica set to be consistent across. File 05 calls this NOT YET EXERCISED honestly.
+### Axis: what does "freshness" mean at this layer?
 
 ```
-  Structure pass — consistency where it actually lives
+  Trace "freshness" across the stack
 
-  ┌─ within one React tab ────────────────────────────────┐
-  │  sessionStorage(bi:diag:<id>): strong consistency      │
-  │  same value across reloads, dies when tab closes       │
-  └────────────────────┬──────────────────────────────────┘
-                       │  fetch
-  ┌─ within one Vercel instance ──────────────────────────┐
-  │  in-memory Map: strong within one process              │
-  │  module-cached schema: same                            │
-  │  no consistency to OTHER instances                     │
-  └────────────────────┬──────────────────────────────────┘
-                       │  HTTPS
-  ┌─ Bloomreach (opaque) ─────────────────────────────────┐
-  │  source of truth                                       │
-  │  our view is stale by up to 60s (McpClient TTL)        │
-  │  Bloomreach's OWN consistency is their problem         │
-  └────────────────────────────────────────────────────────┘
+  Browser              — wants: the data as of "now I clicked Refresh"
+                       — gets: as of the last NDJSON event
+
+  /api/briefing route  — wants: the data as of THIS request
+                       — gets: a mix — schema is process-lifetime stale;
+                                       each tool call is up to 60s stale
+
+  BloomreachDataSource — wants: as of `expiresAt`
+                       — gets: deterministic — TTL-bounded by construction
+
+  Bloomreach loomi-MCP — wants: the truth
+                       — gets: the truth (single source)
 ```
 
----
+The axis-answer differs at each layer. The interesting flips:
+
+- **At the cache boundary** — `now I clicked Refresh` translates to `up to 60s stale` for any read repeated within the window.
+- **At the per-instance boundary** — what one instance sees in its `insights` Map is invisible to another instance. The `?insight=` URL param threads the Insight ITSELF across instances rather than its id, because the id-to-insight lookup is per-instance.
+
+### Seams (load-bearing boundaries)
+
+- `BloomreachDataSource.cache` lookup ↔ live call — drop the cache and there's no staleness; add the cache and you trade freshness for cost. The default 60s TTL is the chosen point.
+- `resolveAnomaly` (`app/api/agent/route.ts:35`) is the ↔ between an `insightId` URL param and the actual Anomaly to investigate. It tries three sources in order: client-passed `?insight=` blob, per-instance Map, demo snapshot — a deliberate hedge against the per-instance staleness problem.
+- The `bi_session` cookie ↔ the per-session sub-maps in `lib/state/insights.ts:14`. Same instance + same session = consistent view. Different instance = empty view.
+
+### Layered decomposition
+
+```
+  "How does staleness propagate?" — held constant
+
+  ┌─ Bloomreach ─────────────────────────────────────┐
+  │  the data changes when business events happen     │
+  │  (a customer buys, a campaign launches)           │
+  └────────────────────┬─────────────────────────────┘
+                       │  → up to 60s of "cache holds the old answer"
+  ┌─ BloomreachData ───▼─────────────────────────────┐
+  │  Source.cache: same args → same answer for 60s    │
+  └────────────────────┬─────────────────────────────┘
+                       │  → no cross-call staleness once the cache is bypassed
+  ┌─ Agent loop ───────▼─────────────────────────────┐
+  │  consumes the cache result as ground truth        │
+  └────────────────────┬─────────────────────────────┘
+                       │  → "the agent's reasoning was based on the cache snapshot"
+  ┌─ Insight in feed ──▼─────────────────────────────┐
+  │  insight.timestamp = when the agent ran           │
+  │  evidence carries the actual data the agent saw   │
+  └──────────────────────────────────────────────────┘
+```
+
+The contrast: at the lowest layer, staleness is "the cache might be 30s out of date." At the highest layer, it's "the briefing reflects the workspace as of the timestamp on the card." The vocabulary changes (epsilon-time, snapshot, evidence) but the underlying question is the same.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You already know that React's `useState` is strongly consistent within one render — you read what you set, immediately. That's the consistency model you take for granted. Distributed systems take it away: the moment two boxes have copies of the same data, you have to pick a weaker model. The standard ladder:
+You know how `useState`'s value is whatever was last set, even if the database has since changed? Same shape: when you cache a tool result for 60s, the *answer* the agent gets is whatever was returned the first time, regardless of what Bloomreach now says. That's not a bug — it's the contract. The model name is **bounded staleness**: not "fresh," not "eventually consistent in the limit," but "guaranteed not more than 60s out of date."
 
 ```
-  The consistency ladder — strongest to weakest
+  Staleness model — the picture
 
-  STRONG               every read sees the latest write
-                       (single process; single transaction)
+      t=0       BloomreachDataSource.callTool(eql_q1, args) → MISS → liveCall
+                cache.set(key, R1, expiresAt: t=60)
+                returns R1
 
-  LINEARIZABLE         every read sees a write committed before it
-                       (looks single-process from outside)
+      t=15      same args → HIT → returns R1 (15s stale)
 
-  READ-YOUR-WRITES     a client sees its own writes immediately
-                       (others may see stale)
+      t=30      same args → HIT → returns R1 (30s stale)
+                (meanwhile, Bloomreach has the real R2)
 
-  CAUSAL               if write B depended on read A, anyone who
-                       sees B also sees A
+      t=61      same args → MISS (expired) → liveCall → returns R2
+                cache.set(key, R2, expiresAt: t=121)
 
-  EVENTUAL             reads converge to the latest write,
-                       given enough time
-
-  STALE / BOUNDED      reads may be up to N seconds out of date
-                       (this is what a TTL cache gives you)
+  the user can read R1 anywhere in [t=0, t=60); after that, R2.
+  monotonic reads? NO — a different instance with no cache could return R2 at t=20.
 ```
 
-blooming insights gets strong consistency *inside* one process (React state, in-memory Map) for free. It uses read-your-writes via the client-as-carrier pattern for cross-request flows. It accepts bounded staleness (60s) for cached MCP reads. It does not need anything weaker because it has no replicas.
+The "no monotonic reads" arrow is the load-bearing surprise. Same user, two browser tabs, two Vercel instances → instant inconsistency window during the cache TTL.
 
-### Move 2 — the moving parts
+### Move 2 — walk the parts
 
-**Use cases.**
-- User opens an investigation, runs the diagnose step, closes the laptop, comes back two hours later. Step 2's diagnosis is still in sessionStorage (tab still open) → step 3 works. If they closed the tab, sessionStorage cleared → step 3 fails with "no diagnosis was handed over."
-- Briefing is generated at 9:00am. Same user re-opens at 9:00:30. The McpClient cache (60s TTL) returns the same EQL results without hitting Bloomreach. Same insights. Even if a fraud event happened at 9:00:15, it's invisible until the cache expires.
-- A test fixture seeds `cached: WorkspaceSchema` directly via `_resetSchemaCache()` (`lib/mcp/schema.ts:194-196`) — exposed precisely because test runs need to control consistency at the process-cache layer.
+#### Part: the cache is the only "staleness" knob
 
-#### Part 1 — the stateful-client / stateless-server pattern (the load-bearing one)
+The TTL is the entire model. It's set per call (`cacheTtlMs` option, default 60_000 — `lib/data-source/bloomreach-data-source.ts:145`) and applies uniformly. We don't have a more granular model — no "always-fresh for execute_analytics_eql, never-stale for list_projects" matrix. The 60s default was chosen to absorb the worst case of a re-mount loop without making the data feel stale to a human watching a feed update.
 
-The investigation flow has two route invocations: step 2 (`/api/agent?step=diagnose`) produces a diagnosis; step 3 (`/api/agent?step=recommend`) consumes that diagnosis. The server does NOT store the diagnosis between these two calls. The *client* carries it.
-
-```
-  Stateful-client / stateless-server — the handoff
-
-  step 2: /api/agent?step=diagnose&insightId=X
-    server:  runs diagnostic agent
-    server:  emits 'diagnosis' event in NDJSON stream
-    client:  receives event, sets cDiag
-    client:  on 'done', writes to sessionStorage:
-             bi:diag:X = { diagnosis: cDiag }
-    server:  DOES NOT REMEMBER cDiag
-             (Vercel instance may recycle; cross-instance: no link)
-
-  user clicks "next step"
-
-  step 3: /api/agent?step=recommend&insightId=X&diagnosis=<json>
-    client:  reads sessionStorage bi:diag:X
-    client:  encodes diagnosis into query string
-    server:  parses diagnosis from query param
-    server:  runs recommendation agent with it
-```
-
-This IS read-your-writes — the client wrote the diagnosis, the client reads it back. The server is stateless across the two requests, and that statelessness is what makes the architecture survive Vercel recycling instances between steps. The cost: the client must carry every piece of state the next request needs, which limits the size of the handoff to "fits in a sessionStorage value and a URL query param."
-
-The boundary conditions:
-- **Tab close between steps.** sessionStorage dies with the tab. Reopen → cache miss → no diagnosis → step 3 throws "no diagnosis was handed over" (`app/api/agent/route.ts:228-230`).
-- **Different browser/device.** No sharing. Opening step 3 on a phone after running step 2 on a laptop will fail the handoff.
-- **Diagnosis bigger than ~4MB.** sessionStorage limit per origin (browser-dependent, commonly 5–10MB). Hasn't been hit in practice but it's a soft ceiling.
-
-```
-  lib/hooks/useInvestigation.ts  (lines 18-19, 70-84, 137-140)
-
-  const stashKey = (step, id) => `bi:inv:${step}:${id}`;
-  const diagHandoffKey = (id) => `bi:diag:${id}`;        ← the carrier key
-
-  // for the recommend step, load the handed-over diagnosis:
-  if (step === 'recommend') {
-    try {
-      const raw = sessionStorage.getItem(diagHandoffKey(id));
-      if (raw) {
-        const d = JSON.parse(raw) as { diagnosis?: Diagnosis };
-        handedDiagnosis = d.diagnosis ?? null;
-        cDiag = handedDiagnosis;
-        if (handedDiagnosis) setDiagnosis(handedDiagnosis);
-      }
-    } catch { /* ignore */ }
-  }
-
-  // on 'done' during the diagnose step:
-  if (step === 'diagnose' && cDiag) {
-    sessionStorage.setItem(
-      diagHandoffKey(id),
-      JSON.stringify({ diagnosis: cDiag }),               ← THE WRITE
-    );
-  }
-       │
-       └─ this is the read-your-writes mechanism. The client writes
-          the diagnosis at the end of step 2 and reads it at the start
-          of step 3. Server holds nothing between the two requests —
-          surviving instance recycles by design.
-```
-
-#### Part 2 — the 60s TTL as a bounded-staleness window (Bloomreach side only)
-
-`BloomreachDataSource.callTool` caches every successful result for 60 seconds (`lib/data-source/bloomreach-data-source.ts:145, 186`). That's a bounded-staleness guarantee — any data returned to the caller is at most 60 seconds out of date relative to Bloomreach. The Olist side has no cache (`lib/data-source/olist-data-source.ts:162` always returns `fromCache: false`), so its results are always fresh relative to the SQLite snapshot. This is an asymmetric staleness contract across the two backends: a `bi:mode=live-bloomreach` briefing sees 60-second-stale data; a `bi:mode=live-sql` briefing sees database-current data. The agent layer is told the same `fromCache: boolean` either way and doesn't care, but a UI tooltip about "last updated" would need to know which backend it asked.
-
-```
-  Bounded staleness — what 60s buys and costs
-
-  bought:  rate-limit headroom (don't re-hit Bloomreach for the
-           same call within 60s)
-           lower latency (cached calls return in 0ms)
-
-  cost:    insights generated from a 59-second-old EQL result
-           reflect a 59-second-old view of customer behavior
-
-  is 60s the right window?
-    for an analytics dashboard answering "what happened
-    yesterday?", absolutely
-    for a real-time fraud-detection dashboard, no — would
-    need TTL ≈ 1s, but at 1s the cache stops absorbing the
-    rate limit and you blow the budget
-```
-
-The bound is fixed and the same for every tool. There's no per-tool TTL — `list_funnels` (schema-shaped, changes daily) and `execute_analytics_eql` (data-shaped, could change minute-to-minute) both get 60s. The right next move at scale: variable TTL per tool, longer for schema tools, shorter for analytics. Not done because the workload doesn't demand it.
-
-```
-  lib/data-source/bloomreach-data-source.ts  (lines 130-137, 144-152)
-
-  this.minIntervalMs = opts.minIntervalMs ?? 200;
-  this.maxRetries = opts.maxRetries ?? 3;
-  this.retryDelayMs = opts.retryDelayMs ?? 10_000;
-  this.retryCeilingMs = opts.retryCeilingMs ?? 20_000;
-  // ttl defaults to 60_000 per call
-
+```ts
+// lib/data-source/bloomreach-data-source.ts:139
+async callTool<T = unknown>(
+  name: string,
+  args: Record<string, unknown>,
+  options: CallToolOptions = {},
+): Promise<CallToolResult<T>> {
   const cacheKey = `${name}:${JSON.stringify(args)}`;
   const ttl = options.cacheTtlMs ?? 60_000;
+  // …
+}
+```
 
-  if (!options.skipCache) {
-    const cached = this.cache.get(cacheKey);
-    if (cached && cached.expiresAt > Date.now()) {        ← lazy check
-      return { result: cached.result as T,
-               durationMs: 0,
-               fromCache: true };
-    }
+#### Part: per-instance state IS a consistency surface
+
+Vercel's serverless instances are independent. `lib/state/insights.ts:14` keeps a session-scoped Map:
+
+```ts
+type SessionFeed = {
+  insights: Map<string, Insight>;
+  investigations: Map<string, Investigation>;
+  anomalies: Map<string, Anomaly>;
+};
+
+const state = new Map<string, SessionFeed>();
+```
+
+That `state` lives in the process. A briefing run that fills the Map on instance A leaves instance B's Map empty, even for the same session cookie. The investigation route knows this and threads the workaround:
+
+```ts
+// app/api/agent/route.ts:35
+function resolveAnomaly(sessionId: string, insightId: string, insightParam?: string | null): Anomaly | null {
+  if (insightParam) {                                  // ← preferred: client passed the blob
+    try {
+      const i = JSON.parse(insightParam) as Insight;
+      if (i && typeof i.metric === 'string' && i.change && Array.isArray(i.scope) && i.severity) {
+        return insightToAnomaly(i);
+      }
+    } catch { /* … */ }
   }
-       │
-       └─ this is the Bloomreach-side bounded-staleness mechanism. Every
-          cached read is at most 60s stale relative to Bloomreach. Per-call
-          TTL is overridable (cacheTtlMs option) but no caller currently
-          does. The Olist adapter has no equivalent — fromCache is always
-          false there (olist-data-source.ts:162), and the same DataSource
-          interface returns identical-shaped envelopes from both sides
-          with different freshness guarantees underneath.
+  const a = getAnomaly(sessionId, insightId);          // ← fallback: same-instance lookup
+  if (a) return a;
+  const i = getInsight(sessionId, insightId);
+  if (i) return insightToAnomaly(i);
+  try {
+    if (existsSync(DEMO_FILE)) { /* … */ }              // ← final fallback: demo snapshot
+  } catch { /* … */ }
+  return null;
+}
 ```
 
-#### Part 3 — the schema cache as "strong-within-process"
-
-`lib/mcp/schema.ts:131-196` holds a module-level `cached: WorkspaceSchema | null`. First request pays the four-call cost (~5s with spacing); every subsequent request in that process reads the cached value.
+The `?insight=` query param is the cross-instance consistency hack. The feed page stashes the full Insight in `sessionStorage`, then writes `?insight=<JSON>` into the URL when navigating to investigate — so the investigate route's instance has the data it needs regardless of which instance fielded the briefing.
 
 ```
-  Module-cached schema — lifetime is the process
+  Execution trace — cross-instance investigate flow
 
-  request 1 to /api/briefing:
-    cached === null → bootstrapSchema → 4 MCP calls → store
-    cached := { projectId, projectName, events, … }
+  client                                    instance A          instance B
+  ──────                                    ──────────          ──────────
+  GET /api/briefing      ──────────────►   build feed,
+                                            putInsights(sid, …)
+                         ◄────────────── NDJSON insight events
 
-  request 2 to /api/briefing (same process):
-    cached !== null → return immediately (no MCP calls)
+  click InsightCard → stash JSON in sessionStorage
 
-  request 3 to /api/agent (same process):
-    cached !== null → return immediately
-
-  request 4 (different process / cold start):
-    cached === null → bootstrap again
+  GET /api/agent?insightId=xyz&insight=<JSON>  ─────────►        resolveAnomaly:
+                                                                  insightParam → JSON.parse
+                                                                  → run investigation
+                                                                  (NEVER reads its empty Map)
 ```
 
-This is strong consistency within one process for the process's lifetime. It's also unbounded staleness — if Bloomreach updates the schema (a new event type added), this process never sees the change. There's `_resetSchemaCache()` exposed for tests but no production trigger. The implicit assumption is that schema changes happen on a much longer timescale than a Vercel process's lifetime, so the staleness is bounded *in practice* by how often Vercel recycles instances. Inferred — not measured.
+This is "session affinity by convention" — the *client* carries enough state that any instance can serve any request. Industry: this is the same idea as `Cookie: jwt=…` in a stateless API, except the cookie is in the URL because it's only needed for this one hop.
 
-```
-  lib/mcp/schema.ts  (lines 131-133, 170-192)
+#### Part: insight.timestamp pins the snapshot
 
-  let cached: WorkspaceSchema | null = null;          ← module-level cache
+`lib/state/insights.ts:26`:
 
-  export async function bootstrapSchema(mcp): Promise<WorkspaceSchema> {
-    if (cached) return cached;                         ← strong-within-process,
-    const { projectId, projectName } = await resolveProject(mcp);
-    const args = { project_id: projectId };
-    const eventSchema = await callOrThrow(mcp, 'get_event_schema', args);
-    const customerProps = await callOrThrow(mcp, 'get_customer_property_schema', args);
-    const catalogs = await callOrThrow(mcp, 'list_catalogs', args);
-    const overview = await callOrThrow(mcp, 'get_project_overview', args);
-    cached = parseWorkspaceSchema({ projectId, projectName, eventSchema,
-                                    customerProps, catalogs, overview });
-    return cached;
-  }
-       │
-       └─ no production invalidation. The cached schema lives as long
-          as the Node process. Vercel will recycle the process eventually,
-          which is the de-facto staleness bound. _resetSchemaCache() is
-          test-only.
+```ts
+export function anomalyToInsight(a: Anomaly): Insight {
+  const id = crypto.randomUUID();
+  // …
+  return {
+    id,
+    timestamp: new Date().toISOString(),                 // ← when the agent ran
+    severity: a.severity,
+    // …
+    evidence: a.evidence,                                 // ← the data the agent SAW
+    // …
+  };
+}
 ```
 
-#### Part 4 — what NOT YET EXERCISED looks like
+Two staleness anchors on every Insight: `timestamp` (when the briefing ran) and `evidence` (the actual tool result the agent based the conclusion on). The UI doesn't promise the data is fresh as of right-now; it promises the briefing was generated at that timestamp from those exact tool calls. That's a different consistency contract, and it's the honest one.
 
-The classical consistency models (causal, vector clocks, conflict-free replicated data types) require multiple replicas with shared state. There is no shared store. There are no replicas of the state to coordinate. The Vercel instances are *unaware of each other* — that's not eventual consistency, it's *no* consistency.
+#### Part: the schema cache as monotonic-read violation
 
-```
-  things that are NOT YET EXERCISED at this consistency lens
+`lib/mcp/schema.ts:190` memoizes the schema for the lifetime of the Node process:
 
-  - read-after-write across replicas
-    (no replicas)
-
-  - causal consistency / vector clocks
-    (no concurrent writes; no causal chains between replicas)
-
-  - conflict resolution (CRDTs, last-write-wins, merge functions)
-    (no writes; no conflicts)
-
-  - read repair / anti-entropy / gossip
-    (no peer state to repair)
-
-  - quorum reads
-    (only one source: Bloomreach)
+```ts
+if (cached) return cached;
 ```
 
-They become relevant the moment the app adds a second writer to any state. For example: if /api/briefing and /api/agent ran on two instances at the same time for the same user and BOTH tried to update a shared "last seen insight" record, you'd need at minimum last-write-wins on a timestamp.
+If Bloomreach adds a new event type after the instance warmed up, the agents won't see it until the instance restarts. This is a process-lifetime staleness bound, not a TTL one. In practice Vercel cycles instances often enough that this hasn't bitten — but the failure mode is real: long-warm instance + new event type = agent doesn't know it exists.
+
+There's a `_resetSchemaCache()` test hook at line 211 but no production reset. A real fix would be a TTL here too (say, 5 minutes), or an LRU on schema with the project_id as the key in case the user switches workspaces.
 
 ### Move 3 — the principle
 
-**The cheapest consistency model is the one you don't need.** blooming insights skips most of the ladder by structurally avoiding the situations that demand the rungs — no shared writable store, no peer replicas, no concurrent writers. What it cannot skip — the cross-step investigation handoff, the bounded staleness of cached reads — it solves with the simplest available primitive (sessionStorage, TTL). The principle: figure out which consistency property your feature actually requires before reaching for the mechanism. Most features need strong-within-one-tab and bounded-staleness-on-reads. Anything stronger is paid for by a database, a queue, or both — and the absence of those in this codebase is the *answer*, not a gap.
+**The consistency model you actually have is the weakest link in your read path.** Here that link is the 60s cache for live reads + process-lifetime for the schema. Naming it bounded staleness — and being explicit about the bound — is more useful than wishing for strong consistency. The architectural pressure that gets you out of this corner (Redis, CDN with cache invalidation, server-sent invalidation messages) is real but expensive; we don't pay it because 60s is plenty fresh for a "what changed this period" analytics workflow.
 
----
+For the UI side: showing `insight.timestamp` next to every card is the cheapest possible "you're reading a snapshot" disclosure. The user sees the time and decides if it's fresh enough.
 
 ## Primary diagram
 
 ```
-  Consistency in blooming insights — what's strong, what's stale, what's absent
+  Full consistency picture — what staleness exists, and what bounds it
 
-  ┌─ Client (one tab) ────────────────────────────────────────────────┐
-  │                                                                    │
-  │  React state:        strong within one render                      │
-  │  sessionStorage:     strong across re-renders / reloads,           │
-  │                      dies with the tab                             │
-  │  bi:diag:<id>        ← STEP 2's WRITE                              │
-  │       │                                                            │
-  │       │ user navigates to step 3                                   │
-  │       ▼                                                            │
-  │  read bi:diag:<id>   ← STEP 3's READ ─── read-your-writes          │
-  │  send in query string                                              │
-  │                                                                    │
-  └─────────────────────────┬─────────────────────────────────────────┘
-                            │ HTTPS
-                            ▼
-  ┌─ Server (Vercel instance — stateless across requests) ────────────┐
-  │                                                                    │
-  │  request N:  reads diagnosis from query param                      │
-  │              no in-process memory of step 2                        │
-  │              cannot recover diagnosis on its own                   │
-  │                                                                    │
-  │  ── caches (per-process, opaque to other instances) ──             │
-  │  McpClient cache:   bounded staleness, 60s TTL                     │
-  │  module schema:     strong within process, unbounded staleness     │
-  │  in-memory Maps:    strong within process, gone on recycle         │
-  │                                                                    │
-  └─────────────────────────┬─────────────────────────────────────────┘
-                            │ HTTPS (within 60s, cached)
-                            ▼
-  ┌─ Bloomreach ───────────────────────────────────────────────────────┐
-  │  source of truth; our view is stale by up to 60s                   │
-  │  their own consistency is opaque                                   │
-  └────────────────────────────────────────────────────────────────────┘
+  ┌─ Browser ─────────────────────────────────────────────────────────┐
+  │  reads: as-of insight.timestamp + evidence (the actual tool data)  │
+  └────────────────────────────┬──────────────────────────────────────┘
+                               │ ?insight=<JSON> hops the per-instance gap
+  ┌─ Vercel instance A ────────▼──────┐    ┌─ Vercel instance B ──────┐
+  │  insights Map: populated           │    │  insights Map: EMPTY     │
+  │  bootstrap cache: populated        │    │  bootstrap cache: empty  │
+  │  data-source cache: populated      │    │  data-source cache:empty │
+  └────────────────────────────┬──────┘    └─────────────┬────────────┘
+                               │                          │
+                               ├──────── shared ──────────┤
+                               │                          │
+                  ┌────────────▼──────────────────────────▼─────────┐
+                  │  bi_session cookie + bi_auth cookie              │
+                  │  (only state both instances can see)             │
+                  └─────────────────────────┬────────────────────────┘
+                                            │ HTTPS Bearer
+                  ┌─────────────────────────▼────────────────────────┐
+                  │  Bloomreach loomi-MCP — single source of truth    │
+                  │  (per-call: cache may serve up to 60s stale)      │
+                  └──────────────────────────────────────────────────-┘
 
-  the only "stale read" boundary that bites in practice:
-    a briefing that re-runs within 60s sees the same MCP results,
-    even if Bloomreach got new events between the two runs.
+  Staleness windows:
+    response cache       — up to 60s, deterministic
+    schema cache         — process lifetime (cold-start bounded)
+    per-instance maps    — INFINITE staleness across instances
+                            (worked around by passing the blob in the URL)
 ```
-
----
 
 ## Elaborate
 
-The stateful-client / stateless-server pattern is exactly what makes serverless platforms (Vercel, AWS Lambda, Cloudflare Workers) feasible for stateful-feeling apps. The platform refuses to promise that two requests see the same process; the app responds by not putting state on the server between requests, and instead carrying it on the client (cookies, sessionStorage, URL params) or in an external durable store. blooming insights does the first; it does not yet do the second.
+The textbook consistency models you'd reach for in a real distributed system:
 
-The 60s TTL is a single-knob system. The right pattern at higher scale is **cache-control via the caller** — let each agent declare how stale a tool result can be ("monitoring tolerates 5 minutes; diagnostic needs fresh") and let `callTool` honor that. The infrastructure for it is already in `CallToolOptions.cacheTtlMs` — what's missing is callsites that use it. The day a "real-time" feature ships, that knob gets wired up.
+- **Linearizable / strong consistency** — every read sees the latest write, globally ordered. Achieved by paying coordination overhead (Raft, Paxos). Not applicable here; there's no consensus group.
+- **Sequential consistency** — operations appear to execute in *some* total order consistent with each process's program order. Same kind of overhead.
+- **Causal consistency** — if op A "happened before" op B, all observers see them in that order. Vector clocks land here. We don't track causality.
+- **Eventual consistency** — replicas converge given no new writes. Common in NoSQL stores. Not applicable: we have no replicas.
+- **Bounded staleness** — reads may be up to N seconds / K versions old. **This is the model we actually have.** TTL caches are the simplest implementation.
+- **Read-your-writes** — a process sees its own writes immediately. **Sort-of true here** within an instance + session; broken across instances (where the `?insight=` URL hack restores it).
+- **Monotonic reads** — once a process sees value V, it never sees an older value. **Not guaranteed here** — bouncing between instances during a cache window can show R2 then R1.
 
-A related concept: read-your-writes guarantees usually come from "sticky sessions" (all of a user's requests go to one server) or from a centralized store. blooming insights gets the same effect by routing the writes through the client, which is technically cleaner because it survives any backend topology change. The cost is that "writes" are limited to "things that fit in sessionStorage."
+The architectural ceiling is honest: we have one upstream, no replicas, no concurrency control. Adding replication would introduce eventual consistency as a new concern; right now it isn't one because there's nothing to be inconsistent against.
 
----
+What to read next: Werner Vogels "Eventually Consistent — Revisited"; the Jepsen consistency cheat sheet; Martin Kleppmann's *Designing Data-Intensive Applications* ch. 9.
 
 ## Interview defense
 
-**Q: What consistency model does this app use?**
+**Q: "What consistency model does this system provide?"**
 
-Three different ones at three different layers. Strong consistency within one Vercel process for in-memory state — Map and module variables. Bounded staleness (60-second TTL) for cached MCP reads. Read-your-writes for cross-request flows, but implemented unusually — by routing the writes through the client's sessionStorage instead of through a server-side store. There's no replication, no eventual consistency, no causal model — because there are no replicas of the state to be inconsistent across.
+> "Bounded staleness, with two different bounds depending on where you look. The 60-second response cache in `BloomreachDataSource` means any repeated read is up to 60s stale by construction. The per-instance Vercel memory is *infinitely* stale across instances — a briefing on instance A is invisible to instance B. We work around the second one by stashing the Insight JSON in `sessionStorage` and threading it through the investigate URL as `?insight=<JSON>`, so any instance can serve the investigation regardless of which one fielded the briefing. Honest answer: not strongly consistent, but the staleness is bounded and surfaced — every insight card shows its timestamp."
 
-```
-  three layers, three models
-
-  in-process state    →  strong (within one process lifetime)
-  cached MCP reads    →  bounded staleness (60s)
-  cross-request flow  →  read-your-writes via stateful client
-```
-
-**Q: How does step 3 of the investigation see the diagnosis from step 2?**
-
-It doesn't, on its own — the server is stateless between the two requests. The client carries the diagnosis: `useInvestigation` writes it to `sessionStorage.bi:diag:<id>` when step 2 completes, and reads it from sessionStorage when step 3 starts, then sends it back to the server in a query parameter. The server's `/api/agent?step=recommend` route requires the diagnosis to be present in the URL — it won't try to recover it on its own, because in production it provably can't (different Vercel instance, no shared store).
+Diagram:
 
 ```
-  the handoff
-
-  step 2 server  ──emits──►  client (cDiag)
-                              │
-                              ▼
-                          sessionStorage[bi:diag:X]
-                              │
-  step 3 server  ◄──reads──── client (URL param)
+  reads: ≤ 60s stale (cache)
+  insights Map: ∞ stale across instances → URL param hack
+  Insight.timestamp: the snapshot disclosure
 ```
 
-**Q: Where would this break?**
+**Q: "What's the load-bearing detail?"**
 
-When the user closes the tab between steps. sessionStorage is per-tab. Reopening to the step-3 URL gives a cache miss → no diagnosis → 500 with "no diagnosis was handed over." The fix would be a server-side store keyed by `insightId` that both routes can read, sized for the diagnosis object — Vercel KV or Upstash Redis would work. Not built today because the only user flows that reach step 3 go through step 2 in the same tab.
+> "Two things. First, the `?insight=<JSON>` URL hack — the feed page stashes the Insight, the URL carries the JSON to the investigate route. That bypasses the per-instance staleness problem without needing a real shared store. Second, the `evidence` array on every Insight — the agent's conclusion travels with the actual tool result it was based on. The UI doesn't promise the data is fresh; it promises 'this is what the agent saw at this timestamp.' That's a different consistency contract, and it's the right one for an analyst tool."
 
----
+**Q: "What's NOT exercised here?"**
 
----
+> "Anything that needs replication. No CRDTs, no vector clocks, no eventual-consistency conflict resolution, no read-your-writes guarantees across instances. There's no second writer to conflict with — Bloomreach is the only source of truth and we only read. The day someone adds a Postgres replica or a second region, this whole file gets rewritten."
+
+**Q: "What about the schema cache?"**
+
+> "Process-lifetime staleness. If Bloomreach adds a new event type after the instance warmed up, the agents won't see it until the instance restarts. Vercel cycles instances often enough that this hasn't bitten, but it's listed in the red-flags audit — the fix is a TTL on `cached` in `lib/mcp/schema.ts:190`, maybe 5 minutes, or making the schema cache an LRU keyed by `project_id` in case the user switches workspaces."
 
 ## See also
 
-- `01-distributed-system-map.md` — Seam A (client ↔ server) is the carrier for read-your-writes
-- `03-idempotency-deduplication-and-delivery-semantics.md` — the same 60s TTL is also a dedup window
-- `05-replication-partitioning-and-quorums.md` — why classical consistency models don't apply (no replicas)
-- `08-sagas-outbox-and-cross-boundary-workflows.md` — the step 2 → step 3 flow as a cross-boundary workflow
-- `10-transport-agnostic-protocol-design.md` — the asymmetric staleness contract between the two adapters
-- `.aipe/study-system-design/audit.md#state-ownership-and-source-of-truth` — the architectural take on state ownership
-
----
+- `03-idempotency-deduplication-and-delivery-semantics.md` — the cache as a dedup story.
+- `07-clocks-coordination-and-leadership.md` — the encrypted-cookie pattern that hops the same per-instance gap for auth state.
+- `09-distributed-systems-red-flags-audit.md` — the schema-cache lifetime and the per-instance throttle gap are both listed there.
+- `../study-database-systems/` — the storage-side vocabulary for ACID, isolation, and snapshot semantics.

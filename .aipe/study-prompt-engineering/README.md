@@ -1,38 +1,50 @@
-# blooming insights — prompt engineering study guide
+# Prompt engineering — study guide
 
-The third companion to [`study-system-design/`](../study-system-design/README.md) and [`study-ai-engineering/`](../study-ai-engineering/README.md). Same per-concept template, but a different voice — **working AI engineer**, not staff engineer: first-person, concrete about bugs, skeptical of advice that only works in demos. 13 concepts, the complete list for the discipline.
+Thirteen concept files, walked in the order a working AI engineer would walk them. Operational discipline first (how a production prompt is built, validated, versioned, budgeted, and iterated against evals). Specific techniques after (few-shot, CoT, self-critique, meta-prompting). Defense and forbidden patterns last.
 
-The subject is blooming insights' four agent prompts — now shipped via `@aptkit/prompts` (the active path, pulled in through `@aptkit/core@0.3.0`) with the previous markdown preserved under `lib/agents/legacy-prompts/{monitoring,diagnostic,recommendation,query}.md` (the legacy path) — read as the versioned, budgeted, validated components they are. Start with [`00-overview.md`](00-overview.md) for the discipline map and the per-concept failure modes.
+Anchored to `blooming_insights`: five agents — monitoring, diagnostic, recommendation, query, intent — each driving a Bloomreach Engagement workspace through the loomi MCP server. The active prompts ship through `@aptkit/core` (the runtime); the prose source-of-truth for each Bloomreach-only prompt lives in `lib/agents/legacy-prompts/*.md`. When a concept exists as a pattern but the substrate is missing in this repo (eval harness, prompt-version logging in production), the file says so honestly.
 
 ## Reading order
 
-Operational discipline first (you can't iterate a prompt you can't budget or evaluate), then the specific techniques.
+Start at `00-overview.md` for the system map (where prompts live, who calls them, how outputs are validated). Then the thirteen concept files in order — each builds on the previous.
 
-**Operational discipline**
+```
+operational discipline                  techniques                            defense / hygiene
+─────────────────────                   ──────────                            ─────────────────
+01 anatomy                              08 few-shot                           12 prompt-injection-defense
+02 structured-outputs                   09 chain-of-thought                   13 forbidden-patterns
+03 prompts-as-code                      10 self-critique
+04 token-budgeting                      11 meta-prompting
+05 eval-driven-iteration
+06 single-purpose-chains
+07 output-mode-mismatch
+```
 
-1. **[01-anatomy.md](01-anatomy.md)** — the four sections of a production prompt; constant (system) vs per-call (injected); the decomposition rule. *C1.7.*
-2. **[02-structured-outputs.md](02-structured-outputs.md)** — extracting a typed contract from prose: fence-strip, validate, retry; why prompt-instructed JSON survives here. *NEW Tier 1.*
-3. **[03-prompts-as-code.md](03-prompts-as-code.md)** — prompts as version-controlled source; the prompt+model-version pairing gap. *NEW Tier 1.*
-4. **[04-token-budgeting.md](04-token-budgeting.md)** — counting tokens as basic hygiene; schema/result/tool-call caps; the unused prefix-cache. *NEW Tier 1.*
-5. **[05-eval-driven-iteration.md](05-eval-driven-iteration.md)** — iterate against a golden set, not vibes; the PATTERN is real prompt-engineering, but there is no in-repo eval harness now (the previous `eval/` suite was removed). The CRITICAL/Never/Do NOT blocks in the legacy prompts are informal regression encoding; the formal harness is the buildable Case B target. *NEW Tier 1.*
+## The thirteen concepts
 
-**Specific techniques**
+| #  | File                              | One-line                                                                          |
+|----|-----------------------------------|-----------------------------------------------------------------------------------|
+| 01 | `01-anatomy.md`                   | Four sections of a production prompt; one job per section, named explicitly.      |
+| 02 | `02-structured-outputs.md`        | Tool-calling and schema enforcement; never "respond only in JSON" in prose.       |
+| 03 | `03-prompts-as-code.md`           | Markdown templates as version-controlled source; prompt + model version pairing.  |
+| 04 | `04-token-budgeting.md`           | Counting tokens, the 80% rule, schema summarisation, prefix caching.              |
+| 05 | `05-eval-driven-iteration.md`     | Golden set, regression suite, change-prompt-then-measure (Case B: substrate gone).|
+| 06 | `06-single-purpose-chains.md`     | Five agents, five jobs; debugging benefit, model-routing benefit.                 |
+| 07 | `07-output-mode-mismatch.md`      | Every chain declares one output mode; mismatches break parsers silently.          |
+| 08 | `08-few-shot.md`                  | Examples constrain output more than instructions; when to use, when to skip.      |
+| 09 | `09-chain-of-thought.md`          | The reasoning prompt; when it helps, when it wastes tokens.                       |
+| 10 | `10-self-critique.md`             | Self-critique and self-consistency; 2–5x token cost for one extra reliability step.|
+| 11 | `11-meta-prompting.md`            | Using an LLM to draft prompts for other LLM calls; aipe's slash-command shape.    |
+| 12 | `12-prompt-injection-defense.md`  | Instruction hierarchies, input delimiters, output schemas as defense-in-depth.    |
+| 13 | `13-forbidden-patterns.md`        | LLMs converge on phrasings; rotate openings, enumerate forbidden formulas.        |
 
-6. **[06-single-purpose-chains.md](06-single-purpose-chains.md)** — one job per chain, each disclaiming the others; debugging and model-routing payoffs. *C1.10.*
-7. **[07-output-mode-mismatch.md](07-output-mode-mismatch.md)** — 3 JSON agents + 1 prose agent; declaring and enforcing the mode at the boundary. *C1.12.*
-8. **[08-few-shot.md](08-few-shot.md)** — examples constrain format better than instructions; format-shaping few-shot vs the zero-shot classifier. *existing.*
-9. **[09-chain-of-thought.md](09-chain-of-thought.md)** — reasoning in a structured `hypothesesConsidered` field, not free prose; when CoT hurts. *existing.*
-10. **[10-self-critique.md](10-self-critique.md)** — critique/revise and N-run voting; why `synthesize()` is recovery, not critique. *NEW Tier 2.*
-11. **[11-meta-prompting.md](11-meta-prompting.md)** — using an LLM to draft prompts; when it saves time, and the spec-vs-LLM-voice risk. *NEW Tier 2.*
-12. **[12-prompt-injection-defense.md](12-prompt-injection-defense.md)** — author-side defenses for the open `?q=` path; defense-in-depth with the runtime layers. *NEW Tier 1 (C5.7).*
-13. **[13-forbidden-patterns.md](13-forbidden-patterns.md)** — negative-constraint instructions (used heavily) and rotating formulas (correctly absent). *existing.*
+## Where the concepts live in this repo
 
-## Case A vs Case B
+The active spine — `lib/agents/{monitoring,diagnostic,recommendation,query,intent}.ts` — each instantiates an AptKit agent class. The prose-source-of-truth for each Bloomreach-only prompt lives at `lib/agents/legacy-prompts/{monitoring,diagnostic,recommendation,query}.md`. Schema compaction lives in `lib/agents/monitoring.ts` as `schemaSummary(schema)`. Type guards at the boundary live in `lib/mcp/validate.ts` (legacy parser) and the AptKit validators inside the package. The forced-final-synthesis-turn discipline lives in `lib/agents/base-legacy.ts:114-156`.
 
-**Case A** (implemented, cited to real `file:line`): anatomy, structured outputs, single-purpose chains, output-mode mismatch, token budgeting, chain-of-thought, and the negative-constraint half of forbidden-patterns. **Case A-partial:** prompts-as-code (no model pairing logged; package-version → output co-log is the new gap), few-shot (format-shaping only; the classifier is zero-shot).
+## What is NOT here
 
-**Case B** (full study material + a blooming-insights-targeted buildable exercise): eval-driven iteration (no in-repo harness now — the previous `eval/` was removed; the CRITICAL blocks in the prompts are still informal regression encoding), self-critique (only recovery exists), meta-prompting (prompts are hand-written), prompt-injection defense (open `?q=`, bounded by read-only tools + validators), and the rotating-formulas half of forbidden-patterns.
-
-> Curriculum-loaded: each file carries a `## Project exercises` block citing `aieng-curriculum.md` concept IDs (C1.7, C1.10, C1.12, C3.1–C3.3, C5.7, plus the NEW Tier-1/Tier-2 concepts) for provenance, with every exercise targeting blooming insights' own files.
-
----
+- No `eval/` pipeline. The 4-pillar eval suite and LLM-as-judge harness do not exist in this repo today. Concept 05 names this honestly as Case B.
+- No vendor-specific prompt syntax tour (XML tags, JSON-mode specifics). These appear inside concept files where they matter, not as their own concepts.
+- No Tree of Thoughts, no constitutional AI, no vision/multi-modal prompting — none exercised by this codebase.
+- No jailbreak research from the attacker side. The defender side (concept 12) is what matters for app builders.

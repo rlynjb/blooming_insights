@@ -1,429 +1,461 @@
-# 01 — Scripted-Anthropic harness
+# 01 — Scripted Anthropic harness
+*Industry name: constructor-injected fakes / dependency injection for testability. Type: Industry standard.*
 
-**Industry name:** Scripted external / deterministic harness around a probabilistic core. **Type:** Industry standard for AI products.
-
-## Zoom out, then zoom in
-
-Every AI feature in blooming insights — diagnosis, recommendation, monitoring scan, query answer, intent classification — runs Claude in a multi-turn loop with tool use. The model's output is non-deterministic. To test the *agent code that wraps* the model, you build a fake `messages.create` that returns a *queued* list of pre-written responses and inject it as the SDK. The real agent code runs end-to-end against the script; the test author controls every turn.
-
-The pattern is shared across the agent test suite: `buildFakeAnthropic` is the harness builder, and five agent test files build directly on it — `base.test.ts` (8 tests), `monitoring.test.ts` (10), `diagnostic.test.ts` (5), `recommendation.test.ts` (5), `query.test.ts` (3). **31 tests total** depend on this harness shape. (`synthesis-instruction.test.ts` and `tool-schemas.test.ts` test sibling concerns and don't take the harness; `intent.test.ts` and `categories.test.ts` mock the SDK at a different layer.)
+## Zoom out — where this pattern lives
 
 ```
-Zoom out — where this pattern sits in the system
+  the harness sits at the SDK seam, not at the network
 
-  ┌─ UI layer (components/, app/*/page.tsx) ─────────────────┐
-  │  Investigation buttons, ReasoningTrace, FeedGrid          │
-  └─────────────────────────────────────────────────────────┘
-                                ▲ stream
-  ┌─ HTTP route ────────────────┴────────────────────────────┐
-  │  app/api/agent/route.ts  →  NDJSON stream                 │
-  └─────────────────────────────────────────────────────────┘
-                                ▲ calls
-  ┌─ ★ AGENT LAYER (where this pattern lives) ★ ────────────┐
-  │  lib/agents/{base,diagnostic,recommendation,monitoring,  │
-  │              query}.ts                                    │
-  │                                                           │ ← we are here
-  │  Tested via: scripted Anthropic + fake DataSource         │
-  │  31 tests across 5 files                                   │
-  └─────────────────────────────────────────────────────────┘
-                                ▲ tool calls
-  ┌─ External (faked at the SDK seam) ──────────────────────┐
-  │  Anthropic Messages API   ←   FAKED in tests             │
-  │  Bloomreach MCP            ←   FAKED in tests             │
-  └─────────────────────────────────────────────────────────┘
+  ┌─ Test layer ─────────────────────────────────────────────────────┐
+  │  test/agents/base.test.ts                                         │
+  │  buildFakeAnthropic([response, response, ...])                    │
+  │  ★ THIS PATTERN ★ — scripted multi-turn fake                      │
+  └─────────────────────────────┬────────────────────────────────────┘
+                                │  injected via constructor / param
+  ┌─ Agent layer ───────────────▼────────────────────────────────────┐
+  │  runAgentLoop({ anthropic, dataSource, ... })                    │
+  │  MonitoringAgent(anthropic, dataSource, schema, allTools)         │
+  └─────────────────────────────┬────────────────────────────────────┘
+                                │  WOULD call .messages.create()
+  ┌─ Provider layer (NEVER REACHED IN TESTS) ────────────────────────┐
+  │  Anthropic API                                                    │
+  └──────────────────────────────────────────────────────────────────┘
 ```
 
-Now zoom in. The pattern's kernel is a **response queue plus an index that advances per call**, wrapped behind a `vi.fn()` so the test can assert on what was *sent* to the model as well as what came back.
+The agent code receives `anthropic` as a parameter. In production, it's
+a real `new Anthropic({ apiKey })`. In tests, it's a hand-rolled object
+whose `.messages.create` drains a scripted queue. No network. No SDK
+internals. No `nock` / `msw` / HTTP-level mocking. The seam is the
+interface, not the wire.
 
-## Structure pass
+## Structure pass — the skeleton this pattern hangs on
 
-**Layers:** the test → the scripted SDK fake → the real agent code → the scripted MCP fake. **Axis traced:** *what's real, what's faked?* **The seams where the answer flips:**
+**Layers:** test → agent → provider. The fake replaces the provider
+end-to-end without touching the agent.
+
+**Axis: control — who decides what the next "model response" is?**
 
 ```
-The axis "is this code real or faked?" — across the test stack
+  control flips at the agent / provider seam
 
-  axis traced = "does this run the production code path?"
-
-  ┌─ FAKE: Anthropic SDK ────────────────────┐
-  │  messages.create = vi.fn(...)             │  faked at the SDK
-  │  pulls next response from a queue          │  boundary (one seam)
-  └──────────────────┬───────────────────────┘
-                     │  flip 1: from here down
-                     │  it's all real
-                     ▼
-  ┌─ ★ REAL: DiagnosticAgent.investigate ★ ──┐
-  │  builds system prompt                     │  REAL — agent class
-  │  calls runAgentLoop                        │  REAL — loop function
-  │  multi-turn for-loop                       │  REAL — control flow
-  │  extracts text + tool_use blocks           │  REAL — block walker
-  │  accumulates messages with tool_result    │  REAL — history mgr
-  │  enforces maxTurns + maxToolCalls         │  REAL — budgets
-  │  parses output via parseAgentJson          │  REAL — parser
-  │  validates via isDiagnosis                 │  REAL — type guard
-  │  on failure, runs synthesize() fallback   │  REAL — fallback path
-  └──────────────────┬───────────────────────┘
-                     │  flip 2: at the MCP
-                     │  call boundary
-                     ▼
-  ┌─ FAKE: McpCaller (one method, 5 lines) ──┐
-  │  async callTool(name, args) {             │  faked at the
-  │    return { result: …, durationMs: 1,     │  McpCaller interface
-  │             fromCache: false };           │  (a second seam)
-  │  }                                         │
-  └──────────────────────────────────────────┘
+  ┌─ test  ───────┐   seam: anthropic.messages.create   ┌─ provider ──┐
+  │  TEST decides │ ════════════════════════════════════►│  (faked)    │
+  │  every reply  │     (responses[idx++])               │  returns    │
+  │  in advance   │                                      │  scripted   │
+  └───────────────┘                                      └─────────────┘
+         ▲                                                      ▲
+         └── same axis (control), two answers ──────────────────┘
+                → this boundary carries a contract:
+                  the agent loop must work for ANY sequence
+                  of valid SDK responses
 ```
 
-Two seams, one real middle. The pattern works because the agent loop's control flow is *deterministic given* the model's outputs. Make the outputs deterministic by scripting them, and every branch becomes assertable.
+In production the LLM decides what comes back. In tests the script
+does. The agent loop doesn't know the difference and shouldn't.
+
+**The seam that matters:** `Anthropic.Messages.Message` shape.
+Anything that satisfies the type satisfies the agent. The fake builds
+one by hand (`base.test.ts:28-48`).
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You queue a list of pre-written responses, hand a function that pops the next one off the queue to the agent (disguised as the SDK), and run the real agent code. The agent thinks it's talking to a model; the test author chose every word the "model" said.
+You know how `useState` takes whatever you hand it as initial value and
+the hook doesn't care if you got it from a fetch, a constant, or a
+test? Same idea. The agent loop takes an `anthropic` parameter and
+doesn't care if it's the real SDK or a hand-rolled object with a
+`.messages.create` method. **Constructor injection at the seam means
+the test gets to BE the SDK for one method.**
 
 ```
-The scripted-Anthropic kernel — queue + index + real loop
+  The pattern — a scripted FSM playing the model's role
 
-  ┌─ test sets up the script ───────────────────────────────┐
-  │  responses = [                                           │
-  │    { content: [toolUseBlock('execute_eql', {…})],        │ ← turn 1: tool call
-  │      stop_reason: 'tool_use' },                          │
-  │    { content: [textBlock('```json\n{…}\n```')],          │ ← turn 2: final JSON
-  │      stop_reason: 'end_turn' },                          │
-  │  ];                                                       │
-  └──────────────────────────────────────────────────────────┘
-                            │
-                            ▼ injected as anthropic
-  ┌─ REAL agent loop runs ──────────────────────────────────┐
-  │  for turn in 0..maxTurns:                                │
-  │     res = await anthropic.messages.create(...)           │ ← pulls next entry
-  │     if no tool_use blocks in res.content:                │
-  │        return finalText                                  │
-  │     for each tool_use block:                             │
-  │        result = await mcp.callTool(name, args)           │ ← faked too
-  │        messages.push(tool_result)                        │
-  └──────────────────────────────────────────────────────────┘
-                            │
-                            ▼
-  ┌─ test asserts on real behaviour ────────────────────────┐
-  │  expect(result.toolCalls).toHaveLength(1)                 │
-  │  expect(result.finalText).toContain('done')               │
-  │  expect(create.mock.calls[1][0].system).toContain('JSON') │ ← assertion on
-  └──────────────────────────────────────────────────────────┘    what was sent
-```
-
-### Move 2 — the walkthrough
-
-#### The response queue + index (part 1 of the kernel)
-
-The fake `messages.create` must return a *different* response each call. A static return value can only test one-turn flows. The pattern: close over a list and an index; advance the index per call.
-
-```
-The queue mechanic — what makes multi-turn testable
-
-  responses[0]  ──┐
-  responses[1]    │
-  responses[2]    │  ←─── idx = 0, ++ on each create() call
-  responses[3]    │       (response queue stays in closure)
-  responses[N]  ──┘
-
-  pseudocode:
-    let idx = 0
-    create = async () => {
-      const resp = responses[idx]
-      idx = idx + 1
-      return resp
-    }
-```
-
-Drop this and you have a single-shot fake. You can test "what does the agent do on one turn with this response," but not "what does the agent do across turns when the model first calls a tool, then returns prose."
-
-#### The shape-faithful response (part 2 of the kernel)
-
-The fake must match the Anthropic SDK's response shape closely enough that the agent's real code doesn't crash on a missing field. The agent reads `content[]`, `stop_reason`, and the block-level `type`/`name`/`input`/`text`. The SDK's type system *also* requires `id`, `model`, `role`, `usage`, `container`, etc. — fields the agent doesn't read, but TypeScript and any defensive runtime checks do.
-
-```
-The shape contract — every field the SDK promises
-
-  pseudocode:
-    fake_response = {
-      id:              'msg_test',
-      type:            'message',
-      role:            'assistant',
-      model:           AGENT_MODEL,
-      stop_reason:     'tool_use' | 'end_turn',
-      stop_sequence:   null,
-      usage:           { input_tokens: 1, output_tokens: 1, … },
-      container:       null,
-      content:         [...the blocks the test cares about...],
-    }
-```
-
-If the test only sets `content` and `stop_reason`, TypeScript yells. More importantly, any production-side defensive code (`response.usage?.input_tokens ?? 0`) reads a field that doesn't exist on the fake, which can flip a branch silently. Match the shape.
-
-#### Mock-call introspection (part 3 of the kernel)
-
-The fake is a `vi.fn(...)`, not just a plain function. That makes `create.mock.calls` available — a list of `[arguments]` arrays, one per call. Tests use this to assert on what the agent *sent* to the model, not just what came back. The single highest-leverage assertion this enables: did the agent append `synthesisInstruction` to the system prompt only on the forced-final turn?
-
-```
-Mock-call introspection — assertion on outbound traffic
-
-  ┌─ the fake is a vi.fn ──────────────────────────────────┐
-  │  create = vi.fn(async () => responses[idx++])           │
-  └────────────────────┬───────────────────────────────────┘
-                       │ every call recorded
+       responses = [r1, r2, r3]      ┐
+       idx       = 0                  │  test owns the script
+                                      ┘
+       ┌──────────────────────────────────┐
+       │  fake.messages.create() {        │  → responses[idx++]
+       │    return responses[idx++]       │     (throws if out of script)
+       │  }                               │
+       └──────────────────────────────────┘
+                       │
+                       │  called once per agent-loop turn
                        ▼
-  ┌─ test reads the call log ──────────────────────────────┐
-  │  calls = anthropic.messages.create.mock.calls           │
-  │  calls[0][0].system  ← system prompt sent on turn 1     │
-  │  calls[1][0].system  ← system prompt sent on turn 2     │
-  │  calls[0][0].tools   ← tools offered on turn 1          │
-  │  calls[1][0].tools   ← (should be empty on forced-final)│
-  └────────────────────────────────────────────────────────┘
+       ┌──────────────────────────────────┐
+       │  runAgentLoop({                  │
+       │    anthropic: fake,              │  ← INJECTED here
+       │    dataSource: fakeMcp,          │  ← also injected
+       │    ...                           │
+       │  })                              │
+       └──────────────────────────────────┘
+                       │
+                       │  asserts on result.toolCalls,
+                       │  result.finalText, callCount()
+                       ▼
+                  test passes / fails
 ```
 
-Without this, you can only test the agent's *return value*. With it, you can test the agent's *outbound behaviour* — which is where the bug-prone branches actually live.
+The script is the test's hypothesis: "given these responses in this
+order, the loop should do X." Each `it()` ships its own script.
 
-#### The DataSource fake (the second seam — renamed in Phase 2)
+### Move 2 — the step-by-step walkthrough
 
-The agent doesn't call the MCP SDK directly. It calls through a `DataSource` interface (`lib/data-source/types.ts`) — three methods, structurally typed. A test satisfies it with a 5-line object literal. No `implements` keyword required; TypeScript accepts the shape match. *(Historical note: v1 of this guide called the interface `McpCaller`. The Phase 2 swap renamed it to `DataSource` when a second implementation was added. Mechanics unchanged; same shape match, same five-line fake works. The second implementation today is `SyntheticDataSource`; the brief stint with `OlistDataSource` is gone with the Olist removal.)*
+#### Step 1 — the agent class takes its deps in the constructor
+
+The whole pattern depends on the agent being **injectable**, not on the
+test being clever. The agent class signature is the load-bearing thing:
+
+```ts
+// lib/agents/monitoring.ts:73-80
+export class MonitoringAgent {
+  constructor(
+    private anthropic: Anthropic,             // ← swappable
+    private dataSource: McpCaller,            // ← swappable
+    private schema: WorkspaceSchema,          // ← swappable
+    private allTools: McpToolDef[],           // ← swappable
+    private sessionId?: string,
+  ) {}
+```
+
+And the `McpCaller` type is deliberately narrowed so the fake only has
+to implement one method:
+
+```ts
+// lib/agents/base.ts:11-14
+/** The agent-facing subset of DataSource used by AptKit tool-registry
+ *  adapters. Full data sources can list tools, but reusable agents
+ *  only need the callTool execution seam. */
+export type McpCaller = Pick<DataSource, 'callTool'>;
+```
+
+`Pick<DataSource, 'callTool'>` is the trick. The full `DataSource`
+interface has six methods; the agent only uses one; the type narrows
+to one; the fake only implements one. **The smaller the contract, the
+cheaper the fake.**
+
+If `MonitoringAgent` reached for `new Anthropic(...)` inside its own
+constructor instead of taking one as a parameter, every test would
+need `vi.mock('@anthropic-ai/sdk', ...)` at module scope. Look at the
+integration tests for that exact dance — `test/api/_helpers.ts:68-84`
+— it works, but it costs a module-level mock with a real class shim
+because Anthropic is `new`-d up. The unit tests don't pay that cost
+because the agent itself is injectable.
+
+#### Step 2 — build the fake as a scripted queue
+
+The fake is plain TypeScript. No mocking library required for the
+shape; vitest's `vi.fn` is used only so the test can assert call counts.
+
+```ts
+// test/agents/base.test.ts:16-56 (annotated)
+function buildFakeAnthropic(responses: FakeResponse[]) {
+  let idx = 0;                                        // ← next index to serve
+  let count = 0;                                      // ← total calls observed
+
+  const create = vi.fn(async () => {
+    count++;
+    const resp = responses[idx];
+    if (!resp) throw new Error(                       // ← LOUD failure if
+      `No scripted response at index ${idx}`);          //    the loop reads
+    idx++;                                            //    past the script
+    return {                                          // ← build a full
+      id: `msg_${idx}`,                                 //    Anthropic message
+      type: 'message' as const,                         //    shape by hand —
+      role: 'assistant' as const,                       //    SDK type guards
+      model: AGENT_MODEL,                               //    won't accept a
+      /* ... usage fields ... */                        //    half-object
+      content: resp.content,                          // ← THE SCRIPT
+      stop_reason: resp.stop_reason,                  // ← THE SCRIPT
+    } as unknown as Anthropic.Messages.Message;
+  });
+
+  return { anthropic: { messages: { create } }, callCount: () => count };
+}
+```
+
+**Why "throw if out of script" is load-bearing.** A silent `undefined`
+return would make the loop hang or fail in a different place. The
+explicit throw turns "the loop made one more call than I expected" into
+a localized, readable failure. This is the cheapest correctness gate
+the fake gets.
+
+#### Step 3 — fake the content blocks too
+
+The `content` array in each response holds either `text` blocks or
+`tool_use` blocks (or both). The test builds them with helpers:
+
+```ts
+// test/agents/base.test.ts:58-70
+function toolUseBlock(id, name, input) {
+  return { type: 'tool_use', id, name, input,
+           caller: { type: 'direct' } } as unknown as Anthropic.Messages.ContentBlock;
+}
+function textBlock(text) {
+  return { type: 'text', text, citations: null } as unknown as Anthropic.Messages.ContentBlock;
+}
+```
+
+A `tool_use` block in a scripted response makes the loop dispatch
+`dataSource.callTool(name, input)`. A `text` block with
+`stop_reason: 'end_turn'` makes the loop return its final text. The
+test gets to script the model's mind one turn at a time.
+
+#### Step 4 — fake the dataSource side, too
+
+Same trick on the other seam:
+
+```ts
+// test/agents/base.test.ts:76-83
+function buildFakeMcp(impl) {
+  return {
+    async callTool(name, args) {
+      const result = await impl(name, args);
+      return { result, durationMs: 1, fromCache: false };
+    },
+  };
+}
+```
+
+Note the return shape: `{ result, durationMs, fromCache }` — the
+production envelope from `McpClient.callTool`. The agent reads `result`;
+the duration and cache flag are observable but optional. The fake fakes
+**the envelope**, not the network.
+
+#### Step 5 — write the test as a sequence of (script, assert)
+
+The control-flow tests in `base.test.ts` follow a tight shape:
+
+```ts
+// test/agents/base.test.ts:105-147 (the canonical happy-path test)
+it('executes a tool then returns final text', async () => {
+  // 1. SCRIPT
+  const { anthropic, callCount } = buildFakeAnthropic([
+    { content: [toolUseBlock('tu1', 'get_project_overview', {...})],
+      stop_reason: 'tool_use' },                        // turn 1: ask for tool
+    { content: [textBlock('done: 5 customers')],
+      stop_reason: 'end_turn' },                        // turn 2: done
+  ]);
+  const mcp = buildFakeMcp(async () => ({
+    isError: false, content: [],
+    structuredContent: { data: { total_customers: 5 } },
+  }));
+
+  // 2. RUN
+  const result = await runAgentLoop({
+    anthropic, dataSource: mcp,
+    agent: 'monitoring', system: 'You are a monitoring agent.',
+    userPrompt: 'Check the project.',
+    toolSchemas: fakeToolSchemas,
+    onToolCall: vi.fn(),
+  });
+
+  // 3. ASSERT — every observable: final text, tool calls, hooks, turn count
+  expect(result.finalText).toContain('done');
+  expect(result.toolCalls).toHaveLength(1);
+  expect(result.toolCalls[0].toolName).toBe('get_project_overview');
+  expect(callCount()).toBe(2);
+});
+```
+
+The script names the test's hypothesis. The asserts pin every observable
+the agent loop produces. No hidden state, no time dependency, no
+network — the test would pass identically on a plane.
 
 ```
-The McpCaller seam — interface is the contract
+  the eight base.test.ts cases — what each scripted shape proves
 
-  pseudocode:
-    interface McpCaller {
-      callTool(name, args, opts?) -> { result, durationMs, fromCache }
-    }
-
-    fake_mcp = {
-      async callTool(name, args) {
-        const result = await impl(name, args)        // scripted per call
-        return { result: result, durationMs: 1, fromCache: false }
-      }
-    }
+  it# scripted shape                          what it pins
+  ─── ─────────────────────────────────────   ───────────────────────────
+  1   [tool_use] [text end_turn]              happy path: dispatch then text
+  2   [text end_turn]                         no-tools path: return turn 1
+  3   [tool_use → mcp throws] [text]          error recovery: record + go on
+  4   [tool_use] [tool_use] (maxTurns: 2)     budget: stop, return ""
+  5   [tool_use] [text] (maxToolCalls: 1)     forced synthesis: omit tools
+                                              on turn 2
+  6   [text+tool_use] [text]                  onText fires per turn-with-text
+  7   [tool_use] [text]                       onToolResult fires after exec
+  8   [tool_use] [text] (synthesisInstruction) instruction appended ONLY on
+                                              the forced-final turn
 ```
 
-The compression matters: the real `BloomreachDataSource` (formerly `McpClient`, now living at `lib/data-source/bloomreach-data-source.ts`) does retries, caching, rate-limit parsing, error tagging — fifty lines of behaviour. The interface narrows it to one method. The test gets to ignore all the production-side complexity and focus on what the agent *does* with the result. That's the seam.
-
-The seam still pays off post-Olist-removal: two production implementations (`BloomreachDataSource` for live, `SyntheticDataSource` for the in-process demo/test path) AND a test convention where every agent test passes a hand-rolled five-line fake. One interface, multiple consumers; the `DataSource` extraction is the load-bearing refactor that keeps the agent layer testable without touching its production code path.
+Eight `it()`. Eight scripts. The control flow of the entire agent loop
+is pinned by which scripts produce which observables. **Strip this
+pattern out and you lose every agent-loop test** — and with them, the
+proof that the loop's budget enforcement, error recovery, and forced
+synthesis behave correctly under any script.
 
 ### Move 2 variant — the load-bearing skeleton
 
-Drop any one of these three and the pattern collapses:
-
-1. **A response queue + advancing index.** Drop this and you can only test single-turn flows. The agent's multi-turn behaviour — message accumulation, tool-then-text, forced-final on budget exhaustion — becomes untestable.
-
-2. **A shape-faithful response object.** Drop this and TypeScript rejects the fake at compile time, or the agent's defensive reads (`response.usage?…`) silently see `undefined` and flip branches.
-
-3. **A vi.fn wrapper + mock.calls inspection.** Drop this and you can assert on what came back from the fake, but not on what was sent to it. The "did `synthesisInstruction` get appended on the forced-final turn?" assertion becomes impossible, and that's the single most bug-prone branch in the loop.
-
-Skeleton = queue + shape + mock.calls. Optional hardening: helper functions for `toolUseBlock(id, name, input)` and `textBlock(text)` (so the queue stays readable), a `callCount()` accessor exposed from the closure (convenience, not necessity).
-
-### Code in this codebase
-
-**Use case A — proving the agent loop's branches end-to-end.** `test/agents/base.test.ts` has 8 tests, each exercising one branch of `runAgentLoop` (tool-then-text, text-only, tool-throws, maxTurns hit, maxToolCalls hit, onText surfacing, synthesisInstruction on forced-final turn). The load-bearing one is the `synthesisInstruction` test on lines 361–383 — it's the bug-prone branch and the test uses `create.mock.calls[0][0].system` vs `calls[1][0].system` to inspect the actual prompts sent.
+The kernel of this pattern is three things. Drop any of them and it
+isn't the pattern anymore.
 
 ```
-test/agents/base.test.ts  (lines 16–48 — the harness builder)
+  THE KERNEL — three parts, what breaks if missing
 
-  function buildFakeAnthropic(responses: FakeResponse[]): {
-    anthropic: { messages: { create: ReturnType<typeof vi.fn> } };
-    callCount: () => number;
-  } {
-    let idx = 0;                                  ← queue index in closure
-    const create = vi.fn(async () => {            ← vi.fn → mock.calls available
-      const resp = responses[idx];
-      idx = idx + 1;                              ← advance per call
-      return {
-        id: 'msg_test',                           ← shape-faithful: fields the
-        type: 'message',                           ← SDK type requires even
-        role: 'assistant',                         ← though the agent doesn't
-        model: AGENT_MODEL,                        ← read them
-        stop_sequence: null,
-        usage: { input_tokens: 1, output_tokens: 1, … },
-        container: null,
-        content: resp.content,
-        stop_reason: resp.stop_reason,
-      };
-    });
-    return { anthropic: { messages: { create } }, callCount: () => idx };
-  }
-       │
-       └─ five lines of mechanics, three lines of shape padding. The shape
-          padding is load-bearing: drop the `usage` field and any defensive
-          read in production-side code reads undefined and silently flips
-          a branch.
+  1. INJECTABLE AGENT
+     constructor takes anthropic + dataSource as params
+     → without this, every test needs vi.mock('@anthropic-ai/sdk', ...)
+       at module scope (the cost the integration tests already pay)
 
-test/agents/base.test.ts  (lines 361–383 — the load-bearing test)
+  2. SCRIPTED QUEUE WITH LOUD EXHAUSTION
+     responses[idx++] with a throw on idx >= responses.length
+     → without the throw, a "the loop made one more call than I
+       expected" bug shows up as undefined.content.flatMap and the
+       failure surfaces 30 lines from its actual cause
 
-  it('appends synthesisInstruction to the system prompt only on the forced-final turn', async () => {
-    const { anthropic } = buildFakeAnthropic([
-      { content: [toolUseBlock('tu8', 'get_project_overview', { project_id: 'z' })],
-        stop_reason: 'tool_use' },                ← turn 1: tool call
-      { content: [textBlock('final')],
-        stop_reason: 'end_turn' },                ← turn 2: forced-final
-    ]);
-    const mcp = buildFakeMcp(async () => ({ ok: true }));
-
-    await runAgentLoop({
-      anthropic: anthropic as unknown as Anthropic,
-      mcp, agent: 'diagnostic', system: 'BASE SYSTEM',
-      userPrompt: 'go', toolSchemas: fakeToolSchemas,
-      maxToolCalls: 1, maxTurns: 8,
-      synthesisInstruction: 'OUTPUT JSON NOW',
-    });
-
-    const calls = (anthropic as ...).messages.create.mock.calls;
-    expect(calls[0][0].system).toBe('BASE SYSTEM');           ← unmodified on turn 1
-    expect(calls[1][0].system).toContain('OUTPUT JSON NOW');  ← augmented on turn 2
-       │
-       └─ this assertion only works because create is a vi.fn. The "appended
-          on the forced-final turn" branch is the one a refactor is most
-          likely to break silently; this test is the load-bearing guard
-          against burning tokens on every turn.
-  });
+  3. NARROW SEAM (McpCaller = Pick<DataSource, 'callTool'>)
+     the fake implements ONE method, not the whole interface
+     → without the narrowing, the fake has to stub list_tools,
+       dispose, bootstrap, etc. — every fake gets heavier every
+       time you add a method to DataSource
 ```
 
-**Use case B — covering all four agents with one pattern.** The same harness builder appears at the top of `base.test.ts` (8 tests on `runAgentLoop`), `diagnostic.test.ts` (5 tests on `DiagnosticAgent.investigate` including the synthesis fallback), `monitoring.test.ts` (10 tests on `MonitoringAgent.scan`), `recommendation.test.ts` (5 tests on `RecommendationAgent.propose`), and `query.test.ts` (3 tests on `QueryAgent.answer`). **31 tests total** depend on this pattern. Strip the harness and the agent layer has zero deterministic coverage.
+Skeleton = these three. Optional hardening on top: `vi.fn()` for call
+counts, helper builders for `tool_use` / `text` blocks, the
+`buildFakeMcp` envelope wrapper. Useful, not load-bearing.
 
-```
-test/agents/diagnostic.test.ts  (lines 273–291 — the synthesis fallback)
-
-  it('synthesizes a diagnosis from gathered evidence when the loop output is unusable', async () => {
-    const { anthropic } = buildFakeAnthropic([
-      // Investigation loop ends with rambling prose (no valid JSON)
-      { content: [textBlock('Let me keep investigating — more queries first.')],
-        stop_reason: 'end_turn' },                ← turn 1: unusable text
-      // The dedicated tool-less synthesis call returns a valid diagnosis
-      { content: [textBlock('```json\n' + VALID_DIAGNOSIS_JSON + '\n```')],
-        stop_reason: 'end_turn' },                ← turn 2: synthesis call
-    ]);
-
-    const agent = new DiagnosticAgent(anthropic as unknown as Anthropic,
-                                       buildFakeMcp(), FIXTURE_SCHEMA, FAKE_TOOL_DEFS);
-
-    const result = await agent.investigate(SAMPLE_ANOMALY);
-    expect(result.conclusion).toContain('payment UI regression');
-    expect(result.hypothesesConsidered).toHaveLength(2);
-       │
-       └─ this proves the WRAPPER's fallback path works when the loop output
-          is unusable. What it does NOT prove: that the real model's output
-          would ever look like the scripted JSON. That's the model-quality
-          gap — once filled by the (now-deleted) Phase 3 eval suite; today
-          unmeasured in this repo. See `study-ai-engineering/05-evals-and-
-          observability/` for the testing discipline that would close it.
-  });
-```
+The interview-payoff move is naming the **loud exhaustion** rule. Most
+people remember the inject-and-script half; far fewer call out that the
+queue has to throw on overflow. It's the part that turns one kind of
+bug (off-by-one in test setup) into a localized failure instead of a
+mystery.
 
 ### Move 3 — the principle
 
-**A probabilistic core is testable when you can substitute it at a known seam.** The Anthropic SDK is the seam; the script is the substitution. The pattern travels to any probabilistic external — payments, geo lookup, third-party AI APIs. The test bench wraps the boundary; the production code runs the real path. What you give up: any signal about the *model's* quality (that's evals, next door). What you get: assertions on every branch of the deterministic glue, fast.
+**Test against the interface, not the wire.** When you own the
+interface (your own `McpCaller` type), the fake is plain TypeScript.
+When you don't own the interface (Anthropic's SDK), satisfy its
+*shape* in-process — never reach for HTTP-level mocking unless the wire
+itself is what you're testing.
 
-## Primary diagram
+The cost: the fake is a parallel implementation of the SDK's contract.
+If the SDK evolves, the fake drifts. The benefit: every test runs in
+milliseconds against a deterministic surface, and the failure modes
+you script are the failure modes you understand.
 
-The full harness, every part labelled:
+## Primary diagram — the whole pattern in one frame
 
 ```
-The scripted-Anthropic harness — full view
+  THE SCRIPTED ANTHROPIC HARNESS — one frame
 
-  ┌─ FAKE Anthropic SDK ────────────────────────────────────┐
-  │                                                         │
-  │  function buildFakeAnthropic(responses) {                │
-  │    let idx = 0;                                          │
-  │    const create = vi.fn(async () => {                    │
-  │      const resp = responses[idx];                        │  ← queue + index
-  │      idx = idx + 1;                                      │
-  │      return {                                            │
-  │        id: 'msg_test', type: 'message', role: 'asst',   │
-  │        model: AGENT_MODEL, stop_sequence: null,         │  ← shape-faithful
-  │        usage: { input_tokens: 1, output_tokens: 1, … }, │
-  │        container: null,                                  │
-  │        content:     resp.content,                        │
-  │        stop_reason: resp.stop_reason,                    │
-  │      };                                                  │
-  │    });                                                   │
-  │    return { messages: { create }, callCount: () => idx } │  ← vi.fn → mock.calls
-  │  }                                                       │
-  └──────────────────────────┬──────────────────────────────┘
-                             │ injected as Anthropic
-                             ▼
-  ┌─ ★ REAL agent code ★ ──────────────────────────────────┐
-  │                                                         │
-  │  new DiagnosticAgent(fakeAnthropic, fakeMcp, schema,    │  agent class
-  │                       toolDefs)                          │  is real
-  │     .investigate(anomaly, { onToolCall, onText, … })    │
-  │     │                                                   │
-  │     ├─ builds system prompt                              │  real
-  │     ├─ calls runAgentLoop                                │  real
-  │     │   ├─ for turn in 0..maxTurns                       │  real
-  │     │   ├─ pulls next scripted response                  │  via fake
-  │     │   ├─ extracts text + tool_use blocks               │  real
-  │     │   ├─ calls mcp.callTool per tool_use               │  via fake
-  │     │   ├─ appends tool_result to messages               │  real
-  │     │   └─ enforces maxTurns + maxToolCalls + forceFinal │  real
-  │     ├─ parses output via parseAgentJson                  │  real
-  │     ├─ validates via isDiagnosis                         │  real
-  │     └─ on failure, runs synthesize() fallback            │  real
-  └──────────────────────────┬──────────────────────────────┘
-                             │ calls mcp.callTool
-                             ▼
-  ┌─ FAKE McpCaller ───────────────────────────────────────┐
-  │                                                         │
-  │  function buildFakeMcp(impl) {                          │
-  │    return {                                             │
-  │      async callTool(name, args) {                       │
-  │        const result = await impl(name, args);          │
-  │        return { result, durationMs: 1, fromCache: false }│
-  │      }                                                  │
-  │    };                                                   │
-  │  }                                                      │
-  └─────────────────────────────────────────────────────────┘
+  ┌─ TEST FILE ────────────────────────────────────────────────────┐
+  │                                                                  │
+  │   const { anthropic, callCount } = buildFakeAnthropic([          │
+  │     { content: [toolUseBlock(...)],  stop_reason: 'tool_use' }, │
+  │     { content: [textBlock('done')],  stop_reason: 'end_turn' },  │
+  │   ]);                                                            │
+  │                          │  injected ↓                           │
+  └──────────────────────────┼───────────────────────────────────────┘
+                             │
+  ┌─ AGENT LOOP (lib/agents/base-legacy.ts) ─────────────────────────┐
+  │                          ▼                                        │
+  │   runAgentLoop({                                                  │
+  │     anthropic,           ← fake provider                          │
+  │     dataSource: fakeMcp, ← fake McpCaller                         │
+  │     toolSchemas, ...                                              │
+  │   })                                                              │
+  │   ─────────────────────────────                                   │
+  │   turn 1: anthropic.messages.create()  → fake serves responses[0]│
+  │           sees tool_use → dataSource.callTool(...)               │
+  │           fake mcp returns { result, durationMs, fromCache }     │
+  │   turn 2: anthropic.messages.create()  → fake serves responses[1]│
+  │           sees text + end_turn → return finalText                 │
+  └──────────────────────────┬───────────────────────────────────────┘
+                             │  result + observables
+  ┌─ TEST ASSERTS ◄──────────┘                                       ┐
+  │   expect(result.finalText).toContain('done')                     │
+  │   expect(result.toolCalls).toHaveLength(1)                       │
+  │   expect(callCount()).toBe(2)                                    │
+  └──────────────────────────────────────────────────────────────────┘
+
+  No network reached. No SDK internals exercised. Test owns every
+  bit of input; agent loop's control flow is the only thing under test.
 ```
 
 ## Elaborate
 
-The "scripted external" pattern predates AI products by decades — it's how you test code that talks to anything probabilistic or expensive (real database, real payments processor, real geo API). The AI variant is mechanically identical; the only thing that changed is which boundary you script. OpenAI's `evals` library, Anthropic's `inspect_ai`, and Langfuse all draw the same line: deterministic harness around the AI call, probabilistic eval *of* the AI call, two complementary disciplines.
+This pattern is older than it looks. It's the **test double** discipline
+(Meszaros, *xUnit Test Patterns*, 2007) applied to LLM SDKs. The shape
+is the same as faking a database connection, a payment gateway, or any
+other slow / costly / non-deterministic external resource — what's
+new here is only **what** is being faked.
 
-The `vi.fn() + mock.calls` mechanic is the unsung enabler. Jest's `jest.fn()` does the same job; the introspection that comes for free is what makes the pattern's full power available. Without it, you can only assert on return values — which is half the contract.
+The closest analog in the React world is faking `fetch` in a custom
+hook test: you don't `nock` the network, you replace the function the
+hook calls. Same idea here: replace the SDK call site, not the wire.
 
-Cross-reference: `study-software-design`'s "deep modules are easy to test" finding maps directly here. `runAgentLoop` is a deep module (one entry point, small interface, a lot of behaviour); the harness is small *because* the module is deep.
+What makes the LLM case different from a payment-gateway fake:
+
+  → **Multi-turn.** The fake has to play across N round trips, not
+    just answer one question. The queue shape solves that.
+  → **Branching control flow.** The model's `stop_reason` and
+    `content` array shape decide what the loop does next. A script
+    that emits `tool_use` versus `end_turn` versus a mix of text +
+    tool_use is exercising different code paths in the loop.
+  → **Token / turn budgets.** The loop has caps (`maxTurns`,
+    `maxToolCalls`) that change behavior. Test 4 and test 5 in
+    `base.test.ts` pin those caps by scripting more turns than the
+    cap allows and asserting the loop stops.
+
+The next-up reading on this pattern: **contract tests** — running the
+same script against the fake AND the real SDK in CI to detect when
+the SDK's response shape evolves out from under you. Not in this repo
+today; named here as the move that would harden the fake against SDK
+drift.
 
 ## Interview defense
 
-**Q: Is this a unit test or an integration test?** Closer to integration. The unit under test is the entire `DiagnosticAgent.investigate` method, which runs a multi-turn loop with real branching, real message-history accumulation, real parser, real type guard, real fallback. The only fakes are at the boundaries: Anthropic at the SDK seam, MCP at the `McpCaller` interface. The middle is real. That's an integration test where the externals are scripted.
+**Q: "Why fake the SDK in-process instead of mocking HTTP at the
+network layer?"**
 
-```
-The fake / real boundary in one diagram
+The seam is the interface, not the wire. The agent loop calls
+`anthropic.messages.create(...)` and reads back `{ content, stop_reason,
+usage }`. Mocking at HTTP means I'd have to fake the SDK's
+serialization, its retry behavior, its error coercion — code I don't
+own and shouldn't pin. Faking at the interface means I script the
+exact shape the agent reads, which is a tiny surface I do own
+(`Anthropic.Messages.Message`). It also runs at memory speed instead
+of network speed.
 
-   FAKE                  REAL                              FAKE
-  ──────              ────────────────                   ──────
-  Anthropic    ─►  DiagnosticAgent.investigate    ─►    McpCaller
-  SDK              │                                     interface
-   .messages.      │  → builds system prompt
-    create         │  → calls runAgentLoop
-   (scripted       │     │
-    queue +        │     ├─ for turn in maxTurns
-    vi.fn)         │     ├─ extracts text/tool blocks
-                   │     ├─ accumulates messages         │ ◄─ scripted
-                   │     ├─ enforces maxTurns budget     │     tool result
-                   │     └─ forceFinal logic              │
-                   │  → parses output via parseAgentJson
-                   │  → validates via isDiagnosis
-                   │  → on failure, runs synthesize()
-                   └────────────────────────────────────
-```
+The diagram I'd draw: the SDK seam with `TEST decides → fake →
+agent loop` on one side and `(would have called) → anthropic.com` on
+the other, and a circle around the SDK boundary showing where the fake
+lives.
 
-**Q: What's the load-bearing part most people forget?** The `vi.fn` wrapper. People often write `const create = async () => responses[idx++]` and lose `mock.calls`. The moment you can't inspect what was *sent* to the model, you lose the highest-leverage class of assertion — the prompt-augmentation tests in `base.test.ts` (forceFinal, tool removal on forced-final turn) all depend on reading `create.mock.calls[N][0]`.
+*anchor:* `test/agents/base.test.ts:16-56` for the fake; `lib/agents/monitoring.ts:73-80` for the injectable agent.
 
-**Q: What does this pattern *not* catch?** Anything that's a function of the real model's output. If Anthropic ships a model that emits worse JSON tomorrow — fewer markdown fences, more rambling prose — every test in this file still passes (the script returns what the test author wrote). That's the AI-eval gap. The harness catches *wiring* bugs; it cannot catch *quality* bugs. You need both disciplines; this pattern is one half.
+**Q: "What's the load-bearing part everyone forgets?"**
+
+The queue throws when it's exhausted. If the loop makes one more call
+than the script expected, you don't want a silent `undefined` flowing
+into `response.content.flatMap` — you want a screaming "no scripted
+response at index N" that points at the exact off-by-one. Same idea
+as a BFS's empty-frontier termination: it's the cheapest correctness
+gate the kernel gets, and it's the part that turns "test failed for
+unclear reasons" into "test failed because turn 3 wasn't scripted."
+
+*anchor:* `test/agents/base.test.ts:25-27` — the throw is one line, and
+it's the one line that turns a confusing failure into a localized one.
+
+**Q: "What's the cost of this pattern?"**
+
+The fake is a parallel implementation of the SDK's response shape, by
+hand, with `as unknown as Anthropic.Messages.Message` to satisfy the
+type. When the SDK's response type evolves, the fake drifts and tests
+break in a way that LOOKS like real failures. The mitigation in this
+repo is two helpers (`textBlock`, `toolUseBlock` in `base.test.ts:58-70`)
+that centralize the shape — when Anthropic adds a field, you fix one
+file, not eight. The further-out mitigation (not done here) is contract
+tests that run the same script against the fake and the real SDK to
+catch drift in CI.
 
 ## See also
 
-- `audit.md#testing-ai-features` — the deterministic-vs-eval seam this pattern straddles
-- `02-fixture-driven-schema-parser.md` — the fixture-driven unit pattern (Level 2), one rung below this on the pyramid
-- `04-acceptance-plus-per-gate-rejection.md` — the type-guard rejection discipline that the harness's `isDiagnosis` validation step depends on
-- `05-llm-eval-as-testing.md` — **RETIRED.** Historical record of LLM-as-judge testing discipline; the in-repo eval suite it references was deleted in PR #8
-- (external) `.aipe/study-ai-engineering/05-evals-and-observability/` — the model-architecture / rubric-design deep walk; the only place this repo still teaches model-quality measurement
-
----
+  → `02-fixture-driven-schema-parser-tests.md` — the same "fake at the
+    interface, not the wire" discipline applied to the MCP envelope.
+  → `04-acceptance-with-per-gate-rejection.md` — what the loop's
+    parsed output is checked against after the harness runs.
+  → `audit.md` lens 2 — where this pattern lives in the bigger
+    pyramid; lens 3 — why the agent's testability is itself a design
+    signal.

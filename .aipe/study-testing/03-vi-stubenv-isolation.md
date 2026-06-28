@@ -1,410 +1,367 @@
-# 03 — `vi.stubEnv` isolation (the AUTH_SECRET flake fix)
+# 03 — vi.stubEnv() isolation
+*Industry name: per-test environment stubbing / test-local config injection. Type: Industry standard (vitest-specific API).*
 
-**Industry name:** Tracked environment stubbing / hermetic env isolation. **Type:** Industry standard (vitest-specific name).
-
-## Zoom out, then zoom in
-
-A flake erodes trust in the whole green bar. Once "oh that test fails sometimes" enters the team's vocabulary, the suite stops being a contract. blooming insights had exactly one flake of record — the AUTH_SECRET crypto test in `auth.test.ts` — and the fix lands as the canonical post-mortem story for the repo. The mechanism: replace direct `process.env.X = …` with `vi.stubEnv` + `vi.unstubAllEnvs`, so vitest tracks the mutation and restores the prior value on test exit even when the test throws.
+## Zoom out — where this pattern lives
 
 ```
-Zoom out — where this pattern lives in the test infrastructure
+  the isolation pattern sits at the test/process boundary
 
-  ┌─ Test suite (221 tests across 24 files) ──────────────────────┐
-  │                                                                │
-  │  vitest runs files in parallel WORKERS                        │
-  │  each worker is a Node process; a worker is reused across     │
-  │  multiple test files; process.env is one object PER PROCESS    │
-  │                                                                │
-  └────────────────────────────────┬───────────────────────────────┘
-                                   │
-  ┌─ ★ ISOLATION LAYER (where this pattern lives) ★ ──────────────┐
-  │                                                                │
-  │  test/mcp/auth.test.ts lines 117–122 — the fixed block          │
-  │     beforeEach: vi.stubEnv('AUTH_SECRET', 'test-secret-…')      │  ← we are here
-  │     afterEach:  vi.unstubAllEnvs()                              │
-  │                                                                │
-  │  Same family in the suite:                                     │
-  │     vi.useFakeTimers / vi.useRealTimers   (time)               │
-  │     vi.stubGlobal('fetch', …) / vi.unstubAllGlobals (globals)  │
-  │     _clearAuthStore / _clear / _clearInvestigationCache        │
-  │       (module-scoped state)                                    │
-  └────────────────────────────────┬───────────────────────────────┘
-                                   │
-  ┌─ Code under test ──────────────▼───────────────────────────────┐
-  │  lib/mcp/auth.ts                                                │
-  │     encryptStore / decryptStore — read process.env.AUTH_SECRET  │
-  │     to derive the AES-256-GCM key                               │
-  └────────────────────────────────────────────────────────────────┘
+  ┌─ vitest worker process ──────────────────────────────────────────┐
+  │                                                                   │
+  │   ┌─ test file A ──────────────┐  ┌─ test file B ──────────────┐  │
+  │   │ vi.stubEnv('AUTH_SECRET',  │  │ (no stub — sees real env)  │  │
+  │   │   'test-secret')           │  │                            │  │
+  │   │ ...runs auth crypto tests  │  │                            │  │
+  │   │ vi.unstubAllEnvs()         │  │                            │  │
+  │   └────────────────────────────┘  └────────────────────────────┘  │
+  │                ★ THE STUB IS SCOPED TO THE TEST ★                  │
+  │                no leak to file B even when they run in parallel    │
+  └──────────────────────────────────────────────────────────────────┘
+                                │
+                                │  if you used process.env.X = '...' instead
+                                ▼
+  ┌─ process-wide env (BAD if shared across workers) ─────────────────┐
+  │  the var stays set after the test, the next test sees it,         │
+  │  parallel workers race on it → flake                              │
+  └──────────────────────────────────────────────────────────────────┘
 ```
 
-Now zoom in. The interesting story is **why direct `process.env.X = …` leaked across files, why `vi.stubEnv` doesn't, and why this is the load-bearing isolation pattern for any process-global the tests touch.**
+This pattern matters because vitest runs test files in parallel by
+default, and `process.env` is process-wide. Setting an env var with
+`process.env.X = 'foo'` in one file CAN leak into another file's test
+running in the same worker — or, worse, the same var written by two
+parallel workers races. `vi.stubEnv` solves both by tracking the
+mutation and restoring it on `vi.unstubAllEnvs()`.
 
-## Structure pass
+## Structure pass — the skeleton this pattern hangs on
 
-**Layers:** one test → tests in one file → tests in one worker process → tests in parallel worker processes. **Axis traced:** *what is shared at this layer, and what isolates it?* **The seams where the answer flips:**
+**Layers:** test → vitest stub-tracker → process.env.
+
+**Axis: state — who owns the env var, and when does it revert?**
 
 ```
-The axis "what's shared, what's isolated?" — across nesting levels
+  state ownership flips across the stub boundary
 
-  axis traced = "what state can leak in or out?"
-
-  ┌─ inside one test ─────────────────────────────┐
-  │  local consts, per-test fakes, expect() asserts│  ISOLATED by language
-  └────────────────────┬──────────────────────────┘    (function scope)
-
-  ┌─ across tests in one file ────────────────────┐
-  │  module-scoped state: memStore, in-mem caches  │  SHARED by default —
-  └────────────────────┬──────────────────────────┘  needs _clear() in
-                                                      beforeEach (every
-                                                      shared-state test
-                                                      file has these)
-
-  ┌─ ★ across files in one worker ★ ──────────────┐
-  │  process.env mutations                         │  THE FLAKE LIVED HERE
-  │  any process-global (process.env, globalThis,  │  vitest reuses one
-  │  vi.useFakeTimers state if not restored)       │  worker process across
-  │                                                 │  many test files; raw
-  │                                                 │  process.env writes
-  └────────────────────┬──────────────────────────┘  leak until the worker
-                                                      exits
-
-  ┌─ across parallel workers ─────────────────────┐
-  │  filesystem writes, network sockets, real DB   │  not used in this suite
-  └───────────────────────────────────────────────┘
+  ┌─ outside the test ──┐  vi.stubEnv() ┌─ inside the stubbed test ──┐
+  │  PROCESS owns       │ ═════════════►│  TEST owns AUTH_SECRET     │
+  │  AUTH_SECRET        │               │  (vitest remembers the     │
+  │  (whatever .env     │               │   prior value to restore)  │
+  │   sets, or unset)   │  vi.unstubAllEnvs()
+  └─────────────────────┘ ◄═════════════└────────────────────────────┘
+         ▲                                              ▲
+         └─── state ownership flips, then flips back ───┘
+              → no other test sees the test-local value
 ```
 
-The flip that matters: **the seam between "module-scoped" and "process-scoped" state.** Module state (memStore) is shared *within* a file and *obvious* — every test file with shared state has a `_clear()` call in `beforeEach`. Process state (`process.env`) is shared *across* every file in the worker and *silent* — there's no compile error, no warning, nothing visible until a parallel worker races for the same global.
+The boundary is `beforeEach` / `afterEach`. The stub is set inside the
+boundary; the restore happens at the boundary. Cross either side and
+the state belongs to the other owner.
+
+**The seam that matters:** `vi.unstubAllEnvs()` in `afterEach`. Without
+it, the stub leaks to the *next test in the same file*. The leak
+across files is harder (vitest re-imports the test file fresh for each
+file's environment) but the within-file leak is the cheap, common one.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-A test is hermetic when it produces the same result every time, regardless of what ran before or runs after. The kernel of hermetic testing is **route every mutation of shared state through a framework-tracked mutator**, so cleanup is automatic even when the test throws.
+You know how a `useState` value reverts to its initial when the
+component unmounts? Same idea here at the test level: `vi.stubEnv`
+"sets" the value for the test, `vi.unstubAllEnvs` "unmounts" the stub
+and restores whatever was there before. The test is a tiny scope; the
+env var is local to that scope.
 
 ```
-The hermetic-test kernel — track and restore
+  The pattern — env mutation tracked, restored on exit
 
-  ┌─ beforeEach: put the world into a known state ─────────────┐
-  │  vi.stubEnv('AUTH_SECRET', 'X')   ← TRACKED env override   │
-  │  vi.useFakeTimers()                ← TRACKED time freeze    │
-  │  vi.stubGlobal('fetch', fn)       ← TRACKED global stub    │
-  │  _clearAuthStore()                ← module reset            │
-  └────────────────────────┬───────────────────────────────────┘
-                           ▼
-  ┌─ the test runs in that world ──────────────────────────────┐
-  │  (may throw — afterEach still runs)                         │
-  └────────────────────────┬───────────────────────────────────┘
-                           ▼
-  ┌─ afterEach (or auto): restore everything ──────────────────┐
-  │  vi.unstubAllEnvs()    ← env back to what worker saw before │
-  │  vi.useRealTimers()    ← time unfrozen                      │
-  │  vi.unstubAllGlobals() ← global back to native fetch        │
-  └────────────────────────────────────────────────────────────┘
+      beforeEach() ────► vi.stubEnv('AUTH_SECRET', 'x')
+                              │
+                              │  vitest remembers: ('AUTH_SECRET', prev)
+                              ▼
+                       process.env.AUTH_SECRET === 'x'   ← test sees this
+                              │
+                              ▼
+                         the test runs
+                              │
+                              ▼
+      afterEach()  ────► vi.unstubAllEnvs()
+                              │
+                              │  vitest restores each tracked var
+                              ▼
+                       process.env.AUTH_SECRET === prev  ← back to baseline
 ```
 
-The point of the *framework-tracked* mutator: it knows what it changed and can put it back. Direct `process.env.X = 'y'` doesn't — vitest has no record of the change and can't restore the prior value.
+The thing that makes it bulletproof is the **tracking**. `vi.stubEnv`
+records every var it touches; `vi.unstubAllEnvs` restores all of them
+in one call. You can't forget to restore one — they all go back
+together.
 
-### Move 2 — the walkthrough
+### Move 2 — the step-by-step walkthrough
 
-#### The flake, before the fix
+#### Step 1 — find the env-dependent code
 
-Before commit `e83a8e0`, the auth crypto block in `auth.test.ts` mutated `process.env.AUTH_SECRET` directly inside `beforeEach` and had no `afterEach`. The flake mechanics:
+Auth cookie crypto reads `AUTH_SECRET` to derive the AES-256-GCM key:
 
-```
-The flake mechanic — process.env leak across parallel workers
-
-  ┌─ vitest scheduler ─────────────────────────────────────────────┐
-  │  spawns N worker processes (one per CPU core, roughly)         │
-  │  each worker is a long-lived Node process                      │
-  │  scheduler assigns test FILES to workers as they finish        │
-  │  one worker → many files, in sequence                          │
-  └──────────────────────────────────────────────────────────────┘
-
-  ┌─ WORKER A timeline ─────────────────────────────────────────────┐
-  │                                                                  │
-  │  T0   run test/mcp/auth.test.ts                                  │
-  │         beforeEach → process.env.AUTH_SECRET = 'test-secret'    │
-  │         test passes                                              │
-  │         NO afterEach → AUTH_SECRET stays set in this process    │
-  │                                                                  │
-  │  T1   worker reused → run test/mcp/client.test.ts                │
-  │         AUTH_SECRET is STILL 'test-secret'                       │
-  │         client tests don't read it; they pass                    │
-  │                                                                  │
-  │  T2   worker reused → run test/mcp/transport.test.ts             │
-  │         STILL set; doesn't matter to these tests                 │
-  └──────────────────────────────────────────────────────────────────┘
-
-  ┌─ WORKER B timeline (parallel) ──────────────────────────────────┐
-  │                                                                  │
-  │  T0   run test/mcp/client.test.ts FIRST                          │
-  │         AUTH_SECRET is UNDEFINED in this worker                  │
-  │                                                                  │
-  │  T1   worker reused → run test/mcp/auth.test.ts                  │
-  │         beforeEach → process.env.AUTH_SECRET = 'test-secret'    │
-  │         crypto test runs against the just-set value             │
-  │         passes (in this run)                                     │
-  │                                                                  │
-  │  T2 …                                                            │
-  │  THE FLAKE: if mid-block the worker pool rebalances or a        │
-  │  parallel read happens, the env can be in an unexpected state.  │
-  │  Failed ~1 in N runs. Passed in isolation. Mystified everyone.  │
-  └──────────────────────────────────────────────────────────────────┘
+```ts
+// the production code in lib/mcp/auth.ts reads AUTH_SECRET at call time:
+//   _authCookieCrypto.encrypt(store) → reads process.env.AUTH_SECRET
+//   _authCookieCrypto.decrypt(token) → same
+// (the test exposes _authCookieCrypto specifically so tests can drive
+//  the round-trip without going through the cookie-jar surface)
 ```
 
-The symptom: green bar most days, red bar occasionally, no diff that explained it. The diagnostic move: notice that the failing test depends on `process.env.AUTH_SECRET` and that no afterEach restores it.
+Without a test-supplied secret, the encryption would either throw
+("AUTH_SECRET is not set") or use a default that the test would have
+to know — both fragile.
 
-#### The fix, what changed
+#### Step 2 — stub the var per-test, restore in afterEach
 
-Switch to `vi.stubEnv`, which vitest *tracks*. Every stub is registered in a per-test list; `vi.unstubAllEnvs()` walks the list and restores prior values. The afterEach guarantees cleanup even when the test throws.
-
-```
-vi.stubEnv mechanic — tracked mutation + automatic restore
-
-  ┌─ test entry ─────────────────────────────────────────────┐
-  │  vi.stubEnv('AUTH_SECRET', 'test-secret')                │
-  │     │                                                     │
-  │     ├─ vitest reads current value:                       │
-  │     │     prior = process.env.AUTH_SECRET (may be undef)│
-  │     │                                                     │
-  │     ├─ stores (varName, prior) in per-test stub registry │
-  │     │                                                     │
-  │     └─ sets process.env.AUTH_SECRET = 'test-secret'     │
-  └─────────────────────┬───────────────────────────────────┘
-                        │
-                        ▼
-  ┌─ test runs (may throw) ─────────────────────────────────┐
-  │  encryptStore / decryptStore read AUTH_SECRET           │
-  │  assertions execute                                       │
-  └─────────────────────┬───────────────────────────────────┘
-                        │
-                        ▼ afterEach runs unconditionally
-  ┌─ test exit ──────────────────────────────────────────────┐
-  │  vi.unstubAllEnvs()                                       │
-  │     │                                                     │
-  │     ├─ walks the stub registry                           │
-  │     │                                                     │
-  │     └─ for each (varName, prior):                        │
-  │           if prior was undefined → delete process.env.X  │
-  │           else → process.env.X = prior                    │
-  └──────────────────────────────────────────────────────────┘
-
-  Net effect: worker.process.env.AUTH_SECRET on test EXIT
-              ===
-              worker.process.env.AUTH_SECRET on test ENTRY
-              (every time, every test)
-```
-
-Now parallel workers no longer race for a global. Each test gets the var set to its expected value on entry; the var is restored to whatever the worker had before on exit. Nothing leaks across files.
-
-#### Why the same shape generalizes (vi.useFakeTimers, vi.stubGlobal)
-
-The pattern repeats for every process-global the suite touches. Time (`Date.now`, `setTimeout`) is a global; `vi.useFakeTimers` is the tracked mutator, `vi.useRealTimers` is the restore. `fetch` is a global; `vi.stubGlobal('fetch', fn)` is the tracked mutator, `vi.unstubAllGlobals` is the restore. The lesson: **never mutate a process-global directly in a test — use the framework's tracked mutator.**
-
-```
-The family — same shape, different globals
-
-  global               tracked mutator              restore
-  ──────               ───────────────              ───────
-  process.env.X        vi.stubEnv('X', val)         vi.unstubAllEnvs()
-  Date.now / timers    vi.useFakeTimers()           vi.useRealTimers()
-  globalThis.fetch     vi.stubGlobal('fetch', fn)   vi.unstubAllGlobals()
-  globalThis.anything  vi.stubGlobal(name, val)     vi.unstubAllGlobals()
-```
-
-All three live in the suite. `vi.useFakeTimers` is in every TTL/retry test in `client.test.ts`. `vi.stubGlobal('fetch', …)` is in the capturing-fetch test in `transport.test.ts`. `vi.stubEnv` is the AUTH_SECRET fix.
-
-### Move 2 variant — the load-bearing skeleton
-
-What is the minimum that makes the pattern correct?
-
-1. **A tracked mutator at test entry.** `vi.stubEnv` (not `process.env.X = …`). Without "tracked," the framework can't restore the prior value because it doesn't know what the prior value was.
-
-2. **An automatic restore at test exit.** `vi.unstubAllEnvs()` in `afterEach`. The restore must run *unconditionally* — including when the test throws. `afterEach` runs on failure; cleanup placed inside the test body after `expect()` does not (because `expect` throws on failure).
-
-3. **Exception-safe cleanup.** Drop this and a single failing test corrupts every test after it in the same worker. The combination of `afterEach` + tracked mutator gives you this for free — even if the test body throws partway through, vitest still calls `afterEach`, which restores via the tracker.
-
-Skeleton = tracked entry + tracked exit + exception-safe. Drop any one and the flake is one parallel-worker race away.
-
-### Code in this codebase
-
-**Use case A — the AUTH_SECRET fix in full context.** The comment block above the `beforeEach` is itself part of the fix. It names *why* the pattern exists, so the next refactor doesn't silently revert to raw mutation.
-
-```
-test/mcp/auth.test.ts  (lines 112–122 — the fixed block, full)
-
-  describe('auth cookie crypto (production backend)', () => {
-    // Isolate AUTH_SECRET with vitest's tracked env stubbing: set it before each
-    // test and restore the prior environment after. Mutating process.env directly
-    // (as before) leaked the var across files running in parallel workers, which
-    // made this block flaky. stubEnv/unstubAllEnvs keeps it self-contained.
-    beforeEach(() => {
-      vi.stubEnv('AUTH_SECRET', 'test-secret-please-ignore');   ← every test starts
-    });                                                          with this exact value
-    afterEach(() => {
-      vi.unstubAllEnvs();                                       ← every test exits
-    });                                                          with the prior env
-       │
-       └─ the comment is the post-mortem itself. Without it, a year from now
-          someone reviews this code, sees "wait, why is this stubEnv pattern
-          here when other tests use plain assignment?" and refactors it back
-          to a flake. The comment is documentation as a guard rail.
-
-  test/mcp/auth.test.ts  (lines 126–133 — the test that depends on the isolation)
-
-    it('round-trips an encrypted store under AUTH_SECRET', () => {
-      const store = { … };
-      const token = _authCookieCrypto.encrypt(store);     ← reads AUTH_SECRET
-      expect(_authCookieCrypto.decrypt(token)).toEqual(store);
-    });
-    it('returns an empty store for a tampered/garbage cookie', () => {
-      expect(_authCookieCrypto.decrypt('not-a-valid-token')).toEqual({});
-    });
-       │
-       └─ both tests need AUTH_SECRET set to a known value. The encrypt/decrypt
-          path derives an AES-256-GCM key from the env var; if the var is the
-          wrong value mid-test, decrypt fails on input it produced itself.
-          That's the exact failure mode the flake produced before the fix.
-```
-
-**Use case B — same family for `fetch`, in the transport test.** `vi.stubGlobal('fetch', …)` is the same pattern applied to a different global; `vi.unstubAllGlobals()` in `afterEach` is the same exception-safe restore.
-
-```
-test/mcp/transport.test.ts  (lines 1–18, 33–39)
-
-  import { describe, it, expect, vi, afterEach } from 'vitest';
-
+```ts
+// test/mcp/auth.test.ts:112-135 (annotated)
+describe('auth cookie crypto (production backend)', () => {
+  // Isolate AUTH_SECRET with vitest's tracked env stubbing: set it before
+  // each test and restore the prior environment after. Mutating
+  // process.env directly (as before) leaked the var across files running
+  // in parallel workers, which made this block flaky. stubEnv/unstubAllEnvs
+  // keeps it self-contained.
+  beforeEach(() => {
+    vi.stubEnv('AUTH_SECRET', 'test-secret-please-ignore');     // ← scoped IN
+  });
   afterEach(() => {
-    vi.unstubAllGlobals();         ← restore real fetch after every test
+    vi.unstubAllEnvs();                                          // ← scoped OUT
   });
 
-  describe('makeCapturingFetch', () => {
-    it('records the body of a non-OK response and leaves the original readable', async () => {
-      const holder = { last: null };
-      const f = makeCapturingFetch(holder);
-      vi.stubGlobal(                ← tracked global stub
-        'fetch',
-        async () => new Response('{"error":"invalid_token", …}', { status: 401 }),
-      );
-       │
-       └─ scripted Response stands in for a real HTTP call. The capturing
-          fetch can then be tested without spinning a real HTTP server. The
-          stub leak is bounded by the file-scoped afterEach above; no other
-          test in the suite sees a stubbed fetch.
+  it('round-trips an encrypted store under AUTH_SECRET', () => {
+    const store = { 'sid-1': { tokens, codeVerifier: 'v', state: 's' } };
+    const token = _authCookieCrypto.encrypt(store);
+    expect(typeof token).toBe('string');
+    expect(token).not.toContain('tok');                          // ← ciphertext,
+    expect(_authCookieCrypto.decrypt(token)).toEqual(store);     //    not plaintext
+  });
+
+  it('returns an empty store for a tampered/garbage cookie', () => {
+    expect(_authCookieCrypto.decrypt('not-a-valid-token')).toEqual({});
+  });
+});
 ```
+
+The comment in the test is doing real work — it names the prior bug
+(parallel-worker leak) and the fix (stubEnv). That's the audit trail
+for "why this style, not the obvious `process.env.X = ...` style."
+
+#### Step 3 — what would go wrong without the discipline
+
+```
+  scenario                                        outcome WITHOUT stubEnv
+  ────────────────────────────────────────────    ─────────────────────────────
+  test A sets process.env.AUTH_SECRET = 'a'      test B runs in the same file,
+  test B runs in the same file, doesn't set it    sees 'a', might pass on 'a'
+                                                  but rely on it implicitly
+                                                  (silent dependency)
+  test A sets process.env.AUTH_SECRET = 'a'      test B in another file,
+  test B in a parallel worker reads it            running in another worker
+                                                  process, would normally NOT
+                                                  see it — but if both files
+                                                  run in the same worker
+                                                  (pool='single', or with
+                                                  vitest's file-grouping),
+                                                  test B sees 'a' as the
+                                                  baseline → flake
+  the test forgets to unset the var              the NEXT test file in the
+  after running                                   same worker inherits it as
+                                                  baseline; tests outside this
+                                                  block start using 'a' as if
+                                                  it were always set
+```
+
+With `stubEnv` + `unstubAllEnvs`, none of these matter — vitest tracks
+the mutation, scopes it to the test, and reverts it cleanly. The leak
+window shrinks to "inside this one `it()`."
+
+#### Step 4 — the rest of the env-handling in the suite
+
+Two other test files write to env directly without using stubEnv:
+
+```ts
+// test/api/briefing.integration.test.ts:112
+process.env.ANTHROPIC_API_KEY = 'test-key';
+
+// test/api/agent.integration.test.ts:146
+process.env.ANTHROPIC_API_KEY = 'test-key';
+```
+
+These are written in a `beforeEach` and never unset. **They're a known
+gap** (called out in `audit.md` lens 4). Today they don't cause flakes
+because:
+
+  → `ANTHROPIC_API_KEY` is only *read* by the route handlers, never
+    asserted on as "should be unset" elsewhere in the suite, so the
+    leak is invisible.
+  → The integration tests run after the unit tests in most local
+    runs, so the order-dependency happens to not bite.
+
+But the pattern is fragile. If a future test wanted to assert "the
+route returns 500 when the API key is missing," it would have to
+either work around the inherited value or convert these two writes to
+`vi.stubEnv` form. The fix is one-line per file:
+`vi.stubEnv('ANTHROPIC_API_KEY', 'test-key')` plus the matching
+`vi.unstubAllEnvs()` in `afterEach`.
+
+#### Step 5 — the sibling pattern: vi.stubGlobal + vi.unstubAllGlobals
+
+The same discipline applies one layer up — to global mutations like
+`fetch`. The transport tests use it:
+
+```ts
+// test/mcp/transport.test.ts:11-13
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+```
+
+And per-test:
+
+```ts
+// test/mcp/transport.test.ts:19-25
+const f = makeCapturingFetch(holder);
+vi.stubGlobal(
+  'fetch',
+  async () => new Response('{"error":"invalid_token"}', { status: 401 }),
+);
+```
+
+Same shape: stub in the test, restore in afterEach. The pattern is
+"track-and-restore for any process-wide mutation." Env vars are the
+common case; globals like `fetch` are the next-most-common; both use
+the same discipline because they're both single-shared-process state.
 
 ### Move 3 — the principle
 
-**Flakes are state leaks in disguise.** A test that fails sometimes is rarely "actually nondeterministic" — it's deterministic given the world state, and the world state changed underneath it. The fix is never "retry the test"; the fix is "find the leak and seal it." Route every mutation of shared state through a framework-tracked mutator. The discipline travels: env vars, timers, globals, module-scoped state — same shape, different name.
+**Process-wide state needs scope-tracked mutation.** Anytime a test
+needs to set something the whole process can see — env vars, globals,
+the system clock, the random seed — write through a tracked stub
+that knows how to restore on teardown. The `let prev = process.env.X;
+process.env.X = 'y'; afterEach(() => { process.env.X = prev; })` style
+works but is one easy `forgot-to-restore` bug away from a leak. Tracked
+stubs (`stubEnv`, `stubGlobal`, `useFakeTimers`) move the discipline
+from human attention to library guarantee.
 
-## Primary diagram
-
-The full before/after, side by side:
+## Primary diagram — the whole pattern in one frame
 
 ```
-The AUTH_SECRET flake fix — before vs after
+  vi.stubEnv() ISOLATION — one frame
 
-  ┌─ BEFORE commit e83a8e0 (flaky) ─────────────────────────────────┐
+  ┌─ vitest test runner ────────────────────────────────────────────┐
   │                                                                  │
-  │  test/mcp/auth.test.ts                                           │
-  │  ────────────────────                                            │
+  │   describe('auth cookie crypto') {                                │
   │                                                                  │
-  │   describe('auth cookie crypto', () => {                          │
   │     beforeEach(() => {                                            │
-  │       process.env.AUTH_SECRET = 'test-secret';   ← raw mutation, │
-  │     });                                            untracked       │
-  │     // (no afterEach — the leak)                                 │
+  │       vi.stubEnv('AUTH_SECRET', 'test-secret');                  │
+  │     });                                ──────────────┐           │
+  │                                                       │           │
+  │     afterEach(() => {                                 ▼           │
+  │       vi.unstubAllEnvs();          ┌──────────────────────────┐  │
+  │     });                            │ tracked-env table:        │  │
+  │                                    │   AUTH_SECRET → prev      │  │
+  │     it('round-trips encrypted', () │   (vitest remembers)      │  │
+  │       process.env.AUTH_SECRET     └──────────────────────────┘  │
+  │         === 'test-secret'                                         │
+  │       _authCookieCrypto.encrypt(...)                              │
+  │     })                                                            │
   │                                                                  │
-  │     it('round-trips an encrypted store', () => {…});             │
-  │   });                                                            │
-  │                                                                  │
-  │  RESULT: process.env.AUTH_SECRET persists in the worker          │
-  │  process after this block exits. The next file the worker runs   │
-  │  inherits the value; if a parallel worker has the var unset and  │
-  │  a downstream test races for it, the suite flakes.               │
-  │                                                                  │
-  │  SYMPTOM: ~1 in N failure rate. Passes in isolation. No diff     │
-  │  explains it. Worst possible kind of flake — looks like           │
-  │  "intermittent," is actually "deterministic given env state."    │
+  │   }   ← when this block exits, every tracked env var is restored │
+  │       no leak to test file B running in the same worker          │
   └──────────────────────────────────────────────────────────────────┘
 
-  ┌─ AFTER commit e83a8e0 (clean) ──────────────────────────────────┐
-  │                                                                  │
-  │  test/mcp/auth.test.ts  (lines 112–122)                          │
-  │  ────────────────────                                            │
-  │                                                                  │
-  │   describe('auth cookie crypto (production backend)', () => {     │
-  │     // Isolate AUTH_SECRET with vitest's tracked env stubbing:   │
-  │     // set it before each test and restore the prior environment │
-  │     // after. Mutating process.env directly (as before) leaked    │
-  │     // the var across files running in parallel workers, which   │
-  │     // made this block flaky. stubEnv/unstubAllEnvs keeps it     │
-  │     // self-contained.                                           │
-  │     beforeEach(() => {                                            │
-  │       vi.stubEnv('AUTH_SECRET', 'test-secret-please-ignore');    │
-  │     });                                                          │
-  │     afterEach(() => {                                            │
-  │       vi.unstubAllEnvs();                                        │
-  │     });                                                          │
-  │                                                                  │
-  │     it('round-trips an encrypted store under AUTH_SECRET', () => {…}); │
-  │     it('returns an empty store for a tampered cookie', () => {…});│
-  │   });                                                            │
-  │                                                                  │
-  │  WHAT CHANGED:                                                   │
-  │   • vi.stubEnv registers the mutation with vitest's tracker.    │
-  │   • afterEach calls vi.unstubAllEnvs, which restores prior      │
-  │     values for every stub registered in this test.              │
-  │   • afterEach runs even when the test throws → exception-safe.  │
-  │   • Worker.process.env on test exit === on test entry.          │
-  │   • Parallel workers no longer race for the global.             │
-  │                                                                  │
-  │  RESULT: 221 tests pass across repeated runs (commit message    │
-  │  says 157 at fix time; suite has grown to 221 since via the    │
-  │  Phase 2 swap and post-Olist cleanup). Zero re-flakes from     │
-  │  this fix's pattern.                                            │
-  │                                                                  │
-  │  THE COMMENT BLOCK is part of the fix — it explains WHY this    │
-  │  pattern exists so the next person doesn't "simplify" it back.  │
-  └──────────────────────────────────────────────────────────────────┘
+  the prior style (process.env.X = 'y' directly) had no restore →
+  parallel-worker flake → the audit trail is in the test's comment
 ```
 
 ## Elaborate
 
-The "stub the global through the framework" pattern is older than vitest — Jest's `jest.replaceProperty` did the same job before being deprecated in favor of `jest.spyOn` for similar use cases. The underlying observation goes back further: a parallel test runner is a multi-process system, and shared state (env vars, files, sockets) needs the same discipline you'd apply to any concurrent system. Locks, isolation, deterministic teardown. The fact that you don't *see* the parallelism doesn't mean it isn't there.
+The vitest `vi.stubEnv` / `vi.unstubAllEnvs` pair is a direct
+descendant of Sinon's `sinon.stub(process.env, 'X')` and Jest's
+`jest.replaceProperty`. The shape is universal across modern JS test
+runners: a per-mutation tracker that the runner can flush on teardown.
 
-The deeper lesson: **the framework's tracked mutator is a kind of context manager**. It pairs a setup operation with a guaranteed teardown, even on exception. Python's `with` statement, Go's `defer`, Rust's `Drop` — all the same idea. vitest's `stubEnv` is the same primitive in a JS testing skin.
+The underlying principle goes deeper than env vars — it's the **stub
+discipline** generalized. Any time the test needs to change something
+the production code reads from a shared source, you want the change
+**scoped to the test**, **tracked by the runner**, and **reverted
+automatically**. Manual reversion is a footgun.
 
-Cross-reference: `study-software-design`'s "principle of least surprise" — the fixed code is *more* code than the raw mutation, but it's also more *honest* about what it's doing. The comment block names the post-mortem; the explicit `afterEach` makes the cleanup contract visible. Surprise-minimizing code is testing-friendly code.
+The history: parallel test execution is what made this matter. When
+tests were single-threaded and sequential, "set the var, run the
+test, unset the var" by hand worked fine because the next test ran
+strictly after. Parallel execution broke that: a parallel worker
+reading `process.env.X` while another worker writes it is a data race
+with no warning. The runner-level stub fixes it by either (a) running
+each file in its own process where the env is fresh, or (b) tracking
+the mutation per-test and never letting it escape the test scope.
+
+The cross-cutting cousin: **fake timers**. `vi.useFakeTimers()` /
+`vi.useRealTimers()` is the same shape applied to `setTimeout` /
+`Date.now`. The cache TTL test in `test/mcp/client.test.ts:49-58`
+uses it for the same reason: time is process-wide state, and the
+test wants to control it locally.
 
 ## Interview defense
 
-**Q: Walk me through a flaky test you fixed.** The AUTH_SECRET crypto test in `auth.test.ts`. Failure mode: passed in isolation, flaked ~1 in N times in the full suite. Root cause: the `beforeEach` set `process.env.AUTH_SECRET` directly and there was no `afterEach`. Vitest runs test files in parallel workers; a single worker process is reused across files, so the env var leaked across file boundaries — when a parallel worker rebalanced or a downstream test read the var, the state wasn't what either side expected. Fix: replace direct mutation with `vi.stubEnv` + `vi.unstubAllEnvs` in `afterEach`, which vitest tracks and restores. One file changed, 15 lines, 157 tests passing at fix time; today 221 tests still clean across repeated runs.
+**Q: "Why not just `process.env.X = 'y'` in the test?"**
 
-```
-The fix in one diagram
+It works until two tests touch the same var. Then it's a flake — the
+test that runs first wins, the test that runs second inherits the
+leaked value, and the third one might mutate it again, and you spend
+half a day chasing a test that "fails sometimes." `vi.stubEnv` tracks
+the mutation per-test and restores on `vi.unstubAllEnvs()`, so the
+leak window is zero.
 
-   BEFORE                           AFTER
-   ──────                           ─────
-   beforeEach(() => {               beforeEach(() => {
-     process.env.AUTH_SECRET = X;     vi.stubEnv('AUTH_SECRET', X);  ← tracked
-   });                              });
-   // (no afterEach — leaks)        afterEach(() => {
-                                       vi.unstubAllEnvs();           ← restored
-                                    });
-```
+I'd point at the comment in `test/mcp/auth.test.ts:114-118`: it names
+the prior bug (parallel-worker leak), names the fix (stubEnv), and
+keeps the audit trail in the test file. That's how you signal "we
+chose this style deliberately, not by accident."
 
-**Q: Why `vi.stubEnv` instead of `delete process.env.X` in afterEach?** Because `delete` doesn't restore the *prior* value — it just deletes. If the worker shell or a parent test had already set `AUTH_SECRET` to something else, `delete` loses that value. `vi.stubEnv` saves the prior value on entry and `vi.unstubAllEnvs` puts it back; the worker ends in exactly the state it started in, every time. The mutation is symmetric — that's what makes it composable with whatever else is going on in the worker.
+*anchor:* `test/mcp/auth.test.ts:112-135` for the canonical pattern;
+`test/mcp/transport.test.ts:11-13` for the same shape on globals.
 
-**Q: What flake classes haven't you generalized this lesson to?** Honest answer: the rest of the suite hasn't been re-audited with the same lens. The fix landed in one file; the discipline hasn't been generalized to a lint rule banning direct `process.env.X = …` in test files. Adding an ESLint rule (or a project-specific check) would prevent the same class of bug from landing in a future test file. That's flag 8 in the red-flag audit and the obvious next move.
+**Q: "What's the load-bearing part people forget?"**
 
-**Q: Has this lesson been generalized at all?** Not in the current codebase. The fix landed in one file (`auth.test.ts`); no ESLint rule yet bans direct `process.env.X = …` in test files. A previous revision of this guide pointed at the Phase 3 eval suite's `EVAL_RUN_TAG` mitigation as a parallel-shared-state generalization at a new layer, but PR #8 deleted the eval pipeline that gave that story its hook. Today the honest answer is: the lesson is correctly applied where it matters (the one flake of record); the next move (a lint rule banning direct env mutation in tests) hasn't been made.
+`afterEach(() => vi.unstubAllEnvs())`. The stub WITHOUT the restore
+leaks to the next `it()` in the same `describe` block. Most people
+remember to stub; far fewer remember the restore. The `unstubAllEnvs`
+shape is nice because it doesn't ask you to remember WHICH vars you
+stubbed — it just restores everything tracked, so the test author
+can't accidentally leave one behind.
+
+It's the same lesson as `useFakeTimers` / `useRealTimers`: the
+"clean up after yourself" half of the API is what makes the pattern
+parallel-safe.
+
+*anchor:* `test/mcp/auth.test.ts:120-122` for the afterEach;
+`test/mcp/transport.test.ts:11-13` for the global-equivalent.
+
+**Q: "Two of your integration tests still write `process.env.ANTHROPIC_API_KEY`
+directly. Why?"**
+
+That's an inconsistency, and it's the kind of thing a code review
+should catch. The reason they don't cause flakes today is luck:
+`ANTHROPIC_API_KEY` is only read by the route under test, never
+asserted on elsewhere, and the leak is invisible. But it's one new
+test away from being a bug. The fix is mechanical — replace the
+direct write with `vi.stubEnv`, add `vi.unstubAllEnvs()` in
+`afterEach`. I left the inconsistency in the audit (lens 4) instead
+of fixing it silently because the goal is to surface the discipline,
+not to ship the cleanup.
+
+*anchor:* `test/api/briefing.integration.test.ts:112` and
+`test/api/agent.integration.test.ts:146` for the direct-write style;
+`test/mcp/auth.test.ts:117-122` for the corrected style.
 
 ## See also
 
-- `audit.md#determinism-isolation-and-flakiness` — the full isolation map for the suite
-- `audit.md#testing-red-flags-audit` — flag 8 (no lint guard on env mutation) is the generalization opportunity this fix points to
-- `01-scripted-anthropic-harness.md` — the agent tests' isolation depends on the same family (`vi.fn`, `vi.stubGlobal` work on the same tracked-mutation principle)
-- `04-acceptance-plus-per-gate-rejection.md` — the type-guard tests this file's `_authCookieCrypto` calls feed
-
----
+  → `01-scripted-anthropic-harness.md` — the injected-fakes pattern
+    that *avoids* needing module-level stubs for the SDK seam.
+  → `audit.md` lens 4 — the broader determinism/isolation/flakiness
+    audit; names the two `process.env.X = ...` direct writes still
+    in the suite.

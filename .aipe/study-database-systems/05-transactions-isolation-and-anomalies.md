@@ -1,230 +1,239 @@
-# Transactions, Isolation, and Anomalies
+# Transactions, isolation, and anomalies
 
-## Subtitle
+Industry standard · Concurrency correctness
 
-How a database guarantees a group of operations behaves like one · Industry standard.
+## Zoom out — where transactions would live, and what's there
 
-## Zoom out, then zoom in
-
-```
-  Zoom out — where transactions sit in a normal app
-
-  ┌─ App ──────────────────────────────────────────┐
-  │  BEGIN; UPDATE; UPDATE; COMMIT;                │
-  └────────────────────┬───────────────────────────┘
-                       │
-  ┌─ Database ─────────▼───────────────────────────┐
-  │  ★ TRANSACTIONS ★                              │
-  │  atomicity (all or nothing)                    │
-  │  consistency (constraints hold)                 │
-  │  isolation (concurrent txns don't see each      │
-  │             other's in-progress writes)         │
-  │  durability (committed survives a crash)        │
-  └────────────────────────────────────────────────┘
-```
-
-### Verdict for this codebase
-
-**Not yet exercised — no `BEGIN` / `COMMIT` anywhere in the repo.** Every state mutation is a single Map operation:
-
-- `putInsights()` calls `clear()` then sets entries (not atomic, see 06)
-- `saveInvestigation()` is one `mem.set()` plus an optional file write
-- `patchState()` in auth is one `writeAll()` call
-
-The closest transaction-shaped code is `withAuthCookies` in `lib/mcp/auth.ts` — a 2-phase wrapper that reads the cookie, mutates an in-memory store, and writes once on exit. That's the shape of a transaction; it's not ACID.
-
-### When this becomes load-bearing
-
-The trigger is **any feature where two related rows must change together or not at all.**
+A transaction is a group of operations that either all happen or none do, observed by other readers as one atomic event. Isolation levels (read-uncommitted, read-committed, repeatable-read, serializable) define what concurrent transactions can see of each other's in-flight work. This codebase has **no transactional boundary anywhere.** Every state write is a single `Map.set`; every read is a single `Map.get`. There's no commit, no rollback, no isolation guarantee — only the JavaScript event loop's run-to-completion semantics.
 
 ```
-  features that would force this concept
+  Zoom out — where transactions would live (and what's there)
 
-  "save an insight + record the save event in audit log"
-     → both rows write or neither: transaction needed
-
-  "transfer a credit from user A to user B"           (classic example)
-     → both balance updates atomic: transaction needed
-
-  "create an investigation + its 12 reasoning steps"
-     → 13 rows must commit together or rollback
-
-  "update insight's status to 'archived' only if
-   current status is 'active' (optimistic concurrency)"
-     → SELECT FOR UPDATE or version column needed
+  ┌─ Service layer ──────────────────────────────────────────────┐
+  │  putInsights(sessionId, items, rawAnomalies?)                 │
+  │     clears insights + anomalies for the session               │
+  │     then writes both back, one by one                         │
+  └───────────────────────────────┬──────────────────────────────┘
+                                  │ Map.clear + Map.set (in loop)
+  ┌─ State layer ──────────────────▼──────────────────────────────┐
+  │  ★ THIS CONCEPT ★                                              │
+  │  no BEGIN, no COMMIT, no ROLLBACK                              │
+  │  no isolation level configurable                               │
+  │  the JS event loop is the ONLY ordering guarantee              │
+  │  consequence: a second writer mid-flight could "tear" reads    │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
-Today: zero of these exist. Every state mutation here is single-row, so there's nothing to make atomic.
+## Zoom in — the question this concept answers
 
-## Structure pass
+In a real DB: "if two operations run concurrently, what does each see of the other, and how do I make multi-step writes safe?" Here: "is there any guarantee that the briefing the UI reads is consistent with what was just written?" Short answer: yes for single-Map-operation reads (the event loop guarantees that), no for any read that spans multiple operations — but the architecture mostly avoids those reads on purpose.
 
-Skipped — no codebase instance.
+## Structure pass — the skeleton
+
+### The four ACID properties — and which ones we have
+
+  - **Atomicity** — all-or-nothing. **NOT GUARANTEED.** `putInsights` is a `clear` + loop of `set`s. If the process dies mid-loop, the Map is half-populated.
+  - **Consistency** — invariants preserved. **APPLICATION-ENFORCED.** No DB to enforce; TypeScript types + validator (`lib/mcp/validate.ts`) do shallow checks.
+  - **Isolation** — concurrent ops don't see each other's partial state. **PARTIAL.** Single Map operations are isolated (JS event loop); multi-step write sequences are not.
+  - **Durability** — committed writes survive crashes. **NONE.** No disk. → see `07-wal-durability-and-recovery.md`.
+
+### The classical isolation anomalies
+
+```
+  anomaly             what it is                              can it happen here?
+  ─────────           ───────────────────────────────         ────────────────────
+  dirty read          reading another tx's uncommitted writes Maybe — see putInsights
+  non-repeatable read same row, second read returns different Yes — between calls
+  phantom read        same WHERE, new rows appear             Yes — between calls
+  lost update         your write overwrites mine              Yes — last-write-wins
+  write skew          two writes that race on a constraint    N/A — no constraint
+```
+
+### Axis: where does the ordering guarantee come from?
+
+```
+  The "ordering" axis, traced through the stack
+
+  ┌─ HTTP / Vercel ─────────────────────────────────────────┐
+  │  no ordering — independent requests on independent      │
+  │  ephemeral instances; the same session can land on      │
+  │  different processes at the same time                   │
+  └─────────────────────────────────────────────────────────┘
+       ┌─ Node event loop ───────────────────────────────────┐
+       │  run-to-completion: ONE microtask at a time         │
+       │  → individual sync ops on a Map are atomic relative │
+       │    to other code on the same loop                   │
+       └─────────────────────────────────────────────────────┘
+            ┌─ Map operations ──────────────────────────────┐
+            │  one Map.set or Map.get is a single statement │
+            │  → no interleaving WITHIN one op              │
+            └───────────────────────────────────────────────┘
+```
+
+The ordering guarantee is *per-operation* (JS atomicity) and *per-instance* (the Map only sees its own process). There is no cross-instance ordering, no cross-request transactional grouping.
+
+### Seams
+
+The seam that matters most: **between writes that look atomic and aren't.** `putInsights` looks like one call from the outside; inside, it's a clear + loop. A reader hitting between the clear and the writes sees an empty session. That's the dirty-read shape — accidentally exposed.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-A transaction is a fence around a group of operations. Inside the fence, the database promises: either all of them happen, or none of them do, and other transactions don't see partial results. The fence is what lets you write `transfer money from A to B` as two updates instead of as some single atomic balance-swap operation.
+If you've ever shipped a React component that does `setUsers([]); users.forEach(u => addUser(u))` and watched the UI flash empty for a frame — you've felt the no-transaction problem. Same shape here. The flash is the moment between "everything cleared" and "everything re-populated," and a reader who arrives during the flash sees the empty state as if it were final.
 
 ```
-  the pattern — transaction lifecycle
+  The shape — the no-transaction "window"
 
-       BEGIN
-         │
-         ├─ UPDATE accounts SET balance = balance - 100 WHERE id = A
-         │
-         ├─ UPDATE accounts SET balance = balance + 100 WHERE id = B
-         │
-         ├─ ... if anything throws ...
-         │       ROLLBACK   ←  both writes undone, B never saw +100
-         │
-         └─ COMMIT          ←  both writes visible to others atomically
+  time ────────────────────────────────────────────────────►
+
+  putInsights():
+    [Map.clear]                                  ← window opens
+                [Map.set #1]
+                              [Map.set #2]
+                                            …
+                                                [Map.set #N]    ← window closes
+
+  a concurrent read that arrives anywhere in the window
+  sees a PARTIAL truth — not "before" and not "after"
 ```
 
-### Move 2 — the moving parts
+In a real DB, the whole sequence would be wrapped in a transaction and the reader's snapshot would either be "before the BEGIN" or "after the COMMIT." Here, the reader can land in the middle.
 
-**Move 2a — ACID.** The properties a transactional engine claims:
+### Move 2 — the walkthrough
 
-- **A**tomicity — all writes commit or none do (undo log + recovery)
-- **C**onsistency — constraints (`NOT NULL`, `CHECK`, FK) hold across the txn boundary
-- **I**solation — concurrent txns don't see each other's in-progress state (level configurable)
-- **D**urability — committed writes survive a crash (WAL — see 07)
+#### The "transaction" boundary: there isn't one
 
-**Move 2b — isolation levels, the dial.** ANSI SQL names four levels; the higher you go, the fewer anomalies are possible, the more contention you pay for.
-
-```
-  the four-level dial
-
-  read uncommitted    can see another txn's uncommitted writes (dirty reads)
-                      almost no engine actually offers this; Postgres treats
-                      it as read committed
-
-  read committed      Postgres default. only sees committed data. but the
-                      same query in the same txn can return different rows
-                      if another txn commits between two reads (non-repeatable
-                      read)
-
-  repeatable read     every read in this txn sees the same snapshot. cannot
-                      see another txn's commits made after our txn started.
-                      mostly fixes non-repeatable reads. phantoms still
-                      possible.
-
-  serializable        the highest level. behaves AS IF txns ran one at a
-                      time, in some serial order. Postgres uses SSI (Serializable
-                      Snapshot Isolation) to detect violations and abort one.
+```ts
+// lib/state/insights.ts:57-71
+export function putInsights(sessionId: string, items: Insight[], rawAnomalies?: Anomaly[]): void {
+  // Replace the previous briefing for THIS session — each run IS the current
+  // feed, not an addition. Without clearing, a warm serverless instance (or a
+  // long-running dev server) accumulates stale insights from earlier runs, so
+  // the feed shows yesterday's anomalies alongside today's. Investigations are
+  // keyed separately and untouched here. Only this session's sub-maps are
+  // cleared — never the outer map, never another session's feed.
+  const s = sessionState(sessionId);
+  s.insights.clear();
+  s.anomalies.clear();
+  items.forEach((i, idx) => {
+    s.insights.set(i.id, i);
+    if (rawAnomalies?.[idx]) s.anomalies.set(i.id, rawAnomalies[idx]);
+  });
+}
 ```
 
-**Move 2c — the anomalies.** Each anomaly is a category of "this happened concurrently and now your data is wrong":
+Annotation:
+  - **Line 64** — `sessionState` returns (or creates) the per-session sub-maps. This is the "namespace" boundary; the function never touches another session's data.
+  - **Lines 65-66** — `clear()` on insights and anomalies. After these two lines run, the session's insights table is empty.
+  - **Lines 67-70** — re-populate, one row at a time. The Map grows from 0 to N entries one entry per loop iteration.
+  - **No BEGIN, no COMMIT.** If you wrapped this in `try { ... } catch { rollback() }`, there's no rollback to call. If the loop throws partway, the session ends with a partial Map and no way to undo.
 
-- **dirty read** — read uncommitted data; if that txn rolls back, you read something that never existed
-- **non-repeatable read** — re-read same row, get different value because someone committed in between
-- **phantom read** — re-run same query (e.g. `WHERE x > 5`), get a row that didn't exist last time
-- **lost update** — both txns read X, both write X+1, second commit overwrites first; you lost a write
-- **write skew** — both txns read overlapping sets, write disjoint rows; constraint that should hold across the set is now violated (the on-call doctors case)
+The function is *idempotent at the granularity of the whole call* — if you run it twice with the same input you get the same end state. But it is NOT atomic — a concurrent reader can see the intermediate states.
 
-Bridge: think of two browser tabs both editing the same Google Doc without operational transform. Without isolation, both write their changes and one wins silently — that's lost update.
-
-### Code in this codebase
-
-None at the database level. The closest transaction-shaped code in the repo is `withAuthCookies` — a read-once, mutate-in-memory, write-once wrapper. The closest "atomicity by accident" is any function body with no awaits inside `lib/state/insights.ts`, which Node's event loop guarantees runs to completion before any other handler can observe its mutations (see 06 for the full concurrency story).
-
-The closest cousin — Node's single-threaded "isolation" (main app):
+#### Why the JavaScript event loop saves you (mostly)
 
 ```
-  lib/state/insights.ts  (lines 30–42)
+  The event loop's safety net
 
-  export function putInsights(items, rawAnomalies?) {
-    insights.clear();              ← operation 1
-    anomalies.clear();             ← operation 2
-    items.forEach((i, idx) => {    ← operations 3...N
-      insights.set(i.id, i);
-      if (rawAnomalies?.[idx])
-        anomalies.set(i.id, rawAnomalies[idx]);
-    });
-  }
-       │
-       └─ this function does N+2 mutations. it runs to completion within
-          one tick of the event loop — meaning no OTHER synchronous code
-          on the same instance can observe intermediate state. that's the
-          closest thing to "transaction isolation" we have, and it only
-          holds because the body has zero awaits.
+  task 1: putInsights(sessionA, [...])      ← starts, runs SYNCHRONOUSLY
+            clear · set · set · set · ... · set
+            └────────────────────────────┘
+                  one synchronous block
 
-          if you added an `await` between clear() and the forEach loop,
-          another concurrent request handler could run during the await,
-          observe insights.size === 0, and act on it. Node's single-thread
-          gives you atomicity FOR FREE only when there's no await inside
-          the critical section.
-
-          across TWO instances (Vercel scale-out) there's no isolation at
-          all — both can race, both can clear and re-fill in interleaved
-          order, and the resulting Map state on each is a partial mix.
-          named in section 06.
+  task 2: getInsight(sessionA, "abc")       ← cannot interrupt task 1
+            waits until task 1 yields the loop
 ```
 
-```
-  lib/mcp/auth.ts  (lines 86–104)
+`putInsights` is synchronous from top to bottom — there's no `await`, no `setTimeout`, no `process.nextTick`. So while `putInsights` is mid-loop, *no other code on the same event loop runs*. A `getInsight` request that arrives during `putInsights` gets queued and runs *after* `putInsights` returns.
 
-  export async function withAuthCookies(fn) {
-    if (NODE_ENV !== 'production') return fn();
-    const raw = (await cookies()).get(AUTH_COOKIE)?.value;
-    const ctx = { store: raw ? decryptStore(raw) : {}, dirty: false };
-    const result = await requestStore.run(ctx, fn);
-    if (ctx.dirty) {
-      (await cookies()).set(AUTH_COOKIE, encryptStore(ctx.store), {...});
-    }
-    return result;
-  }
-       │
-       └─ this is the most transaction-shaped code in the repo. it does:
-          BEGIN: read the cookie, decrypt to a request-scoped store
-          BODY:  fn() runs with the store as the source of truth
-          COMMIT: if dirty, re-encrypt and write the cookie back
+That's where the practical safety comes from. NOT from a transaction. From the event loop.
 
-          it's a 2-phase pattern: read once, mutate in-memory many times,
-          flush once. Without it, every provider call (saveTokens,
-          saveClientInformation, saveCodeVerifier) would read-modify-write
-          the cookie and the request-vs-response cookie split would tear.
-          this isn't ACID — there's no rollback if the request errors mid-
-          way (the cookie just doesn't get written, which is the right
-          behavior here) — but the SHAPE is transactional.
-```
+The cases where this safety net leaks:
+  - **Two warm Vercel instances serving the same session.** Each has its own event loop; they cannot block each other. → see F3 in `audit.md`.
+  - **An `async` write path with an `await` inside.** Today `putInsights` has no `await`. The day one is added (say, to write to a real DB), the safety disappears and the function needs real transactional discipline.
+
+#### Reads that span multiple operations
+
+The risky pattern in any no-transaction system: read A, do something based on it, read B, write a decision. Between A and B, the world can change. The repo mostly *avoids* this pattern. Two examples worth pointing at:
+
+  - **`/api/agent` reads the insight, then runs the diagnostic agent against it, then writes the investigation back.** Between read and write, several seconds elapse and several Bloomreach round-trips happen. If a *new* briefing replaces the insights in that window, the investigation still refers to the *old* insight by ID — and the old insight is gone from the Map. The handler defends against this by stashing the insight in `sessionStorage` on the client (`useInvestigation.ts`, `lib/hooks/useBriefingStream.ts:56`) so the client can re-supply it; the server doesn't need to keep it around.
+  - **`putInsights` is called from a streaming handler.** The whole briefing is built incrementally; only at the end does `putInsights` get called with the final array. There is no per-anomaly write that a reader could observe mid-build.
+
+Both are *architectural* defenses against the missing transactional guarantee, not engine-level ones.
+
+#### Isolation level — implicit "read-uncommitted" with intra-call atomicity
+
+If we had to label what we have on the classical isolation hierarchy: read-uncommitted with *the modifier that any single Map op is atomic*. A reader can see any synchronous step's intermediate state, but cannot see a half-completed Map.set (because Map.set itself is a single op).
+
+In practice: it would feel like read-committed for the patterns the app actually exercises, because nothing async-yields mid-write. But the *guarantee* is much weaker than read-committed, and the day someone adds an `await` to `putInsights` without thinking, the guarantee silently drops.
 
 ### Move 3 — the principle
 
-**Transactions are a contract that lets you write code as if you were alone.** Without them, every multi-write operation must be hand-coded to be re-entrant and conflict-aware — which is exactly the trap concurrent programming has always been. The whole reason relational databases beat hand-rolled storage layers is that ACID transactions are *correct by default*, where the alternative is correct-if-you-think-of-everything.
+A transaction is two things: a *grouping* (these N operations are one logical event) and a *guarantee* (other observers see all or none of them). When you have neither, every multi-step write is a potential consistency bug, and the only defense is to *not write that way* — to make state updates idempotent, replaceable, and small enough that they happen in one synchronous burst. That's what this repo does. The transactional discipline lives in the architecture (full re-compute, single-shot replace) rather than in the engine (there is none). It works at this scale; it would not survive any meaningful concurrent write workload.
 
 ## Primary diagram
 
-Skipped — no codebase instance.
+```
+  The transaction story — what guarantees, where they come from
+
+  ┌─ "transaction-like" guarantees this codebase has ────────────┐
+  │                                                                │
+  │  • single Map.set is atomic            (from V8)              │
+  │  • synchronous block on one event loop  (from Node)            │
+  │  • per-session namespace isolation      (from sessionState)    │
+  │                                                                │
+  │  → in practice: writes within one putInsights() are atomic    │
+  │    relative to reads ON THE SAME INSTANCE on the same loop     │
+  └────────────────────────────────────────────────────────────────┘
+
+  ┌─ guarantees this codebase does NOT have ─────────────────────┐
+  │                                                                │
+  │  • atomicity across instances          (no shared substrate)   │
+  │  • atomicity across async boundaries   (no await in writers)   │
+  │  • durable commit                      (no disk)               │
+  │  • rollback on error                   (no log)                │
+  │  • repeatable read                     (re-read can differ)    │
+  │  • serializability                     (no concurrency control)│
+  │                                                                │
+  │  → in practice: this is fine because writes are full          │
+  │    replaces, never partial updates, and clients stash the      │
+  │    insight they need on their side                             │
+  └────────────────────────────────────────────────────────────────┘
+```
 
 ## Elaborate
 
-The ACID acronym was coined by Härder and Reuter in 1983, and isolation has been the contested property ever since. Lower isolation levels exist because higher ones are expensive — serializable transactions abort more often under contention, and the retry cost is real. Most production Postgres systems run at read-committed and accept the anomalies they can — that's a sane default, not a bug.
+The classical reference for isolation is the SQL standard's four levels and Berenson et al.'s "A Critique of ANSI SQL Isolation Levels" (1995), which catalogued the anomalies each level allows. PostgreSQL's MVCC implementation gives you read-committed by default and serializable on request; many embedded engines serialize all writes globally. In-memory KV stores (Redis, Memcached) usually offer per-key atomicity and nothing larger; transactional KV (FoundationDB, etcd) brings serializability with a coordination cost.
 
-For an app like blooming insights, the practical question once you add a database is not "do I want ACID" (yes) but "do I want serializable or repeatable read." The honest answer is usually "read committed plus carefully placed `SELECT FOR UPDATE` where you have invariants across rows." The day a feature here demands a multi-row invariant, you'll meet this concept for real.
-
-Cross-link: `06-locks-mvcc-and-concurrency-control` is the mechanism that implements isolation. This file is the contract; that file is the enforcement.
+This codebase sits at the "per-op atomicity" floor — it's structurally similar to Memcached's contract, just without the network. The interesting move when you finally need transactions is: are they SINGLE-key (`Map.set` is fine), MULTI-key inside one namespace (need a write lock or MVCC), or CROSS-namespace (need a distributed transaction)? The product hasn't asked for any of these yet. When it does, the answer points at a real datastore.
 
 ## Interview defense
 
-**Q: "Do you have any transactional code in this app?"**
-Not in the ACID sense — we don't have a database. The closest transaction-shaped code is `withAuthCookies` in `lib/mcp/auth.ts` L86-104: it reads the cookie once at the start of a request, lets the OAuth provider mutate an in-memory store throughout the request, and writes the cookie back once at the end. That's a 2-phase pattern with no rollback (errors just don't write), but the SHAPE is transactional. The actual mutations in `lib/state/insights.ts` are "atomic by accident" — Node's event loop runs each handler body to completion before any other handler observes anything, but only when there's no await inside the critical section. Add any await and the atomicity disappears.
+> Q: "How does this app handle transactional updates?"
 
-Diagram: the BEGIN-body-COMMIT shape, with `withAuthCookies` labeled "transactional in shape, not ACID."
+Verdict: it doesn't, because it doesn't have any multi-step writes that need to be atomic. Every "write" is either a single `Map.set` (which V8 makes atomic) or a `putInsights` call that's a clear-then-loop happening synchronously on one event loop. The architecture avoids the partial-write problem by making every state update a full replace — there are no patch-style mutations to interleave.
 
-Anchor: `lib/mcp/auth.ts` L86-104 (transactional shape); `lib/state/insights.ts` L30-42 (atomic-by-accident).
+```
+  the picture you draw — the no-transaction safety net
 
-**Q: "If you added a save-favorites feature with Postgres, what isolation level would you pick?"**
-Read committed, the Postgres default. Save-favorites is a single-row insert per favorite — there's no multi-row invariant. If we later added "your top 10 favorites" with a hard cap, I'd reach for `SERIALIZABLE` on just the insert path (or `SELECT FOR UPDATE` on the cap check) — but I wouldn't pay the cost across all queries.
+   putInsights()  ──synchronous──►  clear · set · set · … · set
+                  └────────────── one tick of the loop ──────────┘
+                                       readers wait
+```
 
-Diagram: the isolation-level dial with read-committed circled.
+The load-bearing point: this works because the write path is synchronous AND the dataset is computed-from-scratch. Both have to be true. The day either changes — an `await` is added, or partial updates become a pattern — the safety net is gone and we need a real transactional substrate.
 
-Anchor: no DB exists yet; this is a hypothetical I'd flag as such.
+> Q: "What's the worst anomaly you could see?"
+
+Two warm Vercel instances serving the same session concurrently can produce torn reads, because each instance has its own Map and event loop. Instance A writes one set of insights; instance B writes another; whichever instance the next request lands on determines what the UI sees. The mitigation is that briefings always replace fully, so eventual divergence resolves on the next run.
+
+> Q: "What's the isolation level?"
+
+If forced onto the SQL hierarchy, read-uncommitted with the caveat that single Map ops are atomic. In practice it behaves like read-committed for the patterns the app actually exercises, because no writer yields the loop mid-write. The guarantee is much weaker than the felt behavior, which is a risk if someone adds an `await` to a writer without realizing what the implicit contract was.
 
 ## See also
 
-- `06-locks-mvcc-and-concurrency-control` — how isolation actually gets enforced
-- `07-wal-durability-and-recovery` — the D in ACID
-- `01-database-systems-map` — the Map state that today has neither A, C, I, nor D
-
----
+  - [`06-locks-mvcc-and-concurrency-control.md`](./06-locks-mvcc-and-concurrency-control.md) — what isolation is implemented with, in real DBs
+  - [`07-wal-durability-and-recovery.md`](./07-wal-durability-and-recovery.md) — the durability half of ACID
+  - [`audit.md`](./audit.md) — F3 (concurrent writes), the operational consequence

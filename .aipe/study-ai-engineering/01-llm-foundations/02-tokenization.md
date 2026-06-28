@@ -1,348 +1,273 @@
-# Tokenization (and the character-budget proxy this codebase uses instead)
+# 02 — tokenization
 
-**Industry name(s):** tokenization, subword tokenization (BPE), context-window budgeting
-**Type:** Industry standard · Language-agnostic
-
-> Models bill and bound work in tokens, not characters; blooming insights does no token counting at all — it bounds every prompt and tool result with *character* budgets (`MAX_TOOL_RESULT_CHARS = 16_000`, route `TRUNC = 4000`, `schemaSummary` caps) plus per-call `max_tokens`, a deliberately coarse proxy for the real unit.
-
-
----
+**Subtitle:** Byte-Pair Encoding (BPE) tokenization · Industry standard
 
 ## Zoom out, then zoom in
 
-**Zoom out — the bigger picture.** Tokenization is the unit the Provider band counts in — context window, `max_tokens`, per-call billing — but blooming insights never runs a tokenizer. The bounding that *should* be token-aware lives one layer up in the per-agent and pipeline code (the `MAX_TOOL_RESULT_CHARS = 16_000` truncation in `lib/agents/base.ts`, the `schemaSummary` caps in `lib/agents/monitoring.ts`, and the `TRUNC = 4000` UI-stream cap in `app/api/agent/route.ts`), all measured in *characters* as a coarse proxy. The only token-denominated control is `max_tokens` on the output side, set right at the Provider call.
+Tokens are the unit your bill is measured in. They're also the unit the
+context window is sized in. Before talking about cost or windows, you have
+to know what one is.
 
 ```
-  Zoom out — where tokenization lives (and where the proxy sits)
+  Zoom out — where tokenization sits
 
-  ┌─ Route + Per-agent (bounds in CHARACTERS — proxy) ┐
-  │  schemaSummary caps    monitoring.ts L15–48        │
-  │  truncate (16_000)     base.ts L31–34              │
-  │  TRUNC (4000) UI       route.ts L99–103            │
-  └─────────────────────────┬──────────────────────────┘
-                            │  messages[] (input size: unknown in tokens)
-  ┌─ Provider ──────────────▼──────────────────────────┐  ← we are here
-  │  anthropic.messages.create({ max_tokens: 4096 })   │
-  │  ★ TOKENIZER ★ (lives inside the SDK, not called)  │
-  │  input tokens = f(messages)  ← never measured      │
-  │  output capped by max_tokens (the real unit)       │
-  └────────────────────────────────────────────────────┘
+  ┌─ Agent layer (Blooming) ─────────────────────────────┐
+  │  schemaSummary() truncates to ~30 customer props,     │
+  │  20 events, 10 props each — BEFORE the LLM sees it    │
+  │  (lib/agents/monitoring.ts:19-60)                     │
+  └──────────────────────────┬────────────────────────────┘
+                             │ "trust the truncate, pay
+                             ▼  for what you ship"
+  ┌─ Adapter (lib/agents/aptkit-adapters.ts:42) ──────────┐
+  │  anthropic.messages.create({ messages, system, … })   │
+  └──────────────────────────┬────────────────────────────┘
+                             │
+  ┌─ Anthropic API ──────────▼────────────────────────────┐
+  │  ★ tokenize input  ★  ─►  model  ─►  detokenize       │  ← we are here
+  │  usage.input_tokens, usage.output_tokens               │
+  └────────────────────────────────────────────────────────┘
 ```
 
-**Zoom in — narrow to the concept.** The question is: how do you keep a prompt inside the window when you do not count the unit the window is measured in? blooming insights answers with a 4-chars-per-token proxy — bound input by `string.length`, bound output by `max_tokens` — and accepts the slop. How it works walks through every budget, the proxy's failure mode for JSON, and the trigger to upgrade to real token accounting.
-
----
+The model sees vectors, not strings. The tokenizer is the bridge.
 
 ## Structure pass
 
-**Layers.** Three layers from caller down to provider: the per-agent prompt-construction code (where the schema-summary and tool-result strings are assembled), the service-layer truncation primitives (`truncate`, `schemaSummary` caps, `TRUNC`), and the provider call where `max_tokens` is the one real token-denominated parameter. Above all three sits the route's UI-stream truncation, which uses the same primitive shape but for a different reason (wire size, not window size).
+  → **One axis to trace — cost.** Tokenization decides how many tokens your
+    7,000-character prompt becomes. Rough ratio: ~4 chars/token in English,
+    fewer in code, fewer still in non-Latin scripts. Cost is per-token, so
+    cost is per-tokenizer-output.
 
-**Axis: cost.** What unit does each layer count work in, and does that unit match what the provider bills? This axis pops the seams because the whole file hinges on a unit mismatch — the proxy unit (characters) above the seam, the real unit (tokens) below. State would flatten everything (data flows down, the model writes back up); cost asked as "is the proxy unit the same as the billed unit?" makes the boundaries flip.
-
-**Seams.** The cosmetic seam is between per-agent prompt construction and the service-layer truncators — both count characters; the unit doesn't flip. The load-bearing seam is between the service layer (characters as proxy) and the provider call (tokens as truth). On the input side the proxy goes in unmeasured; on the output side `max_tokens` is the only real token control. A second cosmetic seam sits sideways: the route's `TRUNC = 4000` looks like model-window bounding but is wire-size bounding — same primitive, different axis answer.
-
-```
-  Structure pass — tokenization
-
-  ┌─ 1. LAYERS ───────────────────────────────────┐
-  │  per-agent prompt construction                 │
-  │  service-layer truncators (truncate, caps)     │
-  │  provider call (max_tokens)                    │
-  │  (route UI-stream — sideways, different axis)  │
-  └────────────────────────┬───────────────────────┘
-                           │  pick the axis
-  ┌─ 2. AXIS ─────────────▼────────────────────────┐
-  │  cost: what unit does each layer count work in │
-  │  and does it match what the provider bills?    │
-  └────────────────────────┬───────────────────────┘
-                           │  trace across layers, find flips
-  ┌─ 3. SEAMS ────────────▼────────────────────────┐
-  │  prompt↔truncators: cosmetic (both in chars)   │
-  │  truncators↔provider: LOAD-BEARING             │
-  │    chars (proxy) → tokens (truth); max_tokens  │
-  │    is the only real-unit control               │
-  └────────────────────────┬───────────────────────┘
-                           ▼
-                   Block 4 — How it works
-```
-
-```
-  A seam — "what unit are we in?" answered two ways
-
-  ┌─ truncators ─┐    seam     ┌─ provider ──┐
-  │ characters   │ ════╪═════► │ tokens      │
-  │ (proxy: ÷4)  │  (it flips) │ (the bill)  │
-  └──────────────┘             └─────────────┘
-         ▲                              ▲
-         └────── same axis, two answers ─┘
-                 → this boundary carries the slop
-```
-
-The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+  → **The seam:** outside the API call (your code) you reason in characters,
+    inside the API call (the model) it reasons in tokens. The
+    `response.usage.input_tokens` field is where the seam shows itself —
+    that number is the *only* honest measurement of what you sent.
 
 ## How it works
 
-**Mental model.** Tokenization is the model's `.split()`, and this codebase never runs it — it bounds work in characters and treats ~4 chars/token as the proxy. Before the transformer sees your text, a tokenizer chops it into subword units drawn from a fixed vocabulary (~100k entries for modern models). "tokenization" might become `token` + `ization`; a rare word splits into more pieces; common words are single tokens. The model's context window, its `max_tokens` cap, and its bill are all counted in these pieces — not in your characters and not in your words. The one real-unit control in the system is `max_tokens` on the output side; everything on the input side is a character budget pretending to be a token budget.
+### Move 1 — the mental model
+
+Think of tokens like syllables. "Hello, world!" is more like 4 syllables than
+13 letters — common words become one token each, rare or compound words break
+into pieces.
 
 ```
-"conversion_rate dropped 18%"
-        │  tokenizer (.split into subword units)
-        ▼
-[ "conversion" "_rate" " dropped" " 18" "%" ]   ← 5 tokens, 27 characters
-        │
-        ▼  rule of thumb: chars / 4 ≈ tokens  (English)
-   27 chars ≈ 7 tokens   (an over-estimate; the real count is 5)
+  Text → tokens (BPE, ~4 chars/token in English)
+
+  "Hello, world!"
+       │
+       ▼  BPE tokenizer
+       │
+  [15496, 11, 995, 0]
+   "Hello"  ","   " world"  "!"
+        4 tokens for 13 characters
+
+  "execute_analytics_eql"   (a tool name from this repo)
+       │
+       ▼
+  ["execute", "_", "analytics", "_", "eq", "l"]
+        ≈ 6 tokens for 21 characters (snake_case is token-hungry)
 ```
 
-The 4-chars-per-token rule is an average over English prose. Code, JSON, numbers, and non-English text tokenize differently — JSON with many short keys and punctuation runs richer (fewer chars per token), so a character budget *over-counts* tokens for prose and may *under-bound* for dense JSON. That looseness is the price of not running a tokenizer.
+The model never sees the string "execute_analytics_eql". It sees the integer
+sequence. That's why typos sometimes produce wildly different behavior — they
+land on different tokens entirely.
 
----
+### Move 2 — the step-by-step walkthrough
 
-### What this system actually does: bound by characters
+**The tokenizer runs server-side on every call.** Blooming never tokenizes
+locally — there's no `tiktoken` import anywhere. The only way to know the token
+count of something is to send it and read back `response.usage`.
 
-There is no tokenizer call anywhere. Every place that could overflow the window is bounded by string length.
+This is why Blooming does *aggressive truncation* before sending. Look at
+`schemaSummary()` in `lib/agents/monitoring.ts:19-60`:
 
-**Tool-result truncation** — the largest source of bloat. The shared agent loop holds a constant for the tool-result char cap and a slicer:
+```typescript
+// lib/agents/monitoring.ts:19-60  (excerpted)
+export function schemaSummary(schema: WorkspaceSchema): string {
+  const MAX_EVENTS = 20;              // top 20 events only
+  const MAX_PROPS_PER_EVENT = 10;     // 10 properties each
+  const MAX_CPROPS = 30;              // 30 customer properties
 
-```
-  MAX_TOOL_RESULT_CHARS = 16_000
-
-  function truncate(s):
-      if length(s) <= MAX_TOOL_RESULT_CHARS:
-          return s
-      return slice(s, 0, MAX_TOOL_RESULT_CHARS) + "\n…[truncated]"
-```
-
-Every tool result is JSON-serialized and passed through `truncate` before being fed back as a tool-result block. A 60,000-character query response becomes 16,000 chars plus a marker. Across a six-tool-call investigation, this caps the cumulative tool-result contribution to ~96,000 characters — roughly 24,000 tokens at the 4:1 estimate.
-
-```
-query result: 60,000 chars
-      │  truncate()  (the agent-loop cap)
-      ▼
-16,000 chars + "\n…[truncated]"
-      │
-      ▼  fed back as tool_result
-conversation stays bounded
-```
-
-**Route event truncation** — a *separate, smaller* budget for what is streamed to the browser. The route handler runs a different cap:
-
-```
-  TRUNC = 4000
-
-  function trunc(v):
-      s = JSON.serialize(v)
-      if s and length(s) > TRUNC:
-          return slice(s, 0, TRUNC) + "…"
-      return v
+  const eventsText = schema.events
+    .slice(0, MAX_EVENTS)
+    .map((e) => {
+      const props = e.properties.slice(0, MAX_PROPS_PER_EVENT).join(', ');
+      return `  - ${e.name} (${e.eventCount}): ${props || '(no properties)'}`;
+    })
+    .join('\n');
+  // … plus a few header lines, the customer-props line, the catalog list
+}
 ```
 
-This 4,000 bound is applied to each tool-call result before it goes into a streaming UI event. It is unrelated to the model's window — it keeps the *wire payload to the UI* small. Two different budgets, two different reasons: 16,000 protects the model's context; 4,000 protects the stream.
+The comment at the top of the function says it explicitly: *"Compact,
+token-bounded schema summary for the prompt (NOT the full 112KB schema)."* The
+real schema for a Bloomreach project can be enormous — a hundred event types,
+each with twenty-plus properties, plus customer properties, plus catalogs. At
+~4 chars/token that's roughly 25–30k input tokens *per call*. The summary
+trims it to ~1–2k tokens.
 
-**Schema summary caps** — bounding the prompt's static prefix. The monitoring agent builds a compact schema string instead of inlining the full ~112KB workspace schema:
+**The numbers in the constants are load-bearing.** They were picked by hand:
 
-```
-schemaSummary caps
-  MAX_EVENTS          = 20    ← top 20 events only
-  MAX_PROPS_PER_EVENT = 10    ← 10 properties each
-  MAX_CPROPS          = 30    ← 30 customer properties
-```
+  → `MAX_EVENTS = 20` — covers the high-volume events that anomalies are
+    actually computed against (`purchase`, `view_item`, `cart_update`, etc.).
+    Sorted by `eventCount` descending in `parseWorkspaceSchema()` so the cut
+    keeps the useful ones.
 
-The comment alongside is explicit: "Compact, token-bounded schema summary for the prompt (NOT the full 112KB schema)." This is the one place the *intent* is named as token-bounding, even though the implementation counts list lengths, not tokens.
+  → `MAX_PROPS_PER_EVENT = 10` — enough for the discriminating dimensions
+    (`customer.country`, `customer.device_type`, `event.category`) without
+    shipping every rare property.
 
-**Output ceiling** — `max_tokens`, the one real token unit in the system. This bounds the *output* (the only place token counts appear directly): 4096 default for agent turns, 2048 for synthesis calls, and a deliberate 16 on the intent classifier to force a one-word answer.
+  → `MAX_CPROPS = 30` — same logic for customer properties.
 
-```
-max_tokens (output token cap — the real unit)
-  agent turn        4096
-  synthesis call    2048
-  intent classifier   16   ← one word, nothing more
-```
+The agent runs 3–6 turns per investigation. At each turn the *whole* history is
+re-sent. If the schema summary were the full 30k, that's 180k input tokens for
+a 6-turn loop — half the context window, ~$0.54 at Sonnet pricing, every
+investigation. The truncation isn't an optimization, it's a budget gate.
 
----
+**You see the cost in the log.** The adapter logs `response.usage` on every
+call (`lib/agents/aptkit-adapters.ts:57-61`):
 
-### Current state vs. future state
-
-```
-CURRENT (character proxy)              FUTURE (real token accounting)
-────────────────────────────────      ────────────────────────────────
-truncate by string length (16_000)     truncate by tokenizer count
-schemaSummary caps list lengths        cap by measured token budget
-no visibility into actual usage        log usage.input/output_tokens
-"is the prompt too big?" = guess       "is the prompt too big?" = known
+```json
+{"site":"agents/diagnostic:aptkit-model","sessionId":"…","usage":{"input_tokens":4823,"output_tokens":612,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}
 ```
 
-The character proxy is correct *enough* today because the consequences of looseness are mild and the window is large relative to the bounded payloads. It becomes wrong when payloads approach the window edge, where the 4:1 estimate's error swamps the safety margin — that is the trigger to add real token accounting (the exercise below).
+That's the canonical measurement. Everything else (character counts, rough
+estimates, "the prompt is short") is hand-waving until you read this number.
 
----
+### Move 3 — the principle
 
-### The principle
+**You don't know how many tokens something is until the server tells you.** Build
+your sizing budgets around `response.usage`, not around character counts. Cap
+your inputs *aggressively* and trust the cap — the model can do its job with
+the top-20 events and 30 customer properties; it cannot do its job if you
+exceed the context window or burn the budget.
 
-Bound work in the cheapest unit that approximates the unit you actually pay in, and only upgrade to the exact unit when the approximation's error starts to bite. You pay in tokens but measure in characters because string length is free and the 4:1 rule is good enough at the current scale. The day a payload sits near the window boundary, the proxy's slop becomes the bug, and real token counting earns its cost.
-
----
-
-### Code in this codebase
-
-**Not the "real" tokenizer — the honest analog is character budgeting.** blooming insights never calls a tokenizer and never reads `res.usage`; it bounds prompts and tool results by `string.length` and bounds output by `max_tokens`, treating ~4 chars/token as an unstated, coarse proxy for the real unit.
-
-#### Files, functions, and line ranges
-
-- **Tool-result char budget:** `MAX_TOOL_RESULT_CHARS = 16_000` and `truncate(s)` — `lib/agents/base.ts` L29, L31–L34. Applied at L150 before each `tool_result`.
-- **Route stream char budget:** `TRUNC = 4000` and `trunc(v)` — `app/api/agent/route.ts` L99–L103. Applied at L192 to the UI event payload only.
-- **Schema-summary caps:** `MAX_EVENTS = 20`, `MAX_PROPS_PER_EVENT = 10` (`lib/agents/monitoring.ts` L21–L22), `MAX_CPROPS = 30` (L33); whole function L15–L48; intent comment at L14.
-- **Output token caps (`max_tokens`):** default `4096` — `lib/agents/base.ts` L74; synthesis `2048` — `lib/agents/diagnostic.ts` L99, `lib/agents/recommendation.ts` L98; classifier `16` — `lib/agents/intent.ts` L20.
-
-#### Where real tokenization would live
-
-A token accounting helper would sit in `lib/mcp/` (e.g. a `tokens.ts` alongside `validate.ts`), wrapping a tokenizer; `truncate` in `lib/agents/base.ts` and the caps in `schemaSummary` would call it instead of `string.length`/`.slice`, and `runAgentLoop` would read `res.usage` after `anthropic.messages.create` (L102) to log real input/output counts.
-
----
-
-## Tokenization — diagram
-
-This diagram spans the layers a string crosses before it reaches the model, and which budget bounds it at each step. The proxy unit (characters) governs the Service layer; the real unit (tokens) appears only as the output cap at the Provider boundary.
+## Primary diagram
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│  SERVICE LAYER (bounded in CHARACTERS — the proxy unit)              │
-│                                                                       │
-│  schema (112KB)                                                       │
-│     │ schemaSummary  monitoring.ts   (20 events/10 props/30)  │
-│     ▼                                                                 │
-│  compact schema string ──┐                                           │
-│                          │ system prompt                             │
-│  EQL tool result (60KB)  │                                           │
-│     │ truncate  base.ts  (16_000 chars)                       │
-│     ▼                    │                                           │
-│  16,000-char result ─────┤                                           │
-│                          ▼                                           │
-│            messages[] (system + turns + tool_results)               │
-└───────────────────────────┬───────────────────────────────────────────┘
-                            │  max_tokens caps the OUTPUT (real tokens)
-┌───────────────────────────▼───────────────────────────────────────────┐
-│  PROVIDER BOUNDARY (counted in TOKENS — the real unit)              │
-│                                                                       │
-│  anthropic.messages.create({ max_tokens })                          │
-│     agent 4096  base.ts     │ synthesis 2048 │ classifier 16        │
-│     input tokens = tokenizer(messages)  ← never measured here        │
-└────────────────────────────────────────────────────────────────────────┘
+  How a single monitoring call lands in tokens
 
-  (separate, parallel) route.ts TRUNC=4000 bounds the UI stream payload,
-  NOT the model window — different budget, different purpose.
+  ┌─ Blooming prepares input ──────────────────────────────┐
+  │  system: monitoring.md prompt   (~2k chars  ≈ 500 tok) │
+  │  user:   schemaSummary(schema)  (~6k chars  ≈ 1.5k tok)│
+  │  user:   category checklist      (~3k chars  ≈ 750 tok) │
+  │  user:   prior turns + tool      (~3-15k chars         │
+  │          results from agent loop  ≈ 750-3.7k tok)      │
+  │                                                        │
+  │  TOTAL INPUT (turn 1):  ~3-4k tokens                   │
+  │  TOTAL INPUT (turn 6):  ~10-15k tokens (grows!)        │
+  └──────────────────────────┬─────────────────────────────┘
+                             │ messages.create
+                             ▼
+  ┌─ Anthropic ───────────────────────────────────────────┐
+  │  tokenize → forward through 70B-or-so params →        │
+  │  emit content blocks                                  │
+  └──────────────────────────┬─────────────────────────────┘
+                             │ response
+                             ▼
+  ┌─ Blooming reads ──────────────────────────────────────┐
+  │  response.usage.input_tokens   ← measure HERE         │
+  │  response.usage.output_tokens                         │
+  │  console.log → Vercel logs (filter by site)           │
+  └────────────────────────────────────────────────────────┘
 ```
-
-The Service layer governs input size in characters; the only token-denominated control in the system is `max_tokens` on the output. The input token count — what the window actually measures — is never computed.
-
----
 
 ## Elaborate
 
-### Where this pattern comes from
+Anthropic, OpenAI, and Google all use variants of Byte-Pair Encoding (BPE), but
+the vocabularies differ. The same string can tokenize to different counts under
+different providers. Blooming doesn't care — it relies on `response.usage` to
+report what it actually was — but a multi-provider future (see
+`08-provider-abstraction.md`) would mean per-provider truncation budgets
+because the same `schemaSummary()` output could blow a smaller-context model
+on one provider and fit fine on another.
 
-Subword tokenization (Byte-Pair Encoding, Sennrich et al. 2016; and its variants WordPiece, SentencePiece, tiktoken's BPE) solves a vocabulary problem: a fixed word vocabulary cannot cover every word, but a fixed *subword* vocabulary can compose any word from pieces. The model's context window and billing are defined over these pieces because the pieces are what the transformer actually processes. The 4-chars-per-token heuristic is an empirical average that OpenAI popularized for English; it is a planning aid, not a measurement.
+The reason the schema summary is hand-written rather than auto-truncated by
+character count: anomaly categories depend on *specific* properties being
+visible. Truncating by character count would randomly drop `customer.country`
+on a schema that happens to alphabetize after a thousand other properties.
+Hand-sorting events by `eventCount` (descending) and customer properties by
+their first-30 order preserves the load-bearing dimensions.
 
-Bounding by a cheap proxy unit instead of the exact unit is a classic systems trade: it is the same instinct as estimating request size by `Content-Length` instead of parsing the body, or rate-limiting by request count instead of CPU cost. The proxy is free; the exact measure has a cost; you use the proxy until its error matters.
-
-### The deeper principle
-
-```
-prose ("the conversion rate fell")   →  ~4 chars / token   (proxy accurate)
-JSON ({"k":1,"v":"x"})               →  ~2–3 chars / token (proxy under-bounds)
-long numbers / ids / base64          →  ~1–2 chars / token (proxy far off)
-```
-
-The proxy's accuracy depends entirely on the *content*. blooming insights feeds the model JSON tool results and a JSON-ish schema summary — content that tokenizes *richer* than prose — so a character budget actually *under-bounds* the token count for those payloads. The `16_000`-char truncation is therefore conservative for JSON: the real token count is higher than `16_000 / 4`, which is the safe direction to be wrong in.
-
-### Where this breaks down
-
-1. **Char truncation can cut JSON mid-structure.** `truncate` slices at a byte offset, not a token or syntactic boundary. A tool result sliced at char 16,000 may end mid-object; the model receives `{"data":[{"x":1},{"y":` — recoverable for a reader but noise for the model. A token-aware or structure-aware truncation would cut at a clean boundary.
-
-2. **No input-token visibility.** Because nothing reads `res.usage`, the system cannot answer "how close was that prompt to the window?" It can only answer "how many characters did we send," which is a guess at the real number. This is the same gap noted in → 06-token-economics.md.
-
-3. **The proxy hides per-content drift.** A briefing over a workspace with very long event names or id-heavy customer properties tokenizes differently from the demo workspace, and the fixed character caps do not adapt. The bound is the same; the token reality is not.
-
-### What to explore next
-
-- **`@anthropic-ai/tokenizer` / `tiktoken`:** run the actual tokenizer to replace the 4:1 estimate with a count.
-- **`res.usage` (input/output tokens):** the SDK returns exact counts per call — the cheapest path to real accounting (no separate tokenizer needed for *measurement after the fact*).
-- **Structure-aware truncation:** slice JSON at the nearest valid boundary rather than a raw char offset.
-
----
+What to read next: `06-token-economics.md` (turn the usage numbers into
+dollars) and `02-context-and-prompts/01-context-window.md` (when the growing
+history hits the wall).
 
 ## Project exercises
 
-### Add real token accounting from `res.usage`
+### Exercise — show token count in the dev capture path
 
-- **Exercise ID:** B1.2 (adapted) — token-economics instrumentation, the cheap half.
-- **What to build:** after each `anthropic.messages.create` in `runAgentLoop`, read `res.usage.input_tokens` / `output_tokens` and accumulate per-agent totals, surfaced via a new field on `AgentRunResult` or a hook.
-- **Why it earns its place:** shows you know the real unit is tokens and that the SDK already returns exact counts — the highest-value, lowest-cost step toward token visibility.
-- **Files to touch:** `lib/agents/base.ts` (`runAgentLoop`, `AgentRunResult`), and the synthesis calls in `lib/agents/diagnostic.ts` / `lib/agents/recommendation.ts`.
-- **Done when:** a single investigation logs total input and output tokens per agent, and the numbers move when you change `max_tokens` or the schema caps.
-- **Estimated effort:** 1–4hr
+  → **Exercise ID:** `study-ai-eng-02.1`
+  → **What to build:** Extend `/api/mcp/capture` (the dev-only snapshot
+    capture) to write a `usage.json` alongside `demo-insights.json` /
+    `demo-investigations.json` that records total input/output tokens
+    per agent for the captured run. Surface a "this capture cost ~$X"
+    line in the dev-only "capture demo" UI.
+  → **Why it earns its place:** Demonstrates measurement before optimization —
+    you can't optimize the prompt if you can't see what each call costs.
+  → **Files to touch:** `app/api/mcp/capture/route.ts`,
+    `app/api/mcp/capture-demo/route.ts`, `app/page.tsx` (the capture button
+    section), `lib/state/insights.ts` (write `usage.json`).
+  → **Done when:** The dev-only capture button shows token totals + estimated
+    USD cost, and the JSON file is committed alongside the demo snapshots.
+  → **Estimated effort:** `1–4hr`
 
-### Replace character truncation with tokenizer-aware truncation
+### Exercise — emit a context-pressure warning
 
-- **Exercise ID:** C1.1 (adapted) — tokenization, applied to the bound.
-- **What to build:** add `lib/mcp/tokens.ts` wrapping `@anthropic-ai/tokenizer`, and rewrite `truncate` in `lib/agents/base.ts` to cut at a token budget that maps cleanly back to a context-window fraction, preferring a valid JSON boundary.
-- **Why it earns its place:** demonstrates you understand char truncation can cut JSON mid-structure and that the real bound is tokens, not bytes.
-- **Files to touch:** `lib/agents/base.ts` (`truncate`, `MAX_TOOL_RESULT_CHARS` → a token budget), new `lib/mcp/tokens.ts`, `test/agents/base.test.ts`.
-- **Done when:** a 60KB JSON tool result is truncated to a configured token budget at a valid boundary, and the count is verified against the tokenizer.
-- **Estimated effort:** 1–4hr
-
----
+  → **Exercise ID:** `study-ai-eng-02.2`
+  → **What to build:** In the agent adapter, after each turn, if
+    `usage.input_tokens > 100_000` (half the Sonnet context window), emit a
+    `{ type: 'context_pressure', tokens, model }` trace event so the UI can
+    show a warning that the loop is getting close to the cap.
+  → **Why it earns its place:** Context overflow today is silent — the model
+    errors at 200k and the route returns a generic message. A visible
+    pressure bar makes the failure mode legible.
+  → **Files to touch:** `lib/agents/aptkit-adapters.ts:57-71`, `lib/mcp/events.ts`
+    (new event type), `components/investigation/ReasoningTrace.tsx`.
+  → **Done when:** A live investigation that pushes past 100k input tokens
+    surfaces a warning in the StatusLog with the current token count.
+  → **Estimated effort:** `1–4hr`
 
 ## Interview defense
 
-### What an interviewer is really asking
+**Q: How do you size your prompts in this codebase?**
 
-"How do you keep prompts inside the context window?" tests whether you know the window is measured in tokens, whether you know the 4:1 rule, and whether you can justify a cheap proxy over exact counting. The senior signal is naming the proxy *as* a proxy and stating the condition under which it fails.
-
-### Likely questions
-
-**[mid] What unit is the context window measured in, and how does this codebase bound it?**
-
-Tokens — subword pieces. The codebase never counts tokens for input; it bounds by characters: `truncate` slices tool results at 16,000 chars (`lib/agents/base.ts` L31–L34) and `schemaSummary` caps lists (L15–L48). The only token control is `max_tokens` on output.
+By measurement, not by estimate. The Anthropic SDK returns `response.usage`
+on every call (`lib/agents/aptkit-adapters.ts:57`), and that gets logged to
+Vercel. The schema summary is hand-truncated to ~1–2k tokens
+(`lib/agents/monitoring.ts:19-60`) so even a 6-turn agent loop stays well
+inside the context window.
 
 ```
-input:  bounded by chars (16_000, schema caps)  → proxy for tokens
-output: bounded by max_tokens (4096/2048/16)    → real tokens
+  Truncation table — why these numbers:
+
+   field                  | cap            | reason
+   ───────────────────────┼────────────────┼───────────────────────────
+   events shown           | 20             | covers high-volume events
+   props per event        | 10             | discriminating dims only
+   customer properties    | 30             | first 30 cover the common
+                          |                | breakdowns
 ```
 
-**[senior] Why is a character budget defensible here, and when does it stop being defensible?**
+**Anchor line:** "The full Bloomreach schema is ~30k tokens; we ship ~1.5k.
+The 20 / 10 / 30 caps in `schemaSummary` are the budget gate."
 
-It is free (`s.length`) and ≈4 chars/token is adequate while payloads sit well inside the window. For JSON it actually *under-bounds* the token count, which is the safe direction. It stops being defensible when a truncated prompt sits near the window edge — there the proxy's ±40% error exceeds the margin, and a 16,000-char result can push the conversation over. That is the trigger to read `res.usage` or run a tokenizer.
+**Q: Why don't you use a tokenizer client-side to count before sending?**
 
-```
-payload << window  →  proxy slop irrelevant  (fine)
-payload ≈ window   →  proxy slop > margin    (bug) → count tokens
-```
+It's not worth it. Anthropic doesn't ship a public client-side tokenizer
+(unlike OpenAI's `tiktoken`), and rolling one would mean re-implementing BPE
+with the exact Anthropic vocabulary — possible but a maintenance hazard. The
+truncation budgets are conservative enough that we don't need pre-check; we
+read the actual count back from `response.usage` and log it.
 
-**[arch] The `16_000` and `4000` constants — same purpose?**
+**Q: What's the load-bearing tokenization fact people forget?**
 
-No. `16_000` (`base.ts` L29) bounds what re-enters the *model's* conversation, protecting the context window. `4000` (`route.ts` L99) bounds the result payload streamed to the *browser*, protecting wire size. Conflating them would mean the UI dictates model context size or vice versa.
-
-```
-16_000 ──▶ model window        4000 ──▶ NDJSON to UI
-(different layers, different limits)
-```
-
-### The question candidates always dodge
-
-**"How many tokens does a typical investigation actually consume?"** The honest answer in this codebase is "unknown — nothing reads `res.usage`." A candidate who invents a number is bluffing; the real answer is to point at the absence and name the cheap fix (read `res.usage`, the exercise above).
-
-### One-line anchors
-
-- `lib/agents/base.ts` L29, L31–L34 — `MAX_TOOL_RESULT_CHARS = 16_000`, char truncation.
-- `app/api/agent/route.ts` L99 — `TRUNC = 4000`, UI-stream budget (different purpose).
-- `lib/agents/monitoring.ts` L14, L21–L22, L33 — token-bounded schema summary via list caps.
-- `lib/agents/intent.ts` L20 — `max_tokens: 16`, the one-word classifier.
-- 4 chars ≈ 1 token (English); JSON tokenizes richer, so char budgets under-bound it.
-
----
+Tokens are re-sent every turn. In a 6-turn agent loop, the system prompt and
+the workspace schema are paid for **6 times**. That's why the per-turn budget
+gets multiplied by turn count when you estimate cost — not added.
 
 ## See also
 
-→ 01-what-an-llm-is.md · → 06-token-economics.md · → 04-structured-outputs.md
-
----
+  → `01-what-an-llm-is.md` — the I/O model that makes tokens visible
+  → `06-token-economics.md` — turn token counts into dollars
+  → `02-context-and-prompts/01-context-window.md` — when the budget runs out

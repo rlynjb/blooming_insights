@@ -1,15 +1,29 @@
-# 07 — System design templates
+# 07 — system design templates
 
-A **system design template** is an interview reframe of the codebase: the verbatim IK-style whiteboard prompt ("design an X"), answered first with the canonical generic architecture and then mapped honestly onto what blooming insights actually does. These files use a different shape from the per-concept study files — nine labelled bullets (the prompt, standard architecture, data model, key components, scale concerns, eval framing, common failure modes, applies-to-this-codebase, how-to-make-it-apply) instead of the Why-care / How-it-works template. The first seven bullets are generic and reusable; only the last two are blooming-insights-specific, and they are answered against the real code.
+Interview reframes. Same code, different framing — "if an interviewer
+says 'design X system,' can you walk through *this* codebase as that
+system?" Two AI templates: search ranking, tech support chatbot. Each
+follows the fixed 9-bullet shape — not the per-concept-file template.
 
 ## Files
 
-- **[01-search-ranking.md](01-search-ranking.md)** — C5.10. "Design a search ranking system that takes a user query and returns the top-k most relevant items from a corpus." Canonical two-stage retrieve-then-rank: query understanding → dense+sparse candidate retrieval → learned/cross-encoder ranking → serving + click logging. **Applies: no.** Blooming insights has no query→corpus search — its one ranking surface is `MonitoringAgent` sorting anomalies by `SEV_RANK` and slicing top-10 (`lib/agents/monitoring.ts:50`/`:92`), and its "retrieval" is live MCP tool calls, not a searchable index.
-- **[02-tech-support-chatbot.md](02-tech-support-chatbot.md)** — C5.14. "Design a tech support chatbot that answers customer questions, escalates when it can't, and learns from agent corrections." Canonical classify → RAG over KB → constrained generation → confident-respond/unsure-escalate → feedback loop. **Applies: partially.** The ask-anything `QueryAgent` (`lib/agents/query.ts`) + heuristic+LLM intent routing (`lib/agents/intent.ts`) + tool-grounded NDJSON streaming is structurally a chatbot over the Bloomreach workspace, but it is missing KB-RAG, an escalation gate, a feedback/correction loop, and multi-turn memory.
-- **[03-multi-rubric-eval-pipeline.md](03-multi-rubric-eval-pipeline.md)** — Senior-level. "Design an evaluation pipeline for a multi-agent LLM product that catches regressions on every prompt edit and model change." Canonical four-pillar architecture: ground-truth fixtures → live agent runs → per-surface scorer (set-overlap / rubric+judge / structural diff + similarity judge) → dated result dirs with embedded calibration receipts → flywheel discipline. **Applies: yes.** This codebase IS the worked example — `eval/scripts/`, `eval/judges/`, `mcp-server-olist/data/olist.db`'s `seeded_anomalies` table, the dated `eval/results/2026-06-15*` paper trail, the PR D → Phase 2.5 → PR E → PR F → PR G flywheel are all real. The named gaps (single-family judge, no pairwise A/B mode, no adversarial set on `?q=`, ad-hoc calibration receipts) are the senior-level honest follow-up.
+```
+01-search-ranking.md         ← search ranking system design
+02-tech-support-chatbot.md   ← tech support chatbot system design
+```
 
-## How to read these
+## How to use these
 
-Read the prompt and the standard architecture as if you were at the whiteboard — they are the answer you would give in any interview, codebase or not. Then read the last two bullets as the honest follow-up an interviewer drills into: *"your repo has this; does it actually implement what you just described?"* The value of these files is the gap between the canonical design and the real code — and being able to defend why blooming insights chose live tool-call retrieval over a search index, a one-shot grounded answerer over a full RAG-plus-escalation support stack, and (for the eval pipeline) the multi-rubric architecture with calibration receipts over a single LLM-judge or no evals at all.
+When an interviewer asks "design a search ranking system" or "design a
+tech support chatbot," the templates give you a whiteboard structure
+to follow:
 
----
+  prompt → standard architecture → data model → key components → scale
+  concerns → eval framing → common failure modes → applies to this
+  codebase → how to make it apply.
+
+Walk the standard architecture first (60 seconds, draw the boxes), then
+dive deep on whichever lens the interviewer probes. The "applies to
+this codebase" answer is honest about what's already built and what
+isn't; the "how to make it apply" names the concrete refactor that
+would land it.

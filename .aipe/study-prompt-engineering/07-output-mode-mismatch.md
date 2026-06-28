@@ -1,349 +1,312 @@
-# Output mode mismatch (declare the mode, enforce it at the boundary)
+# 07 — Output mode mismatch
 
-**Industry name(s):** output mode mismatch, format contract drift, JSON-vs-prose mismatch, output-mode declaration
-**Type:** Industry standard · Language-agnostic
-
-> blooming insights runs three JSON agents and one prose agent — the query agent deliberately opts out of JSON ("No JSON shape is required", `query.md` L49) while the other three demand it. Each prompt declares its mode, the validators enforce it at the boundary, and the bug to watch for is a prompt whose declared mode doesn't match the consumer that handles its output: the `parseAgentJson`/`synthesize()` path assumes JSON, and query is the one path that must not touch it.
-
-
----
+*Chain-boundary contract violations · Industry standard*
 
 ## Zoom out, then zoom in
 
-**Zoom out — the bigger picture.** Output mode mismatch lives at the boundary between Per-agent definitions (where the `## Output` section declares JSON or prose) and the consumer code that reads `finalText` — `parseAgentJson` + a type guard for the JSON agents, or a bare `.trim()` for the prose agent. The concept is exactly that boundary: producer declares, consumer assumes, and a mismatch is the two sides disagreeing about which mode is in play. The mismatch never crashes — it silently degrades, which is why you catch it by reading the two ends together, not by waiting for an exception.
+Output mode mismatch lives at the seams between chains. Pull up where one chain's output meets the next chain's input.
 
 ```
-  Zoom out — where output mode mismatch lives
+  Where output-mode mismatches happen — at every chain handoff
 
-  ┌─ Per-agent definitions ─────────────────────────┐  ← we are here (producer)
-  │  monitoring.md L71  "ONLY JSON, fenced"  ─┐      │
-  │  diagnostic.md L61  "ONLY JSON, fenced"   ├─JSON │
-  │  recommendation.md L49 "ONLY JSON, fenced"─┘     │
-  │  query.md L49 "No JSON — just answer text" ─PROSE│
-  │  (mode also declared in synthesisInstruction)    │
-  └─────────────────────────┬────────────────────────┘
-                            │  finalText (untrusted string)
-  ┌─ Consumer band ─────────▼────────────────────────┐  ← we are here (consumer)
-  │  ★ JSON path: parseAgentJson + isDiagnosis ★     │
-  │     mon.ts L85–92 · diag.ts L73–77 · rec L69–76 │
-  │  ★ PROSE path: finalText.trim() ★                │
-  │     query.ts L47  (NO parseAgentJson)            │
-  │  separate consumer code → modes can't share enforcement│
-  └─────────────────────────┬────────────────────────┘
-                            │
-  ┌─ UI / next agent ───────▼────────────────────────┐
-  │  silent mismatch shows up here (degraded output) │
-  └──────────────────────────────────────────────────┘
+  ┌─ diagnostic agent ──────────────────────────────────────┐
+  │  output mode: JSON object (Diagnosis)                    │
+  │  enforced: isDiagnosis() type guard                       │
+  └────────────────────┬────────────────────────────────────┘
+                       │
+                       ▼  ★ THE SEAM — output mode contract ★    ← we are here
+                       │
+  ┌─ recommendation agent ─▼─────────────────────────────────┐
+  │  input mode: JSON object (Diagnosis)                     │
+  │  expectation: diagnosis.conclusion, diagnosis.evidence    │
+  │  failure if: shape drifts, fields missing, wrong types    │
+  └──────────────────────────────────────────────────────────┘
+
+  Every chain declares one output mode in its prompt. Every consumer
+  asserts that mode. A mismatch is a silent parser break — the kind of
+  bug that ships in dev and explodes in production a week later.
 ```
 
-**Zoom in — narrow to the concept.** The question this file answers: how is each agent's output mode declared, where is it enforced, and how would you catch a mismatch before it ships? Three agents share the JSON path (declare-fenced-JSON → parseAgentJson → guard → reject-on-mismatch) and one agent is deliberately on the prose path (declare-prose → trim → default), with *separate* consumer code so the modes can't accidentally share enforcement. The mode is also declared a second time in each agent's `synthesisInstruction`, so a refactor must keep three sites in sync. Below, you'll see how each mismatch direction degrades silently, and the three-site checklist that catches one in review.
-
----
+This is the bug class that single-purpose chains (concept 06) and structured outputs (concept 02) collectively defend against. The chain boundary is *where the contract lives*, and getting it wrong is the most common cross-chain failure mode.
 
 ## Structure pass
 
-**Layers.** Output mode mismatch lives across four layers, and the mismatch class is "two layers disagree about which mode they're in." Layer A is the *prompt's `## Output` section* — declares JSON-fenced or prose. Layer B is the *synthesis instruction* — the forced-final-turn nudge that *also* declares the mode (so the mode lives in two places per agent). Layer C is the *model's finalText* — what actually came back. Layer D is the *consumer code that reads finalText* — `parseAgentJson` + guard for JSON, `.trim()` for prose. The contract is held by A + B + D agreeing on the mode; C is the test of whether the model honored A + B.
+**Layers.** Outer: the pipeline (multiple chains in sequence). Middle: each chain's declared output mode. Innermost: the consumer's parsing expectation.
 
-**Axis: guarantees.** What does each layer promise about output shape, and which layers *enforce* vs *request*? Guarantees is the right axis (over control or trust) because the mismatch class is exactly a guarantee gap — A and B *request* a mode, the model *might* honor it, D *assumes* a mode. When A says JSON and D assumes prose (or vice versa), nothing crashes — the guarantee silently shifts. The bug is invisible at the layer where it's authored; it surfaces three layers downstream as degraded output.
-
-**Seams.** Two seams, and the second is where you go looking when the user sees raw JSON. Seam 1 (A↔B) — both sites must declare the *same* mode; this is the *internal-consistency seam* within the producer. A refactor that changes A's mode but forgets B leaves the model with conflicting final-turn instructions. The load-bearing seam is Seam 2 (C↔D) — the guarantee flips from *whatever the model emitted* to *whatever the consumer assumes*. The two assumptions either agree (mode honored end-to-end) or disagree (silent degradation: empty `[]` if prose hits the JSON consumer, raw JSON string shown to the user if JSON hits the prose consumer). Neither failure throws. Catching it requires reading A, B, and D together at review-time — the seam is invisible in any one file.
+**Axis — what enforces the contract.** Walk it down:
 
 ```
-  Structure pass — output mode mismatch
+  one axis — "what makes the contract enforceable?" — three layers
 
-  ┌─ 1. LAYERS ───────────────────────────────────┐
-  │  A: prompt ## Output (mode declared)           │
-  │  B: synthesis instruction (mode RE-declared)   │
-  │  C: model finalText (the actual emission)      │
-  │  D: consumer code (mode assumed)                │
-  └────────────────────────┬───────────────────────┘
-                           │  pick the axis
-  ┌─ 2. AXIS ─────────────▼────────────────────────┐
-  │  guarantees: which layer requests vs which     │
-  │  enforces the mode? where do they disagree?    │
-  └────────────────────────┬───────────────────────┘
-                           │  trace A→D, find flips
-  ┌─ 3. SEAMS ────────────▼────────────────────────┐
-  │  S1 (A↔B): internal producer consistency —    │
-  │            both must declare the same mode     │
-  │  S2 (C↔D): emitted mode vs assumed mode        │
-  │            (LOAD-BEARING — silent degradation; │
-  │             never throws, only worsens output) │
-  └────────────────────────┬───────────────────────┘
-                           ▼
-                   Block 4 — How it works
+  ┌─ pipeline layer ───────────────────┐
+  │  ENFORCED by: code review            │  human checks chain A's prompt
+  │                                       │  says what chain B expects
+  └────────────────────────────────────┘
+       ┌─ prompt layer ─────────────────┐
+       │  ENFORCED by: prompt instruction │  "Return ONLY a JSON object in
+       │  + example                        │   a ```json fence: {...}"
+       └────────────────────────────────┘
+            ┌─ runtime layer ────────────┐
+            │  ENFORCED by: type guard    │  isDiagnosis() returns boolean
+            │  (concept 02)               │  at the consumer boundary
+            └────────────────────────────┘
 ```
 
-```
-  A seam — "what mode is this output?" answered two ways
-
-  ┌─ Layer C ────────┐    seam     ┌─ Layer D ────────────┐
-  │  finalText is    │ ═════╪═════► │  consumer assumes    │
-  │  whatever the    │  (it flips  │  JSON (parseAgentJson)│
-  │  model emitted   │   silently) │  OR prose (.trim())  │
-  └──────────────────┘             └──────────────────────┘
-         ▲                                   ▲
-         └────── same axis, two answers ─────┘
-                 → if they disagree: [] or raw JSON to user
-                   no exception, just degraded output
-```
-
-The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+**Seams.** The chain-A-to-chain-B handoff is the load-bearing seam. If either side's understanding of "the output mode" drifts, the handoff breaks. The type guard is the runtime defense; the prompt declaration is the design-time defense; code review is the change-time defense.
 
 ## How it works
 
-**Mental model.** Each agent is a producer with a declared output mode; each agent's caller is a consumer with an assumed mode. The two must agree. The declaration is a line (or block) in the prompt's `## Output` section; the enforcement is the code that reads `finalText`. Picture a switch in each agent's `## Output`: flip it to JSON and the output flows into `parseAgentJson` + guard; flip it to prose and the output flows straight into `.trim()`. A mismatch is the switch declared one way and the consumer wired the other.
+### Move 1 — the mental model
+
+You know how a function signature in TypeScript is a contract — caller and callee agree on input/output types and the compiler enforces it? Output mode at a chain boundary is the *same shape* of contract, except the compiler can't enforce it because the producer is an LLM emitting probabilistic text.
 
 ```
-PRODUCER (prompt ## Output)          CONSUMER (the code that reads final_text)
-─────────────────────────────        ──────────────────────────────────────
-monitoring "JSON array, fenced"   →  parse_agent_json + is_anomaly_array
-diagnostic "JSON object, fenced"  →  parse_agent_json + is_diagnosis
-recommend  "JSON array, fenced"   →  parse_agent_json + is_recommendation_array
-query      "No JSON required,      →  final_text.trim()
-            just the answer text"      (NEVER parse_agent_json)
+  Pattern — chain boundary as a contract, with three enforcement points
+
+  ┌─ chain A ────────────────┐                    ┌─ chain B ──────────────┐
+  │  prompt declares:         │                    │  prompt expects:        │
+  │  "Return ONLY JSON object  │   ───contract───►  │  the Diagnosis shape    │
+  │   in a ```json fence:      │                    │  (conclusion, evidence, │
+  │   {conclusion, evidence,..}│                    │   hypothesesConsidered) │
+  └────────────┬─────────────┘                    └────────────┬───────────┘
+               │                                                │
+               ▼                                                ▼
+        emits text                                        validates shape
+               │                                                ▲
+               │                                                │
+               └────────► type guard at boundary ───────────────┘
+                          (isDiagnosis returns boolean)
+
+  Three enforcement points: prompt declaration · type guard · code review.
+  Lose any one and the contract becomes folklore.
 ```
 
-Three switches point at the JSON path; one points at the prose path. The mismatch bug is any switch whose declaration and consumer disagree.
+The kernel: every chain has *one* declared output mode and the consumer asserts it. Lose any of the three enforcement points and the contract becomes folklore — "well, it usually returns JSON…"
 
----
+### Move 2 — the walkthrough
 
-### Three agents declare JSON
-
-The structured agents each declare JSON mode unambiguously in `## Output`, with "ONLY" and a fenced example:
+**Step 1 — every chain declares its output mode in the prompt.** This is where it lives in this codebase:
 
 ```
-monitoring prompt      "Return ONLY a JSON array of anomaly objects … wrapped in a ```json fenced block"
-diagnostic prompt      "Return ONLY a JSON object (in a ```json fenced block) of exactly this shape"
-recommendation prompt  "Return ONLY a JSON array (in a ```json fenced block) of at most 3 objects"
+  Where each chain declares its output mode
+
+  monitoring.md:70-71   →  "Return ONLY a JSON array of anomaly objects ...
+                            wrapped in a ```json fenced block:"
+  diagnostic.md:58-59   →  "Return ONLY a JSON object (in a ```json fenced
+                            block) of exactly this shape:"
+  recommendation.md:49-50 → "Return ONLY a JSON array (in a ```json fenced
+                            block) of at most 3 objects, each of exactly
+                            this shape:"
+  query.md:46-48        →  "Give a clear, concise answer in plain prose —
+                            a few sentences; you may use short markdown
+                            bullets. ... No JSON shape is required."
 ```
 
-"ONLY" is doing real work — it tells the model the *entire* response is the artifact, no prose around it. The fence is the extraction anchor (→ 02-structured-outputs.md). These three feed the parse-validate-repair funnel: their final text goes into the agent-JSON parser and a type guard, and a synthesize retry exists for the diagnostic and recommendation agents when the JSON doesn't materialize.
+Two output modes in this codebase:
 
-**Code in this codebase — JSON-mode declarations and consumers.** `lib/agents/prompts/{monitoring,diagnostic,recommendation}.md` + their `.ts`. `## Output` (declaration) → `parseAgentJson` + type guard (enforcement). Declarations at `monitoring.md` L71, `diagnostic.md` L61, `recommendation.md` L49; consumers at `monitoring.ts` L85–92 (`parseAgentJson` + `isAnomalyArray` else `[]`), `diagnostic.ts` L73–77 (`tryParseDiagnosis ?? synthesize ?? FALLBACK`), `recommendation.ts` L69–76 (`tryParseRecommendations ?? synthesize` then `[]`). Declare fenced JSON; enforce by extracting, validating, and rejecting non-conforming output to a safe floor.
+  → **Structured JSON in a fence** (monitoring, diagnostic, recommendation, intent).
+  → **Plain prose** (query).
 
----
+**Note query is the odd one out.** Query returns text and the UI renders it as markdown (`StreamingResponse` component). The diagnostic chain's output flows into the recommendation chain; query's output flows to the UI directly. That's why query's output mode is different — it has a different consumer.
 
-### One agent declares prose — deliberately
-
-The query agent's `## Output` says the opposite, and the opposite-ness is the whole point:
-
-```
-query prompt — ## Output
-  Give a clear, concise answer in plain prose — a few sentences; you may use
-  short markdown bullets. Cite the key numbers you found. If you couldn't get
-  the data, say so plainly. No JSON shape is required — just the answer text.
-```
-
-"No JSON shape is required — just the answer text" is the mode declaration. The query agent answers a free-form human question; forcing that through a JSON schema would be the wrong contract — the consumer (the UI) wants prose to show the user, not a typed object. So its consumer reads the output as a string and trims it:
+**Step 2 — the example output IS the contract.** Look at `legacy-prompts/diagnostic.md:58-82`:
 
 ```
-  return final_text.trim() || "I was unable to find enough data to answer that question."
+Return ONLY a JSON object (in a ```json fenced block) of exactly this shape:
+
+```json
+{
+  "conclusion": "string — the best-supported explanation, or an honest...",
+  "evidence": [
+    "string — one piece of evidence per item, citing tool results..."
+  ],
+  "hypothesesConsidered": [
+    {
+      "hypothesis": "string — what you tested",
+      "supported": true,
+      "reasoning": "string — why the data supports or rules this out"
+    }
+  ],
+  "affectedCustomers": {
+    "count": 0,
+    "segmentDescription": "string — optional; include only if..."
+  },
+  "timeSeries": [
+    { "day": "d-13", "value": 0 },
+    { "day": "today", "value": 51 }
+  ]
+}
+```
 ```
 
-No JSON parser. No type guard. No synthesize retry returning a typed shape — the query agent's synthesis instruction says "answer the user question directly and concisely in plain prose," not "emit JSON." The prose path is a deliberately *separate* consumer from the JSON path — the modes don't share enforcement code, which is exactly what keeps the mismatch from happening.
+The example is *the* contract. The prose around it ("of exactly this shape") is reinforcement. The model has both the shape and a worked example to copy. The receiving end (`isDiagnosis` in `lib/mcp/validate.ts:29-35`) checks only the *required* fields — `conclusion` (string), `evidence` (array), `hypothesesConsidered` (array). Optional fields like `affectedCustomers` and `timeSeries` are checked at the UI render layer with safe defaults.
 
-**Code in this codebase — prose-mode declaration and consumer.** `lib/agents/prompts/query.md` + `lib/agents/query.ts`. `## Output` (declaration) → `finalText.trim()` (consumption). Declaration at `query.md` L49 ("No JSON shape is required — just the answer text"); consumer at `query.ts` L47 (`finalText.trim() || '<fallback>'`); prose synthesis nudge at `query.ts` L42–44. Declares prose, consumes as a trimmed string, never touches `parseAgentJson` — the deliberately separate path.
+**Step 3 — the type guard at the boundary.** `lib/mcp/validate.ts:29-35`:
 
----
-
-### Enforcement lives at the boundary, not the prompt
-
-The declaration is necessary but not sufficient — the model honors "Return ONLY JSON" statistically (→ 02-structured-outputs.md). The *enforcement* is the validator at the consuming boundary:
-
-```
-JSON mode enforcement (monitoring consumer):
-  parsed = parse_agent_json(final_text)         ← extract
-  if NOT is_anomaly_array(parsed): return []   ← REJECT wrong-mode output, floor to []
-
-prose mode "enforcement" (query consumer):
-  final_text.trim() || "<fallback sentence>"   ← accept any text; floor to a sentence
+```typescript
+export function isDiagnosis(v: unknown): v is Diagnosis {
+  if (!v || typeof v !== 'object') return false;
+  const d = v as any;
+  return typeof d.conclusion === 'string'
+    && Array.isArray(d.evidence)
+    && Array.isArray(d.hypothesesConsidered);
+}
 ```
 
-The JSON consumers *reject* output that isn't valid JSON of the right shape — that rejection is the enforcement. The prose consumer accepts any text (prose can't be "wrong shape"), flooring only to a default sentence when the text is empty. So the two modes have two different enforcement disciplines: JSON mode validates and rejects; prose mode accepts and defaults. The mismatch danger is asymmetric — feed prose to the JSON consumer and it rejects everything to `[]`; feed JSON to the prose consumer and it cheerfully returns the raw JSON string to the user as if it were an answer.
+The runtime check. If the diagnostic agent returns a JSON object that doesn't have these three required fields, the boundary returns `false`. The caller (the recommendation chain's input handler, or the route handler) decides the fallback — in this codebase, a FALLBACK Diagnosis at `lib/agents/diagnostic-legacy.ts:16-20`:
 
-```
-prose → JSON consumer:  parser throws / guard false → [] (silent empty)
-JSON → prose consumer:  .trim() returns "[{...}]" → user sees raw JSON (silent ugly)
-```
-
-Both failures are *silent* — neither throws an error a monitor would catch. That's what makes mode mismatch insidious: it degrades the output, it doesn't crash.
-
----
-
-### How to catch a mismatch in review
-
-The mismatch is invisible in the prompt alone — you have to read the prompt's declared mode *and* its consumer together. The review checklist:
-
-```
-for each agent:
-  1. read ## Output — what mode does the prompt DECLARE?   (JSON-fenced? prose?)
-  2. read the code that reads final_text — what does it ASSUME?
-       parse_agent_json + guard  → it assumes JSON
-       .trim()                    → it assumes prose
-  3. do (1) and (2) agree?
-       monitoring: JSON ↔ parse_agent_json ✓
-       diagnostic: JSON ↔ parse_agent_json ✓
-       recommend:  JSON ↔ parse_agent_json ✓
-       query:      prose ↔ .trim()         ✓   ← MUST NOT use parse_agent_json
-  4. check the synthesis_instruction too — does the forced-final nudge declare
-       the SAME mode as ## Output?  (query says prose; the others say JSON)
+```typescript
+const FALLBACK: Diagnosis = {
+  conclusion: 'Insufficient data to determine a cause for this change.',
+  evidence: [],
+  hypothesesConsidered: [],
+};
 ```
 
-Step 4 is the subtle one: the mode is declared *twice* — in `## Output` and in the synthesis instruction (→ 01-anatomy.md) — and they must agree. If a refactor changed query's `## Output` to demand JSON but left the synthesis nudge saying "plain prose," the model would get conflicting mode instructions on the final turn. The reviewer's job is to check that an agent's declared mode is consistent across both places *and* matches its consumer.
+The fallback satisfies the contract (it IS a valid Diagnosis). The downstream chain can run against it. Failure stays inside the diagnostic boundary; the pipeline continues.
 
-**Code in this codebase — the mode declared twice (must agree).** The prompt `## Output` section *and* the `synthesisInstruction`. Per-agent `synthesisInstruction` passed to `runAgentLoop`: JSON nudges at `monitoring.ts` L75–78, `diagnostic.ts` L62–66, `recommendation.ts` L58–62 (all say "JSON … fence"); prose nudge at `query.ts` L42–44 ("plain prose"). The forced-final-turn instruction must declare the same mode as `## Output`; a mismatch here gives conflicting final-turn instructions.
-
-**Why this is a codebase strength.** The two modes have *separate* consumer code — the JSON path and the prose path never share a function — so an agent can't accidentally be enforced under the wrong mode by a shared helper. And the mode is stated consistently in both `## Output` and the synthesis nudge for all four agents, so the final-turn instruction never contradicts the section above it.
-
----
-
-### The principle
-
-Output mode is a contract with two ends — the prompt declares it, the consumer enforces it — and the contract is only sound when both ends agree, in both the `## Output` section and the synthesis nudge. blooming insights keeps three agents on the JSON path (declare-fenced-JSON → parse → guard → reject-on-mismatch) and one agent on the prose path (declare-prose → trim → default), with *separate* consumer code so the modes can't accidentally share enforcement. A mismatch never crashes; it silently degrades — which is why you catch it by reading the declaration and the consumer side by side, not by waiting for an exception.
-
----
-
-## Output mode mismatch — diagram
-
-This diagram spans producers (four prompts, two modes) and consumers (two enforcement paths). A reader who sees only this should grasp that mode is declared per prompt, enforced at the boundary, that three agents share the JSON path and query is deliberately on the prose path, and that a mismatch degrades silently.
+**Step 4 — the bug: chain A and chain B disagree.** This is the classic. Most common version in real codebases:
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│  PRODUCERS — each prompt's ## Output declares a MODE                  │
-│                                                                       │
-│   monitoring prompt      "ONLY a JSON array … ```json fenced"   ─┐    │
-│   diagnostic prompt      "ONLY a JSON object … ```json fenced"   ├─JSON│
-│   recommendation prompt  "ONLY a JSON array … ```json fenced"  ─┘     │
-│                                                                       │
-│   query prompt  "No JSON shape is required — just the answer text" ─ PROSE │
-└───────────────┬───────────────────────────────────────────┬───────────┘
-       JSON mode │                                  prose mode │
-┌────────────────▼──────────────────────────┐  ┌──────────────▼───────────┐
-│  JSON CONSUMER (validate + REJECT)         │  │  PROSE CONSUMER (accept) │
-│   parse_agent_json                          │  │   final_text.trim()      │
-│   + shape guards (anomaly/diagnosis/rec)    │  │                          │
-│   wrong shape → [] / FALLBACK               │  │   empty → default sentence│
-│   monitoring · diagnostic · recommendation  │  │   NO parser path          │
-└────────────────────────────────────────────┘  └──────────────────────────┘
+  Anti-pattern — output mode mismatch, the bug
 
-  MISMATCH (silent, never throws):
-    prose → JSON consumer  = guard false → [] (empty output)
-    JSON  → prose consumer = .trim() → user sees raw "[{...}]"
-  catch it: read ## Output mode AND the consumer AND the synthesis nudge together.
+  chain A's prompt says:                  chain B parses with:
+  ─────────────────────                   ───────────────────
+  "Return a list of suggestions,           JSON.parse(text)
+  one per line, in markdown."              → throws on markdown
+
+  OR
+
+  chain A's prompt says:                  chain B parses with:
+  ─────────────────────                   ───────────────────
+  "Return a JSON array of strings."        const obj = JSON.parse(text)
+                                            if (obj.items) ...
+                                            → undefined, silent breakage
+
+  OR  (the dangerous one — both are JSON, both are valid)
+
+  chain A returns:                         chain B expects:
+  ────────────────                         ────────────────
+  { "suggestions": ["a", "b"] }            ["a", "b"]
+  (object with array field)                (array directly)
+                                            → silent parsing succeeds,
+                                              consumer reads .map() on
+                                              an object → empty UI
 ```
 
-Mode is declared per prompt and enforced per consumer; three agents share the JSON path, query is deliberately on the prose path, and any disagreement degrades silently.
+The third one is the *dangerous* one. Both sides are emitting and parsing JSON. The mismatch is in the *shape*, and `JSON.parse` doesn't catch it. The type guard does — that's exactly why it's at the boundary.
 
----
+**Step 5 — how to spot mismatches in code review.** When reviewing a PR that touches a prompt:
+
+  1. **What output mode does this prompt declare?** Read the "Output" section of the `.md` file. Find the literal example.
+  2. **What type guard validates this chain's output?** Open `lib/mcp/validate.ts`, find the `is*` function for this shape.
+  3. **What consumer reads this output?** `grep` for the type. `Diagnosis` is consumed in `lib/agents/recommendation.ts` and in the UI's `EvidencePanel`.
+  4. **Do all three agree?** If the prompt says `evidence: string[]` but the type guard checks `Array.isArray(d.evidence)` (which allows `evidence: number[]`), the type guard is too loose. If the consumer reads `evidence[0].cite` but the prompt's example has `evidence: ["string", "string"]`, the consumer is wrong.
+
+**Layers-and-hops view of the contract at runtime:**
+
+```
+  Layers-and-hops — one chain handoff, three enforcement layers
+
+  ┌─ Diagnostic agent ─────────────────────────────────────┐
+  │  prompt: "Return ONLY a JSON object {...}"              │
+  │  model emits: text                                       │
+  └──────────────┬─────────────────────────────────────────┘
+                 │ hop 1: parseAgentJson(text) → unknown
+  ┌─ Parser ▼ ─────────────────────────────────────────────┐
+  │  extract from ```json fence                              │
+  │  fall back to substring scan                             │
+  │  → unknown (could be anything)                           │
+  └──────────────┬─────────────────────────────────────────┘
+                 │ hop 2: isDiagnosis(parsed) → boolean
+  ┌─ Type guard ▼ ─────────────────────────────────────────┐
+  │  checks: conclusion string, evidence array,             │
+  │  hypothesesConsidered array                              │
+  │  → typed Diagnosis OR fallback                           │
+  └──────────────┬─────────────────────────────────────────┘
+                 │ hop 3: typed Diagnosis passed forward
+  ┌─ Recommendation agent ▼ ───────────────────────────────┐
+  │  reads diagnosis.conclusion, diagnosis.evidence         │
+  │  works because the contract held                         │
+  └─────────────────────────────────────────────────────────┘
+```
+
+### Move 3 — the principle
+
+A chain boundary is a contract. A contract without runtime enforcement is folklore. The prompt declares the mode, the type guard enforces it, the consumer relies on it. All three layers are necessary because the producer is probabilistic and the consumer is deterministic — the runtime check is what bridges the gap. This is the same principle as input validation at any service boundary; the LLM substrate doesn't change it, only sharpens its importance.
+
+## Primary diagram — output mode contract, full enforcement
+
+```
+  ┌─ design time (PR review) ────────────────────────────────────────┐
+  │  reviewer compares:                                                │
+  │    legacy-prompts/diagnostic.md "Output" section                    │
+  │    vs lib/mcp/validate.ts:isDiagnosis()                            │
+  │    vs lib/agents/recommendation.ts (and EvidencePanel.tsx) consumer│
+  └──────────────────────────┬───────────────────────────────────────┘
+                             │
+  ┌─ build time ▼ ───────────────────────────────────────────────────┐
+  │  TypeScript: `Diagnosis` type referenced by isDiagnosis +          │
+  │  consumers + agent return type — drift fails the build             │
+  └──────────────────────────┬───────────────────────────────────────┘
+                             │
+  ┌─ runtime ▼ ──────────────────────────────────────────────────────┐
+  │                                                                    │
+  │  ┌─ chain A ─────────┐    ┌─ parser ─┐    ┌─ type guard ─┐        │
+  │  │  prompt declares   │ →  │ extract  │ →  │ isDiagnosis   │       │
+  │  │  output mode +     │    │ from     │    │ returns bool   │       │
+  │  │  worked example    │    │ fence    │    │                │       │
+  │  └────────────────────┘    └──────────┘    └───────┬───────┘       │
+  │                                                     │               │
+  │                                              ┌──────▼──────┐        │
+  │                                              │ FALLBACK if  │        │
+  │                                              │ guard false  │        │
+  │                                              └──────┬───────┘        │
+  │                                                     │                │
+  │  ┌─ chain B (consumer) ──────────────────────────────▼───────────┐  │
+  │  │  reads typed Diagnosis (real or fallback) — contract held       │  │
+  │  └────────────────────────────────────────────────────────────────┘  │
+  └────────────────────────────────────────────────────────────────────┘
+```
 
 ## Elaborate
 
-### Where this comes from
+This concept is *the most common bug class in multi-agent systems*, and the canonical version of it shows up in every framework you've seen. LangGraph has the same problem — nodes return `state` mutations, and a node that mutates `state.foo` while the next node reads `state.bar` is exactly this bug. CrewAI: agent A's output is "the answer," agent B reads "the result" — silent break. The substrate doesn't matter; the seam matters.
 
-The output-mode contract is the LLM version of `Content-Type` negotiation — the producer declares the format, the consumer must handle that format, and a mismatch is a class of bug as old as HTTP. In LLM tooling, the distinction became sharp once apps started mixing structured-extraction calls (JSON) with conversational calls (prose) in the same system: LangChain's split between `OutputParser`-backed chains and plain text chains is the same two-mode split. The discipline of declaring the mode in the prompt *and* enforcing it at the boundary is the consensus answer to "the model sometimes returns the wrong format" — declare to bias the model, enforce to guarantee.
+Two places to deepen:
 
-### The deeper principle
+- **Anthropic's "Building effective agents."** Names the workflow-vs-agent distinction. Workflows (deterministic chain composition, like this codebase) make contract enforcement easier than autonomous agents because the consumer is *known* at design time.
+- **OpenAPI as a parallel.** REST APIs solved this with OpenAPI schemas + client code generation. The LLM-chain equivalent is what this codebase does informally — the type guard + the TypeScript type. The richer version would be: generate the prompt's example output from the TypeScript type so they can't drift.
 
-```
-mode declared (prompt)        mode enforced (consumer)        agree?
-──────────────────────        ────────────────────────        ──────
-"ONLY JSON, fenced"           parseAgentJson + guard          ✓ JSON path
-"no JSON, just prose"         .trim()                         ✓ prose path
-"ONLY JSON" + .trim()         (declared JSON, consumed prose) ✗ user sees raw JSON
-"just prose" + parseAgentJson (declared prose, consumed JSON) ✗ guard false → []
-```
-
-A mode contract is two-ended. Declaring it only biases the producer; enforcing it only at the consumer can reject everything if the producer was told the wrong mode. Both ends must name the same mode — and in this codebase the producer names it twice (`## Output` and the synthesis nudge), so "both ends agree" is really "all three sites agree."
-
-### Where this breaks down
-
-1. **Both mismatch directions are silent.** Neither feeding prose to the JSON consumer (`[]`) nor JSON to the prose consumer (raw JSON to the user) throws — so a mode mismatch passes tests that only check "didn't crash" and surfaces as degraded output a human has to notice.
-2. **The mode is declared in two places.** `## Output` and the `synthesisInstruction` both state the mode; a refactor can change one and miss the other, leaving the model with conflicting instructions on the final turn.
-3. **Prose mode has no shape to validate.** The query consumer accepts any non-empty string (`query.ts` L47), so a wrong-but-prose answer (e.g. the model apologizing instead of answering) passes the boundary — prose mode trades shape-checkability for flexibility.
-
-### What to explore next
-
-- **A mode-consistency test:** assert each agent's `## Output` mode matches its `synthesisInstruction` mode and its consumer (parseAgentJson vs trim), so a refactor that flips one site fails CI.
-- **A prose-quality guard:** add a light check that the query answer actually contains the cited numbers it claims, catching the "apologized instead of answering" prose-mode failure the string-accept can't.
-- **Typed mode tagging:** give each agent an explicit `outputMode: 'json' | 'prose'` field in code so the consumer is selected by the tag, not by which function the author happened to call.
-
----
-
-## Project exercises
-
-### Add a mode-consistency test across all four agents
-
-- **Exercise ID:** C1.12 (adapted) — output-mode contract integrity.
-- **What to build:** a Vitest test that, for each agent, asserts the declared mode is consistent across three sites — the prompt's `## Output` (JSON-fence vs prose), the `synthesisInstruction`, and the consumer (`parseAgentJson` present vs `.trim()` only) — so a refactor that flips one site without the others fails CI.
-- **Why it earns its place:** turns the "read declaration and consumer together" review step into an enforced invariant, catching the silent mismatch class before it ships.
-- **Files to touch:** new `test/agents/output-mode.test.ts`; reads the four `lib/agents/prompts/*.md` and inspects the four agent `.ts` modules.
-- **Done when:** the test passes for the current four agents and fails if you change `query.md` L49 to demand JSON without also wiring `query.ts` to `parseAgentJson`.
-- **Estimated effort:** 1–4hr
-
-### Add a grounding check to the prose consumer
-
-- **Exercise ID:** C1.12 (adapted) — prose-mode quality enforcement.
-- **What to build:** since prose mode accepts any non-empty string (`query.ts` L47), add a light post-check that the answer actually cites at least one number when the query asked for figures (or explicitly says data was unavailable), surfacing the "apologized instead of answering" failure that the bare `.trim()` lets through.
-- **Why it earns its place:** gives the prose mode the boundary enforcement the JSON mode has — accept-and-default becomes accept-check-and-default.
-- **Files to touch:** `lib/agents/query.ts` (L47 — add the check), `test/agents/query.test.ts`.
-- **Done when:** an empty-or-evasive prose answer triggers the explicit "unable to find data" path rather than returning a vacuous string, and a real numeric answer passes unchanged.
-- **Estimated effort:** 1–4hr
-
----
+In this codebase, concept 02 (structured outputs) is the per-chain output mode discipline; this concept is the cross-chain version of the same enforcement. Concept 06 (single-purpose chains) is the architectural reason the contracts are *small enough* to enforce — a monolithic agent has one giant output mode that's much harder to validate.
 
 ## Interview defense
 
-### What an interviewer is really asking
+**Q: "What's output-mode mismatch?"**
 
-"You have agents returning different formats — how do you keep that straight?" tests whether you treat output format as a per-prompt contract with two ends. The senior signal is naming where the mode is declared, where it's enforced, that a mismatch degrades silently rather than crashing, and how you'd catch it in review.
-
-### Likely questions
-
-**[mid] "Which of your agents return JSON and which return prose, and how do you know?"**
-
-Three return JSON — monitoring, diagnostic, recommendation — each `## Output` says "Return ONLY a JSON … fenced block" (`monitoring.md` L71, `diagnostic.md` L61, `recommendation.md` L49), and their consumers run `parseAgentJson` + a type guard. The query agent returns prose: `query.md` L49 says "No JSON shape is required — just the answer text," and its consumer is `finalText.trim()` (`query.ts` L47), no parsing.
+Bug class at the chain boundary. *(Draw the contract diagram.)* Chain A emits an output mode (JSON array, JSON object, prose). Chain B expects an input mode. When the two disagree, the parser breaks — sometimes loudly with a `JSON.parse` throw, sometimes silently with a shape that *parses* but is the wrong type. The silent kind is the dangerous one. The defense is three layers: the prompt declares the mode + a worked example, a type guard enforces at runtime, and code review checks the prompt vs the consumer when either changes.
 
 ```
-JSON: ## Output "ONLY JSON fenced" → parseAgentJson + guard
-prose: ## Output "no JSON, prose"  → .trim()
+  prompt declaration  +  runtime type guard  +  code review = enforced contract
 ```
 
-**[senior] "How would a mode mismatch show up, and would your tests catch it?"**
+Anchor: *"the dangerous one is when both sides emit and parse JSON but disagree on the shape. JSON.parse doesn't catch it. The type guard does."*
 
-It degrades silently — it doesn't crash. If the query prompt were changed to demand JSON but still consumed by `.trim()`, the user would see raw `[{...}]` as their answer. The reverse — a JSON agent's output sent through `.trim()` — would dump JSON at the user too; prose sent through `parseAgentJson` floors to `[]`. Tests that only assert "didn't throw" miss all of this. I'd catch it by reading the `## Output` mode, the synthesis nudge, and the consumer together — and pin it with a mode-consistency test across those three sites.
+**Q: "How do you spot a mismatch in code review?"**
 
-```
-prose → JSON consumer = [] (silent empty)
-JSON  → prose consumer = raw JSON to user (silent ugly)
-neither throws → "didn't crash" tests pass
-```
+Four-step check. *(Walk it.)* Open the prompt — find the "Output" section, read the literal example. Open `lib/mcp/validate.ts` — find the `is*` guard for that shape. Grep for the type — find the consumers. Compare all three. If the prompt's example has `evidence: string[]` but the guard checks `Array.isArray(evidence)` (which allows `number[]`), the guard's too loose. If the consumer reads `evidence[0].cite` but the prompt says `evidence: ["string"]`, the consumer is wrong.
 
-**[arch] "Why is the query agent prose instead of JSON when the other three are JSON?"**
+Anchor: *"prompt → type guard → consumer. All three must agree. If any two diverge, the third will eventually break."*
 
-Because its consumer is a human reader, not a validator. The query agent answers a free-form question; the UI shows that answer directly. Forcing it through a JSON schema means emitting `{ "answer": "..." }` that the UI immediately unwraps back into prose — ceremony with no benefit, and a schema constraining an inherently unstructured output. The three structured agents produce *artifacts* (typed `Anomaly[]`, `Diagnosis`, `Recommendation[]`) for machine handoff (→ 06-single-purpose-chains.md), so JSON is the right mode for them and prose is right for query.
+**Q: "Why isn't TypeScript enough?"**
 
-```
-artifact for machine handoff → JSON (parseAgentJson + guard)
-answer for a human reader     → prose (.trim())
-```
+Because the producer is an LLM, not a function. TypeScript catches the bug if the *consumer* references the wrong field, but TypeScript can't constrain the *output* of `anthropic.messages.create()` — that's typed as `Anthropic.Messages.ContentBlock[]`. The model can emit any JSON shape it wants inside that. The runtime type guard is the bridge — it's the moment where `unknown` becomes typed `Diagnosis`. Without it, you have TypeScript narrowing on a `(parsed as Diagnosis)` cast that's a lie.
 
-### The question candidates always dodge
-
-**"What happens if the model returns the wrong format anyway?"** It depends which way, and both are silent. A JSON agent that returns prose gets rejected by the guard to `[]` or `FALLBACK` — safe but empty. A prose agent that returns JSON gets `.trim()`'d and handed to the user as-is — the user reads raw JSON. Candidates dodge because the honest answer is "nothing throws, the output just gets worse," which undercuts the comfort of "we validate." The real safety net for JSON is the reject-to-floor; the prose side has no shape to reject against, which is its weak point.
-
-### One-line anchors
-
-- `lib/agents/prompts/query.md` L49 — "No JSON shape is required — just the answer text" — the prose mode declaration.
-- `lib/agents/query.ts` L47 — `finalText.trim() || '<fallback>'` — the prose consumer, no `parseAgentJson`.
-- `lib/agents/prompts/monitoring.md` L71 — "Return ONLY a JSON array … fenced" — a JSON mode declaration.
-- `lib/agents/monitoring.ts` L85–92 — `parseAgentJson` + `isAnomalyArray` else `[]` — JSON boundary enforcement.
-- mode stated twice: `## Output` + the `synthesisInstruction` (`query.ts` L42–44 prose vs `diagnostic.ts` L62–66 JSON) — both must agree.
-
----
+Anchor: *"TypeScript catches consumer bugs. The runtime guard catches producer bugs. Both are necessary because the producer is probabilistic."*
 
 ## See also
 
-→ 02-structured-outputs.md · → 06-single-purpose-chains.md · → 01-anatomy.md
-
----
+- `02-structured-outputs.md` — the per-chain output discipline; this file is the cross-chain extension.
+- `06-single-purpose-chains.md` — small per-chain output modes are what makes the contracts enforceable; monolithic outputs are not.
+- `05-eval-driven-iteration.md` — type guards catch shape mismatches; evals catch *content* mismatches (the diagnosis was the wrong shape OR the diagnosis was the wrong *answer*).
+- `13-forbidden-patterns.md` — sometimes "output mode drift" is the model converging on a phrasing the consumer didn't expect; concept 13 walks the prevention.

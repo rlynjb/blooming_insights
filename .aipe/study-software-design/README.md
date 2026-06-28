@@ -1,77 +1,88 @@
-# blooming insights — software design audit (APOSD applied)
+# Study — Software design
 
-> Ousterhout's *A Philosophy of Software Design* (2nd ed.) is the source of every primitive named in this guide — deep modules, information hiding, complexity, layering, readability, pull-complexity-downward, errors-as-special-cases. Read the book for the framework; this guide is the audit. The companion `read-aposd/` guide (when present) teaches the primitives in their own right.
+A per-repo design audit through John Ousterhout's *A Philosophy of Software Design* (APOSD). The book's primitives — deep modules, information hiding, complexity, layering, pulling complexity down, defining errors out of existence, readability — applied to this codebase's real files.
 
-This guide applies APOSD to **this repo**. Every claim cites a real file path and, where it sharpens the point, a line range. Every finding opens with a verdict, names the one move that matters most, then ranks the rest. Where blooming insights honors the primitive, that's praise — and it's a finding. Where it violates it, that's debt — and it's named plainly, with the move.
+This is the **comprehension** half. The action half lives at `.aipe/audits/design-2026-06-15.md` (per-finding refactor specs). Read this guide to understand the design shape; read the audit to act on the same findings. The book itself is excerpted at `.aipe/read-aposd/` — start there for the primitive in full; come here for "where does this primitive land in *my* code?"
 
-**The 2026-06-02 → 2026-06-15 update.** All three top fixes from the original audit have landed (page.tsx three-hook extraction, `insightToAnomaly` colocation, `synthesize()` lift). Phase 2 added two strong deep moves: the `DataSource` seam (`lib/data-source/`) and the domain-tool `mcp-server-olist/` sibling package. The current audit reflects the post-Phase-2 state; the four pattern files are kept as worked examples (two RESOLVED, two updated).
+---
 
 ## The through-line
 
-**Complexity is the enemy. Deep modules are the weapon.** A deep module hides a lot of behavior behind a small interface — the caller learns a thin contract, the body absorbs the mess. The 2026-06-02 audit identified `McpClient`, `runAgentLoop`, and `coverageFor` as the deep canon and a 817-LOC client component as the worst shallow offender. The 2026-06-15 audit records that the page got extracted (817→462 LOC + three hooks) and the codebase grew two new deep modules at the seam level: `DataSource` (a 73-LOC interface with two adapter implementations behind it) and the `makeDataSource` factory (hides adapter selection, OAuth, subprocess spawn, dispose semantics).
+> **Complexity is the enemy. Deep modules are the weapon.**
 
-```
-The audit, ranked (2026-06-15)
-
-  ┌─ what's deep and earns its place ───────────────────────┐
-  │ DataSource seam      (interface 72 LOC + ~600 LOC behind it)│  ← NEW canon
-  │ BloomreachDataSource (214 LOC, was McpClient — rename)  │
-  │ OlistDataSource      (197 LOC, subprocess adapter)       │
-  │ makeDataSource fac.  (113 LOC, hides 4 orthogonal facts) │
-  │ runAgentLoop         (one fn, 4 callers, recovery lifted)│
-  │ mcp-server-olist     (3 domain tools, no general SQL)    │
-  │ coverageFor + cats   (pure schema gate, unchanged)       │
-  └────────────────────────────────────────────────────────┘
-                       │
-                       │  contrast with…
-                       ▼
-  ┌─ where complexity leaks upward (much smaller now) ─────┐
-  │ InsightCard.tsx      (495 LOC, inline-CSS heavy)        │  ← new ceiling
-  │ synthesisInstruction (×4, partial pull-down opportunity)│
-  │ lib/mcp/client.ts    (17-line shim, honest trade-off)   │
-  └────────────────────────────────────────────────────────┘
-
-  RESOLVED since 2026-06-02
-    app/page.tsx — three hooks extracted, 817→462 LOC
-    insightToAnomaly — colocated + intentional-drop comment + round-trip test
-    synthesize() ×2 — lifted into runAgentLoop as parseResult/recoveryPrompt
-```
-
-## How to read this guide
-
-Two passes:
-
-1. **`audit.md`** — the one-pass survey. Walks the eight APOSD lenses against the codebase: complexity hotspots, deep vs shallow modules, hides and leaks, layers and pass-throughs, configuration ownership, error strategies, readability, and the red-flags capstone. Lenses with nothing get one line; lenses with significant findings cross-link to the deep walks below.
-
-2. **`01-` through `04-`** — the discovered pattern files. Each one is a deep walk on a single design move the repo actually exercises. Read in order; later files build on earlier ones.
-
-## Files
-
-```
-.aipe/study-software-design/
-  README.md                                 (you are here)
-  00-overview.md                            one-page orientation
-  audit.md                                  PASS 1 — the 8-lens audit, ranked (post-Phase-2)
-  01-mcp-client-deep-module.md              deep canon, now BloomreachDataSource (rename note)
-  02-shallow-module-page-component.md       RESOLVED — worked example of the shallow→deep fix
-  03-insight-anomaly-silent-leak.md         RESOLVED — worked example of colocate-comment-test
-  04-synthesize-recovery-duplication.md     RESOLVED — worked example of lift-to-loop
-```
-
-The four pattern files all carry the original verdict at the top so the reader sees what the smell looked like before the fix, and a RESOLVED banner naming what changed. Three of the four show a fix that landed; the fourth (01-) documents the rename and points to where the new deep-module case study (the DataSource seam) is covered in `audit.md`.
-
-## The top three findings — original set ALL RESOLVED, current set is smaller
-
-The 2026-06-02 top three (page.tsx three-hook extraction, `insightToAnomaly` colocation, `synthesize()` lift) have all landed. The 2026-06-15 top three are LOW or MEDIUM:
-
-1. **Clean up `InsightCard.tsx` styling drift** (495 LOC, ~150 inline `style` objects). Pull into named `CSSProperties` constants per section.
-2. **Lift `buildSynthesisInstruction(shape)` into `runAgentLoop`.** Same play as the resolved `synthesize()` lift, smaller scale.
-3. **Rename `r` / `cp` in `lib/insights/derive.ts`.** Trivial.
-
-See `audit.md → Top 3 ranked findings` for the full list and the audit's per-lens diagnoses.
-
-## What blooming insights does well, what shows up as debt
-
-**Honest assessment (2026-06-15).** This codebase is small (~5,000 LOC of source + ~5,000 LOC of tests + the new `eval/` and `mcp-server-olist/` packages), young, and shipped by one person under demo pressure. APOSD wasn't the explicit lens — but Phase 2 was the first refactor where the design primitives drove the moves. The DataSource seam was designed as a deep module; the domain-tool MCP server is an explicit special-purpose-vs-general-purpose call; the `synthesize()` lift is a textbook "define it out of existence." The wins are real: `BloomreachDataSource` (cache + spacing + retry behind one `callTool`); `runAgentLoop` (one function shared by four agents, now with the recovery decision absorbed); `makeDataSource` (one factory hiding four orthogonal facts); `mcp-server-olist` (three domain tools instead of a general SQL hammer); `categories.ts` (pure schema gate the route trusts without thinking). The remaining debt is concentrated in styling (one component) and one partial pull-down (`synthesisInstruction` boilerplate ×4). The biggest open trade-off — `lib/mcp/client.ts` as a 17-line shim instead of a full delete-and-rename — is honest, not lazy: keeping a working seam alive while callers migrate is cheaper than 16 test renames for no behavioral win.
+A deep module is a small interface over a big body. The fewer decisions a caller must know about, the less complexity propagates per change. APOSD's whole book is a toolkit for widening that gap between interface size and body size. This codebase teaches that lesson twice — once at the data layer, once at the agent layer — which is the single most load-bearing software-design move in the repo.
 
 ---
+
+## Reading order
+
+```
+  ┌─ orient ──────────────────────────────────────┐
+  │  00-overview.md   one-page system shape +     │
+  │                   where each APOSD primitive  │
+  │                   shows up                    │
+  └────────────────────┬──────────────────────────┘
+                       │
+  ┌─ Pass 1 ───────────▼──────────────────────────┐
+  │  audit.md         the 8-lens APOSD audit;     │
+  │                   one section per lens; cross-│
+  │                   links to pattern files      │
+  └────────────────────┬──────────────────────────┘
+                       │
+  ┌─ Pass 2 ───────────▼──────────────────────────┐
+  │  01-deep-module-data-source.md                │
+  │  02-information-hiding-aptkit-bridge.md       │
+  │  03-pulled-complexity-down-readndjson.md      │
+  │  04-shallow-module-page-component-resolved.md │
+  └───────────────────────────────────────────────┘
+```
+
+Open `00-overview.md` first if you have not seen the codebase before — it places every primitive on one map. Open `audit.md` first if you have. Pattern files are independent — read in any order.
+
+---
+
+## What earns its own pattern file
+
+A *recurring design move the repo makes deliberately*. A red flag firing in one file is a lens finding; a pattern file is for the shape the codebase exercises load-bearingly. Four files survived that bar:
+
+```
+  ┌──────────────────────────────────────────────────────────┐
+  │ 01 deep-module-data-source                               │
+  │    a 73-LOC interface hiding a 730-LOC body              │
+  │    (BloomreachDataSource + SyntheticDataSource).         │
+  │    the textbook example of a deep module.                │
+  ├──────────────────────────────────────────────────────────┤
+  │ 02 information-hiding-aptkit-bridge                      │
+  │    three 200-LOC adapter classes that bridge AptKit's    │
+  │    generic primitives to Blooming's owned types.         │
+  │    same APOSD lesson at a different scale.               │
+  ├──────────────────────────────────────────────────────────┤
+  │ 03 pulled-complexity-down-readndjson                     │
+  │    one 64-LOC kernel that owns the fetch → reader →      │
+  │    decoder → split('\\n') → JSON.parse loop for FOUR     │
+  │    streaming surfaces.                                   │
+  ├──────────────────────────────────────────────────────────┤
+  │ 04 shallow-module-page-component-resolved                │
+  │    a worked example — what `app/page.tsx` USED to be     │
+  │    (817 LOC, 15 useState, 8 concerns at one altitude),   │
+  │    why it was shallow, and the 3-hook extraction that    │
+  │    fixed it. Useful as the negative-then-positive case.  │
+  └──────────────────────────────────────────────────────────┘
+```
+
+Everything else lives in `audit.md` under its lens.
+
+---
+
+## Source + recommended reading
+
+The primitives in these files come from John Ousterhout's *A Philosophy of Software Design* (2nd ed). Read the book; this guide does not reproduce its prose. The repo's chapter-by-chapter excerpts live at `.aipe/read-aposd/` — those are where the conceptual depth sits. The files here spend their weight on what the primitives look like *in this codebase*.
+
+---
+
+## Cross-links
+
+  → `.aipe/read-aposd/` — chapter-by-chapter book treatment.
+  → `.aipe/audits/design-2026-06-15.md` — action-shaped audit; per-finding refactor specs.
+  → `.aipe/study-system-design/` — system architecture (services, boundaries, scaling), a different altitude.
+  → `.aipe/audit-refactor-page-decomposition/` — the 5-seam reframing that retired the shallow-module case.

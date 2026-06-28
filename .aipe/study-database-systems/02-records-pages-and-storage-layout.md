@@ -1,143 +1,236 @@
-# Records, Pages, and Storage Layout
+# Records, pages, and storage layout
 
-## Subtitle
+Industry standard · Storage engine internals
 
-How a database physically arranges bytes on disk · Industry standard.
+## Zoom out — where storage layout would live, and what's there instead
 
-## Zoom out, then zoom in
+Real database engines spend most of their cleverness on storage layout — how rows pack into pages, how pages live on disk, how the buffer pool warms them into memory, what gets read together. None of that exists here. The "table" is a JavaScript `Map`; the "page" is whatever V8 happens to allocate; the "buffer pool" is the heap.
 
 ```
-  Zoom out — where storage layout lives in a normal app
+  Zoom out — where storage layout would matter (and what's there)
 
-  ┌─ UI ──────────────────────────────────────────┐
-  │  reads/writes records, doesn't see pages       │
-  └────────────────────┬──────────────────────────┘
-                       │
-  ┌─ Service ──────────▼──────────────────────────┐
-  │  queries refer to rows, not byte offsets       │
-  └────────────────────┬──────────────────────────┘
-                       │
-  ┌─ Storage engine ───▼──────────────────────────┐
-  │  ★ STORAGE LAYOUT ★                            │
-  │  rows → pages → segments → files               │
-  │  cache hot pages in the buffer pool            │
-  └────────────────────┬──────────────────────────┘
-                       │
-  ┌─ Disk ─────────────▼──────────────────────────┐
-  │  bytes on an SSD, page-aligned                 │
-  └───────────────────────────────────────────────┘
+  ┌─ Service layer ──────────────────────────────────────────────┐
+  │  putInsights · getInsight · listInsights                      │
+  └───────────────────────────────┬──────────────────────────────┘
+                                  │ Map.get / Map.set
+  ┌─ "Storage" layer ──────────────▼──────────────────────────────┐
+  │  ★ THIS CONCEPT ★                                              │
+  │  Map<sessionId, SessionFeed>           ← the "namespace"       │
+  │    Map<string, Insight>      insights   ← the "table"          │
+  │    Map<string, Investigation> investigations                   │
+  │    Map<string, Anomaly>      anomalies                         │
+  │                                                                │
+  │  no page layout, no row format, no buffer pool                 │
+  │  every Insight is a JS object living wherever V8 put it        │
+  └────────────────────────────────────────────────────────────────┘
+                                  │ (provider owns real storage)
+                                  ▼
+                       Bloomreach Engagement
 ```
 
-### Verdict for this codebase
+## Zoom in — the question this concept answers
 
-**Not yet exercised.** No database, no pages, no rows on disk. The closest cousin is a JavaScript `Map`. `Map.get(key)` is one V8 hash-table probe and a pointer dereference. No pages, no buffer pool, no row format. V8's heap is the storage engine and we don't tune it.
+In a real engine: "what's on disk and how does it get into memory efficiently?" Here: "what does a 'row' look like, what does a 'table' look like, and what guarantees do we have about layout?" Answer: a row is a TypeScript object, a table is a `Map<string, T>`, and the only layout guarantee is insertion order. That's it.
 
-### When this becomes load-bearing
+## Structure pass — the skeleton
 
-Storage layout matters only when a query is CPU- or I/O-bound on bytes we own — none of this codebase's code is that. The trigger is **adding a real engine** (Postgres for saved insights, DuckDB for analytics, etc.). At that moment the access pattern dictates the layout: row-store for OLTP point lookups, columnar for analytical scans across millions of rows.
+### Layers in a real engine vs this repo
 
-## Structure pass
+```
+  layer                  real RDBMS                  this repo
+  ─────────────────      ─────────────────           ─────────────────────
+  table                  named relation, schema      Map<string, T>
+  row format             tuple bytes (NULL bitmap,   JS object reference
+                         varlen, fixed cols)
+  page                   8KB block, header + slots   N/A (heap allocation)
+  buffer pool            page cache in RAM           N/A (heap is the cache)
+  on-disk file           .ibd / heap file            N/A (no persistence)
+  free space mgmt        FSM page, vacuum            N/A (GC handles it)
+```
 
-Skipped — no codebase instance.
+### Axis: where does locality come from?
+
+In a real engine: from co-locating related rows on the same page (clustered index, table partitioning, columnar layout). Here: from nothing. `Map` insertion order is the only layout discipline, and the iteration order it gives you is the only "scan" you get.
+
+### Seams
+
+The interesting seam is between **the type** (`Insight`, `Investigation`, `Anomaly`) and **the storage** (the `Map`). In a real engine that seam is the row-format codec. Here it's `JSON.stringify`/`JSON.parse` for serialization (when we cross to disk for the demo snapshot) and *nothing* for in-memory storage — the type IS the layout.
 
 ## How it works
 
-(General teaching, since the codebase has no instance.)
-
 ### Move 1 — the mental model
 
-A database row isn't a row on disk. It's a small slice of a fixed-size **page** (typically 4KB or 8KB), and the page is the unit of I/O. The database reads a whole page at a time and pulls the row out of it. This is the same trick the CPU uses with cache lines — you can't read one byte, you read a whole line, so pack what you read together.
+If you've ever done `const users = new Map<string, User>(); users.set(u.id, u);` — that's literally the storage layer of this codebase. There's no second tier, no page cache, no flush. The `User` object lives in the heap wherever V8 put it; the `Map` holds a reference.
 
 ```
-  the pattern — rows packed into fixed-size pages
+  The shape — table-as-Map
 
-       ┌─ page (8KB) ──────────────────────────────────────┐
-       │ header │ row1 │ row2 │ row3 │ ... │ free space    │
-       └────────┴──────┴──────┴──────┴─────┴───────────────┘
-                  ▲       ▲       ▲
-                  │       │       │
-            small rows pack many per page → fewer reads per scan
-
-       ┌─ page (8KB) ──────────────────────────────────────┐
-       │ header │       row1 (BLOB column)                  │
-       └────────┴──────────────────────────────────────────┘
-                  ▲
-                  │
-            big rows fill a page → more reads per scan, worse locality
+      Map<string, Insight>
+   ┌──────────────────────────────────┐
+   │  "abc-123" ───► { id, summary, … }│  ← row 1: reference to heap object
+   │  "def-456" ───► { id, summary, … }│  ← row 2: somewhere else in heap
+   │  "ghi-789" ───► { id, summary, … }│  ← row 3
+   └──────────────────────────────────┘
+       ▲                ▲
+       │                │
+       primary key      "row" = JS object reference
+       (hash-indexed)   no co-location guarantees
 ```
 
-### Move 2 — the moving parts
+### Move 2 — the walkthrough
 
-**Move 2a — pages.** Fixed-size I/O units, the unit the buffer pool caches. If your row is 200 bytes, you fit ~40 of them on an 8KB page; a sequential scan of 1M rows is ~25K page reads, not 1M.
+#### A "row" is a TypeScript interface
+
+The schema lives in `lib/mcp/types.ts`:
+
+```ts
+// lib/mcp/types.ts (Insight shape)
+export interface Insight {
+  id: string;
+  timestamp: string;
+  severity: Severity;
+  headline: string;
+  summary: string;
+  metric: string;
+  change: { value: number; direction: 'up' | 'down'; baseline: string };
+  scope: string[];
+  source: 'monitoring';
+  evidence?: Array<{ tool: string; result: unknown }>;
+  impact?: string;
+  history?: unknown;
+  category?: string;
+}
+```
+
+In a real engine the row format would specify byte offsets per column, NULL bitmap position, varchar length prefix. Here it specifies *only* what TypeScript checks at compile time — at runtime the object is a plain V8 hidden-class instance. Optional fields (`?`) are absent properties, not NULL markers.
+
+The deliberate convention in this repo: **new fields stay optional so older snapshots still validate.** From the project context: "new fields stay optional so older snapshots still validate." That's the schema-evolution discipline that substitutes for a migration system.
+
+#### A "table" is `Map<string, T>` keyed by primary key
+
+```ts
+// lib/state/insights.ts:8-12
+type SessionFeed = {
+  insights: Map<string, Insight>;
+  investigations: Map<string, Investigation>;
+  anomalies: Map<string, Anomaly>;
+};
+```
+
+Annotation:
+  - The key type is `string` — always the `id` (or `insightId` for investigations). No composite keys, no autoincrement, no surrogate-vs-natural choice. The key is supplied by the row.
+  - The value type is the row type directly. There's no row codec, no serialization, no buffer pool. The value is a heap reference.
+  - There's *no* secondary structure — no separate index Map, no sorted view, no by-severity bucket. If you want insights-by-severity, you iterate the whole Map and filter. That's a full scan. → see `03-btree-hash-and-secondary-indexes.md`.
+
+#### A "scan" is `Map.values()`
+
+```ts
+// lib/state/insights.ts:81-84
+export function listInsights(sessionId: string): Insight[] {
+  const s = state.get(sessionId);
+  return s ? [...s.insights.values()] : [];
+}
+```
+
+Annotation:
+  - `Map.values()` returns an iterator in **insertion order**. That is the entire scan story.
+  - Spreading into an array materializes the full result set every call — no streaming, no cursor, no LIMIT/OFFSET pagination. The dataset is small enough (today's briefing is ~6–12 insights) that this is fine.
+  - There is no equivalent of an index-only scan, a covering index, or a sequential scan with a WHERE pushdown. The filter, if any, happens in JS on the array.
+
+#### "Pages" don't exist — V8 heap is the only layout
+
+In a real engine, the moment you store thousands of rows you start caring about which rows share a page, because reading one row brings the rest of its page into the buffer pool. Here, every `Insight` is a separate heap allocation. There is no spatial locality, no read-ahead, no page-level eviction.
 
 ```
-  bridge: think of a fetch waterfall. one HTTP request can return a list of 50
-          items, or a single item. you pay one RTT either way. pages are the same
-          tradeoff at the disk level.
+  Real engine                       This repo
+
+   ┌─ page (8KB) ─────┐                heap (V8-managed)
+   │ row 1 │ row 2 │  │             ┌──────────────────────┐
+   │ row 3 │ row 4 │  │             │ obj1                 │
+   │ row 5 │ row 6 │  │             │       obj2           │
+   └──────────────────┘             │              obj3    │
+   read one → all in RAM            │  obj4                │
+                                    └──────────────────────┘
+                                    references in a Map; no co-location
 ```
 
-**Move 2b — row vs columnar layout.** Row-store packs all of a row's columns together (good for "give me this user's row" queries). Column-store packs all values of one column together (good for "give me the average of this column across 1M rows" queries). Same data, different physical layout, different access patterns win.
+The cost difference doesn't matter at the scale this app runs at. The conceptual difference matters when you try to reason about *why* a real database is fast at things like "give me all insights from the last hour" — the answer is "they're on adjacent pages," and the equivalent here is "you iterate every entry."
 
+#### The committed demo snapshot is the only "on-disk format"
+
+When state actually has to cross to disk, the format is JSON:
+
+```ts
+// lib/state/investigations.ts:34-37
+const all = readJson(CACHE_FILE);
+all[insightId] = events;
+try {
+  writeFileSync(CACHE_FILE, JSON.stringify(all));
 ```
-  row-store           column-store
-  ──────────          ────────────
-  [u1: name, age, x]  names:  [u1, u2, u3, u4, ...]
-  [u2: name, age, x]  ages:   [u1.age, u2.age, ...]
-  [u3: name, age, x]  x:      [u1.x, u2.x, u3.x, ...]
-  [u4: name, age, x]
-```
 
-**Move 2c — locality and the heap.** A Postgres heap is unordered — rows go wherever there's space. Clustered indexes (Postgres `CLUSTER`, MySQL InnoDB primary key) re-order the heap to match an access pattern. Without clustering, rows logically near each other can be physically scattered, so a "give me all insights from this week" scan touches more pages than it needs to.
+Annotation:
+  - Format: a single JSON object, keyed by primary key, value is the row. Same shape as the in-memory Map.
+  - Write: whole-file rewrite. Every save reads the entire file, mutates the in-memory object, writes it back. That's `O(n)` per write — fine for tens of investigations, would be a disaster for thousands. Real DBs solved this with append-only files + checkpointing (→ see `07-wal-durability-and-recovery.md`).
+  - No row-level locking, no fsync discipline, no atomic rename. A crash mid-write leaves a truncated JSON file (which the read-side handles with `try/catch` → returns `{}`).
 
-### Code in this codebase
-
-No codebase instance today. The closest analog is the `Map` in `lib/state/insights.ts` — a V8 hash table that doesn't expose pages or layout. If you're learning this concept for the first time, the right move is to mock up a small Postgres locally and read its EXPLAIN output; this codebase won't teach you record-and-page mechanics.
-
-The closest cousin, side-by-side:
-
-```
-  lib/state/insights.ts  (lines 4–6)
-
-  const insights      = new Map<string, Insight>();
-  const investigations = new Map<string, Investigation>();
-  const anomalies     = new Map<string, Anomaly>();
-       │
-       └─ V8 hash table. No pages. At ~10-50 insights per briefing this is
-          correct. If this Map ever held 100K insights we'd want a real
-          engine — Postgres for saved/historical insights, or an external KV
-          for ephemeral cross-instance state.
-```
+This is the closest the codebase gets to a "storage format," and it's a dev-only convenience, not a production path.
 
 ### Move 3 — the principle
 
-**Physical layout determines which queries are cheap.** A schema that's normalized into five tables looks elegant on paper, but if your access pattern always joins those five tables on the same key, you're paying for five separate page lookups every time. Picking row vs column store, picking a clustering key, picking a fill factor — these are all bets on which access pattern is hot.
+Storage layout matters when *getting bytes from disk to CPU* is the bottleneck. When your dataset fits in RAM and your durability requirement is zero, the layout question collapses: store whatever object you have, in whatever order you got it. The discipline of database storage engines is what you reach for the moment one of those two assumptions breaks.
 
 ## Primary diagram
 
-Skipped — no codebase instance to recap.
+```
+  Storage layout for this repo — flat and reference-shaped
+
+  ┌─ Map<sessionId, SessionFeed> ────────────────────────────┐
+  │                                                            │
+  │  "session-A" ──► SessionFeed                              │
+  │                  ├── insights:       Map<string, Insight> │
+  │                  │     "ins-1" ─► { id, ... }             │
+  │                  │     "ins-2" ─► { id, ... }             │
+  │                  ├── investigations: Map<string, Inv>     │
+  │                  └── anomalies:      Map<string, Anomaly> │
+  │                                                            │
+  │  "session-B" ──► SessionFeed                              │
+  │                  ├── insights                              │
+  │                  ├── investigations                        │
+  │                  └── anomalies                             │
+  └────────────────────────────────────────────────────────────┘
+       ▲             ▲                ▲
+       │             │                │
+   namespace     "table"          "row" (JS object reference)
+   (sessionId)   (named Map)      (heap-allocated, no layout discipline)
+```
 
 ## Elaborate
 
-Storage layout is one of the few database topics where the abstraction *almost* matters at every layer of the stack. CPU cache lines, OS page cache, database pages, columnar parquet files — they're all the same trick at different scales: read more than you need so the next read is free, and arrange data so the things you read together are stored together.
+The classical references for storage layout (Hellerstein & Stonebraker's "Anatomy of a Database System," Pavlo's CMU 15-445) treat the page as the atomic unit because disk I/O is the dominant cost. When your "disk" is RAM and your "page" is a heap allocation, those lessons reshape: you start caring about *cache lines* (CPU L1/L2/L3) and *allocator behavior* instead of page layout. Columnar engines like DuckDB and ClickHouse push this further — they rearrange data by column to maximize SIMD throughput. None of that is relevant for ~12 insights in a Map, but it's the next altitude of "storage layout matters" if the local dataset ever grew.
 
-For this codebase, the relevant lift is none until persistence enters the picture. The MCP cache (`Map<key, {result,expiresAt}>`) doesn't care about layout — it's hash-lookup, no scans.
-
-Cross-link: `study-data-modeling` would own the conversation about how to SHAPE the rows. This file owns the conversation about how the rows would be PHYSICALLY laid out — relevant only once both files have something to point at.
+For this codebase, the actionable read is: the storage layout question gets *answered when product asks for a feature that requires it.* "Show me yesterday's briefing" requires persistence + a time index. "Show me which insights I've already investigated" requires either a flag column or a join. Neither has been asked for. When they are, the storage layout decision lands at the same time as the datastore decision.
 
 ## Interview defense
 
-**Q: "How does your app store its data on disk?"**
-Honest answer: it doesn't. State lives in `Map`s inside the Node process; auth lives in an encrypted cookie. The upstream data warehouse is Bloomreach, and they handle storage layout — we never see it. If I were adding persistence, I'd start with Postgres for the saved-insights table, take the 8KB page default, and only revisit layout once a query is provably bound on page I/O.
+> Q: "What's the storage layout in this app?"
 
-Diagram: a generic page diagram with rows packed; an arrow off to "our Maps live here, none of this applies yet."
+Verdict: there isn't one in the database-engine sense. The "tables" are `Map<string, T>` keyed by primary key; the "rows" are TypeScript interfaces; every value is a V8 heap reference with no co-location guarantees. The only on-disk format is JSON — used dev-only for the auth cache and investigation cache, and for the committed demo snapshot.
 
-Anchor: `package.json` has no DB dependencies.
+```
+  the picture you draw — Map → row reference
+
+   Map<"id", Insight>  ──►  { id, summary, change, ... }
+       (hash index)             (V8 heap object)
+```
+
+The load-bearing point: this app's working dataset is tiny (~12 insights per briefing), it fits trivially in RAM, and it's all derivative from upstream Bloomreach. There's no I/O bottleneck to optimize against, so the storage engine machinery doesn't earn its weight.
+
+> Q: "What changes the day you need real storage?"
+
+Two things land together: a datastore decision (Postgres? a KV like Redis? a managed serverless DB?) and a row format (do we serialize the JS object as JSON in a `jsonb` column, or do we shred it into typed columns?). The current `Insight` type is JSON-shaped — variant by source, optional fields — so the first cut is almost certainly a `jsonb` column with a few indexed top-level fields (`severity`, `timestamp`). Real schema-shred comes later if query patterns demand it.
 
 ## See also
 
-- `01-database-systems-map` — what storage actually exists here (none)
-- `03-btree-hash-and-secondary-indexes` — the lookup structures, also not exercised
-- `04-query-planning-and-execution` — also not exercised
-- `study-data-modeling` — how to shape what you'd store
-
----
+  - [`03-btree-hash-and-secondary-indexes.md`](./03-btree-hash-and-secondary-indexes.md) — what indexes you'd add on top of these "tables"
+  - [`07-wal-durability-and-recovery.md`](./07-wal-durability-and-recovery.md) — what "no on-disk format" means for restart
+  - `.aipe/study-data-modeling/` — the schema shape and access patterns

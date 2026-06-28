@@ -1,295 +1,198 @@
-# Stale embeddings (the index drifts from the source it was built from)
+# 09 — stale embeddings
 
-**Industry name(s):** embedding staleness / index freshness, re-indexing, embedding drift, source-of-truth lag
-**Type:** Industry standard · Language-agnostic
-
-> An embedding is a snapshot of a document at the moment it was embedded; when the source changes, the vector is stale and retrieval returns yesterday's answer — so an index needs a freshness policy (TTL, change-detection, or a `embedding_stale_at` marker); blooming insights has no embeddings, but its 60-second TTL cache is the exact freshness/staleness mechanism, and `embedding_stale_at` ↔ cache expiry is a direct parallel.
-
-
----
+**Subtitle:** Freshness tracking on embedded text · Industry standard (Case B)
 
 ## Zoom out, then zoom in
 
-**Zoom out — the bigger picture.** Stale embeddings is a *freshness policy* on the Vector store, parallel to the TTL policy `McpClient` already enforces on tool results (`expiresAt` check at `lib/mcp/client.ts` L40, set at L65, no-cache-on-error at L58–L60). An embedding is a cache of a document's meaning at embed-time, so the same instinct applies — it goes stale when the source changes. blooming insights has no vector store and so no staleness problem, but the *pattern* it would use is already in the codebase, applied to a different payload.
+**Case B.** Embeddings go stale when their source text changes. The
+embedding still exists, still gets retrieved, but it represents the *old*
+content. Result: technically successful retrieval, semantically wrong
+answer.
 
 ```
-  Zoom out — where staleness sits (WOULD BE; parallel to TTL cache)
+  Zoom out — staleness sits at the corpus update boundary
 
-  ┌─ Source document ────────────────────────────────┐
-  │  e.g. past investigation, re-run with new data    │
-  └─────────────────────────┬────────────────────────┘
-                            │  changes
-  ┌─ Vector store ──────────▼────────────────────────┐  ← we are here
-  │  ★ embedding_stale_at? / source_version match? ★  │
-  │  parallel to McpClient's expiresAt > Date.now()   │
-  │  parallel to no-cache-on-error                    │
-  └─────────────────────────┬────────────────────────┘
-                            │
-  ┌─ Retriever ─────────────▼────────────────────────┐
-  │  stale? → re-embed or skip                        │
-  │  fresh? → return                                  │
-  └──────────────────────────────────────────────────┘
-
-  In this codebase: Not yet implemented — String.includes
-  intent matching in lib/agents/intent.ts is what exists
-  instead. The same freshness shape IS in the codebase for
-  TTL caching (lib/mcp/client.ts L40, L65) — different payload.
+  ┌─ Corpus row ───────────────────────────────┐
+  │  source text  | embedding | last_embedded  │  ← we are here
+  │  "...edited..."   v_old        2 days ago  │   (Case B)
+  │                                             │
+  │  ★ STALE: text changed, embedding didn't ★ │
+  └─────────────────────────────────────────────┘
 ```
-
-**Zoom in — narrow to the concept.** The question is: an embedding was computed from a document at one instant — when the document changes, how does the index avoid serving the now-wrong vector? Unlike a TTL cache, nothing expires an embedding automatically, so a changed document silently keeps returning its old vector forever. The model reads outdated content and answers confidently wrong with no error anywhere. How it works walks the three freshness signals (TTL, source-version hash, change-feed invalidation), why no-cache-on-error transfers directly, and the rule that "fresh enough" is a policy decision, not a constant.
-
----
 
 ## Structure pass
 
-**Layers.** Three WOULD-BE layers, plus a real-codebase analog: the source document (changes over time), the vector store with a freshness marker (`embedding_stale_at`, source-version hash), and the retriever that consults the marker before serving. The parallel in real code: `McpClient`'s TTL cache (`expiresAt` check, no-cache-on-error) — same shape, different payload.
-
-**Axis: lifecycle.** When does each vector go from "fresh" to "stale," and what decides? This axis is the right lens because the entire file is about *time-bound validity* — an embedding has a lifecycle tied to its source, and the index needs a policy to track it. State is downstream (the marker is *how* lifecycle is recorded); the upstream question is "when does this thing expire."
-
-**Seams.** The cosmetic seam is between the source document and the vector store as an indexing relationship — both are write-side. The load-bearing WOULD-BE seam is between the vector store (with marker) and the retriever's decision (stale → re-embed or skip; fresh → serve): lifecycle flips here from "tracked" to "acted upon." This is the seam blooming insights *already* implements for TTL tool-result caching — the pattern is in-codebase, just for a different payload. The danger this seam guards against is silent staleness — unlike a 404 or a thrown error, stale embeddings return wrong-but-plausible answers with no signal.
-
-```
-  Structure pass — stale embeddings (WOULD BE)
-
-  ┌─ 1. LAYERS ───────────────────────────────────┐
-  │  source document (changes over time)           │
-  │  vector store (with freshness marker)          │
-  │  retriever (consults marker)                   │
-  │  (real-code analog: McpClient TTL cache)       │
-  └────────────────────────┬───────────────────────┘
-                           │  pick the axis
-  ┌─ 2. AXIS ─────────────▼────────────────────────┐
-  │  lifecycle: when does each vector expire and   │
-  │  what decides?                                 │
-  └────────────────────────┬───────────────────────┘
-                           │  trace across layers, find flips
-  ┌─ 3. SEAMS ────────────▼────────────────────────┐
-  │  source↔store: cosmetic (index relationship)   │
-  │  store↔retriever: LOAD-BEARING (would be)      │
-  │    "tracked" → "acted upon"                    │
-  │    silent staleness if seam absent             │
-  └────────────────────────┬───────────────────────┘
-                           ▼
-                   Block 4 — How it works
-```
-
-The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+  → **One axis to trace — freshness.** Each corpus row has TWO timestamps:
+    when its content last changed, when its embedding was last computed.
+    Staleness = content_updated_at > embedding_updated_at.
 
 ## How it works
 
-**Mental model.** An embedding index *is* a cache: `Map<docId, vector>` where each vector is a derived value computed from a source document. Every truth you know about caches applies — cache invalidation is the hard part, stale reads are silent, and you need an expiry or invalidation rule. This codebase's TTL cache (`Map<key, {result, expiresAt}>` inside the MCP client wrapper) is the same structure with the same problem already solved for tool results.
+### Move 1 — the mental model
+
+Same shape as a stale cache: the data behind the key changed but the
+cached value didn't. The fix is the same: invalidate on write, recompute
+on access (or schedule).
 
 ```
-  TTL cache (tool results)              embedding index (vectors)
-  ──────────────────────────────        ──────────────────────────────
-  Map<key, {result, expiresAt}>         Map<docId, {vector, staleAt?}>
-  serve if expiresAt > Date.now()       trust if source unchanged
-  expires after 60s → re-fetch          source changes → re-embed
-  PROBLEM SOLVED                        SAME PROBLEM, must solve
+  Lifecycle of an embedding
+
+  initial:                       Day 1
+    text:      "We use Sequelize ORM"
+    embedding: v_1
+    embedded_at: Day 1
+
+  edit:                          Day 30
+    text:      "We use Drizzle ORM" (updated!)
+    embedding: v_1                 (NOT updated — stale!)
+    embedded_at: Day 1
+    content_updated_at: Day 30
+
+  query "what ORM do we use?":
+    → retrieves v_1 → maps to "Sequelize"
+    → user sees wrong answer
 ```
 
-The body walks how an embedding goes stale and the three freshness policies.
+### Move 2 — the step-by-step walkthrough
 
----
+**For blooming insights' hypothetical RAG (diagnosis grounding),
+staleness is mostly a non-issue.** Investigations are append-only —
+once created, the diagnosis text doesn't change. The recommendations
+might gain user edits (see `01-llm-foundations/09-user-override-locks.md`),
+but those are separate fields you wouldn't include in the embedding.
 
-### How an embedding goes stale
+**Where staleness WOULD bite if you embedded other corpora:**
+  - Agent prompts (`lib/agents/legacy-prompts/*.md`) — get edited as the
+    prompts evolve. If you RAG over them, every edit needs re-embedding.
+  - Schema metadata — Bloomreach project schemas change as new events get
+    tracked. A `schemaSummary` embedding would go stale every week.
 
-A vector is computed once from a document's text. Three independent events make it stale, and none of them touch the vector:
+**The tracking pattern:**
 
-```
-  1. SOURCE CHANGED   document edited / re-run with new data
-                      → vector describes the OLD text
-  2. MODEL CHANGED    embedding model swapped (02-embedding-model-choice)
-                      → vector lives in the OLD model's space; cosines meaningless
-  3. SCHEMA/CHUNKING  chunk boundaries changed (03-chunking-strategies)
-                      → vector covers a DIFFERENT slice than the index assumes
-```
+```typescript
+// hypothetical lib/rag/store.ts schema
+interface CorpusRow {
+  id: string;
+  text: string;
+  embedding: number[];
+  content_updated_at: string;     // ISO timestamp
+  embedded_at: string;            // ISO timestamp
+  embedding_model: string;        // see 02-embedding-model-choice exercise
+}
 
-Case 1 is the everyday one; case 2 is catastrophic (the *whole* index is stale — a model swap means re-embed everything, the breakpoint from `02`); case 3 happens on any re-chunking. The danger across all three: the vector still *works* (cosine returns a number), so there is no error — just a wrong answer.
-
-### Policy A: TTL (exactly the TTL cache's approach)
-
-The simplest policy is the one the codebase already runs for tool results: stamp each vector with an expiry and re-embed on read after it lapses. `embedding_stale_at` is the literal analog of `expiresAt`.
-
-```
-  embed doc → { vector, embedding_stale_at: now + TTL }   ← like expiresAt
-  on read:
-    embedding_stale_at > now ?  → trust the vector
-                                → else re-embed before use
-```
-
-TTL is blunt — it re-embeds documents that did not change (wasteful) and serves changed documents until the TTL lapses (briefly stale). But it is dead simple and bounds staleness to the TTL window, exactly as the 60-second cache bounds tool-result staleness.
-
-### Policy B: change-detection (content hash / version)
-
-Better: re-embed only when the source actually changed. Store a content hash (or a source version) alongside the vector; on update, compare hashes and re-embed only on mismatch. This is what incremental indexing (`10-incremental-indexing.md`) builds on.
-
-```
-  stored:  { vector, sourceHash: "a1b2" }
-  on source update:
-    hash(newText) == sourceHash ?  → vector still valid, skip
-                                   → else re-embed, update hash + mark fresh
+function isStale(row: CorpusRow): boolean {
+  return new Date(row.content_updated_at) > new Date(row.embedded_at);
+}
 ```
 
-Change-detection re-embeds the minimum — only genuinely changed documents — at the cost of tracking a hash per vector and a write-time comparison.
+**Two re-embed strategies:**
 
-### Policy C: no-stale-on-error (the codebase's other half)
+  → **Eager:** on every text update, re-embed in the same transaction.
+    Simple, correct, adds latency to the write path. Best for low-write
+    workloads (which is the diagnosis-grounding case).
 
-The TTL cache does not only expire — it refuses to cache errors so a failure cannot poison future reads. The embedding analog: if re-embedding fails (the embedding API errors), do *not* overwrite the existing vector with a bad/empty one and do *not* mark it fresh — keep the last-good vector and leave it marked stale to retry. A failed re-embed must not corrupt the index, exactly as a failed tool call must not corrupt the cache.
+  → **Lazy / scheduled:** mark stale, re-embed in a background job
+    nightly. Cheaper write path, longer staleness window. Best for
+    high-write workloads where the embedding latency would dominate.
 
-```
-  re-embed attempt fails (API error)
-    → keep last-good vector
-    → leave embedding_stale_at in the past (retry next read)
-    → never store an empty/error vector
-  (mirrors no-cache-on-error: failures don't poison the index)
-```
+The right choice depends on how time-sensitive the retrieval is. For
+diagnosis grounding, eager is fine — a new investigation is rare enough
+that paying for the embedding inline is invisible.
 
-### The principle
+### Move 3 — the principle
 
-An embedding index is a cache of derived values, so it inherits every caching discipline: invalidation is the hard part, stale reads are silent and dangerous, and you need an explicit freshness policy — a TTL, a change-detector, or both — plus a no-poison-on-error rule. You already implemented all of this for tool results in the TTL cache; an embedding index would re-implement the identical pattern, with `embedding_stale_at` playing the exact role of `expiresAt`.
+**Track when content changed and when the embedding was last computed.
+Staleness is silent — retrieval still succeeds, the answer is just
+wrong.** A timestamp pair per row is the minimum discipline; re-embed
+synchronously on edit if your write volume allows it.
 
----
-
-### Code in this codebase
-
-**Not yet implemented (embedding staleness).** blooming insights retrieves live via MCP tool calls + EQL, so there is no embedding index to go stale — and notably, *live retrieval has no staleness problem at all*, which is a core reason for the no-RAG decision (`11-rag.md`): a fresh tool call always returns current data, where an embedding index would lag.
-
-The honest analog is exact and present: the 60-second TTL cache in `McpClient` *is* the freshness/staleness mechanism, fully implemented. Every cached tool result carries `expiresAt = Date.now() + 60_000` (`lib/mcp/client.ts` L65); the read path serves it only while `cached.expiresAt > Date.now()` (L40); and error results are never cached (L58–L60) so a failure cannot poison the cache. `embedding_stale_at` would be the direct analog of `expiresAt`, and the no-stale-on-error policy the direct analog of no-cache-on-error. An embedding index's freshness policy would live in `lib/state/` and reuse this exact thinking. The `Project exercises` block below is the primary buildable target.
-
----
-
-## Stale embeddings — diagram
-
-This diagram spans the State layer (the index as a cache) and shows the direct parallel to `McpClient`'s TTL cache. A reader who sees only this should grasp that an embedding is a cached snapshot and needs the same expiry/no-poison policy.
+## Primary diagram
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│  STATE LAYER  — the index IS a cache (parallel to McpClient.cache)  │
-│                                                                      │
-│  McpClient.cache         │
-│    Map<key, {result, expiresAt}>                                    │
-│    read:  expiresAt > now ? serve : refetch                        │
-│    error: NOT cached (no poison)                                    │
-│         ║  same shape  ║                                            │
-│         ▼              ▼                                            │
-│  embedding index (would live in lib/state/)                        │
-│    Map<docId, {vector, embedding_stale_at, sourceHash}>            │
-│    read:  fresh ? trust : re-embed       ◀── embedding_stale_at    │
-│    update: hash changed ? re-embed : skip   ↕ ↔ expiresAt          │
-│    re-embed error: keep last-good, stay stale (no poison)          │
-└──────────────────────────────────────────────────────────────────────┘
+  Staleness detection + re-embed
+
+  ┌─ Row state ──────────────────────────────┐
+  │  text:                "..."              │
+  │  embedding:           [...]              │
+  │  content_updated_at:  2026-05-15         │
+  │  embedded_at:         2026-04-01         │  ← stale!
+  └────────────────┬─────────────────────────┘
+                   │
+                   ▼  on next access or scheduled job
+              ┌─ re-embed ─┐
+              │  embed(text) │
+              │  store        │
+              │  embedded_at  │
+              │  = now()      │
+              └──────────────┘
+                   │
+                   ▼
+            row fresh again
 ```
-
-`embedding_stale_at` is `expiresAt` for vectors; the no-poison-on-error rule is `no-cache-on-error` for the index. The codebase already wrote both — for tool results.
-
----
 
 ## Elaborate
 
-### Where this pattern comes from
+In larger production RAG systems, staleness is a real operational
+concern. Documentation sites that re-publish weekly, knowledge bases
+that get edited daily, support ticket corpora that grow constantly —
+all need a re-embedding cadence and an SLA on freshness.
 
-Embedding staleness is cache invalidation wearing a new hat — "there are only two hard things in computer science: cache invalidation and naming things" applies directly. Search engines have managed index freshness for decades (incremental crawl + re-index). The RAG era re-discovered it: teams shipped embedding indexes, the source documents changed, and retrieval silently served old vectors. The responses are the classic cache responses — TTL, content-hash change-detection, and event-driven invalidation (re-embed on a source-changed event) — plus the RAG-specific catastrophe of a model swap invalidating the *entire* index at once.
-
-### The deeper principle
-
-```
-  cache concern              tool-result cache (HAS)       embedding index (would need)
-  ────────────────────────   ───────────────────────────   ────────────────────────────
-  expiry                     expiresAt (60s)               embedding_stale_at
-  no poison on failure       no-cache-on-error (L58–60)    keep last-good vector
-  invalidate on change       TTL lapse → refetch           hash mismatch → re-embed
-  catastrophic invalidation  (n/a — stateless calls)       model swap → re-embed ALL
-```
-
-The first three rows are the same problem the codebase solved for `McpClient`. The fourth is unique to embeddings: because vectors from different models are incomparable (`02`), changing the model invalidates everything at once — there is no partial migration.
-
-### Where this breaks down
-
-1. **TTL re-embeds the unchanged.** A pure-TTL policy re-embeds documents that never changed when their TTL lapses, wasting embedding-API calls. Change-detection (hashing) avoids this but adds per-vector bookkeeping.
-
-2. **Silent staleness has no error.** Unlike a 429 (which `isRateLimited` catches), a stale embedding throws nothing — cosine returns a number, retrieval succeeds, the answer is just wrong. Staleness is invisible without an explicit freshness marker, which is why the marker is mandatory.
-
-3. **Model-swap invalidation is all-or-nothing.** You cannot mix old-model and new-model vectors in one index (their cosines are meaningless), so a model upgrade forces re-embedding the entire corpus before any query works — the costliest staleness event.
-
-### What to explore next
-
-- **Incremental indexing** (`10-incremental-indexing.md`): how change-detection drives selective re-embedding without a full rebuild.
-- **Embedding model choice** (`02-embedding-model-choice.md`): the model swap that invalidates the whole index.
-- **Caching + rate-limiting** (`../../study-system-design/04-caching-and-rate-limiting.md`): the `McpClient` TTL + no-cache-on-error policy this file parallels.
-
----
+For append-only corpora (like blooming insights' investigations), the
+staleness problem doesn't exist. New rows get embedded; old rows never
+change. This is one reason append-only data shapes are nice to work with
+for RAG.
 
 ## Project exercises
 
-### Add an `embedding_stale_at` freshness policy modeled on the TTL cache
+### Exercise — add `content_updated_at` + `embedded_at` to the store schema
 
-- **Exercise ID:** B2A.2 / B2A.4 (adapted) — the primary buildable target.
-- **What to build:** when the embedding index exists, store each vector with `embedding_stale_at` (the `expiresAt` analog) and a `sourceHash`; on read, trust the vector if fresh else re-embed; on a source update, re-embed only when the hash changed; on re-embed failure, keep the last-good vector and leave it stale (the no-cache-on-error analog). Reuse the exact shape from `lib/mcp/client.ts`.
-- **Why it earns its place:** demonstrates you recognize an embedding index as a cache and apply the codebase's own proven freshness + no-poison policy to it — the cache-invalidation interview signal.
-- **Files to touch:** new `lib/state/embedding-index.ts` (the index with `embedding_stale_at` + `sourceHash`), `lib/mcp/embeddings.ts` (re-embed-on-stale), new `test/state/embedding-index.test.ts` (TTL expiry, hash-change re-embed, no-poison-on-error — mirroring `test/mcp/client.test.ts`).
-- **Done when:** a changed document's vector is re-embedded on next read, an unchanged document's vector is reused, and a re-embed failure leaves the last-good vector intact and still marked stale.
-- **Estimated effort:** 1–2 days
-
-### Handle the model-swap full-invalidation case
-
-- **Exercise ID:** C2.11 (adapted) — catastrophic staleness.
-- **What to build:** tag the index with the embedding model id/version; on a model change, detect the mismatch and mark the *entire* index stale (since cross-model cosines are meaningless), then re-embed all documents before serving any query with the new model.
-- **Why it earns its place:** shows you know the worst staleness event — a model swap invalidates everything, with no partial migration — the senior gotcha from `02`.
-- **Files to touch:** `lib/state/embedding-index.ts` (model-version tag + bulk invalidation), `lib/mcp/embeddings.ts`, `test/state/embedding-index.test.ts`.
-- **Done when:** changing the configured embedding model forces a full re-embed and queries never mix old-model and new-model vectors.
-- **Estimated effort:** 1–4hr
-
----
+  → **Exercise ID:** `study-ai-eng-03-09.1`
+  → **What to build:** Extend `SqliteVecStore` (from `04-vector-databases.md`
+    exercise) to track both timestamps. Add `findStale()` that returns
+    rows where `content_updated_at > embedded_at`. Add a one-shot script
+    that re-embeds all stale rows.
+  → **Why it earns its place:** Locks in the staleness discipline before
+    it can bite. Cheap to add now; painful to retrofit later.
+  → **Files to touch:** `lib/rag/store.ts` (schema), new
+    `scripts/re-embed-stale.ts`.
+  → **Done when:** Editing a stored row's text and re-querying still
+    returns stale embedding (proves the problem); running the re-embed
+    script fixes it.
+  → **Estimated effort:** `<1hr`
 
 ## Interview defense
 
-### What an interviewer is really asking
+**Q: How do you keep embeddings fresh?**
 
-"How do you keep an embedding index fresh?" tests whether you recognize the index as a cache and reach for cache-invalidation discipline. The senior signal is naming TTL vs. change-detection, the silent-failure danger (no error on a stale read), the model-swap full-invalidation gotcha, and — for this codebase — pointing at `McpClient`'s `expiresAt` + no-cache-on-error as the exact pattern to reuse.
-
-### Likely questions
-
-**[mid] What makes an embedding go stale, and why is it dangerous?**
-
-The source document changes but the vector is not recomputed, so retrieval returns a vector describing the old text. It is dangerous because it is silent — cosine still returns a number, retrieval succeeds, and the model reads outdated content. There is no error to catch; only an explicit freshness marker surfaces it.
+Track two timestamps per row: `content_updated_at` (when the text last
+changed) and `embedded_at` (when the embedding was last computed).
+Staleness = the first is greater than the second. Re-embed on detect.
 
 ```
-source changes → vector unchanged → stale read → wrong answer (no error)
+  row:
+    text                  "..."
+    embedding             [...]
+    content_updated_at    2026-05-15  ← changed today
+    embedded_at           2026-04-01  ← old vector
+                                       → stale, re-embed
 ```
 
-**[senior] How would you keep the index fresh, reusing what's already in the codebase?**
+For low-write corpora, re-embed eagerly (same transaction as the text
+update). For high-write corpora, mark stale and re-embed in a scheduled
+job.
 
-The same way `McpClient` keeps tool results fresh: a freshness marker (`embedding_stale_at`, the `expiresAt` analog at `lib/mcp/client.ts` L65) plus a no-poison-on-error rule (the no-cache-on-error analog at L58–L60). Better than TTL, store a content hash and re-embed only on mismatch. A failed re-embed keeps the last-good vector and stays marked stale.
+**Anchor line:** "Two timestamps per row. Staleness is silent —
+retrieval succeeds with the wrong answer."
 
-```
-embedding_stale_at ↔ expiresAt
-hash mismatch → re-embed; re-embed error → keep last-good
-```
+**Q: Does this codebase have a staleness problem?**
 
-**[arch] What's the worst staleness event?**
-
-A model swap. Vectors from different embedding models live in incomparable spaces, so changing the model makes every existing vector's cosine meaningless — the *entire* index is stale at once, with no partial migration. You must re-embed the whole corpus before any new-model query works. Tag the index with the model version to detect it.
-
-```
-old-model vectors + new-model query → meaningless cosines
-fix: re-embed ALL (no mixing models)
-```
-
-### The question candidates always dodge
-
-**"How do you even know a vector is stale?"** You don't — that is the trap. Unlike a rate-limit error, staleness throws nothing; the cosine succeeds and the answer is silently wrong. The only way to know is to *make* it visible with an explicit freshness marker (`embedding_stale_at`) or a source-hash comparison. Admitting that staleness is invisible by default — and that the marker is what makes it detectable — is the senior signal.
-
-### One-line anchors
-
-- `lib/mcp/client.ts` L65 — `expiresAt = Date.now() + ttl`: the `embedding_stale_at` analog.
-- `lib/mcp/client.ts` L40 — `expiresAt > Date.now()`: the freshness check to mirror.
-- `lib/mcp/client.ts` L58–L60 — no-cache-on-error: the no-poison-on-re-embed-error analog.
-- An embedding index is a cache; staleness is silent; you need an explicit freshness marker.
-- A model swap invalidates the whole index — re-embed everything, no mixing.
-
----
+Not really — the natural corpus (past investigations) is append-only.
+Investigations don't get edited after creation, so embeddings never go
+stale. If we expanded the corpus to include things that change (agent
+prompts, evolving schemas), staleness tracking would land alongside.
 
 ## See also
 
-→ 10-incremental-indexing.md · → 04-vector-databases.md · → 02-embedding-model-choice.md · → 11-rag.md
+  → `02-embedding-model-choice.md` — `embedding_model` version is the
+    related field
+  → `10-incremental-indexing.md` — when re-embedding becomes a regular job

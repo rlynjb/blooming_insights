@@ -1,39 +1,25 @@
-# 01 — Reasoning patterns
+# 01 · Reasoning patterns
 
-How one model thinks through a task. This is the substrate every topology in SECTION C sits on top of — a supervisor-worker system is supervisor and workers each running one of these patterns inside their own ReAct loop. Cover the family, name where this codebase sits, and name the escalation ladder between them.
+How one model thinks through a task. The substrate every multi-agent topology sits on top of.
 
-`Anchor:` single-agent (primary) · workflow (secondary).
+## Files
 
----
+1. [`01-chains-vs-agents.md`](./01-chains-vs-agents.md) — the boundary that splits "engineer wrote the steps" from "model picks the steps"
+2. [`02-agent-loop-skeleton.md`](./02-agent-loop-skeleton.md) — the load-bearing kernel every loop in this repo instantiates (READ THIS — it's the kernel)
+3. [`03-react.md`](./03-react.md) — the default single-agent pattern; what all four loop-shaped agents in this repo are
+4. [`04-plan-and-execute.md`](./04-plan-and-execute.md) — separate planning from doing (not in this repo; placement only)
+5. [`05-reflexion-self-critique.md`](./05-reflexion-self-critique.md) — agent grades its own output and retries (not in this repo)
+6. [`06-tree-of-thoughts.md`](./06-tree-of-thoughts.md) — branch + score + pick (not in this repo; rarely worth it)
+7. [`07-routing.md`](./07-routing.md) — heuristic-first then LLM router; this repo uses it for intent classification
 
-## Files in this sub-section
+## How this maps to the codebase
 
-- **`01-chains-vs-agents.md`** — the boundary file. Who writes the steps: engineer (chain) or model (agent)? blooming insights is *both* at two layers: the route's `if`-ladder is a chain, each agent's `runAgentLoop` is an agent. Read this first.
-- **`02-react.md`** — the baseline single-agent pattern. `runAgentLoop` (`lib/agents/base.ts` L48–L176) IS the ReAct loop, reused by all four agents (monitoring, diagnostic, recommendation, query) under different prompts and budgets. Defines the escalation ladder used by the rest of the section.
-- **`03-plan-and-execute.md`** — escalate when the path is knowable up front and the executor can stay cheap. blooming insights does NOT use this as a runtime phase; the closest analog is the static "Suggested query plan" section in the monitoring prompt (`lib/agents/prompts/monitoring.md` L39–L47) — a plan-in-prompt, not a plan-phase.
-- **`04-reflexion-self-critique.md`** — escalate when the failure is recognizable to the same model on a second pass. blooming insights does NOT use a critic loop; `synthesize()` in `DiagnosticAgent` and `RecommendationAgent` is a forced-synthesis recovery (same model, no tools, commit now) — not a judgment step. Names the shared-blind-spot limit.
-- **`05-tree-of-thoughts.md`** — branch-and-score reasoning. blooming insights correctly does NOT use this — branch factor × depth × per-step cost is the wrong shape under a ~1 req/s MCP rate limit and a 300s ceiling on a smooth answer surface. Knowing *why* you didn't use it is the senior answer.
-- **`06-routing.md`** — heuristic-first then LLM-second router for the free-form `?q=` path (`lib/agents/intent.ts`). The BRIDGE to multi-agent: same shape that picks a tool inside one agent picks an agent across many. Sets up SECTION C.
-
----
-
-## Reading order
-
-```
-   01-chains-vs-agents      ← the boundary — start here
-            │
-            ▼
-   02-react                  ← the baseline ReAct loop
-            │
-            ▼
-   06-routing                ← the bridge to multi-agent
-            │ (then the family of ReAct escalations)
-            ▼
-   03-plan-and-execute       ← escalation: the path is knowable
-   04-reflexion-self-critique← escalation: the failure is recognizable
-   05-tree-of-thoughts       ← escalation: branch and score (and why not here)
-```
-
-Read 01 first to name the chain/agent boundary in this codebase. Read 02 to see the one ReAct loop four agents share. Read 06 next because it bridges from single-agent (routing a tool) to multi-agent (routing an agent) — it's the conceptual hop to SECTION C. Then read 03 / 04 / 05 in any order as the family of escalations from ReAct, each one naming a different failure mode and the structural cost it pays to fix it.
-
----
+| File | In this codebase? |
+|---|---|
+| chains-vs-agents | **Both** — `app/api/agent/route.ts` is the chain; the four AptKit-backed agents are the agents inside it. |
+| agent-loop-skeleton | **Yes** — every loop is `runAgentLoop()` in `@aptkit/core@0.3.0`. The most load-bearing file in this guide. |
+| ReAct | **Yes** — monitoring, diagnostic, recommendation, query are all ReAct. |
+| plan-and-execute | **No** — not implemented. Diagnostic comes closest (hypothesize then test) but the model still re-plans every turn. |
+| reflexion | **No** — diagnosis is final; no critic agent re-grades it. |
+| tree-of-thoughts | **No** — never worth it for this product. |
+| routing | **Yes** — intent classifier is the LLM-router; the URL `?step=` is the heuristic-router. |

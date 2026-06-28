@@ -1,446 +1,262 @@
-# Sequential pipeline (agents as pipeline stages)
+# Sequential pipeline
 
-**Industry name(s):** Sequential pipeline, prompt chain, agent-as-pipeline-stage, agentic chain
-**Type:** Industry standard · Language-agnostic
+*Industry name: sequential pipeline / chain-of-agents / agent chain — Industry standard.*
 
-> The primary topology in blooming insights: monitoring → diagnostic → recommendation, with the typed `Diagnosis` handed step-to-step as a structured message. The user gates the transition between stages. Each stage is a ReAct loop with its own tool subset and budget — but the order between them is fixed and owned by code.
+**THIS is the pattern this repo uses.** Output of one agent feeds the next, in a fixed order. Three agents, three stages: monitoring → diagnostic → recommendation. Plus a hard split between stage 2 and stage 3 at the HTTP boundary so the user reviews before recommendations run.
 
+## Zoom out — where this pattern lives
 
----
-
-## Zoom out, then zoom in
-
-**Zoom out — the bigger picture.** Sequential pipeline IS the Pipeline coordinator band in blooming insights. `lib/agents/pipeline.ts` is the file — the place where `monitoring → diagnostic → recommendation` is wired as a `.then()` chain of agents, with the typed `Diagnosis` flowing from stage two into stage three as the input that the next agent literally cannot start without. The Per-agent definitions below are the stages; the Shared agent loop below them is what each stage runs inside. This is the topology blooming insights actually uses — every other topology in this folder is a contrast against this one.
+The pipeline spans the whole stack — UI prompts the next stage by navigating to the next URL; the route handler dispatches the next agent; each agent runs on its own request. The pipeline is the *product workflow*.
 
 ```
-  Zoom out — where sequential pipeline lives
+  Where the sequential pipeline lives in blooming insights
 
-  ┌─ Route handler ─────────────────────────────────┐
-  │  app/api/agent/route.ts                          │
-  └─────────────────────────┬────────────────────────┘
-                            │
-  ┌─ Pipeline coordinator ──▼────────────────────────┐  ← we are here
-  │  ★ lib/agents/pipeline.ts ★                       │
-  │  monitoring ──► diagnostic ──► recommendation     │
-  │              Anomaly        Diagnosis             │
-  │  output of one stage IS input of the next         │
-  │  (typed handoff, fixed order, no parallelism)     │
-  └─────────────────────────┬────────────────────────┘
-                            │  per-stage invocation
-  ┌─ Per-agent definitions ─▼────────────────────────┐
-  │  monitoring.ts | diagnostic.ts | recommendation.ts│
-  └─────────────────────────┬────────────────────────┘
-  ┌─ Shared agent loop ─────▼────────────────────────┐
-  │  runAgentLoop (lib/agents/loop.ts) per stage     │
-  └──────────────────────────────────────────────────┘
+  ┌─ UI layer ──────────────────────────────────────────────┐
+  │  app/page.tsx          → /api/briefing  (stage 1)        │
+  │  app/investigate/[id]/page.tsx                            │
+  │     → /api/agent?step=diagnose (stage 2)                  │
+  │  app/investigate/[id]/recommend/page.tsx                  │
+  │     → /api/agent?step=recommend (stage 3)                 │
+  └───────────────────┬──────────────────────────────────────┘
+                      ▼
+  ┌─ Service layer ─────────────────────────────────────────┐
+  │  /api/briefing → MonitoringAgent                         │
+  │  /api/agent?step=diagnose → DiagnosticAgent              │
+  │  /api/agent?step=recommend → RecommendationAgent         │
+  └───────────────────┬──────────────────────────────────────┘
+                      ▼
+  ┌─ Agent layer ───────────────────────────────────────────┐
+  │  THE PIPELINE: monitoring → diagnostic → recommendation │ ← we are here
+  └──────────────────────────────────────────────────────────┘
 ```
-
-**Zoom in — narrow to the concept.** The question is: when do you wire agents as pipeline stages instead of one mega-agent or parallel workers? Sequential pipeline is the answer when the sub-jobs are real (different prompts, different tools, different schemas) AND the order is fixed by a data dependency (each stage needs the previous one's output to start). blooming insights ticks both boxes: the typed `Diagnosis` is literally an input to `recommendation.propose(anomaly, diagnosis, hooks)`. Below, you'll see the mechanics — the typed handoffs, the per-stage budgets, and the schema gate between stages.
-
----
 
 ## Structure pass
 
-**Layers.** Sequential pipeline is anchored to real code in this codebase, so the layers are concrete: the **Pipeline coordinator** (`lib/agents/pipeline.ts` plus the route's `if`-ladder — wires `monitoring → diagnostic → recommendation` and carries the typed `Diagnosis` from stage two into stage three's call signature), the **Per-agent stages** (`monitoring.ts` / `diagnostic.ts` / `recommendation.ts` — each defining its system prompt, tool subset, iteration budget, and synthesis instruction), the **Shared agent loop** (`runAgentLoop` — what each stage runs internally), and the **Typed handoff schemas** (`Anomaly`, `Diagnosis` — the value types passed between stages, the contract that makes the chain typed). The user gates the cross-stage transition; everything else is mechanical.
-
-**Axis: control.** Who decides the order of stages, and who decides what happens inside a stage? This is the right axis because the entire shape of a sequential pipeline is *placing the control flow* at two levels — CODE owns the cross-stage order, MODEL owns the within-stage work. Dependency is a tempting alternate (the data flow IS sequential — stage 3 needs stage 2's `Diagnosis`), but dependency is what the order *encodes*; control is the placement question the topology answers.
-
-**Seams.** Two seams matter, and the second is THE seam this topology is built on. Seam 1 sits between stages — between one Per-agent's output and the next Per-agent's input. Control stays in CODE on both sides (the coordinator picks the next call, the `Diagnosis` is just an argument). The seam is real (it's where the typed handoff lives, where the user-gate sits, where you'd add a re-run or skip later) but control doesn't flip across it. Seam 2 sits between the Pipeline coordinator and the Shared agent loop, *inside* every stage — control flips from CODE (coordinator picks the stage and hands it inputs) to MODEL (the agent loop decides which tool to call). This is the load-bearing seam: it's the chains-vs-agents boundary repeated at every stage, and it's why this topology is "a chain of agents" rather than "a chain of LLM calls."
+The axis: **how does one agent's output become the next agent's input?**
 
 ```
-  Structure pass — Sequential pipeline
+  Sequential pipeline — the data flow
 
-  ┌─ 1. LAYERS ───────────────────────────────────┐
-  │  Pipeline coordinator (lib/agents/pipeline.ts) │
-  │  Per-agent stages (monitoring/diag/rec)        │
-  │  Shared agent loop (runAgentLoop)              │
-  │  Typed handoff schemas (Anomaly, Diagnosis)    │
-  └────────────────────────┬───────────────────────┘
-                           │  pick the axis
-  ┌─ 2. AXIS ─────────────▼────────────────────────┐
-  │  control: who owns order across stages, and    │
-  │           who owns work within a stage?        │
-  └────────────────────────┬───────────────────────┘
-                           │  trace across layers, find flips
-  ┌─ 3. SEAMS ────────────▼────────────────────────┐
-  │  Seam 1: stage N output ↔ stage N+1 input      │
-  │          (CODE → CODE, typed handoff)          │
-  │  Seam 2: Pipeline coord ↔ Shared agent loop    │
-  │          (CODE → MODEL, repeated each stage)   │
-  │          ★ load-bearing — this is why each     │
-  │          stage IS an agent, not just a call    │
-  └────────────────────────┬───────────────────────┘
-                           ▼
-                   Block 4 — How it works
+  ┌──────────────┐  Anomaly[]   ┌──────────────┐  Diagnosis   ┌────────────────┐
+  │ Monitoring   │ ───────────► │ Diagnostic   │ ───────────► │ Recommendation │
+  │ Agent        │              │ Agent        │              │ Agent          │
+  └──────────────┘              └──────────────┘              └────────────────┘
+       ▲                              ▲                              ▲
+       │ trigger:                     │ trigger:                     │ trigger:
+       │ GET /api/briefing            │ GET /api/agent?              │ GET /api/agent?
+       │                              │   insightId=X&               │   insightId=X&
+       │                              │   step=diagnose              │   step=recommend
+       │                              │                              │   &diagnosis={...}
+       │                              │                              │
+       │                              │ stash anomaly                │ pass diagnosis
+       │                              │ via insightParam URL          │ via diagnosis URL
+       │                              │ (survives Vercel cold start) │  param
 ```
 
-```
-  Seam 2 — "who decides the next move?" answered two ways, at every stage
-
-  ┌─ Pipeline coord ─┐    seam      ┌─ Agent loop ──┐
-  │  CODE: order is  │ ═════╪═════► │ MODEL: tool   │
-  │  monitoring →    │   (flips,    │ calls chosen  │
-  │  diag → rec      │   every      │ turn by turn  │
-  │  (fixed)         │   stage)     │ (variable)    │
-  └──────────────────┘              └───────────────┘
-         ▲                                     ▲
-         └───── same axis (control), two answers ─┘
-                → this seam fires N times per request
-```
-
-The skeleton is mapped — the rest of this file walks the typed handoffs, the per-stage budgets, and the schema gate between stages.
-
----
+Three stages, three HTTP boundaries. The pipeline is *split across requests* — that's the unusual part. The split makes sense because the user reviews each stage before continuing; running all three in one request would deny the user the chance to read the diagnosis before recommendations are generated.
 
 ## How it works
 
-**The mental model: a `.then()` chain where each link is an agent.** The order between links is owned by code (the route file's pipeline). What each link *does* — which tools, how many turns, when to stop — is owned by the model. Two layers of control, with the boundary cleanly drawn between them.
+### Move 1 — the mental model
+
+You know `Promise.resolve().then(a).then(b).then(c)` — the chain you wrote where each function's output becomes the next's input. Sequential pipeline is that, except each function is a full ReAct loop and the chain is split across HTTP requests so the user can pause between stages.
 
 ```
-The sequential pipeline in this codebase
+  Sequential pipeline — output of one feeds the next
 
-  monitoring             diagnostic              recommendation
-  agent                  agent                   agent
-  ┌──────────┐           ┌──────────┐            ┌──────────┐
-  │ ReAct    │  Anomaly  │ ReAct    │ Diagnosis  │ ReAct    │
-  │ loop     │ ────────► │ loop     │ ─────────► │ loop     │
-  │ (6 tools)│ (typed)   │ (6 tools)│ (typed)    │ (4 tools)│
-  └──────────┘           └──────────┘            └──────────┘
-       ▲                      ▲                       ▲
-       │                      │                       │
-       └──────────────────────┴───────────────────────┘
-              CODE owns the order
-              (the route handler's if-ladder)
-              + (cross-request handoff via session storage)
+  ┌─────────┐   draft   ┌─────────┐  reviewed  ┌─────────┐
+  │ Agent A │ ────────► │ Agent B │ ─────────► │ Agent C │
+  │ (write) │           │ (edit)  │            │ (format)│
+  └─────────┘           └─────────┘            └─────────┘
+       │                     │                       │
+       └─── each is a full ReAct loop, not just an LLM call ───┘
 ```
 
-The strategy in plain English: **fix the order where you know it, isolate the work where you don't.** The order is fixed because the data flow is sequential (each stage's input is the previous stage's output). The work inside each stage is isolated because each stage has its own prompt, its own tool subset, and its own iteration budget.
+### Move 2 — walk this repo's pipeline
 
-### Isolate the kernel
+**Stage 1 — Monitoring.**
 
-A sequential pipeline of agents has an irreducible kernel: four pieces that make it a pipeline, not just calls in a row.
+Triggered by `GET /api/briefing`. The agent scans the workspace and emits an array of anomalies.
 
-```
-stage_N(input) → TypedMessage      ←  the shape is required
-                      │
-                      ▼  CARRIER (function arg | sessionStorage+URL)
-                      │
-stage_(N+1)(input, TypedMessage)   ←  consumes the typed value as input
-                      │
-                      ▼  per-stage isolation: own tools + own budget
-                      │
-                  next stage…       ←  CODE picks who runs next, not an LLM
-```
+```typescript
+// app/api/briefing/route.ts:257-281 (paraphrased)
+const agent = new MonitoringAgent(anthropic, dataSource, schema, allTools, sid);
+const anomalies = await agent.scan({
+  onToolCall: (tc) => { send({ type: 'tool_call_start', ... }); ... },
+  onToolResult: (tc) => send({ type: 'tool_call_end', ... }),
+  onText: (t) => { if (t.trim()) step(t.trim()); },
+  signal: req.signal,
+}, runnable);
 
-Four load-bearing pieces:
-
-1. **Typed inter-stage message** — a concrete schema (here: a Diagnosis with `conclusion`, `evidence[]`, `hypothesesConsidered[]`, optional `affectedCustomers` / `confidence` / `timeSeries`). Stage N+1 takes it as a typed argument; the type system enforces that "stage N's output is a valid stage N+1 input."
-2. **A handoff carrier** — *something* that moves the typed value from stage N to stage N+1. Two carriers ship in this repo: a function argument when stages run in the same request, a session-storage-write-plus-URL-param-read when they don't. Same message, two carriers.
-3. **A gate that picks who runs next** — the route handler reads a step query param (diagnose | recommend) and picks the lead agent. Code, not an LLM. The Combined Run path makes this gate automatic ("after diagnose, recommend"); the Split Steps path makes it user-driven (the user clicks "see recommendations").
-4. **Per-stage tool subset + budget** — each stage gets only the tools it needs and a budget calibrated to its job (monitoring 6, diagnostic 6, recommendation 4, query 6). The budget IS the per-stage isolation.
-
-The wire-level mechanics — what the diagnosis object looks like, how its session-storage handoff key is shaped, what the inbound parse function validates, how the route's if-ladder dispatches — are below. The kernel is what makes this a pipeline; everything else is hardening.
-
----
-
-### Name each part by what breaks when removed
-
-Each kernel piece is here because something specific breaks if you drop it.
-
-```
-Removed                            What breaks
-────────────────────────────       ─────────────────────────────────────
-typed message schema               Stages can only pass prose. The
-                                   recommendation agent has to re-read
-                                   the diagnostic agent's text output and
-                                   re-derive the structure. Two stages
-                                   stop composing — they become parallel
-                                   solvers of the same problem.
-
-handoff carrier                    The pipeline can't run. In-process:
-                                   no way to thread the return value
-                                   through `start()`. Across requests:
-                                   no way to carry the diagnosis to the
-                                   recommend step at all — Split Steps
-                                   becomes impossible.
-
-the gate                           Combined Run: the next stage fires
-                                   unsolicited on every diagnose, doubling
-                                   spend even when the user didn't want a
-                                   recommendation. Split Steps: the next
-                                   stage never fires, because nothing
-                                   tells the route which agent to run.
-                                   "Deterministic orchestration" requires
-                                   code making the decision; absence of
-                                   the gate means *nothing* is making it.
-
-per-stage tools + budget           Recommendation can call analytics
-                                   tools meant for diagnostic; it
-                                   re-investigates from scratch instead
-                                   of using the handed-over Diagnosis.
-                                   The "pass the typed message forward"
-                                   gain evaporates. Budget compounds
-                                   across stages with no isolation — one
-                                   slow stage burns the next stage's
-                                   allotment too.
+const insights = anomalies.map(anomalyToInsight);
+putInsights(sid, insights, anomalies);
+for (const insight of listInsights(sid)) send({ type: 'insight', insight });
 ```
 
-The kernel composes: the typed message *carries* the work forward, the carrier *moves* it across the boundary, the gate *decides* what runs next, and per-stage isolation *protects* one stage from another's spend. Drop any one and the pipeline reverts to "uncoordinated agents in sequence."
+Output: `Anomaly[]` (the agent's native shape) mapped to `Insight[]` (the UI's shape). Each insight gets streamed to the feed as it's emitted. **The pipeline pauses here** — the user reads the cards on the feed and decides which one to investigate.
 
----
+**Stage 2 — Diagnostic.**
 
-### Separate skeleton from optional hardening
+Triggered by `GET /api/agent?insightId=X&step=diagnose&insight={...}`. The user clicked a card; the URL carries the insight back to the server (or the server resolves it from the session cache).
 
-The kernel is the minimum that makes this a pipeline. Everything around it is hardening — useful, but layered on. The interesting move is that *two of the hardening choices coexist*: the codebase ships *both* carriers, because the same pipeline runs in two modes.
-
-```
-SKELETON (required to be a pipeline)        HARDENING (some chosen, some not)
-─────────────────────────────────────       ──────────────────────────────────
-Diagnosis / Anomaly typed schemas           ┌ Carrier #1: function argument
-  (the inter-stage contract)                │   in-process (PRESENT — Combined
-diagnostic stage: investigate() →           │   Run mode for capture + demo)
-  Promise<Diagnosis>                        ├ Carrier #2: session storage +
-recommendation stage: propose(anomaly,      │   URL param across requests
-  diagnosis, …) consuming the typed Dx      │   (PRESENT — Split Steps mode,
-route picks the next agent from ?step       │   the production UX)
-per-stage tool-call budget + tool subsets   ├ save-investigation +
-                                            │   filter-by-step replay so the
-                                            │   captured event log replays
-                                            │   in either mode (PRESENT —
-                                            │   the demo path)
-                                            ├ streaming each stage's
-                                            │   intermediate output (the
-                                            │   "diagnosis" event) so the
-                                            │   UI renders before the next
-                                            │   stage runs (PRESENT)
-                                            ├ user gate vs automatic gate
-                                            │   (BOTH PRESENT — user gate
-                                            │   in Split Steps, automatic
-                                            │   in Combined Run; the gate's
-                                            │   *existence* is the kernel,
-                                            │   *who/what* triggers it is
-                                            │   hardening)
-                                            ├ an LLM supervisor that picks
-                                            │   the next stage from model
-                                            │   judgment instead of route
-                                            │   code (ABSENT — deliberate;
-                                            │   see the supervisor-worker
-                                            │   note)
-                                            └ parallel fan-out across peer
-                                                stages (ABSENT — stages are
-                                                inherently sequential here;
-                                                see the parallel-fan-out
-                                                note)
+```typescript
+// app/api/agent/route.ts:273-285 (paraphrased)
+stepFor('diagnostic', 'thought', `investigating "${inv.metric}" ...`);
+const diagAgent = new DiagnosticAgent(anthropic, dataSource, schema, allTools, sid);
+const t_diag = performance.now();
+diagnosis = await diagAgent.investigate(inv, { ...hooksFor('diagnostic'), signal: req.signal });
+recordPhase('diagnostic_investigate', t_diag);
+send({ type: 'diagnosis', diagnosis });
 ```
 
-The takeaway is **the pipeline is one shape with two carriers.** In-process: a function call (`dx = await diag.investigate(...); await rec.propose(inv, dx, ...)`). Across requests: a session-storage write plus a URL-param read. The *typed message* — Diagnosis — is the invariant. The carrier is hardening that varies by mode.
+Output: a `Diagnosis` object with `conclusion`, `evidence[]`, `hypothesesConsidered[]`, optionally `affectedCustomers`. Streamed to the EvidencePanel UI. **The pipeline pauses again** — the user reads the diagnosis and clicks "see recommendations →" to proceed.
 
-This is what people mean by "agents as pipeline stages": agents that ship typed messages between themselves the way functions ship typed return values, with code owning the order.
+The hard split: line 289 of the same file says `if (step !== 'diagnose')` — meaning when `step === 'diagnose'`, the route NEVER runs the recommendation agent. The user has to explicitly proceed to stage 3.
 
-**Where the kernel lives in the repo.** Each of the four load-bearing pieces is pinned to specific files and lines:
+**Stage 3 — Recommendation.**
 
-- **Pipeline order (code owns it):** `app/api/agent/route.ts` `GET` stream `start()` body L224–L249 — STEP 2 diagnose (L231–L240), STEP 3 recommend (L244–L249), inter-stage handoff via `diagnosis` (L238, L247).
-- **Typed inter-stage message:** `lib/mcp/types.ts` `interface Diagnosis` at L95–L104.
-- **Cross-request handoff (client side):** `lib/hooks/useInvestigation.ts` — the `case 'done':` block of the SSE handler at L138 (`sessionStorage.setItem(diagHandoffKey(id), JSON.stringify({ diagnosis: cDiag }))`).
-- **Cross-request handoff (server side):** `app/api/agent/route.ts` `parseDiagnosis()` at L86–L97 — validates that the handed-over object has `conclusion`, `evidence[]`, `hypothesesConsidered[]` before resuming the pipeline.
-- **Per-stage budgets (the per-stage "size" of each pipeline link):** `lib/agents/diagnostic.ts` L62 (`maxToolCalls: 6`), `lib/agents/recommendation.ts` L57 (`maxToolCalls: 4`), `lib/agents/monitoring.ts` L101 (`maxToolCalls: 6`).
-- **Demo replay filter (the same pipeline, sliced by step):** `app/api/agent/route.ts` `filterByStep()` at L66–L84 — the cached combined run is filtered to just `diagnose` or just `recommend` events for replay.
+Triggered by `GET /api/agent?insightId=X&step=recommend&diagnosis={...}`. The browser carries the diagnosis from stage 2 in sessionStorage, then passes it as a URL param to stage 3.
 
-```
-shape (not full impl):
-
-  // route.ts — code owns the pipeline order; agents take the DataSource seam
-  if (step === 'recommend') {
-    diagnosis = parseDiagnosis(diagnosisParam);  // resumed handoff
-  } else {
-    const diagAgent = new DiagnosticAgent(anthropic, dataSource, schema, allTools);
-    diagnosis = await diagAgent.investigate(inv, hooksFor('diagnostic'));
-    send({ type: 'diagnosis', diagnosis });      // emit to UI + persist
+```typescript
+// app/api/agent/route.ts:267-272, 289-296 (paraphrased)
+if (step === 'recommend') {
+  diagnosis = parseDiagnosis(diagnosisParam);
+  if (!diagnosis) {
+    throw new Error('no diagnosis was handed over — open the diagnosis step first');
   }
-
-  if (step !== 'diagnose') {
-    const recAgent = new RecommendationAgent(anthropic, dataSource, schema, allTools);
-    const recs = await recAgent.propose(inv, diagnosis!, hooksFor('recommendation'));
-    for (const r of recs) send({ type: 'recommendation', recommendation: r });
-  }
+}
+// ...
+if (step !== 'diagnose') {
+  stepFor('recommendation', 'thought', 'proposing actions based on the diagnosis…');
+  const recAgent = new RecommendationAgent(anthropic, dataSource, schema, allTools, sid);
+  const recommendations = await recAgent.propose(inv, diagnosis!, { ...hooksFor('recommendation'), signal: req.signal });
+  for (const r of recommendations) send({ type: 'recommendation', recommendation: r });
+}
 ```
 
+Output: `Recommendation[]` (up to 3) streamed one at a time to the RecommendationCard UI. End of pipeline.
 
-The full picture is below.
+**Why split stage 2 and stage 3 across requests?**
 
----
+The product reason: the user reviews the diagnosis before recommendations run. If the diagnosis is wrong, generating recommendations from it wastes tokens AND misleads the user. The split forces a human-in-the-loop pause.
 
-## Sequential pipeline — diagram
+The architectural cost: the diagnosis has to round-trip through the browser (sessionStorage + URL param) because Vercel serverless instances are ephemeral. Different requests might land on different instances; in-memory state doesn't survive. So the diagnosis has to be *serializable* and small enough to fit in a URL — both constraints shaped the `Diagnosis` interface.
 
-```
-Sequential pipeline — the full picture in this codebase
+### Move 2.5 — the in-process variant (capture-only)
 
-  ┌─ CODE LAYER (order owner) ────────────────────────────────────────────┐
-  │  the route handler's if-ladder                                        │
-  │                                                                       │
-  │  if step == 'recommend':                                              │
-  │     diagnosis = parse_diagnosis(URL ?diagnosis=…)  ◄── handoff in     │
-  │  else:                                                                │
-  │     diagnosis = await diag_agent.investigate(inv, hooks)              │
-  │     send('diagnosis', diagnosis)                   ──► handoff out    │
-  │                                                                       │
-  │  if step != 'diagnose':                                               │
-  │     recs = await rec_agent.propose(inv, diagnosis, hooks)             │
-  │     send('recommendation', …)                                         │
-  └───────────────────────┬───────────────────────────────────────────────┘
-                          │
-                          ▼
-  ┌─ AGENT LAYER (each stage is a ReAct loop) ───────────────────────────┐
-  │                                                                       │
-  │  ┌─ Diagnostic stage ──┐         ┌─ Recommendation stage ──┐         │
-  │  │ prompt: investigate │         │ prompt: propose actions  │         │
-  │  │ tools: 6 analytics  │         │ tools: 4 feature-spec    │         │
-  │  │ budget: 6 calls     │         │ budget: 4 calls          │         │
-  │  │ output: Diagnosis   ├────────►│ input:  Diagnosis        │         │
-  │  └─────────────────────┘         └──────────────────────────┘         │
-  │       │                                  │                            │
-  │       └──────► shared agent loop ◄───────┘                            │
-  │              same loop primitive, different prompts/tools/budgets     │
-  └────────────────────────────┬──────────────────────────────────────────┘
-                               │
-                               ▼
-  ┌─ MESSAGE LAYER (the inter-stage contract) ───────────────────────────┐
-  │  interface Diagnosis {                                                │
-  │    conclusion: string;                                                │
-  │    evidence: string[];                                                │
-  │    hypothesesConsidered: { hypothesis; supported; reasoning }[];      │
-  │    affectedCustomers?: { count; segmentDescription };                 │
-  │    confidence?: 'high'|'medium'|'low';                                │
-  │    timeSeries?: { day; value }[];                                     │
-  │  }                                                                    │
-  │  (the typed contract between diagnostic and recommendation stages)    │
-  └───────────────────────────────────────────────────────────────────────┘
+The route ALSO supports a combined run (when `step == null`), which is used by the demo-snapshot capture path:
+
+```typescript
+// app/api/agent/route.ts:302
+if (step == null) saveInvestigation(insightId!, collected);
 ```
 
----
+When `step` is omitted, both agents run in series within one request — diagnostic, then recommendation, then the entire trace gets saved to `lib/state/investigations.ts`. This is the in-process variant of the pipeline, no HTTP split. It's used to generate the committed demo snapshot (`lib/state/demo-investigations.json`) that the demo mode replays.
+
+So there are *two* sequencing strategies in the codebase:
+
+```
+  Two ways to run the diagnose→recommend pipeline
+
+  Production (split across HTTP):
+   step 2 request  →  DiagnosticAgent  →  diagnosis to browser
+   step 3 request  →  RecommendationAgent  (with diagnosis from URL)
+   USER PAUSES BETWEEN
+   benefit: human review; works across Vercel cold starts
+
+  Capture (combined in one request):
+   single request  →  DiagnosticAgent  →  RecommendationAgent  →  save
+   no pause
+   benefit: one trace for the demo snapshot; in-process handoff
+```
+
+### Move 3 — the principle
+
+Sequential pipeline is the cheapest multi-agent topology that gives you specialization. Each agent has a narrower prompt, a narrower tool grant, and a known input shape — three real benefits. The cost is latency: stages run in series, so total time is the sum of all stages. In this repo that's acceptable because the user reviews between stages anyway — the user's review time dwarfs the pipeline's compute time, so the sequential constraint is invisible.
+
+The pattern works when:
+- The stages have a natural order (you can't recommend before diagnosing; you can't diagnose without knowing what to investigate)
+- Each stage's output is the next stage's input (no fan-in/fan-out)
+- The cost of review-between-stages is acceptable (the user wants to look at the diagnosis before recommendations are spent on it)
+
+When you'd reach for something else: fan-out when stages don't depend on each other; supervisor when the order isn't known; debate when the stages need to argue. None of those apply here.
+
+## Primary diagram
+
+The pipeline as it actually runs, including the HTTP split:
+
+```
+  Sequential pipeline — production flow, split across requests
+
+  ┌─ Request 1: GET /api/briefing ──────────────────────────────┐
+  │  route → bootstrap → schemaCapabilities → runnableCategories │
+  │  → MonitoringAgent.scan() [ReAct, 8 turns, 6 tool calls]    │
+  │  → Anomaly[] mapped to Insight[]                             │
+  │  → stream each insight as NDJSON                             │
+  └──────────────────────────┬──────────────────────────────────┘
+                             ▼
+                  USER reads feed, clicks a card
+                             │
+                             ▼
+  ┌─ Request 2: GET /api/agent?insightId=X&step=diagnose ───────┐
+  │  route → resolveAnomaly (insight from URL or session)        │
+  │  → DiagnosticAgent.investigate(anomaly) [ReAct, 8, 6]       │
+  │  → Diagnosis (conclusion, evidence, hypotheses)              │
+  │  → stream `diagnosis` event                                  │
+  │  STOPS — does NOT run RecommendationAgent                    │
+  └──────────────────────────┬──────────────────────────────────┘
+                             ▼
+                  USER reads EvidencePanel, clicks "see recommendations →"
+                  (browser stashed `diagnosis` in sessionStorage)
+                             │
+                             ▼
+  ┌─ Request 3: GET /api/agent?insightId=X&step=recommend       │
+  │            &diagnosis={...}                                  │
+  │  route → parseDiagnosis (from URL param)                     │
+  │  → RecommendationAgent.propose(anomaly, diagnosis) [ReAct, 6, 4]│
+  │  → Recommendation[] (up to 3)                                │
+  │  → stream each recommendation as NDJSON                      │
+  └──────────────────────────────────────────────────────────────┘
+```
 
 ## Elaborate
 
-### Where this pattern comes from
+The sequential pipeline is the agent-architecture equivalent of an ETL pipeline — same shape, same tradeoffs. The win is specialization: each stage has a narrower mandate, a narrower tool grant, smaller prompts, and you can swap models per stage (cheap model for the last stage, expensive for the hard one). This repo doesn't currently swap models — all three use `claude-sonnet-4-6` — but the structure would let you (RecommendationAgent's tighter budget would let it switch to haiku for cost without losing much quality).
 
-Sequential pipelines pre-date LLMs by decades — every Unix pipeline (`ps | grep | awk`) is one. The LLM-pipeline version got its current framing from Anthropic's "Building Effective Agents" (2024), which named "prompt chaining" as the simplest agentic workflow: decompose a task into a fixed sequence of steps, where each LLM call processes the output of the previous one. The essay's key insight: when latency is acceptable and accuracy matters, decomposing into a chain trades a single complex prompt for several focused ones — and focused prompts measurably outperform combined ones.
+The HTTP split is the unusual part of this repo's pipeline and the most senior-engineer-y choice. Most agent pipelines run end-to-end in one request and report the whole thing to the user at the end. This one explicitly stops between stage 2 and stage 3 so the human reviews the diagnosis. The architectural cost is real — the diagnosis has to round-trip through the browser — but the product cost of NOT doing this would be larger: an agent generating recommendations from a wrong diagnosis would mislead the user and waste tokens.
 
-### The deeper principle
-
-**Pipelines work when the data dependency is sequential and the order is knowable.** Both halves matter. If the data dependency is sequential but the order isn't knowable (one stage might be skipped, another repeated), you need a state machine or a supervisor. If the order is knowable but the data dependency isn't sequential (sub-jobs are independent), you should fan out in parallel.
-
-```
-   sequential data dep + knowable order   → pipeline
-   sequential data dep + unknowable order → supervisor / state machine
-   independent sub-jobs + any order        → parallel fan-out
-   peer interaction with no fixed order    → swarm / handoff
-```
-
-The pipeline isn't a compromise — it's the right shape when both conditions hold, and only when both conditions hold.
-
-### Where this breaks down
-
-The pipeline breaks when the data dependency starts to branch — e.g. when "the diagnosis might be inconclusive, so re-run with a deeper budget" introduces a back-edge that an `if`-ladder can express but a more complex branching pattern can't. At that point you're in graph orchestration (`./07-graph-orchestration.md`) territory.
-
-It also breaks when latency becomes the constraint — a pipeline's latency is the *sum* of all stages, with no parallelism. If two stages don't actually depend on each other, running them in parallel (fan-out, `./04-parallel-fan-out.md`) is cheaper.
-
-### What to explore next
-- `./04-parallel-fan-out.md` → what the pipeline becomes when sub-jobs are independent
-- `./08-shared-state-and-message-passing.md` → the typed `Diagnosis` is the message-passing version of inter-stage communication
-- `./07-graph-orchestration.md` → pipelines expressed as state graphs with checkpointing and conditional edges
-- `../../study-system-design/07-client-stream-handoff.md` → the cross-request handoff via `sessionStorage` from a system-design perspective
-
----
+The pipeline doesn't preclude going multi-agent later. If the diagnostic agent's quality plateaus, the natural next step is replacing it with a planner+executor+synthesizer (see `../01-reasoning-patterns/04-plan-and-execute.md`) — a sub-pipeline inside stage 2. The outer pipeline stays sequential; one stage gets internal complexity. That's the right escalation path: nest specialization inside an existing stage rather than restructuring the outer pipeline.
 
 ## Interview defense
 
-### What an interviewer is really asking
+**Q: "Walk me through your multi-agent topology."**
 
-When an interviewer asks "why a pipeline" they're testing whether you can defend a *sequential* design under pressure — whether you chose it because the work was sequential, or because you didn't reach for parallelism. The strong signal is naming the data dependency that forces sequential (the recommendation agent's signature takes the diagnosis as an arg). The weak signal is calling pipelines "simpler" without naming the constraint that made simpler enough.
+A: Sequential pipeline — three agents, three stages, fixed order: monitoring → diagnostic → recommendation. Each stage is one full ReAct loop (8 turns, 6 tool calls for monitoring/diagnostic; 6 turns, 4 tool calls for recommendation since it mostly reasons from the upstream output). The supervisor is route code — `app/api/agent/route.ts` dispatches based on the URL `?step=` param. The pipeline is *split across HTTP requests* between stage 2 and stage 3 so the user reviews the diagnosis before recommendations run; the diagnosis round-trips through the browser's sessionStorage and a URL param to make the split work across Vercel's ephemeral serverless instances.
 
-### Likely questions
+Diagram I'd sketch:
 
-[mid] Q: What's the inter-stage message in blooming insights?
-
-A: The typed `Diagnosis` object defined in `lib/mcp/types.ts` L95–L104 — it has `conclusion`, `evidence[]`, `hypothesesConsidered[]`, optional `affectedCustomers`, `confidence`, and `timeSeries`. The diagnostic agent returns it, the recommendation agent takes it as the second argument to `propose(anomaly, diagnosis, hooks)`. In the split-step UX it's persisted to `sessionStorage` with key `bi:diag:<id>` between step 2 and step 3.
-
-Diagram:
 ```
-  diagnostic agent              recommendation agent
-   investigate()    ──Diagnosis──►   propose(_, diagnosis, _)
-                       (typed)
-
-  cross-request:
-   sessionStorage.setItem('bi:diag:<id>', JSON.stringify({diagnosis}))
-   then ?diagnosis=… in the next request URL
-   → parseDiagnosis() validates the shape before resuming
+  /api/briefing          /api/agent?step=diagnose         /api/agent?step=recommend
+       │                          │                              │
+       ▼                          ▼                              ▼
+  ┌─────────┐               ┌─────────┐                     ┌─────────┐
+  │Monitor- │  Anomaly →    │Diagnos- │   Diagnosis →       │Recommen-│
+  │ ing     │  (URL stash)  │ tic     │   (sessionStorage   │ dation  │
+  │ (ReAct) │               │ (ReAct) │    + URL param)     │ (ReAct) │
+  └─────────┘               └─────────┘                     └─────────┘
+       │ stream                  │ stream                         │ stream
+       └─── all output flows back as AgentEvent NDJSON ───────────┘
 ```
 
-[senior] Q: Why didn't you fan these out in parallel?
+Anchor: "the split between stage 2 and stage 3 is the load-bearing UX choice. Without it, the user has no chance to catch a wrong diagnosis before recommendations are generated from it."
 
-A: Because the data dependency is real — `RecommendationAgent.propose(anomaly, diagnosis, hooks)` literally takes the diagnosis as its second arg. There's no way to start the recommendation stage before the diagnostic stage completes; the recommendation agent's prompt references `diagnosis.conclusion` and iterates over `diagnosis.evidence[]`. Parallelizing them would mean running recommendation with no input — wasted work I'd throw away. The constraint forcing sequential is the data flow, not preference.
+**Q: "Why split stage 2 and stage 3 across requests instead of one combined run?"**
 
-Diagram:
-```
-  What the signatures say:
-
-  diagAgent.investigate(anomaly): Promise<Diagnosis>
-                                       │
-                                       ▼
-  recAgent.propose(anomaly, diagnosis, hooks): Promise<Recommendation[]>
-                            ▲
-                            └── this argument forces the order
-```
-
-[arch] Q: At 10x anomaly volume, what's the first thing that breaks in the pipeline?
-
-A: Wall-clock latency, not throughput. Per investigation, the pipeline is ~5–15s (diagnostic) + ~3–8s (recommendation), all sequential under the shared ~1 req/s MCP rate limit (`connect.ts` L92). At 10x volume, more concurrent investigations means more concurrent agent loops competing for the same MCP throughput, not faster individual investigations. The fix is fan-out backpressure (concurrency limiter on the agent layer, see `../05-production-serving/02-fan-out-backpressure.md`) and cross-run caching of repeated EQL sub-steps inside each stage. The pipeline shape itself doesn't change — the bottleneck is at the serving layer.
-
-Diagram:
-```
-  ┌ Route layer (if-ladder) ──── fine, stateless ─────┐
-  ┌ Agent layer (4 ReAct loops) ◄─ contention: 10x    │
-  │                                investigations share │
-  │                                ~1 req/s MCP budget  │
-  ┌ MCP layer (~1 req/s) ◄────────── shared bottleneck │
-  │                                                     │
-  add: fan-out backpressure + cross-run cache here     │
-```
-
-### The question candidates always dodge
-
-Q: If the pipeline is sequential, isn't this just "three chained API calls" — why call it multi-agent at all?
-
-A: Because the unit of work between the chained calls is *not* a single LLM call — it's a full ReAct loop with its own tool budget, its own iteration cap, and its own forced-final-turn behavior. The diagnostic agent runs 3–7 turns of `tool_use` + observation before producing the `Diagnosis`; the recommendation agent runs 2–4 turns before producing recommendations. Each link in the chain is itself an autonomous loop. The reason "three chained API calls" understates it is that those three "calls" are non-deterministic in length, variable in tool selection, and each one writes its own internal trajectory. The chain is one shape; the inside of each link is another shape. The accurate framing is "a chain *of agents*" — and naming the outer shape "pipeline" doesn't downgrade the inner shape from "agent" to "call." Anthropic's "Building Effective Agents" deliberately separates "workflow" (the outer shape) from "agent" (the inner shape) because they're orthogonal — you can have a workflow of agents, and that's exactly what this is.
-
-Diagram:
-```
-  Outer shape: pipeline (sequential, code-owned order)
-
-  ┌──────────┐         ┌──────────┐         ┌──────────┐
-  │  Stage A │ ─Diag─► │  Stage B │ ─Recs─► │ Client   │
-  └──────────┘         └──────────┘         └──────────┘
-       │                     │
-       │ zoom into one stage │
-       ▼                     ▼
-  Inner shape: ReAct LOOP (variable length, model-driven)
-
-   reason → tool → observe → reason → tool → observe → … → final
-
-   chain of agents ≠ chain of calls
-```
-
-### One-line anchors
-
-- "The pipeline order is fixed because the data flow is sequential — `propose(_, diagnosis, _)` requires the diagnosis as an argument."
-- "Each stage has its own prompt, its own tool subset, and its own budget — focus by separation, not by prompt cleverness."
-- "The typed `Diagnosis` is the message; it survives in-process as a function arg and cross-request as a `sessionStorage` value."
-- "It's a chain of agents — the outer shape is sequential, the inner shape is a ReAct loop. Naming the outer 'pipeline' doesn't downgrade the inner from 'agent' to 'call.'"
-
----
+A: Two reasons. First, product: the user reviews the diagnosis before recommendations are generated. If the diagnosis is wrong, generating recommendations from it wastes tokens AND misleads the user. The split forces a human-in-the-loop pause. Second, architectural: Vercel serverless instances are ephemeral — between requests we can't rely on in-memory state. Splitting forces the handoff to be serializable (the `Diagnosis` shape), which is good architecture-pressure: it keeps the agent outputs as plain data, not references to live objects. The combined run still exists (when `step == null`) for the demo-snapshot capture path — it's how we generate the committed snapshot the demo mode replays.
 
 ## See also
 
-→ `./01-when-not-to-go-multi-agent.md` · → `./02-supervisor-worker.md` · → `./08-shared-state-and-message-passing.md` · → systems view: `../../study-system-design/06-multi-agent-orchestration.md` · → client handoff: `../../study-system-design/07-client-stream-handoff.md` · → chain/agent boundary: `../01-reasoning-patterns/01-chains-vs-agents.md`
-
----
+- [`01-when-not-to-go-multi-agent.md`](./01-when-not-to-go-multi-agent.md) — why this is the right minimal topology for this product
+- [`02-supervisor-worker.md`](./02-supervisor-worker.md) — the supervisor is the route code that runs the pipeline
+- [`08-shared-state-and-message-passing.md`](./08-shared-state-and-message-passing.md) — the diagnosis handoff is forced message-passing
+- [`../06-orchestration-system-design-templates/02-agentic-support-system.md`](../06-orchestration-system-design-templates/02-agentic-support-system.md) — the standard architecture for this product shape

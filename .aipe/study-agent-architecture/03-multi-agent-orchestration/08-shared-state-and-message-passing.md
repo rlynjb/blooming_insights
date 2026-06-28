@@ -1,573 +1,204 @@
 # Shared state and message passing
 
-**Industry name(s):** Shared state vs message passing, blackboard pattern vs message passing, multi-agent context routing
-**Type:** Industry standard · Language-agnostic
+*Industry name: shared state / blackboard / message passing — Industry standard.*
 
-> Two models for how agents communicate — a shared blackboard everyone reads/writes, or typed messages handed agent-to-agent. blooming insights firmly uses MESSAGE PASSING: the typed `Diagnosis` is handed step→step (function arg or `sessionStorage`), and each agent's context is scoped to what it's handed. Scoped context = cheaper and less noise, but you must decide what to pass.
+How agents communicate. **This repo uses message passing**, forced by the architecture — Vercel's ephemeral serverless instances make a shared blackboard impractical. The diagnostic agent's output is the recommendation agent's input, passed as a plain JSON URL param.
 
+## Zoom out — where this concept lives
 
----
-
-## Zoom out, then zoom in
-
-**Zoom out — the bigger picture.** This concept lives at the seam between the Pipeline coordinator and the Per-agent definitions — the place where one agent's output becomes another agent's input. blooming insights' implementation here is *message passing*: the typed `Diagnosis` (defined in `lib/schemas/*`) is handed as a function argument from the diagnostic stage to `recommendation.propose(anomaly, diagnosis, hooks)`. There's no shared blackboard; each agent's window holds exactly what was handed to it. The cross-request carrier is `sessionStorage` plus a URL param, but the principle is identical: explicit typed messages, not global state.
+The choice between shared state and message passing is made at the topology level — it shapes how agents are wired together. In this repo it's made at the route layer: each agent gets the *exact* data it needs, via function args (in-process) or URL params (cross-request).
 
 ```
-  Zoom out — where shared-state vs message-passing lives
+  Where the choice lives in blooming insights
 
-  ┌─ Pipeline coordinator ──────────────────────────┐
-  │  lib/agents/pipeline.ts (the orchestrator)       │
-  └─────────────────────────┬────────────────────────┘
-                            │  ★ THIS ★ — the handoff
-                            ▼
-  ┌─ Per-agent definitions ─┴────────────────────────┐  ← we are here
-  │  diagnostic.ts produces  ──► Diagnosis (typed)    │
-  │       │                                            │
-  │       ▼  (message passing — function argument)     │
-  │  recommendation.propose(anomaly, diagnosis, hooks)│
-  │                                                    │
-  │  Alternative (shared state, NOT here):             │
-  │    a global WorkspaceState every agent reads/      │
-  │    writes; every agent's window carries every      │
-  │    other agent's content                           │
-  └─────────────────────────┬────────────────────────┘
-  ┌─ Schemas (orthogonal) ──▼────────────────────────┐
-  │  lib/schemas/* — the typed message contracts      │
-  └──────────────────────────────────────────────────┘
+  ┌─ Service layer ─────────────────────────────────────────┐
+  │  app/api/agent/route.ts                                  │
+  │   chooses HOW each agent receives state                  │ ← we are here
+  │    - in-process handoff: function arg                    │
+  │    - cross-request handoff: URL param + sessionStorage   │
+  │   NEVER a shared blackboard                              │
+  └──────────────────────────────────────────────────────────┘
 ```
-
-**Zoom in — narrow to the concept.** The question is: how do agents communicate — through a shared blackboard or through explicit messages? Shared state is simple to reason about but expensive at scale (every window carries every other agent's content) and unsafe (one bad write poisons every reader). Message passing costs schema-design effort up-front but keeps each agent's context scoped to its job. blooming insights picked message passing — the typed `Diagnosis` is the contract. Below, you'll see both shapes, the cost ledger, and why a curated message beats a blackboard for this codebase's shape.
-
----
 
 ## Structure pass
 
-**Layers.** Four layers carry this concept: the **Pipeline coordinator** (the orchestrator that owns the inter-agent handoff), the **Per-agent definitions** (each one's own conversation history, prompt, and tool subset), the **Message contracts** (the typed schemas — `lib/schemas/*` — that define what crosses an agent boundary), and the **Cross-request carrier** (in-process function args today; `sessionStorage` + URL param for the two-step UI). The would-be alternative — a shared blackboard — would replace the second and third layers with a single global store every agent reads and writes.
-
-**Axis: state.** Who owns each piece of conversational data, where does it live, and who is allowed to mutate it? This is the right axis because the entire choice between message passing and shared state is *who owns context at the inter-agent boundary*. Trust is a real concern (a shared blackboard is unsafe because anyone can poison it) but trust is downstream of state ownership: trust matters because ownership is diffuse in the shared-state model.
-
-**Seams.** Two seams matter. Seam 1 sits between one agent's output and the next agent's input — state-ownership flips from "agent A owns its scratchpad" to "the orchestrator owns the typed message it built from A's output." That seam IS message passing; in the shared-state variant the flip never happens because no one owns anything (everyone reads/writes the blackboard). Seam 2 sits between in-request state (function args in a single request) and cross-request state (`sessionStorage` + URL param across the two-step UI) — state-ownership flips from "the call stack carries it" to "the browser carries it" — but the *principle* is identical (explicit typed message, not global state). Seam 1 is the load-bearing one for the concept; Seam 2 is the same shape recurring across a request boundary.
+The axis: **what does each agent see?**
 
 ```
-  Structure pass — Shared state vs message passing
-
-  ┌─ 1. LAYERS ───────────────────────────────────┐
-  │  Pipeline coordinator                          │
-  │  Per-agent definitions (own conversation each) │
-  │  Message contracts (typed schemas)             │
-  │  Cross-request carrier (sessionStorage + URL)  │
-  └────────────────────────┬───────────────────────┘
-                           │  pick the axis
-  ┌─ 2. AXIS ─────────────▼────────────────────────┐
-  │  state: who owns context at the inter-agent    │
-  │         boundary, and who can mutate it?       │
-  └────────────────────────┬───────────────────────┘
-                           │  trace across layers, find flips
-  ┌─ 3. SEAMS ────────────▼────────────────────────┐
-  │  Seam 1: Agent A output ↔ Agent B input        │
-  │          (A owns scratch → orchestrator owns   │
-  │          typed message → B owns its scratch)   │
-  │          ★ load-bearing — this IS the choice   │
-  │  Seam 2: in-request ↔ cross-request            │
-  │          (call stack → sessionStorage)         │
-  │          same shape, different carrier         │
-  └────────────────────────┬───────────────────────┘
-                           ▼
-                   Block 4 — How it works
+  Shared state (blackboard):              Message passing:
+  ────────────────────────────            ──────────────────────
+  every agent reads/writes the            each agent sees only what
+  same context blob                       was passed to it
+                                          (function arg, URL param)
+  pro: simple to reason about              pro: focused context;
+       (one place for state)                    cheaper per agent;
+                                               no lost-in-the-middle
+                                               from N-agent bloat
+  con: context bloat as agents             con: requires deciding
+       accumulate                                what to pass; bug
+                                                there = missing info
+  con: lost-in-the-middle as the           pro: forced minimalism;
+       blob grows                                each agent stays narrow
 ```
-
-The skeleton is mapped — the rest of this file walks both shapes, the cost ledger, and why a curated typed message beats a blackboard for this codebase.
-
----
 
 ## How it works
 
-**The mental model: explicit props vs global Redux store, applied to agent context.** Each agent's input is curated by whoever called it. The schema of the input is the contract between agents. No agent reads another agent's scratchpad.
+### Move 1 — the mental model
+
+You know props vs context in React — props is message passing (each component receives exactly what it needs); context is shared state (any descendant can read the value). Same shape, agent edition. Message passing keeps each agent's context narrow; shared blackboard puts everything in front of every agent.
 
 ```
-Message passing in this codebase
+  Two models of agent communication
 
-   user request
-       │
-       ▼
-   route.ts (orchestrator owns the messages)
-       │
-       │ hands DiagnosticAgent: { anomaly }
-       ▼
-   ┌──────────────────────┐
-   │ DiagnosticAgent       │   sees: { anomaly } + diag prompt
-   │  - own conversation   │   does NOT see: other agents' state
-   │  - own tool subset    │
-   │  - own scratchpad     │
-   └────────┬──────────────┘
-            │ returns Diagnosis (typed)
-            ▼
-   route.ts (curates the next message)
-       │
-       │ hands RecommendationAgent: { anomaly, diagnosis }
-       ▼
-   ┌──────────────────────┐
-   │ RecommendationAgent   │   sees: { anomaly, diagnosis }
-   │  - own conversation   │   does NOT see: diag's tool calls,
-   │  - own tool subset    │                  scratchpad, history
-   │  - own scratchpad     │
-   └────────┬──────────────┘
-            │ returns Recommendation[]
-            ▼
-        user
+  Shared state (blackboard):                 Message passing:
+  ┌──────────────────────┐                  agent A ──msg──► agent B
+  │   shared context     │                  agent B ──msg──► agent C
+  │  (all agents read     │                  (each agent sees only
+  │   and write here)     │                   what's passed to it)
+  └──────────────────────┘
+   ▲      ▲       ▲
+   A      B       C
 ```
 
-The strategy in plain English: **decide what each agent needs to know, hand them exactly that, and nothing else.** The schema of the handoff message is the contract. Schema changes are visible; ad-hoc shared-state additions aren't.
+### Move 2 — how this repo's message passing works, in two channels
 
-### Layer 1 — shared state (the blackboard pattern)
+**Channel 1: in-process (function args).**
 
-The technical thing: a *shared mutable context object* that every agent reads from and writes to. In LangGraph this is the `StateGraph`'s state schema; in older multi-agent systems this is literally a "blackboard" object. Agents pull what they need; the state grows as the run progresses.
+When the route runs both diagnostic and recommendation in one request (the capture-only combined run), the diagnosis is passed as a function argument:
 
-If you're coming from frontend, this is a global Redux store: every component can subscribe to any slice, every dispatched action mutates a shared state. Powerful, simple to start with, expensive at scale because everyone sees everything.
-
-```
-Shared state — the blackboard
-
-  ┌──────────────────────────────────────────┐
-  │   Shared state (one object)              │
-  │                                          │
-  │   anomaly: {...}                         │
-  │   diagnostic_history: [...]              │
-  │   diagnostic_scratchpad: "..."           │
-  │   diagnosis: {...}                       │
-  │   recommendation_history: [...]          │
-  │   recommendations: [...]                 │
-  │   user_feedback: "..."                   │
-  │                                          │
-  └──────────────────────────────────────────┘
-        ▲ reads          ▲ writes
-        │                │
-    Diagnostic        Recommendation
-    Agent             Agent
-        ▲                ▲
-       reads everything  reads everything
-
-   the recommendation agent's context window now
-   includes diagnostic_history (potentially 30k tokens
-   of EQL responses and intermediate reasoning)
+```typescript
+// app/api/agent/route.ts (combined run flow, paraphrased)
+diagnosis = await diagAgent.investigate(inv, hooksFor('diagnostic'));
+// ...
+const recommendations = await recAgent.propose(inv, diagnosis!, hooksFor('recommendation'));
 ```
 
-The practical consequence: when the recommendation agent runs, its system prompt is wrapped around the whole shared state — every prior agent's output, every tool call, every intermediate thought. The model has to *find* the relevant signal in the noise. This is the "lost-in-the-middle" failure mode scaling with the number of agents.
+`diagnosis` is a plain `Diagnosis` object; `recAgent.propose` receives it as its second argument. No global state, no blackboard. The RecommendationAgent's prompt only sees what the upstream produced.
 
-The condition under which it works: total shared content stays small. With 2 agents and short outputs, the blackboard is fine. With 6 agents and long tool responses, it explodes.
+**Channel 2: cross-request (URL param + browser sessionStorage).**
 
-### Layer 2 — message passing (this codebase's choice)
+When the user reviews the diagnosis between step 2 and step 3, the diagnosis has to survive an HTTP round-trip. Vercel serverless instances are ephemeral — the instance handling step 2 might not handle step 3. So the diagnosis is:
 
-The technical thing: a *typed message* handed from one agent to the next. The next agent's input is the message + its own prompt + its own tool subset — nothing else.
+1. Returned to the browser as a `diagnosis` NDJSON event
+2. Stashed by `lib/hooks/useInvestigation.ts` in `sessionStorage`
+3. Passed back to the server as a `?diagnosis=...` URL param when the user navigates to step 3
+4. Parsed by `parseDiagnosis()` in the route handler
 
-If you're coming from frontend, this is React props: a parent component owns state and passes only what each child needs. The child can't reach up and read the parent's other state. Coupling is explicit and traceable.
-
-```
-Message passing — typed handoff
-
-  ┌─ DiagnosticAgent's world ──┐
-  │ input: { anomaly }         │
-  │ scratchpad: [...]          │
-  │ tool calls: [...]          │ ── these live and die with
-  │ messages[]: [...]          │    this agent's loop
-  └────────┬───────────────────┘
-           │
-           │ returns Diagnosis (CURATED)
-           ▼
-   { conclusion: "...",
-     evidence: [...],
-     hypothesesConsidered: [...] }    ← the message
-           │
-           │ route hands it over
-           ▼
-  ┌─ RecommendationAgent's world ──┐
-  │ input: { anomaly, diagnosis }  │  ← receives ONLY this
-  │ scratchpad: [...]              │
-  │ tool calls: [...]              │
-  │ messages[]: [...]              │
-  └────────────────────────────────┘
-```
-
-The practical consequence: the recommendation agent's context window stays small (the `Diagnosis` is ~1-2k tokens at most). Its prompt is sharper because there's less noise. Tool selection accuracy is higher because the model isn't choosing between tools needed for different agents' jobs.
-
-The condition under which it works: the message schema is expressive enough. If the recommendation agent ever needs something not in `Diagnosis`, you either widen the schema (preferred) or accept that recommendation will be missing context. The schema is the contract.
-
-**Where this lives in the repo.** `interface Diagnosis` in `lib/mcp/types.ts` L95–L104 — `conclusion`, `evidence[]`, `hypothesesConsidered[]`, optional `affectedCustomers`, `confidence`, `timeSeries`.
-
-### Layer 3 — the in-process carrier (function argument)
-
-The technical thing: when both agents run inside the same HTTP request, the message is a *function argument*. The diagnostic agent's `investigate(...)` returns a `Diagnosis`; the recommendation agent's `propose(anomaly, diagnosis, hooks)` takes it as the second parameter. No serialization, no storage in between.
-
-If you're coming from frontend, this is literal function composition: `const dx = await diagnostic(); const recs = await recommendation(dx);`. The type system enforces the contract.
-
-```
-In-process function-arg handoff
-
-  // in the route handler
-  diag_agent  = new diagnostic_agent(...)
-  diagnosis   = await diag_agent.investigate(inv, hooks)
-  // ▲ diagnosis is a Diagnosis object, typed by the return signature
-  send({ type: 'diagnosis', diagnosis })
-
-  rec_agent       = new recommendation_agent(...)
-  recommendations = await rec_agent.propose(inv, diagnosis, hooks)
-  //                                              ▲
-  //                                              │ the message
-```
-
-The practical consequence: the handoff is type-checked at compile time. If you ever changed `Diagnosis`'s shape, TypeScript would flag every call site that passes or receives it. The handoff has zero serialization cost.
-
-The condition under which it works: both agents run in the same process. For cross-request handoffs (the user-gated split-step UX), Layer 4's carrier applies.
-
-**Where this lives in the repo.** `app/api/agent/route.ts` `GET` stream `start()` body L237–L247 — `diagAgent.investigate(inv, hooks)` returns `Diagnosis`; passed to `recAgent.propose(inv, diagnosis!, hooks)`.
-
-### Layer 4 — the cross-request carrier (sessionStorage + URL param)
-
-The technical thing: when the pipeline is split across two HTTP requests (user clicks "see recommendations" between them), the message is *persisted to `sessionStorage` and re-passed via URL query param*. Same typed `Diagnosis` schema, different carrier.
-
-If you're coming from frontend, this is a multi-step form persisting state via `sessionStorage` and reloading it on the next page — the React equivalent of "the message survives a page navigation."
-
-```
-Cross-request handoff
-
-  Step 2 (diagnose request) — client:
-   ─────────────────────────────────────────
-    receives Diagnosis from SSE stream
-    in the investigation hook's 'done' handler:
-      session_storage.set(
-        'bi:diag:<id>',
-        serialize({ diagnosis: c_diag })
-      )
-
-  User clicks "see recommendations"
-       │
-       ▼
-  Step 3 (recommend request) — client:
-   ─────────────────────────────────────────
-    reads 'bi:diag:<id>' from session storage
-    constructs ?diagnosis=<encoded JSON> URL param
-    sends GET /api/agent?insightId=...&step=recommend&diagnosis=...
-
-  Step 3 — server:
-   ─────────────────────────────────────────
-    in the route handler:
-      diagnosis_param = req.searchParams.get('diagnosis')
-      diagnosis       = parse_diagnosis(diagnosis_param)
-      if not diagnosis: throw 'no diagnosis was handed over'
-
-    parse_diagnosis validates the shape:
-      - conclusion: string
-      - evidence: array
-      - hypothesesConsidered: array
-```
-
-The practical consequence: the *carrier* changes (function arg → session storage + URL param), but the *message* is the same typed Diagnosis. The validation function enforces the schema at the trust boundary — if the client sent a malformed object, the route rejects it before resuming the pipeline.
-
-The condition under which it works: the message has to fit in a URL query param (a `Diagnosis` does, comfortably — usually under 4KB). For larger messages, you'd POST them or use a server-side session store.
-
-**Where this lives in the repo.** Client-side write: `lib/hooks/useInvestigation.ts` `case 'done':` of the SSE handler at ~L138 (`sessionStorage.setItem(diagHandoffKey(id), JSON.stringify({ diagnosis: cDiag }))`). Server-side validate-and-resume: `app/api/agent/route.ts` `parseDiagnosis()` at L86–L97 — validates `conclusion: string`, `evidence: array`, `hypothesesConsidered: array` before resuming the pipeline.
-
-### Layer 5 — per-agent tool subsets are part of context scoping
-
-The technical thing: each agent's tool subset is *part of its scoped context*. The recommendation agent can't even attempt to call analytics tools — they're not in its toolbox. Tools are scoped the same way messages are.
-
-If you're coming from frontend, this is component scoping for which side effects can fire: a child component with no `onSubmit` prop literally can't submit the form. The capability isn't there.
-
-```
-Tools as scoped context
-
-  Stage           Tool subset                          Cannot call
-  ──────────────  ──────────────────────────────────   ────────────────
-  diagnostic      execute_analytics_eql, segments,     feature catalog,
-                  funnel, comparison                    scenario specs
-  recommendation  feature catalog, scenario specs,     analytics tools
-                  campaign templates                    (cannot reach
-                                                        the data layer)
-```
-
-The practical consequence: scoping is enforced not just at the message layer (what data the agent sees) but at the capability layer (what tools the agent can call). The recommendation agent reasoning over the typed `Diagnosis` cannot decide to "verify" the diagnosis by re-running an EQL — it doesn't have that tool.
-
-**Where this lives in the repo.** Per-agent allow-list functions in `lib/mcp/tools.ts` — each function returns the tool names that agent can call; recommendation cannot reach analytics tools, diagnostic cannot reach feature-catalog tools. The coverage gate (the typed Diagnosis is *also* the contract for category coverage) lives in `lib/agents/categories.ts` — used to verify the diagnosis touched the expected coverage categories.
-
-```
-shape (not full impl):
-
-  // The message
-  interface Diagnosis {
-    conclusion: string;
-    evidence: string[];
-    hypothesesConsidered: { hypothesis; supported; reasoning }[];
-    affectedCustomers?: { count; segmentDescription };
-    confidence?: 'high'|'medium'|'low';
-    timeSeries?: { day; value }[];
+```typescript
+// app/api/agent/route.ts:84-94 — receive the diagnosis on the way back in
+function parseDiagnosis(param: string | null): Diagnosis | null {
+  if (!param) return null;
+  try {
+    const d = JSON.parse(param);
+    if (d && typeof d.conclusion === 'string' && Array.isArray(d.evidence) && Array.isArray(d.hypothesesConsidered)) {
+      return d as Diagnosis;
+    }
+  } catch {
+    /* ignore */
   }
+  return null;
+}
 
-  // The in-process carrier
-  const diagnosis: Diagnosis = await diagAgent.investigate(inv, hooks);
-  const recs = await recAgent.propose(inv, diagnosis, hooks);  // typed arg
-
-  // The cross-request carrier (client)
-  sessionStorage.setItem('bi:diag:<id>', JSON.stringify({ diagnosis }));
-
-  // The cross-request carrier (server, validation at trust boundary)
-  function parseDiagnosis(param: string | null): Diagnosis | null {
-    if (!param) return null;
-    try {
-      const d = JSON.parse(param);
-      if (d && typeof d.conclusion === 'string'
-            && Array.isArray(d.evidence)
-            && Array.isArray(d.hypothesesConsidered)) {
-        return d as Diagnosis;
-      }
-    } catch { /* ignore */ }
-    return null;
-  }
+// app/api/agent/route.ts:269-272 — gate on it
+if (step === 'recommend') {
+  diagnosis = parseDiagnosis(diagnosisParam);
+  if (!diagnosis) throw new Error('no diagnosis was handed over — open the diagnosis step first');
+}
 ```
 
-### Phase A vs Phase B — what would force a move toward shared state
+The architectural pressure this creates: **the diagnosis has to be small enough to fit in a URL** (browsers and Vercel both have URL length limits). That's a real constraint that shaped the `Diagnosis` interface in `lib/mcp/types.ts` — conclusion is a string, evidence is a string array (not the full tool result), hypotheses are short reasoning strings. The architectural pressure produced a discipline.
+
+### Move 2.5 — why no shared blackboard, even when in-process
+
+Even within a single combined-run request (where in-process shared state would be technically possible), the route handler still uses message passing. Why?
+
+- **Symmetry with the cross-request path.** The cross-request path has to be message-passing (no shared memory); the in-process path matches it so the agents have the same input shape in both cases. Less code, fewer surprises.
+- **Forced minimalism.** Each agent's prompt is narrower because it only sees what it needs. RecommendationAgent doesn't get the raw monitoring trace; it gets the digested Diagnosis. Smaller prompt = cheaper, less lost-in-the-middle.
+- **Test fakes are easier.** Each agent's input is a function arg, not "the current state of the blackboard." Mocking is straightforward — pass a fixture object.
+
+### Move 3 — the principle
+
+Shared state is simple to reason about but every agent sees everything, so context bloats with the number of agents (and the lost-in-the-middle problem scales with it). Message passing scopes each agent's context to what it needs (cheaper, less noise) but requires deciding what to pass — and a bug there means an agent acts on missing information. The production answer is **multi-agent context routing**: pass role-specific context to each agent, not a shared blob. It's a direct application of context engineering (`../04-agent-infrastructure/01-context-engineering.md`).
+
+For systems where the platform forces ephemeral state (serverless, edge), message passing isn't even a choice — it's mandated. This repo turned that mandate into a discipline.
+
+## Primary diagram
+
+The two communication channels in this repo, with the data they carry:
 
 ```
-        Now (message passing)                 If shared state was forced
-┌─────────────────────────────────────┐  ┌─────────────────────────────────────┐
-│ DiagnosticAgent sees: anomaly       │  │ Both agents share a WorkspaceState   │ ←
-│ RecommendationAgent sees:            │  │   anomaly                            │
-│   anomaly + diagnosis                │  │   diagnostic_history                 │
-│ each agent's scratchpad/history     │  │   diagnostic_scratchpad              │
-│   stays in its loop                  │  │   diagnosis                          │
-│ ▼                                    │  │   recommendation_history             │
-│ small context windows                │  │   recommendations                    │
-│ schema-enforced contracts            │  │ ▼                                    │
-│                                      │  │ context windows grow with the run    │
-│                                      │  │ no schema enforcement on shape       │
-└─────────────────────────────────────┘  └─────────────────────────────────────┘
-   moving to shared state buys: a graph-style state engine,
-   easier "free-form" agent access to prior context.
-   costs: larger windows, weaker contracts, harder debugging.
+  Message passing in blooming insights — two channels, one discipline
+
+  Channel 1: in-process (capture combined run)
+  ────────────────────────────────────────────
+  ┌─────────────────────────────────────────────────────────────┐
+  │ within ONE request:                                          │
+  │   diag = await diagAgent.investigate(anomaly)               │
+  │     diag : Diagnosis    ← plain JS object, function arg     │
+  │   recs = await recAgent.propose(anomaly, diag)              │
+  │     recs : Recommendation[]                                  │
+  └─────────────────────────────────────────────────────────────┘
+
+  Channel 2: cross-request (production split-step)
+  ────────────────────────────────────────────────
+  ┌─────────────────────────────────────────────────────────────┐
+  │ step 2 response:                                             │
+  │   { type: 'diagnosis', diagnosis: { conclusion, evidence, …}}│
+  │           │                                                   │
+  │           ▼ useInvestigation.ts → sessionStorage             │
+  │   browser holds the diagnosis                                │
+  │           │                                                   │
+  │           ▼ user clicks "see recommendations →"              │
+  │   GET /api/agent?step=recommend&diagnosis={JSON.stringify(d)}│
+  │           │                                                   │
+  │           ▼ route.ts: parseDiagnosis(diagnosisParam)         │
+  │   recAgent.propose(anomaly, parsed diagnosis)                │
+  └─────────────────────────────────────────────────────────────┘
+
+  Both channels pass the SAME shape (Diagnosis). The architecture
+  enforces it: cross-request requires serializable; in-process matches
+  for symmetry.
 ```
-
-*Now:* each agent's context is curated by the route. Diagnostic sees the anomaly. Recommendation sees anomaly + diagnosis. Neither sees the other's scratchpad. Schema is enforced at the type level (TypeScript) and the validation level (`parseDiagnosis`).
-
-*If shared state was forced:* the day the codebase adopts a graph runtime (`./07-graph-orchestration.md`), the engine's state schema becomes a kind of shared state. The mitigation that real graph runtimes apply: the state schema is *typed and curated* — adding a field is intentional, and graph viewers show every reader/writer of every field. So shared state in a graph runtime is closer to "Redux with TypeScript and strict reducer signatures" than to "blackboard free-for-all" — but the context-window cost still applies, and you have to actively curate what each node reads.
-
-The takeaway: **message passing is the cheapest, most isolated, most type-safe option for inter-agent communication — at the cost of having to design the schema.** blooming insights chose it deliberately. Shared state would be a deliberate choice in a different direction, with different costs.
-
-This is what people mean by "multi-agent context routing" — passing role-specific context to each agent, instead of sharing everything. It's a direct application of the context-engineering discipline: most agent failures are context failures, and bloated shared state is one of the biggest context failures.
-
-The full picture is below.
-
----
-
-## Shared state vs message passing — diagram
-
-```
-Shared state vs message passing — full picture
-
-  ┌─ SHARED STATE (blackboard) ──────────────────────────────────┐
-  │                                                              │
-  │      ┌─────────────────────────────────────┐                 │
-  │      │   Shared workspace state             │                 │
-  │      │   (every agent reads + writes)      │                 │
-  │      │                                     │                 │
-  │      │   anomaly, diagnostic_history,      │                 │
-  │      │   diagnostic_scratchpad, diagnosis, │                 │
-  │      │   recommendation_history, recs,     │                 │
-  │      │   tool_responses[...]               │                 │
-  │      └─────────────────────────────────────┘                 │
-  │              ▲                ▲                              │
-  │              │                │                              │
-  │         ┌────┴───┐        ┌──┴────┐                          │
-  │         │Agent A │        │Agent B│                          │
-  │         └────────┘        └───────┘                          │
-  │                                                              │
-  │   cost:  large windows, no curation, lost-in-the-middle      │
-  │   win:   simple to reason about ("everyone sees everything") │
-  │                                                              │
-  └──────────────────────────────────────────────────────────────┘
-
-  ┌─ MESSAGE PASSING (this codebase) ────────────────────────────┐
-  │                                                              │
-  │   ┌──────────────┐    Diagnosis (typed)    ┌──────────────┐  │
-  │   │DiagnosticAg.  │ ──────────────────────►│Recommendation│  │
-  │   │              │                          │Agent         │  │
-  │   │ scratchpad,  │   in-process: function   │              │  │
-  │   │ history,     │     argument             │ scratchpad,  │  │
-  │   │ tool calls   │   cross-request:         │ history,     │  │
-  │   │ ── stay      │     sessionStorage +     │ tool calls   │  │
-  │   │ scoped here  │     URL param           │ ── stay      │  │
-  │   │              │                          │ scoped here  │  │
-  │   └──────────────┘                          └──────────────┘  │
-  │                                                              │
-  │   cost:  schema design upfront                                │
-  │   win:   small windows, type-safe contracts,                 │
-  │          stage-isolated debugging, no context bloat           │
-  │                                                              │
-  └──────────────────────────────────────────────────────────────┘
-
-  Carriers for the message in this codebase:
-  ┌──────────────────────────────────────────┐
-  │ in-process:   function arg               │
-  │   diagnosis: Diagnosis                   │
-  ├──────────────────────────────────────────┤
-  │ cross-request:                            │
-  │   write:  session_storage.set(            │
-  │            'bi:diag:<id>', serialize(     │
-  │            { diagnosis }))                │
-  │   read:   parse_diagnosis(URL ?diagnosis=)│
-  └──────────────────────────────────────────┘
-  Schema (the contract): interface Diagnosis     (the typed inter-agent message)
-```
-
----
 
 ## Elaborate
 
-### Where this pattern comes from
+The shared-state-vs-message-passing question is older than agents — it's the same axis distributed-systems engineers have argued over for 40 years (shared memory vs message-passing concurrency models, Actor vs procedure-call). The agent-architecture wisdom is the same one those debates landed on: shared state is simpler in the small case and dangerous in the large case; message passing is more code in the small case and more robust in the large case.
 
-The blackboard pattern goes back to 1970s AI research (the HEARSAY-II speech understanding system was the canonical example) — a shared "blackboard" data structure where multiple specialist "knowledge sources" read and write. Message passing is older still — it's the foundational paradigm of distributed computing (Hoare's CSP, Actor model from Hewitt 1973, Erlang's actor model). In the LLM-multi-agent era, the same dichotomy applies: LangGraph's `StateGraph` is shared-state by default (one state schema, every node reads/writes); OpenAI Agents SDK's handoffs and the manually-constructed multi-agent designs (like blooming insights) tend toward message passing.
+For LLM agents specifically there's a second consideration: **context bloat**. A shared blackboard means every agent sees the cumulative state, which means every agent's prompt grows with every other agent's output. By 3-4 agents the context is dominated by other agents' chatter, lost-in-the-middle kicks in, and the model's attention on the actual task degrades. Message passing keeps each agent's prompt focused on its specific input.
 
-### The deeper principle
-
-**Curating context per role is cheaper, safer, and clearer than sharing everything.** Bloated shared state is one of the biggest causes of agent failures — the lost-in-the-middle problem scales with both context length and number of irrelevant items. Message passing forces you to ask "what does this agent actually need?" — and the answer is almost always less than "everything everyone else produced."
-
-```
-   Shared state                       Message passing
-   ────────────────────────────       ────────────────────────────
-   write anything, read anything      typed input, typed output
-   easy to start                      schema design up front
-   cheap PR ("just add a field")      schema change = visible PR
-   expensive at scale (window bloat)  scoped windows, scoped costs
-   safe-by-default? NO — one bad      safe-by-default? YES — bad
-    write poisons every reader         output stays in one agent
-```
-
-This is the same principle as React's "lift state up" + "pass via props" advice vs "throw everything in Redux." Both work; the latter is one PR away from a 200-field global store no one can reason about.
-
-### Where this breaks down
-
-Message passing breaks when the message schema can't keep up with the agents' actual context needs. If you find yourself adding fields to the message every PR, the cost of schema migration starts to dominate. At that point you either accept that "the message is large" (it's a typed shared state, basically) or you adopt a graph runtime's state schema with first-class reducer signatures.
-
-It also breaks when the agents genuinely benefit from inspecting each other's *process* (not just output). For some debate/critic shapes (cross-ref `./05-debate-verifier-critic.md`), the critic needs to see the producer's *reasoning*, not just the conclusion — message passing of just the final output loses that signal. The mitigation is to include reasoning in the schema (`hypothesesConsidered[]` already does this for blooming insights' diagnosis) or to switch that specific path to shared state.
-
-### What to explore next
-- `./03-sequential-pipeline.md` → the pipeline shape that uses message passing as its native communication
-- `./07-graph-orchestration.md` → state graphs typically use shared state (with curated schemas)
-- `./09-coordination-failure-modes.md` → "context bloat" is the failure mode this avoids
-- `../../study-system-design/07-client-stream-handoff.md` → the cross-request carrier (`sessionStorage` + URL param) from a system-design perspective
-
----
+The production-scarred pattern that emerged: even in frameworks that support shared state (LangGraph's State), the discipline is to pass role-specific *slices* of the shared state into each node — not the whole blob. That's message passing wearing shared-state's clothes. This repo just skips the costume and uses real message passing directly.
 
 ## Interview defense
 
-### What an interviewer is really asking
+**Q: "How do your agents share state?"**
 
-When an interviewer asks "how do your agents share data" they're testing whether you know the difference between shared state and message passing — and whether you chose the model deliberately or by default. The strong signal is naming the typed `Diagnosis` as the message and explaining why curation matters (context window cost, debug shape, type safety). The weak signal is calling all inter-agent communication "the agents talk to each other" without naming the mechanism.
+A: They don't — they pass messages. Each agent's input is the previous agent's output, handed over as a plain JSON object. In the combined-run flow (capture only) it's a function argument; in the production split-step flow it's a URL query param round-tripped through the browser's sessionStorage. Both paths use the same `Diagnosis` shape, so the agents have the same input contract regardless of how the data got there.
 
-### Likely questions
+The architectural pressure is interesting: Vercel's ephemeral serverless instances FORCE message passing — there's no shared memory between requests. So the cross-request path had to be serializable, which means the `Diagnosis` shape had to be small enough to fit in a URL. That pressure became a discipline: every agent's input is small and explicit. No blackboard, no context bloat from agents leaking into each other's prompts.
 
-[mid] Q: How does the diagnostic agent's output get to the recommendation agent?
+Diagram I'd sketch:
 
-A: It's handed as a typed `Diagnosis` object — defined in `lib/mcp/types.ts` L95–L104 with `conclusion`, `evidence[]`, `hypothesesConsidered[]`, optional `affectedCustomers`, `confidence`, `timeSeries`. In-process (combined run), the diagnostic agent's `investigate(...)` returns it and the route passes it as the second arg to `recommend.propose(anomaly, diagnosis, hooks)`. Cross-request (split-step UX), the client persists it to `sessionStorage` with key `bi:diag:<id>` and re-sends it as a URL query param when the user clicks "see recommendations"; the route's `parseDiagnosis()` validates the shape before resuming.
-
-Diagram:
 ```
-  In-process:                    Cross-request:
-   diagAgent.investigate(...)     diagAgent.investigate(...)
-        │ returns Diagnosis            │ returns Diagnosis
-        ▼                              ▼
-   recAgent.propose(_, dx, _)      sessionStorage.setItem(
-        ▲                            'bi:diag:<id>', JSON.stringify({...}))
-        │ typed arg                    │
-                                       ▼ user clicks
-                                  ?diagnosis=<encoded> URL
-                                       │
-                                       ▼ next request
-                                  parseDiagnosis(URL param)
-                                       ▼
-                                  recAgent.propose(_, dx, _)
+  ┌──────────┐  Diagnosis  ┌──────────┐
+  │ DiagAgt  │ ──────────► │ RecAgt   │
+  └──────────┘             └──────────┘
+       ▲                        ▲
+       │                        │
+  in-process: function arg      │
+  cross-request: URL param + sessionStorage
+
+  NEVER a shared blackboard. The diagnosis is small enough to URL-encode.
 ```
 
-[senior] Q: Why didn't you use a shared workspace state instead?
+Anchor: "the cross-request handoff at `route.ts:269` is the load-bearing constraint. Diagnosis has to be JSON-serializable and URL-fittable. That pressure shaped the type definition."
 
-A: Three reasons. First, context bloat: shared state means every agent's window carries every prior agent's history — for the recommendation agent, that's ~30k tokens of diagnostic tool calls and intermediate reasoning, vs ~2k for the curated Diagnosis. At Anthropic Sonnet pricing, ~10x more tokens per recommendation call. Second, debug surface: with message passing, "recommendation went wrong" is investigated by reading the Diagnosis and the recommendation agent's loop — two places. With shared state, you have to figure out which field of the shared state the recommendation agent latched onto from any prior agent. Third, type safety: the TypeScript interface `Diagnosis` is enforced at compile time and at the request boundary via `parseDiagnosis`; a shared mutable workspace state would require either a graph runtime's reducer signatures or weaker conventions. The cost of message passing is up-front schema design — I had to decide what `Diagnosis` carries before writing the recommendation prompt — but it's a one-time cost.
+**Q: "Why message passing and not a blackboard, even in-process?"**
 
-Diagram:
-```
-  Shared state                     Message passing (this codebase)
-  ──────────────────────────       ──────────────────────────────
-  rec agent window:                rec agent window:
-   anomaly                          anomaly
-   + diagnostic_history (~30k)      + Diagnosis (~2k)
-   + diagnostic_scratchpad
-   + diagnosis
-                                   ─►  10x cheaper per call
-   ─► high context, drift risk     ─►  stage-localized debugging
-   ─► hard to debug "which field    ─►  schema is the contract
-       did rec latch onto?"
-```
-
-[arch] Q: What would you have to change to scale this codebase past 6+ agents?
-
-A: Eventually I'd move to a graph runtime's *curated* shared state — not a free-for-all blackboard, but a typed state schema where each node declares what it reads and what it writes. The typed `Diagnosis` would become one field in a larger `InvestigationState` (along with `anomaly`, `recommendations`, `userFeedback`, etc.), and each node's reader/writer surface would be explicit. The schema design discipline I have today with `Diagnosis` scales to that — I just need a state engine to enforce it. What I would NOT do is move to free-form shared state (every agent reads/writes any field); the context-window cost and debug surface make it a regression at any scale.
-
-Diagram:
-```
-Scaling path
-
-  blooming insights today        At 6+ agents (refactor target)
-  ────────────────────────       ───────────────────────────────
-  message passing                graph runtime + typed state
-  Diagnosis (1 typed message)    InvestigationState (typed schema)
-  agents see only what's          each node DECLARES reads/writes
-   handed
-  in-process: function args      engine routes state to nodes
-  cross-request: sessionStorage   checkpoint store persists state
-
-   message passing                  curated shared state
-   (small N)                       (graph engine + schema)
-   ▲                                       ▲
-   │       NOT free-for-all blackboard ────┘
-   └─ stay here until N forces the move
-```
-
-### The question candidates always dodge
-
-Q: If you're doing message passing, doesn't that mean the recommendation agent is missing context it might need? What if a critical detail was in the diagnostic agent's scratchpad?
-
-A: Yes — and that's the deliberate cost. The recommendation agent operates on the *curated* `Diagnosis`, not on the diagnostic agent's full reasoning. If a critical detail wasn't in the schema, the recommendation agent misses it. The mitigation isn't to dump shared state on the recommendation agent (which would re-introduce all the costs we just talked about); it's to make the schema *expressive enough*. `Diagnosis.hypothesesConsidered[]` exists specifically because we knew the recommendation agent would want to know which hypotheses were tested and rejected, not just the conclusion. If a future need surfaces — say, "the recommendation agent wants to know which EQL tools the diagnostic agent ran" — I add that field to the schema. It's a visible PR that the diagnostic agent has to write it and the recommendation agent can read it; TypeScript flags every call site. The honest version: message passing forces context engineering to be *explicit*. Shared state lets it be implicit — and implicit context is where lost-in-the-middle failures live. I'd rather pay the schema-design tax than the per-run context-bloat tax. If the schema ever feels too restrictive, the answer is a graph runtime with curated state, not a free-for-all blackboard.
-
-Diagram:
-```
-The cost of message passing — and the response
-
-  Cost:  rec agent sees only the typed Diagnosis
-         (not diag's full history)
-
-  Risk:  a critical detail might be in diag's scratchpad
-         and not in the schema
-
-  Response:
-   1. design the schema to be expressive
-      (hypothesesConsidered[], evidence[], etc.)
-   2. when a new context need surfaces:
-      ─► add a field to Diagnosis (visible PR)
-      ─► TypeScript flags every call site
-      ─► both agents are aware of the change
-   3. if Diagnosis grows past ~15 fields:
-      ─► time to adopt a graph runtime + state schema
-      ─► but still curated, never free-for-all
-```
-
-### One-line anchors
-
-- "blooming insights uses message passing — the typed `Diagnosis` is the message, function args and `sessionStorage` are the carriers."
-- "Each agent's context is scoped to what's handed in plus its own prompt and tool subset; no agent reads another's scratchpad."
-- "Curated context = cheaper LLM bills + smaller windows + type-safe contracts + stage-localized debugging."
-- "Schema growth is visible (TypeScript flags every call site); shared-state additions are silent — that's the architectural difference."
-
----
+A: Symmetry with the cross-request path (less code, fewer surprises), forced minimalism (each agent's prompt is narrower, cheaper, less lost-in-the-middle), and testability (each agent's input is a function arg, not "the current state of some shared object" — fixtures are trivial). The blackboard pattern is more flexible but invites context bloat — by 3-4 agents the shared context is dominated by other agents' chatter. Message passing keeps each agent's prompt focused.
 
 ## See also
 
-→ `./03-sequential-pipeline.md` · → `./07-graph-orchestration.md` · → `./09-coordination-failure-modes.md` · → systems view: `../../study-system-design/06-multi-agent-orchestration.md` · → client handoff: `../../study-system-design/07-client-stream-handoff.md`
-
----
+- [`03-sequential-pipeline.md`](./03-sequential-pipeline.md) — the sequencing that uses this message-passing
+- [`../04-agent-infrastructure/01-context-engineering.md`](../04-agent-infrastructure/01-context-engineering.md) — what "what to pass" means in detail
+- [`07-graph-orchestration.md`](./07-graph-orchestration.md) — the topology where blackboards are common
+- [`09-coordination-failure-modes.md`](./09-coordination-failure-modes.md) — context bloat is one of the failures message-passing prevents

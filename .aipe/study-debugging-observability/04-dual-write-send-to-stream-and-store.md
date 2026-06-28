@@ -1,436 +1,369 @@
-# Dual-write — send to stream and store
+# Dual-write: send to stream and store
 
-**Industry name(s):** dual-write, tee, fan-out write, capture + emit, send-to-many
-**Type:** Industry standard · Project-specific (the specific two destinations are this repo's choice)
+**Industry name(s):** tee / fan-out / dual-write; the streaming-data analogue of `tee(1)`. Some call it *write-through observability* or *interceptor logging*. **Type:** Industry standard pattern, language-agnostic.
 
----
+## Zoom out — where this concept lives
 
-## Zoom out, then zoom in
-
-**Zoom out — the bigger picture.** This pattern is one closure — `send(e: AgentEvent)` in `app/api/agent/route.ts:172-175` — that writes every emitted event to two destinations in one call. One destination is the wire (`controller.enqueue(encodeEvent(e))`), feeding the live UI. The other is an in-process buffer (`collected.push(e)`), feeding the snapshot persisted at `done`. Both writes happen for every event; both are required for the system to work; neither knows about the other.
+The route's `send` function does two things at once: enqueue bytes into the live HTTP stream *and* push the event into an in-memory array that will be persisted on `done`. One function call, two destinations. That's the seam that keeps the live wire and the saved snapshot in lockstep — without it, the replay would drift from the live experience.
 
 ```
-  Zoom out — where the dual-write sits in the request flow
+  Zoom out — dual-write at the service layer, fanning to wire + storage
 
-  ┌─ Agent loop ──────────────────────────────────────┐
-  │  hooks fire on every step                          │
-  │  onText / onToolCall / onToolResult                │
-  └─────────────────────────▲─────────────────────────┘
-                            │ calls send(e: AgentEvent)
-  ┌─ Route handler ─────────┴─────────────────────────┐  ← we are here
-  │  ★ send(e) = collected.push(e) + enqueue(encode(e)) ★ │
-  │  one closure, two writes, on every call             │
-  └────┬────────────────────────────────────────┬──────┘
-       │ write 1: in-process buffer              │ write 2: wire
-       ▼                                         ▼
-  ┌─ collected[] ──────────┐               ┌─ controller (NDJSON stream) ─┐
-  │  request-scoped array  │               │  enqueued bytes              │
-  │  → saveInvestigation   │               │  → UI parses, renders        │
-  │    on send({done})     │               │  → cache replays from same   │
-  └────────────────────────┘               └─────────────────────────────┘
-       │                                         │
-       ▼                                         ▼
-  serves the REPLAY surface                 serves the LIVE surface
-  (cache, fixture, demo)                    (current request)
+  ┌─ UI layer ─────────────────────────────────────────────────┐
+  │  client reads NDJSON stream live                            │
+  └────────────────────▲────────────────────────────────────────┘
+                       │ encoded bytes
+  ┌─ Service layer ────┼──────────────────────────────────────────┐
+  │   ┌────────────────────────────────────────┐                  │
+  │   │ send(e: AgentEvent) — dual writer       │                  │
+  │   │                                          │                  │
+  │   │   ┌─────────────────────────────────┐    │                  │
+  │   │   │ ★ collected.push(e)             │ ──►│─► saved on 'done' │
+  │   │   ╞══════════════════════════════════╡    │                  │
+  │   │   │ ★ controller.enqueue(            │ ──►│─► live wire     │
+  │   │   │     encoder.encode(encodeEvent(e)))│  │                  │
+  │   │   └─────────────────────────────────┘    │                  │
+  │   └────────────────────────────────────────┘                  │
+  │                       │                                       │
+  └───────────────────────┼───────────────────────────────────────┘
+                          │ on 'done': saveInvestigation(id, collected)
+                          ▼
+  ┌─ Storage layer ──────────────────────────────────────────────┐
+  │  in-memory Map → .investigation-cache.json (dev only)         │
+  └───────────────────────────────────────────────────────────────┘
 ```
 
-**Zoom in — narrow to the concept.** A dual-write is one call that produces two artifacts. The art is making it look like one operation to the caller — every emitter in the agent loop calls `send(e)` once, and the closure handles the fan-out. The two destinations have *very different* lifetimes: the wire bytes are gone the moment the stream closes (request-scoped); the in-process buffer survives until the route's `finally` clause and gets snapshotted on success. The dual-write is what makes the same trace serve BOTH the live UI AND the replayable snapshot — without it, you'd either lose replay (drop the push) or lose the live render (drop the enqueue). Both load-bearing.
+**Zoom in.** `send` is a 4-line closure with two writes: array-push first, then stream-enqueue. Every emit site in the route calls `send` instead of touching the controller directly — so the array always sees what the wire sees, in the same order, no exceptions. On `done`, the array is handed to `saveInvestigation` and becomes the next demo replay.
 
----
+The question this pattern answers: *"how do we guarantee the saved snapshot is byte-equivalent to the live stream, without running the agent twice?"*
 
 ## Structure pass
 
-**Layers.** Three: the `send` closure (the dual-write itself), the two destinations (wire and buffer), and the consumers (the live client reading the wire, the cache replay reading the persisted buffer).
+**Layers.** One closure (the `send` function) sitting between the agent loop and two sinks (the HTTP wire + the in-memory array). The closure is the *only* writer that touches the stream from inside the route — every emit site (the four agent hooks, the route's direct sends, the `done` and `error` events) calls `send`.
 
-**Axis: state (where does this evidence live, and how long does it survive?).** Trace it across the writes. The wire write: bytes live in the stream queue until consumed, then in browser process React state for as long as the page is mounted. The buffer write: events live in `collected[]` until the route's `finally` clause; at `done`, `saveInvestigation` lifts them into the 3-rung store (mem → dev file → committed seed). Same event, two trajectories — one ephemeral and consumer-bound, one persistent and reproduction-bound.
-
-**Seams.** Two load-bearing:
-
-- **Closure ↔ each destination.** `send` is the join point. Internally, the dual-write happens *atomically from the closure's perspective* (no `await` between push and enqueue), so an event that lands in the buffer always also lands on the wire. Drop the symmetry and you get partial truths: an event in the snapshot but not on the live wire (broken UI), or an event on the wire but not in the snapshot (broken replay).
-- **Buffer ↔ snapshot.** Crossed once per request, conditionally. `saveInvestigation(insightId, collected)` only runs on the `done` event AND when `step == null` (combined-run path only). The seam matters because it's the gate between "captured during this request" and "available for replay forever after." Crossing it persists; not crossing it (an error before `done`, or a split-step run) leaves the snapshot in request memory only.
-
-A *cosmetic-looking but actually load-bearing* third seam: the `send` closure is defined *inside* the `start(controller)` callback. It captures `collected` and `controller` from its lexical scope. There's no `send` outside the stream's lifetime — that's by design, because both destinations only make sense inside the stream's life.
+**Axis: invariant ordering.** Hold *"are the two sinks always in lockstep?"* constant.
 
 ```
-  Structure pass — dual-write
+  Trace "are the wire and the store in the same order?" across emit sites
 
-  ┌─ 1. LAYERS ───────────────────────────────────┐
-  │  send closure · destinations · consumers       │
-  └────────────────────────┬───────────────────────┘
-                           │  pick the axis
-  ┌─ 2. AXIS ─────────────▼────────────────────────┐
-  │  state: where does this live, how long?        │
-  └────────────────────────┬───────────────────────┘
-                           │  trace, find flips
-  ┌─ 3. SEAMS ────────────▼────────────────────────┐
-  │  closure ↔ each dest: atomic from caller (LOAD)│
-  │  buffer ↔ snapshot:   conditional gate (LOAD)  │
-  │  closure scope = stream lifetime (cosmetic-LOAD)│
-  └────────────────────────┬───────────────────────┘
-                           ▼
-                   Block 4 — How it works
+  emit site                          wire receives    store receives
+  ─────────                          ─────────────    ──────────────
+  diagnostic onText hook  → send →   yes (immediately) yes (synchronous push first)
+  diagnostic onToolCall   → send →   yes              yes
+  recommendation onText   → send →   yes              yes
+  step-by-step stepFor()  → send →   yes              yes
+  diagnosis event         → send →   yes              yes
+  done event              → send →   yes              yes
+                                     
+                                     ▲                ▲
+                                     │                │
+                          same closure → both happen in the same tick,
+                                          push BEFORE enqueue
 ```
 
-Skeleton mapped. Now walk the closure, the two destinations, and the snapshot gate.
+Push-before-enqueue is the *invariant* — it means a writer error inside the controller (back-pressure, closed stream) won't leave the array short an event relative to the wire. The opposite order would: enqueue first, then push — and an enqueue throw skips the push.
 
----
+**Seams.**
+
+1. **Closure ↔ wire.** Contract: `controller.enqueue` accepts encoded bytes. Break it (close the controller mid-stream) → `enqueue` throws; the array has the event but the wire didn't. Detection: surrounding try/catch in the stream-start function.
+2. **Closure ↔ store.** Contract: `collected.push` always succeeds (JS arrays are unbounded). No failure mode worth handling.
+3. **Closure ↔ caller (the agent loop).** Contract: every emit site calls `send`, never the controller directly. Break it (one site forgets and calls `controller.enqueue` directly) → that event goes to the wire but NOT to the store; replay loses it. Discipline: code review + the fact that `controller` is shadowed inside the closure scope (not exposed to the hooks).
+
+Skeleton mapped.
 
 ## How it works
 
-**Mental model.** A dual-write is a *tee* — one input, two outputs, the caller doesn't know there are two. Same shape as Unix's `tee` (read stdin, write stdout AND a file), `WriteStream.pipe` to two destinations, or any logger that ships to multiple sinks. The kernel is two lines: append to a buffer, push to a stream. Both lines run for every event; the caller calls one function.
+### Move 1 — the mental model
+
+You've used `console.log` and watched it print to the terminal *and* to the browser DevTools. That's a tee: one source, two sinks, in lockstep. The Unix `tee(1)` command does the same for pipelines (`some_cmd | tee out.log | next_cmd` — `next_cmd` sees the same bytes that landed in `out.log`).
+
+This route is the same idea inside one function: every event goes to the wire (the next stage of the pipeline, the client) AND to the array (the log file). The trick is that **both writes happen at the same call site** — there's no "log on completion" separate pass, no "send to a logger queue and hope it flushes." Push-then-enqueue, atomically, every time.
 
 ```
-  Pattern — the tee (one call, two destinations)
+  The pattern — one source, two sinks, same call site
 
-           ┌───────────────┐
-           │  send(e)      │   ← single closure called by every emitter
-           └──────┬────────┘
+      emit site (agent hook, route step, terminal event)
                   │
-        ┌─────────┴─────────┐
-        │                   │
-        ▼                   ▼
-  ┌──────────────┐    ┌──────────────────────────────┐
-  │ collected[]  │    │ controller.enqueue(          │
-  │ .push(e)     │    │   encoder.encode(            │
-  │              │    │     encodeEvent(e)))         │
-  │ (buffer)     │    │ (wire)                       │
-  └──────┬───────┘    └──────────┬───────────────────┘
-         │                       │
-         ▼                       ▼
-   on send({done}):       UI reads NDJSON line,
-   saveInvestigation       renders into TraceItem[]
-   (id, collected)         (live render)
-         │
-         ▼
-   snapshot persisted
-   to 3-rung store
-   (replay surface)
+                  ▼
+        send(e: AgentEvent) {
+          collected.push(e);        ──┐
+          controller.enqueue(         │  both happen
+            encoder.encode(           │  in this tick,
+              encodeEvent(e)));     ──┘  in this order
+        }
+                  │
+            ┌─────┴─────┐
+            ▼           ▼
+        wire sink   store sink
+        (live)      (saved on 'done')
 ```
 
-### Move 2 — walk the parts
+### Move 2.1 — the dual-write closure
 
-**Use cases.** Three real moments the dual-write is doing visible work:
+Six lines at **`app/api/agent/route.ts:186-190`**:
 
-- **Live render during a fresh investigation.** The user clicks "investigate" on an insight that's never been cached. The route hits the live path, the agent loop emits, `send(e)` writes to both destinations. The wire bytes stream to the UI; `useInvestigation` parses lines, dispatches into React state, the `ReasoningTrace` component renders each event with a timestamp and agent badge. Simultaneously, `collected[]` is filling up server-side. At `done`, `saveInvestigation` fires and the buffer becomes a persistent snapshot. The user is none the wiser — they just saw a smooth live trace.
-
-- **Same trace, demo replay.** Now another user (or the same user another day) requests the same `insightId`. The route's cache-first gate hits, `getCachedInvestigation` returns the captured `AgentEvent[]` from the seed rung. The replay path iterates the same events through `encodeEvent` and `enqueue`, the wire bytes look identical, the UI renders identically. The dual-write made this possible — without `collected.push(e)`, the original run would have been gone with the request.
-
-- **Capturing the demo seed.** A developer wants a new seed for a new insight. They run dev (`NODE_ENV=development` → `PERSIST=true`), trigger a combined-run live, `send(e)` writes to both destinations, `saveInvestigation` writes mem AND `.investigation-cache.json`. They then copy the relevant entry into `lib/state/demo-investigations.json` and commit. The dev file IS the workflow's capture surface; without it, you'd have to instrument the route specifically for capture.
-
-#### The send closure — two lines that ARE the dual-write
-
-The reader anchor: you've written a helper function that wraps a side effect (`const log = (msg) => { console.log(msg); store.push(msg) }`). Same shape. The closure has no return value — it's pure side effect — and it does the same two things in the same order on every call.
-
-What happens: every emitter in the agent loop calls `send(e)` with one typed event. The closure runs `collected.push(e)` first (writes the buffer), then `controller.enqueue(encoder.encode(encodeEvent(e)))` (writes the wire). The order matters at one specific failure mode: if `enqueue` throws (e.g. the consumer disconnected mid-stream), the buffer write has already happened, so the snapshot is still complete from the buffer's perspective. Pushing first preserves the snapshot's integrity.
-
-Boundary: the closure is synchronous — no `await`. This is deliberate: if there were an `await` between the two writes, the loop could observe an event in the buffer that wasn't yet on the wire. The synchronous-tee guarantee is what makes the dual-write feel atomic to the caller.
-
-```
-  Send closure — two writes, one call
-
-  app/api/agent/route.ts:172-175
-
-  const send = (e: AgentEvent) => {
-    collected.push(e);                                   ← write 1: in-process buffer
-    controller.enqueue(encoder.encode(encodeEvent(e)));  ← write 2: wire bytes
-  };
-                              ▲
-                              │
-                              └─ no return, no await, synchronous tee.
-                                 Caller sees one function; closure does
-                                 two writes. Push first so a failed enqueue
-                                 doesn't leave the buffer inconsistent.
+```typescript
+// app/api/agent/route.ts:186-190
+const collected: AgentEvent[] = [];                          // ← the second sink, declared inside stream start
+const send = (e: AgentEvent) => {
+  collected.push(e);                                          // ← rung 1 of dual write: array push (cannot fail)
+  controller.enqueue(encoder.encode(encodeEvent(e)));         // ← rung 2 of dual write: stream enqueue
+};
 ```
 
-**Code in this codebase — the closure in context:**
+**Reading the choice of order.** `collected.push` first, `controller.enqueue` second. If `enqueue` throws (e.g. controller already closed because the client navigated away), the array still has the event. That keeps the captured snapshot complete even if the wire failed at the very end. Saving a complete-but-not-quite-wire-perfect array is more useful than saving an array that's *missing* the events that didn't make it onto a broken wire.
 
-```
-  app/api/agent/route.ts  (lines 168-175)
+**The collection is scoped to one request.** `collected` is declared inside the `start(controller)` callback at line 185, so each request gets its own array. No cross-request bleed.
 
-  const encoder = new TextEncoder();                                            ← shared encoder
-  const stream = new ReadableStream<Uint8Array>({
-    async start(controller) {
-      const collected: AgentEvent[] = [];                                       ← buffer declaration
-      const send = (e: AgentEvent) => {                                          ← the closure
-        collected.push(e);                                                       ← write 1: in-process buffer
-        controller.enqueue(encoder.encode(encodeEvent(e)));                      ← write 2: wire bytes
-      };
-        │
-        └─ two writes, one call. Synchronous (no await between them) so
-           an event can't end up in the buffer without also being on the
-           wire. Push first because if enqueue throws (consumer disconnect),
-           the buffer is still consistent for the snapshot.
-```
+### Move 2.2 — the helper closures that use `send`
 
-**Code in this codebase — the hooks that call `send`** from the agent loop:
+Every emit site routes through `send`. Two helper closures wrap it, at **`app/api/agent/route.ts:191-210`**:
 
-```
-  app/api/agent/route.ts  (lines 181-195)
+```typescript
+// app/api/agent/route.ts:191-210 (condensed; full version covers all 3 step kinds and 3 hook kinds)
+const stepFor = (
+  agent: AgentName,
+  kind: 'thought' | 'hypothesis' | 'conclusion',
+  content: string,
+) => send({ type: 'reasoning_step', step: { id: crypto.randomUUID(), agent, kind, content } });
 
-  const hooksFor = (agent: AgentName) => ({
-    onText: (t: string) => {
-      if (t.trim()) stepFor(agent, 'thought', t);                              ← stepFor → send (reasoning_step)
-    },
-    onToolCall: (tc: ToolCall) =>
-      send({ type: 'tool_call_start', toolName: tc.toolName, agent }),         ← span OPEN via send
-    onToolResult: (tc: ToolCall) =>
-      send({                                                                    ← span CLOSE via send
-        type: 'tool_call_end',
-        toolName: tc.toolName,
-        agent,
-        durationMs: tc.durationMs ?? 0,                                        ← timing measured by McpClient
-        result: trunc(tc.result),
-        error: tc.error,
-      }),
-  });
-        │
-        └─ every agent action → one send call → two destinations.
-           hooksFor curries the agent label, so each event is correctly
-           attributed. The agent loop never knows about the dual-write —
-           it just calls hooks; the hooks call send; send tees.
+const hooksFor = (agent: AgentName) => ({
+  onText: (t: string) => {
+    if (t.trim()) stepFor(agent, 'thought', t);
+  },
+  onToolCall: (tc: ToolCall) => send({ type: 'tool_call_start', toolName: tc.toolName, agent }),
+  onToolResult: (tc: ToolCall) =>
+    send({
+      type: 'tool_call_end',
+      toolName: tc.toolName,
+      agent,
+      durationMs: tc.durationMs ?? 0,
+      result: trunc(tc.result),
+      error: tc.error,
+    }),
+});
 ```
 
-#### Destination 1 — the wire (live UI)
+**`stepFor` builds a reasoning_step event and routes through `send`.** The `crypto.randomUUID()` is what makes the step replayable — every event has a stable ID that the UI uses for React keys *and* that the replay can preserve.
 
-The reader anchor: you've used `Response.body.getReader()` to stream a fetch response. Same shape — but here the server is the producer, calling `controller.enqueue` with one NDJSON line per event. The bytes ride a `ReadableStream` until the consumer reads them or the stream closes.
+**`hooksFor(agent)` returns the three hooks the agent loop expects.** Each hook builds the matching `AgentEvent` variant and routes through `send`. The agent loop has no idea any of this is happening — it just calls `onText`, `onToolCall`, `onToolResult` as it runs, and those calls each fan to both sinks.
 
-What happens: `encodeEvent(e)` returns `JSON.stringify(e) + '\n'` (string). `encoder.encode(...)` converts it to `Uint8Array`. `controller.enqueue(...)` hands the bytes to the stream's internal queue. The bytes sit there until the consumer's reader pulls them. The HTTP response uses `Content-Type: application/x-ndjson` so the consumer (`useInvestigation`) reads with a streaming `TextDecoder` + `split('\n')`.
+**Note `trunc(tc.result)` at line 207.** The result payload is truncated to 4000 chars (`TRUNC = 4000` at line 97). This applies to both the wire AND the store — the dual-write doesn't distinguish. So a huge EQL result is small in both places, consistently. That's important: the saved snapshot is *not* a richer artifact than the wire; it's exactly the same.
 
-Boundary: the wire bytes are *request-scoped*. Once the response stream closes (either `controller.close()` in `finally`, or the consumer disconnects, or the function times out at `maxDuration=300`), the bytes are gone. Replay never comes from the wire — it comes from the buffer's snapshot. This is why the dual-write exists: the wire alone isn't replayable.
+### Move 2.3 — the persist-on-done call
 
-#### Destination 2 — the buffer (snapshot source)
+The pattern only pays off if the array becomes durable. That happens once, at **`app/api/agent/route.ts:299-302`**:
 
-The reader anchor: you've used `Array.prototype.push` to accumulate items during a process. Same shape, with one wrinkle: this buffer is the *single source of truth* for the snapshot. Whatever is in `collected[]` at `done` time is what gets persisted; if an event is missing from the buffer, it's missing from the snapshot.
-
-What happens: `collected: AgentEvent[] = []` is declared at the top of `start(controller)`. Every `send(e)` pushes to it. When `send({type: 'done'})` runs, the next line in the route is `if (step == null) saveInvestigation(insightId!, collected)` — the array is passed by reference to `saveInvestigation`, which writes mem (always) and the dev file (in dev). The buffer's lifetime ends with the `finally { controller.close() }` after the agent run completes.
-
-Boundary: the buffer is *not* deep-cloned at save time. `saveInvestigation` writes the same array reference to mem (no copy) and serializes via `JSON.stringify` for the dev file (which IS a copy). If anything in the route code mutated `collected[]` after the save (it doesn't — the save is the last meaningful operation), mem would see the mutation. Today the order is "send done → save → close," so the buffer is effectively frozen at save time.
-
-```
-  The two destinations — different lifetimes, different consumers
-
-  destination 1: wire                     destination 2: buffer
-  ─────────────────────────────────       ─────────────────────────────────
-  controller.enqueue(bytes)               collected.push(e)
-        │                                       │
-        ▼                                       ▼
-  HTTP response stream                    in-process array
-        │                                       │
-        ▼                                       ▼
-  consumer: UI                            consumer: saveInvestigation
-        │                                       │
-        ▼                                       ▼
-  React state (page mount)                3-rung store (mem→file→seed)
-        │                                       │
-        ▼                                       ▼
-  rendered DOM                            available for replay forever
-  (current request only)                  (across deploys via seed rung)
-
-  lifetime:  request-scoped               lifetime:  scoped to the snapshot's rung
-  consumer:  the user, right now          consumer:  future requests, including demo
+```typescript
+send({ type: 'done' });                                       // ← the last event hits both sinks
+// Only the combined run (capture) is cached to disk; the split steps are
+// handed off via the client's sessionStorage.
+if (step == null) saveInvestigation(insightId!, collected);   // ← `collected` is the snapshot — fed to the three-rung store
 ```
 
-#### The snapshot gate — conditional persistence
+**Reading the gate `if (step == null)`.** Only combined runs (no `?step=` param — the capture flow) get persisted. Per-step runs (the user investigating step 2 or step 3 separately) don't write to the cache, because the cache is keyed by `insightId` and storing per-step would mean partial snapshots that can't be replayed as a whole. The single-write-per-insight rule means rung 2 holds *complete combined runs only*, which is exactly what the replay branch expects.
 
-The reader anchor: you've written `if (condition) commit()` at the end of a transaction. Same shape — the snapshot is the commit, and the condition has two parts.
+**`saveInvestigation` is the bridge to the three-rung store** (→ `03-three-rung-mem-file-seed-store.md`). It writes to rung 1 always, rung 2 in dev. So the live request's `collected` array becomes the next request's cached fixture, transparently.
 
-What happens: `app/api/agent/route.ts:251-254` calls `send({type: 'done'})` first (the dual-write fires — `done` lands in the buffer and on the wire), then evaluates `if (step == null) saveInvestigation(insightId!, collected)`. The `step == null` check is what gates the snapshot to the combined-run path; split-step runs (`step='diagnose'` or `step='recommend'`) skip the save. The other implicit gate is that this code only runs if the `try` block completed without throwing — error paths skip the save.
+### Move 2.4 — load-bearing skeleton
 
-Boundary: the snapshot is gated on *both* contractual termination (the `done` event) AND the combined-run path (`step == null`). Drop either gate and the cache contents change. Drop the `done` gate: half-finished runs replay as if complete. Drop the `step == null` gate: split-step runs cache, which conflicts with the client's sessionStorage handoff and creates two sources of truth for the cross-step state.
+Three parts. Drop any one and the dual-write contract breaks in a named way.
 
-```
-  Snapshot gate — when the buffer becomes a snapshot
-
-  send({type: 'done'})              ← dual-write fires (buffer + wire)
-        │
-        ▼
-  if (step == null)                 ← gate 1: combined run only
-    saveInvestigation(              ← (split steps use sessionStorage)
-      insightId, collected          ← buffer passed by reference
-    )
-        │
-        ▼  3-rung write: mem always, dev file if PERSIST
-
-  NOT triggered:
-    - send({type:'error'})          ← the catch path emits error,
-                                       skips save (no half-snapshots)
-    - throw before send({done})     ← finally runs, controller closes,
-                                       collected[] is garbage-collected
-                                       with no save
-    - step='diagnose'|'recommend'   ← split-step path skips save
-                                       (sessionStorage handles handoff)
-```
-
-**Code in this codebase — phase outputs and the terminal.** Same `send`, same dual-write:
+**1. Isolate the kernel.**
 
 ```
-  app/api/agent/route.ts  (lines 222-254, abbreviated)
+  dual-write kernel (pseudocode)
 
-  // STEP 2 (diagnose)
-  stepFor('diagnostic', 'thought', `investigating "${inv.metric}"…`);          ← send via stepFor
-  diagnosis = await diagAgent.investigate(inv, hooksFor('diagnostic'));        ← hooks call send
-  send({ type: 'diagnosis', diagnosis });                                      ← phase output via send
+  per-request:
+    collected := []                                    // local to the request
+    send(e) :=
+      collected.push(e)                                // sink A: in-process array
+      controller.enqueue(encode(e))                    // sink B: wire stream
 
-  // STEP 3 (recommend)
-  if (step !== 'diagnose') {
-    stepFor('recommendation', 'thought', 'proposing actions…');
-    const recommendations = await recAgent.propose(inv, diagnosis!,
-                                                    hooksFor('recommendation'));
-    for (const r of recommendations) send({ type: 'recommendation',            ← N recs, N send calls
-                                            recommendation: r });
-  }
-
-  send({ type: 'done' });                                                      ← terminal via send
-  // Only the combined run (capture) is cached to disk; the split steps are
-  // handed off via the client's sessionStorage.
-  if (step == null) saveInvestigation(insightId!, collected);                  ← gate + persist
-        │
-        └─ every emit goes through send. The buffer fills up; the wire
-           emits. At done, the buffer is passed by reference to
-           saveInvestigation. The step==null gate scopes the snapshot
-           to the combined-run path.
+  on terminal event:
+    send({type: 'done'})
+    if condition_for_persisting:
+      saveInvestigation(id, collected)                  // hand collected to durable store
 ```
 
-**Code in this codebase — the error path.** `send` for the typed channel, `console.error` for the untyped one:
+**2. Name each part by what BREAKS when it is missing.**
+
+| Part | What breaks if removed |
+| --- | --- |
+| `const collected = []` declared per-request inside the closure | shared array across requests → events from request N leak into request M's saved snapshot |
+| `collected.push(e)` BEFORE `controller.enqueue` | enqueue throw (closed controller) skips the push → saved snapshot missing the final events |
+| every emit site routes through `send` (not direct `enqueue`) | a forgotten site emits to wire only → saved snapshot is missing those events → replay diverges from the live experience for THAT investigation type |
+| `saveInvestigation(id, collected)` after `send({type:'done'})` | the array exists but is never persisted → cache never warms, every replay is a miss |
+| the `step == null` gate before `saveInvestigation` | per-step runs would overwrite the combined-run snapshot with a partial one → the replay branch's filter has nothing valid to slice |
+
+**3. Separate skeleton from optional hardening.**
+
+The kernel is "one closure, two sinks, persist on terminal." Optional hardening (all currently present): the `trunc(tc.result)` to bound payload size at 4000 chars; the abort check in the replay branch but NOT in the live branch (live `send` calls always enqueue, even after abort, because the controller's own close handles that); the `try/catch` around `writeFileSync` inside `saveInvestigation` (the dual-write itself never sees the disk error).
+
+### Move 2.5 — the sequence
+
+What actually happens, in time, for one tool call event.
 
 ```
-  app/api/agent/route.ts  (lines 255-260)
+  Sequence — one tool_call_end event through dual-write
 
-  } catch (e) {
-    console.error('[agent] error:', e);                                        ← UNTYPED log (stdout)
-    send({                                                                      ← TYPED channel (dual-write)
-      type: 'error',
-      message: `/api/agent · ${e instanceof Error ? e.message : String(e)}`,
-    });
-  } finally {
-    controller.close();
-  }
-        │
-        └─ the catch fires the dual-write for the typed error event —
-           the buffer captures `error` and the wire emits it. NOTE:
-           the snapshot is NOT saved on this path (step==null check
-           is unreached after a throw). The error event lives in the
-           wire and the buffer, but the buffer is garbage-collected
-           without persistence. That's the "broken runs aren't
-           replayable" gap named in audit.md.
+  agent loop                  hooksFor('diagnostic').onToolResult(tc)
+   │                                       │
+   │  tool completes                       │
+   │  (durationMs measured)                │
+   │ ───────────────────────────────────► │
+   │                                       │
+   │                                       │  builds event:
+   │                                       │  { type: 'tool_call_end',
+   │                                       │    toolName, agent: 'diagnostic',
+   │                                       │    durationMs, result: trunc(...), error }
+   │                                       │
+   │                                       │  calls send(event)
+   │                                       │
+   │                          send(e):     │
+   │                          ─────────────│
+   │                                       │── collected.push(e)        [sink A: array]
+   │                                       │
+   │                                       │── encoded := encodeEvent(e) // JSON + '\n'
+   │                                       │── bytes := encoder.encode(encoded)
+   │                                       │── controller.enqueue(bytes) [sink B: wire]
+   │                                       │
+   │  ◄─── returns ─────────────────────── │
+   │                                       │
+   │  (agent loop continues)               │
+   │                                       │
+                                          
+                                  ▲                          ▲
+                          collected[i] = e          wire has the bytes
+                          (sink A complete)         (sink B complete)
+                          
+  on terminal:
+    send({type:'done'})  → both sinks
+    saveInvestigation(insightId, collected) → rung 1 (mem.set) + rung 2 (writeFileSync, dev)
 ```
 
-#### Move 3 — the principle
+Both sinks complete inside the same synchronous tick. There's no async window between the array having the event and the wire having the bytes. That's why the snapshot is byte-equivalent: same encoder, same source, same order, no possible drift.
 
-A dual-write is a *fan-out at the source*: every event has two trajectories, and the caller doesn't know. The lesson generalises: when one stream serves both a live consumer and a future consumer (replay, audit, analytics), capture the events at the source — not after the wire. The temptation is to capture downstream ("the UI will save what it renders" or "I'll log lines I see on the wire"); downstream capture is lossy because intermediaries can drop, reorder, or transform events. Capturing at the source guarantees parity between live and replay — and the typed union (`AgentEvent`) guarantees the captured shape matches the wire shape. The two-line `send` closure is the smallest credible version of this discipline.
+### Move 3 — the principle
 
----
+The general principle: **when one event needs to land in two places, build the tee at the smallest possible scope.** Not a logger queue (asynchronous, can lose events under back-pressure). Not an after-the-fact replay (the agent ran once, you can't re-run it for the snapshot). One synchronous closure that pushes both sinks at the same call site, every time.
+
+The corollary: **route every emit site through the closure.** The discipline is the safety. The moment one emit site calls `controller.enqueue` directly, the saved snapshot is incomplete for that case, and the replay starts lying — and the failure is silent because the live wire is fine.
+
+A reader of the route will notice that the closure does the work of *both* an observability concern (capture the event for later) and a transport concern (send the event now). That coupling is on purpose. Separating them ("emit to wire; observability is downstream") would introduce the async window — and that's exactly what makes saved snapshots drift from live experience.
 
 ## Primary diagram
 
-The full dual-write with the gate and both consumer paths labelled.
+The full picture — one `send`, two sinks, terminal persist.
 
 ```
-  Dual-write — full picture
+  Dual-write — every event goes to wire AND store, at the same call site
 
-  ┌─ Agent loop ────────────────────────────────────────────────┐
-  │  hooksFor(agent) — onText, onToolCall, onToolResult          │
-  │  fires once per agent action                                 │
-  └─────────────────────────▲───────────────────────────────────┘
-                            │ each hook calls send(e)
-  ┌─ Send closure (app/api/agent/route.ts:172-175) ─────────────┐
-  │  const send = (e: AgentEvent) => {                            │
-  │    collected.push(e);                                ─────────┼─► destination 1: buffer
-  │    controller.enqueue(encoder.encode(encodeEvent(e)));───────┼─► destination 2: wire
-  │  };                                                           │
-  └─────────────────────────────────────────────────────────────┘
-            │                                            │
-            │ write 1 (sync, no await)                   │ write 2 (sync, no await)
-            ▼                                            ▼
-  ┌─ collected: AgentEvent[] ─────┐         ┌─ controller queue (Uint8Array) ──┐
-  │  request-scoped               │         │  NDJSON bytes                     │
-  │  one entry per event          │         │  one line per event               │
-  │  declared at start(controller)│         │  consumed by HTTP response stream │
-  └─────────────▲─────────────────┘         └─────────────▲────────────────────┘
-                │                                          │
-                │  when send({done}) fires + step==null    │  read by consumer
-                │  (route.ts:251-254)                      │  (browser, fetch.body)
-                ▼                                          ▼
-  ┌─ saveInvestigation ──────────────────┐    ┌─ useInvestigation (UI) ───────┐
-  │  mem.set(id, collected)               │    │  TextDecoder + split('\n')   │
-  │  if PERSIST: writeFileSync(dev-file)  │    │  for each line:               │
-  │  → 3-rung store                        │    │    JSON.parse → handle(e)     │
-  └─────────────▲─────────────────────────┘    │    switch (e.type) { … }      │
-                │                              └─────────────▲─────────────────┘
-                │ available for replay                       │
-                │ (any future request,                       │ render: TraceItem[]
-                │  including demo seed                       │         → React state
-                │  if committed)                             │         → rendered DOM
-                ▼                                            ▼
-  REPLAY surface (cache hits this)                LIVE surface (this request)
-  → 02-replay-from-snapshot-with-paced-emission   → for this user, right now
-  → 03-three-rung-mem-file-seed-store
+  ┌─ agent layer ────────────────────────────────────────────────────┐
+  │  DiagnosticAgent.investigate(…, hooksFor('diagnostic'))           │
+  │    │                                                              │
+  │    ├─ onText(t)        → stepFor('diagnostic','thought',t)        │
+  │    ├─ onToolCall(tc)   → send({type:'tool_call_start',…})         │
+  │    └─ onToolResult(tc) → send({type:'tool_call_end',…,trunc(res)})│
+  │                                                                   │
+  │  RecommendationAgent.propose(…, hooksFor('recommendation'))       │
+  │    │ (same three hooks, agent: 'recommendation')                  │
+  └────┼──────────────────────────────────────────────────────────────┘
+       │                          ┌─ Route-level direct emits ──────┐
+       │                          │  stepFor('diagnostic','thought',│
+       │                          │    'investigating …')           │
+       │                          │  send({type:'diagnosis', …})    │
+       │                          │  send({type:'recommendation',…})│
+       │                          │  send({type:'done'})            │
+       │                          │  send({type:'error', message:…})│
+       │                          └────┬────────────────────────────┘
+       │                               │
+       └───────────────┬───────────────┘
+                       ▼
+  ┌─ the dual-write closure ──────────────────────────────────────────┐
+  │  const collected: AgentEvent[] = [];   // per-request, in scope    │
+  │  const send = (e: AgentEvent) => {                                  │
+  │    collected.push(e);                  // SINK A first              │
+  │    controller.enqueue(                  // SINK B second             │
+  │      encoder.encode(encodeEvent(e))                                  │
+  │    );                                                                │
+  │  };                                                                  │
+  └─────────┬──────────────────────────────────────┬────────────────────┘
+            │                                       │
+            ▼ rung 1: array push (cannot fail)      ▼ rung 2: bytes on wire
+  ┌─ in-process array ───────┐         ┌─ HTTP chunked response ──────┐
+  │ AgentEvent[]              │         │ NDJSON, content-type         │
+  │   ↓ on 'done'             │         │ application/x-ndjson         │
+  │ saveInvestigation(id,     │         │   ↓                          │
+  │   collected)              │         │ readNdjson on UI consumer    │
+  │   ↓                       │         │   ↓                          │
+  │ three-rung store          │         │ switch (e.type) → React      │
+  │ (mem.set + dev file)      │         │ state                        │
+  └───────────────────────────┘         └──────────────────────────────┘
 ```
-
----
 
 ## Elaborate
 
-The dual-write pattern is the same shape as Unix's `tee` (read input, write to stdout AND a named file), Kafka's "audit log + downstream consumer" architecture (every event into the log AND into the live pipeline), and the Redux DevTools' state-snapshot-per-action discipline (every action dispatched AND captured for time-travel). The common thread: capture at the source, not downstream, so the captured shape exactly matches what the live consumer saw. Downstream capture (e.g. parsing the wire bytes back into events for storage) is lossy because intermediaries can drop, reorder, or transform events. Source capture guarantees parity.
+The dual-write pattern is everywhere because the alternative (emit-then-log-from-the-pipeline) introduces an asynchronous failure mode. The Unix `tee(1)` is the same idea at the OS level. Datadog/Honeycomb client libraries that batch-buffer log lines under back-pressure are an *anti-pattern* version of the same need: they trade durability for throughput by promising "we'll get to it" — fine for most logs, broken for "this log IS the artifact."
 
-What this pattern gets right that ad-hoc capture approaches miss: the dual-write is *synchronous*. The push and the enqueue happen in the same JS tick — no `await` between them, no chance for the loop to observe a buffer entry without a wire entry (or vice versa). Most ad-hoc capture systems use a different shape ("emit, then async-batch to a sink"), which introduces races and partial-state windows. The synchronous-tee here is what makes the snapshot's contents *exactly* match the wire's contents — same events, same order, no missing tail.
+The closest distributed-systems analog is the **transactional outbox pattern**: write to the DB and to an outbox table in one transaction; a worker reads the outbox and publishes to a message bus. Same principle (atomic dual-write to two destinations), more machinery (because the destinations are separate systems). This codebase has the in-process version: the array IS the outbox, `saveInvestigation` IS the worker.
 
-What's missing — and worth naming — is *capture on error*. The dual-write fires for the typed `error` event, but the snapshot is only persisted on `done` (gated by the route's `if (step == null) saveInvestigation`). A run that throws partway through has `error` in `collected[]` but the buffer is garbage-collected without `saveInvestigation` ever being called. A small extension would be a `try/finally` around the dual-write that *always* persists the buffer (perhaps to a separate "broken runs" rung) — at the cost of growing the cache with half-runs that need filtering on read. Today the trade-off is "no broken runs in the replay path" at the cost of "broken runs aren't replayable at all." Naming the gap is the move.
+The **collected.push BEFORE enqueue** ordering is the bit that's easy to get wrong. Most code does it in the obvious "emit, then record" order — which means a failure in emit leaves the record short. Reversing it is the kind of safety lesson you learn by losing one important snapshot.
 
-Worth a note on the closure pattern itself. The dual-write *has* to be a closure (not a top-level function) because both destinations (`collected` and `controller`) are scoped to one request's `start(controller)` callback. There's no `send` outside the stream's lifetime — and that's correct, because a `send` outside the stream couldn't do anything meaningful. The closure scope is what enforces "every emission is request-bound." If you ever wanted to share emission logic across routes (e.g. between `/api/agent` and `/api/briefing`), you'd extract a `createSender(controller, collected, encoder)` factory — but the route-local closure is simpler when there's only one route shape to support.
+The **per-step gate before persist** (`if (step == null)`) is the operational discipline that keeps the cache valid. Without it, partial step runs would overwrite combined runs, and the replay branch's filter would have nothing valid to slice. The capture flow runs combined; the user flow runs split; only the capture path persists.
 
----
+**Adjacent concepts:**
+- **`tee(1)`** — the Unix command that named the pattern.
+- **Reactor pattern's onNext + onComplete callbacks** — pushing through one observable callback to N subscribers.
+- **Transactional outbox** — the durable-message-bus version.
+- **`console.log` interceptors / monkey-patched loggers** — the "log to console AND ship to a backend" version most JS apps run.
+- **Write-through cache** — the storage version (write to cache and DB at once).
+
+**Read next:**
+- `01-ndjson-agent-event-discriminated-union.md` — what gets dual-written.
+- `02-replay-from-snapshot-with-paced-emission.md` — what the saved snapshot becomes.
+- `03-three-rung-mem-file-seed-store.md` — where `saveInvestigation` ends up.
 
 ## Interview defense
 
-**Q1. Walk me through what would break if you dropped one half of the dual-write.**
+**Q: Why push-then-enqueue and not enqueue-then-push?**
+A: Push is safer (JS arrays don't throw on a successful push). Enqueue can throw (closed controller, back-pressure). If enqueue throws, the surrounding try/catch catches it — but if we enqueued *first*, the push never ran and the saved snapshot is missing that event. Pushing first means the saved snapshot is *complete or strictly larger* than the wire experience, never smaller. For a snapshot that's going to become a replay fixture, "more complete" is the right error mode.
 
-Drop `collected.push(e)`: replay dies. The wire still works (the live UI renders correctly), but `saveInvestigation` writes an empty array on `done`. Next request for the same `insightId` reads the cache, finds `[]`, and the replay loop iterates over nothing — the stream closes immediately, the UI sits at "running" forever (the `done` event was never enqueued). The seed becomes useless because there's nothing to seed with.
+> *Sketch:* the closure with arrows showing the order, plus a callout "if enqueue throws here, the push already happened."
 
-Drop `controller.enqueue(...)`: live UI dies. The buffer fills up correctly server-side, `saveInvestigation` writes a complete snapshot, *future* replay works fine. But the current request has nothing on the wire — the consumer's `fetch()` returns an empty body, the UI never sees an event, the page stays blank. The first run of any new investigation looks broken even though the snapshot was captured cleanly.
+**Anchor:** "Push first; the array is the safer sink."
 
-Both writes are load-bearing. The push serves replay (and the demo seed); the enqueue serves the user, right now.
+**Q: Why is `collected` declared inside the stream-start callback?**
+A: Per-request scope. If `collected` were at module level, request A's events would leak into request B's saved snapshot — a serverless instance serving concurrent requests would corrupt every cache write. Declaring it inside the `start(controller)` closure scopes it to one request. Same reason `lib/state/insights.ts:14` uses per-session sub-maps instead of one global Map.
 
-```
-  what breaks if you drop:
-  ───────────────────────────────────────
-  push only:    replay dies, current UI works
-                → next user sees empty replay
-  enqueue only: live UI dies, snapshot is fine
-                → current user sees blank page
-                → future users get a clean replay
-  both:         the route emits nothing observable
-```
+> *Sketch:* the closure scope highlighted, two concurrent request boxes with their own `collected` arrays.
 
-**Anchor:** "name the two consumers — current user (wire) vs future users including demo (snapshot). Both load-bearing."
+**Anchor:** "Scope per request; module-level is a leak."
 
-**Q2. Why is the dual-write synchronous (no await between the writes)?**
+**Q: How do you guarantee every emit site goes through `send`?**
+A: Discipline + scope. The `controller` is shadowed inside the `start` callback — no outer code has a reference. Inside, every emit site either calls `send` directly, calls `stepFor` (which calls `send`), or calls `hooksFor(agent)` which builds the three hooks (which call `send`). The agent loop only sees the hooks — it doesn't even know about the controller. The only place to forget the dual-write is inside the route file itself, on direct calls to `send`-vs-`controller.enqueue`. Code review catches it; the safer move would be to never bind `controller` to a name visible inside `start` — but that's a separate refactor.
 
-Two reasons. (1) **Consistency.** If there were an `await` between `collected.push(e)` and `controller.enqueue(...)`, another microtask could observe the buffer holding event N before the wire has it — or worse, the loop could continue and call `send(e+1)` and end up with events out of order on the wire while the buffer is in order. Synchronous-tee makes the dual-write atomic from the caller's perspective. (2) **Performance.** Both operations are cheap (one array push, one stream enqueue) — adding async coordination would add overhead with no benefit. The closure is a hot path (called once per event, potentially hundreds of events per investigation), so keeping it sync is correct.
+> *Sketch:* the closure scope with `send` inside, `controller` shadowed, all emit sites going through `send`.
 
-The order of the writes also matters: push first, enqueue second. If `enqueue` throws (the consumer disconnected, the stream is closed, etc.), the buffer is still consistent — the event is captured even if the wire ate it. This is what preserves the snapshot's integrity in the rare disconnect case.
+**Anchor:** "Hide the controller; expose only the dual-writer."
 
-```
-  why sync (no await):
-  ──────────────────────────────────────────
-  (1) consistency: caller can't observe a buffer entry without a wire entry
-  (2) performance: hot path, both writes are cheap, no coord overhead
-  (3) order: push first → enqueue-failure leaves buffer consistent
-```
+**Q: Why does only the combined run get persisted?**
+A: The replay branch's per-step filter slices a combined-run snapshot into diagnose / recommend views. If a per-step run overwrote the combined snapshot, the next replay would be a partial that the filter can't slice into the other step. The `if (step == null)` gate at `app/api/agent/route.ts:302` means: only the capture flow (which runs combined) writes the cache. User-driven per-step runs read from cache but don't write. One-direction data flow keeps the cache consistent.
 
-**Anchor:** "synchronous-tee = atomic from the caller; push-first = snapshot-resilient under disconnect."
+> *Sketch:* combined run → write; per-step run → read-only.
 
----
+**Anchor:** "Combined writes; split reads. Cache stays sliceable."
 
----
+**Q: What happens if the client closes the tab mid-stream?**
+A: The agent loop is signaled (`req.signal.aborted` becomes true; the threaded signal cancels the in-flight Anthropic call and the in-flight MCP call). The catch block at `app/api/agent/route.ts:308-310` checks for `DOMException` `AbortError` and returns without sending an error event (no consumer to read it). The `finally` block still fires the phase summary log to Vercel logs *and* runs `disposeDataSource`. The `collected` array exists but is partial; `saveInvestigation` isn't called (we never reached the `done` send). So the cache stays clean — no half-runs persisted. The cost is that the budget burned on a cancelled run is visible only in the phase log line, not as a saved artifact.
+
+> *Sketch:* the abort path: client close → req.signal → loop bail → catch → finally → no saveInvestigation.
+
+**Anchor:** "Abort doesn't write a partial cache."
 
 ## See also
 
-- `audit.md` — the broader lens audit; this pattern is named in observability-map and reproduction-and-evidence.
-- `01-ndjson-agentevent-discriminated-union.md` — the typed shape both writes preserve.
-- `02-replay-from-snapshot-with-paced-emission.md` — the consumer that reads the persisted buffer.
-- `03-three-rung-mem-file-seed-store.md` — where the buffer lands after `saveInvestigation`.
-- `06-eval-result-paper-trail.md` (RETIRED) — the eval runner once did its own dual-write conceptually (candidate output → judge call + on-disk JSON); the seam between live-emission and post-hoc-measurement was where the offline surface attached. The runner is gone (PR #8 / 62c24d7); the pattern still teaches the source-capture-into-two-destinations discipline at offline scope.
-- `.aipe/study-system-design/05-streaming-ndjson.md` — the wire half of the dual-write (system-design angle).
-
----
+- `01-ndjson-agent-event-discriminated-union.md` — the schema being dual-written.
+- `02-replay-from-snapshot-with-paced-emission.md` — what the saved array becomes.
+- `03-three-rung-mem-file-seed-store.md` — where `saveInvestigation` deposits it.
+- `audit.md` § 1 (observability-map), § 2 (reproduction-and-evidence).

@@ -1,351 +1,277 @@
-# Meta-prompting (using an LLM to write prompts for other LLM calls)
+# 11 — Meta-prompting
 
-**Industry name(s):** meta-prompting, prompt generation, prompt-bootstrapping, automatic prompt engineering (APE-adjacent)
-**Type:** Industry standard · Language-agnostic
-
-> Meta-prompting is using a model to draft or improve the prompts you feed to other model calls — the human writes a goal, the model drafts a prompt, the human reviews and edits it, and the edited prompt enters the repo. blooming insights' four prompts are entirely hand-written `.md` files; nothing in the codebase generates a prompt. The workflow saves real time on the initial draft of a complex prompt and almost none on small tweaks — and its failure mode is a prompt that reads like LLM output instead of an engineering spec.
-
-
----
+*LLM-authored prompts · Industry standard · Anchor: aipe (your meta-tooling project)*
 
 ## Zoom out, then zoom in
 
-**Zoom out — the bigger picture.** Meta-prompting sits in an *authoring-time* band that does not exist in the codebase today — a dev-time helper that drafts a `.md` file which then drops into the existing Per-agent definitions band like any hand-written prompt. The runtime path (`readFileSync` → `runAgentLoop` → Provider) never sees the meta-prompt; it sees the committed file, identical in kind to the hand-written four. So the diagram has two halves: the Authoring band (where the human, the meta-prompt, the draft, and the human review live) sits above the Repo, and the Runtime path is untouched below it.
+Meta-prompting is using an LLM to write or improve prompts for other LLM calls. It doesn't live in `blooming_insights` itself — it lives in *aipe*, your meta-tooling project. The two systems exemplify the two sides of meta-prompting: the *consumer* (blooming) and the *generator* (aipe).
 
 ```
-  Zoom out — where meta-prompting lives
+  Meta-prompting — where the prompt generator and consumer sit
 
-  ┌─ Authoring band (dev-time, NOT built) ──────────┐  ← we are here
-  │  human GOAL + {schema} shape                     │
-  │     ↓                                            │
-  │  ★ META-PROMPT (encodes house anatomy) ★         │
-  │     ↓ drafting call                              │
-  │  DRAFT .md text                                  │
-  │     ↓ ⚠ HUMAN REVIEW (non-optional)              │
-  │  reviewed prompt                                 │
-  └─────────────────────────┬────────────────────────┘
-                            │ commit
-  ┌─ Repo ──────────────────▼────────────────────────┐
-  │  lib/agents/prompts/<new>.md  (same dir as the 4)│
-  └─────────────────────────┬────────────────────────┘
-                            │ readFileSync at import
-  ┌─ Per-agent definitions ─▼────────────────────────┐
-  │  PROMPT.replace('{schema}',…) → runAgentLoop     │
-  │  (RUNTIME path unchanged — never sees the meta)  │
-  └──────────────────────────────────────────────────┘
+  ┌─ aipe (the meta-tooling) ─────────────────────────────────────┐
+  │  slash commands map to prompt templates                         │
+  │  /aipe:study-prompt-engineering → reads spec/format/me .md      │
+  │  → spawns Claude Code agent with assembled prompt                │
+  │  ★ THE GENERATOR ★ — LLM authoring prompts                      │ ← we are here
+  └──────────────────────┬────────────────────────────────────────┘
+                         │ produces .md files in
+                         │ .aipe/study-prompt-engineering/
+                         ▼
+  ┌─ output: 14 study .md files ──────────────────────────────────┐
+  │  this very file, plus 13 sibling concept files                  │
+  │  human-reviewed, committed to git                                │
+  └────────────────────────────────────────────────────────────────┘
+
+  ┌─ blooming_insights (the consumer) ────────────────────────────┐
+  │  lib/agents/legacy-prompts/{monitoring,diagnostic,...}.md        │
+  │  prompts authored by HUMANS, version-controlled (concept 03)    │
+  │  → loaded by readFileSync, sent to claude-sonnet-4-6             │
+  │  ★ THE CONSUMER ★ — running prompts in production                │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
-**Zoom in — narrow to the concept.** The question this file answers: when does using a model to draft a prompt save real time, when does it just add a review pass over output you have to rewrite anyway, and how do you keep a generated prompt from reading like LLM output? Meta-prompting earns its place on the initial draft of a *complex* prompt (the 0→70% leap) and becomes overhead on tweaks and high-iteration prompts. The non-negotiable step is the human review — because a generated draft defaults to the polite register ("try to," "where possible") and a prompt with soft rules has soft enforcement. Below, you'll see what the meta-prompt has to encode (the house anatomy from → 01), the hedging-drift failure mode, and the EQL-invention trap only a reviewer catches.
-
----
+aipe is your shipped example of a meta-prompting system. blooming_insights is a consumer of human-authored prompts. The relationship is real: this very file exists because aipe used an LLM to generate it from a spec, and a human (you) reviewed it before commit. That's the meta-prompting workflow in its actually-useful form.
 
 ## Structure pass
 
-**Layers.** Meta-prompting is a four-layer pipeline that sits *entirely above* the runtime path you already know. Layer A is the *human-authored input* — a one-line goal + the workspace schema shape. Layer B is the *meta-prompt itself* — instructions to the drafting model about how to write a blooming insights agent prompt (it has to encode the house anatomy from 01-anatomy.md: Role disclaiming the other agents' jobs, Hard rules, EQL reminders, Output schema, `{schema}` placeholder). Layer C is the *drafting call* that emits a candidate `.md` text. Layer D is the *human review pass* that turns the draft into a committed file — kill the hedging, verify the placeholders, check the EQL syntax the model invented. The commit then drops the artifact into the same `lib/agents/prompts/` directory the hand-written four live in, and runtime never knows the difference.
+**Layers.** Outer: the meta-system that produces prompts. Middle: the workflow (spec → LLM-draft → human-review → committed prompt). Innermost: the produced prompt running in some other system.
 
-**Axis: lifecycle.** When does each layer fire — authoring-time (one-off) or runtime (every request)? Lifecycle is the right axis (the brief calls this out explicitly) because the whole concept lives or dies on whether the model-in-the-loop sits *before* commit or *during* a request. Sliding meta-prompting into runtime would make every request slow, non-deterministic, and unreviewable — the same anti-pattern as a prompt loaded from a database instead of source. Authoring-time meta-prompting is a dev tool; runtime meta-prompting is malpractice. The axis makes that line crisp.
-
-**Seams.** Two seams, and the load-bearing one is the human review pass. Seam 1 (C↔D) — lifecycle still in the *authoring* band but flips from *model-produced* to *human-validated*. This is the seam where the draft's polite-LLM voice ("try to be efficient where possible") has to be dragged to spec voice ("at most 6 tool calls, then stop"). Skip this seam and you ship a prompt whose load-bearing rules read as suggestions. The load-bearing seam is Seam 2 (D↔commit/runtime) — lifecycle flips hard from *authoring-time* to *runtime-immutable* (the seam from 03-prompts-as-code.md). The artifact crossing this seam is indistinguishable from a hand-written prompt; the runtime path doesn't know and doesn't care that a model drafted it. That's the discipline — meta-prompting changes how the file got written, never how the file gets read.
+**Axis — what's the role of the human at each layer?** Walk it down:
 
 ```
-  Structure pass — meta-prompting
+  one axis — "what's the human's role at this layer?" — three layers, three roles
 
-  ┌─ 1. LAYERS ───────────────────────────────────┐
-  │  A: human goal + schema shape                  │
-  │  B: meta-prompt (encodes house anatomy)         │
-  │  C: drafting call → candidate .md text          │
-  │  D: human review (kill hedging, verify EQL)     │
-  │  → commit → runtime path (unchanged)            │
-  └────────────────────────┬───────────────────────┘
-                           │  pick the axis
-  ┌─ 2. AXIS ─────────────▼────────────────────────┐
-  │  lifecycle: authoring-time one-off vs           │
-  │  runtime per-request? (must stay authoring)     │
-  └────────────────────────┬───────────────────────┘
-                           │  trace A→commit, find flips
-  ┌─ 3. SEAMS ────────────▼────────────────────────┐
-  │  S1 (C↔D): model-produced → human-validated    │
-  │            (the hedging-drift fix lives here)   │
-  │  S2 (D↔commit): authoring-time → runtime-      │
-  │            immutable (LOAD-BEARING — the        │
-  │            seam that makes meta-prompting       │
-  │            indistinguishable from hand-author)  │
-  └────────────────────────┬───────────────────────┘
-                           ▼
-                   Block 4 — How it works
+  ┌─ meta-system (aipe) ───────────────────┐
+  │  human: WRITES THE SPEC                  │  high-leverage: spec drives N prompts
+  │  (study-prompt-engineering.md)           │
+  └─────────────────────────────────────────┘
+       ┌─ workflow ─────────────────────────┐
+       │  human: REVIEWS THE DRAFT          │  the load-bearing pass —
+       │  rejects what reads like LLM output │  without it, prompts drift
+       └─────────────────────────────────────┘
+            ┌─ produced prompt ──────────────┐
+            │  human: COMMITS THE RESULT     │  the prompt enters the
+            │  to git (concept 03)            │  codebase as ordinary source
+            └─────────────────────────────────┘
 ```
 
-```
-  A seam — "when does the model run on this prompt?" answered two ways
-
-  ┌─ authoring-time ─┐    seam     ┌─ runtime ────────────┐
-  │  model drafts    │ ═════╪═════► │  model READS the     │
-  │  the .md once,   │  (it flips) │  committed .md every │
-  │  human reviews   │             │  request (no drafting)│
-  └──────────────────┘             └──────────────────────┘
-         ▲                                   ▲
-         └────── same axis, two answers ─────┘
-                 → cross this seam in the wrong direction
-                   (drafting per-request) and the whole thing
-                   becomes slow, non-deterministic, unreviewable
-```
-
-The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+**Seams.** The biggest seam is the *human review pass*. Without it, meta-prompting produces prompts that read like LLM output — verbose, polite, full of hedging. With it, you get prompts that read like engineering specs. The review is what turns "LLM drafted this" from a liability into a productivity multiplier.
 
 ## How it works
 
-**Mental model.** Meta-prompting puts a model in the loop at *authoring* time, not runtime. There is a meta-prompt (instructions to the model about how to write a good agent prompt), an input (the goal plus context like the workspace schema), a drafting call (the model emits a candidate prompt), and — the non-negotiable step — a human review that turns the draft into a committed artifact. The output of the whole process is a versioned `.md` prompt file in the per-agent prompts directory, identical in kind to the hand-written ones (→ 03-prompts-as-code.md); only its origin differs.
+### Move 1 — the mental model
+
+You know how a code generator (Rails scaffold, OpenAPI codegen, Prisma migrate) writes the boilerplate so you can focus on the parts that matter — and then you *read what it wrote* and reject any garbage? Meta-prompting is the same shape, with one twist: the generator and the reviewer are both you, but the generator is the model.
 
 ```
-META-PROMPTING (authoring-time, NOT runtime)
-─────────────────────────────────────────────────────────────
- human writes GOAL          "an agent that flags slow-loading
-   + CONTEXT                 product pages from the schema"
-        │                    + the {schema} shape
-        ▼
- META-PROMPT  →  drafting call
-   "You write system prompts for analytics agents.
-    Mirror this anatomy: Role / Hard rules / method /
-    EQL reminders / Output schema / {schema}."
-        │
-        ▼
- DRAFT prompt  (candidate markdown text)
-        │
-        ▼
- ⚠ HUMAN REVIEW  ← delete fluff, tighten rules, verify
-   the placeholders, kill hedging
-        │
-        ▼
- commit  prompts dir / <new>.md   (a spec, git-reviewed)
+  Pattern — meta-prompting workflow, the kernel
+
+  ┌─ human writes spec ───┐
+  │  "I want a guide on    │  high-level intent, constraints,
+  │   prompt engineering,  │  examples of what good output looks like
+  │   13 concepts, this    │
+  │   format..."           │
+  └──────────┬────────────┘
+             │
+             ▼
+  ┌─ LLM drafts the prompt(s) ─┐
+  │  reads spec + format rules  │  produces N candidate prompts
+  │  → emits 13 .md files       │  in the specified shape
+  └──────────┬─────────────────┘
+             │
+             ▼
+  ┌─ human reviews ────────────┐
+  │  ★ THE LOAD-BEARING STEP ★  │  rejects hedging, marketing
+  │  edit, reject, accept       │  language, drift from the intent
+  └──────────┬─────────────────┘
+             │
+             ▼
+  ┌─ commit to git ────────────┐
+  │  the prompt enters the     │  now treated as ordinary source
+  │  codebase as ordinary       │  (concept 03 applies)
+  │  source                     │
+  └────────────────────────────┘
 ```
 
-The runtime path is untouched. The four agents still load a static markdown file at import; meta-prompting just changes how that file got written the first time. This is the distinction that matters: nothing generates a prompt *per request* — that would be slow, non-deterministic, and unreviewable.
+The kernel: a spec drives the meta-system, the meta-system drafts the prompts, the human reviews, the reviewed prompts ship. Skip the human review and you've automated the production of mediocre prompts.
 
----
+### Move 2 — the walkthrough
 
-### What the meta-prompt has to know
+**Step 1 — when meta-prompting saves time.** Two situations where it earns its place:
 
-A drafting call that produces a usable blooming insights agent prompt needs the shared anatomy baked into it (→ 01-anatomy.md), because that anatomy is what makes the four prompts consistent and reviewable.
+  → **Initial drafting of complex prompts.** A first draft of `legacy-prompts/diagnostic.md` would take a human ~2 hours from scratch — naming the 4-step approach, listing tool reminders, naming common errors, structuring the JSON output spec. An LLM can draft a good first pass in 60 seconds. The human then spends 30 minutes editing — total 30 minutes vs 2 hours.
+  → **Producing N parallel prompts in a consistent shape.** This is exactly what aipe does. The /aipe:study orchestrator spawns 15 sister agents in parallel, each producing one study guide in the same format. A human writing those 15 guides by hand would take weeks. The LLM produces drafts in minutes; the human reviews each one. The *consistency* of the output is the meta-prompting payoff — every guide follows `format.md` because the model was given `format.md`.
 
-```
-THE META-PROMPT must encode the house anatomy
-─────────────────────────────────────────────────────────────
- ## Role          scoped, disclaims the OTHER agents' jobs
- ## Hard rules    "Pass project_id to every call"; "at most N calls"
- method section   how to approach the task
- ## EQL reminders worked query examples in this EQL flavor
- ## Output        exact JSON shape + field rules + example
-                  (or "no JSON — prose" for a query-style agent)
- ## Workspace schema  {schema}   ← the injected placeholder
-```
+**Step 2 — when meta-prompting doesn't save time.** Two situations:
 
-Without this, the model drafts a generic "you are a helpful analytics assistant" prompt that ignores the conventions the rest of the system depends on — the `{schema}`/`{project_id}` placeholders the loader replaces in each agent, the tool-call budget the shared agent loop enforces, the JSON shape the validators check. The meta-prompt's job is to transfer that house style into the draft.
+  → **Small tweaks.** "Change rule 3 to allow 8 tool calls instead of 6" is a one-line edit. Round-tripping through an LLM adds latency without benefit.
+  → **Prompts under high iteration pressure.** When you're tuning a prompt against an eval set and changing it 20 times per day, each LLM-drafted iteration adds 30 seconds of generation + 5 minutes of review for what could be a 10-second human edit. Meta-prompting is for *first drafts*, not for iteration loops.
 
----
+**Step 3 — aipe as the running example.** Look at this very session. The aipe spec for this generator (`study-prompt-engineering.md`) is ~770 lines. It defines:
 
-### Where it saves time vs where it doesn't
+  → A persona (the working AI engineer voice this file is written in).
+  → 13 concepts to cover.
+  → The output folder name.
+  → The reader profile (via `me.md`).
+  → The format rules (via `format.md`).
 
-This is the honest cost accounting the brief demands.
+The aipe orchestrator (`/aipe:study`) spawns 15 sister agents in parallel — one per study generator. Each agent reads the relevant spec + format + me, then drafts the output files. The output files (this one and its 13 siblings) are LLM-drafted, human-reviewed, then committed to `.aipe/study-prompt-engineering/`.
+
+The shape:
 
 ```
-SAVES TIME                          DOESN'T SAVE TIME
-─────────────────────────           ─────────────────────────
-initial draft of a NEW complex      a small tweak to an existing
- prompt (an 85-line diagnostic       prompt ("change the budget
- spec from a goal + schema)          from 6 to 4 calls")
-─────────────────────────           ─────────────────────────
-getting the anatomy + the           a high-iteration prompt you're
- EQL examples + the JSON schema      editing daily against evals —
- scaffolded                          the draft churn outpaces the gen
-─────────────────────────           ─────────────────────────
-the 0→70% leap                      the 95→100% polish
+  Pattern — aipe's meta-prompting shape, applied to this session
+
+  ┌─ spec: study-prompt-engineering.md (~770 lines, human-authored) ──┐
+  │  persona · concept list · output folder · reader profile           │
+  └────────────────────────┬───────────────────────────────────────────┘
+                           │
+                           ▼
+  ┌─ orchestrator: /aipe:study ──────────────────────────────────────┐
+  │  spawns 16 sister agents (15 study + 1 audit)                     │
+  │  each gets:                                                        │
+  │    - the topic spec                                                │
+  │    - format.md (shared structure)                                  │
+  │    - me.md (shared reader profile)                                 │
+  │    - the codebase to anchor to                                     │
+  └────────────────────────┬───────────────────────────────────────────┘
+                           │
+                           ▼
+  ┌─ sister agent (this session) ─────────────────────────────────────┐
+  │  reads spec + format + me + codebase                               │
+  │  drafts 14 .md files                                                │
+  │  → .aipe/study-prompt-engineering/{00-overview, 01-anatomy, ...}.md │
+  └────────────────────────┬───────────────────────────────────────────┘
+                           │
+                           ▼
+  ┌─ human review (next step) ────────────────────────────────────────┐
+  │  THE LOAD-BEARING STEP — without it, output reads like LLM output  │
+  │  reviewer edits voice, rejects hedging, verifies factual claims    │
+  └────────────────────────────────────────────────────────────────────┘
 ```
 
-The asymmetry is the whole decision. Drafting a fresh diagnostic prompt from scratch is a job meta-prompting accelerates — you describe the goal, hand over the schema, get a structured draft, and edit. Changing the monitoring prompt's "at most 6 tool calls" to 4 is a one-line edit; round-tripping it through a model is pure overhead. And a prompt you are iterating on hourly against an eval set (→ 05-eval-driven-iteration.md) is worse handled by regenerating each time — you lose the precise, incremental control that the iteration depends on.
+**Step 4 — the risk: prompts that read like LLM output.** This is the failure mode every meta-prompting system hits. LLMs tend to:
 
----
+  → **Pad with throat-clearing.** "Let's explore the fascinating world of structured outputs..."
+  → **Add unnecessary preambles.** "Before we dive in, let me set the stage..."
+  → **Hedge.** "This *might* be useful in *some* situations *potentially*..."
+  → **Reach for marketing language.** "robust solution," "scalable architecture," "best practices."
 
-### The failure mode — prompts that read like LLM output
+A prompt with any of these reads like marketing copy, not like engineering spec. The model that *runs* against that prompt then *copies the style* — the rationale field gets verbose, the JSON output gets prefaced with "Sure, here's your analysis:", the trace gets longer.
 
-A hand-written prompt in this repo reads like an engineering spec: terse, imperative, every line load-bearing. "Pass `project_id: {project_id}` to **every** tool call — no exceptions" (a Hard rule in the diagnostic prompt). "Never report a change derived from an empty or zero window" (the empty-window block in the monitoring prompt). There is no fluff; you can tell exactly what each line is for.
-
-A generated prompt, committed unreviewed, reads like the model's default register: hedged, padded, courteous.
-
-```
-SPEC (hand-written, this repo)         LLM-DEFAULT (unreviewed draft)
-──────────────────────────────         ──────────────────────────────
-"at most 6 tool calls total,           "Try to be efficient with your
- then stop"                             tool usage where possible"
-"Never report a change derived          "Be careful to consider whether
- from an empty or zero window"          your data windows contain data"
-"Do NOT include an id field"            "You may want to avoid adding
-                                        an id field if appropriate"
-```
-
-The right column is the failure. It hedges where the spec commands ("try to" / "where possible" / "may want to"), it pads, and — fatally for a prompt — the model reads hedged instructions as optional. The whole reason the monitoring prompt's empty-window rule works is that it is an absolute "Never," not a "be careful to consider." A generated draft drifts toward the polite register, and the review step's main job is to drag it back to spec voice: delete the hedges, make every rule imperative, cut anything that is not load-bearing.
-
----
-
-### The principle
-
-Meta-prompting is authoring-time scaffolding: a model drafts a prompt from a goal plus context, and a human edits the draft into a committed spec. It is leverage on the initial draft of a complex prompt and a tax on small tweaks and high-iteration prompts, and its load-bearing step is the human review — because a generated draft defaults to hedged, padded prose, and a prompt only works when every rule is an imperative the model cannot read as optional. blooming insights does none of this; its four prompts are hand-written specs, which is exactly why they read like specs.
-
----
-
-## Meta-prompting — diagram
-
-This diagram spans the authoring pipeline and shows where it joins the existing runtime. The Authoring layer is where the model drafts and the human reviews; the artifact it produces is a markdown file that drops into the *same* prompts directory the hand-written prompts live in; the Runtime layer (sync read at import → shared agent loop) is unchanged and never sees the meta-prompt.
+The defense is in the *spec*. Look at `format.md`'s hard rules:
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│  AUTHORING LAYER   (dev-time helper — NOT built)                      │
-│                                                                       │
-│  human GOAL + {schema} shape                                          │
-│        │                                                              │
-│        ▼                                                              │
-│  META-PROMPT (encodes house anatomy: Role/Hard rules/EQL/Output)      │
-│        │  drafting call                                               │
-│        ▼                                                              │
-│  DRAFT markdown text                                                  │
-│        │                                                              │
-│        ▼  ⚠ HUMAN REVIEW (kill hedging, tighten to spec voice)        │
-│  reviewed prompt                                                      │
-└───────────────────────────┬───────────────────────────────────────────┘
-                            │ commit
-┌───────────────────────────▼───────────────────────────────────────────┐
-│  prompts dir / <new>.md   ← same dir as the hand-written four         │
-│  (indistinguishable in kind from the existing prompt files)           │
-└───────────────────────────┬───────────────────────────────────────────┘
-                            │ sync read at module import
-┌───────────────────────────▼───────────────────────────────────────────┐
-│  RUNTIME LAYER  (unchanged — never sees the meta-prompt)              │
-│   PROMPT.replace("{schema}", …).replace("{project_id}", …)            │
-│   → run_agent_loop(system = PROMPT, …)                                │
-└──────────────────────────────────────────────────────────────────────┘
+  Hard rules from format.md that defend against drift
+
+  → No definition-first openings. Start with shape/scenario, end with term.
+  → Direct, opinionated. No hedging language.
+  → Marketing language banned.
+  → Bridge from what the reader knows in every Move 2 sub-section.
+  → No on-ramps. Skip the slow setup.
 ```
 
-A reader who sees only this should grasp: meta-prompting acts at authoring time, the human review is in the critical path, the output is an ordinary prompt file, and the runtime path is completely unaffected.
+The spec tells the meta-system to NOT produce the failure mode. The human review catches what slips through. The two together produce prompts that read like engineering, not like LLM output.
 
-### Code in this codebase
+**Step 5 — aipe's specific encoding.** aipe uses markdown templates with frontmatter — slash commands map to template files, the template body becomes the prompt, the spec frontmatter declares dependencies (which other specs this one reads). The shape is intentional: prompts as ordinary `.md` source (concept 03), composed via the slash-command surface.
 
-**Not yet implemented.** Nothing in blooming insights generates a prompt; the four agent prompts (`lib/agents/prompts/monitoring.md`, `diagnostic.md`, `recommendation.md`, `query.md`) are hand-written `.md` files loaded verbatim via `readFileSync` (`lib/agents/diagnostic.ts` L13, `monitoring.ts` L12, `recommendation.ts` L14, `query.ts` L13).
+The link to blooming: aipe is the *meta-tool* that drafts study guides; blooming's `legacy-prompts/*.md` are *application prompts* that drive the agents. Both are markdown-first, both are version-controlled, both follow the same prompts-as-code discipline. The difference: aipe's prompts are *about prompts*; blooming's prompts are *about ecommerce analytics*.
 
-There is no partial analog at runtime — the system never produces prompt text, only consumes it. The closest *shape* in the codebase is the static intent-classifier prompt written inline in `lib/agents/intent.ts` (L21–24), which is still hand-authored, not generated. A meta-prompting helper would be a dev-time tool (not part of the request path) that drafts a new agent prompt from a goal plus the workspace schema and outputs a candidate file for human review into `lib/agents/prompts/`.
+### Move 3 — the principle
 
-One nuance worth ruling out: the monitoring prompt now builds its `## Your category checklist` section by interpolating a code-assembled string into a `{categories}` slot (`monitoring.ts` builds the checklist, then `PROMPT.replace('{categories}', checklist)`). That is *dynamic prompt assembly* — code stitching a prompt section from data — not meta-prompting; no model writes the section, code does. Its closest analog is the template interpolation covered in `03-prompts-as-code.md` (the same `{schema}`/`{project_id}` replacement mechanism), not the model-drafts-a-prompt loop this file is about. The Case B verdict stands: nothing in the repo has an LLM generate a prompt.
+Meta-prompting is code generation with a probabilistic generator. The same review discipline that catches generated code regressions catches generated prompt regressions. The *spec* is the leverage — a high-quality spec produces N prompts of consistent quality; the human review is what keeps the bar at engineering level instead of LLM-output level. Without the review, you've automated the production of mediocre prompts; with it, you've multiplied your authoring throughput by an order of magnitude.
 
----
+## Primary diagram — aipe's meta-prompting flow (this session, end to end)
+
+```
+  ┌─ THE SPEC (human-authored, version-controlled) ───────────────────┐
+  │  ~/.claude/plugins/cache/.../specs/study-prompt-engineering.md     │
+  │   - persona: working AI engineer                                    │
+  │   - 13 concepts                                                     │
+  │   - output folder                                                   │
+  │   - reader profile reference                                        │
+  │  ~/.claude/plugins/cache/.../specs/format.md (shared structure)    │
+  │  ~/.claude/plugins/cache/.../specs/me.md (shared reader profile)    │
+  └────────────────────────┬───────────────────────────────────────────┘
+                           │
+  ┌─ ORCHESTRATOR ▼ ────────────────────────────────────────────────────┐
+  │  /aipe:study (or /aipe:study-prompt-engineering standalone)         │
+  │  spawns sister agents in parallel                                    │
+  └────────────────────────┬────────────────────────────────────────────┘
+                           │
+  ┌─ THIS SESSION ▼ ────────────────────────────────────────────────────┐
+  │  Claude reads spec + format + me + codebase                          │
+  │  drafts 14 .md files                                                  │
+  │  → /Users/rein/Public/blooming_insights/.aipe/                       │
+  │    study-prompt-engineering/{00-overview, 01-anatomy, ..., README}.md │
+  └────────────────────────┬────────────────────────────────────────────┘
+                           │
+  ┌─ HUMAN REVIEW (you, after this session) ────────────────────────────┐
+  │  read each file                                                       │
+  │  reject hedging, marketing, slow on-ramps                             │
+  │  verify against codebase (no false claims)                            │
+  │  commit (concept 03 applies — now these are version-controlled)       │
+  └─────────────────────────────────────────────────────────────────────┘
+  ┌─ THE PRODUCED PROMPTS (no longer LLM-output; engineering source) ────┐
+  │  committed to git                                                      │
+  │  blameable, diffable, reviewable                                       │
+  │  drive YOUR future study + interview prep                              │
+  └─────────────────────────────────────────────────────────────────────┘
+```
 
 ## Elaborate
 
-### Where this comes from
+The pattern has a few names in the literature — "prompt programming" (when the spec is treated as a program), "LLM-aided prompt engineering" (when the focus is on the workflow), "meta-prompting" (when the focus is on the LLM-writing-prompts-for-LLMs angle). They're the same thing.
 
-Meta-prompting grew out of two threads. One is the practitioner habit of asking a strong model to "write me a prompt that does X" — informal, but effective for first drafts, and endorsed in vendor prompting guides as a starting point. The other is automatic prompt engineering research (Zhou et al.'s APE, 2022, and the optimizer line like DSPy and OPRO) that generates and *scores* candidate prompts against a dataset, closing the loop with evals rather than a human. blooming insights' relevant version is the human-in-the-loop first one: draft with a model, review as a human, commit. The automated-optimizer version only makes sense once an eval harness exists (→ 05-eval-driven-iteration.md) to score the candidates.
+The interesting variants:
 
-### The deeper principle
+- **Prompt rewriting against an eval set.** A more advanced shape — the LLM generates N variations of a prompt, all run against the eval set, the highest-scoring variation gets committed. Requires concept 05's eval substrate (which this codebase doesn't have). Heavy-handed for most cases but powerful when iterating against a stable benchmark.
+- **APE (Automatic Prompt Engineer).** A research thread (Zhou et al., 2022) on fully-automated prompt generation. Interesting; rarely productionised because the human review is what makes the result usable, and APE assumes you can skip it.
+- **Constitutional AI's self-improvement loop.** A different angle — using LLM-drafted critique to refine *the model's own behavior* via fine-tuning. Adjacent to meta-prompting; same shape (LLM critiquing/drafting prompts), different goal.
 
-```
-hand-author                         meta-prompt
-──────────────────────────────     ──────────────────────────────
-blank file → slow, full control     goal → draft → edit (0→70% fast)
-every line yours                    every line reviewed (or it rots)
-tweaks: trivial                     tweaks: overhead
-```
+Where to read next: Anthropic's prompt-engineering docs reference using Claude to help write prompts for Claude — the most pragmatic take. Eugene Yan's writing on prompt-engineering workflows touches on this. Simon Willison has a running thread on his own usage of LLMs to draft `llm` CLI templates, which is meta-prompting in the wild.
 
-The deep idea: a model is good at producing structure-complete first drafts and bad at knowing which lines must be absolute. So meta-prompting is best where structure dominates (a fresh complex prompt) and worst where precision dominates (a one-line rule change, a hourly eval-driven tweak). The human's irreplaceable contribution is judgment about which instructions are load-bearing — exactly the judgment a generated draft lacks.
-
-### Where this breaks down
-
-1. **The hedging drift.** The headline failure: drafts default to "try to" and "where possible," and a prompt with soft rules has soft enforcement. The empty-window rule in `monitoring.md` works because it is "Never," not "be careful to." Review must convert every soft rule to an imperative.
-
-2. **Plausible-but-wrong domain content.** A drafting model will happily invent EQL syntax that looks right but is not — exactly the trap `diagnostic.md` L35 warns about ("`customers matching` is NOT supported in this EQL flavor"). A generated prompt can confidently include unsupported syntax; only a reviewer who knows the EQL flavor catches it.
-
-3. **Tweaks cost more than they save.** Round-tripping a one-line change through a model is slower than editing the line. Meta-prompting on small edits is negative leverage.
-
-4. **High-iteration prompts resist regeneration.** A prompt you tune hourly against evals needs incremental, controlled edits; regenerating it each time loses the precise state you are converging toward.
-
-### What to explore next
-
-- **Close the loop with evals.** Once `evals/` exists (→ 05), score generated prompt candidates against the golden set instead of relying only on human review — the APE/DSPy direction.
-- **Meta-prompt for improvement, not just drafting.** Feed an existing prompt plus its eval failures and ask the model to propose targeted edits — still human-reviewed.
-- **A linter for spec voice.** A simple check that flags hedging words ("try to", "where possible", "may want to") in `lib/agents/prompts/*.md` would catch the drift mechanically, generated or not.
-
----
-
-## Project exercises
-
-### Build a dev-time prompt-drafting helper
-
-- **Exercise ID:** C-meta-prompting (adapted) — generate a new agent prompt from a goal + the workspace schema.
-- **What to build:** a standalone dev script (not on the request path) that takes a one-line goal and the workspace `{schema}` shape, calls a model with a meta-prompt that encodes the house anatomy (Role disclaiming other agents' jobs / Hard rules including the `project_id`-every-call and `at most N tool calls` rules / a method section / EQL reminders in this EQL flavor / an exact Output JSON shape or a prose directive / the `{schema}` placeholder), and writes a candidate `lib/agents/prompts/<name>.md` for human review. The script must NOT wire the prompt into runtime — it stops at producing a reviewable draft.
-- **Why it earns its place:** demonstrates meta-prompting as authoring-time scaffolding (not runtime generation), forces you to encode the house anatomy from `01-anatomy.md`, and keeps the human review in the critical path.
-- **Files to touch:** new `scripts/draft-prompt.ts` (dev tool); reference `lib/agents/prompts/diagnostic.md` as the anatomy template and `lib/mcp/schema.ts` for the `{schema}` shape; output to `lib/agents/prompts/`.
-- **Done when:** running the script with a goal like "flag product pages with rising bounce" produces a draft `.md` with all six anatomy sections and the correct placeholders, and a human review pass turns it into a committable spec by removing hedging and verifying the EQL examples.
-- **Estimated effort:** 1–4hr
-
-### Add a spec-voice linter for the prompt files
-
-- **Exercise ID:** C-meta-prompting (adapted, extension) — catch the hedging-drift failure mode mechanically.
-- **What to build:** a small check (script or test) that scans `lib/agents/prompts/*.md` for soft-rule hedging words ("try to", "where possible", "if appropriate", "you may want to") and fails if a Hard-rules or CRITICAL section contains one — catching the exact register a generated draft drifts toward.
-- **Why it earns its place:** turns the "reads like LLM output" failure mode into an automated gate, so a generated draft (or any edit) cannot silently soften a load-bearing rule.
-- **Files to touch:** new `scripts/lint-prompts.ts` or `test/agents/prompts.test.ts`; scans `lib/agents/prompts/*.md`.
-- **Done when:** the linter passes on the current four hand-written prompts and fails if a Hard-rule line is rewritten with a hedging phrase.
-- **Estimated effort:** <1hr
-
----
+In this codebase, concept 03 (prompts as code) is the *prerequisite* — the produced prompts only become trustworthy when they enter version control like any other source. Concept 05 (eval-driven iteration) is the *complement* — the eval set catches regressions in produced prompts the same way it catches regressions in human-authored ones.
 
 ## Interview defense
 
-### What an interviewer is really asking
+**Q: "Do you use LLMs to help write prompts?"**
 
-"Have you used a model to write your prompts?" tests whether you treat meta-prompting as a magic button or as authoring-time scaffolding with a mandatory review step. The senior signal is naming where it saves time (complex first drafts) versus where it doesn't (tweaks, high-iteration), and identifying the hedging-drift failure mode that makes the review non-optional.
-
-### Likely questions
-
-**[mid] "Would you have a model generate these agent prompts?"**
-
-For the initial draft of a new complex one, yes — describe the goal, hand it the workspace schema, and let it scaffold the anatomy (Role / Hard rules / EQL reminders / Output schema). But it's authoring-time, not runtime: the output is a `.md` file that goes into `lib/agents/prompts/` and gets reviewed exactly like the hand-written four. For a one-line tweak like changing `monitoring.md`'s tool-call budget, no — editing the line is faster than a round-trip.
+Yes — that's exactly what aipe (my meta-tooling project) does. The slash commands map to prompt templates; the orchestrator spawns sister agents that each draft a study guide following the spec. *This* study guide on prompt engineering is itself an example — Claude drafted these 14 markdown files in one session from a spec I authored; I review each file, edit voice, reject hedging or marketing language, then commit. The pattern saves an order of magnitude of authoring time on first drafts.
 
 ```
-new complex prompt → draft with model → review → commit  ✓
-one-line tweak      → edit the line directly             ✗ (gen is overhead)
+  spec → LLM draft → HUMAN REVIEW → commit
+                       ↑ load-bearing step
 ```
 
-**[senior] "What's the failure mode of a generated prompt, and how do you prevent it?"**
+Anchor: *"first drafts, not iteration loops. The review pass is what turns LLM output into engineering source."*
 
-Hedging drift. A draft defaults to the model's polite register — "try to be efficient," "be careful to consider" — and a prompt with soft rules has soft enforcement. The reason `monitoring.md`'s "Never report a change derived from an empty window" works is that it's an absolute, not a suggestion. Prevention is the review step: convert every soft rule to an imperative, cut the padding, and verify domain content like EQL syntax (the draft will happily invent unsupported clauses).
+**Q: "What's the failure mode?"**
 
-```
-draft: "try to avoid empty windows"   → model treats as optional
-spec:  "Never report ... empty window" → model treats as a hard rule
-review's job: drag the draft to spec voice
-```
-
-**[arch] "When does meta-prompting become automated prompt optimization, and what does it require?"**
-
-When you replace the human reviewer's taste with a measured score. APE/DSPy/OPRO generate candidate prompts and rank them against a metric — which requires an eval harness (→ 05) that blooming insights doesn't have yet. Without evals you can only do human-in-the-loop drafting; with evals you can close the loop and optimize prompts against the golden set instead of by judgment.
+Prompts that read like LLM output. *(Name the symptoms.)* Padding, throat-clearing, hedging, marketing language. If the meta-system produces a prompt full of "let's explore" and "this might be useful," the model running against that prompt copies the style — the rationale field gets verbose, the JSON output gets prefaced with chat-tone preamble, the trace gets longer. The defense is in the spec (banned-words lists in `format.md`) AND in the human review.
 
 ```
-no evals → human-in-the-loop drafting (taste)
-with evals → automated optimization (score candidates) — APE/DSPy/OPRO
+  symptoms in produced prompts:           defense:
+  ────────────────────────────           ───────
+  "Let's explore..."                      banned in format.md
+  "It's important to note..."             banned in format.md
+  "potentially might be useful"           hedging banned
+  "scalable solution"                     marketing banned
+                                          + human review pass
 ```
 
-### The question candidates always dodge
+Anchor: *"the review is what turns it from automated mediocrity into a productivity multiplier."*
 
-**"If a model wrote your prompt, how would you know it's any good?"** You review it as a spec and — ideally — score it against evals; candidates dodge because "the model wrote it and it looks fine" feels sufficient. A generated draft that reads fluently can hedge load-bearing rules into optionality and embed plausible-but-wrong EQL. "Looks fine" is the trap. The honest answer: human review for spec voice and domain correctness now, eval scoring once the harness exists.
+**Q: "When NOT to use it?"**
 
-### One-line anchors
+Two cases. Small tweaks — round-tripping through an LLM adds latency without benefit; faster to edit by hand. And tight iteration loops — when I'm tuning a prompt against an eval set and changing it 20 times per day, each LLM-drafted iteration costs 5 minutes of review for what could be a 10-second human edit. Meta-prompting is for *first drafts* and for *parallel production* (15 study guides at once), not for iterating on a single prompt.
 
-- `lib/agents/prompts/diagnostic.md` — hand-written 85-line spec; the anatomy a meta-prompt must encode.
-- `lib/agents/diagnostic.ts` L13 — `readFileSync` of the static prompt; runtime never generates.
-- `lib/agents/prompts/monitoring.md` L31 — "Never report a change derived from an empty window": the absolute a draft would soften.
-- `lib/agents/prompts/diagnostic.md` L35 — unsupported `customers matching`: the domain content only a reviewer catches.
-- Zhou et al. 2022 (APE); DSPy / OPRO — automated optimization, presupposes evals.
-
----
+Anchor: *"meta-prompting wins on first drafts and parallel production. Loses on small tweaks and tight iteration."*
 
 ## See also
 
-→ 01-anatomy.md · → 03-prompts-as-code.md · → 05-eval-driven-iteration.md · → 10-self-critique.md
-
----
+- `03-prompts-as-code.md` — the prerequisite; produced prompts only become source when they enter version control with the same discipline as human-authored ones.
+- `05-eval-driven-iteration.md` — the complement; the eval set catches regressions whether the prompt was hand-written or LLM-drafted.
+- `08-few-shot.md` — meta-prompting often uses few-shot inside the spec (show the LLM what good output looks like, then ask it to produce more).
+- `13-forbidden-patterns.md` — banning specific phrases in the spec is the meta-prompting application of concept 13.

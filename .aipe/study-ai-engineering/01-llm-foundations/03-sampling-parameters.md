@@ -1,335 +1,209 @@
-# Sampling parameters (and the defaults this codebase deliberately keeps)
+# 03 — sampling parameters
 
-**Industry name(s):** sampling parameters, decoding controls — temperature, top-p (nucleus), top-k
-**Type:** Industry standard · Language-agnostic
-
-> Sampling controls how randomly the model picks the next token; blooming insights sets *none* of them — it accepts Claude's default temperature everywhere and tunes only `max_tokens`, including a deliberate `16` on the intent classifier to force a one-word answer.
-
-
----
+**Subtitle:** Temperature / top-p / top-k · Industry standard
 
 ## Zoom out, then zoom in
 
-**Zoom out — the bigger picture.** Sampling parameters live inside the Provider step — the moment after the model produces a distribution over the next token and *something* has to pick one. That selection happens inside `anthropic.messages.create` at `lib/agents/base.ts` L102, and the codebase touches only one knob alongside it: `max_tokens`. Temperature, top-p, top-k are all left at provider defaults across every call site (agent loop, both `synthesize()` calls, intent classifier).
+Sampling parameters live inside the model call — they're knobs on how the next
+token is chosen. Blooming doesn't currently set any of them; everything runs at
+provider defaults.
 
 ```
-  Zoom out — where sampling lives
+  Zoom out — sampling sits inside one call
 
-  ┌─ Per-agent (what gets passed)  ───────────────────┐
-  │  classifier   intent.ts L18–25     max_tokens 16   │
-  │  agent turn   base.ts L92–100      max_tokens 4096 │
-  │  synthesis    diagnostic.ts L97–116 max_tokens 2048│
-  │  NO temperature / top_p / top_k on any call site   │
-  └─────────────────────────┬──────────────────────────┘
-                            │  params → create()
-  ┌─ Provider ──────────────▼──────────────────────────┐  ← we are here
-  │  anthropic.messages.create(params)                 │
-  │  P(next token)  ──▶  ★ SAMPLE ★  ──▶  append      │
-  │  ↑ reshape by temperature/top_p/top_k (DEFAULT)    │
-  │  max_tokens bounds how many iterations of the loop │
-  └────────────────────────────────────────────────────┘
+  ┌─ Agent loop ─────────────────────────────────┐
+  │  adapter.complete({ messages, system,        │
+  │                     tools, max_tokens })     │
+  └────────────────────┬─────────────────────────┘
+                       │  no temperature, no top_p, no top_k
+                       ▼  passed through
+  ┌─ Anthropic — sampler ────────────────────────┐
+  │  ★ sample next token using defaults ★         │  ← we are here
+  └───────────────────────────────────────────────┘
 ```
-
-**Zoom in — narrow to the concept.** The question is: for *this* call, do you want the output to vary or to be the same every time? Sampling parameters are the per-task answer — temperature 0 for classification, default for exploration, somewhere in between for synthesis. blooming insights answers "default everywhere," which How it works shows is defensible for three of the four agents and a small gap on the classifier.
-
----
 
 ## Structure pass
 
-**Layers.** Three layers: the per-agent call sites (where parameters could be set — classifier, agent turn, synthesis), the provider call (`anthropic.messages.create(params)`), and the sampler inside the model that consumes those parameters and reshapes the distribution. Above all three sits the prompt itself, which is the *other* way to control output stability (and the one this codebase actually uses).
+  → **One axis to trace — determinism.** `temperature=0` → deterministic
+    output. Higher values → more variance. This codebase uses *no* sampling
+    overrides, which means provider defaults (Sonnet ~`temperature=1.0`)
+    apply. The agents produce structured JSON outputs that are validated by
+    runtime type guards — so variance in *prose* is tolerable, but variance
+    in *shape* breaks `parseAgentJson` and the call gets rejected.
 
-**Axis: control.** Who decides how the next token gets picked? This axis is the right lens because sampling parameters are the dial *the caller* turns to constrain model behavior — but blooming insights leaves that dial untouched and instead pushes determinism upstream into the prompt. Trust would flatten everything (the model is always probabilistic at this layer); cost is not the story (temperature doesn't move the bill); control is the lens that exposes the deliberate-non-decision.
-
-**Seams.** The cosmetic seam is between per-agent call sites and the provider call — params just pass through. The load-bearing seam is between the provider call and the sampler inside the model: this is where control over output variance would change hands if the caller passed `temperature` / `top_p` / `top_k`. blooming insights never passes them, so control stays with the provider's defaults — making the seam *invisible by abdication*. The interesting flip is sideways: `max_tokens: 16` on the classifier forces determinism not by reshaping the distribution but by ending the loop early — a length lever masquerading as a randomness lever.
-
-```
-  Structure pass — sampling parameters
-
-  ┌─ 1. LAYERS ───────────────────────────────────┐
-  │  per-agent call sites (could set; don't)       │
-  │  provider call (params pass through)           │
-  │  sampler inside model (reshapes distribution)  │
-  └────────────────────────┬───────────────────────┘
-                           │  pick the axis
-  ┌─ 2. AXIS ─────────────▼────────────────────────┐
-  │  control: who decides how the next token gets  │
-  │  picked — caller or provider defaults?         │
-  └────────────────────────┬───────────────────────┘
-                           │  trace across layers, find flips
-  ┌─ 3. SEAMS ────────────▼────────────────────────┐
-  │  call site↔provider: cosmetic (pass-through)   │
-  │  provider↔sampler: LOAD-BEARING                │
-  │    where temperature/top_p/top_k WOULD flip    │
-  │    control; here it stays with defaults        │
-  └────────────────────────┬───────────────────────┘
-                           ▼
-                   Block 4 — How it works
-```
-
-The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+  → **The seam (which doesn't exist yet):** the place to plumb a temperature
+    setting would be `AnthropicModelProviderAdapter.complete()` — but
+    AptKit's `ModelRequest` type doesn't currently expose a temperature
+    field, so plumbing it through means extending AptKit core. This is the
+    Case B refactor.
 
 ## How it works
 
-**Mental model.** This codebase sets none of the randomness knobs — only `max_tokens` — so the operative verdict is "Claude's defaults for everything that shapes the distribution; the only lever pulled is length." The model outputs a probability distribution over the whole vocabulary for the next token. Sampling parameters reshape that distribution and then pick from it. Think of it as a weighted `Array.prototype.find` over the vocabulary where the weights are the probabilities and the parameters control how aggressively you favor the top weights.
+### Move 1 — the mental model
+
+The model assigns a probability to every possible next token. Sampling decides
+how to pick one.
 
 ```
-model output: P(next token)
-  "diagnostic" 0.55   "monitoring" 0.30   "recommendation" 0.10   ...rest 0.05
+  Same context, three sampling settings, three behaviors
 
-temperature scales the gap between these probabilities:
-  T → 0    : pick argmax → "diagnostic" every time      (deterministic)
-  T = 1    : sample as-is → mostly "diagnostic", sometimes others
-  T → high : flatten → near-uniform → unpredictable
+  next-token distribution: ["the": 0.42, "a": 0.18, "an": 0.12, …]
 
-top-p (nucleus): keep the smallest set of tokens summing to p, sample within it
-top-k         : keep only the k highest-probability tokens, sample within them
+  temperature=0   →  always "the"  (deterministic / argmax)
+  temperature=0.7 →  usually "the", sometimes "a", rarely "an"
+  temperature=1.5 →  any reasonable token, including rare ones
+
+  top_p=0.9       →  keep tokens until cumulative probability ≥ 0.9, then
+                     sample uniformly among those. Adapts to confidence.
+
+  top_k=40        →  hard cap: only consider the top 40 tokens.
 ```
 
-The default (when you set nothing) is the provider's chosen middle: enough randomness for natural prose, not so much that output is incoherent. blooming insights accepts that default everywhere and never reshapes the distribution.
+### Move 2 — the step-by-step walkthrough
 
----
+**What Blooming actually sets.** Look at the adapter again
+(`lib/agents/aptkit-adapters.ts:42-71`):
 
-### What this system sets: only `max_tokens`
-
-Scan every model-call site and the honest fact lands: no `temperature`, no `top_p`, no `top_k` is passed anywhere. The only decoding-adjacent parameter set is `max_tokens`, which is a *length* cap, not a *randomness* control.
-
-The agent loop's call carries exactly four params — `model`, `max_tokens`, `system`, `messages` — plus `tools` on non-final turns:
-
-```
-  params = {
-    model:       AGENT_MODEL,
-    max_tokens:  maxTokens,
-    system:      forceFinal ? base + synthesisInstruction : base,
-    messages:    messages,
-  }
-```
-
-No `temperature` field. Same for both synthesis calls and the intent classifier.
-
-```
-every model-call site:
-  model        ✓ set
-  max_tokens   ✓ set        (length, not randomness)
-  system       ✓ set
-  messages     ✓ set
-  tools        ✓ (non-final turns only)
-  temperature  ✗ DEFAULT
-  top_p        ✗ DEFAULT
-  top_k        ✗ DEFAULT
+```typescript
+const params: Anthropic.Messages.MessageCreateParamsNonStreaming = {
+  model: this.defaultModel,
+  max_tokens: request.maxTokens ?? 4096,
+  messages: request.messages.map(toAnthropicMessage),
+};
+if (request.system) params.system = request.system;
+if (request.tools?.length) params.tools = request.tools.map(toAnthropicTool);
+// ← no temperature
+// ← no top_p
+// ← no top_k
 ```
 
----
+That's the whole `params` object. No sampling overrides. Anthropic's default
+`temperature` is 1.0; the model is sampling freely turn-to-turn.
 
-### The one deliberate decoding choice: `max_tokens: 16` on the classifier
+**Why this is fine for THIS codebase, even though it sounds risky.** The
+agents produce JSON that gets:
 
-`max_tokens` is tuned per call, and the most pointed value is on the intent classifier:
+  1. Extracted by `parseAgentJson` (lenient — strips markdown fences, scans
+     for `[`/`{`, tries multiple parses). `lib/mcp/validate.ts:3-13`.
+  2. Validated by a type guard (`isAnomalyArray`, `isDiagnosis`,
+     `isRecommendationArray`). `lib/mcp/validate.ts:17-57`.
+  3. If validation fails, the agent loop emits an error or the model
+     gets another turn to try again (AptKit's loop handles this internally).
 
-```
-  response = provider_sdk.messages.create({
-    model:       CLASSIFIER_MODEL,
-    max_tokens:  16,
-    system:      "Classify the user query as exactly one word: "
-                 "monitoring ... diagnostic ... recommendation. "
-                 "Reply with ONLY the one word.",
-    messages:    [{ role: "user", content: query }],
-  })
-```
+So the model can vary its *prose* across runs — different diagnostic
+explanations, different recommendation rationales — without breaking the
+contract, because the contract is the parsed JSON shape.
 
-16 tokens is enough for one word and nothing else. The classifier physically cannot ramble — the length cap enforces what the system prompt requests. The full ladder of `max_tokens` values:
+**Where this is fragile.** Two places:
 
-```
-max_tokens by call    value   purpose
-──────────────────    ─────   ──────────────────────────────
-agent turn             4096    room for tool-use + JSON output
-diagnostic synthesis   2048    one structured artifact, no exploration
-recommendation synth.  2048    one structured array
-classifier               16    one word — bound the answer hard
-```
+  → **The intent classifier.** `classifyIntent` is a one-shot, no-tools call
+    that returns a single label (`diagnostic` / `monitoring` /
+    `recommendation` / `query`). At default temperature, the same ambiguous
+    query could classify differently on repeat. `temperature=0` would make
+    repeats deterministic. AptKit's `classifyIntent` doesn't expose
+    sampling, so the fix needs to land in AptKit.
 
-This is the system being deliberate about *length* while leaving *randomness* at default. The classifier would, ideally, also pin temperature to 0 (a classification has one right answer) — but it does not, relying instead on a sharp prompt plus the tiny `max_tokens` to make the output stable in practice.
+  → **The monitoring agent's category selection.** When two categories
+    fire on the same data (e.g. `revenue_drop` and `conversion_drop`
+    measuring overlapping things), the agent's tie-breaking is
+    non-deterministic. The prompt mitigates by enforcing severity sorting
+    (`critical → warning → info → positive`), so two runs end up with the
+    same ordered list even if the prose around each anomaly differs.
 
----
+### Move 3 — the principle
 
-### Current state vs. future state
+**Use temperature = 0 when the output is going to be parsed; let the model run
+hot when the output is going to be read by a human.** This codebase emits both
+shapes from the same model — JSON contracts AND human-readable `summary` /
+`rationale` / `conclusion` fields. The tradeoff is being made implicitly: the
+JSON shape survives variance because of the runtime validator, and the human
+prose benefits from variance because it makes the agent feel less
+robotic. If parse failures start showing up in logs, temperature=0 on the
+*final synthesis turn* is the move — not on every turn (which would make
+multi-turn loops less robust to ambiguity).
 
-```
-CURRENT                                FUTURE (where temperature would help)
-────────────────────────────────      ────────────────────────────────────
-all calls: default temperature         classifier: temperature 0 (determinism)
-classifier: max_tokens 16 only         synthesis:  temperature 0 (stable JSON)
-synthesis:  default temperature         agents:     keep default (analysis prose)
-```
-
-Two calls have a determinism interest that default temperature does not serve: the **intent classifier** (one correct label per query) and the **synthesis pass** (the same evidence should yield the same JSON). Both would benefit from `temperature: 0`. The agent exploration turns are different — mild variety in how the model phrases its reasoning is harmless and arguably helps it explore.
-
----
-
-### The principle
-
-Sampling randomness is a per-task setting, not a global default: classification and structured synthesis want determinism (temperature 0); open-ended generation tolerates or wants variety. You can accept the provider default everywhere — defensible for the analytical, JSON-extracting agents, slightly suboptimal for the two calls that have one right answer. Tuning `max_tokens` but not `temperature` shows the team controlled *length* (the cost and shape lever) and left *randomness* alone (the determinism lever) — a reasonable but incomplete set of decoding decisions.
-
----
-
-### Code in this codebase
-
-**Partially addressed — `max_tokens` only.** No `temperature`, `top_p`, or `top_k` is set on any `anthropic.messages.create` call; Claude's defaults apply everywhere. The only per-call decoding tuning is `max_tokens`.
-
-#### Files, functions, and line ranges
-
-- **Agent turn params (no temperature):** `lib/agents/base.ts` L92–L100; `max_tokens: maxTokens` with default `4096` at L74; call at L102.
-- **Diagnostic synthesis (no temperature):** `lib/agents/diagnostic.ts` L97–L116; `max_tokens: 2048` at L99.
-- **Recommendation synthesis (no temperature):** `lib/agents/recommendation.ts` L96–L122; `max_tokens: 2048` at L98.
-- **Intent classifier (no temperature; `max_tokens: 16`):** `lib/agents/intent.ts` L18–L25; the `16` at L20; one-word system prompt L21–L23.
-- **Models:** `AGENT_MODEL = 'claude-sonnet-4-6'` (`lib/agents/base.ts` L9); `CLASSIFIER_MODEL = 'claude-haiku-4-5-20251001'` (`lib/agents/intent.ts` L14).
-
-#### Why default temperature is defensible for these agents
-
-Three of the four agents are JSON-extraction analysts: they read tool results and emit a structured artifact, then everything is parsed and validated downstream (→ 01-what-an-llm-is.md). For that work, mild output variation is invisible — the parse step normalizes phrasing away, and the type guards reject anything malformed regardless of how it was sampled. Determinism would not improve the *parsed* result; it would only make snapshot testing of the raw text easier. So leaving temperature at default costs nothing the system cares about. The two calls that genuinely want determinism — the classifier and the synthesis pass — are where the absence is a real (small) gap.
-
----
-
-## Sampling parameters — diagram
-
-This diagram shows where decoding controls would act in the call path, and what blooming insights actually sets at each call. The Provider layer owns the sampling step; the Service layer sets only `max_tokens`.
+## Primary diagram
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│  SERVICE LAYER (what this codebase sets per call)                    │
-│                                                                       │
-│  classifier  intent.ts   model, max_tokens:16,  system, msgs  │
-│  agent turn  base.ts    model, max_tokens:4096, system, msgs │
-│  synthesis   diagnostic model, max_tokens:2048, system, msgs │
-│       │                                                              │
-│       │  NO temperature / top_p / top_k on any call                  │
-└───────┼────────────────────────────────────────────────────────────────┘
-        │  params → create()  base.ts
-┌───────▼────────────────────────────────────────────────────────────────┐
-│  PROVIDER LAYER (Anthropic — owns the sampling step)                 │
-│                                                                       │
-│  P(next token) ──▶ [ reshape by temperature/top_p/top_k ]            │
-│                          │ (left at DEFAULT — Anthropic's choice)    │
-│                          ▼                                            │
-│                    sample one token ──▶ append ──▶ loop              │
-│                          │                                           │
-│  max_tokens bounds how many times this loop runs (length cap)        │
-└────────────────────────────────────────────────────────────────────────┘
+  Sampling in this codebase — current state
+
+  ┌─ AptKit ModelRequest ─────────────────────────┐
+  │  { messages, system?, tools?, maxTokens? }    │  ← no sampling field
+  └────────────────────┬──────────────────────────┘
+                       │
+                       ▼ adapter passes through
+  ┌─ Anthropic MessageCreateParams ───────────────┐
+  │  { model, max_tokens, system, messages, tools}│  ← also no sampling
+  └────────────────────┬──────────────────────────┘
+                       │
+                       ▼ provider applies defaults
+  ┌─ Anthropic sampler ───────────────────────────┐
+  │  temperature ≈ 1.0   (Sonnet default)         │
+  │  top_p, top_k = provider defaults             │
+  └───────────────────────────────────────────────┘
+
+  Refactor target: add `temperature?: number` to ModelRequest in AptKit,
+  thread through in adapter, set temperature=0 for intent classifier.
 ```
-
-The randomness knobs live entirely on the Provider side and are never overridden. The Service side controls only how *long* the output can be, not how *varied*.
-
----
 
 ## Elaborate
 
-### Where this pattern comes from
+The decision to leave sampling at defaults is *implicit*, not deliberate.
+Nobody picked `temperature=1.0`; it just wasn't set. For a product where the
+JSON validation layer catches bad shapes, this has been fine. For a more
+serious eval harness (see `05-evals-and-observability/`) you'd want
+`temperature=0` for reproducibility — same inputs, same outputs, golden tests
+that don't flake.
 
-Temperature comes from the softmax: dividing logits by a temperature `T` before normalizing scales the distribution's sharpness. `T → 0` collapses to argmax (greedy decoding); `T = 1` samples the raw distribution; `T > 1` flattens it toward uniform. Top-k (Fan et al. 2018) and top-p / nucleus sampling (Holtzman et al. 2019) were introduced to fix a failure of pure temperature sampling: a long tail of low-probability tokens can still be picked and derail the output, so both methods truncate the eligible set before sampling. These three are the standard decoding controls across every major provider.
-
-"Use defaults until a task proves it needs otherwise" is a sane engineering posture — but classification and structured extraction are exactly the tasks that *do* prove it. The literature is consistent: for tasks with a single correct output, greedy decoding (`T = 0`) is the baseline.
-
-### The deeper principle
-
-```
-task shape                       want                    setting
-──────────────────────────────  ──────────────────────  ───────────────
-single correct label            determinism             temperature 0
-extract one structured object   determinism + stability  temperature 0
-analytical reasoning prose      coherence, mild variety  default ok
-brainstorm / creative draft     diversity                temperature ↑, top_p ↓
-```
-
-The classifier (`intent.ts`) sits in the top row: a query has one intent, and randomness can only introduce wrong labels on borderline inputs. The synthesis calls sit in the second row: the same gathered evidence should yield the same diagnosis. The agent exploration turns sit in the third row, where the default is fine.
-
-### Where this breaks down
-
-1. **Borderline classifications flip.** A query that the model scores 0.51 "diagnostic" / 0.49 "monitoring" will, under default temperature, occasionally sample "monitoring." With `temperature: 0` it always picks "diagnostic." The `16`-token cap and sharp prompt make this rare, but not impossible — the randomness knob is still live.
-
-2. **Synthesis output is not reproducible.** Re-running `synthesize()` on the same `toolCalls` can produce a differently-worded `conclusion`. Harmless for the user; annoying for any future eval harness that wants a stable baseline to diff against.
-
-3. **Defaults are opaque and provider-controlled.** Because nothing is set, the effective temperature is whatever Anthropic chose and could change between model versions. The codebase has no record of, or control over, its own randomness.
-
-### What to explore next
-
-- **`temperature: 0` for the classifier and both synthesis calls:** the one-line change that makes the deterministic-by-nature calls deterministic in fact (the exercise below).
-- **`top_p` for the agent turns:** if exploration ever feels too repetitive or too scattered, nucleus sampling is the finer control than temperature alone.
-- **Stop sequences:** an alternative to `max_tokens: 16` for bounding the classifier — stop after the first word rather than after 16 tokens.
-
----
+The intent classifier is the most likely place a temperature override actually
+ships. Repeat queries giving inconsistent intents is a classic frustration —
+the user types the same thing twice and gets routed differently. Pinning
+`temperature=0` for that one model is a 5-line change once AptKit exposes the
+parameter.
 
 ## Project exercises
 
-### Pin temperature 0 on the classifier and both synthesis calls, then measure determinism
+### Exercise — plumb temperature through AptKit + Blooming, set it to 0 for intent
 
-- **Exercise ID:** B1.3 (adapted) — sampling control for deterministic sub-tasks.
-- **What to build:** add `temperature: 0` to the classifier call and both `synthesize()` calls, leave the agent exploration turns at default, then run each fixed input N times and record how often the output is identical before vs. after.
-- **Why it earns its place:** demonstrates you know which calls have a single correct answer and that you measured the effect rather than asserting it — the exact "show the determinism" interview signal.
-- **Files to touch:** `lib/agents/intent.ts` (classifier), `lib/agents/diagnostic.ts` (`synthesize`), `lib/agents/recommendation.ts` (`synthesize`); a small repeat-run script under `test/`.
-- **Done when:** the classifier returns the identical label on N/N repeats of a borderline query, and a `synthesize()` call returns byte-identical JSON on N/N repeats of the same `toolCalls`, with the before/after counts recorded.
-- **Estimated effort:** 1–4hr
-
-### Replace the classifier's `max_tokens: 16` bound with a stop sequence
-
-- **Exercise ID:** C1.3 (adapted) — decoding-control alternatives.
-- **What to build:** swap `max_tokens: 16` for a stop sequence that ends generation after the first word, and compare robustness on adversarial multi-word queries.
-- **Why it earns its place:** shows you understand `max_tokens` and stop sequences are two different ways to bound output, with different failure modes.
-- **Files to touch:** `lib/agents/intent.ts` (`classifyIntent`), `test/agents/intent.test.ts`.
-- **Done when:** the classifier returns a single word for inputs that previously produced two, and `parseIntent` still maps it correctly.
-- **Estimated effort:** <1hr
-
----
+  → **Exercise ID:** `study-ai-eng-03.1`
+  → **What to build:** Open a PR against `@rlynjb/aptkit-core` to add
+    `temperature?: number` to `ModelRequest`. Update
+    `AnthropicModelProviderAdapter.complete()` to pass it through. Set
+    `temperature: 0` in `classifyIntent`'s adapter construction.
+  → **Why it earns its place:** "How do you make the classifier
+    deterministic?" is a real question for any LLM-routing product, and
+    the answer "we can't, the param isn't exposed" is unsatisfying. This
+    exercise is small but spans a package boundary — good signal.
+  → **Files to touch:** AptKit core (upstream) ·
+    `lib/agents/aptkit-adapters.ts:42-71` · `lib/agents/intent.ts:21-38`.
+  → **Done when:** Two identical queries to `classifyIntent` produce identical
+    outputs in a unit test (deterministic), and the existing intent tests
+    still pass.
+  → **Estimated effort:** `1–4hr` (the upstream PR is the most of it).
 
 ## Interview defense
 
-### What an interviewer is really asking
+**Q: What temperature does this codebase run at?**
 
-"What temperature do you use?" probes whether you understand that randomness is a per-task setting and whether you can defend a default. The senior move is to admit the codebase uses defaults, explain why that is fine for the analytical agents, and name the two calls where it is a (small) gap — rather than claiming a tuned value that does not exist.
+Provider defaults — Anthropic's `temperature ≈ 1.0`. We don't set sampling
+parameters anywhere in `AnthropicModelProviderAdapter.complete()`. The
+agents produce structured JSON validated by a runtime type guard
+(`lib/mcp/validate.ts`), so variance in the prose around the JSON is
+tolerable; the contract is the shape, not the wording.
 
-### Likely questions
+**Q: Where would lower temperature actually help here?**
 
-**[mid] What sampling parameters does this codebase set?**
+The intent classifier (`lib/agents/intent.ts`). It's a one-shot, no-tools call
+that returns a single label. At `temperature=0` repeat queries would always
+classify identically. The blocker is that AptKit's `classifyIntent` doesn't
+expose a temperature parameter today — it's a one-line addition to
+`ModelRequest` and an adapter passthrough.
 
-Only `max_tokens`. No `temperature`, `top_p`, or `top_k` is passed on any `anthropic.messages.create` call (`lib/agents/base.ts` L92–L100, all `create` sites). Claude's defaults apply for randomness.
-
-```
-set:    model, max_tokens, system, messages, (tools)
-unset:  temperature, top_p, top_k  → provider default
-```
-
-**[senior] The intent classifier has one correct answer per query. Is default temperature the right choice for it?**
-
-No — ideally it would be `temperature: 0`. A classification has a single right label, so greedy decoding removes a source of error for free; under default temperature a borderline query can sample the wrong label. The codebase mitigates with a sharp prompt and `max_tokens: 16` (`lib/agents/intent.ts` L20), which makes flips rare but does not eliminate them. The clean fix is one line.
-
-```
-borderline query: P(diagnostic)=0.51, P(monitoring)=0.49
-  default temp → samples monitoring ~49% of the time
-  temperature 0 → always diagnostic
-```
-
-**[arch] Would you set `temperature: 0` everywhere?**
-
-No — selectively. Pin it on the classifier and both `synthesize()` calls (single correct output, want reproducibility). Leave the agent exploration turns at default: greedy decoding can make multi-step reasoning repetitive or get stuck, and the agents' output is parsed and validated anyway, so the variance is absorbed.
-
-```
-classifier   → temp 0   (one label)
-synthesis    → temp 0   (stable JSON)
-agent turns  → default  (exploration, parsed downstream)
-```
-
-### The question candidates always dodge
-
-**"Why didn't you set temperature at all?"** The honest answer is that the team controlled length (`max_tokens`) but not randomness, and the analytical agents do not need it because their output is parsed and validated — but the classifier and synthesis *do* have a determinism interest that the default does not serve. Pretending the default was a deliberate determinism choice would be wrong; it is an accepted gap.
-
-### One-line anchors
-
-- No `temperature`/`top_p`/`top_k` anywhere — `lib/agents/base.ts` L92–L100 is representative.
-- `lib/agents/intent.ts` L20 — `max_tokens: 16`, the one-word classifier bound (not a randomness control).
-- `lib/agents/diagnostic.ts` L99 / `recommendation.ts` L98 — synthesis `max_tokens: 2048`, default temperature.
-- temperature 0 = argmax (deterministic); default = mild randomness; the classifier and synthesis want the former.
-
----
+**Anchor line:** "We tolerate variance because the validator catches bad
+shapes. The next move is `temperature=0` for intent classification — small
+PR against AptKit, immediate determinism win."
 
 ## See also
 
-→ 01-what-an-llm-is.md · → 02-tokenization.md · → 07-heuristic-before-llm.md
-
----
+  → `04-structured-outputs.md` — the validator that makes default sampling safe
+  → `08-provider-abstraction.md` — the adapter where temperature would land

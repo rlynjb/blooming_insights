@@ -1,545 +1,191 @@
 # Coordination failure modes
 
-**Industry name(s):** Coordination failure modes, multi-agent failure taxonomy, the "2-5x overhead" failures
-**Type:** Industry standard · Language-agnostic
+*Industry name: multi-agent failure modes — Industry standard.*
 
-> The failures that don't exist in single-agent systems. Walk the table and show which ones blooming insights' design PREVENTS structurally vs CONTROLS with mechanisms. Thesis: deterministic orchestration buys you fewer failure modes — infinite handoff and synthesis failure are structurally absent because no autonomous handoff and no LLM merge exist.
+The failures that don't exist in single-agent systems but show up the moment you have two or more. This repo's minimal-multi-agent shape *forbids* most of them by topology choice, but the cost-blowup and synthesis-failure cases still apply.
 
+## Zoom out — which failures show up where
 
----
-
-## Zoom out, then zoom in
-
-**Zoom out — the bigger picture.** Coordination failure modes span every band a multi-agent system touches — but they cluster around the Pipeline coordinator (synthesis failure, infinite handoff, cost blowup) and the Shared agent loop (tool-call cascade, context bloat). In blooming insights, several of these are *structurally absent*: no LLM supervisor → no synthesis failure; no peer handoff → no infinite handoff; message-passing instead of shared state → no context bloat. The remaining ones are *mechanically controlled*: tool-call caps in `runAgentLoop`, cost limits via Haiku classifier and per-stage budgets, token-revocation guard via a one-time auto-reconnect.
+The applicability of each failure depends on the topology. This repo's deterministic sequential pipeline + code supervisor eliminates the orchestration-decision failures (infinite handoff, supervisor wandering) but not the cost/budget failures.
 
 ```
-  Zoom out — where coordination failures live
+  Which failures apply to this repo
 
-  ┌─ Pipeline coordinator ──────────────────────────┐  ← we are here
-  │  lib/agents/pipeline.ts                          │
-  │  ★ failures here ★                                │
-  │   ── synthesis failure (no LLM merger here)       │
-  │   ── infinite handoff (no peer transfer here)     │
-  │   ── cost blowup (per-stage budgets cap this)     │
-  └─────────────────────────┬────────────────────────┘
-                            │
-  ┌─ Per-agent / message-passing ───▼────────────────┐
-  │  typed Diagnosis as the contract                  │
-  │   ── context bloat (no shared blackboard)         │
-  └─────────────────────────┬────────────────────────┘
-                            │
-  ┌─ Shared agent loop ─────▼────────────────────────┐
-  │  runAgentLoop                                     │
-  │   ── tool-call cascade (maxToolCalls 6/6/6/4)     │
-  │   ── forced-final on budget spent                 │
-  └─────────────────────────┬────────────────────────┘
-                            │
-  ┌─ Tools + MCP transport ─▼────────────────────────┐
-  │   ── token-revocation (one-time auto-reconnect)   │
-  └──────────────────────────────────────────────────┘
+  ┌─ DO NOT APPLY (topology forbids) ─────────────────────┐
+  │  Infinite handoff (A→B→A→B…)                          │
+  │    — agents never hand off; route dispatches          │
+  │  Supervisor wandering / wrong-worker dispatch          │
+  │    — supervisor is code; `if (step === X)` can't wander│
+  │  Context bloat from shared blackboard                  │
+  │    — no blackboard (message passing forced by Vercel) │
+  └────────────────────────────────────────────────────────┘
+
+  ┌─ DO APPLY ─────────────────────────────────────────────┐
+  │  Tool-call cascade (one agent triggers a storm)        │ ← see below
+  │  Cost blowup (2-5x overhead compounds silently)        │ ← see below
+  │  Synthesis failure (supervisor merges contradictions)  │ ← see below
+  │     (route handler synthesizes by passing through;     │
+  │      contradiction = inconsistent agent outputs)       │
+  └────────────────────────────────────────────────────────┘
 ```
-
-**Zoom in — narrow to the concept.** The question is: which multi-agent failures does blooming insights' design prevent by being deterministic, and which does it control with explicit mechanisms? Two categories matter — *structural prevention* (the failure can't happen because the shape doesn't allow it) and *control mechanism* (the failure could happen but a cap stops it). Below, you'll see the full table of failures and which row blooming insights handles in which way.
-
----
 
 ## Structure pass
 
-**Layers.** Coordination failures cluster across four layers: the **Pipeline coordinator** (where synthesis failure, infinite handoff, and cost blowup would originate in a more autonomous topology), the **Per-agent / message-passing layer** (where context bloat would originate if state were shared), the **Shared agent loop** (where tool-call cascade and runaway turns originate), and the **Tools + MCP transport** (where token-revocation and rate-limit failures originate). Each layer has its own failure family and its own containment story.
-
-**Axis: failure.** Where does each failure mode originate, how does it propagate, and where does it get contained — structurally (the system shape doesn't allow it) or mechanically (a cap stops it before it explodes)? This is the right axis because the whole file is a *failure taxonomy mapped against containment*. Control is a tempting alternate (because choosing deterministic orchestration is what makes most of these structurally absent) but control is the *cause* of containment; failure is the lens that organizes which failures actually need handling.
-
-**Seams.** Two seams matter. Seam 1 sits between the would-be failure surfaces and what blooming insights' design *removes by being deterministic* — failure propagation flips from "possible" (autonomous shape) to "structurally absent" (CODE-supervised shape). Seam 2 sits between the failures that *can* still happen and the per-layer caps that bound them (turn caps, tool-call caps, budget caps, one-time auto-reconnect) — failure flips from "possible and unbounded" to "possible and capped." Seam 2 is the load-bearing one for the working system: it's where the explicit mechanisms earn their keep. Seam 1 is the load-bearing one for the *argument* — most of this file's thesis is "deterministic orchestration buys you fewer failure modes."
+The axis: **what mitigation lives at what layer?**
 
 ```
-  Structure pass — Coordination failure modes
-
-  ┌─ 1. LAYERS ───────────────────────────────────┐
-  │  Pipeline coordinator (synthesis, handoff,     │
-  │     cost blowup)                               │
-  │  Per-agent / message-passing (context bloat)   │
-  │  Shared agent loop (tool cascade, turn drift)  │
-  │  Tools + MCP transport (token revoke, 429s)    │
-  └────────────────────────┬───────────────────────┘
-                           │  pick the axis
-  ┌─ 2. AXIS ─────────────▼────────────────────────┐
-  │  failure: where does it originate, propagate,  │
-  │           get contained?                       │
-  └────────────────────────┬───────────────────────┘
-                           │  trace across layers, find flips
-  ┌─ 3. SEAMS ────────────▼────────────────────────┐
-  │  Seam 1: possible-failures ↔ structural-       │
-  │          absences (autonomous shape →          │
-  │          CODE-supervised shape)                │
-  │  Seam 2: still-possible failures ↔             │
-  │          per-layer caps (unbounded → capped)   │
-  │          ★ load-bearing — where mechanisms     │
-  │          earn their keep                       │
-  └────────────────────────┬───────────────────────┘
-                           ▼
-                   Block 4 — How it works
+  Failure                  Mitigation in this repo                Where it lives
+  ─────────                ──────────────────────                 ──────────────
+  Tool-call cascade        maxToolCalls per agent (4 or 6)        kernel (AptKit)
+  Cost blowup              maxTurns per agent (6 or 8)            kernel (AptKit)
+  Synthesis failure        validators on each agent's output      AptKit per-agent
+                           + structural prompt rules               prompts
 ```
-
-The skeleton is mapped — the rest of this file walks the failure taxonomy and which row blooming insights handles structurally vs mechanically.
-
----
 
 ## How it works
 
-**The mental model: every multi-agent failure is "I forgot to constrain a loop or a budget."** The question is whether you constrain it structurally (the loop doesn't exist) or mechanically (the loop has a cap). Deterministic orchestration is the structural answer; budgets and counters are the mechanical answer.
+### Move 1 — the mental model
+
+Multi-agent failure modes are *emergent* — they don't show up in unit tests where you test one agent in isolation. They show up when agents compose, and they manifest as cost blowups, infinite loops, or contradictory outputs. The mitigation pattern is always the same: bound the bad-case behavior at the lowest layer, so the failure surfaces fast and stops.
 
 ```
-Two ways to bound a failure
+  Coordination failure modes — table of failures and mitigations
 
-  STRUCTURAL                       MECHANICAL
-  ──────────────────               ─────────────────────
-  the failure can't happen         the failure CAN happen
-   because the system shape         but a specific mechanism
-   doesn't allow it                 caps it before it explodes
-  no LLM supervisor →              tool-call cascade → maxToolCalls cap
-   no synthesis failure            cost blowup → per-stage budget +
-  no peer handoff →                 Haiku classifier
-   no infinite handoff             token-revocation → one-time guarded
-  no shared blackboard →             auto-reconnect
-   no shared-state bloat
+  ┌──────────────────────┬──────────────────────────┐
+  │ Failure              │ Mitigation               │
+  ├──────────────────────┼──────────────────────────┤
+  │ Infinite handoff     │ Handoff counter; force   │
+  │ (A→B→A→B…)            │ stop or escalate to human│
+  ├──────────────────────┼──────────────────────────┤
+  │ Tool-call cascade    │ Per-agent and global      │
+  │ (one agent triggers  │ iteration caps; budget    │
+  │ a storm of calls)    │ ceiling that halts the run│
+  ├──────────────────────┼──────────────────────────┤
+  │ Context bloat as      │ Message passing / context │
+  │ agents accumulate     │ routing instead of a       │
+  │ shared state         │ shared blackboard          │
+  ├──────────────────────┼──────────────────────────┤
+  │ Synthesis failure    │ Validate worker outputs    │
+  │ (supervisor merges    │ against a schema before    │
+  │ contradictory results│ synthesis; surface         │
+  │ )                    │ conflicts, don't average   │
+  ├──────────────────────┼──────────────────────────┤
+  │ Cost blowup          │ Per-run token budget;      │
+  │ (2-5x overhead       │ cheap models for workers,  │
+  │ compounds silently)  │ expensive only for the     │
+  │                      │ supervisor                 │
+  └──────────────────────┴──────────────────────────┘
 ```
 
-The strategy in plain English: **prefer structural prevention; fall back to mechanical control.** Structurally prevented failures cost zero debugging time because they can't happen. Mechanically controlled failures need watchful mechanisms — caps, budgets, retries — that you can grep for in the code.
+### Move 2 — failure by failure, with this repo's specifics
 
-### Layer 1 — Tool-call cascade (controlled mechanically)
+**Tool-call cascade.**
 
-The technical thing: an agent loop emits more tool calls per turn or stays in the loop longer than you intended, burning the budget on calls instead of arriving at an answer. The single-agent shape (cross-ref the ai-engineering agents-vs-chains note) has this risk; multi-agent amplifies it (N agents, N times the risk).
+The classic failure: one agent retries a flaky tool every turn, burning the whole budget on a tool that isn't coming back. In a multi-agent system this compounds — if Worker A keeps retrying and that retry causes Worker B to retry its dependency, you get a cascade.
 
-The mitigation in blooming insights: a *hard per-loop tool-call cap per agent* plus a *forced-final-turn mechanic* in the shared agent loop.
+In this repo, the mitigation is at the kernel layer:
+- `MonitoringAgent`: `maxToolCalls=6` (capped at AptKit's `AnomalyMonitoringAgent`)
+- `DiagnosticAgent`: `maxToolCalls=6`
+- `RecommendationAgent`: `maxToolCalls=4` (tighter — it mostly reasons from diagnosis)
+- `QueryAgent`: `maxToolCalls=6`
 
-```
-The mechanism, pseudocode
+The cap is enforced inside `runAgentLoop` — once hit, the synthesis turn fires regardless of what the model wants. **No agent in this repo can issue more than 6 tool calls per run** by topology guarantee. See `../01-reasoning-patterns/02-agent-loop-skeleton.md`.
 
-  for turn in 0..max_turns:
-    budget_spent = tool_calls.length >= per_loop_tool_budget
-    force_final  = turn == max_turns - 1 OR budget_spent
-    params = { ... }
-    if not force_final:
-        params.tools = tool_schemas
-        # ▲ tools STRIPPED on forced-final
-        # ▲ model literally cannot emit more tool calls
-    res = await model.create(params)
-    ...
-```
+What's *not* yet mitigated: per-tool circuit breaking (see `../05-production-serving/03-per-tool-circuit-breaking.md`). A flaky tool still wastes calls until the budget is spent; it doesn't get short-circuited.
 
-Per-agent caps:
-- monitoring: 6 tool calls
-- diagnostic: 6 tool calls
-- recommendation: 4 tool calls
-- query: 6 tool calls
+**Cost blowup.**
 
-**Where this lives in the repo.** The mechanism is `runAgentLoop()` in `lib/agents/base.ts` L90–L101 — `budgetSpent` check (L90), `forceFinal` derivation (L91), tools stripped from request when forced (L101). The per-agent caps: `lib/agents/monitoring.ts` L101 (`maxToolCalls: 6`), `lib/agents/diagnostic.ts` L62 (`maxToolCalls: 6`), `lib/agents/recommendation.ts` L57 (`maxToolCalls: 4`), `lib/agents/query.ts` L41 (`maxToolCalls: 6`). The MCP rate-limit spacer (the secondary cascade bound) is `lib/mcp/connect.ts` L92 — `minIntervalMs: 1100` on the McpClient constructor options.
+Multi-agent overhead compounds silently. A 3-agent pipeline with 6 tool calls each = up to 18 LLM calls + 18 tool calls per investigation. Without per-agent budgets, that climbs to ~50 calls fast.
 
-```
-shape (the mechanism for tool-call cascade — most-load-bearing):
+In this repo, the mitigation is per-agent budgets plus the bounded sequential structure (no fan-out). Total per-investigation budget worst-case:
+- DiagnosticAgent: 8 turns × ~1 LLM call each + 6 tool calls = ~14 calls
+- RecommendationAgent: 6 turns + 4 tool calls = ~10 calls
+- Total: ~24 LLM calls + ~10 tool calls per investigation
 
-  // lib/agents/base.ts L90–L101
-  const budgetSpent = maxToolCalls !== undefined
-    && toolCalls.length >= maxToolCalls;
-  const forceFinal = turn === maxTurns - 1 || budgetSpent;
-  const params: Anthropic.Messages.MessageCreateParamsNonStreaming = {
-    model: AGENT_MODEL,
-    max_tokens: maxTokens,
-    system: forceFinal && synthesisInstruction
-      ? `${system}\n\n${synthesisInstruction}` : system,
-    messages,
-  };
-  if (!forceFinal) params.tools = toolSchemas;
-  // ▲ when forceFinal is true, tools are NOT passed; model
-  //   literally cannot emit another tool_use; must produce text
-  const res = await anthropic.messages.create(params);
-```
+Bounded and predictable. Cost blowup mitigated.
 
-The practical consequence: the cascade is *structurally impossible past the cap*. Once the budget is spent, the loop strips tools from the API request — the model literally cannot emit another tool_use. It's forced to emit text. The cascade can't run longer than the cap allows.
+What's *not* yet mitigated: a per-run token-ceiling that halts the entire pipeline if the sum exceeds a threshold. Today the per-agent caps add up to a bounded total, but if a future change loosened any cap, there's no global guard.
 
-The condition under which this works: the cap is set conservatively. 6 turns is enough for the diagnostic agent's typical 3–5 query investigation; 4 is enough for the recommendation agent's typical 2–3 feature lookups. If a future agent's job genuinely needed 12 turns, the cap would need to be raised — at the cost of larger blast radius if the cascade fires.
+**Synthesis failure.**
 
-### Layer 2 — Cost blowup (controlled mechanically)
+In a fan-out + merge topology, the synthesis step has to handle contradictory worker outputs — Worker A says "the drop is caused by mobile checkout"; Worker B says "the drop is caused by payment processor." Averaging is wrong; flagging the conflict is right.
 
-The technical thing: the 2-5x token overhead of multi-agent systems compounds silently — each agent's prompt, each turn, each tool call carries cost; multiple agents per run multiplies it.
+In this repo, synthesis is degenerate — the route handler "synthesizes" by passing through. Each agent's output is the next agent's input directly; there's no merger to fail. **Synthesis failure is forbidden by topology.**
 
-The mitigation in blooming insights: a *mixed-model strategy* (cheap classifier, expensive workers) plus *bounded per-stage budgets*.
+The case where it would re-appear: if MonitoringAgent ever fanned out (`04-parallel-fan-out.md`), the merger would need to handle "two categories detected the same anomaly with different severities" — the synthesis failure shows up at the merger boundary.
+
+**Validators as the structural defense.**
+
+Even without a synthesis step, each agent's output has to pass an AptKit-layer validator before it's surfaced — `tryParseAnomalies`, `tryParseDiagnosis`, `validateRecommendations`. These catch shape errors (missing fields, wrong types) before the next agent in the pipeline sees them. The validator is what turns "free-form text from a model" into "guaranteed-shape data the next agent can rely on."
+
+### Move 3 — the principle
+
+Multi-agent failure modes are emergent; mitigations belong at the lowest layer where the failure can be bounded. Per-agent budgets in the kernel; per-tool breakers at the data-source layer; validators at the agent-output boundary. The senior-engineer move is naming WHICH failure each mitigation prevents and WHAT topology change would re-expose the failure.
+
+The minimal-multi-agent shape in this repo eliminates several failures by topology (handoff, supervisor wandering, context bloat). The remaining failures (cost, cascade) are bounded by the kernel's per-agent caps. The unaddressed failure (per-tool breaker) is the natural next investment when traffic justifies it.
+
+## Primary diagram
+
+The failure → mitigation → layer map for this repo:
 
 ```
-Mixed-model + bounded budgets
+  Coordination failure modes — what's mitigated where
 
-  intent classifier:  cheap classifier model (~$0.25/MTok input)
-   one call per query; ~150ms; tiny prompt
-
-  agent workers:      expensive worker model (~$3/MTok input)
-   bounded by per-loop tool-call budget per stage:
-     monitoring     6 turns max → ~$0.30 typical
-     diagnostic     6 turns max → ~$0.40 typical
-     recommendation 4 turns max → ~$0.20 typical
-     query          6 turns max → ~$0.30 typical
+  ┌─ AptKit kernel (per-agent budgets) ──────────────────────┐
+  │  maxTurns + maxToolCalls + forced-final synthesis        │
+  │  PREVENTS: tool-call cascade, infinite turn loop          │
+  └────────────────────────────┬─────────────────────────────┘
+                               │
+  ┌─ AptKit per-agent validator ──────────────────────────────┐
+  │  tryParseAnomalies / tryParseDiagnosis / validateRecs     │
+  │  PREVENTS: malformed handoff between agents               │
+  └────────────────────────────┬─────────────────────────────┘
+                               │
+  ┌─ Route handler (topology) ────────────────────────────────┐
+  │  sequential pipeline (no fan-out)                          │
+  │  code supervisor (no LLM-decided dispatch)                 │
+  │  message passing (no blackboard)                           │
+  │  PREVENTS: handoff loops, supervisor wander, context bloat │
+  └────────────────────────────┬─────────────────────────────┘
+                               │
+  ┌─ DataSource adapter (BloomreachDataSource) ──────────────┐
+  │  ~1 req/s spacing + retry on rate-limit + 60s cache       │
+  │  PREVENTS: provider 429-storm                             │
+  │  DOES NOT YET PREVENT: per-tool failure cascade           │ ← gap
+  └───────────────────────────────────────────────────────────┘
 ```
-
-The practical consequence: the run cost is bounded above by `sum(per-stage-budget)`. There's no scenario where one agent eats the whole budget — the per-stage caps slice it. The Haiku classifier saves ~10x on the intent-routing call, where Sonnet-grade reasoning isn't needed.
-
-The condition under which this works: the per-stage budgets are calibrated to typical agent behavior. Quarterly review of actual per-run cost would catch drift; today the budgets are tight enough that drift is unlikely.
-
-**Where this lives in the repo.** The cheap-classifier choice is `lib/agents/intent.ts` `classifyIntent()` at L14 — `CLASSIFIER_MODEL = 'claude-haiku-4-5-20251001'`. The expensive-workers choice is `lib/agents/base.ts` `AGENT_MODEL` constant at L9 — `AGENT_MODEL = 'claude-sonnet-4-6'`.
-
-### Layer 3 — Infinite handoff (structurally absent)
-
-The technical thing: in swarm/handoff systems (cross-ref the swarm-handoff note), peer agents transfer control to each other; the failure mode is A → B → A → B forever, with each agent thinking the other should handle the task.
-
-The prevention in blooming insights: *no agent has a `transfer_to_<peer>` tool*. The pipeline transitions are owned by the route handler, not by the agents. The agents have no capability to hand off.
-
-```
-Why infinite handoff cannot happen here
-
-  ┌─ Per-agent tool subsets ────────────────────┐
-  │  diagnostic:       analytics, segments,      │
-  │                    funnel, comparison        │
-  │                    (NO transfer_to_*)         │
-  │  recommendation:   feature catalog, scenario  │
-  │                    specs, campaign templates  │
-  │                    (NO transfer_to_*)         │
-  │  query:            broader read-only          │
-  │                    (NO transfer_to_*)         │
-  │  monitoring:       read-only metrics          │
-  │                    (NO transfer_to_*)         │
-  └──────────────────────────────────────────────┘
-
-  No tool means no capability. The model in any agent
-  cannot emit a transfer_to_* tool_use because the tool
-  schema isn't in its tool_schemas array. The runtime
-  never sees a handoff to process.
-```
-
-The practical consequence: the failure literally cannot fire. Future code review of any PR that introduces a `transfer_to_*` tool would surface this risk; today the surface is empty.
-
-The condition under which this works: the prevention is permanent unless someone adds handoff tools. If a future PR added them, the prevention would have to be replaced with a `MAX_HOPS` counter — but that's a future decision, not a current debt.
-
-**Where this lives in the repo.** `lib/mcp/tools.ts` per-agent tool allow-lists — no `transfer_to_*` tools in any agent's subset; no agent has the capability to hand off.
-
-### Layer 4 — Synthesis failure (structurally absent)
-
-The technical thing: in supervisor-worker with an LLM supervisor (cross-ref the supervisor-worker note), the supervisor reads multiple workers' outputs and *merges them into a final answer*. When workers contradict, an LLM supervisor tends to *average* the contradictions into a confident-sounding compromise — losing the signal that the disagreement existed.
-
-The prevention in blooming insights: *no LLM supervisor exists, and no LLM merge step exists*. The route's "merge" between diagnostic and recommendation is a function call carrying the typed Diagnosis — no model intermediates. The recommendation agent receives the diagnosis as a typed argument and operates on it directly.
-
-```
-Why synthesis failure cannot happen here
-
-  ┌─ The route's "synthesis" ──────────────────┐
-  │                                             │
-  │   recommendations = await                   │
-  │     rec_agent.propose(                      │
-  │       inv,                                  │
-  │       diagnosis,    ◄── typed arg           │
-  │       hooks                                 │
-  │     )                                       │
-  │                                             │
-  │   No model is consulted to "merge" diag and │
-  │   recommendation. No averaging of           │
-  │   contradictory outputs. No LLM in the      │
-  │   handoff path.                              │
-  └─────────────────────────────────────────────┘
-```
-
-The practical consequence: there is no path where two agents' outputs could be averaged into a wrong answer by a third LLM. The recommendation agent reads the diagnosis as-is and proposes based on it. If the diagnosis is wrong, the recommendation will propose from a wrong premise — but that's a single-agent quality issue (the diagnostic agent's), not a multi-agent synthesis failure.
-
-The condition under which this works: the codebase avoids adopting an LLM supervisor and an LLM merge. The "when not to go multi-agent" note documents the architectural commitment.
-
-**Where this lives in the repo.** `app/api/agent/route.ts` `GET` stream `start()` body L237–L247 — the "synthesis" between diagnostic and recommendation is a function call passing the typed `Diagnosis`; no LLM merger runs.
-
-### Layer 5 — Context bloat (structurally absent)
-
-The technical thing: when agents share a blackboard (cross-ref the shared-state-and-message-passing note), each agent's context window grows with every other agent's output. At 6+ agents, "lost in the middle" becomes the dominant failure mode — the model can't find the signal in the noise.
-
-The prevention in blooming insights: *message passing*. The recommendation agent's context is the anomaly + the typed Diagnosis + its own prompt + its own tool subset. It does NOT include the diagnostic agent's messages, scratchpad, or intermediate tool calls.
-
-```
-Why context bloat cannot happen here
-
-  Diagnostic agent's context           Recommendation agent's context
-  (scoped to diagnostic's loop)        (scoped to recommendation's loop)
-  ─────────────────────────────        ──────────────────────────────────
-  anomaly                              anomaly
-  diagnostic prompt + tools            recommendation prompt + tools
-  conversation history (this agent)    Diagnosis (curated, ~2k tokens)
-  scratchpad (this agent)              conversation history (this agent)
-                                       scratchpad (this agent)
-
-  no overlap, no shared accumulator
-```
-
-The practical consequence: each agent's context window stays small and focused. Adding a future agent (e.g. a hypothetical summarization agent) doesn't bloat the existing agents' windows — it gets its own scoped context.
-
-The condition under which this works: the message schema (Diagnosis) is expressive enough that the recommendation agent doesn't need more than what's passed. If the schema grew past ~15 fields, the message itself would start to feel like shared state, at which point the graph-orchestration note's graph-runtime curated-state model becomes the next step.
-
-**Where this lives in the repo.** The architectural choice of message passing is documented in `./08-shared-state-and-message-passing.md`; the `Diagnosis` schema (the message) is `lib/mcp/types.ts` L95–L104.
-
-### Layer 6 — Token revocation mid-run (controlled mechanically)
-
-The technical thing: blooming insights' MCP server uses OAuth tokens for the Bloomreach connection. Tokens can be revoked mid-run (admin action, expiration); when that happens, MCP calls start failing 401.
-
-The mitigation in blooming insights: a *one-time guarded auto-reconnect* triggered on 401, with a session-storage flag to prevent infinite reconnect loops.
-
-```
-The mechanism, pseudocode
-
-  on MCP 401 response in agent run:
-    already_tried = session_storage.get('bi:reconnecting') == '1'
-    if already_tried:
-      # tried once, still failing — give up, surface error
-      session_storage.remove('bi:reconnecting')
-      show_error(...)
-    else:
-      session_storage.set('bi:reconnecting', '1')
-      # redirect to OAuth flow to refresh token
-      window.location = auth_url
-
-  on successful reconnect:
-    session_storage.remove('bi:reconnecting')
-```
-
-The practical consequence: the user gets one automatic reconnect attempt per failure. If the reconnect also fails (e.g. token genuinely revoked, admin policy), the system surfaces an error rather than looping. The session-storage flag is the bound.
-
-The condition under which this works: the failure is transient (a revoked token can be re-authorized via the OAuth flow). If the failure were truly terminal, the auto-reconnect would still try once and then surface the error — graceful degradation.
-
-**Where this lives in the repo.** `app/page.tsx` — the reconnect handler in the agent-stream error path: L394 (clear flag on success), L410 (read flag), L416 (set flag), L427 (clear on reconnect).
-
-### Phase A vs Phase B — the failures the design retires vs the ones it accepts
-
-```
-        Structurally absent (retired)      Mechanically controlled (accepted)
-┌─────────────────────────────────────┐  ┌─────────────────────────────────────┐
-│ Infinite handoff                    │  │ Tool-call cascade                    │
-│   no agent has transfer_to_* tools  │  │   per-loop tool-call caps per agent  │
-│   ▼                                 │  │   + forced-final-turn in shared loop│
-│ Synthesis failure                   │  │                                      │
-│   no LLM merge step; route handoff  │  │ Cost blowup                          │
-│   is a function call with typed     │  │   cheap model for classifier,        │
-│   Diagnosis                         │  │   expensive model for workers;       │
-│                                     │  │   per-stage budgets                  │
-│ Context bloat                       │  │                                      │
-│   no shared blackboard; each agent  │  │ Token revocation mid-run             │
-│   sees only what's handed           │  │   one-time guarded auto-reconnect    │
-│                                     │  │   via a session-storage flag         │
-└─────────────────────────────────────┘  └─────────────────────────────────────┘
-   Retired: zero on-call burden — the          Accepted: explicit mechanisms,
-   failure simply cannot happen.                 grep-able in code, bounded
-                                                  by specific values.
-```
-
-*Structurally absent:* infinite handoff, synthesis failure, context bloat. These don't show up in incidents, on-call, or replays because the system shape doesn't allow them. They're not "mitigated" — they're *not possible*.
-
-*Mechanically controlled:* tool-call cascade, cost blowup, token revocation. These could happen if the mechanisms weren't there; they're bounded by specific values (6/6/6/4 caps, model-tier choice, `sessionStorage` flag). Each one is a line of code you can point to.
-
-The takeaway: **deterministic orchestration is a failure-mode-retirement strategy.** You don't make the failures less likely; you make them impossible. The cost is the architectural choice (no LLM supervisor, no autonomous handoff, no shared blackboard); the win is incidents that don't happen.
-
-This is what people mean by "the safest production code is the code that doesn't run." Failure modes that don't exist don't need monitoring, don't fire pages, don't burn on-call hours.
-
-The full picture is below.
-
----
-
-## Coordination failure modes — diagram
-
-```
-The full failure-mode landscape
-
-  ┌─ SINGLE-AGENT failures (inherited, not new) ─────────────────┐
-  │  - hallucination, prompt injection, tool misuse, etc.        │
-  │  - covered in the ai-engineering agents-vs-chains note        │
-  └──────────────────────────────────────────────────────────────┘
-
-  ┌─ MULTI-AGENT failures (the new cluster) ─────────────────────┐
-  │                                                              │
-  │  Failure              ┌─ Structurally absent ─┬ Mechanically │
-  │                       │ in blooming insights  │ controlled    │
-  │  ─────────────────    ┼───────────────────────┼──────────────│
-  │  Infinite handoff     │ ✓ no transfer_to_*    │              │
-  │                       │   tools anywhere       │              │
-  │  ─────────────────    ┼───────────────────────┼──────────────│
-  │  Synthesis failure    │ ✓ no LLM merge;       │              │
-  │                       │   route handoff is     │              │
-  │                       │   function call +      │              │
-  │                       │   typed Diagnosis      │              │
-  │  ─────────────────    ┼───────────────────────┼──────────────│
-  │  Context bloat        │ ✓ message passing      │              │
-  │                       │   (Diagnosis as msg)   │              │
-  │                       │   not shared state     │              │
-  │  ─────────────────    ┼───────────────────────┼──────────────│
-  │  Tool-call cascade    │                       │ ✓ per-loop    │
-  │                       │                       │   tool-call    │
-  │                       │                       │   caps 6/6/6/4 │
-  │                       │                       │   + forced-final│
-  │  ─────────────────    ┼───────────────────────┼──────────────│
-  │  Cost blowup          │                       │ ✓ cheap model  │
-  │                       │                       │   for classifier│
-  │                       │                       │   expensive for │
-  │                       │                       │   workers; per- │
-  │                       │                       │   stage budgets │
-  │  ─────────────────    ┼───────────────────────┼──────────────│
-  │  Token revocation     │                       │ ✓ one-time     │
-  │   mid-run              │                       │   guarded      │
-  │                       │                       │   auto-reconnect│
-  │                       │                       │   via session-  │
-  │                       │                       │   storage flag  │
-  └──────────────────────────────────────────────────────────────┘
-
-  Thesis: 3 failures structurally absent (zero on-call cost)
-          3 failures mechanically controlled (specific code,
-          bounded values, grep-able)
-```
-
----
-
-## Elaborate
-
-### Where this pattern comes from
-
-The multi-agent failure-mode taxonomy got its current popular framing from a combination of: (a) Anthropic's "Building Effective Agents" (2024), which named "cost blowup" and the 2-5x overhead empirically; (b) LangGraph's documentation, which named "infinite handoff" and "synthesis failure" as the canonical failures their checkpointing prevents; (c) production write-ups from teams running multi-agent systems at scale (e.g. Replit, Hugging Face) reporting on the specific incidents they hit. The "structural prevention vs mechanical control" framing is a long-standing safety-engineering principle (Reason's Swiss-cheese model from 1990) applied to agent design.
-
-### The deeper principle
-
-**Failure modes that can't fire don't need monitoring.** The cheapest production system is the one whose failure modes are structurally absent — because absent failures don't need alerts, runbooks, on-call coverage, or post-mortems. The cost is upfront architectural choices that retire those failures.
-
-```
-   Mechanical control            Structural prevention
-   ──────────────────────        ──────────────────────
-   failure can fire               failure cannot fire
-   mechanism bounds it            shape forbids it
-   needs monitoring (is the       no monitoring needed
-    mechanism still working?)
-   on-call burden: low            on-call burden: zero
-   debugging: walk the mechanism  debugging: not applicable
-```
-
-The deeper version: this is the same principle as type systems vs runtime checks. A type system *prevents* whole categories of bug from compiling; a runtime check *catches* the bug when it fires. Both are valid; the type system is cheaper at production time because the bugs simply don't exist in deployed code.
-
-### Where this breaks down
-
-The structural-prevention argument breaks when the prevention is *too restrictive* — when the architectural choice that retires a failure also retires capability the system genuinely needs. For example: blooming insights structurally prevents infinite handoff by not having handoff at all. The cost is no runtime adaptability in stage ordering. If product needs grow to require adaptive ordering, structural prevention has to be relaxed and the mechanism (`MAX_HOPS` counter) replaces it.
-
-The mechanical-control argument breaks when the mechanism is poorly calibrated. A `maxToolCalls: 6` cap that's too tight for the diagnostic agent's actual job will produce truncated diagnoses, not infinite loops. The mechanism prevents the failure but introduces a different one (premature termination). Calibration is half the work.
-
-### What to explore next
-- `./01-when-not-to-go-multi-agent.md` → the architectural choice that retires the failures
-- `./06-swarm-handoff.md` → the "infinite handoff" failure in detail
-- `./05-debate-verifier-critic.md` → the "synthesis failure" failure in detail
-- `./08-shared-state-and-message-passing.md` → the "context bloat" failure in detail
-- `../05-production-serving/` → cost-aware production controls beyond what this file covers
-
----
 
 ## Interview defense
 
-### What an interviewer is really asking
+**Q: "What are the failure modes you'd worry about in a multi-agent system, and which apply to yours?"**
 
-When an interviewer asks "what could go wrong" or "how do you handle [specific failure]" they're testing two things: do you know the failure mode by name, and can you point to the specific mechanism (or architectural choice) that addresses it in YOUR code. The strong signal is the structural-vs-mechanical distinction — naming which failures simply can't happen in this codebase vs which ones are controlled by a specific cap. The weak signal is "we'd add monitoring" without naming the failure or the mechanism.
+A: Five canonical failures. Three don't apply to this repo by topology choice: infinite handoff (no agent-to-agent handoff; route dispatches), supervisor wandering (supervisor is code; an `if` statement can't wander), context bloat from shared blackboard (no blackboard; message passing forced by Vercel's ephemeral instances). Two do apply: tool-call cascade and cost blowup — both bounded by per-agent budgets in the AptKit kernel (`maxToolCalls=4 or 6`, `maxTurns=6 or 8`, forced-final synthesis). One half-applies: synthesis failure — the route's "synthesis" is degenerate pass-through today, so contradictions can't arise; if we ever fanned out (`04-parallel-fan-out.md`), the synthesis step would need a real conflict-detection step.
 
-### Likely questions
+The unaddressed gap: per-tool circuit breaking. A flaky tool today still wastes calls until the per-agent budget is spent. The fix is a per-tool breaker at the data-source layer (`../05-production-serving/03-per-tool-circuit-breaking.md`) that fails fast on a known-dead tool and feeds the open-circuit state back to the agent as an observation so the agent's reasoning routes around it.
 
-[mid] Q: What's the worst-case scenario for an agent loop, and how do you bound it?
+Diagram I'd sketch:
 
-A: Tool-call cascade — an agent loop emits tool calls every turn for the full `maxTurns` budget, burning the budget without producing a final answer. The bound in blooming insights is two-layered: `maxToolCalls` caps per agent (6/6/6/4 in monitoring/diagnostic/query/recommendation) and the forced-final-turn mechanic in `runAgentLoop` (`lib/agents/base.ts` L90–L101) — when the budget is spent, the loop strips `tools` from the request, so the model literally cannot emit another `tool_use`; it has to produce text. The cascade is structurally bounded by the cap.
-
-Diagram:
 ```
-  Tool-call cascade prevention
-
-  for turn in maxTurns:
-    if toolCalls.length >= maxToolCalls:
-       params.tools = undefined  ◄── stripped
-       (model cannot emit tool_use anymore)
-       force final text output
-    else:
-       params.tools = toolSchemas
-       proceed normally
+  Topology-prevented:               Budget-bounded:
+   - infinite handoff                - tool-call cascade
+   - supervisor wander               - cost blowup
+   - context bloat
+                              Topology-degenerate (no merger):
+                                - synthesis failure
+                              Not yet mitigated:
+                                - per-tool failure cascade
+                                  (fix: circuit breaker)
 ```
 
-[senior] Q: How would you compare blooming insights' coordination failure surface vs an autonomous multi-agent system?
+Anchor: "the kernel's `maxToolCalls` is the single most load-bearing failure-bound. Without it, one flaky tool + an agent loop = the entire iteration budget spent on retries — the worst kind of cost blowup because it produces nothing."
 
-A: blooming insights structurally prevents three of the six canonical multi-agent failures, because the deterministic orchestration choice retires them: no peer handoff means no infinite handoff (`lib/mcp/tools.ts` has no `transfer_to_*` tools anywhere); no LLM merge means no synthesis failure (the route's handoff is a function call with typed `Diagnosis`); message passing means no context bloat (each agent's window is scoped to what's handed). The three remaining — tool-call cascade, cost blowup, token revocation — are mechanically controlled with specific caps and one-time guarded reconnects. An autonomous system would have to mechanically control all six, with mechanisms that themselves can fail. So the question is: where would I rather spend the bug surface? Three mechanisms with structural backstops, or six mechanisms with no backstops. I picked the first; the cost was giving up adaptive routing.
+**Q: "Where does the 2-5x multi-agent overhead show up in your numbers?"**
 
-Diagram:
-```
-  Coordination failure modes — surface comparison
-
-  blooming insights         autonomous multi-agent
-  ──────────────────        ─────────────────────
-  3 structurally absent     ALL controlled by mechanisms
-  3 mechanically controlled
-                            6 mechanisms to:
-  monitoring surface: 3      - calibrate (each value matters)
-  on-call burden:    low     - monitor (still working?)
-                             - debug (which mechanism failed?)
-
-                            monitoring surface: 6
-                            on-call burden:    high
-```
-
-[arch] Q: How would this failure-prevention model scale to 10 agents?
-
-A: The structural-prevention model holds. Message passing scales (each agent's context stays scoped); no LLM merge scales (handoffs stay typed function args); no peer handoff scales (route stays the supervisor). What changes is the *calibration* of the mechanical controls. With 10 agents, per-stage budgets need a global per-run cap to prevent the sum from exceeding what the MCP rate limit can support; the Haiku-classifier-Sonnet-worker split stays the right shape but you might add a third tier (Sonnet for hard stages, Haiku for easy stages). The token-revocation handler doesn't change. The breakpoint is whether the route file becomes a switchboard at 10 agents — if yes, you adopt a graph runtime (`./07-graph-orchestration.md`), but the failure-mode model still applies: the graph runtime's curated state preserves the no-context-bloat property; explicit nodes preserve the no-infinite-handoff property; the engine's checkpointing actually adds resumability as a NEW prevention (failures recover from checkpoint instead of re-running).
-
-Diagram:
-```
-At 10 agents — what changes vs what holds
-
-  ┌─ STRUCTURAL prevention (holds) ─────┐
-  │ no peer handoff (no transfer_to_*)  │
-  │ no LLM merge (function-arg handoffs)│
-  │ message passing (scoped contexts)   │
-  └─────────────────────────────────────┘
-  ┌─ MECHANICAL controls (recalibrate) ─┐
-  │ tool-call cascade: per-stage caps + │
-  │   GLOBAL per-run cap (new)          │
-  │ cost blowup: model-tier routing per │
-  │   stage (3-tier, not 2)             │
-  │ token revocation: unchanged          │
-  └─────────────────────────────────────┘
-  ┌─ NEW preventions (if graph adopted) ┐
-  │ failure recovery: checkpoint resume  │
-  │   instead of full re-run             │
-  └─────────────────────────────────────┘
-```
-
-### The question candidates always dodge
-
-Q: You claim 3 failures are "structurally absent" — but they're absent because you didn't build the features that cause them. Isn't that just calling absence of features a virtue?
-
-A: Yes, deliberately. The architectural choice IS the prevention. I didn't build LLM supervisor and autonomous handoff, and that choice retires the failure modes those features introduce. The alternative — building the features and then preventing their failures with mechanisms — is strictly more cost: more code, more on-call burden, more debugging surface. The honest framing is that I picked a less-capable system in exchange for a smaller failure surface, and I can defend that choice because the capability I gave up (adaptive runtime routing) is one I can grep for in the route file (`route.ts` L199–L249) and prove the codebase doesn't need today. The day adaptive routing becomes a hard requirement, I'd add LLM supervisor, accept the failure modes, and mechanism-control them — but until then, "absence of feature = absence of failure" is the cheapest possible answer to the question "how do you handle infinite handoff?" The answer is: I don't, because no agent in this codebase can hand off, and you can verify that by grepping `lib/mcp/tools.ts` for `transfer_to_*` and finding zero hits. That's not handwaving; that's a structural property of the system.
-
-Diagram:
-```
-The "absence" argument, made concrete
-
-  Feature absent              ─►  Failure mode absent
-  ──────────────────────         ──────────────────────────────
-  no transfer_to_* tools         no infinite handoff
-   (lib/mcp/tools.ts)             (cannot fire — no capability)
-  no LLM merger                  no synthesis failure
-   (route.ts L237–L247)           (cannot fire — function call only)
-  no shared blackboard            no context bloat from sharing
-   (message passing)              (cannot fire — scoped contexts)
-
-  This isn't handwaving — it's a structural property
-  you can verify by grepping the code.
-  Absent failures need zero monitoring.
-```
-
-### One-line anchors
-
-- "Three failures structurally absent (handoff, synthesis, bloat), three mechanically controlled (cascade, cost, token revocation) — that's the failure surface."
-- "Structural prevention is cheaper than mechanical control because absent failures need no monitoring."
-- "Tool-call cascade is bounded structurally: when `maxToolCalls` is hit, the runtime strips tools from the request — the model literally cannot emit another tool_use."
-- "Deterministic orchestration retires three failure modes for free; the cost is giving up adaptive runtime routing."
-
----
+A: Worst-case investigation: DiagnosticAgent (8 turns × ~1 LLM call + 6 tool calls = ~14 calls) + RecommendationAgent (6 + 4 = ~10 calls) = ~24 LLM calls per investigation. Compared to a hypothetical single-agent "investigate and recommend in one loop" with a 12-call budget, that's ~2x the calls. The buy: each agent has a narrower prompt + tighter tool grant, so each call is cheaper than a do-everything single-agent's call. Net: probably ~1.5x cost for the specialization. Acceptable when the structure also gives us the human-in-the-loop pause between stages (the user reviews the diagnosis before recommendations are generated).
 
 ## See also
 
-→ `./01-when-not-to-go-multi-agent.md` · → `./06-swarm-handoff.md` · → `./05-debate-verifier-critic.md` · → `./08-shared-state-and-message-passing.md` · → systems view: `../../study-system-design/06-multi-agent-orchestration.md` · → mechanics: `../../study-ai-engineering/04-agents-and-tool-use/01-agents-vs-chains.md`
-
----
+- [`../01-reasoning-patterns/02-agent-loop-skeleton.md`](../01-reasoning-patterns/02-agent-loop-skeleton.md) — where the budget exits live
+- [`../05-production-serving/03-per-tool-circuit-breaking.md`](../05-production-serving/03-per-tool-circuit-breaking.md) — the unaddressed gap
+- [`../05-production-serving/02-fan-out-backpressure.md`](../05-production-serving/02-fan-out-backpressure.md) — what synthesis failure would look like if topology changed
+- [`../04-agent-infrastructure/05-guardrails-and-control.md`](../04-agent-infrastructure/05-guardrails-and-control.md) — the full control envelope around a loop

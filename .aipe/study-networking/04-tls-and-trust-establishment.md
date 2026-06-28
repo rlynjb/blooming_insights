@@ -1,369 +1,320 @@
 # TLS and trust establishment
 
-**Industry name(s):** TLS 1.2/1.3, transport encryption, certificate validation, system trust store
-**Type:** Industry standard · Language-agnostic
+**Encryption in transit, certificates, and where TLS terminates** · Industry standard
 
-> Every hop in this repo runs over TLS; termination happens at the platform edge for inbound and at the provider for outbound; the only crypto we *write* is the AES-256-GCM that encrypts the `bi_auth` cookie at rest. Cert pinning, custom CAs, and mTLS are `not yet exercised`.
+## Zoom out — where this concept lives
 
----
-
-## Zoom out, then zoom in
-
-**Zoom out — the bigger picture.** TLS shows up in two distinct ways in this app: as the encryption-in-transit on every network hop (which we delegate entirely to the platform and the system trust store), and as a *property the auth cookie depends on* (the `bi_auth` cookie is `Secure`, meaning it only rides on HTTPS connections, and that's the entire reason it's safe to put encrypted OAuth tokens in it).
+TLS sits between TCP (the byte stream) and HTTP (the protocol semantics). Every wire in this app is HTTPS, which means TLS wraps every byte that leaves the Service band — and every byte that enters it from the browser.
 
 ```
-Zoom out — where TLS shows up
+  Zoom out — TLS wraps each wire end-to-end
 
-┌─ Browser ──────────────────────────────────────────────────────────┐
-│  https://<app>.vercel.app                                          │
-│  TLS terminated AT Vercel's edge                                   │
-└────────────────┬───────────────────────────────────────────────────┘
-                 │ ★ TLS 1.2 / 1.3 ★
-                 │ cookies: bi_session, bi_auth (httpOnly+Secure)
-                 │ ★ Secure flag means: only ride on TLS ★
-                 ▼
-┌─ Vercel edge → function ───────────────────────────────────────────┐
-│  TLS terminated at edge; function-to-edge link is internal         │
-│  but treated as encrypted (platform-managed)                       │
-└────────┬───────────────────────────────────────────────┬───────────┘
-         │                                                │
-   HTTPS POST /mcp/                              HTTPS POST /v1/messages
-   public CA chain                                public CA chain
-   no pinning, no custom CAs                      no pinning
-         │                                                │
-         ▼                                                ▼
-┌─────────────────────────────┐                ┌──────────────────────────┐
-│  Bloomreach Loomi MCP       │                │  Anthropic API           │
-│  (TLS terminator: theirs)   │                │  (TLS terminator: theirs)│
-└─────────────────────────────┘                └──────────────────────────┘
+  ┌─ UI band ──────────────────────────────┐
+  │  Browser                                │
+  └────────────────┬───────────────────────┘
+                   │
+                   │  TLS termination #1: Vercel edge
+                   │  (we don't see plaintext on this hop)
+                   ▼
+  ┌─ Edge ─────────────────────────────────┐
+  │  Vercel proxy (re-encrypts to function) │
+  └────────────────┬───────────────────────┘
+                   │
+                   │  TLS to the function (internal)
+                   ▼
+  ┌─ Service band ─────────────────────────┐ ← we are here
+  │  Next.js route handler                  │
+  └──┬──────────────────────────────┬──────┘
+     │                              │
+     │  TLS to Bloomreach           │  TLS to Anthropic
+     │  (cert chain verified        │  (cert chain verified
+     │   by Node's bundle)          │   by Node's bundle)
+     ▼                              ▼
+  ┌─ Provider ─────────┐  ┌─ Provider ─────────┐
+  │ loomi-mcp-alpha    │  │ api.anthropic.com  │
+  └────────────────────┘  └────────────────────┘
 ```
 
-**Zoom in — narrow to the concept.** The question this file answers: where does encryption start and end, who validates the certificate, what crypto do we actually write ourselves, and which security guarantees rely on TLS being present? The honest answer is "all network crypto is delegated; the one place we *write* crypto is the cookie-at-rest encryption in `lib/mcp/auth.ts`, and that's a deliberately small surface."
+## Zoom in — the concept
 
----
+Three TLS sessions to reason about. We terminate the user-facing one at Vercel's edge (we don't own the cert; Vercel does). We *originate* two outbound TLS sessions to providers and let Node validate their certs against the system CA bundle. No certificate pinning, no mTLS, no custom trust store anywhere.
 
 ## Structure pass
 
-**Layers.** Two layers of trust. **Transport-layer trust** (TLS): the system trust store decides whether to believe Bloomreach's cert chain and Anthropic's cert chain, and the platform decides whether to believe the browser's connection. **Application-layer trust**: we trust the contents of the `bi_auth` cookie because we encrypted it (AES-256-GCM) and the receiver (us) is the only holder of `AUTH_SECRET`. Two completely different mechanisms, both called "trust"; they don't substitute for each other.
+### Layers
 
-**Axis: trust.** Trace "who can read or tamper with these bytes?" across the layers. On the wire: nobody except endpoints (TLS encrypts; cert chain proves the endpoint). In the cookie: the browser can read the base64url blob but cannot decrypt it (AES-256-GCM under a secret it doesn't have); the server can decrypt and re-encrypt; if `AUTH_SECRET` is leaked, the blob is plaintext. In the function's memory: anyone with code-execution in the function sees `ANTHROPIC_API_KEY`, `AUTH_SECRET`, and the decrypted OAuth tokens. Trust is layered, not flat.
+- **Browser ↔ Vercel edge** — TLS 1.2/1.3 with Vercel's wildcard cert (`*.vercel.app`) or a configured custom domain cert (Let's Encrypt / Vercel-managed).
+- **Vercel edge ↔ function** — internal hop, encrypted by Vercel's infrastructure. We don't see it.
+- **Function ↔ provider** — TLS 1.2/1.3 originating from Node, validating the provider's cert against Node's bundled CA.
 
-**Seams.** Three seams matter.
-
-  → **Seam 1: cleartext app code → TLS-wrapped bytes.** Failure flips from "anyone on the wire can read it" to "only endpoints can." We delegate this. There is no place in the code where we touch the TLS handshake or the cert chain.
-  → **Seam 2 (load-bearing): plaintext token in memory → AES-encrypted blob in cookie.** Failure flips from "token gone if process dies" to "token survives any number of cold starts inside a 10-day window." This is the one crypto seam we own.
-  → **Seam 3: presence of TLS → `Secure` cookie flag.** Failure flips from "cookie sent over both HTTP and HTTPS" to "cookie ONLY sent over HTTPS." This is what makes putting tokens in a cookie safe in the first place.
+### One axis held constant — `who validates the certificate?`
 
 ```
-Three trust seams — what flips, what we own
+  axis = "who decides this connection is trusted?"
 
-  seam                              flip                        owned?
-  ────                              ────                        ──────
-  cleartext → TLS bytes             public → endpoint-only      no
-  in-memory → cookie blob           ephemeral → 10-day persist  yes
-  TLS present → Secure cookie       any link → HTTPS only       yes (the flag)
+  ┌─ Browser ↔ Vercel ────────┐  the BROWSER validates the edge cert
+  │                            │  → cert chain rooted in a public CA
+  │                            │    (Let's Encrypt, etc.)
+  └────────────────────────────┘
+
+  ┌─ Vercel edge ↔ function ──┐  VERCEL validates — internal infra
+  │                            │  → opaque to us
+  └────────────────────────────┘
+
+  ┌─ Function ↔ Bloomreach ───┐  NODE validates against /etc/ssl
+  │                            │  → trust roots ship with the runtime;
+  │                            │    no custom CAs added in our code
+  └────────────────────────────┘
+
+  ┌─ Function ↔ Anthropic ────┐  same as Bloomreach
+  │                            │
+  └────────────────────────────┘
 ```
 
-The skeleton is mapped — the rest walks each mechanism.
+### Seams
 
----
+- **Browser ↔ edge** — public PKI. Cert mismatch = browser blocks the request before our code runs.
+- **Edge ↔ function** — Vercel's internal mTLS. We can't observe failures; we'd see them as 502s.
+- **Function ↔ provider** — Node-managed. Cert failure throws inside `fetch`, surfaces as a network error to our route, which logs it and returns 500.
 
 ## How it works
 
-### Mental model
+### Move 1 — the mental model
 
-TLS handles the wire. Cookie encryption handles persistence across stateless function invocations. The two layers compose: the cookie can only contain OAuth tokens *because* TLS guarantees the cookie itself only travels on encrypted hops, and the cookie can survive process death *because* it's encrypted at rest with a server-only key.
-
-```
-The shape — two crypto domains, no overlap
-
-  on the wire:                              at rest:
-  ─────────────                              ────────
-  TLS 1.2/1.3                                AES-256-GCM
-  endpoint-authenticated                     server-key-authenticated
-  ephemeral (per connection)                 persistent (10-day cookie)
-  delegated to platform                      written in lib/mcp/auth.ts
-       │                                          ▲
-       └─── enables ──── Secure cookie flag ──────┘
-            (cookie only crosses TLS hops)
-```
-
-### Move 2 walkthrough
-
-**Use cases this walkthrough covers.**
-
-  → **First user load in production.** Browser hits `https://<app>.vercel.app`; TLS terminates at edge; function reads cookies; if `bi_auth` present, decrypts it; if not, returns `{needsAuth, authUrl}` and the browser navigates to Bloomreach's IdP over TLS.
-  → **OAuth callback.** The IdP 302s back to `/api/mcp/callback?code=…` over TLS; the function decrypts `bi_auth` to recover the PKCE verifier saved during `connect`, exchanges the code over TLS to Bloomreach, persists new tokens in the re-encrypted cookie.
-  → **Cold start after instance death.** Function comes up with no memory of prior state; the cookie's encrypted blob is the only state that survived; decrypts, reads tokens, proceeds.
-
-**TLS on every hop.** All three production hops are HTTPS. The browser → edge link uses TLS terminated at Vercel; the cert is whatever Vercel provisions for `*.vercel.app` (or your custom domain via Let's Encrypt). The function → Bloomreach link uses TLS terminated by Bloomreach; their cert chain is validated by Node's bundled trust store. Same for the function → Anthropic link. We do not pin certs; we do not load a custom CA; we do not disable validation.
+TLS does three things at once: (1) proves the server is who the URL says it is (cert chain), (2) negotiates a shared key (key exchange), (3) encrypts every byte after that (record layer). The first part is the only one we have any code dealing with — and even then, only indirectly through Node's defaults.
 
 ```
-TLS handshake — what we don't touch
+  the handshake — the part that costs RTTs
 
-  client                                  server
-  ──────                                  ──────
-  ClientHello (supported ciphers)  ──►    
-                                          ServerHello + cert chain
-                                   ◄──    
-  validate cert against trust store       
-  (Node's bundled or browser's)           
-  key exchange                     ─►◄─   
-  encrypted application data       ─►◄─   
+  Client                                   Server
+     │   ClientHello                          │  ┐
+     │   • TLS versions supported              │  │  TLS 1.3:
+     │   • cipher suites                       │  │  1 round-trip
+     │   • SNI: "loomi-mcp-alpha.bloomreach.com"│  │  (Client sends keyshare
+     │ ────────────────────────────────────►   │  │   in ClientHello,
+     │                                          │  │   server responds with
+     │   ServerHello + cert chain + Finished    │  │   cert + Finished)
+     │ ◄────────────────────────────────────   │  │
+     │                                          │  │  TLS 1.2:
+     │   ClientFinished                         │  │  2 round-trips
+     │ ────────────────────────────────────►   │  │  (additional exchange
+     │                                          │  │   for keyshare)
+     │   === application data starts ===        │  ┘
+     │ ◄═══════════════════════════════════►   │
 ```
 
-Nothing in this repo touches that handshake. We do not set `tls.rejectUnauthorized = false`. We do not pass a `ca` option. We do not write `https.request` with a custom agent. If a cert verification fails (e.g. Bloomreach rotates and we cache a stale resolver), undici throws and our `liveCall` wraps it in `McpToolError`.
+The SNI line is worth keeping in mind: TLS sends the target hostname in the clear, so the server can pick the right cert. That's `loomi-mcp-alpha.bloomreach.com` on wire #2, `api.anthropic.com` on wire #3. SNI is how virtual hosting works under TLS.
 
-**The `Secure` cookie flag — TLS as a precondition for cookie safety.** When `setSessionCookie` or `withAuthCookies` sets a cookie in production, it passes `secure: true`. The browser then refuses to send that cookie on any HTTP (non-TLS) request. This is what makes putting encrypted OAuth tokens in the cookie acceptable — the cookie blob never crosses a cleartext hop, so the only thing on the wire is the AES-encrypted ciphertext over TLS-encrypted bytes (double-wrapped).
+### Move 2 — walk each TLS session
 
-```
-Pseudocode — Secure flag enforces TLS
+#### Session 1 — Browser to `<app-host>` (Vercel-terminated)
 
-  in production:
-    cookies.set('bi_auth', encryptedBlob, {
-      httpOnly: true,         // JS in the page cannot read it
-      secure: true,           // ← browser refuses to send over HTTP
-      sameSite: 'none',       // allows the cross-site OAuth callback
-      path: '/',
-      maxAge: 60*60*24*10,    // 10 days
-    })
-  
-  in development (localhost, no TLS):
-    cookies.set('bi_auth', encryptedBlob, {
-      httpOnly: true,
-      // ★ no secure: true ★ — localhost is http://, the browser
-      // would refuse to send a Secure cookie at all, breaking dev
-      sameSite: 'lax',
-      path: '/',
-    })
-```
+We don't own any code on this session. Vercel terminates TLS at its edge. The cert is:
 
-The boundary that catches people: in development on `localhost`, `Secure` cookies don't ride at all (the browser drops them), so `session.ts` and `auth.ts` both omit `secure: true` when `NODE_ENV !== 'production'`. Forgetting that pattern would make dev OAuth silently fail with no cookies.
+- `*.vercel.app` for preview deploys and the default production URL.
+- A Let's Encrypt cert for any custom domain configured in the Vercel dashboard.
 
-The split, in the matching session-cookie helper:
+The browser validates the chain. If validation fails, the request never reaches our function — the browser shows its scary cert-error page. Our code's only TLS interaction here is implicit: we set the session cookie `Secure: true` in production (`lib/mcp/session.ts:12`), which is a contract — *don't send this cookie over plain HTTP*. Without HTTPS, the cookie wouldn't ride; without the cookie, we have no session.
 
-```
-lib/mcp/session.ts  (lines 10-14, dev/prod cookie split)
-
+```ts
+// lib/mcp/session.ts:10-14
 function sessionCookieOpts() {
   return process.env.NODE_ENV === 'production'
     ? { httpOnly: true, secure: true, sameSite: 'none' as const, path: '/' }
     : { httpOnly: true, sameSite: 'lax' as const, path: '/' };
-                       │
-                       └─ no secure:true in dev, because localhost is
-                          http://. A Secure cookie on a non-TLS hop
-                          would simply not be sent — the dev OAuth
-                          flow would silently break.
 }
 ```
 
-And the matching attribute set on `bi_auth`, the encrypted cookie:
+`Secure: true` is one of the few places our application code directly *depends on* TLS being present.
 
-```
-lib/mcp/auth.ts  (lines 86-103, withAuthCookies' flush)
+#### Session 2 — Function to `loomi-mcp-alpha.bloomreach.com`
 
-(await cookies()).set(AUTH_COOKIE, encryptStore(ctx.store), {
-  httpOnly: true,
-       │
-       └─ JS in the page can't read it; XSS can't exfiltrate the cookie
-          even if it can hit your API.
-  secure: true,
-       │
-       └─ load-bearing in prod: browser refuses to send this over HTTP.
-          Combined with the public app being HTTPS-only on Vercel, the
-          encrypted blob never crosses cleartext.
-  sameSite: 'none',
-       │
-       └─ required for the cross-site OAuth callback: SameSite=Lax would
-          drop the cookie on the IdP→callback bounce in some browsers,
-          and we'd lose the PKCE verifier.
-  path: '/',
-  maxAge: AUTH_COOKIE_MAX_AGE,   // 10 days, matches token lifetime
+We originate this. The SDK does:
+
+```ts
+// lib/mcp/connect.ts:76-79
+const transport = new StreamableHTTPClientTransport(mcpUrl(), {
+  authProvider: provider,
+  fetch: makeCapturingFetch(httpErrors),
 });
 ```
 
-**The cookie encryption — AES-256-GCM under `AUTH_SECRET`.** This is the only crypto code we write. We take the `AUTH_SECRET` env var, SHA-256 it into a 32-byte key, generate a fresh random 12-byte IV per encryption, encrypt the JSON-stringified store, append the GCM auth tag, base64url the whole thing, and put it in the cookie. To decrypt: extract IV (first 12 bytes), auth tag (next 16), ciphertext (rest), `createDecipheriv`, `setAuthTag`, decrypt. A tampered ciphertext or rotated `AUTH_SECRET` triggers the GCM auth-tag check to fail, decrypt throws, and `decryptStore` returns `{}` — treated as "no auth."
+The `mcpUrl()` returns an `https://` URL. The `fetch` we pass through is the global `fetch` (wrapped). Node's `fetch` uses undici, which uses the system CA bundle plus the bundled Mozilla CA list to validate the server cert.
 
 ```
-Pseudocode — AES-256-GCM round trip
+  Layers-and-hops — TLS validation on Wire #2
 
-  function encryptStore(store):
-    key = sha256(env.AUTH_SECRET)         // 32 bytes → AES-256
-    iv = random_bytes(12)                  // GCM: 96-bit IV is standard
-    cipher = createCipheriv('aes-256-gcm', key, iv)
-    ciphertext = cipher.update(json(store)) ++ cipher.final()
-    tag = cipher.getAuthTag()              // 16 bytes
-    return base64url(iv ++ tag ++ ciphertext)
-  
-  function decryptStore(token):
-    try:
-      buf = base64url_decode(token)
-      iv = buf[0..12]
-      tag = buf[12..28]
-      ciphertext = buf[28..]
-      decipher = createDecipheriv('aes-256-gcm', key, iv)
-      decipher.setAuthTag(tag)              // ← GCM authenticated decrypt:
-                                            //   any bit-flip in ciphertext OR
-                                            //   tag fails the auth check
-      plaintext = decipher.update(ciphertext) ++ decipher.final()
-      return json_parse(plaintext)
-    catch:
-      return {}                              // tampered or rotated secret →
-                                              // treat as no auth, force re-OAuth
+  ┌─ Function ─────────────────┐                   ┌─ Bloomreach ──┐
+  │ makeCapturingFetch         │  ClientHello      │                │
+  │   ↳ global undici fetch    │ ────────────────► │                │
+  │                            │                   │                │
+  │                            │  ServerHello +    │                │
+  │                            │  cert chain       │                │
+  │ Node validates:            │ ◄──────────────── │                │
+  │   • hostname matches SAN   │                   │                │
+  │   • each cert in chain     │                   │                │
+  │     signed by next         │                   │                │
+  │   • root is in CA bundle   │                   │                │
+  │   • not expired            │                   │                │
+  │                            │                   │                │
+  │ if any check fails:        │                   │                │
+  │   fetch throws             │                   │                │
+  │   → captured as            │                   │                │
+  │     McpToolError           │                   │                │
+  └────────────────────────────┘                   └────────────────┘
 ```
 
-The choice of GCM (authenticated encryption) is load-bearing. With CBC + HMAC you'd have two keys and a chance to make order-of-operations mistakes (encrypt-then-MAC vs MAC-then-encrypt). GCM bundles confidentiality + integrity into one primitive with one key, and decrypt fails closed on any tampering. The 12-byte IV is the GCM standard; a fresh IV per encryption is mandatory (reusing one with the same key catastrophically breaks confidentiality).
+What we DON'T do: pin the cert, pin the issuer, install a custom CA, use mTLS. If Bloomreach rotates their cert (within the public PKI), we follow them silently. If their cert expires or fails validation, every tool call throws and the briefing returns an error. There's no half-state.
 
-The actual encrypt/decrypt round trip — the one place we write app crypto:
+#### Session 3 — Function to `api.anthropic.com`
+
+Same story. The Anthropic SDK constructs `https://api.anthropic.com/v1/messages` and uses the standard Node fetch. Same CA bundle, same validation, same failure mode.
+
+#### Authorization vs. encryption — keep them separate
+
+TLS proves the *server is who the URL says*. It does NOT prove *we have permission to use the API*. That's a separate layer:
+
+- Wire #1: cookies (`bi_session`, `bi_auth`) — proves the request belongs to a session.
+- Wire #2: OAuth 2.1 Bearer token in the `Authorization` header — proves we have a current valid grant from Bloomreach.
+- Wire #3: `x-api-key: sk-ant-…` in the header — proves we own the Anthropic account.
 
 ```
-lib/mcp/auth.ts  (lines 62-79, the encrypt/decrypt round trip)
+  TLS proves "who"; Authorization proves "what you can do"
 
-function encryptStore(store: Store): string {
-  const iv = randomBytes(12);
-                       │
-                       └─ fresh per encryption; reusing an IV with the
-                          same key catastrophically breaks GCM. Node's
-                          randomBytes is cryptographically secure.
-  const cipher = createCipheriv('aes-256-gcm', aesKey(), iv);
-                       │
-                       └─ aesKey() = sha256(AUTH_SECRET) → 32 bytes.
-                          AES-256-GCM = authenticated encryption with
-                          associated data; one primitive does confi-
-                          dentiality + integrity. We pass no AAD because
-                          there's nothing to bind it to.
-  const enc = Buffer.concat([cipher.update(JSON.stringify(store), 'utf8'), cipher.final()]);
-  return Buffer.concat([iv, cipher.getAuthTag(), enc]).toString('base64url');
-                                                              │
-                                                              └─ base64url
-                                                                 because the
-                                                                 cookie value
-                                                                 cannot contain
-                                                                 +, /, or =.
-}
-
-function decryptStore(token: string): Store {
-  try {
-    const buf = Buffer.from(token, 'base64url');
-    const decipher = createDecipheriv('aes-256-gcm', aesKey(), buf.subarray(0, 12));
-    decipher.setAuthTag(buf.subarray(12, 28));
-                       │
-                       └─ MUST be called BEFORE update/final in GCM.
-                          Wrong order or missing tag → throws on final.
-    const plain = Buffer.concat([decipher.update(buf.subarray(28)), decipher.final()]).toString('utf8');
-    return JSON.parse(plain) as Store;
-  } catch {
-    return {};
-                       │
-                       └─ tampered ciphertext, rotated AUTH_SECRET, or
-                          corrupt cookie all land here. We FAIL CLOSED:
-                          empty store = "no auth", forcing a fresh OAuth.
-                          Crucially we do not throw — the request can
-                          still serve the auth-required path.
-  }
-}
+  ┌──── TLS ────┐   ┌──── HTTP ───────┐
+  │  server     │   │  Bearer eyJ…    │
+  │  identity   │ + │  Authorization  │ = authenticated request
+  │  (cert)     │   │  header         │
+  └─────────────┘   └─────────────────┘
 ```
 
-**What's NOT here.** No cert pinning. No custom CA loading. No mTLS (we authenticate to Bloomreach with an OAuth Bearer, not a client cert). No proxy configuration. No `tls.connect` direct calls. No HSTS header we set ourselves (Vercel may set one). No CSP header we set. These are all `not yet exercised`. A grep for `pinning`, `ca:`, `rejectUnauthorized`, `tls.connect`, `https.Agent` across `lib/` and `app/` returns no app hits. If we later needed to talk to an internal service with a private CA, or wanted to pin Bloomreach's cert against MITM at the platform layer, the insertion point would be `lib/mcp/transport.ts`'s `makeCapturingFetch` — passing a custom `dispatcher` with a TLS-aware connector.
+Both fail closed. A wrong cert: TLS handshake fails, no request goes through. A wrong/expired token: TLS handshake succeeds, 401 comes back, the route surfaces it.
 
-### Principle
+### Move 2.5 — token leakage and TLS
 
-Delegate transport crypto, write only the application crypto you cannot avoid. The TLS handshake is solved by the platform and the system trust store; touching it (custom CAs, pinning) adds maintenance burden without adding security at this scale. The cookie encryption is the *only* crypto we cannot delegate, because we need OAuth tokens to survive a stateless function's death, and we don't run a shared key-value store. Picking AES-256-GCM (authenticated encryption, single key, fail-closed) over CBC+HMAC is the right call because the failure modes are simpler.
+Two failure modes the codebase guards against, both related to the fact that **TLS encrypts the wire, but it doesn't help once the bytes are inside our process**.
 
----
+First: if a TLS-encrypted response body contains an OAuth token (which happens with the `token` endpoint response and with some error envelopes), and we `console.error` the response body, the token lands in Vercel logs in plaintext. The redaction layer in `lib/mcp/transport.ts:55-76` exists for exactly this:
+
+```ts
+// lib/mcp/transport.ts:55-61
+const TOKEN_PATTERNS: RegExp[] = [
+  /Bearer\s+[A-Za-z0-9._\-+/=]+/g,
+  /"access_token"\s*:\s*"[^"]+"/g,
+  /"refresh_token"\s*:\s*"[^"]+"/g,
+  /"id_token"\s*:\s*"[^"]+"/g,
+  /"code_verifier"\s*:\s*"[^"]+"/g,
+];
+```
+
+Every captured body is run through `redactSecrets` before being stored or logged (`transport.ts:110`). TLS gets the bytes there safely; this code keeps them from leaking after arrival.
+
+Second: the `bi_auth` cookie that holds tokens at rest in the browser is AES-256-GCM encrypted in production (`lib/mcp/auth.ts:62-67`). TLS encrypts the cookie *in flight*; the encryption-at-rest is so a cookie dumped from a logged-out tab, browser extension, or memory snapshot doesn't expose tokens. Defense in depth — TLS isn't enough on its own when the secret has to be stored.
+
+### Move 3 — the principle
+
+**TLS validates server identity and encrypts the channel; it doesn't authorize the request.** Confusing the two leads to security thinking that's miscalibrated in both directions — "we have HTTPS, so we're secure" (no — anyone with the URL can hit the unauthenticated endpoints) and "we don't trust this connection, let's add mTLS" (probably not — the threat model is token theft, not impersonation of `api.anthropic.com`). Knowing what TLS does and doesn't do is the foundation for layering Authorization correctly on top.
 
 ## Primary diagram
 
-The recap — every place TLS or app-crypto lives.
-
 ```
-TLS + app-crypto — full recap
+  the recap — TLS terminations and trust chains
 
-UI band ────────────────────────────────────────────────────────────
-┌──────────────────────────────────────────────────────────────────┐
-│  Browser                                                          │
-│  https://<app>.vercel.app  → TLS validated against browser store  │
-│  cookies: bi_session, bi_auth                                     │
-│     • httpOnly:true → JS cannot read                              │
-│     • secure:true (prod) → only sent on HTTPS                     │
-│     • sameSite:'none' (prod) → survives cross-site OAuth bounce   │
-└─────────────────┬────────────────────────────────────────────────┘
-                  │ TLS 1.2/1.3 to Vercel edge
-                  ▼
-Edge band ─────────────────────────────────────────────────────────
-┌──────────────────────────────────────────────────────────────────┐
-│  Vercel edge                                                      │
-│  • terminates TLS for *.vercel.app (or custom-domain cert)       │
-│  • internal hop to function: platform-managed                    │
-└──────────────────────────────────┬───────────────────────────────┘
-                                   │
-Service band ──────────────────────▼───────────────────────────────
-┌──────────────────────────────────────────────────────────────────┐
-│  Serverless function                                              │
-│  ★ READS cookies, decrypts bi_auth via AES-256-GCM ★              │
-│  • AUTH_SECRET (env, server-only)                                 │
-│    → sha256 → 32-byte key                                         │
-│    → decipher(buf[0..12]=iv, buf[12..28]=tag, buf[28..]=ct)       │
-│    → JSON → {sessionId: {tokens, clientInformation, codeVerifier}}│
-│  • re-encrypts on dirty write before flushing the cookie back     │
-│  • on tamper/rotate: decrypt fails closed → treated as no auth    │
-└────┬─────────────────────────────────────────────┬───────────────┘
-     │                                              │
-     │ TLS via Node trust store                     │ TLS via Node trust store
-     │ public CA chain                              │ public CA chain
-     │ no pinning, no custom CA                     │ no pinning
-     ▼                                              ▼
-┌─────────────────────────────┐                ┌──────────────────────────┐
-│  Bloomreach (their TLS)     │                │  Anthropic (their TLS)   │
-└─────────────────────────────┘                └──────────────────────────┘
+  ┌─ Browser ──────────────────────────────────────────────┐
+  │  validates Vercel cert against public CA              │
+  └─────────────────────┬──────────────────────────────────┘
+                        │ TLS 1.2/1.3
+                        ▼
+  ┌─ Vercel edge ──────────────────────────────────────────┐
+  │  terminates TLS · re-encrypts on internal hop          │
+  └─────────────────────┬──────────────────────────────────┘
+                        │ Vercel internal mTLS
+                        ▼
+  ┌─ Function (Node) ──────────────────────────────────────┐
+  │  originates two outbound TLS sessions                   │
+  │  ┌──────────────────────────┐  ┌──────────────────────┐│
+  │  │ undici → Bloomreach      │  │ Anthropic SDK → API  ││
+  │  │ validates cert against   │  │ validates cert       ││
+  │  │ Node CA bundle           │  │ same bundle          ││
+  │  │ Auth: Bearer (OAuth 2.1) │  │ Auth: x-api-key      ││
+  │  └──────────────────────────┘  └──────────────────────┘│
+  └────────────────────────────────────────────────────────┘
+
+  + TOKEN HYGIENE inside the process:
+      redactSecrets strips Bearer/access_token/refresh_token
+      from captured bodies before logging
+      → lib/mcp/transport.ts:55-76, applied at transport.ts:110
+
+  + COOKIE AT REST:
+      bi_auth = AES-256-GCM encrypted store of tokens + PKCE verifier
+      → lib/mcp/auth.ts:62-79
 ```
-
----
 
 ## Elaborate
 
-The choice between symmetric authenticated encryption (AES-GCM, ChaCha20-Poly1305) and "encrypt-then-MAC" (CBC + HMAC) is mostly settled now: AEAD primitives are simpler, faster on modern CPUs, and harder to misuse. GCM specifically requires a unique IV per encryption with the same key, which Node's `randomBytes(12)` handles correctly (the 96-bit IV space is large enough that birthday collisions are not a concern for the volume here).
+What's `not yet exercised`:
 
-The 10-day cookie lifetime is *much* longer than typical OAuth refresh-token cycles; that's because we want the user to not re-OAuth across sessions, and the cookie *is* the persistence layer (we have no DB to keep tokens in). The cost: a stolen cookie is valid for 10 days. Defense-in-depth: `httpOnly` blocks JS theft; `Secure` blocks cleartext transit; rotating `AUTH_SECRET` instantly invalidates all cookies. We have no cookie-revocation mechanism short of secret rotation.
+- **No cert pinning.** A common hardening for mobile/native apps; rarely worth it for serverless web apps because rotating roots breaks pinned clients.
+- **No mTLS upstream.** Bloomreach and Anthropic don't require it; we don't offer it.
+- **No HSTS preload registration.** Vercel sets HSTS headers; whether we're on the preload list depends on the domain config.
+- **No custom CA store.** Everything trusts the standard system roots.
 
-What we deliberately don't do: store tokens in `localStorage` (readable by any script in the page) or `sessionStorage` (same), or expose them via an authenticated `/api/me` endpoint (would let a stolen session-id holder pull tokens). The encrypted-cookie pattern keeps tokens server-side-only while surviving cold starts.
+Where TLS hardening *would* matter: if we move to a private Bloomreach deployment with a private CA, the connect step would need `NODE_EXTRA_CA_CERTS` set. Not exercised today.
 
----
+A note on TLS-1.2 vs 1.3: we don't pin a version. Node negotiates the highest both sides support. For our providers, that's TLS 1.3 in practice (one round-trip, faster connection). The cold-start handshake cost is half what it would be on TLS 1.2.
 
 ## Interview defense
 
-**Q1: Walk me through the TLS story end to end.**
+**Q: Where does TLS terminate for browser requests?**
 
-Three TLS hops, all delegated. Browser → Vercel edge: cert from Let's Encrypt / Vercel's wildcard, validated by the browser. Function → Bloomreach: cert validated by Node's bundled trust store. Function → Anthropic: same. We don't pin certs, don't load custom CAs, don't touch the handshake. The one place crypto leaks into application code is the `bi_auth` cookie: we AES-256-GCM encrypt the OAuth tokens under `AUTH_SECRET` because the function is stateless and the cookie is the only state that survives cold starts.
+> At the Vercel edge. The browser validates Vercel's cert against the public CA roots. The internal hop from edge to function is also encrypted, but that's Vercel's infrastructure — we don't see it. Our application code's only direct TLS dependency on this wire is `Secure: true` on the session cookies, which is the contract "don't send these over plain HTTP."
 
 ```
-Diagram-while-you-speak
+  on the whiteboard:
 
-  TLS (platform)              cookie crypto (us)
-  ──────────────              ──────────────────
-  3 hops, all HTTPS           AES-256-GCM
-  system trust store          AUTH_SECRET → sha256 → 32-byte key
-  no pinning                  random 12-byte IV per encrypt
-  delegated                   GCM auth tag → fail closed on tamper
+  Browser ──TLS(public CA)──► Vercel edge ──TLS(internal)──► function
+                                                              ▲
+                                          our code starts here │
 ```
 
-Anchor: "transport crypto delegated; application crypto narrow and authenticated."
+Anchor: we don't own the user-facing cert; Vercel does.
 
-**Q2: Why AES-GCM and not CBC + HMAC?**
+**Q: How does the function validate Bloomreach's cert?**
 
-GCM is authenticated encryption — one primitive does confidentiality and integrity, one key, fail-closed on tampering. CBC + HMAC needs two keys, an order-of-operations decision (encrypt-then-MAC is correct; MAC-then-encrypt has known attacks), and more code surface to get wrong. The GCM IV requirement (unique per encryption) is satisfied by `randomBytes(12)`.
+> Node's `fetch` (undici) uses the bundled Mozilla CA list to validate the chain. We pass an `https://` URL to `StreamableHTTPClientTransport`, the SDK calls our wrapped `fetch`, undici does the handshake, validates SNI matches the cert SAN, walks the chain to a trusted root. No pinning, no custom CA. If validation fails, `fetch` throws, the transport surfaces it as an `McpToolError`, the route surfaces it as a 500 with the real message.
 
-**Q3: What's the threat model for the `bi_auth` cookie?**
+```
+  on the whiteboard:
 
-The blob carries OAuth tokens with a 10-day lifetime. Risks ranked: (1) `AUTH_SECRET` leak — the entire 10-day cookie population becomes decryptable, mitigated by rotating the secret (which invalidates all cookies); (2) cookie theft via XSS — blocked by `httpOnly`; (3) MITM on the wire — blocked by `Secure` + TLS; (4) replay after logout — we have no server-side revocation, so a stolen valid cookie is valid until expiry. The defense-in-depth is real but the revocation gap is honest.
+  https://loomi-mcp-alpha.bloomreach.com/mcp
+         │
+         ▼
+  undici handshake
+         │
+         ▼
+  Mozilla CA list (bundled with Node) → chain validates → done
+```
 
----
+Anchor: standard public PKI, no custom trust.
 
----
+**Q: TLS encrypts the wire. What about the tokens once they arrive?**
+
+> Two protections. First, `redactSecrets` in `lib/mcp/transport.ts:55-76` runs over every captured error body before it goes to `console.error` — Bearer tokens, access tokens, refresh tokens, PKCE verifiers all get replaced with `[redacted]`. That keeps Vercel logs clean. Second, the `bi_auth` cookie that holds tokens at rest in the browser is AES-256-GCM encrypted under `AUTH_SECRET` in production (`lib/mcp/auth.ts:62`). TLS protects transit; this protects what lands.
+
+```
+  on the whiteboard:
+
+  TLS wire ═══════════ in-process ═══════════ at-rest
+      ↑                  ↑                       ↑
+  encrypts            redactSecrets          AES-256-GCM
+  the bytes           strips tokens          (bi_auth cookie)
+                      before logs
+```
+
+Anchor: TLS is one layer of three.
 
 ## See also
 
-  → `01-network-map.md` — every hop named, every TLS boundary visible.
-  → `02-dns-routing-and-addressing.md` — how the cert's hostname matches resolution.
-  → `05-http-semantics-caching-and-cors.md` — the cookies' other flags and what they bind to.
-  → `../study-security/` — for the application-level trust audit; this file covers the mechanism, that one covers whether it's enough.
+- `01-network-map.md` — where each TLS session sits
+- `05-http-semantics-caching-and-cors.md` — the Authorization layer that rides on top of TLS
+- `study-security/audit.md` — the full trust story per wire

@@ -1,283 +1,277 @@
-# Replication and Read Consistency
+# Replication and read consistency
 
-## Subtitle
+Industry standard · Distributed storage internals
 
-How a database keeps multiple copies of data in sync and what reads see across them · Industry standard.
+## Zoom out — where replication would live, and what's there instead
 
-## Zoom out, then zoom in
-
-```
-  Zoom out — where replication sits in a normal app
-
-  ┌─ App ──────────────────────────────────────────┐
-  │  one read query, one write query               │
-  └──────────────┬───────────────┬─────────────────┘
-                 │ writes go here │ reads can go here
-  ┌─ Primary ───▼────┐  ┌─ Replica ▼─────────┐
-  │  accepts writes  │  │  reads from log    │
-  └────┬─────────────┘  └────────────────────┘
-       │ WAL stream
-       └─────────────────────────────────►
-                                ★ THIS GUIDE ★
-                              (lag, consistency
-                               level, failover)
-```
-
-### Verdict for this codebase
-
-**Not yet exercised in the database sense — but the same FAMILY of problem (read consistency across multiple stores) does exist here, and it's the second-most-real database concern we have after the rate limit (06).**
-
-There is no primary database, so no replica. What we DO have, that exhibits the same shape of problem: **every warm Vercel instance has its own in-memory state.** Two users hitting two instances see two different "current briefings" — not because of replication lag, but because there's no shared store at all.
-
-This is one altitude up from classical replication. Classical replication: one primary, N replicas, eventually consistent under network lag. Ours: N stateless functions, each with their own private cache, no replica relationship at all. The reader-side problem (stale data, divergence) is the same family — the cause is different.
-
-### When this becomes load-bearing
+Replication is the mechanism that gives a database high availability and read scale: the same data lives on multiple nodes (primary + replicas, or multi-primary with consensus), and reads can be served from any of them. Read consistency defines what the replica is allowed to show you — the latest write (strong), eventually-the-latest (eventual), or a snapshot from when you started (snapshot isolation). This codebase has **no database, no replication mechanism, and no consistency contract — but it does have one structure that resembles a frozen read replica: the committed `demo-*.json` snapshot.**
 
 ```
-  triggers that make replication / consistency a real concern
+  Zoom out — where replication would live (and what's there)
 
-  shared rate-limit budget across instances (already named in 06)
-     → no shared store today; each instance counts independently
-
-  saved insights visible across instances
-     → as soon as state is per-user-durable, "which copy do I read"
-       becomes a real question
-
-  read replicas to scale reads
-     → only matters once primary is the bottleneck; not us yet
-
-  multi-region deployment
-     → cross-region lag is measured in tens of ms; matters for
-       read-after-write UX
-```
-
-## Structure pass
-
-```
-  axis: "if I write here, when can a different reader see it?"
-
-  ┌─ same Map in same instance ───────────────┐
-  │  immediately. same memory, no network.    │  → strong, no lag
-  └────────────────────────────────────────────┘
+  ┌─ Service layer ──────────────────────────────────────────────┐
+  │  /api/briefing  /api/agent                                    │
+  └───────────────────────────────┬──────────────────────────────┘
                                   │
-                                  │  cross an instance boundary
-                                  ▼
-  ┌─ different Vercel instance ──────────────┐
-  │  never (today). no shared store; the     │  → no consistency at all
-  │  other instance has its own private Map. │     — different "truths"
-  └───────────────────────────────────────────┘
+  ┌─ Two "read paths" ────────────▼───────────────────────────────┐
+  │  ★ THIS CONCEPT ★                                              │
+  │                                                                │
+  │  LIVE PATH                          DEMO PATH                  │
+  │  ─────────                          ─────────                  │
+  │  agent runs against Bloomreach      reads demo-*.json files    │
+  │  60s response cache on top          frozen at last capture     │
+  │                                                                │
+  │  ↑ "primary" (fresh, expensive)     ↑ "frozen read replica"    │
+  │    rate-limited at provider           deterministic, instant   │
+  └────────────────────────────────────────────────────────────────┘
                                   │
-                                  │  if we had a shared store
-                                  ▼
-  ┌─ shared store (e.g. Vercel KV) ──────────┐
-  │  immediately (KV is strongly consistent  │  → strong consistency at
-  │  within a region) or after ~ms (cross-   │     cost of a network hop
-  │  region replication)                     │
-  └───────────────────────────────────────────┘
-                                  │
-                                  │  if we add Postgres + read replicas
-                                  ▼
-  ┌─ Postgres primary + replica ─────────────┐
-  │  writes hit primary. replicas trail by   │  → eventual consistency;
-  │  WAL ship latency (typically <100ms).     │     "read your writes" may
-  │  read-after-write on a replica can miss   │     fail on replica unless
-  │  the just-written row.                    │     you route reads to primary
-  └───────────────────────────────────────────┘
+  ┌─ Multi-instance heap ──────────▼──────────────────────────────┐
+  │  each Vercel instance holds its OWN in-memory Map             │
+  │  → instances diverge; no replication between them              │
+  │  → not a "replica set" — independent caches that don't sync   │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
-The seam is each storage boundary. Each one changes the answer to "when can a different reader see my write."
+## Zoom in — the question this concept answers
+
+In a real DB: "how do replicas stay in sync, and what staleness do my reads tolerate?" Here, three honest answers depending on which "replica" you mean:
+  1. **The demo snapshot** is a frozen, immutable, deterministic "read replica" that ages until manually re-captured.
+  2. **The 60s response cache** is a per-instance lazy "cache replica" with a fixed TTL — read-your-own-writes if you write through it, eventually-consistent otherwise.
+  3. **Multi-instance Maps** are independent stores that *look* like replicas but never sync; "consistency" between them is whatever the next briefing run produces.
+
+## Structure pass — the skeleton
+
+### The three "replica" shapes in this codebase
+
+```
+  shape                  what it is                          consistency model
+  ─────                  ──────────────────                  ─────────────────
+  demo-*.json            committed snapshot of one run       FROZEN (never updates)
+  60s response cache     per-instance TTL cache over EQL     stale ≤60s per key
+  multi-instance Map     independent heaps per Vercel proc   divergent, no sync
+```
+
+None of them are a "replica" in the strict sense (no replication protocol, no log shipping, no consensus). All three are *cache-shaped* artifacts that play replica-like roles.
+
+### Axis: where does freshness come from?
+
+```
+  The "freshness" axis, across the three replica analogs
+
+  demo-*.json:          frozen at capture time (manual refresh only)
+  60s response cache:   refreshed on miss after expiry
+  multi-instance Map:   refreshed on each briefing re-run
+  Bloomreach (primary): always fresh by definition
+```
+
+Each "replica" has a different staleness contract, and the contracts are NOT explicit anywhere in code — they're emergent properties of the cache mechanics. That's the risk: a reader who doesn't know the contract may treat a stale read as fresh.
+
+### Seams
+
+The seam that matters: **the demo/live toggle.** When the UI switches between demo mode (read from snapshot) and live mode (read from Bloomreach with cache), it switches between two *different consistency models* without saying so. Demo guarantees deterministic replay; live guarantees ≤60s staleness per query. The same UI renders both identically — the user has to know which one they're looking at.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-A primary database accepts writes. Each write goes into the WAL. Replicas stream the WAL and apply it to their own copy. Reads from replicas see whatever the WAL has shipped so far — which is "the primary as of `now - lag`."
+If you've ever used a CDN that caches your API responses, served a stale page from the cache while the origin was being re-fetched, and shown the user "data as of 30 seconds ago" — that's exactly the consistency model of the 60s response cache. The demo snapshot is a different shape: imagine taking a screenshot of your API responses at one moment, committing them to git, and serving the screenshot when you don't want to hit the origin. That's `demo-*.json`.
 
 ```
-  the pattern — primary + replica via WAL streaming
+  The shape — three "replicas," three freshness contracts
 
-       writes ──► primary ──► WAL ──► network ──► replica
-                                                    │
-                                                    ▼
-                                                 read
+   Bloomreach              ← primary; always fresh
+        │
+        │ tool calls (rate-limited ~1 req/s)
+        ▼
+   60s response cache       ← per-instance; ≤60s staleness
+        │
+        │ tool result
+        ▼
+   in-memory Map            ← per-instance; written on briefing
+        │
+        │ HTTP read
+        ▼
+   UI (live mode)
 
-       lag = network RTT + replica apply time
-       typically <100ms for healthy systems
-       can spike to seconds under load
+   ────────────────────────────────────────────────────────
+
+   demo-*.json (committed)  ← frozen snapshot; staleness = (now - capture-time)
+        │
+        │ direct read
+        ▼
+   UI (demo mode)
 ```
 
-The contract the replica makes: "I'm at most `lag` seconds behind the primary." The contract it does NOT make: "if you read from me right after writing to the primary, you'll see your write." That guarantee is **read-your-writes**, and it requires extra work — usually routing reads-after-writes back to the primary for a short window.
+### Move 2 — the walkthrough
 
-### Move 2 — the moving parts
+#### The demo snapshot — a frozen read replica
 
-**Move 2a — sync vs async replication.** Sync: primary waits for replica to ack the WAL before returning COMMIT. Strong durability, slow commits, single-replica-failure stalls writes. Async: primary returns immediately, replica catches up later. Fast commits, possible data loss on primary failure.
+The two JSON files are committed in `lib/state/demo-insights.json` and `lib/state/demo-investigations.json`. They capture one live briefing run end-to-end, including the agent's reasoning trace, every tool call, and every result.
 
-**Move 2b — consistency levels for the read path.**
-
-- **eventual** — eventually all replicas converge. No "when" promised. Default for most replicated systems.
-- **read-your-writes** — your own writes are visible to your subsequent reads. Implemented by sticky-session-to-primary or by a per-client high-water-mark.
-- **monotonic reads** — you never see time go backwards. Once you've seen a row at v=5, you won't later see v=4 from a lagged replica.
-- **strong / linearizable** — reads always see the latest committed value. Expensive; usually only the primary can serve these.
-
-**Move 2c — failover.** Primary dies. A replica is promoted. Outstanding writes that hadn't shipped yet are lost (async) or ack-blocked (sync). Failover orchestration is a hard problem — split-brain (two nodes both think they're primary) is the canonical failure mode.
-
-```
-  bridge: think of a master React Query cache + multiple browser tabs. one
-          tab mutates, optimistically updates its own cache, then revalidates
-          from the server. other tabs don't see the change until they
-          revalidate too. tabs are "replicas"; the server is "primary."
-          mental model transfers exactly — you've already shipped this.
+```ts
+// lib/state/investigations.ts:9
+const DEMO_FILE = join(process.cwd(), 'lib/state/demo-investigations.json');
 ```
 
-**Move 2d — the codebase's version of this problem (the real teaching here).**
-
-We don't have a primary. We don't have replicas. We have N stateless serverless instances, each with their own Maps. The shape is:
-
-```
-  shape — divergence-by-design
-
-  user A's briefing request → instance 1
-        instance 1's putInsights() fills its Map with insights {A1, A2, A3}
-
-  user B's investigation request → instance 2
-        instance 2 looks up insight A1 in its Map — NOT THERE
-        instance 2 falls through to the demo file, or to the client-sent blob
-
-  user A's next investigation request → instance 3 (different again)
-        instance 3 has neither A1 in its Map nor a sticky route to instance 1
-        falls through to the client-sent blob (?insight=... query param)
-
-  → the SOLE consistency guarantee here is "the client sends the data with
-     every request." that's why app/api/agent/route.ts L37-47 exists — it's
-     a "carry your own state" pattern that bypasses the server's lack of
-     shared store.
+```ts
+// lib/state/investigations.ts:22-28
+export function getCachedInvestigation(insightId: string): AgentEvent[] | null {
+  if (mem.has(insightId)) return mem.get(insightId)!;
+  const fromFile = PERSIST ? readJson(CACHE_FILE)[insightId] : undefined;
+  if (fromFile) return fromFile;
+  const fromDemo = readJson(DEMO_FILE)[insightId];
+  return fromDemo ?? null;
+}
 ```
 
-This is closer to **stateless web architecture circa 2005 with cookies as the state vehicle** than it is to anything modern replicated. Which is correct for the scale, but you should know that's what you're shipping.
+Annotation:
+  - **Line 26** — the demo file is the *last* fallback in the read chain. In-memory first, dev cache second, committed snapshot third. The snapshot is the always-available default.
+  - This is the moral equivalent of a read replica that was perfect at one moment and hasn't received any replication since. In real-DB terms, it's "infinite lag" — and that's the deliberate trade for "zero failure mode."
+  - The refresh mechanism is a dev-only one-click capture script in `app/page.tsx` (the "capture this as the demo snapshot" button). There's no automatic replication, no lag monitor, no failover. Manual refresh is the only way to update.
 
-The cross-request investigation lookup uses three fallbacks because the server can't be trusted to have the state:
+In replica vocabulary: this is a **manually-promoted snapshot replica.** It serves stale reads forever (or until someone re-captures). The consistency model is "deterministic but old."
 
-1. `?insight=...` query param (client-sent blob)
-2. `getAnomaly(insightId)` / `getInsight(insightId)` from the in-memory Map (this-instance hit, otherwise miss)
-3. Demo fixture lookup
+#### The 60s response cache — a per-instance TTL cache
 
-Side-by-side with the real code:
+`BloomreachDataSource` caches every successful tool call result for 60 seconds:
 
-```
-  app/api/agent/route.ts  (lines 37–62)
+```ts
+// lib/data-source/bloomreach-data-source.ts:122,144-148
+private cache = new Map<string, { result: unknown; expiresAt: number }>();
+// ...
+const cacheKey = `${name}:${JSON.stringify(args)}`;
+const ttl = options.cacheTtlMs ?? 60_000;
 
-  function resolveAnomaly(insightId, insightParam?) {
-    if (insightParam) {                          ← FIRST TRY: client-sent blob.
-      try {                                         this is the "consistency
-        const i = JSON.parse(insightParam) as Insight;
-        if (i && ...validates...) {                fix" — every request carries
-          return insightToAnomaly(i);              its own data, so cross-
-        }                                          instance lookup becomes
-      } catch { /* fall through */ }              moot.
-    }
-    const a = getAnomaly(insightId);             ← SECOND TRY: in-memory.
-    if (a) return a;                                only works on same instance
-    const i = getInsight(insightId);                that ran the briefing.
-    if (i) return insightToAnomaly(i);
-    try {                                        ← THIRD TRY: demo file.
-      if (existsSync(DEMO_FILE)) { ... }            committed fixture; always
-    } catch { /* ignore */ }                       present, never "correct"
-    return null;                                    for a live briefing.
+if (!options.skipCache) {
+  const cached = this.cache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return { result: cached.result as T, durationMs: 0, fromCache: true };
   }
-       │
-       └─ the three-tier fallback IS the consistency model. the comment in
-          the source ("the only source that survives Vercel's per-instance
-          memory") names the problem explicitly. without the client-carried
-          blob, this function would return null whenever the user's next
-          request hit a different instance than the briefing did — which is
-          most of the time on a scaled-out deployment.
+}
 ```
 
-```
-  app/api/briefing/route.ts (the briefing happens here; insights are
-                              written to instance-local state)
+Annotation:
+  - **Line 122** — one cache per `BloomreachDataSource` instance, which is one per session (constructed in `lib/mcp/connect.ts`). Different sessions don't share cache hits.
+  - **Line 145** — TTL is 60s by default. The agent loop never overrides; only debug tooling does.
+  - **Lines 147-152** — if the key exists AND hasn't expired, return the cached result tagged `fromCache: true`. The flag flows out to the UI's tool-call trace.
 
-  // somewhere in the stream handler:
-  const insights = anomalies.map(anomalyToInsight);
-  putInsights(insights, anomalies);              ← writes to THIS instance's Map.
-  for (const insight of listInsights())            no other instance sees these
-    send({ type: 'insight', insight });           insights at any consistency
-                                                   level.
-       │
-       └─ each call to /api/briefing produces a "current briefing" that is
-          local to one instance. there is no "the" current briefing across
-          the deployment.
+In consistency terms: this is a **read-after-write consistent** cache for queries you've made within the last 60s (you'll see your own cached writes), and **eventually consistent up to 60s** for queries someone else made. There's no invalidation — entries simply expire. A real-DB analog: the buffer pool with TTL-based eviction (which isn't quite how real buffer pools work, but the staleness shape is the same).
+
+The cost of this shape: **a briefing kicked off 30s after a previous one returns mostly-cached numbers.** For 90-day window queries, that's invisible — the underlying metric doesn't move meaningfully in 30 seconds. For tighter-window queries, it would be a real correctness issue.
+
+#### The multi-instance Map divergence — accidental "replication"
+
+Two Vercel instances serving the same session each hold their own Map. They look like replicas from the outside (same session ID, same data shape) but they don't sync with each other.
+
 ```
+  The divergence picture
+
+  instance A's Map                      instance B's Map
+  ┌────────────────────────┐            ┌────────────────────────┐
+  │ session-X:             │            │ session-X:             │
+  │   insights: { A1, A2 } │            │   insights: { } empty  │
+  └────────────────────────┘            └────────────────────────┘
+       (ran briefing here)                   (cold start, no briefing yet)
+            │                                        │
+            └──── never replicate ───────────────────┘
+            user can hit either, sees different data
+```
+
+In replica vocabulary: this is the *anti-pattern* — replicas that don't replicate. The consistency model is "whatever instance you happen to land on," which is no consistency at all. The mitigation lives outside the replica layer: the client stashes data in `sessionStorage` (`lib/hooks/useBriefingStream.ts:56`) so the data follows the *user*, not the *instance*. Effectively, the client becomes a poor-man's distributed cache that bridges the divergence.
+
+This is fine because the data isn't of record. If the user lands on instance B with an empty Map, they re-run the briefing or the client re-supplies what it has. No data is lost; just some computation is redone.
+
+#### What read consistency the live path actually offers
+
+If you ask "what does the UI in live mode actually guarantee about freshness?" — the honest answer:
+  - **Within one briefing run:** every query the agent issues is at most 60s stale (because the cache filled within the same run for repeated queries, or it was a fresh upstream call for new queries).
+  - **Across briefing runs within 60s:** repeated queries return identical cached results. The two briefings will land on the same underlying data.
+  - **Across briefing runs >60s apart:** every query goes upstream fresh. Two runs may produce different anomalies as Bloomreach data shifts.
+  - **Across two instances simultaneously:** they don't see each other. Whichever instance runs the next briefing first wins; the other instance's view is irrelevant.
+
+None of these guarantees are surfaced to the UI. The UI shows "live" or "demo" and the user reasons about freshness from the label.
+
+#### What the demo path guarantees
+
+  - **Deterministic.** Every run returns identical content. Useful for testing UI changes against a stable backdrop.
+  - **Instant.** No network, no rate limit, no LLM call. The snapshot reads from `lib/state/demo-*.json` synchronously.
+  - **Stale.** The data is exactly as fresh as the last commit to those files. The "capture this as the demo snapshot" dev tool refreshes it; CI does not.
+
+The deliberate trade: **reliable demo > fresh demo.** The alpha MCP server is unreliable enough during demo windows that a frozen replica is the better presentation path. That's an explicit architectural choice, surfaced in the project context.
 
 ### Move 3 — the principle
 
-**Read consistency is a contract about WHEN, not IF.** Every multi-copy system gives up some "when" — the only choice is which guarantee you buy and at what cost. Strong consistency costs latency. Eventual costs UX surprises. Read-your-writes costs routing complexity. Whichever you pick, the application has to be designed knowing which guarantee it has. The mistake is assuming "the data will be there" without naming the contract — and that's exactly the kind of mistake this codebase would make under load, today, because no contract is named.
+Replication is the answer to two different questions: *availability* (can I read when one node is down?) and *scale* (can I serve more reads than one node can?). Cache is the answer to a third question: *latency/cost* (can I avoid the expensive read?). The shapes overlap — both are "data lives in multiple places" — but the consistency contracts diverge. Real replication asks "how stale can the replica be relative to the primary?" (lag bound). Cache asks "how stale can the cached value be relative to truth?" (TTL or invalidation policy). Treating one like the other is how stale-data bugs ship. This codebase has caches (the 60s response cache and the demo snapshot) and pretends they aren't replicas — which is correct, because they don't promise the contract a replica would.
 
 ## Primary diagram
 
 ```
-  blooming insights — multi-instance divergence (the real shape)
+  Replication and read consistency — the complete picture
 
-  ┌─ user A's browser ──────┐         ┌─ user B's browser ──────┐
-  │  sessionStorage holds   │         │  sessionStorage holds   │
-  │  {A1, A2, A3}           │         │  {B1, B2}                │
-  └────────────┬────────────┘         └────────────┬────────────┘
-               │                                    │
-               │  HTTP                              │  HTTP
-               ▼                                    ▼
-       ┌─ Vercel ─────────────────────────────────────────────────┐
-       │                                                            │
-       │  instance 1                  instance 2                    │
-       │  ┌──────────────┐            ┌──────────────┐              │
-       │  │ Map A1,A2,A3 │            │ Map B1,B2    │              │
-       │  └──────────────┘            └──────────────┘              │
-       │       ↑                            ↑                       │
-       │       │ no shared store, no replication, no failover       │
-       │       │                                                    │
-       └───────┴────────────────────────────────────────────────────┘
-                              │
-                              ▼
-                       ┌─ Bloomreach ─┐
-                       │  the actual  │
-                       │  source of   │
-                       │  truth       │
-                       └──────────────┘
+  ┌─ provider ────────────────────────────────────────────────────┐
+  │  Bloomreach Engagement (primary, source of truth)              │
+  │  consistency: whatever they offer (opaque to us)               │
+  └────────────────────────────────┬──────────────────────────────┘
+                                   │ live queries (~1 req/s)
+  ┌─ data-source cache ────────────▼──────────────────────────────┐
+  │  Map<"name:args", {result, expiresAt}>                         │
+  │  contract: read-after-write within 60s window                  │
+  │           eventually-consistent up to 60s for others           │
+  │  scope:   per-instance (not shared across processes)           │
+  │  invalidation: TTL only, no explicit invalidation              │
+  └────────────────────────────────┬──────────────────────────────┘
+                                   │ tool results
+  ┌─ per-instance state ───────────▼──────────────────────────────┐
+  │  Map<sessionId, SessionFeed>                                   │
+  │  contract: instance-local, last-write-wins on collision        │
+  │  divergence: instances do NOT sync; client mitigates           │
+  └────────────────────────────────────────────────────────────────┘
 
-  consistency model: "client carries its own state via cookies + query params."
-  contract: weak. no "read your writes" on the server side.
-  this works because users don't expect cross-instance state today.
+  ────────────────────────────────────────────────────────────────
+
+  ┌─ demo path (parallel read path) ───────────────────────────────┐
+  │  lib/state/demo-insights.json                                  │
+  │  lib/state/demo-investigations.json                            │
+  │  contract: frozen at last capture (manual refresh)             │
+  │  scope:   global (committed to repo, identical for all users)  │
+  │  invalidation: dev "capture" command rewrites the files        │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-Replication algorithms divide into log-shipping (Postgres, MySQL) and consensus-based (Raft in CockroachDB, Paxos in Spanner). Log-shipping is simpler and faster but doesn't handle primary-failover gracefully without external orchestration. Consensus is slower per write but handles failover automatically — every write goes through a quorum, so there's no question who's primary.
+The classical references for replication consistency are the consistency-model papers (Lamport's "Time, Clocks, and the Ordering of Events," Brewer's CAP, Vogels' "Eventually Consistent"). The hierarchy from strongest to weakest: linearizable → sequential → causal → eventual → no-consistency. Real DBs sit at different points: Postgres primary-replica is read-your-own-writes if you read your own primary, eventually consistent on replicas, with a measurable lag. DynamoDB offers eventual or strong reads as a per-request flag. Spanner offers external consistency via TrueTime. Cassandra tunes per-query via R+W>N quorum.
 
-For blooming insights, the relevant migration when consistency matters is to a single shared store (Vercel KV / Upstash). That gives you strong consistency within a region for free — KV writes are linearizable on the primary, and reads see your writes immediately. You don't need replication; you need shared state. The day you outgrow KV is the day you need Postgres + replicas, which is a different conversation again.
+The "cache as quasi-replica" pattern this codebase uses has its own lineage: CDN edge caches, Cloudflare Workers KV, Vercel's own Edge Cache. The shape is always: a TTL-bounded cache layer that absorbs read load, with no invalidation other than expiry. It works well when staleness within the TTL is acceptable, and badly when downstream-of-the-cache writes need to be visible immediately.
 
-Cross-link: `study-distributed-systems` owns the consensus / log-shipping deep dive. This file is just the consistency contract.
+The demo snapshot is something more specific: a **golden snapshot.** Used for deterministic UI development, demo reliability, and regression testing. In other ecosystems this is the role of fixture files, recorded HTTP responses (VCR-style), or test-mode mocks. Here it's promoted to a runtime path — the same UI renders against it as against live.
 
 ## Interview defense
 
-**Q: "What's your read consistency story?"**
-Per-instance Maps with a client-carried fallback. There's no shared store, so two requests on two instances see two different "current briefings" — that's by design at this scale, not a bug, but it's a sharp edge. The mitigation is `app/api/agent/route.ts` L37-47: every navigation from the feed to an investigation carries the insight blob in a query param, so the investigation route doesn't have to find the insight in shared state — it just unpacks the blob the client sent. The honest framing is "the client is the source of truth between the feed render and the investigation request."
+> Q: "How does this app handle read consistency?"
 
-Diagram: the multi-instance picture with the client-carry arrow drawn explicitly.
+Verdict: there are three "replica-like" surfaces, each with a different consistency contract, and none of them are formally a replica. The 60s response cache on the data-source adapter offers read-after-write within the window and eventual consistency up to 60s for others. The committed demo snapshot is a frozen golden snapshot, deterministic but as old as the last manual capture. Multi-instance heaps are accidental "replicas" that don't sync at all — divergence is mitigated by stashing data on the client in sessionStorage.
 
-Anchor: `app/api/agent/route.ts` L37-47.
+```
+  the picture you draw — three replica-like surfaces
 
-**Q: "If you added saved insights with Postgres, what consistency level would you read at?"**
-Read-your-writes from the same web session. Route all reads to the primary for a user who's just written, by a sticky-session token or by a "wrote within last 30s" cookie. Other users' reads can hit replicas. This is the standard recipe for a read-mostly workload that needs UX-level consistency without paying primary-lookup latency on every read.
+   60s cache         ≤60s stale, per-instance
+   demo-*.json       frozen at capture, deterministic
+   multi-instance    divergent, no sync, client bridges
+```
 
-Diagram: primary + replica with a routed-to-primary arrow for fresh writes.
+The load-bearing point: none of these promise the strong-consistency contract of a real replica, and the architecture is built around that. Live mode says "things might be up to 60s old" (silently). Demo mode says "this is the captured replay" (via the demo/live toggle).
 
-Anchor: hypothetical; flag in interview.
+> Q: "What's the worst inconsistency you could see?"
+
+Two instances diverging on a session is the loudest case — the user sees different data depending on which Vercel instance answered their request. The user-visible symptom is "the briefing I just saw is now empty," which is annoying but recoverable (refresh re-runs). The 60s cache rarely manifests because the queried metrics use 90-day windows that don't move meaningfully in a minute.
+
+> Q: "When would real replication enter the picture?"
+
+When a single instance can't handle the read load AND there's data of record to replicate. Today neither is true — the local state is derivative (no need to replicate it) and the upstream (Bloomreach) handles replication on its side. The day local data of record exists (saved investigations, audit log), the replication question lands at the same time as the datastore question.
 
 ## See also
 
-- `06-locks-mvcc-and-concurrency-control` — the same problem at a finer altitude
-- `07-wal-durability-and-recovery` — replication ships the WAL
-- `01-database-systems-map` — the per-instance Maps that DON'T replicate
-- `study-distributed-systems` — consensus algorithms when you need them
-- `study-system-design` — when to reach for KV vs Postgres vs nothing
-
----
+  - [`07-wal-durability-and-recovery.md`](./07-wal-durability-and-recovery.md) — durability is the precondition for replication
+  - [`04-query-planning-and-execution.md`](./04-query-planning-and-execution.md) — how the 60s cache acts as a materialized view
+  - [`audit.md`](./audit.md) — F4 (60s cache staleness), F5 (demo snapshot as frozen replica)

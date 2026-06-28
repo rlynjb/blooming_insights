@@ -1,477 +1,467 @@
-# Indexing vs query patterns
+# 03 — Indexing vs query patterns
 
-**Industry name(s):** Indexing · query plan · N+1 · access path · the "frequent query, no index" smell · index-tuned-to-query-shape
-**Type:** Industry standard · Language-agnostic
-
-> **Activated for real in Phase 2.** The original framing (2026-06-01) was "not yet exercised — no DB, just `Map.get(id)`." That's now wrong. The `mcp-server-olist/` package has a SQLite database with **9 explicit indexes**, each one chosen to support a specific query that one of the three Olist tools (`get_metric_timeseries`, `get_segments`, `get_anomaly_context`) actually issues. The textbook lesson "the right index is the one that matches the access path" plays out concretely here — every `CREATE INDEX` line in `mcp-server-olist/scripts/seed-olist.ts` can be pointed back to the WHERE / GROUP BY / JOIN it supports. The file also still covers the in-memory `Map`s (trivial, by-id) and the Bloomreach EQL recipes (still the rate-limited-upstream pattern).
-
----
+**Access-pattern-shaped storage · Industry standard**
 
 ## Zoom out, then zoom in
 
-**Zoom out — the bigger picture.** Three stores, three regimes now. (1) The in-memory per-session `Map`s the repo owns for UI state — key-only, `get(id)` is the only access pattern, `Map` is already a hash. (2) The Bloomreach upstream — a real columnar event store accessed through EQL via the MCP layer; the repo can't see its indexes, and the cost it pays is rate-limit slots, not query time. (3) **The Olist SQLite DB** — owned by the repo, schema designed in `seed-olist.ts`, 9 indexes designed against the 3 tools' query shapes; the repo CAN see the indexes here, and the cost it pays is local disk I/O and a single-process EXPLAIN-able query plan.
+The classical question — *do the indexes match the queries the app
+actually runs?* — usually means "is there a B-tree on the column we
+filter by." In **blooming_insights** the question is the same but the
+answer is `Map.get(id)`. There's no DB, so there's also no `EXPLAIN`. The
+question worth asking is whether the **Map shape** matches the **access
+shape**.
 
 ```
-  Zoom out — three stores, three regimes
+  Zoom out — every read path in the app
 
-  ┌─ UI client band ─────────────────────────────────────────┐
-  │  reads insights/investigations by id                       │
-  └────────────────────────────┬─────────────────────────────┘
-                               │ GET /api/agent?insight=…
-  ┌─ Route handler band ───────▼─────────────────────────────┐
-  │  getInsight(sid, id), getAnomaly(sid, id)                 │
-  │  → SessionFeed.get(sid).insights.get(id)                  │
-  │  → O(1) hash, by-id only, no index needed                 │
-  └────────────────────────────┬─────────────────────────────┘
-                               │ agent.scan(), agent.investigate()
-  ┌─ Agent loop band ──────────▼─────────────────────────────┐
-  │  monitoring/diagnostic/recommendation construct queries   │
-  │  via mcp.callTool — abstract over BOTH stores below       │
-  └────────────────────────────┬─────────────────────────────┘
-                               │
-                ┌──────────────┴──────────────┐
-                │                              │
-         live-bloomreach                live-sql (Olist)
-                │                              │
-                ▼                              ▼
-  ┌─ Bloomreach upstream ──────────┐ ┌─ Olist SQLite (owned) ──────────┐
-  │ execute_analytics_eql            │ │ get_metric_timeseries           │
-  │ rate-limited 1 req/s             │ │ get_segments                    │
-  │ indexes opaque                   │ │ get_anomaly_context             │
-  │ cost = round-trip slots          │ │ cost = local I/O + plan choice  │
-  │ ★ cousin pattern                 │ │ 9 EXPLICIT INDEXES, each one    │
-  │                                  │ │   matches a known query shape   │
-  │                                  │ │ ★ TEXTBOOK CASE — visible plans │
-  └──────────────────────────────────┘ └──────────────────────────────────┘
+  ┌─ UI ──────────────────────────────────────────────────────────────┐
+  │  feed page         → list all insights for this session           │
+  │  investigate/[id]  → get one insight + its diagnosis              │
+  │  recommend/[id]    → get one insight + its recommendations        │
+  │  StatusLog         → stream new AgentEvents as they arrive        │
+  └──────────────────────┬────────────────────────────────────────────┘
+                         │  fetch → session cookie → server route
+  ┌─ State layer ─────── ▼──── ★ THIS CONCEPT ★ ──────────────────────┐
+  │                                                                   │
+  │   Map<sessionId, SessionFeed>                                     │ ← we are here
+  │       ├─ insights:        Map<insightId, Insight>                 │
+  │       ├─ investigations:  Map<insightId, Investigation>           │
+  │       └─ anomalies:       Map<insightId, Anomaly>                 │
+  │                                                                   │
+  │   Map<insightId, AgentEvent[]>  (event log cache)                 │
+  │                                                                   │
+  └──────────────────────┬────────────────────────────────────────────┘
+                         │  cache miss
+  ┌─ Substrate ──────────▼────────────────────────────────────────────┐
+  │  EQL queries — substrate handles its own indexing                 │
+  │  ~1 req/s rate limit; 60s response cache                          │
+  └───────────────────────────────────────────────────────────────────┘
 ```
 
-**Zoom in — narrow to the concept.** The question this topic asks is: do the indexes that exist support the queries actually run? Three layers, three answers. **For the in-memory store, the answer is trivial** — `Map.get(id)` is the only access pattern and `Map` is the index. **For the Bloomreach upstream, the repo can't see the indexes**, and the cost it pays is rate-limit slots — so "minimize round-trips" replaces "minimize index lookups." **For the Olist SQLite, the answer is fully visible** — the 9 indexes in `SCHEMA_SQL` were chosen explicitly to support the three tools' query patterns, and every index can be traced back to a `WHERE` / `GROUP BY` / `JOIN` it supports.
+Zoom in. Two layers run "queries" — the in-process Maps (which serve
+every UI read in O(1)) and the substrate (which the agents query via EQL,
+where Bloomreach handles indexing). The state layer's Maps **are** the
+indexes; the substrate's indexes are not the app's problem. The hot
+question for the audit: are the keys right, and is the access pattern
+truly key-based?
 
 ---
 
-## Structure pass
-
-**Layers.** Same four-layer stack. The interesting layers for queries are the **agent loop band** (where queries are constructed) and the **MCP wrapper band** (where the spacing gate enforces the real cost).
-
-**Axis: round-trip cost.** For each query, what does it cost? Not in CPU or IO — in *MCP round-trips against a 1 req/s limit*. The agent budget (6 tool calls per loop) is the equivalent of a query budget. Pick the right axis because in a normal DB, "cost" is index scan vs seq scan; here, "cost" is one more 1-second wait. That changes which optimizations matter.
-
-**Seams.** Three matter. **Seam 1: in-memory store ↔ readers.** No index needed — `Map` is already O(1) by key. **Seam 2: EQL recipes ↔ rate limit.** Each recipe is one round-trip and one rate-limit slot. The static recipes in `categories.ts` are designed to bundle multiple metrics into one EQL call (file 03's exemplar). **Seam 3: agent loop ↔ EQL.** The diagnostic and recommendation agents construct EQL *during* the loop, with the budget guardrails in `runAgentLoop` capping the round-trip count at 6.
+## Structure pass — the axis is "how is this fetched?"
 
 ```
-  Structure pass — round-trip cost across seams
+  Trace ONE axis — "what's the key for this read?" — across layers
 
-  ┌─ 1. LAYERS ──────────────────────────────────────────────┐
-  │  UI · Route · Agent loop · MCP wrapper                    │
-  └─────────────────────────────┬────────────────────────────┘
-                                │  pick the axis
-  ┌─ 2. AXIS ──────────────────▼─────────────────────────────┐
-  │  round-trip cost: how many 1-second slots does this query │
-  │  spend? (not CPU; not IO — wall-clock under a rate limit) │
-  └─────────────────────────────┬────────────────────────────┘
-                                │  trace across seams
-  ┌─ 3. SEAMS ─────────────────▼─────────────────────────────┐
-  │  S1: in-memory Maps ↔ readers   ★ O(1) — no index needed │
-  │  S2: EQL recipes ↔ rate limit   ★ BUNDLED (multi-metric)  │
-  │  S3: agent loop ↔ EQL           ★ BUDGETED (maxToolCalls) │
-  └─────────────────────────────┬────────────────────────────┘
-                                ▼
-                        Block 4 — How it works
+  ┌─ access path ──────────────────────┐
+  │  list all insights for a session   │   → key = sessionId
+  │  get one insight by id             │   → key = (sessionId, insightId)
+  │  get diagnosis for an insight      │   → key = (sessionId, insightId)
+  │  stream events as they arrive      │   → key = (sessionId, insightId)
+  │  capture demo snapshot             │   → key = insightId (single-tenant)
+  └────────────────────────────────────┘
+
+  every read is a primary-key lookup OR a full scan of one session's data.
+  no read uses a secondary attribute as the key.
+  → a Map is sufficient.
 ```
+
+The seam to watch: **session boundary.** Reads inside one session are
+trivial; cross-session aggregation (e.g. "show me all critical insights
+across all users today") would not be a Map lookup — it'd be a full scan
+of every session's sub-map. The audit notes this; today the app has no
+cross-session read.
 
 ---
 
 ## How it works
 
-### Move 1 — the access-path picture, both stores
+### Move 1 — the mental model
 
-You know how `dict[key]` in Python is O(1) — no index needed because the hash IS the index? That's the in-memory store. Now imagine the *other* store is a remote service that returns whatever you ask for, but only lets you ask once per second. The optimization isn't "use the right index" — it's "ask for as many things as you can per ask." Different shape entirely.
-
-```
-  the two access regimes
-
-  IN-MEMORY                        REMOTE-WITH-RATE-LIMIT
-  ┌─ store ─────────┐              ┌─ store ─────────────────┐
-  │ Map<id, value>  │              │ Bloomreach (opaque)     │
-  │ (insights,      │              │ accessed via EQL        │
-  │  anomalies,     │              │ rate-limited 1 req/s    │
-  │  investigations)│              └─────────────┬───────────┘
-  └────────┬────────┘                            │
-           │ get(id)                             │ mcp.callTool(eql)
-           ▼                                     ▼
-       O(1) hash                          ~1s wall-clock per call
-       (no index needed)                  (the bottleneck)
-
-  optimization moves:                    optimization moves:
-    none — the data shape IS              1. bundle metrics into one EQL
-    the access path                        2. share calls between agents
-                                           3. cache identical calls
-                                              (TTL cache in McpClient)
-                                           4. cap the agent's call budget
-                                              (maxToolCalls)
-```
-
-### Move 2 — the in-memory store, walked
-
-There's not much to walk. The three `Map`s in `lib/state/insights.ts` are accessed by id; that's it. **One operation per Map:**
+You know how a JS `Map<string, T>` is basically a hash table — `get(key)`
+is O(1), `[...map.values()]` is O(n), `delete(key)` is O(1)? That's the
+whole index story here. Every access pattern the app needs reduces to one
+of those three operations.
 
 ```
-  the in-memory queries — all are single-key lookups
+  The "Map IS the index" pattern
 
-  Map                  read                       write              cost
-  ───────────────────  ─────────────────────────  ─────────────────  ────
-  insights             getInsight(id)             putInsights(...)   O(1)
-  anomalies            getAnomaly(id)             putInsights(...)   O(1)
-  investigations       getInvestigation(id)       putInvestigation() O(1)
+       ┌─ access pattern ─────┐    ┌─ Map operation ──┐
+       │  by id               │ ──►│  .get(id)        │  O(1)
+       │  list this session   │ ──►│  [...values()]   │  O(n) per session
+       │  write a new value   │ ──►│  .set(id, v)     │  O(1)
+       │  clear last briefing │ ──►│  .clear()        │  O(n) sub-map
+       │  delete one session  │ ──►│  .delete(id)     │  O(1)
+       └──────────────────────┘    └──────────────────┘
 
-  the only iteration:
-    listInsights()  →  [...insights.values()]
-                       O(n) — used by the briefing list endpoint
-                       n ≤ 10 (capped by monitoring agent's slice(0, 10))
+  No access pattern in the codebase asks for:
+    - "all insights with severity = critical" (no SCAN BY ATTRIBUTE)
+    - "all sessions modified in the last hour" (no RANGE OVER TIMESTAMPS)
+    - "insights sorted by change.value descending" (no SORTED INDEX)
 ```
 
-What breaks if a query pattern emerges that ISN'T by id: nothing, today — there is none. The hypothetical that would force an index: "find all insights with `severity === 'critical'` from the last hour." Today that'd be `O(n)` iteration. With n ≤ 10 it doesn't matter. With n in the thousands, you'd want a secondary index keyed by `severity` (or `category`, or `timestamp` bucket). The repo isn't there.
+The Map is **enough** precisely because every read is keyed. The day the
+product asks "show me a leaderboard of which metrics moved the most this
+week," the Map stops being enough — you'd need a secondary structure or
+a real DB. See `06-access-patterns-and-storage-choice.md`.
 
-### Move 2 — the EQL recipes, walked
+### Move 2 — the access patterns, one at a time
 
-The `CATEGORIES` registry in `lib/agents/categories.ts` (L19–L112) declares 10 recipes — one per anomaly category. Each is a function that takes `projectId` and returns an EQL string. **One recipe per category, designed to be one round-trip:**
+#### **Read: feed page (`listInsights(sessionId)`)**
 
-```
-  the recipe pattern — multi-metric in one call
+The feed renders every insight for the current session. The read is
+**one Map.get + one spread of its values**:
 
-  category              eql(projectId) →
-  ──────────────────    ────────────────────────────────────────────────
-  conversion_drop       select count event view_item,
-                              count event checkout,
-                              count event purchase
-                          in last 90 days
-                          ↑ THREE metrics, ONE round-trip
-
-  cart_abandonment      select count event cart_update,
-                              count event checkout,
-                              count event purchase
-                          in last 90 days
-                          ↑ THREE metrics, ONE round-trip
-
-  revenue_drop          select sum event purchase.total_price,
-                              count event purchase
-                          in last 90 days
-                          ↑ TWO metrics, ONE round-trip
+```typescript
+// lib/state/insights.ts:81-84
+export function listInsights(sessionId: string): Insight[] {
+  const s = state.get(sessionId);
+  return s ? [...s.insights.values()] : [];
+}
 ```
 
-This is the **batching pattern** equivalent to a JOIN in SQL — bundle the related metrics into one query rather than firing N queries. The win isn't query-engine optimization (the upstream might run each metric as a separate scan internally — we can't see); the win is **fewer rate-limit slots**. With a 1 req/s limit and a 6-call budget per agent run, bundling three metrics into one EQL is a 3× win on what fits in the budget.
+Annotation:
 
-What breaks if you split a recipe into three single-metric queries: each one burns a rate-limit slot and a budget slot. A monitoring agent with 10 categories and 3 metrics each would need 30 slots; today the recipes pack them into 10 — and the monitoring prompt's "suggested query plan" further packs them into ~5 (`prompts/monitoring.md` L41–L47).
-
-### Move 2 — the agent loop's budget gate
-
-The monitoring agent caps tool calls at 6. The diagnostic agent caps at 6. The recommendation agent caps at 4. These are explicit `maxToolCalls` arguments to `runAgentLoop` (`monitoring.ts` L101, `diagnostic.ts` L62, `recommendation.ts` L57). The budget IS the query plan limit. When the budget is exhausted, `runAgentLoop` switches to a tool-less synthesis turn — the agent must conclude from what it already gathered.
-
-```
-  the budget — query-plan cap per agent
-
-  agent              maxToolCalls   what it spends them on
-  ─────────────────  ────────────   ──────────────────────────────────
-  monitoring         6              ~5 EQL queries to compute the
-                                    coverage-grid metrics; 1 spare for
-                                    a breakdown or sparkline
-
-  diagnostic         6              EQL queries to test 2-3 hypotheses
-                                    (each hypothesis ~2 queries on average)
-
-  recommendation     4              EQL queries to check whether a
-                                    candidate Bloomreach feature already
-                                    exists (e.g. find existing segments)
-
-  what breaks past the budget:
-    runAgentLoop sets `forceFinal: true` and removes tools from the next
-    Anthropic call. the synthesisInstruction says "you have NO more tool
-    calls — answer with what you have." the agent is forced to conclude.
-```
-
-What this models in DB terms: it's a **query-cost ceiling**. SQL has `statement_timeout` and connection-pool limits; this is the equivalent for an LLM-driven query plan.
-
-### Move 2 — the cache (the only "index" the repo owns)
-
-`McpClient` has a TTL cache keyed by `${name}:${JSON.stringify(args)}` (mentioned in `study-software-design/audit.md#information-hiding-and-leakage` as a strong hide). Identical tool calls within the TTL skip the network round-trip and return cached results.
+- **L82 `state.get(sessionId)`** — O(1) hash lookup. The `state` Map is
+  the *outer* map; its key is the session UUID from the `bi_session`
+  cookie.
+- **L83 `[...s.insights.values()]`** — O(n) where n is the number of
+  insights *in this session* (typically 5-15 for a briefing). The order
+  is insertion order (Map iteration is ordered in JS).
 
 ```
-  the cache — a degenerate index, by content hash
+  Feed read flow
 
-  key = `${toolName}:${JSON.stringify(args)}`
-                          ↑
-                          this is effectively the query-result hash;
-                          identical (name, args) → identical result
-
-  cache hit:    skip network + skip rate-limit slot
-  cache miss:   round-trip + spacing-gate wait + store on success
-
-  what it indexes against:  the EXACT tool-call signature
-  what it doesn't help:     two queries with different args that
-                            return overlapping data (no partial
-                            cache, no rewrite)
+  Browser           Route                State layer
+    │                │                       │
+    │  GET /         │                       │
+    │ ──────────────►│  bi_session cookie    │
+    │                │ ──────────────────────►  state.get(sessionId)   O(1)
+    │                │                       │      │
+    │                │                       │      ▼ SessionFeed
+    │                │                       │  [...insights.values()] O(n)
+    │                │ ◄─────────────────────│
+    │ ◄──────────────│  Insight[]            │
 ```
 
-In a real query engine, the cache analog is a result cache or materialized view. This one is the dumbest possible version (exact match on a serialized key); the repo's queries are stable enough that this is plenty.
+What this gets right: the **outer Map is per-session** specifically so two
+warm requests in the same Vercel instance don't iterate each other's
+data. Without that scoping, `[...insights.values()]` would return *every
+user's* insights from every concurrent session — the exact bleed comment
+above `state` warns against (`lib/state/insights.ts:7-13`).
 
-### Move 2 — the Olist indexes, mapped to the queries they support
+#### **Read: investigate page (`getInsight(sessionId, id)`)**
 
-The most concrete part of this file. `mcp-server-olist/scripts/seed-olist.ts` creates 9 indexes in `SCHEMA_SQL`. Each one is the answer to a specific query the three Olist tools issue. Walk them in pairs:
+Two-level lookup, both O(1):
 
-```
-  Olist indexes — each one matched to its query
-
-  ┌─ idx_orders_purchase_ts ──────────────────────────────────┐
-  │  ON orders(purchase_ts)                                    │
-  │                                                              │
-  │  query that uses it (get_metric_timeseries):                │
-  │    SELECT date_bucket(purchase_ts), SUM(...)                 │
-  │    FROM orders JOIN order_items ...                          │
-  │    WHERE purchase_ts BETWEEN ? AND ?                         │
-  │    GROUP BY date_bucket(purchase_ts)                         │
-  │                                                              │
-  │  what breaks without it: every time-bucket aggregation       │
-  │  becomes a full table scan of `orders` (~9,800 rows).        │
-  │  small now, painful at 10x.                                  │
-  └─────────────────────────────────────────────────────────────┘
-
-  ┌─ idx_orders_customer ─────────────────────────────────────┐
-  │  ON orders(customer_id)                                    │
-  │                                                              │
-  │  query that uses it: FK join from orders → customers        │
-  │  (every time the dimension is `state`).                      │
-  │                                                              │
-  │  what breaks without it: nested-loop join becomes O(n²)      │
-  │  in the worst case (n = order count).                        │
-  └─────────────────────────────────────────────────────────────┘
-
-  ┌─ idx_items_order, idx_items_product ──────────────────────┐
-  │  ON order_items(order_id), order_items(product_id)         │
-  │                                                              │
-  │  query that uses idx_items_order:                            │
-  │    every join from orders → order_items                     │
-  │  query that uses idx_items_product:                          │
-  │    every dimension='category' filter (join through products)│
-  │                                                              │
-  │  the two together cover both directions of the M:N bridge.  │
-  └─────────────────────────────────────────────────────────────┘
-
-  ┌─ idx_payments_order, idx_payments_type ───────────────────┐
-  │  ON payments(order_id), payments(type)                     │
-  │                                                              │
-  │  idx_payments_order: every join orders → payments           │
-  │  idx_payments_type:  every dimension='payment_type' filter  │
-  │                                                              │
-  │  ★ idx_payments_type is the index that supports the          │
-  │     voucher-dropoff seeded anomaly's detection query        │
-  │     (file 09 covers the anomaly).                            │
-  └─────────────────────────────────────────────────────────────┘
-
-  ┌─ idx_customers_state ─────────────────────────────────────┐
-  │  ON customers(state)                                       │
-  │                                                              │
-  │  query that uses it: every dimension='state' filter or      │
-  │  group-by — including the SP-revenue-drop seeded anomaly.   │
-  └─────────────────────────────────────────────────────────────┘
-
-  ┌─ idx_products_category ───────────────────────────────────┐
-  │  ON products(category)                                     │
-  │                                                              │
-  │  query that uses it: every dimension='category' query —    │
-  │  including the electronics-spike seeded anomaly.            │
-  └─────────────────────────────────────────────────────────────┘
-
-  ┌─ idx_reviews_order ───────────────────────────────────────┐
-  │  ON reviews(order_id)                                      │
-  │                                                              │
-  │  not yet hot — no tool reaches reviews today. but pre-      │
-  │  indexed because the seeded data populates the table and a  │
-  │  future "review_score by segment" query would need it.      │
-  │  the only speculative index in the set.                     │
-  └─────────────────────────────────────────────────────────────┘
+```typescript
+// lib/state/insights.ts:73-75
+export function getInsight(sessionId: string, id: string): Insight | null {
+  return state.get(sessionId)?.insights.get(id) ?? null;
+}
 ```
 
-**The pattern:** indexes here aren't speculative-on-everything (`CREATE INDEX ON every column` would be wasteful). They're chosen by walking the three tool implementations and asking, for each WHERE / GROUP BY / JOIN: "does an index exist?" Read `mcp-server-olist/src/tools/get_metric_timeseries.ts` and `get_segments.ts` and `get_anomaly_context.ts`, list the predicates, and you can predict the index list. That's the textbook discipline — design the schema against the access path, not against the table.
+The compound key `(sessionId, insightId)` is split across **two nested
+Maps** rather than concatenated into a single key. This is more code than
+`state.get(\`${sessionId}:${id}\`)` would be, but it matches how the data
+naturally clusters — a session owns a set of insights; clearing the
+session clears them all.
 
-What's missing: **no compound indexes.** A `(state, purchase_ts)` composite would be faster than the two singletons for queries that filter both. Today the volume is small enough (single-digit milliseconds per query at 9,800 orders) that single-column indexes suffice. At 10x data this becomes the next move.
+```
+  Two-level Map = a tree-shaped index
 
-What's also missing: **no covering indexes.** SQLite supports `INCLUDE`-like columns via prefix tricks, but none of the indexes here carry payload — every index hit is followed by a table lookup for the actual values. Fine at this scale.
+  state: Map<sessionId, SessionFeed>
+   │
+   ├─ session-A ─── insights ─── { id1: Insight, id2: Insight, ... }
+   │                anomalies ── { id1: Anomaly, id2: Anomaly, ... }
+   │                investigations ── { ... }
+   │
+   └─ session-B ─── insights ─── { id3: Insight, ... }
 
-### Move 2 — what's STILL not here (the honest "not yet exercised")
+  benefit: O(1) "drop this session's data" via .delete(sessionId)
+  cost:    O(1) lookup is now TWO chained .get() calls
+```
 
-A few classic data-modeling concerns under this heading still don't apply:
+#### **Write: end-of-briefing (`putInsights(sessionId, items)`)**
 
-- **No query plans inspected in CI** — the schema picks the indexes correctly today, but there's no `EXPLAIN QUERY PLAN` check that runs as a test. A future schema change could regress to a full scan and nothing would catch it until the wall-clock got noticeably slower.
-- **No N+1 queries observable in the agent loop** — the agent issues one tool call per logical question, and each tool call returns aggregated data. The "N+1" failure mode (loop in app code issuing one query per row) doesn't have a place to live here — the agent is the loop, but the LLM is rate-limited by the agent budget, not by the SQL count.
-- **No relational-store layer for UI state** — the in-memory per-session `Map`s still serve insights/investigations. The buildable target named in 2026-06-01 (Postgres for `insights`/`investigations`) has been built only as Olist (analytics) — the UI layer is unchanged.
-- **No EXPLAIN-based index recommendation** — the indexes were chosen by reading the SQL, not by running a load profile. That's the right move for a 9,800-row deterministic dataset; at production scale, the discipline would shift to "watch slow query log + auto-recommend."
+This is the only multi-write operation in the state layer. It clears and
+re-fills the session's sub-maps:
+
+```typescript
+// lib/state/insights.ts:57-71
+export function putInsights(sessionId: string, items: Insight[], rawAnomalies?: Anomaly[]): void {
+  // Replace the previous briefing for THIS session — each run IS the current
+  // feed, not an addition. Without clearing, a warm serverless instance (or a
+  // long-running dev server) accumulates stale insights from earlier runs, so
+  // the feed shows yesterday's anomalies alongside today's. Investigations are
+  // keyed separately and untouched here. Only this session's sub-maps are
+  // cleared — never the outer map, never another session's feed.
+  const s = sessionState(sessionId);
+  s.insights.clear();
+  s.anomalies.clear();
+  items.forEach((i, idx) => {
+    s.insights.set(i.id, i);
+    if (rawAnomalies?.[idx]) s.anomalies.set(i.id, rawAnomalies[idx]);
+  });
+}
+```
+
+The clear-then-fill is the **closest thing this codebase has to a
+transaction**. It's not atomic (no rollback if `set` throws midway), but
+it *is* isolated per session — the comment makes the boundary explicit.
+See `04-transactions-and-integrity.md` for the integrity story.
+
+#### **Read: substrate (the actual "query" layer)**
+
+The agents issue EQL queries against the substrate. The "indexing" at this
+layer isn't the app's problem — Bloomreach owns the event store and its
+indexes. What the app **does** own is the **60s response cache** in
+`BloomreachDataSource`:
+
+```typescript
+// lib/data-source/bloomreach-data-source.ts:122-152
+export class BloomreachDataSource implements DataSource {
+  private cache = new Map<string, { result: unknown; expiresAt: number }>();
+  ...
+
+  async callTool<T = unknown>(
+    name: string,
+    args: Record<string, unknown>,
+    options: CallToolOptions = {},
+  ): Promise<CallToolResult<T>> {
+    const cacheKey = `${name}:${JSON.stringify(args)}`;
+    const ttl = options.cacheTtlMs ?? 60_000;
+
+    if (!options.skipCache) {
+      const cached = this.cache.get(cacheKey);
+      if (cached && cached.expiresAt > Date.now()) {
+        return { result: cached.result as T, durationMs: 0, fromCache: true };
+      }
+    }
+    ...
+```
+
+The cache key is `name + JSON.stringify(args)`. This is the **deduplication
+index** for repeated tool calls during a single briefing — the monitoring
+agent and diagnostic agent both call `get_event_schema` early, and the
+second call is a Map hit instead of a round trip.
+
+```
+  Substrate cache as a dedup index
+
+       ┌─ monitoring agent ─┐                    ┌─ diagnostic agent ─┐
+       │  get_event_schema  │                    │  get_event_schema  │
+       └─────────┬──────────┘                    └─────────┬──────────┘
+                 │                                         │
+                 │  cacheKey = "get_event_schema:{...}"    │
+                 ▼                                         ▼
+       ┌──────────────────────────────────────────────────────────┐
+       │  cache.get(cacheKey)                                     │
+       │    miss → liveCall → cache.set(key, result, ttl=60s)     │
+       │    hit  → return immediately, fromCache:true             │
+       └──────────────────────────────────────────────────────────┘
+```
+
+The 60s TTL is the load-bearing parameter. Bloomreach rate-limits at ~1
+req/s globally per user; without a cache, a single briefing would
+re-query the same schema 4-5 times and burn the rate budget.
+
+#### **Read: investigation cache (file-backed in dev)**
+
+The `getCachedInvestigation` function is the only read with a *three-tier
+fall-through* in the repo:
+
+```typescript
+// lib/state/investigations.ts:22-28
+export function getCachedInvestigation(insightId: string): AgentEvent[] | null {
+  if (mem.has(insightId)) return mem.get(insightId)!;
+  const fromFile = PERSIST ? readJson(CACHE_FILE)[insightId] : undefined;
+  if (fromFile) return fromFile;
+  const fromDemo = readJson(DEMO_FILE)[insightId];
+  return fromDemo ?? null;
+}
+```
+
+Read order — try memory, fall through to the dev file, fall through to the
+committed demo. The "index" here is the same `insightId` key across three
+storage tiers; the function abstracts the tier choice from the caller.
+
+```
+  Three-tier fall-through
+
+  ┌─ tier 1 ────────────┐
+  │  in-process Map     │   O(1) — typical case during a session
+  │  (mem)              │
+  └──────┬──────────────┘
+         │  miss
+  ┌──────▼──────────────┐
+  │  .investigation-    │   reads the WHOLE file then indexes by key
+  │   cache.json (dev)  │   O(file) — not great, but dev-only
+  └──────┬──────────────┘
+         │  miss
+  ┌──────▼──────────────┐
+  │  demo-investigations│   reads the WHOLE file (3,487 lines)
+  │   .json (committed) │   O(file) — fine for demo (10 fixed insights)
+  └─────────────────────┘
+```
+
+The audit flags one inefficiency: `readJson(CACHE_FILE)` and
+`readJson(DEMO_FILE)` re-parse the entire JSON file on **every read**.
+For dev with a handful of cached investigations that's fine; if the cache
+grew to thousands, parsing 100KB+ JSON per request would show up in
+flamegraphs. The mitigation is to lift the parse into module init —
+trivial when needed.
 
 ### Move 3 — the principle
 
-The right index is the one that matches the access path. When the access path is "by id," a hash is the only index. When the access path is "by content over a rate-limited remote," the optimization moves UP a layer — bundle, cache, budget. The data-modeling skill doesn't translate; the *spirit* does — every query has a cost, name the cost, design the access path to minimize it. In this repo, the cost is rate-limit slots, and the design moves are the bundled recipes plus the budget gate plus the TTL cache. None of them look like an index, but all of them play the same role.
+**The right "index" is whatever lets every read be O(1) in the access
+shape the product actually has.** Here that's a per-session Map, because
+every access is keyed by `(sessionId, insightId)`. The day the product
+grows a "show me critical insights across all users this hour" view, the
+Map stops being enough — that's a `WHERE severity = 'critical' AND
+timestamp > NOW() - 1 hour` query, which needs either a sorted index or
+a real query engine.
 
-### Code in this codebase
-
-The repo anchors for the access paths Move 2 walked — both the in-memory paths and the cost-layer pieces (bundled recipes, budget gate, content-hash cache).
-
-#### The in-memory access paths
-
-```
-lib/state/insights.ts  (lines 44–54)
-
-  export function getInsight(id: string): Insight | null {
-    return insights.get(id) ?? null;          ← Map.get, O(1)
-  }
-
-  export function getAnomaly(id: string): Anomaly | null {
-    return anomalies.get(id) ?? null;
-  }
-
-  export function listInsights(): Insight[] {
-    return [...insights.values()];            ← O(n); n capped at 10 by the
-  }                                            ← monitoring agent's slice(0, 10)
-       │
-       └─ no secondary indexes. no filtering. no sorting. the only access
-          pattern is "give me this id" (or "give me all"). that's why
-          there's no index layer.
-```
-
-#### A bundled EQL recipe
-
-```
-lib/agents/categories.ts  (lines 24–33)
-
-  {
-    id: 'conversion_drop',
-    label: 'conversion rate drop',
-    requires: ['view_item', 'checkout', 'purchase'],
-    whyItMatters: '...',
-    eql: () => `select count event view_item,
-                       count event checkout,
-                       count event purchase
-                  in last 90 days`,           ← THREE metrics in ONE round-trip
-    thresholds: { critical: 20, warning: 10 },
-  }
-       │
-       └─ this is the "covering index" analog for the rate-limit world:
-          ask for everything the category needs in one call. firing three
-          separate `count event` calls would burn 3× the budget and 3×
-          the rate-limit slots for the same data.
-```
-
-#### The budget gate
-
-```
-lib/agents/monitoring.ts  (lines 100–106)
-
-  maxTurns: 8,
-  maxToolCalls: 6, // hard cap — bounds latency under the 1 req/s MCP limit
-  synthesisInstruction:
-    'You have NO more tool calls available. Stop querying now and output ' +
-    'your final answer. Respond with ONLY a JSON array of anomaly objects ' +
-    'in a ```json fence (or [] if nothing meaningful), based on the data ' +
-    'you have already gathered.',
-       │
-       └─ when the budget is spent, runAgentLoop drops the tool schemas
-          from the next Anthropic call and appends the synthesisInstruction
-          as a user message. the agent is forced to answer from what it
-          already queried. this is the "no more query budget" path.
-```
-
-#### The cache key (a content-hash index)
-
-```
-lib/mcp/client.ts  (around line 102 — referenced in software-design audit)
-
-  const key = `${name}:${JSON.stringify(args)}`;
-                          ↑
-                          identical (name, args) → identical result
-                          cache hit skips both network and rate-limit slot
-       │
-       └─ this is the only piece of the repo that does anything index-like.
-          it's an exact-match content cache, no rewrite, no overlap detection.
-          good enough because the agent's recipe set is small and the args
-          are stable across a single run.
-```
+The generalisation: start with the access pattern, then choose the
+storage shape. Most codebases get this backwards — they pick PostgreSQL
+because that's the default, then discover their access pattern is 100%
+key-based and they're paying the cost of relational semantics for
+nothing. **blooming_insights** does it right: the access pattern is
+trivially keyed, so a `Map` is the entire data layer.
 
 ---
 
 ## Primary diagram
 
-Access paths and their costs, recap.
+Every "query" in the app and how it gets answered.
 
 ```
-  the access paths — both stores, both regimes
+  Indexes vs queries — the full map
 
-  ┌─ IN-MEMORY (owned by the repo) ─────────────────────────┐
-  │                                                            │
-  │   insights: Map<id, Insight>          ─┐                   │
-  │   anomalies: Map<id, Anomaly>         ─┤  get(id) — O(1)   │
-  │   investigations: Map<insightId, Inv> ─┘                   │
-  │                                                            │
-  │   listInsights() — O(n), n ≤ 10                            │
-  │                                                            │
-  │   "indexes" needed today: none                             │
-  │                                                            │
-  └────────────────────────────────────────────────────────────┘
+  ┌─ UI access pattern ──────────────┬─ data path ────────────────────────────────┐
+  │                                  │                                            │
+  │  feed: list all insights         │  state.get(sessionId).insights.values()    │
+  │                                  │  O(1) + O(n)                               │
+  │                                  │                                            │
+  │  /investigate/[id]: one insight  │  state.get(sessionId).insights.get(id)     │
+  │                                  │  O(1) + O(1)                               │
+  │                                  │                                            │
+  │  /recommend/[id]: investigation  │  state.get(sessionId).investigations       │
+  │                                  │  O(1) + O(1)                               │
+  │                                  │                                            │
+  │  StatusLog: stream events        │  getCachedInvestigation(id) → 3-tier       │
+  │                                  │  mem O(1) → file O(file) → demo O(file)    │
+  │                                  │                                            │
+  │  agent loop: query substrate     │  BloomreachDataSource.callTool             │
+  │                                  │  cache.get(name+args) O(1) → liveCall      │
+  │                                  │                                            │
+  │  (not exercised) cross-session   │  WOULD need: iterate every sub-map         │
+  │  aggregation                     │  O(sessions × insights/session)            │
+  │                                  │  → buildable target: a real DB             │
+  │                                  │                                            │
+  └──────────────────────────────────┴────────────────────────────────────────────┘
 
-  ┌─ BLOOMREACH UPSTREAM (queried via EQL) ─────────────────┐
-  │                                                            │
-  │   static recipes:                                          │
-  │     CATEGORIES[].eql(projectId)   ← 10 bundled recipes     │
-  │     each runs as ONE round-trip                            │
-  │                                                            │
-  │   live construction:                                       │
-  │     diagnostic/recommendation agents write EQL              │
-  │     during the agent loop                                  │
-  │                                                            │
-  │   cost layer:                                              │
-  │     McpClient spacing gate (1.1s between calls)            │
-  │     TTL cache (exact-match on toolName + args)             │
-  │     agent budget (maxToolCalls per agent)                  │
-  │     forceFinal synthesis when budget exhausted             │
-  │                                                            │
-  │   "indexes" needed today: none — the repo can't add them   │
-  │                                                            │
-  └────────────────────────────────────────────────────────────┘
+  Every supported access pattern is O(1) or O(n-in-this-session).
+  No N+1 issue today because no read joins across sessions.
 ```
 
 ---
 
 ## Elaborate
 
-The deeper structural point: **most data-modeling intuition about indexes maps to the wrong cost here.** A DBA's instinct is "the query is slow, the explain plan shows a seq scan, add an index." In this repo, no query is "slow" in the wall-clock-of-an-individual-query sense — every EQL call returns quickly (~100ms), but every call also burns one of six budget slots and one of N rate-limit slots. The optimization isn't "make each query faster." It's "fit more meaningful data into each query, and fit fewer queries into the run." The bundled-recipe pattern in `categories.ts` and the agent's "suggested query plan" in `monitoring.md` are both expressions of that.
+Where this comes from: the "right structure matches access pattern" rule
+is older than DBs. It's why `std::vector` exists alongside `std::list`,
+why DynamoDB asks you to design a *partition key* before you write any
+data, why Redis offers half a dozen structures (`SET`, `ZSET`, `HASH`,
+`LIST`, `STREAM`) — each one is optimal for one access shape.
 
-If the repo ever owned a queryable store of its own — say, a Postgres `insights` table — the access paths would matter. The hottest reads would be (a) the briefing list (`SELECT * FROM insights WHERE workspace_id = ? ORDER BY timestamp DESC`), which would need an index on `(workspace_id, timestamp DESC)`, and (b) the single-insight fetch (`SELECT * FROM insights WHERE id = ?`), which the PK index covers. Beyond that, filtering by severity or category would need secondary indexes if the n gets large. None of this exists today, and none of it should until the use case demands it.
+The seam to **system design**: the choice to keep state in process memory
+is a system-design call (no DB, no Redis, no Dynamo). The choice of `Map`
+vs `object` vs `Set` for that in-memory state is data modeling. See
+`06-access-patterns-and-storage-choice.md` for the system-design
+boundary.
 
-A note on the demo seed JSON. `lib/state/demo-insights.json` is a *fully materialized* result set — 12 insights, each ~1KB, totaling ~12KB. Reading it is a single `readFileSync + JSON.parse`. That's the simplest possible "materialized view": pre-compute the result once, store it as a flat file, read it back as a unit. It works because the access pattern is "give me all 12" — there's no need to query it. The moment the demo grows to 1000 insights with filters, this stops being viable. The data-modeling concern would be real then; it isn't now.
+What this codebase consciously doesn't do — and is right not to:
+
+- **No secondary indexes.** No "give me all insights with
+  severity=critical." If that read appeared, the right move would be a
+  second Map keyed by severity, kept in sync by the same writer
+  (`putInsights`). Until then, paying for it is waste.
+- **No range queries.** No "insights from the last hour." If that read
+  appeared, you'd want either a sorted structure or a real DB.
+- **No JOINs.** The two-level Map *is* the join — every consumer holds
+  the join key (`insightId`) and follows it across maps.
+
+What to read next: `04-transactions-and-integrity.md` walks how multi-Map
+writes stay coherent without a transaction primitive.
+
+---
 
 ## Interview defense
 
-**Q: How does this repo handle indexing?**
-A: For the data the repo owns — three in-memory `Map`s in `lib/state/insights.ts` — there is no index layer because every access is `Map.get(id)`, which is already O(1). The only iteration is `listInsights()` over ≤10 entries. For the upstream Bloomreach store, the repo can't add indexes (it doesn't own the store), so the equivalent optimization is at the query-construction layer: bundle multiple metrics into one EQL call to spend fewer rate-limit slots. The `CATEGORIES` registry in `lib/agents/categories.ts` is the bundling — three metrics per recipe, one round-trip per category. The McpClient TTL cache (`lib/mcp/client.ts` L102) is the only index-like structure — keyed on `${toolName}:${JSON.stringify(args)}`, exact-match.
+**Q: "How do you make sure your queries hit indexes?"**
 
-**Q: Where would you start indexing if you migrated this to Postgres?**
-A: Primary keys cover the by-id reads (insights, investigations, anomalies). Add an index on `(workspace_id, timestamp DESC)` for the briefing-list query — that's the hottest non-PK read in any version of this. Add an index on `Investigation.insightId` (FK) if it isn't the PK. Beyond that, wait — adding indexes preemptively wastes write cost. The closest place this matters today is the in-memory `listInsights()` returning O(n) — but with n capped at 10, it's noise.
+Verdict first: every read in the codebase is a primary-key Map lookup, so
+the question doesn't arise — there's no query planner to outsmart. The
+state layer is structured around the access pattern: a per-session outer
+Map, three keyed inner Maps (insights, investigations, anomalies). Every
+UI page reads by `(sessionId, insightId)`; both lookups are O(1).
 
 ```
-  diagram while you talk
+  the answer, sketched
 
-  what the repo OWNS:                    what the repo QUERIES:
-  ┌─ in-memory Maps ──┐                  ┌─ Bloomreach EQL ───────┐
-  │ Map.get(id) O(1)  │                  │ rate-limited 1 req/s    │
-  │ no index needed   │                  │ bundled recipes         │
-  └───────────────────┘                  │ TTL cache (exact-match) │
-                                          │ agent budget (6 calls)  │
-                                          └─────────────────────────┘
+  state: Map<sessionId, SessionFeed>          ← outer Map
+   │                                            ★ scoped per user
+   ├─ session-A ── { insights:        Map<insightId, Insight> }
+   │              { investigations:   Map<insightId, Investigation> }
+   │              { anomalies:        Map<insightId, Anomaly> }
+   │
+   └─ session-B ── { ... }
+
+  feed read:          state.get(sid).insights → [...values()]
+  investigate read:   state.get(sid).insights.get(id)
+  both O(1) chained.
 ```
+
+Anchor: "the load-bearing piece is the *outer* Map being per-session —
+without that scoping, listing one user's insights would iterate every
+user's data in a warm serverless instance."
+
+**Q: "Where would this design break?"**
+
+Verdict first: the day the product wants cross-session aggregation —
+"show me all critical insights across all customers today." That's a
+`WHERE severity = 'critical'` over every session's sub-map, which is a
+full scan with no index to help. The Map shape stops being right; you'd
+move to Postgres (or DynamoDB with a GSI).
+
+```
+  the access pattern that breaks the Map
+
+  current pattern               cross-session pattern
+  ─────────────────             ─────────────────────
+  by (sessionId, insightId)     by attribute (severity)
+            │                            │
+            ▼                            ▼
+        Map.get(id)              ITERATE every session,
+        O(1)                     iterate every insight
+                                 O(sessions × insights/session)
+                                      ▲
+                                      │
+                                 → secondary index or real DB
+```
+
+Anchor: "the access pattern is the design input — the moment that input
+changes, the storage shape has to change with it. I'd reach for a real
+DB the day cross-session reads appeared, not before."
+
+---
 
 ## See also
 
-- `01-the-data-model-and-its-shape.md` — `WorkspaceSchema` and the capability set are the upstream schema view the EQL is constructed against.
-- `04-transactions-and-integrity.md` — FKs and WAL on the Olist side; the agent-contract layer's runtime guards.
-- `06-access-patterns-and-storage-choice.md` — three storage layers, three durability stories; the in-memory Maps are still by-id-only.
-- `08-the-olist-relational-schema.md` — the schema each index supports, in 3NF.
-- `09-deterministic-synthetic-data.md` — the seeded anomalies that exercise the index plans (the SP and electronics queries hit `idx_customers_state` and `idx_products_category`).
-- `study-software-design/audit.md#information-hiding-and-leakage` — the McpClient cache is named as a strong-hide example.
-
----
+- [`01-the-data-model-and-its-shape.md`](./01-the-data-model-and-its-shape.md)
+  — the entities the Maps store
+- [`04-transactions-and-integrity.md`](./04-transactions-and-integrity.md)
+  — how multi-Map writes stay consistent without a transaction
+- [`06-access-patterns-and-storage-choice.md`](./06-access-patterns-and-storage-choice.md)
+  — when the access pattern would force you off Maps
+- [`audit.md`](./audit.md) — checklist with this file's findings

@@ -1,348 +1,274 @@
-# Token economics (the cost controls present, the cost meter absent)
+# 06 — token economics
 
-**Industry name(s):** token economics, LLM cost engineering, model-tiering / cost-aware routing
-**Type:** Industry standard · Language-agnostic
-
-> Every model call costs money proportional to tokens, with output tokens ~5× the price of input; blooming insights controls cost with hard tool-call budgets, character truncation, and a cheap haiku classifier in front of expensive sonnet agents — but it has *no* cost meter: nothing logs `res.usage`, so the spend is bounded but unmeasured.
-
-
----
+**Subtitle:** Per-call cost ledger · Industry standard
 
 ## Zoom out, then zoom in
 
-**Zoom out — the bigger picture.** Token economics is not in one band — it is the *shape of decisions* made across several. The bounds live in the Per-agent definitions (`maxToolCalls` budgets) and the Agent loop (`budgetSpent`/`forceFinal` in `lib/agents/base.ts` L90–L91, `truncate` at L31–L34); model tiering picks haiku for intent (`lib/agents/intent.ts` L14) vs sonnet for analysis (`lib/agents/base.ts` L9); and the Provider returns `res.usage` on every response — the one piece of cost data that nothing in this codebase ever reads.
+Cost is per token. Per call, you pay for both input and output, at different
+rates, and output costs ~5x more than input. Per agent loop, you pay for input
+*every turn* because the model is stateless.
 
 ```
-  Zoom out — where cost levers live (and the missing meter)
+  Zoom out — where dollars get spent in one investigation
 
-  ┌─ Intent parsing + Pipeline ─────────────────────┐
-  │  HAIKU classifier   intent.ts L14  ← tier lever │
-  └─────────────────────────┬───────────────────────┘
-                            │
-  ┌─ Per-agent + Agent loop ▼───────────────────────┐  ← we are here
-  │  maxToolCalls budgets (6/6/4/6)                 │
-  │  budgetSpent → forceFinal   base.ts L90–91      │
-  │  truncate (16_000 chars)    base.ts L31–34      │
-  │  synthesize() spike (conditional)               │
-  └─────────────────────────┬───────────────────────┘
-                            │  create(params)
-  ┌─ Provider ──────────────▼───────────────────────┐
-  │  SONNET ($)   cost = in·p_in + out·(5·p_in)     │
-  │  res.usage = { input_tokens, output_tokens }    │
-  │                      ★ NEVER READ ★             │
-  └─────────────────────────────────────────────────┘
+  ┌─ /api/agent (one investigation) ──────────────────┐
+  │  bootstrap     ≈ 0   tokens     ($0; no LLM)       │
+  │  listTools     ≈ 0   tokens     ($0; no LLM)       │
+  │  diagnostic    6 turns × ~5k in + ~1k out          │
+  │                ≈ 30k in + 6k out ≈ $0.18           │
+  │  recommendation 4 turns × ~5k in + ~1k out         │
+  │                ≈ 20k in + 4k out ≈ $0.12           │
+  │  TOTAL per investigation:        ≈ $0.30           │
+  └─────────────────────────────────────────────────────┘
+
+  ┌─ /api/briefing (one daily check) ─────────────────┐
+  │  monitoring    6 turns × ~6k in + ~2k out          │
+  │                ≈ 36k in + 12k out ≈ $0.29          │
+  └─────────────────────────────────────────────────────┘
 ```
-
-**Zoom in — narrow to the concept.** The question is two parts: how do you *bound* cost so a runaway loop cannot rack up an unbounded bill, and how do you *measure* it so you know which call dominates? blooming insights answers the first with three levers (budgets, truncation, tiering) and answers the second not at all. How it works walks each lever, names the conditional `synthesize()` spike as the likely line item, and points at the one-field fix (`res.usage`) the codebase never makes.
-
----
 
 ## Structure pass
 
-**Layers.** Four layers, each home to a cost lever or its absence: the intent classifier (tier lever — haiku vs sonnet), the per-agent definitions (call-count budgets `maxToolCalls`), the agent loop (input truncation via `truncate`, output bound via `max_tokens`), and the provider response (`res.usage` returning exact input/output token counts — never read).
+  → **One axis to trace — cost per unit work.** Input vs output, turn count
+    vs single call, sonnet vs haiku. Holding "what's one unit of work?"
+    constant across the agents:
+    - monitoring: one briefing scan ≈ $0.30
+    - diagnostic: one investigation ≈ $0.18
+    - recommendation: one set of recs ≈ $0.12
+    - intent: one classify ≈ $0.0003 (haiku)
 
-**Axis: cost.** What does each layer contribute to the per-run bill, and is there a meter on it? This is the right axis because the file's whole frame is "three dials are present, the gauge is absent" — the layers cleanly partition into "bound" (turns the dial) and "measure" (reads the gauge), and only the cost lens makes that distinction visible. Control would flatten it (every layer is CODE-decided); failure would mis-frame (cost overrun is the failure, not the mechanism).
-
-**Seams.** The cosmetic seam is between the per-agent definitions and the agent loop — both are *bounding* layers, just with different primitives. The load-bearing seam is between the agent loop (where the call is made) and the provider response (where `res.usage` comes back). Cost-knowledge flips here from "estimated by characters and call count" to "exactly known per call" — but the codebase doesn't cross it. The unread `res.usage` field *is* the missing meter; the load-bearing seam is open on both sides because nothing connects them.
-
-```
-  Structure pass — token economics
-
-  ┌─ 1. LAYERS ───────────────────────────────────┐
-  │  intent classifier (tier lever)                │
-  │  per-agent definitions (call-count budgets)    │
-  │  agent loop (truncate + max_tokens)            │
-  │  provider response (res.usage — never read)    │
-  └────────────────────────┬───────────────────────┘
-                           │  pick the axis
-  ┌─ 2. AXIS ─────────────▼────────────────────────┐
-  │  cost: what does each layer contribute to the  │
-  │  bill, and is there a meter on it?             │
-  └────────────────────────┬───────────────────────┘
-                           │  trace across layers, find flips
-  ┌─ 3. SEAMS ────────────▼────────────────────────┐
-  │  per-agent↔loop: cosmetic (both bound)         │
-  │  loop↔res.usage: LOAD-BEARING                  │
-  │    "estimated by chars" → "exactly known"      │
-  │    but this codebase NEVER crosses it          │
-  └────────────────────────┬───────────────────────┘
-                           ▼
-                   Block 4 — How it works
-```
-
-The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+  → **The seam:** the input-side accumulation. Every agent turn re-pays for
+    the system prompt, the schema summary, and the conversation so far. The
+    multiplier is *turn count*, not "additional cost per turn." A 6-turn
+    loop with a 5k-token prompt costs 30k input tokens for the prompt alone.
 
 ## How it works
 
-**Mental model.** Token cost is `input_tokens × input_price + output_tokens × output_price`, summed over every call in a run, where `output_price ≈ 5 × input_price`. So three levers move the bill: how many *calls* you make (budget), how *big* each call's input is (truncation), and how *expensive* each call's model is (tiering). blooming insights pulls all three on the bounding side and pulls none on the measuring side.
+### Move 1 — the mental model
+
+Imagine a meter on the wire. Every byte you send is counted as input; every
+byte the model writes back is counted as output. The meter starts again on
+every API call.
 
 ```
-cost(run) = Σ over calls  (input_tokens · p_in  +  output_tokens · p_out)
-                                                         ▲
-                                              p_out ≈ 5 · p_in
-levers:
-  fewer calls   → maxToolCalls budget        (bound)
-  smaller input → truncate / schemaSummary   (bound)
-  cheaper model → haiku classifier vs sonnet (bound)
-  know the bill → log res.usage              (MEASURE — absent)
+  One call: the cost ledger
+
+  ┌─ Input tokens (you pay $3/M for sonnet) ──────────┐
+  │   system prompt       ~500   tokens                │
+  │   schema summary      ~1500  tokens                │
+  │   category checklist  ~750   tokens                │
+  │   tool definitions    ~1000  tokens                │
+  │   prior turns (turn N) ~N × 1k tokens              │
+  │   TOTAL (turn 1):     ~4-5k                        │
+  │   TOTAL (turn 6):    ~10-15k                       │
+  ├────────────────────────────────────────────────────┤
+  │ Output tokens (you pay $15/M for sonnet)           │
+  │   tool_use args       ~50-200                      │
+  │   text reasoning      ~200-500                     │
+  │   final JSON          ~1-2k                        │
+  │   TOTAL per turn:     ~500-2000                    │
+  ├────────────────────────────────────────────────────┤
+  │ Cost per turn (turn 6):                            │
+  │   input:  12000 × $3/1M  = $0.036                  │
+  │   output:  1500 × $15/1M = $0.0225                 │
+  │   TOTAL per turn:        ≈ $0.06                   │
+  └────────────────────────────────────────────────────┘
 ```
 
-The first three are dials you can turn before the call; the fourth is a gauge you read after. The codebase has the dials and not the gauge.
+### Move 2 — the step-by-step walkthrough
 
----
+**The pricing table.** As of 2026, the models this codebase uses:
 
-### Lever 1 — call-count budgets
+  → `claude-sonnet-4-6` — $3 / 1M input, $15 / 1M output.
+  → `claude-haiku-4-5-20251001` — $1 / 1M input, $5 / 1M output.
 
-Each agent caps total tool calls, which caps the number of agent-turn model calls (each tool round-trip is a model call). The budgets:
+**The actual measurement source.** Every `complete()` call logs `usage` to
+Vercel logs (`lib/agents/aptkit-adapters.ts:57-61`):
 
-```
-agent           maxToolCalls   why
-──────────────  ────────────   ────────────────────────────────────
-monitoring          6          bound scan latency under 1 req/s MCP limit
-diagnostic          6          bound investigation depth
-recommendation      4          fewer queries needed to propose actions
-query               6          free-form, broad tool access
-```
-
-A `budgetSpent` check flips `forceFinal` once the count of tool calls hits the agent's budget, forcing the model to stop querying and emit its answer. Without this, the loop runs until `maxTurns` (8) or the route's `maxDuration` of 300s — burning tokens on every wasted turn. The budget is the primary defense against a runaway bill.
-
-```
-turn 0  2 calls
-turn 1  4 calls            (diagnostic, budget 6)
-turn 2  6 calls → budgetSpent → forceFinal → emit JSON, STOP
-                                             no turn 3+ → no extra tokens
+```typescript
+console.log(JSON.stringify({
+  site: this.logSite,                // e.g. "agents/diagnostic:aptkit-model"
+  sessionId: this.sessionId,
+  usage: response.usage,             // {input_tokens, output_tokens,
+                                     //  cache_creation_input_tokens,
+                                     //  cache_read_input_tokens}
+}));
 ```
 
----
+To get a real cost number, you'd filter Vercel logs by `site` for the
+investigation period, sum `input_tokens` and `output_tokens`, multiply by the
+pricing. There's no in-app aggregation; the logs are the source of truth.
 
-### Lever 2 — input truncation
+**Where the money goes in a typical diagnostic loop.** Walking the numbers:
 
-Output tokens cost ~5×, but *input* tokens accumulate fast in a multi-turn loop because every prior tool result rides along in `messages` on every subsequent call. Truncation caps that growth: the agent loop slices each tool result to a 16,000-character ceiling, and the monitoring agent caps the static schema prefix via list-count caps. See → 02-tokenization.md for the full character-budget story.
+  → **Turn 1.** Input ≈ 4k (system prompt + schema summary + anomaly context
+    + tool defs). Output ≈ 200 (model picks a tool, emits `tool_use`
+    block, very little prose). Cost: ~$0.015.
 
-```
-without truncation:           with truncation:
-turn 0: schema + 60KB result  turn 0: schema + 16KB result
-turn 1: + 60KB result         turn 1: + 16KB result
-turn 2: + 60KB result         turn 2: + 16KB result
-input grows ~60KB/turn        input grows ~16KB/turn  ← ~3.75× cheaper input
-```
+  → **Turn 2.** Input ≈ 5k (turn 1's everything + the tool_use block from
+    turn 1 + the tool result). Output ≈ 300. Cost: ~$0.020.
 
----
+  → **Turn 3-5.** Each ~6-9k input, ~300-500 output. Each ~$0.025-$0.035.
 
-### Lever 3 — model tiering (cheap classifier vs dear agents)
+  → **Turn 6 (final synthesis).** Input ≈ 10k. Output ≈ 1500 (the full
+    `Diagnosis` JSON). Cost: ~$0.055.
 
-The cheapest routing decision: do not pay the expensive model to do a trivial job. Intent classification — mapping a query to one of three labels — uses a cheap-tier model (the haiku-class classifier), while the actual analysis uses a more capable model (the sonnet-class agent):
+  → **Total:** ~$0.18 for one diagnostic investigation.
 
-```
-classify intent   → cheap tier   (fast)             max_tokens 16
-analyze / diagnose → dear tier    (capable, costly)  max_tokens 4096
-```
+The output cost on turn 6 is the single biggest line. That's the
+synthesis-turn pattern — the model has held back on prose until it has all
+the data, then emits the whole structured answer. Output costs 5x input,
+so the final-turn shape dominates.
 
-A classifier call capped at `max_tokens: 16` (→ 03-sampling-parameters.md) costs a tiny fraction of an agent turn. Putting the cheap model on the routing decision and the expensive model on the reasoning is textbook cost-aware tiering.
+**Why output costs more.** The model's compute cost per token is the same
+on input and output; the pricing premium on output reflects two things:
+(1) it's pure generation, no parallelization (a single token at a time),
+and (2) it's the value-add (anyone can supply text — only the model can
+generate the answer). Provider pricing reflects this across the industry.
 
----
+**Where the cost hits today.** Live mode is gated by the Bloomreach side, not
+Anthropic. The alpha MCP server's "1 per 10s" rate limit caps the throughput
+at ~360 tool calls per hour per user; agent loops do 3-10 tool calls each so
+the budget caps at ~30-50 investigations per hour. Demo mode is free. So the
+*current* Anthropic bill is small — maybe $10-30/month for the user's own
+testing. The number scales linearly with users + live-mode usage.
 
-### Where the big line item is, and the meter that would show it
+### Move 3 — the principle
 
-The single most expensive call in an investigation is the **synthesis pass** when it runs. The `synthesize()` call is a *full dear-tier call* with `max_tokens: 2048` of output, and it formats up to six tool results as evidence text in its input — large input, large output, on the dear model. It only fires when the loop's final turn fails to produce valid JSON (→ 04-structured-outputs.md), so its cost is conditional: zero on the happy path, ~2× the agent's tokens on the unlucky path.
+**Cost = (input_tokens × turn_count × input_rate) + (output_tokens × output_rate).
+Output dominates per turn; input dominates per loop.** The two cost-reduction
+levers are: (1) cap turn count (`max_tokens` on output, hard tool-call caps in
+prompts: 6 for monitoring/diagnostic, 4 for recommendation), and (2) cap
+per-turn input (`schemaSummary()` trimming). Both are in place. The next
+lever is prompt caching — re-sending the same system prompt prefix every
+turn could be a cache-hit, but that's a Case B (see
+`06-production-serving/01-llm-caching.md`).
 
-```
-investigation token cost (dear tier)
-  diagnostic loop   : up to 6 turns × growing input + 4096 output
-  synthesis (maybe) : large evidence input + 2048 output   ← the spike
-  recommendation    : up to 4 turns × input + 4096 output
-  + synthesis (maybe): another spike
-```
-
-The meter to see this is the response's `usage` field — the provider SDK returns `input_tokens` and `output_tokens` on every response. **Nothing in the codebase reads it.** There is no per-call log, no per-run token total, no cost dashboard. The spend is *bounded* (the three levers guarantee a worst case) but *unmeasured* (no one knows the typical case, or which call dominates it).
-
----
-
-### Current state vs. future state
-
-```
-CURRENT (bounded, blind)              FUTURE (bounded, metered)
-────────────────────────────────     ────────────────────────────────
-maxToolCalls caps worst case          + usage logged per call
-truncation caps input growth          + per-agent token totals
-cheap-tier classification             + cost = tokens × price table
-NO record of actual spend             + per-run cost log row
-"which call is expensive?" = guess    "which call is expensive?" = query
-```
-
-The bounds make a runaway bill *impossible*; the missing meter makes the *typical* bill *invisible*. You cannot tune what you cannot see — the first optimization after shipping is the meter, not another bound.
-
----
-
-### The principle
-
-Cost engineering is two disciplines: bound the worst case before the call (budgets, truncation, tiering) and measure the typical case after the call (usage logging). This system does the first thoroughly — a runaway loop cannot happen — and skips the second entirely, so it has guarantees without observability. That is a fine posture for a bounded demo and a liability the moment you need to tune cost against real traffic, because the meter is the prerequisite for every targeted optimization.
-
----
-
-### Code in this codebase
-
-**Partially addressed — bounds present, meter absent.** Cost is controlled by `maxToolCalls` budgets, input truncation, and haiku-vs-sonnet tiering, but nothing reads `res.usage`; there is no `ai_call_log`, per-run token total, or cost dashboard.
-
-#### Files, functions, and line ranges
-
-- **Call-count budgets (`maxToolCalls`):** monitoring `6` (`lib/agents/monitoring.ts` L74), diagnostic `6` (`lib/agents/diagnostic.ts` L61), recommendation `4` (`lib/agents/recommendation.ts` L57), query `6` (`lib/agents/query.ts` L41); enforced via `budgetSpent`/`forceFinal` at `lib/agents/base.ts` L90–L91.
-- **Input truncation:** `MAX_TOOL_RESULT_CHARS = 16_000` / `truncate` — `lib/agents/base.ts` L29, L31–L34; `schemaSummary` caps — `lib/agents/monitoring.ts` L15–L48.
-- **Model tiering:** `CLASSIFIER_MODEL = 'claude-haiku-4-5-20251001'` — `lib/agents/intent.ts` L14; `AGENT_MODEL = 'claude-sonnet-4-6'` — `lib/agents/base.ts` L9.
-- **The big line item:** `synthesize()` sonnet calls — `lib/agents/diagnostic.ts` L87–L126 (`max_tokens: 2048` at L99), `lib/agents/recommendation.ts` L82–L132 (L98).
-- **The absent meter:** no read of `res.usage` anywhere; the model call at `lib/agents/base.ts` L102 returns it and discards it.
-
-#### Where the meter would live
-
-A token-accounting field would accumulate on `AgentRunResult` (`lib/agents/base.ts` L24–L27), populated by reading `res.usage` after `create` (L102) and after each `synthesize()` call. The route (`app/api/agent/route.ts`) would sum per-agent totals and either stream a final `usage` event or write an `ai_call_log` row alongside `saveInvestigation` (called at `app/api/agent/route.ts` L254; the store is `lib/state/investigations.ts` L30).
-
----
-
-## Token economics — diagram
-
-This diagram spans the call path and marks where each cost lever acts and where the missing meter would sit. Service-layer dials bound the spend; the Provider response carries the usage the codebase never reads.
+## Primary diagram
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│  SERVICE LAYER (cost levers — all on the bounding side)              │
-│                                                                       │
-│  classifyIntent → HAIKU  intent.ts   ← tier: cheap model         │
-│       │                                                              │
-│  runAgentLoop (SONNET base.ts L9)                                    │
-│   maxToolCalls budget  monitoring 6 / diag 6 / rec 4 / query 6       │
-│       │  budgetSpent → forceFinal  base.ts   ← fewer calls    │
-│   truncate tool result → 16_000 chars  base.ts  ← smaller in  │
-│   schemaSummary caps   monitoring.ts            ← smaller in  │
-│       │                                                              │
-│   synthesize() (conditional)  diagnostic out  ← spike  │
-└───────────────────────────┬───────────────────────────────────────────┘
-                            │  create(params)  base.ts
-┌───────────────────────────▼───────────────────────────────────────────┐
-│  PROVIDER LAYER (Anthropic — where the bill is set)                 │
-│                                                                       │
-│  cost = input_tokens · p_in  +  output_tokens · p_out                │
-│                                          (p_out ≈ 5 · p_in)          │
-│  res.usage = { input_tokens, output_tokens }   ◀── NEVER READ        │
-│                                                    (no meter)         │
-└────────────────────────────────────────────────────────────────────────┘
+  Cost flowchart — where to spend a token-reduction hour
+
+   start
+     │
+     ▼
+  measure (read Vercel logs for `usage` field)
+     │
+     ▼
+  is input growing per turn?  ── yes ──►  truncate schema / history more
+     │ no                                  (schemaSummary tweak)
+     ▼
+  is output > 1k per turn?    ── yes ──►  lower max_tokens or prompt
+     │ no                                  for terser output
+     ▼
+  is turn count > 4?          ── yes ──►  cap tool calls harder
+     │ no                                  (prompt or AptKit config)
+     ▼
+  do system prompt + tool      ── yes ──►  enable Anthropic prompt caching
+  defs repeat verbatim                     (Case B in this codebase)
+  per turn?
+     │ no
+     ▼
+  consider switching to haiku
+  for non-synthesis turns
+  (Case B — model routing)
 ```
-
-Every lever the codebase pulls is upstream of the call (bound the spend); the one thing it never touches is `res.usage` downstream of the call (measure the spend).
-
----
 
 ## Elaborate
 
-### Where this pattern comes from
+The "haiku for triage, sonnet for synthesis" model-routing pattern is the
+biggest cost-reduction move that hasn't been made in this codebase. The intent
+classifier is already on haiku; the *first few exploratory turns* of the
+diagnostic loop could plausibly run on haiku and only the final synthesis
+turn on sonnet. The blocker is that AptKit owns the loop and doesn't expose a
+per-turn model choice today. The exercise below names the refactor.
 
-Token-based billing is universal across LLM providers, and the asymmetry — output tokens priced several times higher than input — reflects that generation is autoregressive (each output token requires a full forward pass) while input is processed in parallel. The ~5× figure is an order-of-magnitude rule across Anthropic and OpenAI tiers; the exact multiple varies by model. Cost-aware *model tiering* (cheap model for routing/classification, expensive model for reasoning) is the LLM analog of putting a cheap regex check before an expensive parse, or a CDN cache before an origin server.
-
-Reading `res.usage` and logging it is the LLM equivalent of request-level observability — the same instinct as logging response time and status code on every HTTP call. Production LLM systems treat per-call token logging as table stakes precisely because the bill is otherwise invisible.
-
-### The deeper principle
-
-```
-bound (before the call)              measure (after the call)
-──────────────────────────────      ──────────────────────────────
-guarantees a worst case              reveals the typical case
-prevents runaway bills               enables targeted tuning
-maxToolCalls, truncate, tiering      res.usage logging, ai_call_log
-present in this codebase             ABSENT in this codebase
-```
-
-Bounding answers "can this ever cost too much?" — no, the budget caps it. Measuring answers "what does it actually cost, and where?" — unknown here. The two are independent: you can have airtight bounds and zero visibility, which is exactly this codebase's state.
-
-### Where this breaks down
-
-1. **No way to find the expensive call.** Without `res.usage`, you cannot confirm the `synthesize()` pass is the line item, or how often it fires. Every cost optimization after shipping would be a guess — the network-tab-missing problem.
-
-2. **Bounds are in *calls*, not *tokens*.** `maxToolCalls` caps round-trips, but a single turn with a huge truncated-but-still-16KB input and a full 4096-token output can cost more than two small turns. The budget bounds the wrong unit for fine cost control (it bounds latency well; cost only coarsely).
-
-3. **Conditional synthesis cost is invisible.** The `synthesize()` spike is exactly the cost the team would want to track (it doubles an agent's tokens when it fires), and it is the one with no meter at all — its frequency is unknown.
-
-### What to explore next
-
-- **`res.usage` logging:** the single highest-value addition — exact input/output tokens per call, for free (already returned).
-- **`ai_call_log` table / structured cost log:** persist per-run token totals to query "p50/p95 cost per investigation" and "how often does synthesis fire?"
-- **Anthropic prompt caching (`cache_control`):** the system prompt and schema summary are identical across turns of one agent — caching them would cut repeated input-token cost; currently absent.
-- **Token-unit budgets:** cap by accumulated tokens (read from `res.usage`) rather than only by call count, for tighter cost bounds.
-
----
+Anthropic's prompt caching (introduced 2024) is the other big lever. Every
+agent turn re-sends the system prompt verbatim — perfect cache candidate. The
+`cache_creation_input_tokens` and `cache_read_input_tokens` fields in
+`response.usage` are already being logged, they're just always `0` because
+nothing is being cached. Adding `cache_control: { type: 'ephemeral' }` to the
+system block in `AnthropicModelProviderAdapter.complete()` (and to the schema
+summary block, which is also stable per session) would cut input cost on
+turns 2+ by ~90%. See `06-production-serving/01-llm-caching.md` for the
+walkthrough.
 
 ## Project exercises
 
-### Log `res.usage` per agent run
+### Exercise — emit per-investigation cost summary at done
 
-- **Exercise ID:** B1.2 (adapted) — token-economics instrumentation.
-- **What to build:** read `res.usage.input_tokens` / `output_tokens` after every `create` in `runAgentLoop` and both `synthesize()` calls, accumulate per-agent totals on `AgentRunResult`, and stream a final `usage` event so the UI can show the run's token cost.
-- **Why it earns its place:** turns a blind-but-bounded system into a measured one — the single highest-value, lowest-cost cost-engineering step.
-- **Files to touch:** `lib/agents/base.ts` (`runAgentLoop`, `AgentRunResult`), `lib/agents/diagnostic.ts` / `lib/agents/recommendation.ts` (`synthesize`), `lib/mcp/events.ts` (a `usage` event), `app/api/agent/route.ts`.
-- **Done when:** one investigation streams a final usage total, the synthesis spike is visible in the per-agent breakdown when it fires, and the numbers move with `max_tokens` and budget changes.
-- **Estimated effort:** 1–4hr
+  → **Exercise ID:** `study-ai-eng-06.1`
+  → **What to build:** Accumulate `usage` numbers across all `complete()`
+    calls inside a single route invocation, and emit a final
+    `{ type: 'cost_summary', inputTokens, outputTokens, estUsd }` event
+    before `{ type: 'done' }`. The UI shows it in the investigation
+    footer.
+  → **Why it earns its place:** Makes the cost visible at the unit-of-work
+    boundary. Today the only way to know what an investigation cost is
+    grepping Vercel logs.
+  → **Files to touch:** `lib/agents/aptkit-adapters.ts` (accumulator on the
+    adapter), `app/api/agent/route.ts` (emit before done),
+    `lib/mcp/events.ts`, `components/investigation/EvidencePanel.tsx`.
+  → **Done when:** Live investigation shows "this investigation: 32k in / 4k
+    out · ~$0.16" in the UI.
+  → **Estimated effort:** `1–4hr`
 
-### Persist an `ai_call_log` and report cost percentiles
+### Exercise — enable Anthropic prompt caching on the system block
 
-- **Exercise ID:** B1.8 (adapted) — cost observability over time.
-- **What to build:** write a per-run record (per-agent input/output tokens, whether synthesis fired, computed cost from a price table) alongside `saveInvestigation`, and add a small `/debug`-style view reporting p50/p95 tokens-per-investigation and synthesis-fire rate.
-- **Why it earns its place:** shows you can answer "what does an investigation cost and how often does the expensive path trigger?" with data, not guesses.
-- **Files to touch:** `lib/state/investigations.ts` (extend `saveInvestigation`), a new `lib/state/ai-call-log.ts`, `app/api/agent/route.ts` (write the row), a report under `app/debug/`.
-- **Done when:** running several investigations produces queryable per-run cost records and a percentile report, including how often `synthesize()` fired.
-- **Estimated effort:** 1–2 days
-
----
+  → **Exercise ID:** `study-ai-eng-06.2`
+  → **What to build:** In `AnthropicModelProviderAdapter.complete()`, when
+    `request.system` is present, send it as a structured `system` array
+    with `cache_control: { type: 'ephemeral' }` instead of a plain string.
+    Verify the next turn's `usage.cache_read_input_tokens` is >0.
+  → **Why it earns its place:** Cuts input cost on turns 2+ by ~90% for the
+    cached prefix. The biggest cost lever still on the table.
+  → **Files to touch:** `lib/agents/aptkit-adapters.ts:49`, and possibly
+    AptKit `ModelRequest` (if `system` needs to be structured upstream).
+  → **Done when:** Logs show `cache_read_input_tokens > 0` on the second
+    turn of any agent loop. A back-of-envelope check shows ~50%+ input
+    cost reduction across a 6-turn loop.
+  → **Estimated effort:** `1–4hr` (AptKit upstream may add a half-day).
 
 ## Interview defense
 
-### What an interviewer is really asking
+**Q: What does one investigation cost in dollars?**
 
-"How do you control LLM cost?" tests whether you know the levers (budget, truncation, tiering) *and* whether you separate bounding from measuring. The senior signal is volunteering the gap: "we bound it well but never log `res.usage`, so we can't say what it actually costs" — honesty plus the named fix.
-
-### Likely questions
-
-**[mid] What stops an agent from running up an unbounded token bill?**
-
-`maxToolCalls` (e.g. `6` for diagnostic, `lib/agents/diagnostic.ts` L61). Once `toolCalls.length >= maxToolCalls`, `budgetSpent` flips `forceFinal` (`lib/agents/base.ts` L90–L91), the model loses its tools and must emit its answer — no further turns, no further tokens.
+About $0.30 end-to-end (diagnostic ~$0.18 + recommendation ~$0.12). The
+monitoring scan is about the same — ~$0.30 for one daily briefing. The
+biggest line item is the final synthesis turn's output tokens: ~1-2k of JSON
+at sonnet's $15/M-output rate is ~$0.02 per call, and the synthesis turn is
+the most expensive in every agent loop.
 
 ```
-6 calls reached → budgetSpent → forceFinal → emit JSON, STOP
+  Cost per agent (one unit of work):
+    monitoring (briefing scan)        ≈ $0.30
+    diagnostic (one investigation)    ≈ $0.18
+    recommendation (one rec set)      ≈ $0.12
+    intent classify (haiku)           ≈ $0.0003
+
+  Per-turn dominance:
+    input cost dominates LOOP cost (multiplied by turn count)
+    output cost dominates PER-TURN cost (5× input rate)
 ```
 
-**[senior] Output tokens cost ~5× input. Which call in an investigation is the expensive one, and how would you confirm it?**
+**Anchor line:** "Output is 5× more expensive than input per token. The
+synthesis turn dominates each call; the prompt re-send dominates the loop."
 
-The conditional `synthesize()` pass — a full sonnet call with up to 2048 output tokens and large evidence input (`lib/agents/diagnostic.ts` L87–L126). It only fires when the loop's final turn fails to produce valid JSON. To *confirm* it, you would read `res.usage` per call — which this codebase does not do, so today it is a reasoned guess, not a measurement.
+**Q: What's the biggest cost-reduction move you haven't shipped yet?**
 
-```
-loop ok      → no synthesis → cheaper
-loop fails   → synthesis spike (2048 out, big in) → ~2× the agent's tokens
-confirm: log res.usage  ← absent
-```
+Anthropic prompt caching on the system block. Every agent turn re-sends the
+~500-token system prompt verbatim — perfect cache candidate. The
+`response.usage` already has `cache_creation_input_tokens` and
+`cache_read_input_tokens` fields; they're being logged, they're always zero
+today because we don't set `cache_control: { type: 'ephemeral' }`. Setting
+it on the `system` block in `AnthropicModelProviderAdapter.complete()` would
+cut input cost on turns 2+ by ~90% for the cached prefix.
 
-**[arch] You're asked to cut the LLM bill 30%. First step?**
-
-Build the meter. Read `res.usage` per call and persist a per-run total (`ai_call_log`), because you cannot target what you cannot see. *Then* the data tells you whether to attack the synthesis fire rate (better synthesis prompt), the repeated system prompt (prompt caching), or input size (tighter truncation). Optimizing before measuring is the network-tab-missing mistake.
-
-```
-1. log res.usage → find the dominant cost
-2. attack THAT (caching / synthesis rate / truncation)
-   not a guess
-```
-
-### The question candidates always dodge
-
-**"What does one investigation actually cost?"** The honest answer in this codebase: unknown — nothing logs `res.usage`. The spend is *bounded* by the budgets but never *measured*. A candidate who quotes a dollar figure is fabricating; the real answer is to name the absent meter and the one-field fix.
-
-### One-line anchors
-
-- `lib/agents/diagnostic.ts` L61 / `recommendation.ts` L57 — `maxToolCalls` budgets (6 / 4).
-- `lib/agents/base.ts` L90–L91 — `budgetSpent`/`forceFinal`, the call-count cap.
-- `lib/agents/intent.ts` L14 — haiku classifier; `lib/agents/base.ts` L9 — sonnet agents (tiering).
-- `lib/agents/diagnostic.ts` L87–L126 — `synthesize()`, the conditional big line item.
-- `res.usage` returned at `base.ts` L102 and discarded — no cost meter exists.
-
----
+**Anchor line:** "Caching is one config flag away. The usage object already
+has the cache fields; they're just always zero."
 
 ## See also
 
-→ 02-tokenization.md · → 03-sampling-parameters.md · → 07-heuristic-before-llm.md · → 08-provider-abstraction.md
-
----
+  → `02-tokenization.md` — what `input_tokens` is actually counting
+  → `06-production-serving/01-llm-caching.md` — the cache that would cut this in half
+  → `06-production-serving/02-llm-cost-optimization.md` — model routing as the next lever

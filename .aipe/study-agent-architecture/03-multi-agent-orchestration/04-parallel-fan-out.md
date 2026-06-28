@@ -1,451 +1,184 @@
-# Parallel fan-out / fan-in
+# Parallel / fan-out-fan-in
 
-**Industry name(s):** Parallel fan-out, fan-out fan-in, scatter-gather, map-reduce-style agents
-**Type:** Industry standard · Language-agnostic
+*Industry name: parallel / fan-out / map-reduce agents — Industry standard.*
 
-> Independent sub-jobs run simultaneously; a merger combines the results. blooming insights does NOT fan out — the pipeline is sequential, user-gated, and the ~1 req/s MCP rate limit makes wide concurrency a poor fit. The topology that earns its overhead the day independent sub-questions across multiple domains arrive in one request.
+Independent subtasks run simultaneously, a merger combines. **Not in this repo.** Bloomreach's ~1 req/s rate limit makes parallel calls infeasible without a concurrency cap, and no agent in the repo currently fans out work to concurrent workers.
 
+## Zoom out — where this concept would live
 
----
-
-## Zoom out, then zoom in
-
-**Zoom out — the bigger picture.** Parallel fan-out would replace the Pipeline coordinator band's *shape* — instead of a sequential `monitoring → diagnostic → recommendation` chain, you'd split a query into N independent sub-questions, fire N agent loops concurrently, and merge their results. In blooming insights, the Pipeline band is sequential and forced to be so by a typed data dependency: `recommendation.propose(anomaly, diagnosis, hooks)` literally requires the diagnosis as input. The diagram below shows the parallel-fan-out topology on top and blooming insights' sequential pipeline underneath for contrast.
+If adopted, it would replace one of the sequential stages — likely a MonitoringAgent refactor that fans out one worker per category instead of running them sequentially in one ReAct loop.
 
 ```
-  Zoom out — where parallel fan-out WOULD live
+  Where fan-out WOULD live (hypothetical refactor)
 
-  ┌─ Pipeline coordinator ──────────────────────────┐  ← we are here
-  │  ★ PARALLEL FAN-OUT shape (★ THIS ★, absent):     │
-  │       split                                       │
-  │    ┌────┼────┬────┬────┐                          │
-  │    ▼    ▼    ▼    ▼    ▼                          │
-  │   [A]  [B]  [C]  [D]  [E]   (concurrent agents)   │
-  │    └────┴────┴────┴────┘                          │
-  │              ▼ merge                              │
-  │  ── absent in blooming insights ──                │
-  │                                                   │
-  │  blooming insights' actual shape (sequential):    │
-  │    monitoring ─► diagnostic ─► recommendation     │
-  │    (typed handoff forces order — Diagnosis is a   │
-  │     required argument to propose())               │
-  └─────────────────────────┬────────────────────────┘
-                            │
-  ┌─ Per-agent definitions ─▼────────────────────────┐
-  │  workers identical either way                     │
-  └──────────────────────────────────────────────────┘
+  ┌─ Agent layer ──────────────────────────────────────────┐
+  │  Today:  MonitoringAgent (one ReAct loop, 6 calls       │
+  │           serial across all runnable categories)        │
+  │  Future: MonitoringDispatcher → N CategoryWorkers       │ ← would live here
+  │           (one worker per category, run in parallel,    │
+  │           merged into one anomaly list)                 │
+  └─────────────────────────────────────────────────────────┘
 ```
-
-**Zoom in — narrow to the concept.** The question is: when does parallelism between agents save latency without sacrificing correctness, and when does it just multiply costs? The latency win is real only when the sub-jobs are *genuinely* independent; the cost win only when parallelism is bounded against provider rate limits. blooming insights' sub-jobs are NOT independent (the typed `Diagnosis` enforces a dependency), so fan-out doesn't apply to the current flow. Below, you'll see where fan-out fits, the silent failure mode of fake-independence, and the future query shape that would earn the topology.
-
----
 
 ## Structure pass
 
-**Layers.** Parallel fan-out would need four layers: the **Splitter** (decomposes the request into N independent sub-questions — deterministic or LLM-driven), the **Concurrent workers** (N agent loops running simultaneously), the **Merger** (combines results — function call or another agent), and a **Concurrency-backpressure layer** sitting alongside (enforces N-at-a-time against provider rate limits). In blooming insights none of these exist for the analyst flow; what occupies the Pipeline coordinator band is the sequential pipeline (`monitoring → diagnostic → recommendation`) with a typed `Diagnosis` data-dependency enforcing the order.
-
-**Axis: control.** Who decides which sub-jobs run, in what order, and against what concurrency budget? This is the right axis because fan-out is fundamentally about *placing concurrency decisions* — splitting, scheduling, merging — and each of those is a control-flow choice. Cost is the killing argument in this codebase (the ~1 req/s MCP rate limit means wide concurrency just serializes again, with extra coordination tax), but cost is the *consequence* of letting control fan out without a backpressure layer. Control is upstream.
-
-**Seams.** Two seams are load-bearing in the WOULD-BE shape. Seam 1 sits between the Splitter and the Concurrent workers — control flips from CODE (or MODEL) deciding the split, to CODE managing N parallel executions. Seam 2 sits between the Concurrent workers and the Merger — control flips from N-workers-with-results back to a single point that aggregates. Seam 2 is the load-bearing one because that's where partial failures get handled (one worker errors, the merger still has to produce something) and where the *fake independence* failure mode hides (the merger silently combines outputs that needed to talk to each other). In blooming insights both seams are absent because the typed `Diagnosis` enforces sequential dependency at the Pipeline band; there's nothing to split.
+The axis: **do the subtasks depend on each other?**
 
 ```
-  Structure pass — Parallel fan-out (would-be shape)
+  Sequential pipeline (today):              Fan-out (hypothetical):
+  ──────────────────────────                ───────────────────────
+  one ReAct loop scans                      one worker per category,
+  N categories serially                     all running in parallel
+                                            then merge into one list
 
-  ┌─ 1. LAYERS ───────────────────────────────────┐
-  │  Splitter (decomposes into N sub-questions)    │
-  │  Concurrent workers (N agent loops)            │
-  │  Merger (aggregates results)                   │
-  │  Concurrency-backpressure (caps N for limits)  │
-  └────────────────────────┬───────────────────────┘
-                           │  pick the axis
-  ┌─ 2. AXIS ─────────────▼────────────────────────┐
-  │  control: who decides what runs in parallel    │
-  │           and against what budget?             │
-  └────────────────────────┬───────────────────────┘
-                           │  trace across layers, find flips
-  ┌─ 3. SEAMS ────────────▼────────────────────────┐
-  │  Seam 1: Splitter ↔ Concurrent workers         │
-  │          (single decision → fan-out)           │
-  │  Seam 2: Workers ↔ Merger                      │
-  │          (N results → 1) ★ load-bearing —      │
-  │          partial failure + fake-independence   │
-  │          hide here                             │
-  │  In this repo: typed Diagnosis dependency      │
-  │  prevents the fan-out from existing            │
-  └────────────────────────┬───────────────────────┘
-                           ▼
-                   Block 4 — How it works
+  works because: categories don't            wins on: latency — N categories
+  depend on each other, but                  in parallel cost the time of
+  Bloomreach rate-limit (~1 req/s)           the slowest, not the sum
+  forces serialization at the                forced cost: per-worker context
+  data-source layer                          setup; concurrency cap to honor
+                                             the rate limit
 ```
-
-The skeleton is mapped — the rest of this file walks the fan-out mechanics, the silent fake-independence failure mode, and the future query shape that would earn the topology.
-
----
 
 ## How it works
 
-**The mental model: `Promise.all()` with a merge.** Each promise is an agent; the merge is either a function call (deterministic) or another agent (when the merge itself needs reasoning).
+### Move 1 — the mental model
+
+You know `Promise.all([a(), b(), c()])` — N independent requests, fire all at once, wait for all to settle, merge results. Fan-out is that pattern over agents instead of fetch calls. The constraint that makes it work: the subtasks must be *genuinely independent* — no subtask needs another's output. If they're dependent, it's a pipeline (see `03-sequential-pipeline.md`), not a fan-out.
 
 ```
-Parallel fan-out in one picture
+  Parallel fan-out — split + merge
 
-  user question
-       │
-       ▼
-   ┌──────────────────────────┐
-   │ split into N sub-questions│  (deterministic or by an LLM)
-   └─────┬──────┬──────┬───────┘
-         ▼      ▼      ▼
-     ┌─────┐┌─────┐┌─────┐
-     │ A   ││ B   ││ C   │     concurrent ReAct loops
-     └──┬──┘└──┬──┘└──┬──┘
-        └─────┼──────┘
-              ▼
-      ┌──────────────┐
-      │ merge        │       function call OR agent
-      └──────────────┘
-              │
-              ▼
-          final answer
+           ┌──────── split ────────┐
+           ▼          ▼            ▼
+      ┌────────┐ ┌────────┐  ┌────────┐
+      │agent 1 │ │agent 2 │  │agent 3 │   (concurrent)
+      └────┬───┘ └────┬───┘  └────┬───┘
+           └──────────┼───────────┘
+                      ▼
+              ┌──────────────┐
+              │ merge agent  │  synthesizes
+              └──────────────┘
 ```
 
-The strategy in plain English: **start all the work you can, wait for the slowest, then combine.** The win is latency; the constraint is that the work has to be genuinely independent — and that the upstream provider can absorb N concurrent calls without rate-limiting you back to sequential. blooming insights fails both gates today: the typed `Diagnosis` makes recommendation strictly dependent on diagnostic, and the ~1 req/s MCP spacer collapses any fan-out's wall-clock win back toward sequential at the MCP layer. The closest existing primitive is the sequential pipeline (`monitoring → diagnostic → recommendation`) and the per-agent serial spacing — fan-out is the contrast.
+### Move 2 — what it would look like for the monitoring agent
 
-### Layer 1 — the split (decomposition)
+The MonitoringAgent today runs ONE ReAct loop with `maxToolCalls=6` and an enforced category list in the prompt's `{categories}` slot. The model picks one category, queries it, moves to the next category. Categories are independent — the conversion-drop check doesn't depend on the revenue-drop check — but they run in series because one agent is doing all of them.
 
-The technical thing: a *deterministic decomposition* (code splits the user request into N sub-jobs) or an *LLM decomposition* (a planner agent reads the request and emits an array of sub-tasks).
-
-If you're coming from frontend, deterministic decomposition is "I know I always need users + orders + products to render the page, so I write `Promise.all([getUsers, getOrders, getProducts])` in code." LLM decomposition is "the user typed a free-form question, and an LLM reads it and emits the list of fetches that answer it." The first is cheap and predictable; the second is adaptive but pays a model-call cost for the planning turn.
+A fan-out refactor would:
 
 ```
-Two decomposition strategies
+  Hypothetical fan-out monitoring
 
-  Deterministic                       LLM decomposition
-  ────────────────────                ────────────────────────
-  the SPLIT is in code                a planner agent reads the
-   (always the same N jobs)            request and emits sub-jobs
-  free, predictable                    +1 LLM call per request
-  works when the user                  works when the user request
-   request shape is fixed               is open-ended
+  ┌─ MonitoringDispatcher ────────────────────────────────────┐
+  │  schemaCapabilities → runnableCategories(...)             │
+  │  for each runnable category:                              │
+  │    spawn CategoryWorker(category, anthropic, dataSource)  │
+  │  await Promise.all(workers) WITH concurrency cap          │
+  └────────────────────────┬──────────────────────────────────┘
+                           ▼ parallel (capped at, say, 3 concurrent)
+  ┌─ CategoryWorker (one per runnable category) ─────────────┐
+  │  ReAct loop, tighter budget (maxToolCalls=2)              │
+  │  prompt: "check ONLY this category: <recipe>"             │
+  │  output: Anomaly | null                                   │
+  └────────────────────────┬──────────────────────────────────┘
+                           ▼
+  ┌─ MonitoringMerger ────────────────────────────────────────┐
+  │  collect workers' outputs                                 │
+  │  filter nulls; sort by severity                           │
+  │  emit Anomaly[]                                           │
+  └────────────────────────────────────────────────────────────┘
 ```
 
-The practical consequence: which split you use determines whether fan-out is "free" or "costs a planner turn." For a fixed UI like "give me a 30-day overview across 4 metrics," deterministic split is fine — the four sub-jobs are always the same. For "ask blooming insights anything," the planner has to decide what sub-questions to fan out.
+The wins:
+- **Latency**: 5 categories in parallel cost the time of the slowest, not the sum
+- **Tighter prompts per worker**: each worker sees only its category, not all 10
+- **Failure isolation**: one worker hitting an error doesn't taint the others
 
-The condition under which this works: the sub-jobs really *are* independent. If sub-job B depends on sub-job A's output, you have a pipeline, not a fan-out — and parallelizing them either doesn't work (B can't start) or wastes work (B runs without context and the result gets thrown away).
+The costs:
+- **Concurrency cap mandatory**: Bloomreach rate-limits at ~1 req/s globally; firing 10 workers concurrently triggers 429s. Need a semaphore at the data-source layer to bound concurrency (see `../05-production-serving/02-fan-out-backpressure.md`).
+- **Per-worker context setup**: each worker needs the workspace schema injected separately (~5K tokens × N workers vs 1× for the current sequential design)
+- **Merger logic**: deduplication, severity reconciliation, "did multiple categories detect the same underlying anomaly" — non-trivial
 
-### Layer 2 — concurrency control (the rate-limit reality)
+### Move 3 — the principle
 
-The technical thing: a *semaphore* that caps how many workers run at once. `N` is the cap. The first `N` workers run immediately; the next ones queue; as each worker finishes, the next queued one starts.
+Fan-out wins on latency when subtasks are genuinely independent AND the per-call cost is dominated by latency (not tokens). The Bloomreach rate limit changes the math here: even if the workers fire in parallel, the data source serializes them to ~1 req/s, so the wall-clock win is bounded by `min(N_concurrent_cap, rate_limit_window)`. With a 6-call budget across 5 categories, the upside is ~3-4x latency improvement *if* you can get the concurrency cap to 3-4 concurrent.
 
-If you're coming from frontend, this is `Promise.all()` with a concurrency limit — the same thing you reach for when you have 200 independent fetches but don't want to open 200 connections at once. Libraries: `p-limit`, `bluebird.map(..., { concurrency: N })`.
+## In this codebase
 
-```
-The semaphore
+**Not implemented.** No agent in the repo fans out work to concurrent workers. Specific reasons:
 
-  Supervisor says: "fan out 12 workers"
-       │
-       ▼
-  ┌────────────────────────────────────────┐
-  │ Semaphore (concurrency cap N=4)        │
-  │   slots: [worker1][worker2][worker3]   │
-  │          [worker4]                     │
-  │   queue: [w5, w6, w7, w8, w9, w10,     │
-  │           w11, w12]                    │
-  │                                        │
-  │  as a slot frees, the next worker      │
-  │  starts                                │
-  └────────────────────────────────────────┘
-       │
-       ▼
-  Provider sees at most 4 concurrent calls
-```
+- **Bloomreach's ~1 req/s rate limit** (`lib/data-source/bloomreach-data-source.ts` enforces this with proactive spacing + retry). Concurrent calls to the same `dataSource` would either queue at the data-source layer (defeating the parallelism) or 429 the server (waste).
+- **No semaphore primitive yet** for capping concurrency below the proactive-spacing limit. Adding fan-out requires building this first.
+- **MonitoringAgent's 6-call budget is small enough** that the sequential cost is acceptable — typically 6-10 seconds for a full briefing. The user's review time on the feed dwarfs this; the latency win wouldn't be felt.
+- **The 300s Vercel maxDuration** is comfortably above the sequential cost anyway. Fan-out's win is mostly architectural (failure isolation, tighter prompts), not latency.
 
-The practical consequence: the cap is what prevents fan-out from melting your provider rate limit. Without it, fan-out of 20 workers slams the provider with 20 concurrent requests; you get 429s, retries, and end up *slower* than sequential.
+The natural opportunity: if we ever added a feature like "analyze all 50 customer segments in parallel," sequential would become the bottleneck and fan-out would be the right answer — with backpressure as the load-bearing addition (see `../05-production-serving/02-fan-out-backpressure.md`).
 
-The condition under which this works: the cap has to match the provider's rate limit divided by per-call duration. In blooming insights' case, MCP is ~1 req/s (the MCP client enforces a ~1.1s spacer between calls). Each agent loop makes multiple MCP calls. Even N=2 concurrent agent loops would serialize their MCP calls through the spacer — you'd get sequential MCP throughput with the overhead of concurrent agent loops.
+## Primary diagram
 
-### Layer 3 — the merge (function call vs agent)
-
-The technical thing: a *combiner* that takes the workers' outputs and produces the final answer. Two flavors: a function call (deterministic merge — e.g. `[...results]` or `Object.assign(...results)`) or an LLM merge (a final agent that reads all worker outputs and writes a synthesis paragraph).
-
-If you're coming from frontend, function-call merge is `Promise.all([...]).then(([a, b, c]) => render(a, b, c))` — your render function combines. LLM merge is `Promise.all([...]).then(([a, b, c]) => llm.summarize([a, b, c]))` — you outsource the combination to a model.
+The contrast — today's sequential monitoring vs hypothetical fan-out:
 
 ```
-Two merge strategies
+  Comparison — sequential vs fan-out monitoring
 
-  Function-call merge              LLM merge
-  ─────────────────────────────    ─────────────────────────────
-  combine outputs in code           one more agent reads all
-   ({ a, b, c } or [a, b, c])       worker outputs and writes
-  free, deterministic                a synthesis
-  works when outputs combine        +1 LLM call (~1–3s)
-   cleanly                          works when synthesis itself
-                                     needs reasoning
-                                    risk: fabrication, averaging
-                                     contradictions
+  TODAY (sequential, one MonitoringAgent ReAct loop):
+  ┌────────────────────────────────────────────────┐
+  │  while not done (maxToolCalls=6):              │
+  │    pick category from {categories} slot         │
+  │    query it                                     │
+  │    accumulate                                   │
+  │  total time = sum of all queries (~6-10s)       │
+  └────────────────────────────────────────────────┘
+
+  HYPOTHETICAL (fan-out, parallel workers + merger):
+  ┌────────────────────────────────────────────────┐
+  │  Dispatcher: spawn 1 worker per category       │
+  │   ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐│
+  │   │worker│ │worker│ │worker│ │worker│ │worker││ ← parallel
+  │   │ rev  │ │ conv │ │ cart │ │churn │ │ ...  ││   (capped at
+  │   └──┬───┘ └──┬───┘ └──┬───┘ └──┬───┘ └──┬───┘│   N concurrent
+  │      └────────┴───────┬┴───────┴────────┘     │    by semaphore)
+  │                       ▼                        │
+  │              ┌──────────────────┐              │
+  │              │ Merger: dedupe,  │              │
+  │              │ sort by severity │              │
+  │              └──────────────────┘              │
+  │  total time ≈ slowest worker + merger          │
+  │  forced cost: concurrency cap, per-worker      │
+  │  context, merger logic                         │
+  └────────────────────────────────────────────────┘
 ```
-
-The practical consequence: LLM merge is where fan-out earns most of its "agentic" reputation — it's the multi-agent shape that *feels* most like multiple agents collaborating. But the merge step is also where the worst failure mode lives: contradictions averaged into a confident-sounding wrong answer. Function-call merge sidesteps this by refusing to merge — you just hand the worker outputs back as a list and let the caller decide.
-
-The condition under which function-call merge works: the worker outputs are *additive* (each worker's output is one piece of the final answer, not an opinion on the same question). When they're opinionated (e.g. three workers each propose recommendations and you need ONE final list), you either need a deterministic ranker or an LLM merge.
-
-### Phase A vs Phase B — where fan-out would fit in this codebase
-
-Right now there's no fan-out anywhere. The query agent handles one free-form question end-to-end; the pipeline is sequential. Here's where the breakpoint would land.
-
-```
-        Now (no fan-out)                If a multi-domain query arrived
-┌─────────────────────────────────┐  ┌─────────────────────────────────┐
-│ free-form ?q=…                  │  │ ?q="give me 30-day funnel +      │ ←
-│   ▼                             │  │  conversion + retention +       │
-│ classify_intent (cheap, ~150ms) │  │  segments overview"             │
-│   ▼                             │  │   ▼                              │
-│ query agent.answer(q, intent)   │  │ classify_intent → MULTI-DOMAIN   │
-│   ReAct loop (1 stage, 1 budget)│  │   ▼                              │
-│   sequential MCP calls          │  │ fan out 4 sub-agents             │ ←
-│   ▼                             │  │   (one per domain)               │
-│ single answer                   │  │   semaphore N=2 (MCP rate limit) │
-│                                 │  │   ▼                              │
-│                                 │  │ merge agent synthesizes one      │ ←
-│                                 │  │  cross-domain overview           │
-└─────────────────────────────────┘  └─────────────────────────────────┘
-   the query agent today is single-domain; the breakpoint is
-   when one user request spans multiple independent domains
-```
-
-*Now:* the query agent processes one question at a time. If the question spans multiple domains (e.g. "compare funnel AND conversion AND retention"), the agent serializes the analytics calls inside its single loop — it makes 4 sequential tool calls under the ~1.1s spacer, totaling ~5 seconds for the data alone.
-
-**Where the constraint and the would-be fan-out point live in the repo.** The constraint that makes wide fan-out impractical today is `lib/mcp/connect.ts` L92 — `minIntervalMs: 1100` on the McpClient constructor options (the per-MCP-call spacer). The single-domain path that would become fan-out at the breakpoint is `QueryAgent.answer()` in `lib/agents/query.ts` L41–L42 (the current `maxToolCalls: 6` budget for one agent handling the whole question).
-
-*If a multi-domain query arrived:* the classifier (or the planner agent) would emit a list of 4 sub-questions; 4 sub-agents would fan out, each running their own ReAct loop for their domain; a merge agent (or a function-call merge with a synthesis prompt) would combine them. The latency win: ~max(t1, t2, t3, t4) ≈ 2 seconds per agent + merge ≈ ~3 seconds total, vs ~5+ sequential. The cost: 4 worker LLM loops + 1 merge LLM call instead of 1 worker loop.
-
-The takeaway: **fan-out earns its overhead when the per-domain latency × N exceeds the parallel max × N × concurrency-overhead.** That's a quantitative breakpoint. Under the current MCP rate limit, N=2 with two-domain queries is plausibly worth it; N=8 isn't.
-
-This is what people mean by "fan out when independent, sequential when dependent, capped by the provider's rate limit either way." Fan-out isn't a free lunch — it's a tradeoff between latency and cost, gated by upstream concurrency tolerance.
-
-The full picture is below.
-
----
-
-## Parallel fan-out — diagram
-
-```
-Parallel fan-out — full picture
-
-  ┌─ DECOMPOSITION (the split) ───────────────────────────────────┐
-  │                                                                │
-  │  user request                                                  │
-  │       │                                                        │
-  │       ▼                                                        │
-  │   ┌──────────────────────────────────────┐                     │
-  │   │ either: code splits (deterministic)  │                     │
-  │   │ or:     LLM planner splits (adaptive)│                     │
-  │   └────┬─────────┬──────────┬────────────┘                     │
-  │        ▼         ▼          ▼                                  │
-  │      sub-job   sub-job    sub-job                              │
-  │       A         B          C                                   │
-  └────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-  ┌─ CONCURRENCY CONTROL (the semaphore) ─────────────────────────┐
-  │                                                                │
-  │   ┌─────────────────────────────────┐                          │
-  │   │ Semaphore (cap N)               │                          │
-  │   │  pop up to N concurrent         │                          │
-  │   │  queue the rest                 │                          │
-  │   │                                 │                          │
-  │   │  set N = provider rate limit /  │                          │
-  │   │           per-call duration     │                          │
-  │   └─────────────────────────────────┘                          │
-  │                                                                │
-  └────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-  ┌─ WORKERS (concurrent ReAct loops) ────────────────────────────┐
-  │                                                                │
-  │      ┌────────┐  ┌────────┐  ┌────────┐                       │
-  │      │worker A│  │worker B│  │worker C│  ... up to N at a time│
-  │      │ ReAct  │  │ ReAct  │  │ ReAct  │                       │
-  │      └────┬───┘  └────┬───┘  └────┬───┘                       │
-  │           └───────────┼──────────┘                            │
-  │                       ▼                                       │
-  └────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-  ┌─ MERGE (the combine) ─────────────────────────────────────────┐
-  │                                                                │
-  │   ┌─────────────────────────────────┐                          │
-  │   │ either: function-call merge     │                          │
-  │   │   (deterministic combine)       │                          │
-  │   │ or:     LLM merge agent         │                          │
-  │   │   (synthesis with reasoning)    │                          │
-  │   └─────────────────────────────────┘                          │
-  │                                                                │
-  └────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-                         final answer
-
-  blooming insights: NOT YET IMPLEMENTED — the pipeline is
-  sequential, the query agent is single-domain, and the ~1 req/s
-  MCP rate limit means N>1 fan-out would serialize at the MCP
-  layer anyway. See the orchestration system-design templates
-  for the refactor.
-```
-
----
-
-## Elaborate
-
-### Where this pattern comes from
-
-Fan-out fan-in is older than computing as a discipline — every map-reduce job is fan-out fan-in, every parallel test runner is fan-out fan-in, every `Promise.all` is a baby fan-out. The agentic version got its current framing from Anthropic's "Building Effective Agents" (2024) under the name "parallelization," which named two sub-modes: *sectioning* (a task is broken into independent subtasks that run in parallel) and *voting* (the same task is run N times for diversity, then results are aggregated). LangGraph's "Send" API and OpenAI Agents SDK's parallel handoffs both ship fan-out as a first-class primitive.
-
-### The deeper principle
-
-**Latency parallelism is free only when the work is genuinely independent AND the upstream can absorb the concurrency.** Both halves are constraints. Ignoring either turns "fan-out" into "fan-out followed by serialization at the bottleneck," which costs the same wall-clock time as sequential and pays N× the LLM bill.
-
-```
-Two conditions for fan-out to pay off
-
-  ┌──────────────────────────────────┐
-  │ 1. sub-jobs are INDEPENDENT       │
-  │    (B doesn't need A's output)   │
-  └──────────────────────────────────┘
-  ┌──────────────────────────────────┐
-  │ 2. upstream can ABSORB N         │
-  │    concurrent calls without       │
-  │    rate-limiting you back to     │
-  │    sequential                     │
-  └──────────────────────────────────┘
-
-  fail (1) → wasted work (B runs without context, discarded)
-  fail (2) → wall-clock identical to sequential, pay N× LLM cost
-```
-
-This is the same principle behind `Promise.all` with concurrency caps — and the same reason React's concurrent mode introduces transitions: parallelism is a strategy with a cost ceiling, not a free axis.
-
-### Where this breaks down
-
-Fan-out breaks when the sub-jobs *secretly* depend on each other — when the planner doesn't realize that sub-job B needs sub-job A's output, fans them out, B runs without context, and the merger combines a context-less B output into the answer. This is the classic "fan-out hides the dependency" failure mode.
-
-It also breaks when the merge is an LLM and the worker outputs contradict each other — the LLM merger tends to *average* contradictions into a confident-sounding compromise rather than surfacing the conflict. The mitigation is to validate worker outputs against a schema before synthesis (cross-reference: `./09-coordination-failure-modes.md`'s "synthesis failure" entry).
-
-### What to explore next
-- `../05-production-serving/02-fan-out-backpressure.md` → the concurrency-cap mechanic that makes fan-out safe under rate limits
-- `./03-sequential-pipeline.md` → the shape fan-out becomes when sub-jobs are dependent (this codebase)
-- `./09-coordination-failure-modes.md` → "tool-call cascade" and "synthesis failure" — both fan-out-amplified
-- `../06-orchestration-system-design-templates/` → the "multi-agent research assistant" template, which uses fan-out as standard
-
----
 
 ## Interview defense
 
-### What an interviewer is really asking
+**Q: "Why doesn't your monitoring agent fan out across categories?"**
 
-When an interviewer asks "why don't you fan out" they're testing whether you can defend an *absence* — whether you considered parallelism and chose against it, or didn't reach for it. The strong signal is naming the constraints (data dependency + rate limit) that make fan-out worse than sequential today. The weak signal is calling fan-out "more complex" without naming the specific complexity (semaphores, merge fabrication, hidden-dependency failures).
+A: Three reasons. First, Bloomreach's ~1 req/s rate limit serializes all calls at the data-source layer anyway — fan-out without a concurrency cap that respects the rate limit would just 429 the server. Second, no semaphore primitive in the codebase yet — adding fan-out requires building backpressure as a prerequisite (`../05-production-serving/02-fan-out-backpressure.md`). Third, the sequential cost is acceptable — a full monitoring scan is 6-10 seconds, well under the user's review time on the feed. The latency win from fan-out wouldn't be felt.
 
-### Likely questions
+If we added a feature where the per-task budget grew (analyzing 50 customer segments instead of 10 categories), fan-out would become the right answer. The refactor would be: split the MonitoringAgent into a Dispatcher (spawns workers) + N CategoryWorkers (one per category, tighter prompt, smaller budget) + a Merger (dedupes, sorts by severity). The load-bearing addition isn't the fan-out itself — it's the concurrency cap on the data source.
 
-[mid] Q: Could the pipeline be parallel?
+Diagram I'd sketch:
 
-A: No — the recommendation agent's signature literally takes the diagnosis as a required argument: `propose(anomaly, diagnosis, hooks)`. Recommendation can't start before diagnostic finishes. The pipeline is sequential by data dependency, not by preference. The signature is the contract.
-
-Diagram:
 ```
-  diagnostic.investigate(): Promise<Diagnosis>
-                                  │ this output…
-                                  ▼
-  recommendation.propose(_, diagnosis, _)
-                            ▲
-                            │ …is required input
-   parallelism here would mean running propose
-   without a diagnosis — TypeScript won't compile it,
-   and the model would have nothing to propose from.
+  ┌─ Dispatcher ──┐
+  └──────┬────────┘
+   ┌─────┼─────┬─────┐  ← parallel, capped at N concurrent
+   ▼     ▼     ▼     ▼
+  [w]   [w]   [w]   [w]
+   │     │     │     │
+   └─────┴─┬───┴─────┘
+           ▼
+        merger → Anomaly[]
 ```
 
-[senior] Q: What about fanning out inside a single agent's loop — e.g. the QueryAgent making 4 EQL calls in parallel?
+Anchor: "fan-out without backpressure on a rate-limited dependency is the multi-agent version of an unbounded queue — it works in dev, dies in prod."
 
-A: That would help on multi-domain queries (funnel + conversion + retention + segments in one question), but two constraints block it today. First, the MCP client enforces ~1.1s spacing between calls (`connect.ts` L92, `minIntervalMs: 1100`) — that's a rate limit on the MCP server, not on the agent. Even if I fanned out 4 concurrent EQL calls from the agent, the MCP client would serialize them through the 1.1s spacer. So the wall-clock win collapses to "sequential MCP calls with the overhead of concurrent agent code." Second, the QueryAgent today handles one question at a time end-to-end; a multi-domain split would need a planner stage to decompose the question, which is itself an LLM call. The fan-out earns its overhead only when the per-domain latency × N exceeds the parallel max × N × (1 + planner_overhead) — a quantitative breakpoint that isn't met today.
+**Q: "When would fan-out earn its complexity here?"**
 
-Diagram:
-```
-  What I'd need to change for fan-out to pay off:
-
-  ┌─ 1. relax the MCP rate limit ──┐
-  │   (~1 req/s → ~3–5 req/s)      │ ← required, currently fixed
-  └────────────────────────────────┘
-  ┌─ 2. add a planner / splitter ──┐
-  │   (or a deterministic split)   │ ← +1 LLM call OR static code
-  └────────────────────────────────┘
-  ┌─ 3. add a semaphore (N=2 or 3) ┐
-  │   to cap concurrency           │ ← protects the new rate limit
-  └────────────────────────────────┘
-  ┌─ 4. add a merge step           ┐
-  │   (function-call or LLM)       │ ← combine sub-domain results
-  └────────────────────────────────┘
-```
-
-[arch] Q: At 100x usage, would you reach for fan-out?
-
-A: Only for specific paths. The investigation pipeline stays sequential — the data dependency between diagnostic and recommendation doesn't disappear at any scale. The QueryAgent's multi-domain path becomes worth fanning out at some volume × multi-domain-query-frequency × relaxed-MCP-rate threshold. But the dominant scaling fix at 100x isn't fan-out within one request — it's *backpressure across requests*: limiting how many concurrent investigations hit the MCP server at once, regardless of whether each investigation is sequential or fanned-out. Fan-out within a request and backpressure across requests are orthogonal — and at high load, the across-request constraint matters more. See `../05-production-serving/02-fan-out-backpressure.md`.
-
-Diagram:
-```
-  Two axes of concurrency
-
-  ┌──────────────────────────────────────────────┐
-  │   WITHIN a request (fan-out)                  │
-  │   ┌────┐┌────┐┌────┐                          │
-  │   │ A  ││ B  ││ C  │ workers in parallel       │
-  │   └────┘└────┘└────┘                          │
-  └──────────────────────────────────────────────┘
-                  ×
-  ┌──────────────────────────────────────────────┐
-  │   ACROSS requests (concurrent investigations) │
-  │   ┌─request 1─┐ ┌─request 2─┐ ┌─request 3─┐  │
-  │   │ pipeline  │ │ pipeline  │ │ pipeline  │  │
-  │   └───────────┘ └───────────┘ └───────────┘  │
-  └──────────────────────────────────────────────┘
-
-  At 100x, the second axis dominates. Backpressure first;
-  fan-out only for multi-domain paths that earn it.
-```
-
-### The question candidates always dodge
-
-Q: If you're not fanning out, you're leaving wall-clock latency on the table. Why is "sequential is fine" the right answer for an agentic product?
-
-A: Because wall-clock latency *isn't* the constraint that hurts users here. The two-step UX is gated by the user clicking "see recommendations" — there's a human-in-the-loop pause between diagnostic and recommendation that dwarfs any sequential vs parallel difference. The diagnostic step itself takes ~5–7 seconds, which fits well under "the user reads the result and decides." If diagnostic dropped to 3 seconds via fan-out, the user still spends 5–10 seconds reading before clicking — the parallelism doesn't reach the user. Where it WOULD matter is the free-form query path, where the user is waiting for one answer. But that path is single-domain today (the classifier in `intent.ts` routes to one of five intents), so there's nothing to fan out. The honest version: fan-out is a latency optimization that doesn't move the needle until the user-facing latency budget is the binding constraint, and right now the user-facing constraint is "did the diagnosis show me something useful?" — a quality question, not a latency one. I'd reach for fan-out the day quality is solid and 30+ seconds of multi-domain query latency was the complaint.
-
-Diagram:
-```
-What fan-out optimizes vs what the user cares about
-
-  ┌────────────────────────────┐  ┌─────────────────────────────┐
-  │ Fan-out optimizes:         │  │ User-facing constraint here: │
-  │  wall-clock latency        │  │  "is the diagnosis useful?"   │
-  │  WITHIN one request,       │  │  (quality, not latency)       │
-  │   when sub-jobs are        │  │                                │
-  │   independent              │  │  + the gate between step 2    │
-  │                            │  │   and step 3 is a USER click  │
-  │                            │  │   (5–10s of human time anyway)│
-  └────────────────────────────┘  └─────────────────────────────┘
-
-  Until quality is solid, fan-out optimizes
-  the wrong axis.
-```
-
-### One-line anchors
-
-- "The pipeline is sequential because the function signature requires it — `propose(anomaly, diagnosis, hooks)` enforces the order."
-- "Fan-out's win is `max` instead of `sum`, but only when sub-jobs are independent AND the upstream can absorb N concurrent calls."
-- "Under our ~1 req/s MCP limit, a fan-out semaphore cap of N=1–2 collapses the latency win back toward sequential — it's a non-win today."
-- "The breakpoint is multi-domain queries in one request, AND a relaxed rate limit — not a vibes-based 'let's go parallel.'"
-
----
+A: When the per-task budget exceeds the sequential time budget. Today, MonitoringAgent's 6-call budget against ~1 req/s is ~6-10 seconds total — fine. If we added "scan 50 customer segments per category" (a 10x expansion of the budget), sequential becomes ~60-100 seconds — at the edge of Vercel's 300s but starting to hurt UX. Fan-out at 4-concurrent gets that back to ~15-25 seconds. The breakpoint is "the user can feel the wait." Today they can't; with a 10x budget they would.
 
 ## See also
 
-→ `./03-sequential-pipeline.md` · → `./01-when-not-to-go-multi-agent.md` · → backpressure: `../05-production-serving/02-fan-out-backpressure.md` · → systems view: `../../study-system-design/06-multi-agent-orchestration.md`
-
----
+- [`03-sequential-pipeline.md`](./03-sequential-pipeline.md) — the pattern this repo currently uses
+- [`../05-production-serving/02-fan-out-backpressure.md`](../05-production-serving/02-fan-out-backpressure.md) — the prerequisite for safely fanning out against a rate-limited provider
+- [`09-coordination-failure-modes.md`](./09-coordination-failure-modes.md) — what fan-out exposes you to (tool-call cascade, cost blowup)

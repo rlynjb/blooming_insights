@@ -1,301 +1,200 @@
-# Query rewriting & HyDE (transform the question before you retrieve)
+# 08 — query rewriting and HyDE
 
-**Industry name(s):** query rewriting, query expansion, HyDE (Hypothetical Document Embeddings), query understanding
-**Type:** Industry standard · Language-agnostic
-
-> The user's raw question is rarely the best retrieval query; query rewriting reshapes it (expand, decompose, or — in HyDE — embed a *hypothetical answer* instead of the question) so it lands closer to the documents that hold the answer; blooming insights does query *understanding* (classify intent, translate to EQL) but not retrieval-query rewriting, so this is study material grounded in a real analog.
-
-
----
+**Subtitle:** LLM-augmented query → better retrieval · Industry standard (Case B)
 
 ## Zoom out, then zoom in
 
-**Zoom out — the bigger picture.** Query rewriting / HyDE is the *pre-retrieval* transform — it reshapes the user's raw query *before* it hits the retriever, so the embedded query lands near the answer documents rather than near other questions. blooming insights already does an upstream cousin of this: `classifyIntent` (`lib/agents/intent.ts` L17–L31) labels the free-form `?q=` and each agent translates natural-language questions into structured EQL. But a retrieval-style query rewrite would sit between the user and a (non-existent) retriever, not between the user and the agent.
+**Case B.** Two patterns for the same problem: user queries are short and
+ambiguous; documents are long and specific; their embedding spaces don't
+always align. Run an LLM step BEFORE retrieval to bridge the gap.
 
 ```
-  Zoom out — where query rewriting / HyDE sits (WOULD BE)
+  Zoom out — query rewriting sits in front of retrieval
 
-  ┌─ User query ─────────────────────────────────────┐
-  │  "why are people leaving without buying?"         │
-  └─────────────────────────┬────────────────────────┘
-                            │
-  ┌─ Query transform ───────▼────────────────────────┐  ← we are here
-  │  ★ rewrite | decompose | HyDE (hypothetical doc) ★│
-  │  embed an answer-shaped string, not the question  │
-  └─────────────────────────┬────────────────────────┘
-                            │  transformed query (or hypothetical doc)
-  ┌─ Retriever ─────────────▼────────────────────────┐
-  │  cosine-nearest neighbors over real documents     │
-  └─────────────────────────┬────────────────────────┘
-                            │
-  ┌─ Reranker / LLM context ▼────────────────────────┐
-  └──────────────────────────────────────────────────┘
-
-  In this codebase: Not yet implemented — String.includes
-  intent matching in lib/agents/intent.ts is what exists
-  instead; classifyIntent is a related but different transform
-  (labels the query, doesn't rewrite for retrieval).
+  ┌─ user query (short, ambiguous) ───────────┐
+  │  "fix the auth thing"                      │
+  └────────────┬───────────────────────────────┘
+               │
+               ▼  ★ LLM rewrite OR HyDE ★      ← we are here
+               │                                (Case B)
+               ▼
+  ┌─ retrieve over better query ──────────────┐
+  │  embedding aligned with doc-space          │
+  └────────────────────────────────────────────┘
 ```
-
-**Zoom in — narrow to the concept.** The question is: when the user's literal words are a poor match for the documents, how do you transform the query so retrieval finds the right ones? Users phrase questions in their vocabulary, documents are written in theirs, and the gap means the literal query embeds far from any answer that would satisfy it. Embedding a *hypothetical answer* (HyDE) lands near real answers because answers look like answers. How it works walks four transforms — synonym expansion, decomposition, step-back, and HyDE — and the cost/recall tradeoff each makes.
-
----
 
 ## Structure pass
 
-**Layers.** Four WOULD-BE layers: the user query (raw), the pre-retrieval transform (rewrite, expand, decompose, or HyDE — embed a hypothetical answer), the retriever (cosine over real documents), and the reranker / LLM context. The transform sits *before* retrieval, reshaping the question to look more like the answer.
-
-**Axis: state.** What's the shape of the string that crosses each boundary — a question, a transformed question, a hypothetical answer, or retrieved real answers? This axis is the right lens because the file's whole insight is that *changing the input's shape* (question → answer-shaped doc in HyDE) makes retrieval land in a different neighborhood. Cost is downstream; control doesn't flip; the load-bearing change is what *kind of string* is being embedded.
-
-**Seams.** The cosmetic seam is between retriever and reranker — same string-shape passes through. The load-bearing WOULD-BE seam is between the raw query and the transformed query (or hypothetical document): state-shape flips from "user-phrased question" to "answer-shaped string." This is the seam HyDE exists to install — embedding a question-shape always lands among other questions; embedding an answer-shape lands among real answers. blooming insights has a cousin transform upstream (`classifyIntent` labels intent), but it doesn't reshape for retrieval.
-
-```
-  Structure pass — query rewriting & HyDE (WOULD BE)
-
-  ┌─ 1. LAYERS ───────────────────────────────────┐
-  │  user query (raw)                              │
-  │  transform (rewrite / decompose / HyDE)        │
-  │  retriever (cosine)                            │
-  │  reranker / LLM context                        │
-  └────────────────────────┬───────────────────────┘
-                           │  pick the axis
-  ┌─ 2. AXIS ─────────────▼────────────────────────┐
-  │  state (shape): what KIND of string crosses    │
-  │  each boundary — question or answer-shape?     │
-  └────────────────────────┬───────────────────────┘
-                           │  trace across layers, find flips
-  ┌─ 3. SEAMS ────────────▼────────────────────────┐
-  │  retriever↔reranker: cosmetic                  │
-  │  raw query↔transform: LOAD-BEARING             │
-  │    question-shape → answer-shape               │
-  │    HyDE lands embeddings near real answers     │
-  └────────────────────────┬───────────────────────┘
-                           ▼
-                   Block 4 — How it works
-```
-
-The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+  → **One axis to trace — cost vs recall.** Extra LLM call per query
+    (~$0.001 with haiku, ~50-200ms latency) in exchange for measurable
+    recall lift. Earns its place when recall@k is poor for short queries.
 
 ## How it works
 
-**Mental model.** Retrieval quality is bounded by the query you hand it: garbage query, garbage candidates, and no reranker can recover. Query rewriting is input pre-processing — the same discipline as sanitizing and normalizing a form field before you use it — applied to the retrieval query. You have three levers.
+### Move 1 — the mental model
+
+Two approaches:
+
+**Query rewriting:** the LLM expands the query into something more
+retrievable.
 
 ```
-  raw question ──▶ [ rewrite ] ──▶ better retrieval query ──▶ retrieve
-                      │
-       ┌──────────────┼──────────────────┐
-       ▼              ▼                   ▼
-   EXPAND          DECOMPOSE            HyDE
-   add synonyms    split compound       embed a hypothetical
-   & context       into sub-queries      ANSWER, not the question
+  query:    "fix the auth thing"
+            ↓ LLM rewrite
+  rewrite:  "how to debug authentication token verification errors"
+            ↓ embed → cosine search
+            (matches docs about auth debugging)
 ```
 
-The body walks each lever and the codebase's existing query-understanding analog.
-
----
-
-### Expansion: add the words the document uses
-
-The raw query may lack the document's vocabulary. Expansion adds synonyms, related terms, or context so the query overlaps the document's wording (helps sparse retrieval directly; helps dense by pulling the embedding toward the topic).
+**HyDE (Hypothetical Document Embeddings):** the LLM generates a
+*hypothetical answer* to the query, then you embed that answer and
+search for similar real docs.
 
 ```
-  raw:      "people leaving without buying"
-  expanded: "people leaving without buying; cart abandonment;
-             checkout drop-off; failed conversion; abandoned purchase"
-                     │
-                     └──▶ now overlaps documents that say "cart abandonment"
+  query:    "fix the auth thing"
+            ↓ LLM generates hypothetical answer
+  hyde:     "To debug authentication, check the JWT signature against
+             the secret in env. Verify the token isn't expired…"
+            ↓ embed the hypothetical answer → cosine search
+            (matches real docs about JWT debugging)
 ```
 
-A cheap model (the same tier as the intent classifier) generates the expansion. Expansion trades precision for recall — too many added terms can pull in noise.
+### Move 2 — the step-by-step walkthrough
 
-### Decomposition: split a compound question
+**Why both work.** Embedding spaces are biased toward the kind of text
+they were trained on. Documents in your corpus are long, descriptive,
+specific. User queries are short, vague, often missing terms. The
+embedding of a short query lands in a different part of the space than
+the embedding of a long descriptive doc — even when they're
+semantically about the same thing.
 
-A multi-part question retrieves badly because no single document matches all parts. Decomposition splits it into sub-queries, retrieves for each, and merges (often with RRF, `06`).
+Rewriting and HyDE both produce embeddings that look more like the
+*documents* you want to retrieve, so cosine search lands in the right
+region.
 
-```
-  raw: "why did mobile sales drop and what should we do?"
-        │
-        ├─▶ "why did mobile sales drop"        → retrieve diagnoses
-        └─▶ "what to do about sales drops"     → retrieve recommendations
-                     │
-                     └──▶ merge results (each sub-query retrieved cleanly)
-```
+**For blooming insights' hypothetical RAG, would either help?** Mixed
+answer:
 
-This mirrors what the route *already* does at the agent level: the intent classifier routes a question to diagnostic *or* recommendation, and a compound question is conceptually two intents. Decomposition is that split applied to retrieval queries.
+  → If the queries are anomalies (`anomaly.metric + anomaly.scope`),
+    they're already structured — short but specific. Probably don't need
+    rewriting.
+  → If the queries are user-typed free-form ("show me past investigations
+    similar to this checkout drop"), rewriting could help. HyDE might
+    overshoot — generating a hypothetical past investigation could mix
+    facts that don't apply to the user's actual context.
 
-### HyDE: embed a hypothetical answer, not the question
+**Cost-benefit.** An extra haiku call adds ~$0.0003 and ~50ms. On a corpus
+of ~100 items, the recall lift is likely small (cosine search already
+covers most of the space). On a corpus of ~100k items, the lift is
+real because the search is more targeted.
 
-The sharpest trick. Questions and answers occupy different regions of embedding space — a question embeds near other questions. HyDE (Hypothetical Document Embeddings) asks a cheap model to *write a fake answer* to the question, then embeds *that* and retrieves with it. The fake answer is wrong in its specifics but right in its *shape and vocabulary*, so it lands near the real answer documents.
+**Hypothetical implementation:**
 
-```
-  question "why are users churning?"
-       │
-   model writes a HYPOTHETICAL answer:
-   "Users churn when onboarding friction rises and the
-    activation event fires less often after signup..."
-       │
-   embed the hypothetical answer (NOT the question)
-       │
-   retrieve ──▶ lands near REAL answer documents
-                (answers look like answers)
-```
-
-The hypothetical answer is discarded after embedding; only its vector is used. HyDE costs one extra cheap generation per query and reliably lifts recall when question/answer vocabulary diverges.
-
-### The codebase's query-understanding analog
-
-This system does query *understanding* — the sibling of query rewriting — without doing retrieval-query rewriting. The intent classifier is a query *classifier*; the agent then translates the question into EQL / tool args. That is reshaping the user's words into the engine's input form — exactly the spirit of query rewriting, applied to an exact analytics engine (EQL) rather than to embedding retrieval. The difference: EQL translation produces an *exact* query (the schema names are known), so there is no vocabulary-gap recall problem to close — the rewriting levers (expand/HyDE) matter for *fuzzy* retrieval, which the codebase does not yet do.
-
-### The principle
-
-Retrieval is only as good as the query handed to it, so transform the query to match the documents *before* retrieving — close the vocabulary gap with expansion, the compound-question problem with decomposition, and the question-vs-answer gap with HyDE's hypothetical answer. It is input normalization for the retrieval stage: the same reason you sanitize a form field before using it, applied to the question before it hits the index.
-
----
-
-### Code in this codebase
-
-**Not yet implemented (retrieval-query rewriting).** blooming insights retrieves live via exact EQL — where the query is translated, not rewritten-for-recall — and has no embedding retrieval whose query would need expansion or HyDE.
-
-The honest analog is real and present: blooming insights does *query understanding*, the sibling discipline. `classifyIntent` (`lib/agents/intent.ts` L17–L31) classifies the free-form `?q=` into an intent with a cheap haiku call (`max_tokens: 16`), preceded by the pure `parseIntent` substring heuristic (L6–L12). Then the agent translates the natural-language question into structured EQL and tool arguments — reshaping the user's words into the engine's consumable form. That translation is query-rewriting-adjacent: it transforms the question before retrieval. The difference is that EQL is *exact* (schema names are known), so there is no vocabulary-gap recall problem the expand/HyDE levers exist to solve. Those levers would live in a `lib/mcp/retrieval.ts` if fuzzy retrieval over past investigations is added. The `Project exercises` block below is the primary buildable target.
-
----
-
-## Query rewriting & HyDE — diagram
-
-This diagram spans the Service layer (the rewrite step before retrieval). A reader who sees only this should grasp that the raw question is transformed into a better retrieval query before the index is touched.
-
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│  SERVICE LAYER  (would live in lib/mcp/retrieval.ts / lib/agents/)  │
-│                                                                      │
-│  CURRENT (query understanding, exact):                              │
-│    raw q ──▶ .trim() (route) ──▶ classifyIntent (haiku) ──▶ intent  │
-│           ──▶ agent translates to EQL/tool args (exact query)       │
-│                                                                      │
-│  PROPOSED (query rewriting, fuzzy retrieval):                       │
-│    raw q                                                            │
-│      ├─▶ EXPAND (synonyms/context)  ─┐                              │
-│      ├─▶ DECOMPOSE (sub-queries)    ─┤─▶ better retrieval query(s)  │
-│      └─▶ HyDE (hypothetical answer) ─┘        │                     │
-│                                               ▼                     │
-│                                        embed + retrieve (01/05/06)  │
-└──────────────────────────────────────────────────────────────────────┘
+```typescript
+// lib/rag/rewrite.ts (Case B)
+async function rewriteQuery(rawQuery: string): Promise<string> {
+  const response = await anthropic.messages.create({
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 200,
+    system: 'Rewrite the user query into a longer, more specific search query that would match documentation about the topic.',
+    messages: [{ role: 'user', content: rawQuery }],
+  });
+  return response.content
+    .filter((c): c is Anthropic.Messages.TextBlock => c.type === 'text')
+    .map(c => c.text)
+    .join(' ');
+}
 ```
 
-The current path produces an exact EQL query; the proposed path reshapes a fuzzy question for embedding retrieval. Both are query understanding; only the second is retrieval-query rewriting.
+### Move 3 — the principle
 
----
+**Bridge the query-document embedding gap by augmenting the query, not
+the corpus.** Rewriting and HyDE are both cheap (one extra small LLM
+call) and don't require re-embedding anything. Reach for them when
+recall on short queries is the bottleneck.
+
+## Primary diagram
+
+```
+  Query rewriting vs HyDE — same goal, two paths
+
+  ┌─ Rewriting ────────────────────────────────┐
+  │  short query → LLM rewrites to be longer/  │
+  │  more specific → embed rewrite → search    │
+  │                                             │
+  │  preserves query INTENT                     │
+  │  pads with retrieval-friendly terms        │
+  └─────────────────────────────────────────────┘
+
+  ┌─ HyDE ─────────────────────────────────────┐
+  │  short query → LLM generates HYPOTHETICAL  │
+  │  answer → embed the hypothetical → search  │
+  │                                             │
+  │  matches doc-shape (long, descriptive)     │
+  │  RISK: hypothetical may invent facts        │
+  └─────────────────────────────────────────────┘
+```
 
 ## Elaborate
 
-### Where this pattern comes from
+The HyDE pattern was introduced in "Precise Zero-Shot Dense Retrieval
+without Relevance Labels" (Gao et al., 2022). The clever bit: even when
+the hypothetical answer is partially wrong, its *embedding* still lands
+in the right neighborhood for retrieval. The wrongness gets corrected by
+the actual retrieved doc.
 
-Query rewriting is older than RAG — query expansion (adding synonyms via thesauri or pseudo-relevance feedback) is a 1970s IR technique. The LLM era added two things: cheap generative rewriting (a small model expands or decomposes for pennies) and HyDE (Gao et al., 2022), which exploited the question-vs-answer embedding gap by generating a hypothetical document. Multi-query retrieval (generate several paraphrases, retrieve each, fuse) and step-back prompting (rewrite to a more general question first) are recent variants. All share one premise: spend a cheap generation to improve the query before paying for retrieval.
+Query rewriting is the older pattern (predates LLMs as
+synonym-expansion). With LLMs the rewriting can be much smarter —
+adding implicit terms, expanding acronyms, normalizing phrasing.
 
-### The deeper principle
-
-```
-  problem                       rewriting lever        cost
-  ──────────────────────────    ────────────────────   ──────────────
-  vocabulary mismatch           expansion              1 cheap gen
-  compound question             decomposition + fuse    1 gen + N retrievals
-  question ≠ answer space       HyDE (hypothetical)     1 cheap gen
-  ambiguous intent              classification          1 cheap gen (codebase HAS this)
-```
-
-Each lever spends a small, cheap model call to make the expensive retrieval more accurate — the same heuristic-then-LLM economy the codebase applies with `parseIntent` before `classifyIntent`. Query understanding (classify) and query rewriting (transform) are two faces of "fix the input before you act on it."
-
-### Where this breaks down
-
-1. **Expansion can hurt precision.** Adding too many synonyms pulls in loosely-related documents, lowering precision to raise recall. The expansion must be bounded and topical, not a thesaurus dump.
-
-2. **HyDE can hallucinate the wrong shape.** If the cheap model writes a hypothetical answer about the wrong topic (misreads the question), its embedding lands near the wrong documents — a confident retrieval of irrelevant results. HyDE inherits the generator's mistakes.
-
-3. **Rewriting adds latency and a failure point.** Every lever is an extra model call before retrieval. For exact queries (EQL) it is pure overhead — there is no recall gap to close, so rewriting would only add latency and risk mistranslation.
-
-### What to explore next
-
-- **Tool routing** (`../04-agents-and-tool-use/04-tool-routing.md`): `classifyIntent` is the query-understanding the codebase already ships.
-- **Hybrid retrieval** (`06-hybrid-retrieval-rrf.md`): decomposed sub-queries are typically fused with RRF.
-- **HyDE and multi-query retrieval:** the generative-rewriting techniques to evaluate when fuzzy retrieval exists.
-
-### Honest security note
-
-The free-form `?q=` is only `.trim()`'d (route) and passed straight to the model as `userPrompt` (`lib/agents/query.ts`), with no prompt-injection sanitization. Query rewriting is *not* input sanitization — a HyDE generator fed a malicious query inherits the injection. Rewriting improves recall; it does not harden the input. (See the production-serving security file for the injection treatment.)
-
----
+In production, the choice between them is often empirical. Rewriting
+tends to be safer (preserves intent); HyDE tends to be more powerful
+(matches document shape). Some systems use both.
 
 ## Project exercises
 
-### Add HyDE-based retrieval for past-investigation search
+### Exercise — A/B test rewriting on the labeled fixture set
 
-- **Exercise ID:** B2B.5 (adapted) — the primary buildable target.
-- **What to build:** for the fuzzy "find similar past investigations" query, generate a hypothetical answer with a cheap model (haiku tier, like `classifyIntent`), embed *that* instead of the raw question, and retrieve. Compare recall against embedding the raw question.
-- **Why it earns its place:** demonstrates you understand the question-vs-answer embedding gap and the cheap-generation-improves-retrieval economy — and that you apply it to fuzzy retrieval, not exact EQL.
-- **Files to touch:** new `lib/mcp/retrieval.ts` (`hydeSearch`), `lib/agents/intent.ts` (reuse the haiku-tier model), `lib/mcp/embeddings.ts`, new `test/mcp/retrieval.test.ts`.
-- **Done when:** a question phrased in user vocabulary retrieves a past investigation phrased differently that the raw-question embedding missed, with a measured recall improvement.
-- **Estimated effort:** 1–2 days
-
-### Add query decomposition for compound questions, fused with RRF
-
-- **Exercise ID:** C2.8 (adapted) — decomposition.
-- **What to build:** detect a compound `?q=` ("why did X drop and what should we do?"), split it into sub-queries with a cheap model, retrieve each over the investigation corpus, and fuse with RRF (`06`). Mirror the existing intent-routing split at the retrieval-query level.
-- **Why it earns its place:** shows you handle multi-part questions by decompose-retrieve-fuse rather than one muddled retrieval, connecting query rewriting to fusion.
-- **Files to touch:** `lib/mcp/retrieval.ts` (`decomposeAndRetrieve`), `lib/agents/intent.ts` (the split prompt), `lib/mcp/retrieval.ts` (`rrfFuse` from `06`), `test/mcp/retrieval.test.ts`.
-- **Done when:** a two-part question retrieves clean candidates for each part and fuses them, outperforming a single retrieval of the raw compound query.
-- **Estimated effort:** 1–2 days
-
----
+  → **Exercise ID:** `study-ai-eng-03-08.1`
+  → **What to build:** Add `lib/rag/rewrite.ts` with an LLM rewrite
+    function. Run recall@5 on the labeled fixture (from exercise 07.1)
+    with and without rewriting. If lift > 5pp, ship it; if not, don't.
+  → **Why it earns its place:** Demonstrates "I don't ship retrieval
+    enhancements without measuring." Empirical, not hopeful.
+  → **Files to touch:** new `lib/rag/rewrite.ts`, `test/rag/recall.test.ts`
+    (add A/B comparison).
+  → **Done when:** Recall numbers documented; ship/skip decision made
+    based on measurement.
+  → **Estimated effort:** `1–4hr`
 
 ## Interview defense
 
-### What an interviewer is really asking
+**Q: Have you used query rewriting or HyDE?**
 
-"How do you improve retrieval when the user's words don't match the documents?" tests whether you fix the *query* before reaching for a better retriever. The senior signal is naming expansion/decomposition/HyDE, explaining the question-vs-answer embedding gap, and distinguishing query *understanding* (classify/translate, which the codebase does) from retrieval-query *rewriting* (which it does not, because EQL is exact).
+Not in this codebase — there's no RAG to put it in front of. The
+patterns are: rewriting (LLM expands a short query into a longer
+retrieval-friendly one); HyDE (LLM generates a hypothetical answer, you
+embed *that* and search for similar real docs). Both add one cheap LLM
+call before retrieval; both earn their place when short-query recall is
+the bottleneck.
 
-### Likely questions
+For this codebase's hypothetical diagnosis-grounding RAG, rewriting
+might help on user-typed free-form queries; HyDE is probably overkill
+because the corpus is small and the bias-toward-doc-shape problem only
+shows up at scale.
 
-**[mid] What is HyDE and why does it help?**
+**Anchor line:** "Bridge the query-document embedding gap by augmenting
+the query, not the corpus. Cheap, no re-embedding needed."
 
-HyDE generates a hypothetical *answer* to the question and embeds that instead of the question. Questions embed near other questions; answers embed near real answer documents. So the hypothetical-answer vector lands closer to the documents that actually answer the query, raising recall. The fake answer is discarded after embedding.
+**Q: Why does HyDE work even when the hypothetical is wrong?**
 
-```
-embed(question) → near other questions
-embed(hypothetical answer) → near real answers ✓
-```
-
-**[senior] When is query rewriting pure overhead?**
-
-When the query is already exact. blooming insights translates `?q=` into EQL with known schema names — there is no vocabulary gap to close, so expansion or HyDE would add a generation, latency, and a mistranslation risk for zero recall gain. Rewriting belongs to fuzzy embedding retrieval, not exact structured querying.
-
-```
-exact EQL query → rewriting = overhead
-fuzzy embedding query → rewriting closes the recall gap
-```
-
-**[arch] How does decomposition relate to what the codebase already does?**
-
-`classifyIntent` already splits a question into one intent (diagnostic/recommendation). A compound question is conceptually two intents; decomposition is that split at the *retrieval-query* level — break "why did X drop and what to do" into two sub-queries, retrieve each, fuse with RRF. Same "split the input" instinct, applied to retrieval.
-
-```
-classifyIntent: question → one intent
-decomposition: question → sub-queries → retrieve each → RRF fuse
-```
-
-### The question candidates always dodge
-
-**"Doesn't rewriting the query risk changing what the user asked?"** Yes — and it is the real cost. Expansion can pull in off-topic synonyms; HyDE can hallucinate the wrong topic and confidently retrieve irrelevant documents; decomposition can split a question wrong. Every lever inherits the cheap generator's mistakes. Naming this — that rewriting trades a recall gain for a mistranslation risk — is the senior signal, not blind enthusiasm for HyDE.
-
-### One-line anchors
-
-- `lib/agents/intent.ts` L17–L31 — `classifyIntent`: the query understanding the codebase ships (classify, not rewrite).
-- `lib/agents/intent.ts` L6–L12 — `parseIntent`: substring heuristic before the cheap classifier.
-- HyDE embeds a hypothetical *answer*; questions embed near questions, answers near answers.
-- EQL is exact — no vocabulary gap, so retrieval-query rewriting is overhead.
-- Rewriting is not sanitization — it inherits any prompt injection in the raw query.
-
----
+The hypothetical answer's *embedding* still lands in the right
+neighborhood semantically, even when specific facts are wrong. You're
+retrieving real docs whose embeddings are close to the hypothetical;
+the wrongness gets corrected by what you actually retrieve. It's
+counter-intuitive but it's the empirical finding from the HyDE paper.
 
 ## See also
 
-→ 01-embeddings.md · → 05-dense-vs-sparse.md · → 06-hybrid-retrieval-rrf.md · → ../04-agents-and-tool-use/04-tool-routing.md
+  → `01-embeddings.md` — the bias-toward-training-distribution that this fixes
+  → `11-rag.md` — the pipeline this sits in front of

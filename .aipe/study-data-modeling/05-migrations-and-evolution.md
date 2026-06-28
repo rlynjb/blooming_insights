@@ -1,149 +1,158 @@
-# Migrations and evolution
+# 05 — Migrations and evolution
 
-**Industry name(s):** Schema migrations · evolution · backwards compatibility · forward-compatible reads · prompt versioning as schema-as-code · rebuild-from-seed (in lieu of migrations)
-**Type:** Industry standard · Language-agnostic
-
-> **The agent contract still evolves softly; the Olist DB evolves by destructive rebuild.** Four axes now. (1) The TypeScript interfaces in `lib/mcp/types.ts` evolve through git diffs with an explicit "add as optional" policy. (2) The agent prompts in `lib/agents/prompts/*.md` are the de-facto schema for what each agent emits, versioned through git. (3) The demo seed JSONs (`lib/state/demo-*.json`) are stored snapshots that have to still validate against the current `Insight` interface — solved by the "all enrichments optional" rule. (4) **NEW: the Olist SQLite schema** lives in `mcp-server-olist/scripts/seed-olist.ts` as a string constant (`SCHEMA_SQL`) and "migrations" are achieved by `unlinkSync(DB_PATH) + recreate`. There's no `ALTER TABLE`, no `up/down`, no rollback — because the DB is a deterministic synthetic dataset (`mulberry32(seed=42)`, file 09), drop-and-reseed gives byte-identical data every time. That's a legitimate "no migrations needed" design choice, NOT a gap. The day the DB starts accepting writes from real users, it stops being legitimate.
-
----
+**Additive schema change / optional-field discipline · Industry standard**
 
 ## Zoom out, then zoom in
 
-**Zoom out — the bigger picture.** Three things evolve in this repo, none of them with formal migration tooling. The TypeScript interfaces evolve through git. The markdown agent prompts evolve through git. The committed demo-seed JSON evolves through manual re-capture (`scripts/capture-demo.ts`). The integrity gate that lets all three evolve without breaking each other is the "optional fields everywhere" policy: every Tier-1 enrichment in `Insight`, every newer field in `Anomaly`, and every optional field in `Recommendation` is marked `?` so older snapshots and older agent outputs still validate against the current types.
+The classical question — *how do schema changes ship safely under live
+data?* — usually means `CREATE TABLE`, `ALTER TABLE ADD COLUMN`, a
+backfill job, a feature flag. In **blooming_insights** there's no DB and
+no live persistent data, so the analog migration concern is:
+**how do the TypeScript types evolve without breaking older snapshots,
+older agent outputs, or the demo replay?**
 
 ```
-  Zoom out — what evolves, where
+  Zoom out — where "schema change" actually happens
 
-  ┌─ Spec band (the requirements doc) ────────────────────────┐
-  │  blooming-insights-spec.md                                  │
-  │  Recommendation defined TWICE (older + richer)              │
-  │  the code chose; the comment names the choice (types.ts L114)│
-  └──────────────────────────┬────────────────────────────────┘
-                             │
-  ┌─ Schema band (TypeScript interfaces) ──▼──────────────────┐
-  │  lib/mcp/types.ts                                          │
-  │  policy: "add as optional, never remove or rename"          │
-  │  enforces: backwards-compat reads (old JSON still parses)   │
-  └──────────────────────────┬────────────────────────────────┘
-                             │ guards re-check at LLM seam
-  ┌─ Prompt band (the agent schemas) ──────▼──────────────────┐
-  │  lib/agents/prompts/{monitoring,diagnostic,recommendation,query}.md│
-  │  these ARE the schema for what each agent emits             │
-  │  versioned through git, no codegen, hand-aligned with types │
-  └──────────────────────────┬────────────────────────────────┘
-                             │ produces JSON validated by validate.ts
-  ┌─ Stored snapshot band (committed demo JSON) ──▼───────────┐
-  │  lib/state/demo-insights.json (~12KB, 12 insights)          │
-  │  lib/state/demo-investigations.json                         │
-  │  treated as "live data under migration" — must validate     │
-  │  against the current Insight/Investigation shape            │
-  └────────────────────────────────────────────────────────────┘
+  ┌─ Type system (source of truth) ──────────────────────────────────┐
+  │  lib/mcp/types.ts                                                 │
+  │  lib/mcp/schema.ts (WorkspaceSchema)                              │
+  │  lib/mcp/events.ts (AgentEvent union)                             │
+  └──────────────────────┬───────────────────────────────────────────┘
+                         │  any new field flows three places
+            ┌────────────┼────────────────────┐
+            ▼            ▼                    ▼
+  ┌─ Agent output ─┐  ┌─ Runtime ─────┐  ┌─ Committed JSON ─────┐
+  │  prompts emit  │  │  validators   │  │  demo-insights.json   │
+  │  new field     │  │  in           │  │  demo-investigations  │
+  │                │  │  validate.ts  │  │  must still parse     │
+  └────────────────┘  └───────────────┘  └───────────────────────┘
+                                              ★ THIS CONCEPT ★ ← we are here
 ```
 
-**Zoom in — narrow to the concept.** The question this concept answers: when a shape changes, what has to stay working? In a relational world, the answer is the existing rows in the table, the existing application code, and the existing reports/dashboards. Here, the answer is the existing demo snapshot (`demo-insights.json` was captured weeks ago), the existing agent prompts (the LLM might still emit older shapes), and the existing UI render code (which expects optional fields to maybe-be-absent). The migration story is **always-additive, always-optional**.
+Zoom in. There are no SQL migrations because there's no SQL. But every
+type change has three consumers — the agent prompts that emit values, the
+validators that accept values, the committed JSON snapshots that already
+hold old values. The migration story is the discipline that keeps the
+three in sync without an `ALTER TABLE` to lean on.
+
+The verdict up front: **the codebase has exactly one migration
+strategy — every new field is optional.** It works because the consumers
+all gracefully handle missing fields. It's about to be tested as the type
+grows; see the audit for the test that would lock it in.
 
 ---
 
-## Structure pass
-
-**Layers.** Same four-layer stack. The interesting layer is the **agent loop band**, where the prompts double as schema-as-code.
-
-**Axis: backwards compatibility.** For each change, which already-shipped artifacts have to keep working? This is the right axis because evolution is *literally* about not-breaking-the-old. Cost is wrong (most changes are free); failure is wrong (most changes don't fail loudly — they fail silently in the old data). Backwards compatibility is the discriminator: if a change keeps the demo seed validating and old agent outputs validating, it's safe; if it doesn't, you have a migration.
-
-**Seams.** Three matter. **Seam 1: spec ↔ code.** The spec is markdown; the code is TypeScript. They can drift (and have — see the dual `Recommendation` definitions). Reconciliation is manual, with a comment in the code naming the chosen shape. **Seam 2: types ↔ stored data.** The demo JSON has to validate against the current `Insight` interface. The "all enrichments optional" rule is what makes this work. **Seam 3: prompts ↔ types.** The agent prompts say "emit this JSON shape"; the validators check that shape; the types declare it. Three places, one schema, manually kept in sync.
+## Structure pass — the axis is "what breaks if I add or remove this field?"
 
 ```
-  Structure pass — backwards compatibility across seams
+  Trace ONE axis — "what breaks?" — across three consumers
 
-  ┌─ 1. LAYERS ──────────────────────────────────────────────┐
-  │  Spec · TypeScript types · Prompts · Stored snapshots     │
-  └─────────────────────────────┬────────────────────────────┘
-                                │  pick the axis
-  ┌─ 2. AXIS ──────────────────▼─────────────────────────────┐
-  │  backwards compatibility: does this change keep already-  │
-  │  shipped artifacts (demo, old agent outputs) working?     │
-  └─────────────────────────────┬────────────────────────────┘
-                                │  trace across seams
-  ┌─ 3. SEAMS ─────────────────▼─────────────────────────────┐
-  │  S1: spec ↔ code        ★ MANUAL, drift visible (comment) │
-  │  S2: types ↔ stored data ★ ENFORCED ("add as optional")   │
-  │  S3: prompts ↔ types    ★ MANUAL, three-place sync        │
-  └─────────────────────────────┬────────────────────────────┘
-                                ▼
-                        Block 4 — How it works
+  for any field change on, say, Insight:
+
+  ┌─ consumer 1: agent prompt ─────────────────────┐
+  │  emits a field that the agent generates        │
+  │  ADD optional   → no break (won't emit, fine)  │
+  │  ADD required   → BREAKS (validator rejects)   │
+  │  REMOVE field   → no break (no longer emitted) │
+  └─────────────────────────────────────────────────┘
+  ┌─ consumer 2: validate.ts ──────────────────────┐
+  │  checks shape of LLM output                    │
+  │  ADD optional   → no break                     │
+  │  ADD required   → BREAKS old agent runs        │
+  │  REMOVE field   → no break (no longer checked) │
+  └─────────────────────────────────────────────────┘
+  ┌─ consumer 3: committed demo JSON ──────────────┐
+  │  frozen snapshots that must still validate     │
+  │  ADD optional   → no break                     │
+  │  ADD required   → BREAKS demo replay           │
+  │  REMOVE field   → no break (extra field okay)  │
+  └─────────────────────────────────────────────────┘
+
+  → the axis collapses to one rule:
+    every additive change MUST be optional, until a recapture+commit
+    makes it safe to promote to required.
 ```
+
+The seam: the demo JSON commits are the **frozen substrate** of the
+migration story. They're the equivalent of "live data in production" —
+old shapes that the new code must still read.
 
 ---
 
 ## How it works
 
-### Move 1 — the migration shape, in this repo
+### Move 1 — the mental model
 
-You know how a Rails migration is "an `up` and a `down`, run in sequence against a versioned database"? None of that exists here. What does exist is a softer pattern: **schema evolves through git, and the "live data" you have to keep validating against is committed alongside the schema** (the demo JSON). The migration story is therefore:
-
-```
-  the evolution pattern — three places, one policy
-
-         (1) add the field
-                │
-                ▼
-  ┌─ lib/mcp/types.ts ────────────────┐
-  │ interface Insight {                │   ALWAYS optional: `?` marker
-  │   ...existing required fields,    │   ALWAYS additive: never remove
-  │   newField?: NewType;             │   ALWAYS named explicitly: no
-  │ }                                  │   `extends BaseInsight` shortcuts
-  └────────────────────────────────────┘
-                │
-                ▼
-  ┌─ lib/agents/prompts/*.md ─────────┐
-  │ Update the Output section to       │   the agent learns to emit
-  │ describe newField (when to emit,   │   the new field; OLD agent runs
-  │ what it means)                     │   are still valid (field absent)
-  └────────────────────────────────────┘
-                │
-                ▼
-  ┌─ lib/mcp/validate.ts ─────────────┐
-  │ Optionally add a guard check,      │   USUALLY skipped (optionals
-  │ but only for required-required-   │   aren't validated at the seam;
-  │ for-rendering fields              │   the UI handles absent gracefully)
-  └────────────────────────────────────┘
-                │
-                ▼
-  ┌─ lib/state/demo-*.json ───────────┐
-  │ Old snapshots still validate       │   no migration needed; the
-  │ because the field is optional      │   "always optional" rule
-  │ (it just won't render that bit     │   makes evolution free
-  │  for old data)                     │
-  └────────────────────────────────────┘
-```
-
-The contrast with a relational migration is sharp:
+Think of it like adding a column to a Postgres table in production: you
+don't add it as `NOT NULL` immediately, because every existing row
+violates that constraint. You add it as nullable, backfill, then promote
+to `NOT NULL` once every row has a value. Same idea here, but the
+"existing rows" are committed JSON snapshots and the "column" is a
+TypeScript field.
 
 ```
-  RELATIONAL                             THIS REPO
-  ────────────────────────────           ──────────────────────────────
-  ALTER TABLE insights                   add `newField?: T` to interface
-    ADD COLUMN newField TEXT;            (optional)
+  The additive-only migration pattern
 
-  UPDATE insights                        no backfill — old rows stay
-    SET newField = ... WHERE ...;         absent; UI handles absent
-
-  reversible? yes, via DOWN              reversible? yes, via git revert
-  zero-downtime? requires care            zero-downtime? trivially —
-  (NOT NULL needs a default)             optionals are always safe
-
-  rollout: deploy migration,              rollout: deploy the code; the
-  then deploy code that uses it           agent gradually emits the field
-                                          on new runs; old data is fine
+  ┌─ phase 1: add field as optional ─────────────────────┐
+  │  field?: T   (interface)                              │
+  │  validator does NOT check field                       │
+  │  agent prompt MAY emit field                          │
+  │  UI checks `if (insight.field) { render }`            │
+  │                                                       │
+  │  → old snapshots still parse                          │
+  │  → new snapshots optionally carry the field           │
+  └─────────────────┬─────────────────────────────────────┘
+                    │ (later, optional)
+                    ▼
+  ┌─ phase 2: capture fresh demo snapshot ───────────────┐
+  │  one-click capture in dev runs the live agents and    │
+  │  writes lib/state/demo-*.json with the new field      │
+  │  populated                                            │
+  │                                                       │
+  │  → demo snapshot now exercises the new field          │
+  └─────────────────┬─────────────────────────────────────┘
+                    │ (rarely, only after every consumer
+                    │  reliably emits + uses the field)
+                    ▼
+  ┌─ phase 3: promote to required ───────────────────────┐
+  │  field: T (no `?`)                                    │
+  │  validator now requires it                            │
+  │  UI removes the `if (field)` guard                    │
+  │  any older snapshot would now fail validation         │
+  │                                                       │
+  │  → in practice this codebase has NEVER promoted a     │
+  │    field — every business-owner enrichment lives as   │
+  │    optional. The promotion step is buildable target,  │
+  │    not current state.                                 │
+  └───────────────────────────────────────────────────────┘
 ```
 
-### Move 2 — the optional-field policy
+Phase 3 hasn't happened yet for any of the enrichment fields
+(`revenueImpact`, `aov`, `funnel`, `affectedCustomers`, `history`, …).
+They've all stayed optional. The current state is "every enrichment is
+phase 1 forever," which is conservative but safe.
 
-The comment at `lib/mcp/types.ts` L54 names the policy explicitly:
+### Move 2 — the evolution mechanisms, one at a time
 
-```
-  the policy, in the codebase's own words
+#### **Mechanism 1: optional-field-only additions to interfaces**
 
+Open `lib/mcp/types.ts:36-62` and look at the `Insight` interface. The
+required fields are tiny — `id`, `timestamp`, `severity`, `headline`,
+`summary`, `metric`, `change`, `scope`, `source`. Everything below
+`source: 'monitoring' | 'query'` is optional and labeled with a comment
+explaining its provenance:
+
+```typescript
+// lib/mcp/types.ts:47-62 (annotated)
+  source: 'monitoring' | 'query';
+  // how this insight was found: the tool(s) the monitoring agent used and their
+  // result (e.g. { current, prior }). Optional — older snapshots lack it.
+  evidence?: { tool: string; result: unknown }[];
+  // one-sentence business impact, written by the monitoring agent (why this
+  // change matters for the business). Optional — older snapshots lack it, so
+  // the UI falls back to a derived explanation.
+  impact?: string;
   // ── business-owner enrichments (Tier 1). All optional + derived from the
   //    existing evidence, so older snapshots still validate and render. ──
   revenueImpact?: { lostUsd: number; expectedUsd: number; currency: 'USD' };
@@ -152,388 +161,428 @@ The comment at `lib/mcp/types.ts` L54 names the policy explicitly:
   affectedCustomers?: number;
   history?: number[];
   downstreamReady?: { diagnosis: boolean; recommendations: number };
-
-  the two halves matter:
-    1. "All optional"             — older snapshots still validate
-    2. "derived from the existing  — even the new fields are computable
-        evidence"                    from already-stored evidence; you
-                                     can re-derive them for old rows if
-                                     a downstream consumer needs them
+  category?: CategoryId;
 ```
 
-This is the **forward-compatible read** pattern. New writers might emit the field; old writers don't; both kinds of data round-trip through the same validator. The cost: the UI has to handle "field might be absent" everywhere. That cost is bounded — the UI is rendering one shape with consistent fallbacks.
+The comment above each tranche is the migration changelog. It tells the
+next reader: this field was added later, older snapshots don't have it,
+the UI has a fallback. No commit history needed — the type *itself*
+documents its evolution.
 
-### Move 2 — the dual-spec Recommendation as a worked example
+This is the entire migration toolkit. Three lines of comment, one `?` per
+field. No SQL, no migration runner, no rollback script.
 
-The spec at `blooming-insights-spec.md` contains **two different `Recommendation` definitions** — one in the "data model" section, one in the "recommendation agent" section. The code in `lib/mcp/types.ts` L114–L130 picks the richer one and names the choice in a comment:
+#### **Mechanism 2: discriminated union with both old and new shapes**
 
-```
-  the migration trace — when the spec drifts and the code has to pick
+The hardest field to evolve was `estimatedImpact` on `Recommendation`.
+Old snapshots had it as a *string* ("+$15K MRR"); the new shape is an
+*object* ({ range, rangeUsd?, assumption }). Adding a new optional field
+wouldn't work — the *type itself* needed two shapes.
 
-  blooming-insights-spec.md
-    "data model" section:
-      Recommendation { title, rationale, bloomreachFeature, ... }
-
-    "recommendation agent" section:
-      Recommendation { id, title, rationale, bloomreachFeature: 5-member union,
-                       steps[], estimatedImpact, confidence, ... }
-
-                          ↓ which one wins?
-
-  lib/mcp/types.ts L113–L114:
-    // CANONICAL Recommendation shape. NOTE: the spec contains TWO different
-    // Recommendation definitions (one in "data model", one in "recommendation
-    // agent"). Use this RICHER one ... everywhere — it has `id`, `steps`, and
-    // the 5-member `bloomreachFeature` union.
-
-                          ↓ the implication
-
-  if someone updates the spec, the comment is the only signal that:
-    (a) the spec divergence is known
-    (b) the code already made a deliberate choice
-    (c) the spec's "data model" section is stale
-
-  this is a soft-migration: the code is the truth; the spec is a stale draft;
-  the comment carries the migration receipt.
+```typescript
+// lib/mcp/types.ts:108-110
+export type EstimatedImpact =
+  | string
+  | { range: string; rangeUsd?: { low: number; high: number }; assumption: string };
 ```
 
-What breaks without the comment: a future contributor reads the spec, sees the simpler shape, "fixes" the code to match, and breaks every consumer that uses `steps`, `id`, or the 5-member union. The comment is the **migration documentation in lieu of formal versioning**. It works because the spec is for one reader (Rein) and the codebase is small; at team scale it doesn't.
+This is a **discriminated union by structure** — at runtime,
+`typeof e === 'string'` tells you which variant. The helper functions
+normalize both shapes for the UI:
 
-### Move 2 — the prompts ARE the schema (for what each agent emits)
-
-The four prompt files (`lib/agents/prompts/{monitoring,diagnostic,recommendation,query}.md`) end with an `## Output` section that *literally specifies the JSON shape*. Example from `monitoring.md` L70–L98:
+```typescript
+// lib/insights/derive.ts:3-9
+export function impactRange(e: EstimatedImpact): string {
+  return typeof e === 'string' ? e : e.range;
+}
+export function impactAssumption(e: EstimatedImpact): string | null {
+  return typeof e === 'string' ? null : (e.assumption?.trim() || null);
+}
+```
 
 ```
-  the prompt as schema-as-code (excerpt from monitoring.md)
+  Evolving a field that changed SHAPE, not just got new sub-fields
 
-  ## Output
+  before:  estimatedImpact: string             "+$15K MRR"
+                          │
+                          │ add fields without breaking old snapshots
+                          ▼
+  after:   estimatedImpact: string | { range, rangeUsd?, assumption }
+                                                  ▲
+                                                  │ new shape
+                                                  │
+                          old snapshots still validate (string branch)
+                          new agent output emits the object branch
+                          UI helpers normalize via impactRange/impactAssumption
+```
 
-  Return ONLY a JSON array of anomaly objects, at most 10 items, sorted by
-  severity ..., wrapped in a ```json fenced block. Each item:
+The validator handles the union:
 
-  [
-    {
-      "metric": "purchase_revenue",
-      "category": "revenue_drop",
-      "scope": ["global"],
-      "change": { "value": 18.5, "direction": "down", "baseline": "90d" },
-      "severity": "critical",
-      "impact": "...",
-      "evidence": [
-        { "tool": "execute_analytics_eql", "result": { "current": 42000, "prior": 51500 } }
-      ]
-    }
-  ]
+```typescript
+// lib/mcp/validate.ts:46-48
+const impactOk =
+  typeof x.estimatedImpact === 'string' ||
+  (!!x.estimatedImpact && typeof x.estimatedImpact === 'object' && typeof x.estimatedImpact.range === 'string');
+```
 
-  Field rules:
-  - `category` — REQUIRED. ...
-  - `metric` — short snake_case name ...
-  - `scope` — `["global"]` unless ...
+Both branches pass; only an entirely missing or wrong-typed value
+fails. The validator is the **migration gate** — as long as both old
+and new shapes pass, the code accepts both at the same time, indefinitely.
+
+This is the same pattern Postgres calls a "expand-contract migration":
+
+```
+  expand-contract analogy
+
+  Postgres migration:                  This codebase:
+  ────────────────────                 ───────────────
+  1. ADD COLUMN new_field NULL          1. estimatedImpact: string | { ... }
+  2. backfill: SET new_field = ...      2. agent prompt updated to emit new shape
+  3. (deploy app reading new_field)     3. UI helpers read both shapes
+  4. DROP COLUMN old_field              4. (never run — old shape kept forever)
+```
+
+The codebase stops at step 3. There's no step 4 because there's no need
+— keeping both shapes valid costs ~5 lines of validator + ~5 lines of
+helper, and removes the entire risk of an old snapshot breaking.
+
+#### **Mechanism 3: the demo JSON snapshot as the migration regression suite**
+
+Every type change has to keep `lib/state/demo-insights.json` (665 lines)
+and `lib/state/demo-investigations.json` (3,487 lines) parseable. These
+files are the equivalent of **"live data in production"** for migration
+testing — frozen real outputs that any change must continue to read.
+
+```
+  Demo JSON as the migration regression suite
+
+  ┌─ what the snapshots contain ──────────────────────────────────┐
+  │  demo-insights.json:                                          │
+  │    - 10+ Insight values from a real briefing                  │
+  │    - mix of severities, scopes, with/without evidence         │
+  │    - coverage report                                          │
+  │                                                               │
+  │  demo-investigations.json:                                    │
+  │    - AgentEvent[] for each demo insight                       │
+  │    - includes tool_call_start/end with substrate results      │
+  │    - includes diagnosis + recommendations events              │
+  └────────────────────────────────┬──────────────────────────────┘
+                                   │
+                                   │  every type change must keep
+                                   │  these parseable + renderable
+                                   ▼
+  ┌─ what the demo path exercises ────────────────────────────────┐
+  │  /?demo=cached → reads demo-insights.json directly             │
+  │  /investigate/[id] → reads demo-investigations.json by id      │
+  │                                                                │
+  │  if the JSON drifts from the type, the demo silently shows     │
+  │  empty fields (no crash) — and that's the WORST outcome,       │
+  │  because silent degradation hides regression                   │
+  └───────────────────────────────────────────────────────────────┘
+```
+
+The risk this leaves open: **adding a required field to `Insight` is
+not currently caught by any test.** TypeScript will refuse to compile new
+code that constructs an `Insight` without the field. But the JSON file
+is loaded with `JSON.parse` → `as Insight` (effectively), so it bypasses
+the compile-time check. The UI silently renders with the field undefined.
+
+The audit recommends a test like:
+
+```typescript
+// suggested: test/state/demo-snapshot.test.ts (not yet written)
+import demoInsights from '@/lib/state/demo-insights.json';
+import { isInsight } from '@/lib/mcp/validate';
+
+it('demo-insights.json conforms to current Insight shape', () => {
+  demoInsights.insights.forEach((i) => {
+    expect(isInsight(i)).toBe(true);
+  });
+});
+```
+
+(`isInsight` would need to be added to `validate.ts`; today only
+`isAnomalyArray`, `isDiagnosis`, `isRecommendationArray` exist.)
+
+#### **Mechanism 4: capture script as the data migration runner**
+
+When a new optional field starts being emitted by the agents, the demo
+snapshots become **stale** in the sense that they don't exercise the new
+field. The fix is the **dev-only one-click capture** (referenced in
+project context):
+
+```
+  Capture as the data-migration step
+
+  dev:                                        prod:
+  ─────                                       ─────
+  1. open app at /                            (no migration needed —
+  2. switch to live mode                       agents always run fresh)
+  3. click "capture this as demo"
+  4. live agents run a full briefing          
+  5. AgentEvent[] written to                  
+     lib/state/demo-*.json                    
+  6. commit the JSON                          
+  7. now /?demo=cached exercises the          
+     new field too                            
+```
+
+The capture step is the only "migration runner" in the codebase. It
+doesn't transform old data into new shape (no in-place migration); it
+*re-derives* a fresh snapshot from the substrate. This is the
+recomputability story showing up again — because every value can be
+recomputed from upstream, "migration" is just "recapture."
+
+#### **Mechanism 5: process-global cache invalidation (the latent bug)**
+
+One specific evolution risk worth calling out: the `WorkspaceSchema`
+cache in `lib/mcp/schema.ts:138` is **process-global**, not
+session-scoped:
+
+```typescript
+// lib/mcp/schema.ts:138-209 (relevant fragment)
+let cached: WorkspaceSchema | null = null;
+
+export async function bootstrapSchema(
+  dataSource: DataSource,
+  opts: BootstrapOpts = {},
+): Promise<WorkspaceSchema> {
+  if (cached) return cached;
   ...
+  cached = parseWorkspaceSchema({ ... });
+  return cached;
+}
 
-  this is THE schema for the Anomaly objects the monitoring agent emits.
-  it has to stay aligned with:
-    - lib/mcp/types.ts:    interface Anomaly
-    - lib/mcp/validate.ts: isAnomalyArray
-
-  there's no codegen. alignment is manual, enforced by:
-    - the runtime guard (which rejects shapes that don't match)
-    - the agent's repeated runs (a drift surfaces as empty briefings)
+export function _resetSchemaCache(): void {
+  cached = null;
+}
 ```
 
-When a field is added to `Anomaly`, the prompt's `## Output` section has to be updated too, otherwise the agent won't know to emit it. That's a three-place edit (types + validate + prompt), with the runtime guard as the only enforcement that the three agree. **The prompt is git-versioned the same way any other code file is**, which is the closest thing to "schema migration" the repo has.
-
-### Move 2 — the demo seeds as "live data"
-
-`lib/state/demo-insights.json` is a 12-insight snapshot captured by `scripts/capture-demo.ts`. It's checked in. It serves two purposes: (a) the offline demo when no MCP credentials are available, (b) the test fixture for the route handler. It was captured *weeks ago* against an *older shape* of the codebase.
-
-```
-  the demo seed as a "live data" stand-in
-
-  when:    captured 2026-05-28 (timestamp in the file)
-  by:      scripts/capture-demo.ts running a full agent loop
-  shape:   the Insight interface as of that date
-  used by: app/api/agent/route.ts (DEMO_FILE fallback)
-           app/api/briefing/route.ts (offline mode)
-           several tests in test/
-
-  what evolution looks like when the Insight interface changes:
-
-    case A — field added (optional)
-      ✓ the demo seed still validates (TypeScript accepts missing optional)
-      ✗ the demo seed doesn't show off the new field in the UI
-      → option 1: re-capture the demo (run scripts/capture-demo.ts)
-      → option 2: manually patch the JSON to add the new field
-      → option 3: ignore — the demo's old shape is fine for the offline mode
-
-    case B — field made required
-      ✗ the demo seed FAILS to validate
-      → must either re-capture or backfill the field on every existing row
-
-    case C — field renamed
-      ✗ the demo seed loses the value silently (old name not read)
-      → must re-capture or write a migration script
-
-  the policy "always add as optional" makes case A the only path that
-  actually happens. cases B and C aren't supported — there's no migration
-  tooling, and the seed is the only "live data" so a forward-incompatible
-  change would require a manual re-capture.
-```
-
-What breaks without this discipline: an incompatible rename ships, the demo route returns invalid data, the UI crashes when no MCP is available — i.e. exactly the kind of regression an integration test would normally catch, except there's no test that validates the demo seed against the current interface. The discipline is the test.
-
-### Move 2 — Olist's "migrations": drop-and-reseed (NEW 2026-06-16)
-
-The Olist DB's schema lives in `mcp-server-olist/scripts/seed-olist.ts` as the `SCHEMA_SQL` constant. To change the schema, you edit the string and run `npm run seed`. The seeder does:
+Today both adapters (Bloomreach with one project, synthetic with one
+fixed project) expose the same schema regardless of who's asking, so the
+process-global cache is fine. The day a user has **two Bloomreach
+workspaces** and switches between them in one Vercel warm instance, the
+second workspace sees the first's `WorkspaceSchema` until the next
+deploy. That's a multi-workspace evolution that the cache shape doesn't
+support.
 
 ```
-  the seed-as-migration pattern
+  the latent multi-workspace bug
 
-  1. compute DB_PATH                       (mcp-server-olist/data/olist.db)
-  2. if (existsSync(DB_PATH)) unlinkSync   ← destructive: delete the file
-  3. db = new Database(DB_PATH)             ← fresh empty file
-  4. db.exec(SCHEMA_SQL)                    ← create all tables + indexes
-  5. db.transaction(() => {                 ← all bulk inserts in one txn
-       insert customers, products,
-              orders, order_items,
-              payments, reviews,
-              seeded_anomalies
-     })()
-  6. (done — DB file is now identical across machines because
-      mulberry32(seed=42) is deterministic; see file 09)
+  user A connects to workspace W1
+       │
+       ▼
+  bootstrapSchema → cached = W1's schema
+       │
+       │  later, user B (same warm instance) connects to workspace W2
+       ▼
+  bootstrapSchema → returns CACHED W1, not W2 ← bug
+
+  fix: key the cache by projectId (or by sessionId).
+  not done today because the product is single-workspace per session.
 ```
 
-**What this gives:** zero migration tooling, zero `up/down` scripts, zero rollback story — and it's correct. Because the seed is deterministic, two developers running `npm run seed` end up with byte-identical DBs. Because the schema is destructive-rebuild, "what's the current schema?" is always `SCHEMA_SQL` — no schema-version table, no checking which migrations have applied.
-
-**What this only works because of:** the DB is **read-only at runtime** (only the seeder writes), and the data is **synthetic** (no real customer data to preserve). Both invariants are load-bearing. The moment either flips — the moment a tool starts writing, or the moment the data is real — drop-and-reseed becomes destructive in the bad sense. That's when Drizzle migrations or `node-pg-migrate` would have to land.
-
-**The contrast with the agent-contract side:**
-
-```
-  Agent-contract side               Olist DB side
-  ───────────────────────────       ────────────────────────────
-  evolves softly through git        evolves destructively
-  every new field is OPTIONAL       schema is a constant string
-  old snapshots still validate      no "old data" — reseed gives
-                                     the current shape every time
-  no migration tool needed          no migration tool needed
-   (because additive only)           (because deterministic + read-only)
-  forward-compatible reads          backwards compatibility is NIL
-                                     (a SCHEMA_SQL change wipes everything)
-```
-
-Both are legitimate "no migration tooling" stories — but for opposite reasons. The agent contract preserves old data by making every change additive. The Olist DB throws away old data by making the data regenerable. Two solutions to "we don't have migrations"; both work for the constraints they live under.
+The audit flags it. The fix is small (`Map<projectId, WorkspaceSchema>`),
+but it's not the current state — and the comment in the file would need
+updating to match.
 
 ### Move 3 — the principle
 
-Schema evolution is a question of who has to do what when the shape changes. In a relational system with live writers and durable customer data, the answer is "the DBA runs the migration, the app reads the new shape, old data gets backfilled or upcast at read time." Here, the answer splits two ways: the agent contract evolves by **add-only with optional fields** (existing data validates against the new shape automatically), and the Olist DB evolves by **deterministic-rebuild** (no existing data to preserve because the seed regenerates it). Both are "no migration tooling" — and both are right, for the constraints they hold. The day either invariant breaks (data becomes load-bearing for the agent side; the DB starts taking real writes), the soft story stops working.
+**Schema evolution without a migration tool requires three disciplines:**
 
-### Code in this codebase
+1. **Additive-only changes.** Every new field is optional. You never
+   remove a field; you let it stay forever even if no one emits it.
+2. **Both shapes valid at the same time.** When a field's *shape*
+   changes, the type becomes a union and stays a union — never a
+   replacement.
+3. **The frozen snapshots are the regression suite.** Old committed
+   JSON has to keep parsing and rendering. If you want stronger
+   enforcement, add a test that re-validates the JSON against the
+   current type.
 
-The repo anchors for the evolution policies Move 2 walked — the optional-field policy on the interface, the dual-spec resolution comment, the prompt as schema-as-code, and the committed snapshot under migration.
-
-#### The optional-field policy in the interface
-
-```
-lib/mcp/types.ts  (lines 36–62)
-
-  export interface Insight {
-    id: string;                       ← always present
-    timestamp: string;                ← always present
-    severity: Severity;
-    headline: string;
-    summary: string;
-    metric: string;
-    change: { ... };
-    scope: string[];
-    source: 'monitoring' | 'query';
-
-    // The 4 fields below were added LATER. All optional, so older
-    // demo snapshots (captured before they existed) still validate.
-    evidence?: { tool: string; result: unknown }[];
-    impact?: string;
-
-    // ── business-owner enrichments (Tier 1). All optional + derived from the
-    //    existing evidence, so older snapshots still validate and render. ──
-    revenueImpact?: { lostUsd: number; expectedUsd: number; currency: 'USD' };
-    aov?: { current: number; prior: number };
-    funnel?: { view: number; cart: number; checkout: number; purchase: number };
-    affectedCustomers?: number;
-    history?: number[];
-    downstreamReady?: { diagnosis: boolean; recommendations: number };
-    category?: CategoryId;
-  }
-       │
-       └─ the comment IS the migration policy. every new field is
-          optional. every reader of an Insight has to handle absent.
-          this is the entire migration story for the type itself.
-```
-
-#### The dual-spec resolution comment
-
-```
-lib/mcp/types.ts  (lines 113–116)
-
-  // CANONICAL Recommendation shape. NOTE: the spec contains TWO different
-  // Recommendation definitions (one in "data model", one in "recommendation agent").
-  // Use this RICHER one (the recommendation-agent version) everywhere — it has `id`,
-  // `steps`, and the 5-member `bloomreachFeature` union.
-  export interface Recommendation { ... }
-       │
-       └─ a literal migration-receipt-in-a-comment. tells any future
-          editor: the spec drifted, this is the chosen branch, don't
-          "correct" the code back to the simpler shape.
-```
-
-#### The prompt as schema-as-code
-
-```
-lib/agents/prompts/monitoring.md  (lines 70–98)
-
-  ## Output
-
-  Return ONLY a JSON array of anomaly objects, at most 10 items ...
-
-  [
-    {
-      "metric": "purchase_revenue",
-      "category": "revenue_drop",
-      "scope": ["global"],
-      "change": { "value": 18.5, "direction": "down", "baseline": "90d" },
-      "severity": "critical",
-      "impact": "...",
-      "evidence": [
-        { "tool": "execute_analytics_eql", "result": { "current": 42000, "prior": 51500 } }
-      ]
-    }
-  ]
-
-  Field rules:
-  - `category` — REQUIRED. the checklist `id` this anomaly belongs to ...
-  - `metric` — short snake_case name (e.g. `purchase_revenue`, ...).
-  - `scope` — `["global"]` unless you located the change in a specific segment/country.
-  - `change.value` — magnitude as a positive percentage; ...
-  ...
-       │
-       └─ THIS is what the agent learns the shape from. it has to stay
-          aligned with types.ts and validate.ts. there's no codegen,
-          no schema-derived prompt — it's hand-written markdown, edited
-          alongside the type. git is the migration tool.
-```
-
-#### The committed snapshot
-
-```
-lib/state/demo-insights.json  (12 insights, ~12KB, captured 2026-05-28)
-
-  {
-    "insights": [
-      {
-        "id": "35e00e48-cdb3-4caf-aa92-b8afcea95bae",
-        "timestamp": "2026-05-28T23:14:36.313Z",
-        "severity": "critical",
-        "headline": "global purchases_exceed_sessions · +109.5%",
-        ...
-        "evidence": [{ "tool": "execute_analytics_eql", "result": { ... } }],
-        "impact": "There are 21,570 purchases but only 10,296 session_start ...",
-        "downstreamReady": { "diagnosis": true, "recommendations": 3 }
-      },
-      ...
-    ]
-  }
-       │
-       └─ NOTE what's NOT in this row: `revenueImpact`, `aov`, `funnel`,
-          `affectedCustomers`, `history`, `category`. all of those are
-          optional fields the interface was extended with after the
-          capture. the JSON still validates today because each is `?`.
-          this is the "live data under migration" story in miniature.
-```
+The generalisation: every long-lived system eventually grows multiple
+generations of its own data. With a DB, migrations make this explicit
+(and dangerous when run wrong). Without a DB, the discipline is the
+same — *don't break old shapes* — but it's enforced by convention rather
+than by a migration runner. The convention works as long as someone
+notices when it breaks.
 
 ---
 
 ## Primary diagram
 
-Migration paths, recap.
+The full migration story in one frame.
 
 ```
-  Schema evolution — what changes how
+  Schema evolution map for blooming_insights
 
-  ┌─ ALWAYS-SAFE CHANGES (no migration needed) ──────────────┐
-  │                                                            │
-  │   add optional field to an interface                       │
-  │     types.ts: foo?: T          ← always allowed            │
-  │     old data: still validates  (field absent OK)           │
-  │     prompts:  agent learns when prompt updated             │
-  │     guards:   no change needed for optionals               │
-  │     demo:     still loads; just doesn't show new field     │
-  │                                                            │
-  └────────────────────────────────────────────────────────────┘
+  ┌─ TYPE CHANGE (source of truth) ──────────────────────────────────┐
+  │                                                                  │
+  │  edit lib/mcp/types.ts → add `newField?: T` to Insight           │
+  │  (or for shape change: `field: OldShape | NewShape`)             │
+  │                                                                  │
+  └────────────┬───────────────┬────────────────┬────────────────────┘
+               │               │                │
+   propagates to:              │                │
+               │               │                │
+  ┌────────────▼────┐  ┌───────▼────────┐  ┌────▼──────────────────┐
+  │ Agent prompt    │  │ validate.ts    │  │ Committed JSON         │
+  │                 │  │                │  │                        │
+  │ may emit field  │  │ check newField │  │ continues to parse —   │
+  │ MAY = optional  │  │ ONLY if you    │  │ field is `undefined`   │
+  │ now             │  │ promote to req │  │ for old snapshots      │
+  │                 │  │                │  │                        │
+  │ when stable →   │  │                │  │ when ready → recapture │
+  │ stop being      │  │                │  │ via /?capture=demo,    │
+  │ optional in     │  │                │  │ commit refreshed JSON  │
+  │ prompt          │  │                │  │                        │
+  └─────────────────┘  └────────────────┘  └────────────────────────┘
+                                                       │
+                                                       │ silent risk:
+                                                       │ no test re-validates
+                                                       │ JSON against type
+                                                       ▼
+                                            ┌────────────────────────┐
+                                            │ AUDIT FLAG             │
+                                            │ add test that          │
+                                            │ asserts every insight  │
+                                            │ in demo JSON conforms  │
+                                            │ to current Insight     │
+                                            └────────────────────────┘
 
-  ┌─ NOT SUPPORTED (would need migration tooling) ───────────┐
-  │                                                            │
-  │   rename a field         ← breaks demo seed silently       │
-  │   make optional required ← breaks demo seed loudly         │
-  │   change a field's type  ← breaks demo seed loudly         │
-  │   remove a field         ← breaks any consumer reading it  │
-  │                                                            │
-  │   today's workaround: re-capture demo manually + edit any  │
-  │   committed JSON. no rollback story.                       │
-  │                                                            │
-  └────────────────────────────────────────────────────────────┘
-
-  ┌─ SOFT MIGRATIONS (spec ↔ code drift) ────────────────────┐
-  │                                                            │
-  │   spec edits a shape definition                            │
-  │   code may or may not match                                │
-  │   resolution: comment in types.ts names the choice         │
-  │     (e.g. "use this RICHER one — the spec has two")        │
-  │   enforcement: none (the spec is markdown)                 │
-  │                                                            │
-  └────────────────────────────────────────────────────────────┘
+  Latent issue (separate): WorkspaceSchema cache is process-global.
+  Move to Map<projectId, WorkspaceSchema> the day multi-workspace ships.
 ```
 
 ---
 
 ## Elaborate
 
-The deeper structural choice: the repo **treats the type definition as a contract that one-way evolves**. Adding is always safe; removing or renaming is never tried. This is the same pattern as Protocol Buffers' "always optional, never reuse field numbers" or Avro's "schema evolution with reader/writer schemas" — except enforced socially (a comment, a code review) rather than technically (a schema-evolution tool). For a one-person codebase at this size, social enforcement is fine. At team scale, the right move would be Zod or `io-ts` schemas that derive both the type and the validator, plus a generated JSON Schema the spec and prompts could lint against.
+Where this comes from: the **expand-contract migration** pattern (also
+called parallel change, or N+1 versioning) is the canonical safe
+deployment pattern for online schema changes. The discipline this
+codebase practices — optional-only additions, never-remove, both shapes
+valid — is the *expand* phase, indefinitely.
 
-The prompts-as-schema choice is the most interesting in the audit. Most repos keep schema in TypeScript/SQL and prompts as free-form natural language. This repo's prompts are **half English, half schema-spec** — the "Output" sections of every prompt file specify the exact JSON shape, in the same file as the agent's instructions. That's deliberate (the prompt and the schema travel together — change the prompt to demand a new field, you're declaring schema). The downside: the prompt file is the third place the shape is encoded, and the manual alignment is a footgun.
+The seam to **distributed systems**: protocol versioning is the same
+shape. Protobuf's optional-only-additions, gRPC's *don't reuse field
+numbers*, REST APIs' `?v=2` versioning — all of them implement the same
+principle. The fact that this codebase has no network protocol of its
+own doesn't matter; the type → JSON snapshot relationship is exactly the
+same problem.
 
-A note on the seed JSONs as live-data analogues. `demo-insights.json` was captured weeks ago and reads against a more recent interface. Today this works because every field added since was optional. If someone made a field required, the demo JSON would fail validation and the offline mode would break. **The "always optional" rule is what holds the migration story together for this committed-data story.** Without it, every interface change would require running `scripts/capture-demo.ts` and committing the regenerated snapshot — a manual step easy to forget. The optional rule retires the chore.
+What this codebase consciously doesn't do — and is right not to:
 
-A note on what's NOT here: no schema versioning, no `version: 1` discriminator on `Insight`, no upcast/downcast layer. The implicit assumption is "there's only one version, and it's whatever's in the current types.ts." If the repo ever ships clients that talk to multiple backend versions (a mobile app with stale code), that assumption breaks and the model needs a version field. Not the case today.
+- **No migration tool.** Drizzle, Prisma, Knex — none would help when
+  there's no DB to migrate. The "migration" is editing a `.ts` file and
+  recapturing the demo snapshot.
+- **No rollback story.** A bad type change is rolled back by editing
+  the file. Git is the rollback.
+- **No backfill jobs.** Existing data is the demo snapshot; you don't
+  backfill it, you recapture it.
+
+What it consciously does — and what would be wrong to remove:
+
+- **The comments above optional fields are migration documentation.**
+  They tell the next reader why a field is optional. Removing them
+  makes the migration history invisible.
+- **The discriminated-union `EstimatedImpact`** is the cheapest example
+  of a *shape* change done safely. The pattern should be the default
+  for any future shape changes.
+
+What to read next: `06-access-patterns-and-storage-choice.md` walks the
+buildable target — the day this codebase would grow real persistence and
+need real migrations.
+
+---
 
 ## Interview defense
 
-**Q: How does this repo handle schema migrations?**
-A: There's no DB, so no migration tooling — but schema still evolves, through three softer paths. (1) The TypeScript interfaces in `lib/mcp/types.ts` evolve through git, with an explicit "always add as optional" policy named in the comment at L54. (2) The agent prompts in `lib/agents/prompts/*.md` carry the output JSON shape — they're the schema for what each agent emits, versioned through git, manually kept aligned with the types. (3) The committed demo seed `lib/state/demo-insights.json` is the closest thing to "live data" — it has to keep validating against the current interface, which works because of the always-optional rule. The pattern that holds this together: forward-compatible reads with optional fields, fail-soft validators that accept superset/subset shapes.
+**Q: "How do you ship a schema change safely under live data?"**
 
-**Q: Walk me through the dual-Recommendation case.**
-A: The spec at `blooming-insights-spec.md` defines `Recommendation` twice — a simpler version in the "data model" section and a richer one in the "recommendation agent" section. The code in `lib/mcp/types.ts` L114–L130 picks the richer one and names the choice in a comment: "Use this RICHER one ... everywhere." That comment is a literal migration-receipt-in-a-comment — it tells any future editor that the divergence is known and which branch is canonical. At team scale this is too soft (a comment isn't a tool), but for a one-person repo it's the right weight: the choice is visible, reviewable, and revertable through git.
+Verdict first: by **never removing or making something required.**
+Every new field is optional with a comment that says when it was added
+and what older snapshots look like without it. The TypeScript type is
+the source of truth; the committed demo JSON is the regression suite
+that any change has to keep parseable.
 
 ```
-  diagram while you talk
+  the answer, sketched
 
-  spec (markdown)         types.ts (TypeScript)
-  ──────────────────      ────────────────────────
-  Recommendation v1   ─┐
-  Recommendation v2   ─┴─→  picks v2 + comment
-                            ("RICHER one — has id,
-                             steps, 5-member union")
-
-  no codegen. no enforcement. git diff + the comment
-  are the migration log.
+  add a field:
+    ┌─ phase 1: optional ─────────────────────┐
+    │  field?: T                              │   safe; old snapshots
+    │  validator doesn't require it           │   still parse
+    │  UI checks `if (field)` before rendering│
+    └────────────────────┬────────────────────┘
+                         │
+                         │ much later, maybe never
+                         ▼
+    ┌─ phase 2: recapture demo ───────────────┐
+    │  one-click capture script writes fresh   │
+    │  JSON with the field populated           │
+    │  commit the new JSON                     │
+    └────────────────────┬────────────────────┘
+                         │
+                         │ rarely promoted to required
+                         ▼
+    ┌─ phase 3: required ─────────────────────┐
+    │  field: T                               │
+    │  validator requires it                  │
+    │  old snapshots would now fail validation│
+    │  → in practice this codebase has never  │
+    │    promoted; phase 1 forever is OK      │
+    └─────────────────────────────────────────┘
 ```
+
+Anchor: "the load-bearing thing people forget is *expand-contract*.
+You add the new shape, you keep the old shape valid, you defer the
+'contract' phase indefinitely if it's cheap to keep both. In this
+codebase, both have been kept forever — which is conservative but
+costs almost nothing."
+
+**Q: "What's the riskiest evolution path in this codebase?"**
+
+Verdict first: **adding a required field to `Insight` would silently
+break the demo replay.** TypeScript catches new code that constructs an
+`Insight` without the field, but the committed JSON is loaded via
+`JSON.parse` and cast — so an old `Insight` missing the new field would
+*parse* fine and the UI would render with the field undefined. Silent
+degradation, hard to notice in dev.
+
+```
+  the silent-degradation path
+
+  add Insight.criticalNewField (required)
+      │
+      ▼
+  type edit:    tsc catches new construction sites ✓
+  validator:    rejects new agent output without field ✓
+  demo JSON:    parses fine (extra field absent)
+               UI renders without that field
+               nothing crashes, but the card looks broken
+               → silent regression, no test catches it
+```
+
+The fix is a runtime validator for the demo JSON (`isInsight` in
+`validate.ts`, called from a Vitest test). 30 minutes of work; the
+audit recommends it.
+
+Anchor: "silent failures are the dangerous ones — the codebase has a
+strong story for *loud* failures (the LLM-output validators reject
+malformed shapes), but no story today for *silent* drift between the
+type and the committed JSON. That's the gap I'd close first."
+
+---
 
 ## See also
 
-- `01-the-data-model-and-its-shape.md` — the 8 interfaces that evolve, and the dual-shape `Diagnosis` as a mid-migration smell.
-- `02-normalization-and-duplication.md` — the `affectedCustomers` ghost field declared but never written is mid-migration debt.
-- `04-transactions-and-integrity.md` — the Olist seed transactions (the rebuild is one atomic operation).
-- `06-access-patterns-and-storage-choice.md` — the three storage layers and their durability stories.
-- `08-the-olist-relational-schema.md` — `SCHEMA_SQL` lives here.
-- `09-deterministic-synthetic-data.md` — `mulberry32(seed=42)` is what makes destructive-rebuild a legitimate migration strategy.
-- `study-software-design/audit.md#pull-complexity-downward` — the prompts owning their own output-shape schema is "pull complexity downward" applied to schema evolution.
-
----
+- [`01-the-data-model-and-its-shape.md`](./01-the-data-model-and-its-shape.md)
+  — the types being evolved
+- [`02-normalization-and-duplication.md`](./02-normalization-and-duplication.md)
+  — why the demo JSON has to stay in sync with the runtime types
+- [`04-transactions-and-integrity.md`](./04-transactions-and-integrity.md)
+  — the validator layer that gates new shapes at ingest
+- [`06-access-patterns-and-storage-choice.md`](./06-access-patterns-and-storage-choice.md)
+  — the buildable target where real migrations would start mattering
+- [`audit.md`](./audit.md) — checklist with this file's findings

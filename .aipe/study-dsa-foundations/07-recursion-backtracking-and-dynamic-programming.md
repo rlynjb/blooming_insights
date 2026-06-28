@@ -1,554 +1,548 @@
 # Recursion, backtracking, and dynamic programming
 
-**Industry name(s):** recursion (direct, tail, mutual), backtracking (depth-first search of state spaces), dynamic programming (memoization / tabulation), divide and conquer
-**Type:** Industry standard · Language-agnostic
+*State spaces, repeated subproblems, memoization, tabulation — Industry standard · Case B (not exercised; taught from fundamentals)*
 
-> Three related techniques for problems that can be broken into smaller versions of themselves. **Recursion** is the syntax. **Backtracking** is recursion with explicit undo for state-space search. **Dynamic programming** is recursion plus memoization to avoid recomputing overlapping subproblems. **None of these are exercised in this codebase** — the code is flat, sequential, and never needs to solve a problem by reducing it to a smaller version of itself.
-
----
-
-## Zoom out, then zoom in
-
-**Zoom out — the bigger picture.** **Not yet exercised.** The codebase has no recursive functions of its own. The only recursion in `lib/` and `app/` is `mkdir({recursive: true})` in `app/api/mcp/capture/route.ts` — and that recursion happens inside the Node standard library, not in the codebase's code. There's no backtracking — no state-space search where you try a choice, recurse, and undo on dead-end. There's no dynamic programming — no overlapping subproblems, no memoization table, no tabulation. Every algorithm here is a flat loop or a higher-order array operation (`.map`, `.filter`, `.reduce`). This is honest: the problems this codebase solves don't *call for* recursion. The next sections teach all three techniques, name the load-bearing kernels, and end with the triggers that would put them in this repo.
+## Zoom out — recursion-shaped work in this repo (very little)
 
 ```
-Zoom out — what this chapter teaches vs what the repo uses
+  Recursion / DP shapes in this codebase
+  ──────────────────────────────────────
 
-┌─ Everywhere in the codebase ─────────────────────────────┐
-│  flat loops, .map/.filter/.reduce, await sequences        │
-│                                                            │
-│  • no recursive function in lib/ or app/                  │  ← not yet exercised
-│  • no backtracking (no state-space search)                │  ← not yet exercised
-│  • no DP (no overlapping subproblems)                     │  ← not yet exercised
-│  • no divide-and-conquer (no problem split into halves)   │  ← not yet exercised
-└────────────────────────────┬─────────────────────────────┘
-                             │
-┌─ The one recursive thing ──▼─────────────────────────────┐
-│  mkdir({recursive: true})                                  │
-│  in app/api/mcp/capture/route.ts                          │
-│  → recursion happens INSIDE Node's standard library,      │
-│     not in our code                                        │
-└──────────────────────────────────────────────────────────┘
+  ┌─ UI layer ────────────────────────────────────┐
+  │  React itself recurses through the component   │
+  │  tree (framework concern; you don't write it)  │
+  └────────────────────────┬──────────────────────┘
+                           │
+  ┌─ Service layer ────────▼──────────────────────┐
+  │  ★ NO RECURSIVE FUNCTIONS in lib/             │
+  │  ★ NO BACKTRACKING                             │
+  │  ★ NO DYNAMIC PROGRAMMING                      │
+  │                                                │
+  │  The closest thing: JSON.stringify/parse       │
+  │  recurses internally — opaque to you           │
+  └────────────────────────┬──────────────────────┘
+                           │
+  ┌─ Provider boundary ────▼──────────────────────┐
+  │  Agent loop "explores" but the LLM picks the   │
+  │  next move — no recursive search you wrote     │
+  └───────────────────────────────────────────────┘
 ```
 
-**Zoom in — narrow to the concept.** The question is: when does a problem call for recursion? The answer is when (a) the problem has a *natural self-similar structure* — solving it for N reduces to solving it for N-1 or N/2 (factorial, tree walks, divide-and-conquer sort), (b) you need to *explore a state space* with the ability to *undo* (n-queens, sudoku, maze solving — that's backtracking), or (c) you have *overlapping subproblems* where the same subcomputation appears in many recursion branches (Fibonacci, edit distance, coin change — that's dynamic programming). This codebase has none of these patterns. Its problems are flat data transformations: take an array, run some validators, produce a smaller array. The next sections walk all three techniques' kernels and end with the triggers that would put them in this repo.
+Verdict-first: this repo has **zero hand-written
+recursion, zero backtracking, zero DP**. The agent
+loops are iterative (an iteration budget plus a
+while-loop inside AptKit); state is flat (Maps and
+arrays); there are no overlapping subproblems anywhere.
+The only recursion that runs is what
+`JSON.stringify`/`JSON.parse` do internally on
+nested objects, and that's opaque.
 
----
+So this file is Case B end-to-end: teach recursion,
+backtracking, and DP from fundamentals, anchored to
+your reincodes work (Tree traversals as generators,
+BST recursion) and to canonical interview problems.
+The DP gap is real and consequential — it's the
+single largest gap between this repo's surface and a
+senior interview's surface.
 
-## Structure pass
+## Structure pass — three techniques, one root question
 
-**Layers.** Each technique has the same three-layer stack: the **base case** (the recursion's stopping condition — load-bearing; miss it and you stack-overflow), the **recursive case** (the part that calls itself with a smaller input — must make progress toward the base case), and the **combination step** (how you build the answer for N from the answer for N-1 or smaller). For DP, add a fourth layer: the **memo** (the table that caches subproblem results so you don't recompute them).
-
-**Axis: control.** Who decides what to recurse into, what to back off from, what to remember? For recursion, the caller drives — each call picks the next smaller problem. For backtracking, the algorithm tries-then-undoes — control flows forward on a guess and backward on a dead-end. For DP, the algorithm computes-once-cache-always — control flows up the dependency DAG of subproblems. Picking the wrong axis (treating a flat loop as recursion, or recursion as iteration) is the most common bug — and the most common code-review request ("rewrite this as a loop").
-
-**Seams.** Two seams matter; both absent here. **Seam 1: recursion vs iteration.** Same algorithm, two phrasings — recursion is sometimes clearer (tree walks), iteration is always more efficient (no stack frames). **Seam 2: plain recursion vs memoized recursion.** Same recursive structure, two cost profiles — plain recursion recomputes overlapping subproblems exponentially; memoized recursion (top-down DP) computes each subproblem once. The codebase exercises neither today because it has no recursive structure to begin with.
-
-```
-Structure pass — recursion, backtracking, DP
-
-┌─ 1. LAYERS ─────────────────────────────────────────┐
-│  Base case (stop condition) · Recursive case (call  │
-│  smaller version) · Combination step (build N from  │
-│  N-1) · Memo (cache subproblem results, for DP)     │
-└────────────────────────┬─────────────────────────────┘
-                         │  pick the axis
-┌─ 2. AXIS ─────────────▼──────────────────────────────┐
-│  control: who picks the next subproblem, who decides │
-│  when to back off, who decides what to cache         │
-└────────────────────────┬─────────────────────────────┘
-                         │  trace across layers, find flips
-┌─ 3. SEAMS ────────────▼──────────────────────────────┐
-│  S1: recursion vs iteration (same algo, two forms)   │
-│      — absent (no recursion in this codebase)        │
-│  S2: plain vs memoized recursion (DP)                │
-│      — absent (no overlapping subproblems)           │
-└────────────────────────┬─────────────────────────────┘
-                         ▼
-                 Block 4 — How it works
-```
+Three techniques, one question held constant: *"is
+this problem made of smaller versions of itself?"*
 
 ```
-A real recursion seam — "do I recompute or remember?" answered two ways
+  One question, three answers
+  ───────────────────────────
 
-┌─ Plain recursion ──┐    seam     ┌─ Memoized (DP) ───────┐
-│  fib(n) = fib(n-1) │ ═════╪═════►│  memo[n] cached;       │
-│         + fib(n-2) │  (it flips) │  fib(n) returns memo[n]│
-│  cost: O(2^n)      │             │  if cached, else       │
-│  (exponential —    │             │  computes once         │
-│  recomputes fib(3) │             │  cost: O(n)            │
-│  hundreds of times)│             │                        │
-└────────────────────┘             └────────────────────────┘
-        ▲                                       ▲
-        └────── same axis (control), two answers ─┘
-                → memoization is what turns exponential into linear
-                  for problems with overlapping subproblems
+  "is this problem made of smaller versions of itself?"
+
+  ┌─ Plain recursion ────────────────────┐
+  │ YES, and each subproblem is unique   │
+  │ → just recurse; nothing to cache     │
+  │ examples: tree traversal, divide-    │
+  │   and-conquer (merge sort, quicksort)│
+  └──────────────────────────────────────┘
+
+  ┌─ Backtracking ───────────────────────┐
+  │ YES, and you're exploring CHOICES;   │
+  │ when one path fails, undo and try    │
+  │ another                              │
+  │ examples: N-queens, sudoku, regex    │
+  │   matching, generating permutations  │
+  └──────────────────────────────────────┘
+
+  ┌─ Dynamic programming ────────────────┐
+  │ YES, and the SAME subproblem appears │
+  │ many times → MEMOIZE / TABULATE      │
+  │ examples: Fibonacci, longest common  │
+  │   subsequence, coin change, knapsack │
+  └──────────────────────────────────────┘
 ```
 
-The skeleton is mapped — the rest of this file teaches all three techniques.
+The seam where these flip: **whether subproblems
+repeat**. Pure recursion when they don't. Backtracking
+when you need to explore branches with undo.
+DP when subproblems overlap enough that caching
+amortizes the cost. Get this wrong (recurse a DP
+problem without memoizing) and your runtime explodes
+from O(N) to O(2^N).
 
----
+Hand off to How it works.
 
 ## How it works
 
-### Mental model
+#### Move 1 — the mental model
 
-Three techniques, ordered by sophistication:
-
-```
-  RECURSION              — a function that calls itself
-                           (need: base case + recursive case)
-
-  BACKTRACKING           — recursion + explicit undo
-                           (need: state, try a choice, recurse,
-                            undo on dead-end)
-
-  DYNAMIC PROGRAMMING    — recursion + memoization
-                           (need: overlapping subproblems +
-                            optimal substructure)
-```
-
-The trick everyone learns: recursion is just a loop in fancy clothes — usually. The exceptions are problems where the data structure is naturally recursive (trees) or where you need to *unwind* state (backtracking) or where memoization buys you exponential-to-polynomial speedup (DP). For everything else, write a loop.
-
-### Move 1 — recursion (the syntax)
-
-A recursive function calls itself with a smaller input. Two parts: the **base case** (the input is small enough to answer directly, no further recursion) and the **recursive case** (call yourself with a reduced input, combine the result).
+You already use recursion every time React renders a
+component that renders another component. The shape:
+**a function that calls itself on a smaller version
+of the input.** The smaller version is what makes it
+terminate — without it, you'd loop forever.
 
 ```
-factorial(n):
-  if n <= 1: return 1          // base case
-  return n * factorial(n - 1)  // recursive case
+  Recursion — the shape
+  ─────────────────────
 
-factorial(4):
-  4 * factorial(3)
-      3 * factorial(2)
-          2 * factorial(1)
-              return 1        ← base case
-          return 2 * 1 = 2
-      return 3 * 2 = 6
-  return 4 * 6 = 24
+  function f(input):
+    if input is base case:           ← termination
+      return base answer
+    smaller = reduce(input)          ← shrink the problem
+    sub = f(smaller)                 ← recurse on smaller
+    return combine(input, sub)       ← build answer from sub
+
+  two parts that MUST be there:
+    1. base case — otherwise infinite recursion
+    2. reduction toward base — otherwise also infinite
 ```
 
-```
-the call stack during factorial(4):
-
-  TOP   factorial(1)   ← currently executing
-        factorial(2)
-        factorial(3)
-        factorial(4)
-  BOTTOM (main)
-
-  each call has its own frame: parameters, local vars, return address
-  base case returns first; results bubble back up the stack
-```
-
-**Critical rules:**
-
-1. **Every recursive call must reduce toward the base case.** `factorial(n-1)` reduces; `factorial(n)` doesn't (infinite recursion). `factorial(n+1)` actively moves away from the base case (stack overflow).
-
-2. **The base case must terminate.** `if n == 1: return 1` works for `factorial(positive integer)`; for `factorial(-1)` it never hits and overflows. Real code defensively checks the precondition.
-
-3. **Tail recursion** — when the recursive call is the *last* thing the function does — can be optimized into a loop by some compilers (Scheme, Scala, Kotlin with `tailrec`). JavaScript engines do NOT do this in practice (the spec allows it; no major engine implements it). Don't rely on tail-call optimization in JS.
-
-**Where recursion shines:**
-
-- **Tree walks** — `walk(node) { visit(node); for each child: walk(child); }` — natural fit for the data structure.
-- **Divide and conquer** — sort, search, FFT, matrix multiply — split the problem, recurse, combine.
-- **Mathematical definitions that are inherently recursive** — factorial, Fibonacci, Ackermann.
-- **Backtracking** (next move).
-- **Parser recursion** — recursive-descent parsers mirror the grammar's structure.
-
-**Where iteration wins:**
-
-- **Linear scans of arrays** — `for (const x of arr) ...` is clearer than `process(arr[0]) ; process_rest(arr.slice(1))`.
-- **Fixed-step state machines** — explicit `state = 'A'; while (state !== 'done') ...` beats recursive state transitions.
-- **Anywhere stack depth could exceed the call stack limit** — JavaScript's typical limit is ~10K-30K frames; recursion deeper than that overflows.
-
-**In this codebase: not yet exercised.** Every loop is a `for` or a higher-order array method. The deepest "recursive structure" is the 2-level schema, which is read with two flat loops. The user's portfolio (`reincodes/Tree.ts`, `BinarySearchTree.ts`, sorting visualizers) has recursive implementations — the codebase doesn't reach for that style.
-
-**Code in this codebase — the only "recursive" thing is a stdlib parameter (`app/api/mcp/capture/route.ts`).**
+The most common recursion shape — your BST traversal
+in reincodes:
 
 ```ts
-// app/api/mcp/capture/route.ts (paraphrased — the only occurrence of "recursive" in the repo)
-await mkdir(dir, { recursive: true });
-```
-
-This isn't *our* recursion — it's a parameter to Node's `fs.promises.mkdir` telling the stdlib to create intermediate directories. The recursion happens inside Node, not in the codebase's code. From the codebase's perspective, this is just a flag. It belongs here only as a footnote: a beginner sometimes counts "I use `{recursive: true}`" as "my codebase exercises recursion." It doesn't. Confirmed by grep across `lib/` and `app/`: no function calls itself. The deepest function-call nesting is `agent.scan() → runAgentLoop() → mcp.callTool() → liveCall() → transport.callTool()` — five levels, all distinct functions, no self-call. The plausible trigger: schema grows deeper than 3-4 levels and a recursive walker becomes the cleanest expression; OR a grammar appears in the agent intent classifier and recursive-descent parsing is natural.
-
-### Move 2 — backtracking (state-space search with undo)
-
-Backtracking is recursion plus **explicit undo**. You try a choice, recurse, and if the recursion fails (no solution found), you undo the choice and try the next one. The classic kernel:
-
-```
-backtrack(state):
-  if state is a complete solution:
-    record/return solution
+// reincodes — BinarySearchTree.ts
+function inorder(node):
+  if node == null:                   // base case
     return
-  for each choice from state.candidates():
-    apply choice to state
-    backtrack(state)
-    undo choice from state          // ← the "backtrack" part
+  inorder(node.left)                 // recurse left
+  visit(node.value)                  // process self
+  inorder(node.right)                // recurse right
 ```
 
-**The four backtracking problems everyone learns:**
+That's the kernel. Three lines, the entire algorithm.
+Pre-order moves `visit(node)` to the top; post-order
+moves it to the bottom. Same recursion, different
+visit time.
 
 ```
-  problem        what's the state          what's a choice
-  ────────────   ────────────────────      ─────────────────────────
-  n-queens       board configuration       place a queen in next column
-  sudoku         partial grid              fill next empty cell with 1-9
-  subset sum     current subset            include/exclude next element
-  maze solver    current position          step N/S/E/W
+  Recursion execution — call stack for inorder
+  ────────────────────────────────────────────
+
+  tree:        5
+             ╱   ╲
+           3       8
+          ╱ ╲
+         1   4
+
+  inorder(5)
+    inorder(3)
+      inorder(1)
+        inorder(null) → return
+        visit(1)                    ← 1 emitted
+        inorder(null) → return
+      visit(3)                      ← 3 emitted
+      inorder(4)
+        inorder(null) → return
+        visit(4)                    ← 4 emitted
+        inorder(null) → return
+    visit(5)                        ← 5 emitted
+    inorder(8)
+      inorder(null) → return
+      visit(8)                      ← 8 emitted
+      inorder(null) → return
+
+  result: 1, 3, 4, 5, 8             ← sorted! the BST payoff
 ```
 
-```
-n-queens for N=4 — backtracking tree (abbreviated):
+The call stack IS your data structure here. Each
+recursive call pushes a frame; each return pops one.
+**The break case if you go too deep:** stack
+overflow. Languages typically allow 10,000-100,000
+frames before they blow. For balanced trees that's
+fine (depth = log N). For degenerate trees
+(insert-sorted) it's a real risk.
 
-  place column 0:
-    row 0 → place column 1:
-      row 0 → conflict, fail
-      row 1 → conflict, fail
-      row 2 → place column 2:
-        row 0 → conflict, fail
-        row 1 → conflict, fail
-        row 2 → conflict, fail
-        row 3 → conflict, fail
-        → UNDO column 1 row 2
-      row 3 → place column 2:
-        row 1 → place column 3:
-          row 2 → SOLUTION!  ← record
-                                 [0,3,1,2]
-```
+#### Move 2 — the three techniques worked through
 
-The "undo" is what makes it *backtracking* and not *enumerate all*. Without explicit undo, the algorithm would either modify state and never restore it (wrong solutions), or copy state on every branch (exponential memory).
+**Plain recursion — divide and conquer**
 
-**Where backtracking shows up:**
-
-- **Constraint satisfaction** — n-queens, sudoku, scheduling under constraints.
-- **Combinatorial generation** — generate all subsets, all permutations, all combinations.
-- **Maze and puzzle solving** — find a path, find all paths, find the shortest path with constraints.
-- **Compiler register allocation** — assign variables to registers under constraints.
-
-**In this codebase: not yet exercised.** No constraint satisfaction problem. No combinatorial generation. No state-space search.
-
-**What would trigger reaching for backtracking?** If an agent had to generate a *valid combination of tool calls* satisfying multiple constraints (call this before that; if A is called, can't call B; total token budget ≤ X), backtracking would be the natural search strategy. Today the tool calls are linear (the LLM decides what to call next; no constraint solver runs).
-
-**Code in this codebase — `not yet exercised`.** No state-space search anywhere. The closest abstraction is the JSON extraction fallback ladder in `lib/mcp/validate.ts` L3–L13 — three attempts in order, each falls through to the next on failure. But it's *not* backtracking: there's no *undo*, no shared state being modified-and-restored, no recursive descent into branches. It's a flat sequential fallback.
+The cleanest example: merge sort. Split, recurse on
+both halves, merge.
 
 ```
-parseAgentJson (validate.ts L3–L13):
+  PSEUDOCODE — merge sort
+  ───────────────────────
 
-  try fenced-block regex  ──► success: return
-                              fail: continue
-  try bare JSON.parse     ──► success: return
-                              fail: continue
-  try substring scan      ──► success: return
-                              fail: throw
+  function mergeSort(arr):
+    if arr.length <= 1:                 // base case
+      return arr
+    mid    = arr.length / 2
+    left   = mergeSort(arr[0..mid])     // recurse left
+    right  = mergeSort(arr[mid..end])   // recurse right
+    return merge(left, right)           // combine
 
-  NOT backtracking — no undo, no state modification, no recursion.
-  Just three attempts in a linear ladder.
+  function merge(a, b):
+    result = []
+    i = j = 0
+    while i < a.length and j < b.length:
+      if a[i] <= b[j]:
+        result.push(a[i++])
+      else:
+        result.push(b[j++])
+    return result + a[i..] + b[j..]    // drain remaining
+
+  cost: T(N) = 2·T(N/2) + O(N)         // master theorem
+                                        // → T(N) = O(N log N)
 ```
 
-### Move 3 — dynamic programming (recursion + memoization)
+You've implemented this in reincodes (Sorting/
+visualizers — merge sort animation). The animation
+showing recursion *splitting* then *merging back* is
+the picture to keep.
 
-Dynamic programming applies when a recursive problem has **overlapping subproblems** and **optimal substructure**. The same subcomputation appears in many recursion branches; memoizing it turns exponential into polynomial.
+**Backtracking — explore-with-undo**
 
-**Naive recursion for Fibonacci:**
-
-```
-fib(n):
-  if n <= 1: return n
-  return fib(n-1) + fib(n-2)
-
-fib(5):
-              fib(5)
-              /    \
-          fib(4)   fib(3)        ← fib(3) computed once here…
-          /    \   /    \
-       fib(3) fib(2)…  …          ← …and AGAIN here
-       /    \
-    fib(2) fib(1)
-    /    \
-  fib(1) fib(0)
-
-  cost: O(2^n) — every node in the tree is a call
-```
-
-**Memoized recursion (top-down DP):**
+Backtracking is recursion plus "try a choice, recurse,
+if it fails undo the choice and try another." The
+canonical example: N-queens.
 
 ```
-memo = {}
-fib(n):
-  if n in memo: return memo[n]
-  if n <= 1: return n
-  memo[n] = fib(n-1) + fib(n-2)
-  return memo[n]
+  N-queens — place 8 queens on an 8x8 board so none attack
+  ────────────────────────────────────────────────────────
 
-  cost: O(n) — each fib(k) computed once, then cached
-  space: O(n) — the memo
+  PSEUDOCODE
+  ──────────
+  function place(row, board):
+    if row == N:                        // all queens placed
+      record(board)
+      return
+    for col in 0..N-1:
+      if safe(row, col, board):         // doesn't attack any prior queen
+        board[row] = col                // CHOOSE
+        place(row + 1, board)           // RECURSE
+        board[row] = -1                 // UNDO  ← the backtracking move
+
+  load-bearing parts (what breaks if you remove each):
+    - the safe() check       ← would place attacking queens
+    - the recursion          ← would only try one row
+    - the UNDO step          ← side-effects from one branch
+                                pollute the next branch
 ```
 
-**Tabulation (bottom-up DP):**
+**The hallmark of backtracking: the explicit "undo"
+after the recursive call.** You're maintaining
+mutable state (the board) across calls, and you have
+to leave it the way you found it for sibling branches.
+If you don't undo, branch B inherits branch A's
+choices and you produce garbage.
+
+This repo has zero backtracking; the right anchor for
+practicing it is the river-crossing puzzle in your
+reincodes `PG.ts`, which solves the same shape with
+BFS instead. BFS is *not* backtracking — it explores
+states in parallel by enqueueing them all — but the
+problem class is the same: search a state space.
+Backtracking is the depth-first variant with
+explicit undo.
+
+**Dynamic programming — caching repeated subproblems**
+
+The Fibonacci example everyone uses, because it
+shows the catastrophe of *not* caching:
 
 ```
-fib(n):
-  if n <= 1: return n
-  table = [0, 1, ...]
-  for i from 2 to n:
-    table[i] = table[i-1] + table[i-2]
-  return table[n]
+  Naive recursive Fibonacci — overlapping subproblems
+  ───────────────────────────────────────────────────
 
-  cost: O(n)
-  space: O(n) — or O(1) if you only keep the last two values
+  function fib(n):
+    if n < 2: return n
+    return fib(n - 1) + fib(n - 2)
+
+  call tree for fib(5):
+
+                  fib(5)
+                /        \
+            fib(4)        fib(3)
+            /    \        /    \
+        fib(3)  fib(2)  fib(2) fib(1)
+        /   \    / \    / \
+     fib(2) fib(1) ...
+
+  fib(3) computed TWICE, fib(2) THREE times.
+  cost: O(2^N) — exponential
 ```
 
-**The DP recipe** (Steven Skiena's formulation):
-
-1. Express the answer as a recursive function of smaller subproblems.
-2. Identify the dimensions of state (what arguments does your recursive function take?).
-3. Tabulate or memoize. Top-down (memoize) is easier; bottom-up (tabulate) saves stack space.
-
-**The two preconditions:**
-
-- **Overlapping subproblems** — the recursion tree has repeated nodes. Without overlap, memoization buys nothing (each subproblem is solved exactly once anyway, e.g. binary tree walk).
-- **Optimal substructure** — the answer for N can be computed from optimal answers to smaller subproblems. Without it, DP doesn't apply (e.g. longest *simple* path in a graph is NP-hard precisely because optimal substructure fails).
-
-**Where DP shows up:**
-
-- **Sequence alignment** — edit distance, longest common subsequence, sequence-to-sequence matching.
-- **Coin change** — fewest coins to make N cents; how many ways to make N cents.
-- **Knapsack** — best subset of items under a weight constraint.
-- **Longest increasing subsequence** — classic O(N²) DP, refinable to O(N log N).
-- **Matrix chain multiplication** — optimal parenthesization.
-- **Optimal binary search trees** — given access frequencies, build the BST that minimizes expected access time.
-
-**In this codebase: not yet exercised.** No problem here has overlapping subproblems. The agent pipeline is a fixed sequence. The derivation functions are pure projections. The sort is one-shot. No optimization-under-constraints problem with subproblem structure.
-
-**What would trigger reaching for DP?** If the recommendation agent had to *choose the optimal subset of recommendations to present* under a constraint (e.g., "fit 3 recommendations that together exceed K total expected impact and don't conflict"), that's a 0/1 knapsack variant — DP territory. Today recommendations are presented as-is, no optimization.
-
-**Code in this codebase — `not yet exercised`.** No memoization table, no tabulation, no recurrence. The TTL cache (`lib/mcp/client.ts` L80) is a *cache* of tool-call results, not a memoization table for subproblems — there's no recursive structure being cached. The derivation functions (`lib/insights/derive.ts`) recompute on every call; there's no overlapping subproblem to memoize. The plausible trigger: an optimization problem appears — "pick K recommendations totaling impact ≥ T without conflicting" — that's a 0/1 knapsack and classical DP.
-
-### Move 2 variant — the irreducible kernel of each technique
-
-**Recursion kernel:**
+The fix is *memoization*: cache each subproblem's
+answer the first time you compute it, return the
+cached value on subsequent calls.
 
 ```
-RECURSION (the kernel)
-─────────────────────────────────
-  base case (must terminate)
-  recursive case (must reduce input)
-  combination step (build N from N-1's result)
+  Memoized Fibonacci — top-down DP
+  ────────────────────────────────
 
-  what breaks if missing:
-    base case → infinite recursion → stack overflow
-    reduction → infinite recursion → stack overflow
-    combination → result for N never built; useless return
+  cache = Map()                          // memo table
+
+  function fib(n):
+    if n < 2: return n
+    if cache.has(n): return cache.get(n) // ← the cache check
+    result = fib(n - 1) + fib(n - 2)
+    cache.set(n, result)
+    return result
+
+  cost: O(N) — each subproblem computed once
 ```
 
-**Backtracking kernel:**
+The other flavor is *tabulation*: build the answers
+bottom-up in a table, no recursion.
 
 ```
-BACKTRACKING (the kernel)
-─────────────────────────────────
-  state representation
-  candidate generation (what choices to try)
-  recursion into chosen state
-  undo step (the "backtrack")
-  base case (complete solution or dead-end)
+  Tabulated Fibonacci — bottom-up DP
+  ──────────────────────────────────
 
-  what breaks if missing:
-    undo → state corrupted across branches; wrong solutions
-    candidate gen → can't explore the space
-    base case → never recognize a solution or a dead-end
+  function fib(n):
+    if n < 2: return n
+    dp = [0, 1]
+    for i in 2..n:
+      dp[i] = dp[i-1] + dp[i-2]
+    return dp[n]
+
+  cost: O(N) time, O(N) space
+  → can reduce to O(1) space by only keeping last two
 ```
 
-**DP kernel:**
+**The DP skeleton — five parts:**
+
+1. **Define the subproblem** — what does `dp[i]`
+   mean? "Best answer considering the first `i`
+   inputs." **What breaks without it:** you can't
+   write the recurrence.
+
+2. **Write the recurrence** — `dp[i] = f(dp[i-1],
+   dp[i-2], ...)`. **What breaks without it:** no
+   algorithm, just a name.
+
+3. **Identify base cases** — what's the answer for
+   the smallest input? **What breaks without it:** the
+   recurrence has nowhere to bottom out.
+
+4. **Choose direction** — top-down (recursion +
+   memo) or bottom-up (iteration + table). Both work;
+   bottom-up uses less stack.
+
+5. **Optimize space if possible** — if `dp[i]` only
+   depends on `dp[i-1]` and `dp[i-2]`, you don't need
+   the whole array. **What breaks without it:** O(N)
+   space when O(1) was possible.
+
+This is the technique that doesn't show up in
+blooming-insights and is the highest-leverage gap to
+close before a senior interview. The practice plan in
+`08-dsa-foundations-practice-map.md` sequences the
+canonical DP problems.
+
+#### Move 2.5 — recursion → iteration conversion
+
+Any recursion can be converted to iteration using an
+explicit stack. Three reasons to do it:
+
+1. **Avoid stack overflow** on very deep recursion.
+2. **Save function-call overhead** in hot loops.
+3. **Get tail-call optimization** in languages that
+   don't auto-TCO (most JS engines do not).
+
+The pattern:
 
 ```
-DYNAMIC PROGRAMMING (the kernel)
-─────────────────────────────────
-  state (the subproblem identifier)
-  recurrence (how N's answer builds from smaller subproblems)
-  memo table (cache subproblem results)
-  base case for the recurrence
+  Recursion → iteration with explicit stack
+  ─────────────────────────────────────────
 
-  what breaks if missing:
-    memo → exponential blowup (recompute every subproblem)
-    recurrence → no way to combine subproblems
-    state identifier → memo lookups miss (or collide); wrong answers
+  recursive                          iterative
+  ─────────                          ─────────
+  function dfs(node):                stack = [start]
+    if node == null: return          while stack not empty:
+    visit(node)                        node = stack.pop()
+    dfs(node.left)                     if node == null: continue
+    dfs(node.right)                    visit(node)
+                                       stack.push(node.right)
+                                       stack.push(node.left)
+                                       //          ↑
+                                       //  push RIGHT first so
+                                       //  LEFT pops first — same
+                                       //  traversal order as recursion
 ```
 
-**Skeleton vs hardening:**
+You've implemented both in reincodes (BST insert is
+shown both recursive and iterative). The iterative
+version is what you reach for when N might be very
+deep.
 
-```
-SKELETON                              HARDENING
-─────────────────────────────         ─────────────────────────────────
-recursion: base + recursive case      tail-call optimization (some langs)
-backtracking: state + undo            constraint propagation (faster cuts)
-DP: state + recurrence + memo         space-optimized DP (O(1) instead of O(N))
-                                      iterative DP avoiding stack (bottom-up)
-```
+#### Move 3 — the principle
 
-### Move 3 — the principle
-
-**Recursion is for problems that are self-similar; iteration is for problems that aren't.** A flat list of items being transformed one at a time is not self-similar — write a loop. A tree being walked is self-similar — write recursion. A state space being searched with backtracking is self-similar — write backtracking recursion. A subproblem that overlaps with itself is *especially* self-similar — write DP.
-
-The codebase has only flat-list-being-transformed problems today. That's why no recursion appears. The day it gets a problem with self-similar structure, recursion will be the right answer.
-
----
+Recursion is a description style — "the answer for N
+in terms of the answer for N-1 (or N/2, etc.)."
+Backtracking is recursion plus undo — used when you
+explore alternatives and one branch's state must not
+leak into another's. Dynamic programming is recursion
+plus memoization — used when subproblems repeat
+exponentially often. The decision is *not* "which
+technique?", it's *"do my subproblems overlap?"* If
+no, plain recursion. If yes and you're exploring
+choices, backtracking. If yes and you're optimizing
+a value, DP.
 
 ## Primary diagram
 
-The three techniques, their kernel, when each applies, and the codebase's gap.
-
 ```
-                THE RECURSION FAMILY — when to reach for each
+  The three techniques — pick by the subproblem shape
+  ───────────────────────────────────────────────────
 
-  ┌────────────────────┬────────────────────────┬────────────────────────┐
-  │ RECURSION          │ BACKTRACKING           │ DYNAMIC PROGRAMMING    │
-  │ (plain)            │ (recursion + undo)     │ (recursion + memo)     │
-  ├────────────────────┼────────────────────────┼────────────────────────┤
-  │ apply when:        │ apply when:            │ apply when:            │
-  │ • data is recursive│ • state-space search   │ • overlapping subprobs │
-  │   (tree, AST)      │ • need to try / undo   │ • optimal substructure │
-  │ • problem reduces  │ • generate combinations│                        │
-  │   to smaller N     │   under constraints    │                        │
-  ├────────────────────┼────────────────────────┼────────────────────────┤
-  │ kernel:            │ kernel:                │ kernel:                │
-  │ • base case         │ • state                │ • state                │
-  │ • recursive case    │ • candidate generation  │ • recurrence relation │
-  │ • combination       │ • try → recurse → undo  │ • memo table          │
-  │                     │ • base case             │ • base case           │
-  ├────────────────────┼────────────────────────┼────────────────────────┤
-  │ cost:              │ cost:                  │ cost:                  │
-  │ varies — O(N) for  │ exponential in state   │ O(states × work/state) │
-  │ linear recursion,  │ size — usually O(b^d)  │ — usually polynomial   │
-  │ O(2^N) for naive   │ where b = branching,   │                        │
-  │ Fibonacci          │ d = depth              │                        │
-  ├────────────────────┼────────────────────────┼────────────────────────┤
-  │ examples:          │ examples:              │ examples:              │
-  │ • tree walk         │ • n-queens             │ • Fibonacci            │
-  │ • DFS               │ • sudoku               │ • edit distance        │
-  │ • factorial         │ • subset sum           │ • coin change          │
-  │ • merge sort        │ • maze solver          │ • knapsack             │
-  │ • divide & conquer  │ • permutations         │ • LCS / LIS            │
-  ├────────────────────┼────────────────────────┼────────────────────────┤
-  │ in repo:           │ in repo:               │ in repo:               │
-  │ NOT YET EXERCISED  │ NOT YET EXERCISED      │ NOT YET EXERCISED      │
-  └────────────────────┴────────────────────────┴────────────────────────┘
+  ┌──────────────────────────────────────────────────────┐
+  │ situation                       technique            │
+  ├──────────────────────────────────────────────────────┤
+  │ recurse, each subproblem        plain recursion      │
+  │ unique                          (tree ops, merge     │
+  │                                  sort, quicksort)    │
+  │                                                      │
+  │ explore choices, each branch    backtracking         │
+  │ tries one option then undoes    (N-queens, sudoku,   │
+  │                                  permutations)       │
+  │                                                      │
+  │ optimal value, subproblems      dynamic programming  │
+  │ overlap (same args called       (memoization or      │
+  │ exponentially often)             tabulation)         │
+  │                                                      │
+  │ recursion too deep to fit       iterative + explicit │
+  │ on the call stack               stack                │
+  └──────────────────────────────────────────────────────┘
 
-  trigger to start using:
-  • recursion: data becomes tree-shaped or a recursive grammar appears
-  • backtracking: need to generate valid configurations under constraints
-  • DP: optimization problem with overlapping subproblems shows up
+  blooming-insights uses NONE of these.
+  Anchors live in reincodes: Tree.ts (n-ary recursion
+  with generators), BinarySearchTree.ts (recursive +
+  iterative variants).
 ```
-
----
 
 ## Elaborate
 
-### Where they come from
+Dynamic programming was named by Richard Bellman in
+the 1950s — the term was chosen partly to sound
+impressive to grant funders, not because it
+describes the technique well. A more honest name
+would be "recursion with caching." The canonical
+problems — Fibonacci, longest common subsequence,
+edit distance, coin change, knapsack, matrix-chain
+multiplication, longest increasing subsequence —
+are worth knowing as patterns, because most DP
+problems are variations on these few shapes.
 
-**Recursion** as a programming concept is as old as Lisp (1958) and Algol 60. The mathematical idea is older — Peano's axioms (1889) defined natural numbers recursively. Before recursion-aware languages, programmers simulated it with explicit stacks.
+The space-optimization step (notice `dp[i]` only
+depends on `dp[i-1]` and `dp[i-2]` → keep two
+variables, not an array) is the move that separates
+"I know DP exists" from "I can write production DP
+code." Interview problems frequently *require* the
+space optimization for the solution to fit memory
+constraints.
 
-**Backtracking** was named by D. H. Lehmer in the 1950s in the context of combinatorial enumeration. The basic strategy (try, recurse, undo) appears in 19th-century puzzle-solving algorithms (n-queens has a backtracking solution dating to 1850).
+Backtracking is the direct ancestor of constraint
+solvers (SAT, SMT) and game-tree search (alpha-beta
+pruning). Both add pruning heuristics on top of
+backtracking's "try, undo" skeleton. Real chess
+engines are backtracking + alpha-beta + transposition
+tables (a DP-style cache of previously-evaluated
+positions).
 
-**Dynamic programming** was coined by Richard Bellman in the 1950s. The name "dynamic programming" was chosen partly for political reasons — Bellman was working at RAND and needed a name that didn't sound like mathematical research (which would have lost funding). "Programming" referred to planning, not coding. The technique itself is a systematic application of memoization to recursive optimization problems.
+Recursion's deepest payoff is *divide and conquer* —
+the proof technique that gets you the master theorem
+(T(N) = a·T(N/b) + f(N)). Merge sort, quicksort,
+binary search, FFT, Karatsuba multiplication are all
+divide-and-conquer. The recurrence relation IS the
+analysis.
 
-### The deeper principle
-
-**Recursion expresses problems where the solution for N is naturally expressed in terms of the solution for a smaller version of the same problem.** That's the test. If you can't say "the answer for N is some function of the answer for N-1 (or N/2, or some subset)," you don't have a recursive problem — you have a sequential one, and a loop is clearer.
-
-**Backtracking is recursion plus a state machine.** The state represents "what choices have I made so far?" The recursion explores "what choice should I make next?" The undo restores the state when the recursion returns. The combination — recursion plus reversible state mutation — is what makes it backtracking.
-
-**DP is recursion plus a cache plus a proof.** The cache (memo) is the implementation. The proof is *optimal substructure*: an optimal solution to the problem contains optimal solutions to the subproblems. Without that proof, memoization doesn't help — you might be caching wrong intermediate answers.
-
-```
-  problem characteristics → technique:
-
-  self-similar structure                             → recursion
-  + state-space search + need to undo                → backtracking
-  + overlapping subproblems + optimal substructure   → dynamic programming
-```
-
-### Where they break down
-
-- **Recursion blows the stack.** JavaScript engines limit call-stack depth to ~10K-30K frames. Deep recursion overflows. The fix is conversion to iteration with an explicit stack (DFS), or to tabulation (DP).
-
-- **Backtracking is exponential.** The search space size is `b^d` where b is the branching factor and d is the depth. Pruning helps — early termination on partial-state infeasibility — but worst case is still exponential. NP-hard problems (SAT, traveling salesman) are NP-hard precisely because no algorithm escapes the exponential.
-
-- **DP memo blows memory.** For 2D DP (e.g. edit distance over strings of length M and N), the table is O(M·N). For long sequences this is the limit. Space-optimization reduces 2D to two rows (current + previous), O(min(M, N)).
-
-- **DP requires *optimal substructure*.** Some problems look DP-shaped but aren't — e.g., longest *simple* path in a graph (no repeated vertices) doesn't have optimal substructure, so DP doesn't apply (and the problem is NP-hard).
-
-### What to explore next
-
-- **Master theorem** — closed-form solution for the recurrence T(N) = aT(N/b) + f(N) common in divide-and-conquer. Tells you the cost of merge sort (O(N log N)), binary search (O(log N)), Strassen's matrix multiply (O(N^2.81)) at a glance.
-
-- **Memoization decorators** — Python's `@functools.lru_cache`, JavaScript libraries like `memoize-one`, Reselect (Redux) — turn any pure recursive function into a memoized one without changing the function body.
-
-- **Iterative deepening DFS (IDDFS)** — combines BFS's optimality with DFS's memory efficiency by repeatedly doing depth-limited DFS with increasing depth bounds. Used in chess engines and some IK pathfinding problems.
-
-- **Branch-and-bound** — backtracking with an upper bound that prunes branches that can't beat the current best. Used in integer linear programming and combinatorial optimization.
-
-- **Your own portfolio** — recursion shows up in your sorting visualizers (merge sort, quicksort) and tree traversals (`reincodes/BinarySearchTree.ts` insert/delete). Those are the kernels rehearsed; the codebase hasn't asked for them yet.
-
----
+For deep grounding: CLRS Chapters 4 (divide and
+conquer), 15 (dynamic programming), and the
+backtracking material in Chapter 16. Sedgewick
+*Algorithms 4th Ed* §1.1 (recursion warmup), §6.3
+(reductions and intractability).
 
 ## Interview defense
 
-**What they are really asking.** Whether you can name the three techniques and distinguish them. Senior signal: identifying when a problem is genuinely recursive vs when it just looks recursive. Architect signal: recognizing the trigger for DP (overlapping subproblems + optimal substructure) and knowing when *not* to reach for it.
+**Q: Walk me through Fibonacci three ways: naive,
+memoized, tabulated.**
 
----
+Model answer: "Naive recursion is `fib(n) = fib(n-1)
++ fib(n-2)`, base cases `fib(0)=0`, `fib(1)=1`. Cost
+is O(2^N) because the call tree has overlapping
+subproblems — `fib(3)` computed three times in
+`fib(5)`. Memoization adds a cache: check the map
+before recursing, store after computing. Cost drops
+to O(N), one entry per subproblem. Tabulation skips
+recursion entirely — build `dp[0..n]` bottom-up.
+Same O(N), no stack risk. The final move: since
+`dp[i]` only depends on `dp[i-1]` and `dp[i-2]`,
+keep two variables instead of an array — O(1)
+space."
 
-**[mid] "What's the difference between recursion and dynamic programming?"**
+**Q: What's the most-forgotten part of backtracking?**
 
-Recursion is the syntax — a function that calls itself. Dynamic programming is recursion *plus memoization* applied to problems with overlapping subproblems. Naive recursive Fibonacci is exponential (O(2^N)) because `fib(3)` gets computed many times in the recursion tree. Memoized recursive Fibonacci is linear (O(N)) because each `fib(k)` is computed once and cached. The recursion is the *structure*; the memoization is what turns it from "elegant but slow" into "elegant and fast."
+Model answer: "The undo step after the recursive
+call. The kernel is choose → recurse → undo, and
+people skip the undo because in simple examples the
+code happens to work. The break case: mutable state
+from one branch pollutes the next sibling branch.
+For N-queens, that means trying column 0 in row 0,
+recursing, and never being able to try column 1 in
+row 0 because the board still shows a queen at (0,
+0). The explicit `board[row] = -1` after `place(row+
+1)` returns is the load-bearing line."
 
-```
-  recursion only           recursion + memoization (DP)
-  ────────────────         ─────────────────────────────
-  fib(40) = ~10^12 ops     fib(40) = 40 ops
-  (exponential)             (linear, with O(N) memo space)
-```
+**Q: When do you reach for DP vs greedy vs
+backtracking?**
 
----
+Model answer: "Greedy when each local choice is
+provably optimal (Dijkstra, Huffman, interval
+scheduling). DP when subproblems overlap and the
+optimal solution decomposes into subproblems
+(knapsack, LCS, edit distance). Backtracking when
+you have to *enumerate* feasible solutions or find
+*any* solution by exploring choices (N-queens,
+sudoku, permutations). The decision tree: 'can I
+prove a local choice is always right?' → greedy. If
+not, 'do my subproblems overlap?' → DP. If they
+don't overlap but I'm exploring → backtracking."
 
-**[senior] "When would you *not* reach for DP, even if a problem looks DP-shaped?"**
+**Q: Why doesn't blooming-insights use any of these?**
 
-Three cases. First: when **subproblems don't overlap**, memoization buys nothing — a binary tree walk visits each node exactly once even without a memo. Second: when **optimal substructure fails** — longest *simple* path in a graph (no repeated vertices) can't be built from optimal solutions to smaller subproblems because a "longer" sub-path might force you to revisit a vertex. Third: when **state space is too large to memoize** — DP over real numbers can't tabulate, and DP over very high-dimensional state explodes the table. The first two are theoretical (DP doesn't apply); the third is practical (DP applies but isn't tractable).
-
-```
-  problem characteristic                  DP applies?
-  ─────────────────────────────────       ──────────────────────
-  no overlapping subproblems              no (memo buys nothing)
-  no optimal substructure                 no (subprob answers wrong)
-  state space too large                   technically yes, but
-                                          infeasible memory
-```
-
----
-
-**[arch] "This codebase has no recursion of its own. Is that a problem? When would you add it?"**
-
-It's not a problem — the data is flat. Every algorithm here is a linear scan or a higher-order array op, and that matches the data shape (flat arrays of insights, evidence, recommendations). Three triggers would change my mind: (1) the schema grows recursive (deep nested objects with arbitrary depth), and a recursive walker is the cleanest expression; (2) an agent needs to generate a valid combination of tool calls under constraints — backtracking is the right search strategy; (3) an optimization problem appears where the same subcomputation recurs — like "pick the K recommendations that together maximize expected impact" (knapsack), which is classical DP. None of those has fired. The skill is recognizing the trigger when it arrives, not preemptively adding recursion for elegance points.
-
----
-
-**The dodge: "but you have `mkdir({recursive: true})` — doesn't that count?"**
-
-No. The `recursive: true` is a parameter passed to Node's `fs.promises.mkdir`. The recursion happens inside Node's standard library — Node walks the path, creates intermediate directories. The codebase's code doesn't have a recursive function. Calling this "the codebase uses recursion" inflates the description; it's like saying "I use binary trees" because I called `Map.set` (V8's Map uses a balanced tree internally for huge sizes). Library internals don't count. Cite `app/api/mcp/capture/route.ts`.
-
----
-
-**Anchors (cite these in your answer)**
-
-- `app/api/mcp/capture/route.ts` — only occurrence of "recursive" in the codebase, and it's a stdlib parameter
-- `lib/mcp/validate.ts` L3–L13 — three-attempt fallback ladder (sequential, not backtracking)
-- `lib/mcp/client.ts` L80 — TTL cache (cache, not memoization — no recursive structure being cached)
-- (No file paths for recursion, backtracking, or DP — these are `not yet exercised`.)
-
----
+Model answer: "The workload doesn't ask. The agent
+loops are iterative with a budget — that's the
+right shape because the LLM is the search policy, not
+my code. State is flat (Maps and arrays); there's no
+optimization problem that decomposes into overlapping
+subproblems. If I grew an evaluator that scored
+agent transcripts and wanted *optimal* tool sequences
+(rather than the model's choice), DP or A* would
+become relevant. Right now, the iterative budget +
+LLM-as-policy combination is honest. Hands-on for
+the missing techniques lives in reincodes (Tree.ts
+recursive generators, BinarySearchTree.ts recursive
++ iterative variants) and on the practice plan."
 
 ## See also
 
-→ `04-trees-tries-and-balanced-indexes.md` (trees are the natural data structure for recursion; tree walks are the canonical recursive algorithm) · → `05-graphs-and-traversals.md` (DFS is recursion with a visited set; backtracking is DFS plus undo) · → `06-sorting-searching-and-selection.md` (merge sort, quicksort, quickselect are all recursive/divide-and-conquer — `not yet exercised` directly here, but V8's Timsort uses recursion internally) · → `08-dsa-foundations-practice-map.md` (where these three rank in the practice plan)
+- `03-stacks-queues-deques-and-heaps.md` — the
+  call stack is itself a stack, and DFS via explicit
+  stack mirrors recursion
+- `04-trees-tries-and-balanced-indexes.md` — tree
+  operations are the canonical first recursion
+- `05-graphs-and-traversals.md` — DFS is recursion;
+  backtracking is DFS with undo
+- `08-dsa-foundations-practice-map.md` — the DP
+  canon (Fibonacci, LCS, edit distance, knapsack, coin
+  change, LIS) on the practice plan

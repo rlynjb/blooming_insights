@@ -1,340 +1,276 @@
-# Prompts as code (versioning, review, and the observability gap)
+# 03 — Prompts as code: versioning and observability
 
-**Industry name(s):** prompts-as-code, prompt versioning, prompt source control, prompt observability
-**Type:** Industry standard · Language-agnostic
-
-> blooming insights treats prompts as source — four `.md` files loaded with `readFileSync`, version-controlled, git-diffable, reviewed in PRs like any other code. What it does *not* yet do is pair a prompt version with the model that ran it (model IDs live in `base.ts` L9 and `intent.ts` L14, separate from the prompts) or log which prompt version produced which output — so the "worked on Sonnet, breaks on the next Sonnet" failure can't be traced.
-
-
----
+*Prompts-as-source · Industry standard*
 
 ## Zoom out, then zoom in
 
-**Zoom out — the bigger picture.** Prompts-as-code spans more bands than any other concept in this guide. The `.md` files sit in the Repo (under source control, reviewed in PRs), the `readFileSync` load happens at the Per-agent definitions band (each agent's module import), the model ID lives separately at the Provider/agent-loop boundary, and the persisted outputs land in the cross-cutting telemetry surface where `saveInvestigation` writes records. The concept's authoring half is everywhere on the left; its observability half — pairing prompt with model and logging the pair against output — is everywhere absent on the right.
+Where does the *source-of-truth* for a production prompt live? Not in a chat box. Not in a Notion doc. Pull up where it lives in this repo.
 
 ```
-  Zoom out — where prompts-as-code lives
+  Where the prompt source-of-truth lives
 
-  ┌─ Repo ──────────────────────────────────────────┐  ← we are here
-  │  ★ lib/agents/prompts/*.md (git-versioned) ★    │
-  │  git log · PR diff · review                     │
-  └─────────────────────────┬────────────────────────┘
-                            │  readFileSync at import
-  ┌─ Per-agent definitions ─▼────────────────────────┐  ← we are here
-  │  ★ PROMPT const  monitoring.ts L13 etc. ★        │
-  │  runtime-immutable (no live edit)                │
-  └─────────────────────────┬────────────────────────┘
-                            │  runs on
-  ┌─ Provider / agent loop ─▼────────────────────────┐
-  │  AGENT_MODEL = 'claude-sonnet-4-6'  base.ts L9   │
-  │  (decoupled from the prompt — never paired)       │
-  └─────────────────────────┬────────────────────────┘
-                            ┊  no co-logging
-  ┌ ─ Telemetry (gap) ─ ─ ─▼─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─┐
-   saveInvestigation  route.ts L254 persists OUTPUTS
-   MISSING: prompt sha + model id per output
-  └ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘
+  ┌─ Source control (git) ──────────────────────────────────────────┐
+  │  lib/agents/legacy-prompts/monitoring.md     ← reviewed in PRs    │
+  │  lib/agents/legacy-prompts/diagnostic.md       diffable, blameable │
+  │  lib/agents/legacy-prompts/recommendation.md   audit log via git    │
+  │  lib/agents/legacy-prompts/query.md                                 │
+  └──────────────────────┬───────────────────────────────────────────┘
+                         │  readFileSync at module load
+  ┌─ Build / runtime ▼ ──────────────────────────────────────────────┐
+  │  const PROMPT = readFileSync(...legacy-prompts/monitoring.md...) │ ← we are here
+  │  // imported once per agent, interpolated per call                │
+  └──────────────────────┬───────────────────────────────────────────┘
+                         │
+  ┌─ Anthropic API ▼ ────────────────────────────────────────────────┐
+  │  claude-sonnet-4-6 — prompt + model VERSION = the unit that ships  │
+  └──────────────────────────────────────────────────────────────────┘
 ```
 
-**Zoom in — narrow to the concept.** The question this file answers: are the prompts treated as code, and if so, how completely — what's version-controlled, what's reviewed, and what's *not* yet tracked? blooming insights nails the authoring half (file + git + PR + import-time read) and skips the observability half (prompt SHA + model ID logged per output). Below, you'll see why a one-line bump to `AGENT_MODEL` is the diff that silently regresses every prompt tuned to the old model, and why "prompts as code" needs the pairing and the per-output log to be real.
-
----
+A production prompt is *source code with a different syntax*. It lives in the repo, gets reviewed in PRs, gets diffed by `git blame`, and ships with a specific model version. The instant you treat it as anything less — a config string, a Notion doc, a "let me just edit this in the UI" — you lose every property that lets you ship safely.
 
 ## Structure pass
 
-**Layers.** Prompts-as-code is best understood as a four-layer timeline, not a single artifact. Layer A is *authoring-time* — the `.md` file in the repo, the git history, the PR diff, the reviewer's comments. Layer B is *deploy/import-time* — `readFileSync` baking the prompt into the running process, making the deployed bytes equal to the committed bytes. Layer C is *request-time* — the model executes against that prompt on a specific `AGENT_MODEL` constant that lives in a *different* file from the prompt. Layer D is *post-hoc / observability-time* — the persisted record of what happened, which today is `saveInvestigation` writing outputs only, with no prompt-SHA or model-ID stamped on them.
+**Layers.** Outer: the prompt in source control. Middle: the prompt loaded into the running process. Innermost: the prompt + model pair that actually runs.
 
-**Axis: lifecycle.** When does each piece exist, when is it pinned, when is it unrecoverable? This is the right axis because the gap this file is honest about — "we can review a prompt but can't trace a regression to one" — is a *temporal* gap. It's not about who controls (clearly the author, then code), and not about state (the prompt is immutable at runtime). It's about which layer captures which fact, and the fact missing at Layer D (which prompt SHA produced which output, on which model) is the one a future incident response will need *after* the prompts and model have already moved on.
-
-**Seams.** Three seams; the third is the load-bearing one. Seam 1 (A↔B) — lifecycle flips from *editable* to *runtime-immutable*; the import-time read is the gate, and the win is that deployed == committed. Seam 2 (B↔C) — the prompt and the model meet at request-time but were *paired by nobody*; the model ID is in `base.ts`, the prompt is in `prompts/monitoring.md`, and their pairing exists only in someone's memory. Seam 3 (C↔D) is the load-bearing one — lifecycle flips from *happening-now* to *recoverable-later*, and right now the boundary leaks: outputs persist, prompt-SHA and model-ID don't. The "worked on Sonnet, breaks on the next Sonnet" failure lives in this leak — by the time the regression is noticed, you can't recover which prompt-version × model-version pair produced the bad diagnosis from last week.
+**Axis — what changes here vs what doesn't.** Walk it:
 
 ```
-  Structure pass — prompts as code
+  one axis — "is this part allowed to change between deploys?" — three layers
 
-  ┌─ 1. LAYERS ───────────────────────────────────┐
-  │  A: authoring-time (.md, git, PR)              │
-  │  B: import-time (readFileSync → in-process)    │
-  │  C: request-time (prompt + AGENT_MODEL meet)   │
-  │  D: post-hoc (persisted record / trace)        │
-  └────────────────────────┬───────────────────────┘
-                           │  pick the axis
-  ┌─ 2. AXIS ─────────────▼────────────────────────┐
-  │  lifecycle: when does each fact exist and      │
-  │  when is it pinned for the next reader?         │
-  └────────────────────────┬───────────────────────┘
-                           │  trace A→D, find flips
-  ┌─ 3. SEAMS ────────────▼────────────────────────┐
-  │  S1 (A↔B): editable → runtime-immutable        │
-  │  S2 (B↔C): prompt & model paired by nobody     │
-  │  S3 (C↔D): happening-now → recoverable-later   │
-  │            (LOAD-BEARING — and currently leaks) │
-  └────────────────────────┬───────────────────────┘
-                           ▼
-                   Block 4 — How it works
+  ┌─ layer 1: .md file in git ─────────┐
+  │  CHANGES via PR only               │   reviewed, diffed, blameable
+  └────────────────────────────────────┘
+       ┌─ layer 2: PROMPT const in process ─┐
+       │  IMMUTABLE per deploy              │   readFileSync at module load
+       └────────────────────────────────────┘
+            ┌─ layer 3: prompt + model pair ──┐
+            │  CHANGES on deploy OR upgrade   │   the unit you regression-test
+            └─────────────────────────────────┘
 ```
 
-```
-  A seam — "can a future reader recover what ran?" answered two ways
-
-  ┌─ Layer C ────────┐    seam     ┌─ Layer D ────────────┐
-  │  prompt + model  │ ═════╪═════► │  saved: outputs only │
-  │  in memory, in   │  (it flips) │  MISSING: prompt sha │
-  │  flight          │             │  + model id per output│
-  └──────────────────┘             └──────────────────────┘
-         ▲                                   ▲
-         └────── same axis, two answers ─────┘
-                 → this boundary loses the pair → un-bisectable regression
-```
-
-The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+**Seams.** The git-to-process seam is `readFileSync(join(process.cwd(), 'lib/agents/legacy-prompts/...md'))`. The process-to-model seam is the SDK call — the same prompt against `claude-sonnet-4-6` vs `claude-sonnet-4-7` is *two different deployments* from a regression-testing standpoint.
 
 ## How it works
 
-**Mental model.** A prompt-as-code system has four properties: the prompt is a *file* (not a DB row or dashboard field), it is *loaded as source* by the program, it is *versioned* in the same repo as the code, and its version is *paired and logged* with the model and output for observability. blooming insights has the first three solidly and the fourth not at all. Picture two halves: the authoring half (file + load + version + review) is complete; the observability half (pair + log) is empty.
+### Move 1 — the mental model
+
+You know how you don't write SQL queries as concatenated strings inline in your route handlers — you put them in `.sql` files, version them with migrations, review the diff in PRs? Same shape, different file extension.
 
 ```
-AUTHORING HALF  (have it)              OBSERVABILITY HALF  (don't)
-─────────────────────────────         ─────────────────────────────
-file:    a versioned markdown file     pair:  prompt@sha + model id
-load:    sync read at import           log:   which prompt → which output
-version: git history                   trace: bisect a regression to a line
-review:  PR diff                       alert: failure rate per prompt version
+  Three artifacts that ship together as ONE deploy
+
+  ┌──────────────┐          ┌──────────────┐          ┌──────────────┐
+  │  prompt.md   │  ──+──►  │  model ver   │  ──=──►  │  prod        │
+  │  (vN in git) │          │  (sonnet-4-6)│          │  behavior    │
+  └──────────────┘          └──────────────┘          └──────────────┘
+       │                          │                          │
+       PR-reviewed                bumped in code             tested against
+       diffable                   tied to a date             eval set (or
+                                                             demo snapshot
+                                                             in this repo)
 ```
 
-The left column is what makes a prompt a maintainable artifact. The right column is what makes a regression *findable*. The codebase has the left, lacks the right.
+Change *either* of the first two and the behavior changes. Both belong in source control. Both belong in the PR. Both belong in the deployment story.
 
----
+### Move 2 — the walkthrough
 
-### The prompt is a file, loaded as source
-
-Each agent reads its prompt off disk at module load — once, synchronously, as the module is imported:
+**The .md file as source.** Look at `lib/agents/legacy-prompts/monitoring.md`. It's a markdown file with three things: prose rules, fenced examples, and `{placeholder}` interpolation points. It is *literally readable* by a human, and it reviews like prose in a PR. Here's the top:
 
 ```
-  PROMPT = read_file_sync(prompts_dir + "/monitoring.md")
-  PROMPT = read_file_sync(prompts_dir + "/diagnostic.md")
-  PROMPT = read_file_sync(prompts_dir + "/recommendation.md")
-  PROMPT = read_file_sync(prompts_dir + "/query.md")
+You are the monitoring agent in blooming insights, an AI analyst for an
+ecommerce workspace running on Bloomreach Engagement (EQL-shaped tools).
+
+## Role
+...
+
+## Hard rules
+1. Pass `project_id: {project_id}` to every tool call.
+2. ...
 ```
 
-The markdown files are not strings hidden in a code literal and they are not rows in a database — they are first-class files in the prompts directory. That placement is the whole move: a prompt under the source tree is reviewed, diffed, and shipped exactly like the code next to it. A teammate changing the monitoring prompt's "90-day window" method shows up in the PR as a content diff a reviewer reads line by line.
+Because it's markdown, it renders nicely on GitHub during code review. Because it's *one file per agent*, you can `git log lib/agents/legacy-prompts/monitoring.md` to see every change ever made to the monitoring prompt. Because the placeholders are explicit (`{project_id}`, `{schema}`, `{categories}`), the boundary between "stable prompt" and "per-call injection" is visible in the source.
 
-```
-edit prompt → git diff → PR review → merge → ships with the build
-   (same lifecycle as any other source file)
-```
+**The load step — `readFileSync` at module top.** `lib/agents/monitoring-legacy.ts:13`:
 
-Because the read runs at import, the prompt is also baked into the running process — there is no live-edit path, no dashboard override, no way for the deployed prompt to differ from the committed one. That immutability-at-runtime is a feature: the prompt that ran is exactly the prompt in the commit.
-
-**Code in this codebase — prompts loaded as versioned source.** `lib/agents/{monitoring,diagnostic,recommendation,query}.ts` + `lib/agents/prompts/*.md`, module-level `PROMPT` constant via `readFileSync` at `monitoring.ts` L13, `diagnostic.ts` L13, `recommendation.ts` L14, `query.ts` L13. The prompt is a repo file loaded as source at import — diffable, reviewable, runtime-immutable.
-
-### The markdown choice: prose that reviews like prose
-
-The prompts are Markdown, not code template literals, and that matters for review. A reviewer reading the diagnostic prompt's "Investigation approach" section reads it as prose — the way the model reads it — not as an escaped string with `\n`s. The instruction *is* the artifact; Markdown keeps it legible as one. The headings (`## Role`, `## Hard rules`) double as a structure a reviewer can scan (→ 01-anatomy.md).
-
-### Runtime interpolation is part of the same pattern: `{categories}`
-
-The versioned-markdown-plus-runtime-interpolation pattern is not only for static values like `{schema}` and `{project_id}`. The monitoring prompt has a `## Your category checklist` section whose body is a single `{categories}` slot, and that slot is filled with a string the code *builds at call time*:
-
-```
-  scan(hooks?, categories = []):
-    if categories is non-empty:
-        checklist = join_lines(categories.map(c =>
-            "- `" + c.id + "` (" + c.label + ") — " + c.why_it_matters + " …"))
-    else:
-        checklist = "(no checklist provided — scan for any significant recent change)"
-
-    system = PROMPT
-      .replace("{schema}",     schema_summary(schema))
-      .replace(/{project_id}/g, schema.project_id)
-      .replace("{categories}", checklist)        # ← same replace pattern
+```typescript
+const PROMPT = readFileSync(
+  join(process.cwd(), 'lib/agents/legacy-prompts/monitoring.md'),
+  'utf8',
+);
 ```
 
-This is the *same* discipline as `{schema}`/`{project_id}`: the constant lives in the version-controlled markdown, and a runtime value is stamped into a named slot with a string replace right before the call. The only thing that differs is provenance — `{schema}` is a workspace summary and `{project_id}` is one id, while `{categories}` is a checklist *assembled in code* from the anomaly-category list the scan method now takes. The prompt file stays the diffable, reviewable artifact; the per-call payload is the runnable-category list the route gates and passes in. For the prompts-as-code lens, the takeaway is that "what's in the file" and "what's injected" is still a clean two-way split even when the injected value is computed — the slot is committed, the content is built per call. (The gate that decides which categories get passed is its own topic — → ../study-ai-engineering/04-agents-and-tool-use/07-capability-gating.md.)
+One read, at module load, into a `const`. The prompt is then *immutable for the lifetime of the process*. This matters more than it looks:
 
----
+  → **No accidental mutation.** The string is `const`, not a let or a global config.
+  → **No file watchers, no hot-reload of prompts at runtime.** The prompt that shipped with this deploy is the prompt that runs.
+  → **The unit of change is a deploy.** To change the prompt, you change the file, commit, push, deploy. That's it. There's no admin UI to "edit the prompt live." Concept 11 (meta-prompting) is what people reach for when they want that, and it has its own tradeoffs.
 
-### Move 2.5 — current state vs. the missing half
+**The interpolation step.** `lib/agents/monitoring-legacy.ts:95-98`:
 
-The honest part. Here is what is *not* wired, and why it bites.
-
-**Gap 1 — model ID is separate from the prompt.** The model the prompt runs on is a constant in code, in a different file from the prompt:
-
-```
-agent model      = "claude-sonnet-4-6"          ← the 3 agents + query
-classifier model = "claude-haiku-4-5-20251001"  ← the classifier
-```
-
-Nothing ties the monitoring prompt's content hash to the agent model string. They version independently. You can change the prompt without touching the model, and change the model without touching any prompt — and there is no record that pins which prompt version was validated against which model version. A prompt is tuned for the behavior of a *specific* model; decoupling them in the source means the pairing exists only in someone's memory.
-
-```
-prompt version:  monitoring prompt @ abc123     ─┐
-                                                  ├─ NOT paired, NOT co-logged
-model version:   the agent model constant       ─┘
+```typescript
+const system = PROMPT
+  .replace('{schema}', schemaSummary(this.schema))
+  .replace(/\{project_id\}/g, this.schema.projectId)
+  .replace('{categories}', checklist);
 ```
 
-**Code in this codebase — model IDs (separate from the prompts).** `lib/agents/base.ts`, `lib/agents/intent.ts` — `AGENT_MODEL` and `CLASSIFIER_MODEL` constants at `base.ts` L9 (`'claude-sonnet-4-6'`), `intent.ts` L14 (`'claude-haiku-4-5-20251001'`). The model version lives in code, decoupled from the prompt files — unpaired and independently versioned.
+Three named placeholders, three substitutions. No `eval`, no template engine, no `${}` interpolation. The dynamism is explicit: those three values change per call; everything else is stable. The boundary between "what I committed" and "what I sent" is exactly three string substitutions.
 
-**Gap 2 — no prompt-version → output observability.** The route handler streams the trace and persists the events on stream close, but the persisted record carries the *outputs* (diagnosis, recommendations, reasoning steps) — not the prompt SHA or the model ID that produced them. So given a bad diagnosis from last week, you cannot answer "which monitoring prompt was live then, on which model?" without correlating git history to a deploy timestamp by hand.
+**Prompt + model — the unit that ships.** Look at `lib/agents/base-legacy.ts:10`:
 
-```
-saved:      reasoning_step · diagnosis · recommendation · done
-NOT saved:  prompt sha · model id · prompt version tag
-→ can't bisect a regression to a prompt line or a model bump
+```typescript
+export const AGENT_MODEL = 'claude-sonnet-4-6';
 ```
 
-**Why this is the "worked-on-Sonnet-breaks-on-the-next-Sonnet" risk, precisely.** Change the agent-model constant to a newer model. The prompts are unchanged, so the diff looks safe — one line, a model string. But the prompts were tuned against the *old* model's behavior: its default formatting, its tendency to fence JSON, its adherence to the monitoring prompt's "do not re-run variations" rule. The new model may format differently, and now the diagnostic agent's parse-failure rate climbs. Because the prompt version and model version aren't paired or co-logged, the regression presents as "diagnoses got worse" with no signal pointing at the model bump. The fix that would make it traceable — log `{promptSha, model}` with every output — is exactly the missing half.
+Pinned model version. Not "the latest sonnet" — a specific version. This is the other half of "prompts as code": you don't just version the prompt, you version the *combination*. When Anthropic releases Sonnet 4.7, the active codebase keeps running 4.6 until somebody bumps this constant in a PR.
 
-**Code in this codebase — output persistence (no prompt/model metadata).** `app/api/agent/route.ts`, the `saveInvestigation` call in the stream's `start`, L254 (`saveInvestigation(insightId!, collected)`); `collected` is the `AgentEvent[]` of outputs, declared at L171 and pushed to in `send` at L173. Persists the streamed outputs for cache-replay; carries no prompt SHA, model ID, or version tag — the observability gap.
-
-**Why this is a codebase strength (the half it has).** The prompts being plain `.md` under `lib/` means every behavior change is a reviewable diff with git history, and the import-time read guarantees the deployed prompt equals the committed prompt. That is the foundation; the missing half is additive, not a rewrite.
-
----
-
-### The principle
-
-Putting prompts in files buys you the authoring half of prompts-as-code: diff, review, history, runtime immutability. It does *not* automatically buy the observability half: pairing prompt version with model version and logging both against output. A prompt is logic tuned to a specific model; treating it as code means versioning *the pair* and recording which pair produced which result. blooming insights nailed the first half and left the second for later — which is a defensible early-stage choice as long as you know the gap is there before the model upgrade that exposes it.
-
----
-
-## Prompts as code — diagram
-
-This diagram spans the authoring half (solid) and the observability half (dashed). A reader who sees only this should grasp that the prompt is a versioned file loaded as source, that the model ID lives elsewhere unpaired, and that nothing logs the prompt-version → output link.
+Here's what an actual model-upgrade PR would look like in this repo:
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│  AUTHORING HALF — IMPLEMENTED                                         │
-│                                                                       │
-│  prompts directory (*.md)  ──sync read──▶  PROMPT const               │
-│   monitoring · diagnostic · recommendation · query prompts            │
-│                                                                       │
-│   git history ── PR diff ── review ── ships in the build              │
-│   (runtime-immutable: import-time read, no live edit)                 │
-└───────────────────────────┬───────────────────────────────────────────┘
-                            │  runs on
-┌───────────────────────────▼───────────────────────────────────────────┐
-│  MODEL IDs — SEPARATE, UNPAIRED                                       │
-│   agent model      = "claude-sonnet-4-6"                              │
-│   classifier model = "claude-haiku-4-5-20251001"                      │
-└───────────────────────────┬───────────────────────────────────────────┘
-                            ┊  (no pairing, no co-logging)
-┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ▼ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐
-   OBSERVABILITY HALF — NOT IMPLEMENTED
-   investigation save persists OUTPUTS only:
-     reasoning_step · diagnosis · recommendation · done
-   MISSING: prompt sha · model id · version tag per output
-   → a model bump is a 1-line diff that can silently regress
-└ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘
+  PR — "Upgrade monitoring agent to Sonnet 4.7"
+
+  diff --git a/lib/agents/base-legacy.ts b/lib/agents/base-legacy.ts
+  -export const AGENT_MODEL = 'claude-sonnet-4-6';
+  +export const AGENT_MODEL = 'claude-sonnet-4-7';
+
+  diff --git a/lib/agents/legacy-prompts/monitoring.md b/lib/agents/legacy-prompts/monitoring.md
+  -3. Make at most 6 tool calls total, then stop and return your JSON answer.
+  +3. Make at most 5 tool calls total (4.7 is more decisive), then stop and return your JSON answer.
 ```
 
-The authoring half is solid; the model ID is decoupled; the observability half is empty — which is the line between "we can review a prompt" and "we can trace a regression to one."
+The two changes ship together. The PR description names the regression test (which, in this repo, is the captured demo snapshot at `lib/state/demo-*.json` — see concept 05). The PR reviewer can see the *exact* prompt diff and the *exact* model bump in one place.
 
----
+**Layers-and-hops view of one prompt change reaching production:**
+
+```
+  Layers-and-hops — prompt change → production
+
+  ┌─ Editor ───────────────────────────────────────────────┐
+  │  open lib/agents/legacy-prompts/monitoring.md           │
+  │  edit rule 3                                            │
+  └──────────────┬─────────────────────────────────────────┘
+                 │ hop 1: git diff (reviewable, prose-level diff)
+  ┌─ Pull request ▼ ───────────────────────────────────────┐
+  │  PR rendered on GitHub with prose-style diff             │
+  │  reviewer compares against demo snapshot output          │
+  └──────────────┬─────────────────────────────────────────┘
+                 │ hop 2: merge to main
+  ┌─ Deploy (Vercel) ▼ ────────────────────────────────────┐
+  │  next build → readFileSync runs at module load time     │
+  │  prompt baked into the bundle                            │
+  └──────────────┬─────────────────────────────────────────┘
+                 │ hop 3: request comes in
+  ┌─ Runtime ▼ ────────────────────────────────────────────┐
+  │  PROMPT const interpolated, sent to AGENT_MODEL          │
+  │  output validated, streamed to UI                        │
+  └────────────────────────────────────────────────────────┘
+```
+
+Every hop preserves the prompt-as-source property. No admin UI mutation. No live editing. No "let me just patch this on prod." If the prompt is wrong on production, the fix is a PR.
+
+**What's missing in this repo (Case B for prompt observability).** This is the honest gap. The legacy `.md` files are version-controlled, but at runtime there's no log line that says "this output was produced by prompt vSHA + model v4-6." If a customer reports "the diagnosis was wrong," there's no way to look up which exact prompt version they got.
+
+What that would look like:
+
+```
+  What's missing — runtime prompt-version logging
+
+  ┌─ Agent call ──────────────────────────────────────────┐
+  │  console.log({                                          │
+  │    site: 'agents/monitoring',                           │
+  │    promptSha: 'abc123' /* git sha of monitoring.md */,  │
+  │    model: AGENT_MODEL,                                  │
+  │    sessionId,                                           │
+  │  });                                                    │
+  └───────────────────────────────────────────────────────┘
+```
+
+The structured log line already exists at `lib/agents/aptkit-adapters.ts:57-61` — it logs `site`, `sessionId`, and `usage`. Adding `promptSha` and `model` would close the loop. Without it, prompt + model are versioned in *source* but not in *traces* — you can git-blame a prompt change, but you can't trace "which prompt version produced this specific UI output."
+
+The other gap: **no automated regression detection across model upgrades.** When Sonnet 4 → 4.6 shipped, this repo manually compared outputs against the demo snapshot. Concept 05 walks what eval-driven iteration would look like; the prompts-as-code discipline is the *prerequisite* for evals (you can't run a regression suite against a prompt-version you don't have).
+
+### Move 3 — the principle
+
+The thing that makes a prompt safe to change is the same thing that makes any code safe to change: it lives in version control, ships through PRs, runs against a regression suite. The discipline is identical to SQL-migration discipline or schema-migration discipline. The only thing that's specific to prompts is that the regression suite has to handle *probabilistic* output — which is what concept 05 is about.
+
+## Primary diagram — prompts as code, the full pipeline
+
+```
+  ┌─ Source of truth ───────────────────────────────────────────────────┐
+  │  lib/agents/legacy-prompts/{monitoring,diagnostic,recommendation,    │
+  │     query}.md                                                         │
+  │  + lib/agents/base-legacy.ts:AGENT_MODEL = 'claude-sonnet-4-6'        │
+  └────────────────────┬────────────────────────────────────────────────┘
+                       │ git
+  ┌─ PR ▼ ──────────────────────────────────────────────────────────────┐
+  │  prompt diff renders as prose-level diff                              │
+  │  reviewer sanity-checks against demo snapshot output                  │
+  └────────────────────┬────────────────────────────────────────────────┘
+                       │ deploy
+  ┌─ Process ▼ ─────────────────────────────────────────────────────────┐
+  │  readFileSync at module load → const PROMPT                          │
+  │  AGENT_MODEL constant                                                 │
+  │  IMMUTABLE for the lifetime of this process                          │
+  └────────────────────┬────────────────────────────────────────────────┘
+                       │ per request
+  ┌─ Call site ▼ ───────────────────────────────────────────────────────┐
+  │  PROMPT.replace('{schema}', ...).replace(/\{project_id\}/g, ...)     │
+  │  anthropic.messages.create({ model: AGENT_MODEL, system: <interp>, …})│
+  └─────────────────────────────────────────────────────────────────────┘
+  ┌─ Missing in this repo (next step) ─────────────────────────────────┐
+  │  runtime log line with promptSha + model so traces can be tied       │
+  │  back to the exact prompt version (concept 05's prerequisite)        │
+  └─────────────────────────────────────────────────────────────────────┘
+```
 
 ## Elaborate
 
-### Where this comes from
+The pattern in this repo is the *minimum viable* prompts-as-code shape: `.md` files in git, `readFileSync` at module load, named placeholders, pinned model version. It's the same shape `aipe` itself (your meta-tooling project) takes — slash commands map to `.md` template files, frontmatter for variables, the markdown body as the prompt source. The convergence is real: any system that needs to *edit prompts safely* converges here.
 
-Prompts-as-code is the consensus correction to "prompts in a dashboard." The early LLM-app pattern was to edit prompts in a vendor console for speed; teams learned the hard way that an un-versioned prompt is an un-bisectable bug, and the field converged on "prompts are source." Tools like PromptLayer, LangSmith, and Humanloop exist specifically to add the *observability half* — pairing prompt version with model and run, and logging outputs against both. The authoring half (files in the repo) is the table stakes; the tooling ecosystem is almost entirely about the second half blooming insights hasn't built.
+The richer end of this discipline:
 
-### The deeper principle
+- **Prompt registries** (PromptLayer, LangSmith, OpenAI's prompt management). External services that store prompts and surface a version-history UI. Useful when non-engineers need to edit prompts; overhead otherwise.
+- **In-context prompt versioning.** The next step from this codebase: tag every log line with the prompt's git SHA, so a trace can be tied back to the exact version. Cheap to add (one extra field), invaluable when debugging "why was *this* output produced?"
+- **A/B testing prompts.** Run two prompts against the same input, score the outputs. Requires the eval substrate (concept 05) to be real.
 
-```
-prompt-as-text-in-a-DB     prompt-as-code (authoring)     prompt-as-code (full)
-────────────────────────   ──────────────────────────    ─────────────────────────
-edit live, no diff         file + git + review            + model pairing
-no history                 runtime-immutable              + per-output logging
-unbisectable               bisectable by hand             bisectable automatically
-                           ◀── blooming insights is here
-```
+Where to read next: Hamel Husain's *"Your AI Product Needs Evals"* (hamel.dev/blog/posts/evals/) — the canonical reference for why prompts-as-code is the *prerequisite* for evals. Simon Willison's running thread on prompts-as-source. PromptLayer's docs for what a managed prompt-registry looks like; you'll see the same shape with a different syntax.
 
-The progression is: make it a file (review), then make it observable (trace). A prompt is logic tuned to a model; the full discipline versions the pair and records which pair ran. blooming insights is one step short of full — production traffic doesn't carry a prompt SHA, and there's no in-repo eval-bench history that bisects prompt deltas against output scores. There's also a *new* dimension to the gap now that the active prompts ship via `@aptkit/prompts`: the prompt version is the package version, which can move independently of the app deploy. A `npm install` that bumps `@aptkit/core` from 0.3.0 → 0.3.1 changes the prompts the agents read without touching any line under `lib/agents/prompts/`. The single-line silent-regression risk just moved from "a model bump in `base.ts` L9" to "a transitive package bump in `package-lock.json`" — and the same missing co-log (prompt version + model id per output) leaves both invisible.
-
-### Where this breaks down
-
-1. **A model bump looks safe in a diff.** Changing `base.ts` L9 is a one-line change that the diff makes look trivial — but it can regress every prompt tuned to the old model, with no co-logged signal pointing at the cause.
-2. **`readFileSync` at import means no hot-fix.** The runtime immutability that makes the deployed prompt trustworthy also means fixing a prompt requires a redeploy — fine for safety, slow for incident response.
-3. **`.md` prompts aren't validated against their loaders.** Nothing asserts the placeholders in `monitoring.md` match the `.replace` calls in `monitoring.ts` (→ 01-anatomy.md exercise), so a prompt-only edit can introduce an un-injected placeholder that a code review of the `.md` alone won't catch.
-
-### What to explore next
-
-- **Co-log the pair:** add `{ promptSha, model }` to the persisted investigation record (`route.ts` L254) so every output is traceable to a prompt version and model version.
-- **Pin the pairing in code:** colocate the model ID with the prompt (e.g. front-matter in the `.md`, or a per-agent config) so a model change forces a deliberate prompt-pairing decision rather than a silent decoupled edit.
-- **Prompt version tags:** stamp a semantic version or git SHA into the loaded prompt and surface it in the trace, so a regression can be bisected to a prompt line automatically.
-
----
-
-## Project exercises
-
-### Co-log prompt SHA and model ID with every investigation
-
-- **Exercise ID:** C1.7 (adapted) — prompts-as-code observability.
-- **What to build:** compute a content hash of each loaded prompt at import (alongside the `PROMPT` const), and include `{ promptSha, model: AGENT_MODEL }` in the record `saveInvestigation` persists (`route.ts` L254), so every saved investigation is traceable to the exact prompt version and model that produced it.
-- **Why it earns its place:** closes the highest-value half of the observability gap — turns "diagnoses got worse last week" from a manual git/deploy correlation into a field on the record.
-- **Files to touch:** `lib/agents/{monitoring,diagnostic,recommendation,query}.ts` (export the prompt hash), `lib/state/investigations.ts` (widen the persisted shape), `app/api/agent/route.ts` (L162 — attach provenance).
-- **Done when:** a saved investigation record carries the prompt SHA and model ID, and changing a prompt changes the recorded SHA on the next run.
-- **Estimated effort:** 1–4hr
-
-### Pin the model pairing in the prompt file
-
-- **Exercise ID:** C1.7 (adapted) — version the prompt↔model pair.
-- **What to build:** add a front-matter line to each `lib/agents/prompts/*.md` declaring the model it's tuned for, parse it at load, and assert it matches `AGENT_MODEL` / `CLASSIFIER_MODEL` — so a model bump in `base.ts` L9 that doesn't update the prompts' declared pairing fails fast instead of silently regressing.
-- **Why it earns its place:** makes the prompt↔model coupling explicit and enforced, so the "worked-on-Sonnet-breaks-on-the-next" upgrade can't ship unnoticed.
-- **Files to touch:** the four `lib/agents/prompts/*.md` (front-matter), the four agent `.ts` files (parse + assert at load), `lib/agents/base.ts` / `lib/agents/intent.ts` (export the expected model).
-- **Done when:** bumping `AGENT_MODEL` without updating the prompts' declared model throws at load, and a matching pair loads cleanly.
-- **Estimated effort:** 1–4hr
-
----
+In this codebase, concept 05 (eval-driven iteration) is the discipline that turns prompts-as-code from "we can version them" into "we can change them safely." Without evals, prompts-as-code gives you *visibility* (you can see what changed); with evals, it gives you *confidence* (you know what the change did).
 
 ## Interview defense
 
-### What an interviewer is really asking
+**Q: "Where do your prompts live?"**
 
-"How do you manage your prompts?" tests whether you treat prompts as throwaway strings or as versioned logic — and, at the senior level, whether you know that "prompts as code" has a second half (observability) most teams skip. The strong answer names both halves and is honest about which one this codebase has.
-
-### Likely questions
-
-**[mid] "Where do your prompts live and how are they changed?"**
-
-In `lib/agents/prompts/*.md`, loaded with `readFileSync` at import (`monitoring.ts` L13 etc.). Changing one is a PR diff on the `.md` with git history and review, and because the read is at import time the deployed prompt always equals the committed one — no live editing.
+In the repo, as `.md` files under `lib/agents/legacy-prompts/`. Loaded with `readFileSync` at module top into a const. *(Draw the diagram.)* The interpolation step is three explicit `String.prototype.replace` calls — no template engine. The whole prompt is reviewable in a PR as a prose diff, blameable with `git blame`, and ships as part of the bundle.
 
 ```
-edit monitoring.md → PR diff → review → merge → ships (import-time read)
+  .md file in git  →  readFileSync at module load  →  const  →  per-call interpolation
 ```
 
-**[senior] "A diagnosis quality dropped last week. How do you find the cause?"**
+Anchor: *"the prompt is source code. It lives in the repo, reviews in PRs, ships in deploys."*
 
-Today, with difficulty — `saveInvestigation` (`route.ts` L254) persists the outputs but not the prompt SHA or model ID, so I'd correlate `git log lib/agents/prompts/` and `base.ts` L9 history against the deploy timeline by hand. The right fix is co-logging `{ promptSha, model }` with each record so I can filter by version. The gap is the observability half of prompts-as-code; the authoring half (files + git) is there.
+**Q: "What happens when Anthropic releases a new model?"**
 
-```
-have:  outputs persisted
-need:  { promptSha, model } per output → filter the regression to a version
-```
-
-**[arch] "You bumped the model in `base.ts` L9 and quality regressed. Why was that hard to catch?"**
-
-Because the prompts and the model version are decoupled in the source and never co-logged. The prompts in `lib/agents/prompts/*.md` were tuned to the old model's behavior — its default formatting, its JSON-fencing habit, its adherence to `monitoring.md` L11's "do not re-run variations." A one-line model change leaves the prompts unchanged, so the diff looks safe, and nothing records which prompt version was validated against which model. The regression shows up as "output got worse" with no signal pointing at the bump.
+It's a one-line PR that ships *with* whatever prompt changes are needed: `AGENT_MODEL` constant bumps in `base-legacy.ts`, prompt rules adjust in the relevant `.md`. The two ship together because they're one regression. The honest gap in this repo: I don't have an automated regression suite, so the verification is by-hand against the captured demo snapshot. The *next* version of this discipline is what concept 05 walks — an eval set the PR runs against in CI.
 
 ```
-base.ts L9: model bump (1-line diff)  → prompts unchanged, tuned to OLD model
-no pairing/co-log → regression untraceable to the model change
+  PR diff:                                          regression check today:
+  - AGENT_MODEL = 'claude-sonnet-4-6';              compare against
+  + AGENT_MODEL = 'claude-sonnet-4-7';              lib/state/demo-*.json
+  + ...prompt rule edits in monitoring.md           by-hand (gap; eval set
+                                                    is the next step)
 ```
 
-### The question candidates always dodge
+Anchor: *"prompt + model are one unit. They ship together because they're one regression."*
 
-**"Is putting prompts in files enough to call them 'code'?"** No — and candidates dodge because conceding it admits their setup is half-done. Files buy review and history; "prompts as code" in full means versioning the prompt↔model pair and logging which pair produced which output. blooming insights has the authoring half and not the observability half — and naming that gap precisely is the senior move, not claiming completeness.
+**Q: "What's missing in your version of this?"**
 
-### One-line anchors
+Two things. One: runtime prompt-version logging — I version the prompt in source but don't tag it in the log line, so I can't trace a specific UI output back to a specific prompt version. The fix is one extra field in the existing structured log at `aptkit-adapters.ts:57`. Two: an automated regression suite. I have the captured demo snapshot, which is a useful single-data-point regression check, but it's not an eval set. Concept 05 is what I'd build next.
 
-- `lib/agents/monitoring.ts` L13 — prompt loaded as source via `readFileSync` (same at `diagnostic.ts` L13, `recommendation.ts` L14, `query.ts` L13).
-- `lib/agents/base.ts` L9 — `AGENT_MODEL` constant, decoupled from the prompts.
-- `lib/agents/intent.ts` L14 — `CLASSIFIER_MODEL`, separately versioned.
-- `app/api/agent/route.ts` L254 — `saveInvestigation` persists outputs only, no prompt/model provenance.
-- the gap: prompt version + model version are neither paired nor co-logged → untraceable regression.
-
----
+Anchor: *"prompts-as-code without runtime version logging is half the discipline. The other half is tying the trace back to the exact prompt version that ran."*
 
 ## See also
 
-→ 01-anatomy.md · → 02-structured-outputs.md · → 06-single-purpose-chains.md
-
----
+- `01-anatomy.md` — the four-section structure is what fits cleanly into a `.md` file with named placeholders.
+- `05-eval-driven-iteration.md` — prompts-as-code is the prerequisite for evals; without versioned prompts, you can't measure what a change did.
+- `11-meta-prompting.md` — when "non-engineers want to edit prompts" comes up, this is the path. Tradeoffs are real.

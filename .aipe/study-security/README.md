@@ -1,59 +1,84 @@
-# Study — Security
+# study-security · reading order
 
-Security audit of blooming insights, traced along the **trust axis**: every input is hostile until proven otherwise, every boundary either enforces a trust decision or leaks one.
+The single question this guide answers: **what can an attacker reach in
+blooming insights, and what happens when they do?**
 
-This is not a marketing document. The point of the audit is to name what the codebase gets right *and* what it doesn't — code-level findings, not aspirations. Where the repo is too small to exercise a concept honestly, it's said. Where a real gap exists, it's named with file and line, not softened.
+The repo runs a Next.js 16 app that brokers a browser into a third-party
+OAuth-protected MCP server, runs Claude as the policy engine, and streams
+the agent's thinking back to the UI. Three trust boundaries carry the
+weight. Trace them in this order and the rest of the file list reads in
+context.
 
 ```
-  The only question:  what can an attacker reach, and what happens when they do?
+  the trust axis — three boundaries, in order
 
-  trace the trust axis across every boundary ─────────────
-     where does untrusted input enter?      (the attack surface)
-     who is allowed past this boundary?      (authn / authz)
-     what's hidden, what's exposed?          (secrets / data)
-     what do my dependencies let in?         (supply chain)
+  ┌─ untrusted ──────────────┐
+  │ browser  (query params,  │
+  │ POST bodies, cookies)    │
+  └──────────┬───────────────┘
+             │  HTTP  ← boundary 1: route validates input + session
+  ┌─ Service ▼───────────────┐
+  │ Next.js API route        │
+  └──────────┬───────────────┘
+             │  MCP   ← boundary 2: OAuth2.1 + PKCE + DCR + AES-256-GCM cookie
+  ┌─ Provider ▼──────────────┐
+  │ Bloomreach MCP server    │
+  └──────────┬───────────────┘
+             │ Claude reads result; route validates model output
+             │        ← boundary 3: parseAgentJson + type guards + FALLBACK
+             ▼
+  ┌─ UI ─────────────────────┐
+  │ React (auto-escape)      │
+  └──────────────────────────┘
 ```
 
----
+## Read in this order
 
-## Reading order
+  1. `00-overview.md` — the whole-system map, the three boundaries, the
+     single load-bearing control at each, and the one finding worth
+     keeping awake at night.
+  2. `audit.md` — the 8-lens pass: what the codebase does (with
+     `file:line`) or "not yet exercised" honestly. The capstone red-flag
+     checklist sits at the bottom.
+  3. Pattern files (Pass 2) — discovered controls and gaps that earned a
+     deep walk:
 
-This guide uses the two-pass shape: one survey file (`audit.md`) and five pattern files. Read in this order:
+     - `01-encrypted-cookie-oauth-state.md` — how OAuth/PKCE/token state
+       survives Vercel's stateless functions without a shared store: an
+       AES-256-GCM-encrypted `bi_auth` cookie keyed by `AUTH_SECRET`.
+     - `02-als-scoped-request-store.md` — how the SDK's many `state()` /
+       `saveTokens()` calls in a single request all see one decrypted
+       view of the store, with a single flush. Read-after-write inside
+       one request without the Next.js request-vs-response cookie split.
+     - `03-type-guard-trust-boundary.md` — how model output crosses from
+       hostile string to typed value: `parseAgentJson` + per-shape type
+       guards + `FALLBACK` constants. The seam between "what Claude
+       said" and "what the UI renders."
+     - `04-read-only-tool-whitelist.md` — how the agents are kept
+       read-only by construction. Per-agent allowlists in
+       `lib/mcp/tools.ts` mean `monitoring` literally cannot reach a
+       write tool, even if Claude asks.
+     - `05-open-tool-surface-gap.md` — the proxy-shaped route
+       (`POST /api/mcp/call`). Now allowlisted against `ALL_KNOWN`, but
+       still doesn't scope the allowlist by *agent* or by *args*, so a
+       session-auth'd user (or stolen cookie) can call any
+       bootstrap/diagnostic tool the union covers.
 
-| # | File | What it covers |
-|---|---|---|
-| — | [Overview — security in blooming insights](./00-overview.md) | One-page orientation: the trust topology + the file index |
-| — | [audit.md](./audit.md) | Pass 1 — the 8-lens audit (trust boundaries, authn/authz, input validation, secrets, data exposure, deps, LLM/agent, red-flags) with top-3 ranked findings |
-| 01 | [encrypted-cookie-oauth-state](./01-encrypted-cookie-oauth-state.md) | AES-256-GCM `bi_auth` cookie carrying full OAuth state across serverless requests |
-| 02 | [als-scoped-request-store](./02-als-scoped-request-store.md) | `AsyncLocalStorage<RequestStore>` — the synchronization primitive behind `withAuthCookies` |
-| 03 | [type-guard-trust-boundary](./03-type-guard-trust-boundary.md) | `parseAgentJson` + `isXxx` + `FALLBACK` — the load-bearing model-output gate |
-| 04 | [read-only-tool-whitelist](./04-read-only-tool-whitelist.md) | Per-agent capability minimization in `lib/mcp/tools.ts` |
-| 05 | [open-tool-surface-gap](./05-open-tool-surface-gap.md) | The H1 finding: `POST /api/mcp/call` accepts any tool name with no allowlist |
+## What this guide does not cover
 
----
+  → Bloomreach's own server security (out of scope; trust-boundary 2
+    treats it as a black-box provider).
+  → Distributed-systems threat modeling (Vercel's edge platform is
+    trusted as a single-tenant runtime).
+  → The dev-only routes (`/api/mcp/capture`, `/api/mcp/capture-demo`)
+    beyond noting they're gated by `NODE_ENV === 'production'` and
+    return 403 in prod. They're called out in `audit.md` for
+    completeness, no pattern file.
 
-## How to use this guide
+## Cross-links to other study guides
 
-**Quickest read.** Open `audit.md`. The verdict-first paragraph + "Top 3 ranked findings" section gives you the headline in two screens.
-
-**Per-boundary depth.** Each pattern file walks one mechanism from zoom-out to interview defense. Pick the one that matches the question you have.
-
-**Defending it in an interview or review.** Every pattern file ends with an **Interview defense** block (the questions a senior reviewer will actually ask, with model answers + diagrams) and a **Validate** block (four levels: reconstruct → explain → apply → defend).
-
----
-
-## Cross-references
-
-Two existing files in this codebase already cover slices of the security surface from a different angle:
-
-- `.aipe/study-system-design/02-oauth-boundary.md` — the canonical OAuth/PKCE/DCR + encrypted cookie treatment, from the architecture angle. `01-encrypted-cookie-oauth-state.md` references it instead of re-deriving the OAuth mechanics.
-- `.aipe/study-ai-engineering/06-production-serving/03-prompt-injection.md` — the prompt-injection treatment from the LLM angle (what the attack shape is, why structural defenses work). Both `03-type-guard-trust-boundary.md` and `04-read-only-tool-whitelist.md` reference it instead of duplicating.
-
----
-
-## What this audit does NOT cover
-
-- **Threat modeling at scale.** No DDoS analysis, no abuse cost modeling, no distributed-systems trust (this isn't a multi-tenant service).
-- **Compliance.** No GDPR/CCPA/SOC2 paperwork. The audit is technical — if the code touches PII unsafely, it's flagged here, but the policy frame is not.
-- **Penetration testing.** No exploit code. The spec is explicit: name the weakness, name the fix, never write the attack.
-- **Bloomreach IdP internals.** The MCP server's auth, rate-limits, and data handling are out of scope — we audit the trust boundary *toward* it, not its insides.
+  → `study-system-design/` — the architecture-and-scale story. Same
+    boundaries, different axis (control + state instead of trust).
+  → `study-software-design/` — the interfaces-and-complexity story. The
+    `DataSource` seam is design; *who's allowed to call which tool* is
+    security.

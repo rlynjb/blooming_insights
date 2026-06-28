@@ -1,475 +1,561 @@
-# The data model and its shape
+# 01 — The data model and its shape
 
-**Industry name(s):** Schema · entity model · data model · TypeScript interface as schema · duck-typed interface (the `WorkspaceSchema` bridge)
-**Type:** Industry standard · Language-agnostic · Project-specific (the typed-schema variant)
-
-> The model. The **agent contract** is 8 TypeScript interfaces in `lib/mcp/types.ts` that pin every shape the four agents pass between each other — this file walks them. As of 2026-06-19, the Olist SQLite second domain is gone (PR #8, commit 62c24d7); the dual-derivation `WorkspaceSchema` story now bridges **Bloomreach** (live MCP) and the **in-process synthetic fixture** (`lib/data-source/synthetic-data-source.ts`). The bridge interface is the same `WorkspaceSchema` in `lib/mcp/schema.ts` derived two different ways: `bootstrapSchema(BloomreachDataSource)` from MCP introspection, and `syntheticWorkspaceSchema` — a top-level `const` literal in `synthetic-data-source.ts`. Same shape, two sources — the duck-typed-interface pattern, applied to "this is what an analyst-readable workspace looks like." The compiler enforces the model across module boundaries; the only seam where it can't see is the LLM output (file 04). The center of gravity for the agent contract is `Insight`, the enriched view of `Anomaly` the UI consumes. File 11 zooms in on the synthetic fixture as a data-modeling-for-test pattern.
-
----
+**Entity-relationship sketch · Project-specific**
 
 ## Zoom out, then zoom in
 
-**Zoom out — the bigger picture.** This concept lives at the seam between the **MCP wrapper band** (where the upstream Bloomreach schema is parsed) and the **agent loop band** (where the typed shapes get produced, validated, and stored). The interfaces in `lib/mcp/types.ts` are the contracts every layer above this seam relies on; the parser in `lib/mcp/schema.ts` is how the *upstream* model crosses into the repo.
+Every data-modeling guide starts with the schema diagram. For
+**blooming_insights** the "schema" is **TypeScript interfaces** — they're
+what every layer agrees on, what `validate.ts` guards at runtime, and what
+the demo JSON snapshots were emitted to match.
 
 ```
-  Zoom out — where the data model lives
+  Zoom out — where the type system lives
 
-  ┌─ UI client band ───────────────────────────────────────────┐
-  │  app/page.tsx, components/*                                 │
-  │  reads:    Insight, Diagnosis, Recommendation               │
-  │  the UI is a typed-shape consumer; never sees raw MCP data  │
-  └──────────────────────────┬─────────────────────────────────┘
-                             │  Insight[], Investigation
-  ┌─ Route handler band ─────▼─────────────────────────────────┐
-  │  app/api/{briefing,agent}/route.ts                          │
-  │  produces:  Insight[]  via anomalyToInsight()               │
-  │  consumes:  Insight    via insightToAnomaly() (the leak)    │
-  └──────────────────────────┬─────────────────────────────────┘
-                             │  Anomaly[], Diagnosis, Recommendation[]
-  ┌─ Agent loop band ────────▼─────────────────────────────────┐
-  │  monitoring/diagnostic/recommendation/query .ts             │
-  │  validates JSON-from-LLM with the three guards in           │
-  │  lib/mcp/validate.ts            ★ THE SCHEMA MODEL ★        │
-  │                                  (lib/mcp/types.ts)         │
-  └──────────────────────────┬─────────────────────────────────┘
-                             │  schemaSummary(WorkspaceSchema)
-  ┌─ MCP wrapper band ───────▼─────────────────────────────────┐
-  │  lib/mcp/schema.ts: parseWorkspaceSchema()                  │
-  │  the UPSTREAM model — Bloomreach workspace, projected       │
-  │  into one TypeScript shape this repo owns                   │
+  ┌─ UI layer ─────────────────────────────────────────────────┐
+  │  components/feed/InsightCard.tsx                            │
+  │  components/investigation/EvidencePanel.tsx                 │
+  │  reads Insight / Diagnosis / Recommendation                 │
+  └───────────────────────────┬────────────────────────────────┘
+                              │  NDJSON over fetch
+  ┌─ Route layer ─────────────▼────────────────────────────────┐
+  │  app/api/briefing/  app/api/agent/                          │
+  │  emits AgentEvent (lib/mcp/events.ts)                       │
+  └───────────────────────────┬────────────────────────────────┘
+                              │  in-process function call
+  ┌─ Agent + state layer ─────▼────────────────────────────────┐
+  │  lib/agents/{monitoring,diagnostic,recommendation}.ts       │
+  │  lib/state/{insights,investigations}.ts                     │
+  │  ★ lib/mcp/types.ts  ←── the schema lives here              │ ← we are here
+  │  ★ lib/mcp/schema.ts ←── WorkspaceSchema + parser           │
+  └───────────────────────────┬────────────────────────────────┘
+                              │  callTool(name, args)
+  ┌─ Substrate ───────────────▼────────────────────────────────┐
+  │  BloomreachDataSource (live)  or  SyntheticDataSource       │
+  │  raw events: purchase / view_item / session_start / ...     │
   └────────────────────────────────────────────────────────────┘
 ```
 
-**Zoom in — narrow to the concept.** The question this concept answers: when an agent emits a JSON object and another agent or the UI consumes it, what guarantees the shape? Two layers: TypeScript at compile time (`types.ts`), runtime guards at the LLM seam (`validate.ts`). That's the schema model — interfaces above, type guards at the boundary, in-memory `Map`s as the store.
+The interfaces in `lib/mcp/types.ts` are this app's **data dictionary** —
+the single source of truth that every layer reads from and writes to. The
+fact that they're types rather than `CREATE TABLE` statements doesn't
+change the role they play.
+
+Now zoom in. There are five entities worth knowing by name, and one wire
+format. The relationships are simple — almost everything keys off
+`Insight.id`.
 
 ---
 
-## Structure pass
+## Structure pass — layers, axis, seams
 
-**Layers.** Same four-layer stack: UI → route → agent loop → MCP wrapper. For data modeling, the load-bearing layer is the **agent loop band** — that's where the shapes are produced and validated. The UI is a downstream consumer; the route is a pass-through with one notable conversion (`insightToAnomaly`, the leak).
-
-**Axis: schema ownership.** For each shape, which file owns its definition? This is the right axis because every data-modeling question reduces to ownership: where does the field list live, who's allowed to add to it, who has to be updated when it changes. Cost is wrong (shapes are free to define); failure is wrong (TypeScript catches most failures at compile time). Schema ownership pops the seams — where the owner is clear (`types.ts` owns every interface), the model is clean; where it's split (the Insight↔Anomaly round-trip), there's a leak.
-
-**Seams.** Three matter here. **Seam 1: types.ts ↔ everything.** Single source of truth for the 8 interfaces. Clean ownership. **Seam 2: validate.ts ↔ LLM output.** The runtime narrowing at the boundary where TypeScript blinds itself (the model emits `string`, not a typed object). Clean ownership — three guards, one per shape the LLM produces. **Seam 3: state/insights.ts + api/agent/route.ts.** Both write field-copy logic for the `Insight↔Anomaly` round-trip. Not clean — the field list is implicitly co-owned. That's where the model fractures.
+Before the mechanics, read the skeleton. The axis worth tracing across this
+schema is **state ownership** — *who owns each piece of data, and where
+does ownership change hands?*
 
 ```
-  Structure pass — schema ownership
+  Trace ONE axis — "who owns this data?" — across the layers
 
-  ┌─ 1. LAYERS ──────────────────────────────────────────────┐
-  │  UI · Route · Agent loop · MCP wrapper                    │
-  │  the agent loop band is where shapes are produced         │
-  └─────────────────────────────┬────────────────────────────┘
-                                │  pick the axis
-  ┌─ 2. AXIS ──────────────────▼─────────────────────────────┐
-  │  schema ownership: which file owns this shape?            │
-  │  owned cleanly = one file; co-owned = two = a leak        │
-  └─────────────────────────────┬────────────────────────────┘
-                                │  trace across seams
-  ┌─ 3. SEAMS ─────────────────▼─────────────────────────────┐
-  │  S1: types.ts ↔ everyone         ★ CLEAN (single source) │
-  │  S2: validate.ts ↔ LLM output    ★ CLEAN (three guards)  │
-  │  S3: state ↔ route field-copy    ★ LEAKED (file 02)      │
-  └─────────────────────────────┬────────────────────────────┘
-                                ▼
-                        Block 4 — How it works
+  ┌─ substrate ──────────────────────────────────┐
+  │  Bloomreach owns events; synthetic adapter   │   → SUBSTRATE owns
+  │  owns its in-process facts                   │
+  └───────────────────┬──────────────────────────┘
+                      │  seam: callTool result envelope
+  ┌─ adapter ─────────▼──────────────────────────┐
+  │  WorkspaceSchema (parsed once, cached)       │   → APP owns the SHAPE,
+  │  Anomaly / Diagnosis / Recommendation        │     substrate owns the FACTS
+  └───────────────────┬──────────────────────────┘
+                      │  seam: agent emits → state.put
+  ┌─ state ───────────▼──────────────────────────┐
+  │  Insight (enriched Anomaly) in session Map   │   → SESSION owns
+  └───────────────────┬──────────────────────────┘
+                      │  seam: NDJSON over fetch
+  ┌─ UI ──────────────▼──────────────────────────┐
+  │  InsightCard reads, never mutates            │   → UI is read-only
+  └──────────────────────────────────────────────┘
 ```
+
+Three seams pop out, each one a contract worth naming:
+
+- **substrate → adapter** — the `WorkspaceSchema` and the raw event types
+  cross this seam. Both adapters (Bloomreach, synthetic) must satisfy the
+  *same* `WorkspaceSchema` shape, even though one is OAuth-backed MCP and
+  the other is a hardcoded JS object.
+- **agent → state** — `Anomaly` enters, `Insight` exits. The widening
+  happens here (see `02-normalization-and-duplication.md`).
+- **state → UI** — the wire format is `AgentEvent[]`, not raw `Insight[]`.
+  The UI sees a *log*, not a snapshot.
+
+Skeleton mapped. Now the mechanics.
 
 ---
 
 ## How it works
 
-### Move 1 — the model as a picture
+### Move 1 — the mental model
 
-You know how a DB schema is "a list of tables, each with columns and types, and FK arrows between them"? Same shape here, except the "tables" are TypeScript interfaces, the "columns" are properties, and the "FK arrows" are reference fields (`Anomaly.category` references a `CategoryId` enum; `Investigation.insightId` references an `Insight.id`). The store is in-memory `Map`s instead of relational tables, but the model-shape question — *which entities, with which fields, related how* — is the same.
-
-```
-  the model — entities and their relationships
-
-       ┌────────────────────┐
-       │  WorkspaceSchema   │  ← upstream, not owned (parsed from Bloomreach)
-       │  (events, props,   │
-       │   catalogs, totals)│
-       └─────────┬──────────┘
-                 │ projected into capability set, then…
-                 ▼
-       ┌────────────────────┐                ┌──────────────────────┐
-       │  AnomalyCategory   │◄─────fk────────│  Anomaly             │
-       │  (one of 10 ids)   │   category?    │  metric, scope[],     │
-       └────────────────────┘                │  change, severity,    │
-                                             │  evidence[], impact?  │
-                                             │  history?, category?  │
-                                             └──────────┬───────────┘
-                                                        │ anomalyToInsight()
-                                                        ▼
-                                             ┌──────────────────────┐
-                                             │  Insight             │
-                                             │  id (uuid) ★PK★      │
-                                             │  + all Anomaly fields│
-                                             │  + 6 derived fields  │
-                                             └──────────┬───────────┘
-                                                        │ insightId
-       ┌────────────────────┐                           ▼
-       │  Diagnosis         │◄───────────────┐  ┌──────────────────────┐
-       │  conclusion,       │                └──│  Investigation       │
-       │  evidence[],       │                   │  insightId ★FK★      │
-       │  hypotheses[]      │                   │  reasoning[],         │
-       └────────────────────┘                   │  diagnosis,           │
-       ┌────────────────────┐                   │  recommendations[]    │
-       │  Recommendation    │◄──────────────────│                       │
-       │  id, title,        │                   └──────────────────────┘
-       │  bloomreachFeature,│
-       │  steps[], impact   │
-       └────────────────────┘
-```
-
-### Move 2 — the eight interfaces, one at a time
-
-The model has 8 interfaces. Walk each by what role it plays. **One operation per part — never two interfaces at once.**
-
-#### `WorkspaceSchema` — one interface, two derivations (duck-typed bridge)
-
-`WorkspaceSchema` is a single TypeScript shape that two completely different domains derive into. The **Bloomreach** domain calls `bootstrapSchema(dataSource)` which fans out across the MCP introspection tools and projects the result into the typed shape. The **Synthetic** domain is the *literal constant* `syntheticWorkspaceSchema` exported from `lib/data-source/synthetic-data-source.ts` — no I/O, no DB read, no derivation: 10 events with their property lists, customer properties, two catalogs, totals, and a `dataHorizon` are baked into the source. Both produce the same shape; both feed the same `schemaCapabilities()` projection; the agent loop above this seam cannot tell which one it's reading.
+If you've ever drawn an ER diagram with three tables and a foreign key, you
+already know the shape. The twist here is that the "tables" are interfaces
+and the "rows" are `Map` values keyed by string IDs.
 
 ```
-  the duck-typed bridge — same shape, two domains
+  The entity graph — six shapes, one join key
 
-  ┌─ BLOOMREACH derivation ─────────────────────────────────┐
-  │  bootstrapSchema(BloomreachDataSource)                    │
-  │    list_cloud_organizations  ─┐                           │
-  │    list_projects              │  4 MCP round-trips        │
-  │    get_event_schema           ├─ parseWorkspaceSchema()   │
-  │    get_customer_property_schema│                          │
-  │    list_catalogs              │                           │
-  │    get_project_overview     ──┘                           │
-  └────────────┬────────────────────────────────────────────┘
-               │
-               ▼
-       WorkspaceSchema {
-         projectId, projectName,
-         events: { name, properties[], eventCount }[],
-         customerProperties[], catalogs[],
-         totalCustomers, totalEvents, oldestTimestamp,
-         dataHorizon?: { from, to, durationDays }      ← ★ Synthetic sets it
-       }
-               ▲
-               │
-  ┌─ SYNTHETIC derivation ──────────────────────────────────┐
-  │  syntheticWorkspaceSchema   ← top-level const literal    │
-  │    (lib/data-source/synthetic-data-source.ts L85–L108)   │
-  │    projectId  = 'synthetic-blooming-project'              │
-  │    projectName = 'Synthetic Blooming Workspace'           │
-  │    10 events (with hand-authored property lists):         │
-  │      'purchase'      52,840  total_price, product_id,     │
-  │                              category, payment_type,      │
-  │                              state, campaign_id,          │
-  │                              voucher_code, inventory_level│
-  │      'view_item'    241,900  product_id, category, state,│
-  │                              device_type, referrer        │
-  │      'session_start' 198,400 device_type, state,         │
-  │                              utm_source, campaign_id,     │
-  │                              landing_page                 │
-  │      'cart_update'   91,360  product_id, category,        │
-  │                              quantity, cart_value, state  │
-  │      'checkout'      73,610  · 'search'        44,220    │
-  │      'email_open'    38,540  · 'voucher_redeemed' 9,420  │
-  │      'return'         4,860  · 'payment_failure' 2,360   │
-  │    totalEvents     = 757,710                              │
-  │    totalCustomers  = 126,420                              │
-  │    dataHorizon: 2025-12-01 → 2026-06-01 (182 days)        │
-  └────────────┬────────────────────────────────────────────┘
-               │
-               ▼ both feed:
-       schemaCapabilities()  ← projects into Set<string>
-       schemaSummary()       ← interpolated into agent prompts
+         ┌──────────────────────┐
+         │   WorkspaceSchema    │   substrate metadata
+         │  (1 per app process) │   — projectId, events[], counts
+         └──────────┬───────────┘
+                    │  read by every agent for context
+                    │
+         ┌──────────▼───────────┐
+         │       Anomaly        │   "the metric moved"
+         │  (N per briefing)    │   — metric, scope, change, evidence
+         └──────────┬───────────┘
+                    │  one-to-one widening (anomalyToInsight)
+                    │
+         ┌──────────▼───────────┐
+         │       Insight        │ ◄──── id = primary key everywhere downstream
+         │  (N per briefing)    │
+         └──────────┬───────────┘
+                    │  insightId
+        ┌───────────┼───────────────────────────┐
+        │           │                           │
+   ┌────▼────┐ ┌────▼─────────┐  ┌──────────────▼──────┐
+   │Diagnosis│ │Recommendation│  │  AgentEvent[]       │
+   │ (0..1)  │ │   (0..N)     │  │  (stream replay)    │
+   └─────────┘ └──────────────┘  └─────────────────────┘
 ```
 
-The interesting part is `dataHorizon` — set on the synthetic branch, absent on Bloomreach. The synthetic window is fixed (we own the const); the Bloomreach branch is open-ended (live workspace, data flows in). The agent prompts read `dataHorizon` if present and anchor `time_range` inside it; without the field, the prompts fall back to "90-day windows of recent data." This is **forward-compatible extension** — the optional field carries domain-specific information the universal interface deliberately leaves open.
+`Insight.id` is the join key everything else hangs off — investigations,
+event logs, the URL of the investigate page (`/investigate/[id]`). The
+agents never see each other's data; they communicate by *writing* shapes
+into this graph and *reading* shapes back out.
 
-What breaks if `WorkspaceSchema` is wrong: the prompt the agent sees (`schemaSummary` interpolates this shape) becomes inconsistent with what the tools can actually query. Wrong on the Bloomreach side, the agent writes EQL against events that don't exist. Wrong on the synthetic side (specifically the event-property lists), the agent issues `execute_analytics_eql` calls referencing properties the dispatcher in `SyntheticDataSource.dispatch()` never returns — and every query collapses to the same fixed `analyticsResult` constant. File 11 walks the in-process synthetic fixture pattern; the rest of this section stays on the agent contract.
+### Move 2 — the entities, one at a time
 
-What breaks if a third derivation appears (say, a Shopify adapter): no compiler-level enforcement that the new derivation produces the same shape — only TypeScript's structural typing. Today there's no abstract base class, no Zod schema both branches conform to; the contract is "produce something with these fields." That's enough for two derivations; at three or more, the unenforced parallel structure would start to drift.
+Six shapes, each one bolded sub-heading. Read in order; each one builds on
+the one before it.
 
-#### `CategoryId`, `AnomalyCategory`, `CategoryCoverage`, `CoverageItem`, `CoverageReport` — the schema-capability layer
+#### **WorkspaceSchema — the substrate dictionary**
 
-Five tightly-coupled shapes that together form the **schema-aware coverage gate**. `CategoryId` is the closed enum (10 categories). `AnomalyCategory` is the row in the static registry. `CategoryCoverage` is a 3-state value. `CoverageItem` and `CoverageReport` are the per-briefing summary.
+This is the only "schema" the app stores about its substrate. It lists what
+events exist, what properties they carry, how many customers, and the time
+horizon of the data. The agents read it to know what they can query.
+
+```typescript
+// lib/mcp/schema.ts:8-25
+export interface WorkspaceSchema {
+  projectId: string;
+  projectName: string;
+  /** Events sorted by eventCount descending (most active first). */
+  events: { name: string; properties: string[]; eventCount: number }[];
+  customerProperties: string[];
+  catalogs: { id: string; name: string }[];
+  totalCustomers: number;
+  totalEvents: number;
+  oldestTimestamp: number | null;
+  /** Inclusive `from`, exclusive `to` ISO dates bounding the data — when known.
+   *  `undefined` for live Bloomreach (open-ended). */
+  dataHorizon?: { from: string; to: string; durationDays: number };
+}
+```
+
+Line-by-line:
+
+- `projectId` / `projectName` — substrate-scoped IDs. Bloomreach uses
+  `'wobbly-ukulele'`-style slugs; synthetic uses
+  `'synthetic-blooming-project'`.
+- `events: { name, properties, eventCount }[]` — denormalized for read.
+  Every event carries its own property list inline so the agents don't
+  have to JOIN; the cost is that adding a property means re-emitting the
+  whole record.
+- `dataHorizon` — the load-bearing **optional** field. Synthetic substrates
+  emit a concrete range (`2025-12-01` → `2026-06-01`); Bloomreach leaves
+  it `undefined` because the substrate is open-ended. The agent prompts
+  branch on its presence to set their EQL `time_range` window.
 
 ```
-  the coverage chain
+  WorkspaceSchema is a CACHED denormalized snapshot
 
-  CATEGORIES[]                    Set<string>
-  (static registry,               (capabilities the workspace exposes)
-   10 rows)                              │
-        │                                │
-        └──────────┬─────────────────────┘
-                   │ coverageFor()  ← pure: subset check on requires + enriches
+  ┌─ source (4 MCP tool calls) ───────────────────────────────┐
+  │  get_event_schema           → event names + properties     │
+  │  get_customer_property_schema → customer properties        │
+  │  list_catalogs                → catalogs                   │
+  │  get_project_overview         → totals + per-event counts  │
+  └────────────────┬──────────────────────────────────────────┘
+                   │  parseWorkspaceSchema (pure)
                    ▼
-        CategoryCoverage  ('full' | 'limited' | 'unavailable')
-                   │
-                   │ wrapped per category
-                   ▼
-        CoverageItem[]  = CoverageReport
-                   │
-                   │ rendered as the coverage grid + injected into prompts
-                   ▼
-        UI tile + agent checklist
+  ┌─ destination (1 cached object, process-global) ───────────┐
+  │  WorkspaceSchema                                           │
+  │  — joined + sorted by eventCount desc                      │
+  │  — `cached` in lib/mcp/schema.ts:138                       │
+  └───────────────────────────────────────────────────────────┘
 ```
 
-What breaks if `CategoryId` and the `CATEGORIES` registry drift apart: `runnableCategories()` returns rows the agent doesn't recognize, or skips rows the registry needs. The compiler enforces the `id: CategoryId` link.
+The bug-shaped detail: the cache is **process-global, not session-scoped**
+(`lib/mcp/schema.ts:138`). Today both substrates expose the *same* schema
+across sessions, so this is fine. The day a customer has two Bloomreach
+workspaces and switches between them in one Vercel instance, the second
+workspace sees the first's schema. The audit flags it — see
+`audit.md` → migrations-and-evolution.
 
-#### `Anomaly` — what the monitoring agent emits
+#### **Anomaly — the monitoring agent's output**
 
-The output of the monitoring agent. **8 required fields, 3 optional.** Required: `metric`, `scope`, `change` (a 3-field nested object), `severity`, `evidence`. Optional: `impact`, `history`, `category`. This is the shape `isAnomalyArray` validates at the LLM seam.
+The minimal record of *something moved.* The monitoring agent emits these;
+they enter the state layer through `putInsights` (which widens them into
+`Insight`s on the way in).
 
-```
-  Anomaly — required vs optional, with what each is for
-
-  required (compile-time + runtime enforced):
-    metric         string         "purchase_revenue"
-    scope          string[]       ["mobile", "checkout"]
-    change         { value, direction, baseline }
-    severity       'critical' | 'warning' | 'info' | 'positive'
-    evidence       { tool, result }[]   ← what query found this
-
-  optional (enrichments — newer; older snapshots lack them):
-    impact         string         agent-written business-impact sentence
-    history        number[]       12 weekly values for sparkline
-    category       CategoryId     which coverage-grid tile fired this
-```
-
-What breaks if `evidence` is empty: `deriveInsightFields()` can't compute `revenueImpact`, the UI loses the dollar figure, but the Insight still renders. That's the optional-field design choice — fields degrade gracefully when absent.
-
-#### `Insight` — the enriched view the UI consumes
-
-The center of gravity. **8 required fields + 9 optional Tier-1 enrichments.** Most of the required fields are copies of `Anomaly` fields (severity, metric, change, scope) plus three stamped at write-time (`id`, `timestamp`, `source`). The Tier 1 enrichments (`revenueImpact`, `aov`, `funnel`, `affectedCustomers`, `history`, `downstreamReady`) are *derived* — they exist so the UI doesn't have to recompute the same values on every render.
-
-```
-  Insight — three groups of fields
-
-  COPIED FROM ANOMALY (via anomalyToInsight)
-    severity, metric, change, scope, evidence?, impact?,
-    history?, category?
-    └─ this is the field-copy list. it lives in:
-       1. the Insight interface itself  (truth source)
-       2. anomalyToInsight()             (copies 8)
-       3. insightToAnomaly()             (copies 4 ← THE LEAK)
-
-  STAMPED AT WRITE TIME
-    id            crypto.randomUUID()  ← PK
-    timestamp     ISO string
-    headline      derived from scope + metric + change
-    summary       derived from metric + change
-    source        'monitoring' | 'query'
-
-  DERIVED (Tier 1 business-owner enrichments)
-    revenueImpact?         { lostUsd, expectedUsd, currency }
-    aov?                   { current, prior }
-    funnel?                { view, cart, checkout, purchase }
-    affectedCustomers?     number ← denormalized from Diagnosis
-    history?               number[]
-    downstreamReady?       { diagnosis, recommendations }
+```typescript
+// lib/mcp/types.ts:83-92
+export interface Anomaly {
+  metric: string;
+  scope: string[];                          // ["mobile", "checkout"]
+  change: { value: number; direction: 'up' | 'down'; baseline: string };
+  severity: Severity;
+  evidence: { tool: string; result: unknown }[];
+  impact?: string;
+  history?: number[];                       // 12 weekly values (sparkline)
+  category?: CategoryId;                    // coverage-grid bucket
+}
 ```
 
-What breaks if you add a new field to `Anomaly` and forget to update `insightToAnomaly`: TypeScript will not catch it (the function returns an Anomaly literal with a *subset* of fields, which is a valid Anomaly). The round-trip silently drops the new field on the agent route path. That's the leak that file 02 unpacks.
+Five fields are required, three optional. The required set is the *minimum
+contract* the diagnostic agent needs to do its job — give it
+`metric + scope + change + severity + evidence` and it can investigate. The
+optional fields are downstream enrichments the monitoring agent *can*
+emit but the schema doesn't force.
 
-#### `Diagnosis` — what the diagnostic agent emits
+The shape is intentionally narrow. `evidence: { tool, result }[]` is the
+escape hatch — `result` is `unknown`, so the agent can put whatever the
+tool returned in there without the type system pinning it down. This is
+flexibility bought at the cost of validation: the `result` could be
+anything, and the UI has to defensively `findCurrentPrior(evidence)` to
+extract `{current, prior}` numbers if they're present.
 
-5 fields. Three required: `conclusion`, `evidence`, `hypothesesConsidered`. Two optional: `affectedCustomers`, `confidence`, `timeSeries`. The optional `confidence` is the interesting one — when the agent emits it, the UI uses it; when it doesn't, the UI derives it client-side from `hypothesesConsidered`. Both paths converge on the same enum.
+#### **Insight — the UI-shaped enrichment of Anomaly**
 
-#### `Recommendation` — what the recommendation agent emits
+What the feed actually renders. Every `Anomaly` is widened into an
+`Insight` by `anomalyToInsight` (`lib/state/insights.ts:25`); the widening
+adds an `id`, a `headline`, a `summary`, and derives business-owner
+fields like `revenueImpact`.
 
-The richest shape. 6 required, 5 optional. The **canonical** shape; the spec contains two different `Recommendation` definitions, and the code uses the richer one with a comment naming the choice (`lib/mcp/types.ts` L114–L130). That comment is itself a schema-evolution artifact — the spec drifted, the code picked, the comment names the choice.
-
+```typescript
+// lib/mcp/types.ts:36-62
+export interface Insight {
+  id: string;
+  timestamp: string;
+  severity: Severity;
+  headline: string;             // "mobile conversion dropped 18%"
+  summary: string;              // one-line context
+  metric: string;
+  change: { value: number; direction: 'up' | 'down'; baseline: string };
+  scope: string[];
+  source: 'monitoring' | 'query';
+  evidence?: { tool: string; result: unknown }[];
+  impact?: string;
+  // ── business-owner enrichments (Tier 1) ──
+  revenueImpact?: { lostUsd: number; expectedUsd: number; currency: 'USD' };
+  aov?: { current: number; prior: number };
+  funnel?: { view: number; cart: number; checkout: number; purchase: number };
+  affectedCustomers?: number;
+  history?: number[];
+  downstreamReady?: { diagnosis: boolean; recommendations: number };
+  category?: CategoryId;
+}
 ```
-  Recommendation — the canonical (richer) shape, with the dual-spec context
 
-  the spec contains TWO definitions of Recommendation:
-    1. "data model" section            ← simpler, older
-    2. "recommendation agent" section  ← richer, current
+`Insight` is a **superset of `Anomaly`** — every field from `Anomaly` is
+either copied verbatim or transformed into a display-shaped version. That
+intentional overlap is what `02-normalization-and-duplication.md` is
+about. Three things worth noticing in the field list:
 
-  the comment in types.ts L114 names the choice:
-    "Use this RICHER one … everywhere — it has `id`, `steps`,
-     and the 5-member `bloomreachFeature` union."
+- `id: string` is the **primary key** (a `crypto.randomUUID()` minted in
+  `anomalyToInsight`). It's the join key for `Diagnosis`, `Recommendation`,
+  and the cached event log.
+- Every enrichment field (`revenueImpact`, `aov`, `funnel`, …) is
+  `optional`. This is migrations-by-optional — see
+  `05-migrations-and-evolution.md`.
+- `source: 'monitoring' | 'query'` — a discriminator that says where the
+  insight came from. The "query" path (free-form Q&A in `QueryBox`)
+  produces single insights without going through the monitoring scan.
 
-  required (compile + runtime):
-    id, title, rationale,
-    bloomreachFeature: 'scenario'|'segment'|'campaign'|'voucher'|'experiment',
-    steps[], estimatedImpact, confidence
+#### **Diagnosis — the diagnostic agent's output**
 
-  optional (Tier 1 enrichments):
-    effort, timeToSetUpMinutes, readResultInDays,
-    prerequisites[], successMetric
+A single conclusion plus the evidence and hypotheses that got there.
+Keyed implicitly by the `insightId` it answers (the `Investigation`
+wrapper carries that key).
+
+```typescript
+// lib/mcp/types.ts:95-104
+export interface Diagnosis {
+  conclusion: string;
+  evidence: string[];
+  hypothesesConsidered: { hypothesis: string; supported: boolean; reasoning: string }[];
+  affectedCustomers?: { count: number; segmentDescription: string };
+  confidence?: 'high' | 'medium' | 'low';
+  timeSeries?: { day: string; value: number }[];
+}
 ```
 
-What breaks if a future spec edit re-introduces the simpler shape: the comment is the only thing flagging the divergence. There's no compile-time enforcement that the spec and the code agree — the spec is markdown, the code is TypeScript. File 05 covers this as a "migration" concern (the spec IS the schema in a soft sense; the code has to drift consciously).
+`evidence: string[]` here is **different** from `Anomaly.evidence` —
+diagnosis evidence is *human-readable bullet points* (rendered as
+markdown), not `{tool, result}` envelopes. Same field name, different
+shape. That's a real overload of the word "evidence" in the type system;
+the audit calls it out.
 
-#### `ToolCall`, `ReasoningStep` — the trace shape
+#### **Recommendation — the recommendation agent's output**
 
-Two trace shapes used by `Investigation.reasoning[]`. `ToolCall` records what a tool call did (agent, name, args, result/error, durationMs). `ReasoningStep` wraps a `ToolCall` with a step kind (`thought | tool_call | hypothesis | conclusion`). Both are append-only; they're never updated.
+The "what to do" with steps and a Bloomreach feature chip. Multiple
+recommendations can hang off one `insightId`.
 
-#### `Investigation` — the full agent run
+```typescript
+// lib/mcp/types.ts:116-130
+export interface Recommendation {
+  id: string;
+  title: string;
+  rationale: string;
+  bloomreachFeature: 'scenario' | 'segment' | 'campaign' | 'voucher' | 'experiment';
+  steps: string[];
+  estimatedImpact: EstimatedImpact; // string (legacy) OR { range, rangeUsd?, assumption }
+  confidence: 'high' | 'medium' | 'low';
+  effort?: 'low' | 'medium' | 'high';
+  timeToSetUpMinutes?: number;
+  readResultInDays?: number;
+  prerequisites?: { label: string; satisfied: boolean }[];
+  successMetric?: string;
+}
+```
 
-The final aggregate. 4 fields: `insightId` (FK), `reasoning[]`, `diagnosis`, `recommendations[]`. Stored under `insightId` in the `investigations` Map. **Note:** `Investigation.diagnosis` is a *narrower* shape than the standalone `Diagnosis` interface — it has only `conclusion`, `evidence`, and `hypothesesConsidered` as `string[]`. This is a denormalization smell (file 02): the same data, two shapes, with the wider one losing fidelity when it's nested.
+`estimatedImpact: EstimatedImpact` is a **discriminated union** that
+carries both the new shape and the legacy shape:
+
+```typescript
+// lib/mcp/types.ts:108-110
+export type EstimatedImpact =
+  | string
+  | { range: string; rangeUsd?: { low: number; high: number }; assumption: string };
+```
+
+That union is the most honest piece of migration evidence in the codebase.
+Old demo snapshots have `estimatedImpact: "+$15K MRR"` (a string); new
+agent output emits `{ range: "+$10K–$20K MRR", assumption: "..." }`. The
+UI helper `impactRange(e)` (`lib/insights/derive.ts:5`) normalizes both
+shapes so the card render code doesn't branch.
+
+#### **AgentEvent — the wire format**
+
+NDJSON streamed from `/api/agent` to the UI. Not stored long-term as such
+— but the *cache* of an investigation is `AgentEvent[]`, so it's
+de-facto persisted in `.investigation-cache.json` and in the demo
+`demo-investigations.json` snapshot (3,487 lines).
+
+```typescript
+// lib/mcp/events.ts:4-12
+export type AgentEvent =
+  | { type: 'reasoning_step'; step: ReasoningStep }
+  | { type: 'tool_call_start'; toolName: string; agent: AgentName }
+  | { type: 'tool_call_end'; toolName: string; agent: AgentName; durationMs: number; result?: unknown; error?: string }
+  | { type: 'insight'; insight: Insight }
+  | { type: 'diagnosis'; diagnosis: Diagnosis }
+  | { type: 'recommendation'; recommendation: Recommendation }
+  | { type: 'done' }
+  | { type: 'error'; message: string };
+```
+
+This is a **discriminated union with `type` as the tag** — eight variants,
+one per kind of thing that can happen during an agent run. The UI consumes
+them in arrival order and renders the trace as a scrolling log. Because
+the cache *is* the event array, the demo replay is literally
+"re-emit this list of events in order."
+
+The shape lets the UI render *progress*, not just a final result — which is
+the product's whole "show your work" pitch. The cost: every change to
+`Insight` or `Diagnosis` ripples into every cached `AgentEvent[]`, so the
+demo JSON snapshots are the regression suite for type drift (see
+`05-migrations-and-evolution.md`).
 
 ### Move 3 — the principle
 
-The model is what every other module relies on. When it's a single source of truth (`types.ts`), every boundary is clean. When two files implicitly co-own a piece of it (the field-copy list), every change has to land in N files at once and TypeScript can't help. The test: **for any field, can you point at one file where adding it lands?** If yes, the model is clean. If the answer is "you add it to the interface, but you also have to remember to update X and Y," the model has fractured.
+**The schema is wherever the type system says it is.** In a Rails app
+that's `db/schema.rb`. In a Drizzle app that's `migrations/0003_chunks.sql`.
+In **blooming_insights** it's `lib/mcp/types.ts` plus `lib/mcp/schema.ts`
+plus `lib/mcp/events.ts`. The role is identical — a single source of
+truth that every layer reads against. The fact that no migration tool
+runs against it doesn't change what it is.
 
-### Code in this codebase
-
-The repo anchors for what Move 2 walked — the interface declarations, the upstream projection, and where the field-copy leak lives in code.
-
-#### The 8 interfaces, with the canonical comment
-
-```
-lib/mcp/types.ts  (lines 36–141)
-
-  export interface Insight {
-    id: string;                              ← PK, stamped by crypto.randomUUID
-    timestamp: string;
-    severity: Severity;
-    headline: string;
-    summary: string;
-    metric: string;
-    change: { value: number; direction: 'up' | 'down'; baseline: string };
-    scope: string[];
-    source: 'monitoring' | 'query';
-    evidence?: { tool: string; result: unknown }[];   ← optional, agent-emitted
-    impact?: string;                                   ← optional, agent-emitted
-    // ── business-owner enrichments (Tier 1). All optional + derived from the
-    //    existing evidence, so older snapshots still validate and render. ──
-    revenueImpact?: { lostUsd: number; expectedUsd: number; currency: 'USD' };
-    aov?: { current: number; prior: number };
-    funnel?: { view: number; cart: number; checkout: number; purchase: number };
-    affectedCustomers?: number;
-    history?: number[];
-    downstreamReady?: { diagnosis: boolean; recommendations: number };
-    category?: CategoryId;
-  }
-       │
-       │  the "All optional + derived from the existing evidence, so older
-       │  snapshots still validate and render" comment IS the migration policy
-       │  for this interface. when a new field is added, it goes here as
-       │  optional. old data still validates. file 05 walks this.
-       └──
-```
-
-#### The capacity-set projection (the upstream → owned bridge)
-
-```
-lib/agents/categories.ts  (lines 116–127)
-
-  export function schemaCapabilities(schema: {
-    events: { name: string; properties: string[] }[];
-    catalogs?: { name: string }[];
-  }): Set<string> {
-    const set = new Set<string>();
-    for (const e of schema.events ?? []) {
-      set.add(e.name);                          ← event names as bare strings
-      for (const p of e.properties ?? [])
-        set.add(`${e.name}.${p}`);              ← properties as "event.prop"
-    }
-    for (const c of schema.catalogs ?? [])
-      set.add(`catalog:${c.name}`);             ← catalogs as "catalog:name"
-    return set;
-  }
-       │
-       │ this is the model-level translation: the upstream nested
-       │ WorkspaceSchema becomes a flat Set<string> the coverage gate
-       │ can test membership against. the namespaced keys ("event.prop",
-       │ "catalog:name") are the shape; they're THE schema for the gate.
-       └──
-```
-
-#### Where the leak sits in code (UPDATED — partly retired)
-
-Both conversion functions now live in `lib/state/insights.ts` — `anomalyToInsight` at L25–L45, `insightToAnomaly` at L53–L55. The doc comment on `insightToAnomaly` names the deliberate drop explicitly: "Intentionally drops evidence/impact/history/category — the agent loop only needs metric/scope/change/severity to investigate; the rest is regenerated downstream." A round-trip test lives in `test/state/insights.test.ts`. The point for *this* file: the `Insight` interface is still the schema; the two functions are now colocated implementations of the field-copy. File 02 walks the updated status (the schema-side leak is retired; a wire-format leak is still live).
+The generalisation: when you don't have a database, you still have a
+schema — it just lives in your type system, and the discipline you'd
+apply to migrations (additive changes only, backfill before remove,
+versioned snapshots as your regression suite) applies to your interfaces.
 
 ---
 
 ## Primary diagram
 
-The full picture — the 8 interfaces, with the upstream model on top, the owned model in the middle, and the leak boundary at the bottom.
+The whole entity graph in one frame, layers labelled, every arrow named.
 
 ```
-  the model — full recap
+  blooming_insights data model — entities, layers, and the join key
 
-  ┌─ UPSTREAM ───────────────────────────────────────────────┐
-  │                                                            │
-  │   WorkspaceSchema    ← parseWorkspaceSchema (pure)         │
-  │   ↓ schemaCapabilities                                     │
-  │   Set<string>        ← coverageFor + AnomalyCategory       │
-  │                                                            │
-  └────────────────┬─────────────────────────────────────────┘
-                   │ checklist injected into monitoring prompt
-                   ▼
-  ┌─ OWNED (types.ts is the single source) ─────────────────┐
-  │                                                            │
-  │   Anomaly  ── anomalyToInsight ──►  Insight                │
-  │      ▲                                  │                  │
-  │      │                                  │ stored by id     │
-  │      │ insightToAnomaly (LOSSY)         ▼                  │
-  │      │                          insights: Map<id, Insight> │
-  │      │                          anomalies: Map<id, Anomaly>│
-  │      │                                                     │
-  │   Diagnosis  ───┐                                          │
-  │                  ├──► Investigation { reasoning[],         │
-  │   Recommendation──┘                    diagnosis,           │
-  │                                         recommendations[] } │
-  │                                          │                  │
-  │                                          ▼                  │
-  │                               investigations: Map<iid, Inv> │
-  │                                                            │
-  │   ToolCall, ReasoningStep — embedded in Investigation       │
-  │                                                            │
-  └────────────────┬─────────────────────────────────────────┘
-                   │ all reads at the LLM boundary
-                   ▼
-  ┌─ VALIDATE.TS (the runtime narrowing) ───────────────────┐
-  │   isAnomalyArray, isDiagnosis, isRecommendationArray      │
-  │   (the only schema check TypeScript can't do on its own)  │
-  └──────────────────────────────────────────────────────────┘
+  ┌─ SUBSTRATE LAYER ──────────────────────────────────────────────────┐
+  │  raw events (Bloomreach or synthetic)                              │
+  │    purchase · view_item · session_start · cart_update · checkout   │
+  └─────────────────┬──────────────────────────────────────────────────┘
+                    │  callTool() — execute_analytics_eql etc.
+                    ▼
+  ┌─ ADAPTER LAYER ────────────────────────────────────────────────────┐
+  │  ┌──────────────────────────┐                                       │
+  │  │     WorkspaceSchema      │   built once, cached                  │
+  │  │  events[] + counts +     │   lib/mcp/schema.ts:138               │
+  │  │  customerProperties[]    │                                       │
+  │  └──────────────────────────┘                                       │
+  └─────────────────┬──────────────────────────────────────────────────┘
+                    │  monitoring agent emits
+                    ▼
+  ┌─ STATE LAYER (per-session Map) ────────────────────────────────────┐
+  │                                                                    │
+  │   ┌─────────────┐   anomalyToInsight    ┌─────────────┐            │
+  │   │   Anomaly   │ ─────────────────────►│   Insight   │            │
+  │   │  (raw)      │                       │  (enriched) │            │
+  │   └─────────────┘                       └──────┬──────┘            │
+  │                                                │ id                │
+  │              ┌─────────────────────────────────┼───────────┐       │
+  │              ▼                                 ▼           ▼       │
+  │       ┌──────────────┐               ┌────────────────┐ ┌────────┐ │
+  │       │  Diagnosis   │               │ Recommendation │ │ Agent  │ │
+  │       │  (0..1 per   │               │   (0..N per    │ │ Event[]│ │
+  │       │   insightId) │               │    insightId)  │ │ cache  │ │
+  │       └──────────────┘               └────────────────┘ └────────┘ │
+  └─────────────────┬──────────────────────────────────────────────────┘
+                    │  NDJSON stream (AgentEvent variants)
+                    ▼
+  ┌─ UI LAYER (read-only) ─────────────────────────────────────────────┐
+  │  InsightCard · EvidencePanel · RecommendationCard · StatusLog      │
+  │  joins by `insight.id`; never mutates                              │
+  └────────────────────────────────────────────────────────────────────┘
 ```
+
+`Insight.id` is the join key threaded from the state layer through the
+URL (`/investigate/[id]`) and back into every downstream entity.
 
 ---
 
 ## Elaborate
 
-The interesting structural choice here is that **`types.ts` carries no logic** — it's pure shape. Every type guard, every conversion, every derivation lives elsewhere. This is the right call for a small TypeScript repo: the file is read as a reference, not maintained as code. When a new field is added, the diff is one line in the interface (and *should* be one line in each conversion function, but the leak makes that two).
+Where this comes from: the type-as-schema pattern is the same one you'd
+see in any "no-DB" event-driven backend — Cloudflare Workers with
+Durable Object state, AWS Lambda with DynamoDB write-through, edge
+functions that compose external APIs without owning data. The discipline
+predates "serverless" by decades — RPC interfaces in CORBA, Protocol
+Buffer messages, GraphQL types are all examples of *the schema is the
+contract that the type system enforces.*
 
-The repo doesn't use a schema-as-code tool (no Zod, no io-ts, no JSON Schema). The argument for adding one would be that the runtime guards in `validate.ts` are hand-rolled (every new field is a new line in `isAnomalyArray`); a schema-as-code tool would derive both the TypeScript type and the runtime validator from one source. The argument against: this repo has 3 guards (anomaly, diagnosis, recommendation) and they're 50 lines total. The complexity tax of Zod would exceed the maintenance saving until the count grows.
+What it connects to in adjacent topics:
 
-The dual-shape `Diagnosis` (full vs nested-in-Investigation) is the most surprising thing in the model. `Investigation.diagnosis` is `{ conclusion, evidence: string[], hypothesesConsidered: string[] }` — three string arrays. The standalone `Diagnosis` is richer (`hypothesesConsidered` is an object array with `{ hypothesis, supported, reasoning }`). The nested form is a *narrower projection* of the wider type. Two options to clean this up: (a) make `Investigation.diagnosis: Diagnosis` and accept the breaking change in stored data; (b) keep the projection but name it `DiagnosisSummary` so it doesn't look like a typo. The current state — same name, different shape — is the worst of both worlds.
+- **software design** — normalization-as-information-hiding. `Insight`
+  hides the raw evidence behind a derived `revenueImpact`. See
+  `02-normalization-and-duplication.md`.
+- **distributed systems** — the substrate is a third-party system the app
+  doesn't own. Every "schema" decision here is really *a contract with
+  Bloomreach*, mediated by `WorkspaceSchema`.
+- **system design** — the choice to not own a database is an architecture
+  call. The schema audit doesn't second-guess it, but it does name the
+  ceiling: if you ever wanted cross-session aggregation, you'd need a
+  real store. See `06-access-patterns-and-storage-choice.md`.
+
+What to read next: `02-normalization-and-duplication.md` walks the
+`Anomaly` → `Insight` widening as a normalization-vs-denormalization case
+study. `03-indexing-vs-query-patterns.md` shows how the Map structure
+*is* the index.
+
+---
 
 ## Interview defense
 
-**Q: What's the schema in blooming insights?**
-A: It's typed interfaces, not a relational schema. The 8 interfaces in `lib/mcp/types.ts` are the model — `Insight`, `Anomaly`, `Diagnosis`, `Recommendation`, plus supporting shapes (`WorkspaceSchema`, `CoverageReport`, `ToolCall`, `Investigation`). The store is three in-memory `Map`s in `lib/state/insights.ts`. The compiler enforces the model at every module boundary. The one place it can't see is the LLM seam — the model emits JSON-as-string — so three type guards in `lib/mcp/validate.ts` re-narrow at that boundary.
+**Q: "Walk me through your data model."**
 
-**Q: Walk me through the Insight↔Anomaly relationship.**
-A: `Anomaly` is the monitoring agent's output. `Insight` is the UI's input — same data plus derived fields (`headline`, `summary`, `revenueImpact`, etc.) plus identity (`id`, `timestamp`). `anomalyToInsight` in `lib/state/insights.ts` (L8–L28) does the forward conversion — copies 8 fields, derives 5. The reverse is in `app/api/agent/route.ts` (L29–L31) and copies only 4 — it drops `evidence`, `impact`, `history`, and `category`. The reverse exists because the browser sends the `Insight` shape to the agent route and the diagnostic agent wants `Anomaly`. The leak: the field-copy list lives in three files, no compiler enforcement that they agree.
+Verdict first: there's no database, so the schema is TypeScript interfaces
+in `lib/mcp/types.ts`. Five entities, one join key.
 
 ```
-  diagram while you talk
+  the answer, sketched
 
-  types.ts        Anomaly { metric, scope, change, severity, evidence,
-                            impact?, history?, category? }
-                  Insight { id, timestamp, severity, headline, summary,
-                            metric, change, scope, source,
-                            evidence?, impact?, history?, category?,
-                            + 6 derived Tier 1 fields }
-
-  state/insights.ts  anomalyToInsight(a) → copies 8 + derives 5
-  api/agent/route.ts insightToAnomaly(i) → copies 4, DROPS 4 ★ leak
+  WorkspaceSchema (substrate metadata, 1 per process)
+        │
+        ▼  agents query the substrate for events
+  Anomaly (monitoring output)  ──►  Insight (UI-shaped, has id)
+                                          │
+                       ┌──────────────────┼─────────────────┐
+                       ▼                  ▼                 ▼
+                   Diagnosis    Recommendation[]    AgentEvent[]
+                  (0..1)         (0..N)             (the cache)
+                                                    
+  Insight.id is the primary key everywhere downstream.
 ```
+
+Anchor: "the load-bearing piece people forget is `WorkspaceSchema` — it's
+the contract that lets the same agent code run against live Bloomreach OR
+a synthetic adapter; both adapters return the same shape."
+
+**Q: "Why TypeScript interfaces instead of a real schema?"**
+
+Verdict first: because nothing the app produces needs to outlive a
+request. Every metric is recomputed from the substrate on demand; the
+state layer is a write-through cache of the most recent briefing, not a
+record of truth.
+
+```
+  the test that picks the storage shape
+
+  is the data RECOMPUTABLE from upstream?
+       │
+       │  yes — every metric is a fresh EQL query
+       ▼
+  in-memory cache is enough; a DB would buy nothing
+       │
+       │  if the answer were "no" — e.g. user-authored
+       │  comments on an insight — the answer flips
+       ▼
+  THEN a real DB earns its keep
+```
+
+Anchor: "I'd add Postgres the day a user can edit an insight. Until then
+the substrate IS the database."
+
+**Q: "What's the riskiest part of this schema?"**
+
+Verdict first: `evidence: { tool: string; result: unknown }[]`. The
+`unknown` is doing a lot of work — the UI defensively scans evidence
+arrays looking for `{ current, prior }` numbers, which means the schema
+*allows* an evidence record that the UI can't render.
+
+```
+  the unknown escape hatch
+
+  Anomaly.evidence: [{ tool, result: unknown }]
+                                    │
+                                    │  agent emits whatever the tool returned
+                                    ▼
+  UI: findCurrentPrior(evidence)  ──── tries every entry, may find nothing
+                                       │
+                                       │  if nothing: card shows '--' placeholders
+                                       ▼
+                                  silent degradation
+```
+
+Anchor: "the cost of the flexibility is silent degradation; the fix is a
+discriminated union over the known tool families, with `unknown` as the
+explicit fallback variant."
+
+---
 
 ## See also
 
-- `02-normalization-and-duplication.md` — the Insight↔Anomaly story, now partly fixed; the wire-format leak that still lives.
-- `04-transactions-and-integrity.md` — what `validate.ts` does at the LLM seam; what the session-scoped `Map`s now enforce.
-- `05-migrations-and-evolution.md` — how the typed schema evolves under git.
-- `08-the-olist-relational-schema.md` — RETIRED. Historical pattern.
-- `09-deterministic-synthetic-data.md` — RETIRED. The pattern still applies (see file 11); the mulberry32/SQLite anchors are gone.
-- `11-in-process-synthetic-fixture.md` — the SyntheticDataSource as a data-modeling-for-test pattern: same agent-facing interface as the live adapter, in-process deterministic data.
-- `study-software-design/audit.md#information-hiding-and-leakage` — the original framing of the Insight↔Anomaly leak as a hiding/leakage problem.
-
----
+- [`02-normalization-and-duplication.md`](./02-normalization-and-duplication.md)
+  — why `Anomaly` and `Insight` are both kept around
+- [`03-indexing-vs-query-patterns.md`](./03-indexing-vs-query-patterns.md)
+  — how `Map<id, T>` answers every query the UI makes
+- [`05-migrations-and-evolution.md`](./05-migrations-and-evolution.md)
+  — the optional-field discipline that keeps demo JSON parseable as
+  fields grow
+- [`audit.md`](./audit.md) — the consolidated red-flag checklist

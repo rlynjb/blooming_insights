@@ -1,420 +1,408 @@
-# 07 — clocks, coordination, leadership
+# Clocks, coordination, and leadership
 
-**Industry name(s):** clock skew · happens-before · logical clocks (Lamport, vector) · leases · leader election · split-brain
-**Type:** Industry standard · Language-agnostic
-
-> **Verdict-first: NOT YET EXERCISED at the distributed level.** blooming insights uses `Date.now()` in five places — `BloomreachDataSource` cache TTLs, `BloomreachDataSource` spacing tracker, `OlistDataSource.callTool` for `durationMs`, `useInvestigation` UI timestamps, and `Insight.timestamp` ISO strings — and **every one of those is within a single process**. No two processes compare clock values; no logical-clock protocol exists; no lease is acquired; no leader is elected. The classical distributed-systems clock concerns (skew between nodes, happens-before across processes, split-brain when two nodes both think they're leader) do not apply because the boxes whose clocks would need to agree don't exist. The most consequential clock fact in the codebase: **`Insight.timestamp` is generated server-side per-instance**, so two instances generating insights for the same anomaly stamp them at slightly different wall-clock times — currently invisible because each instance overwrites the other (`putInsights` clears first), but it would become a real ordering question if insights were ever merged across instances.
-
----
+**Industry name:** ephemeral compute coordination via signed cookies, AsyncLocalStorage request-scoped state, server timestamps · **Type:** Industry standard for "stateless-by-default" platforms — leader election / distributed clocks are Case B
 
 ## Zoom out, then zoom in
 
-```
-  Zoom out — clocks in this codebase
+Verdict first: this codebase has **one real coordination problem** — Vercel's serverless instances are ephemeral and share nothing, so the OAuth `connect` request and the OAuth `callback` request may land on different instances. The fix is an AES-256-GCM encrypted cookie + AsyncLocalStorage. That's the entire "coordination" chapter that's actually exercised. Everything else (leader election, distributed locks, vector clocks, hybrid logical clocks) is **Case B — not exercised**.
 
-  ┌─ UI layer ──────────────────────────────────────────────┐
-  │  ts: Date.now() on TraceItem  ◄── per-tab, single clock │
-  │  no cross-tab ordering                                   │
-  └─────────────────────────┬───────────────────────────────┘
-                            │
-  ┌─ Service layer ─────────▼───────────────────────────────┐
-  │  McpClient cache: now > expiresAt        ◄── single process│
-  │  McpClient spacing: now - lastCallAt     ◄── single process│
-  │  Insight.timestamp = new Date().toISOString()             │
-  │  ★ all within ONE process — no cross-process compare ★    │ ← we are here
-  └─────────────────────────┬───────────────────────────────┘
-                            │
-  ┌─ Provider layer ────────▼───────────────────────────────┐
-  │  Bloomreach event timestamps (their clocks; opaque to us)│
-  │  Anthropic response timing (their clocks; opaque to us)  │
+```
+  Zoom out — where coordination lives (and doesn't)
+
+  ┌─ Browser ────────────────────────────────────────────────┐
+  │  one tab → one session cookie → one (or more) request    │
+  └────────────────────────┬─────────────────────────────────┘
+                           │ cookies ride every request
+  ┌─ Vercel cohort ────────▼─────────────────────────────────┐
+  │  N independent instances. The ONLY thing they coordinate │
+  │  on is what the user's cookie says:                      │
+  │                                                           │
+  │  ★ bi_auth     — encrypted DCR client info + PKCE        │ ← we are here
+  │                  verifier + OAuth tokens                  │
+  │  ★ bi_session  — sessionId for in-memory map lookups     │
+  │                                                           │
+  │  ✗ no leader election                                    │
+  │  ✗ no distributed locks                                  │
+  │  ✗ no consensus group                                    │
+  │  ✗ no clock-skew problem (no ordering across instances)  │
   └──────────────────────────────────────────────────────────┘
 ```
 
-**Zoom in.** The question this file answers: *do any two processes in this system need to agree on what time it is?* The answer is no — every wall-clock reading is consumed inside the same process that took it. No process compares its clock to another's. No process waits for a lease to expire on a different process's clock. No process holds a leadership role that depends on heartbeat timing. This file walks the concepts so they're in your vocabulary, points at the four `Date.now()` callsites and confirms each one's safety, and names the future feature that would force this topic to become real.
-
----
+This file is two halves: a deep walk of the cookie-as-shared-state pattern (the real one), then short Case-B notes on leadership/clocks (the absent ones).
 
 ## Structure pass
 
-**Layers.** Three. UI (one tab's clock, used for timestamping `TraceItem`s for display order). Service (one process's clock, used for cache TTL and rate-limit spacing). Provider (their clock, opaque to us — we just store the ISO string they send).
-
-**Axis: same-clock vs cross-clock comparison.** Hold one question: *is this clock reading ever compared to a reading from a different clock?* In this codebase, the answer for every callsite is **no**. `Date.now()` for cache TTL is compared to a `Date.now()` taken later in the same process. `Date.now()` for `lastCallAt` is compared to a `Date.now()` taken later in the same process. `Date.now()` for `TraceItem.ts` is used to display events in arrival order in the same tab. Cross-clock comparison doesn't happen. Skew doesn't matter.
-
-**Seams.** One real, one absent.
-
-- **Seam: process clock ↔ wall-clock representation.** The `Insight.timestamp` field is an ISO string the UI displays; the *value* is the producing instance's `new Date().toISOString()`. As long as one instance produces all insights for one feed, there's no comparison across clocks. The current `putInsights` (`lib/state/insights.ts:30-42`) makes this work by clearing the Map first — each briefing fully replaces the prior one, so timestamps never get mingled across instances.
-- **Seam: process clock ↔ another process's clock** — *does not exist*. No leader election, no lease, no heartbeat, no quorum vote that depends on clock agreement.
+### Axis: where does state live, and who can see it?
 
 ```
-  Structure pass — clocks within a process, not across
+  Trace "who can see this state" across the stack
 
-  ┌─ within one Vercel process ─────────────────────────┐
-  │  Date.now() for cache:    compared to Date.now()    │
-  │                            in same process — safe    │
-  │  Date.now() for spacing:  same                       │
-  │  toISOString for insight: ISO string for display     │
-  │                            — no comparison           │
-  └────────────────────────┬────────────────────────────┘
-                           │  no clock comparison crosses this seam
-                           │  because nothing about another process's
-                           │  clock is ever read
-                           ▼
-  ┌─ within another Vercel process ─────────────────────┐
-  │  same code, same patterns, ITS clock                 │
-  └──────────────────────────────────────────────────────┘
+  Browser            — sees: localStorage 'bi:mode', sessionStorage stashes,
+                              cookies (bi_session, bi_auth, the value),
+                              the JSON in ?insight= URL params
+
+  bi_auth cookie     — sees: ONLY the request handler that decrypts it
+                       (per-request, ALS-scoped) — instance A and B both can,
+                       given the same cookie
+
+  bi_session cookie  — sees: every request handler (plaintext UUID)
+
+  Per-instance Maps  — sees: this instance's handlers only
+                       (insights, investigations, schema cache)
+
+  Bloomreach upstream — sees: the Bearer token (revealed every request)
 ```
 
----
+The axis-answer flips dramatically across layers. The cookie is the **only** state that survives across instances. Per-instance Maps die at the boundary. That's not a bug — that's the platform.
+
+### Seams (load-bearing boundaries)
+
+- `withAuthCookies` (`lib/mcp/auth.ts:86`) ↔ everything inside the request. Reads the cookie ONCE at request start, flushes ONCE at end via `AsyncLocalStorage`. Drop this wrapping and the SDK's many synchronous `provider.tokens()` / `provider.saveCodeVerifier(v)` calls would each re-read the cookie and hit Next's "request-vs-response cookie split" (a read after a set in the same request returns the OLD value).
+- The PKCE verifier ↔ the OAuth round-trip. Saved during `connect` on instance A, read during `callback` on instance B. The cookie is the only thing that bridges them.
+- The clock readings on `lastCallAt` (`lib/data-source/bloomreach-data-source.ts:191`) ↔ rate-limit logic. These are per-instance — two instances have independent `lastCallAt`. That's why proactive spacing doesn't fully prevent rate-limit hits at scale.
+
+### Layered decomposition: what is "consistent enough" at this layer?
+
+```
+  "Is state consistent across instances?" — held constant
+
+  ┌─ bi_auth cookie ─────────────────────────────────────────┐
+  │  YES — encrypted, signed, authoritative                   │   → coordinated
+  │  any instance can decrypt and trust it                    │
+  └────────────────────────┬─────────────────────────────────┘
+       ┌──────────────────────────────────────────────────────┐
+       │ bi_session cookie                                    │   → coordinated
+       │ UUID, plaintext; the routing key for in-memory state │
+       └────────────────────────┬─────────────────────────────┘
+            ┌─────────────────────────────────────────────────┐
+            │ per-instance Maps (insights, investigations)    │   → NOT coordinated
+            │ instance A populates, instance B doesn't see it │      (the gap is real)
+            └────────────────────────┬────────────────────────┘
+                 ┌────────────────────────────────────────────┐
+                 │ per-instance schema cache                  │   → NOT coordinated
+                 │ instance B may bootstrap independently     │
+                 └────────────────────────┬───────────────────┘
+                      ┌───────────────────────────────────────┐
+                      │ per-instance lastCallAt (rate-limit)  │   → NOT coordinated
+                      │ two instances can race the rate limit │     (red flag)
+                      └───────────────────────────────────────┘
+```
+
+The contrast: only the cookie is coordinated. Everything else is per-instance, which is fine when the operation is idempotent (cache, schema bootstrap) and problematic when it isn't (the rate limit — two instances could each be at ~1.1s since their last call, doubling the actual upstream rate).
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You already know `Date.now()` returns milliseconds since 1970 from the machine's clock. The distributed-systems issue: every machine's clock is slightly different. Two `Date.now()` readings from two machines, even taken at the "same" instant, can differ by milliseconds (well-synced via NTP), seconds (sloppy), or hours (broken). This means **you cannot order events from different machines by their wall-clock timestamps and get the right answer.**
+You know how a JWT carries claims so the server doesn't need to look anything up — every request is self-contained? Same idea: the `bi_auth` cookie carries the OAuth state (DCR client info + PKCE verifier + tokens) so every Vercel instance can serve any request without needing a shared database. The browser is the "shared store" because it's the only thing that's actually constant across the request span.
+
+The twist is the **inside-a-single-request reads/writes**: the MCP SDK calls `provider.tokens()` and `provider.saveCodeVerifier(v)` synchronously, many times, during a single OAuth flow. Next.js's `cookies()` API gives you the *request* cookie on read; if you `set` during the request, the read still returns the OLD value (a `set` only affects the response). So we can't naively re-read the cookie on every method call. Solution: read once at the start, hold in an `AsyncLocalStorage`-scoped object, flush at the end.
 
 ```
-  Why wall-clock doesn't work across machines
+  Cookie-as-shared-state kernel — the picture
 
-  machine A clock:  ─── 10:00:00.000 ──────► event A1 at 10:00:00.500
-  machine B clock:  ─── 09:59:59.800 ──────► event B1 at 10:00:00.300 (B-clock)
-                                                     (= 10:00:00.500 A-clock)
-
-  did A1 happen "before" B1?
-    by wall-clock timestamps:    A1.ts (500) > B1.ts (300) → B1 first
-    by actual real-world time:   they were simultaneous
-
-  → wall-clock ordering is unreliable across machines
+       request enters
+            │
+            ▼
+   withAuthCookies(fn) {
+     raw = cookies().get('bi_auth').value
+     ctx = { store: decrypt(raw) || {}, dirty: false }
+            │
+            ▼  ─ AsyncLocalStorage scope ─
+     await requestStore.run(ctx, fn)
+        │
+        ▼
+     provider.codeVerifier() → readState(sid).codeVerifier
+                              → readAll() reads ctx.store
+     provider.saveTokens(t) → patchState(sid, {tokens:t})
+                            → writes ctx.store, ctx.dirty = true
+        │
+        ▼  ─ scope ends ─
+     if (ctx.dirty) cookies().set('bi_auth', encrypt(ctx.store), {…})
+   }
 ```
 
-Three classical responses to this:
+That kernel is the pattern. Everything else (the AES-256-GCM crypto, the `SameSite=None` cookie flag, the dev/test fallbacks) is hardening on top.
 
-```
-  Distributed clock patterns — the kernel
+### Move 2 — walk the parts
 
-  LAMPORT CLOCKS       integer counter; on send, bump and attach;
-                       on receive, max(local, received) + 1
-                       gives partial ordering ("if A causally before B,
-                       L(A) < L(B)" — but not vice versa)
+#### Part: the three backends (dev / test / production)
 
-  VECTOR CLOCKS        one counter per node; on send, attach vector;
-                       on receive, element-wise max + bump own
-                       gives full causal ordering (can detect concurrency)
-
-  HYBRID LOGICAL       wall-clock + logical bump; close-to-real-time
-                       but still total-orderable
-
-  LEASES               "I own X until time T (your clock + my clock skew)"
-                       short-lived locks that auto-expire
-                       requires both sides agree on a generous-enough margin
+```ts
+// lib/mcp/auth.ts:34
+const PERSIST = process.env.NODE_ENV === 'development';
+const CACHE_FILE = join(process.cwd(), '.auth-cache.json');
+const memStore = new Map<string, SessionAuthState>();
 ```
 
-**None of these apply in blooming insights** because no event from one machine is ever compared to or merged with an event from another machine within our code.
+Three backends because three environments have different needs:
 
-### Move 2 — the four `Date.now()` callsites, walked
+- **Dev**: gitignored file (`.auth-cache.json`). Next's dev server hot-reloads, which would wipe an in-memory Map mid-flow. Persistence to disk is what lets the DCR client info + PKCE verifier survive a hot-reload between `connect` and `callback`.
+- **Test**: in-memory Map, isolated per run, with `_clearAuthStore()` for setup.
+- **Production**: encrypted cookie, ALS-scoped per request.
 
-**Use cases.**
+This is the pattern: **the storage backend follows the failure mode of the runtime**. Dev needs persistence across module reloads; test needs isolation; prod needs cross-instance shared state.
 
-Every existing use case is within-process and safe. The interesting *non*-use cases are the features that would force this to become a real concern:
-- Scheduled briefings (would need cron + leader election; Vercel Cron Jobs handles it).
-- "Don't run two briefings in parallel for the same user" (would need a distributed lock; Vercel KV `SET NX` with TTL is the easy solution).
-- Merging insights from two parallel briefings into one feed (would need ordering; HLC or per-event UUID with tiebreak).
+#### Part: AES-256-GCM with key derived from `AUTH_SECRET`
 
-#### Callsite 1 — BloomreachDataSource cache TTL (`lib/data-source/bloomreach-data-source.ts:149, 186`)
-
-```
-  Cache TTL — within-process comparison only
-
-  set:    expiresAt = Date.now() + ttl     ← same process's clock
-  read:   if cached.expiresAt > Date.now() ← same process's clock
-          → return cached
-
-  comparison: this process's Date.now() at T vs same process's at T+N
-  skew matters? NO — same monotonic-ish clock
-  exception: NTP correction during the 60s window could shift
-             Date.now() backward. Practically irrelevant — a one-
-             time NTP step is rare on Vercel and at most causes one
-             cache miss
-```
-
-Safe. No distributed clock issue.
-
-```
-  lib/data-source/bloomreach-data-source.ts  (lines 149-150, 185-186)
-
-  if (cached && cached.expiresAt > Date.now()) {        ← read-time comparison
-    return { result: cached.result as T, durationMs: 0, fromCache: true };
+```ts
+// lib/mcp/auth.ts:51
+function aesKey(): Buffer {
+  const secret = process.env.AUTH_SECRET;
+  if (!secret) {
+    throw new Error('AUTH_SECRET is required in production to encrypt the auth cookie. ' +
+      'Set it in your Vercel project environment variables.');
   }
-  // ...
-  const now = Date.now();                                ← write-time stamp
-  this.cache.set(cacheKey, { result, expiresAt: now + ttl });
-       │
-       └─ both Date.now() calls happen in the same Node process.
-          Comparison is monotonic-ish — safe even across NTP corrections
-          (worst case: one extra cache miss or one extra hit, no
-          correctness impact).
-```
+  return createHash('sha256').update(secret).digest(); // 32 bytes → AES-256
+}
 
-#### Callsite 2 — BloomreachDataSource spacing (`lib/data-source/bloomreach-data-source.ts:191, 197, 200`)
+function encryptStore(store: Store): string {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', aesKey(), iv);
+  const enc = Buffer.concat([cipher.update(JSON.stringify(store), 'utf8'), cipher.final()]);
+  return Buffer.concat([iv, cipher.getAuthTag(), enc]).toString('base64url');
+}
 
-```
-  Spacing tracker — within-process comparison only
-
-  on call:  elapsed = Date.now() - this.lastCallAt
-            if elapsed < minIntervalMs: sleep(diff)
-            ...transport.callTool...
-            this.lastCallAt = Date.now()
-
-  comparison: same process's clock at two times
-  skew matters? NO
-  exception (also irrelevant): NTP step could make elapsed negative;
-             the `< minIntervalMs` test stays correct, just sleeps the
-             full interval. No data corruption possible.
-```
-
-Safe. No distributed clock issue.
-
-```
-  lib/data-source/bloomreach-data-source.ts  (lines 190-205)
-
-  const elapsed = Date.now() - this.lastCallAt;
-  if (elapsed < this.minIntervalMs) {
-    await new Promise((r) => setTimeout(r, this.minIntervalMs - elapsed));
-  }
+function decryptStore(token: string): Store {
   try {
-    const result = await this.transport.callTool(name, args);
-    this.lastCallAt = Date.now();                        ← record after success
-    return result;
-  } catch (err) {
-    this.lastCallAt = Date.now();                        ← also record on fail
-    // ...
+    const buf = Buffer.from(token, 'base64url');
+    const decipher = createDecipheriv('aes-256-gcm', aesKey(), buf.subarray(0, 12));
+    decipher.setAuthTag(buf.subarray(12, 28));
+    const plain = Buffer.concat([decipher.update(buf.subarray(28)), decipher.final()]).toString('utf8');
+    return JSON.parse(plain) as Store;
+  } catch {
+    return {}; // tampered, rotated-secret, or corrupt cookie → treat as no auth
   }
-       │
-       └─ rate-limit spacing tracker. Same-process clock comparison;
-          no skew issue. Cross-instance leak: two Vercel instances each
-          have their own lastCallAt, so concurrent calls from different
-          instances can both fire within Bloomreach's window. That's a
-          coordination issue (file 05), not a clock issue.
+}
 ```
 
-#### Callsite 2b — OlistDataSource durationMs (`lib/data-source/olist-data-source.ts:152, 159`)
+The cookie layout is `iv (12) | authTag (16) | ciphertext`. AES-GCM gives both confidentiality and authenticity — a tampered cookie fails `decipher.final()` and we return `{}`, which translates to "no auth, run OAuth again." Rotating `AUTH_SECRET` has the same effect: all existing cookies decrypt to `{}`, all users re-auth.
 
-```
-  Olist durationMs — within-process comparison only
+Three details on the cookie itself:
 
-  on call:  const start = Date.now()
-            ... await client.callTool(..., { signal })
-            const durationMs = Date.now() - start
-            return { result, durationMs, fromCache: false }
+- **`httpOnly: true`** — not readable from JS, so XSS can't exfiltrate.
+- **`secure: true`** — only over HTTPS.
+- **`sameSite: 'none'`** — required so the cookie survives the cross-site OAuth return from Bloomreach's IdP to `/api/mcp/callback`.
 
-  comparison: same process's clock at two times (start vs end)
-  skew matters? NO — same monotonic-ish clock
-  cross-process? NO — even though the call traverses a stdio pipe
-                       to a subprocess, BOTH Date.now() readings
-                       happen in the parent process; the child's
-                       clock is never read by our code
+#### Part: AsyncLocalStorage — the request-scoped lens
+
+```ts
+// lib/mcp/auth.ts:46
+interface RequestStore { store: Store; dirty: boolean }
+const requestStore = new AsyncLocalStorage<RequestStore>();
 ```
 
-Safe. The interesting observation: even though this callsite is *about* an IPC round-trip, the clock comparison stays within one process — the parent measures wall-clock duration from before-send to after-receive without touching the child's clock at all. The child has its own clock and presumably writes log timestamps with it, but those are display-only (file 06, the stderr stream).
+ALS lets you carry context through async chains without explicit threading. In our case, it carries `{store, dirty}` so any code running inside `withAuthCookies(fn)` can read/write the same in-memory object, and a single flush at the end persists changes. Per-request isolation: two concurrent requests on the same instance each get their own ALS context, no shared state between them.
 
-#### Callsite 3 — UI TraceItem timestamps (`lib/hooks/useInvestigation.ts:107, 113`)
+```ts
+// lib/mcp/auth.ts:114
+function readAll(): Store {
+  const ctx = requestStore.getStore();
+  if (ctx) return ctx.store; // production: ALS-scoped, cookie-backed
+  if (!PERSIST) return Object.fromEntries(memStore); // test
+  try {
+    if (existsSync(CACHE_FILE)) return JSON.parse(readFileSync(CACHE_FILE, 'utf8')) as Store;
+  } catch { /* … */ }
+  return {};
+}
 
-```
-  TraceItem.ts — for UI display order, single tab
-
-  on each agent event:
-    const it: TraceItem = { kind: 'step', ..., ts: Date.now() }
-
-  comparison: not really compared; used as a render ordering hint
-              and possibly shown to the user as "X seconds ago"
-  cross-process? NO — generated in the browser, consumed in same tab
-```
-
-Safe. No distributed clock issue.
-
-#### Callsite 4 — Insight.timestamp (`lib/state/insights.ts:14`)
-
-```
-  Insight.timestamp — produced server-side, ISO format
-
-  anomalyToInsight: {
-    id: crypto.randomUUID(),
-    timestamp: new Date().toISOString(),    ← server's clock at conversion
-    ...
+function writeAll(store: Store): void {
+  const ctx = requestStore.getStore();
+  if (ctx) {
+    ctx.store = store;
+    ctx.dirty = true;
+    return;
   }
-
-  comparison: the UI may display "generated 5 minutes ago" using
-              new Date(timestamp) vs Date.now() in the browser
-              — that compares the SERVER's clock to the BROWSER's clock
-              → mild clock skew here is real
-
-  worst case: a few minutes of "ago" being slightly wrong
-              for a user with a badly-set machine clock
-  safety: human-readable ISO; nothing else depends on it
+  // … dev/test branches
+}
 ```
 
-Mostly safe. The cross-clock comparison server→browser is the only one in the codebase, and the consequence of skew is a display glitch ("3 minutes ago" off by 30 seconds for a user whose machine clock is 30s slow). No data corruption.
+`readAll` and `writeAll` are the only two functions that touch storage; they switch on backend by checking `requestStore.getStore()` first. The `dirty` flag is the optimization that avoids re-encrypting and writing a cookie when nothing changed (a pure-read request leaves `dirty: false`, so no `Set-Cookie` goes out).
 
 ```
-  lib/state/insights.ts  (lines 8-28, specifically line 14)
+  Execution trace — one OAuth flow across two instances
 
-  export function anomalyToInsight(a: Anomaly): Insight {
-    const id = crypto.randomUUID();
-    // ...
-    return {
-      id,
-      timestamp: new Date().toISOString(),               ← server's clock,
-      // ...                                                ISO string format
-    };
-  }
-       │
-       └─ the only "produced here, displayed there" timestamp. UI
-          compares to browser Date.now() for "X minutes ago" rendering.
-          Skew effect is cosmetic; no data path depends on the value.
+  request                                instance A          instance B
+  ──────                                 ──────────          ──────────
+  GET /api/briefing                      withAuthCookies:
+                                          raw = cookies().get → undefined
+                                          ctx = {store:{}, dirty:false}
+                                          connectMcpInner(sid):
+                                            provider.clientMetadata
+                                            client.connect (DCR + PKCE)
+                                            provider.saveClientInformation(info)
+                                              → ctx.store[sid].clientInformation
+                                              → ctx.dirty = true
+                                            provider.saveCodeVerifier(v)
+                                              → ctx.store[sid].codeVerifier
+                                              → ctx.dirty = true
+                                            provider.redirectToAuthorization(url)
+                                              → lastAuthorizeUrl captured
+                                            throws UnauthorizedError
+                                          catch returns {authUrl}
+                                          flush: cookies().set('bi_auth', encrypt(ctx.store))
+                                                                                  ← cookie returned
+   browser navigates to Bloomreach IdP                       (cookie now in jar)
+
+  GET /api/mcp/callback?code=…           [different instance!]
+                                                              withAuthCookies:
+                                                               raw = cookies().get → present
+                                                               ctx = {store: decrypt(raw),
+                                                                       dirty: false}
+                                                               completeAuth(sid, code):
+                                                                 transport.finishAuth(code):
+                                                                   provider.clientInformation()
+                                                                     → ctx.store[sid].clientInfo
+                                                                       ← survived!
+                                                                   provider.codeVerifier()
+                                                                     → ctx.store[sid].codeVerifier
+                                                                       ← also survived!
+                                                                   exchange code for tokens
+                                                                   provider.saveTokens(t)
+                                                                     → ctx.dirty = true
+                                                               flush: cookies().set('bi_auth', encrypt)
+                                                                                    ← updated cookie
 ```
 
-### Move 3 — what NOT YET EXERCISED looks like (and what would force it)
+The trace shows the load-bearing move: **state created on instance A is recovered verbatim on instance B**, with no shared database, no Redis, no Vercel KV. The cookie is the only thing both instances can see.
+
+#### Part: server timestamps — the only "clocks" in this repo
+
+There's no distributed clock concern because there's no ordering decision that crosses an instance. The only timestamps that matter:
+
+- **`Insight.timestamp`** (`lib/state/insights.ts:32`) — `new Date().toISOString()` at the time the briefing ran. Server-local clock. The UI shows it as the snapshot disclosure.
+- **`lastCallAt`** (`lib/data-source/bloomreach-data-source.ts:191`) — `Date.now()` for proactive rate-limit spacing. Per-instance. Used for relative timing only (`elapsed = now - lastCallAt`).
+- **`expiresAt`** in the cache — `Date.now() + ttl`. Same — relative timing on the local clock.
+
+No clock-skew problem because every comparison is local to one process. No vector clocks because there's no causality to track across processes. No hybrid logical clocks because there's no need to order events across instances.
+
+If we ever shared the cache across instances (Redis), the TTL math would still be safe (each instance's clock is close enough for 60s windows). If we ever tried to *order* events across instances — say, "investigation 1 came before investigation 2" globally — *then* we'd need vector clocks or HLCs.
+
+### Move 2.5 — Case B: leadership, distributed locks, consensus
+
+These are real distributed-systems concepts. **They are not in this repo.** Documented here so you know what they'd add.
 
 #### Leader election
 
-**Not exercised.** No node has a special role. Every Vercel instance is interchangeable. No leader, no follower, no role transition.
+Pattern: N replicas run the same code; one is elected leader (Raft, Bully algorithm, Zookeeper ephemeral nodes); only the leader writes; followers read. Adds complexity: split-brain detection, leader failover, fencing tokens.
+
+**When this repo would need it:** If a background job (refresh schema every hour, refresh demo snapshot nightly) had to run *exactly once* across the Vercel cohort. Today there's no such job — everything is request-driven.
 
 ```
-  What would force leader election
-
-  feature: "exactly one briefing per organization per day at 8am"
-    needs: ONE Vercel function to fire per (org, day)
-    risk:  if you trigger N functions and only one should "win," need
-           leader election OR a coordinating service
-
-  solution: lean on Vercel Cron Jobs — the platform IS the leader-
-            election protocol; ONE function is invoked per cron entry,
-            guaranteed by Vercel's infrastructure
+  Phase A (today)           vs       Phase B (if a background job existed)
+  ───────────────────              ───────────────────────────────────────
+  every request runs                a single "leader" instance runs the job
+  the schema bootstrap              on schedule; others skip it
+  independently (idempotent,        coordination cost: Raft / locks /
+  duplicate work tolerated)         leader-election infra
 ```
 
-#### Lease / lock
+#### Distributed locks
 
-**Not exercised.** No code acquires a lock saying "I own this resource for the next N seconds." The closest thing is the `startedRef` guard in `useInvestigation`, which is a *process-local* once-per-mount flag, not a distributed lock.
+Pattern: a shared lock (Redis SETNX with TTL, etcd lease, Zookeeper) that only one process can hold. Used for serializing access to a critical section across processes.
 
-```
-  What would force a distributed lock
+**When this repo would need it:** If the schema bootstrap had to run *only once across all instances* (today it can run on each cold instance independently, and the duplicate work is wasted bandwidth not corrupted state). Or if we ever did atomic increment-style writes against shared state.
 
-  feature: "user clicks 'rerun briefing' — don't run two in parallel"
-    today: nothing prevents two parallel runs from two tabs / two clicks
-    risk:  doubles MCP cost; second run may overwrite first
+#### Consensus (Raft / Paxos)
 
-  solution: Vercel KV with SET NX user:briefing-lock TTL=60s
-            → first request acquires; second sees the lock and 409s
-            this IS a lease — short-lived lock with auto-expiry
-            requires clock-skew margin (KV's clock vs Vercel function's)
-            in practice: KV is single-source-of-truth for the lock,
-            its clock is the only one that matters
-```
+Pattern: a group of N nodes agree on an ordered log of operations, surviving up to f failures (where N = 2f+1). Used for replicated state machines (etcd, Consul, distributed databases).
 
-#### Split-brain
+**When this repo would need it:** Never, at this shape. Consensus is for distributed *databases*; we don't have one.
 
-**Not exercised.** There's no role you could split-brain across. No leader, no primary, no quorum vote.
+#### Vector clocks / HLCs / Lamport timestamps
 
-#### Hybrid Logical Clocks / vector clocks
+Pattern: each process tags its events with a logical clock that captures causal precedence. Used to determine "happened-before" across processes without a global clock.
 
-**Not exercised.** No event from one process is causally ordered against an event from another process inside our code. If we eventually merged insights from two instances, we'd want a Lamport or HLC timestamp on each insight to order them; today we don't merge, so we don't need to order.
+**When this repo would need it:** If two users edited the same investigation concurrently, vector clocks would let us detect the conflict ("user A's edit and user B's edit are concurrent — show a merge UI"). Today, investigations are write-once per session.
 
-### Move 3 (real) — the principle
+### Move 3 — the principle
 
-**Clocks become a distributed-systems problem only when one machine reads another machine's clock.** Inside one process, `Date.now()` is fine — it's monotonic enough and consistent with itself. The instant you need two processes to agree on "who got there first" or "who holds the lock until when," wall-clock comparisons stop working and you reach for logical clocks, consensus, or a single source-of-truth clock (a coordinator). blooming insights stays on the easy side of this line by structurally avoiding the situations that cross it — no peer coordination, no leases, no leader. When the day comes that a feature needs one, the right move is to lean on Vercel KV's atomic operations (its clock is the only one that matters) rather than trying to coordinate Vercel function clocks against each other.
+**Coordination is expensive. Don't add it unless the failure mode forces you.** The cookie-as-shared-state pattern is the cheapest possible "distributed" state — the browser is doing the carrying, and the encryption + AsyncLocalStorage wrapping is the entire price. No Redis, no Raft, no locks. The pattern works because we picked the corner of the design space where state changes infrequently (per OAuth flow, not per request) and the state is small (< 8KB cookie limit).
 
----
+The day we need real coordination — a background job, a shared lock, multi-region cohorts that need to agree on something — the cost goes up dramatically. Knowing where that line is, and staying on this side of it, is most of the design judgment in this pattern.
 
 ## Primary diagram
 
 ```
-  Clocks in blooming insights — every Date.now() callsite, classified
+  Full picture — the only coordination pattern in this codebase
 
-  ┌─ browser ────────────────────────────────────────────────────┐
-  │                                                                │
-  │   TraceItem.ts = Date.now()                                    │
-  │   → single tab, single clock, display-order only — SAFE        │
-  │                                                                │
-  │   new Date(insight.timestamp).getTime() vs Date.now()          │
-  │   → cross-clock (server→browser), display-only — MILD SKEW OK  │
-  │                                                                │
-  └────────────────────────────────┬─────────────────────────────┘
-                                   │  no other cross-clock comparisons
-                                   ▼
-  ┌─ Vercel instance (one process) ──────────────────────────────┐
-  │                                                                │
-  │   McpClient.cache.expiresAt = Date.now() + 60_000              │
-  │   ... if (cached.expiresAt > Date.now()) ...                   │
-  │   → same process, same clock — SAFE                            │
-  │                                                                │
-  │   McpClient.lastCallAt = Date.now()                            │
-  │   ... elapsed = Date.now() - lastCallAt ...                    │
-  │   → same process, same clock — SAFE                            │
-  │                                                                │
-  │   anomalyToInsight: timestamp = new Date().toISOString()       │
-  │   → produced here, displayed there — see browser box above     │
-  │                                                                │
-  │   ─── what would FORCE a distributed clock problem ───         │
-  │   - leader election (no role exists)                            │
-  │   - distributed lock (no resource needs one)                    │
-  │   - causal ordering of cross-instance events (no merge)         │
-  │   all NOT YET EXERCISED                                         │
-  │                                                                │
-  └────────────────────────────────────────────────────────────────┘
+  ┌─ Browser ─────────────────────────────────────────────────────────┐
+  │  cookies: bi_session=<uuid>; bi_auth=<encrypted blob>              │
+  │  every request carries them                                        │
+  └────────────────────────────┬──────────────────────────────────────┘
+                               │ HTTPS, every request
+  ┌─ Vercel instance (any of N) ──────────────────────────────────────┐
+  │                                                                    │
+  │  withAuthCookies(fn) {                                             │
+  │    raw = cookies().get('bi_auth').value                            │
+  │    ctx = { store: decrypt(raw) || {}, dirty: false }                │
+  │    await requestStore.run(ctx, fn)   ─ AsyncLocalStorage scope ─    │
+  │       ↓                                                             │
+  │       BloomreachAuthProvider methods (readState/patchState)          │
+  │         → readAll() reads ctx.store                                 │
+  │         → writeAll() updates ctx.store, sets ctx.dirty             │
+  │       ↑                                                             │
+  │    if (ctx.dirty) cookies().set('bi_auth', encrypt(ctx.store), {…}) │
+  │  }                                                                  │
+  │                                                                    │
+  │  per-instance, NOT coordinated:                                    │
+  │    • insights/investigations Maps (per-session sub-maps)           │
+  │    • lib/mcp/schema.ts `cached` (process-lifetime)                 │
+  │    • BloomreachDataSource cache + lastCallAt                       │
+  │    • timestamps (Insight.timestamp, Date.now())                    │
+  │                                                                    │
+  └────────────────────────────────────────────────────────────────────┘
+
+  Case B (not exercised here):
+    • leader election (would need: background scheduled jobs)
+    • distributed locks (would need: shared mutable state)
+    • consensus (would need: replicated state machine)
+    • vector clocks (would need: concurrent updates to shared resources)
 ```
-
----
 
 ## Elaborate
 
-The reason clocks are hard in distributed systems isn't that NTP is bad — it's that NTP gives you "close-enough for most things" without telling you how close. The fundamental result is Lamport's: physical time is a fiction; causal ordering is what you can actually know. If you need to know "did A happen before B," and they're on different machines, you need to attach causal information (Lamport counter, vector clock, HLC timestamp) at the source so the comparison is meaningful at the merge point.
+The cookie-as-shared-state pattern has a name in industry: **stateless session management with signed cookies**, used by every JWT-based system. The novel-to-us part is using it for the OAuth flow's transient state (PKCE verifier, DCR client info) rather than just for the user identity. The risk that pushed us here is the same risk that pushed everyone there: ephemeral compute (Vercel, Lambda) doesn't have a shared memory layer by default, and adding one (Redis, Vercel KV) is an extra service to operate and pay for.
 
-blooming insights skips this entire problem space by structurally not having cross-machine comparisons. That's not because the engineers are clever; it's because the architecture has no shared writable state that two machines would need to order writes into. The day a feature lands that needs such ordering — say, a shared insight feed where two organizations' admins both mark insights as "resolved" — you'd reach for either a server-assigned monotonic counter (single point of truth) or HLC timestamps (distributed but reasonable). Postgres's `SERIAL` column is a poor-man's monotonic counter; Vercel KV's `INCR` is the same idea in a key-value store. Both work because they centralize the clock to one place — the storage layer — and let everyone else read from it.
+AsyncLocalStorage is the Node analog of Java's `ThreadLocal` or Go's context.Context — a way to thread per-request state through async chains without polluting function signatures. The Next.js cookie API problem (request-vs-response split, can't read your own writes within a request) is well-known; ALS is the standard workaround.
 
-The right next move IF a coordination concern arose: lean on Vercel KV. Its atomic operations (`INCR`, `SET NX`, `EXPIRE`) cover 90% of the cases (counters, locks, leases) without needing a custom clock protocol. The other 10% (true consensus, complex transactional ordering) is what you'd add Postgres or a dedicated coordinator for.
-
----
+What to read next: Marc Brooker's "Caches, modes, and unprincipled gradients" for the cookie-as-cache shape; the Vercel KV docs for the next step up; the Raft paper if you want to know what leader election actually costs.
 
 ## Interview defense
 
-**Q: How do you handle clock skew in this system?**
+**Q: "How do you handle state across your serverless instances?"**
 
-I don't have to. Every `Date.now()` reading in this codebase is compared to another reading from the same process — cache TTLs, rate-limit spacing, UI display timestamps. There's no leader election, no distributed lock, no causal ordering across instances, so the classical clock-skew concerns don't fire. The one cross-clock comparison is server-generated `Insight.timestamp` (ISO string) versus browser `Date.now()` for "X minutes ago" rendering — and the consequence of skew is cosmetic, not corrupting.
+> "The honest answer: I don't have shared state across instances except for what's in the user's cookies. The only real coordination problem is the OAuth flow — the `connect` request and the `callback` may land on different Vercel instances. So the DCR client info, PKCE verifier, and tokens all live in an AES-256-GCM encrypted cookie called `bi_auth`. The pattern: read the cookie once at request start, decrypt into an AsyncLocalStorage-scoped object, let the OAuth SDK do its many synchronous reads/writes against that object, flush back to the cookie at request end. Cross-instance state without Redis."
 
-```
-  the four Date.now() callsites, classified
-
-  cache TTL          ← same process, monotonic-enough, safe
-  rate-limit spacing ← same process, safe
-  TraceItem.ts (UI)  ← same tab, safe
-  Insight.timestamp  ← server→browser cosmetic skew, safe
-```
-
-**Q: What would force you to deal with this?**
-
-A feature that needs two machines to agree on "who got there first." Scheduled briefings — exactly one Vercel function should fire per cron entry — would force leader election (and Vercel Cron Jobs would solve it for me at the platform layer). A "rerun lock" so two parallel briefings can't run for the same user — distributed lock, easiest done with Vercel KV's `SET NX` with TTL. Merging insights from two parallel runs into one feed — distributed ordering, easiest via a server-assigned monotonic ID.
+Diagram:
 
 ```
-  the three features that would force it
-  
-  cron-style schedule  →  Vercel Cron Jobs (platform handles it)
-  "don't run two"      →  Vercel KV SET NX + TTL
-  merge ordered feed   →  monotonic counter or HLC
+  instance A: connect → save verifier to ctx → encrypt → Set-Cookie
+                                                        │
+  browser:    Cookie: bi_auth=...                       │
+                                                        ▼
+  instance B: callback → decrypt cookie → read verifier → exchange code → save tokens → re-encrypt → Set-Cookie
 ```
 
-**Q: What's the load-bearing concept people forget?**
+**Q: "Why AsyncLocalStorage?"**
 
-The lease — a lock with a TTL. A naive distributed lock without an expiration would deadlock if the holder dies before releasing. A lease auto-releases after N seconds; if the holder is still alive and needs more time, it renews. The clock-skew margin matters: you set the lease to (max work time + max clock skew between holder and store), so the holder doesn't lose its lease early. In a Vercel KV-style world this is moot because KV's clock is the only one that matters — but it's the conceptual primitive people skip when first reaching for a distributed lock.
+> "Next.js's `cookies()` API is request-scoped — `cookies().set(...)` only affects the response. A read after a set in the same request returns the OLD value. The OAuth SDK calls `provider.saveCodeVerifier(v)` and `provider.codeVerifier()` many times during a single flow, often interleaved with `tokens()` and `saveTokens()`. Re-reading the cookie on every call would lose the most recent writes. ALS lets me read the cookie ONCE at request entry, hold the decrypted store in a per-request object, let the SDK hammer it synchronously, and flush ONCE at exit. The `dirty` flag is the optimization — pure-read requests don't trigger a re-encrypt or a Set-Cookie."
 
----
+**Q: "What if `AUTH_SECRET` rotates?"**
 
----
+> "Every existing cookie decrypts to `{}` (the try/catch in `decryptStore` swallows the GCM authentication failure). All users re-auth. That's the deliberate behavior — rotating the secret is a force-logout. Same effect for tampered cookies."
+
+**Q: "What's NOT here that I should be aware of?"**
+
+> "No leader election, no distributed locks, no consensus, no vector clocks. The per-instance state (insights Map, schema cache, BloomreachDataSource cache) is uncoordinated — instance A's cache is invisible to instance B. That's fine for idempotent reads but the `lastCallAt` rate-limit spacing is per-instance too, so two warm instances can technically race the upstream's rate limit. Listed in the red-flags audit. The day a background job needs to run exactly once across the cohort, leader election earns its place."
+
+**Q: "What's the load-bearing detail?"**
+
+> "AsyncLocalStorage scoping. Without it, the OAuth SDK's mid-request `saveCodeVerifier` would write a cookie that the next `codeVerifier()` call inside the same request couldn't read. The whole flow would silently fail with 'no PKCE code_verifier stored for this session.' The scoping is what makes the in-request reads consistent."
 
 ## See also
 
-- `02-partial-failure-timeouts-and-retries.md` — the spacing tracker and retry waits both depend on within-process `Date.now()` comparisons
-- `03-idempotency-deduplication-and-delivery-semantics.md` — the cache TTL is a clock-based dedup window
-- `05-replication-partitioning-and-quorums.md` — replication is the other "not yet exercised" that would force this topic
-- `08-sagas-outbox-and-cross-boundary-workflows.md` — workflows often need timestamps; the step 2 → step 3 flow doesn't
-- `.aipe/study-runtime-systems/` — event loop within one Vercel instance (when generated)
-
----
+- `01-distributed-system-map.md` — the picture this file is the deep walk of.
+- `04-consistency-models-and-staleness.md` — the per-instance staleness the cookie pattern fixes for auth (and the `?insight=` URL hack fixes for everything else).
+- `09-distributed-systems-red-flags-audit.md` — the per-instance `lastCallAt` rate-limit gap is listed there.
+- `../study-security/` — the cookie crypto, the secret rotation, the redaction at `lib/mcp/transport.ts:66`.

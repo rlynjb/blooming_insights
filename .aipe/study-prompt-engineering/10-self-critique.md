@@ -1,344 +1,287 @@
-# Self-critique and self-consistency (the model checks its own work)
+# 10 — Self-critique and self-consistency
 
-**Industry name(s):** self-critique / self-refine, self-verification, self-consistency (sample-and-vote), reflexion-style revision
-**Type:** Industry standard · Language-agnostic
-
-> Self-critique runs the model a second time to evaluate and revise its own output; self-consistency runs the model N times and votes. Both buy reliability with 2–5× the tokens. blooming insights does neither — its `synthesize()` is a clean-context RETRY for recovery-from-no-JSON, not a critique step — and the trap to respect is that a model grading itself shares the blind spots that produced the output.
-
-
----
+*Output-quality bootstrapping · Industry standard · Case B (not used in this codebase)*
 
 ## Zoom out, then zoom in
 
-**Zoom out — the bigger picture.** Self-critique and self-consistency are a hypothetical second-pass band that would sit *between* the existing Per-agent definitions output and the consumer (Pipeline coordinator for the agents, UI for the classifier). In blooming insights today this band is empty — `DiagnosticAgent.investigate` returns and the diagnosis streams straight to the user with no verify step, and `classifyIntent` returns one word with no vote. The only second model call that exists — `synthesize()` — sits inside the Per-agent definitions band as a clean-context retry gated on parse failure, *not* on the successful path, which is what makes it recovery and not verification.
+Self-critique would live as a *second* pass over a chain's output, before the structured Diagnosis or Recommendation reaches the consumer.
 
 ```
-  Zoom out — where self-critique/self-consistency would live
+  Where self-critique WOULD live (it doesn't, in this codebase today)
 
-  ┌─ Per-agent definitions ─────────────────────────┐
-  │  DiagnosticAgent.investigate → Diagnosis v1     │
-  │  classifyIntent → one word                       │
-  │  (synthesize() is here too: RECOVERY, not critique)│
-  └─────────────────────────┬────────────────────────┘
-                            │ first output
-  ┌ ─ VERIFICATION band ─ ─ ▼ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─┐  ← we are here
-   ★ self-critique (sequential): critique(v1) → v2 ★
-   ★ self-consistency (parallel): run N → vote ★
-     ⚠ shared blind spot: same model approves its own
-       systematic error
-   (Not yet implemented in blooming insights)
-  └ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─┘
-                            │
-  ┌─ Pipeline / UI ─────────▼────────────────────────┐
-  │  ships verified output                            │
-  └──────────────────────────────────────────────────┘
+  ┌─ Agent loop (current) ───────────────────────────────────────────┐
+  │  ┌─ tool loop (concept 06) ──┐    ┌─ structured output (02) ─┐    │
+  │  │  hypotheses + queries      │ →  │ Diagnosis + type guard   │ →  │ UI
+  │  │  conclude in N turns       │    │ FALLBACK on parse fail   │    │
+  │  └────────────────────────────┘    └──────────────────────────┘    │
+  └────────────────────────────────────────────────────────────────────┘
+
+  ┌─ Agent loop (with self-critique inserted) ───────────────────────┐
+  │  ┌─ tool loop ──┐    ┌─ ★ critique pass ★ ──┐    ┌─ revised  ─┐ │ ← we are here
+  │  │  same        │ →  │  "Score your own      │ →  │ Diagnosis │ │
+  │  │              │    │   answer 1–5; what's   │    │ + type    │ │
+  │  │              │    │   weak about it?"      │    │ guard     │ │
+  │  └──────────────┘    └────────────────────────┘    └───────────┘ │
+  └────────────────────────────────────────────────────────────────────┘
 ```
 
-**Zoom in — narrow to the concept.** The question this file answers: when is it worth running the model again to check or re-vote its own answer, and when is that just paying 2–5× the tokens to confirm its own mistake? Self-critique trades depth (one careful re-read) for reliability; self-consistency trades breadth (N independent samples) for it. Both have a hard ceiling — a model grading its own work shares the priors that produced the error — and both target different output shapes (critique for prose, vote for discrete labels). Below, you'll see why `synthesize()` is recovery and not critique, where verification would actually pay off here, and how to blunt the shared-blind-spot trap with an independent checker.
-
----
+This file is **Case B**: the pattern is real and widely used in production for high-stakes outputs; this codebase doesn't use it today. The honest framing matters — self-critique costs 2–5x in tokens for one extra reliability step, and for the outputs this codebase produces (anomalies, diagnoses, recommendations rendered as UI cards), the cost/benefit hasn't landed on "yes." Two places it would land on yes are named in Project Exercises below.
 
 ## Structure pass
 
-**Layers.** Self-critique / self-consistency would sit across four layers and you have to name them precisely or you'll mistake `synthesize()` for verification (the trap this whole file fights). Layer A is the *first generation* — `DiagnosticAgent.investigate` returns a diagnosis, or `classifyIntent` returns one word. Layer B is the *trigger gate* — *what decides whether a second call fires?* Today this gate fires only on parse-failure (`tryParseDiagnosis(finalText) == null`); a real verify pass would fire on the *successful* path. Layer C is the *second call's input* — today `synthesize()` re-reads evidence in clean context (the first output is never seen); a critique pass would take v1 as input. Layer D is the *shipped output* — the artifact that reaches the user.
+**Layers.** Outer: the original output. Middle: the critique pass. Innermost: the revised output.
 
-**Axis: control.** What triggers the second call, and what does it look at? Control is the right axis because the entire distinction between "recovery" and "verification" is *which condition controls the second call's invocation* and *what the second call sees*. State doesn't bite (both paths produce a typed value); guarantees is downstream of the control choice. The bug to avoid — calling `synthesize()` self-critique because there's "a second model call" — collapses if you trace control across A→D: today's second call is *gated on failure* and *blind to v1*; a critique call would be *gated on success* and *anchored on v1*. Different gate, different input — different concept entirely.
-
-**Seams.** One load-bearing seam dominates this concept. Seam 1 (A↔B) — control flips from *v1 was produced* to *should a second call fire, and why?* The today-answer is "only if v1 didn't parse"; the would-be answer is "yes, to verify v1 follows from evidence" (critique) or "yes, run v1 again N times and vote" (consistency). Pick the wrong trigger condition and you have recovery dressed up as verification — `synthesize()` exactly. The second seam (B↔C) — control flips from *trigger condition* to *what the second model sees*. A clean-context retry sees evidence only; a critique sees v1 + evidence; a vote sees nothing extra (each run is independent). These two seams together determine whether you've built recovery (today), verification (would-be), or voting (would-be), and the answer is determined by *which gate fires when* and *what crosses the seam*.
+**Axis — what does the second pass add?** Walk it down:
 
 ```
-  Structure pass — self-critique and self-consistency
+  one axis — "what does the second pass add?" — three answers
 
-  ┌─ 1. LAYERS ───────────────────────────────────┐
-  │  A: first generation (v1)                       │
-  │  B: trigger gate (parse-failure? success?)      │
-  │  C: second call input (evidence? v1?)           │
-  │  D: shipped output                              │
-  └────────────────────────┬───────────────────────┘
-                           │  pick the axis
-  ┌─ 2. AXIS ─────────────▼────────────────────────┐
-  │  control: what triggers the second call, and  │
-  │  what does it see?                              │
-  └────────────────────────┬───────────────────────┘
-                           │  trace A→D, find flips
-  ┌─ 3. SEAMS ────────────▼────────────────────────┐
-  │  S1 (A↔B): v1 produced → which gate fires?     │
-  │            (LOAD-BEARING — failure-gate is     │
-  │             recovery; success-gate is verify)   │
-  │  S2 (B↔C): gate → what the second call sees    │
-  │            (evidence-only vs v1-as-input)       │
-  └────────────────────────┬───────────────────────┘
-                           ▼
-                   Block 4 — How it works
+  ┌─ self-critique ────────────────────────┐
+  │  ADDS: targeted revisions to weak parts │  2x tokens, 1 extra call
+  └────────────────────────────────────────┘
+       ┌─ self-consistency ────────────────┐
+       │  ADDS: voting across N runs        │  N x tokens, N calls
+       └────────────────────────────────────┘
+            ┌─ LLM-as-judge in eval ────────┐
+            │  ADDS: per-output scoring      │  used at eval time, not runtime
+            │  for the eval set              │  (concept 05)
+            └────────────────────────────────┘
 ```
 
-```
-  A seam — "why does the second call fire?" answered two ways
-
-  ┌─ today ──────────┐    seam     ┌─ would-be ───────────┐
-  │  v1 failed to    │ ═════╪═════► │  v1 is VALID → run   │
-  │  parse → re-     │  (it flips) │  critique → revise   │
-  │  derive (recover)│             │  (verify)            │
-  └──────────────────┘             └──────────────────────┘
-         ▲                                   ▲
-         └────── same axis, two answers ─────┘
-                 → same model call shape, opposite gate:
-                   recovery (today) vs verification (built)
-```
-
-The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+**Seams.** Two seams matter. Output-to-critique is the seam where you decide *what to critique* — the full output, or specific fields. Critique-to-revision is where the model has to decide if its first answer was good enough. The second seam is where the diminishing-returns problem hides.
 
 ## How it works
 
-**Mental model.** These are two different shapes for "use the model more than once to get a more reliable answer."
+### Move 1 — the mental model
 
-Self-critique is *sequential*: generate → critique → revise. The second call reads the first call's output and the question, and either approves it or rewrites it. Self-consistency is *parallel*: generate N times independently, then pick the answer the runs agree on. One spends tokens on depth (one careful re-read); the other spends tokens on breadth (many independent draws).
-
-```
-SELF-CRITIQUE (sequential)            SELF-CONSISTENCY (parallel)
-─────────────────────────             ─────────────────────────
- generate ──▶ output v1               run 1 ─▶ answer A
-     │                                run 2 ─▶ answer A
-     ▼                                run 3 ─▶ answer B
- critique(v1) ─▶ "issue: …"           run 4 ─▶ answer A
-     │                                run 5 ─▶ answer A
-     ▼                                    │
- revise ──▶ output v2                  vote ─▶ A  (4 of 5)
-─────────────────────────             ─────────────────────────
- cost: 2–3× tokens                    cost: N× tokens
- catches: errors a re-read finds      catches: high-variance / unstable answers
-```
-
-The cost framing is the load-bearing part: self-critique is roughly 2–3× the tokens of a single call (generate + critique + maybe revise); self-consistency is literally N× (you run the whole thing N times). You do not sprinkle these everywhere — you spend them where being wrong is expensive.
-
----
-
-### Self-critique — generate, then evaluate-and-revise
-
-The critique call is given the original input AND the first output, and asked a pointed question: does this output actually follow from the evidence? Is every claim grounded? It returns either "approved" or a revised version.
+You know how a good code reviewer doesn't just rubber-stamp your PR — they read it back to you, find the weak part, ask the question that exposes the bug? Self-critique is asking the model to be its own code reviewer. Self-consistency is the same idea but quorum-based — run the model N times and vote.
 
 ```
-VERIFY PASS on a diagnosis (would-be flow)
-─────────────────────────────────────────────────────────────
- diagnosis v1  { conclusion, evidence[], hypothesesConsidered[] }
-        │
-        ▼
- critique call:  "Here is the anomaly, the queries run, and this
-                  diagnosis. Does the conclusion follow from the
-                  evidence? Flag any claim not supported by a query
-                  result. Return the diagnosis unchanged if sound,
-                  or a corrected one."
-        │
-        ▼
- diagnosis v2  (approved, or conclusion softened to match evidence)
-        │
-        ▼  THEN stream to the user
+  Pattern — self-critique, the kernel
+
+       ┌─ original answer ─┐
+       │  Diagnosis v1      │
+       └─────────┬─────────┘
+                 │
+                 ▼
+       ┌─ critique pass ───┐
+       │  "Read your answer │  ← second LLM call, same model
+       │   above. Score it  │     fresh context, sees only v1
+       │   1-5. Name the    │     plus the rubric
+       │   weakest part."   │
+       └─────────┬─────────┘
+                 │
+                 ▼
+       ┌─ revise (or keep) ┐
+       │  Diagnosis v2      │  ← either the original (if critique
+       └────────────────────┘     said it was fine) or a revision
+                                  targeting the weak part
 ```
 
-This is exactly what blooming insights does NOT have. The diagnosis produced by the diagnostic agent streams to the user the moment it validates — there is no second call that reads it back against the evidence. The natural insertion point is between the investigate call returning and the diagnosis event firing into the stream.
+The mechanism: a fresh-context second pass catches some of the issues the first pass missed. Not all of them — the *same model* has the *same blind spots*. But for issues the first pass *would* have caught with more attention, the second pass often does.
 
-The high-value target here is specific: catching the diagnosis that concludes "mobile checkout regressed" when the evidence rows actually show desktop moved. The type guard accepts it (`conclusion` is a string), the user sees a confident wrong cause. A verify pass that re-reads conclusion-against-evidence is the layer that catches the well-formed-but-wrong output the validators cannot.
+### Move 2 — the walkthrough
 
----
-
-### Self-consistency — run N, vote
-
-For a *classification* — a small, discrete output space — sampling N times and voting is cheap and effective. Each run is an independent draw; if the answer is stable the votes agree, and if it is borderline the majority smooths the noise.
+**Self-critique, step by step.** Pseudocode:
 
 ```
-N-RUN VOTE on the intent classifier (would-be flow)
-─────────────────────────────────────────────────────────────
- query: "did mobile drop and what do I do about it?"  ← ambiguous
+  # self-critique loop, conceptual
 
- run 1 ─▶ diagnostic       (classifier, temperature default)
- run 2 ─▶ diagnostic
- run 3 ─▶ recommendation
- run 4 ─▶ diagnostic
- run 5 ─▶ diagnostic
-        │
-        ▼
- vote ─▶ diagnostic  (4 of 5)   ← stable decision on a borderline query
+  # 1. run the chain normally
+  answer_v1 = await chain.run(input)
+
+  # 2. score it with a rubric
+  critique = await llm.complete({
+    system: "Score the following answer 1-5 against this rubric: ...",
+    user: f"Answer: {answer_v1}\nRubric: [cites evidence, ...]"
+  })
+
+  # 3. revise if the score is below threshold
+  if critique.score < 4:
+    answer_v2 = await llm.complete({
+      system: "Revise the answer based on the critique below.",
+      user: f"Original: {answer_v1}\nCritique: {critique.feedback}"
+    })
+    return answer_v2
+  return answer_v1
 ```
 
-The intent classifier is a single call: one Haiku request, `max_tokens: 16`, one word, parsed by a small intent parser. It is cheap (the whole point of the Haiku-vs-Sonnet routing) so N-run voting is affordable here in a way it would not be on the Sonnet agents. This is the natural place self-consistency would earn its keep: a borderline question that flips between `diagnostic` and `recommendation` between runs would settle on a majority instead of a coin flip.
+Three calls total. The original chain (could itself be a multi-turn tool loop). The critique. The optional revision. **2–3x token cost** for one extra reliability step.
 
----
-
-### Why `synthesize` is NOT self-critique
-
-This must be said plainly because it is the obvious thing to mistake. blooming insights has a second model call in the diagnostic and recommendation paths — the synthesize retry — and it is **not** a critique or verify step.
+**Self-consistency, step by step.** Different pattern, same goal:
 
 ```
-synthesize  IS a clean-context RETRY          NOT a critique
-─────────────────────────────────────────────────────────────
- trigger:  try_parse_diagnosis(final_text) == null  (no usable JSON)
- input:    the EVIDENCE, freshly formatted          NOT the first output
- ask:      "produce the diagnosis JSON now"          NOT "is v1 correct?"
- goal:     RECOVER a parseable artifact              NOT verify a good one
+  # self-consistency, conceptual
+
+  # 1. run the chain N times with the same input
+  candidates = await Promise.all([
+    chain.run(input),
+    chain.run(input),
+    chain.run(input),
+    chain.run(input),
+    chain.run(input),  # N = 5
+  ])
+
+  # 2. vote — pick the most common answer
+  return mode(candidates)
 ```
 
-The trigger tells the whole story. The synthesize path only runs when the loop produced no parseable JSON — `try_parse_diagnosis(final_text) ?? await synthesize(...) ?? FALLBACK`. When the loop *does* produce a valid diagnosis, synthesize never runs and nothing checks that diagnosis. It is a recovery mechanism for the structured-output contract (→ 02-structured-outputs.md), aimed at "the model kept wanting to query and never emitted JSON." It does not read a first answer and ask "is this right?" — it never even sees the first answer; it re-derives from evidence in a clean context. A critique pass would do the opposite: it would run *on the successful path*, take the valid diagnosis as input, and evaluate it.
+N calls total. Higher latency, higher cost, but works well for classifier outputs where "the right answer" is well-defined and stable across runs. **N x token cost.**
 
-So the honest current state: blooming insights has a clean-context retry (recovery), zero self-critique (verification), and zero self-consistency (voting).
+**Step 3 — when the extra cost is worth it.** Three situations:
 
----
+  → **High-stakes outputs.** An email the system is about to send. A summary that goes to a customer. A diagnosis a marketer will act on. Any output where being wrong has a real cost.
+  → **Low-trust classifiers.** Sentiment analysis on customer feedback when the downstream action is "auto-escalate to support." Self-consistency (vote across N runs) is exactly the shape that fits here.
+  → **Content that's hard to manually review.** When the output is long-form or there are many of them, you can't have a human review every one. Self-critique provides a synthetic second pair of eyes.
 
-### The principle
-
-Self-critique and self-consistency both spend extra model calls to raise reliability — one by re-reading and revising, one by sampling and voting — and both are worth it only where the cost of being wrong exceeds the 2–5× token cost AND the failure is the kind a re-read or a vote can catch. The hard ceiling on both is the shared-blind-spot problem: a model grading its own work approves the same systematic error that produced it, so self-critique catches careless errors, not confident-wrong reasoning. blooming insights does neither today; its only second call (`synthesize()`) is recovery, not verification.
-
----
-
-## Self-critique / self-consistency — diagram
-
-This diagram spans the decision. The Generation layer produces a first output; for low-stakes output it ships directly (today's path); for high-stakes output a Verification layer either re-reads-and-revises (self-critique) or samples-and-votes (self-consistency) before shipping. The shared-blind-spot warning sits on the critique edge because that is where it bites.
+**Step 4 — the diminishing returns problem.** This is the critical caveat. A model critiquing its own output has the *same blind spots* that produced the output in the first place. If the model has a systematic bias (over-confident in factually-wrong claims, say), self-critique will sometimes reinforce the bias instead of catching it.
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│  GENERATION LAYER                                                     │
-│   diagnostic_agent.investigate → Diagnosis v1                         │
-│   intent classifier → one word                                        │
-└───────────────┬──────────────────────────────────────────────────────┘
-                │ first output
-        ┌───────┴────────────────────────────┐
-        │ low stakes                          │ high stakes
-        ▼  (TODAY's path — both flows)        ▼  (NOT built)
-┌─────────────────────┐         ┌──────────────────────────────────────┐
-│ ship as-is          │         │  VERIFICATION LAYER                  │
-│ (no second look)    │         │                                      │
-│                     │         │  self-critique (sequential):         │
-└─────────────────────┘         │   critique(v1, evidence) → v2        │
-                                │   ⚠ shared blind spot: same model    │
-                                │      approves its own systematic err │
-                                │                                      │
-                                │  self-consistency (parallel):        │
-                                │   run N → vote   (cheap on classifier)│
-                                │   cost: N× tokens                    │
-                                └──────────────────┬───────────────────┘
-                                                   ▼
-                                            ship verified output
+  Pattern — the blind-spot problem
 
-  (separate) synthesize — runs ONLY when v1 failed to parse; a
-  clean-context RETRY, NOT a critique of a good v1.
+  ┌─ model's blind spot: ──────────────────────────────┐
+  │  consistently scores ambiguous causal claims as     │
+  │  "high confidence" even when evidence is thin       │
+  └───────────────────────┬────────────────────────────┘
+                          │
+                          ▼
+  ┌─ answer v1 ─────────────────────────────────────────┐
+  │  "High confidence: revenue dropped due to mobile     │
+  │   regression." (evidence actually thin)              │
+  └───────────────────────┬─────────────────────────────┘
+                          │
+                          ▼
+  ┌─ self-critique pass ────────────────────────────────┐
+  │  "Score the answer 1-5 for evidence-strength."       │
+  │  → "4/5 — the answer is well-supported."             │
+  │     ↑ SAME BLIND SPOT, MISSED THE BUG               │
+  └─────────────────────────────────────────────────────┘
 ```
 
-A reader who sees only this should grasp: verification is conditional on stakes, self-critique is sequential and self-consistency is parallel, both cost extra tokens, and the existing `synthesize()` sits outside this entirely — it is recovery, not verification.
+Mitigations:
 
-### Code in this codebase
+  → **Rotate models.** Critique with a different model (Sonnet output critiqued by Opus, Haiku output critiqued by Sonnet). Different training data → different blind spots.
+  → **Critique with a specific rubric, not "is this good?"** Forcing the model to score against a *checklist* — "does it cite a specific number? does it name the segment? does it explain the causal link?" — limits how much the model can rubber-stamp itself.
+  → **Spot-check with humans.** Self-critique replaces human review at scale; it doesn't *replace* it entirely. The eval set (concept 05) is where you measure how well the critique tracks human judgment.
 
-**Not yet implemented.** There is no self-critique, self-verification, or self-consistency anywhere in blooming insights; no output is re-read for correctness and nothing is sampled-and-voted.
+**Step 5 — what this codebase does instead.** It's worth being honest about why self-critique isn't in this codebase. Three reasons:
 
-The closest existing analog is `synthesize()` (`lib/agents/diagnostic.ts` L82–121, `lib/agents/recommendation.ts` L82–127) — but it is a *clean-context retry for recovery-from-no-JSON*, not a critique: it fires only when `tryParseDiagnosis(finalText)` returns null (`diagnostic.ts` L73–77), it never sees the first output, and it re-derives the artifact from evidence rather than evaluating an existing one. A real verify pass would live between `DiagnosticAgent.investigate` returning and `send({ type: 'diagnosis' })` in `app/api/agent/route.ts` (L153–154); an N-run vote would wrap `classifyIntent` in `lib/agents/intent.ts` (L17–31).
+  → **The outputs are surfaced to the user with provenance.** Every Anomaly card shows the metric and the change %. Every Diagnosis shows the conclusion AND the evidence. Every Recommendation shows the rationale AND the assumption. The user *is* the review pass — they see the work and can override it.
+  → **The forced-final synthesis turn is a poor man's self-critique.** When the diagnostic loop exhausts its budget, the recovery prompt at `lib/agents/diagnostic-legacy.ts:79-101` hands the model its own evidence back and asks for a structured answer. That's not self-critique, but it's adjacent — the model gets one more pass to clean up its output.
+  → **The eval set hasn't shown a need.** Concept 05 names that there *is* no eval set, so this argument is weaker than it sounds. The honest version: without an eval set, I haven't *measured* a need for self-critique. The next eval set would be the place to test whether self-critique on the recommendation agent's rationale field would lift quality enough to justify the token cost.
 
----
+**Where it WOULD make sense in this codebase.** Two places I'd reach for it:
+
+  → **Recommendation agent rationale field.** This is the field most exposed to the user, and the field where the model is most likely to write a confidently-wrong "this will recover $X" claim. A self-critique pass against a rubric (cites a number, names the segment, explains the link) would catch hand-waved rationales.
+  → **High-confidence diagnoses on thin evidence.** The diagnosis confidence is derived deterministically (`diagnosisConfidence` in `lib/insights/derive.ts`) — but a self-critique pass could be a sanity check on the *content* of `conclusion` when confidence is high. "You said this with high confidence; cite the specific numbers that warrant that confidence."
+
+### Move 3 — the principle
+
+A second pass over your own work catches a fraction of the errors the first pass missed — bounded by the model's blind spots. Self-critique is the cheap shape; self-consistency is the parallel shape; LLM-as-judge in evals is the offline shape. All three trade tokens for reliability. The discipline: don't add them preemptively, add them when you measure the cost/benefit lands favorably for *this specific output*.
+
+## Primary diagram — self-critique vs self-consistency vs eval-judge
+
+```
+  THREE FLAVORS OF "LLM CHECKING LLM OUTPUT"
+  ──────────────────────────────────────────
+
+  ┌─ self-critique (runtime, 1 extra call) ──────────────────────────┐
+  │  chain output v1  →  critique pass  →  revise (or keep) v2        │
+  │  cost: 2-3x tokens                                                  │
+  │  fixes: targeted weak spots in the answer                            │
+  │  catches NOTHING in the model's blind spots                          │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  ┌─ self-consistency (runtime, N parallel calls) ───────────────────┐
+  │  run N times → vote → pick the mode                                │
+  │  cost: N x tokens (cheaper if you can run in parallel)              │
+  │  fixes: stochastic variance in classifier outputs                    │
+  │  works ONLY when there's a "right answer" that's stable               │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  ┌─ LLM-as-judge in evals (offline, concept 05) ─────────────────────┐
+  │  golden case + chain output → judge scores against rubric           │
+  │  cost: one extra call per eval case                                 │
+  │  fixes: catches regressions in the eval CI loop                       │
+  │  same blind-spot problem; rotate judge model + human spot-check 10% │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  this codebase uses NONE of these today. Closest thing: the forced-final
+  synthesis turn (lib/agents/base-legacy.ts:239-270 + diagnostic-legacy.ts:
+  79-101) which is more "recovery" than "critique" — same model, fresh
+  prompt, structured-output forcing function.
+```
 
 ## Elaborate
 
-### Where this comes from
+The self-consistency paper (Wang et al., 2022) is the canonical reference for the voting flavor. The mechanism is robust on math word problems and other tasks with a clear right answer; less robust on open-ended generation where the "vote" has to be on something fuzzier than a single integer answer.
 
-Self-consistency comes from Wang et al., "Self-Consistency Improves Chain of Thought Reasoning" (2022): sample multiple reasoning paths and take the majority answer, which beats greedy decoding on reasoning tasks. Self-critique / self-refine traces to Madaan et al.'s "Self-Refine" (2023) and the Reflexion line (Shinn et al., 2023): have the model produce feedback on its own output and revise. Anthropic's and OpenAI's prompting guides both describe verify-then-revise patterns. The common thread is using extra inference to convert a single uncertain sample into a more reliable answer.
+Self-critique as a runtime pattern doesn't have a single canonical paper because it's mostly engineering folklore — every production AI engineer has tried it on something. The honest summary: it lifts quality more reliably than self-consistency on open-ended outputs, costs less, and has the blind-spot problem more sharply.
 
-### The deeper principle
+Three places to deepen:
 
-```
-one sample                          verified output
-──────────────────────────────     ──────────────────────────────
-a draw from a distribution          consensus (vote) or re-checked (critique)
-cheap, fast                         2–5× tokens
-fine for low-stakes / reviewable    worth it for high-stakes / hard-to-review
-```
+- **Anthropic's research on "Constitutional AI" (Bai et al., 2022).** Self-critique applied to safety, with a constitution (set of principles) as the rubric. Different goal from quality improvement; same mechanism.
+- **OpenAI's "Process supervision" work.** Critique the reasoning steps, not just the answer. A more nuanced version of self-critique that catches *process* errors rather than *output* errors.
+- **The "weak-to-strong generalization" literature.** When a weaker model critiques a stronger model's output, does it help? Mostly no, but the failure modes are educational — the weak critic over-flags surface issues and misses substantive ones.
 
-The deep idea: reliability is buyable with inference, but the exchange rate is not constant. On a discrete, high-variance output (a borderline classification) a vote buys a lot of reliability per token. On a confident, systematically-wrong generation, a self-critique by the same model buys almost nothing, because the error is in the model's belief, not its carelessness. You spend where the exchange rate is good.
-
-### Where this breaks down
-
-1. **The shared blind spot.** This is the headline caveat. A model critiquing itself shares the priors that produced the output; if it hallucinated a cause confidently, asking it "is this right?" often gets "yes." Self-critique catches sloppiness (a claim that contradicts the evidence in the same context) far better than it catches confident-wrong reasoning. For the latter you need an *independent* check — a different model, or a human, or a deterministic validator — not the same model again.
-
-2. **Diminishing returns.** The second critique pass catches most of what any critique pass will catch; a third rarely helps. N-run voting flattens out too — going from 5 to 11 runs barely moves a stable answer and only matters for genuinely borderline cases. Past the knee you are paying tokens for noise.
-
-3. **Self-consistency needs a discrete answer to vote on.** Voting works on the intent classifier (three labels) and would NOT work on the diagnosis prose — there is nothing to take a majority of when every run phrases the conclusion differently. For free-form output you need a different aggregation (judge-and-pick) or you fall back to critique.
-
-4. **Latency and cost.** Self-consistency is N× the latency unless you parallelize the calls, and N× the spend regardless. On the Sonnet agents (`AGENT_MODEL`, `base.ts` L9) that is expensive; on the Haiku classifier it is cheap — which is exactly why the classifier is the right place to start.
-
-### What to explore next
-
-- **Independent-model critique.** Use a different model (or the cheaper Haiku) to critique the Sonnet diagnosis, breaking the shared-blind-spot problem the same-model critique suffers.
-- **Confidence-gated verification.** Only run the verify pass when the diagnosis is low-confidence or when the evidence array is short — spend the extra tokens only on the risky outputs.
-- **Evals as the real correctness layer.** Self-critique raises reliability but cannot prove correctness; a golden-set eval (→ 05-eval-driven-iteration.md) is what actually measures whether the diagnoses are right.
-
----
+In this codebase, concept 05 (eval-driven iteration) is the *offline* version of the same LLM-as-judge mechanism — the difference is when it runs (CI vs runtime) and what triggers the revision (a failing eval case vs a low critique score). Concept 09 (chain-of-thought) is the *intra-call* version — reasoning through the problem before answering, vs reasoning about the answer after producing it.
 
 ## Project exercises
 
-### Add a verify pass on the diagnosis before it streams
+### Exercise — Add self-critique to the recommendation agent's rationale field
 
-- **Exercise ID:** C-self-critique (adapted) — self-critique / self-verification on a high-stakes output.
-- **What to build:** between `DiagnosticAgent.investigate` returning and `send({ type: 'diagnosis' })` (`app/api/agent/route.ts` L153–154), add a single critique call that receives the anomaly, the gathered tool results, and the diagnosis, and answers "does the conclusion follow from the evidence?" — returning the diagnosis unchanged if sound or a corrected one if a claim is unsupported. Reuse the `synthesize()` clean-context call shape (`lib/agents/diagnostic.ts` L82–121) as the structural template, but feed it the *first diagnosis* as input (the thing `synthesize()` never sees) and use the cheaper Haiku model as the critic to blunt the shared-blind-spot problem.
-- **Why it earns its place:** demonstrates you can distinguish recovery (`synthesize()`) from verification, place the verify pass on the *successful* path, and address the shared-blind-spot weakness by making the critic independent.
-- **Files to touch:** `lib/agents/diagnostic.ts` (a `critique` method), `app/api/agent/route.ts` (wire it before the `diagnosis` event), `test/agents/diagnostic.test.ts` (a case where critique corrects an evidence-contradicting conclusion).
-- **Done when:** a diagnosis whose conclusion contradicts its evidence is corrected (or flagged) by the critique pass before streaming, and a sound diagnosis passes through unchanged with one extra call.
-- **Estimated effort:** 1–4hr
+  → **Exercise ID:** SELFCRIT-RECCO-RATIONALE
+  → **What to build:** After `RecommendationAgent.propose()` produces its `Recommendation[]`, run a second LLM call that scores each `rationale` against a rubric (cites a specific number from the diagnosis, names the affected customer segment, explains the causal link from diagnosis to action, is actionable for a marketer). Recommendations with a rationale scoring <4/5 get a revision pass.
+  → **Why it earns its place:** The rationale field is the most exposed to the user and the most likely to drift into hand-waved language. The cost (2x recommendation tokens — small, since recommendations are short) is bounded. Concept 05's eval substrate doesn't exist yet, so the *measurement* of whether this helps lives on the same to-do list.
+  → **Files to touch:** `lib/agents/recommendation.ts` (or `recommendation-legacy.ts`), add a `critiqueRationale()` helper, optionally a new prompt at `lib/agents/legacy-prompts/critique-rationale.md`.
+  → **Done when:** the recommendation flow returns rationales that all score ≥4 on the rubric in a 10-case test; the trace shows the critique pass running for any below-threshold rationale.
+  → **Estimated effort:** ~3–4 hours including the rubric.
 
-### Add an N-run vote to the intent classifier
+### Exercise — Add self-consistency to the intent classifier
 
-- **Exercise ID:** C-self-consistency (adapted) — sample-and-vote on a discrete classification.
-- **What to build:** wrap `classifyIntent` (`lib/agents/intent.ts` L17–31) so it runs the Haiku classification N times (e.g. N=5), collects the parsed intents via `parseIntent`, and returns the majority label; tie-break to the existing default (`diagnostic`). Keep it behind a small N so the extra Haiku calls stay cheap.
-- **Why it earns its place:** self-consistency is only correct on a discrete output with a cheap model — exactly the classifier — and the exercise forces you to recognize why the same technique is wrong for the Sonnet prose agents.
-- **Files to touch:** `lib/agents/intent.ts` (vote wrapper around `classifyIntent`), `test/agents/intent.test.ts` (a case where 3-of-5 runs settle a borderline query).
-- **Done when:** a borderline query that the single call flips between `diagnostic` and `recommendation` settles on a stable majority label across runs, and the cost is N cheap Haiku calls, not N Sonnet calls.
-- **Estimated effort:** <1hr
-
----
+  → **Exercise ID:** SELFCONS-INTENT
+  → **What to build:** Modify `classifyIntent()` in `lib/agents/intent.ts` to optionally run N=3 calls in parallel and return the mode (or a low-confidence fallback if N=3 disagrees). Gate the behavior behind a `selfConsistent: boolean` parameter so the default stays single-shot.
+  → **Why it earns its place:** Intent classification is exactly the self-consistency shape — a small valid range (three values), well-defined "right answer," cheap model (Haiku 4.5). Voting across 3 Haiku calls is faster than running the wrong downstream agent and recovering.
+  → **Files to touch:** `lib/agents/intent.ts` (or `intent-legacy.ts`); a small unit test that verifies the vote logic.
+  → **Done when:** with `selfConsistent: true`, the classifier runs 3 Haiku calls in parallel and returns the majority intent (or `'diagnostic'` fallback on a 1-1-1 split, matching the existing default).
+  → **Estimated effort:** ~2 hours including the test.
 
 ## Interview defense
 
-### What an interviewer is really asking
+**Q: "Do you use self-critique?"**
 
-"How would you make the LLM's output more reliable?" tests whether you reach for "run it again" reflexively or know *which* re-run (critique vs vote), what each costs, and what each cannot catch. The senior signal is naming the shared-blind-spot ceiling and correctly identifying `synthesize()` as recovery, not verification.
-
-### Likely questions
-
-**[mid] "There's a second model call in the diagnostic path — `synthesize()`. Is that self-critique?"**
-
-No. `synthesize()` (`diagnostic.ts` L82–121) is a clean-context retry that fires only when the loop produced no parseable JSON — `tryParseDiagnosis(finalText) ?? synthesize() ?? FALLBACK` (L73–77). It never sees the first output and re-derives the diagnosis from evidence. Self-critique would do the opposite: run on the *successful* path, take the valid diagnosis as input, and evaluate whether it follows from the evidence.
+Not in this codebase today. *(Be direct.)* The outputs are all surfaced to the user with provenance — every Anomaly shows the change %, every Diagnosis shows the evidence, every Recommendation shows the rationale and assumption. The user IS the review pass. I haven't measured a quality gap that self-critique would close, but the honest version of that is: I don't have an eval set yet, so I haven't *measured* anything. The two places I'd reach for it are the recommendation agent's rationale field and high-confidence diagnoses on thin evidence — both are where the model is most likely to write confidently-wrong claims.
 
 ```
-synthesize() : v1 failed to parse → re-derive from evidence  (recovery)
-critique     : v1 is valid → re-read it vs evidence → revise  (verification)
+  where self-critique would land in this repo:
+  ─ recommendation rationale (most user-exposed, most drift-prone)
+  ─ high-confidence diagnosis on thin evidence (over-confident bias)
 ```
 
-**[senior] "When is self-consistency the right tool, and where would you NOT use it here?"**
+Anchor: *"don't add it preemptively. Add it when you measure the lift on a specific output."*
 
-Self-consistency votes over a discrete output, so it fits the intent classifier (three labels, cheap Haiku, `intent.ts` L17–31) — N runs settle a borderline query into a majority. It does NOT fit the diagnosis: the output is free prose, every run phrases the conclusion differently, and there is nothing to take a majority of. For the prose agents you'd reach for critique or a judge, not a vote.
+**Q: "What's the failure mode?"**
 
-```
-classifier (discrete, cheap)  → vote ✓
-diagnosis (prose, expensive)  → vote ✗  (nothing to vote on; use critique)
-```
-
-**[arch] "You add a self-critique pass and the model still approves its own hallucinations. Why, and what fixes it?"**
-
-The shared blind spot: the critic is the same model with the same priors, so it endorses the confident-wrong reasoning it produced. Self-critique catches sloppy errors (a claim contradicting evidence in-context), not systematic ones. The fix is an *independent* checker — a different model, the cheaper Haiku as critic, a deterministic validator, or a human — plus evals (→ 05) as the real correctness measure, since critique raises reliability but never proves correctness.
+The blind-spot problem. *(Draw the diagram.)* A model critiquing its own output has the same blind spots that produced the output in the first place. If the model systematically over-confides in causal claims, self-critique will rubber-stamp the over-confident output instead of catching it. Three mitigations: rotate models (Sonnet output critiqued by Opus), use a specific rubric instead of "is this good?", spot-check with humans on a sample to verify the critique tracks human judgment.
 
 ```
-same-model critique → endorses own systematic error (shared priors)
-independent critique → can disagree → catches confident-wrong
+  blind-spot mitigations:
+  ─ rotate model for the critique pass
+  ─ rubric (checklist), not "is this good?"
+  ─ human spot-check on 10%
 ```
 
-### The question candidates always dodge
+Anchor: *"the critic has the same blind spots as the producer. Same model, same biases. Rotate the model or you're rubber-stamping."*
 
-**"Does the model checking its own work actually make it more correct, or just more confident?"** Often just more confident, and candidates dodge because "add a self-critique pass" sounds rigorous. A same-model critique shares the blind spot that produced the error, so it frequently rubber-stamps. The honest answer: self-critique catches careless errors, not confident systematic ones; for the latter you need independence, and for proof of correctness you need evals — not a self-graded pat on the back.
+**Q: "Self-critique vs self-consistency — when each?"**
 
-### One-line anchors
+Different shapes. *(Pull up the three-flavor diagram.)* Self-critique: one extra call, targeted revision of weak parts, works on open-ended outputs. Self-consistency: N parallel calls, vote on the answer, works only when there's a stable right answer (classifiers). For the intent classifier in this codebase, self-consistency fits — three Haiku calls in parallel, vote on the intent. For the recommendation rationale, self-critique fits — one extra Sonnet call against a rubric, revise if it scores low. Both share the same blind-spot caveat.
 
-- `lib/agents/diagnostic.ts` L73–77 — `tryParse ?? synthesize ?? FALLBACK`: `synthesize()` is recovery, gated on parse failure.
-- `lib/agents/diagnostic.ts` L82–121 — `synthesize()`: clean-context, re-derives from evidence, never reads v1.
-- `app/api/agent/route.ts` L153–154 — diagnosis streams unverified; the verify-pass insertion point.
-- `lib/agents/intent.ts` L17–31 — single-call classifier; the cheap target for an N-run vote.
-- Wang et al. 2022 (self-consistency); Madaan et al. 2023 (self-refine) — the canonical sources.
-
----
+Anchor: *"self-critique for open-ended outputs; self-consistency for classifiers with a stable right answer."*
 
 ## See also
 
-→ 02-structured-outputs.md · → 05-eval-driven-iteration.md · → 09-chain-of-thought.md · → 11-meta-prompting.md
+- `02-structured-outputs.md` — self-critique adds a step to the structured-output pipeline; the validator still runs at the end.
+- `05-eval-driven-iteration.md` — the offline version of LLM-as-judge; runs in CI instead of at runtime.
+- `09-chain-of-thought.md` — CoT is reasoning *through* the problem; self-critique is reasoning *about* the answer. Complementary, not redundant.
+- `06-single-purpose-chains.md` — self-critique adds a small chain to an existing pipeline; the single-purpose discipline keeps the critique chain itself focused.

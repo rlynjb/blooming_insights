@@ -1,129 +1,100 @@
-# Study — Debugging & Observability (blooming insights)
+# Overview — Debugging & Observability in blooming insights
 
-> The trace IS the product. blooming insights has **three observability surfaces**: (1) the live NDJSON `AgentEvent` stream the UI renders, (2) the 221-test Vitest output, (3) the dev cache files (`.auth-cache.json`, `.investigation-cache.json` — gitignored). The fourth offline surface (the committed eval result paper trail under `eval/results/`) was removed with the Olist pipeline in PR #8 (commit 62c24d7); `06-eval-result-paper-trail.md` is kept as a RETIRED historical record. AptKit's traces flow back into surface 1 through `BloomingTraceSinkAdapter` (`lib/agents/aptkit-adapters.ts:100`) — same NDJSON contract, additional producer. What's still missing is everything backend-grade: no structured logger, no metrics pipeline, no Sentry/OTel/Langfuse, no on-call rotation, no SLOs. Honest about both halves.
+## The shape, in one frame
 
----
-
-## How this guide is structured
-
-This is an **audit-style** guide, in two passes.
-
-**Pass 1 — `audit.md`.** One file walks the 8-lens inventory (observability-map, reproduction-and-evidence, structured-logs-and-correlation, metrics-slis-slos-and-alerts, traces-and-request-lifecycles, state-snapshots-and-debugging-boundaries, incident-analysis-and-prevention, debugging-observability-red-flags-audit). Each lens gets one `##` section: what the codebase actually does, with `file:line` grounding, or `not yet exercised` honestly. Lenses with significant findings cross-link into pattern files.
-
-**Pass 2 — the discovered-pattern files (`01-` through `05-`).** Five live patterns earned their own files because they pass the three tests in `me.md`: they have a name, they're load-bearing (something specific breaks if you remove them), and a senior engineer skimming the file list recognizes each as a real architectural pattern. `06-eval-result-paper-trail.md` is preserved with a RETIRED banner — the offline-eval pattern it teaches is real and worth reading, but the code it anchored to (the Olist pipeline) is gone from the repo as of PR #8.
-
-The file list itself is a learning artifact — read it once and you know what's interesting about how this repo handles observability.
-
----
-
-## The repo's shape, observability axis first
+The product is "an analyst that shows its work." The same NDJSON event pipe that streams reasoning to the user *is* the developer's primary debugging surface. So the on-call evidence trail and the demo's "watch the agent think" UI are the same wire.
 
 ```
-  blooming insights through the observability lens — three surfaces
+  How this repo reveals its behavior — three surfaces
 
-  ┌─ ONLINE (live, request-scoped) ──────────────────────────────────┐
-  │                                                                   │
-  │  ┌─ UI (renders the trace live) ────────────────────┐            │
-  │  │  ReasoningTrace · StatusLog · ProcessStepper      │            │
-  │  └─────────────────────────▲────────────────────────┘            │
-  │                            │  NDJSON lines      surface 1: trace  │
-  │  ┌─ Route handler (frames events) ──────────────────┐            │
-  │  │  /api/agent   · send(e) → controller.enqueue      │            │
-  │  │  /api/briefing · same shape + workspace/coverage  │            │
-  │  └─────────────────────────▲────────────────────────┘            │
-  │                            │                                      │
-  │  ┌─ Agent loop (emits events) ──────────────────────┐            │
-  │  │  hooks: onText / onToolCall / onToolResult        │            │
-  │  │  → reasoning_step / tool_call_start / _end        │            │
-  │  │  durationMs measured around the MCP call          │            │
-  │  │  AptKit traces flow in via BloomingTraceSinkAdapter│           │
-  │  └─────────────────────────▲────────────────────────┘            │
-  │                            │                                      │
-  │  ┌─ Provider + tools ──────┴────────────────────────┐            │
-  │  │  Anthropic · Bloomreach MCP                       │            │
-  │  │  console.error in 2 route catch blocks            │            │
-  │  └──────────────────────────────────────────────────┘            │
-  │                                                                   │
-  │  surface 2: Vitest output (221 unit tests; deterministic)         │
-  │  surface 3: dev cache files (.auth-cache.json,                    │
-  │             .investigation-cache.json — gitignored)               │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌─ UI layer ─────────────────────────────────────────────────┐
+  │  StatusLog / ReasoningTrace                                │
+  │     ▲                                                       │
+  │     │ TraceItem (step | tool, ts)                           │
+  └─────┼───────────────────────────────────────────────────────┘
+        │
+  ┌─ Service layer ─────────────────────────────────────────────┐
+  │  GET /api/briefing  ──┐                                     │
+  │  GET /api/agent     ──┤                                     │
+  │                       │  encodeEvent(AgentEvent)            │
+  │                       ▼                                     │
+  │                ╔═══════════════════════╗                    │
+  │                ║  ★ NDJSON stream ★    ║  ← SURFACE 1       │
+  │                ╚═══════════════════════╝     (live trace)   │
+  │                       │                                     │
+  │                       ├─► console.log({route,phases,…})     │
+  │                       │   (Vercel logs, per-request summary)│
+  │                       ▼                                     │
+  │                 saveInvestigation(id, collected)            │
+  └─────────────────────────────────────────────────────────────┘
+                          │
+  ┌─ Storage layer ───────▼─────────────────────────────────────┐
+  │  in-memory Map → .investigation-cache.json (dev only)        │
+  │                → lib/state/demo-investigations.json (seed)   │
+  │  ╔══════════════════════════════════════════╗               │
+  │  ║  ★ Recoverable post-mortem evidence ★    ║  ← SURFACE 3  │
+  │  ╚══════════════════════════════════════════╝               │
+  └─────────────────────────────────────────────────────────────┘
 
-  state ownership          │   the trace IS the product
-  failure containment      │   try/catch in the stream's start()
-  durability               │   saveInvestigation → mem→file→seed
-  metrics                  │   durationMs only, not aggregated
-  alerts / SLOs            │   not yet exercised
-  model-behavior debug     │   not yet exercised — RESOLVED-BY-DELETION
-                           │   (Olist pipeline removed PR #8 / 62c24d7;
-                           │    the offline eval surface went with it)
+  Plus: ★ Vitest test output ★  ← SURFACE 2
+        24 files / 221 passing — the deterministic correctness gate
 ```
 
-This guide reads the codebase through that single axis: **at every layer, what evidence exists, and what doesn't?** `audit.md` walks all 8 lenses; the pattern files take the load-bearing patterns deep. With the eval pipeline gone, unit tests catch *wiring* bugs and the live trace catches *what just happened* — there is no longer an offline surface that catches *model-behavior* bugs in this repo.
+Three surfaces, not four. The fourth (an `eval/results/<date>/` paper trail) existed briefly and was retired with the Olist work — be honest about that when defending this in an interview.
 
----
+## The three surfaces
 
-## The verdict, ranked
+### 1. NDJSON streaming trace (live)
 
-The ranking spotlights what's load-bearing in this repo, not a generic checklist.
+The `AgentEvent` discriminated union at **`lib/mcp/events.ts:4-12`** is the wire contract. Eight variants: `reasoning_step | tool_call_start | tool_call_end | insight | diagnosis | recommendation | done | error`. Encoded one-per-line, terminated with `'\n'`.
 
-1. **The NDJSON event union is the load-bearing primitive.** `lib/mcp/events.ts:4–12` defines `AgentEvent` as a discriminated union; `encodeEvent` is one JSON.stringify + '\n'. That eight-line file is the contract every observability surface in the app speaks. If you rebuild this codebase from scratch, this file is what you write first. → `01-ndjson-agentevent-discriminated-union.md`
+Two routes produce it: `app/api/briefing/route.ts` (monitoring scan) and `app/api/agent/route.ts` (diagnostic + recommendation + free-form query). Four client consumers read it via the shared kernel at **`lib/streaming/ndjson.ts:17-64`**: `useBriefingStream.ts`, `useInvestigation.ts`, `useDemoCapture.ts`, and `StreamingResponse.tsx`. One wire, two producers, four consumers, one kernel.
 
-2. **The cache-first replay path makes the trace re-creatable.** `app/api/agent/route.ts:127–141` short-circuits the live run when a cached `AgentEvent[]` exists, re-emitting it at 180ms ticks so the UI can't tell live from replay. No creds required for seeded runs. → `02-replay-from-snapshot-with-paced-emission.md`
+When the LLM picks a wrong tool, when a Bloomreach call times out, when an anomaly is mis-categorised — you see it live in `StatusLog` because that's the same data the agent emitted. There's no separate debug log to consult.
 
-3. **`saveInvestigation(id, events[])` lifts the trace into a 3-rung store.** `lib/state/investigations.ts:7–41` writes the captured `AgentEvent[]` to mem (per-process), the dev file (`.investigation-cache.json`, dev only), and the committed seed (`lib/state/demo-investigations.json`, crosses deploys). Each rung serves a different scope. → `03-three-rung-mem-file-seed-store.md`
+### 2. Vitest test output
 
-4. **The dual-write `send(e)` closure is what makes the same trace serve live AND replay.** `app/api/agent/route.ts:172–175` pushes to `collected[]` and enqueues NDJSON bytes on every call — one closure, two destinations. Drop the push and replay dies; drop the enqueue and the live UI dies. → `04-dual-write-send-to-stream-and-store.md`
+24 test files / 221 tests. `test/mcp/events.test.ts` pins the NDJSON encode/decode round-trip. `test/streaming/ndjson.test.ts` pins the line-buffered parse semantics (including the trailing-buffer flush). `test/api/briefing.integration.test.ts` (7 cases) pins the 9-case event dispatcher the briefing hook depends on. This is the *correctness gate before behavior gets weird in production* — neighbor to this guide, owned by `study-testing`.
 
-5. **The `e83a8e0` flake-fix is the only documented incident post-mortem.** `process.env.AUTH_SECRET` was mutated directly inside one test file; vitest's parallel workers leaked the var across files. Fix is `vi.stubEnv` + `vi.unstubAllEnvs` in `beforeEach`/`afterEach`. The post-mortem shape generalises to any future incident. → `05-auth-secret-flake-postmortem.md`
+### 3. Dev cache files (gitignored) + committed seed
 
-6. **`durationMs` is the only metric primitive — and it's per-call, never aggregated.** `lib/mcp/client.ts:112,134` measures wall-clock around each MCP `liveCall`; `tool_call_end` carries it forward through the trace. It's enough to show "this tool took 340ms" in the UI. It is NOT enough to answer "what's p95 over the last hour" — there's no histogram, no time-series store, no rollup. Cited honestly in `audit.md` (metrics-slis-slos-and-alerts) as `not yet exercised` past the per-call number.
+Three-rung store at **`lib/state/investigations.ts:11-28`**: in-memory `Map` → `.investigation-cache.json` (dev only) → `lib/state/demo-investigations.json` (committed seed). The same lookup walks all three. Same idea for OAuth state at `lib/mcp/auth.ts:34-36` and the in-memory `memStore`.
 
-7. **Logs are unstructured and rare.** Four `console.error` calls in the entire repo — all in the two route handler catch blocks. No logger, no levels, no correlation ID, no redaction. The correlation primitive that *does* exist is the trace itself — every event in a stream belongs to one investigation, no IDs needed. Top-3 finding in `audit.md`.
+When a live run produces a useful failure, the dev cache *already saved it*. You can re-open the page and the cached events replay — the bug is reproducible without re-running the agent.
 
-8. **AptKit traces converge into the same surface, not a new one.** `BloomingTraceSinkAdapter` (`lib/agents/aptkit-adapters.ts:100`) maps AptKit's `CapabilityEvent`s — `step`, `tool_call_start`, `tool_call_end` — back into Blooming's existing `onText`/`onToolCall`/`onToolResult` hooks, which in turn emit the same NDJSON `AgentEvent` variants. One trace surface, multiple producers — that's the design, and it's why introducing AptKit didn't grow the observability map.
+## Ranked findings (what's interesting first)
 
-9. **Two backend-grade gaps are honest and named.** No incident tooling (no Sentry, no on-call rotation, no runbooks, no SLO definitions). No backend trace sink (no OpenTelemetry/Langfuse export, even though `@opentelemetry/api` is transitively in `node_modules` via Next.js). `audit.md` (debugging-observability-red-flags-audit lens) ranks them by consequence.
+1. **The NDJSON wire is both the UX and the debug surface.** This is the load-bearing decision. It eliminates the divergence problem (the dev log saying one thing while the user sees another) because there's only one pipe. → `01-ndjson-agent-event-discriminated-union.md`.
 
----
+2. **Replay is built in.** The demo path isn't a fixture jig bolted on for tests — it's a real route (`/api/briefing?demo=cached`, `/api/agent` cache-first branch at `app/api/agent/route.ts:125-142`) that emits the snapshot at a paced 180ms/event so it *feels* like the live run. That gives you a reproducible debugging fixture per investigation. → `02-replay-from-snapshot-with-paced-emission.md`.
 
-## Reading order
+3. **The three-rung store is the post-mortem evidence trail.** A failure on the live route writes to in-memory and (in dev) `.investigation-cache.json`. Recovery is reload-the-page; investigation is open-the-JSON-file. → `03-three-rung-mem-file-seed-store.md`.
 
-1. **`audit.md`** — the one-pass survey across all 8 lenses. Verdict-first; ends with the Top 3 ranked findings.
-2. **`01-ndjson-agentevent-discriminated-union.md`** — the foundational pattern. Every other file depends on this 8-line union.
-3. **`02-replay-from-snapshot-with-paced-emission.md`** — the cache-first short-circuit that makes the trace a real reproduction primitive.
-4. **`03-three-rung-mem-file-seed-store.md`** — the persistence layer; each rung serves a different scope.
-5. **`04-dual-write-send-to-stream-and-store.md`** — the two-line closure that makes the same trace serve both live and replay.
-6. **`05-auth-secret-flake-postmortem.md`** — the only documented incident in the repo, as a reusable post-mortem template for future ones.
-7. **`06-eval-result-paper-trail.md`** — **RETIRED.** The pattern (an offline eval result-dir as a 4th observability surface) is real and still worth reading; the code anchors are gone with the Olist pipeline (PR #8 / 62c24d7). Read as a historical artifact, not as a current repo walk.
+4. **The collected/send dual-write is the seam between live and replay.** Every emitted event is pushed into `collected` so `saveInvestigation(insightId, collected)` writes the same shape the live stream produced — no separate "snapshot format." → `04-dual-write-send-to-stream-and-store.md`.
 
-**Then pick by need:**
+5. **The `AUTH_SECRET` flake was the postmortem that named the pattern: "wrap setup in try/catch and surface the message."** Production-only 500 because `aesKey()` threw before the route could send a JSON body. Fixed by `app/api/briefing/route.ts:170-179` + `app/api/agent/route.ts:166-174`. → `05-auth-secret-flake-postmortem.md`.
 
-- **understand the trace as substrate** → start at `01-` then `04-`.
-- **a real bug landed in your inbox** → `audit.md` (reproduction-and-evidence), then `02-`, then `05-` for the post-mortem template.
-- **doing a triage / hand-off** → `audit.md` Top 3 ranked findings.
-- **why the metrics section is so short** → `audit.md` (metrics-slis-slos-and-alerts) — read it precisely *because* it names what isn't here.
-- **want to read about offline eval as a debugging substrate** → `06-` (RETIRED — the pattern, not the current code).
+## Per-phase wall-clock log line
 
-## Cross-links (don't duplicate)
+Server-side `console.log` (Vercel logs only — not on the NDJSON wire), emitted once per request from the `finally` block at **`app/api/briefing/route.ts:317-324`** and **`app/api/agent/route.ts:331-338`**:
 
-- `.aipe/study-ai-engineering/05-evals-and-observability/04-llm-observability.md` — covers the same `AgentEvent` stream from the LLM-observability angle (trace = product surface, span = bracketed tool call, replay = cache snapshot). This guide cross-links into that file rather than re-teaching it; the angle here is generic debugging/observability (what evidence exists at every boundary), not specifically LLM telemetry.
-- `.aipe/study-testing/` — owns the testing discipline that surrounds the flake-fix (parallel-worker isolation, env stubbing as a pattern). This guide uses the flake-fix as the *incident* worked example; the testing guide owns the *test-design* lesson.
-- `.aipe/study-performance-engineering/` — owns aggregated latency and bottleneck analysis. This guide names `durationMs` as the *primitive*; the performance guide owns what to *do* with it.
-- `.aipe/study-system-design/05-streaming-ndjson.md` — the NDJSON wire as a system-design pattern.
-- `.aipe/study-system-design/04-caching-and-rate-limiting.md` — the broader caching pattern around the 3-rung store.
+```json
+{"route":"/api/briefing","sessionId":"…","mode":"live-bloomreach",
+ "totalMs":118433,"phases":[
+   {"phase":"schema_bootstrap","durationMs":2104},
+   {"phase":"coverage_gate","durationMs":3},
+   {"phase":"list_tools","durationMs":611},
+   {"phase":"monitoring_scan","durationMs":115714}
+ ],"aborted":false}
+```
 
-## What's `not yet exercised` (explicit)
+Shared shape across both routes so a single Vercel filter (`phases.phase = "schema_bootstrap"`) reads both. Fires on error too, so when the 300s ceiling kills a request you can see exactly which phase burned the budget. The Anthropic `res.usage` cost meter lives in a sibling line, logged on every model call at **`lib/agents/aptkit-adapters.ts:57-61`**.
 
-- **metrics aggregation** — no histogram, no rollup, no time-series store. `durationMs` is per-call only.
-- **on-call rotation** — solo repo, no PagerDuty/Opsgenie, no rotation schedule, no escalation policy.
-- **SLO/SLA definitions** — no error-budget math, no defined service objective, no alerting thresholds.
-- **structured logger** — no pino/winston/bunyan/logger.ts module; `console.error` × 4 is the entire backend log surface.
-- **backend trace sink** — no OpenTelemetry/Langfuse/Datadog export; the trace lives in the UI + cache snapshot only.
-- **error monitoring** — no Sentry, no Bugsnag, no client-side error reporting.
-- **runbooks** — no `docs/runbooks/` directory, no incident response playbook past "read the trace".
-- **offline eval surface** — RESOLVED-BY-DELETION. PR #8 (commit 62c24d7) removed the entire Olist pipeline; `eval/results/`, `EVAL_RUN_TAG`, and the K-iteration judge artifacts went with it. `06-eval-result-paper-trail.md` is preserved with a RETIRED banner; the pattern is real, the repo no longer instantiates it.
+## What's not yet exercised (be honest)
 
-Each is called out in the relevant `audit.md` lens, not buried.
+- **No SLI/SLO/alerting infra.** No metrics endpoint, no Sentry, no PagerDuty, no synthetic monitoring. The phase log is the closest thing to an SLI ("did the route finish under 300s"); nobody pages on it.
+- **No distributed tracing.** No OpenTelemetry, no spans, no trace IDs propagated cross-service. The session ID at `lib/mcp/session.ts` is the closest thing to a correlation ID — it threads through `console.log` lines but nothing collects them into a trace tree.
+- **No structured-log redaction beyond auth tokens.** `redactSecrets` at `lib/mcp/transport.ts:55-76` scrubs `Bearer …`, `access_token`, `refresh_token`, `id_token`, `code_verifier`. Customer PII in EQL results is NOT redacted — see audit lens 3.
+- **No runbook documentation.** The auth-secret postmortem is preserved here (file 05), but there's no `/runbooks/` directory; the next incident has to rediscover the pattern.
 
----
+The honest framing: this repo has *strong* observability on its own loop (the agents' reasoning) and *weak* observability on the surrounding infrastructure (the platform, the third-party MCP server, the user's session). The next layer of debugging investment is alerting + tracing, not more logs.

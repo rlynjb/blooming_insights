@@ -1,61 +1,88 @@
-# Prompt engineering — the discipline, mapped to this codebase
+# Overview — prompt engineering in `blooming_insights`
 
-Prompt engineering, the way it survives production, is not "wording tricks" — it is the engineering discipline of treating a prompt as a versioned, budgeted, injectable component with a typed boundary around it. blooming insights is a clean specimen, but with a twist worth naming up front: the **active prompts now ship through an npm package** (`@aptkit/prompts`, pulled in via `@aptkit/core@0.3.0`), while the previous markdown prompts are preserved under `lib/agents/legacy-prompts/` and exercised by the four `*-legacy.ts` agents only. Both paths assemble a Claude call with injected context, are bounded by a tool-call budget, and parse back through a validator that refuses to trust the model's prose. This guide reads those prompts — package-shipped and legacy alike — as the artifact they are, and names, for each of the 13 concepts, what the codebase does, what it deliberately doesn't, and the production failure mode the concept exists to prevent.
+The orientation page. Where prompts live, who calls them, what they produce, and where every later concept file plugs in.
+
+## The system, one diagram
 
 ```
-┌─ authoring (source) ──────────────────────────────────────────────┐
-│  active path:  @aptkit/prompts (npm package, via @aptkit/core)    │
-│  legacy path:  lib/agents/legacy-prompts/{monitoring,diagnostic,  │
-│                recommendation,query}.md                            │
-│   Role · Hard rules · method · EQL reminders · Output · {schema}   │
-└───────────────┬───────────────────────────────────────────────────┘
-                │ active: package import        [01,03,06,07,14]
-                │ legacy: readFileSync at module load
-                ▼
-┌─ assembly (per call) ─────────────────────────────────────────────┐
-│  system = prompt  +  injected {project_id}/{anomaly}/{diagnosis}/  │
-│  {intent}/{schema}  +  userPrompt   +  synthesisInstruction(final) │
-│  budget: maxToolCalls 6/6/4/6 · max_tokens 4096/2048/16            │
-│   anatomy [01] · token budget [04] · few-shot/EQL [08] · CoT [09]  │
-└───────────────┬───────────────────────────────────────────────────┘
-                │ claude-sonnet-4-6 (agents) · haiku (classifier)
-                ▼
-┌─ output boundary ─────────────────────────────────────────────────┐
-│  parseAgentJson (strip ```json fence → bare → scan)               │
-│  type guards → synthesize() retry → FALLBACK                       │
-│   structured outputs [02] · output-mode mismatch [07]             │
-│  query path: prose, NO validator, user ?q= interpolated  [12]      │
-└───────────────┬───────────────────────────────────────────────────┘
-                │ no in-repo eval harness; scoring is off-path
-                ▼
-   what's MISSING (the buildable gaps)
-   eval-driven iteration harness [05] · self-critique [10]
-   meta-prompting [11] · injection delimiters [12]
-   rotating formulas if a digest is added [13]
-   prompt-package version → output co-logging [03,14]
+  Where prompts live, top to bottom
+
+  ┌─ UI (React 19 · App Router) ─────────────────────────────────────────────┐
+  │  feed page · investigate pages · QueryBox                                │
+  └──────────────────────────────────┬───────────────────────────────────────┘
+                                     │  fetch + NDJSON ReadableStream
+  ┌─ Route handlers (/api/briefing · /api/agent) ───────────────────────────┐
+  │  bootstrap MCP schema  →  instantiate agent  →  stream events back      │
+  └──────────────────────────────────┬───────────────────────────────────────┘
+                                     │
+  ┌─ Agent adapters (lib/agents/*.ts) ──────────────────────────────────────┐
+  │  MonitoringAgent · DiagnosticAgent · RecommendationAgent · QueryAgent    │
+  │  intent.classifyIntent                                                   │
+  │  Each one a thin wrapper that:                                           │
+  │    • picks the right AptKit agent class                                  │
+  │    • passes 3 adapters (model · tools · trace) + workspace schema        │
+  └──────────────────────────────────┬───────────────────────────────────────┘
+                                     │
+  ┌─ AptKit runtime (@aptkit/core@0.3.0) ───────────────────────────────────┐
+  │  AnomalyMonitoringAgent · DiagnosticInvestigationAgent · ...             │
+  │  Owns: the tool-use loop · forced-final synthesis turn · validators      │
+  │  Carries the active system prompts (Bloomreach-only)                      │
+  └──────────────────────────────────┬───────────────────────────────────────┘
+                                     │
+  ┌─ Anthropic API · MCP server ────────────────────────────────────────────┐
+  │  claude-sonnet-4-6 (agents) · claude-haiku-4-5 (intent)                  │
+  │  Bloomreach loomi connect MCP → execute_analytics_eql + ancillary tools  │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  Legacy prose-source-of-truth (Bloomreach-only) at:
+    lib/agents/legacy-prompts/{monitoring,diagnostic,recommendation,query}.md
+  Loaded only by lib/agents/*-legacy.ts (not the active path).
 ```
 
-## The 13 concepts — grouped, with the failure mode each prevents
+The active path runs through AptKit; the legacy `.md` files are the version-controlled Bloomreach-only source-of-truth for the same shapes, kept readable as markdown for review and audit.
 
-**Operational discipline (read first):**
+## The five agents and what each one's prompt does
 
-- **[01 anatomy](01-anatomy.md)** — *Prevents:* prompt drift, where mixing constant and per-call content into one blob makes every change a guess. blooming insights: the shared Role/Hard-rules/Output/`{schema}` shape, now sourced from `@aptkit/prompts` on the active path and preserved as `.md` files on the legacy path. **Case A.**
-- **[02 structured outputs](02-structured-outputs.md)** — *Prevents:* the parser breaking when a courteous model wraps JSON in a markdown fence. blooming insights: prompt-instructed fenced JSON + `parseAgentJson` fence-strip + type guards + retry. **Case A.**
-- **[03 prompts as code](03-prompts-as-code.md)** — *Prevents:* a prompt that worked on one model silently breaking on the next, with no record of the pairing. blooming insights: prompts live in source — either as a versioned npm package (`@aptkit/prompts`) on the active path or as `.md` files in `lib/agents/legacy-prompts/`; the model-ID pairing and the package-version → output co-log are the honest gaps. **Case A-partial.**
-- **[04 token budgeting](04-token-budgeting.md)** — *Prevents:* a chain that worked on small inputs truncating or timing out at scale because nobody counted. blooming insights: `schemaSummary` caps, char budgets, tool-call caps — no prefix caching. **Case A.**
-- **[05 eval-driven iteration](05-eval-driven-iteration.md)** — *Prevents:* iterating by vibes and shipping a "better" prompt that regresses an untracked edge case. blooming insights: the PATTERN is real prompt-engineering work, but there is no in-repo eval harness now — the `eval/` suite and its receipts are gone. The CRITICAL/Never/Do NOT blocks in the legacy prompts are still informal regression encoding; the formal harness is the buildable target. **Case B.**
+| Agent          | What its prompt asks for                                            | Output shape                |
+|----------------|---------------------------------------------------------------------|-----------------------------|
+| `monitoring`   | Walk the category checklist, run 90d-vs-prior-90d, emit anomalies   | `Anomaly[]` (JSON in fence) |
+| `diagnostic`   | Generate 2–3 hypotheses, query to falsify, conclude                 | `Diagnosis` (single object) |
+| `recommendation`| Given a diagnosis, propose 2–3 Bloomreach actions with dollar impact| `Recommendation[]`         |
+| `query`        | Answer a free-form user question with grounded numbers              | Natural-language text       |
+| `intent`       | Classify a query as monitoring / diagnostic / recommendation        | One word                    |
 
-**Specific techniques:**
+Four return structured JSON (a tool-calling agent loop with schema validation at the boundary). One — `query` — returns prose. One — `intent` — is a single-shot classifier with no tools and no JSON. The shape of the output drives almost every prompt-engineering decision downstream.
 
-- **[06 single-purpose chains](06-single-purpose-chains.md)** — *Prevents:* a multi-purpose chain that's brittle, expensive to fail, and hard to debug. blooming insights: monitoring/diagnostic/recommendation each scoped and disclaiming the others. **Case A.**
-- **[07 output-mode mismatch](07-output-mode-mismatch.md)** — *Prevents:* chain A emits JSON, chain B expects prose, the parser breaks. blooming insights: 3 JSON agents + 1 prose agent, mode declared per prompt. **Case A.**
-- **[08 few-shot](08-few-shot.md)** — *Prevents:* output that drifts because instructions alone don't constrain format. blooming insights: format-shaping examples (EQL reminders, JSON exemplars); the classifier is zero-shot. **Case A-partial.**
-- **[09 chain-of-thought](09-chain-of-thought.md)** — *Prevents:* wrong multi-step conclusions, and free-form reasoning that pollutes a structured answer. blooming insights: hypotheses forced into the structured `hypothesesConsidered[].reasoning` field. **Case A.**
-- **[10 self-critique](10-self-critique.md)** — *Prevents:* shipping a low-trust output with no verify step. blooming insights: `synthesize()` is recovery, not critique — true self-critique is unbuilt. **Case B.**
-- **[11 meta-prompting](11-meta-prompting.md)** — *Prevents:* slow hand-drafting of complex prompts (and the risk of prompts that read like LLM output). blooming insights: prompts are hand-written; no generator. **Case B.**
-- **[12 prompt-injection defense](12-prompt-injection-defense.md)** — *Prevents:* user `?q=` input carrying instructions the model obeys. blooming insights: trim-only input, no delimiters/hierarchy; read-only tools + validators bound the blast radius. **Case B (partial structural mitigations).**
-- **[13 forbidden patterns](13-forbidden-patterns.md)** — *Prevents:* a generative chain converging on the same phrasing every run. blooming insights: heavy negative-constraint instructions; rotation correctly absent (structured/one-shot outputs). **Case A (constraints) / Case B (rotation).**
+## The two-axis structure
 
-> Reading order, and the Case A/B split, live in [README.md](README.md). The companion guides are [`../study-ai-engineering/`](../study-ai-engineering/README.md) (the systems lens on the same agents) and [`../study-system-design/`](../study-system-design/README.md).
+Two axes carry across every concept file:
 
----
+```
+  axis 1 — output mode             axis 2 — call shape
+
+  structured        ─►  schema     single-shot   ─►  intent
+  (JSON / fenced)       validation                   (no tools, 1 turn)
+                        boundary
+                                   tool-use loop ─►  monitoring · diagnostic
+  free prose        ─►  no parse                      · recommendation · query
+  (query)               just stream                  (multi-turn, budget-capped,
+                        to UI                         forced-final on overflow)
+```
+
+Both axes flip the engineering. Structured output forces schemas + validators + retry. Tool-use loops force budget caps + forced-final synthesis. The intent classifier hits neither — it's the simplest possible prompt in the codebase, and the comparison sharpens what makes the others complex.
+
+## What you'll learn, in order
+
+**01–07 — operational discipline.** Read these before the techniques. They are how a prompt becomes production code: four-section anatomy (01), structured outputs via tool-calling (02), prompts-as-code under version control (03), token budgeting (04), eval-driven iteration (05), single-purpose chains (06), output-mode discipline (07).
+
+**08–11 — specific techniques.** Few-shot (08), chain-of-thought (09), self-critique (10), meta-prompting (11). Each one a tool with a sharp shape — knowing when to reach for it is the work.
+
+**12–13 — defense and hygiene.** Prompt-injection defense (12). Forbidden patterns (13).
+
+## What this codebase is honest about NOT having
+
+- **No eval harness in the repo today.** Concept 05 walks the eval-driven iteration pattern and names Case B: the pattern is real, the substrate is absent — no `eval/` directory, no 4-pillar suite, no LLM-as-judge harness in this repo. The honest framing matters — without evals, prompt iteration in this repo is by-hand against the captured demo snapshot.
+- **No production prompt-version logging.** The legacy `.md` files are version-controlled, but there's no log entry that says "this output was produced by prompt vX of monitoring.md." Concept 03 names this as the next step.
+- **No automated drift detection across model upgrades.** Sonnet 4 → Sonnet 4.6 was a manual swap. Concept 03 names what would need to exist to catch a regression.
+
+These gaps are real, and naming them is part of the discipline. A production AI engineer's portfolio doesn't have to be complete — it has to be honest about what's complete and what's next.

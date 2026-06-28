@@ -1,609 +1,573 @@
-# Access patterns and storage choice
+# 06 — Access patterns and storage choice
 
-**Industry name(s):** Storage choice · access-pattern fit · in-memory store · key-value · document store · serverless cold-start · session-scoped state · in-process synthetic fixture
-**Type:** Industry standard · Language-agnostic · Project-specific (the session-keyed-in-memory variant + the in-process synthetic adapter)
-
-> The storage choice question: **does the storage shape match the read/write pattern?** This repo has **three storage layers** as of 2026-06-19 (the Olist SQLite tier from the 2026-06-16 audit was removed in PR #8). (1) **Session-scoped in-memory** `Map<sessionId, SessionFeed>` in `lib/state/insights.ts` for live UI state — by-id reads within a session, per-session isolation between users. (2) **Committed demo seeds** (`lib/state/demo-*.json`) — git-tracked, durable forever. (3) **In-process synthetic fixture** (`lib/data-source/synthetic-data-source.ts`) — const literals returned through the DataSource interface; the live-synthetic mode uses this when the user wants the real agent loop against fake data. A dev-only `.investigation-cache.json` also exists and survives `npm run dev` restarts but never reaches production (Vercel FS is read-only). The access pattern is **layered by lifetime**: per-request UI state in (1), per-commit fixtures in (2), per-process fake data in (3). The classic mismatch from the 2026-06-01 version — "per-process memory on serverless" — is partly bridged by the session-scoping (multi-user safety) and by the wire-format-as-state pattern (the browser carries the data across cold starts). The mismatch hasn't been retired; it's been bounded.
-
----
+**Storage-shape matching access-shape · Industry standard**
 
 ## Zoom out, then zoom in
 
-**Zoom out — the bigger picture.** Three storage layers, one access pattern. The owned data lives in three in-memory `Map`s. A dev-only file-backed cache (`.investigation-cache.json`) survives `npm run dev` restarts. A committed demo seed (`lib/state/demo-insights.json`, `demo-investigations.json`) survives forever — it's git-tracked and serves the offline mode. On Vercel, where serverless instances are ephemeral, the in-memory store is per-instance, so the route handler has a **three-source fallback chain** for resolving any anomaly: client-passed wire-format → in-memory → demo seed.
+The classical question — *does the storage shape match the read/write
+pattern?* — is the seam to system design. **blooming_insights** answers
+it with "no database, because the access pattern doesn't ask for one."
+This file walks why that's right, names the ceiling, and shows the
+buildable target the day the access pattern shifts.
 
 ```
-  Zoom out — the storage layers
+  Zoom out — the storage tiers and what each one is for
 
-  ┌─ Read access pattern (UI → route → store) ───────────────┐
-  │                                                            │
-  │   request: investigate insight `abc-123`                   │
-  │                                                            │
-  │   resolveAnomaly(id, insightParam):                        │
-  │     1. is there a ?insight= JSON param? ── yes → trust it  │
-  │     2. is anomalies Map.get(id) ≠ null?  ── yes → use it   │
-  │     3. is insights Map.get(id) ≠ null?   ── yes → convert  │
-  │        (lossy via insightToAnomaly — the leak)             │
-  │     4. is the demo seed JSON's id match? ── yes → use it   │
-  │     5. else → 404                                          │
-  │                                                            │
-  └────────────────────────────────────────────────────────────┘
-
-  ┌─ The three storage layers (in priority order) ───────────┐
-  │                                                            │
-  │   1. session-scoped in-memory Maps                         │
-  │      lib/state/insights.ts                                 │
-  │      Map<sessionId, SessionFeed>                           │
-  │      lifetime: one process instance (Vercel: warm only)    │
-  │      ephemeral; lost on cold start; no I/O cost            │
-  │                                                            │
-  │   2. committed demo seed                                   │
-  │      lib/state/demo-insights.json                          │
-  │      lib/state/demo-investigations.json                    │
-  │      lifetime: forever (git-tracked)                       │
-  │      shipped fixture; offline mode; replayed for demo path │
-  │                                                            │
-  │   3. in-process synthetic fixture                          │
-  │      lib/data-source/synthetic-data-source.ts              │
-  │      const literals returned through DataSource.callTool() │
-  │      lifetime: one process instance; deterministic         │
-  │      used in live-synthetic mode (real agent loop / fake   │
-  │      data); see file 11                                    │
-  │                                                            │
-  │   (also: a dev-only .investigation-cache.json; NEVER ships │
-  │    to production — Vercel FS is read-only)                 │
-  │                                                            │
-  └────────────────────────────────────────────────────────────┘
+  ┌─ Browser ───────────────────────────────────────────────────────┐
+  │  localStorage 'bi:mode'    user preference (mode toggle)         │
+  │  sessionStorage 'inv:<id>' per-tab investigation hydration       │
+  └──────────────────┬──────────────────────────────────────────────┘
+                     │
+  ┌─ Vercel serverless ─────────────────────────────────────────────┐
+  │  Cookies: bi_session + bi_auth   per-user identity + tokens     │
+  │  in-process Maps                  the feed + investigations      │
+  │  60s response cache               substrate dedup                │
+  └──────────────────┬──────────────────────────────────────────────┘
+                     │
+  ┌─ Disk (dev only, gitignored) ───────────────────────────────────┐
+  │  .auth-cache.json                                                │
+  │  .investigation-cache.json     ★ THIS CONCEPT decides ★          │ ← we are here
+  │                                  do we need real persistence?    │
+  └──────────────────┬──────────────────────────────────────────────┘
+                     │
+  ┌─ Committed JSON (versioned) ────────────────────────────────────┐
+  │  lib/state/demo-{insights,investigations}.json                   │
+  │  the reliable presentation path                                  │
+  └──────────────────┬──────────────────────────────────────────────┘
+                     │
+  ┌─ External substrate ────────────────────────────────────────────┐
+  │  Bloomreach Engagement (events, customers, catalogs)             │
+  │  SyntheticDataSource (deterministic facts)                       │
+  └─────────────────────────────────────────────────────────────────┘
 ```
 
-**Zoom in — narrow to the concept.** The question this concept answers: does the choice of `Map` (in-memory KV) match the access pattern? **Yes for the read pattern** — every read is by-id, which is the strongest case for a hash. **No for the write durability** — a briefing computed on one Vercel instance may not be visible to the next one, which is why the wire-format fallback exists (the browser holds the briefing's full Insight JSON in sessionStorage and ships it back to the route). The mismatch isn't with the access pattern, it's with the *deployment model* (ephemeral instances vs the in-process Map assumption).
+Zoom in. There are six storage tiers in the codebase, and exactly one
+choice was made deliberately: **no real persistence layer of our own.**
+The interesting question is how that choice survives — and what would
+break it.
 
 ---
 
-## Structure pass
-
-**Layers.** Same four-layer stack. The interesting layer is the **state module band** + the **deployment substrate** (Vercel serverless vs local dev).
-
-**Axis: durability boundary.** For each piece of state, what survives what? — a request, a warm instance, a cold start, a git commit. Pick the right axis because storage choice is *literally* about durability tradeoffs. Cost is wrong here (RAM is free); failure is wrong (these layers don't fail-propagate). Durability boundary pops the seams: each store layer has a different boundary it survives, and the fallback chain crosses them in priority order.
-
-**Seams.** Three matter. **Seam 1: request ↔ in-memory Map.** Each request reads/writes the same Map within an instance. Per-instance scope. **Seam 2: warm instance ↔ cold start.** In-memory Maps survive warm requests, die on cold start. **Seam 3: process lifetime ↔ committed data.** The demo seed survives indefinitely; the in-memory Maps don't. The fallback chain is the bridge: when the in-memory layer is empty (cold start), the demo seed is the floor.
+## Structure pass — the axis is "who owns this data, and how long does it live?"
 
 ```
-  Structure pass — durability boundaries
+  Trace ONE axis — "ownership + lifetime" — across tiers
 
-  ┌─ 1. LAYERS ──────────────────────────────────────────────┐
-  │  UI · Route · State module · Filesystem · Git              │
-  │  (deployment substrate matters here)                       │
-  └─────────────────────────────┬────────────────────────────┘
-                                │  pick the axis
-  ┌─ 2. AXIS ──────────────────▼─────────────────────────────┐
-  │  durability boundary: what survives what?                 │
-  │  per-request / warm-instance / cold-start / git           │
-  └─────────────────────────────┬────────────────────────────┘
-                                │  trace across seams
-  ┌─ 3. SEAMS ─────────────────▼─────────────────────────────┐
-  │  S1: request ↔ Map         ★ ALWAYS available (in-process)│
-  │  S2: warm ↔ cold start     ★ LOST (Maps die on cold start)│
-  │  S3: process ↔ git seed    ★ ALWAYS available (committed) │
-  └─────────────────────────────┬────────────────────────────┘
-                                ▼
-                        Block 4 — How it works
+  tier                             | owner       | lifetime           | recoverable
+  ─────────────────────────────────┼─────────────┼────────────────────┼─────────────
+  browser localStorage             | user        | until they clear   | no — user pref
+  session cookie (bi_session)      | server      | session            | re-mint trivially
+  auth cookie (bi_auth, prod)      | server      | until re-auth      | re-auth flow
+  in-process Maps                  | warm server | until cold/restart | YES, recompute
+  dev JSON cache                   | dev box     | until rm           | YES, recompute
+  committed demo JSON              | repo        | git history        | YES, recapture
+  external substrate (Bloomreach)  | Bloomreach  | forever            | n/a — read-only
+  ─────────────────────────────────┴─────────────┴────────────────────┴─────────────
+
+  axis seam:  "do WE own data that we cannot recover from upstream?"
+  answer:     NO. every data tier owned by us is recomputable.
+  therefore:  no DB needed. the moment that answer flips, a DB earns its keep.
 ```
+
+Each row's answer to "recoverable" is yes — except for the substrate,
+which we don't own. The recoverability of *our* data is the entire
+justification for the no-DB choice.
 
 ---
 
 ## How it works
 
-### Move 1 — the storage choice, as a picture
+### Move 1 — the mental model
 
-You know how `localStorage.setItem(k, v)` is a key-value store that survives until the user clears it? Same shape here, except (a) it's server-side and (b) "until the user clears it" becomes "until the Vercel instance is reclaimed (~minutes of idle)." The data shape is the same as `localStorage` — string keys, structured values, no joins, no queries. The storage shape (`Map`) matches that perfectly. The mismatch isn't shape; it's durability.
-
-```
-  the choice — Map vs the alternatives
-
-  CHOICE                         FITS THIS ACCESS PATTERN?
-  ───────────────────────────    ────────────────────────────────
-  Map<id, value>     ← current   YES — by-id reads, whole-briefing writes
-                                  NO  — durability across cold starts
-
-  Postgres / SQLite              YES — same access pattern + durability
-                                  cost: schema + migrations + deps
-
-  Redis                          YES — same access + durability + TTL
-                                  cost: a managed service
-
-  filesystem JSON                YES on dev (works today via
-                                  .investigation-cache.json)
-                                  NO on Vercel (read-only FS)
-
-  why Map is the right call FOR NOW:
-    - dataset is bounded (10 insights per briefing)
-    - access pattern is by-id only
-    - no persistence requirement for the demo (the seed covers offline)
-    - the live data is recomputable (re-run the agents)
-    - no migration story needed
-    - zero dependencies, zero ops
-
-  when it stops being the right call:
-    - users expect briefings to persist across sessions
-    - the dataset grows past warm-instance memory
-    - secondary access patterns emerge (filter by severity, by date)
-    - multiple workers need to share state
-```
-
-### Move 2 — the three store layers, one at a time
-
-#### `lib/state/insights.ts` — session-scoped in-memory (UPDATED 2026-06-16)
-
-The shape has been refactored from "three module-level Maps shared by all requests" to "an outer Map keyed by sessionId, with three inner Maps per session." This fixes a multi-user safety bug — a single warm Vercel instance serves many users, and module-level globals would let `putInsights().clear()` for user A wipe user B's feed mid-briefing.
+You know the rule "pick the data structure that matches the access
+pattern"? That's `Array.push` vs `Set.add` vs `Map.get`. The same rule
+scales up to storage choice: pick the **storage system** that matches
+the access pattern. No-DB-because-no-need is a real answer — *if* the
+access pattern truly doesn't need one.
 
 ```
-  the session-scoped layer
+  The decision tree — what storage matches what access pattern?
 
-  const state = new Map<string, SessionFeed>();        ← outer, NEVER cleared
-
-  type SessionFeed = {
-    insights:       Map<string, Insight>;              ← per-session
-    investigations: Map<string, Investigation>;        ← per-session
-    anomalies:      Map<string, Anomaly>;              ← per-session
-  };
-
-  reads:  getInsight(sessionId, id) →
-            state.get(sessionId)?.insights.get(id) ?? null
-          ── two-level hash lookup, O(1)
-  writes: putInsights(sessionId, items, raw) clears + repopulates
-          ONLY this session's sub-feed
-
-  lifetime semantics (unchanged):
-    LOCAL DEV: outer Map lives until you Ctrl-C the dev server
-    VERCEL:    outer Map lives per warm instance — minutes of idle, no longer
-               ANY cold start = empty outer Map, fall back to seed/wire-param
-
-  what's new vs 2026-06-01: cross-session isolation.
-    user A's briefing run no longer wipes user B's feed.
-    test/state/insights.test.ts has explicit isolation tests.
+  start: does the app OWN data the user creates?
+                                 │
+                ┌────────────────┴──────────────────┐
+              YES                                  NO
+                │                                   │
+                ▼                                   ▼
+  does it need to outlive a process restart?    in-memory cache works
+                │                                   │
+       ┌────────┴────────┐                          │  this codebase is here:
+      YES               NO                          │  every data tier we own
+       │                 │                          │  is recomputable from the
+       ▼                 ▼                          │  substrate (Bloomreach or
+  real DB           in-memory cache                 │   synthetic adapter).
+                                                    │
+                                                    ▼
+                                              done — no DB
 ```
 
-#### `lib/data-source/synthetic-data-source.ts` — the in-process synthetic fixture (NEW)
+The codebase sits firmly in the right branch. Every "store" it has is a
+**write-through cache of recomputable data**. Lose the cache, recompute.
+Done.
 
-A pure in-process adapter. No disk. No DB. No PRNG. The `SyntheticDataSource` class implements the same `DataSource` interface as `BloomreachDataSource`, dispatches on tool name in a switch, and returns hand-authored const literals through the standard `{ structuredContent, content }` result envelope. The agent loop above this seam cannot tell the difference between this and a live MCP call — same shape, same envelope, same `listTools()` surface. File 11 walks the pattern.
+### Move 2 — the storage tiers, one at a time
 
-```
-  the in-process synthetic layer
+Six tiers. Each one has a different lifetime and a different reason for
+existing.
 
-  reads:  via DataSource.callTool(name, args)
-          dispatched by switch in SyntheticDataSource.dispatch()
-          returns const literals (analyticsResult, customers, segments,
-          campaigns, scenarios, catalogItems, ...)
+#### **Tier 1: browser localStorage `bi:mode`**
 
-  writes: NONE at runtime — every payload is source code
-          to change the data: edit lib/data-source/synthetic-data-source.ts
-          + restart the process (or wait for Next.js HMR)
-
-  lifetime semantics:
-    in-memory for the lifetime of the process; trivially restored on
-    reload (the literals are part of the bundle, not a file the FS
-    has to ship)
-    survives Vercel cold starts implicitly — the data IS the code
-
-  what this is for: the live-synthetic mode in
-  lib/data-source/index.ts (makeDataSource → SyntheticDataSource) gives
-  the user the real agent loop against fake data, without the OAuth
-  dance and without the 1 req/s Bloomreach rate limit.
-
-  determinism contract: not asserted in code. The data is stable today
-  because the literals are stable; nothing prevents a future edit
-  from introducing Math.random() inside dispatch(). See finding #7 in
-  the audit (file 07).
-```
-
-#### `lib/state/investigations.ts` — the dev file cache (secondary)
-
-A separate layer just for investigations. Uses the same `Map<insightId, AgentEvent[]>` in memory, but ALSO writes to `.investigation-cache.json` in dev only. The dev cache survives across `npm run dev` restarts so iterating on the investigate page doesn't require re-running every agent.
+User preference. The toggle between demo / live / live-synthetic
+modes persists across visits because users want it to.
 
 ```
-  the dev file cache — DEV ONLY
+  bi:mode storage shape
 
-  const PERSIST = process.env.NODE_ENV === 'development';
-  const CACHE_FILE = join(process.cwd(), '.investigation-cache.json');
+  key:    'bi:mode'
+  value:  'demo' | 'live-bloomreach' | 'live-synthetic'
+  read:   on every page load (client-side)
+  write:  when user clicks the mode toggle
 
-  reads (in order):
-    1. mem.get(insightId)              ← in-process Map
-    2. readJson(CACHE_FILE)[insightId]  ← dev file (dev only)
-    3. readJson(DEMO_FILE)[insightId]   ← committed seed (always)
-    4. null
-
-  writes:
-    mem.set(insightId, events)         ← always
-    if (PERSIST) {                     ← dev only
-      const all = readJson(CACHE_FILE);
-      all[insightId] = events;
-      writeFileSync(CACHE_FILE, ...);  ← best effort
-    }
-
-  what breaks in production: the second layer doesn't exist. Vercel's
-  filesystem is read-only. the production fallback chain is mem → demo.
-  (the comment in the file names this: "serverless FS is read-only.")
-
-  what breaks if you delete .investigation-cache.json mid-dev: nothing
-  catastrophic — the next investigation re-runs the agents and writes
-  it back. just slower for one click.
+  why localStorage and not a cookie?
+    - this is purely client-side UX state, never read by the server
+    - cookies would round-trip on every request — wasted bytes
+    - localStorage survives across sessions (user expects mode to stick)
 ```
 
-#### `lib/state/demo-*.json` — the committed seed (floor)
+Match score: ideal. User-scoped, client-only, persistent. localStorage
+exists for exactly this.
 
-Two files, git-tracked: `demo-insights.json` (~12KB, 12 insights) and `demo-investigations.json` (the matching investigations). Captured by `scripts/capture-demo.ts` running a full real agent loop, then committed. Acts as both the **offline mode** (when no Bloomreach credentials are available) and the **floor of the fallback chain** (when the in-memory layer is empty).
+#### **Tier 2: server session cookie `bi_session`**
 
-```
-  the committed seed — always available
+Per-user identity for scoping in-memory Maps. A UUID minted on first
+request:
 
-  lifetime: as long as the git repo exists
-  shape:    same Insight / Investigation interfaces (must validate)
-  size:     bounded — ~12 insights, ~12KB total (for demo-insights)
-  source:   scripts/capture-demo.ts (re-capture on demand)
-
-  read access:
-    existsSync(DEMO_FILE) + readFileSync(DEMO_FILE, 'utf8') + JSON.parse
-    O(n) where n is the seed size. n is small, so n doesn't matter.
-
-  use cases:
-    1. offline mode: no BLOOMREACH_API_KEY → the briefing route serves
-       the seed instead of running the live agents
-    2. cold-start fallback: the live route falls through to the seed
-       when the in-memory layer is empty AND the wire-format param
-       isn't present
-    3. tests: several tests load the seed as a fixture
-
-  why this is correct: the seed isn't pretending to be live data. it's
-  pretending to be a SHIPPED EXAMPLE. it has all the right shape, with
-  hand-curated values that demo well. cheap, durable, no infrastructure.
+```typescript
+// lib/mcp/session.ts (snippet)
+export async function getOrCreateSessionId(): Promise<string> {
+  const jar = await cookies();
+  let id = jar.get(COOKIE)?.value;
+  if (!id) {
+    id = crypto.randomUUID();
+    jar.set(COOKIE, id, sessionCookieOpts());
+  }
+  return id;
+}
 ```
 
-### Move 2 — the three-source fallback chain (the access pattern made concrete)
+This is the join key for everything in the state layer (see
+`03-indexing-vs-query-patterns.md`). Without it, two users hitting the
+same warm Vercel instance would share a feed.
 
-The route handler's `resolveAnomaly` function (L37–L61 of `app/api/agent/route.ts`) is the fallback chain. **One source per fallback:**
+#### **Tier 3: server auth cookie `bi_auth` (prod only)**
 
-```
-  resolveAnomaly — three sources in priority order
-
-  STEP 1: wire-format param  (?insight=<JSON> from the browser)
-    ├ exists?
-    │   ├ parses as JSON?
-    │   │   └ has metric, change, scope, severity?
-    │   │       └ return insightToAnomaly(parsed)   ← TRUSTED PATH
-    │   └ no → fall through
-    └ no → fall through
-
-  STEP 2: anomalies Map  (the in-memory raw store)
-    ├ getAnomaly(insightId) ≠ null?
-    │   └ return it
-    └ null → fall through
-
-  STEP 3: insights Map  (the in-memory enriched store)
-    ├ getInsight(insightId) ≠ null?
-    │   └ return insightToAnomaly(insight)  ← LOSSY (drops 4 fields)
-    └ null → fall through
-
-  STEP 4: demo seed file  (last resort)
-    ├ DEMO_FILE exists?
-    │   ├ parse JSON
-    │   │   └ find insight by id
-    │   │       └ return insightToAnomaly(found)  ← LOSSY
-    │   └ catch → null
-    └ no → null
-
-  STEP 5: return null  → the route returns 404
-```
-
-**Why this many sources?** Each step exists for a real failure mode:
-- **Wire-format param**: the most reliable when the user clicks from the briefing — the browser holds the Insight in sessionStorage and ships it back. Survives any cold start because the data travels with the request.
-- **`anomalies` Map**: the right answer when the in-memory store is warm AND the user clicked through within the same instance. No conversion loss.
-- **`insights` Map**: the user navigated directly via URL (not through the briefing UI) AND the in-memory layer happens to have the Insight (warm and the briefing was recent).
-- **Demo seed**: the user is in offline mode OR the demo id was passed in directly.
-
-What breaks: if all four miss, the route returns 404. The UI handles it by showing "investigation not found." The 4-source fallback exists *because* the in-memory layer is unreliable on Vercel — without it, every cold start would 404 any in-progress investigation.
-
-### Move 2 — the wire-format-as-bridge pattern
-
-The single most interesting access-pattern decision in this codebase. The investigate page is a separate route from the briefing; the user clicks an insight and the browser navigates to `/investigate?id=…&insight=<JSON>`. The `&insight=<JSON>` is the **entire Insight JSON, URL-encoded, shipped from the browser back to the route**.
+The encrypted OAuth tokens for Bloomreach. AES-256-GCM under
+`AUTH_SECRET`, stored in an httpOnly cookie. In dev, the same tokens
+live in `.auth-cache.json` (gitignored, plaintext).
 
 ```
-  the wire-format bridge — diagram
+  prod vs dev auth storage
 
-  ┌─ briefing page ─────────────────────────────────────────┐
-  │  /api/briefing  →  Insight[]                             │
-  │  user clicks an insight                                   │
-  │  app/page.tsx stores it in sessionStorage                │
-  │  navigates to /investigate?id=abc&insight=<JSON>         │
-  └──────────────────────────┬───────────────────────────────┘
-                             │ URL (with the JSON param)
-                             ▼
-  ┌─ investigate page ──────────────────────────────────────┐
-  │  /api/agent?id=abc&insight=<JSON>                        │
-  │  resolveAnomaly sees ?insight= first, uses it            │
-  │  ★ no need to look up by id at all                       │
-  └──────────────────────────────────────────────────────────┘
+  prod (Vercel, serverless):              dev (local):
+  ────────────────────────                ───────────
+  encrypted cookie (bi_auth)              plaintext file (.auth-cache.json)
+  AsyncLocalStorage-scoped store          single-tenant
+  per-request decrypt + re-encrypt        load once, write on change
 
-  why this exists: the route can't trust that its in-memory store has
-  the insight. Vercel might have cold-started a different instance.
-  the browser is the durability layer.
-
-  what it costs:
-    - URL bloat (the Insight JSON ~ 500-800 bytes URL-encoded)
-    - the insightToAnomaly leak (file 02) — the route has to convert
-      back to Anomaly for the diagnostic agent
-
-  what it gains:
-    - zero round-trips to look up the insight
-    - works across cold starts trivially
-    - no DB needed for "remember this for the next request"
+  why the split? serverless filesystem is read-only in prod —
+  you can't write a file. cookies are the only writable store.
 ```
 
-This is the **stateless-route + state-on-the-client** pattern, common in serverless. The browser IS the durability layer. The wire format being lossy is acceptable because the diagnostic agent only needs the four fields (`metric`, `scope`, `change`, `severity`) to start investigating — the other fields (`evidence`, `impact`) would be nice-to-have but aren't load-bearing. The leak (file 02) is the *cost* of this design.
+This is the only encrypted-at-rest data in the app. The choice (encrypted
+cookie vs server-side session store like Redis) is a system-design call,
+not a data-modeling one — but the *shape* of what's stored (a token bag
+keyed by user) is data-modeling.
 
-### Move 2 — the alternative that would retire all of this
+#### **Tier 4: in-process Maps (the actual "database")**
 
-A single Postgres or SQLite table with two relations:
+This is the load-bearing tier. The session-keyed `Map<sessionId,
+SessionFeed>` in `lib/state/insights.ts` and the
+`Map<insightId, AgentEvent[]>` in `lib/state/investigations.ts` are
+the entire "live" data layer.
+
+Lifetime: from process start to process death. Vercel keeps a warm
+serverless instance alive for ~minutes to ~hours; after that it cold-
+starts a new one and the Maps are empty. The next briefing call refills
+them from scratch (substrate query → agent loop → write).
 
 ```
-  the buildable target — one table, one FK
+  the in-process Map as a write-through cache
 
-  insights (table)
-    id              uuid PK
-    timestamp       timestamptz
-    severity        text  (check constraint: in 4 values)
-    metric          text
-    change          jsonb (the { value, direction, baseline } subobject)
-    scope           text[] (Postgres array; or jsonb)
-    source          text  (check: in 2 values)
-    evidence        jsonb (variable shape — jsonb fits)
-    impact          text
-    revenue_impact  jsonb  ← all Tier 1 fields as jsonb or columns
-    ...
-
-  investigations (table)
-    insight_id      uuid PK + FK → insights(id) ON DELETE CASCADE
-    reasoning       jsonb  (the AgentEvent[] array)
-    diagnosis       jsonb
-    recommendations jsonb
-
-  what retires:
-    - the three-source fallback chain (route looks up by id, period)
-    - the wire-format bridge (no need to ship the JSON in the URL)
-    - the insightToAnomaly leak (no conversion needed; agent reads
-      from the same row with all fields intact)
-    - the per-instance memory problem (Postgres survives Vercel
-      instance lifecycle trivially)
-    - the .investigation-cache.json dev file (the DB IS the cache)
-
-  what costs:
-    - a managed DB (Vercel Postgres, Supabase, Neon — all serverless-
-      friendly)
-    - a schema-as-code layer (Drizzle is the natural fit — already in
-      Rein's portfolio via AdvntrCue)
-    - one migration to seed from demo-insights.json
-    - a few weeks of operational learning curve
+  request                    state layer                    substrate
+     │                            │                              │
+     │  GET /                     │                              │
+     │ ──────────────────────────►│                              │
+     │                            │  listInsights(sessionId)     │
+     │                            │  → []  (empty after cold)    │
+     │                            │                              │
+     │  POST /api/briefing        │                              │
+     │ ──────────────────────────►│                              │
+     │                            │  agent loop                  │
+     │                            │ ────────────────────────────►│ query
+     │                            │                              │
+     │                            │ ◄────────────────────────────│ events
+     │                            │  putInsights(sessionId, [...])│
+     │                            │  Maps now have the briefing  │
+     │                            │                              │
+     │  GET /                     │                              │
+     │ ──────────────────────────►│                              │
+     │                            │  listInsights → cached       │
+     │ ◄──────────────────────────│                              │
 ```
 
-Doing this would not just solve the durability problem — it would retire the worst data-modeling smell in the repo (the Insight↔Anomaly leak) because the conversion path that introduces the leak would no longer exist.
+Match score: ideal **for this access pattern.** Every read is keyed.
+Every value is recomputable. The "store" is just the most recent
+briefing.
+
+#### **Tier 5: gitignored dev JSON caches**
+
+`.auth-cache.json` and `.investigation-cache.json` exist for developer
+ergonomics: when you restart the dev server, you don't want to re-do
+OAuth or re-run a 30-second briefing. The cache lets you pick up where
+you left off.
+
+```typescript
+// lib/state/investigations.ts:6-9
+const PERSIST = process.env.NODE_ENV === 'development';
+const CACHE_FILE = join(process.cwd(), '.investigation-cache.json');
+const DEMO_FILE = join(process.cwd(), 'lib/state/demo-investigations.json');
+```
+
+`PERSIST` is the load-bearing flag — file writes only happen in dev,
+because Vercel's serverless filesystem is read-only in production.
+
+#### **Tier 6: committed demo JSON snapshots (the presentation reliability layer)**
+
+`lib/state/demo-insights.json` (665 lines) and
+`lib/state/demo-investigations.json` (3,487 lines) are the reliable
+presentation path. They get checked into git, deployed with the app, and
+served when the user picks demo mode.
+
+```
+  demo JSON as the "fixed dataset" tier
+
+  ┌─ purpose ──────────────────────────────────────────────┐
+  │  - reliable demo for screenshots / interviews / pitches │
+  │  - no auth required, no rate limits, instant load       │
+  │  - same shape as live data (same types, same UI)        │
+  │  - regenerated via one-click capture (dev only)         │
+  └─────────────────────────────────────────────────────────┘
+
+  ┌─ what it ISN'T ────────────────────────────────────────┐
+  │  - not a database (no updates, no queries)              │
+  │  - not user data (it's frozen demo content)             │
+  │  - not the source of truth (the substrate is)           │
+  └─────────────────────────────────────────────────────────┘
+```
+
+Match score: ideal for "data that's part of the deploy." This is *content*,
+not *data* — it's versioned with the code because that's the right
+lifetime for it.
+
+#### **Tier 7: external substrate (not ours)**
+
+Bloomreach Engagement (live) or `SyntheticDataSource` (in-process). We
+*never* write to either. The substrate is the source of truth for events,
+customers, catalogs — every metric the agents compute starts from a
+substrate query.
+
+```typescript
+// lib/data-source/synthetic-data-source.ts:85-108
+export const syntheticWorkspaceSchema: WorkspaceSchema = {
+  projectId: PROJECT_ID,
+  projectName: PROJECT_NAME,
+  events: syntheticEvents,
+  ...
+  totalCustomers: 126_420,
+  totalEvents: 757_710,
+  oldestTimestamp: Date.UTC(2025, 11, 1),
+  dataHorizon: { from: '2025-12-01', to: '2026-06-01', durationDays: 182 },
+};
+```
+
+The synthetic adapter is a 516-line JavaScript file. Every "row" is a
+JS object literal. Counts are hardcoded:
+52,840 purchases / 241,900 view_items / 198,400 session_starts /
+91,360 cart_updates. That's not a database either — it's a
+**deterministic fixture** that pretends to be one, satisfying the
+`DataSource` interface so the same agent code runs against it.
+
+```
+  why synthetic data is in-process (not in a DB)
+
+  the access pattern: agent issues EQL-like query, gets back rows
+  the synthetic answer: pre-computed analytics result object
+
+  any DB you'd reach for would be massive overkill — there's
+  exactly one fixed "row" per query type, all deterministic.
+  the simplest thing that satisfies the DataSource interface is
+  a function that switch()s on tool name and returns canned data.
+```
+
+Match score: ideal for fixtures. The data never changes; it's part of
+the code; agents can run against it offline with no setup.
+
+### Move 2.5 — current state vs future state
+
+This is the file where the buildable-target comparison matters most.
+
+```
+  Current state vs future state — when would the no-DB choice break?
+
+  Phase A — current state                Phase B — buildable target
+  ─────────────────────                  ──────────────────────────
+  every data tier is recomputable        users can author content
+  no cross-session reads                 (saved insights, comments,
+  no cross-user analytics                 shared briefings, alerts)
+  no audit trail                                       │
+  no scheduled jobs                                    │
+            │                                          ▼
+            ▼                              the access pattern grows:
+  Map-of-Maps is enough                    - "all critical insights this week"
+  no DB needed                             - "this user's saved annotations"
+                                          - "send me an alert when X"
+                                                       │
+                                                       ▼
+                                          → PostgreSQL with:
+                                            users(id, email, ...)
+                                            insights(id, session_id, ...,
+                                                     created_at, severity)
+                                            annotations(id, insight_id,
+                                                        user_id, body)
+                                            alert_rules(id, user_id, metric, ...)
+                                          + indexes on (severity, created_at)
+                                          + Drizzle migrations
+                                          + transactions for multi-row writes
+
+  the migration cost is ~real but bounded:
+  - types.ts stays the source of truth (Drizzle generates from types)
+  - the Map<id, Insight> wrapper becomes a Postgres query
+  - validate.ts still earns its keep at the LLM boundary
+  - the demo JSON tier could stay (frozen fixtures don't move to DB)
+```
+
+The takeaway: **almost nothing has to change** to make this codebase
+ready for a real DB the day the access pattern demands it. The types
+are already the source of truth. The data layer is already abstracted
+behind `putInsights` / `getInsight` functions. Swapping the Map for a
+Postgres call is mechanical, not architectural.
+
+This is the **payoff** of the deliberate no-DB choice: you're not stuck
+when you outgrow it.
 
 ### Move 3 — the principle
 
-Storage choice is access-pattern fit plus durability fit. The repo's `Map`s are a textbook access-pattern fit (by-id reads of bounded data) and a textbook durability mismatch (per-instance memory on ephemeral serverless). The mismatch is bridged by two compensating patterns: the wire-format-as-state (the browser holds the data, ships it back) and the committed seed (a static floor for offline/cold-start). Both patterns work, both are reasonable for a demo-and-portfolio repo, both introduce their own complexity (the leak from the lossy conversion; the seed-vs-live divergence). The right next move is to graduate to a real KV or relational store — but only when "users expect the briefing to persist" becomes a real requirement.
+**The right storage is whatever matches the access pattern.** Most
+codebases reach for Postgres because that's the default, then discover
+they're paying for relational semantics they don't use. **blooming_insights**
+does it backwards (and right): identify the access pattern (keyed by
+session + insight ID, recomputable from upstream), pick the simplest
+thing that fits (in-process Maps), accept the ceiling (no cross-session
+reads), document the buildable target (Postgres when the ceiling
+becomes a wall).
 
-### Code in this codebase
-
-The repo anchors for the storage layers and the four-source resolution Move 2 walked.
-
-#### The three Maps
-
-```
-lib/state/insights.ts  (lines 8–14, UPDATED)
-
-  type SessionFeed = {
-    insights:       Map<string, Insight>;
-    investigations: Map<string, Investigation>;
-    anomalies:      Map<string, Anomaly>;
-  };
-  const state = new Map<string, SessionFeed>();
-       │
-       └─ outer Map keyed by sessionId. each session gets its own
-          SessionFeed (three inner Maps). the outer Map is NEVER
-          cleared by a request; only the inner Maps for THIS session
-          are cleared on putInsights(sessionId, ...). multi-user safe
-          on a warm Vercel instance.
-```
-
-#### The dev file cache
-
-```
-lib/state/investigations.ts  (lines 1–24)
-
-  import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-  import { join } from 'node:path';
-  import type { AgentEvent } from '../mcp/events';
-
-  // Sources (in order): in-memory (this process) → dev file → committed demo seed.
-  // Writes go to in-memory always, and to the dev file in development only
-  // (serverless FS is read-only).
-  const PERSIST = process.env.NODE_ENV === 'development';
-  const CACHE_FILE = join(process.cwd(), '.investigation-cache.json');
-  const DEMO_FILE = join(process.cwd(), 'lib/state/demo-investigations.json');
-
-  const mem = new Map<string, AgentEvent[]>();
-       │
-       └─ the comment names the entire layered model: in-memory → dev
-          file → demo seed. and names the prod constraint explicitly:
-          "serverless FS is read-only." this comment IS the architecture.
-
-  export function getCachedInvestigation(insightId: string): AgentEvent[] | null {
-    if (mem.has(insightId)) return mem.get(insightId)!;
-    const fromFile = PERSIST ? readJson(CACHE_FILE)[insightId] : undefined;
-    if (fromFile) return fromFile;
-    const fromDemo = readJson(DEMO_FILE)[insightId];
-    return fromDemo ?? null;
-  }
-       │
-       └─ the read fallback chain. one return per layer. note the
-          PERSIST gate skips the file read entirely in production,
-          where it would always miss anyway.
-```
-
-#### The four-source resolution at the route
-
-```
-app/api/agent/route.ts  (lines 33–62)
-
-  function resolveAnomaly(insightId: string, insightParam?: string | null): Anomaly | null {
-    // 1. WIRE-FORMAT PARAM (the durable client-side bridge)
-    if (insightParam) {
-      try {
-        const i = JSON.parse(insightParam) as Insight;
-        if (i && typeof i.metric === 'string'
-              && i.change
-              && Array.isArray(i.scope)
-              && i.severity) {
-          return insightToAnomaly(i);
-        }
-      } catch { /* malformed — fall through */ }
-    }
-
-    // 2. IN-MEMORY ANOMALIES MAP (no conversion needed)
-    const a = getAnomaly(insightId);
-    if (a) return a;
-
-    // 3. IN-MEMORY INSIGHTS MAP (lossy conversion)
-    const i = getInsight(insightId);
-    if (i) return insightToAnomaly(i);
-
-    // 4. COMMITTED DEMO SEED (last resort)
-    try {
-      if (existsSync(DEMO_FILE)) {
-        const snap = JSON.parse(readFileSync(DEMO_FILE, 'utf8')) as { insights?: Insight[] };
-        const di = (snap.insights ?? []).find((x) => x.id === insightId);
-        if (di) return insightToAnomaly(di);
-      }
-    } catch { /* ignore */ }
-
-    return null;
-  }
-       │
-       └─ four sources, each with a specific failure mode it covers.
-          two of them (steps 3 and 4) are lossy because they go through
-          insightToAnomaly — the leak from file 02. if the route went
-          to a real DB, step 2 would be the only source, no leak.
-```
-
-#### The wire-format bridge (the browser side)
-
-```
-app/page.tsx  (the briefing component, when an insight is clicked)
-
-  // (paraphrased — the actual code lives in the click handler)
-  sessionStorage.setItem('selectedInsight', JSON.stringify(insight));
-  const url = `/investigate?id=${insight.id}&insight=${encodeURIComponent(JSON.stringify(insight))}`;
-  router.push(url);
-       │
-       └─ the Insight travels with the navigation. the route then prefers
-          this wire-format payload over its in-memory store. this is what
-          makes the route correct under Vercel's cold-start model — the
-          browser is the durability layer.
-```
+The generalisation: storage choice is a **product decision in disguise**.
+The day the product wants cross-user analytics, you need a DB. Until
+then, a Map is the entire data layer. Don't fight the access pattern;
+match it.
 
 ---
 
 ## Primary diagram
 
-The storage layers and the access pattern, recap.
+The six tiers, what each is for, what would force a change.
 
 ```
-  Storage and access — full picture
+  Storage tier map — current state + buildable target
 
-  ┌─ READ ACCESS PATTERN ────────────────────────────────────┐
-  │                                                            │
-  │   GET /api/agent?id=abc&insight=<JSON>                    │
-  │   GET /api/investigate?id=abc                             │
-  │                                                            │
-  │   resolveAnomaly walks 4 sources in priority order         │
-  │                                                            │
-  └────────────────┬─────────────────────────────────────────┘
-                   │
-        ┌──────────┼──────────┬──────────┬──────────┐
-        ▼          ▼          ▼          ▼          ▼
-   wire-format   anomalies  insights  demo seed   404
-   (?insight=)   Map        Map       file
-   ★ DURABLE     ephemeral  ephemeral ★ DURABLE
-     (browser)   (warm only)(warm only) (git)
+  ┌─ TIER ───────────────────┬─ FIT ─┬─ WOULD CHANGE WHEN ───────────────┐
+  │                          │       │                                   │
+  │ browser localStorage     │  ★★★  │ never (user pref, ideal use)      │
+  │   bi:mode                │       │                                   │
+  │                          │       │                                   │
+  │ session cookie           │  ★★★  │ never (per-user scoping)          │
+  │   bi_session             │       │                                   │
+  │                          │       │                                   │
+  │ auth cookie / dev file   │  ★★   │ if tokens needed to outlive       │
+  │   bi_auth                │       │   a single user's browser         │
+  │                          │       │   → server-side session store     │
+  │                          │       │                                   │
+  │ in-process Maps          │  ★★★  │ if access pattern grew secondary  │
+  │   state/{insights,       │       │   indexes (e.g. "all critical     │
+  │    investigations}.ts    │       │   insights across users")         │
+  │                          │       │   → Postgres + indexes            │
+  │                          │       │                                   │
+  │ dev JSON caches          │  ★★★  │ never relevant in prod            │
+  │   .investigation-cache   │       │                                   │
+  │                          │       │                                   │
+  │ committed demo JSON      │  ★★★  │ if demo data grew to MB or        │
+  │   lib/state/demo-*.json  │       │   needed updates between deploys  │
+  │                          │       │   → CMS / object storage          │
+  │                          │       │                                   │
+  │ external substrate       │  ★★★  │ never (not ours; we just read)    │
+  │   Bloomreach / Synthetic │       │                                   │
+  │                          │       │                                   │
+  └──────────────────────────┴───────┴───────────────────────────────────┘
 
-  ┌─ STORE LAYERS ───────────────────────────────────────────┐
-  │                                                            │
-  │   1. in-memory Maps          (per-instance, ephemeral)     │
-  │      lib/state/insights.ts                                 │
-  │      lib/state/investigations.ts                           │
-  │                                                            │
-  │   2. dev file cache          (cross-restart in dev only)   │
-  │      .investigation-cache.json                             │
-  │                                                            │
-  │   3. committed demo seed     (forever, git-tracked)        │
-  │      lib/state/demo-insights.json                          │
-  │      lib/state/demo-investigations.json                    │
-  │                                                            │
-  └────────────────────────────────────────────────────────────┘
-
-  ┌─ THE STATELESS-ROUTE-WITH-CLIENT-STATE BRIDGE ───────────┐
-  │                                                            │
-  │   sessionStorage on the browser holds the Insight          │
-  │   the navigation URL includes ?insight=<JSON>              │
-  │   the route trusts the wire-format param FIRST             │
-  │   (per-instance memory isn't relied on for correctness)    │
-  │                                                            │
-  └────────────────────────────────────────────────────────────┘
+  the load-bearing decision:
+  in-process Maps are fit-for-purpose IFF every data tier we own
+  is recomputable from the substrate. that property holds today;
+  the day it stops holding, Postgres earns its keep.
 ```
 
 ---
 
 ## Elaborate
 
-The deeper choice here is that **the repo prefers correctness-via-redundancy over correctness-via-infrastructure**. Adding a real DB would solve every storage problem cleanly, but it'd also add a dependency, a schema migration story, an ops surface, and a deployment dependency. The current design hides all of that behind the four-source fallback chain — at the cost of one leak (`insightToAnomaly` drops fields) and one design smell (the route trusts the browser to ship the full Insight back). For a demo-and-portfolio repo on Vercel Hobby with a single user, the tradeoff is reasonable. For a production system with multiple users and persistent state expectations, it isn't.
+Where this comes from: the **CQRS** (Command Query Responsibility
+Segregation) world makes this seam explicit — read models live wherever
+they're cheapest to read; write models live wherever they're authoritative.
+In **blooming_insights**, the "authoritative write model" is the
+substrate (Bloomreach), which the app never writes to. The "read model"
+is the in-process Maps, recomputed on every briefing. That's CQRS with
+the *commands* delegated to a third party.
 
-The wire-format bridge is the genuinely clever part. Most serverless apps solve the cold-start problem with a DB or KV (Redis, DynamoDB). This one solves it with sessionStorage + a URL param — zero infrastructure. The cost is the URL gets long (~500 bytes), but URLs handle that fine. The win is enormous: the route is completely stateless from a correctness standpoint; the in-memory Maps are pure optimization. If they're warm, the user gets a fast response without re-running the briefing. If they're cold, the wire-format payload makes the route still work.
+The seam to **system design** (`.aipe/study-system-design/`): the choice
+between "in-process Maps" and "Postgres on Supabase" is an architecture
+call — *which datastore.* That decision belongs in system-design, not
+here. This file's job was just to confirm that the *shape* of the data
+the app holds doesn't fight whatever store is chosen.
 
-A subtle access-pattern point: the `anomalies` Map exists because the wire-format bridge is **lossy**. The browser ships `Insight`, but the diagnostic agent wants `Anomaly` (with the raw evidence). When the in-memory `anomalies` Map has the right id, the route uses it (step 2) — full evidence, no loss. Only when the Map misses does the route fall through to the lossy conversion paths (steps 1, 3, 4). That priority ordering is exactly correct: prefer the highest-fidelity source, fall through to lower-fidelity ones with documented loss.
+What this codebase consciously doesn't do — and is right not to:
 
-What this repo would look like with Drizzle + Vercel Postgres: schema in `lib/db/schema.ts` (5-10 columns per table), migrations in `drizzle/`, a single-table `insights` with a JSONB `evidence` column, a related `investigations` table with FK to insights. The full Insight JSON would live in one row, every cold start would still find it, no wire-format bridge needed, no four-source fallback. The route handler would be simpler. The leak would retire (no conversion needed). The cost: dependency, migrations, a managed service. **The buildable target is well-shaped; it's just not the right call until the durability requirement is real.** Rein has shipped exactly this pattern in AdvntrCue (Postgres + Drizzle + Netlify Functions) — the playbook is in the portfolio.
+- **No Redis / Memcached.** A second cache layer would buy nothing; the
+  Maps are already in-process and the rate limit on the substrate (not
+  on us) is the constraint that matters.
+- **No relational DB.** Until the access pattern grows beyond
+  primary-key Map lookups, Postgres-on-Supabase would add ops burden
+  with no read-path benefit.
+- **No S3 / object storage.** Demo JSON is small enough to live in
+  git; agent output is ephemeral.
+
+What it does consciously and right:
+
+- **Substrate-as-truth.** The app owns nothing the substrate doesn't.
+  This is the entire justification for the no-DB choice — and it's the
+  property that, if violated, would force the choice to change.
+- **DataSource interface.** The `DataSource` abstraction
+  (`lib/data-source/types.ts`) means both adapters (Bloomreach, synthetic)
+  satisfy the same shape. A third adapter — say, a Postgres-backed
+  fixture for tests — would slot in without touching any caller.
+
+What to read next: `audit.md` for the consolidated checklist; the
+system-design study guide for the "which datastore" complement to this
+file.
+
+---
 
 ## Interview defense
 
-**Q: Walk me through the storage choice in this repo.**
-A: Three layers. **(1) Session-scoped in-memory** in `lib/state/insights.ts` — `Map<sessionId, SessionFeed>` where each `SessionFeed` is three inner Maps (`insights`, `anomalies`, `investigations`). Per-session isolation: one user's `putInsights` clears only that session's sub-maps. Reads are two-level `state.get(sessionId)?.insights.get(id)` (O(1) hash lookups). **(2) Committed demo seeds** (`lib/state/demo-*.json`) — git-tracked, durable forever; the demo path replays these as plain JSON. **(3) In-process synthetic fixture** (`lib/data-source/synthetic-data-source.ts`) — const literals returned through `DataSource.callTool()`, no PRNG, no disk; used by the live-synthetic mode for the real agent loop against fake data. Durability across Vercel cold starts: layer 1 dies, layers 2 and 3 always live (one is committed JSON, the other is bundled source). The route's `resolveAnomaly` walks four sources (wire-format param → per-session anomalies → per-session insights → demo seed) to bridge the layer-1 ephemeral gap.
+**Q: "Why no database?"**
 
-**Q: What's the wire-format bridge and why does it exist?**
-A: When the user clicks an insight on the briefing, the browser puts the entire Insight JSON in `sessionStorage` AND ships it back as a `?insight=<JSON>` URL param when navigating to the investigate page. The route prefers this param over its in-memory store. It exists because Vercel cold starts mean the in-memory store can't be trusted — a briefing computed on instance A may not be visible to instance B. Letting the browser carry the state across the cold-start boundary makes the route stateless-for-correctness while keeping the in-memory Maps as a pure optimization for warm hits. The cost is a long URL (~500 bytes) and the `insightToAnomaly` leak (the route converts the lossy `Insight` back to `Anomaly`, dropping 4 fields). Net: cheap, correct, no infrastructure.
+Verdict first: because every data tier the app *owns* is recomputable
+from the substrate. The substrate (Bloomreach) is the source of truth for
+events, customers, catalogs; the app never writes to it; every metric
+the UI shows is recomputed on demand. There's nothing to persist.
 
 ```
-  diagram while you talk
+  the test that decides "DB or no DB"
 
-  briefing page                        investigate page
-  ──────────────                       ─────────────────
-  click insight                        GET /api/agent?id=X&insight=<JSON>
-   ├ sessionStorage.set(insight)        │
-   └ navigate ──────────────────────────┴ resolveAnomaly walks 4 sources:
-                                          1. wire-format param  ★ durable
-                                          2. anomalies Map      (warm only)
-                                          3. insights Map       (warm only, lossy)
-                                          4. demo seed          ★ always available
-
-  the browser bridges the cold-start gap. no DB needed.
+  question:  is the data RECOMPUTABLE from upstream?
+                          │
+                          ▼
+                ┌─────────┴─────────┐
+              YES                 NO
+                │                   │
+                ▼                   ▼
+  in-memory cache is enough    real DB earns its keep
+                │
+                ▼
+  this codebase is here:
+    every metric → fresh EQL query
+    every Insight → fresh agent emission
+    every Diagnosis → fresh agent emission
+    losing the cache → next request rebuilds it
 ```
+
+Anchor: "the day a user can edit an insight — annotate, save, share —
+the answer flips and Postgres earns its keep. Until then the substrate
+IS the database."
+
+**Q: "What's the ceiling on this design?"**
+
+Verdict first: **cross-session reads.** The Map-of-Maps shape gives O(1)
+access within a session and nothing across sessions. The day the product
+wants "show me all critical insights from every customer today," that's
+a `WHERE severity = 'critical' AND created_at > ...` query — a full
+scan over every session's sub-map, with no secondary index to help.
+That's when I'd reach for Postgres.
+
+```
+  the ceiling, sketched
+
+  current access pattern:            ceiling pattern:
+  ────────────────────────           ──────────────────
+  by (sessionId, insightId)          by attribute (severity, date)
+            │                                   │
+            ▼                                   ▼
+        Map.get(id)                  WHERE severity = ...
+        O(1)                         needs a sorted index or
+                                     a real query engine
+```
+
+Anchor: "the buildable target is small — types.ts stays the source of
+truth, Drizzle generates the schema from it, the `putInsights` /
+`getInsight` functions become Postgres queries. Maybe a day of work
+when the access pattern flips, no architecture rewrite."
+
+**Q: "What's the riskiest tier?"**
+
+Verdict first: **the committed demo JSON**, because there's no test
+that re-validates it against the current types. Adding a required field
+to `Insight` would silently break the demo replay — the JSON would
+parse, the UI would render with the field undefined, no crash. The fix
+is a 30-line Vitest test that runs `isInsight` over every entry. The
+audit recommends it.
+
+```
+  the silent-drift risk
+
+  demo-insights.json (committed, frozen)
+            │
+            │  loaded via JSON.parse + cast (no validation)
+            ▼
+  rendered by UI assuming current Insight shape
+            │
+            │  if Insight.criticalNewField was added (required):
+            │    - JSON parses fine
+            │    - field is undefined
+            │    - UI renders with empty data
+            │    - no error logged
+            ▼
+  silent regression — only caught by manual inspection
+```
+
+Anchor: "loud failures are easy; silent ones are dangerous. The
+codebase has strong validators on LLM output but no validator on the
+demo JSON snapshots. That's the gap I'd close first if I owned this."
+
+---
 
 ## See also
 
-- `01-the-data-model-and-its-shape.md` — the entities stored in each layer; `WorkspaceSchema` dual derivation (Bloomreach + Synthetic).
-- `02-normalization-and-duplication.md` — the wire-format leak is now the load-bearing one (the schema-side fix shipped); session-scoped state makes a server-side lookup safe.
-- `04-transactions-and-integrity.md` — session-scoped sub-maps; the integrity invariants per layer.
-- `05-migrations-and-evolution.md` — git-evolves-types is the only migration story now.
-- `08-the-olist-relational-schema.md` — RETIRED. Historical second-domain.
-- `09-deterministic-synthetic-data.md` — RETIRED. Pattern still applies; anchors gone.
-- `11-in-process-synthetic-fixture.md` — the `SyntheticDataSource` pattern: same agent interface as the live adapter, const literals as the data.
-- `study-system-design/*` — the system-design side of this question (which datastore, scaling, replication).
-
----
+- [`00-overview.md`](./00-overview.md) — the whole storage picture in one
+  diagram
+- [`03-indexing-vs-query-patterns.md`](./03-indexing-vs-query-patterns.md)
+  — the Map shape that makes the in-process tier work
+- [`04-transactions-and-integrity.md`](./04-transactions-and-integrity.md)
+  — what enforces correctness without a DB-side check
+- [`05-migrations-and-evolution.md`](./05-migrations-and-evolution.md)
+  — type evolution as the migration story
+- [`audit.md`](./audit.md) — the consolidated checklist
+- `.aipe/study-system-design/` — the "which datastore" complement to
+  this file

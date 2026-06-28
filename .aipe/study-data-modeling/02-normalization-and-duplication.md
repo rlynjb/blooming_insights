@@ -1,532 +1,461 @@
-# Normalization and duplication
+# 02 — Normalization and duplication
 
-**Industry name(s):** Normalization · single source of truth · denormalization · the "same fact, two places" smell · derived data
-**Type:** Industry standard · Language-agnostic
-
-> The DB analog of information hiding. A normalized model stores each fact once; a denormalized one duplicates a fact deliberately to make a read faster. The original framing of this file (2026-06-01) was "this repo has no relational store, but the pattern shows up in the typed shapes — the **Insight↔Anomaly field-copy list** lives in three files and the round-trip is silently lossy." Two things have changed since then. **(1) The schema-side leak has been partly fixed**: `insightToAnomaly` is now colocated with `anomalyToInsight` in `lib/state/insights.ts`, a doc comment names the drop, and `test/state/insights.test.ts` carries the round-trip. The field-copy list now lives in *two* files (the interface and the colocated functions), not three, and the drift is tested. **(2) The brief 2026-06-16 second domain (Olist SQL, 3NF + FKs) is gone** as of PR #8 (commit 62c24d7). The "two relational analogs" framing is back to "one typed-shape analog"; the textbook 3NF contrast case no longer exists in this repo. This file still walks the schema-side story; the wire-format leak is still where the cost remains.
-
----
+**Single source of truth / deliberate denormalization · Industry standard**
 
 ## Zoom out, then zoom in
 
-**Zoom out — the bigger picture.** This concept lives at the **agent loop ↔ route handler ↔ state module** seam. The agent emits an `Anomaly`; the state module stores it as an `Insight`; the route handler converts back to `Anomaly` to feed a downstream agent. Three crossings, three implicit copies of the same field list — and only the first one (the interface in `types.ts`) is a single source.
+Normalization is the *data* analog of information-hiding in code: store
+every fact in exactly one place so it can't disagree with itself. The
+classic violation is the same row's `total` not matching `SUM(line_items)`
+— two places that hold the same fact, drifting apart over time.
 
 ```
-  Zoom out — where the duplication sits
+  Zoom out — where duplication can leak in this codebase
 
-  ┌─ Agent loop band ──────────────────────────────────────┐
-  │  monitoring agent emits Anomaly[]                       │
-  └──────────────────────────┬─────────────────────────────┘
-                             │ Anomaly[]
-  ┌─ State module band ──────▼─────────────────────────────┐
-  │  lib/state/insights.ts                                  │
-  │  anomalyToInsight()    ← COPY #1: 8 fields forward      │
-  │  insightToAnomaly()    ← COPY #2: 4 fields back (DROPS 4│
-  │                          — now colocated, doc-commented,│
-  │                          and tested in insights.test.ts)│
-  │  Map<sessionId, { insights, anomalies, investigations }>│
-  └──────────────────────────┬─────────────────────────────┘
-                             │ Insight to UI, then over the wire as
-                             │ ?insight=<JSON>, then back to route
-  ┌─ Route handler band ─────▼─────────────────────────────┐
-  │  app/api/agent/route.ts: resolveAnomaly()               │
-  │  → JSON.parse(?insight=) + insightToAnomaly()           │
-  │    (still drops 4 fields — the loss is now SHIPPED      │
-  │     across the URL, not just across modules)            │
-  └────────────────────────────────────────────────────────┘
-                  ▲
-                  │  AND in the background:
-                  │  lib/mcp/types.ts owns the canonical field list
-                  │  (the interface itself)  ← THE TRUTH SOURCE
+  ┌─ Substrate (Bloomreach / Synthetic) ─────────────┐
+  │  Raw events — owned by the substrate, not us     │
+  │  (we never duplicate these)                       │
+  └────────────────────┬─────────────────────────────┘
+                       │  agents query
+  ┌─ Agent + state layer ───────────────────────────┐
+  │  Anomaly  ──widen──►  Insight   ★ THIS CONCEPT ★ │ ← we are here
+  │  (raw)                (enriched + denormalized)   │
+  │                                                   │
+  │  Investigation { insightId, diagnosis,           │
+  │                  recommendations }                │
+  │  (also keyed by insightId)                        │
+  └────────────────────┬─────────────────────────────┘
+                       │  NDJSON stream
+  ┌─ UI ────────────────▼────────────────────────────┐
+  │  reads, never mutates → no duplication concern   │
+  └──────────────────────────────────────────────────┘
 ```
 
-**Zoom in — narrow to the concept.** The question this concept answers: when you add a field to `Anomaly`, how many files have to change in lock-step? In a fully normalized model, the answer is 1 (the interface). In the 2026-06-01 version of this repo, the answer was **3** (the interface, two conversion functions in two files) and TypeScript only caught the first. **Today the answer is 2** — the interface and one file (`lib/state/insights.ts`) that holds both conversions. The two functions can still drift from each other (TypeScript still can't catch the drop because the fields are optional), but the round-trip test in `test/state/insights.test.ts` does. The remaining problem is at the wire-format boundary: the route still reads the dropped fields off the URL param, the four-field projection is still the data that reaches the diagnostic agent. The schema's not the leak source anymore; the wire format is.
+Zoom in. There are exactly **two duplication policies** worth auditing in
+this repo: the deliberate `Anomaly` → `Insight` widening (denormalization
+for read speed) and a handful of accidental overlaps that the schema *could*
+let drift. The first is correct; the second is what the audit hunts.
 
 ---
 
-## Structure pass
-
-**Layers.** Same four-layer stack. The duplication sits at one seam (route ↔ state) plus a parallel "shadow store" pattern (`anomalies` Map alongside `insights` Map).
-
-**Axis: redundancy.** For each fact in the model, how many places store or copy it? Redundancy is the right axis because normalization is *literally* about counting copies. Pick any field — say `Anomaly.evidence` — and trace it: defined once in `types.ts`, copied once in `anomalyToInsight`, dropped silently in `insightToAnomaly`. Three locations involved, only two with the value. That count IS the audit.
-
-**Seams.** Three matter. **Seam 1: types.ts ↔ the field list.** Single owner — clean. **Seam 2: state ↔ route field-copy.** Same fact, two implementations — the leak. **Seam 3: `anomalies` Map ↔ `insights` Map.** A parallel store that holds the *same* anomaly twice — once as a raw `Anomaly`, once embedded as the copied fields inside `Insight`. That's a *deliberate* denormalization (the route needs the raw evidence back for the diagnostic agent), but it isn't documented as one.
+## Structure pass — the axis is "who can mutate this fact?"
 
 ```
-  Structure pass — redundancy across seams
+  Trace the mutation axis — for any duplicated fact, ask:
 
-  ┌─ 1. LAYERS ──────────────────────────────────────────────┐
-  │  UI · Route · Agent loop · MCP wrapper                    │
-  └─────────────────────────────┬────────────────────────────┘
-                                │  pick the axis
-  ┌─ 2. AXIS ──────────────────▼─────────────────────────────┐
-  │  redundancy: how many places store or copy this fact?     │
-  │  1 = normalized; 2+ = denormalized (intentional or leak)  │
-  └─────────────────────────────┬────────────────────────────┘
-                                │  trace across seams
-  ┌─ 3. SEAMS ─────────────────▼─────────────────────────────┐
-  │  S1: types.ts owns the field list      ★ NORMALIZED       │
-  │  S2: state ↔ route field-copy          ★ LEAKED (the bug) │
-  │  S3: anomalies Map ↔ Insight fields    ★ DENORMALIZED     │
-  │                                          (intentional)    │
-  └─────────────────────────────┬────────────────────────────┘
-                                ▼
-                        Block 4 — How it works
+  ┌─ source of truth ─┐    seam     ┌─ derived copy ────┐
+  │ ★ MUTABLE here ★  │ ═══════════►│ READ-ONLY here    │   safe (cache)
+  └───────────────────┘             └───────────────────┘
+
+  ┌─ original ────────┐    seam     ┌─ derived copy ────┐
+  │ MUTABLE here      │ ═══════════►│ ★ ALSO MUTABLE ★  │   RED FLAG
+  └───────────────────┘             └───────────────────┘
+                                    (drift possible)
 ```
+
+A duplication is safe when only one side can be written. The Insight
+widening is safe (the agent never re-edits an Anomaly after emitting it).
+The places where two writers exist — the audit names them in
+`audit.md`.
 
 ---
 
 ## How it works
 
-### Move 1 — duplication, three flavors
+### Move 1 — the mental model
 
-You know how a Postgres view is just a pre-computed SELECT — same data as the base tables, surfaced in a friendlier shape? That's *intentional* denormalization. Now imagine someone wrote that view as a triggered INSERT into a second table, and then someone else wrote a different INSERT into a third table that has *almost* the same columns but drops a few. The three tables drift; nothing connects them at the schema level. That's the leak. Same shape here, except the "tables" are TypeScript interfaces and the "INSERTs" are conversion functions.
-
-```
-  three flavors of duplication — and which one is which here
-
-  FLAVOR              DEFINITION                       IS IT A PROBLEM?
-  ──────────────────  ───────────────────────────────  ────────────────────
-  normalized          fact lives in 1 place            no — this is the goal
-  denormalized        fact deliberately copied for     no IF documented and
-  (intentional)       a read-path performance win        single-source-of-truth
-                                                         is named
-  leaked              same fact in N files, no single  YES — invariant has
-  (accidental)        owner, no enforcement that they    no enforcer; drift
-                      agree                              is invisible
-```
-
-In this repo:
-
-- The `Insight` interface itself **(normalized)** — types.ts is the truth source for the field list.
-- The `anomalies` Map alongside the `insights` Map **(intentional denormalization)** — the route needs the raw `Anomaly` back to feed the diagnostic agent, and copying-into-Insight is lossy by design (the headline gets derived, the evidence stays opaque). Storing both is *correct*. It just isn't named as a deliberate denormalization in the code.
-- The Insight↔Anomaly field-copy across `anomalyToInsight` and `insightToAnomaly` **(leaked)** — the field list is implicitly co-owned by two functions, and TypeScript can't enforce that they agree.
-
-### Move 2 — the worst case, walked (UPDATED — fix has landed in code)
-
-The Insight↔Anomaly field-copy list. **Two locations now (was 3), only one is the truth source. The drift is now tested.**
+Think of it like the `useState` + `useMemo` pattern in React. You don't
+re-derive `expensive(x)` on every render; you cache it. But you also don't
+let the cache go stale — the cache key depends on the source. Same idea
+here: `Insight` is a `useMemo`-style derived view of `Anomaly`, materialized
+into the store so the UI doesn't recompute it on every render.
 
 ```
-  the field list — two locations, with the test as the third enforcer
+  The widening pattern — one source of truth, one derived view
 
-  ┌─ lib/mcp/types.ts ─────────────────────────┐
-  │  interface Anomaly {                        │
-  │    metric, scope, change, severity,         │  ← TRUTH SOURCE
-  │    evidence, impact?, history?, category?   │     (the 8 fields)
-  │  }                                          │
-  └─────────────────────────────────────────────┘
-                       │
-        ┌──────────────┴───────────────┐
-        │                              │  both colocated in
-        ▼                              ▼  lib/state/insights.ts
-  ┌─ anomalyToInsight ──┐    ┌─ insightToAnomaly ──┐
-  │ COPIES ALL 8:       │    │ COPIES 4:           │
-  │   severity          │    │   metric            │
-  │   metric            │    │   scope             │
-  │   change            │    │   change            │
-  │   scope             │    │   severity          │
-  │   evidence          │    │ DROPS 4 (deliberate│
-  │   impact            │    │   per the doc       │
-  │   history           │    │   comment on L47-52)│
-  │   category          │    │   evidence          │
-  │                     │    │   impact            │
-  │ + derives 5 more    │    │   history           │
-  │ + deriveInsightFields│   │   category          │
-  └─────────┬───────────┘    └─────────┬───────────┘
-            │                          │
-            └────────────┬─────────────┘
-                         │
-                         ▼
-              ┌─ test/state/insights.test.ts ─┐
-              │  round-trip suite — catches    │  ← THIRD ENFORCER
-              │  drift on every future change  │     (the test)
-              └────────────────────────────────┘
-   lib/state/insights.ts L25–L55 (both functions, same module)
+         ┌──────────────┐
+         │   Anomaly    │   the FACT (what changed, by how much)
+         │   (source)   │   minimal contract for the diagnostic agent
+         └──────┬───────┘
+                │  anomalyToInsight (lib/state/insights.ts:25)
+                │   ├─ mints an id
+                │   ├─ derives headline + summary from change
+                │   ├─ runs deriveInsightFields → revenueImpact when applicable
+                │   └─ copies evidence/impact/history/category verbatim
+                ▼
+         ┌──────────────┐
+         │   Insight    │   the VIEW (what the UI renders)
+         │  (derived)   │   superset of Anomaly + display fields
+         └──────────────┘
+
+         BOTH are kept in the session Map, indexed by the same id.
+         Anomaly is the input the diagnostic agent needs;
+         Insight is what the feed and the investigate page render.
 ```
 
-**What breaks if you add `affectedCustomers` to `Anomaly` (updated trace):**
+The rule: derived data is fine to materialize when (a) the derivation isn't
+free, (b) the source never mutates after creation, (c) the cost of storing
+both is bounded. All three hold here.
 
-```
-  the change-amplification trace, today
+### Move 2 — the duplication policies, one at a time
 
-  1. lib/mcp/types.ts            ← interface change
-     ✓ TypeScript demands every Anomaly literal include the field
-     ...UNLESS the field is marked optional. If optional, the compiler
-     stays quiet. Both functions still compile.
+#### **Policy 1: `Anomaly` → `Insight` widening (deliberate, correct)**
 
-  2. lib/state/insights.ts       ← add copy line in anomalyToInsight
-                                    AND in insightToAnomaly (if you
-                                    want it carried back). BOTH in
-                                    the same file now.
-     ✗ TypeScript does NOT enforce this.
-     ✓ The round-trip test in test/state/insights.test.ts WILL fail
-       if the field roundtrips lossy — drift is caught at test time
-       instead of at "two days later in production."
+The most visible duplication is also the cheapest to defend. Read the
+widening function with the headers in mind:
 
-  RESULT: the test is the integrity check the compiler can't be.
-  This is the same shape as relational integrity: a CHECK constraint
-  is what a NOT NULL constraint would be at compile time, but
-  enforced at insert time. Here the round-trip test is the CHECK
-  constraint at commit time.
-```
-
-This is still **change amplification** — but now bounded: one file's worth of edits, with a test gate. The fix is the textbook way to retire a multi-place field-copy: colocate, then assert the invariant. What it did NOT retire: the wire format still sends and receives the full `Insight` JSON via `?insight=`, the route still calls `insightToAnomaly()` on the parsed param, and the four-field projection is still what reaches the diagnostic agent. The smell moved from "schema duplicated across files" to "schema's lossy projection is the wire contract." See the next sub-section.
-
-### Move 2.5 — the wire format is now the leak source
-
-The route handler's `resolveAnomaly()` in `app/api/agent/route.ts` (L35–L60) walks four sources to find the anomaly the user clicked. The **first** source — the highest-priority one — is `?insight=<JSON>` from the browser's `sessionStorage`. The browser ships the full Insight; the route runs `JSON.parse` + the 4-field shape check + `insightToAnomaly`; the 4-field projection is what feeds the diagnostic agent. The other three sources (per-session `anomalies` Map, per-session `insights` Map, demo seed) ALL eventually call `insightToAnomaly` too when the raw Anomaly isn't available.
-
-```
-  the wire-format-as-leak — what's actually shipped vs what survives
-
-  ┌─ briefing page ───────────────────────────────────────┐
-  │  insight = { id, timestamp, severity, headline,         │
-  │              summary, metric, change, scope, source,    │
-  │              evidence:[...], impact:"...", history:[...],│
-  │              category:'revenue_drop',                   │
-  │              revenueImpact:{...}, aov:{...}, funnel:{...}}│
-  │              ← 12+ fields                               │
-  │  sessionStorage.setItem('selectedInsight', JSON(insight))│
-  │  navigate(`/investigate?id=X&insight=${encodeURIComponent(JSON(insight))}`)│
-  └──────────────────────────┬──────────────────────────────┘
-                             │ URL carries the full JSON (~500-2000 bytes)
-                             ▼
-  ┌─ route handler ───────────────────────────────────────┐
-  │  resolveAnomaly:                                        │
-  │    JSON.parse(insightParam)            ← full Insight    │
-  │    isPlausibleInsight(parsed)?         ← 4-field check   │
-  │    return insightToAnomaly(parsed)     ← DROPS 4 FIELDS │
-  │                                          (evidence,      │
-  │                                           impact, history,│
-  │                                           category)      │
-  └──────────────────────────┬──────────────────────────────┘
-                             │ Anomaly with empty evidence[]
-                             ▼
-  ┌─ diagnostic agent ────────────────────────────────────┐
-  │  sees: metric, scope, change, severity, evidence=[]    │
-  │  does NOT see: the original evidence that found this   │
-  │                anomaly. has to re-query the data.       │
-  └────────────────────────────────────────────────────────┘
+```typescript
+// lib/state/insights.ts:25-45
+export function anomalyToInsight(a: Anomaly): Insight {
+  const id = crypto.randomUUID();
+  const sign = a.change.direction === 'down' ? '-' : '+';
+  const headline = `${a.scope.join(' ')} ${a.metric} · ${sign}${Math.abs(a.change.value)}%`.toLowerCase();
+  return {
+    id,
+    timestamp: new Date().toISOString(),
+    severity: a.severity,
+    headline,
+    summary: `${a.metric} ${a.change.direction} ${Math.abs(a.change.value)}% vs ${a.change.baseline}`.toLowerCase(),
+    metric: a.metric,
+    change: a.change,
+    scope: a.scope,
+    source: 'monitoring',
+    evidence: a.evidence,
+    impact: a.impact,
+    history: a.history,
+    category: a.category,
+    ...deriveInsightFields(a),
+  };
+}
 ```
 
-The four dropped fields traveled across the URL, hit the route, and got thrown away. The diagnostic agent then has to re-discover the same evidence with a fresh tool call — a wasted round-trip against a 1 req/s rate limit. The schema-side fix retired the *invisible* loss; the wire-format-side loss is **visible** (the code comment names it) but still costly. The next move is to fix the wire format to ship `?id=<insightId>` and rely on the per-session `anomalies` Map for the lookup. The session-scoped state (file 04) makes that lookup safe — different users no longer share a single map.
+Annotation by line:
 
-### Move 2 — the intentional denormalization (not a bug)
-
-The `anomalies` Map in `lib/state/insights.ts` (L6) stores raw `Anomaly` objects keyed by `Insight.id`. The route handler reaches for it via `getAnomaly(insightId)` (L48) when the user clicks an insight and the diagnostic agent needs to investigate. This is a denormalization — every `Anomaly`'s data is *also* stored embedded inside its `Insight`. Why not just walk back from `Insight`?
-
-```
-  why the parallel store exists
-
-  ┌─ Anomaly ──────────────┐
-  │ metric, scope, change, │
-  │ severity, evidence,    │
-  │ impact?, history?,     │
-  │ category?              │  ← 8 fields, fully agent-emitted
-  └────────────┬───────────┘
-               │ anomalyToInsight
-               ▼
-  ┌─ Insight ──────────────┐
-  │ id, timestamp, ...     │
-  │ severity, metric,      │
-  │ change, scope,         │
-  │ evidence?, impact?,    │  ← 4 of 8 carried (when present)
-  │ history?, category?    │
-  │ + headline, summary,   │
-  │   source               │  ← 3 derived from Anomaly fields
-  │ + revenueImpact?, ...  │  ← 6 derived/optional Tier 1 fields
-  └────────────────────────┘
-
-  reverse path: Insight → Anomaly would require:
-    - reversing the headline derivation  (lossy — capitalization, spacing)
-    - reversing the summary derivation   (lossy)
-    - reconstructing evidence            (POSSIBLE — it's carried forward)
-    - reconstructing the raw structure   (NO — evidence's `result: unknown`
-                                          is opaque to the conversion)
-
-  so the parallel store is correct: the agent's raw Anomaly is the
-  source of truth for evidence and the diagnostic agent wants it
-  intact. storing both IS the right call. it just isn't named as a
-  deliberate denormalization in the code.
-```
-
-What breaks if `anomalies` and `insights` Maps drift out of sync — say `putInsights` inserts an Insight but the parallel `anomalies` set fails halfway: `getAnomaly()` returns null for an insightId that has a valid `getInsight()` answer, and the route handler falls back to `insightToAnomaly` (the lossy path). That's an integrity invariant the in-memory store has no way to enforce (file 04 picks this up).
-
-### Move 2 — the derived-field denormalization
-
-`Insight` has 6 derived fields (`revenueImpact`, `aov`, `funnel`, `affectedCustomers`, `history`, `downstreamReady`). The "source" for each is either the agent's evidence or a separate agent's output. `deriveInsightFields()` in `lib/insights/derive.ts` computes one of them (`revenueImpact`) from `Anomaly.evidence` at write time; the others are either agent-emitted or denormalized from a downstream call (`affectedCustomers` is "denormalized from Diagnosis.affectedCustomers.count" per the comment at types.ts L58).
+- **L26 `crypto.randomUUID()`** — the `id` doesn't exist on `Anomaly`; it's
+  minted here. This is the join key downstream (Diagnosis, Recommendation,
+  AgentEvent cache all use it).
+- **L27–28 `headline` + `summary`** — *derived strings* from
+  `change.direction` + `change.value`. The fact (`change`) is also kept in
+  full one field down. Why both? The headline is a presentation choice
+  (lowercased, sign-prefixed) that's easier to compute once than re-format
+  in every card render.
+- **L31 `change: a.change`** — copied **by reference**. The source object
+  is shared, not cloned. Safe because nobody mutates an `Anomaly` after
+  emit, but it means a future mutation here would leak into the `Insight`.
+  See audit.md → integrity.
+- **L33–37 evidence/impact/history/category** — *passed through unchanged*.
+  Same fields, same names, same shapes. This is the "no transformation"
+  duplication.
+- **L38 `...deriveInsightFields(a)`** — spreads in `revenueImpact` (and
+  future business-owner fields) computed from the evidence. Fully derived
+  — no new facts, just re-shaped existing ones.
 
 ```
-  derived fields — who owns them, in priority order
+  What's duplicated, and what its policy is
 
-  field              source                              who owns it
-  ──────────────     ────────────────────────────        ──────────────────
-  revenueImpact?     COMPUTED from Anomaly.evidence      derive.ts (one place)
-                     at write time
-                     (only when metric matches REVENUE_RE
-                      AND direction === 'down')
-
-  aov?               agent-emitted (no derivation fn)    monitoring agent
-  funnel?            agent-emitted                       monitoring agent
-  history?           agent-emitted                       monitoring agent
-                     OR copied from Anomaly.history      anomalyToInsight
-                                                          (when present)
-
-  affectedCustomers? DENORMALIZED from                   the comment names it;
-                     Diagnosis.affectedCustomers.count   no code path actually
-                                                         denormalizes it today.
-                                                         the field exists on
-                                                         Insight; nothing
-                                                         writes it.
-
-  downstreamReady?   agent-route-stamped                 the route that runs
-                                                         the investigation
+  field         | Anomaly       | Insight       | policy
+  ──────────────┼───────────────┼───────────────┼──────────────────────
+  metric        | yes (source)  | yes (verbatim)| pass-through
+  scope[]       | yes (source)  | yes (verbatim)| pass-through
+  change{}      | yes (source)  | yes (verbatim)| pass-through (shared ref)
+  severity      | yes (source)  | yes (verbatim)| pass-through
+  evidence[]    | yes (source)  | yes (verbatim)| pass-through (shared ref)
+  impact?       | yes (source)  | yes (verbatim)| pass-through
+  history?      | yes (source)  | yes (verbatim)| pass-through
+  category?     | yes (source)  | yes (verbatim)| pass-through
+  headline      |       —       | DERIVED       | computed from change/scope
+  summary       |       —       | DERIVED       | computed from change/baseline
+  id            |       —       | MINTED        | randomUUID
+  timestamp     |       —       | MINTED        | now()
+  revenueImpact?|       —       | DERIVED       | from evidence[].current/prior
 ```
 
-What breaks: the comment says `affectedCustomers` is denormalized from `Diagnosis`, but no function in the repo actually does this denormalization (grep for `affectedCustomers =` finds zero writes). The field is declared, the comment is aspirational, the code path doesn't exist. This is a **mid-migration shape** — the interface has been extended for a future write path that hasn't shipped. File 05 covers the pattern (interfaces leading the code).
+The verdict on this duplication: **safe and right.** Anomalies are
+emitted once at briefing time and never mutated; Insights are
+write-once-per-briefing too (the `putInsights` function clears the
+session sub-map and rebuilds). The lifecycle is "create both together,
+read until next briefing, discard both together." There's nowhere for
+them to drift.
 
-### Move 2 — the dual-shape Diagnosis (a normalization smell)
+Reverse mapping exists too:
 
-The `Diagnosis` interface in `types.ts` has rich `hypothesesConsidered: { hypothesis, supported, reasoning }[]`. The nested `Investigation.diagnosis` shape (also in `types.ts`) has `hypothesesConsidered: string[]`. Same name, different schema.
+```typescript
+// lib/state/insights.ts:52-55
+export function insightToAnomaly(i: Insight): Anomaly {
+  return { metric: i.metric, scope: i.scope, change: i.change, severity: i.severity, evidence: [] };
+}
+```
+
+This deliberately **drops** evidence/impact/history/category — the comment
+above it states the policy: the diagnostic agent only needs
+`metric/scope/change/severity` to investigate; the rest is regenerated
+downstream. That's information-hiding done well — the diagnostic agent
+can't *accidentally* depend on a field that wasn't part of its contract.
+
+#### **Policy 2: `Insight.affectedCustomers` denormalized from `Diagnosis.affectedCustomers.count`**
+
+This is the duplication worth scrutinizing. The same number lives in two
+places:
+
+```typescript
+// lib/mcp/types.ts:58
+affectedCustomers?: number; // denormalized from Diagnosis.affectedCustomers.count
+
+// lib/mcp/types.ts:99
+affectedCustomers?: { count: number; segmentDescription: string };
+```
+
+`Insight.affectedCustomers` is a *number*; `Diagnosis.affectedCustomers`
+is an object with `{count, segmentDescription}`. The number on `Insight`
+is meant to be the `count` from the diagnosis, copied up so the feed card
+can render "9,340 customers affected" without loading the investigation.
 
 ```
-  the dual-shape smell
+  The denormalization chain
 
-  standalone Diagnosis (types.ts L95–L104)
-    hypothesesConsidered: { hypothesis: string;
-                            supported: boolean;
-                            reasoning: string }[]
+  Diagnosis.affectedCustomers.count  ── (sometime later) ──►  Insight.affectedCustomers
+       │                                                            │
+       │   source of truth (diagnostic agent emits this)             │   cached copy (feed card reads)
+       │                                                            │
+       └──────────────── must stay in sync ─────────────────────────┘
 
-  embedded in Investigation (types.ts L132–L141)
-    diagnosis: {
-      conclusion: string;
-      evidence: string[];
-      hypothesesConsidered: string[];        ← LOSSY projection
-    }
-
-  what happens when you flatten:
-    { hypothesis: "X", supported: true, reasoning: "Y is up 30%" }
-      → "X"  (just the hypothesis string)
-    you lose the supported flag and the reasoning paragraph.
-
-  is this a deliberate projection or a drift?
-    - if deliberate: rename to DiagnosisSummary, write the projection fn,
-      have one place own it
-    - if drift: replace Investigation.diagnosis with the full Diagnosis
-      type, accept the breaking change in any stored Investigation
-
-  current state: same name, different shape — the worst of both worlds.
+  The risk: there's no code in the repo today that writes
+  Insight.affectedCustomers FROM Diagnosis. The comment says
+  "denormalized from" but the wiring isn't enforced — it's set
+  when the agent emits the insight, before diagnosis exists.
 ```
+
+This one is **safe in practice today but structurally weak.** The
+monitoring agent emits `Insight.affectedCustomers` based on its own
+estimate (from `Anomaly.evidence`); the diagnostic agent later emits
+`Diagnosis.affectedCustomers` based on its deeper investigation. They can
+*and do* disagree — the monitoring estimate is rough, the diagnosis is
+refined. The comment "denormalized from Diagnosis" is aspirational, not
+enforced.
+
+The fix that would close the loop: when diagnosis finishes, write its
+count back to the Insight (a real denormalization with a single writer
+path). Until that exists, treat the two values as *independent
+estimates*, not one canonical fact. The audit flags this.
+
+#### **Policy 3: the demo JSON files duplicate live state shape**
+
+`lib/state/demo-insights.json` (665 lines) and
+`lib/state/demo-investigations.json` (3,487 lines) hold a frozen snapshot
+of what a real briefing produced. The duplication is **schema duplication**
+— the JSON is *shaped* like `Insight[]` / `Investigation` because it was
+written that way by the capture script. The runtime types and the
+committed JSON must agree, or the demo replay breaks.
+
+```
+  Demo JSON as a frozen "view" of the live type system
+
+  lib/mcp/types.ts          ─── must agree ───►   lib/state/demo-insights.json
+       │                                                  │
+       │  source of truth                                 │  derived snapshot
+       │  (the TypeScript types)                          │  (committed JSON)
+       │                                                  │
+       └──── add a required field on Insight, ────────────┘
+             and the demo snapshot stops validating;
+             the demo branch in production breaks.
+
+  Migration discipline: new fields are OPTIONAL so old snapshots
+  still parse. See 05-migrations-and-evolution.md.
+```
+
+The duplication is *safe by discipline*, not by enforcement — there's no
+test that re-validates the demo JSON against the current `Insight` type
+on every commit. Adding a required field today would break the demo
+silently (the JSON would parse as a plain object, the field would be
+`undefined`, and the UI would render empty). The discipline is:
+**every new `Insight` field lands as optional, full stop.** The audit
+notes that this discipline could be enforced as a test.
+
+#### **Policy 4: the `evidence` field is overloaded**
+
+This isn't duplication of data; it's duplication of the **name**:
+
+```typescript
+// lib/mcp/types.ts:48
+evidence?: { tool: string; result: unknown }[];     // Insight.evidence — tool envelopes
+
+// lib/mcp/types.ts:88
+evidence: { tool: string; result: unknown }[];      // Anomaly.evidence — same shape
+
+// lib/mcp/types.ts:97
+evidence: string[];                                  // Diagnosis.evidence — markdown bullets
+```
+
+Two different shapes, same field name, all live in `types.ts`. A reader
+sees `evidence` in a function signature and has to look at the surrounding
+type to know which one it is. The audit flags this as a minor renaming
+opportunity (e.g. `Diagnosis.evidence` → `Diagnosis.evidenceBullets`); it
+hasn't bitten anyone yet because the consumer code is short.
 
 ### Move 3 — the principle
 
-Normalization is information hiding for data. The test is the same: **search the codebase for the field list and count occurrences.** One = normalized. Two with one of them named as a deliberate denormalization = correct denormalization. Two or three with no single owner = a leak. In this repo, the `Insight` field list occurs in three files (types, state, route); two of them are not enforced by the compiler. That's the audit, and it's exactly the same finding the software-design audit names — the lens is different (data shape vs information hiding), the bug is the same.
+**Denormalization is a cache, not a redefinition.** When you duplicate a
+fact deliberately — `Insight` carrying both `change` and `headline`, or
+`affectedCustomers` appearing on both `Insight` and `Diagnosis` — the
+right framing is: *there is one source of truth and one or more derived
+views, and the views can be rebuilt from the source.*
 
-### Code in this codebase
+The discipline that keeps denormalization safe is **a single writer per
+derived view, and a clear path back to the source.** The
+`anomalyToInsight` widening is a textbook example — one function does the
+copy, no other code path mutates the derived view. The
+`Insight.affectedCustomers` policy is the textbook counter-example today —
+two independent writers, no enforcement that they agree.
 
-The repo anchors for what Move 2 walked — both copy functions colocated, the parallel-Maps denormalization, and the derived-field projection.
-
-#### Both copy functions, now colocated
-
-```
-lib/state/insights.ts  (lines 25–55)
-
-  export function anomalyToInsight(a: Anomaly): Insight {
-    const id = crypto.randomUUID();
-    const sign = a.change.direction === 'down' ? '-' : '+';
-    const headline = `${a.scope.join(' ')} ${a.metric} · ${sign}${Math.abs(a.change.value)}%`.toLowerCase();
-    return {
-      id, timestamp: new Date().toISOString(),
-      severity: a.severity,        ← COPY
-      headline,                     ← derived
-      summary: ...,                 ← derived
-      metric: a.metric,             ← COPY
-      change: a.change,             ← COPY
-      scope: a.scope,               ← COPY
-      source: 'monitoring',         ← stamped
-      evidence: a.evidence,         ← COPY
-      impact: a.impact,             ← COPY
-      history: a.history,           ← COPY
-      category: a.category,         ← COPY
-      ...deriveInsightFields(a),    ← +5 derived (currently only revenueImpact)
-    };
-  }
-
-  /**
-   * Reverse mapper. Intentionally drops evidence/impact/history/category —
-   * the agent loop only needs metric/scope/change/severity to investigate;
-   * the rest is regenerated downstream. The dropped fields are tested in
-   * test/state/insights.test.ts (round-trip suite).
-   */
-  export function insightToAnomaly(i: Insight): Anomaly {
-    return { metric: i.metric, scope: i.scope, change: i.change,
-             severity: i.severity, evidence: [] };
-  }
-       │
-       └─ both functions, one module, one doc comment naming the drop.
-          the test/state/insights.test.ts round-trip catches drift on every
-          future change. the schema-side leak is retired.
-```
-
-#### The intentional denormalization — the parallel Maps
-
-```
-lib/state/insights.ts  (lines 4–6, 30–42)
-
-  const insights = new Map<string, Insight>();
-  const investigations = new Map<string, Investigation>();
-  const anomalies = new Map<string, Anomaly>();   ← parallel store
-       │
-       │ no comment names why the parallel exists. it's because:
-       │   - Insight is lossy (evidence stays carried but everything
-       │     else is derived/denormalized)
-       │   - the diagnostic agent wants the original Anomaly
-       │   - so we keep both, keyed by the same id
-       │
-       └ add a one-line comment: "raw Anomaly kept alongside Insight
-         so the diagnostic agent can investigate from the original
-         agent output (Insight is a UI-friendly enriched view)."
-
-  export function putInsights(items: Insight[], rawAnomalies?: Anomaly[]): void {
-    insights.clear();
-    anomalies.clear();
-    items.forEach((i, idx) => {
-      insights.set(i.id, i);
-      if (rawAnomalies?.[idx]) anomalies.set(i.id, rawAnomalies[idx]);
-    });
-  }
-       │
-       └─ the parallel insert. the integrity invariant: every key in
-          `insights` should have a matching key in `anomalies` IF
-          rawAnomalies is passed. file 04 picks up what enforces that.
-```
-
-#### The derived-field denormalization — revenueImpact
-
-```
-lib/insights/derive.ts  (lines 27–40)
-
-  const REVENUE_RE = /revenue|sales|gmv|total_price|spend/i;
-
-  export function deriveInsightFields(anomaly: Anomaly): Partial<Insight> {
-    const out: Partial<Insight> = {};
-    const cp = findCurrentPrior(anomaly.evidence);   ← scan evidence array
-    if (cp && REVENUE_RE.test(anomaly.metric) && anomaly.change.direction === 'down') {
-      out.revenueImpact = {
-        lostUsd: Math.round(cp.current - cp.prior),   ← computed at write time
-        expectedUsd: Math.round(cp.prior),
-        currency: 'USD',
-      };
-    }
-    return out;
-  }
-       │
-       └─ this IS the denormalization: revenueImpact is a stored projection
-          of evidence + metric + change. computed once at write, read N times
-          by the UI. correct denormalization — the input (evidence) is also
-          kept on the Insight, so the projection is reproducible if the rules
-          change. (the agent can also emit revenueImpact directly; precedence
-          is "spread last wins" — the derived value overrides the agent's.)
-```
+The generalisation: every cache needs an invalidation story. In a DB
+world that's "delete the row when the source changes." Here it's "the
+session sub-map gets cleared on every new briefing" (`putInsights` line
+65). The cache lifetime IS the invalidation strategy — and it works
+because the briefing is the natural unit of consistency.
 
 ---
 
 ## Primary diagram
 
-The duplication audit, ranked.
+The deliberate vs accidental duplications in one frame.
 
 ```
-  Normalization audit — ranked
+  Duplication map for blooming_insights
 
-  NORMALIZED (good)
-  ─────────────────────────────────────────────────────────────
-  1. The interface definitions in types.ts
-     8 interfaces, one file, single source of truth for the model.
+  ┌─ STATE LAYER ──────────────────────────────────────────────────────┐
+  │                                                                    │
+  │   ┌──────────────┐  anomalyToInsight  ┌──────────────┐             │
+  │   │   Anomaly    │ ──────────────────►│   Insight    │ ◄────┐      │
+  │   │  (source)    │  SAFE: 1 writer    │  (view)      │      │      │
+  │   └──────────────┘  source immutable  └──────────────┘      │      │
+  │                                              ▲              │      │
+  │                                              │              │      │
+  │                                              │ id           │      │
+  │                                              │              │      │
+  │   ┌──────────────────────────┐               │              │      │
+  │   │       Diagnosis          │   .affectedCustomers.count   │      │
+  │   │                          │   ─ ─ ─ ─ aspirationally ─ ─ ┘      │
+  │   │  affectedCustomers:{     │   denormalized into                 │
+  │   │    count, segmentDesc }  │   Insight.affectedCustomers         │
+  │   └──────────────────────────┘   but NOT enforced — RED FLAG       │
+  │                                                                    │
+  │  evidence overloaded across Anomaly/Insight/Diagnosis (naming      │
+  │  duplication, not data duplication) — minor; rename candidate.     │
+  │                                                                    │
+  └─────────────────┬──────────────────────────────────────────────────┘
+                    │  capture script writes
+                    ▼
+  ┌─ COMMITTED JSON (demo replay) ─────────────────────────────────────┐
+  │                                                                    │
+  │  demo-insights.json + demo-investigations.json                     │
+  │  shape duplicates types.ts — must stay in sync                     │
+  │  protected by the "new fields are optional" discipline only        │
+  │  RED FLAG (latent): no test re-validates JSON against the types    │
+  │                                                                    │
+  └────────────────────────────────────────────────────────────────────┘
 
-  2. The CATEGORIES registry in lib/agents/categories.ts
-     10 rows, one file. Both the agent prompts (via the checklist)
-     and the coverage gate read from this one source.
-
-  3. The schemaCapabilities projection
-     Set<string> is computed once from WorkspaceSchema; coverageFor
-     reads it. No fact about "what events the workspace has" is
-     stored twice.
-
-  INTENTIONAL DENORMALIZATION (correct, but undocumented)
-  ─────────────────────────────────────────────────────────────
-  1. anomalies Map alongside insights Map (lib/state/insights.ts L6)
-     The raw Anomaly is kept so the diagnostic agent can have the
-     evidence intact. Correct — but not commented as a deliberate
-     denormalization. Add a one-line comment.
-
-  2. The Insight headline + summary + derived fields
-     Computed once at write time, stored on the Insight, read N
-     times by the UI. Correct: the alternative is recomputing on
-     every render.
-
-  LEAKED (debt — drift is invisible)
-  ─────────────────────────────────────────────────────────────
-  1. Insight↔Anomaly field-copy list                ★ WORST
-     three locations:
-       lib/mcp/types.ts                  (the interface)
-       lib/state/insights.ts L8–L28      (anomalyToInsight)
-       app/api/agent/route.ts L29–L31    (insightToAnomaly DROPS 4)
-     fix: colocate both functions in lib/state/insights.ts; write
-          a round-trip test; OR fix the wire format so the route
-          accepts just the insightId (no conversion needed).
-
-  2. Diagnosis vs Investigation.diagnosis           ★ DUAL-SHAPE
-     same name, different schema. types.ts L95 vs L132.
-     fix: rename the embedded one DiagnosisSummary and write the
-          projection function; or unify on the full Diagnosis.
-
-  3. affectedCustomers ghost-field
-     declared on Insight (types.ts L59), commented as "denormalized
-     from Diagnosis", no code path actually writes it.
-     fix: ship the write path or remove the field until it's wired.
+  Verdict:
+    SAFE     — Anomaly → Insight widening (single writer, source immutable)
+    LATENT   — Insight.affectedCustomers vs Diagnosis.affectedCustomers.count
+               (two independent estimates, no enforcement they agree)
+    LATENT   — demo JSON vs types.ts (discipline-protected, not test-enforced)
+    COSMETIC — `evidence` field name reused across three types
 ```
 
 ---
 
 ## Elaborate
 
-The deeper pattern here is that **derived-field denormalization with no precedence rule is itself a leak.** `Insight.revenueImpact` can be set by three paths: (a) the monitoring agent emits it in the JSON; (b) `deriveInsightFields()` computes it from evidence; (c) some future code might compute it from the diagnostic agent's output. Today the precedence is whatever-runs-last-wins (the spread `...deriveInsightFields(a)` in `anomalyToInsight` overrides whatever the agent emitted). That's an implicit rule. A future contributor adding the third path would have to reverse-engineer which wins. Make it explicit: name a single owner per derived field and stamp the others as fallbacks.
+Where this comes from: Codd's normal forms (1NF, 2NF, 3NF) are about
+preventing update anomalies — the same fact in two rows lets you update
+one and forget the other. Denormalization for read speed is the
+deliberate inverse, recognized as a real pattern under names like
+"materialized view," "read model" (in CQRS), or "denormalized cache."
 
-The Insight↔Anomaly leak is *also* a wire-format leak in disguise. The reason the route handler converts `Insight` back to `Anomaly` is that the browser ships the entire `Insight` JSON in a query parameter (`?insight=...`) when navigating to the investigate page. The route doesn't trust that the in-memory `anomalies` Map will have the entry (it might not — Vercel cold start), so it accepts the client-provided shape. If the route accepted just the `insightId` and looked up *whichever store has it* (in-memory → demo seed), the conversion function disappears and the leak retires. The data model is fine; the wire format is the leak source.
+The seam to **software design**: information-hiding says a module should
+expose what callers need and hide the rest. The
+`anomalyToInsight` widening is information-hiding done in the data layer
+— `Insight` exposes a *display* contract; `Anomaly` exposes an
+*investigation* contract. The `insightToAnomaly` reverse mapping
+deliberately drops fields so the diagnostic agent can't reach for them.
+See `.aipe/study-software-design/` for the code-side analog if it exists.
 
-A note on storage choice and normalization: in a relational store, the right design here would be *one* `insights` table with a JSONB `evidence` column (the LLM-generated structure is too variable to normalize further). The `anomalies` data lives entirely inside `Insight.evidence` — there's no row that exists in `anomalies` but not in `insights`. The parallel `Map` only exists because the in-memory `Insight` is *also* lossy (derived headline, derived summary), so reconstructing the raw `Anomaly` from `Insight` is not a clean round-trip. A relational schema would skip this problem by keeping the raw evidence as the source and projecting headline/summary at read time (a view), not at write time (a stored field).
+What to read next: `04-transactions-and-integrity.md` walks how integrity
+is enforced *without* a DB to enforce it — the `validate.ts` runtime
+checks, the per-session Map isolation, and the gap where two writers can
+disagree on `affectedCustomers`.
+
+---
 
 ## Interview defense
 
-**Q: Walk me through the worst normalization smell in this repo.**
-A: The Insight↔Anomaly field-copy list. Same fact ("which fields make up the Anomaly-to-Insight crossing") in three places: the `Anomaly` interface in `types.ts`, `anomalyToInsight()` in `state/insights.ts`, and `insightToAnomaly()` in `api/agent/route.ts`. The first is the truth source. The second copies 8 fields and derives 5. The third copies only 4 and silently drops `evidence`, `impact`, `history`, `category`. Add a new field to `Anomaly` and the round-trip drops it; tests pass; nobody notices until the downstream agent looks for the field. TypeScript can't catch this because the dropped fields are optional. The fix: colocate both conversion functions in `lib/state/insights.ts` with a shared field-copy helper, AND write a round-trip test. Better still: fix the wire format so the route doesn't need to convert at all.
+**Q: "Where do you keep the same fact in two places, and why is that safe?"**
+
+Verdict first: in the `Anomaly → Insight` widening. The widening is safe
+because there's exactly one writer (`anomalyToInsight` in
+`lib/state/insights.ts:25`) and the source is immutable after emit. The
+risky duplication is `Insight.affectedCustomers` vs
+`Diagnosis.affectedCustomers.count` — two independent estimates, no code
+that reconciles them.
 
 ```
-  diagram while you talk
+  the answer, sketched
 
-                  types.ts (Anomaly interface)
-                  ← TRUTH SOURCE for the 8 fields
-                            │
-                ┌───────────┴───────────┐
-                ▼                       ▼
-  anomalyToInsight (state)     insightToAnomaly (route)
-     copies 8                     copies 4, DROPS 4
-     derives 5                    (silent loss)
+  ┌─ SAFE duplication ──────┐
+  │  Anomaly ──widen──► Insight    1 writer, source immutable │
+  └─────────────────────────┘
 
-           field-copy list lives in 3 files;
-           TypeScript catches the first, not 2/3
+  ┌─ RISKY duplication ─────┐
+  │  Insight.affectedCustomers ─ ─ ─ Diagnosis.aff'd.count   │
+  │                                                          │
+  │  two independent estimates — comment says "denormalized" │
+  │  but no code enforces it                                 │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-**Q: When is denormalization correct vs leaked?**
-A: Correct when (a) there's a named single owner, (b) the denormalization is for a documented read-path win, and (c) the source of truth is still derivable from the input. The `anomalies` Map parallel to `insights` is correct denormalization — the raw `Anomaly` is needed for downstream agents that the lossy `Insight` shape can't feed. The Insight↔Anomaly field-copy is leaked because the same list lives in three files with no owner. The `revenueImpact` derived field is borderline: it's computed at write time AND the agent might also emit it, with implicit "spread last wins" precedence — make the precedence explicit and it's correct denormalization.
+Anchor: "the load-bearing thing people forget is *single writer*. As
+soon as two writers exist, the duplication isn't a cache anymore — it's
+a contradiction waiting to happen."
+
+**Q: "Why have both `Anomaly` and `Insight` at all? Why not pick one?"**
+
+Verdict first: because they're two contracts for two different consumers.
+`Anomaly` is the contract the diagnostic agent needs (minimal:
+`metric/scope/change/severity/evidence`). `Insight` is the contract the
+UI needs (rich: `headline/summary/revenueImpact/...`). One type couldn't
+serve both without one consumer pulling fields it shouldn't depend on.
+
+```
+  one type vs two contracts
+
+  ONE type:               TWO types:
+  ┌──────────────┐       ┌──────────┐    ┌──────────┐
+  │ Anomalysight │       │ Anomaly  │───►│ Insight  │
+  │ (everything) │       │ minimal  │    │ enriched │
+  └──────────────┘       └──────────┘    └──────────┘
+       │                      │               │
+       │ both agents see      │ diag agent    │ UI sees
+       │ both have to know    │ sees only     │ only what
+       │ which fields to read │ what it needs │ it renders
+       ▼                      ▼               ▼
+  COUPLED                 INDEPENDENT — `insightToAnomaly`
+                          deliberately DROPS evidence/impact/...
+```
+
+Anchor: "the reverse mapping `insightToAnomaly` deliberately drops fields
+— that's the information-hiding signal that the two types are doing
+different jobs."
+
+---
 
 ## See also
 
-- `01-the-data-model-and-its-shape.md` — the 8 interfaces and where the truth source lives for each shape.
-- `04-transactions-and-integrity.md` — the per-session sub-maps now make the cross-Map invariant safe across users; runtime guards at the LLM seam.
-- `06-access-patterns-and-storage-choice.md` — the wire-format decision that's now the leak source; the move to `?id=` plus per-session lookup.
-- `08-the-olist-relational-schema.md` — RETIRED. Historical pattern (3NF, FKs as the contrast case).
-- `11-in-process-synthetic-fixture.md` — the SyntheticDataSource: no normalization story (in-memory const literal, no FK, no joins) — the contrast case is now "flat fixture vs typed agent contract."
-- `study-software-design/audit.md#information-hiding-and-leakage` — the original framing of the same leak as an information-hiding problem.
-
----
+- [`01-the-data-model-and-its-shape.md`](./01-the-data-model-and-its-shape.md)
+  — the entity graph and join key
+- [`04-transactions-and-integrity.md`](./04-transactions-and-integrity.md)
+  — what enforces the invariant that `affectedCustomers` agrees (today:
+  nothing)
+- [`05-migrations-and-evolution.md`](./05-migrations-and-evolution.md)
+  — the optional-field discipline that keeps demo JSON parseable
+- [`audit.md`](./audit.md) — the consolidated checklist with this file's
+  red flags

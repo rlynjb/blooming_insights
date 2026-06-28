@@ -1,549 +1,435 @@
-# 07 — Backpressure, bounded work, and cancellation
+# Backpressure, bounded work, and cancellation
 
-**Industry name(s):** bounded concurrency · deadline budgets · forced-synthesis turn · graceful degradation · the missing `AbortController`
-**Type:** Industry standard · Project-specific application
-
-> **Verdict (Phase 2): bounded work is still *very* well done; cancellation is now HALF-WIRED.** Every agent run still has a hard wall: `maxDuration = 300s` (route), `maxToolCalls = 6` (agent), `maxRetries = 3` (rate-limit retry), `retryCeilingMs = 20_000` (per-retry cap), `MAX_TOOL_RESULT_CHARS = 16_000` (per-result history cap), and now a **per-call `AbortSignal.timeout(30_000)` on every subprocess tool call** (`lib/data-source/olist-data-source.ts:151`, `lib/mcp/transport.ts:131`). The forced-synthesis turn is still the most surprising and most load-bearing primitive. The big Phase 2 update: the `DataSource` interface now accepts `opts?: { signal?: AbortSignal }` (`lib/data-source/types.ts:38-44`), `SdkTransport` and `OlistDataSource` both compose that signal with the 30s timeout via `composeSignals`, and the SDKs propagate it down to `fetch` / `client.callTool`. What's STILL missing: the route handler doesn't read `req.signal`, `runAgentLoop` doesn't accept a signal parameter, and `useInvestigation` still doesn't `ac.abort()` on cleanup. So the signal chain exists *inside* the adapter but the *browser→route→loop* hops aren't connected. A subprocess call can be cancelled by its own timeout; a tab close still doesn't stop the run.
-
----
+**Industry name:** `AbortController` / `AbortSignal` propagation · per-call timeout · spacing gate · `maxDuration` route ceiling · **Type:** Industry standard (composed in a project-specific way)
 
 ## Zoom out, then zoom in
 
-**Zoom out — the bigger picture.** Bounded work lives in the **Server runtime** band — every budget is enforced inside `runAgentLoop` or `McpClient`. The client side has one bounding primitive: `startedRef` (don't double-mount fetch). Providers (Anthropic, Bloomreach) enforce their OWN bounds (token limits, rate limits) — we honor them by sizing OUR bounds smaller than theirs. Cancellation, when it exists, would propagate from client→server→provider via `AbortController` chains — none of that wiring is present today.
+The whole stack ends up running on **three bounds**, layered: a per-call 30s timeout, a ~1.1s spacing gate between calls, and a 300s per-request ceiling. Above all of those rides the propagated `AbortSignal`, which composes with each. There is no queue, no semaphore, no token bucket — just signals and timeouts forming the bounding box.
 
 ```
-  Where bounds and cancellation would live
+  Zoom out — three nested time bounds, one signal threading them
 
-  ┌─ Browser ────────────────────────────────────────────────────────┐
-  │  bound:        startedRef.current (run fetch once per mount)     │
-  │  cancellation: explicitly NOT used (see useInvestigation:32-36)   │
-  └────────────────────────│─────────────────────────────────────────┘
-                           │  HTTPS
-  ┌─ Vercel function ──────▼─────────────────────────────────────────┐  ← we are here
-  │                                                                  │
-  │  HARD WALL:    maxDuration = 300s                                 │
-  │  agent loop:   maxTurns = 8, maxToolCalls = 6                     │
-  │                forceFinal + synthesisInstruction (forced-synthesis│
-  │                  turn — the surprising load-bearing piece)         │
-  │  MCP (Bloomreach): minIntervalMs = 1100 (spacing gate)            │
-  │                    maxRetries = 3, retryDelayMs = 10_000,         │
-  │                    retryCeilingMs = 20_000                        │
-  │  DataSource (Phase 2):                                            │
-  │    callTool(name, args, opts?: { signal?: AbortSignal })          │
-  │    per-call AbortSignal.timeout(30_000) ORed via composeSignals   │
-  │    → SdkTransport (Bloomreach) and OlistDataSource (SQL) both      │
-  │      enforce a 30s adapter-level wall on every call               │
-  │  cancellation: HALF-WIRED. Adapter accepts signal; route still    │
-  │    does NOT read req.signal nor pass anything to runAgentLoop.    │
-  │    useInvestigation still does NOT abort on cleanup.              │
-  └────────────────────────│─────────────────────────────────────────┘
-                           │
-  ┌─ Providers ────────────▼─────────────────────────────────────────┐
-  │  Anthropic: max_tokens = 4096 per turn (their cap; we set it)    │
-  │  Bloomreach: 1 req/s/user (their cap; we space at 1.1s)           │
-  └──────────────────────────────────────────────────────────────────┘
+  ┌─ band 2: Node server ★ THIS FILE ★ ─────────────────────────────┐
+  │                                                                   │
+  │  Vercel route ceiling: maxDuration = 300s ───────────┐            │
+  │  ┌─────────────────────────────────────────────────┐ │            │
+  │  │  agent loop                                      │ │            │
+  │  │   ┌────────────────────────────────────────┐    │ │            │
+  │  │   │  one MCP tool call                     │    │ │            │
+  │  │   │   ┌──────────────────────────────┐     │    │ │            │
+  │  │   │   │ spacing gate: ≤1.1s wait     │     │    │ │            │
+  │  │   │   └──────────────────────────────┘     │    │ │            │
+  │  │   │   ┌──────────────────────────────┐     │    │ │            │
+  │  │   │   │ per-call timeout: 30s        │     │    │ │            │
+  │  │   │   └──────────────────────────────┘     │    │ │            │
+  │  │   │   + rate-limit retry ≤3 × 20s          │    │ │            │
+  │  │   └────────────────────────────────────────┘    │ │            │
+  │  └─────────────────────────────────────────────────┘ │            │
+  │                                                       │            │
+  │  ▲ req.signal (AbortSignal) composes with             │            │
+  │    each per-call timeout via composeSignals           │            │
+  │                                                       │            │
+  └───────────────────────────────────────────────────────┘            │
+                                                                       │
+  ▼  AbortSignal propagation                                           │
+  client (useInvestigation): deliberately does NOT cancel on unmount ──┘
 ```
 
-**Zoom in — the concept.** A *bound* is a deliberate limit on work that prevents one runaway operation from consuming a budget meant for many. *Backpressure* is bounds-driven signaling: "I'm full, slow down." *Cancellation* is propagated abort: "the consumer doesn't want this anymore, stop." This codebase is excellent at bounds, doesn't really do backpressure (the streams are slow enough that buffer pressure never builds), and deliberately skips cancellation.
-
----
+Zoom in. The interesting mechanic is the **`AbortSignal` propagation through `DataSource.callTool`** and how it composes with the per-call 30s timeout. That's the only cancellation primitive in the system; everything else is either a timeout (a self-firing signal) or a coarse phase boundary that does `signal.throwIfAborted()`.
 
 ## Structure pass
 
-**Layers.** Three nested:
-1. **Per-call** — `MAX_TOOL_RESULT_CHARS`, the 16KB truncation.
-2. **Per-agent-run** — `maxTurns`, `maxToolCalls`, the forced-synthesis turn.
-3. **Per-route** — `maxDuration`, the only platform-enforced wall.
-
-**Axis traced: *what happens when a bound is hit?***
+**Axis: who decides this work should stop?**
 
 ```
-  "What happens when a bound is hit?" — across layers
+  Four altitudes, one question (who decides to stop?)
 
-  ┌─ per-call bound (16KB truncation) ────────────┐
-  │  result gets sliced + "…[truncated]" marker    │   → silent degradation
-  │  agent continues with reduced context          │
-  └────────────────────┬──────────────────────────┘
-                       │
-  ┌─ per-agent-run bound (maxToolCalls=6) ───────▼┐
-  │  next turn omits `tools` from the API call     │   → forced synthesis;
-  │  synthesisInstruction appended to system        │     model MUST emit JSON
-  └────────────────────┬──────────────────────────┘
-                       │
-  ┌─ per-route bound (maxDuration=300s) ─────────▼┐
-  │  Vercel kills the function. Mid-flight work    │   → hard kill; in-progress
-  │  is gone. No graceful shutdown hook fires.     │     work is just lost
-  └───────────────────────────────────────────────┘
-
-  the answer escalates: per-call is graceful, per-route is brutal.
-  the in-between layers exist to make sure we hit "graceful" first.
+  ┌─ Vercel platform ───────────────────────────────────────────┐
+  │  maxDuration=300s — the platform kills the process          │  → PLATFORM
+  │  if the route runs over                                     │     decides
+  └────────────────────────┬───────────────────────────────────┘
+                           │
+  ┌─ client (browser) ────▼────────────────────────────────────┐
+  │  fetch() lives or dies with the tab                         │  → BROWSER
+  │  useInvestigation deliberately won't cancel on unmount      │     decides
+  └────────────────────────┬───────────────────────────────────┘     (but the hook
+                           │                                          opts out)
+  ┌─ server handler ──────▼────────────────────────────────────┐
+  │  req.signal — propagated through every async layer          │  → REQUEST
+  │  throwIfAborted at coarse boundaries                        │     signal decides
+  └────────────────────────┬───────────────────────────────────┘
+                           │
+  ┌─ per-call ────────────▼────────────────────────────────────┐
+  │  AbortSignal.timeout(30_000) inside SdkTransport            │  → PER-CALL
+  │  composed via composeSignals(req.signal, timeout)           │     timeout decides
+  │  first one to fire wins                                     │
+  └────────────────────────────────────────────────────────────┘
 ```
 
-**Seams.** Two:
-
-1. **Between budget-hit and outcome.** What does the system do when it runs out of room? Three different answers (truncate, force synthesis, get killed). The design is to make sure the cheap one always fires before the expensive one.
-2. **Between request and consumer.** The seam where cancellation would propagate — and doesn't. Server has no way to know the client disconnected.
-
----
+**Seam: every `composeSignals` call.** That's where two abort signals are OR'd into one. The Bloomreach transport's `callTool` (`lib/mcp/transport.ts:131`) is the only place this composition happens for tool calls. Cancellation propagation is a *chain*: client → req.signal → composeSignals → inner fetch's abort.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You already know how `Promise.race([fetch, timeout])` aborts a slow fetch — you set a deadline, whichever resolves first wins. Bounded work is the same pattern at a higher altitude: every layer of the system sets a deadline (or a count limit) that's smaller than the next layer up. The route gets 300s. The agent inside it gets 6 tool calls (call them 1.1s gate + ~1s HTTP each = ~12.6s) and 8 turns (~2-15s each, ~80s worst case). Anthropic gets 4096 tokens per turn. The cap-on-cap-on-cap means you almost never hit the outer one — you trip a cheap inner bound first.
+You know how `fetch(url, { signal })` can be aborted by calling `controller.abort()` on the matching `AbortController`? Same primitive, scaled up to chain through every layer of the stack. One signal flows from `req.signal` (provided by Next.js) into the agent loop, into the DataSource, into the MCP transport, into the underlying `fetch`. At each layer, it's optionally composed with a fresh timeout signal so that *either* a client cancel *or* a per-call timeout fires the abort.
 
 ```
-  The bounded-work kernel — nested deadlines
+  Pattern — signal propagation chain
 
-       ┌─ outer: maxDuration = 300s (Vercel) ─────────────┐
-       │                                                  │
-       │   ┌─ middle: maxTurns × turn-cost ≤ ~120s ─────┐ │
-       │   │                                            │ │
-       │   │   ┌─ inner: maxToolCalls = 6 calls × ─────┐│ │
-       │   │   │  ~2s = ~12s of MCP work               ││ │
-       │   │   │                                       ││ │
-       │   │   │   ┌─ innermost: 16KB per tool ──────┐ ││ │
-       │   │   │   │  result, 4096 tokens per turn   │ ││ │
-       │   │   │   └─────────────────────────────────┘ ││ │
-       │   │   └───────────────────────────────────────┘│ │
-       │   └────────────────────────────────────────────┘ │
-       └──────────────────────────────────────────────────┘
+  req.signal ──┐
+               ├──► composeSignals  ──► fetch({signal})
+   AbortSignal─┤      (OR via
+   .timeout(30k)│     AbortSignal.any)
+               ┘
 
-  by the time you'd hit maxDuration, you've already hit (and gracefully
-  handled) maxToolCalls, the synthesis-instruction kicks in, the model
-  emits its JSON, the route returns clean.
+  if EITHER fires → the OR'd signal fires → fetch aborts → throws AbortError
 ```
+
+The threading is the entire trick. Forget to pass `signal` at any layer and the cancel stops there; the layers below keep running.
 
 ### Move 2 — the moving parts
 
-#### 1) `maxDuration = 300` — the platform-enforced wall
+#### Move 2.1 — the `DataSource.callTool` signature carries the signal
 
-`export const maxDuration = 300` at the top of `app/api/agent/route.ts:20` and `app/api/briefing/route.ts:17` tells Vercel to give this function up to 300 seconds before killing it. Hobby tier caps at 60s; Pro tier caps at 300s. The repo is sized for Pro because a live investigation under the 1.1s MCP gate plus auth setup runs ~100-115s, which doesn't fit in 60s.
+`lib/data-source/types.ts:63-71` declares the contract:
 
-```
-  maxDuration — the only bound the app doesn't get to enforce
+```ts
+// lib/data-source/types.ts:63-71 (annotated)
+export interface DataSource {
+  callTool(
+    name: string,
+    args: Record<string, unknown>,
+    opts?: DataSourceCallOptions,            // ← { signal?: AbortSignal }
+  ): Promise<DataSourceCallResult>;
 
-  request comes in at t=0
-  ...work happens, awaits the gate, awaits Anthropic, awaits MCP...
-  if not done by t=300:
-    Vercel kills the function process. SIGKILL-equivalent — no graceful
-    shutdown hook fires. ReadableStream is left mid-emit; client sees a
-    truncated body. saveInvestigation never runs for this insight.
-```
-
-What breaks without it: Hobby's 60s default kicks in. Any live (non-replay) investigation gets killed at 60s, mid-loop. The route comment explains this in line: "300s = Vercel Pro's max. A live investigation … runs ~100-115s …; 60s (Hobby) cannot fit it" (`app/api/agent/route.ts:18-19`).
-
-#### 2) `maxTurns = 8` + `maxToolCalls = 6` — agent-loop budgets
-
-`runAgentLoop` (`lib/agents/base.ts:48-176`) enforces two parallel budgets:
-
-- `maxTurns` — how many round-trips with the Anthropic API. Default 8.
-- `maxToolCalls` — total tool calls across all turns. Default unset; agents pass 6.
-
-Either one triggers the `forceFinal` branch (`lib/agents/base.ts:90-92`). When `forceFinal` is true: the next API call omits `tools` from the params AND appends `synthesisInstruction` to the system prompt.
-
-```
-  the dual budget — either trip the same outcome
-
-  loop turn N:
-    budgetSpent = maxToolCalls !== undefined && toolCalls.length >= maxToolCalls
-    forceFinal  = turn === maxTurns - 1 || budgetSpent
-
-  if forceFinal:
-    DON'T send tools[] in the API params
-    DO append synthesisInstruction to the system prompt
-       ("You have NO more tool calls available. Stop querying now and
-         output your final answer…")
-
-  → model can NOT request another tool call (no schemas to call)
-  → model is INSTRUCTED to emit its final JSON
-  → next response has no tool_use blocks → loop terminates normally
+  listTools(opts?: DataSourceListOptions): Promise<unknown>;
+}
 ```
 
-What breaks without this: the model wants to keep exploring. It returns another tool_use, we loop again, we hit `maxTurns`, but on the last turn we still SENT tools — so the model emits another tool_use we can't fulfill. The loop returns `finalText: ''`, the caller has no diagnosis, the user sees a fallback message. The forced-synthesis turn is what turns "I ran out of budget" into "I gave you the best answer I can with what I have."
+Both methods accept `signal`. The agent layer always passes it; the route handlers always pass it from `req.signal`. There is no "skip-signal" path.
 
-#### 3) The forced-synthesis turn — the load-bearing kernel of bounded work
+#### Move 2.2 — Bloomreach adapter: signal threads through to the transport
 
-This is the surprising piece. Most ReAct loops just stop when they hit the budget — and produce nothing. The repo's approach is to use the budget exhaustion as a TRIGGER for a different KIND of API call: tool-less, synthesis-only.
+`lib/data-source/bloomreach-data-source.ts:139-205` shows the full path:
 
-```
-  forced-synthesis turn — the most load-bearing budget primitive
+```ts
+// lib/data-source/bloomreach-data-source.ts:139-205 (excerpts)
+async callTool<T = unknown>(
+  name,
+  args,
+  options: CallToolOptions = {},      // ← { signal?, cacheTtlMs?, skipCache? }
+): Promise<CallToolResult<T>> {
+  // ... cache check ...
+  let result = await this.liveCall(name, args, options.signal);  // ← signal pass-down
 
-  budget OK turns:
-    POST /messages with:
-      tools: [list of MCP tool schemas]
-      system: "You're a diagnostic agent. Use tools to investigate."
-    → model returns tool_use or text
-
-  forced-final turn:
-    POST /messages with:
-      (no tools)
-      system: original + "\n\nYou have NO more tool calls. Output ONLY
-                          a JSON object in a ```json fence matching the
-                          diagnosis shape. Base on evidence already
-                          gathered. Don't ask for more queries."
-    → model CANNOT request a tool
-    → model is told what shape to emit
-    → response is the structured JSON (or a parse failure that triggers
-       a final synthesize() fallback at lib/agents/diagnostic.ts:73-83)
-```
-
-What breaks without it: budget exhaustion produces no output. The model keeps reaching for tools that aren't there, the loop terminates with `finalText: ''`, the diagnostic agent has no diagnosis to return. This is the difference between "graceful degradation" and "silent failure."
-
-The diagnostic agent goes one further: if even the forced-synthesis turn fails to produce a valid JSON, it runs a *separate, dedicated synthesis call* (`DiagnosticAgent.synthesize` at `lib/agents/diagnostic.ts:87-126`) that hands the model just the evidence it already gathered and asks for the structured conclusion. Two-stage fallback for the case the model just won't stop trying to query.
-
-#### 4) `McpClient.minIntervalMs = 1100` — proactive spacing
-
-The spacing gate isn't a bound on OUR work — it's a bound on the rate of calls we make to the provider. `liveCall` (`lib/mcp/client.ts:148-153`) checks `Date.now() - this.lastCallAt`; if it's less than 1.1s, it `await new Promise(r => setTimeout(r, gap))` until the window opens. Sized at 1.1s because Bloomreach's observed window is 1 req/s; spacing at the full 10s window (the OTHER observed window) would cost ~60s for a 6-call investigation and blow the route budget.
-
-```
-  the spacing gate — provider-respecting backpressure
-
-  ──── time ────►
-  call 1:   ▓ HTTP
-  gap:      ░░░░░░░░░░░ 1.1s
-  call 2:   ▓ HTTP
-  gap:      ░░░░░░░░░░░ 1.1s
-  call 3:   ▓ HTTP
-  ...
-
-  the wait is non-blocking (yields the event loop — see 03).
-  it's how we cooperate with the rate limit WITHOUT eating the
-  expensive retry path (~10s per retry penalty).
-```
-
-#### 5) Rate-limit retry — bounded recovery
-
-When the spacing gate isn't enough (race with another instance, undercount, etc.), Bloomreach returns a rate-limit error. `McpClient.callTool` (`lib/mcp/client.ts:122-132`) parses the error text for a retry hint (`"Retry after ~12 seconds"` or `"per 10 second"`), waits that long (plus a 500ms buffer), retries. Bounded by `maxRetries = 3` and `retryCeilingMs = 20_000`.
-
-```
-  retry loop — bounded by count AND ceiling
-
-  result = liveCall(...)
-  retries = 0
-  while isRateLimited(result) and retries < 3:
-    retries += 1
-    hint = parseRetryAfterMs(result)              ← prefer server's hint
-    backoff = retryDelayMs * 2^(retries-1)        ← else exponential off 10s
-    wait = min(hint+500 ?? backoff, 20_000)       ← capped at 20s
-    sleep(wait)
-    result = liveCall(...)
-
-  max time spent in retry: 3 × 20s = 60s
-  → still within maxDuration but burns a serious chunk of it
-  → that's why maxRetries stays at 3, not 10 — the route's 300s
-     would be half-consumed by retry waits alone at higher counts
-```
-
-What breaks without the ceiling: a misparsed "Retry after ~600 seconds" could legitimately wait 10 minutes — way past the route's budget. The ceiling clamps any single wait to 20s regardless of what the server claims.
-
-#### 6) The 4KB per-event truncation — bounding the cache size
-
-Route-level: `TRUNC = 4000` (`app/api/agent/route.ts:99-103`, `app/api/briefing/route.ts:69-73`). Every tool result that goes into the NDJSON stream (and into the saved `collected[]` for `saveInvestigation`) is sliced to 4000 chars. Without it, one big EQL result would make a single cached investigation 100KB+ and the NDJSON event size unpredictable.
-
-```
-  per-event truncation — bounded cache, bounded UI rendering
-
-  raw tool result (could be hundreds of KB):
-    JSON.stringify(result) → 250_000 chars
-
-  trunc(...) at route layer:
-    250_000 > 4000 → slice + "…"
-
-  result: every cached AgentEvent is small; the cache stays MB-scale,
-          not GB-scale. UI renders the truncated result in the trace
-          panel without blowing layout.
-```
-
-#### 7) Cancellation — the half-wired Phase 2 update
-
-The DataSource layer now accepts a signal. The adapter layer composes it with `AbortSignal.timeout(30_000)`. The agent loop and the route still don't propagate one.
-
-```
-  cancellation — what's wired (Phase 2), what isn't
-
-  ┌─ wired INSIDE the adapter (Phase 2) ─────────────────────┐
-  │   OlistDataSource.callTool(name, args, opts?) {          │
-  │     const signal = composeSignals(                        │
-  │       opts?.signal,                       ← caller's      │
-  │       AbortSignal.timeout(this.toolTimeoutMs),  ← 30s     │
-  │     );                                                    │
-  │     return this.client.callTool(..., { signal })          │
-  │   }                                                        │
-  │   SdkTransport.callTool (Bloomreach) — same pattern        │
-  └───────────────────────────────────────────────────────────┘
-  ┌─ NOT wired client → server ──────────────────────────────┐
-  │   useInvestigation effect:                                │
-  │     const ac = new AbortController()                      │
-  │     fetch(url, { signal: ac.signal })                     │
-  │     return () => ac.abort()       ← STILL not done        │
-  │     (React StrictMode workaround at                       │
-  │      useInvestigation.ts:32-36 still in place)            │
-  └───────────────────────────────────────────────────────────┘
-  ┌─ NOT wired server → loop → adapter ──────────────────────┐
-  │   GET(req) {                                              │
-  │     const signal = req.signal     ← STILL not read        │
-  │     await runAgentLoop({ ..., signal })                   │
-  │   }                                                       │
-  │   runAgentLoop has no `signal` parameter today;           │
-  │   even if it did, it would need to pass to                │
-  │   dataSource.callTool({ signal }) — which IS now ready    │
-  └───────────────────────────────────────────────────────────┘
-  ┌─ what happens TODAY when client disconnects ─────────────┐
-  │   server keeps running                                    │
-  │   Anthropic call still bills                              │
-  │   MCP gate still sleeps and calls                         │
-  │   subprocess gets a 30s wall per tool call (only "real"   │
-  │     cancellation source today — fires on hanging child)   │
-  │   saveInvestigation still runs at the end                 │
-  └───────────────────────────────────────────────────────────┘
-```
-
-The reason for the missing browser→route hop is still documented at `lib/hooks/useInvestigation.ts:32-36`: React StrictMode's double-mount + the `startedRef` guard interacted with cleanup-time aborts to abort the stream before the first byte arrived. The pragmatic fix was to let the fetch finish. What's NEW since the previous version of this guide: the *server-side* signal chain now exists. Half the work is done. The remaining work is two edits in `runAgentLoop` (accept `signal`, pass to `dataSource.callTool({ signal })` and to `anthropic.messages.create({ signal })`) plus one edit in each route (`const signal = req.signal; await runAgentLoop({ ..., signal })`).
-
-What this costs concretely is unchanged: a user who opens an investigation and closes the tab three seconds in still incurs the full 100s of Anthropic + subprocess work. The new floor is "no individual subprocess call hangs more than 30s" — that's strictly better than the pre-Phase-2 state but doesn't address the abandoned-investigation cost.
-
-#### 8) Backpressure — the lever not pulled
-
-The route does `controller.enqueue(...)` without checking `controller.desiredSize` or awaiting `controller.ready` (if it existed). On a slow client, the stream's internal buffer could grow. In practice it doesn't matter — the NDJSON events are small (kilobytes), the total stream is sub-MB over 100s, and the client reads as fast as the server writes. But it's a primitive we could reach for if a future feature streamed megabytes (e.g. a CSV export).
-
-```
-  enqueue vs backpressure-aware enqueue
-
-  TODAY:
-    controller.enqueue(bytes)                ← just push, no check
-
-  IF backpressure mattered:
-    if (controller.desiredSize < 0) {
-      await waitForReader()
-    }
-    controller.enqueue(bytes)
-
-  doesn't matter today because:
-   - data per event ≤ 4KB
-   - events per second ≤ a few
-   - total per stream ≤ ~1MB
-   - clients drain faster than we produce
-```
-
-#### 9) Code in this codebase
-
-**Use cases.** Every long-running route applies the same stack of bounds:
-
-- **Live diagnose** (`app/api/agent/route.ts:225-240`) — calls `DiagnosticAgent.investigate` which calls `runAgentLoop` with `maxToolCalls = 6`. Forced synthesis fires after 6 tool calls. Two-stage fallback (re-synthesize → static FALLBACK).
-- **Live briefing** (`app/api/briefing/route.ts:218-240`) — `MonitoringAgent.scan` with `maxToolCalls = 6`. Same forced-synthesis pattern; on parse failure, degrades to `return []` (no anomalies) instead of crashing the route.
-- **Rate-limit storm** — `McpClient.callTool` catches a 429, parses the wait, sleeps up to 20s, retries up to 3 times.
-
-**Code side by side.**
-
-```
-  lib/agents/base.ts (lines 85-102) — the bound-checking and forceFinal switch
-
-  for (let turn = 0; turn < maxTurns; turn++) {
-    const budgetSpent = maxToolCalls !== undefined && toolCalls.length >= maxToolCalls;
-    const forceFinal = turn === maxTurns - 1 || budgetSpent;
-                                                      │
-                                                      └─ THIS line is the dual-budget logic.
-                                                         either bound trips the same forceFinal.
-
-    const params: Anthropic.Messages.MessageCreateParamsNonStreaming = {
-      model: AGENT_MODEL,
-      max_tokens: maxTokens,
-      system: forceFinal && synthesisInstruction ? `${system}\n\n${synthesisInstruction}` : system,
-                                                  │
-                                                  └─ THE forced-synthesis instruction.
-                                                     applied to system ONLY on the forced turn.
-      messages,
-    };
-    if (!forceFinal) params.tools = toolSchemas;
-                       │
-                       └─ THE load-bearing move: when forced, DON'T send tools.
-                          the model literally cannot request another tool call.
-                          it must produce text (which had better be JSON).
-```
-
-```
-  lib/agents/monitoring.ts (lines 101-105) — agent supplies the budget
-
-  const { finalText } = await runAgentLoop({
-    // ...
-    maxTurns: 8,
-    maxToolCalls: 6, // hard cap — bounds latency under the 1 req/s MCP limit
-                     │
-                     └─ EXPLICITLY justified inline: the bound is sized AGAINST
-                        the MCP gate. 6 calls × ~2s/call = ~12s of MCP work;
-                        within the 300s wall with headroom for Anthropic latency.
-    synthesisInstruction:
-      'You have NO more tool calls available. Stop querying now and output your final answer. ' +
-      'Respond with ONLY a JSON array of anomaly objects in a ```json fence (or [] if nothing ' +
-      'meaningful), based on the data you have already gathered. Do not say you need more queries.',
-  });
-```
-
-```
-  lib/agents/monitoring.ts (lines 109-119) — graceful degradation
-
-  let parsed: unknown;
-  try {
-    parsed = parseAgentJson(finalText);
-  } catch {
-    return [];     ← parse failure on forced-synthesis output: surface as "no anomalies"
-                     instead of throwing 500. the route still completes, the user sees
-                     an empty feed and a coverage note, not an error page.
-  }
-  if (!isAnomalyArray(parsed)) return [];
-```
-
-```
-  lib/agents/diagnostic.ts (lines 73-83) — two-stage synthesis fallback
-
-  const diag =
-    tryParseDiagnosis(finalText) ??              ← stage 1: forced-synthesis output
-    (await this.synthesize(anomaly, toolCalls)) ??  ← stage 2: dedicated tool-less call
-    FALLBACK;                                    ← stage 3: static "insufficient data"
-                                                  ▲
-                                                  └─ each stage is a tighter constraint:
-                                                     - stage 1: full system prompt + synth instruction
-                                                     - stage 2: just the evidence + "output JSON"
-                                                     - stage 3: hard-coded "I don't know"
-                                                     guaranteed to terminate with SOMETHING.
-```
-
-```
-  lib/mcp/client.ts (lines 122-132) — bounded rate-limit retry
-
-  let retries = 0;
-  while (isRateLimited(result) && retries < this.maxRetries) {   ← count cap
-    retries++;
-    const hintMs = parseRetryAfterMs(result);
-    const backoffMs = this.retryDelayMs * 2 ** (retries - 1);
-    const waitMs = Math.min(
-      hintMs != null ? hintMs + RETRY_BUFFER_MS : backoffMs,
-      this.retryCeilingMs,                                       ← ceiling cap
-    );
+  // retry ladder (NOT signal-aware — see below)
+  while (isRateLimited(result) && retries < this.maxRetries) {
     await sleep(waitMs);
-    result = await this.liveCall(name, args);
+    result = await this.liveCall(name, args, options.signal);
   }
-        │
-        └─ DUAL bound: count (3) AND per-wait ceiling (20s). max total time in
-           retry: ~60s. justification: any single retry on the 10s window already
-           absorbs most of one minute; raising maxRetries higher trades route
-           budget for resilience that's rarely needed in practice.
+  // ...
+}
+
+private async liveCall(name, args, signal?: AbortSignal): Promise<unknown> {
+  // ... spacing gate ...
+  try {
+    return await this.transport.callTool(name, args, { signal });  // ← into transport
+  } catch (err) {
+    throw new McpToolError(name, errorDetail(err), { cause: err });
+  }
+}
 ```
 
-```
-  lib/hooks/useInvestigation.ts (lines 32-36, 47) — the missing cancellation, justified
+**Two things to notice.** First, the signal is threaded through every layer down to the transport. Second, the retry ladder's `sleep(waitMs)` is **not** signal-aware — if the client cancels mid-retry-wait, we sleep for the full duration before the next `liveCall` sees the aborted signal and throws. So a 20s retry wait can delay cancellation by up to 20s. Minor; worth knowing.
 
-  // NOTE: we deliberately do NOT cancel the fetch on effect cleanup. React
-  // StrictMode (dev) mounts → cleans up → re-mounts; cancelling on the first
-  // cleanup, with the started-guard blocking the re-mount, aborted the stream
-  // and left the logs empty. The started-guard prevents a double fetch; the
-  // in-flight run simply completes (setState after unmount is a safe no-op).
-  ...
-  if (startedRef.current) return; // run once per mount (survives StrictMode)
-  startedRef.current = true;
-       │
-       └─ THE bound that replaces cancellation: "run the fetch once per mount."
-          combined with "never abort on cleanup," this gives us StrictMode-
-          survivable single-shot streaming. trade: a client tab-close doesn't
-          stop the server.
+#### Move 2.3 — `composeSignals` does the OR
+
+`lib/mcp/transport.ts:173-189` is the actual composition:
+
+```ts
+// lib/mcp/transport.ts:173-189 (annotated)
+export function composeSignals(...signals: (AbortSignal | undefined)[]): AbortSignal {
+  const filtered = signals.filter((s): s is AbortSignal => !!s);
+  if (filtered.length === 0) return new AbortController().signal;
+  if (filtered.length === 1) return filtered[0];
+  if (typeof (AbortSignal as unknown as { any?: unknown }).any === 'function') {
+    return (AbortSignal as any).any(filtered);             // ← Node 20+ native AbortSignal.any
+  }
+  // fallback for older runtimes
+  const ac = new AbortController();
+  for (const s of filtered) {
+    if (s.aborted) { ac.abort((s as any).reason); return ac.signal; }
+    s.addEventListener('abort', () => ac.abort((s as any).reason), { once: true });
+  }
+  return ac.signal;
+}
 ```
+
+Used at `lib/mcp/transport.ts:131`:
+
+```ts
+const signal = composeSignals(opts?.signal, AbortSignal.timeout(TOOL_TIMEOUT_MS));
+try {
+  return await this.client.callTool({ name, arguments: args }, undefined, { signal });
+} catch (err) {
+  if (isTimeoutError(err)) {
+    throw new Error(`HTTP 0: timeout after ${TOOL_TIMEOUT_MS}ms`, { cause: err });
+  }
+  // ...
+}
+```
+
+So inside one MCP call, the active signal is `req.signal OR AbortSignal.timeout(30_000)`. Whichever fires first aborts the fetch. The catch branch tags timeouts as `HTTP 0:` so callers can distinguish them from server-returned errors.
+
+```
+  Execution trace — composed signal firing
+
+  state:  req.signal aborted=false, timeout fires at +30s
+  ─────   ───────────────────────────────────────────────
+  t=0     liveCall enters, calls transport.callTool({signal})
+  t=0     composeSignals returns OR'd signal
+  t=0     client.callTool dispatches fetch with OR'd signal
+  t=12s   ... still waiting on Bloomreach ...
+  t=18s   user closes tab → browser severs connection
+  t=18s   Vercel marks req.signal as aborted
+  t=18s   OR'd signal fires (req.signal branch)
+  t=18s   underlying fetch sees abort, throws DOMException
+  t=18s   transport.callTool throws, liveCall catches, rethrows McpToolError
+
+  Alternative trace — timeout wins:
+  t=0     ...
+  t=30s   AbortSignal.timeout fires (timeout branch)
+  t=30s   fetch aborts, throws DOMException
+  t=30s   isTimeoutError → re-throws as 'HTTP 0: timeout after 30000ms'
+```
+
+#### Move 2.4 — synthetic adapter accepts the signal but ignores it
+
+`lib/data-source/synthetic-data-source.ts:319-331`:
+
+```ts
+async callTool(
+  name: string,
+  args: Record<string, unknown> = {},
+  _opts?: DataSourceCallOptions,           // ← signal accepted, name prefixed with _ to silence linter
+): Promise<DataSourceCallResult> {
+  const started = Date.now();
+  const payload = this.dispatch(name, args);
+  return {
+    result: payload,
+    durationMs: Date.now() - started,
+    fromCache: false,
+  };
+}
+```
+
+Why ignore the signal: the dispatch is **synchronous in-process work** — there's nothing async to interrupt. The signal exists in the signature because the abstract `DataSource` interface mandates it; the implementation doesn't need to act on it.
+
+**This is the honest framing.** It's not a bug; it's not technical debt; it's the right shape. If a future adapter did long-running CPU work, it'd need to check `signal.aborted` periodically. The synthetic dispatch is <1ms, so the question doesn't arise.
+
+#### Move 2.5 — the route handler is the cancellation source
+
+`app/api/agent/route.ts` plants `req.signal.throwIfAborted()` at every coarse phase boundary plus threads `req.signal` into every async call:
+
+```ts
+// app/api/agent/route.ts (line numbers in source)
+:226   req.signal.throwIfAborted();                              // before bootstrap
+:235   const schema = await bootstrap(req.signal);               // bootstrap with signal
+:237   req.signal.throwIfAborted();
+:239   const rawTools = await dataSource.listTools({ signal: req.signal });
+:248   req.signal.throwIfAborted();                              // before intent classification
+:250   const intent = await classifyIntent(anthropic, q, sid, req.signal);
+:274   req.signal.throwIfAborted();                              // before diagnostic
+:282   diagnosis = await diagAgent.investigate(inv, { ..., signal: req.signal });
+:290   req.signal.throwIfAborted();                              // before recommendation
+:294   const recommendations = await recAgent.propose(..., { ..., signal: req.signal });
+```
+
+The `throwIfAborted()` calls are belt-and-braces — they make cancellation immediate at the boundary even if the next async call wouldn't have observed the signal for a few seconds (e.g. mid-spacing-gate). The `await` calls with `signal` ensure cancellation propagates *into* the call as well.
+
+Catch + early-return on AbortError keeps the cancellation clean:
+
+```ts
+// app/api/agent/route.ts:303-310
+} catch (e) {
+  if (e instanceof DOMException && e.name === 'AbortError') {
+    return;                                                       // no error event, no log noise
+  }
+  console.error('[agent] error:', redactSecrets(formatError(e)));
+  send({ type: 'error', message: ... });
+}
+```
+
+#### Move 2.6 — the client deliberately does NOT cancel on unmount
+
+`lib/hooks/useInvestigation.ts:32-37` is the comment that owns this decision:
+
+```
+NOTE: we deliberately do NOT cancel the fetch on effect cleanup. React
+StrictMode (dev) mounts → cleans up → re-mounts; cancelling on the first
+cleanup, with the started-guard blocking the re-mount, aborted the stream
+and left the logs empty. The started-guard prevents a double fetch; the
+in-flight run simply completes (setState after unmount is a safe no-op).
+```
+
+What this means in practice:
+
+  → Real user closes tab → browser kills connection → `req.signal` aborts server-side → cancellation chain fires.
+  → React StrictMode mount-unmount-remount → hook cleanup runs → nothing happens → stream continues → re-mount sees `startedRef.current=true` and skips → in-flight stream eventually completes and any `setState` after unmount is a React no-op.
+
+The tradeoff is honest: **a user who nav-aways within the SPA (without closing the tab) keeps a server function running for up to 300s of budget burn.** The hook author chose StrictMode-safety over aggressive cancellation; for an analytics app where investigations are explicitly opened by clicking, that's defensible.
+
+The other hooks **do** plumb cancellation correctly — `useBriefingStream` has a `cancelledRef.current` latch (`lib/hooks/useBriefingStream.ts:130-132, 150-152`) polled by `readNdjson`'s `cancelOn` option. So the briefing stream stops reading on unmount; only the investigation stream doesn't.
+
+#### Move 2.7 — what's the *bounded work* story
+
+There's no work-queue, no semaphore. The bounding is purely time-based:
+
+| bound | source | scope | what it bounds |
+|---|---|---|---|
+| 300s | `maxDuration = 300` | per route invocation | total wall time of one request |
+| 30s | `TOOL_TIMEOUT_MS` (`transport.ts:38`) | per MCP call | one tool round-trip |
+| 1.1s | `minIntervalMs: 1100` (`connect.ts:97`) | between MCP calls | rate limit compliance |
+| 20s × 3 | `retryCeilingMs / maxRetries` (`bloomreach-data-source.ts:135-136`) | per retry wait | rate-limit retry ceiling |
+
+Notice what's missing: **no upper bound on the number of tool calls per request.** The agent loop can call as many tools as it wants until the 300s ceiling fires. The spacing gate is the de-facto throttle (~270 calls max in 300s at 1.1s spacing, minus the actual call time). This is "not yet exercised" as a hard cap; the spacing+timeouts combine to bound it implicitly.
+
+### Move 2 variant — the load-bearing skeleton
+
+The cancellation kernel is **3 parts**. Strip any one and cancellation breaks somewhere.
+
+**Kernel:**
+  1. Accept a `signal` parameter at every async boundary.
+  2. Compose it with timeouts via `composeSignals` at the inner-most call.
+  3. Re-throw AbortErrors and let the route handler's catch differentiate them.
+
+**What breaks if you remove each:**
+
+  → **Remove #1 (drop signal from a layer's signature).** Cancel events fire at the source but don't reach the inner fetch. The user sees a "stuck" stream until the per-call timeout fires (30s) or the route ceiling fires (300s).
+  → **Remove #2 (skip composition with timeout).** The per-call ceiling is gone. One hung Bloomreach connection burns the full 300s budget on a single call. The comment at `transport.ts:32-38` explicitly names this as the design reason.
+  → **Remove #3 (no AbortError handling in catch).** The cancellation chain works, but every cancel produces a noisy error event on the wire and a noisy log line. The user-facing path looks like a failure rather than a clean cancellation.
+
+**Optional hardening** (not in the kernel): the `throwIfAborted()` at coarse boundaries — speeds up cancellation latency by interrupting at the next phase boundary instead of waiting for the next async call to observe the signal. Nice-to-have, not load-bearing.
 
 ### Move 3 — the principle
 
-**Bounded work isn't pessimism — it's the only way to make optimistic guarantees.** "This route will respond in under 300 seconds" is a real promise only if you've sized every internal budget smaller than the wall and given every budget exhaustion a graceful fallback. The repo does this well: the cheap inner bound (forced synthesis) fires before the expensive outer bound (Vercel kill), and the user gets a coherent answer rather than a truncated body. The piece this codebase deliberately gives up — cancellation — is a separate concern: it's about RESPECTING the consumer's "I'm done." Bounded work makes the system robust; cancellation makes it polite.
-
----
+Cancellation in JavaScript is a **chain of opt-ins**, not a runtime feature. There's no equivalent of OS-level `kill` or POSIX signals; you have to pass `AbortSignal` to every layer and compose it with every fresh timeout at every layer. The discipline is the design. The codebase makes this discipline visible by accepting `signal` in the abstract `DataSource` interface, so an adapter that fails to thread it would fail typing review. The places it deliberately doesn't propagate (synthetic dispatch, retry sleeps, the investigation hook) are commented and owned.
 
 ## Primary diagram
 
-The full bounded-work picture for one investigation request, with every budget visible:
-
 ```
-  One investigation request — every budget in one frame
+  Backpressure / bounded work / cancellation — the full picture
 
-  ┌─ Vercel function ─────────────────────────────────────────────────────┐
-  │  HARD WALL: maxDuration = 300s ───────────────────────────────────────│
-  │                                                                       │
-  │  ┌─ route handler ────────────────────────────────────────────────┐   │
-  │  │                                                                │   │
-  │  │  per-event TRUNC = 4000 chars (applied to tool results)        │   │
-  │  │  REPLAY_DELAY_MS = 180 (paces cached-replay events)            │   │
-  │  │                                                                │   │
-  │  │  ┌─ runAgentLoop ──────────────────────────────────────────┐   │   │
-  │  │  │  maxTurns = 8                                          │   │   │
-  │  │  │  maxToolCalls = 6 (agent-supplied)                     │   │   │
-  │  │  │  MAX_TOOL_RESULT_CHARS = 16_000 (per turn)             │   │   │
-  │  │  │                                                        │   │   │
-  │  │  │  on forceFinal turn:                                   │   │   │
-  │  │  │    OMIT tools[] from API params                        │   │   │
-  │  │  │    APPEND synthesisInstruction to system               │   │   │
-  │  │  │    → model MUST emit final JSON                        │   │   │
-  │  │  │                                                        │   │   │
-  │  │  │  ┌─ McpClient ──────────────────────────────────────┐  │   │   │
-  │  │  │  │  minIntervalMs = 1100   (spacing gate)           │  │   │   │
-  │  │  │  │  maxRetries = 3                                  │  │   │   │
-  │  │  │  │  retryDelayMs = 10_000  (fallback per retry)     │  │   │   │
-  │  │  │  │  retryCeilingMs = 20_000 (cap per retry wait)    │  │   │   │
-  │  │  │  │  cacheTtlMs = 60_000 (per-call default)          │  │   │   │
-  │  │  │  └──────────────────────────────────────────────────┘  │   │   │
-  │  │  │                                                        │   │   │
-  │  │  │  ┌─ Diagnostic agent fallback ─────────────────────┐   │   │   │
-  │  │  │  │  if forceFinal output ≠ valid JSON:             │   │   │   │
-  │  │  │  │    synthesize() — separate tool-less call with  │   │   │   │
-  │  │  │  │    the evidence gathered so far                 │   │   │   │
-  │  │  │  │  if synthesize() fails:                         │   │   │   │
-  │  │  │  │    FALLBACK = "Insufficient data…"               │   │   │   │
-  │  │  │  └─────────────────────────────────────────────────┘   │   │   │
-  │  │  └─────────────────────────────────────────────────────────┘  │   │
-  │  │                                                                │   │
-  │  │  CANCELLATION: not implemented. Client disconnect → server     │   │
-  │  │                keeps running until natural end or maxDuration. │   │
-  │  └────────────────────────────────────────────────────────────────┘   │
-  │                                                                       │
-  └───────────────────────────────────────────────────────────────────────┘
+  ┌─ client (useInvestigation, useBriefingStream) ──────────────────┐
+  │                                                                  │
+  │  useBriefingStream:  cancelledRef.current → readNdjson cancelOn  │
+  │  useInvestigation:   DOES NOT CANCEL (StrictMode opt-out)        │
+  │                                                                  │
+  └────────────────────────────────┬────────────────────────────────┘
+                                   │  HTTP (close on tab close only)
+  ┌─ Vercel platform ──────────────▼────────────────────────────────┐
+  │  maxDuration = 300s — kills the process if route runs over       │
+  │  req.signal fires when client disconnects                        │
+  └────────────────────────────────┬────────────────────────────────┘
+                                   │
+  ┌─ route handler ────────────────▼────────────────────────────────┐
+  │  req.signal.throwIfAborted() — at every coarse phase boundary    │
+  │  req.signal — passed to bootstrap, listTools, every agent run    │
+  │  catch (AbortError) → return early, no error event               │
+  └────────────────────────────────┬────────────────────────────────┘
+                                   │
+  ┌─ agent layer ──────────────────▼────────────────────────────────┐
+  │  signal passed through to every ds.callTool({signal})            │
+  └────────────────────────────────┬────────────────────────────────┘
+                                   │
+  ┌─ BloomreachDataSource ─────────▼────────────────────────────────┐
+  │  spacing gate: ≤1.1s setTimeout (NOT signal-aware)               │
+  │  liveCall: passes signal to transport.callTool                   │
+  │  retry sleep: ≤20s (NOT signal-aware)                            │
+  └────────────────────────────────┬────────────────────────────────┘
+                                   │
+  ┌─ SdkTransport ─────────────────▼────────────────────────────────┐
+  │  composeSignals(opts.signal, AbortSignal.timeout(30_000))        │
+  │  whichever fires first wins                                      │
+  └────────────────────────────────┬────────────────────────────────┘
+                                   │
+  ┌─ MCP SDK / fetch ──────────────▼────────────────────────────────┐
+  │  fetch(url, {signal}) — aborts on signal, throws DOMException    │
+  └──────────────────────────────────────────────────────────────────┘
+
+  SyntheticDataSource: accepts signal, ignores it (sync dispatch).
 ```
-
----
 
 ## Elaborate
 
-The forced-synthesis turn is a useful pattern beyond this codebase — it shows up in any ReAct/tool-using loop. The principle: when you exhaust a budget, don't just stop; *change what kind of work the model is allowed to do*. By removing tools and instructing for output, you convert "I ran out of time" into "give me your best answer." It's the difference between a hard timeout and a graceful deadline.
+`AbortController` / `AbortSignal` landed in browsers around 2017 and Node followed shortly after; `AbortSignal.timeout` (the self-firing variant) came in Node 17.3. `AbortSignal.any` (the static composer) is Node 20.3+ — which is exactly why `composeSignals` falls back to a manual `AbortController` glue for older runtimes (`lib/mcp/transport.ts:180-189`). Vercel's Node 20 image has both natives.
 
-The absent `AbortController` is also a useful pattern lesson — the cost of NOT having it is exactly the visible cost of an abandoned investigation. Threading it through would cost maybe 20 lines (route reads `req.signal`, `runAgentLoop` accepts `signal`, hands to Anthropic + transport). The lever exists; it just hasn't been pulled because the StrictMode workaround took priority.
+The "thread signal through every layer" discipline is the same shape as Go's `context.Context` as a first argument — except Go enforces it culturally (every standard library function takes `ctx` first), where JavaScript leaves it as an optional last argument. Adopting Go's discipline in TypeScript means making `opts.signal` part of every abstract interface, which is exactly what `DataSource` does.
 
-Worth reading next: the Anthropic SDK docs on AbortController support (it's a first-class parameter), the WHATWG fetch spec on `AbortSignal`, and Vercel's Functions docs on what `maxDuration` actually does at the platform level.
-
----
+Worth reading: the WHATWG DOM spec for `AbortSignal.any` semantics (especially around `reason` propagation); the MCP SDK source for how `client.callTool({signal})` actually plumbs the signal into the underlying transport.
 
 ## Interview defense
 
-**Q: What's the most load-bearing budget primitive in the agent loop?**
-A: The forced-synthesis turn (`lib/agents/base.ts:90-101`). When either `maxTurns` or `maxToolCalls` is hit, the next API call OMITS the `tools` parameter AND appends a `synthesisInstruction` to the system prompt. The model literally cannot request another tool call (no schemas to call) and is explicitly told to emit its final JSON. Without it, budget exhaustion produces empty output — the model keeps wanting to query, the loop terminates with `finalText: ''`, the user sees nothing. With it, budget exhaustion produces the best answer the model can give from what it gathered. That's the difference between a hard wall and a graceful deadline.
+**Q: Walk me through cancellation propagation in this codebase end-to-end.**
+
+Five layers, every one accepts `signal`:
 
 ```
-  forced synthesis — the kernel
-
-  turn N, budget OK:                  turn N+1, budget spent:
-  tools: [schemas]                    (no tools)
-  system: base                        system: base + "stop. output JSON."
-  → tool_use or text                  → text (which is the JSON we asked for)
+  client (real tab close — not React unmount)
+      ↓
+  browser severs TCP
+      ↓
+  Vercel: req.signal aborts
+      ↓
+  route handler: req.signal.throwIfAborted() OR await with signal
+      ↓
+  DataSource.callTool({signal})
+      ↓
+  SdkTransport.callTool: composeSignals(signal, AbortSignal.timeout(30_000))
+      ↓
+  fetch({signal}): aborts → throws DOMException AbortError
+      ↓
+  catch (AbortError) at the route → early return → finally closes the stream
 ```
 
-**Q: There's no `AbortController` anywhere. Defend that.** (Updated)
-A: As of Phase 2, that's no longer fully true. The DataSource layer accepts an `AbortSignal` via `callTool(name, args, opts?: { signal })`, and both adapters compose it with `AbortSignal.timeout(30_000)` via `composeSignals` — so individual subprocess and Bloomreach calls have a hard 30s wall. What's still NOT wired is the browser→route→loop chain: `useInvestigation` still doesn't `ac.abort()` on cleanup (the React StrictMode workaround at `useInvestigation.ts:32-36`), the route still doesn't read `req.signal`, and `runAgentLoop` still doesn't accept a `signal` parameter. So a tab close still doesn't stop the run. The remaining work is mechanical (3 edits) — the structural piece (adapter signal support) is done. The defense: half the work that was hard (designing the seam) is now in place; the easy half (wiring) is gated by deciding whether the StrictMode trade-off is still worth the abandoned-investigation cost.
+Two places it deliberately doesn't propagate:
+  1. The investigation hook (`useInvestigation:32-37`) — won't cancel on React unmount because StrictMode would empty the trace.
+  2. `BloomreachDataSource.sleep` inside the retry ladder (`bloomreach-data-source.ts:172`) — not signal-aware, so a cancel during a 20s retry wait is delayed up to 20s.
 
----
+The synthetic adapter accepts the signal and ignores it (`synthetic-data-source.ts:319-331`) because the dispatch is synchronous — there's nothing to interrupt.
 
----
+Anchor: "signal threaded through every layer, OR'd with a timeout at the fetch boundary, AbortError handled at the route."
+
+**Q: What's the load-bearing kernel of cancellation, and what would break without it?**
+
+Three parts:
+
+```
+   #1 ──► every async boundary accepts a signal parameter
+   #2 ──► composeSignals OR's it with per-call timeout
+          at the innermost layer
+   #3 ──► catch AbortError, distinguish from real errors
+```
+
+Drop #1: cancel events fire at the top but stop at the first layer that doesn't pass `signal` down. The cancel becomes "stuck stream until the 30s per-call timeout fires."
+
+Drop #2: a hung Bloomreach connection burns the full 300s route budget on one call. The 30s ceiling is the only thing protecting us from that scenario.
+
+Drop #3: every cancel looks like a failure. Logs are noisy, the UI's error path fires on benign disconnects.
+
+The optional-hardening part — `throwIfAborted()` at coarse phase boundaries — just speeds up the latency. Not load-bearing; reduces cancellation lag from "next await" to "next phase boundary."
+
+```
+  the test:  remove one part, name the consequence
+   #1 missing → cancel doesn't reach fetch
+   #2 missing → no per-call ceiling
+   #3 missing → noisy logs on disconnect
+```
 
 ## See also
 
-- `01-runtime-map.md` — `maxDuration` is the hard wall on the runtime; per-call 30s is the subprocess wall.
-- `03-event-loop-and-async-io.md` — why `await setTimeout` for the spacing gate is the right backpressure primitive; child-loop framing.
-- `04-shared-state-races-and-synchronization.md` — `composeSignals` as the OR-combinator and its 10-LOC duplication.
-- `05-memory-stack-heap-gc-and-lifetimes.md` — the 16KB and 4KB truncations bound the heap as well as the budget.
-- `06-filesystem-streams-and-resource-lifecycle.md` — `dispose()` as the resource-cleanup analog to `controller.close()`.
-- `08-runtime-systems-red-flags-audit.md` — where the half-wired cancellation ranks against the other risks.
-
----
+  → `02-processes-threads-and-tasks.md` for the single-thread context that makes cancellation latency = "next yield point."
+  → `03-event-loop-and-async-io.md` for the event-loop mechanics behind `AbortSignal.timeout`.
+  → `06-filesystem-streams-and-resource-lifecycle.md` for the `finally { controller.close() }` that pairs with cancellation.
+  → `08-runtime-systems-red-flags-audit.md` for the ranked risks this seam creates.

@@ -1,347 +1,392 @@
-# Provider abstraction (a testability seam, not a multi-provider switch)
+# 08 — provider abstraction
 
-**Industry name(s):** dependency injection / inversion of control, provider abstraction, test seam (fakes over network)
-**Type:** Industry standard · Language-agnostic
-
-> The agent system injects both its MCP caller (`McpCaller` / `McpTransport`) and its Anthropic client through function parameters so tests can pass fakes and run with no network — but this is a *testability* seam, not multi-LLM-provider switching: there is one provider (Anthropic), no factory, and no way to swap Claude for another model.
-
-
----
+**Subtitle:** `ModelProvider` adapter pattern · Industry standard (load-bearing)
 
 ## Zoom out, then zoom in
 
-**Zoom out — the bigger picture.** Provider abstraction lives at the seam between the Per-agent / Agent loop layer and the Provider band. The agent loop in `lib/agents/base.ts` depends on two narrow interfaces — `McpCaller` (L16–L22) and the injected `anthropic: Anthropic` parameter (L48–L49) — and constructs neither. The Route handler builds the real clients (`new Anthropic` at `app/api/agent/route.ts` L207, `connectMcp` for MCP) and passes them down; tests pass fakes through the same parameter.
+`@aptkit/core@0.3.0` defines the abstract `ModelProvider` interface. Blooming
+implements it once, in `AnthropicModelProviderAdapter`. AptKit runs every
+agent loop through this seam without knowing Anthropic exists. That's the
+whole reason AptKit is reusable — and the whole reason swapping providers in
+blooming insights is a 30-line job.
 
 ```
-  Zoom out — where the injection seam sits
+  Zoom out — the provider seam
 
-  ┌─ Route / Test (chooses implementation) ─────────┐
-  │  PROD: new Anthropic(...) + connectMcp           │
-  │  TEST: fakeAnthropic + scripted McpCaller        │
-  └─────────────────────────┬───────────────────────┘
-                            │  passed as parameters
-  ┌─ Per-agent + Agent loop ▼───────────────────────┐  ← we are here
-  │  ★ runAgentLoop({ anthropic, mcp, ... }) ★      │
-  │  depends on:  Anthropic (CONCRETE SDK type)     │
-  │               McpCaller (structural interface)  │
-  │  constructs:  nothing                           │
-  └─────────────────────────┬───────────────────────┘
-                            │
-  ┌─ Provider wrappers + Provider ──▼──────────────┐
-  │  anthropic.messages.create(params)              │
-  │  mcp.callTool(name, args)                       │
-  │  (one provider; no vendor-neutral interface,    │
-  │   no factory, no swap path)                     │
-  └─────────────────────────────────────────────────┘
+  ┌─ AptKit core (@aptkit/core@0.3.0) ─────────────────────┐
+  │  AnomalyMonitoringAgent · DiagnosticInvestigationAgent  │
+  │  RecommendationAgent · QueryAgent · classifyIntent      │
+  │       ▲                                                 │
+  │       │ holds a ModelProvider reference                 │
+  │       │ (provider-neutral interface — messages, tools,  │
+  │       │  system, maxTokens, signal)                     │
+  │       ▼                                                 │
+  └─────────┼───────────────────────────────────────────────┘
+            │ implements ModelProvider
+  ┌─────────┴────────────────────────────────────────────────┐
+  │  ★ AnthropicModelProviderAdapter — lib/agents/aptkit-    │
+  │     adapters.ts:26-72 (30 LOC; the WHOLE provider seam) │  ← we are here
+  └─────────┬────────────────────────────────────────────────┘
+            │ uses Anthropic SDK directly
+            ▼
+  ┌─────────────────────────────────────────────────────────┐
+  │  @anthropic-ai/sdk · api.anthropic.com                  │
+  │  messages.create({model, messages, system, tools, …})   │
+  └─────────────────────────────────────────────────────────┘
 ```
-
-**Zoom in — narrow to the concept.** The question is: how do you test the loop's logic — budget, tool feedback, forced final turn — without a live API key and a live server on every run? Inject both clients by parameter so a test passes a fake. But be precise about what this buys: a *test seam* is not *provider portability*. blooming insights built the first (fakes over the network — 169 tests run with no key) and stopped short of the second (the `anthropic` param is the concrete SDK type, not a vendor-neutral interface).
-
----
 
 ## Structure pass
 
-**Layers.** Three layers: the chooser (Route in production, test setup in tests) that constructs concrete clients, the agent loop / per-agent code that depends only on the injected parameters (`McpCaller`, `anthropic`), and the provider/MCP transports themselves (Anthropic SDK, MCP HTTPS transport). The agent layer constructs nothing; the chooser constructs everything; the transports do the network.
+  → **One axis to trace — dependency direction.** AptKit depends on the
+    `ModelProvider` interface; Blooming's adapter depends on AptKit's
+    interface AND on the Anthropic SDK. The dependency points from concrete
+    *into* abstract — classic adapter pattern. AptKit never imports
+    `@anthropic-ai/sdk`, never sees `Anthropic.Messages.MessageParam`.
 
-**Axis: dependency.** Who depends on whom, and which way does the import arrow point? This axis is the right lens because dependency injection IS a dependency-direction inversion: the agent layer would normally `import { Anthropic } from '@anthropic-ai/sdk'` and `new` it; instead the chooser holds that import and passes the instance in. Control would mis-frame (the agent loop always decides what to call); trust isn't moving here; dependency direction is what flips at the seam.
+  → **The seam is the file `lib/agents/aptkit-adapters.ts`.** 207 lines,
+    three adapter classes:
+    - `AnthropicModelProviderAdapter` — the LLM seam (this file).
+    - `BloomingToolRegistryAdapter` — the data source seam (see
+      `04-agents-and-tool-use/02-tool-calling.md`).
+    - `BloomingTraceSinkAdapter` — the trace seam (see
+      `04-agents-and-tool-use/01-agents-vs-chains.md`).
 
-**Seams.** The cosmetic seam is between the agent loop and the SDK call itself — both run on the same provider concretion. The load-bearing seam is the parameter boundary: between the chooser and the agent loop, dependency flips from "concrete classes constructed here" to "no construction, only a shape parameter." Crossing this seam is what makes 169 tests run with no API key. A sideways non-flip worth naming: this is *not* a multi-provider seam — the `anthropic` parameter is the concrete SDK type, not a vendor-neutral interface, so swapping providers would still touch the agent layer.
-
-```
-  Structure pass — provider abstraction
-
-  ┌─ 1. LAYERS ───────────────────────────────────┐
-  │  chooser (route or test) — constructs clients  │
-  │  agent loop / per-agent — depends on params    │
-  │  provider + MCP transports — do the network    │
-  └────────────────────────┬───────────────────────┘
-                           │  pick the axis
-  ┌─ 2. AXIS ─────────────▼────────────────────────┐
-  │  dependency: who depends on whom, and which    │
-  │  way does the import arrow point?              │
-  └────────────────────────┬───────────────────────┘
-                           │  trace across layers, find flips
-  ┌─ 3. SEAMS ────────────▼────────────────────────┐
-  │  agent↔SDK call: cosmetic                      │
-  │  chooser↔agent: LOAD-BEARING                   │
-  │    "constructs here" → "only consumes param"   │
-  │    this is what makes fakes work               │
-  │  (NOT a multi-provider seam — concrete type)   │
-  └────────────────────────┬───────────────────────┘
-                           ▼
-                   Block 4 — How it works
-```
-
-The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+  → **Axis flip at the seam:** above (AptKit), control flow is
+    provider-neutral; below (the adapter), control flow is Anthropic-
+    specific (auth header, SSE/non-SSE, retry, types). The flip is what
+    makes the seam load-bearing.
 
 ## How it works
 
-**Mental model.** Two narrow interfaces define the *shape* the agent layer depends on; concrete classes implement them for production; the agent layer receives an implementation by parameter and never constructs one. Swapping the implementation (real → fake) is a different argument, not a code change inside the consumer.
+### Move 1 — the mental model
+
+You've written this exact shape in a frontend codebase: a `useAuth()` hook
+that returns `{ user, signIn, signOut }` without specifying whether the
+backend is Firebase, Auth0, or your own JWT server. The hook is the
+interface; the implementation is the adapter. Swap providers, no consuming
+code changes.
 
 ```
-the shared agent loop depends on INTERFACES, not classes
-      │
-  ┌───▼─── McpCaller ───────────────┐   ┌── provider SDK param ──┐
-  │ callTool(name, args, opts?)      │   │ concrete SDK type       │
-  └──────────────────────────────────┘   └─────────────────────────┘
-      ▲                    ▲                  ▲           ▲
-   prod MCP client    buildFakeMcp        real client   fake client
-   (production)        (tests)            (production)   (tests)
+  The provider seam as a wall socket
 
-  injection point: runAgentLoop({ provider_sdk, mcp, ... })
+  ┌─ AptKit (the appliance) ─────────────────┐
+  │  needs ModelProvider                     │
+  │      .complete(request) → ModelResponse  │
+  │      .id      ('anthropic', 'openai', …) │
+  │      .defaultModel                       │
+  └──────────────┬───────────────────────────┘
+                 │ plug
+                 ▼
+  ┌─ AnthropicModelProviderAdapter ──────────┐
+  │  implements ModelProvider                │
+  │  uses Anthropic SDK underneath           │
+  └──────────────────────────────────────────┘
+
+  Swap the plug, swap the wiring underneath, the appliance doesn't know.
 ```
 
-The consumer is written once against the interface; production and tests differ only in what they pass in. That is dependency injection, and it is the entire mechanism.
+### Move 2 — the step-by-step walkthrough
 
----
+**The interface — what AptKit demands.** From the imports in
+`lib/agents/aptkit-adapters.ts:2-14`, AptKit exposes:
 
-### The MCP seam: the transport and caller interfaces
+```typescript
+type ModelProvider = {
+  readonly id: string;
+  readonly defaultModel: string;
+  complete(request: ModelRequest): Promise<ModelResponse>;
+};
 
-There are two narrow interfaces, one nested inside the other's stack. The transport interface is the minimal surface the *client wrapper* depends on — just `callTool` and `listTools`:
+type ModelRequest = {
+  messages: ModelMessage[];
+  system?: string;
+  tools?: ModelTool[];
+  maxTokens?: number;
+  signal?: AbortSignal;
+};
 
-```
-  interface McpTransport:
-      callTool(name, args)  -> Promise<unknown>
-      listTools()           -> Promise<unknown>
-```
-
-The production transport wraps the real MCP SDK client. A test passes a fake transport instead. The production transport also carries an optional HTTP-error holder populated by a capturing `fetch` wrapper handed to the SDK — it records the body of any non-OK HTTP response (cloning so the SDK can still read it). On a failed call, the transport attaches that captured body to the thrown error so callers see the real server message instead of a bare "Unauthorized." This is error-detail plumbing *behind* the same narrow interface — it does not change the seam's shape (`callTool` / `listTools` still return `Promise<unknown>`), so test fakes are unaffected.
-
-The agent-facing caller interface is what the *agent loop* depends on — the richer caller surface with caching / timing metadata:
-
-```
-  interface McpCaller:
-      callTool(
-        name,
-        args,
-        opts?: { cacheTtlMs?: number, skipCache?: boolean },
-      ) -> Promise<{ result: unknown, durationMs: number, fromCache: boolean }>
-```
-
-The intent is explicit in the comment alongside: "Minimal structural interface for an MCP caller so that unit tests can inject a fake without depending on the concrete MCP client class or any network. The production client structurally satisfies this interface." The production client is not even named in the interface — it just *structurally* matches, so a hand-written fake matches too.
-
-```
-McpTransport  ── production transport (wraps SDK Client)   ── prod
-              ── fake transport                              ── tests
-McpCaller     ── production MCP client (structural match)   ── prod
-              ── buildFakeMcp / scripted object              ── tests
+type ModelResponse = {
+  content: ModelContentBlock[];   // text | tool_use
+  usage: { inputTokens: number; outputTokens: number };
+  model: string;
+};
 ```
 
----
+That's the contract. Three fields on the provider, four on the request, three
+on the response. AptKit's agent classes call `provider.complete(request)` in
+a loop and parse `content` for text or tool_use blocks.
 
-### The provider seam: an injected parameter
+**The implementation — Blooming's adapter.** `AnthropicModelProviderAdapter`
+(`lib/agents/aptkit-adapters.ts:26-72`):
 
-The shared agent loop takes the provider SDK client as the first field of its options:
+```typescript
+export class AnthropicModelProviderAdapter implements ModelProvider {
+  readonly id = 'anthropic';
+  readonly defaultModel: string;
+  private readonly logSite: string;
 
-```
-  async function runAgentLoop(opts: {
-      anthropic: ProviderSDK,
-      mcp:       McpCaller,
-      ...
-  })
-```
+  constructor(
+    private readonly anthropic: Anthropic,
+    agent: AgentName,
+    private readonly sessionId?: string,
+    model = AGENT_MODEL,                              // 'claude-sonnet-4-6'
+    logSite = `agents/${agent}:aptkit-model`,
+  ) {
+    this.defaultModel = model;
+    this.logSite = logSite;
+  }
 
-The loop never constructs the provider SDK. It uses the injected instance at the one call site:
+  async complete(request: ModelRequest): Promise<ModelResponse> {
+    const params: Anthropic.Messages.MessageCreateParamsNonStreaming = {
+      model: this.defaultModel,
+      max_tokens: request.maxTokens ?? 4096,
+      messages: request.messages.map(toAnthropicMessage),  // ← translation
+    };
+    if (request.system) params.system = request.system;
+    if (request.tools?.length) params.tools = request.tools.map(toAnthropicTool);
 
-```
-  response = await provider_sdk.messages.create(params)
-```
+    const response = await this.anthropic.messages.create(
+      params,
+      request.signal ? { signal: request.signal } : undefined,
+    );
 
-In production, the route constructs the real client once and passes it down: `new ProviderSDK({ apiKey: env.API_KEY })`, then hands it to each agent's constructor. In tests, a fake object with a `messages.create` method that returns scripted content blocks is passed instead — no key, no network. Every agent takes the provider SDK as a constructor argument, propagating the seam from the route down to the loop.
+    console.log(JSON.stringify({                            // ← logging
+      site: this.logSite,
+      sessionId: this.sessionId,
+      usage: response.usage,
+    }));
 
-```
-route: new ProviderSDK({apiKey}) ──┐
-                                   ├──▶ new DiagnosticAgent(sdk, mcp, ...)
-test:  fakeProviderSDK           ──┘        └──▶ runAgentLoop({ sdk, mcp, ... })
-                                                       sdk.messages.create()
-```
-
----
-
-### Current state vs. future state — be honest about the gap
-
-```
-WHAT EXISTS (testability seam)         WHAT DOES NOT (provider portability)
-────────────────────────────────      ──────────────────────────────────────
-inject provider SDK by param           a Provider interface (chat/complete)
-inject McpCaller by param              an OpenAI/Gemini implementation of it
-fakes in tests, no network             a factory: pickProvider(name) → impl
-AGENT_MODEL is a hard-coded const      model/provider chosen at runtime/config
-```
-
-The injected provider parameter is typed as the *concrete* provider SDK type — not a vendor-neutral `LLMProvider` interface. The loop calls `messages.create` with the provider's specific message / tool / tool-use shapes. Swapping in another vendor would require translating message shapes, tool-call formats, and response parsing — there is no abstraction over that, and no factory to select a provider. The curriculum's "swap one vendor for another" is a **Case B** capability here: study material and a buildable target, not something the codebase does.
-
-What the seam *does* enable, fully and well, is the thing that matters most for a 169-test suite: **fakes over the network.** The model and tool clients are injectable, so the loop's logic is tested deterministically with no key and no server.
-
----
-
-### The principle
-
-Inject your dependencies behind a narrow interface and you get testability for free; you get *portability* only if the interface is also vendor-neutral. You take the first half deliberately — the seam exists to inject fakes, and the interfaces are exactly as wide as the consumer needs — and stop short of the second half if there is one provider and no requirement to switch. Naming that boundary honestly is the point: this is a test seam, and a real provider factory is the next step, not a present feature.
-
----
-
-### Code in this codebase
-
-**Partially addressed — a test seam, not provider portability.** The MCP caller and the Anthropic client are injected by parameter so tests pass fakes and run with no network; but the `anthropic` parameter is the concrete SDK type, there is no vendor-neutral provider interface, and no factory — a single Anthropic provider with no swap path.
-
-#### Files, functions, and line ranges
-
-- **MCP transport interface:** `McpTransport` — `lib/mcp/transport.ts` L7–L10; production `SdkTransport` wrapping the SDK `Client` — L41–L74. Error-detail plumbing behind the interface: `HttpErrorHolder` (L15–L17), `makeCapturingFetch` (L24–L36), and the captured-body attach on failure (L52–L58, L66–L72).
-- **Tool-error type:** `McpToolError` — `lib/mcp/client.ts` L68–L77, thrown by `McpClient.liveCall` (L161) to tag a failed call with its tool name + the underlying server detail; `errorDetail` (L55–L62) unwraps the nested cause. This is the application-layer counterpart to the transport's captured body — both make a failure legible without widening the `McpCaller` interface.
-- **MCP caller interface (agent-facing):** `McpCaller` — `lib/agents/base.ts` L16–L22; intent comment ("inject a fake without depending on the concrete McpClient class or any network") — L11–L14. `McpClient` satisfies it structurally.
-- **Injected Anthropic client:** `anthropic: Anthropic` in `runAgentLoop` opts — `lib/agents/base.ts` L48–L49; the single call site — L102. Real client constructed in the route — `app/api/agent/route.ts` L207 (inside the stream's `start`); propagated through each agent's constructor.
-- **Hard-coded model identity (no runtime selection):** `AGENT_MODEL = 'claude-sonnet-4-6'` — `lib/agents/base.ts` L9; `CLASSIFIER_MODEL` — `lib/agents/intent.ts` L14.
-
-#### Where multi-provider would live
-
-A vendor-neutral `LLMProvider` interface (e.g. `complete(messages, tools, maxTokens) → { text, toolCalls, usage }`) would sit in `lib/agents/` alongside `base.ts`; an `AnthropicProvider` would wrap the current `anthropic.messages.create` call and an `OpenAIProvider` would translate to/from Chat Completions. `runAgentLoop` would take `provider: LLMProvider` instead of `anthropic: Anthropic`, and a factory `createProvider(name)` (driven by config) would choose the implementation. The injection *point* already exists — only the *neutral interface* and the *factory* are missing.
-
----
-
-## Provider abstraction — diagram
-
-This diagram spans the route (constructs real clients), the agent layer (depends on interfaces), and the two implementation worlds (production vs. test). A reader who sees only this should grasp that the consumer takes its dependencies as parameters, and that the seam swaps real for fake — not Anthropic for another vendor.
-
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│  ROUTE / TEST (where implementations are chosen)                     │
-│                                                                       │
-│  PRODUCTION  app/api/agent/route.ts                                  │
-│    new Anthropic({apiKey}) ──┐                                 │
-│    connectMcp → McpClient        ──┤                                 │
-│  TEST                              │                                 │
-│    fakeAnthropic { messages.create }──┤   inject                     │
-│    scripted McpCaller             ──┘                                │
-└───────────────────────────┬───────────────────────────────────────────┘
-                            │  passed as parameters (DI)
-┌───────────────────────────▼───────────────────────────────────────────┐
-│  AGENT LAYER (depends on INTERFACES, constructs nothing)            │
-│                                                                       │
-│  runAgentLoop({ anthropic: Anthropic, mcp: McpCaller, ... })         │
-│     anthropic.messages.create(params)              base.ts           │
-│     mcp.callTool(name, args)                       base.ts           │
-│                                                                       │
-│  interfaces:  McpCaller  base.ts                                     │
-│               McpTransport  transport.ts L7–10                       │
-│  NOTE: `anthropic` is the CONCRETE SDK type — not a vendor-neutral   │
-│         LLMProvider. No factory. Single provider.                    │
-└────────────────────────────────────────────────────────────────────────┘
+    return {
+      content: response.content.flatMap(toModelContentBlock),  // ← translation
+      usage: {
+        inputTokens: response.usage.input_tokens,
+        outputTokens: response.usage.output_tokens,
+      },
+      model: response.model,
+    };
+  }
+}
 ```
 
-The agent layer depends on interfaces and receives implementations from above. The seam swaps real clients for fakes (testability) — it does not swap Anthropic for another vendor (portability), which would need a vendor-neutral interface and a factory that do not exist.
+Walk it:
 
----
+  → **Constructor (lines 31-40):** takes the Anthropic client, the agent
+    name (for the log site label), the session id (for log filtering), and
+    an optional model override (so the intent classifier can pass haiku).
+
+  → **`complete()` (lines 42-71):** builds Anthropic-specific params from
+    the provider-neutral request, calls the SDK, translates the response
+    back, returns the provider-neutral shape. The two `.map(...)` calls on
+    lines 47 and 64 are the translation layer — the only place the
+    `ModelContentBlock` shape gets matched against
+    `Anthropic.Messages.ContentBlock`.
+
+  → **The signal threading (line 54):** the route's `req.signal` arrives
+    here via AptKit's loop and gets passed to `anthropic.messages.create`.
+    When the browser navigates away, this is the line that lets the
+    in-flight HTTP call cancel.
+
+**The translation helpers (lines 144-202).** These are private to the
+adapter file:
+
+  → `toAnthropicMessage` — maps `ModelMessage` ({role, content}) to
+    `Anthropic.Messages.MessageParam`. Three content shapes: text,
+    tool_use, tool_result.
+
+  → `toAnthropicTool` — maps `ModelTool` ({name, description, inputSchema})
+    to `Anthropic.Messages.Tool` (renames `inputSchema` → `input_schema`).
+
+  → `toModelContentBlock` — the reverse direction. Drops thinking blocks
+    (Anthropic sometimes emits these when extended thinking is enabled; the
+    AptKit model doesn't have a `thinking` content variant, so they get
+    dropped). Maps text and tool_use through.
+
+These three functions are the *entire* Anthropic-specific surface area. To
+add an OpenAI provider, you'd write three parallel functions
+(`toOpenAIMessage`, etc.) and a `OpenAIModelProviderAdapter` class. The
+agent code (`lib/agents/monitoring.ts`, `diagnostic.ts`, etc.) would not
+change.
+
+**Where the swap would happen.** Right now `lib/agents/monitoring.ts:85`:
+
+```typescript
+model: new AnthropicModelProviderAdapter(this.anthropic, 'monitoring', this.sessionId),
+```
+
+To swap providers, this line becomes:
+
+```typescript
+model: provider === 'openai'
+  ? new OpenAIModelProviderAdapter(this.openai, 'monitoring', this.sessionId)
+  : new AnthropicModelProviderAdapter(this.anthropic, 'monitoring', this.sessionId),
+```
+
+And every agent file gets the same conditional. Or — cleaner — a factory in
+`lib/agents/base.ts` that takes `provider` and returns the matching adapter,
+called once per agent construction. The factory pattern is the standard move
+once you have more than one provider.
+
+### Move 3 — the principle
+
+**The adapter holds all the provider-specific knowledge. The agent code holds
+none.** That asymmetry is what lets the codebase evolve. A new model release
+on Anthropic (Sonnet 5) lands as a string constant change. A new provider
+(Google Gemini) lands as a new adapter file. A new agent (e.g. a fraud
+detector) lands as a new agent class that takes a `ModelProvider` and
+doesn't care which one. Three changes, three different files, zero
+cross-pollution.
+
+## Primary diagram
+
+```
+  The full provider seam — read top to bottom
+
+  ┌─ Agent classes (lib/agents/*.ts) ───────────────────────┐
+  │  MonitoringAgent · DiagnosticAgent · RecommendationAgent│
+  │  QueryAgent · classifyIntent                            │
+  │       │                                                 │
+  │       ▼ each constructs                                 │
+  │  new AnthropicModelProviderAdapter(                     │
+  │    this.anthropic,         ← injected Anthropic client  │
+  │    'monitoring' | 'diagnostic' | …,                     │
+  │    this.sessionId,                                      │
+  │    model? = AGENT_MODEL,   ← intent overrides to haiku  │
+  │  )                                                       │
+  └────────────────────────┬────────────────────────────────┘
+                           │ passes adapter to AptKit
+                           ▼
+  ┌─ AptKit agent (e.g. DiagnosticInvestigationAgent) ──────┐
+  │  constructor({ model, tools, workspace, trace }) {      │
+  │    this.modelProvider = model;                          │
+  │  }                                                      │
+  │  while (not done) {                                     │
+  │    const response = await this.modelProvider.complete({ │
+  │      messages, system, tools, signal                    │
+  │    });                                                  │
+  │    // dispatch text or tool_use…                        │
+  │  }                                                      │
+  └────────────────────────┬────────────────────────────────┘
+                           │ provider.complete(req)
+                           ▼
+  ┌─ AnthropicModelProviderAdapter.complete() ──────────────┐
+  │  request.messages.map(toAnthropicMessage)               │
+  │  request.tools?.map(toAnthropicTool)                    │
+  │  await anthropic.messages.create(params, {signal})      │
+  │  log usage                                              │
+  │  return { content: …, usage: {…}, model }                │
+  └────────────────────────┬────────────────────────────────┘
+                           │ HTTPS
+                           ▼
+  ┌─ api.anthropic.com ─────────────────────────────────────┐
+  │  POST /v1/messages                                      │
+  └─────────────────────────────────────────────────────────┘
+```
 
 ## Elaborate
 
-### Where this pattern comes from
+The adapter pattern was canonical before LLMs (Gang of Four book, 1994). The
+LLM era has made it the dominant pattern at provider boundaries because
+providers shift fast: model releases monthly, pricing changes, capability
+upgrades (vision, audio, extended thinking). Pinning to a single SDK at
+every call site is technical debt waiting to happen.
 
-Dependency injection / inversion of control is foundational software design (the Dependency Inversion Principle: depend on abstractions, not concretions). Its primary practical payoff has always been *testability* — a unit under test is isolated from slow, networked, or stateful collaborators by injecting test doubles. The "structural interface" flavor here (`McpClient` satisfies `McpCaller` without declaring it) is TypeScript's structural typing doing the work an explicit `implements` would do in a nominal language.
+LangChain made the pattern famous (`BaseChatModel`); AptKit's `ModelProvider`
+is a leaner version of the same shape. The leaner-ness matters: AptKit's
+interface is three properties + one method. LangChain's `BaseChatModel` is
+dozens of methods, hooks, callbacks, and serialization helpers. The smaller
+interface is easier to implement (Blooming's adapter is 30 lines vs ~300 for
+a LangChain provider).
 
-Provider abstraction over LLM vendors is a *related but distinct* application: a vendor-neutral interface plus a factory so the same code runs on different models. Libraries like LangChain's `BaseChatModel`, LiteLLM, and the Vercel AI SDK's provider adapters exist specifically to provide this. Crucially, vendor-neutrality requires the interface to *not* expose any one vendor's shapes — which is exactly where blooming insights' seam stops, because its interface is the concrete Anthropic type.
-
-### The deeper principle
-
-```
-inject the dependency           +  vendor-neutral interface
-──────────────────────────         ──────────────────────────────
-→ TESTABILITY                       → PORTABILITY
-  fakes over network                  swap providers in prod
-  present in this codebase            absent in this codebase
-```
-
-These are two independent properties that happen to share a mechanism (injection). You can have testability without portability — inject the concrete client. You cannot have portability without testability — a neutral interface is injectable by construction. blooming insights sits in the first box: injection for fakes, concrete type, no swap.
-
-### Where this breaks down
-
-1. **Adding a second provider is not a config change — it is a refactor.** Because the seam exposes `anthropic.messages.create` with Anthropic message/tool shapes, supporting OpenAI means rewriting the loop's request building (`lib/agents/base.ts` L92–L101), tool-call extraction (L116–L118), and the synthesis calls — everywhere that touches the concrete API shape. The injection point helps, but it is not sufficient.
-
-2. **`AGENT_MODEL` is a constant, not config.** The model is hard-coded (`lib/agents/base.ts` L9). The doc comment says "Can be swapped at call-site by changing AGENT_MODEL" — which is true for *Anthropic models*, but it is a source edit, not runtime selection, and it cannot reach a different vendor.
-
-3. **The seam can lull you into overstating portability.** A reviewer seeing injected clients might assume provider-swapping is "almost done." It is not — the hard part (the neutral interface and the translation layers) has not been started. Naming the seam as *testability-only* prevents that misread.
-
-### What to explore next
-
-- **A vendor-neutral `LLMProvider` interface + factory:** the actual multi-provider capability (the exercise below).
-- **LiteLLM / Vercel AI SDK provider adapters:** off-the-shelf neutral interfaces that translate to many vendors — what you'd reach for instead of hand-rolling.
-- **Config-driven model selection:** move `AGENT_MODEL` from a const to environment/config so at least Anthropic-model choice is runtime, a precursor to full provider selection.
-
----
+The single-provider state today reflects scope, not principle. blooming
+insights doesn't need multi-provider yet; the user is running their own keys
+against Anthropic for development and demo, and the alpha Bloomreach server's
+rate limit is the binding constraint, not the Anthropic side. When that
+changes — when the product becomes user-facing with provider-level cost
+budgets — the adapter pattern is what makes "let's try Gemini for the
+intent classifier and see if it's cheaper" a Tuesday-afternoon experiment
+rather than a refactor.
 
 ## Project exercises
 
-### Introduce a vendor-neutral `LLMProvider` behind the injected parameter
+### Exercise — add an `OpenAIModelProviderAdapter`
 
-- **Exercise ID:** B1.6 (adapted) — provider portability built on the existing seam.
-- **What to build:** define an `LLMProvider` interface (e.g. `complete({ system, messages, tools, maxTokens }) → { text, toolCalls, usage }`), implement `AnthropicProvider` wrapping the current `anthropic.messages.create` call, and change `runAgentLoop` to take `provider: LLMProvider` instead of `anthropic: Anthropic`.
-- **Why it earns its place:** demonstrates you can tell a test seam from a portability seam and convert the former into the latter without breaking the loop's logic or its tests.
-- **Files to touch:** new `lib/agents/provider.ts` (interface + `AnthropicProvider`), `lib/agents/base.ts` (`runAgentLoop` signature + the L102 call), each agent constructor, `app/api/agent/route.ts` (construct the provider), the agent tests (fakes now implement `LLMProvider`).
-- **Done when:** all existing tests pass against the new interface, and the loop calls `provider.complete(...)` instead of `anthropic.messages.create(...)`.
-- **Estimated effort:** 1–2 days
+  → **Exercise ID:** `study-ai-eng-08.1`
+  → **What to build:** Implement `OpenAIModelProviderAdapter` against the
+    same `ModelProvider` interface, using `openai.chat.completions.create`
+    underneath. Write the three translation helpers (messages, tools,
+    content blocks). Add a `MODEL_PROVIDER=openai|anthropic` env var to
+    pick the provider at agent-construction time.
+  → **Why it earns its place:** "Show me how you'd swap providers" is a
+    common interview question. The answer "I added 30 more lines and one
+    env var" lands much better than "we're tightly coupled to Anthropic."
+  → **Files to touch:** new `lib/agents/openai-adapter.ts` (alongside
+    `aptkit-adapters.ts`), `lib/agents/base.ts` (factory),
+    `lib/agents/monitoring.ts` / `diagnostic.ts` / `recommendation.ts` /
+    `query.ts` / `intent.ts` (each picks via factory), `package.json`
+    (`openai` dep), tests.
+  → **Done when:** `MODEL_PROVIDER=openai npm run dev` runs the same agents
+    against `gpt-4o` (or the configured model) with no other code change.
+  → **Estimated effort:** `1–2 days`
 
-### Add an `OpenAIProvider` and a config-driven factory
+### Exercise — extract a `lib/agents/providers/` directory
 
-- **Exercise ID:** B1.6 (adapted) — the actual provider swap.
-- **What to build:** implement `OpenAIProvider` translating to/from Chat Completions (message shapes, tool-call format, usage), add `createProvider(name)` selecting the implementation from config/env, and prove a diagnostic run works on both.
-- **Why it earns its place:** shows you handled the leaky parts — tool-call semantics and structured-output differences — that make portability harder than it looks (→ 04-structured-outputs.md).
-- **Files to touch:** new `lib/agents/providers/openai.ts`, `lib/agents/provider.ts` (`createProvider`), `app/api/agent/route.ts` (read the config), config/env wiring.
-- **Done when:** a single config value switches a diagnostic investigation between Claude and an OpenAI model, both producing a valid `Diagnosis`.
-- **Estimated effort:** 1–2 days
-
----
+  → **Exercise ID:** `study-ai-eng-08.2`
+  → **What to build:** Refactor `lib/agents/aptkit-adapters.ts` so the three
+    adapter classes each live in their own file:
+    `providers/anthropic-model.ts`, `providers/blooming-tools.ts`,
+    `providers/blooming-trace.ts`. Re-export from a barrel. Sets up the
+    file structure for future providers.
+  → **Why it earns its place:** Tiny refactor, but it's the difference
+    between "one file with 207 lines" and "a directory of adapters." The
+    second shape signals provider-multiplicity is expected.
+  → **Files to touch:** `lib/agents/aptkit-adapters.ts` (split), every
+    importer (just a path update), barrel file.
+  → **Done when:** Each adapter has its own file, no behavior change, tests
+    pass.
+  → **Estimated effort:** `<1hr`
 
 ## Interview defense
 
-### What an interviewer is really asking
-
-"Is your system provider-agnostic?" tests whether you can tell a test seam from a portability seam. The senior signal is precision: "we inject the client for *testability* — fakes, no network — but it's the concrete Anthropic type, so swapping providers is a refactor, not a flag." Overclaiming portability because you see injected clients is the trap.
-
-### Likely questions
-
-**[mid] How do you test the agent loop without calling Claude or a live MCP server?**
-
-Both are injected. `runAgentLoop` takes `anthropic` and `mcp` as parameters (`lib/agents/base.ts` L48–L62) and constructs neither; tests pass fakes — a scripted `messages.create` and a scripted `McpCaller` — so the loop runs its full logic with no network or key.
+**Q: How would you swap from Anthropic to OpenAI in this codebase?**
 
 ```
-runAgentLoop({ anthropic: fake, mcp: fake, ... }) → no network, deterministic
+  One adapter file, one factory in base.ts.
+
+  Today:
+    new AnthropicModelProviderAdapter(this.anthropic, agent, sessionId)
+
+  After:
+    makeModelProvider(provider, ...args)
+       │
+       ├── 'anthropic' → AnthropicModelProviderAdapter (existing)
+       └── 'openai'    → OpenAIModelProviderAdapter (new, ~40 LOC)
 ```
 
-**[senior] Could you swap Claude for GPT-4 by changing the injected client?**
+AptKit defines a `ModelProvider` interface (`id`, `defaultModel`,
+`complete(request) → response`). Blooming implements it in
+`lib/agents/aptkit-adapters.ts:26-72` — 30 lines for Anthropic, three
+translation helpers (`toAnthropicMessage`, `toAnthropicTool`,
+`toModelContentBlock`) for the type mapping. A second provider is the same
+shape with different SDK calls.
 
-No — and that's the honest distinction. The injected `anthropic` is the *concrete* SDK type, and the loop calls `anthropic.messages.create` with Anthropic message/tool/`tool_use` shapes (`lib/agents/base.ts` L92–L118). The seam enables *fakes*, not *vendors*. A real swap needs a vendor-neutral `LLMProvider` interface and translation layers — which don't exist. The injection point is the foundation for it, not the feature itself.
+**Anchor line:** "The agent code never imports `@anthropic-ai/sdk`. Only the
+adapter does. That's the property that makes the swap a 40-line addition."
 
-```
-present: inject real vs fake (same Anthropic shape)
-absent:  inject Anthropic vs OpenAI (needs neutral interface + translation)
-```
+**Q: What's the load-bearing part of the adapter?**
 
-**[arch] Would you build the provider abstraction now?**
+The translation helpers. The `.complete()` method is mostly a passthrough —
+the interesting work is in the three converters that turn AptKit's
+provider-neutral types into Anthropic-specific types and back. If you forgot
+to handle `tool_result` in `toAnthropicContentBlock`, multi-turn loops
+silently corrupt their conversation history. If you forgot to drop unknown
+content types in `toModelContentBlock`, future Anthropic features (thinking
+blocks, citations) would break the parse.
 
-Not without a requirement. A vendor-neutral interface plus per-provider translation is real work with a leaky-abstraction risk (vendors differ on tool-call semantics and structured outputs). Building it before a second provider is needed is speculative generality. The trigger is a concrete requirement — cost arbitrage, a reliability fallback, or a customer mandate — at which point the existing injection point is exactly what you build it on.
-
-```
-one provider, fast tests → concrete injection (now, correct)
-multi-provider required  → neutral interface + factory (then)
-```
-
-### The question candidates always dodge
-
-**"You have an abstraction over MCP and an injected Anthropic client — so you're provider-agnostic, right?"** No. The honest answer is that the seam is for *testability*, the `anthropic` parameter is the concrete vendor type, and there is no factory or neutral interface — so it is *not* provider-agnostic. Claiming portability from the presence of injection is the exact overclaim this question baits.
-
-### One-line anchors
-
-- `lib/agents/base.ts` L16–L22 — `McpCaller`, the structural test interface.
-- `lib/mcp/transport.ts` L7–L10 — `McpTransport`; `SdkTransport` (prod) at L41–L74; `HttpErrorHolder`/`makeCapturingFetch` at L15–L36.
-- `lib/mcp/client.ts` L68–L77 — `McpToolError`, the tool-tagged failure type thrown by `McpClient.liveCall` (L161).
-- `lib/agents/base.ts` L48–L62 — injected `anthropic` + `mcp` params; concrete SDK type.
-- `lib/agents/base.ts` L9 — `AGENT_MODEL` hard-coded; no runtime/vendor selection.
-- Test seam ≠ provider portability: same mechanism, different (and here, only the first) property.
-
----
+**Anchor line:** "The 30 lines of `.complete()` are passthrough. The 50 lines
+of translation are where bugs hide."
 
 ## See also
 
-→ 01-what-an-llm-is.md · → 04-structured-outputs.md · → 06-token-economics.md · → 05-streaming.md
-
----
+  → `01-what-an-llm-is.md` — the one method (`complete`) the adapter implements
+  → `04-agents-and-tool-use/02-tool-calling.md` — the parallel `ToolRegistry` adapter
+  → `06-token-economics.md` — what cost-per-provider comparisons buy you

@@ -1,402 +1,253 @@
-# 05 — replication, partitioning, quorums
+# Replication, partitioning, and quorums
 
-**Industry name(s):** replicas · shards · partition keys · quorum reads/writes · failover
-**Type:** Industry standard · Language-agnostic
-
-> **Verdict-first: NOT YET EXERCISED at the app level, but the family of hazards has bitten us once already.** blooming insights has **no replication, no partitioning, no quorum protocol, no failover mechanism** — because it has nothing to replicate. There is no database to shard, no Redis cluster to failover, no Cassandra ring to write to with quorum. Vercel runs *multiple instances of the Next.js process* horizontally, but the code treats each instance as if it were the only one — there's no cross-instance state, no leader, no consensus. That isn't a gap to fix; it's the deliberate "no database" architectural choice (see `study-system-design/audit.md#storage-choice-and-durability-boundaries`). However, the **eval scripts in Phase 3 hit a real shared-mutable-state-across-processes hazard** when two K=10 runs raced to write into the same `eval/results/<date>/` directory; the `EVAL_RUN_TAG` env var is the post-hoc fix. That anecdote IS distributed-systems thinking applied to a single-host multi-process scenario, and the lesson generalises. This file walks the concepts so they're in your vocabulary, tells the parallel-run war story, names which Bloomreach-side replication is opaque to us, and pinpoints the *first* feature that would force this whole topic to become real.
-
----
+**Industry name:** primary/replica, leader-follower, consistent hashing, quorum reads/writes · **Type:** Industry standard — Case B (not exercised in this repo)
 
 ## Zoom out, then zoom in
 
-```
-  Zoom out — the replication picture (what's actually here)
+Verdict, first sentence: **this repo does not replicate or partition any state.** No replica set, no shards, no consistent hashing, no quorum reads. This file is here so you can defend the absence and recognize when the gap would start mattering.
 
-  ┌─ UI layer ──────────────────────────────────────────────┐
-  │  one tab → one client → no peers                         │
-  │  no replication concern                                  │
-  └─────────────────────────┬───────────────────────────────┘
-                            │
-  ┌─ Service layer ─────────▼───────────────────────────────┐
-  │  Vercel runs N instances horizontally                    │
-  │  ★ each instance is INDEPENDENT — no shared state ★      │ ← this is the
-  │  no leader, no quorum, no failover                       │   topic for us
-  │  (this is NOT replication; it's "no coordination")       │
-  └─────────────────────────┬───────────────────────────────┘
-                            │
-  ┌─ Provider layer ────────▼───────────────────────────────┐
-  │  Bloomreach MCP — multi-region replication likely, but   │
-  │  invisible to us; we see one HTTPS endpoint              │
-  │  Anthropic — same: opaque, single-endpoint API           │
+```
+  Zoom out — where replication WOULD live (and doesn't)
+
+  ┌─ UI layer ───────────────────────────────────────────────┐
+  │  React 19 client                                          │
+  └──────────────────────────────────────────────────────────┘
+
+  ┌─ Service layer — Vercel serverless cohort ───────────────┐
+  │  N ephemeral instances. They share NOTHING except:        │
+  │    • bi_session cookie  (per-user routing)                │
+  │    • bi_auth cookie     (auth state)                      │
+  │                                                           │
+  │  ✗ no replicated state                                    │
+  │  ✗ no shared cache layer (Redis, Memcached)               │
+  │  ✗ no consistent hashing                                  │
+  └──────────────────────────────────────────────────────────┘
+
+  ┌─ Provider layer ─────────────────────────────────────────┐
+  │  Bloomreach loomi-MCP — ONE upstream                      │
+  │  (its internal replication is opaque to us)               │
+  │                                                           │
+  │  Anthropic API — ONE upstream                             │
+  │  (same — opaque)                                          │
+  └──────────────────────────────────────────────────────────┘
+
+  ┌─ "Database" ──────────────────────────────────────────────┐
+  │  ✗ no database. Period.                                   │
+  │  in-memory Maps (per-instance) + gitignored JSON files    │
+  │  for dev auth + committed JSON snapshots for demo replay  │
   └──────────────────────────────────────────────────────────┘
 ```
 
-**Zoom in.** The question this file answers: *if some part of this system needed to be highly available across machines, where would you start?* The honest answer for blooming insights is "you'd start by adding a database and then this whole topic becomes relevant." Today, the topic does not apply. This file teaches the concepts anyway so you can name them in an interview, and so when the first replication-requiring feature arrives you know what to reach for.
+If you're studying for a distributed-systems interview, the chapter on replication/partitioning is real — but the truthful answer for this codebase is "not exercised." Read this file to know what you'd be adding when it becomes time.
 
----
+## Structure pass (compressed — there's no mechanism to walk)
 
-## Structure pass
-
-**Layers.** Only the service layer is interesting. The client layer is one-user-one-tab; replication doesn't apply. The provider layer is opaque — Bloomreach and Anthropic almost certainly run replicated infrastructure (they'd have to, at their scale), but we see one HTTPS endpoint and have no visibility into how requests are distributed across replicas behind it.
-
-**Axis: who can lose what.** Hold one question across the service layer: *what happens if this instance dies right now, and where does the work resume?* If a Vercel instance dies mid-investigation, the answer is: **nothing resumes**. The in-flight stream errors out at the client. The next request lands on a different instance with an empty Map. The user re-runs from scratch. There's no replica to fail over to because the state isn't replicated anywhere.
-
-**Seams.** Two would-be seams that aren't load-bearing today.
-
-- **Seam: Vercel-instance ↔ Vercel-instance.** The seam where replication *would* live if there were state to replicate. There isn't, so the seam is unused.
-- **Seam: our-region ↔ Bloomreach-region.** Geographic seam. Latency varies by where Vercel routes the request from and where Bloomreach serves from. Not under our control. Not visible to our code.
+### Axis: where could a replica or shard logically live?
 
 ```
-  Structure pass — the would-be seams
+  Trace "could-this-replicate?" across the stack
 
-  ┌─ Vercel inst1 ──┐     ?    ┌─ Vercel inst2 ──┐
-  │  Map<id, …>      │ ◄ ──── ► │  Map<id, …>      │   ← no link;
-  │                  │           │                  │     no consensus;
-  └──────────────────┘           └──────────────────┘     no replication
-       │                              │
-       │  HTTPS                       │  HTTPS
-       ▼                              ▼
-  ┌─ Bloomreach API endpoint (opaque single URL) ──────────┐
-  │  almost certainly replicated internally                 │
-  │  Anthropic too                                          │
-  │  we see one URL; their replication is their problem     │
-  └─────────────────────────────────────────────────────────┘
+  Browser            — N tabs already exist; client-side replication = none
+  Vercel instance    — N instances exist; share nothing → "replication-less"
+  Caches             — per-instance, not shared → each replica is its own cache
+  State              — per-instance + per-session Maps; never shared
+  Datastore          — DOES NOT EXIST. Nothing to replicate.
 ```
 
----
+The axis answer is "no" at every layer. There's nowhere replication would land because there's no stateful component that owns durable state.
 
-## How it works
+### Seams (load-bearing absences)
 
-### Move 1 — the mental model
+- **No primary/replica seam.** Each Vercel instance is independent and authoritative for its own per-instance memory only. There's no "promote to primary" event because there's no primary.
+- **No partition key boundary.** The `bi_session` cookie acts a bit like a routing key (per-user isolation), but Vercel doesn't pin a session to an instance — any instance can serve any request. This means the *opposite* of sharding: any data that needs to span requests has to ride the request itself (cookie, URL param) or live in the upstream.
+- **No quorum seam.** No N/W/R decisions to make.
 
-You already know that a backup is one extra copy of your data. Replication is the same idea, automated and continuous — multiple machines hold copies, kept in sync, so one dying doesn't lose data and one being slow doesn't slow reads.
+## Move 1 — what the picture would look like if it existed
 
-```
-  The replication kernel — three patterns
-
-  PRIMARY-REPLICA       one machine accepts writes, copies to
-                        N read replicas
-                        easy to reason about; primary is SPOF for writes
-
-  MULTI-PRIMARY         every machine accepts writes, syncs to all
-                        no write SPOF; conflict resolution required
-                        (last-write-wins, CRDTs, vector clocks)
-
-  QUORUM (Dynamo-style) write requires W replicas to ack,
-                        read requires R, W + R > N for consistency
-                        no leader; high availability; tunable
-
-  none of these are exercised in blooming insights — there's
-  no state worth replicating yet
-```
-
-Partitioning is orthogonal: *what subset of the data does this machine hold?* Partition key picks the shard; routing layer picks the destination. blooming insights has no partitions because there's no data set big enough to need them.
-
-### Move 2 — the moving parts (named, then marked NOT YET EXERCISED)
-
-**Use cases.**
-
-In the Vercel app: none today. Every file path that would normally appear here — connection pools to a primary, read-replica routing, quorum-write configuration, failover handlers — does not exist. The closest thing to "instance-aware logic" is the comment in `lib/mcp/auth.ts:38-104` explaining that the encrypted cookie backend exists precisely *because* there's no cross-instance store, and the auth flow has to survive Vercel routing the connect and callback requests to different instances.
-
-In the eval scripts: the `EVAL_RUN_TAG` env var IS the codebase's only existing answer to a shared-mutable-state-across-processes hazard. Four scripts honor it (`eval/scripts/run-detection.ts`, `run-diagnosis.ts`, `run-recommendation.ts`, `run-regression.ts`); each computes its results-dir as `${date}-${tag}` if the tag is set, plain `${date}` otherwise. The fix is one-shape, repeated.
-
-#### Part 1 — primary-replica
-
-A primary accepts writes; one or more read replicas pull from a replication stream. Replication lag is the staleness window between a write committing on the primary and being visible on the replica. Failover means promoting a replica to primary when the primary dies.
+For contrast, here's the shape this repo would take if a replicated datastore landed.
 
 ```
-  Primary-replica — the kernel
+  Hypothetical: what replication WOULD add (not in this repo)
 
-  ┌─ primary ──┐ ── writes ──► ┌─ replica1 ─┐  reads
-  │ write log  │ ── stream ───► │  read-only │  served from
-  └────────────┘ ── ────────►── └────────────┘  any replica
-                              │  ┌─ replica2 ─┐
-                              └─►│  read-only │
-                                 └────────────┘
+  ┌─ Browser ──────────┐
+  └─────────┬──────────┘
+            │
+  ┌─ Vercel cohort ────┴────────────────────────────┐
+  │  load balancer (already exists)                  │
+  └──────────┬──────────────────────────────────────┘
+             │
+   ┌─────────┴─────────────┐
+   │                       │
+   ▼                       ▼
+  ┌─ Replica 1 ──┐    ┌─ Replica 2 ──┐    ┌─ Replica 3 ──┐
+  │  primary     │    │  follower     │    │  follower     │
+  │  (writes)    │    │  (reads)      │    │  (reads)      │
+  └──────┬───────┘    └──────▲────────┘    └──────▲────────┘
+         │ async replication │                    │
+         └───────────────────┴────────────────────┘
 
-  failover: replica promoted to primary when primary dies
-  load: reads scale with replica count, writes don't
+  Adding this would introduce:
+    • replica lag (eventual consistency)
+    • failover (leader election, split-brain risk)
+    • partition key for sharding (consistent hashing)
+    • quorum reads/writes (N/W/R tradeoff)
+    • client-side read repair OR strong-read on follower miss
 ```
 
-**Status in blooming insights: NOT YET EXERCISED.** Becomes relevant the first time a feature needs durable shared state — a user-facing history of insights ("show me last week's anomalies") would require a database, and that database would want at least one read replica for the briefing's analytical reads.
+None of those concerns apply today. The closest analog to "multi-replica" is "the Vercel cohort serves all reads," but every instance hits the same Bloomreach upstream — fan-out, not replication.
 
-#### Part 2 — quorum (Dynamo-style)
+## Move 2 — what's actually here, by way of counter-example
 
-No leader. Writes require W replicas to ack; reads require R; if W + R > N (total replicas), every read sees the latest write. Trades off latency for availability.
+### The single-source-of-truth pattern
 
-```
-  Quorum write — pseudocode
+```ts
+// lib/mcp/schema.ts:166
+export async function resolveProject(
+  dataSource: DataSource,
+  opts: BootstrapOpts = {},
+): Promise<{ projectId: string; projectName: string }> {
+  const orgs = unwrap<{ data: { id: string; name: string }[] }>(
+    await callOrThrow(dataSource, 'list_cloud_organizations', {}, opts),
+  ).data;
+  if (!orgs?.length) throw new Error('no cloud organizations for this user');
 
-  function write(key, value):
-    in parallel, send write to all N replicas
-    wait for W acks
-    return success  (the other (N-W) replicas eventually catch up)
+  const projects = unwrap<{ data: { id: string; name: string }[] }>(
+    await callOrThrow(dataSource, 'list_projects', { cloud_organization_id: orgs[0].id }, opts),
+  ).data;
+  if (!projects?.length) throw new Error('no projects in organization');
 
-  function read(key):
-    in parallel, read from all N replicas
-    wait for R responses
-    return the value with the highest version
-```
-
-**Status in blooming insights: NOT YET EXERCISED.** Would only become relevant at much larger scale than this app needs — Dynamo, Cassandra, Riak. The "right" first step toward replication for this codebase is a managed database (Postgres, Vercel KV), not a quorum-based store.
-
-#### Part 3 — partitioning (sharding)
-
-Pick a partition key (user_id, organization_id, geographic region). Route each request to the shard that owns its key. Each shard is an independent unit.
-
-```
-  Partitioning — the kernel
-
-  request (key=user_42)  ──► router  ──► shard 2 (owns hash(user_42))
-  request (key=user_99)  ──► router  ──► shard 0 (owns hash(user_99))
-
-  good partition key:  high cardinality (many distinct values),
-                       even distribution (no hot shard),
-                       stable (key doesn't change for a record)
-
-  bad partition key:   low cardinality → some shards do all the work
-                       skewed → "hot key" problem
-                       changing → records have to migrate
+  const pinned = process.env.BLOOMREACH_PROJECT_ID;
+  const project = (pinned && projects.find((p) => p.id === pinned)) || projects[0];
+  return { projectId: project.id, projectName: project.name };
+}
 ```
 
-**Status in blooming insights: NOT YET EXERCISED.** No data is large enough to need partitioning. The natural partition key when it does become relevant is `bi_session` (user-scoped) or `projectId` (workspace-scoped, since Bloomreach is keyed that way). The natural shard would be Vercel KV namespaces or a Postgres schema-per-organization. Not built; not needed yet.
+The "partition key" here is the user (via the OAuth Bearer token) — Bloomreach handles the multi-tenancy. We pick *one* project (`pinned ?? projects[0]`) and use that for the lifetime of the schema cache. There's no sharding decision to make at our layer.
 
-#### Part 4 — failover and the lack-of-leader-election in the codebase
+### The "demo snapshot" as a degenerate datastore
 
-A failover protocol picks a new primary when the current one dies. It requires consensus (Raft, Paxos, or a coordinator like Zookeeper) to avoid split-brain (two primaries thinking they're primary).
+`lib/state/demo-insights.json` (committed) is the only thing in this repo that survives a process restart with no upstream. It's not a database — it's a JSON file the briefing route serves verbatim:
 
-```
-  Leader election — the question consensus answers
-
-  N nodes; one is supposed to be the leader.
-  the current leader's heartbeat stops.
-  WHO becomes the next leader, and how do all N agree?
-
-  consensus protocols (Raft, Paxos, ZAB):
-    a quorum of N must agree on the new leader
-    split-brain is prevented by making the quorum impossible
-    for two competing leaders to both achieve
-```
-
-**Status in blooming insights: NOT YET EXERCISED.** There IS no leader to elect. No node has a special role. Every Vercel instance is interchangeable; the system simply has no notion of "the instance that owns X." If a feature needed one — for example, a "global lock so two briefings for one user don't run concurrently" — that would force consensus (probably Vercel KV's `SET NX` as a poor-man's lock with TTL, not a real consensus protocol). Not built; not needed.
-
-The only place the codebase acknowledges horizontal scaling is in the auth backend selection. Here's the seam between "single-process dev" and "multi-instance production" — and the choice the code makes about it:
-
-```
-  lib/mcp/auth.ts  (lines 22-36, 38-104)
-
-  // Storage backend, keyed by our app session id. Three backends, selected by env:
-  //   • development → a gitignored file (.auth-cache.json).
-  //   • test → in-memory Map (isolated per run).
-  //   • production (Vercel) → an encrypted httpOnly cookie, via `withAuthCookies`.
-  //     The `connect` and `callback` requests run on different ephemeral
-  //     instances, so the browser cookie is the only state both can see.
-  const PERSIST = process.env.NODE_ENV === 'development';
-  const CACHE_FILE = join(process.cwd(), '.auth-cache.json');
-  const memStore = new Map<string, SessionAuthState>();
-       │
-       └─ this comment IS the codebase's only explicit acknowledgment
-          that production is multi-instance. The "shared store" for
-          the auth flow is the browser cookie — i.e. the client carries
-          the state. Same pattern as bi:diag:<id> in useInvestigation.
-          NEITHER is replication; both are "push state to where you can
-          see it across instances."
-```
-
-#### Part 5 — what IS replicated that we can name
-
-Two things in the dependency graph are almost certainly replicated, but invisible to our code.
-
-- **Bloomreach MCP.** A SaaS analytics platform. Inferred: serves traffic from multiple regions, with their own internal replication and routing. We see `https://loomi-mcp-alpha.bloomreach.com/mcp/` and `~1 req/s/user`. Their failover is their problem; if their primary region goes down, our retries either succeed against the failover or fail.
-- **Anthropic API.** Same story. Multi-region, multi-tenant, opaque to us. Their availability is their problem.
-
-There's nothing we can do at the codebase to participate in their replication — we're a client, not a peer. The right response to their failure is the partial-failure handling in file 02.
-
-```
-  lib/state/insights.ts  (lines 4-6)
-
-  const insights = new Map<string, Insight>();             ← per-process;
-  const investigations = new Map<string, Investigation>();    no replica
-  const anomalies = new Map<string, Anomaly>();              no failover
-       │
-       └─ this is the gap that file 09 (red-flags audit) ranks as the
-          #1 distributed-systems risk. It's not "the wrong design"; it's
-          "the right design at hackathon scale, with the cost honestly
-          named." Adding replication here means adding a database first.
-```
-
-#### Part 6 — the parallel-eval K=10 race (real war story, single host, multiple processes)
-
-The Phase 3 eval pipeline writes its results into `eval/results/<YYYY-MM-DD>/` per script. Two K=10 runs on the same day — say, one from the main session and one from a sub-agent in another shell — both compute the same date string, both call `mkdirSync(... { recursive: true })`, both `JSON.stringify` per-run results, and both write `summary.md` at the end. **There is no coordination.** The faster writer's output gets clobbered by the slower writer's; the earlier `summary.md` is overwritten silently; the directory ends up with rows from two interleaved runs and no way to tell which is which.
-
-```
-  The race — two processes, one directory, no lock
-
-  process A (eval/scripts/run-detection K=10)        process B (same)
-     │                                                  │
-     ├── mkdirSync('eval/results/2026-06-15')          ├── mkdirSync('...')
-     │                                                  │
-     ├── run 1/10 (~30s)                               ├── run 1/10 (~30s)
-     ├── write summary partial                         ├── write summary partial
-     ├── run 2/10                                      ├── run 2/10
-     │   ...                                              ...
-     ├── write summary.md  ←─ A's final                ├── write summary.md
-     │                          ─ clobbered ──────────►│   ←─ B overwrites A
-     │                                                  │
-  → directory contains a mix of A's and B's per-run JSON,
-    B's summary.md, and no way to recover A's
-```
-
-This bit the team for real: the main session ran K=10 from Bash while PR E's sub-agent ALSO ran K=10 in parallel. The race was detected via `ps aux` (two `node` processes mid-eval), and the rogue PIDs were killed before they finished overwriting each other. The fix wasn't a lock or a coordinator — it was **separating the namespace**: every eval script now reads `process.env.EVAL_RUN_TAG` and appends the tag as a suffix on the date-stamped directory.
-
-```
-  The fix — namespace separation via EVAL_RUN_TAG
-
-  process A: EVAL_RUN_TAG=baseline    → eval/results/2026-06-15-baseline/
-  process B: EVAL_RUN_TAG=after-fix   → eval/results/2026-06-15-after-fix/
-                                         (different dirs; no race)
-
-  pseudocode (the actual pattern, repeated in run-detection.ts,
-              run-diagnosis.ts, run-recommendation.ts, run-regression.ts):
-
-    date = new Date().toISOString().slice(0, 10)
-    tag = process.env.EVAL_RUN_TAG          ← optional namespace
-    dirName = tag ? `${date}-${tag}` : date
-    dir = resolve(REPO_ROOT, 'eval/results', dirName)
-    if not exists(dir): mkdirSync(dir, recursive: true)
-```
-
-The distributed-systems lessons here are real even though it's a single host:
-
-- **Shared mutable state across processes is a hazard regardless of network.** Two Node processes on the same machine writing to the same path is morally identical to two replicas writing to the same key.
-- **The cheapest coordination is namespace separation.** Instead of a lock, give each writer its own directory. This is why partition keys (file's Part 3) exist as a primitive even outside multi-replica databases — partitioning is "let writers not collide" applied at any altitude.
-- **Detection > prevention when prevention is expensive.** A `flock` on the directory would prevent the race but block the second writer. The chosen fix (suffix) lets both runs proceed in parallel into separate namespaces — strictly better for the eval workflow, where comparing two runs IS the point.
-- **The hazard is invisible without observability.** No error fired. No exception. The team noticed because they could *see* two `node` processes in `ps aux`. Without that, the race would have produced a confusing summary and no debug trail.
-
-The right next move when a real cross-instance hazard arises in the Vercel app (not just the eval scripts): the same pattern applies. Namespace-separate by `bi_session` (one user, one namespace) or `sessionId` (one route invocation, one namespace), and the cross-instance hazard converts into a non-race.
-
-```
-  eval/scripts/run-detection.ts  (lines 87-100)
-
-  function makeResultsDir(): { dir: string; date: string } {
-    const today = new Date();
-    const date = today.toISOString().slice(0, 10);
-    // EVAL_RUN_TAG lets a same-day re-run land in a sibling dir (e.g.
-    // `2026-06-15-after-fix/`) instead of overwriting the prior run's
-    // summary.md and raw audit trail.
-    const tag = process.env.EVAL_RUN_TAG;
-    const dirName = tag ? `${date}-${tag}` : date;
-    const dir = resolve(REPO_ROOT, 'eval/results', dirName);
-    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-    return { dir, date };
+```ts
+// app/api/briefing/route.ts:86
+if (demo && existsSync(DEMO_FILE)) {
+  let snapshot: DemoSnapshot | null = null;
+  try {
+    snapshot = JSON.parse(readFileSync(DEMO_FILE, 'utf8')) as DemoSnapshot;
+  } catch {
+    snapshot = null;
   }
-       │
-       └─ namespace-separation as a coordination primitive. Without the
-          tag suffix, two parallel K=10 runs collide; with it, they
-          partition their writes by tag. Same pattern lives in
-          run-diagnosis.ts:118-127, run-recommendation.ts:136-145,
-          run-regression.ts:178-187 — four copies, deliberately
-          duplicated because each script is a standalone process and
-          the cost of factoring this out is higher than the cost of
-          one extra `const tag = process.env.EVAL_RUN_TAG`.
+  if (snapshot) { /* replay */ }
+}
 ```
 
-### Move 3 — the principle
+If this ever became a real datastore (the user can edit notes on an investigation, say), replication would land here. Today it's read-only and ships with the repo, so its "consistency model" is just `git pull`.
 
-**Replication is the answer to "what happens when this dies?" — but only when there's something durable to keep alive.** blooming insights has no durable state outside Bloomreach itself; if the Vercel instance dies, the user retries from scratch and nothing is lost (the briefing was re-derivable; the investigation was re-runnable). Replication is the right tool the moment that stops being true — when there's a feature where "the user wouldn't be able to redo the work." Until then, the right answer to "why no replication?" is "because nothing here would benefit from it" — and saying that plainly is honest distributed-systems thinking, not a confession.
+### Per-instance in-memory caches — read-replica-shaped, but not replicas
 
----
+```
+  Three Vercel instances, each with its own everything
+
+  ┌─ Instance A ─────────┐ ┌─ Instance B ─────────┐ ┌─ Instance C ─────────┐
+  │ insights Map: {…}     │ │ insights Map: {…}     │ │ insights Map: {…}     │
+  │ schema cache: {…}     │ │ schema cache: {…}     │ │ schema cache: (cold)  │
+  │ data-source cache: {…}│ │ data-source cache: {…}│ │ data-source cache: {…}│
+  └──────────┬───────────┘ └──────────┬───────────┘ └──────────┬───────────┘
+             └─────────────────────────┴────────────────────────┘
+                                       │
+                                       ▼
+                         ┌─ Bloomreach loomi-MCP ─┐
+                         │  the only source of    │
+                         │  truth                 │
+                         └────────────────────────┘
+```
+
+Each instance is its own cache — that *resembles* the "fan-out to N read replicas" pattern, but with two crucial differences: (a) the caches are populated lazily per request, not seeded from a primary; (b) instances never talk to each other. Two requests for the same data hit two different caches, with no coordination between them. That's not replication — it's "every instance is alone."
+
+## What would change if replication landed
+
+A practical, ranked list of what'd need to be added:
+
+1. **Add Redis (or Vercel KV) as a shared cache layer.** The 60s response cache currently in `BloomreachDataSource` becomes a shared layer — instance A's cache hit serves instance B's request. This is the *cheapest* "replication" win and the one we'd reach for first.
+2. **Move `insights` and `investigations` Maps out of process.** Same store. Removes the `?insight=` URL param hack from the consistency model.
+3. **Add a TTL to the schema cache and move it to Redis too.** Solves the process-lifetime staleness in `lib/mcp/schema.ts:190`.
+4. **THEN** start thinking about partitioning (multi-region Vercel + multi-region Redis), at which point quorum reads/writes (W=1, R=2 for example) would become a real choice.
+5. **Only THEN** start thinking about Postgres + read replicas, at which point replication lag, failover, and split-brain become concerns.
+
+This list is the migration path. We're at step 0. The honest framing is that this is right-sized for a portfolio project; the same listing as a production roadmap would be sensible at scale.
+
+## Why this doesn't matter (yet)
+
+The volume profile keeps this corner empty:
+
+- One user per session. No fan-out.
+- Read-only upstream tools (no writes to dedup, replicate, or order).
+- Bounded duration (max 300s per request → instance never needs warm long-running state).
+- Demo snapshot is the "shared store" and it's a JSON file in git.
+
+The architectural pressure that *would* push us into real replication: multi-tenant teams sharing a workspace (now you have to share `insights` across users), or letting the user save/edit briefings (now you need a real write path with conflict resolution).
 
 ## Primary diagram
 
 ```
-  Replication-shaped concerns in blooming insights — and what they actually look like
+  Full picture — what's NOT here
 
-  ┌─ within our code ────────────────────────────────────────────────┐
-  │                                                                   │
-  │  Vercel inst1   inst2   inst3   inst4    (N instances)            │
-  │      │           │       │       │                                │
-  │      │           │       │       │                                │
-  │  ★ each one independent — no leader, no peers ★                    │
-  │  ★ in-memory state is per-instance ★                              │
-  │                                                                   │
-  │  REPLICATION:        not exercised                                │
-  │  PARTITIONING:       not exercised                                │
-  │  QUORUMS:            not exercised                                │
-  │  LEADER ELECTION:    not exercised                                │
-  │  FAILOVER:           not exercised                                │
-  │                                                                   │
-  └─────────────────────────┬────────────────────────────────────────┘
-                            │  HTTPS
-                            ▼
-  ┌─ external (opaque) ──────────────────────────────────────────────┐
-  │                                                                   │
-  │  Bloomreach MCP:    almost certainly replicated internally;        │
-  │                     we see one endpoint                            │
-  │  Anthropic API:     same                                           │
-  │  Bloomreach IdP:    same                                           │
-  │                                                                   │
-  │  their replication is their problem; we see failures and retry     │
+  ┌─ Browser ─────────────────────────────────────────────────────────┐
+  │  one tab, one user (today)                                         │
+  └────────────────────────────┬──────────────────────────────────────┘
+                               │ HTTPS
+  ┌─ Vercel cohort ────────────▼──────────────────────────────────────┐
+  │  N independent instances. SHARE NOTHING except cookies.            │
+  │                                                                    │
+  │  ✗ no Redis        ✗ no leader election    ✗ no shard key          │
+  │  ✗ no Postgres     ✗ no consensus group    ✗ no quorum             │
+  │  ✗ no failover     ✗ no read repair        ✗ no replication lag    │
+  └────────────────────────────┬──────────────────────────────────────┘
+                               │ HTTPS Bearer
+  ┌─ Bloomreach loomi-MCP ─────▼──────────────────────────────────────┐
+  │  ONE upstream. Its internal replication is opaque.                 │
+  │  (we don't pay coordination cost; we pay rate-limit cost instead)  │
   └───────────────────────────────────────────────────────────────────┘
-
-  what would force this picture to change:
-    feature requiring durable shared state
-    → add Postgres or Vercel KV
-    → that database has replicas
-    → THEN this file becomes load-bearing
 ```
-
----
 
 ## Elaborate
 
-The first feature that would force this whole topic to become real: **a shared workspace where two users can see and react to the same briefing.** Currently each user gets their own (per-bi_session) feed. A shared workspace needs: durable storage (database), cross-instance coordination (so user A's mark-as-resolved is visible to user B in real time), and probably read replicas (the dashboard's read load eclipses the briefing's write load by orders of magnitude). That's when you reach for Postgres + a read replica + Vercel KV for pub/sub.
+The standard distributed-systems vocabulary for replication and partitioning lives in Kleppmann *Designing Data-Intensive Applications* chapters 5–6 and Lindsey Kuper's distributed-systems lectures. Worth knowing at the vocabulary level for interviews even when not exercised:
 
-The second feature: **scheduled briefings (cron-style "run the briefing for org X every morning at 8am").** Scheduled jobs need a leader — exactly one Vercel function should fire per schedule. Vercel's own Cron Jobs feature handles this (the platform IS the leader-election protocol); you'd lean on the platform rather than building consensus yourself.
+- **Synchronous vs asynchronous replication.** Sync = primary waits for follower ack (strong consistency, slow); async = fire-and-forget (fast, replica lag). Most real systems are async or "semi-sync" (wait for at least one follower).
+- **Leader-based vs leaderless.** Leader-based (Postgres, MySQL, MongoDB): one writer, many readers. Leaderless (DynamoDB, Cassandra, Riak): writes go to N replicas with W acknowledging, reads go to R replicas — the N/W/R quorum tradeoff.
+- **Single-leader vs multi-leader.** Multi-leader (CRDTs, last-write-wins, version vectors) lets multiple regions accept writes; required for active-active multi-region. Conflict resolution is the whole story.
+- **Partitioning strategies.** Hash partitioning (uniform distribution, no range scans), range partitioning (range scans cheap, hot-spot risk), consistent hashing (minimal rebalance on node add/remove). Re-sharding is its own hard problem.
+- **Quorum math.** N replicas, write to W, read from R; strong consistency requires W + R > N. Common: N=3, W=2, R=2 — tolerate one replica down on either side.
 
-The pattern: blooming insights doesn't avoid distributed-systems work by being clever; it avoids it by not building features that require it. The day the features arrive, the work arrives with them.
-
----
+What to read next: Kleppmann ch. 5–6; the DynamoDB paper; the Cassandra docs on tunable consistency; Aphyr's Jepsen reports for what goes wrong in practice.
 
 ## Interview defense
 
-**Q: What does your replication strategy look like?**
+**Q: "How do you handle replication in this system?"**
 
-There isn't one. Every piece of mutable state in this app is either per-process in-memory or per-tab in sessionStorage — there's nothing durable to replicate. The only "shared" state across requests is the encrypted auth cookie, which the client carries. Vercel runs multiple instances horizontally but the app treats them as independent — no leader election, no quorum, no failover protocol. The first feature that needs shared durable state would force me to add a database, and at that point replication becomes a real decision; until then it's deliberately absent.
+> "I don't. This repo has no replicated state — no Redis, no Postgres, no shared cache, no replica set. The Vercel cohort serves all reads but every instance is independent; they share nothing except cookies. The day this needs to change, the first move is Vercel KV or Redis to hold the response cache and the `insights` maps; the per-instance staleness I work around with a `?insight=<JSON>` URL hack would go away. Only after THAT would partitioning, quorum reads, or a Postgres primary/replica setup become real choices."
+
+Diagram you sketch:
 
 ```
-  the honest answer
+  today:   N Vercel instances → 1 Bloomreach (fan-out, no shared cache)
 
-  no replicas        ←  no shared state
-  no quorum          ←  no peers to vote
-  no leader election ←  no role to assign
-  no failover        ←  nothing to fail over to
-
-  if instance dies mid-flow:
-    in-flight stream errors out
-    user retries
-    nothing was lost (the work was re-derivable)
+  step 1:  N Vercel instances → 1 Redis (shared 60s cache) → 1 Bloomreach
+  step 2:  + Postgres for write state → multi-region → quorum reads
 ```
 
-**Q: Bloomreach is presumably multi-region replicated. Does that change anything for you?**
+**Q: "What would push you into real replication?"**
 
-Their replication is opaque to us — we see one HTTPS endpoint. Their failover is their problem, but it lands on us as a partial-failure event: a 5xx or a timeout that we have to handle. File 02 (partial failure) walks the McpClient retry loop that catches this. We don't participate in their replication; we observe its symptoms.
+> "Three triggers: (1) multi-user teams sharing a workspace — `insights` becomes a shared collection. (2) Persistent investigations — the user saves notes, that's a write path with concurrency. (3) Multi-region latency — at which point the shared cache and shared state need to replicate, and the conflict-resolution choices (leader vs leaderless, last-write-wins vs CRDTs) become real. None of those exist today."
 
-**Q: What's the first feature that would force you to build real replication?**
+**Q: "What's the single closest thing to replication you have?"**
 
-A shared workspace where two users see the same briefing. That breaks the per-bi_session model — the data has to live somewhere both sessions can read it. Adding Postgres gets you durable storage, and the moment you have Postgres on Vercel, you probably want a read replica for the analytical reads the dashboard does. That's also when leader election becomes relevant for scheduled jobs — running the briefing at 8am for an org needs exactly one Vercel function to fire, and Vercel Cron Jobs handles that for me as platform-level leader election.
-
----
-
----
+> "The per-instance caches. Three Vercel instances, three independent caches, all pointing at the same Bloomreach upstream — it *resembles* fan-out to read replicas. But there's no coordination, no read repair, no consistency story between them. Each instance is its own little world. That's the honest framing — not replicated, just multiplied."
 
 ## See also
 
-- `01-distributed-system-map.md` — Seam B (the cross-instance gap) is the seam this file is about
-- `04-consistency-models-and-staleness.md` — consistency models only matter when there are multiple replicas to be consistent across
-- `07-clocks-coordination-and-leadership.md` — also NOT YET EXERCISED, for related reasons
-- `09-distributed-systems-red-flags-audit.md` — ranks "in-memory state on serverless" as the #1 risk; the parallel-eval hazard is named in there too
-- `.aipe/study-testing/05-llm-eval-as-testing.md` — the eval pipeline + `EVAL_RUN_TAG` flywheel in detail
-- `.aipe/study-system-design/audit.md#storage-choice-and-durability-boundaries` — the architectural take on why no database
-
----
+- `01-distributed-system-map.md` — the picture this file is the counter-example to.
+- `04-consistency-models-and-staleness.md` — the per-instance staleness this file would solve if replication landed.
+- `07-clocks-coordination-and-leadership.md` — the encrypted-cookie pattern that hops the per-instance gap for auth specifically.
+- `09-distributed-systems-red-flags-audit.md` — listed alongside the per-instance throttling caveat.

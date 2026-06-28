@@ -1,292 +1,180 @@
-# 09 — distributed-systems red flags (ranked)
+# Distributed systems red flags audit
 
-**Industry name(s):** risk register · failure-mode audit · partial-failure inventory
-**Type:** Audit — opinionated, ranked
+**Industry name:** ranked coordination + partial-failure risks · **Type:** Project-specific audit grounded in real files
 
-> **Verdict-first:** the three load-bearing distributed-systems risks in this codebase, in order of how soon they bite: **(1) cross-instance state silently missing** when Vercel routes a request to a different instance than the one that holds the in-memory `Map` (the same finding `study-system-design/` ranks as its #1 CRITICAL); **(2) no per-tool timeout on the Bloomreach MCP call** — a hung Bloomreach connection consumes the route's whole 300s budget with no upstream signal; **(3) no idempotency story for any future write** — the moment the recommendation agent gets an "execute" button, the absence of an idempotency key per click becomes a data-corruption bug. Everything else (no retry on Anthropic, no per-tool TTL tuning, sessionStorage tab-only handoff, no resume-on-disconnect for NDJSON streams) is real but ranks below these three. **Resolved by deletion (2026-06-18):** RISK 10 (subprocess lifecycle hazards on the Olist adapter) and RISK 9 (K=10 parallel-eval race) — the Olist adapter was deleted in PR #8 and the eval pipeline was retired with it.
+A ranked list of distributed-systems risks in this codebase, with `file:line` evidence for each verdict. Severity reflects *likelihood × blast radius* in the current shape — not what a textbook would call critical.
 
----
-
-## Zoom out, then zoom in
-
-```
-  Zoom out — the risk surface
-
-  ┌─ UI layer ───────────────────────────────────────────────┐
-  │  RISK 7: NDJSON disconnect = lost events (low impact)     │
-  │  RISK 5: sessionStorage tab-only handoff                  │
-  └─────────────────────────┬────────────────────────────────┘
-                            │
-  ┌─ Service layer ─────────▼────────────────────────────────┐
-  │  ★ RISK 1: cross-instance state loss (CRITICAL) ★         │ ← top risk
-  │  ★ RISK 2: no per-tool timeout on the MCP call (HIGH) ★   │
-  │  ★ RISK 3: no idempotency for future writes (HIGH) ★      │
-  │  RISK 4: no retry on Anthropic transport errors           │
-  │  RISK 6: no per-tool TTL tuning                           │
-  │  (RISK 9 + RISK 10 retired — Olist adapter deleted)       │
-  └─────────────────────────┬────────────────────────────────┘
-                            │
-  ┌─ Provider layer ────────▼────────────────────────────────┐
-  │  RISK 8: Bloomreach's own failures (their problem,        │
-  │          our retry handles)                               │
-  └──────────────────────────────────────────────────────────┘
-```
-
-**Zoom in.** This file ranks every distributed-systems risk in the codebase by *how soon does this actually hurt a user, and how badly when it does?* Severity bands: **CRITICAL** (will silently corrupt or lose data), **HIGH** (will degrade UX or burn budget under predictable conditions), **MEDIUM** (will cause failures only under stress or after specific feature additions), **LOW** (real but bounded; named for honesty, not action).
+Severities: **critical** (would cause data loss or correctness bug in prod) · **warning** (would cause UX degradation or wasted cost) · **info** (real concern, not currently biting) · **deliberate** (a gap by design, listed for completeness).
 
 ---
 
-## Structure pass
+## #1 — Per-instance rate-limit spacing — burstable across the cohort  · severity: **warning**
 
-**Layers.** Same three the rest of the guide uses — UI, Service, Provider.
+**Evidence:** `lib/data-source/bloomreach-data-source.ts:191` — `lastCallAt` is a private field on `BloomreachDataSource`, instantiated per connection (which is per request, on a per-instance OAuth provider). Two warm Vercel instances each have their own `lastCallAt`.
 
-**Axis: blast radius.** Hold one question across the risks: *when this fires, how many users are affected and what do they observe?* The top two are service-layer issues that affect every user under specific conditions (cross-instance route, hung MCP call). The middle risks are conditional on features that don't exist yet. The bottom risks are bounded — bad UX moments, not data corruption.
+**The risk:** The proactive 1.1s spacing (`minIntervalMs: 1100`, set in `lib/mcp/connect.ts:97`) prevents one instance from hammering Bloomreach. But two warm instances handling the same user's requests can each call at ~1.1s intervals, *doubling* the effective rate. Bloomreach's rate limit is per-user GLOBAL, not per-instance.
 
-**Seams.** None — this file is an audit, not a mechanism walkthrough.
+**What happens in practice:** the retry ladder catches the 429 envelope and waits the stated penalty window (~10s), so correctness is preserved. The cost is latency — every "burst" becomes a 10s+ wait that the user notices.
+
+**The fix when it starts mattering:** shared rate-limit state in Redis / Vercel KV (a `lastCallAt:${userId}` key with atomic CAS). Same shape as the bi_auth cookie pattern but for per-user, not per-session.
+
+**Cross-link:** `02-partial-failure-timeouts-and-retries.md` (the retry ladder that absorbs this) · `07-clocks-coordination-and-leadership.md` (the cookie pattern that would model the fix).
 
 ---
 
-## The ranked findings
+## #2 — No in-flight lock on schema bootstrap — duplicate work on cold start  · severity: **warning**
 
-### RISK 1 — cross-instance state silently missing (CRITICAL)
+**Evidence:** `lib/mcp/schema.ts:186-209`. The `cached` module variable is checked once; if it's `null` and two concurrent requests both call `bootstrapSchema`, both run the 6-call orchestration (`list_cloud_organizations` → `list_projects` → `get_event_schema` + 3 siblings). Both write to `cached`; the second one wins.
 
-**Where:** `lib/state/insights.ts:4-6`, `lib/state/investigations.ts:11`, `lib/mcp/schema.ts:131`
-**Cross-link:** `study-system-design/audit.md#system-design-red-flags-audit` ranks this #1 with the same evidence.
+**The risk:** ~6 wasted MCP calls per duplicated bootstrap, each paying the ~1.1s spacing. Under load on a cold instance, this becomes a thundering-herd problem against an upstream that rate-limits.
 
-**The failure:** In production on Vercel, two requests for the same user can land on two different process instances. Each instance has its own `Map<string, Insight>` and its own `cached: WorkspaceSchema | null`. When a request for `/api/agent?insightId=X` lands on an instance whose Map doesn't have X, the lookup returns null. The route falls back to `resolveAnomaly` (`app/api/agent/route.ts:37-62`), which tries in-memory first (miss), then the `?insight=` query param (if the client sent it), then the demo snapshot. For live runs without the query param, the result is a 404.
+**What happens in practice:** reads are idempotent so correctness is preserved. The cost is wasted bandwidth and a slower first response when concurrent requests race.
 
-**Why it's CRITICAL:** It's silent — no error fires, no observability flags it. The user sees a 404 or an empty feed and assumes "the system isn't working" rather than "the state landed on a different instance." This is the bug that breaks first under any concurrent load.
+**The fix:** memoize the in-flight Promise, not the resolved value. One-line change:
 
-**Evidence of the gap:**
-```
-  lib/state/insights.ts:4-6
-  const insights = new Map<string, Insight>();    ← per-process; no cross-instance link
-  const investigations = new Map<string, Investigation>();
-  const anomalies = new Map<string, Anomaly>();
+```ts
+let inflight: Promise<WorkspaceSchema> | null = null;
+export async function bootstrapSchema(...) {
+  if (cached) return cached;
+  if (inflight) return inflight;
+  inflight = (async () => { /* … existing body … */ cached = …; inflight = null; return cached; })();
+  return inflight;
+}
 ```
 
-**Mitigation present:** The client carries the insight via `?insight=<json>` query param in live mode (`lib/hooks/useInvestigation.ts:160-161`). This works as a backstop *for the agent route* but not for the briefing route, and not for any route that doesn't accept the data via query.
-
-**Right next move:** Vercel KV (or any cross-instance store) keyed by `bi_session + insightId`. ~50 lines of code to swap the `Map` for a KV-backed reader. The "no database" architectural choice is deliberate (file 05 of `study-system-design/`) but it's also the single biggest distributed-systems risk in the codebase.
+**Cross-link:** `03-idempotency-deduplication-and-delivery-semantics.md` (where the cache pattern is discussed).
 
 ---
 
-### RISK 2 — no per-tool timeout on the MCP call (HIGH)
+## #3 — Schema cache has no TTL — process-lifetime staleness  · severity: **info**
 
-**Where:** `lib/data-source/bloomreach-data-source.ts:190-205`, `lib/mcp/transport.ts:47-59`
+**Evidence:** `lib/mcp/schema.ts:190` (`if (cached) return cached;`) and `:211` (`_resetSchemaCache()` is test-only, no production reset).
 
-**The failure:** `BloomreachDataSource.liveCall` awaits `transport.callTool(name, args, { signal })` with only the route-level cancellation signal (not a per-call timer). If Bloomreach's MCP server accepts the TCP connection but then hangs (no response, no FIN), the await hangs. The only ceiling is the route's `maxDuration = 300` (`app/api/agent/route.ts:20`). A single hung MCP call burns the whole 5-minute budget; from the user's perspective, the briefing or investigation appears stuck for 5 minutes then errors out (or, in production, gets killed with no observable error if Vercel's process kill doesn't propagate to a clean stream close).
+**The risk:** If Bloomreach adds a new event type, customer property, or catalog after the Vercel instance warmed up, the agents won't see it until the instance restarts. Vercel cycles instances often enough that this hasn't bitten — but the failure mode is "agent reasons about a workspace that doesn't match reality."
 
-**Why it's HIGH and not CRITICAL:** Bloomreach almost certainly has its own server-side timeouts, so in practice the hang would resolve within seconds — but you have no contract on this from your side. A hang under Bloomreach incident conditions IS plausible and would burn budget for every concurrent user.
+**The fix when it starts mattering:** add a TTL (5 minutes is plausible) or an LRU keyed by `projectId` so switching workspaces also invalidates. Bigger fix: move the schema cache to Redis/KV with the same TTL.
 
-**Right next move:** Compose `AbortSignal.timeout(30_000)` with the existing `options.signal` in `liveCall`; throw `McpToolError` with a "tool timeout" detail on timeout. ~10 lines. (Historical note: the now-deleted `OlistDataSource` adapter already used this pattern; the building block is well-trodden, just never lifted into the Bloomreach side.)
-
-**Why it's not done:** Same reason as much of the codebase's distributed-systems hardening — hackathon scale hasn't exercised it. A single incident's worth of "the demo froze for 5 minutes" would justify the 10 lines.
+**Cross-link:** `04-consistency-models-and-staleness.md` (the process-lifetime staleness corner).
 
 ---
 
-### RISK 3 — no idempotency story for any future write (HIGH, conditional)
+## #4 — Per-instance ephemeral state requires a URL-param workaround  · severity: **info**
 
-**Where:** `lib/agents/recommendation.ts`, `lib/agents/diagnostic.ts`, `lib/data-source/bloomreach-data-source.ts` — all currently read-only
+**Evidence:** `lib/state/insights.ts:14` (the per-process `state` Map) and `app/api/agent/route.ts:35` (`resolveAnomaly` reads three sources in order: `?insight=<JSON>` URL param, then same-instance Map, then demo snapshot).
 
-**The failure:** Currently the codebase only calls read tools (`list_*`, `get_*`, `execute_analytics_eql` on Bloomreach). Every retry is safe because rereading data has no effect. The moment a write tool is added — `create_voucher`, `start_campaign`, `update_segmentation` — the absence of idempotency means a retried write creates a duplicate. The `BloomreachDataSource.callTool` retry loop (file 02) would happily retry a 429 on a write, potentially creating two vouchers from one user click.
+**The risk:** A briefing that fills the `insights` Map on instance A leaves instance B's Map empty. Without the `?insight=` URL hack (the feed page stashes the Insight in `sessionStorage` and threads its JSON through the investigate URL), an investigation request landing on a fresh instance would return 404 "insight not found."
 
-**Why it's HIGH and conditional:** The failure cannot fire today (no writes). The day a write is added, it fires immediately. That makes this a "ready to bite the moment a feature ships" risk — worth tracking even though it's currently inert.
+**What happens in practice:** the hack works — the client-side stash is the cross-instance bridge. But it means the API contract for `/api/agent` includes "you should also pass the Insight JSON" which is unusual.
 
-**Right next move when the day comes:** Add an `idempotencyKey?: string` to `DataSourceCallOptions` (`lib/data-source/types.ts:38`); when present, include it in the args under a known key (e.g. `_idem`); maintain a `Map<idempotencyKey, result>` separate from the TTL cache, with a much longer retention. Server-side support depends on Bloomreach (or any future write-capable backend) honoring an idempotency key in the request — verify before relying on it.
+**The fix when it starts mattering:** move insights/investigations to Redis/KV. Removes the URL hack from the contract.
 
-**Reminder anchor:** the comment block in `lib/agents/recommendation.ts` (the prompt template) explicitly limits the agent to *describing* actions, not executing them. That comment IS the distributed-systems control that keeps this risk inert.
-
----
-
-### RISK 4 — no retry on Anthropic transport errors (MEDIUM)
-
-**Where:** `lib/agents/base.ts:102` (`anthropic.messages.create(params)`)
-
-**The failure:** The Anthropic SDK call has no retry wrapper in this code. If Anthropic returns a 5xx, a 429, or a network error, it propagates as an exception that the route catches and emits as `{ type: 'error' }`. The user sees an error and has to manually retry by reloading. **Inferred:** the Anthropic SDK may retry internally; the codebase does not configure or override.
-
-**Why it's MEDIUM:** Anthropic's published reliability is high; transient failures are rare. The user-driven retry (reload the page) absorbs the rare event. But under an Anthropic incident, *every* request fails immediately with no app-side resilience.
-
-**Right next move:** A thin retry wrapper around `anthropic.messages.create` — at most 2 retries with 1s + 5s backoff on 5xx and 429. Per-call; no need for a shared client like `McpClient`. ~15 lines.
+**Cross-link:** `04-consistency-models-and-staleness.md` (the per-instance staleness deep walk) · `05-replication-partitioning-and-quorums.md` (the migration path that solves this).
 
 ---
 
-### RISK 5 — sessionStorage handoff is tab-only (MEDIUM)
+## #5 — Cancellation deliberately not propagated in one client hook  · severity: **info (documented, deliberate)**
 
-**Where:** `lib/hooks/useInvestigation.ts:18-19, 137-140`
+**Evidence:** `lib/hooks/useInvestigation.ts:33-37`:
 
-**The failure:** The diagnosis handoff between step 2 and step 3 lives in `sessionStorage.bi:diag:<id>`. sessionStorage is per-tab; closing the tab loses it. A user who runs step 2, closes the laptop, and reopens the step 3 URL tomorrow gets "no diagnosis was handed over" (`app/api/agent/route.ts:228-230`).
+> we deliberately do NOT cancel the fetch on effect cleanup. React StrictMode (dev) mounts → cleans up → re-mounts; cancelling on the first cleanup, with the started-guard blocking the re-mount, aborted the stream and left the logs empty.
 
-**Why it's MEDIUM:** UX papercut, not data corruption. The user navigates back to step 2, which re-runs (live) or replays (from cache), then forward to step 3. Recoverable, but bad first impression.
+**The risk:** If a user clicks an investigation card, then navigates away mid-stream, the upstream MCP calls keep running until the 300s deadline. Wasted Anthropic + Bloomreach calls, no UI to receive them.
 
-**Right next move:** Persist the diagnosis server-side keyed by `insightId` in Vercel KV. This change ALSO partially mitigates RISK 1 (server-side cross-instance store). Couple the two improvements.
+**What happens in practice:** the cost is real on truly aborted runs, but the dev-mode StrictMode breakage is worse. The guard pattern (`startedRef.current`) prevents the double-fetch in dev; the in-flight run completes in prod with no consumer (`setState` after unmount is a safe no-op).
 
----
+**The fix when it starts mattering:** detect StrictMode (or use a stronger "single-mount" pattern with a ref-based abort that only fires after a delay confirming the second mount didn't come) and re-enable cancel-on-cleanup. Low priority; the dev experience is the bigger win.
 
-### RISK 6 — fixed 60s TTL across all tools (LOW)
-
-**Where:** `lib/mcp/client.ts:103`
-
-**The failure:** Every tool gets the same 60s cache TTL. `list_funnels` (schema-shaped, slow to change) and `execute_analytics_eql` (data-shaped, real-time) get the same staleness budget. The infrastructure to vary TTL exists (`CallToolOptions.cacheTtlMs`) but no callsite uses it.
-
-**Why it's LOW:** Current workload doesn't exercise the difference. Real-time-sensitive features would force a per-tool TTL story; nothing today is real-time-sensitive.
-
-**Right next move:** Wire `cacheTtlMs` at each callsite based on tool semantics — schema tools at hours, analytics tools at minutes, summary tools at 60s. Trivial change once the workload demands it.
+**Cross-link:** `06-queues-streams-ordering-and-backpressure.md` (the cancellation pattern this is an exception to).
 
 ---
 
-### RISK 7 — no resume-on-disconnect for NDJSON streams (LOW)
+## #6 — No write path = no idempotency keys, no compensation, no outbox  · severity: **deliberate**
 
-**Where:** `app/api/agent/route.ts:131-141, 169-264`, `lib/hooks/useInvestigation.ts:184-208`
+**Evidence:** `lib/data-source/synthetic-data-source.ts` tool dispatch — every case returns a read result. `lib/mcp/tools.ts` enumerates only `list_*`/`get_*`/`execute_*` tools across the five tool catalogs. The `Recommendation.steps[]` field is plain text for the user to execute manually in Bloomreach's UI.
 
-**The failure:** If the client disconnects mid-stream (closes tab, loses network), the server writes fail silently and the stream closes. The client cannot reconnect and resume; it can only re-fetch from the start. For the demo/cached path this is fine (instant restart). For a live agent run that's already burned 60s of MCP calls, this means re-burning them on retry.
+**Why this is deliberate, not a gap:** the product's pitch is "an analyst that shows its work" — propose, don't execute. The user keeps agency over real Bloomreach writes. Adding execution would add: idempotency keys (Bloomreach API would need to support them, or we'd need a client dedup table), a reconciliation log (durable per-step state), compensation handlers (some steps reversible, some not), an outbox (only if we add a local datastore), and an orchestrator. None of that is cheap, and none of it earns its place when the user is already a competent orchestrator with Bloomreach's UI open.
 
-**Why it's LOW:** Mid-stream disconnect is rare. The route's `try/catch/finally` ensures clean closure on the server side. The cached-replay path absorbs most retries without re-running the agent.
-
-**Right next move:** Switch to Server-Sent Events with `Last-Event-ID` and a server-side per-stream cursor. The `collected: AgentEvent[]` (line 171 of `app/api/agent/route.ts`) is already shaped right — replay from index N. Lift IF a workload arises where mid-stream disconnect is common.
+**Cross-link:** `08-sagas-outbox-and-cross-boundary-workflows.md` (the full deep walk).
 
 ---
 
-### RISK 8 — Bloomreach's own failures (LOW, external)
+## #7 — No replication, no shared cache, no leader election  · severity: **deliberate**
 
-**Where:** External — not our code.
+**Evidence:** the absence of any Redis client, KV client, Postgres driver, or coordination library in `package.json`. State is per-instance in-memory Maps + a gitignored dev file + committed demo JSON snapshots.
 
-**The failure:** Bloomreach's MCP server goes down, slow, or starts returning unexpected error shapes. Our `BloomreachDataSource` retry handles 429s; non-429 transport errors throw immediately and surface to the user as a stream error.
+**Why this is deliberate, not a gap:** one upstream, read-only tools, no fan-out, no second writer. The architectural pressure that *would* push us into real coordination (multi-user shared workspaces, persistent investigations, background scheduled jobs) doesn't exist yet.
 
-**Why it's LOW from a "what can we do" perspective:** This is the external dependency every system has. Our partial-failure handling (file 02) is the right shape for it; bigger investments (circuit breaker, fallback model, multi-provider failover) are scale features.
-
-**Right next move:** A simple circuit breaker — open after 5 consecutive non-429 failures in 30 seconds; close after a 30-second cooldown probe. Spares the user 6 sequential 30s retry attempts during an incident. ~30 lines.
+**Cross-link:** `05-replication-partitioning-and-quorums.md` (the full Case B walk and migration path).
 
 ---
 
-### RISK 9 — parallel-eval race (RETIRED — eval pipeline removed)
+## #8 — `lastCallAt` updates on error (good!) — but does not protect against burst-and-fail  · severity: **info**
 
-The K=10 parallel-eval race documented at the previous refresh (two eval scripts overwriting `eval/results/<date>/`) was resolved by deletion: the Olist adapter and the eval pipeline that tested it were retired in PR #8 (2026-06-18). The `EVAL_RUN_TAG` convention is gone with the scripts. Kept here only as an explanatory marker so a reader who saw this risk at the previous refresh knows where it went.
+**Evidence:** `lib/data-source/bloomreach-data-source.ts:200`:
 
-**Lesson worth keeping:** Namespace separation as a coordination primitive (the `EVAL_RUN_TAG` trick) generalises — if a future cross-process scenario lands, the pattern is "give each process a unique tag and namespace the output directory by it." Cheap, enforces zero-shared-state by construction.
-
----
-
-### RISK 10 — subprocess lifecycle hazards on the Olist adapter (RETIRED — adapter removed)
-
-The Olist subprocess adapter was deleted in PR #8 (2026-06-18). All three previously-listed hazards (forgotten dispose leaks, no respawn on crash, silent dispose) are gone with the code. Kept here as an explanatory marker so a reader who saw RISK 10 at the previous refresh knows it's resolved-by-deletion, not "fixed-in-place." The `SyntheticDataSource` that replaced the Olist adapter has no subprocess lifecycle (it's an in-process JS object), so the failure modes that defined this risk are not reachable.
-
-**Lesson worth keeping (in case a future adapter brings a subprocess back):** lazy + idempotent + concurrency-safe `connect()`; explicit `dispose()` exposed on the factory result; route handlers must call `dispose` in `finally`. Document the contract on the `DataSource` interface the day any new adapter brings a real lifetime back.
-
----
-
-### Code in this codebase
-
-A cross-cutting index for the ranked findings above — each row points at the file, the line range, and what the reader should look at when they open it.
-
-| Risk | File | Line(s) | What to look at |
-|------|------|---------|-----------------|
-| 1 (CRITICAL) | `lib/state/insights.ts` | 4-6 | per-process Map; no cross-instance link |
-| 1 | `lib/state/investigations.ts` | 11, 22-41 | mem-first fallback chain; misses on cold instance |
-| 1 | `app/api/agent/route.ts` | 37-62 | `resolveAnomaly` — the fallback chain that silently misses |
-| 2 (HIGH) | `lib/data-source/bloomreach-data-source.ts` | 190-205 | `liveCall` — no `AbortSignal.timeout` composed in |
-| 2 | `app/api/agent/route.ts` | 20 | `maxDuration = 300` — the only ceiling on the MCP call |
-| 3 (HIGH cond.) | `lib/data-source/types.ts` | 38-40 | `DataSourceCallOptions` has no idempotency key field |
-| 3 | `lib/agents/base.ts` | 144-156 | tool-call dispatch — no per-call idempotency |
-| 4 (MED) | `lib/agents/base.ts` | 102 | `anthropic.messages.create` — no retry wrapper |
-| 5 (MED) | `lib/hooks/useInvestigation.ts` | 18-19, 137-140 | sessionStorage handoff — tab-only |
-| 5 | `app/api/agent/route.ts` | 228-230 | the "no diagnosis was handed over" throw |
-| 6 (LOW) | `lib/data-source/bloomreach-data-source.ts` | 145 | `ttl = options.cacheTtlMs ?? 60_000` — no callsite overrides |
-| 7 (LOW) | `app/api/agent/route.ts` | 169-264 | stream has no event ID or resume |
-| 7 | `lib/hooks/useInvestigation.ts` | 184-208 | consumer has no Last-Event-ID logic |
-| 8 (LOW ext.) | external | — | no circuit breaker on `BloomreachDataSource` for non-429 |
-| 9 (retired) | — | — | eval pipeline removed in PR #8; `EVAL_RUN_TAG` gone with it |
-| 10 (retired) | — | — | `OlistDataSource` deleted in PR #8; subprocess lifecycle moot |
-
----
-
-## Primary diagram
-
-```
-  Distributed-systems risks — ranked by blast radius and inevitability
-
-  ┌─ when does it fire? ──────────────────┬─ blast radius ──┐
-  │                                         │                 │
-  │ RIGHT NOW under any concurrent load:    │                 │
-  │  ★ RISK 1: cross-instance state loss   │ all users       │
-  │    silent; 404s or empty feeds          │ silent failure  │
-  │                                         │                 │
-  │ UNDER ANY HANG / INCIDENT:              │                 │
-  │  ★ RISK 2: no Bloomreach call timeout  │ one request     │
-  │    burns 300s budget                    │ visible freeze  │
-  │  RISK 4: no Anthropic retry             │ one request     │
-  │  RISK 8: Bloomreach incident            │ all users       │
-  │                                         │                 │
-  │ THE DAY A WRITE FEATURE SHIPS:          │                 │
-  │  ★ RISK 3: no idempotency              │ data corruption │
-  │                                         │ duplicate writes│
-  │                                         │                 │
-  │ UNDER TAB-CLOSE EDGE CASES:             │                 │
-  │  RISK 5: sessionStorage tab-only        │ one user        │
-  │  RISK 7: no NDJSON resume               │ one user        │
-  │                                         │                 │
-  │ NEVER FOR THIS WORKLOAD:                │                 │
-  │  RISK 6: fixed 60s TTL                  │ none today      │
-  │                                         │                 │
-  │ RETIRED (resolved by deletion):         │                 │
-  │  RISK 9 / RISK 10 — Olist adapter +    │ n/a             │
-  │    eval pipeline removed in PR #8       │                 │
-  │                                         │                 │
-  └─────────────────────────────────────────┴─────────────────┘
-
-  the top 3 (RISKs 1, 2, 3) are the ones worth fixing first;
-  everything below is honest about the bound on impact
+```ts
+} catch (err) {
+  this.lastCallAt = Date.now();   // ← even on error
+  throw new McpToolError(name, errorDetail(err), { cause: err });
+}
 ```
 
----
+**Why this is here:** without it, a string of consecutive failures would each fail immediately and try again immediately, hammering the upstream while it's already unhappy.
 
-## The first three fixes (recommended priority)
+**Why it's listed:** this is a *good* pattern, but it has a subtle limit — if the *very first* call fails fast (DNS, TLS, instant 401), then the second call also runs ~1.1s later, fails again, and the user waits N × 1.1s seeing one failure each. There's no exponential backoff on transport errors (only on rate-limit envelopes). The 30s per-call timeout caps the worst case.
 
-If you had a week:
+**The fix when it starts mattering:** classify transport errors and apply backoff to repeated ones — but this is over-engineering for a single-user CLI-ish use case. Listed for completeness.
 
-1. **Vercel KV-backed state store.** Swap `lib/state/insights.ts`'s `Map` and `lib/state/investigations.ts`'s `mem` for KV reads/writes keyed by `bi_session + id`. Fixes RISK 1 outright and partially fixes RISK 5 (diagnosis handoff can also live in KV). Probably 100-150 lines of code with tests.
-
-2. **Per-tool timeout in `BloomreachDataSource`.** Compose `AbortSignal.timeout(30_000)` with the existing `options.signal` in `liveCall`. Throw `McpToolError` with timeout detail. Fixes RISK 2. ~10 lines.
-
-3. **Anthropic retry wrapper.** Wrap `anthropic.messages.create` in `lib/agents/base.ts` with up to 2 retries on 5xx and 429 with 1s + 5s backoff. Fixes RISK 4. ~20 lines.
-
-After these three, the codebase's distributed-systems posture goes from "honestly named hackathon-scale" to "production-aware single-tenant." The remaining work (idempotency for writes, circuit breaker, SSE with resume) becomes feature-driven rather than infrastructure-driven.
+**Cross-link:** `02-partial-failure-timeouts-and-retries.md` (the retry ladder).
 
 ---
 
-## Interview defense
+## #9 — Reconnect predicate divergence — two regex variants, deliberately not unified  · severity: **info (documented)**
 
-**Q: What's the biggest distributed-systems risk in this codebase?**
+**Evidence:** `lib/hooks/useReconnectPolicy.ts:33-34`:
 
-In-memory state on Vercel. Every piece of state — insights, investigations, the cached schema — lives in process-local `Map`s and module-level variables. Vercel scales horizontally and recycles instances; nothing in the code coordinates across instances. The failure is silent: a request landing on a fresh instance just sees an empty Map. There's a partial workaround (the client carries the insight in a query param for live mode) but no general solution. Fix is Vercel KV, keyed by session + id; ~150 lines including tests.
-
-```
-  RISK 1: cross-instance state loss
-
-  inst A: Map{X: Insight}   inst B: Map{}
-                              │
-  user request lands on inst B → null → 404 (silently)
-  
-  fix: replace Map with Vercel KV reads
+```ts
+const AUTH_ERROR_RE_AUTO   = /invalid_token|unauthor|forbidden|401|session expired|reconnect/i;
+const AUTH_ERROR_RE_BUTTON = /unauthor|forbidden|401|session expired/i;
 ```
 
-**Q: What's the highest-leverage second fix?**
+**The risk:** The button predicate is missing `invalid_token` and `reconnect`. So an auth-shaped error that *auto* matches one of those would not match the manual-button predicate — meaning if auto-reconnect already fired (and the flag is set), the user sees an error UI but no reconnect button to click.
 
-A per-tool timeout on MCP calls. Today a hung Bloomreach connection burns the route's whole 300s budget — five minutes of visible freeze with no upstream signal. Wrap `transport.callTool` in `Promise.race` against a 30-second timer; throw a tagged error on timeout. Maybe 15 lines. Closes the "hung connection" failure mode without restructuring anything.
+**Why this is deliberate (per the comment):** unifying the regexes would need live verification against the alpha Bloomreach server to be sure the manual-button case doesn't change for the worse. Filed as a latent bug; not this refactor's job.
 
-**Q: What's the latent risk you'd flag for a code reviewer?**
-
-The day someone adds a write tool — `create_voucher`, `start_campaign`, anything that mutates Bloomreach state — the existing retry loop will happily retry a 429 and potentially create duplicate writes. No idempotency key is sent today because no write is being made. The recommendation agent only *describes* actions; the moment that becomes execute, you need idempotency keys per click plus server-side dedup. The architectural control today is the prompt saying "describe, don't execute" — that's the only thing preventing the bug.
+**Cross-link:** `02-partial-failure-timeouts-and-retries.md` (the reconnect policy walk).
 
 ---
+
+## #10 — Anthropic streaming, retries, and timeouts not in our control  · severity: **info**
+
+**Evidence:** `lib/agents/intent.ts:21` and the AptKit adapters layer in `lib/agents/aptkit-adapters.ts` (the model provider wrapper). We pass `signal` through to the SDK; we don't wrap it in our own retry/timeout/backoff.
+
+**Why this is mostly fine:** Anthropic's SDK has its own internal retry on transient errors. Our route-level 300s budget bounds the worst case. The signal propagation means tab-close cancels in-flight model calls.
+
+**The risk:** if Anthropic API behavior changes (different rate-limit shape, more transient failures), we have no application-level retry to catch it. Errors propagate as-is into the NDJSON `error` event.
+
+**The fix when it starts mattering:** wrap the SDK with a retry like the BloomreachDataSource one, but classification differs (HTTP 429 vs Bloomreach's body-embedded envelope). Low priority because we don't hit the rate limit at our volume.
+
+---
+
+## Top finding
+
+**#1 (per-instance rate-limit spacing)** is the highest-leverage *real* gap in the current shape — every other warning is either deliberate, dev-only, or already self-healing. Two warm instances doubling the effective rate against a per-user upstream rate limit is the single risk most likely to bite under any non-trivial load increase, and the fix (shared `lastCallAt` in KV) is a clean one-pattern lift.
+
+## Reading order for the audit
+
+1. Skim #1, #2 first — the two warnings worth acting on.
+2. Read #3, #4, #5 to know what's tolerated and why.
+3. Read #6, #7 to defend the deliberate gaps in interviews.
+4. #8–#10 are info-level — useful to know, not actionable today.
 
 ## See also
 
-- `01-distributed-system-map.md` — the map that puts these risks in spatial context
-- `02-partial-failure-timeouts-and-retries.md` — RISK 2 in mechanism depth
-- `03-idempotency-deduplication-and-delivery-semantics.md` — RISK 3 in mechanism depth
-- `04-consistency-models-and-staleness.md` — RISK 5 in mechanism depth
-- `05-replication-partitioning-and-quorums.md` — RISK 1's structural cause
-- `10-transport-agnostic-protocol-design.md` — RETIRED; the Phase-2 two-transport design RISK 10 attached to
-- `.aipe/study-system-design/audit.md#system-design-red-flags-audit` — the system-design twin of this audit
-- `.aipe/study-security/` — security-shaped risks at the same boundaries
+- `02-partial-failure-timeouts-and-retries.md` — the deep walk that informs #1, #8, #9, #10.
+- `03-idempotency-deduplication-and-delivery-semantics.md` — informs #2.
+- `04-consistency-models-and-staleness.md` — informs #3, #4.
+- `05-replication-partitioning-and-quorums.md` — the migration path that resolves #1, #3, #4.
+- `06-queues-streams-ordering-and-backpressure.md` — informs #5.
+- `07-clocks-coordination-and-leadership.md` — the cookie pattern that models the fix for #1.
+- `08-sagas-outbox-and-cross-boundary-workflows.md` — defends #6.

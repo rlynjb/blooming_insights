@@ -1,293 +1,215 @@
-# Incremental indexing (update the index without rebuilding it)
+# 10 — incremental indexing
 
-**Industry name(s):** incremental indexing, upsert/delete, change-data-capture re-indexing, index maintenance
-**Type:** Industry standard · Language-agnostic
-
-> A retrieval index is built once but the source keeps changing, so you need to add, update, and delete vectors *in place* rather than re-embedding the whole corpus on every change — an upsert keyed by document id, driven by change-detection; blooming insights has no index, but its append-keyed investigation store is the same "write by key, update in place" shape, so this is study material grounded in a real analog.
-
-
----
+**Subtitle:** Deltas vs full rebuild · Industry standard (Case B)
 
 ## Zoom out, then zoom in
 
-**Zoom out — the bigger picture.** Incremental indexing is the *write path* of a vector store — how new and changed documents enter the index without a full rebuild. blooming insights already uses the exact shape for keyed upserts in `saveInvestigation` (`lib/state/investigations.ts`): `mem.set(insightId, events)` overwrites one entry and leaves the rest untouched. A vector store would do the same with `(id, vector)` rows, plus deletes and a change-feed feeding the indexer.
+**Case B.** Two patterns for keeping the index up-to-date: full rebuild
+(walk all corpus, re-embed everything, swap) and incremental (track
+changes, embed only the deltas, merge). For blooming insights' append-
+only diagnosis corpus, incremental is the natural shape.
 
 ```
-  Zoom out — where incremental indexing sits (WOULD BE)
+  Zoom out — where indexing fits in the data lifecycle
 
-  ┌─ Source corpus (keeps changing) ─────────────────┐
-  │  past investigations, schema, docs                │
-  └─────────────────────────┬────────────────────────┘
-                            │  change feed / version diff
-  ┌─ Indexer (write path) ──▼────────────────────────┐  ← we are here
-  │  ★ upsert (id, vector) — touch ONLY what changed ★│
-  │  parallel to mem.set(insightId, events)           │
-  │  delete-by-id, embed-only-the-new                 │
-  └─────────────────────────┬────────────────────────┘
-                            │
-  ┌─ Vector store ──────────▼────────────────────────┐
-  │  index stays live; cost ∝ change, not corpus      │
-  └─────────────────────────┬────────────────────────┘
-                            │
-  ┌─ Retriever ─────────────▼────────────────────────┐
-  └──────────────────────────────────────────────────┘
-
-  In this codebase: Not yet implemented — String.includes
-  intent matching in lib/agents/intent.ts is what exists
-  instead. The keyed-upsert shape IS in the codebase (Map.set
-  in lib/state/investigations.ts) — different payload.
+  ┌─ Corpus (lib/state/investigations.ts) ───────┐
+  │  append a new investigation                  │
+  └────────────────────┬─────────────────────────┘
+                       │
+                       ▼  ★ INDEX ★
+                       │  full rebuild  OR  incremental    ← we are here
+                       ▼                                    (Case B)
+  ┌─ Vector store ────────────────────────────────┐
+  │  upsert(id, vec, meta)                         │
+  └────────────────────────────────────────────────┘
 ```
-
-**Zoom in — narrow to the concept.** The question is: the index was built from a corpus that keeps changing — how do you keep it current without paying to re-embed everything on every change? Re-embedding the entire corpus is correct but O(N) per change, unaffordable the moment the corpus or change-rate grows. An incremental upsert touches exactly the changed document — O(1) per change, the rest of the index untouched, and the index stays live. How it works walks the add/update/delete operations, change-detection sources (file watchers, DB CDC, version hashes), and the freshness handoff to → 09-stale-embeddings.md.
-
----
 
 ## Structure pass
 
-**Layers.** Four WOULD-BE layers: the source corpus (changing), a change-detection feed (file watcher, DB CDC, version-hash diff), the indexer's write path (upsert by id, delete by id, embed-only-the-new), and the vector store. The change-detection feed is what makes incremental indexing different from a full rebuild — it tells you exactly what to touch.
-
-**Axis: lifecycle.** When and how often does each layer's work happen — every change (incremental) or every rebuild (full)? This axis is the right lens because the file's whole insight is that the write-path lifecycle changes from O(N) per rebuild to O(changes) per change — same correctness, different cost-per-event. State is downstream of lifecycle; control doesn't move; the upstream question is "when do you pay."
-
-**Seams.** The cosmetic seam is between change-detection and the indexer — both are write-time. The load-bearing WOULD-BE seam is between full-rebuild and incremental-upsert as two alternative shapes of the same write layer: lifecycle flips from "everything, on every change" to "only what changed." This is the seam that makes a live index affordable. blooming insights already crosses an analogous seam for its investigation store (`mem.set(insightId, events)` is keyed upsert, not list-rebuild) — same primitive, different payload.
-
-```
-  Structure pass — incremental indexing (WOULD BE)
-
-  ┌─ 1. LAYERS ───────────────────────────────────┐
-  │  source corpus (changing)                      │
-  │  change-detection feed (CDC / watcher / hash)  │
-  │  indexer write path (upsert / delete)          │
-  │  vector store (stays live)                     │
-  └────────────────────────┬───────────────────────┘
-                           │  pick the axis
-  ┌─ 2. AXIS ─────────────▼────────────────────────┐
-  │  lifecycle: full rebuild on every change, or   │
-  │  upsert only what changed?                     │
-  └────────────────────────┬───────────────────────┘
-                           │  trace across layers, find flips
-  ┌─ 3. SEAMS ────────────▼────────────────────────┐
-  │  change-detection↔indexer: cosmetic            │
-  │  full-rebuild↔incremental: LOAD-BEARING        │
-  │    O(N) per change → O(changes) per change     │
-  │    cousin in repo: mem.set keyed upsert        │
-  └────────────────────────┬───────────────────────┘
-                           ▼
-                   Block 4 — How it works
-```
-
-The skeleton is mapped — the rest of this file walks the mechanics that hang off it.
+  → **One axis to trace — write amplification.** Full rebuild re-embeds N
+    items per change (huge). Incremental re-embeds 1 (constant).
+    Tradeoff: full rebuild is simpler and ensures consistency; incremental
+    is faster but has edge cases (concurrent updates, deletion ordering).
 
 ## How it works
 
-**Mental model.** Treat the index as a keyed store you mutate, not a build artifact you regenerate. The codebase already has the right instinct in its in-process state map for investigations: `Map.set(key, value)` updates one entry in place. Incremental indexing is the three CRUD-by-key operations — upsert (add or replace), delete — over vectors, gated by change-detection so you only touch what changed.
+### Move 1 — the mental model
+
+Same shape as cache invalidation: targeted (this one entry) vs nuclear
+(rebuild everything). Targeted is cheaper at steady state; nuclear is
+simpler to reason about.
 
 ```
-  full rebuild (O(N) per change)        incremental (O(changes))
-  ──────────────────────────────        ──────────────────────────────
-  for every doc: re-embed, replace      for changed doc: re-embed, upsert
-  re-embeds the unchanged               touches only the changed
-  index offline/stale during build      index stays live
-       │                                     │
-       └── correct but unaffordable          └── the production approach
+  Two patterns
+
+  ┌─ Full rebuild ─────────────────────────────────┐
+  │  walk corpus → re-embed everything → swap index │
+  │  Simple, correct, expensive                     │
+  │  Run nightly or weekly                          │
+  │  Good when: corpus < 10k items, batch-oriented  │
+  └─────────────────────────────────────────────────┘
+
+  ┌─ Incremental ──────────────────────────────────┐
+  │  on add:    upsert new row                      │
+  │  on edit:   re-embed + upsert (see 09-stale)   │
+  │  on delete: remove from index                   │
+  │  Fast, complex, edge-case-prone                 │
+  │  Good when: live system, freshness matters      │
+  └─────────────────────────────────────────────────┘
 ```
 
-The body walks the operations and the change-detection that drives them.
+### Move 2 — the step-by-step walkthrough
 
----
+**For blooming insights' append-only investigation corpus, incremental is
+trivial.** No edits, no deletes (well, except cleanup), just appends.
+The pattern:
 
-### The three operations, keyed by id
+```typescript
+// Hypothetical lib/state/investigations.ts (modified)
+export async function saveInvestigation(insightId: string, events: AgentEvent[]) {
+  // existing: save the investigation as before
+  saveToDisk(insightId, events);
 
-An incremental index supports add/update (unified as *upsert*) and delete, each addressed by document id — exactly the key-addressing the in-process state map uses for investigations.
-
-```
-  ADD     new document        → embed → index.set(docId, {vector, hash, staleAt})
-  UPDATE  document changed     → embed → index.set(docId, ...)   (same op as add)
-  DELETE  document removed     → index.delete(docId)
-                                  (and any chunk vectors derived from it)
-```
-
-Add and update are the same upsert — `set` by key overwrites if present, inserts if not — which is why `Map.set` covers both. Delete is the one people forget: a removed source document whose vector lingers will be retrieved as a ghost result.
-
-### Change-detection drives the upserts
-
-You upsert only what changed, detected by comparing a stored content hash (or source version) against the current document — the same change-detection that drives freshness in `09-stale-embeddings.md`.
-
-```
-  on a corpus update:
-    for each current doc:
-      stored = index.get(docId)
-      if !stored                       → ADD (new)
-      else if hash(doc) != stored.hash → UPDATE (changed)
-      else                              → skip (unchanged, no embed cost)
-    for each indexed docId not in current corpus → DELETE (gone)
+  // NEW: also upsert into the vector index
+  const inv = reconstructInvestigation(events);
+  const vec = await embed(investigationToChunkText(inv));
+  await vectorStore.upsert(insightId, vec, {
+    conclusion: inv.diagnosis.conclusion,
+    created_at: new Date().toISOString(),
+  });
+}
 ```
 
-The unchanged-skip is where the savings live: a corpus of 500 investigations with 1 changed produces 1 embed call, not 500.
+That's it. Every new investigation upserts one row. No rebuild ever
+needed for this corpus shape.
 
-### Chunk-level granularity
+**When you'd need full rebuild:**
+  - Embedding model upgrade. New model = new vector space = re-embed
+    everything. This is the canonical "full rebuild" trigger.
+  - Schema change in the chunk text (e.g. decide to include
+    recommendations in the chunk after months of only including
+    diagnoses).
+  - Detected corruption (vectors don't match their source text — rare
+    but happens with replication bugs).
 
-If documents are chunked (`03-chunking-strategies.md`), a changed document may have changed only one chunk. Tracking chunks by id (`docId#chunkIndex`) lets you re-embed only the changed chunk, not the whole document — the same upsert pattern one level finer.
+**Dual-serve during rebuild.** A naive rebuild flow:
+  1. Mark current index as "v1, serving"
+  2. Build new index "v2, building" alongside
+  3. When v2 is complete, atomic swap: v2 → serving, v1 → archived
+  4. Drop v1 after a grace period
+
+This keeps the system queryable during the rebuild. For small corpora
+where rebuild takes minutes, you can skip the dual-serve and just halt
+queries briefly. For large corpora, dual-serve is essential.
+
+**Deletion ordering.** In an incremental flow, what happens when an
+investigation gets deleted? You have to remove the vector from the
+index AND from any in-memory cache. If your retrieval has a small
+LRU cache (some vector stores do), a recently-deleted row can briefly
+still appear in results. Cache invalidation = the same hard problem
+it always was.
+
+### Move 3 — the principle
+
+**Prefer incremental indexing for append-only corpora; reserve full
+rebuild for embedding-model upgrades and recovery scenarios.** Match
+the indexing strategy to the corpus's write pattern. For append-only
+(blooming insights' case), incremental is trivially correct; for
+edit-heavy, the staleness-tracking from `09-stale-embeddings.md`
+becomes the workhorse.
+
+## Primary diagram
 
 ```
-  investigation 42 edited: only the recommendation section changed
-  ┌──────────────────────────────────────────────┐
-  │ 42#diagnosis   hash same  → skip               │
-  │ 42#hypothesis  hash same  → skip               │
-  │ 42#rec         hash diff  → re-embed, upsert    │ ◀── only this
-  └──────────────────────────────────────────────┘
+  Incremental indexing for an append-only corpus
+
+  ┌─ saveInvestigation(id, events) ────────────┐
+  │                                            │
+  │  1. saveToDisk(id, events)                 │
+  │     (existing behavior)                    │
+  │                                            │
+  │  2. NEW: derive Investigation from events  │
+  │                                            │
+  │  3. NEW: const text = chunkText(inv)       │
+  │                                            │
+  │  4. NEW: const vec = await embed(text)     │
+  │                                            │
+  │  5. NEW: await vectorStore.upsert(id, vec, │
+  │           {conclusion, created_at})        │
+  │                                            │
+  └────────────────────────────────────────────┘
+
+  full rebuild ONLY triggered by:
+    - embedding_model upgrade (re-embed all rows)
+    - chunk-text schema change (rare)
+    - detected corruption (very rare)
 ```
-
-### The codebase's keyed-upsert analog
-
-The in-process state map for investigations is the pattern in miniature: a `set(insightId, events)` upserts one investigation by key into an in-memory `Map`, and (in dev) merges into a JSON file by key (`all[insightId] = events`) rather than rewriting unrelated entries. That is incremental indexing's core move — write by key, update in place, leave the rest — already present for raw investigation events. An embedding index would do the same with vectors plus change-detection.
-
-### The principle
-
-Keep the index current by mutating it in place — upsert and delete keyed by document id, gated by change-detection so cost scales with what changed, not with corpus size. A full rebuild is the correct semantics and the wrong economics; the keyed-upsert the codebase already uses for its state map is the right shape, extended with a content hash to skip the unchanged and a delete path to evict ghosts.
-
----
-
-### Code in this codebase
-
-**Not yet implemented (incremental embedding indexing).** blooming insights retrieves live via MCP tool calls + EQL, so there is no embedding index to maintain — and a live tool call needs no indexing at all, which is part of the no-RAG rationale (`11-rag.md`): there is no index to keep current because every query reads the source live.
-
-The honest analog is `saveInvestigation` (`lib/state/investigations.ts`): it is keyed in-place upsert. `mem.set(insightId, events)` overwrites exactly the one investigation by key (leaving the rest), and in development it merges into the JSON cache by key (`all[insightId] = events`) instead of rewriting unrelated entries. That is the add/update-by-id core of incremental indexing, minus the change-detection and the delete path. `getCachedInvestigation` (`lib/state/investigations.ts`) is the keyed read. An incremental embedding index would extend this exact pattern in `lib/mcp/embeddings.ts` / `lib/state/` with a content hash (skip unchanged) and a delete path (evict ghosts). The `Project exercises` block below is the primary buildable target.
-
----
-
-## Incremental indexing — diagram
-
-This diagram spans the Service layer (change-detection + the three operations) and the State layer (the keyed index). A reader who sees only this should grasp that updates are per-document upserts/deletes, not a full rebuild.
-
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│  SERVICE LAYER  (would live in lib/mcp/embeddings.ts)               │
-│                                                                      │
-│  corpus update event                                                 │
-│      │  change-detection (hash compare, like 09)                    │
-│      ├── new doc       → embed → UPSERT by id                       │
-│      ├── changed doc   → embed → UPSERT by id (or changed chunk)    │
-│      ├── unchanged     → skip (no embed cost)                       │
-│      └── removed doc   → DELETE by id (+ derived chunks)            │
-└──────────────────────────┬───────────────────────────────────────────┘
-                           │ per-document mutations
-┌──────────────────────────▼───────────────────────────────────────────┐
-│  STATE LAYER  (lib/state/ — keyed index, like investigations.ts)    │
-│   Map<docId, {vector, hash, staleAt}>                               │
-│   set(id,..) = upsert (add/update)   delete(id) = evict             │
-│   ◀── exactly the in-process state map's set-by-id shape              │
-└──────────────────────────────────────────────────────────────────────┘
-```
-
-Cost flows with the number of changes, not the corpus size — the upsert/delete-by-key shape `saveInvestigation` already uses.
-
----
 
 ## Elaborate
 
-### Where this pattern comes from
+The incremental-vs-rebuild distinction is old (database indexing has
+faced it for decades). What's specific to LLM embeddings: the
+*invalidation trigger* often isn't a content change — it's an embedding-
+model upgrade. The model team ships v2 of the embedder; every vector
+under v1 is now in a different coordinate system and can't be compared
+meaningfully to v2 vectors. The fix is a full re-embed under v2.
 
-Incremental indexing is foundational to search engines — Lucene/Elasticsearch maintain segments that are merged and updated incrementally rather than rebuilt, and crawlers re-index only changed pages. The database world calls the trigger change-data-capture (CDC): emit an event on every row change and update derived structures (including embedding indexes) from the event stream. The RAG era inherited all of it: every production vector DB exposes `upsert` and `delete` by id, and the standard pipeline is "source change event → re-embed the changed item → upsert," not periodic full rebuilds.
-
-### The deeper principle
-
-```
-  derived structure        update strategy           cost per change
-  ──────────────────────   ───────────────────────   ───────────────
-  embedding index          upsert/delete by id       O(changes)
-  full rebuild             re-embed everything        O(N)
-  saveInvestigation (HAS)  mem.set by key            O(1)
-```
-
-The principle is universal to any derived-from-source structure: maintain it incrementally, keyed, driven by change-detection. A full rebuild is the fallback for when the index is corrupt or the model changed (the `09` model-swap case), not the steady-state update path.
-
-### Where this breaks down
-
-1. **Forgotten deletes leave ghosts.** Upsert-only maintenance never removes vectors for deleted documents, so retrieval returns results pointing at content that no longer exists. The delete path is as important as the upsert and is the most commonly omitted.
-
-2. **Concurrent updates can race.** Two upserts of the same id (a re-run finishing while an edit lands) can interleave; without ordering or a version check, the index can end up with the older vector. `saveInvestigation`'s `mem.set` has the same last-write-wins exposure for investigations.
-
-3. **Incremental indexes drift over time.** Many small upserts can leave an ANN index (`04`) sub-optimally structured (fragmented graph, unbalanced clusters), degrading recall until a periodic compaction/rebuild. Incremental is the steady state; an occasional rebuild is still needed.
-
-### What to explore next
-
-- **Stale embeddings** (`09-stale-embeddings.md`): change-detection is shared between freshness and incremental update.
-- **Vector databases** (`04-vector-databases.md`): `upsert`/`delete` are native vector-DB operations; ANN indexes need periodic compaction.
-- **Chunking** (`03-chunking-strategies.md`): chunk-level ids enable re-embedding only the changed chunk.
-
----
+This is why `embedding_model_version` (from the exercise in
+`02-embedding-model-choice.md`) is the load-bearing field — it's the
+trigger that *requires* a rebuild, distinct from any content change.
 
 ## Project exercises
 
-### Build incremental upsert/delete for the embedding index
+### Exercise — wire incremental upsert into `saveInvestigation`
 
-- **Exercise ID:** B2A.4 / B2B.1 (adapted) — the primary buildable target.
-- **What to build:** extend the embedding index (`09`) with `upsert(docId, text)` (embed + replace by id, skip if the content hash matches) and `remove(docId)` (delete the vector and its derived chunk vectors). Drive it from a change-detector that compares hashes, mirroring `saveInvestigation`'s keyed-write pattern. Track chunks by `docId#chunkIndex` so only changed chunks re-embed.
-- **Why it earns its place:** demonstrates you maintain an index in place with cost proportional to change — including the delete path most candidates forget — extending the codebase's own keyed-upsert pattern.
-- **Files to touch:** new `lib/state/embedding-index.ts` (`upsert`/`remove` by id + hash skip), `lib/mcp/embeddings.ts` (embed-on-change), `lib/state/investigations.ts` (emit a change signal on `saveInvestigation`), new `test/state/embedding-index.test.ts` (upsert skips unchanged, delete evicts ghosts, chunk-level update).
-- **Done when:** changing one investigation re-embeds only its changed chunk, an unchanged investigation triggers zero embed calls, and a deleted investigation's vectors are evicted so it cannot be retrieved.
-- **Estimated effort:** 1–2 days
-
-### Add periodic ANN compaction with a drift check
-
-- **Exercise ID:** C2.12 (adapted) — incremental-index maintenance.
-- **What to build:** after many incremental upserts, detect index drift (e.g. a recall regression on a fixed eval set) and trigger a periodic full rebuild/compaction, keeping incremental as the steady-state path and rebuild as the occasional repair.
-- **Why it earns its place:** shows you know incremental indexes degrade over time and that a periodic rebuild is still needed — the maintenance nuance.
-- **Files to touch:** `lib/state/embedding-index.ts` (compaction + drift check), new `scripts/index-compact.ts`, `test/state/embedding-index.test.ts`.
-- **Done when:** a recall regression on the eval set after many upserts triggers a rebuild that restores recall, with incremental updates remaining the default.
-- **Estimated effort:** 1–4hr
-
----
+  → **Exercise ID:** `study-ai-eng-03-10.1`
+  → **What to build:** Modify `saveInvestigation` in
+    `lib/state/investigations.ts` to also call `vectorStore.upsert` with
+    the new investigation's embedding. Idempotent (safe to call twice).
+    Verify by triggering a fresh diagnostic and confirming the new
+    investigation is retrievable on the very next query.
+  → **Why it earns its place:** The trivial-but-essential write-side
+    wiring. Without it, the vector store is always one investigation
+    behind.
+  → **Files to touch:** `lib/state/investigations.ts`, new
+    `test/state/investigations-rag.test.ts`.
+  → **Done when:** A unit test saves an investigation, queries the
+    vector store, and finds the new vector at top-1.
+  → **Estimated effort:** `1–4hr`
 
 ## Interview defense
 
-### What an interviewer is really asking
+**Q: How would you keep the vector index current with the
+investigation corpus?**
 
-"How do you keep a vector index up to date?" tests whether you reach for incremental upsert/delete instead of periodic full rebuilds. The senior signal is naming change-detection-driven per-document upserts, remembering the delete path (ghosts), noting that incremental indexes drift and need occasional compaction, and — here — pointing at `saveInvestigation`'s keyed `mem.set` as the existing pattern to extend.
-
-### Likely questions
-
-**[mid] Why not just rebuild the whole index when something changes?**
-
-Because a rebuild re-embeds every document to update one — O(N) per change, with the index stale or offline during the build. Incremental indexing embeds only the changed document and upserts its vector by id, so cost scales with the change, not the corpus. It is `Map.set(id, vector)`, the same shape as `saveInvestigation`.
+Incremental upsert on `saveInvestigation`. The corpus is append-only,
+so the simplest possible pattern works: every new investigation embeds
+and upserts in the same code path as the disk save. No background jobs,
+no rebuild cadence, no dual-serve.
 
 ```
-rebuild: re-embed all 500 to update 1 (O(N))
-upsert:  embed 1, set by id (O(changes))
+  saveInvestigation(id, events)
+      → save to disk (existing)
+      → embed(chunkText) → vectorStore.upsert(id, vec, meta)
 ```
 
-**[senior] What operation do people forget, and what breaks without it?**
+Full rebuild is reserved for embedding-model upgrades — when the model
+changes, every vector is in a new coordinate system and they all need
+re-embedding under the new model.
 
-Delete. Upsert-only maintenance never removes vectors for deleted source documents, so retrieval returns ghost results pointing at content that no longer exists. Delete-by-id (plus deleting derived chunk vectors) is as essential as upsert and is the most commonly omitted operation.
+**Anchor line:** "Append-only corpora love incremental indexing. Full
+rebuild only when the embedding model changes."
 
-```
-doc deleted, vector lingers → retrieved as ghost
-fix: index.delete(docId) + delete its chunks
-```
+**Q: When would you do dual-serve during rebuild?**
 
-**[arch] Is incremental indexing enough on its own?**
-
-No — incremental is the steady-state path, but many small upserts degrade an ANN index's structure (fragmented graph, unbalanced clusters), lowering recall over time. You still need a periodic compaction/full rebuild as repair, triggered by a recall regression on a fixed eval set. Incremental for the common case, rebuild for maintenance and for the model-swap full-invalidation case from `09`.
-
-```
-incremental upserts → drift → recall regression
-periodic compaction/rebuild → restore recall
-```
-
-### The question candidates always dodge
-
-**"What about deletes?"** Most candidates describe add/update and stop. A removed source document whose vector stays in the index is a silent correctness bug — the retriever surfaces a result for content that is gone. Naming the delete path (and deleting derived chunk vectors) unprompted is the senior signal.
-
-### One-line anchors
-
-- `lib/state/investigations.ts` — `saveInvestigation` `mem.set(insightId, events)`: keyed in-place upsert, the pattern to extend.
-- `lib/state/investigations.ts` — `all[insightId] = events`: keyed JSON merge, not a full rewrite.
-- Upsert + delete by id, driven by change-detection — cost scales with change.
-- The delete path is the forgotten one; omit it and deleted docs become ghosts.
-- Incremental indexes drift; a periodic compaction/rebuild is still needed.
-
----
+When the corpus is large enough that the rebuild takes more than a few
+seconds AND queries can't pause. Build v2 of the index alongside v1,
+atomic-swap when complete, drop v1 after a grace period. For this
+codebase's scale (hundreds of vectors), rebuild takes seconds and you
+can just pause queries briefly. Dual-serve becomes essential at ~10k+
+vectors.
 
 ## See also
 
-→ 09-stale-embeddings.md · → 04-vector-databases.md · → 03-chunking-strategies.md · → 11-rag.md
+  → `09-stale-embeddings.md` — the edit-aware version of this pattern
+  → `02-embedding-model-choice.md` — when full rebuild becomes mandatory

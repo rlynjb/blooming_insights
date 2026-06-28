@@ -1,138 +1,142 @@
-# Performance engineering — audit
+# Performance audit — 8 lenses
 
-> **Verdict-first:** blooming insights is bounded by **three measurable ceilings and one partially-measured cost line**. The ceilings: `maxDuration = 300s` per route (`app/api/agent/route.ts:20`, `app/api/briefing/route.ts:17`), `minIntervalMs = 1100` Bloomreach spacing (`lib/mcp/connect.ts:92`), and per-agent `maxToolCalls` (6/6/6/4). The partially-measured cost line: the `synthesize()` fallback in `lib/agents/diagnostic.ts:87-126` and `lib/agents/recommendation.ts:82-132` — output-token-heavy structured JSON output that fires whenever the loop fails to emit valid JSON; **3 of 5 Anthropic call sites now log `res.usage`** (`lib/agents/base.ts:135` runAgentLoop, `base.ts:257` runRecoveryTurn, `intent.ts:36` intent classifier — added since 2026-06-02), but `diagnostic.ts:87-126` and `recommendation.ts:82-132` synthesize() retries still don't. The strongest pattern in the codebase is the 60s TTL cache that bypasses both spacing and network on a hit — now at `lib/data-source/bloomreach-data-source.ts:122,144-148` after the Phase 2 PR A seam extraction (`lib/mcp/client.ts` is now a 17-line backwards-compat shim). New ceiling on the eval side: ~$10-15 total Anthropic spend across all 4 Phase 3 eval pillars (detection/diagnosis/recommendation/regression) — first real per-investigation cost number the codebase has. Top finding: complete the meter (add `console.log` to the 2 remaining synthesize() call sites) so the cost-concentration story closes, then assess whether `synthesize()` is genuinely dominant.
+Pass 1 of the two-pass discipline. Every lens walked against the current code. Where a lens earns a dedicated walkthrough, it cross-links to the pattern file in Pass 2.
 
 ## performance-budget
 
-blooming insights ships **four hard budgets** and **zero soft budgets**. The four:
+The repo has **three explicit budgets** and they are all named in code with the reasoning attached.
 
-- **Route ceiling.** `maxDuration = 300` at `app/api/agent/route.ts:20` and `app/api/briefing/route.ts:17`. Pinned at Vercel Pro's max. The comment names the rationale: "A live investigation runs ~100-115s under the ~1 req/s MCP limit; 60s (Hobby) cannot fit it."
-- **Per-agent tool-call cap.** `maxToolCalls = 6` (monitoring `lib/agents/monitoring.ts:101`, diagnostic `lib/agents/diagnostic.ts:62`, query `lib/agents/query.ts:41`), `4` (recommendation `lib/agents/recommendation.ts:57`). Triggers forced synthesis when hit (`lib/agents/base.ts:88-101`).
-- **Tool-result context cap.** `MAX_TOOL_RESULT_CHARS = 16_000` (`lib/agents/base.ts:29`) for the model's context; a tighter `TRUNC = 4000` (`app/api/agent/route.ts:99-103`) for the UI event stream. Same pattern, two consumers, two budgets.
-- **Per-call latency floor.** `minIntervalMs = 1100` (`lib/mcp/connect.ts:92`) enforced as a sleep before every MCP call. This is a floor, not a cap.
+- **Route budget — 300s.** `app/api/agent/route.ts:22` and `app/api/briefing/route.ts:19` both set `export const maxDuration = 300`. The comment explains why: Hobby's 60s cannot fit a 6-call investigation behind the ~1 req/s MCP floor. This is Vercel Pro's maximum.
+- **Per-MCP-call budget — 30s.** `lib/mcp/transport.ts:38` sets `TOOL_TIMEOUT_MS = 30_000` and composes it with `req.signal` via `AbortSignal.any` (`lib/mcp/transport.ts:131,150`). Whichever fires first wins. A single hung MCP call cannot eat the whole 300s.
+- **Per-agent tool-call cap.** Set inside `@aptkit/core`: monitoring 6, diagnostic 6, recommendation 4, query 6 (`node_modules/@aptkit/core/.../monitoring-agent.js:56`, etc.). The kill-switch the model cannot escape. The legacy mirror lives at `lib/agents/{diagnostic,recommendation,monitoring,query}-legacy.ts`.
 
-What's **not codified**: no p95 latency SLO, no error-rate budget, no cost-per-investigation cap. All four hard budgets work because the next layer up enforces them (Vercel kills, the loop counts, truncate clips, the sleep sleeps). The three missing soft budgets need a meter that doesn't exist.
+There is no user-visible perf budget (no LCP target, no INP target). The user-visible contract is "the stream starts within hundreds of ms even when the total run is 30-90s" — see `04-progressive-ndjson-stream.md`.
 
-→ see `01-300s-vercel-budget-as-hard-ceiling.md` for the deep walk on the route-budget contract (set-by-judgment, zero headroom, architectural cost of lifting it)
+→ see `01-vercel-route-budget.md` for the deep walk of the 300s ceiling and how the code defends it.
 
 ## measurement-baselines-and-profiling
 
-blooming insights measures **one number** today: per-tool-call duration, emitted as `tool_call_end.durationMs` on the NDJSON event stream (`lib/mcp/events.ts:7`, captured at `lib/mcp/client.ts:112,134`). It's *displayed* in the UI's status panel and *never persisted* — every refresh wipes the history. A baseline ("a typical investigation takes 100-115s") exists only as a *comment* in `app/api/agent/route.ts:18-19`.
+There is **no flamegraph, no profiler, no RUM**. The measurement surface is a single per-request structured log line emitted in the `finally` block of both routes:
 
-The cheapest unread meter was `res.usage` returned by every `anthropic.messages.create` call. **PARTIALLY RESOLVED as of 2026-06-15**: 3 of 5 sites now log it (`lib/agents/base.ts:135` runAgentLoop's main turn, `base.ts:257` runRecoveryTurn, `lib/agents/intent.ts:36` intent classifier). The two remaining sites are the synthesize() fallback Anthropic calls inside `lib/agents/diagnostic.ts:87-126` and `lib/agents/recommendation.ts:82-132` — exactly the call sites the cost-concentration finding suspects of dominating. Closing those two completes the meter and unblocks the cost-concentration confirmation.
+```
+  app/api/briefing/route.ts:317  console.log(JSON.stringify({
+                                   route: '/api/briefing',
+                                   sessionId, mode, totalMs, phases, aborted
+                                 }));
+  app/api/agent/route.ts:331     // same shape, route: '/api/agent'
+```
 
-**New measured data point (Phase 3, 2026-06-15):** ~$10-15 total Anthropic spend across all 4 eval pillars (detection + diagnosis + recommendation + regression) running K=10 per anomaly × 3 seeded anomalies. Recommendation eval alone: 34:50 runtime for K=10 across 3 anomalies. This is the first real "what does an end-to-end investigation cost" data the codebase has — though it's measured against `OlistDataSource` (hermetic SQLite), not the production Bloomreach path. The 30s `AbortSignal.timeout(30_000)` added on the Olist side at `lib/data-source/olist-data-source.ts:151` is the first per-call timeout in the codebase (Bloomreach side still has no per-call timeout — asymmetric coverage).
+Phases are recorded via `recordPhase(phase, started)` (`app/api/briefing/route.ts:205`, `app/api/agent/route.ts:217`). The shape is deliberately shared so a single Vercel filter — e.g. `phases.phase = "schema_bootstrap"` — reads across both endpoints.
 
-**Parallel-execution incident (real perf anecdote, 2026-06-15):** K=10 eval was kicked off twice in parallel during Phase 3 PR E — main session ran K=10 from Bash while a sub-agent ALSO ran K=10. Detected via `ps aux`; killed PIDs 30039/30040 before they overwrote results. Mitigation: `EVAL_RUN_TAG` env var added for result-dir namespace separation. The eval suite is now the codebase's first concrete "parallel runs of the same expensive operation will collide" experience.
+Anthropic per-call `usage` is logged per model call at `lib/agents/aptkit-adapters.ts:60` with the call-site tag `agents/<agent>:aptkit-model`. That is the cost meter.
 
-What's still `not yet exercised`:
-- Load testing (no k6, no autocannon, no synthetic baseline)
-- Profiler integration (no clinic, no 0x, no `--inspect`)
-- Per-investigation summary (the `collected: AgentEvent[]` array at `app/api/agent/route.ts:171` has the inputs but never aggregates)
-- APM / Sentry / Datadog
-- Web Vitals (no `useReportWebVitals`, no Vercel Speed Insights)
-- No per-call timeout on Bloomreach side (only on Olist side)
-
-→ see `04-synthesize-as-cost-concentration.md` for the deep walk on the dominant unmeasured cost line and why the meter is load-bearing
+Baselines are documented in the route comments (`/api/agent` route: "live investigation runs ~100-115s under the ~1 req/s MCP limit") and in `00-overview.md`. There is no committed benchmark suite or before/after evidence file. **Naming this as a gap is the honest move** — the project has phase logs and Anthropic usage logs, but no profiling pipeline.
 
 ## latency-throughput-and-tail-behavior
 
-A typical live investigation runs **~100-115s** end-to-end (per the comment at `app/api/agent/route.ts:18-19`). It's the sum of three serialized waits: ~6.6s of MCP spacing per agent (6 calls × 1100ms), ~3-10s of Anthropic latency per turn (up to 8 turns × 2 agents), and any rate-limit retry waits (up to 20s each, capped at 3 retries per call by `lib/mcp/client.ts:121-132`).
+This is a low-throughput, high-latency system. There is no concurrent request fan-in; each route serves one user's investigation at a time. The interesting tail behavior lives on the **upstream side**:
 
-**Throughput** per user is `1 / latency` ≈ 0.01 inv/sec ≈ 36/hour. Bloomreach's ~1 req/s/user GLOBAL rate cap IS the throughput ceiling; there's no batching, no parallelism (neither Bloomreach MCP nor Anthropic's `messages` API expose batch endpoints).
+- The Bloomreach alpha server states its own rate-limit window in error text — observed as `(1 per 1 second)` AND `(1 per 10 second)`. `BloomreachDataSource.callTool` parses the stated window (`lib/data-source/bloomreach-data-source.ts:64-71`) and retries against it; falls back to `retryDelayMs = 10_000` exponential backoff when nothing parseable is there.
+- Worst-case single-call tail: `maxRetries: 3` × `retryCeilingMs: 20_000` = 60s on one stuck call. The 30s per-call timeout (`lib/mcp/transport.ts:38`) is a separate ceiling for transport-level hangs.
+- No p50/p95/p99 collection. The phase log produces a stream of single observations; aggregation lives in Vercel's log search, not in code.
 
-**The tail** (p99) is not measured. Its shape is knowable from the retry math: 2 calls × 3 retries × 20s = +120s on top of the typical ~100s, which can scrape against the 300s route ceiling. When the tail crosses 300s, Vercel kills the function and the user sees a half-stream.
-
-The serial chain (bootstrap → diagnostic → recommendation, `app/api/agent/route.ts:231-249`) is causally chained — recommendation needs the diagnosis as input, so no `Promise.all` is possible.
+→ see `02-mcp-spacing-and-retry.md` for the spacing-vs-retry teardown.
 
 ## cpu-memory-and-allocation
 
-**I/O-bound, not CPU-bound.** The dominant CPU work is `JSON.stringify` on tool results (`lib/agents/base.ts:150`, `lib/mcp/client.ts:102`) and the truncate function clipping at 16k chars. Per-investigation CPU is single-digit seconds across ~100s of wall-clock — ~100:1 wait-to-CPU ratio. No profiler is integrated; the CPU hot path is inferred from code shape, not measured.
+Not yet exercised in any deep way. A few real moves:
 
-**Three memory shapes**, all bounded:
+- **Bounded tool-result size.** `lib/agents/base-legacy.ts:33` truncates each tool result to `MAX_TOOL_RESULT_CHARS = 16_000` before feeding it back to the model — keeps the prompt token budget from runaway growth on a chatty tool.
+- **Bounded NDJSON event payloads.** Both routes truncate per-event result payloads to 4000 chars via `trunc()` (`app/api/agent/route.ts:97-101`, `app/api/briefing/route.ts:71-75`) before emitting them on the wire. The full result still hits the server log; the wire stays small.
+- **Bounded schema summary.** `schemaSummary` (`lib/agents/monitoring.ts:19-60`) caps to 20 events × 10 properties + 30 customer properties before injecting `{schema}` into the system prompt. Without this cap, the 112KB raw schema would dominate every Claude turn.
 
-- **Per-request.** The `messages: MessageParam[]` in `runAgentLoop` (`lib/agents/base.ts:79`) grows by 2 entries per turn, bounded by `maxTurns = 8`. Peak ~256KB per agent. Released at function return.
-- **Per-instance.** The in-memory `Map`s in `lib/state/insights.ts:4` (cleared at every `putInsights` via `.clear()` at `:36`) and `lib/state/investigations.ts:11` (no `.delete` — grows monotonically in a warm instance). Schema cache at `lib/mcp/schema.ts:131` — single-slot, ~30-100KB, lives until instance cools.
-- **Per-deploy.** `readFileSync`'d prompts (`lib/agents/diagnostic.ts:14`, `monitoring.ts:13`, `recommendation.ts:14`, `query.ts:13`) — few KB each, held for deploy lifetime.
-
-The one **unbounded growth path**: `investigations.set(id, events)` at `lib/state/investigations.ts:31` — no LRU, no eviction. De-facto bound is instance death. For demo scale fine; the shape is the classic Node leak pattern that bites when traffic patterns change.
+There is no profiling of GC pressure, no allocation tracking, no streaming-of-large-blobs work. This is a stateless serverless app; memory pressure is not the live failure mode.
 
 ## io-network-and-database-bottlenecks
 
-Two outbound HTTPS destinations, one outbound stream, **no database**:
+**There is no database.** State lives in in-memory maps (`lib/state/insights.ts`, `lib/state/investigations.ts`); dev persists to gitignored JSON files. The I/O bottlenecks are all **upstream API**:
 
-- **Outbound HTTPS to Bloomreach MCP** (the bottleneck). `StreamableHTTPClientTransport` (`lib/mcp/connect.ts:71`). ~10-15 calls per investigation × ~1.5-3s each (spacing + network + EQL server time). Rate cap: ~1 req/s/user GLOBAL.
-- **Outbound HTTPS to Anthropic** (the variance source). `anthropic.messages.create` at 4 call sites. ~8-16 calls per investigation × ~3-10s each. No upper bound from the contract.
-- **Outbound NDJSON streaming.** `ReadableStream<Uint8Array>` via `controller.enqueue` — one line per event, ~100-200 events per investigation. `Cache-Control: no-cache, no-transform` prevents intermediary buffering.
-- **Filesystem.** `readFileSync` for prompts at module load (cold-start cost, ~10-20ms). Demo snapshot reads on `?demo=cached`. Dev-mode `writeFileSync` to `.investigation-cache.json` and `.auth-cache.json` (guarded by `PERSIST = process.env.NODE_ENV === 'development'`); serverless FS is read-only so this is a no-op in prod.
+- **MCP transport.** `@modelcontextprotocol/sdk`'s `StreamableHTTPClientTransport` over HTTPS to `loomi-mcp-alpha.bloomreach.com/mcp`. Every tool call is one round-trip. The 1.1s spacing dominates wall-clock far more than per-call HTTP latency does.
+- **Anthropic API.** Two models: `claude-sonnet-4-6` for agents, `claude-haiku-4-5-20251001` for intent classification (the intent classifier is the only place a cheaper model is used).
+- **Schema bootstrap — 4 sequential MCP calls.** `bootstrapSchema` (`lib/mcp/schema.ts:186-209`) runs `get_event_schema`, `get_customer_property_schema`, `list_catalogs`, `get_project_overview` in order. The sequential shape is required because `BloomreachDataSource.minIntervalMs = 1100` would serialize parallel calls anyway. With the in-process schema cache (`lib/mcp/schema.ts:131`), bootstrap is sub-ms after the first call within the same Node process.
 
-Time attribution per typical investigation: Bloomreach ~25%, Anthropic ~60%, NDJSON ~0%, FS ~0%, DB 0% (does not exist). Bloomreach is the *structural* bottleneck (caps throughput); Anthropic owns the *minutes spent*.
+The dominant I/O cost is the MCP server's rate limit, not network latency.
 
-The deliberate absence of a database is the load-bearing architectural choice — cross-link to `study-system-design/audit.md#storage-choice-and-durability-boundaries`. It buys deploy simplicity + zero state-op latency; it costs durability + cross-instance consistency.
+→ see `03-ttl-cache-no-cache-on-error.md` for the 60s response cache.
 
 ## caching-batching-and-backpressure
 
-**Two real caches plus one persistence-as-cache layer.** No batching opportunity. No backpressure (the spacing gate looks like it but isn't).
+Three distinct caching mechanisms, no batching, no real backpressure:
 
-- **TTL cache (60s, exact-match).** Code moved during Phase 2 PR A — now at `lib/data-source/bloomreach-data-source.ts:122,144-148` (was `lib/mcp/client.ts`; the old path is a 17-line backwards-compat shim). Keyed on `${name}:${JSON.stringify(args)}`. On a hit: `durationMs: 0, fromCache: true` — bypasses both spacing gate AND network. Errors are NOT cached — a rate-limit error would otherwise poison the cache for 60s; bypassing caching for errors lets the next call retry immediately after spacing.
-- **Schema cache (per-instance, no TTL).** `let cached: WorkspaceSchema | null = null` at `lib/mcp/schema.ts:131`. Populated on first `bootstrapSchema` call (~6-12s), reused forever (until instance death). Saves the bootstrap cost per warm request.
-- **Investigation replay store.** `mem: Map<string, AgentEvent[]>` at `lib/state/investigations.ts:11`. Three-source fallback: in-memory → dev cache file → committed demo JSON. This is *replay/persistence*, not a perf cache — a live re-run would produce different events.
+- **60s TTL response cache** in `BloomreachDataSource` (`lib/data-source/bloomreach-data-source.ts:122,144-148`). Keyed by `name+args`. Critically: returns BEFORE writing when `isError === true` (line 179). A transient 429 cannot poison the cache.
+- **In-process schema cache.** `bootstrapSchema` memoizes the whole `WorkspaceSchema` in a module-level `let cached` (`lib/mcp/schema.ts:131,190,200`). Test-only `_resetSchemaCache()`. Within one warm Vercel function instance, the 4-call bootstrap collapses to sub-ms.
+- **Investigation cache.** `lib/state/investigations.ts` — in-memory map + dev file. Demo seed lives at `lib/state/demo-investigations.json` (3,487 lines). The `/api/agent` route checks this cache first (`app/api/agent/route.ts:125`) and replays the captured stream to the client without re-running the agents.
 
-**Batching:** `not yet exercised`. Bloomreach MCP exposes no batch endpoint; Anthropic's `messages` is one-turn-per-call. The cache is the equivalent lever — remove the call entirely.
+**No batching** — MCP calls are issued one at a time (the 1.1s spacing forces serialization).
 
-**Backpressure:** `not yet exercised`. The spacing gate (`lib/mcp/client.ts:148-152`) sleeps `minIntervalMs - elapsed` before every call. Same code shape as throttling/backpressure, opposite semantic: it's **rate-limit compliance** (deterministic, fires every call, no queue, no signal). Backpressure needs a queue with depth and an upward signal — neither exists because there's no fan-out. Becomes necessary IF parallel-agent topology ever ships. Cross-link `study-agent-architecture/05-production-serving/02-fan-out-backpressure.md`.
+**No true backpressure.** `minIntervalMs = 1100` is rate-limit compliance — a fixed proactive delay. Backpressure would mean "downstream is slow → upstream sees that signal and slows down accordingly." Here, upstream (the agent) just sleeps before every call regardless of downstream state. The distinction matters — see `02-mcp-spacing-and-retry.md` for the full teaching point.
 
-**Prompt-prefix caching** (Anthropic feature): `not yet exercised`. The 5-10KB system prompts are re-tokenized every turn. Adding `cache_control: { type: 'ephemeral' }` is the cheap shrink lever; cross-link `study-ai-engineering/06-production-serving/01-llm-caching.md`.
+The synthetic data source (`lib/data-source/synthetic-data-source.ts`) is the **bypass** for both the cache and the spacing — `live-synthetic` mode keeps the real agent loop but uses a deterministic in-process tool catalog. No network, no spacing, no cache pressure. The killer demo path.
 
-→ see `02-ttl-cache-with-no-cache-on-error.md` for the deep walk on the cache mechanics
-→ see `03-spacing-gate-as-rate-limit-compliance.md` for the compliance-vs-backpressure distinction
+→ see `03-ttl-cache-no-cache-on-error.md`.
 
 ## rendering-client-and-mobile-performance
 
-The strategy is **"hide the latency, don't fight it"** — applied perceived-performance design without measured validation.
+Mostly **not yet exercised** as deliberate performance work, but the basics are honest:
 
-Four UX moves convert ~100s of actual latency into ~1-2s of time-to-feedback:
+- **No `React.memo`, no `useMemo`, no `useCallback`** in `components/` or `app/`. Grep returns zero matches. The component tree is small (`max-w-5xl` container, a handful of cards, a streaming trace panel) and the renders are cheap.
+- **No virtualization.** The trace panel renders all events as a flat list. Demo investigations cap around 60-80 events; live runs cap at ~6-10 tool calls × a few text turns. Virtualization would be premature.
+- **No bundle analysis script.** No `@next/bundle-analyzer`, no LCP/INP measurement, no Lighthouse pipeline committed to the repo.
+- **No image work.** No `<Image>` usage; the only images are `favicon.ico`.
+- **Tailwind v4 CSS-first.** Custom keyframes (`bi-fade-up`, `bi-progress`, `bi-dots`) live in `app/globals.css`; design tokens are CSS custom properties. No CSS-in-JS runtime cost.
 
-- **NDJSON streaming.** `useInvestigation` hook (`lib/hooks/useInvestigation.ts:184-208`) reads chunks via `response.body.getReader()`, splits on `\n`, dispatches per-event. Server-side `ReadableStream` (`app/api/agent/route.ts:167-264`, `app/api/briefing/route.ts:178-258`) with `Cache-Control: no-cache, no-transform` to prevent intermediary buffering.
-- **Skeleton placeholders.** `components/shared/Skeleton.tsx`, `components/investigation/RecommendationCardSkeleton.tsx`, `CoverageGrid` loading prop. Match real-content dimensions to prevent layout shift.
-- **ProcessStepper.** `components/shared/ProcessStepper.tsx` — three steps (monitoring → diagnostic → recommendation) with `pending | active | complete | error` states. Active step has `animate-pulse`.
-- **StatusLog.** `components/shared/StatusLog.tsx` — live agent thoughts + tool calls with durations. `replaceRunningTool` (`useInvestigation.ts:86-95`) updates a tool entry in place when its duration arrives.
-
-**What's not measured:** no Web Vitals (LCP/INP/CLS), no Vercel Speed Insights, no React Profiler integration, no `@next/bundle-analyzer`, no time-to-first-event / time-to-diagnosis metrics. Same gap as `measurement-baselines-and-profiling` — applied without validation.
-
-**Per-event setState (`useInvestigation.ts:97-150`)** is not batched — fine at today's ~1-2 events/sec, would dominate render time at higher rates (e.g. streamed text-deltas).
-
-Mobile-specific perf, PWA / service-worker, and native (React Native) are all `not yet exercised` — this is a web app.
-
-→ see `05-progressive-streaming-perceived-perf.md` for the deep walk on the perceived-perf kernel
+The honest framing: client-side perf is not where the bottlenecks live. The user's perceived latency is dominated by the server stream (see `04-progressive-ndjson-stream.md`), and that is correctly optimized. Calling this lens out as a deliberate non-investment is more honest than inventing findings.
 
 ## performance-red-flags-audit
 
-Ranked by consequence × likelihood. The discipline is *forcing the rank* — if every item is "high priority," nothing is.
+Ranked by consequence. Each row names the **evidence** — either a baseline or an explicitly missing measurement.
 
-**Top three (HIGH consequence).**
+```
+  rank  risk                                   evidence
+  ────  ─────────────────────────────────────  ────────────────────────────────
+  1     a single hung MCP call could blow      bounded — TOOL_TIMEOUT_MS = 30_000
+        the entire 300s route budget           in lib/mcp/transport.ts:38
+                                               + AbortSignal composition
 
-1. **Cost concentration on `synthesize()`** — `lib/agents/diagnostic.ts:87-126`, `lib/agents/recommendation.ts:82-132`. Output-heavy structured JSON, fires whenever the loop fails to emit valid JSON. Unmeasured because no `res.usage` logging. Fix: requires #2 to land first. → see `04-synthesize-as-cost-concentration.md`
-2. **`res.usage` logging — partially landed 2026-06-15** — 3 of 5 sites now log (`lib/agents/base.ts:135` runAgentLoop, `base.ts:257` runRecoveryTurn, `lib/agents/intent.ts:36` intent classifier). 2 sites remaining are `lib/agents/diagnostic.ts:87-126` and `lib/agents/recommendation.ts:82-132` synthesize() retries — the exact call sites #1 suspects of dominating. ~2 `console.log` lines closes it. Phase 3 also produced the first real per-investigation cost data: ~$10-15 total across K=10 eval across 4 pillars.
-3. **300s route budget pinned at ceiling** — `app/api/agent/route.ts:20`, `app/api/briefing/route.ts:17`. Zero headroom for retry storms. Fix: queue + worker (requires DB) or tighten `maxToolCalls`. → see `01-300s-vercel-budget-as-hard-ceiling.md`
+  2     a transient 429 poisoning the cache,   bounded — early return BEFORE the
+        making subsequent calls return the     cache write at
+        429 envelope from cache for 60s        lib/data-source/bloomreach-data-source.ts:179
 
-**Middle four (MEDIUM consequence).**
+  3     in-process schema cache surviving      bounded by Vercel's serverless
+        too long after the workspace mutates   isolation — each cold function
+                                               instance re-bootstraps. Risk only
+                                               within a warm instance lifetime.
 
-4. **No prompt-prefix caching** — `lib/agents/base.ts:92-101` has no `cache_control` blocks; the 5-10KB system prompts re-tokenize every turn. Fix: insert `cache_control: { type: 'ephemeral' }` (~5 lines per call site).
-5. **`investigations` Map grows monotonically** — `lib/state/investigations.ts:11,31`. No `.delete`, no LRU. Bounded only by instance death. Fix: LRU cap (~20 lines).
-6. **Schema cache has no TTL** — `lib/mcp/schema.ts:131,170`. Stale until cold restart. Fix: `cachedAt` + TTL check (~10 lines).
-7. **No Web Vitals / time-to-first-event metric** — no `useReportWebVitals`, no `performance.mark`. Fix: ~10 lines in `app/layout.tsx`.
+  4     bootstrap (4 sequential MCP calls)     ~4.4s floor in the cold path; sub-ms
+        adds ≥4.4s to every cold request       in the warm path via the in-process
+                                               cache. Phase log: schema_bootstrap.
 
-**Bottom three (LOW consequence today).**
+  5     the alpha MCP server revokes tokens    handled by the page's auto-reconnect
+        after minutes — a long-running         (app/page.tsx + useReconnectPolicy);
+        investigation can race the revocation  one-shot guard prevents loops.
 
-8. **Per-event setState not batched** — `lib/hooks/useInvestigation.ts:97-150`. Works at today's rates; would matter if event rates jumped. Trigger: streamed text-deltas or fan-out.
-9. **NDJSON event size sometimes large** — ~120-200KB per investigation. Bandwidth is cheap. Trigger: constrained mobile network.
-10. **Bootstrap chain serialized** — `lib/mcp/schema.ts:178-185`, 4-6 sequential calls (~6-12s cold cost). Not fixable — rate limit forbids parallel. Schema cache mitigates on warm.
+  6     no profiler, no RUM, no committed      GAP — the only signal is the
+        before/after benchmarks                per-request phase log read in Vercel.
+                                               Anthropic res.usage is logged per call
+                                               at lib/agents/aptkit-adapters.ts:60.
 
-**Honest `not yet exercised`:** load testing, profiler integration, batching, formal SLOs. Each has a real "why not" — providers don't support batching; profilers come after monitoring; SLOs need a meter.
+  7     no p95/p99 aggregation in code         GAP — phase log emits single
+                                               observations; aggregation is left to
+                                               whoever reads the Vercel log.
 
-## Top 3 ranked findings
+  8     replay delays (REPLAY_DELAY_MS 140 /   not a risk — perceived-performance
+        180) extend demo wall-clock by         choice. The replay would otherwise
+        seconds                                dump the whole snapshot in one flush.
 
-1. **`res.usage` logging — partially landed 2026-06-15** — 3 of 5 sites now log (`base.ts:135`, `base.ts:257`, `intent.ts:36`). Close the remaining 2 (`diagnostic.ts:87-126`, `recommendation.ts:82-132` synthesize() retries) to finish unblocking #2.
-2. **Cost concentration on `synthesize()`** — `lib/agents/diagnostic.ts:87-126`, `lib/agents/recommendation.ts:82-132` — suspected dominant per-investigation cost (long structured JSON output, fires when loop fails to parse). Cannot be confirmed or fixed until #1 lands. Once measured, lever is tightening `maxToolCalls` (fewer forced syntheses) or reshaping the JSON output (smaller schema).
-3. **300s route budget at ceiling, zero headroom** — `app/api/agent/route.ts:20`, `app/api/briefing/route.ts:17` — pinned at Vercel Pro's max. Typical ~100-115s, worst-case retry storm (~280-300s+) crosses the ceiling and the route dies mid-stream. Cheap fix: tighten `maxToolCalls`. Architectural fix: queue + worker (requires DB).
+  9     bundle size unmeasured                 GAP — no analyzer script. The
+                                               surface is small (5 page routes, a
+                                               handful of components) so unlikely
+                                               to be load-bearing today.
+```
+
+The top three are **already bounded** in code — the risk is real, the mitigation is named and visible. The bottom three are **measurement gaps**, not behavioral risks. The honest framing: the bounding mechanics exist; the observability does not.
