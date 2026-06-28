@@ -1,252 +1,260 @@
-# Chapter 4 — The Scale Story
+# Chapter 4 — The scale story
 
-When an interviewer asks "what breaks first at 10x?" they are not asking you to recite a horizontal-scaling playbook. They are watching whether you know where YOUR system's load actually lands. The wrong move here is to start naming Redis and Kafka and read replicas — because in this system the first thing that breaks at 10x is none of those. It is a rate limit you do not own, on a server you do not run. The strong move is to point straight at it, prove you measured it, and only then walk to the infrastructure you would add. You will get more credit for "the ceiling is upstream of my code, here is exactly where" than for a tour of components you have not wired in.
+The scale question is a senior-leveling probe. The interviewer doesn't actually care whether your portfolio app handles a million users. They care whether you can think about *what breaks first*, in what order, with what fix. If you answer with "Vercel auto-scales," you've failed the probe before they finished asking it.
 
-So before anything else, internalize the shape of the load. This is the sequence of what breaks, in order, as you turn up users, data, and latency-sensitivity:
+This chapter walks three scale scenarios — 10× users, 100× data, 10× latency-sensitive requests. For each, you'll name **the first bottleneck**, **the second bottleneck**, **what you'd add when**, and **how you'd measure to know**. The trick is that for *this* codebase, the binding constraint is almost never your own service. It's almost always upstream. Owning that honestly is the senior move.
 
-```
-┌ BLOOMING INSIGHTS — WHAT BREAKS FIRST, IN ORDER ────────────────────────────┐
-│                                                                              │
-│  TURN UP USERS ──────────────────────────────────────────────────────────► │
-│   1x          10x                         100x                               │
-│   │            │                            │                                │
-│   ▼            ▼                            ▼                                 │
-│  fine    ┌───────────────┐          ┌──────────────────┐                     │
-│          │ #1 Bloomreach │          │ #2 in-memory     │                     │
-│          │ ~1 req/s PER  │          │ state is PER-    │                     │
-│          │ USER + token  │          │ INSTANCE (warm   │                     │
-│          │ revocation    │          │ cache; cold      │                     │
-│          │ (NOT my code) │          │ start re-boots)  │                     │
-│          └───────────────┘          └──────────────────┘                     │
-│                                                                              │
-│  TURN UP DATA ───────────────────────────────────────────────────────────► │
-│   1x ───────────────────────────────────────────────► 100x                  │
-│   │  EQL runs server-side at Bloomreach. 90d-vs-prior-90d +                  │
-│   │  maxToolCalls budget bound the work REGARDLESS of dataset size.          │
-│   ▼  What grows: query latency under ~1.1s spacing. Wall: 300s function cap. │
-│                                                                              │
-│  TURN UP LATENCY-SENSITIVITY ────────────────────────────────────────────► │
-│   │  NDJSON stream → user sees the trace immediately (perceived-latency win) │
-│   ▼  Hard wall: ~1.1s inter-call spacing × tool-call count, then 300s ceiling│
-│      60s TTL cache absorbs repeats.                                          │
-│                                                                              │
-│  ── DEMO PATH (?demo=cached): static snapshot, no auth, no MCP → scales      │
-│     trivially. The reliable presentation path. ──────────────────────────── │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
+## The scale-bottleneck chart — what breaks first as load grows
 
-Everything in this chapter is a walk through that picture: three scenarios, each with a first bottleneck, a second, what you add and when, and how you measure it. Notice up front that two of the three first-bottlenecks live at Bloomreach, not in your code — that is the honest center of the story, and the place an interviewer will respect you for going first.
-
----
-
-## Scenario 1 — 10x users (concurrency)
+The visual anchor for the chapter. Trace one row at a time.
 
 ```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ "What breaks first if 10x more analysts hit this at once?"                     │
-│ → Do you know whether your ceiling is your code, your platform, or the upstream│
-│   API — and can you tell them apart?                                           │
-└──────────────────────────────────────────────────────────────────────────────┘
+  blooming insights — what breaks first under each scale dimension
+
+  ───────────────────────────────────────────────────────────────────
+  SCENARIO          1st bottleneck         2nd bottleneck         3rd
+  ───────────────────────────────────────────────────────────────────
+
+  10× concurrent    Bloomreach rate-       Anthropic per-org      Vercel
+  users (live)      limit (~1 RPS,         token throughput       function
+                    revokes after          (Sonnet 4.6)           concurrency
+                    minutes)                                       per region
+                          │                       │                    │
+                          ▼                       ▼                    ▼
+                    add queue +            add request batching    scale to
+                    one MCP connection     across users in a       per-request
+                    per workspace, not     workspace; cache        instance pool
+                    per request            insights at session     (Vercel default
+                                           level                   handles this)
+
+
+  100× data         Bloomreach EQL         Synthetic adapter      In-process
+  (workspace        query latency          512 LOC has to         insights Map
+  10× bigger)       (90-day window over    keep parity with       cardinality
+                    a much bigger event    real shapes
+                    stream)
+                          │                       │                    │
+                          ▼                       ▼                    ▼
+                    push narrower          regenerate from        session-key
+                    aggregations into      a real workspace       eviction policy
+                    EQL; reduce            snapshot               (today: grows
+                    period-over-period     periodically            unbounded per
+                    span; sample                                  process; OK at
+                    customer scope                                low N, not at
+                                                                  high N)
+
+
+  10× latency-      Anthropic time-to-     Bloomreach per-call    NDJSON line
+  sensitive         first-token (Sonnet    spacing (~1.1s)        framing /
+  requests          4.6 ~600ms-1s) on      multiplied by 10-15    serialization
+  (faster TTFB)     a forced-synthesis     calls per agent run    (negligible
+                    final turn                                    today, becomes
+                                                                  real at very
+                                                                  high event
+                                                                  rates)
+                          │                       │                    │
+                          ▼                       ▼                    ▼
+                    consider Haiku for     measure actual         pre-serialize
+                    monitoring agent's     headroom; tighten      hot-path event
+                    first pass; reserve    spacing; or fan out    shapes; today
+                    Sonnet for             concurrent reads       not worth it
+                    diagnostic synthesis   over multiple
+                                           workspaces
 ```
 
-The first thing that breaks is not mine, and I lead with that. The hard ceiling is Bloomreach's loomi MCP server: it rate-limits roughly **one request per second, per user**, and on the alpha endpoint it **revokes tokens after a few minutes**. My Vercel functions can fan out as wide as Vercel lets them — serverless concurrency is genuinely fine, each request gets its own function instance. But every live briefing or investigation is a chain of MCP tool calls, and each chain is paced at `minIntervalMs: 1100` in `lib/mcp/connect.ts` (line 92) precisely because that per-user window is the real constraint. Ten analysts, ten independent token sets, ten independent ~1 req/s budgets — that part scales linearly. What does not scale is a single analyst trying to go faster: their work is serialized behind that spacing, and no amount of my own concurrency fixes a per-user upstream limit.
+That's the whole chapter on one page. The pattern that should jump out: **the first bottleneck is always upstream**. Not your code. Owning that is the scale conversation's punchline.
 
-The second thing that breaks is mine, and I own it cleanly — the broader per-instance state story. The concurrent-user wipe bug I had at an earlier scale (a global `Map<id, Insight>` plus `putInsights.clear()` at the top of every briefing write) is **resolved**: `lib/state/insights.ts` is now `Map<sessionId, SessionFeed>` and the outer map is never cleared by a request, so concurrent users on one warm instance don't wipe each other any more. What remains, the next-bottleneck story, is cross-instance: the 60s response cache lives inside one `BloomreachDataSource` instance (the `cache` Map at `lib/data-source/bloomreach-data-source.ts:122`), cached investigations live in a module-level `Map` in `lib/state/investigations.ts`, a cold start re-bootstraps the schema from scratch, and two requests on different instances share nothing. I already worked around the cross-instance piece for the feed→investigate handoff — an investigation's source insight is handed to the agent route through the URL (`?insight=`), parsed in `resolveAnomaly`, *because* I knew in-memory state wouldn't survive Vercel's per-instance memory between the feed and the investigate page. That is a band-aid, not a store.
-
-So at multi-user scale, here is what I add and when. The trigger is "more than one instance needs to see the same investigation" — which is the moment I leave a single warm instance. I add a **shared cache (Redis)** to replace the per-instance 60s Map, and a **persistent investigation store** (Redis or a small Postgres) to replace `lib/state/investigations.ts` and the `?insight=` hand-off. I would also move the OAuth PKCE state and tokens out of the encrypted `bi_auth` cookie into that shared store — the code comment in `lib/mcp/connect.ts` (lines 11-14) already names this as the likely production fix, because the connect request and the callback request can land on different ephemeral instances.
-
-How I measure whether I need it yet: I instrument cold-start rate (cold starts re-bootstrap the schema, which is the expensive part) and cache-hit ratio on the `McpClient` Map. If cold starts are rare and hit-ratio is high, per-instance state is fine and I do not add Redis — adding a shared store before the data says I need it just buys me a new network dependency and a new failure surface for no win.
-
-> ▸ The ceiling at 10x users is Bloomreach's ~1 req/s-per-user limit and token revocation, not my serverless concurrency.
-
-> ▸ My in-memory state is per-instance by design today; the moment two instances must agree on one investigation, I add Redis — not before.
-
-**Strong vs. weak — when they ask "how do you scale to more users":**
+## The big question — "how does this scale?"
 
 ```
-┌─────────────────────────────────────┬─────────────────────────────────────┐
-│ WEAK                                 │ STRONG                               │
-├─────────────────────────────────────┼─────────────────────────────────────┤
-│ "I'd add Redis, a load balancer,     │ "The first ceiling is Bloomreach's   │
-│  and horizontal autoscaling for      │  ~1 req/s per-user limit and token   │
-│  scalability."                       │  revocation — upstream of my code.   │
-│                                      │  Vercel concurrency is fine. My own  │
-│                                      │  bottleneck is per-instance in-memory│
-│                                      │  state; I'd add Redis the moment two │
-│                                      │  instances must share one            │
-│                                      │  investigation."                     │
-├─────────────────────────────────────┼─────────────────────────────────────┤
-│ Why it's weak: names components      │ Why it works: tells them apart —     │
-│ without locating the load. Can't     │ upstream limit vs. platform vs. my   │
-│ tell upstream limit from own code.   │ code — and ties each fix to a        │
-│ Sounds rehearsed, not measured.      │ trigger I can measure.               │
-└─────────────────────────────────────┴─────────────────────────────────────┘
+  ┌─────────────────────────────────────────────────┐
+  │ THEY ASK                                        │
+  │   "How does this scale? What if you had ten     │
+  │    times the load?"                             │
+  │                                                 │
+  │ WHAT THEY'RE TESTING                            │
+  │   Will you reach for "Vercel auto-scales" or    │
+  │   do you actually know what your binding        │
+  │   constraint is? Can you sequence bottlenecks   │
+  │   — what breaks first, what next, what after    │
+  │   that?                                         │
+  └─────────────────────────────────────────────────┘
 ```
 
-Follow-up decision tree for this scenario:
+The strong opener — the sentence that frames the whole answer:
+
+> "Before I answer the load number, let me name the binding constraint, because it shapes everything below it. **My code is not the bottleneck in this system.** The two upstreams are — Bloomreach loomi connect at roughly one request per second, with tokens that revoke after minutes; and the Anthropic API on a per-org TPM budget. So when you ask 'how does this scale,' the honest first answer is: it scales until I hit one of those two, and after that the question is how I avoid hammering them. Then we can talk about my service."
+
+Now you've done two things in one sentence: you've shown you know what *actually* breaks first, and you've reframed the question to a design conversation you can have.
+
+## Scenario 1 — 10× concurrent users on live mode
+
+> "First bottleneck is the Bloomreach rate limit. The alpha server is documented at roughly one request per second per workspace, and I space my calls at about 1.1 seconds to stay conservative. A single diagnostic agent makes ten to fifteen tool calls. So one user costs me roughly 15 seconds of upstream time. Ten concurrent users on the same workspace would serialize on the upstream — I'd be effectively single-threaded against Bloomreach.
+>
+> "The fix is **one MCP connection per workspace, not per request**. Today every `/api/briefing` call opens its own connection through `BloomreachDataSource`. At 10× users I'd add a workspace-level connection pool with a request queue — every user's tool call goes onto the queue, the queue drains at the upstream's rate limit, results fan back out. The data-source seam at `lib/data-source/types.ts` is the right place for that — it's a connection-management change inside `BloomreachDataSource`, no caller-side change.
+>
+> "Second bottleneck is the Anthropic per-org token budget. Sonnet 4.6 has a TPM ceiling per org, and a 15-call agent run consumes meaningful tokens per user. At 10× I'd batch where possible — same monitoring scan can serve multiple users in the same workspace, which means caching the monitoring output at the session or workspace level, not re-running it per request.
+>
+> "What I'd measure to know: per-request upstream latency on Bloomreach (I'd add a histogram on `BloomreachDataSource.executeEql`), and rate-limit-error rate. If I'm not seeing 429s I have headroom; if I'm seeing them I need the queue. The `res.usage` logs I already write at `lib/agents/aptkit-adapters.ts:60,65` give me the Anthropic-side token accounting."
 
 ```
-"10x users" answered
+  ┌─────────────────────────┬─────────────────────────┐
+  │ WEAK SCALE ANSWER       │ STRONG SCALE ANSWER     │
+  ├─────────────────────────┼─────────────────────────┤
+  │ "Vercel serverless      │ "Binding constraint     │
+  │ functions auto-scale,   │ isn't my service —      │
+  │ so the app should       │ it's the upstream       │
+  │ handle more users       │ rate limit. First       │
+  │ pretty well."           │ thing that breaks at    │
+  │                         │ 10× users is serial-    │
+  │                         │ ization against         │
+  │                         │ Bloomreach. Fix is      │
+  │                         │ one connection per      │
+  │                         │ workspace with a        │
+  │                         │ request queue."         │
+  ├─────────────────────────┼─────────────────────────┤
+  │ Why it's weak:          │ Why it works:           │
+  │ Cargo-culted infra      │ Names the actual        │
+  │ confidence. Doesn't     │ binding constraint.     │
+  │ name a bottleneck.      │ Names the fix and       │
+  │ Doesn't show you've     │ where it lives in       │
+  │ thought about it.       │ the codebase. Names     │
+  │                         │ what you'd measure.     │
+  └─────────────────────────┴─────────────────────────┘
+```
+
+```
+  ┃ "My code is not the bottleneck in this system.
+  ┃  The two upstreams are."
+```
+
+## Scenario 2 — 100× data (workspace 10× bigger)
+
+> "This is the most interesting scenario for this system, because the agents are doing period-over-period on a 90-day window. At 100× data, the EQL queries get slower in two ways: more events to aggregate, and more cardinality in the breakdowns (more countries, more product categories, more customer segments).
+>
+> "First bottleneck is **EQL query latency**. The monitoring agent runs maybe six to eight queries per scan, each over 90 days. At 10× workspace size those go from sub-second to multi-second. The fix is upstream: push narrower aggregations into EQL — instead of `sum event purchase.total_price` over 90 days globally, ask for daily buckets and aggregate client-side. Or reduce the window for the first-pass scan (30 days), and only use 90 days for confirmed anomalies that need stable comparison. Both keep the analyst loop honest; they just spend less data on each pass.
+>
+> "Second bottleneck is the **synthetic adapter's parity**. At 10× workspace size the real Bloomreach response shapes start exercising edge cases the synthetic adapter doesn't model — sparse countries, long-tail products, customers with no events. The cost there is that my synthetic dev path stops matching production behavior. The fix is to regenerate the synthetic data periodically from a real workspace snapshot, not to hand-author it.
+>
+> "Third is the in-process `Map<sessionId, SessionFeed>` — it grows unbounded per process. At very high session counts I'd add an LRU eviction. But honestly, the session is short-lived (one user, one briefing), so the cardinality isn't worrying until I'm at thousands of concurrent sessions, which loops back to scenario 1.
+>
+> "Measure: per-EQL-call latency histograms; cardinality of monitoring-scan result sets per workspace size. If a 90-day scan crosses ~5 seconds I'd push the window-narrowing change."
+
+## Scenario 3 — 10× latency-sensitive requests (faster TTFB)
+
+> "Time-to-first-byte on the streamed feed is dominated by two things: Anthropic time-to-first-token on a forced-synthesis turn, and the cumulative spacing of Bloomreach tool calls in the agent loop. The synthesis turn alone is roughly 600ms to 1s for Sonnet 4.6. The tool-call spacing is 1.1s per call, multiplied by however many tool calls the agent makes.
+>
+> "First bottleneck is the **synthesis latency on Sonnet**. The strongest lever here is model selection per agent stage. Right now everything runs on Sonnet 4.6, except the intent classifier which is Haiku. I'd consider moving the *monitoring scan's first-pass detection* to Haiku — it's a structured pattern-match against EQL results, which Haiku handles fine — and reserving Sonnet for the diagnostic's hypothesis-testing synthesis where reasoning quality matters.
+>
+> "Second bottleneck is the **call spacing on Bloomreach**. I'm at 1.1 seconds because the rate limit is ambiguous. If I had a documented limit and could measure headroom in production, I'd tighten to whatever the real ceiling supports. At 10× latency-sensitive requests that's worth real engineering investment — but only with the measurement, never with a guess.
+>
+> "Third is **NDJSON line framing and serialization**, which is negligible today. Each line is small, `JSON.stringify` is fast. At very high event rates on a single connection I'd pre-serialize the hot-path event shapes (`reasoning_step`, `tool_call_start`), but I'm not within an order of magnitude of needing that.
+>
+> "Measure: TTFB on `/api/briefing` (the first NDJSON line); per-agent-stage latency; the existing `res.usage` logs to know which model is consuming what."
+
+## The follow-up tree
+
+Scale questions usually chain. Walk the branches.
+
+```
+  You give the binding-constraint answer.
         │
         ▼
-   ├─► IF THEY ASK "so the demo path scales fine?"
-   │     Yes — and that's deliberate. ?demo=cached replays a committed
-   │     snapshot (lib/state/demo-insights.json) as a paced NDJSON stream
-   │     (REPLAY_DELAY_MS=140 in app/api/briefing/route.ts). No auth, no MCP,
-   │     no per-user limit. It scales like any static file read. It's the
-   │     reliable presentation path precisely BECAUSE it touches none of the
-   │     bottlenecks I just named.
-   │
-   ├─► IF THEY ASK "why didn't you just add Redis from the start?"
-   │     No data told me to. A single warm instance with a 60s cache serves
-   │     the demo and a single analyst's live session fine. Adding a shared
-   │     store before I'm multi-instance buys a network hop and a new failure
-   │     surface for zero measured win. I named the trigger; I'd add it then.
-   │
-   └─► IF THEY ASK "what about 10,000 concurrent users with multi-region
-         failover?"  → see the "I don't know" box below. I have NOT built
-         horizontal-scale infra. I say so, then name what I'd add and how
-         I'd measure — I do not improvise a distributed design I can't defend.
-```
-
----
-
-## Scenario 2 — 100x data
-
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ "What happens when the workspace has 100x the events?"                         │
-│ → Does your work grow with the dataset, or did you bound it on purpose?         │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
-
-This is the scenario where the design actually holds up, and I say so plainly: **100x data barely moves my system, because I never pull the data into my process.** The EQL queries run server-side at Bloomreach — I call `execute_analytics_eql`, Bloomreach scans its own warehouse, and I get back small aggregates like `{ current: 42000, prior: 51500 }`. The monitoring method is period-over-period on 90-day windows — current 90d vs prior 90d, derived from a 90d and a 180d query (the recipe is spelled out in `lib/agents/prompts/monitoring.md`, lines 22-27). That returns counts and sums, not rows. Whether the workspace has a million events or a hundred million, the aggregate I get back is the same handful of numbers.
-
-The second bound is the agent's tool-call budget. `runAgentLoop` in `lib/agents/base.ts` enforces a `maxToolCalls` cap and, once it is spent, forces a final synthesis turn (line 90-91: `budgetSpent`, and the forced-final logic). Monitoring is capped at 6 calls (`lib/agents/monitoring.ts` line 101), diagnostic at 6, query at 6, recommendation at 4. So the total work per run is bounded by a constant number of bounded-size queries — it does not grow with the dataset at all. The schema summary I feed the model is also capped: top 20 events, 10 properties each, 30 customer properties (`schemaSummary` in `lib/agents/monitoring.ts`, lines 24-35), so even a workspace with thousands of event types does not blow up my prompt.
-
-What actually grows with 100x data is **query latency at Bloomreach** — a count over a much larger table takes longer to come back — and that latency is paid serially under my ~1.1s spacing. The wall is the **300s function ceiling** (`maxDuration = 300` in both `app/api/briefing/route.ts` line 17 and `app/api/agent/route.ts` line 20). A live investigation already runs ~100-115s under the rate limit (per the comment in the agent route, lines 18-19); if each underlying EQL got several times slower on a huge dataset, a single run could approach that 300s cap.
-
-What I would add, and when: if query latency on big workspaces pushed runs toward 300s, I would not try to make my loop faster — the spacing is fixed by the upstream limit. I would **shrink the number of calls or pre-aggregate.** Concretely: cache the schema bootstrap (it is the same per workspace and gets re-read every cold start), and lean harder on the 60s response cache so a repeated category check is free. How I measure: p50/p95 of total EQL round-trip latency per call, and total calls per run. If p95 round-trip times the call count creeps toward 300s, that is my signal to cut calls, not to add infrastructure.
-
-> ┃ "100x data barely moves me because EQL runs at Bloomreach — I get aggregates back, not rows, and a fixed tool-call budget caps the work regardless of dataset size."
-
----
-
-## Scenario 3 — 10x latency-sensitive requests
-
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ "What if these requests become latency-sensitive — users won't wait?"          │
-│ → Did you design for perceived latency, and do you know your real wall-clock     │
-│   ceiling?                                                                       │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
-
-I separate two things here, because interviewers conflate them and I want to show I do not: **perceived latency** and **wall-clock latency.** I already won the perceived-latency fight by design. The whole system streams its reasoning as NDJSON over a `ReadableStream` — the briefing and agent routes enqueue events line by line (consumed by `lib/streaming/ndjson.ts:readNdjson` in the browser, a shared kernel across all 4 streaming surfaces, not EventSource). The user sees "reading the workspace schema…", then each category resolving, then the live EQL queries, *as they happen.* Time-to-first-token is a few hundred milliseconds. Nobody stares at a spinner for two minutes; they watch an analyst think. That is the single biggest latency lever and it is already pulled.
-
-The wall-clock ceiling is the honest other half — and only on the Bloomreach path. A full live-bloomreach run is **~1.1s inter-call spacing × number of tool calls**, plus model time per turn, capped by the **300s function limit.** That is why the tool-call budgets are low — they are not just about cost, they bound latency. The 60s TTL cache (`lib/data-source/bloomreach-data-source.ts:122`, post-Phase-2 PR A rename) absorbs repeats: if two analysts check the same category inside a minute, the second pays zero. Critically, the cache does the right thing under load — it is **never written on an error** (an `isError` result returns without caching), so a transient 429 during a burst can never poison the cache and serve a stale error to the next caller. On the `live-synthetic` path there's no rate limit and no network — calls are in-process function calls — so wall-clock latency there is essentially the model time only.
-
-The piece of "model time" I would flag honestly if pushed on cost: AptKit's runtime now logs `res.usage` on every model call (`lib/agents/aptkit-adapters.ts:60,65` in the `AnthropicModelProviderAdapter`), so I do have the per-call number for the migrated active path. What I do *not* have is a per-investigation roll-up or a budget threshold; I can quote the meter but I haven't built the aggregation that would let me set a soft cost cap.
-
-What I would add at 10x latency-sensitive load, and when: the first move is to make the cache shared (Scenario 1's Redis), so the 60s absorb-repeats win spans instances instead of one warm box. The trigger is the same — multi-instance traffic. Beyond that, for truly latency-bound use I would pre-compute briefings on a schedule rather than on-demand, so the common-case read is a snapshot replay (which already scales trivially, like the demo path) and only genuinely-fresh investigations pay the live cost.
-
-How I measure: **p50 and p95 of a full briefing run, and the tool-call count per run.** Those two numbers together tell me everything — if p95 is creeping up, I look at whether it is more calls (cut the budget or pre-aggregate) or slower calls (Bloomreach-side, which I cannot fix, so I cache harder). I would also track time-to-first-event separately from total time, because the streaming design means those can diverge a lot and the first one is what users actually feel.
-
-> ▸ Perceived latency is already solved by NDJSON streaming; the wall-clock ceiling is ~1.1s × call-count under the 300s cap, and I measure both p50/p95 and call-count.
-
-Follow-up decision tree for latency:
-
-```
-"latency" answered
+        ├─► "What do you measure to know when to add it?"
+        │     Always have one ready per bottleneck. EQL
+        │     histogram. Bloomreach 429 rate. Anthropic
+        │     TPM. TTFB. Don't say "monitoring" — say
+        │     the specific signal.
         │
-        ▼
-   ├─► IF THEY ASK "why NDJSON over a reader loop and not Server-Sent Events?"
-   │     SSE (EventSource) is GET-only and reconnects on its own, which fights
-   │     my one-shot reconnect guard. A fetch + ReadableStream reader gives me
-   │     full control of the request and a plain newline-delimited JSON contract
-   │     (lib/mcp/events.ts). I parse line by line; the client routes any
-   │     non-NDJSON body down a plain-JSON fallback, so a malformed stream still
-   │     degrades instead of hanging.
-   │
-   ├─► IF THEY ASK "isn't 300s a long time to hold a function open?"
-   │     Yes — that's Vercel Pro's max and it's a real cost. I set it because a
-   │     live investigation needs ~100-115s under the rate limit and Hobby's 60s
-   │     can't fit it. The streaming design means the user isn't blocked the
-   │     whole time; they're reading the trace. The fix for chronic long runs is
-   │     pre-computed briefings, not a bigger timeout.
-   │
-   └─► IF THEY ASK "what's your p95 right now?"
-         I haven't run this under sustained load, so I don't have a measured p95
-         to quote — see the "I don't know" box. I know the components of the
-         number (spacing × calls + model time) and I know which metrics I'd
-         capture. I won't invent a figure.
+        ├─► "What if you couldn't change the upstream?"
+        │     Re-frame to *your* design moves: caching,
+        │     queueing, batching, lower-cost model per
+        │     stage. The data-source seam lets you change
+        │     the implementation without changing callers.
+        │
+        ├─► "How would you load-test it?"
+        │     Synthetic adapter is the answer — it's in-
+        │     process and deterministic. You can drive
+        │     N concurrent sessions through the real
+        │     agent path without touching Bloomreach.
+        │     Be honest that you haven't run the test;
+        │     describe the setup.
+        │
+        └─► "What about cost?"
+              The token-accounting log at aptkit-adapters
+              .ts:60,65 is the on-ramp. Per-stage token
+              counts × per-agent runs × users gives you
+              an envelope. Honest about not having a
+              production number yet.
 ```
 
----
+## When you don't know
 
-## The honest center: horizontal scale I have not built
-
-This is the part of the chapter where you will get pushed past your depth, and the whole credibility of everything above depends on how you handle it. You have not built at horizontal scale. Do not let the strong answers in Scenarios 1-3 tempt you into improvising a multi-region distributed design when they push. Stop at the edge of what you have built and name it.
+The question most likely to push you past your depth is **multi-region** or **distributed scale at FAANG numbers**. You haven't built either. Don't pretend.
 
 ```
-╔══════════════════════════════════════════════════════════════════════════════╗
-║ "I DON'T KNOW" RECOVERY — horizontal scale / multi-region failover             ║
-║                                                                                ║
-║ THE PUSHBACK: "Okay, run this for 10,000 concurrent users across three         ║
-║   regions with automatic failover. Walk me through the architecture."          ║
-║                                                                                ║
-║ SAY: "I haven't built at horizontal scale — no multi-region replication, no    ║
-║   hot-path queue infra, no load balancing under sustained traffic. So I'm not  ║
-║   going to invent a design I can't defend. What I CAN do is tell you where my  ║
-║   current system would break first and what I'd reach for: the per-instance    ║
-║   in-memory state goes to a shared store (Redis) the moment I'm multi-instance;║
-║   the OAuth tokens move out of the cookie into that store; and because the     ║
-║   real ceiling is Bloomreach's per-user rate limit, the scaling question is    ║
-║   really 'how many independent user-token budgets do I have,' not 'how big is  ║
-║   my fleet.' For the failover and multi-region piece specifically, I'd want to ║
-║   pair with someone who's run it — I'd be learning, and I'd measure before I   ║
-║   committed to a topology."                                                    ║
-║                                                                                ║
-║ WHAT THIS SIGNALS: you know the boundary of your own experience and you don't  ║
-║   bluff across it. You redirect to the part you CAN reason about (your own     ║
-║   bottlenecks, the upstream limit) instead of freezing. Senior interviewers    ║
-║   read this as trustworthy — they now believe everything you DID claim.        ║
-║                                                                                ║
-║ DO NOT SAY: "I'd just add a load balancer and autoscaling group and shard the  ║
-║   database across regions with eventual consistency." You'd be reciting words  ║
-║   for a system you've never operated. The next question ("how do you handle a  ║
-║   split-brain during a region failover?") ends the bluff in one move, and now  ║
-║   they doubt the answers you actually earned.                                   ║
-╚══════════════════════════════════════════════════════════════════════════════╝
+  ╔═══════════════════════════════════════════════╗
+  ║ WHEN YOU DON'T KNOW                           ║
+  ║                                               ║
+  ║   They ask: "How would you handle a million   ║
+  ║   concurrent users across three regions?"     ║
+  ║                                               ║
+  ║   You haven't shipped a multi-region system   ║
+  ║   under real load. Don't invent one.          ║
+  ║                                               ║
+  ║   Say:                                        ║
+  ║   "I haven't shipped a multi-region system    ║
+  ║    at that scale. What I can tell you is      ║
+  ║    where the failure points in this           ║
+  ║    architecture would land first: the         ║
+  ║    in-process insights map becomes a real     ║
+  ║    problem when traffic spans multiple        ║
+  ║    instances, so cross-instance state moves   ║
+  ║    to KV or Postgres. The Bloomreach          ║
+  ║    workspace is per-tenant, so a million      ║
+  ║    users across workspaces is a per-tenant    ║
+  ║    rate-limit problem, not a single-tenant    ║
+  ║    one. Beyond that I'd be guessing at        ║
+  ║    failure modes I haven't operated. Happy    ║
+  ║    to design it with you on the whiteboard    ║
+  ║    if you want — I just won't claim I've      ║
+  ║    shipped it."                               ║
+  ║                                               ║
+  ║   What this signals: senior-level honesty     ║
+  ║   about the gap between portfolio-scale       ║
+  ║   experience and FAANG-scale experience,      ║
+  ║   without giving up the design ground you     ║
+  ║   *do* know.                                  ║
+  ║                                               ║
+  ║   Do NOT say:                                 ║
+  ║   "You'd put it behind a load balancer and    ║
+  ║    use Redis for caching and add more         ║
+  ║    instances." Generic. The interviewer       ║
+  ║    will ask follow-ups you can't answer.      ║
+  ╚═══════════════════════════════════════════════╝
 ```
 
-> ┃ "I haven't run this at horizontal scale, so I won't invent a topology I can't defend — but I can tell you exactly where it breaks and what I'd measure before I added anything."
+## What you'd change in the scale story
 
----
+The one thing missing from the scale story today is **a real load test on the synthetic adapter**. The setup exists — `makeDataSource('live-synthetic', sessionId)` runs the agent loop end-to-end with no upstream. I could drive N concurrent `/api/briefing` calls against that and measure the in-process Map cardinality, the per-stage latency, the memory growth. I haven't. The trigger is preparing for a real interviewer who asks "have you measured" — at that point I want a number to point to, not a defense of the design alone.
 
-## What you'd change
+## One-page summary
 
-If I were taking this past a demo and toward real multi-instance load, the change I'd lift first is the same one I named last refresh and have already half-done: the 60s cache, the cached investigations, and the OAuth PKCE/token state all survive only inside one warm instance, and I'm already routing an insight through the URL because I knew that. I would put a shared store (Redis to start) behind the cache and the investigation store, and move the auth state there too, which would also let me re-enable the CSRF `state` validation that is written and tested but currently unwired (`consumeState` in `lib/mcp/auth.ts`) because the SDK calls `state()` multiple times per flow and a shared store could track issued states properly. The cheap correctness fix from a previous refresh — session-keying `lib/state/insights.ts` — has shipped (`Map<sessionId, SessionFeed>`), so the concurrent-user wipe bug is no longer on this list. What I would NOT change preemptively is anything to fight the upstream rate limit — that is Bloomreach's number, not mine, and the right response is more independent user budgets and harder caching, not a faster loop.
+**Core claim:** Scale questions are about sequencing bottlenecks. For this system, the first bottleneck is *always upstream*. Naming that honestly reframes the conversation into a design discussion you can have.
 
----
-
-## Summary — Chapter 4
-
-**Core claim:** At 10x the first ceiling is upstream (Bloomreach's ~1 req/s-per-user limit + token revocation), my own first bottleneck is per-instance in-memory state (and the concurrent-user wipe bug has shipped its fix), and I have not built horizontal-scale infra — I know exactly where it breaks and what I'd measure before adding anything.
-
-**Questions covered:**
-- *What breaks first at 10x users?* — Bloomreach's per-user rate limit + token revocation (not my code); then the broader per-instance cache/investigation state (cross-instance, not same-instance — the same-instance concurrent-user wipe was fixed by session-keying `lib/state/insights.ts`), addressed by Redis when I go multi-instance.
-- *What happens at 100x data?* — Almost nothing: EQL runs at Bloomreach, I get aggregates not rows, and the maxToolCalls budget bounds work regardless of size. Cost is query latency under the 300s cap.
-- *What about 10x latency-sensitive requests?* — Perceived latency is already solved by NDJSON streaming (shared `readNdjson` kernel); wall-clock ceiling on the Bloomreach path is ~1.1s × call-count under 300s; the 60s cache (now in `bloomreach-data-source.ts:122`) absorbs repeats. Live-synthetic path has no rate-limit ceiling at all. Measure p50/p95 and call-count.
-- *10,000 users, multi-region failover?* — Haven't built it; name the bottleneck, the shared-store fix, and that the scaling unit is independent user-token budgets — don't improvise a topology.
+**The three scenarios in one line each:**
+- **10× users** → first bottleneck is Bloomreach rate limit; fix is one MCP connection per workspace + request queue.
+- **100× data** → first bottleneck is EQL query latency; fix is narrower aggregations and shorter window for first-pass scans.
+- **10× latency-sensitive** → first bottleneck is Sonnet synthesis time; fix is per-stage model selection (Haiku for first-pass, Sonnet for synthesis).
 
 **Pull quotes:**
-- "The ceiling at 10x users is Bloomreach's ~1 req/s-per-user limit and token revocation, not my serverless concurrency."
-- "100x data barely moves me because EQL runs at Bloomreach — I get aggregates back, not rows, and a fixed tool-call budget caps the work."
-- "Perceived latency is already solved by NDJSON streaming; the wall-clock ceiling on the Bloomreach path is ~1.1s × call-count under the 300s cap."
-- "I haven't run this at horizontal scale, so I won't invent a topology I can't defend — but I can tell you exactly where it breaks."
-- "The concurrent-user wipe bug from a previous refresh has shipped its fix: `Map<sessionId, SessionFeed>` in `lib/state/insights.ts`. The next bottleneck is cross-instance, not same-instance."
+```
+  ┃ "My code is not the bottleneck in this system.
+  ┃  The two upstreams are."
 
-**What you'd change:** Lift state (cache, investigations, OAuth tokens) out of per-instance memory into a shared store (Redis to start) when I go multi-instance — this would also let me re-enable the written-but-unwired CSRF `state` validation in `lib/mcp/auth.ts:consumeState`. Don't build anything to fight the upstream rate limit — that number isn't mine.
+  ┃ "I'd tighten the call spacing once the upstream
+  ┃  is stable and I have a measurement, never with
+  ┃  a guess."
+```
 
----
+**What you'd change:** run a real load test against the synthetic adapter to get numbers you can point at, instead of defending the design alone.

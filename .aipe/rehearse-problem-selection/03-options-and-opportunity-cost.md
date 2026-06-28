@@ -1,439 +1,204 @@
 # 03 — Options and opportunity cost
 
-The reviewer who asks "why this and not something else?" is
-testing whether you actually had options. A problem-selection
-brief that lists one option is a project plan, not a selection.
-This chapter puts blooming insights up against four real
-alternatives, with **do nothing** as the first one, and names
-the opportunity cost of each.
+**Industry name:** Options analysis / opportunity-cost framing — Coach posture
 
-The frame for all five options is the **same 7-day window**, the
-**same builder** (one person, mid-pivot into AI engineering), and
-the **same explicit goal** (a portfolio-and-rubric-credible
-build). That keeps the comparison honest.
+The chapter that proves you didn't just pick the first plausible path. Coach voice: name the alternatives, name what each one would have cost you, and lead with the most consequential decision-revisit on the project.
 
-  ## The five options
+The AptKit migration is the L5 story here — **defer-then-migrate**, evaluated-and-accepted mode.
+
+---
+
+## Zoom out — the option space at decision time
 
 ```
-  THE OPTION SPACE — five real ways to spend the week
+  The options at Phase 1 — what could have been built
+  with the same three engineer-weeks
 
-  ┌─ option A: DO NOTHING ─────────────────────────────────────┐
-  │  skip the hackathon entirely · invest the week elsewhere   │
-  └────────────────────────────────────────────────────────────┘
+  ┌─ Option A: do nothing ───────────────────────────────┐
+  │  no project, no portfolio piece, no learning         │
+  │  cost: zero work, zero signal                        │
+  └──────────────────────────────────────────────────────┘
 
-  ┌─ option B: smaller frontend showcase project ──────────────┐
-  │  a slick, polished, single-feature React/Next demo          │
-  │  ("the kind Rein's already shipped seven times")            │
-  └────────────────────────────────────────────────────────────┘
+  ┌─ Option B: classic RAG chatbot over Bloomreach docs ─┐
+  │  "ask questions about Bloomreach features"          │
+  │  cost: well-trodden, no differentiation              │
+  │        (AdvntrCue already proves you can do RAG)     │
+  └──────────────────────────────────────────────────────┘
 
-  ┌─ option C: a different hackathon track ────────────────────┐
-  │  same hackathon, different track (e.g. content gen,         │
-  │  customer personalization), simpler MCP surface             │
-  └────────────────────────────────────────────────────────────┘
+  ┌─ Option C: dashboard generator ──────────────────────┐
+  │  "describe a chart, get an EQL query + viz"          │
+  │  cost: incremental, not a workflow shift             │
+  │        (an analyst still has to know what to ask)    │
+  └──────────────────────────────────────────────────────┘
 
-  ┌─ option D: solo AI side-project, no contest ───────────────┐
-  │  a multi-agent build, but for a domain Rein cares about     │
-  │  personally (notes, fitness, dev-tools), no deadline        │
-  └────────────────────────────────────────────────────────────┘
-
-  ┌─ option E: blooming insights (the choice that won) ────────┐
-  │  multi-agent analyst on Bloomreach MCP, hackathon track 3   │
-  └────────────────────────────────────────────────────────────┘
+  ┌─ Option D: agentic analyst with streamed reasoning ──┐ ★ picked
+  │  monitoring → diagnosis → recommendation loop        │
+  │  + provenance as the differentiator                  │
+  │  cost: harder to build, novel UI surface,            │
+  │        but no other portfolio project shaped this way│
+  └──────────────────────────────────────────────────────┘
 ```
 
-Each option is evaluated against four axes the reader actually
-cares about:
+The verdict was Option D. The rest of this chapter is why, and what the next layer of decision-options looked like *inside* D.
+
+---
+
+## Why Option D over A/B/C
+
+**Why not A (do nothing):** the opportunity cost of doing nothing is the portfolio piece itself. The IK pivot needs work that demonstrates AI-engineering judgment, not just frontend craft. Zero work, zero signal.
+
+**Why not B (RAG chatbot over docs):** I already shipped a RAG product (AdvntrCue — `pgvector` + GPT-4 + tool-calling + session memory). Building another RAG would teach me nothing new and would land in a reviewer's "okay, another RAG demo" bucket. The opportunity cost of B is *re-proving what I've already proved.*
+
+**Why not C (dashboard generator):** the workflow doesn't shift. An analyst with a dashboard generator still has to know what question to ask. The product would compress one step ("write EQL") without addressing the harder steps ("notice the metric moved" and "decide what to do"). The opportunity cost of C is solving the easy part of the problem.
+
+**Why D:** the analyst's loop has three stages (notice → hunt → decide), and no existing product runs all three. Building an agent that runs the whole loop, with the reasoning trace visible, addresses a workflow that doesn't have a clean product today. The opportunity cost of D is engineering effort and risk that the agent quality won't be good enough — and that's the right cost to take on at this career stage.
+
+---
+
+## The harder option space — inside Option D
+
+Once D was picked, the consequential decisions weren't *what to build* — they were *how to build the agent loop.* That's where the L5 story lives.
+
+### Decision 1 — Hand-rolled `runAgentLoop` vs. use a library (Phase 1)
+
+The option space:
 
 ```
-  THE FOUR AXES (per me.md THE ARC + the rubric)
+  Agent runtime — Phase 1 options
 
-  1. PORTFOLIO SIGNAL   does this advance the AI-engineering pivot?
-  2. CONTEST UPSIDE     is there a judged outcome with a defined rubric?
-  3. RISK / FRAGILITY   what's the likelihood it ships / works in the demo?
-  4. WHAT IT FORECLOSES the opportunity cost — what does it prevent?
+  ┌─ Option a: use LangChain/LlamaIndex ─────────────────┐
+  │  cost: heavy abstraction, opinionated tool schemas,  │
+  │        steep learning curve, debugging through       │
+  │        someone else's loop                            │
+  └──────────────────────────────────────────────────────┘
+
+  ┌─ Option b: use a smaller library (Mastra, etc.) ─────┐
+  │  cost: newer, less battle-tested, library-specific   │
+  │        primitives still in flux                       │
+  └──────────────────────────────────────────────────────┘
+
+  ┌─ Option c: hand-roll the loop ──────────────────────┐ ★ picked
+  │  cost: more code to write and own                    │
+  │  payoff: own the budget (maxToolCalls), own the      │
+  │          forced-synthesis turn, own the streaming    │
+  │          contract end to end                          │
+  └──────────────────────────────────────────────────────┘
 ```
 
-  ## Option A — do nothing (the load-bearing baseline)
+**The pick (c) was deliberate.** Two reasons it was the right call at the time:
 
-The first option in any honest selection. *Don't* spend the week
-on this. Take the week back for something else, or for nothing.
-This is the option every other option has to beat.
+1. **The rate-limited Bloomreach MCP server demanded a tool-call budget.** Letting an off-the-shelf agent loop run free against a ~1 req/s server with token revocation would have produced 429s and a broken demo. Owning the loop meant owning `maxToolCalls` and the back-pressure logic.
 
-```
-  axis             reading
-  ─────────────    ────────────────────────────────────────
-  portfolio        [0] no new artifact · IK curriculum and
-                       existing portfolio still represent you
-  contest upside   [0] no submission, no rubric, no judging
-  risk             [LOW] no risk of a broken demo
-  forecloses       [HIGH] forecloses the hackathon (it's a
-                       fixed-window event, doesn't repeat
-                       this year) and the AI-pivot artifact
-```
+2. **The forced final synthesis turn was load-bearing.** When the agent ran out of tool calls, it needed *one more turn* with no tools to produce a final answer. That contract was project-specific; baking it into a generic library loop would have been ugly.
 
-**Why this is the right option to take seriously.** A common
-failure mode is treating "ship something" as automatically better
-than "ship nothing." It's not. A bad demo is worse than no demo.
-A half-finished portfolio piece looks worse than no entry. The
-honest question is "is the *expected value* of the build positive
-given all the failure modes?" If the build was going to ship at
-50% quality, do-nothing wins.
+The opportunity cost of (c) was real: more code to maintain, no library updates riding for free, the "is your loop correct?" question on me alone.
 
-**Why it loses here.** Three reasons it loses, in order:
+**Coach line for Decision 1:** *"I started by owning the loop on purpose. The rate-limited server made a hard tool-call budget non-negotiable, and the forced-synthesis turn was a project-specific contract that didn't fit any library's shape at the time. The cost was carrying the loop code myself, and I took it deliberately."*
 
-1. **The hackathon is non-recurring this year.** Loomi connect
-   AI hackathon, June 2026 (`blooming-insights-spec.md` L37–L43).
-   The window is fixed. Skipping means the option is gone, not
-   deferred. That's a load-bearing fact — it changes the EV
-   calculation.
+### Decision 2 — Stick with hand-rolled or migrate to AptKit (Phase 4) ★ the L5 revisit
 
-2. **Rein is mid-pivot and needs the artifact.** The `me.md`
-   "THE ARC" diagram is explicit: 7 years of frontend, now
-   transitioning into AI engineering. The portfolio currently
-   has the five system-design shapes (`me.md` table) but the
-   AI-engineering work is concentrated in AdvntrCue (one RAG
-   project). A second serious AI build broadens the portfolio
-   from "shipped one AI thing" to "shipped two AI things on
-   different shapes."
-
-3. **The build is structurally completable in the window.** The
-   audit (`.aipe/study-system-design/audit.md`) confirms the
-   architecture is small enough that one person could ship it
-   in a week — and the architecture choices (no DB, single
-   tenant, demo-mode snapshot) are explicitly calibrated to that
-   constraint. The risk wasn't "it won't ship." The risk was
-   "it ships at 70%." Do-nothing only wins if the realistic
-   landing was below ~50%.
-
-**The opportunity cost of NOT doing nothing** — i.e. of choosing
-to build anything at all in the window — is whatever Rein would
-have done with that week. The honest framing: a week of IK
-curriculum advancement, or a week of resting before interviews,
-or a week of catching up on personal projects. Real costs. The
-build had to be worth them.
-
-  ## Option B — a polished frontend showcase
-
-A different shape entirely: spend the week on a single-feature
-React/Next demo with great visual polish. Something like a
-sophisticated data-grid, an animation showcase, a design-system
-build — the kind of project Rein has already shipped seven times
-professionally.
+This is the most consequential decision-revisit on the project. It's where the senior signal lives.
 
 ```
-  axis             reading
-  ─────────────    ────────────────────────────────────────
-  portfolio        [+] adds a polish artifact, but DOESN'T
-                       advance the AI pivot — it reinforces
-                       the "frontend specialist" identity
-                       Rein is explicitly pivoting OUT of
-  contest upside   [0] no contest unless picked into one
-  risk             [LOW] frontend polish is Rein's home turf;
-                       7 years of practice; very low risk
-  forecloses       [HIGH] forecloses the contest entry;
-                       forecloses the AI-pivot artifact;
-                       forecloses the MCP-fluency signal
+  Agent runtime — Phase 4 options
+  (after AptKit v0.3.0 shipped with a generic primitive surface)
+
+  ┌─ Option a: stick with hand-rolled runAgentLoop ──────┐
+  │  cost: keep carrying the loop, no library leverage,  │
+  │        every new model/feature is a manual port      │
+  │  benefit: known, working, tested                     │
+  └──────────────────────────────────────────────────────┘
+
+  ┌─ Option b: migrate to AptKit via adapter layer ──────┐ ★ picked
+  │  cost: 3 Blooming adapter classes, one migration PR  │
+  │  benefit: library owns the loop;                     │
+  │           Blooming owns the boundary;                 │
+  │           legacy preserved at base-legacy.ts as      │
+  │           rollback receipt                            │
+  └──────────────────────────────────────────────────────┘
+
+  ┌─ Option c: rip-and-replace (use AptKit directly,     │
+  │            delete the boundary)                       │
+  │  cost: leak AptKit primitives into agent code;       │
+  │        any future library swap becomes a full        │
+  │        rewrite                                        │
+  └──────────────────────────────────────────────────────┘
 ```
 
-**Why this loses for THIS builder.** The portfolio already has
-the frontend signal in volume. Another frontend polish project
-is *additive*, not *load-bearing*. Rein doesn't need more
-frontend evidence; she needs more AI-engineering evidence to
-counterbalance the seven years of frontend that already
-dominates the portfolio.
+**The pick was (b) — migrate via adapter, keep the boundary, preserve the legacy as a rollback receipt.**
 
-This option would be the right choice for a different builder —
-someone newer to frontend, or someone where polish is the gap.
-For this builder, it reinforces the wrong identity.
-
-  ## Option C — a different hackathon track, simpler MCP
-
-Same hackathon, different track. The Loomi Connect AI hackathon
-likely had multiple tracks; track 3 (analytics agents) is the
-hardest. Simpler tracks (content generation, personalization,
-single-tool integrations) would have been easier to ship at
-higher quality.
+This is the **defer-then-migrate** pattern, evaluated-and-accepted mode:
 
 ```
-  axis             reading
-  ─────────────    ────────────────────────────────────────
-  portfolio        [+] still an AI-engineering artifact, but
-                       a simpler one — less differentiation
-                       in a portfolio review
-  contest upside   [+] easier to ship at higher quality;
-                       possibly higher chance of winning a
-                       simpler track
-  risk             [LOWER] less surface area, fewer moving parts,
-                       fewer ways to break
-  forecloses       [MEDIUM] forecloses the hardest-track signal;
-                       forecloses the multi-agent architecture
-                       (single-tool tracks don't justify it)
+  Defer-then-migrate — the senior shape
+
+  Phase 1                Phase 4
+  ───────                ───────
+  HAND-ROLL              MIGRATE (with discipline)
+  the loop               ──────────────────────
+  ──────────             → adapter layer keeps
+  → owned the              the boundary mine
+    constraints           (Blooming-shaped, not
+    (rate limit,           AptKit-shaped)
+    forced               → legacy preserved at
+    synthesis)             base-legacy.ts as
+  → no library             rollback receipt
+    fit at the           → 3 adapter classes,
+    time                   one migration PR
+                         → library owns the loop,
+                           I own the boundary
+
+  ╲                            ╱
+   ╲     same engineer        ╱
+    ╲    revisits her own    ╱
+     ╲   decision when the  ╱
+      ╲  conditions change ╱
+       ╲──────────────────╱
+              L5 move
 ```
 
-**Why this loses.** Two reasons:
+**Why this is L5 not L3:**
 
-1. **The rubric specifically rewards the hard track.** Criterion 4
-   (execution quality) and criterion 5 (innovation) both bias
-   toward depth. A single-tool MCP integration is easier to ship
-   but harder to defend as innovative. Multi-agent orchestration
-   on a fresh MCP surface is unusual enough to be a real
-   differentiation claim.
+- **L3** would be "I migrated to AptKit because the hand-rolled loop was getting unwieldy" — a reactive change.
+- **L4** would be "I migrated to AptKit because it has better features now" — a feature-driven change.
+- **L5** is: *"My original decision was deliberate and right at the time. The conditions changed — AptKit shipped a clean generic-primitive surface that fit the constraints I'd been carrying manually. I revisited the decision, picked the cleaner shape, kept the boundary discipline mine via 3 adapter classes, and preserved the legacy implementation as a rollback receipt at `base-legacy.ts`. The library owns the loop now; I own the boundary."*
 
-2. **The harder track teaches Rein more.** Sub-section
-   `04-agents-and-tool-use/` in `.aipe/study-ai-engineering/` is
-   explicitly named as the richest area of the codebase — *agents-
-   vs-chains, tool calling, ReAct, tool routing, memory, error
-   recovery, capability gating*. A simpler track would not have
-   exercised any of that. The portfolio value of the build comes
-   *from* the architectural difficulty, not despite it.
+The three adapter classes are the boundary. The legacy file is the receipt. Both together prove the migration was discipline, not capitulation.
 
-The opportunity cost of choosing the hard track is real: higher
-risk of incomplete shipping, longer hours, more failure modes.
-The honest counter: the cuts in chapter 02 (no DB, no evals,
-single tenant, demo mode default) are exactly what reduce that
-risk to manageable.
+**Coach line for Decision 2:** *"This is the most consequential decision I revisited on the project. I defended the hand-rolled loop in Phase 1 — and I still defend that call. AptKit 0.3.0 changed the conditions: generic primitives that fit the constraints I'd been carrying. The migration was 3 adapter classes; library owns the loop, I own the boundary, legacy preserved at base-legacy.ts. The shape of the answer is 'evaluated and accepted,' not 'I gave up.'"*
 
-  ## Option D — solo AI side-project, no contest
+---
 
-Build the same kind of multi-agent project, but for a personal-
-domain problem (notes-on-fitness, dev-tools, code-review
-assistant) on a self-defined timeline. No external deadline. No
-external judging. Total creative control.
+## The general principle — opportunity cost is the question, not "is this good?"
 
 ```
-  axis             reading
-  ─────────────    ────────────────────────────────────────
-  portfolio        [+] adds an AI-engineering artifact, but
-                       without external validation or rubric
-                       to anchor the claim
-  contest upside   [0] no contest
-  risk             [MEDIUM] no deadline pressure means project
-                       likely takes 4–8 weeks instead of 1,
-                       higher risk of mid-build pivot or
-                       scope creep that never resolves
-  forecloses       [HIGH] forecloses the hackathon (non-
-                       recurring); forecloses the third-party
-                       validation; forecloses the MCP-on-a-
-                       brand-new-surface claim
+  The shape of an opportunity-cost answer
+
+  ┌─ Naive answer ─────────────────────────────────────┐
+  │  "I built X because it's the best approach."        │
+  │  → no comparison; reviewer learns nothing about     │
+  │     your judgment                                    │
+  └─────────────────────────────────────────────────────┘
+
+  ┌─ L5 answer ────────────────────────────────────────┐
+  │  "I built X. The alternatives were Y and Z.        │
+  │   Y would have cost me [specific cost]; Z would    │
+  │   have cost me [specific cost]. I picked X         │
+  │   because [specific tradeoff], and the cost of X   │
+  │   was [named honestly]."                            │
+  │  → comparison + cost-naming = senior signal        │
+  └─────────────────────────────────────────────────────┘
 ```
 
-**Why this is the closest runner-up.** Genuinely. The personal-
-domain version of this build would have been more fun, more
-creatively controlled, and would have the same architectural
-shape. Most of the lessons from blooming insights would transfer.
+The general lesson: **every decision in a senior conversation deserves an opportunity-cost answer.** "I picked X" is not enough. "I picked X over Y, because Y would have cost me [N], and the cost of X I accepted was [M]" is the shape.
 
-**Why it still loses.** Three reasons, in order:
+---
 
-1. **External validation matters in a portfolio review.** "Built
-   a multi-agent system for a hackathon, here's the rubric it
-   scored against" is a stronger claim than "built a multi-agent
-   system for myself, here's what I think it's worth." A judged
-   contest gives the work a third-party anchor that a side
-   project cannot.
+## See also
 
-2. **No-deadline projects routinely fail to ship.** The 7-day
-   contest deadline is *load-bearing for completion*. Side
-   projects without a deadline tend to grow into 6-month
-   half-finished things that never make it to the portfolio.
-   The hackathon's hardness is partially what forces the
-   completion.
-
-3. **The MCP surface itself is the timely angle.** Bloomreach
-   loomi connect went into alpha in 2026; building on it now is
-   "early to a real protocol on a real platform." A side
-   project on a personal domain doesn't carry that "first to
-   the platform" signal.
-
-The right call is to do *both*, sequentially. Hackathon first
-(blooming insights, June 2026), then a personal-domain AI build
-when the rest of the schedule allows. Chapter 04 names what
-"success" looks like for blooming insights specifically.
-
-  ## Option E — blooming insights (the choice that won)
-
-The build that exists. Multi-agent analyst on Bloomreach MCP,
-hackathon track 3, 7-day window, shipped on time.
-
-```
-  axis             reading
-  ─────────────    ────────────────────────────────────────
-  portfolio        [++] advances the AI pivot · adds multi-
-                        agent + MCP fluency · second serious
-                        AI artifact alongside AdvntrCue
-  contest upside   [++] real rubric · real deadline · real
-                        judging · all 5 criteria intentionally
-                        addressed (blooming-insights-spec.md
-                        L51–L59)
-  risk             [MEDIUM] real risk on the alpha MCP surface;
-                        mitigated by demo mode that replays a
-                        committed snapshot
-  forecloses       [REAL] forecloses the week · forecloses
-                        anything else that would have used
-                        the same 7 days
-```
-
-The case for this option, in one paragraph:
-
-> The hackathon is non-recurring; the MCP surface is brand-new;
-> the architecture is small enough to ship in a week; the build
-> exercises exactly the AI-engineering primitives Rein is pivoting
-> into; the rubric provides a defensible scoring frame; the cuts
-> in chapter 02 make the demo reliable; and the portfolio gains
-> an AI-engineering artifact with third-party validation. The
-> opportunity cost is one week, and the realistic landing was
-> >70% — which beat do-nothing's flat 0.
-
-  ## The decision matrix — the five options side by side
-
-The visual that holds the whole comparison.
-
-```
-  THE DECISION MATRIX
-
-  option   portfolio   contest    risk         forecloses
-  ─────    ─────────   ───────    ────         ──────────
-  A NOTH   0           0          LOW          HIGH (hackathon
-                                                gone, no artifact)
-  B FE     +           0          LOW          HIGH (AI pivot
-                                                + contest)
-  C ALT    +           +          LOWER        MEDIUM (depth
-                                                signal cut)
-  D SOLO   +           0          MEDIUM       HIGH (contest
-                                                gone, no anchor)
-  E THIS   ++          ++         MEDIUM       REAL (the week
-                                                is gone)
-
-  the winner has the only ++ in both portfolio AND contest,
-  with MEDIUM risk mitigated by the demo-mode cut (chapter 02).
-```
-
-  ## A sixth option, considered AFTER the hackathon — use a library, not your own loop
-
-The original five options were "what should I spend the week
-on." This sixth one is different: a *post-hackathon* revisit
-that's worth naming in the brief because it's a real
-**defer-then-migrate** pattern, and a reviewer who's read the
-codebase will ask about it.
-
-**The option:** at hackathon time, run agents on a hand-rolled
-`runAgentLoop` (`lib/agents/base.ts`). Post-hackathon, migrate
-those agents to be thin wrappers over `@aptkit/core@0.3.0` while
-keeping a Blooming-owned adapter layer
-(`lib/agents/aptkit-adapters.ts`, 206 LOC — three bridges:
-`AnthropicModelProviderAdapter`, `BloomingToolRegistryAdapter`,
-`BloomingTraceSinkAdapter`). The legacy loop is preserved at
-`lib/agents/base-legacy.ts` for the legacy path.
-
-```
-  axis             reading
-  ─────────────    ────────────────────────────────────────
-  portfolio        [++] the build-then-migrate arc IS the
-                        signal — "I built my own loop, then
-                        migrated to a library, kept the
-                        domain adapter on my side" is a
-                        deeper agent-architecture story than
-                        either option alone
-  contest upside   N/A  post-hackathon decision
-  risk             [LOW] reversible — the legacy path stays
-                        in tree until the migration proves
-                        out
-  forecloses       [LOW] forecloses nothing immediately;
-                        if AptKit drifts in a direction the
-                        agents can't tolerate, base-legacy.ts
-                        is the rollback
-```
-
-**Why this was the right call at the time of the hackathon, AND
-why migrating after was also the right call.** Both are true.
-The hackathon decision was right because:
-
-1. **No library existed that fit the shape.** Building the loop
-   gave full control over the NDJSON streaming contract, the
-   forced-final synthesis turn, the bounded tool-call budget.
-   A library that didn't expose those would have been a fight.
-
-2. **Building it once is how you learn what a library should
-   look like.** Migrating later was straightforward because
-   the contracts were known.
-
-The post-hackathon migration was right because:
-
-1. **The loop turned out to be 80% reusable across projects.**
-   The agent-architecture primitive isn't Blooming-specific.
-   Centralizing it in `@aptkit/core` means the next agent
-   project starts from a tested base.
-
-2. **The domain seam (the adapters at `lib/agents/aptkit-adapters.ts`)
-   is where the *interesting* code lives.** Library swallows
-   the boilerplate; Blooming keeps the domain shape.
-
-```
-  THE DEFER-THEN-MIGRATE PATTERN, NAMED
-
-  ┌─ at decision time ─────────────────────────────────────────┐
-  │  "build it ourselves"  vs  "use a library"                  │
-  │  → no library exists that fits the shape                    │
-  │  → ship ourselves; the loop is small enough                 │
-  └────────────────────────┬───────────────────────────────────┘
-                           │  ship · learn · contracts
-                           │            settle
-                           ▼
-  ┌─ at revisit time ──────────────────────────────────────────┐
-  │  "stay self-built"  vs  "lift to library"                   │
-  │  → the loop is now 80% reusable; lift the kernel,           │
-  │    keep the domain adapter                                  │
-  │  → both paths preserved; rollback is cheap                  │
-  └────────────────────────────────────────────────────────────┘
-```
-
-This isn't a sixth option in the original decision space — it's a
-*revisit* of an implicit decision the original build made (build
-the loop ourselves) once the conditions changed (the loop became
-extractable). A senior reviewer respects "the decision was right
-then, the revisit is right now, both are deliberate."
-
-  ## The opportunity cost no other option pays
-
-Every option except A pays "the week." That's the same cost
-across B/C/D/E. The *differentiating* costs are what each option
-forecloses.
-
-```
-  WHAT EACH OPTION COSTS YOU IRREVERSIBLY
-
-  A  loses: the hackathon window (non-recurring), the artifact
-  B  loses: the AI-pivot signal, the contest, the MCP-fluency claim
-  C  loses: the hard-track signal, the multi-agent depth
-  D  loses: the contest, the third-party validation anchor
-  E  loses: the week (recoverable) + the optionality to do A/B/C/D
-            (also recoverable later, since none of those are
-            time-locked the way the hackathon is)
-```
-
-Option E is the only one whose foreclosures are recoverable later.
-A/B/C/D each foreclose at least one thing that doesn't come back.
-That's the asymmetry that tips the call.
-
-  ## What this chapter establishes
-
-```
-  → five real options were considered, including do-nothing
-  → the same four axes were applied to each
-  → do-nothing is the load-bearing baseline; named explicitly,
-    not waved past
-  → the closest runner-up is option D (solo AI side project);
-    its loss case is narrow and named
-  → option E wins on the only ++ in BOTH portfolio AND contest,
-    with the highest-recoverable opportunity cost
-  → a sixth option (build-then-migrate to @aptkit/core) was
-    revisited post-hackathon and named; the build-then-migrate
-    arc is itself the signal, not a contradiction of the
-    original choice
-```
-
-The selection holds. Chapter 04 picks up the question of how
-"success" is measured for a project shaped like this one — and
-why some standard product-success metrics deliberately don't
-apply.
-
-Read chapter 04 next.
+- `01-problem-brief.md` — the problem the options were trying to solve
+- `02-scope-cuts-and-non-goals.md` — Cut 2 (eval) is another decision-revisit story
+- `04-success-metrics-and-feedback-loop.md` — how I knew the AptKit migration didn't regress quality
+- `05-skeptical-reviewer-questions.md` — "why migrate?" answer
+- `.aipe/audit-refactor-page-decomposition/` — sister refactor pattern (decompose then adapt)
+- `.aipe/study-agent-architecture/` — the technical deep-dive on the AptKit migration

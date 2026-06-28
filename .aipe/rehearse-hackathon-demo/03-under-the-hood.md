@@ -1,308 +1,194 @@
-# 03 — Under the hood   (6:00–8:00, 2 minutes)
+# Chapter 3 — Under the hood   (6:00 – 8:00, 2 minutes)
 
-  ## Opening hook
+## Opening hook
 
-The demo just landed. The room is leaning in. Now they have a
-question: how did that actually work? Chapter 3 answers it in
-two minutes, one level deep, then stops.
+You just spent five minutes letting the room watch the thing work. Now you have two minutes to convince them you understand **why** it works — to earn the credibility that turns "neat demo" into "real engineer." Two minutes. Not three. Not an architecture tour. **One diagram, three sentences of value per part, and you walk off the lectern at 8:00.**
 
-This is where most hackathon demos lose the audience a second
-time. The presenter has earned the room's attention with the
-money shot, then immediately squanders it on an architecture
-tour — five boxes, four arrows, six acronyms — until the room
-checks out again. Don't. You pick the single most impressive
-mechanism in the codebase, you draw one diagram of it, and you
-explain it in three sentences. Then you move on.
+The single biggest failure mode of this chapter is going one level too deep. The room does not need the full agent loop pseudocode. They need to see that there are multiple agents, that they talk to each other, that the data they ran against in the demo had a clean substitution boundary behind it, and that the streaming trace they just watched is the same shape on every screen. That's it. **Go exactly one level deep and stop.**
 
-The one mechanism worth showing for blooming insights is the
-**adapter boundary** — `@aptkit/core` owns the agent loop
-runtime, three Blooming-owned adapters bridge it to Anthropic
-and to a `DataSource` interface, and the DataSource has two
-implementations (Bloomreach MCP, or in-process synthetic). The
-NDJSON streaming pipeline sits on top of it and bridges the
-loop's callbacks to the React UI. The whole thing is what makes
-the money shot possible AND what makes live-synthetic the killer
-demo path. Every other architectural choice serves it.
+## The time-budget bar
 
-This is the senior selling point: **library owns the loop,
-Blooming owns the domain.** Swapping data sources doesn't touch
-the agents. Swapping the model provider doesn't touch the
-agents. The seam is where credibility lives.
-
-  ## The time-budget bar
-
-Two minutes. The room is willing to hear ONE technical thing
-right now. Spend the budget on the right thing.
+Two minutes. Two halves. One diagram on the screen the whole time.
 
 ```
-  ┌──────────────────────────────────────────────────────────┐
-  │ ░░░░░░░░░░░░░░░░░░░░░░░░░░▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░░░░░░░░░░░░ │
-  │ 0:00 ────────────────── 6:00 ─── 8:00 ─────────────10:00 │
-  │   UNDER THE HOOD — you own 6:00 to 8:00 (2 minutes)      │
-  └──────────────────────────────────────────────────────────┘
+  6:00 ┌─────────────────────────────────────────────────────────────┐
+       │ ░░░░░░░░░░░░░░░░░░░░░░░░░▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░░░░░░░ │
+       │                                                              │
+       │ 03  UNDER THE HOOD  ← you are here             6:00 – 8:00   │
+       │                                                              │
+       │     half 1 (60s): the four-agent loop                        │
+       │     half 2 (60s): the DataSource seam                        │
+  8:00 └─────────────────────────────────────────────────────────────┘
 ```
 
-  ## The chapter-opening diagram — the streaming pipeline
+## The chapter-opening diagram
 
-One picture, the whole thing. This is the architecture diagram
-you draw on screen or hold up on a slide. Everything you say in
-chapter 3 maps onto a part of this diagram.
+This is the only diagram you put on the screen for the entire chapter. It carries both halves. Practice pointing at the boxes; you will not narrate the whole thing — you will point at the parts as you talk.
 
 ```
-  the architecture · adapter boundaries make live-synthetic work
+UNDER THE HOOD — the architecture in one frame
 
-  ┌─ browser ───────────────────────────────────────────────────┐
-  │  useInvestigation()  ← lib/hooks/useInvestigation.ts         │
-  │   reader = res.body.getReader()                              │
-  │   for each '\n'-delimited line:                              │
-  │     setItems((p) => [...p, JSON.parse(line)])                │
-  └─────────────────────────────────────────┬───────────────────┘
-                                            │  HTTP body, NDJSON
-                                            ▼
-  ┌─ Next.js route (app/api/agent/route.ts) ─────────────────────┐
-  │  ReadableStream wraps the agent run; every callback becomes  │
-  │  one NDJSON line on the wire (AgentEvent contract)           │
-  └─────────────────────────────────────────┬───────────────────┘
-                                            │  agent.investigate(…)
-                                            ▼
-  ┌─ Blooming-owned agents (lib/agents/*.ts) ────────────────────┐
-  │  diagnostic.ts · monitoring.ts · recommendation.ts ·         │
-  │  query.ts · intent.ts                                         │
-  │   ↓ thin wrappers — each constructs an @aptkit/core agent    │
-  │     with two adapters injected:                              │
-  └──────────────┬───────────────────────────┬───────────────────┘
-                 │                           │
-                 ▼                           ▼
-  ┌─ AptKit loop ───────────┐  ┌─ aptkit-adapters.ts (Blooming) ─┐
-  │  @aptkit/core@0.3.0      │  │  AnthropicModelProviderAdapter  │
-  │  owns the agent runtime  │  │   → Anthropic SDK              │
-  │  (think→tool→observe     │  │  McpToolRegistryAdapter        │
-  │   loop, retries, budget) │  │   → DataSource                 │
-  │  Blooming does NOT       │  │  CapabilityTraceSink           │
-  │  own this anymore        │  │   → onText/onToolCall callbacks │
-  └──────────────┬──────────┘  └────────────┬─────────────────────┘
-                 │  loop calls tools          │
-                 ▼                           ▼
-  ┌─ DataSource seam (lib/data-source/types.ts) ─────────────────┐
-  │   interface DataSource {                                     │
-  │     getSchema(): WorkspaceSchema                             │
-  │     executeAnalyticsEql(query): EqlResult                    │
-  │     …                                                        │
-  │   }                                                          │
-  └─────────────┬───────────────────────────┬───────────────────┘
-                │                           │
-   live-bloomreach                  live-synthetic
-                ▼                           ▼
-  ┌─ BloomreachDataSource ─┐   ┌─ SyntheticDataSource ──────────┐
-  │ lib/data-source/        │   │ lib/data-source/                │
-  │  bloomreach-data-source │   │  synthetic-data-source.ts       │
-  │  → MCP JSON-RPC over    │   │  → in-process deterministic     │
-  │    HTTP to alpha server │   │    ecommerce data (516 LOC)     │
-  │  OAuth + rate limits    │   │  no auth · no network · runs    │
-  │                         │   │  anywhere with ANTHROPIC_API_KEY│
-  └─────────────────────────┘   └─────────────────────────────────┘
+  ┌─ UI layer ─────────────────────────────────────────────────────────┐
+  │   app/page.tsx → useBriefingStream → reads NDJSON from /api/briefing│
+  │                                                                     │
+  │                  the streaming trace renders here, live              │
+  └────────────────────────────┬────────────────────────────────────────┘
+                               │  NDJSON over ReadableStream
+  ┌─ Service layer ────────────▼────────────────────────────────────────┐
+  │                                                                     │
+  │   ┌─ INTENT ROUTER ─┐   ┌─ MONITORING ──┐                          │
+  │   │  Haiku-4.5      │──▶│  Sonnet-4.6   │ ─ finds anomalies         │
+  │   └─────────────────┘   └───────┬───────┘                          │
+  │                                 │                                   │
+  │                                 ▼                                   │
+  │                         ┌─ DIAGNOSTIC ──┐                          │
+  │                         │  Sonnet-4.6   │ ─ tests hypotheses        │
+  │                         └───────┬───────┘                          │
+  │                                 │                                   │
+  │                                 ▼                                   │
+  │                         ┌─ RECOMMEND ───┐                          │
+  │                         │  Sonnet-4.6   │ ─ proposes actions        │
+  │                         └───────┬───────┘                          │
+  │                                                                     │
+  │   all four run on @aptkit/core@0.3.0 — library owns the loop        │
+  │                                 │                                   │
+  └─────────────────────────────────┼───────────────────────────────────┘
+                                    │  asks for data via …
+  ┌─ DataSource SEAM ────────────────▼──────────────────────────────────┐
+  │                                                                     │
+  │   ┌─ SyntheticDataSource ─┐    ┌─ BloomreachDataSource ─┐           │
+  │   │  in-process, det.      │ OR │  MCP + OAuth, alpha    │           │
+  │   │  events on demand      │    │  rate-limited 1 req/s  │           │
+  │   └────────────────────────┘    └────────────────────────┘           │
+  │                                                                     │
+  │   ★ THIS BOUNDARY IS THE PRODUCT'S SECRET WEAPON ★                 │
+  └─────────────────────────────────────────────────────────────────────┘
 ```
 
-The reasoning steps don't reach React after the agent finishes —
-they reach React as the agent thinks them. And the agents don't
-know whether they're talking to Bloomreach or to in-process
-synthetic data; the DataSource seam hides it. Same agent code
-serves both. Read that diagram once a day until the demo.
+One screen. You will point at three parts of this diagram in order: the four-agent stack, the `@aptkit/core` label, and the DataSource boundary. Each point is one sentence.
 
-  ## The three sentences
+## The body — two halves, sixty seconds each
 
-You explain this in three sentences. Practice them. Don't
-improvise; you'll over-explain.
+### Half 1 — the four agents and the runtime   (6:00 – 7:00)
 
-  ## Sentence 1 — the adapter boundary   (6:00–6:30)
+Point at the agent boxes in the diagram. You are not explaining what each agent does — the demo just did that. You are naming the **shape** and naming **who runs the loop**.
 
 ```
-  ┃ "i don't own the agent loop anymore — i pulled it out into
-  ┃  a published library, @aptkit/core. my five agents are thin
-  ┃  wrappers that hand the loop two adapters: one to anthropic,
-  ┃  one to a DataSource interface. the loop runs the
-  ┃  think-tool-observe cycle; the adapters know what 'a tool'
-  ┃  and 'a model' actually mean in my domain."
+  SHOW (on screen)                  SAY (out of your mouth)
+  ────────────────────────────────  ──────────────────────────────────────
+  point at the intent router box    "Intent router classifies what came in
+                                     — briefing, investigation, or free-form
+                                     question."
+  point at the three Sonnet agents  "Three task agents — monitoring,
+                                     diagnostic, recommendation — each runs
+                                     a Claude tool-use loop until it's done."
+  point at the @aptkit/core label   "The loop itself isn't mine — it's
+                                     `@aptkit/core@0.3.0`, a library I
+                                     authored. I own the boundary; the
+                                     library owns the loop."
 ```
 
-Then point at the middle of the diagram — the AptKit box on the
-left, the adapter box on the right. The senior point: the loop
-is reusable infrastructure; the domain plugs in through
-adapters.
+That last sentence is the credibility move. You built the library that the demo runs on, and you can name the file — `lib/agents/aptkit-adapters.ts`, three adapter classes, around 200 lines. **Mention the line count out loud** — it makes the claim concrete.
 
-  ## Sentence 2 — the DataSource seam   (6:30–7:00)
+The script line for this half:
 
 ```
-  ┃ "the DataSource seam is what makes this demo possible. the
-  ┃  agents call into a DataSource interface — they don't know
-  ┃  whether it's the real Bloomreach MCP server or a 500-line
-  ┃  in-process synthetic ecommerce dataset i wrote. same agent
-  ┃  code path. that's how this demo runs with zero auth and
-  ┃  zero upstream dependencies, while still being a real agent
-  ┃  run with real model reasoning."
+┃ "Three task agents on a runtime I authored. The library owns the
+┃  loop; I own the boundary."
 ```
 
-Then point at the DataSource band of the diagram. The two
-implementations — `BloomreachDataSource`, `SyntheticDataSource`
-— are both in `lib/data-source/`. The agents don't import
-either; they import the interface. Vendor swaps don't touch
-domain code.
+### Half 2 — the DataSource seam   (7:00 – 8:00)
 
-  ## Sentence 3 — the NDJSON streaming bridge   (7:00–7:30)
-
-This is the engineering detail that earns credibility for the
-money shot specifically — it's the reason the reasoning trace
-materializes line-by-line on screen instead of arriving as a
-blob at the end.
+Point at the DataSource boundary at the bottom of the diagram. This is the part that earns you the strongest engineering credit, and it is the part most demos cannot show because most demos do not have it.
 
 ```
-  ┃ "the agent loop fires callbacks on every thought, tool call
-  ┃  start, and tool result. the route encodes each one as one
-  ┃  line of NDJSON and pushes it into a streaming response.
-  ┃  the browser reads the stream line-by-line and appends each
-  ┃  event to react state. that's why the trace fills in live
-  ┃  instead of all at once."
+  SHOW (on screen)                  SAY (out of your mouth)
+  ────────────────────────────────  ──────────────────────────────────────
+  point at the two DataSource boxes  "The agents don't talk to Bloomreach.
+                                      They talk to a DataSource — one
+                                      interface, two adapters."
+  point at SyntheticDataSource       "What you just watched was running
+                                      against the synthetic adapter —
+                                      in-process, deterministic, creds-free.
+                                      Real agents, fake data."
+  point at BloomreachDataSource      "Same agents, different adapter, hit
+                                      Bloomreach over MCP and OAuth. The
+                                      agent code didn't change. The seam
+                                      survived two adapter swaps already."
 ```
 
-That sentence is the difference between "I built a UI for an
-agent" and "I built the live observability surface that lets a
-user trust the agent." Judges who have shipped systems will
-notice — and it's the load-bearing part of the money shot they
-just watched.
+That last clause — "the seam survived two adapter swaps already" — is the proof. You don't have to elaborate; if a judge wants to know what got swapped, they'll ask in Q&A and you have the answer ready (Olist arrived, Olist left, Synthetic arrived — see chapter 04).
 
-  ## The "I built one" beat — 30 seconds left   (7:30–8:00)
-
-You have thirty seconds left in chapter 3. Use them to deflect
-to chapter 4 (the build story) — but don't burn them on dead
-silence either. Show ONE thing on screen that proves the trace
-they just watched is real.
+The script line for this half:
 
 ```
-  SHOW (on screen)                  SAY (out loud)
-  ──────────────────────────        ───────────────────────────
-  scroll the status log up so       "every blue line in this log
-   the EQL query text from the        is a real query the model
-   live trace is visible              just generated. nothing is
-                                      canned."
-  ──────────────────────────        ───────────────────────────
-  hand-off into chapter 4           "let me tell you the part
-                                      that was hard to build."
+┃ "Real agents, fake data. The seam is the thing that lets that be true."
 ```
 
-  ## Strong vs weak — the under-the-hood failure mode
+That sentence is the second-strongest line in the whole demo. Make it land.
 
-The mistake is going one level too deep. Two levels is a
-lecture; one is a credibility win. Stop at one.
+## Strong move versus weak move — the depth knob
 
-```
-  WEAK UNDER-THE-HOOD               STRONG UNDER-THE-HOOD
-  ─────────────────────────────     ─────────────────────────────
-  opens a separate slide with       points at the running app,
-   five boxes and twelve arrows      draws or shows ONE diagram
-                                     of the streaming pipeline
-  walks through every box:
-   "this is the Next.js route,      says THREE sentences:
-    which uses streaming response     · the agent loop
-    bodies via ReadableStream,        · the streaming bridge
-    which then is consumed in the     · one load-bearing
-    React component using a useRef…"    constraint (rate limit)
-  ─────────────────────────────     ─────────────────────────────
-  3 minutes · room is glazing       90 seconds · room is nodding
-  by minute 2                       presenter has 30s buffer
-  ─────────────────────────────     ─────────────────────────────
-  judges' next question:            judges' next question:
-   "what does it do, exactly?"       "what was hard to build?"
-   (you already lost them)           (this is the question you
-                                      WANT — chapter 4 answers it)
-```
-
-The strong version sets up chapter 4. The weak version makes
-chapter 4 redundant because you've already burned through the
-budget. Trust the diagram. Three sentences.
-
-  ## ╔══════════════════════════════════════════════════════════╗
-  ## ║ IF IT BREAKS — under the hood                             ║
-  ## ║                                                            ║
-  ## ║ This chapter has no live interaction — it's the diagram   ║
-  ## ║ and three sentences. The only way it breaks is if a judge ║
-  ## ║ interrupts mid-sentence with a deep technical question     ║
-  ## ║ ("what model? what's the context window? why MCP?"). DO   ║
-  ## ║ NOT answer it inside chapter 3. Say:                      ║
-  ## ║                                                            ║
-  ## ║   "great question — i'll cover that in q&a after the      ║
-  ║    demo. for now, this is the one thing i want to show you." ║
-  ## ║                                                            ║
-  ## ║ Then finish the three sentences. The q&a chapter (06) has ║
-  ## ║ the answers prepped: claude sonnet 4.6, MCP because        ║
-  ║ bloomreach already speaks it, the agent loop comes from       ║
-  ║ @aptkit/core (i own the published package), the DataSource    ║
-  ║ seam in lib/data-source/types.ts is what enables live-        ║
-  ║ synthetic, the legacy hand-rolled loop is preserved at        ║
-  ║ lib/agents/base-legacy.ts for reference. You're ready for it  ║
-  ║ — just not right now.                                         ║
-  ## ╚══════════════════════════════════════════════════════════╝
-
-  ## Tighten it — if you're running long
-
-You have two minutes for this chapter. If you walked into it
-with ninety seconds because chapter 2 ran long, here's the cut
-order:
+This is the chapter where engineers overshoot. The strong-vs-weak contrast is about how deep to go.
 
 ```
-  cut 1   drop the "I built one" beat at 7:30
-            saves 30s · costs only the bridge into chapter 4
-
-  cut 2   drop sentence 3 (the NDJSON streaming bridge)
-            saves 30s · costs the money-shot explanation. you
-            keep the adapter-boundary + DataSource story, which
-            is the load-bearing part for the senior selling
-            point.
-
-  cut 3   show the diagram for 5 seconds without explaining
-            it, say "the short version: the loop comes from a
-            library i wrote, the data source has two impls,
-            this demo is one of them" and skip to ch 4.
-            saves 60s · costs almost everything. only do this
-            if you're at 7:30 with chapter 3 still on screen.
+WEAK MOVE (too deep)                  STRONG MOVE (one level, stops)
+──────────────────────────────────    ──────────────────────────────────
+opens up the file, scrolls            stays on the diagram the whole time
+through aptkit-adapters.ts
+"so the AdapterClass implements       "I own the boundary; the library
+ the AgentRuntime interface which      owns the loop."
+ wraps the Claude SDK's tool-use…"
+runs over budget into chapter 04      finishes at 7:55, walks into 04
+loses the room at minute 7             keeps the room through to the close
 ```
 
-The floor: the architecture diagram and sentences 1+2 (the
-adapter boundary and the DataSource seam). That's the irreducible
-minimum. The streaming bridge is the third sentence; cut it
-before the boundary story. The boundary IS the senior selling
-point — "library owns the loop, Blooming owns the domain" is the
-sentence judges with infra background care about.
+The discipline is to go to **one** level of detail and stop. Not zero (you'd be back in the demo). Not two (you'd lose the room). Exactly one. The diagram is the level. Point at boxes. Stop.
 
-  ## ────────────── RUN SHEET — chapter 3 ─────────────────────
+## If it breaks
+
+The screen is not running anything in this chapter. The diagram is static. The only failure mode is you, going long. The recovery is internal.
 
 ```
-  ┌───────────────────────────────────────────────────────────┐
-  │ UNDER THE HOOD · 6:00–8:00 · 2 minutes                    │
-  ├───────────────────────────────────────────────────────────┤
-  │ 6:00   show the architecture diagram                      │
-  │ 6:05   SENTENCE 1 — the adapter boundary                  │
-  │         "i don't own the agent loop anymore — @aptkit/    │
-  │          core does. my agents are thin wrappers with two  │
-  │          adapters: anthropic and a DataSource interface." │
-  │ 6:30   SENTENCE 2 — the DataSource seam                   │
-  │         "the agents don't know if they're talking to      │
-  │          bloomreach or to my in-process synthetic data.   │
-  │          same agent code. that's why this demo runs with  │
-  │          zero auth and zero upstream dependency."         │
-  │ 7:00   SENTENCE 3 — the NDJSON streaming bridge           │
-  │         "the loop fires callbacks · the route turns each  │
-  │          into NDJSON · browser appends to react. that's   │
-  │          why the trace fills in live."                    │
-  │ 7:30   scroll the status log up, show real EQL text       │
-  │         "every blue line is a real query the model just   │
-  │          generated."                                      │
-  │ 7:55   bridge: "let me tell you the part that was hard."  │
-  ├───────────────────────────────────────────────────────────┤
-  │ MUST NAIL   diagram + sentence 1 (the adapter boundary)   │
-  │ IF BREAKS   "i'll cover that in q&a" · finish sentences   │
-  │ TIGHTEN     cut "i built one" → cut sentence 3 → diagram  │
-  │             alone + the boundary line                      │
-  └───────────────────────────────────────────────────────────┘
+╔══════════════════════════════════════════════════════════════════════════╗
+║ IF IT BREAKS                                                              ║
+║ You feel the urge to keep explaining past 8:00 →                          ║
+║   1. Stop mid-sentence if you have to.                                    ║
+║   2. Say: "I'll go deeper in Q&A — let me show you what got built."       ║
+║   3. Walk straight into chapter 04.                                       ║
+║ The judge who wants more depth will ask. The room that didn't ask doesn't ║
+║ want it. Going over here costs you the close.                             ║
+╚══════════════════════════════════════════════════════════════════════════╝
 ```
 
-Read chapter 4 next.
+## Tighten it
+
+If the slot is short and you only have 60 seconds for this chapter:
+
+- **Drop half 1. Keep half 2.** The DataSource seam is the more impressive of the two and the harder of the two to fake. The four-agent loop is visible from the demo's trace; the seam is invisible without you saying it.
+- **Floor:** the seam sentence — "real agents, fake data — the seam is the thing that lets that be true." If you cut this chapter to one line, that's the line.
+
+## The one-page run sheet
+
+```
+╭─────────────────── UNDER THE HOOD — RUN SHEET ───────────────────────╮
+│ Budget: 6:00 – 8:00 (2 min)       Diagram on screen the whole time    │
+│                                                                        │
+│ TWO HALVES:                                                            │
+│   1. (6:00) point at agents → "Intent router. Three task agents.       │
+│        Each runs a Claude tool-use loop." Then point at @aptkit/core:  │
+│        "Three task agents on a runtime I authored. The library owns    │
+│        the loop; I own the boundary." (200-line adapter file.)         │
+│                                                                        │
+│   2. (7:00) point at DataSource boxes → "Agents talk to a DataSource   │
+│        — one interface, two adapters." Then: "Real agents, fake data.  │
+│        The seam is the thing that lets that be true."                  │
+│                                                                        │
+│ CLOSE: "And it survived two adapter swaps already." [walk into 04]    │
+│                                                                        │
+│ IF IT BREAKS: if you feel yourself going long, stop mid-sentence,      │
+│   say "I'll go deeper in Q&A," walk into chapter 04.                   │
+│                                                                        │
+│ TIGHTEN IT: drop half 1, keep the seam sentence.                       │
+╰────────────────────────────────────────────────────────────────────────╯
+```

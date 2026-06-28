@@ -1,428 +1,201 @@
 # 01 — Problem brief
 
-The first four questions of any problem-selection brief, answered
-against what the repo actually establishes — and labelled clearly
-where the answer is **evidence** vs **inference** vs **discovery
-still required**.
+**Industry name:** Problem statement / opportunity brief — Coach posture
 
-  ## The legend you read this chapter with
+The 90-second answer to *"what is this for, and why does it deserve to exist?"* Coach voice: lead with the verdict, then rank what carries weight.
 
-```
-  [E]  EVIDENCE       — grounded in repo files, commits, docs,
-                        or named external constraints
-  [I]  INFERENCE      — reasonable read of the shape of the work;
-                        not directly proven by the repo
-  [D]  DISCOVERY      — open question; would need real validation
-                        before any further investment
-```
+---
 
-Every claim in this chapter carries one of those three tags. The
-honest framing of a contest submission is "lots of [E] about the
-contest constraints, lots of [I] about the merchant pain, a few
-critical [D]s that we'd answer before turning this into a
-product."
-
-  ## 1. Who experiences the pain — beneficiaries and exclusions
-
-  ### Primary beneficiary (named in the spec)
-
-The spec names a target user, but it names them as a *positioning
-choice*, not as a researched audience.
+## Zoom out — where this problem lives
 
 ```
-  THE NAMED USER (blooming-insights-spec.md L55)
+  Where the problem sits — the analyst's day
 
-  ┌─────────────────────────────────────────────────────────────┐
-  │  "merch leads, store operators without analysts"            │
-  │                                                             │
-  │  hackathon rubric criterion 1, 20%:                         │
-  │  "problem relevance & clarity — named target user           │
-  │   (merch leads, store operators without analysts).          │
-  │   specific pain (hours of manual correlation).              │
-  │   measurable value (30-second time-to-answer)."             │
-  └─────────────────────────────────────────────────────────────┘
+  ┌─ The marketer/analyst on Bloomreach Engagement ──────┐
+  │  opens the workspace, eyeballs metrics, thinks:      │
+  │   "huh, revenue is down in USA — why?"               │
+  └─────────────────────────┬────────────────────────────┘
+                            │  the loop they run manually
+                            ▼
+  ┌─ 1. NOTICE ──────────────────────────────────────────┐
+  │  scan dashboards, spot a metric that moved           │
+  └─────────────────────────┬────────────────────────────┘
+                            │
+                            ▼
+  ┌─ 2. HUNT ────────────────────────────────────────────┐
+  │  run ad-hoc EQL, slice by country/segment,           │
+  │  form hypotheses, eliminate them one by one          │
+  └─────────────────────────┬────────────────────────────┘
+                            │
+                            ▼
+  ┌─ 3. DECIDE ──────────────────────────────────────────┐
+  │  pick a Bloomreach action:                            │
+  │  scenario / segment / campaign / voucher / experiment│
+  └──────────────────────────────────────────────────────┘
+
+  blooming insights = an agent that runs all three,
+  AND streams its reasoning so the analyst sees HOW it
+  reached each conclusion.
 ```
 
-[E] The persona exists in the spec and in the project context
-(`.aipe/project/context.md` L9–L17). It's a real, namable user
-category.
+This whole loop sits *outside* Bloomreach today — in the analyst's head, in a Notion doc, in a Slack thread. The product moves it inside the workspace and makes the reasoning visible.
 
-[I] The pain claim — "hours of manual correlation, decisions
-end up driven by gut" — is a reasonable read of how non-analyst
-operators interact with workspace tools. It's also a standard
-trope. The repo does not contain user interviews, support tickets,
-churn analysis, or workflow recordings that prove this pain
-exists at scale for *this* product's actual users.
+---
 
-[D] What would establish the pain: at least 5 conversations with
-people who fit the persona, ideally on a real Bloomreach
-workspace, ideally with a recording of the "I spotted something
-weird; what do I do" workflow they currently run. None of that
-exists in the repo. **Naming this gap is not optional** — see
-chapter 05 question 1 for how to answer when a reviewer asks
-"where's the user research."
+## The verdict — what this is for
 
-  ### Secondary beneficiary — the real one for this build
+**An AI analyst that runs the analyst's loop end-to-end, and shows its work as a first-class UI surface.**
 
-The submission is to a contest. The judges and the hiring panel
-are the actual beneficiaries the build was optimised for.
+Not "a chatbot for Bloomreach." Not "a dashboard." An agent that does the three-stage loop above — **monitoring → diagnosis → recommendation** — and streams the reasoning trace, tool calls, and current-vs-prior numbers so every conclusion is auditable.
 
-```
-  THE REAL AUDIENCE THIS WAS BUILT FOR
+The differentiator is not the loop itself. Plenty of agents run loops. The differentiator is **provenance** — you click into the trace and see the EQL query that produced the number, the prior 90-day baseline it compared against, and the hypothesis the diagnostic agent eliminated before landing on its conclusion.
 
-  ┌── tier 1: contest judges ──────────────────────────────────┐
-  │  Loomi Connect AI Hackathon, Track 3                       │
-  │  5-criterion rubric (problem relevance, MCP utilization,   │
-  │  agent behavior, execution quality, innovation) × 20% each │
-  │  submission deadline: jun 2, 2026, 4:00 pm pst             │
-  │  evidence: blooming-insights-spec.md L37–L59               │
-  └────────────────────────────────────────────────────────────┘
+---
 
-  ┌── tier 2: hiring panels and reviewers ─────────────────────┐
-  │  Rein is mid-pivot from frontend (7+ yrs) into AI eng;     │
-  │  the build exists as a portfolio artifact too              │
-  │  evidence: me.md "THE ARC" diagram + the existence of      │
-  │  this whole .aipe/ rehearse-* book set                     │
-  └────────────────────────────────────────────────────────────┘
+## The user — who hurts
 
-  ┌── tier 3 (aspirational): actual merchants ─────────────────┐
-  │  the spec names them — but no real merchant has touched    │
-  │  this product, validated this product, or asked for this   │
-  │  product. inferred audience.                                │
-  └────────────────────────────────────────────────────────────┘
-```
+A marketer or growth analyst working in a Bloomreach Engagement ecommerce workspace. Concretely: someone whose week looks like this:
 
-[E] Tier 1 is dead-real: a named hackathon, a published rubric,
-a fixed deadline. The whole architecture aligns with hitting all
-five criteria intentionally (`blooming-insights-spec.md` L51–L59).
+- Monday: check the dashboard, notice purchase revenue dipped in one country.
+- Monday afternoon: run a few EQL queries to figure out *why* — was it traffic? funnel conversion? a specific catalog category?
+- Tuesday: write up a finding, propose a campaign or segment change in Bloomreach.
+- Wednesday: build the scenario or segment in the UI.
 
-[E] Tier 2 is real for Rein specifically: the `me.md` reader
-profile names the AI-engineering pivot; the existence of
-`.aipe/rehearse-interview-defense/` and this whole brief
-indicates the build is being prepared for technical-defense
-scrutiny. Portfolio audience is named, not inferred.
+The pain isn't *any one step*. It's that the loop is **manual, slow, and unrecorded.** By Friday, no one can reconstruct the reasoning that led to the campaign — the EQL queries are gone, the hypotheses are in someone's head, the prior baseline was eyeballed.
 
-[I] Tier 3 is the *positioned* user but not the validated one.
-This is the gap the rubric criterion 1 is asking you to close
-with a story, not the gap user research has closed with data.
+**Specifically:**
+- **Noticing** is slow because there are no saved dashboards in this workspace; every metric is ad-hoc EQL (the workspace fact, not a product limitation).
+- **Hunting** is slow because forming and testing hypotheses requires writing more EQL, and analysts who write EQL daily are scarce.
+- **Deciding** is slow because the analyst has to map "purchase revenue is down in USA" to "which of {scenario, segment, campaign, voucher, experiment} is the right Bloomreach feature" — and that mapping isn't documented anywhere.
 
-  ### A fourth real beneficiary — anyone running the demo without Bloomreach creds [E]
+---
 
-The hackathon book named two real audiences (judges + portfolio
-reviewers) and one inferred one (merchants). A fourth real
-audience appeared post-hackathon when the **synthetic data
-source** (`lib/data-source/synthetic-data-source.ts`, 516 LOC,
-commit `c75ec3e`) shipped: **anyone evaluating the agents
-without depending on the Bloomreach alpha being up.**
+## The evidence — what proves the pain
+
+This is where you separate "I think this is useful" from "I built it because the workspace told me to."
+
+**Evidence from the workspace itself** (the "wobbly-ukulele" Bloomreach project the agents run against):
+
+- **No saved funnels or dashboards** — every metric the product computes is built ad-hoc from EQL (`execute_analytics_eql` via MCP). If the analyst wants to know revenue trend, someone has to write the query. The MCP server has no `get_dashboard` tool because there's nothing to get.
+- **Sparse tail in the dataset** — the 90-day window discipline (`lib/agents/monitoring.ts`) exists because shorter windows produce bogus ±100% swings on this workspace's tail. That's a real constraint discovered by running the agent and seeing it return garbage.
+- **The MCP server's rate limit** (~1 req/s, alpha) and **token revocation** (minutes) — `lib/mcp/client.ts` carries the rate-limit + retry logic because the first version of the agent loop hammered the server and got 429'd. Real operational pain, real engineering response.
+
+**Evidence from the workflow inferred** (label honest — this is the inference, not measured):
+
+- *Inference:* analysts at this level don't have time to write 6 EQL queries per investigation. *Cannot prove this from the repo alone* — would need user-research interviews to verify. Listed as a discovery question, not a fact.
+- *Inference:* the "which Bloomreach feature is the right one" mapping is undocumented and tribal. *Partially proved* by the agent's recommendation prompt (`lib/agents/prompts/recommendation.md`) having to enumerate the five Bloomreach feature types and their use cases — if the mapping existed in docs, the prompt could cite them.
+
+**Discovery questions still open** (the honest gaps):
+
+- How many anomalies per week does a typical Bloomreach analyst actually investigate?
+- What's the median time-to-recommendation today, end-to-end?
+- Do analysts trust LLM-generated diagnoses, or do they rerun every query themselves?
+
+A staff reviewer will respect these questions being named more than they'll respect fake numbers.
+
+---
+
+## Why now — what changed
 
 ```
-  THE FOURTH AUDIENCE (post-hackathon, real)
+  The three "why now" pressures
 
-  ┌── tier 2.5: creds-free reviewers and contributors ─────────┐
-  │  bi:mode is now a 3-way toggle: demo | live-bloomreach |   │
-  │  live-synthetic. live-synthetic runs the SAME agents       │
-  │  against the SAME tool contracts, but the data source is   │
-  │  Blooming-owned deterministic ecommerce events             │
-  │  (purchase / view_item / session_start / cart_update) —    │
-  │  no Bloomreach token, no alpha-server quirks, no rate      │
-  │  limit. evidence: lib/data-source/synthetic-data-source.ts │
-  │  + the 3-way mode toggle on app/page.tsx                   │
-  └────────────────────────────────────────────────────────────┘
+  ┌─ 1. MCP standardization (2024-2025) ─────────────────┐
+  │  Bloomreach published a loomi connect MCP server     │
+  │  → tools (queries, segments, customers) are now      │
+  │     callable from any agent runtime                  │
+  │  → the "how do I get the data" problem went from     │
+  │     "build a custom integration" to "speak MCP"      │
+  └─────────────────────────┬────────────────────────────┘
+                            │
+                            ▼
+  ┌─ 2. Tool-use models matured (Claude Sonnet 4.6) ─────┐
+  │  multi-turn tool use is reliable enough that the     │
+  │  agent can plan→query→re-plan without the orchestra- │
+  │  tor having to micromanage every step                │
+  └─────────────────────────┬────────────────────────────┘
+                            │
+                            ▼
+  ┌─ 3. Streaming-trace UX is normalized ────────────────┐
+  │  users have seen ChatGPT/Claude thinking traces and  │
+  │  expect to see the reasoning, not just the answer    │
+  │  → "show your work" is a sellable feature, not a     │
+  │     debugging UI                                      │
+  └──────────────────────────────────────────────────────┘
 ```
 
-This is a real expansion of who can experience the product
-end-to-end. A hiring reviewer cloning the repo can now exercise
-the full agent loop on the synthetic adapter without obtaining
-a Bloomreach workspace token. That removes a friction point that
-existed in the original brief (demo-mode was instant but
-inert-for-live-queries; now live-synthetic gives them a live
-agent loop on data they trust because it's deterministic and
-owned by the project).
+The "why now" is not *"AI is hot."* It's that three specific things — MCP, reliable tool-use, and normalized streaming UX — all landed in a window where building this with three engineer-weeks is possible. Two years ago it would have been six months and a custom integration per data source. One year from now, every BI vendor has shipped their own version.
 
-  ### Exclusions — who is intentionally outside scope
+**Coach note:** when a reviewer asks "why now?" — DO NOT say "AI is the future." Say "MCP made the data callable, tool-use models got reliable, and streaming traces became a normal UI primitive — three things that weren't true 18 months ago."
 
-The spec names these directly. Restate them so the reviewer can't
-push you into them.
+---
 
-```
-  OUT-OF-SCOPE USERS
+## Beneficiaries and exclusions
 
-  → enterprise data teams with dedicated analysts
-       (they already have the SQL+BI muscle this replaces)
-  → marketers on platforms other than Bloomreach
-       (the build is MCP-native; deliberately not portable —
-        though the DataSource SEAM at lib/data-source/types.ts
-        now serves 2 adapters: Bloomreach + Synthetic; the
-        "MCP-native" claim is narrower than it was in June 2026)
-  → ops/support roles who need transactional answers
-       (it's a what-changed-and-why tool, not a customer-lookup)
-  → operators wanting writes / autonomous action
-       (read-only MCP by construction — see blooming-insights-spec.md L26–L30)
-```
+**Who benefits:**
+- The marketer/analyst working in Bloomreach Engagement on an ecommerce workspace — primary user.
+- The growth team lead who reviews the analyst's recommendations — secondary, gets auditable receipts.
+- The Bloomreach platform itself — every recommendation is a Bloomreach feature, so successful adoption deepens platform usage.
 
-[E] All four are spec-stated or architecturally enforced. The
-read-only constraint is the deepest one — the tool whitelist in
-`lib/mcp/tools.ts` makes "agent takes action" structurally
-impossible, not just unimplemented. That's a deliberate scope
-cut, not a missing feature (see chapter 02).
+**Who is intentionally outside scope:**
+- Non-Bloomreach workspaces. The agent is hardcoded to MCP tools the loomi connect server exposes. Porting to Segment / Amplitude / Snowflake would be a separate product, not a config.
+- Non-ecommerce workspaces. Subscription / B2B / media workspaces have different metric shapes — the prompts and `WorkspaceSchema` (`lib/mcp/schema.ts`) assume ecommerce primitives (revenue, AOV, funnel: view → cart → checkout → purchase).
+- Real-time alerting. The product is a 90-day-window analyst, not a 5-minute-window monitor. If something breaks in production *right now*, this isn't the tool.
+- Engineers debugging the Bloomreach platform itself. The agent reads through the customer's lens, not the operator's.
 
-  ## 2. Evidence and current cost — what the repo actually proves
+The exclusions matter as much as the inclusions. Naming what this is NOT for tells the reviewer you've thought about the boundary.
 
-This is the question every skeptical reviewer asks first. The
-honest answer in three buckets:
+---
 
-  ### What the repo proves [E]
+## Constraints — what shapes the solution
 
-```
-  ┌─ what is genuinely evidenced ─────────────────────────────────┐
-  │                                                                │
-  │  → the technical problem is real and solvable                 │
-  │     `audit.md` documents 4 working agents, an MCP client      │
-  │     with TTL cache + spacing + retry, NDJSON streaming, and   │
-  │     a schema-gated coverage system that actually runs against │
-  │     a real Bloomreach workspace. The agent finds anomalies    │
-  │     in `demo-insights.json`. The reasoning trace renders.     │
-  │     The product exists.                                       │
-  │                                                                │
-  │  → the contest provides legitimate cover for the investment   │
-  │     `blooming-insights-spec.md` L37–L59 names the hackathon,  │
-  │     the track, the rubric, the deadline. This is a real       │
-  │     event with real criteria — not a manufactured pretext.    │
-  │                                                                │
-  │  → Bloomreach's MCP surface is brand-new (alpha)              │
-  │     `blooming-insights-spec.md` L62 cites the alpha endpoint  │
-  │     `https://loomi-mcp-alpha.bloomreach.com/mcp`. The         │
-  │     hackathon exists because the surface is new. Building     │
-  │     a serious agent on a fresh MCP surface is itself          │
-  │     a portfolio-credible move.                                │
-  │                                                                │
-  │  → the product's "transparent reasoning" angle is genuinely   │
-  │     different from the named competitors                       │
-  │     `blooming-insights-spec.md` L14–L16 names conjura, graas, │
-  │     owly as black-box analyst tools. The streaming reasoning  │
-  │     trace (`audit.md` system-map) is the architectural        │
-  │     differentiator and it's actually implemented, not         │
-  │     marketed.                                                  │
-  └────────────────────────────────────────────────────────────────┘
-```
+These come from the repo and the workspace, not from imagination.
 
-  ### What the repo does NOT prove [D]
+**Technical:**
+- **Rate limit** — ~1 req/s on the alpha MCP server (`lib/mcp/client.ts`). Every agent design has to budget tool calls; the `maxToolCalls` cap was load-bearing in the hand-rolled loop and remains so under AptKit.
+- **Token revocation** — the alpha server revokes OAuth tokens after minutes. Auto-reconnect on `invalid_token` is required (`app/page.tsx`), and "live" mode is recovery-oriented rather than presentation-reliable. Demo mode exists because of this.
+- **No saved reports** — every metric is ad-hoc EQL, so the agent has to know how to compose queries, not just consume pre-built dashboards.
+- **Vercel function ceiling** — `maxDuration = 300` on the agent routes. The agent loop has to finish in 5 minutes or stream a partial result.
 
-```
-  ┌─ what is NOT evidenced and would have to be discovered ───────┐
-  │                                                                │
-  │  → that any merchant wants this                               │
-  │     no interviews, no waitlist, no design-partner pilots,     │
-  │     no support-ticket analysis. zero customer-discovery       │
-  │     artifacts in the repo.                                    │
-  │                                                                │
-  │  → that "30 seconds to answer" is a meaningful metric for     │
-  │     anyone but the rubric                                     │
-  │     `blooming-insights-spec.md` L55 cites "measurable value   │
-  │     (30-second time-to-answer)" but there's no baseline       │
-  │     measurement of how long the current workflow takes, no    │
-  │     comparative study, no user-reported pain magnitude.       │
-  │                                                                │
-  │  → that the diagnoses are *good enough* to bet on             │
-  │     there's no eval set, no labeled ground truth, no          │
-  │     accuracy measurement. The agent finds anomalies it        │
-  │     thinks are real; whether a merchant would agree they're   │
-  │     real, important, or actionable is untested.               │
-  │     (see `study-ai-engineering` 05-evals: "evals are the      │
-  │     Case-B gap" — explicitly named in the codebase audit.)    │
-  │                                                                │
-  │  → that the recommendations are right                         │
-  │     the recommendation agent maps anomalies to Bloomreach     │
-  │     features (scenario / segment / campaign / voucher /       │
-  │     experiment) — but whether any of those recommendations    │
-  │     would survive a merchandiser's gut-check has not been     │
-  │     evaluated.                                                │
-  └────────────────────────────────────────────────────────────────┘
-```
+**Product:**
+- **Provenance is non-negotiable** — the differentiator IS the trace. Any design that hides the reasoning trace (e.g. "wait for the final answer, then render") loses the product. The NDJSON streaming contract (`lib/mcp/events.ts`) exists to keep the trace surface live.
+- **Demo mode must work without auth** — the alpha server's token revocation makes live demos fragile, so the demo replays a committed snapshot. This isn't a hack; it's the presentation-reliable path.
 
-  ### Current cost without the build [I]
+**Time:**
+- This is a portfolio/interview project, not a funded product. Scope every decision against "what can one engineer ship in N weeks and defend in a 45-minute conversation."
 
-The spec's framing of current cost is plausible but unmeasured.
-State it that way:
+**Migration / organizational:**
+- N/A — solo project, no migration constraints, no organizational politics. Naming this explicitly tells a reviewer you know what *would* matter at scale.
 
-> [I] **The inferred current cost** is some number of analyst-hours
-> per anomaly per week per workspace, with an unknown error rate
-> from gut-driven decisions. The repo does not contain measurements
-> of either. The hackathon rubric *treats this cost as established*
-> for the purpose of judging; whether it survives contact with a
-> real customer is the discovery question.
+---
 
-If a reviewer presses on cost numbers, **do not invent them**. Say
-"the spec frames the pain in qualitative terms; we'd quantify it
-with [3 measurable things] before pitching this as a product."
-The 3 measurable things (write them in chapter 05 question 1):
-**(1)** time-to-first-action on a real anomaly today (stopwatch
-five merchants), **(2)** post-hoc agreement rate ("would you have
-acted on this anomaly the way the agent suggested"), **(3)**
-self-reported confidence in current dashboard-driven decisions
-on a 1–7 scale (the gap is the size of the pain).
+## The smallest useful scope — what validates the premise
 
-  ## 3. Why now — what changed, what cost compounds
+The narrowest slice that proves "an analyst that shows its work is genuinely useful" is **one anomaly, end-to-end, with the trace visible.**
 
-This is the *only* question with strong evidence beyond the
-"this is a contest" answer. Three real forces converged in
-mid-2026; the build rides all three.
+That means:
+- The monitoring agent detects one significant change in the workspace.
+- The diagnostic agent forms and tests at least one hypothesis against real EQL queries.
+- The recommendation agent proposes one concrete Bloomreach action.
+- The UI streams the reasoning trace, tool calls, and current-vs-prior numbers for all three stages.
 
-```
-  THE THREE FORCES CONVERGING (mid-2026)
+If that loop works once, end-to-end, with the trace visible — the premise is validated. Everything else (multiple anomalies, ranking, free-form Q&A, demo mode, eval harness) is hardening on the kernel.
 
-      MCP becomes
-      a serious            agent loops with
-      protocol             tool use become            Bloomreach
-      (Anthropic)          a standard primitive       opens
-           │                       │                  loomi connect
-           │                       │                  MCP (alpha)
-           │                       │                       │
-           ▼                       ▼                       ▼
-   ┌──────────────────────────────────────────────────────────┐
-   │   may–jun 2026: the hackathon exists BECAUSE all three    │
-   │   landed at once. blooming insights is one of the first   │
-   │   serious agents built against the Bloomreach surface.    │
-   └──────────────────────────────────────────────────────────┘
-```
+**The repo state today proves this slice works:** the demo snapshot in `lib/state/demo-insights.json` and `lib/state/demo-investigations.json` is a captured live run of exactly this loop. Click "investigate" on a card, watch the trace stream, read the recommendation. That's the validated premise, shipped.
 
-[E] All three forces are real and verifiable:
+---
 
-- **MCP as a protocol** — `package.json` L14 (`@modelcontextprotocol/sdk ^1.29.0`) confirms the SDK exists and is on a 1.x version. The protocol stabilised enough in 2025 for a serious build to depend on it.
-- **Anthropic SDK with tool use** — `package.json` L13 (`@anthropic-ai/sdk ^0.99.0`) confirms a near-1.0 SDK with the tool-use loop the agents use.
-- **Bloomreach loomi connect alpha** — `blooming-insights-spec.md` L62 names the alpha endpoint. The hackathon exists *because* the surface is new and the company wants ecosystem builds.
+## The takeaway
 
-[I] The "why now" for the *merchant* is weaker. Merchants have
-been drowning in dashboards for 15 years; that's not new. What's
-new is the *solution shape* — MCP-native agents are credible in
-mid-2026 in a way they were not in mid-2024. The reframe a
-skeptical reviewer accepts: *"we couldn't have built this two
-years ago — the protocols and the model capability weren't there."*
+The problem is real (analysts manually run this loop today, slowly, without records), the evidence is mixed-but-honest (workspace facts proven; user-workflow inferences labeled), the "why now" is specific (MCP + tool-use + streaming-trace UX in the same window), the boundary is named (ecommerce Bloomreach, not generic BI), and the validating slice is shipped.
 
-[E] The deadline-induced "why now" is concrete: the submission
-window closes June 2, 2026, 4:00 pm pst. After that date, this
-specific build's contest-judged claim expires. The portfolio
-claim doesn't expire; the rubric-criterion claim does.
+The next chapter is the harder one — **what you did NOT build, and why.** That's where senior judgment shows up.
 
-  ## 4. Constraints — what's visible from the repo
+---
 
-Five real constraints shaped the build. Each is evidence in the
-repo, each shaped a non-trivial decision.
+## See also
 
-  ### Constraint 1 — time-boxed by the contest [E]
-
-The hackathon window (`blooming-insights-spec.md` L41–L43) is the
-hard ceiling. Build window opened May 26, 2026; submission deadline
-June 2, 2026, 4:00 pm pst. That's ~7 calendar days for the full
-build. Every architecture decision is downstream of this.
-
-```
-  the 7-day window forced:
-  → no database (state in Maps + cookies + committed JSON)
-  → no test against real customers (no time for discovery)
-  → no eval harness (no time to build labeled ground truth)
-  → no multi-tenant (single workspace: wobbly-ukulele)
-  → no write-path actions (read-only by construction)
-```
-
-This constraint is *load-bearing*. Half the scope cuts in
-chapter 02 exist because of it.
-
-  ### Constraint 2 — Bloomreach rate limit and alpha quirks [E]
-
-`audit.md` documents the constraint precisely: **~1 req/s/user
-GLOBAL** to the MCP server, and the alpha server **revokes
-tokens after minutes** (`.aipe/project/context.md` L88–L89).
-
-```
-  the rate limit forced:
-  → McpClient with 1.1s spacing + TTL cache + retry
-       (lib/mcp/client.ts)
-  → schema-gated coverage so the agent never burns the budget
-       on impossible categories (lib/agents/categories.ts)
-  → demo mode that replays a committed snapshot for the live demo
-       (because live mode is too fragile for a presentation)
-  → POST-HACKATHON: the synthetic adapter
-       (lib/data-source/synthetic-data-source.ts) as a third
-       mode entirely — no rate limit, no token revocation,
-       same agent-facing tool contracts. The constraint is
-       still real for live-bloomreach mode; it no longer gates
-       reviewer evaluation of the agents.
-```
-
-This is an evidenced operational constraint, not a hypothetical
-one. It shaped real code.
-
-  ### Constraint 3 — Vercel function ceiling (300s) [E]
-
-`audit.md` documents `maxDuration = 300` on every route. That's
-the hard ceiling on how long any single agent run can take.
-Typical run is ~70–120s (`audit.md` Ceiling 2); headroom shrinks
-when Bloomreach is slow.
-
-```
-  the 300s ceiling forced:
-  → bounded tool-call budget (maxToolCalls: 6)
-  → forced-final synthesis turn so the agent always returns
-       structured output even if it ran out of turns
-  → NDJSON streaming so the user sees progress, not a 90s blank
-```
-
-  ### Constraint 4 — solo build, no team [I → E]
-
-[I] The build's commit history (`git log --oneline -30`) shows
-a single author thread. No PR reviews, no collaborator commits.
-This is a solo project.
-
-[E] The `me.md` reader profile names Rein as the single builder;
-the system-design portfolio lists this project as her work
-specifically.
-
-```
-  solo build constraint forced:
-  → "do the thing one person can ship in a week"
-  → no team-coordination overhead, but also no spare hands for
-       eval design, design-partner outreach, infra work
-  → portfolio-shape thinking (one engineer's signature)
-       over product-shape thinking (a team's roadmap)
-```
-
-  ### Constraint 5 — the AI-pivot frame [E]
-
-The whole build sits inside Rein's deliberate pivot from frontend
-specialist into AI engineering (`me.md` "THE ARC" diagram). This
-is an organizational constraint of a different kind: **the
-selection of this problem is itself a career move**.
-
-```
-  the AI-pivot frame favored:
-  → multi-agent orchestration (the AI-engineering signal)
-  → MCP integration (the protocol-fluency signal)
-  → streaming + structured outputs (the production-AI signal)
-  over:
-  → CRUD frontend work (already in the portfolio 7x)
-  → pure-frontend showcase projects (not the pivot direction)
-```
-
-Naming this is honest. If a reviewer asks "why this and not a
-different hackathon problem," the answer "this maximally signals
-the pivot I'm in" is a strong, defensible answer.
-
-  ## What this chapter establishes — and what it doesn't
-
-```
-  ESTABLISHED [E]                  NOT ESTABLISHED [I/D]
-  ──────────────────────────────   ──────────────────────────
-  → real hackathon, real rubric    → merchant pain at scale
-  → real fresh MCP surface         → 30s time-to-answer as
-  → genuine architectural diff       a real user metric
-  → 5 real shaping constraints     → diagnosis accuracy
-                                   → recommendation quality
-                                   → willingness to pay
-```
-
-This is the honest base. Chapter 02 takes those constraints and
-shows the scope cuts that fell out of them. Chapter 03 puts this
-option up against four real alternatives, including doing nothing.
-
-Read chapter 02 next.
+- `02-scope-cuts-and-non-goals.md` — what got cut and why
+- `03-options-and-opportunity-cost.md` — what else you could have built
+- `04-success-metrics-and-feedback-loop.md` — how you know any of this works
+- `.aipe/project/context.md` — the project framing

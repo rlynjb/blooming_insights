@@ -1,185 +1,97 @@
-# 00 — Overview · the problem-selection brief
+# Problem selection — overview
 
-You're walking into a room — a judge, a hiring panel, a skeptical
-peer — and the first question is going to be a version of this:
-**"why did you build this?"** Not "how does it work" (that's the
-defense book). Not "show me the demo" (that's the hackathon
-book). The question underneath both: *why does this problem
-deserve the week of your life you spent on it.*
+**Industry name:** Problem brief / investment justification — Coach posture
 
-This brief is the answer. Five chapters, each a load-bearing piece
-of the case. Read them once front to back to know the argument,
-then keep chapter 05 open under pressure — that's where the
-skeptical-reviewer questions live with the answers that hold.
+This is the **why this problem deserves investment** book. Before any design doc, before any roadmap, before any "let me show you the architecture" — a reviewer wants to hear that you picked the right problem. This bundle is the answer.
 
-  ## What this brief is — and what it is not
+You're going into a room where someone — staff engineer, hiring manager, design partner — is going to ask one of these in the first 90 seconds:
 
-It is a problem-selection artifact: ten questions answered against
-the actual repo. **User pain, evidence, why now, beneficiaries,
-constraints, options including do-nothing, smallest validated
-slice, non-goals, success metrics, risks.**
+- *"Why this and not something else?"*
+- *"Is the eval gap honest, or is that a planning excuse?"*
+- *"Why did you rewrite the agent loop after defending the hand-rolled one?"*
+- *"What did you cut, and would you cut it again?"*
 
-It is *not* a pitch deck. It is not a market-sizing exercise. It
-is not a justification of the choices inside the build (that's
-the design doc) or a defense of the architecture under pressure
-(that's the interview-defense book). It is the layer **before**
-solution design — the layer that says "this problem is worth
-solving, here's the case, here's what we deliberately won't do."
+Each chapter rehearses one of those rooms.
+
+---
+
+## The five chapters
 
 ```
-  WHERE THIS BRIEF SITS
+  The brief — what each chapter is for
 
-  ┌─ rehearse-problem-selection ────────────────────┐
-  │  WHY this problem deserves investment   ★ here ★ │
-  └────────────────────┬────────────────────────────┘
-                       │  once the WHY holds
-                       ▼
-  ┌─ rehearse-design-doc ───────────────────────────┐
-  │  HOW the significant technical decisions land    │
-  └────────────────────┬────────────────────────────┘
-                       │
-  ┌─ rehearse-hackathon-demo ───────────────────────┐
-  │  HOW the resulting value is shown in 10 min      │
-  └────────────────────┬────────────────────────────┘
-                       │
-  ┌─ rehearse-interview-defense ────────────────────┐
-  │  HOW the work is defended under scrutiny         │
-  └─────────────────────────────────────────────────┘
+  ┌─ 01 problem-brief ───────────────────────────────────┐
+  │  WHO hurts, WHAT proves it, WHY now                  │
+  │  the 90-second answer to "what is this for"          │
+  └─────────────────────────┬────────────────────────────┘
+                            │  once the pain is named,
+                            ▼
+  ┌─ 02 scope-cuts-and-non-goals ────────────────────────┐
+  │  what you DIDN'T build, and the receipts:            │
+  │    Cut 1: no live BigQuery — fakes for the seam      │
+  │    Cut 2: eval pipeline — built, ran, retired (L5)   │
+  │    Cut 3: no persistent storage — in-memory + JSON   │
+  └─────────────────────────┬────────────────────────────┘
+                            │  cuts justified, now compare
+                            ▼
+  ┌─ 03 options-and-opportunity-cost ────────────────────┐
+  │  what else you could have built with the same time   │
+  │  + the defer-then-migrate story:                     │
+  │    hand-rolled runAgentLoop  →  AptKit migration     │
+  │    (L5 evaluated-and-accepted revisit)               │
+  └─────────────────────────┬────────────────────────────┘
+                            │  the path picked, now measure
+                            ▼
+  ┌─ 04 success-metrics-and-feedback-loop ───────────────┐
+  │  Phase 3 eval portfolio — real measured numbers      │
+  │    K=10 per anomaly, 4 pillars, 8/8 + 3/3 calibration│
+  │    3 named bugs surfaced (BRL units, binary judge,   │
+  │    conclusion instability)                           │
+  │  retired with Olist; rebuild target = Synthetic      │
+  └─────────────────────────┬────────────────────────────┘
+                            │  metrics on table, now defend
+                            ▼
+  ┌─ 05 skeptical-reviewer-questions ────────────────────┐
+  │  the 4 probes that land hardest, with the answers    │
+  │  that hold under follow-up                           │
+  └──────────────────────────────────────────────────────┘
 ```
 
-If the WHY doesn't hold, the next three books are decoration on a
-problem nobody asked for.
+---
 
-  ## The verdict up front
+## The one-line pitch for the project
 
-**The problem is contest-justified, not market-validated.** That
-distinction is the whole frame. Read it twice.
+> An AI analyst for a Bloomreach Engagement ecommerce workspace that runs the loop a human analyst runs — **what changed → why → what to do** — and streams the agents' reasoning as a first-class UI surface, so every conclusion carries provenance (the exact tool calls, current-vs-prior numbers, streamed reasoning trace).
 
-Blooming insights was built for the **Loomi Connect AI Hackathon
-(June 2026, Track 3 — Analytics Agents & Decision Intelligence)**.
-The submission deadline was June 2, 2026 (`blooming-insights-spec.md` L37–L45).
-The "user" is not a paying merchant; the user is a **hackathon
-judge scoring against a 5-criterion rubric** plus, downstream, **a
-hiring panel evaluating the portfolio**. The problem statement
-("merchants drown in dashboards, decisions get made on gut")
-appears in the project context (`.aipe/project/context.md` L9–L17)
-as a framing claim — **not as validated user research**.
+The differentiator is not "we built an agent." It's **an analyst that shows its work** — receipts, not assertions.
 
-That doesn't make the project unjustified. It makes the
-*justification different* than a startup founder's would be. The
-case for the build is:
+---
 
-```
-  1. a real hackathon track existed with a real rubric
-     → the build hits all 5 criteria intentionally
-  2. the MCP server it depends on is a real, brand-new
-     surface (Bloomreach loomi connect alpha)
-     → "first to demo a serious agent on this" is a
-       legible portfolio claim
-  3. the "transparent reasoning trace as UI" angle is
-     a genuine differentiator vs the named competitors
-     (conjura, graas, owly — all black-box outputs)
-  4. the build exercises the AI-engineering pivot Rein
-     is in — agent loops, MCP, structured-output
-     validation, streaming — in one coherent shape
-```
+## The strongest defense in this brief
 
-Four reasons to spend the week. None of them are "we validated
-the merchant pain." Stating that honestly is the strongest move —
-overclaiming validated user pain is the fastest way to lose the
-room.
+If a reviewer has 30 seconds and you have to pick *one* thing to lead with, lead with **Cut 2 — the eval pipeline.**
 
-  ## The 1-line problem statement (the version that holds)
+Most candidates at this level say "I didn't have time for evals" (L1 weakness) or "evals are on the roadmap" (L2). The honest answer here is L5 territory:
 
-```
-  ┃ "ecommerce merchants on Bloomreach already have the data
-  ┃  to know what changed and why — but the answers are
-  ┃  scattered across dashboards, EQL editors, and tribal
-  ┃  knowledge; an agent that reads the workspace and shows
-  ┃  its reasoning end-to-end is a credible solution shape
-  ┃  for a hackathon judging that exact capability."
-```
+> "I cut evals in Phase 1 — hackathon scope, ship the loop first. Then in Phase 3 I shipped the suite anyway: 4 pillars, K=10 per anomaly, LLM-as-judge calibrated against 8/8 manual spot-check on detection and 3/3 on diagnosis. It surfaced three real bugs nothing else would have caught — BRL cents-vs-Reais misread (the judge flagged a R$131,965 AOV at run 8), binary calibration breakdown on 29/30 diagnosis runs, and 30% conclusion instability as the regression baseline. Then I retired the suite when the Olist MCP server it scored against was retired — the in-process Synthetic adapter is a cleaner shape for the same job. The receipt of having built it and used it to find bugs is stronger than promising to build it."
 
-Two halves. The first half is the inferred user problem. The
-second half — **"a credible solution shape for a hackathon judging
-that exact capability"** — is the part that's actually evidenced
-by the work. Lead with the honest framing; let the first half
-ride on the second's coattails, not the other way around.
+That's the shape every chapter in this brief is trying to teach you to land: **shipped, learned, made a call** — never "we plan to."
 
-  ## The chapters — what each one carries
+---
 
-```
-  01  PROBLEM BRIEF
-      who has the pain · what's evidence vs inference · why now ·
-      beneficiaries and exclusions · the constraints visible
-      from the repo · including the credentialed-dependency cut
-      that the synthetic adapter resolved post-hackathon
+## How to use this book
 
-  02  SCOPE CUTS AND NON-GOALS
-      the smallest useful slice · what NOT to build · the cuts
-      that made the build shippable in the hackathon window ·
-      and the cuts taken THEN PUT BACK THEN REMOVED AGAIN
-      (the Phase 3 eval flywheel arc — built, used, retired
-      with its substrate)
+Read 01 first to refresh the problem framing. Read 02 next — it carries the most interview leverage. Then 03 (the AptKit migration story is the second-strongest defense). Use 04 as your numbers reference. Use 05 the night before the conversation.
 
-  03  OPTIONS AND OPPORTUNITY COST
-      five real options including DO NOTHING · what each buys
-      and what each costs · why this option won · the
-      build-then-migrate pattern (own agent loop → AptKit core)
-      added as a worked option-revisit
+Coach voice throughout. When you see "say this, not that" — that's the rep.
 
-  04  SUCCESS METRICS AND FEEDBACK LOOP
-      observable outcomes for a hackathon-shaped project ·
-      the rubric as the feedback loop · what "success" cannot
-      mean here (and why) · the Phase 3 receipts: 4 measured
-      numbers, 3 real bugs surfaced, then retired
+---
 
-  05  SKEPTICAL REVIEWER QUESTIONS
-      the seven (now nine) questions a senior reviewer asks ·
-      the answer that holds for each one · the dodge that does
-      not · plus the post-hackathon probes: "why retire the
-      eval substrate?", "why migrate to AptKit after building
-      your own loop?"
-```
+## See also
 
-  ## How to read this brief
-
-```
-  pass 1   read chapters 01 → 05 in order              ~25 min
-           hold the verdict above as the spine while you do
-
-  pass 2   re-read 05 only — speak each answer out loud  ~10 min
-           the answers must land in spoken English, not
-           just on the page
-
-  pass 3   morning of (interview / demo Q&A / review)    ~5 min
-           skim chapter 05's first sentence of each answer
-           those are your in-the-room one-liners
-```
-
-If you have time for only one pass, make it pass 2. Pass 1 builds
-the case in your head; pass 2 is what you actually say.
-
-  ## What this brief deliberately does not do
-
-```
-  → it does not invent users
-       no fake personas, no "we talked to 17 merchants"
-  → it does not invent metrics
-       no NPS, no conversion lift, no "30% time saved"
-  → it does not invent market evidence
-       no TAM, no competitive teardown beyond what the spec names
-  → it does not invent organizational constraints
-       no fake stakeholders, no fake roadmap pressure
-  → it does not pretend the problem is bigger than it is
-       the hackathon framing is named; not buried
-```
-
-If a reviewer asks "where's your user research?" the honest
-answer is in chapter 05 question 1: *we don't have any, this is
-a contest submission, here's what would be required to validate
-the problem if we wanted to take it past the hackathon.* The
-discovery questions are real outputs of this brief, not failures
-of it.
-
-Read chapter 01 next.
+- `02-scope-cuts-and-non-goals.md` — the cuts (Cut 2 = the eval story)
+- `03-options-and-opportunity-cost.md` — the defer-then-migrate AptKit story
+- `04-success-metrics-and-feedback-loop.md` — the measured numbers from Phase 3
+- `05-skeptical-reviewer-questions.md` — the four probes and the answers
+- `.aipe/project/context.md` — the project framing this brief is built on
+- `.aipe/rehearse-interview-defense/` — sister book, defends the *technical* choices (this book defends the *problem choice*)

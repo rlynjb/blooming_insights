@@ -1,385 +1,373 @@
-# Chapter 6 — The Hard Parts
+# Chapter 6 — The hard parts
 
-This is the chapter where the interview stops being about the system and starts being about you. The questions are simple — "what was the hardest bug?", "what part are you proudest of?", "what's the part you're least sure about?" — and they are the ones that separate people who built something from people who narrated something. The trap is treating the third one as a confession. It isn't. The person across the table already knows you have gaps; what they're measuring is whether you know where your gaps are and can stand on the edge of one without falling in.
+This is the chapter that decides whether the interviewer leaves the room thinking *"this person ships things"* or *"this person passed three rounds of code-with-AI without ever debugging anything."* The reflection questions in this chapter — the hardest bug, the proudest part, the least confident part — are not soft questions. They are the highest-signal questions in the interview.
 
-So this chapter teaches you to do three things on demand: walk a real bug from symptom to insight to fix, name the thing you're proudest of without inflating it, and point at the part of your own codebase you understand least — and own it so cleanly that it reads as senior signal instead of a hole. Start by getting honest about the terrain.
+The trap is to over-prepare a clean story. Real debugging stories aren't clean. They have the wrong-hypothesis-for-an-hour part, the wait-it-was-actually-this part, the I-can-explain-it-now-but-I-couldn't-then part. **Those are the parts that prove you shipped it.** Strip them out and the story sounds like a postmortem written by someone who wasn't there.
 
-```
-┌ CONFIDENCE MAP — blooming insights, by how hard you can defend it ──────────────┐
-│                                                                                  │
-│  HIGH — you built this deliberately, you can whiteboard it cold                  │
-│  ┌────────────────────────────────────────────────────────────────────────┐   │
-│  │ NDJSON streaming trace        useInvestigation StrictMode fix            │   │
-│  │ (events.ts + shared           (started-guard + no-cancel-on-cleanup)     │   │
-│  │  lib/streaming/ndjson.ts)     coverage gate (categories.ts)             │   │
-│  │ DataSource seam + 3 adapters  AptKit adapter boundary                   │   │
-│  │ (lib/data-source/types.ts)    (lib/agents/aptkit-adapters.ts)            │   │
-│  │ demo-vs-live split            coverage_item per-tile reveal (briefing)   │   │
-│  │ SyntheticDataSource           Phase 3 eval flywheel (built, used,       │   │
-│  │ (516 LOC, in-process)         surfaced bugs, removed substrate)         │   │
-│  └────────────────────────────────────────────────────────────────────────┘   │
-│                                                                                  │
-│  MEDIUM — you chose it on purpose but the tuning is approximate                  │
-│  ┌────────────────────────────────────────────────────────────────────────┐   │
-│  │ ~1.1s inter-call spacing      retry/backoff math                         │   │
-│  │ 60s cache TTL                 the agent prompts / synthesis instruction  │   │
-│  │ maxToolCalls budget = pick    the AES cookie store I wrote around auth   │   │
-│  └────────────────────────────────────────────────────────────────────────┘   │
-│                                                                                  │
-│  LOW — I use it correctly but I do not know it at the byte level                 │
-│  ┌────────────────────────────────────────────────────────────────────────┐   │
-│  │ MCP wire protocol internals   OAuth PKCE + DCR mechanics (SDK provider)  │   │
-│  │ AptKit's runtime internals    (I built the adapter boundary, not the     │   │
-│  │ (the loop they own)           runtime — clear line, same shape as MCP)   │   │
-│  │ distributed scale / multi-region / hot-path queues / load balancing      │   │
-│  └────────────────────────────────────────────────────────────────────────┘   │
-│                                                                                  │
-│  RULE: answer from HIGH. Reach into MEDIUM with "I picked the simple option."    │
-│        At the LOW boundary, stop and say so — that's the recovery box.           │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
+This chapter has three hard bugs from real work on this codebase, the part of the project you're proudest of, and the part you're least confident defending — owned with the receipts that turn an L4 answer into an L5 one.
 
-Everything in this chapter lives somewhere on that map. The bug stories come from HIGH, the proudest-part comes from HIGH, and the "least confident" answer is you walking yourself, on purpose, down to the LOW band and planting a flag there.
+## The confidence map — what to defend hard, what to be honest about
 
----
-
-## Prompt 1 — "What was the hardest bug you hit?"
-
-┌──────────────────────────────────────────────────────────────────────────┐
-│ Surface: tell me about a hard bug.                                          │
-│ Probe:   can you debug something you can't see, and isolate cause from      │
-│          symptom — or do you just thrash until it works?                    │
-└──────────────────────────────────────────────────────────────────────────┘
-
-The strong answer has a shape: symptom, why it was confusing, the insight, the fix, and what made it hard. The hardest bug I hit was a React StrictMode double-fetch in `lib/hooks/useInvestigation.ts`, and it has all five.
-
-Here is how I'd walk it:
-
-The symptom was empty logs. I'd open an investigation page in development, the reasoning trace would render its frame, and then nothing would stream into it. No error in the console. The network tab showed a request that started and got cancelled. In production it was fine. That "dev-only" detail is the whole key, and it's the first thing I'd say out loud, because it tells the interviewer I noticed the discriminating fact instead of just staring at the failure.
-
-The reason dev-only matters: `reactStrictMode` is on, which is the Next.js default, and StrictMode in development mounts a component, immediately runs its effect cleanup, then re-mounts. Two things in my hook were fighting each other inside that mount-cleanup-remount cycle. First, I had a started-guard — a `useRef` so the fetch runs once per mount and I don't fire two streams. Second, I was cancelling the in-flight fetch on effect cleanup, which is the textbook "clean up your effects" move. Apart, both are correct. Together they killed the stream: the first mount started the fetch, the cleanup cancelled it, and then on the re-mount the started-guard said "already started" and blocked the re-fetch. So I cancelled the only request and then refused to make another one. Empty logs.
+The chapter's visual anchor. Trace the regions; the color tells you the defense posture.
 
 ```
-StrictMode dev lifecycle, with the BUG in place:
+  blooming insights — confidence map by region
 
-  mount #1 ──► effect runs ──► startedRef = true ──► fetch() begins streaming
-     │
-     ▼
-  cleanup  ──► abort the fetch         ◄── "good hygiene" cancel
-     │            (stream killed)
-     ▼
-  mount #2 ──► effect runs ──► startedRef already true ──► RETURN, no fetch
-     │
-     ▼
-  result: zero events ever reach the trace → empty logs
+  ┌──────────────────────────────────────────────────────────────┐
+  │ HIGH CONFIDENCE — defend hard, walk the code                  │
+  ├──────────────────────────────────────────────────────────────┤
+  │                                                                │
+  │  · Adapter boundary at lib/agents/aptkit-adapters.ts          │
+  │    (3 classes, ~200 LOC; library owns loop, I own boundary)    │
+  │                                                                │
+  │  · DataSource seam at lib/data-source/types.ts                 │
+  │    (survived 2 adapter swaps; receipt-driven)                  │
+  │                                                                │
+  │  · Streaming kernel at lib/streaming/ndjson.ts                 │
+  │    (64 LOC, 4 surfaces)                                        │
+  │                                                                │
+  │  · Page decomposition (app/page.tsx 461 LOC + 3 hooks)         │
+  │                                                                │
+  │  · Session-keyed insights map (the wipe bug fix, shipped)      │
+  │                                                                │
+  └──────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────────────────────────────────────────────────┐
+  │ MEDIUM CONFIDENCE — defend with the receipt, name the gap    │
+  ├──────────────────────────────────────────────────────────────┤
+  │                                                                │
+  │  · MCP transport / envelope handling                          │
+  │    (transport.ts works; corner cases I haven't exhausted)      │
+  │                                                                │
+  │  · Reconnect policy (useReconnectPolicy)                       │
+  │    (works in dev; not stress-tested in a real revoke storm)    │
+  │                                                                │
+  │  · Prompt discipline (the "cite evidence" / "lower confidence" │
+  │    pattern in diagnostic.ts; no live eval to verify regression)│
+  │                                                                │
+  └──────────────────────────────────────────────────────────────┘
+
+  ╔══════════════════════════════════════════════════════════════╗
+  ║ LOWER CONFIDENCE — own honestly, walk the receipts of having ║
+  ║                    done the work, name what version 2 looks  ║
+  ║                    like                                       ║
+  ╠══════════════════════════════════════════════════════════════╣
+  ║                                                                ║
+  ║  · Eval coverage TODAY                                         ║
+  ║    Phase 3 4-pillar eval suite was built, used, retired with   ║
+  ║    the Olist substrate. Three receipts: built it end-to-end,   ║
+  ║    used it to find 3 real bugs, know what v2 looks like        ║
+  ║    against the synthetic adapter. The gap is real AND owned    ║
+  ║    with evidence — strongest possible L5 framing.              ║
+  ║                                                                ║
+  ║  · OAuth PKCE internals beyond the SDK surface                 ║
+  ║    Defaulted-to. Can defend the wrapper, not the protocol.     ║
+  ║                                                                ║
+  ║  · Multi-instance / cross-process state                        ║
+  ║    Designed for, not shipped. Seam is ready, trigger isn't.    ║
+  ║                                                                ║
+  ╚══════════════════════════════════════════════════════════════╝
 ```
 
-The insight was that the guard and the cancel were solving for different lifetimes. The guard protects against a *double* fetch; the cancel protects against a *leaked* fetch after unmount. But under StrictMode the cleanup doesn't mean "the user navigated away" — it means "I'm about to remount you." So cancelling on cleanup was treating a fake unmount as a real one.
+The lower-confidence region is the most important part of this map. Most candidates try to hide it. You're going to lead with it — and you're going to lead with it well, because you have the receipts that turn the gap into a strength.
 
-The fix is two lines of intent. I keep the started-guard so I never fire two streams, and I deliberately do *not* cancel the fetch on cleanup. The in-flight run simply finishes; if the component really did unmount, the `setState` calls are no-ops, which is safe. That tradeoff is written into the file as a comment so the next person doesn't "fix" it back. It's the `NOTE` block at the top of `useInvestigation.ts`: started-guard at line 47, and the deliberate no-cancel decision is the whole reason there's no `AbortController` in that effect.
-
-What made it hard wasn't the fix — it was that it only reproduced under StrictMode, so the failing condition was a dev-only lifecycle quirk, and the symptom ("empty logs") pointed at the stream, the server, or the parser before it pointed at the hook. I had to rule out the server first, which I did by confirming production streamed fine.
-
-┃ "The guard protects against a double fetch; the cancel protects against a leaked one. Under StrictMode they were solving for different lifetimes, and together they cancelled the only request I had."
-
-If they want a second bug — and the strong move is to offer one — I have a cleaner isolation story.
-
-### The second bug, if they push for "anything trickier in production?"
-
-┌──────────────────────────────────────────────────────────────────────────┐
-│ Surface: anything that only showed up in prod?                              │
-│ Probe:   can you isolate an environment-specific failure methodically?      │
-└──────────────────────────────────────────────────────────────────────────┘
-
-The briefing endpoint returned a bare 500 in production while demo mode returned 200. That contrast was the entire diagnosis. Demo mode never touches credentials — it replays a committed JSON snapshot — so demo=200 told me the route, the stream, and the parser were all fine. Live=500 told me the failure was in the credentialed setup path that demo skips. That narrowed it to one thing: the production cookie encryption.
-
-`aesKey()` in `lib/mcp/auth.ts` throws if `AUTH_SECRET` is unset, and it only runs in production because the dev/test backends use a file or an in-memory map. The throw happened during pre-stream setup, before I'd committed to the `ReadableStream`, and it was unguarded, so it surfaced as a bare 500 with no message. The fix was to wrap `getOrCreateSessionId` and `connectMcp` in a try/catch and return the *real* error string — you can see it now at `app/api/briefing/route.ts` lines 161-171. After the fix, the same missing-secret condition returns a 500 that actually says `AUTH_SECRET is required in production…`, and a missing/expired token returns a 401 the feed redirects on, not a 500.
+## Hard bug 1 — StrictMode double-fetch in `useInvestigation`
 
 ```
-ISOLATION BY CONTRAST:
-
-  demo  = 200  ──┐
-                 ├──► the route/stream/parser are FINE
-  live  = 500  ──┘     (demo exercises all of them, creds-free)
-       │
-       ▼
-  what does LIVE do that DEMO skips?  ──► credentialed setup
-       │
-       ▼
-  what in setup can throw before the stream?  ──► aesKey() on unset AUTH_SECRET
-       │
-       ▼
-  fix: guard the setup, return the real message → 200/401/500 are now honest
+  ┌─────────────────────────────────────────────────┐
+  │ THEY ASK                                        │
+  │   "Tell me about the hardest bug you fixed in   │
+  │    this project."                               │
+  │                                                 │
+  │ WHAT THEY'RE TESTING                            │
+  │   Can you walk me through a real debugging      │
+  │   sequence — wrong hypothesis, isolation,       │
+  │   correct fix? Do you understand the framework  │
+  │   you're using deeply enough to debug its       │
+  │   interaction with your code?                   │
+  └─────────────────────────────────────────────────┘
 ```
 
-The teaching point I'd land: I didn't add logging and guess. I used the two environments as a differential — the thing that worked and the thing that didn't differed in exactly one dimension, and that dimension was the answer.
+The strong answer, told in your voice with the wrong-turn included:
 
-┌─ STRONG vs WEAK — telling a bug story ─────────────┬───────────────────────────────┐
-│ WEAK                                                │ STRONG                         │
-├─────────────────────────────────────────────────────┼───────────────────────────────┤
-│ "There was a race condition with React and the      │ "Empty logs, dev-only. That    │
-│  fetch, it was really tricky, I tried a bunch of     │  'dev-only' was the key —      │
-│  things and eventually adding a ref fixed it."       │  StrictMode remounts. My guard │
-│                                                      │  and my cleanup-cancel were    │
-│                                                      │  fighting: I cancelled the     │
-│                                                      │  only fetch, then the guard    │
-│                                                      │  blocked the remount."         │
-├─────────────────────────────────────────────────────┼───────────────────────────────┤
-│ Why it's weak: "tried a bunch of things" is         │ Why it works: symptom → the    │
-│ thrashing. "Race condition" is a label, not a       │ discriminating fact → the      │
-│ mechanism. No discriminating fact, no causal chain. │ mechanism → the fix, and names │
-│ I can't tell if you understood it or got lucky.     │ the tradeoff you kept on        │
-│                                                      │ purpose. That's diagnosis.     │
-└─────────────────────────────────────────────────────┴───────────────────────────────┘
-
-### Follow-up decision tree — where this one usually goes
+> "Symptom: in development, the logs sidebar on the investigate page was empty. In production, it worked fine. I had a hook — `useInvestigation` — that opened an NDJSON stream, parsed events, and pushed them into state. In dev I'd open the page and see nothing; in prod the same page would render the trace as expected.
+>
+> "My first hypothesis was a caching issue — that maybe the dev server was serving a stale bundle. Spent an hour confirming that wasn't it. Second hypothesis was an env-var difference. Also not it.
+>
+> "Then I added a console log at every event the hook handled and watched the order in dev. Two fetches started. The cleanup ran between them. Both got cancelled. Neither delivered events.
+>
+> "That's when I named the actual mechanism. **React StrictMode runs effects twice in development.** I had two protections in the hook: a `useRef` latch — the **started-guard** — to prevent the once-per-mount fetch from running twice, and an AbortController in cleanup — the **cleanup-cancel** — to abort the in-flight fetch on unmount. The guard worked. The cancel also worked. Together they cancelled the only fetch I had.
+>
+> "The way to see it: the guard protects against a double fetch; the cancel protects against a leaked one. They are solving for different lifetimes. The guard says 'only one fetch per mount sequence.' The cancel says 'when this mount goes away, kill its fetch.' Under StrictMode, the dev sequence is mount → cleanup → remount. The first mount fires the fetch. The cleanup cancels it. The remount asks the guard 'should I fire?' and the guard says 'no, one's already started' — but the started one is dead. Empty logs.
+>
+> "Fix: **keep the guard, drop the cancel-on-cleanup.** `setState` after unmount is a safe no-op in React — the framework just ignores the update. The pending fetch completes; if the component is gone, the result is discarded; if the user back-navs (which the hook supports through `sessionStorage`), the result is there for them. That's what the live code at `lib/hooks/useInvestigation.ts` does today."
 
 ```
-"What was the hardest bug?"  → (the StrictMode double-fetch)
-   │
-   ├─ "Why not just turn off StrictMode?"
-   │     └─► "It's the Next default and it surfaced a real lifecycle bug —
-   │          the same remount happens with fast-refresh and remounts in prod
-   │          navigation. Disabling it hides the bug, doesn't fix the hook.
-   │          I'd rather the hook be correct under remounts."
-   │
-   ├─ "Don't you leak the request if the user really navigates away?"
-   │     └─► "The fetch completes and its setState calls become no-ops after
-   │          unmount — that's a wasted response, not a leak or a crash. For a
-   │          short investigation stream I traded a rare wasted fetch for a
-   │          stream that never aborts mid-flight. If these were expensive or
-   │          long-lived I'd add an AbortController gated on a *real* unmount,
-   │          not on the first StrictMode cleanup."
-   │
-   └─ "How did you know it was the hook and not the server?"
-         └─► "Production streamed fine and demo mode streamed fine — both hit
-              the same server route and the same parser. Only the dev client
-              path failed. That pointed at the hook, not the stream."
+  ┃ "The guard protects against a double fetch; the
+  ┃  cancel protects against a leaked one. Under
+  ┃  StrictMode they were solving for different
+  ┃  lifetimes — together they cancelled the only
+  ┃  request I had."
 ```
 
----
-
-## Prompt 2 — "What part are you proudest of?"
-
-┌──────────────────────────────────────────────────────────────────────────┐
-│ Surface: what are you proudest of building?                                 │
-│ Probe:   do you have taste? what do you think "good" looks like, and did    │
-│          you actually build the thing you're claiming?                      │
-└──────────────────────────────────────────────────────────────────────────┘
-
-The answer I lead with is the streamed reasoning trace as a first-class surface — the product idea that an analyst should *show its work*, not just hand you a verdict. Most "AI analyst" demos give you a spinner and then a paragraph. Mine streams the agent's actual reasoning steps and tool calls to the UI as they happen, on every page: the feed shows the monitoring scan narrating into a `StatusLog`, and each investigation page renders a `ReasoningTrace` that fills in step-by-step. Those components are real — `components/shared/StatusLog.tsx` and `components/investigation/ReasoningTrace.tsx` — and they're fed by the NDJSON `AgentEvent` contract in `lib/mcp/events.ts`, read off a `ReadableStream` in `useInvestigation.ts` with a plain reader loop, not `EventSource`.
-
-Why I'm proud of it: it's the difference between a tool that asks you to trust it and a tool that earns the trust. When the trace shows the exact EQL query the agent ran and the result it got back, a human analyst can audit the conclusion. That's a product stance, and I built the whole pipe for it — the event types, the server emitting them, the client reading them line by line.
-
-The thing I'd mention second, because it's the same instinct pointed at honesty rather than transparency, is the coverage gate in `lib/agents/categories.ts`. The system runs a fixed 10-category anomaly checklist, but a workspace can only support a category if it emits the events that category needs — `conversion_drop` needs `view_item`, `checkout`, and `purchase`. Before spending any LLM or EQL budget, `coverageReport()` gates the checklist against the live schema and `runnableCategories()` filters to only what the data supports. The categories the workspace can't support render as ghost tiles in `CoverageGrid.tsx` (the `unavailable` branch) instead of being faked. The system tells you "I can't check fraud here because there's no `payment_failure` event" rather than quietly producing a confident, empty answer.
-
-┃ "An analyst that shows its work. The trace isn't a loading animation — it's the audit trail, streamed."
-
-▸ The coverage gate is the same value as the trace, aimed inward: don't fake a category the data can't support; show a ghost tile and say why.
-
-┌─ STRONG vs WEAK — "proudest part" ─────────────────┬───────────────────────────────┐
-│ WEAK                                                │ STRONG                         │
-├─────────────────────────────────────────────────────┼───────────────────────────────┤
-│ "I'm proud of the whole thing, it's a polished      │ "The streamed reasoning trace. │
-│  multi-agent AI analyst with a really clean UI."     │  An analyst should show its    │
-│                                                      │  work — so I stream the agent's│
-│                                                      │  steps and exact EQL to the UI │
-│                                                      │  as they happen. It's the      │
-│                                                      │  audit trail, not a spinner."  │
-├─────────────────────────────────────────────────────┼───────────────────────────────┤
-│ Why it's weak: "the whole thing" has no taste in    │ Why it works: one thing, a     │
-│ it. "Polished" and "clean" are adjectives, not       │ reason it matters, and it maps │
-│ decisions. Nothing here is yours specifically.       │ to files you can open. It's a  │
-│                                                      │ point of view, defensible.     │
-└─────────────────────────────────────────────────────┴───────────────────────────────┘
-
-### Follow-up decision tree
+Trace of the bug, side-by-side:
 
 ```
-"What are you proudest of?"  → (the streamed reasoning trace)
-   │
-   ├─ "Why NDJSON over a ReadableStream, not Server-Sent Events?"
-   │     └─► "SSE is a heavier contract — event framing, auto-reconnect I
-   │          don't want mid-investigation, and it's GET-only. I'm already
-   │          doing a fetch; reading newline-delimited JSON off the body
-   │          reader is the whole client. One JSON.parse per line."
-   │
-   ├─ "Isn't showing the reasoning just exposing the model's chain-of-thought?"
-   │     └─► "It's the tool calls and their real results, not raw token-level
-   │          thinking. The value is auditability — you can see the exact EQL
-   │          query and the numbers it came back with, and check the verdict
-   │          against them."
-   │
-   └─ "What if the agent's reasoning is wrong but looks convincing?"
-         └─► "That's exactly why I show the EQL and the result, not just the
-              prose. A wrong conclusion with the query visible is falsifiable;
-              a wrong conclusion behind a spinner isn't."
+  WHAT I EXPECTED                         WHAT ACTUALLY HAPPENED (dev only)
+  ─────────────                           ──────────────────────────────────
+  mount     → fetch starts                mount     → fetch A starts
+                                          cleanup   → fetch A aborted
+                                          remount   → guard: "A started"
+                                                       → skip fetch B
+                                          result: empty logs forever
 ```
 
----
-
-## Prompt 3 — "What part are you least confident defending?"
-
-┌──────────────────────────────────────────────────────────────────────────┐
-│ Surface: where are you weakest on this project?                             │
-│ Probe:   do you know your own boundaries — or will you bluff and get caught?│
-└──────────────────────────────────────────────────────────────────────────┘
-
-This is the one to get exactly right, because the wrong instinct is to deflect to something safe ("uh, maybe the CSS could be cleaner"). That fails the probe — it tells the interviewer you either don't know where your real edge is or you won't admit it. The strong move is to walk yourself straight to the LOW band of the confidence map and plant the flag there, on purpose.
-
-My honest answer: the part I'm least confident defending at depth is the MCP wire protocol internals and the OAuth PKCE + DCR mechanics. I use the SDK's `OAuthClientProvider` — that's a *defaulted-to* decision, in the honest sense: I took the SDK's provider shape rather than implementing the flow myself, and I didn't deeply evaluate alternatives because there wasn't a real one worth the time for an alpha integration. What I *do* understand is the shape: PKCE means I send a code challenge and later prove I hold the verifier; DCR means the client registers itself dynamically instead of pre-provisioned credentials; tokens refresh. And I understand — and built — the production store I wrapped around it: my `BloomreachAuthProvider` keys persistence by app session id, and in production I back it with an AES-256-GCM encrypted `bi_auth` cookie, seeded once per request through `AsyncLocalStorage` so the SDK's many synchronous read/write calls don't trip Next's read-after-set cookie split. That wrapper is mine and I can defend every line. What I can't do is recite the byte-level token exchange or the exact PKCE challenge derivation from memory.
-
-That distinction — *defaulted-to the SDK for the protocol, deliberate for the wrapper* — is the senior move. I'm not claiming to have implemented OAuth; I'm claiming to know precisely where the SDK's responsibility ends and mine begins.
-
-There's a second answer here that's actually sharper, and I'd offer it second if they let me, because it's the answer a staff interviewer would respect most: **the part I'm least confident defending is the absence of a current eval harness — but the story underneath it is the strongest part of my answer.** There is no `eval/` directory in this repo today. Every prompt edit and every model swap ships with zero in-repo quality measurement, and the 221 unit tests prove plumbing, not output quality.
-
-What makes that not a confession but a *story* is what happened before the absence: I built the harness. The Phase 3 work added a four-pillar eval suite — detection precision/recall, diagnosis 5-criterion rubric, recommendation 3-criterion rubric, regression capture-and-score — running K=10 against three seeded anomalies in a SQLite substrate, with LLM-as-judge calibrated by 8/8 + 3/3 manual spot-check agreement. The flywheel surfaced real bugs (a BRL cents-vs-Reais unit-narration bug the judge caught at run 8; a binary calibration breakdown in 29/30 diagnosis runs; conclusion instability at 30% regression baseline). The substrate was the Olist MCP server. When I retired Olist (the in-process Synthetic adapter is a cleaner shape for the same job), the eval suite went with it — its scorer was hard-coded to Olist's seeded anomaly ids. So today: same gap as before I started Phase 3, but with the experience of having shipped the harness, used it to find bugs, and learned what the next version should look like (against the Synthetic substrate, decoupled from any one adapter's seed data).
-
-So if an L4 interviewer asks "how do you know any of the agent outputs are good," my honest answer is: "Today, by eyeballing the trace — same as before. But I built it once, surfaced three real bugs via the flywheel, retired it with the substrate, and the next version goes against the Synthetic adapter so it's not coupled to a removed seed." Owning the gap *with the receipt of having done the work* is a stronger L5 move than promising to build something. The retired files carry RETIRED banners in `.aipe/study-*` as a paper trail.
-
-One more honest gap, while we're here: a11y on the streaming surfaces. The reasoning trace, the coverage grid resolving live, the insight cards dropping in — none of those streamed regions is wrapped in `aria-live`, `role="status"`, or `role="log"`. A screen-reader user gets silence while a sighted user watches the agent think. That's not a regret; it's a discipline I didn't build into the project, and the fix is small (the regions exist; they just need the right ARIA roles). If they push, I'd own it the same way as the eval gap — name what's there, name what isn't, and name the cheap concrete fix.
-
-╔══════════════════════════════════════════════════════════════════════════════╗
-║ "I DON'T KNOW" RECOVERY BOX — pushed on OAuth/MCP protocol internals           ║
-║                                                                                ║
-║ The pushback: "Walk me through the PKCE handshake byte by byte." or            ║
-║               "How does the MCP transport frame a tool call on the wire?"      ║
-║                                                                                ║
-║ Say: "I'm going to be honest about my boundary here. I use the MCP SDK's       ║
-║      OAuthClientProvider — that's a defaulted-to decision, I took the SDK's    ║
-║      flow rather than implementing it. I know the shape: PKCE proves I hold    ║
-║      the verifier, DCR registers the client dynamically, tokens refresh. What  ║
-║      I built and can defend in full is the persistence around it — the         ║
-║      session-keyed provider and the AES-256-GCM cookie store with the          ║
-║      AsyncLocalStorage seeding. I can't recite the byte-level exchange."       ║
-║                                                                                ║
-║ What this signals: you know the boundary between SDK and your code, you can    ║
-║      name your decision mode honestly, and you don't bluff protocol internals  ║
-║      you didn't implement. That reads as senior, not junior.                   ║
-║                                                                                ║
-║ Do NOT say: "Yeah, so PKCE generates a random verifier and then…" and          ║
-║      improvise. If you get a detail wrong the whole answer collapses, and a    ║
-║      bluff caught here poisons everything else you've said.                    ║
-╚══════════════════════════════════════════════════════════════════════════════╝
-
-┃ "I defaulted to the SDK for the protocol and built the cookie store around it deliberately. I can defend the wrapper to the line; I won't bluff the byte-level handshake."
-
-The same boundary discipline applies if they pivot to distributed scale — multi-region, hot-path queues, load balancing. That's also LOW band for me, and I say so the same way: "I haven't run this at horizontal scale; my state is in-memory per Vercel instance on purpose for a single-upstream demo. I can reason about what I'd add — a shared store, a persistent investigation store — but I'd be theorizing past where I've shipped." Chapter 4 has the scale reasoning; here the move is just to mark the edge cleanly.
-
-### Follow-up decision tree
+## Hard bug 2 — the bare 500 from `/api/briefing` in production
 
 ```
-"What are you least confident defending?"  → (MCP/OAuth protocol internals)
-   │
-   ├─ "So you don't really understand OAuth?"
-   │     └─► "I understand the flow shape and the security properties — PKCE
-   │          stops an intercepted code from being redeemed without the
-   │          verifier. What I delegated is the wire-level implementation, to
-   │          the SDK. I drew the line where the SDK draws it."
-   │
-   ├─ "What would you have to learn to own the whole flow?"
-   │     └─► "The exact authorization-code grant exchange, the PKCE challenge
-   │          derivation (S256 hash of the verifier), and the DCR registration
-   │          request shape. I know what they do; I'd need to learn the exact
-   │          byte formats to implement them without the SDK."
-   │
-   └─ "Why did you build your own cookie store instead of using the SDK's?"
-         └─► "The SDK's default persistence assumes one process. On Vercel the
-              connect and callback requests land on different ephemeral
-              instances, so I needed a store both can read — the encrypted
-              cookie — and the AsyncLocalStorage seeding to dodge Next's
-              read-after-set split. That part was a real, deliberate problem."
+  ┌─────────────────────────────────────────────────┐
+  │ THEY ASK                                        │
+  │   "Tell me about a bug that only showed up in   │
+  │    production."                                 │
+  │                                                 │
+  │ WHAT THEY'RE TESTING                            │
+  │   Can you isolate prod-only bugs by contrast?   │
+  │   Do you reach for error messages, or do you    │
+  │   leak bare 500s into production?               │
+  └─────────────────────────────────────────────────┘
 ```
 
----
-
-## Prompt 4 — "Tell me about a time you debugged something subtle." (the coverage-reveal story)
-
-┌──────────────────────────────────────────────────────────────────────────┐
-│ Surface: tell me about a subtle bug, or how you debug in general.           │
-│ Probe:   can you measure instead of guess, and prove where a problem is     │
-│          before you fix it?                                                 │
-└──────────────────────────────────────────────────────────────────────────┘
-
-This is the story I reach for when the question is really "how do you debug?" rather than "what's the worst bug?" — because it's all measurement and no luck.
-
-The symptom: the anomaly-coverage grid "loaded all at once." The per-category checklist *logs* streamed into the status panel fine, one line at a time, but the grid tiles all resolved in a single pop at the end. That mismatch — logs incremental, grid not — was the clue. The naive read is "the server isn't streaming the grid data." So I measured: I checked when each line actually arrived off the stream. The server *was* streaming fine, line by line. The grid was the problem: it resolved from a single bulk `coverage` event emitted *after* the whole checklist, so no matter how the lines arrived, the tiles had nothing to render against until that one event landed.
-
-The fix was to emit coverage *per category* — a `coverage_item` event per tile — so each tile resolves in step with its own log line, and the grid renders pending "checking…" skeleton tiles for categories it hasn't heard about yet. You can see both in the code: the briefing route loops and emits a log line then its `coverage_item` together (`app/api/briefing/route.ts` around lines 113-118 in the demo replay, and 209-212 in the live path), and `CoverageGrid.tsx` renders the pending "checking…" tile when a category hasn't reported yet (the `loading` branch, around line 145).
-
-Now here's the honest nuance, and saying it unprompted is the senior signal in this whole story: the tile-by-tile reveal is genuinely incremental in the *demo* replay, because the replay paces events at `REPLAY_DELAY_MS = 140`. On a *live* run, the coverage gate is a pure synchronous function over the schema — it's instant — so the tiles still effectively resolve at once, and the genuinely incremental live work is the EQL trace that comes after, not the gate. I'm not going to claim the gate streams meaningfully in production when it doesn't. The `coverage_item` change made the *presentation* honest and the demo paced; it didn't make an instant computation slow.
+> "Symptom: in production, `/api/briefing` returned a bare 500 — no error body, just a 500 status. The browser's error panel showed 'something went wrong.' In demo mode (the cached snapshot) the same page returned 200. In local dev everything worked.
+>
+> "I had three things to vary: demo vs live, prod vs dev, my local Vercel vs deployed Vercel. The contrast that isolated it was **demo=200, live=500 in prod**. Demo skips the entire credentialed-setup path. So whatever was failing was in the setup that demo doesn't run. That narrowed it from 'the route is broken' to 'something in the auth bootstrap is throwing pre-stream.'
+>
+> "The actual cause: `aesKey()` in `lib/mcp/auth.ts` throws if `AUTH_SECRET` is unset. I had set it in dev (and in my local `.env.local`) but not in the production Vercel env. The throw happened during the synchronous setup *before* the route started streaming, which means it never reached the part of the handler that emits structured error JSON. Next.js's default behavior is to send a bare 500.
+>
+> "Two fixes. **Immediate**: set the env var in production. **Real**: wrap the setup in a try/catch that returns a structured error JSON with the actual cause — `AUTH_SECRET is required in production; set it in your Vercel project settings.` Now if anyone else hits this misconfiguration, they get the actual message in the UI's error panel, not a bare 500. The lesson is that pre-stream throws need their own error path; you can't rely on the stream's error envelope to catch them."
 
 ```
-WHAT I MEASURED → WHAT I CONCLUDED:
-
-  observation: log lines arrive one-by-one  ┐
-               grid tiles arrive all-at-once ┘ ── a MISMATCH, so where's the seam?
-       │
-       ▼
-  measure per-line arrival off the stream ──► server streams each line fine
-       │
-       ▼
-  so the seam is downstream of the server ──► the grid waited on ONE bulk
-       │                                       `coverage` event after the checklist
-       ▼
-  fix: emit `coverage_item` per category ──► tile resolves with its own line;
-       │                                     unreported tiles show "checking…"
-       ▼
-  honest nuance: incremental for real only in the DEMO (paced 140ms);
-                 live gate is instant — the live incremental work is the EQL trace
+  ┌─────────────────────────┬─────────────────────────┐
+  │ WEAK PROD BUG STORY     │ STRONG PROD BUG STORY   │
+  ├─────────────────────────┼─────────────────────────┤
+  │ "I had a bug where the  │ "Bare 500 in prod only. │
+  │ API was returning 500   │ Demo=200, live=500 in   │
+  │ in production. I fixed  │ prod isolated it to the │
+  │ it by setting the right │ credentialed-setup path │
+  │ environment variable."  │ that demo skips. Cause: │
+  │                         │ aesKey() throws on      │
+  │                         │ missing AUTH_SECRET     │
+  │                         │ before the route starts │
+  │                         │ streaming. Two fixes:   │
+  │                         │ set the env var, and    │
+  │                         │ wrap the setup in a     │
+  │                         │ try/catch returning a   │
+  │                         │ real error JSON."       │
+  ├─────────────────────────┼─────────────────────────┤
+  │ Why it's weak:          │ Why it works:           │
+  │ Skips the isolation     │ Shows the contrast      │
+  │ method. Reads like the  │ that isolated the bug.  │
+  │ root cause was obvious  │ Names the file and the  │
+  │ from the start.         │ specific failing call.  │
+  │                         │ Names the real fix      │
+  │                         │ (not just the env var). │
+  └─────────────────────────┴─────────────────────────┘
 ```
 
-┃ "I didn't guess where the stall was — I measured per-line arrival and proved the server streamed fine, so the grid was the issue."
+## Hard bug 3 — the "all at once" coverage reveal
 
-▸ The senior tell: I volunteered that the tile reveal is only truly paced in the demo. Owning the nuance beats overselling the fix.
+> "Symptom that bugged me: I'd added per-category coverage tracking to the monitoring agent — each category was supposed to light up in the UI grid as the agent confirmed it had been checked. But in practice the grid sat empty and then resolved all-at-once at the end. The streaming reasoning log next to it was streaming correctly, per category.
+>
+> "First hypothesis was that the server was buffering. Measured per-line arrival on the NDJSON stream — it wasn't. Each category's reasoning step was arriving at its real time. So the server was streaming fine; the issue was downstream.
+>
+> "Read the UI code carefully. The grid was bound to a single bulk `coverage` event that was emitted only once, at the end of the run, with the full set of confirmed categories. The per-category statuses I wanted weren't being emitted at all — only the final aggregate.
+>
+> "Fix: emit a `coverage_item` event per category as the agent confirmed it, in addition to (or instead of) the final aggregate. UI binds to those. Now in demo the categories reveal tile-by-tile, paced. In live the gate is still effectively instant because the categories confirm fast — but the wiring is right, so when the agent slows down (under a rate-limit storm, for example), the user sees real per-tile progress instead of a frozen grid.
+>
+> "Lesson: 'the stream is broken' is the wrong first hypothesis when the stream is *also* working for a different surface. The bug is almost always at the event-shape boundary — what the producer emits vs what the consumer binds to."
 
-╔══════════════════════════════════════════════════════════════════════════════╗
-║ "I DON'T KNOW" RECOVERY BOX — "so it doesn't really stream live?"              ║
-║                                                                                ║
-║ The pushback: "You just said the gate is instant live — so the streaming      ║
-║               grid is basically a demo effect?"                                ║
-║                                                                                ║
-║ Say: "For the gate, yes — it's a synchronous schema check, so live it          ║
-║      resolves at once and I'm not going to pretend otherwise. The streaming    ║
-║      that matters live is the EQL trace, where each query genuinely takes      ║
-║      time. The `coverage_item` change made the presentation honest — a tile    ║
-║      maps to its own log line — and made the demo paced. I separated those     ║
-║      two claims on purpose."                                                   ║
-║                                                                                ║
-║ What this signals: you distinguish real behavior from presentation, and you    ║
-║      don't let a clean demo tempt you into overstating what the system does.   ║
-║                                                                                ║
-║ Do NOT say: "No no, it fully streams live too" — it doesn't, and the gate is   ║
-║      a pure function they can read in categories.ts. Getting caught            ║
-║      overstating here costs you the whole "shows its work" credibility.        ║
-╚══════════════════════════════════════════════════════════════════════════════╝
+## The proudest part — what to lead with
 
----
+```
+  ┌─────────────────────────────────────────────────┐
+  │ THEY ASK                                        │
+  │   "What's the part of this project you're most  │
+  │    proud of?"                                   │
+  │                                                 │
+  │ WHAT THEY'RE TESTING                            │
+  │   Do you know what's actually load-bearing in   │
+  │   your own work? Will you point at the          │
+  │   shiniest feature or at the discipline that    │
+  │   made the shiny feature possible?              │
+  └─────────────────────────────────────────────────┘
+```
 
-## What you'd change
+> "Not the agents — the **adapter boundary**. `lib/agents/aptkit-adapters.ts`. Three Blooming-owned classes, about 200 lines, between my code and `@aptkit/core@0.3.0`. The reason I'm proud of it isn't the size; it's that it captures a discipline I revisited.
+>
+> "I started by owning the agent loop myself — `runAgentLoop` is still at `lib/agents/base-legacy.ts` lines 86 to 176. That was deliberate, because I needed two things off-the-shelf libraries don't always give you: a hard `maxToolCalls` budget against a rate-limited upstream, and a forced final synthesis turn so the loop terminates with a structured answer instead of a half-finished tool call. When `@aptkit/core` reached `0.3.0` with a clean primitive surface, I read the source, confirmed both disciplines survived in the new shape, and migrated. The legacy is preserved as my rollback receipt.
+>
+> "What makes this the proudest part: it's the single most consequential decision-revisit in the project. *Library owns the loop. I own the boundary.* Three small classes, 200 lines, and a paragraph in the README that says exactly what each adapter is responsible for. That's the kind of decision-shape I'd want to defend at any senior level."
 
-If I redid the hardest-bug work, the change isn't to the fix — the started-guard plus no-cancel-on-cleanup is correct and I'd keep it. It's that I'd reach for the differential sooner. With the StrictMode bug I spent time suspecting the server and the parser before the "dev-only, prod-fine" fact made me look at the hook; with the bare-500 I got to the demo-vs-live contrast fast and it paid off immediately. The lesson I carry forward is to start every "works here, fails there" bug by writing down the one dimension the two environments differ in, before touching code. On the coverage-reveal story I'd change less — measuring before fixing is exactly what I'd do again — but I'd add a small note in the code that the live gate is instant so a future reader doesn't try to "fix" the grid into streaming a synchronous computation.
+```
+  ┃ "I own the boundary; AptKit owns the loop. Three
+  ┃  small adapter classes, about 200 lines, and the
+  ┃  legacy loop is preserved for the day I need to
+  ┃  peel back to it."
+```
 
----
+## The least confident part — the eval flywheel arc
 
-## One-page summary — Chapter 6
+This is the L5 closer. Get this answer right and you've shown the interviewer something most candidates can't: that you can own a gap *with the receipts of having done the work*. The gap is real; the receipts make it the strongest possible version of owning it.
 
-**Core claim:** I can walk a real bug from symptom to insight to fix, name what I'm proudest of with a point of view behind it, and mark my own weakest spot cleanly — the LOW band of the confidence map — without bluffing.
+```
+  ┌─────────────────────────────────────────────────┐
+  │ THEY ASK                                        │
+  │   "What's the part of this project you're       │
+  │    least confident defending?"                  │
+  │                                                 │
+  │ WHAT THEY'RE TESTING                            │
+  │   This is the highest-signal question in any    │
+  │   senior interview. Honest answer with receipts │
+  │   = L5. Honest answer without receipts = L4.    │
+  │   Dishonest answer = no offer.                  │
+  └─────────────────────────────────────────────────┘
+```
 
-| Prompt | One-line answer |
-|---|---|
-| Hardest bug? | StrictMode double-fetch in `useInvestigation.ts`: my started-guard and cleanup-cancel fought — cancelled the only fetch, then blocked the remount. Fix: guard + no-cancel-on-cleanup. |
-| Trickier in prod? | Briefing bare-500: demo=200 vs live=500 isolated it to the credentialed setup; `aesKey()` threw on unset `AUTH_SECRET`, unguarded. Wrapped setup, returned the real message. |
-| Proudest part? | The streamed reasoning trace — an analyst that shows its work — backed by the coverage gate that ghosts categories the data can't support instead of faking them. |
-| Least confident? | Two honest answers: (1) **the current eval gap** — no `eval/` in repo today; 221 tests prove plumbing, not output quality. But the receipt: I shipped the 4-pillar eval suite in Phase 3, surfaced 3 real bugs via the flywheel (BRL cents-vs-Reais, calibration binary, conclusion instability), retired the harness when the Olist substrate was retired (it was hard-coded to those seeded anomaly ids); next version goes against the Synthetic adapter. (2) MCP/OAuth protocol internals + AptKit runtime internals — defaulted-to the SDK / library; I defend the wrappers and adapters, not the byte-level handshake or the loop internals. |
-| Subtle debug? | Coverage "loaded all at once": measured per-line arrival, proved the server streamed fine, the grid waited on one bulk event. Fix: `coverage_item` per tile — honestly only paced in the demo. |
+The strong answer, in your voice, told as an arc:
+
+> "Eval coverage today. I don't have a live eval suite running against the current code path. Let me tell you why that's the honest answer, and why I'd give it the same way at L5 as at L4 — because the receipts are different.
+>
+> "Earlier in the project I built a **Phase 3, four-pillar eval suite**. The pillars were detection (precision and recall on anomaly detection), diagnosis (a five-criterion rubric with a pass threshold of 7), recommendation (a three-criterion rubric with a pass threshold of 4), and regression (a capture-and-score pattern combining structural diffs with an LLM similarity judge). The agent under test was Sonnet 4.6; the judge was also Sonnet 4.6. K=10 runs per anomaly across 3 seeded anomalies in an Olist SQLite substrate.
+>
+> "I calibrated the LLM-as-judge with manual spot checks — 8 of 8 and 3 of 3 agreement on independent samples — so I knew the judge wasn't rubber-stamping its own outputs.
+>
+> "The suite found **three real bugs** the unit tests would never have caught. First: a **BRL cents-vs-Reais unit-narration bug**. The recommendation judge flagged it at run 8 when the agent claimed implausible R$131,965 average order values — about $26,000 per order, obviously wrong. Cents were stored in the data; the agent was narrating them as Reais. Second: a **binary calibration breakdown**. The diagnosis confidence field was zero in 29 of 30 runs — always 'high' because the prompt always said 'three hypotheses tested,' never a real calibration. Third: **conclusion stability**. The 30% regression baseline meant the same input produced semantically-equivalent output only 30% of the time across runs.
+>
+> "Then I retired the eval suite — PR #8, commit 62c24d7, in June — when I retired the Olist substrate. The scorer was hard-coded to Olist's seeded anomaly IDs; it wouldn't run against the synthetic adapter without rewrites.
+>
+> "So here's where I am right now: **same eval gap as before I built Phase 3, but with three receipts I didn't have then.** I built it end-to-end. I used it to find three real bugs that shipped fixes. I know exactly what version 2 looks like — the same four-pillar pattern, rewired against the synthetic adapter, with the judge calibrated against fresh manual samples.
+>
+> "If you ask me 'why don't you have an eval today,' the answer isn't 'I haven't gotten to it.' The answer is 'I had one, I used it, I retired it with its substrate, and I haven't rebuilt it against the new substrate yet.' That's the gap I'd close next, and I can walk you through the rebuild design if you want."
+
+```
+  ┃ "Same eval gap as before Phase 3, but with three
+  ┃  receipts I didn't have then: I've built it
+  ┃  end-to-end, I've used it to find three real
+  ┃  bugs, and I know what version two looks like."
+```
+
+The decision tree this answer opens up:
+
+```
+  You give the "eval gap with receipts" answer.
+        │
+        ▼
+        ├─► "Walk me through one of the bugs the eval caught."
+        │     Lead with the BRL cents-vs-Reais bug. It's the
+        │     most concrete and the easiest to picture. "The
+        │     judge flagged it at run 8 when the agent claimed
+        │     R$131,965 average order values — about $26K per
+        │     order. Cents stored, narrated as Reais."
+        │
+        ├─► "What does v2 look like?"
+        │     Same four pillars (detection / diagnosis /
+        │     recommendation / regression). Rewired against
+        │     the synthetic adapter (deterministic, in-
+        │     process, no network — perfect for evals). The
+        │     judge needs fresh manual calibration on the
+        │     new substrate. The scorer hard-coded to Olist
+        │     IDs gets replaced with one parameterized on
+        │     synthetic-adapter scenario IDs.
+        │
+        ├─► "Why retire the eval with the substrate?"
+        │     The scorer was substrate-coupled — it knew
+        │     about specific seeded anomalies in Olist by
+        │     ID. Decoupling it from the substrate is a
+        │     non-trivial rewrite. I made the call to retire
+        │     it cleanly rather than carry it half-working.
+        │     The right shape of v2 is parameterized on
+        │     substrate, not hand-coded against one.
+        │
+        └─► "How did you calibrate the LLM judge?"
+              Manual spot-check, 8/8 and 3/3 agreement on
+              independent samples. The point of the
+              calibration was to prove the judge wasn't
+              rubber-stamping its own outputs — same model,
+              same family. The agreement on independent
+              samples is the signal.
+```
+
+## When you don't know
+
+The least-confident answer above leans into the gap. But there's another territory in this chapter where the right move is the **When You Don't Know** box: **the internals of `@aptkit/core`'s loop**. You built three adapters against its surface; you didn't write the loop.
+
+```
+  ╔═══════════════════════════════════════════════╗
+  ║ WHEN YOU DON'T KNOW                           ║
+  ║                                               ║
+  ║   They ask: "Walk me through AptKit's loop    ║
+  ║   line by line. How does it decide when to    ║
+  ║   stop?"                                      ║
+  ║                                               ║
+  ║   You haven't read every line of the library. ║
+  ║   You read enough to confirm your two         ║
+  ║   disciplines survived.                       ║
+  ║                                               ║
+  ║   Say:                                        ║
+  ║   "I haven't memorized AptKit's loop line by  ║
+  ║    line. What I can tell you is the two       ║
+  ║    properties I confirmed before I migrated   ║
+  ║    onto it: a hard tool-call budget, and a    ║
+  ║    forced final-synthesis turn. The library   ║
+  ║    expresses both through its configuration   ║
+  ║    surface — I tested both worked, and the    ║
+  ║    legacy hand-rolled loop is preserved at    ║
+  ║    base-legacy.ts as my fallback if I ever    ║
+  ║    need to peel back. Want me to walk through ║
+  ║    how the forced-synthesis pattern works in  ║
+  ║    my own code first?"                        ║
+  ║                                               ║
+  ║   What this signals: you know what you owned, ║
+  ║   you know what you delegated, and you can    ║
+  ║   re-route to a thread you can walk in depth. ║
+  ║                                               ║
+  ║   Do NOT say:                                 ║
+  ║   "It uses a standard agent loop pattern      ║
+  ║    where it calls the model and then executes ║
+  ║    tools and then..." Vague paraphrase of a   ║
+  ║    library you haven't read carefully will    ║
+  ║    collapse on the first detail probe.        ║
+  ╚═══════════════════════════════════════════════╝
+```
+
+## What you'd change about the hard parts
+
+The one thing you'd reconsider in this chapter is **rebuilding the eval suite against the synthetic adapter before the next big agent change**. The substrate is right (deterministic, in-process, perfect for evals). The pattern is right (four pillars, calibrated LLM judge). What's missing is the wiring time. The trigger is any change to a prompt or to the agent loop discipline — at that point I want the regression baseline back, with v2's parameterized scorer.
+
+## One-page summary
+
+**Core claim:** The hardest-bug, proudest-part, and least-confident answers are the highest-signal in any senior interview. Tell them with the wrong turns included, the file paths cited, and the receipts of having done the work.
+
+**The three hard bugs in one line each:**
+- **StrictMode double-fetch** → guard + cancel were solving for different lifetimes; fix is keep the guard, drop the cancel.
+- **Bare 500 from `/api/briefing`** → pre-stream `aesKey()` throw on missing `AUTH_SECRET`; fix is try/catch returning real error JSON.
+- **All-at-once coverage reveal** → server streamed fine; UI was bound to a bulk event; fix is emit `coverage_item` per category.
+
+**Proudest part:** the adapter boundary at `lib/agents/aptkit-adapters.ts` — library owns the loop, I own the boundary, legacy preserved.
+
+**Least confident part:** eval coverage today — owned with the receipts of the Phase 3 build-and-retire arc, three real bugs caught, and a clear v2 plan against the synthetic adapter.
 
 **Pull quotes:**
-- "The guard protects against a double fetch; the cancel protects against a leaked one — they were solving for different lifetimes."
-- "An analyst that shows its work. The trace isn't a loading animation — it's the audit trail, streamed."
-- "I defaulted to the SDK for the protocol and built the cookie store around it deliberately. I won't bluff the byte-level handshake."
-- "I didn't guess where the stall was — I measured per-line arrival and proved the server streamed fine."
+```
+  ┃ "The guard protects against a double fetch; the
+  ┃  cancel protects against a leaked one. Under
+  ┃  StrictMode they were solving for different
+  ┃  lifetimes — together they cancelled the only
+  ┃  request I had."
 
-**The "what you'd change" sentence:** I'd write down the single dimension two environments differ in before touching code, and leave a note that the live coverage gate is instant so nobody tries to make a synchronous computation stream.
+  ┃ "Same eval gap as before Phase 3, but with three
+  ┃  receipts I didn't have then."
 
----
+  ┃ "I own the boundary; AptKit owns the loop."
+```
+
+**What you'd change:** rebuild the eval suite against the synthetic adapter — the substrate and the pattern are right, the wiring is the work. Trigger is any change to a prompt or to the loop discipline.

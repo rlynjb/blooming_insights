@@ -1,116 +1,93 @@
-# blooming insights — interview defense book
+# Overview — how to use this book
 
-This is your book for defending **blooming insights** as a whole project in a senior interview. Not a reference grid you look things up in — a book you read front to back once, then re-skim the night before. Eight chapters, in order, each one a continuous narrative that walks the interview questions in its territory and ends with a one-page summary you can review in two minutes.
+This book has one job: get you ready to defend **blooming insights** in a senior-engineering interview without freezing, without rambling, and without overclaiming. It is paired with the comprehension guides under `.aipe/study-system-design/` and `.aipe/study-ai-engineering/`. Those teach you the patterns deeply, one at a time. This book teaches you to *speak* them — at the project level, under pressure, with an interviewer who will interrupt you.
 
-The reader is you: a frontend engineer (7+ years, Vue/React, enterprise customers) pivoting into AI engineering, who built a multi-agent AI analyst. The book is written in your voice — every "strong answer" is first-person, present tense, and meant to be read aloud until it sounds like you. The coach writing it has sat on hiring committees and watched candidates collapse under follow-ups; the whole book is built around *not* collapsing.
+You used AI heavily to build this project. So did everyone else interviewing in 2026. The interview doesn't reward pretending otherwise; it rewards owning what you shipped. Every chapter in this book is built on that posture. Chapter 8 is dedicated to the meta-question, but the AI-honest framing runs through the whole book.
 
-## How to use this book
+## The system at a glance — the recurring map
 
-```
-  FIRST READ          REVIEW              NIGHT BEFORE
-  ──────────          ──────              ────────────
-  chapters in order   skim each chapter's  read ONLY the
-  one per sitting     visual treatments —  one-page summary
-  front to back       diagrams, callouts,  at the end of each
-                      pull quotes, the     chapter. Nothing else.
-                      "I don't know" boxes
-        │                   │                    │
-        ▼                   ▼                    ▼
-  build the whole     refresh the shape    walk in with the
-  defense             without re-reading   pull quotes loaded
-```
-
-A reader who skims only the six recurring visual treatments — the chapter-opening diagrams, the "what they're really asking" callouts, the strong-vs-weak side-by-sides, the double-line "I don't know" boxes, the follow-up decision trees, and the pull quotes — gets roughly 70% of the book. The prose is there for the first deep read.
-
-## The system at a glance
-
-Every chapter leans on this picture; when you lose the thread mid-interview, this is what you re-anchor to.
+Every chapter returns to this picture. Burn it into memory; it's the diagram you'll redraw on every whiteboard.
 
 ```
-┌─ UI (Next.js 16 App Router · React 19) ───────────────────────────────────────┐
-│  feed (CoverageGrid + InsightCard + StatusLog) — 461 LOC across page.tsx +     │
-│  useBriefingStream + useReconnectPolicy + useDemoCapture (3 extracted hooks)   │
-│  investigate/[id] (diagnose)   …/recommend (decide)                            │
-│       │ fetch /api/briefing       │ fetch /api/agent?step=…   (readNdjson)      │
-└───────│───────────────────────────│────────────────────────────────────────────┘
-        ▼  NDJSON over a ReadableStream — lib/streaming/ndjson.ts:readNdjson,
-           shared by all 4 streaming surfaces
-┌─ Route handlers (Vercel · maxDuration = 300) ─────────────────────────────────┐
-│  /api/briefing: bootstrap schema → coverage gate → monitoring scan → insights  │
-│  /api/agent (step=diagnose|recommend): cache-replay (demo) OR live             │
-│       ▼ Active spine: @aptkit/core's runtime (AnomalyMonitoringAgent +          │
-│         DiagnosticInvestigationAgent + RecommendationAgent + QueryAgent +       │
-│         parseIntent), glued in via 3 Blooming-owned adapter classes in          │
-│         lib/agents/aptkit-adapters.ts (Anthropic SDK → ModelProvider;           │
-│         DataSource → ToolRegistry; AptKit traces → Blooming NDJSON hooks).      │
-│         The Blooming-authored runAgentLoop is preserved at base-legacy.ts.      │
-│       ▼ DataSource seam (lib/data-source/types.ts) — abstract surface, 3        │
-│         adapters today: BloomreachDataSource (HTTPS+OAuth, 60s cache,           │
-│         ~1.1s spacing, bounded backoff, no-cache-on-error) + SyntheticData-     │
-│         Source (in-process Blooming-owned synthetic ecommerce) + interface      │
-│       OAuthClientProvider (PKCE + DCR) · prod auth = AES-256-GCM `bi_auth`      │
-│       cookie (Bloomreach side only; Synthetic needs none)                       │
-└──── state: in-memory maps keyed by session (NO DB) + committed demo-*.json ─── Bloomreach MCP · Anthropic ─┘
+  blooming insights — system at a glance
+
+  ┌─ UI layer (Next.js 16 App Router + React 19) ────────────────────────┐
+  │  app/page.tsx (feed)         app/investigate/[id]/{,recommend}/      │
+  │   ▲          ▲                                                       │
+  │   │ NDJSON   │ NDJSON                                                │
+  └───┼──────────┼───────────────────────────────────────────────────────┘
+      │          │
+  ┌─ Service layer (Next.js route handlers, maxDuration=300s) ────────────┐
+  │  /api/briefing       /api/agent (step=diagnose|recommend|null)        │
+  │           │                              │                            │
+  │           ▼                              ▼                            │
+  │  agents: monitoring · diagnostic · recommendation · query · intent    │
+  │  thin wrappers over @aptkit/core@0.3.0                                │
+  │           │                              │                            │
+  │           └──────────► lib/agents/aptkit-adapters.ts ◄────────────────┤
+  │                       (3 Blooming-owned adapter classes, 206 LOC)     │
+  │                       Anthropic · ToolRegistry · TraceSink            │
+  │                              │                                        │
+  └──────────────────────────────┼────────────────────────────────────────┘
+                                 │  (the seam — adapters either side)
+  ┌─ Data layer ─────────────────▼────────────────────────────────────────┐
+  │  lib/data-source/types.ts  ── DataSource interface                    │
+  │     ├─ BloomreachDataSource  (HTTPS + OAuth PKCE + ~1.1s spacing)     │
+  │     └─ SyntheticDataSource   (516 LOC in-process deterministic)       │
+  └───────────────────────────────────────────────────────────────────────┘
+                                 │
+  ┌─ Provider layer ─────────────▼────────────────────────────────────────┐
+  │  Anthropic API (Sonnet 4.6 + Haiku for intent)                        │
+  │  Bloomreach loomi connect MCP (alpha)                                 │
+  └───────────────────────────────────────────────────────────────────────┘
+
+  bi:mode  = 'demo' | 'live-bloomreach' | 'live-synthetic'  (default demo)
 ```
 
-The spine: **UI → route → AptKit runtime (via 3 Blooming adapters) → DataSource seam → 3 adapters → providers (Bloomreach HTTPS OR in-process synthetic)**, no database in the middle. Chapter 2 walks it band by band.
+That's the whole system. Three flips down the stack worth tattooing on the inside of your eyelids:
 
-## The eight chapters
+- **The agent boundary.** AptKit owns the loop; you own the boundary. Three small adapter classes (~200 LOC). Legacy hand-rolled `runAgentLoop` preserved at `lib/agents/base-legacy.ts:86-176`.
+- **The data-source seam.** Two adapters today. The seam has survived two adapter swaps without changing the caller surface.
+- **The streaming kernel.** One `readNdjson` at `lib/streaming/ndjson.ts` (64 lines) consumed by four streaming surfaces.
 
-```
-01 ── THE PITCH            the project in 10s / 30s / 90s; compression discipline
-02 ── THE ARCHITECTURE     the whiteboard walk + where they interrupt
-03 ── THE CHOICES          5 load-bearing decisions, each with criterion + cost
-04 ── THE SCALE STORY      what breaks first at 10x users / 100x data / 10x latency
-05 ── THE FAILURE STORY    rate limits, token revocation, malformed LLM output, …
-06 ── THE HARD PARTS       hardest bug, proudest part, weakest spot
-07 ── THE COUNTERFACTUALS  the 4 decisions you'd reconsider, with triggers
-08 ── THE AI QUESTION      "did you use AI?" — own the boundary, three modes
-```
-
-**01 — The pitch.** Your project in three lengths. The ten-second version is the hardest. Ends the 90-second version on a tradeoff you'd own — the single highest-signal pitch move. *Covers: "what did you build?", "tell me more", "walk me through a project."*
-
-**02 — The architecture.** The system as a labeled diagram you can redraw from memory, the request flow walked top-down, and a map of where interviewers interrupt with the one-liner for each. *Covers: "walk me through the system", "how does the loop stop?", "why four agents?".*
-
-**03 — The choices.** One defense per load-bearing choice — Next.js, the own-agent-loop-over-a-framework call, the sonnet/haiku model split, NDJSON-over-SSE, and no-database. Each names a criterion and a cost. *Covers: "why X not Y?" for every real decision.*
-
-**04 — The scale story.** Three scenarios — 10x users, 100x data, 10x latency-sensitive — with the first bottleneck, the second, and what you'd add when. Honest about the horizontal-scale gap you haven't built. *Covers: "what breaks first at scale?".*
-
-**05 — The failure story.** The real failure surfaces — MCP rate limits, mid-session token revocation, auth-before-stream, the pre-stream setup throw, malformed LLM output, empty data windows — and what the system does in each. *Covers: "what happens when things go wrong?".*
-
-**06 — The hard parts.** The StrictMode double-fetch bug, the production-only 500, the proudest surface (reasoning streamed live), and the part you defend least confidently (MCP/OAuth internals). Answering honestly without collapsing. *Covers: "hardest bug?", "proudest of?", "least confident defending?".*
-
-**07 — The counterfactuals.** The four most reconsiderable decisions — no-DB, demo-replay-as-reliability, fixed spacing, exact-name coverage deps — each with the AI-decision mode and the trigger that would flip it. Plus what you would *not* change, to avoid manufactured regret. *Covers: "what would you do differently?".*
-
-**08 — The AI question.** "Did you use AI?" Yes — and the answer is locating the boundary between deliberate, evaluated-and-accepted, and defaulted-to decisions. The three real bugs you caught the machine on. *Covers: "did you use AI?", "explain this line by line", "what did AI get wrong?".*
-
-## How this connects to the rest of the study system
-
-This book is the **wide opener** — it prepares you for the project-level questions that open an interview. When the interviewer stops asking about the project and drills into *one pattern* — the DataSource seam, the TTL cache, the schema-gated coverage, the AptKit primitive boundary — that's the **deep dive**, and those defenses live in the per-concept Interview-defense blocks inside the study guides:
+## The chapters
 
 ```
-  .aipe/rehearse-interview-defense/   ← THIS book — the whole project, wide
-  .aipe/interview-notes.md             ← one-page AI-interview cheat sheet
-                                          (top 10 questions, gaps to pre-empt)
-  .aipe/study-system-design/           ← request flow, caching, streaming,
-                                          coverage gate, DataSource seam (the
-                                          load-bearing system-design lesson —
-                                          3 adapters behind one interface)
-  .aipe/study-agent-architecture/      ← ReAct, tool-use, the AptKit runtime
-                                          layer, multi-agent topology
-  .aipe/study-ai-engineering/          ← LLM foundations, prompts, cost,
-                                          rate limiting, prompt injection
-  .aipe/study-software-design/         ← 05-aptkit-primitive-adapter-boundary
-                                          (the AOSD case study for "library +
-                                           adapter pattern at the agent /
-                                           library boundary")
+  01 — The pitch                10s / 30s / 90s. Compression discipline.
+  02 — The architecture         The whiteboard walk. End-to-end request flow.
+  03 — The choices              Five load-bearing decisions and their costs.
+  04 — The scale story          What breaks at 10×, 100×, 10× latency.
+  05 — The failure story        Token revoke, rate-limit, partial writes.
+  06 — The hard parts           Three real bugs. The proudest part. Least confident.
+  07 — The counterfactuals      Four decisions to reconsider; four to keep.
+  08 — The AI question          Decisions mine, AI typed faster. Owned.
 ```
 
-Use them together. This book gets you through the first fifteen minutes without rambling; the cheat sheet is the night-before review; the concept files get you through the follow-up that goes three layers down on a single decision. The reader who studies only this book sounds fluent and folds on the first deep follow-up; the reader who studies only the concept files freezes on "walk me through your project." Pair them.
+## How to read it
 
 ```
-┃ This book is the wide opener. The concept files are the
-┃ deep dives. An interview needs both.
+  First read              Review (1 hour)         Night before
+  ────────────            ─────────────────       ──────────────
+  one chapter             skim chapter            one-page summary
+  per sitting             openings + pull         at the end of
+  front to back           quotes + boxes          each chapter
+                          re-draw the map         re-draw the map
 ```
 
----
+The visual treatments do most of the work. If you only have an hour, skim the chapter-opening diagrams, the **WHAT THEY'RE REALLY ASKING** callouts, the strong-vs-weak side-by-sides, the double-bordered **WHEN YOU DON'T KNOW** boxes, and the pull quotes. That gets you ~70% of the book. The prose is for the deeper passes.
+
+## How this book composes with the rest
+
+The concept files under `.aipe/study-system-design/` and `.aipe/study-ai-engineering/` each carry their own Interview defense block — that's where you go for the **one-decision deep dive** (the OAuth boundary, the streaming kernel, the multi-agent orchestration). This book is for the **wide opener** — the moment the interviewer says "walk me through what you built." The concept files are the depth; this book is the breadth.
+
+Use both. The concept files prepare you for the drill-down. This book prepares you for the opener — and for the seven-to-ten chapter-shaped territories that follow it.
+
+## One pull quote to anchor the whole book
+
+```
+  ┃ "I own the boundary; AptKit owns the loop. Three small
+  ┃  adapter classes, around 200 lines of code, and the legacy
+  ┃  loop is preserved for the day I need to peel back to it."
+```
+
+Read that twice. If you can defend why every word is in it — why "boundary," why "loop," why "preserved," why "the day I need" — you can defend most of this project.

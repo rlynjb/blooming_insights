@@ -1,343 +1,275 @@
-# Chapter 7 — The Counterfactuals
+# Chapter 7 — The counterfactuals
 
-The strongest thing you can do in an interview is volunteer what you'd reconsider before anyone asks. It flips the dynamic: instead of the interviewer hunting for the weak decision and you defending it, you walk them to it yourself and show you already know the tradeoff. That reads as someone who's made a lot of decisions and lived with them — which is exactly what they're checking for.
+The senior-engineer move is to **volunteer what you'd reconsider before being asked**. Junior candidates wait for the interviewer to find a weakness and then defend it. Senior candidates name the reconsideration themselves, with a named trigger that would change the decision, and the named tradeoff that's being paid in the meantime.
 
-But there's a trap on the other side, and it's just as fatal: manufacturing regret for decisions that were obviously right. If you "reconsider" using TypeScript or streaming over a fetch reader, you signal that you can't tell a real tradeoff from a settled one. So this chapter does two jobs. It names the three or four decisions in blooming insights that are genuinely reconsiderable and gives you the strong counterfactual for each — and it names, briefly, the calls you would *not* change, because knowing which is which is the whole skill.
+The mirror-image trap is the *fake regret* — fabricating a counterfactual for a decision that was clearly right, because you think the interviewer wants to hear it. They don't. A fake counterfactual is louder than a missing one. This chapter teaches you both halves: **the four decisions you'd reconsider** (each with a real trigger), and **the four decisions you'd keep** (each with the receipt that proves it earned its place).
 
-```
-┌ COUNTERFACTUALS MATRIX — what I decided vs. what I'd change, and why ────────────┐
-│                                                                                  │
-│ DECISION                  MODE              WOULD CHANGE WHEN…                    │
-│ ───────────────────────── ───────────────── ──────────────────────────────────  │
-│ in-memory state, no DB    deliberate        multi-INSTANCE (the concurrent-      │
-│   (Map<sessionId,…> per   (for the context)   user wipe is RESOLVED via session- │
-│    Vercel inst.)                                keying — what remains is cross-  │
-│                                                 instance: shared store (Redis)   │
-│                                                 + persistent investigation store │
-│                                                                                  │
-│ demo-replay = reliability evaluated-and-     upstream becomes stable             │
-│   path (committed JSON)   accepted            → drop replay as the demo path,    │
-│   for an alpha upstream                         keep it only as a fixture        │
-│                                                                                  │
-│ fixed ~1.1s call spacing  evaluated-and-     I have headroom + real traffic      │
-│   (Bloomreach side only)  accepted            → token-bucket / adaptive limiter  │
-│                                                 that uses the window better      │
-│                                                                                  │
-│ coverage deps = EXACT     deliberate (no     workspaces name events differently  │
-│   event-name match        alias layer yet)    → normalization / alias layer in   │
-│   (Set.has, no aliasing)                        schemaCapabilities                │
-│                                                                                  │
-│ ════════ WOULD NOT CHANGE (don't manufacture regret here) ════════              │
-│ NDJSON over fetch reader (shared readNdjson kernel) · TypeScript                 │
-│ DataSource seam + adapter pattern (survived 2 adapter swaps without              │
-│   changing caller surface — receipt, not future-proofing)                        │
-│ AptKit primitive boundary (3 small adapter classes in aptkit-adapters.ts;        │
-│   library owns the loop, I own the boundary, legacy loop preserved)              │
-│ — settled calls; "reconsidering" these signals I can't tell a tradeoff from      │
-│   a non-issue.                                                                    │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
+## The counterfactuals matrix — the chapter on one page
 
-The right-hand column is the discipline: every reconsiderable decision has a *trigger condition* — the thing that would have to change for the counterfactual to win. A decision without a trigger isn't a tradeoff, it's an opinion. Let's walk them.
-
----
-
-## Decision 1 — In-memory state, no database
-
-┌──────────────────────────────────────────────────────────────────────────┐
-│ Surface: where do you store state? Why no database?                         │
-│ Probe:   did you choose no-DB on purpose and know its cost — or did you      │
-│          just skip persistence because it was a hackathon?                  │
-└──────────────────────────────────────────────────────────────────────────┘
-
-This is a *deliberate* decision, and I say that word, because the honest framing is "right for the context, with a cost I can name." The context: a single upstream (one Bloomreach workspace), a demo, no multi-user requirement. State lives in in-memory maps — `lib/state/investigations.ts` keeps a `new Map<string, AgentEvent[]>` for cached investigations, and the auth/insights state is the same shape. There's no Postgres, no Redis, no vector store. For what this is, that's the correct amount of infrastructure.
-
-The cost I'd name before they ask: per-instance state. The earlier sharper grade of this cost — a real correctness bug at modest concurrency where a global `Map` plus `putInsights.clear()` wiped concurrent users on one warm instance — is **resolved**. `lib/state/insights.ts` is now `Map<sessionId, SessionFeed>` and the outer map is never cleared by a request, so concurrent users on one warm instance don't wipe each other. What remains is cross-instance: a cold start re-bootstraps the schema from scratch, and an investigation cached on instance A isn't visible to a request that lands on instance B. There's a dev-file fallback (`.investigation-cache.json`) and a committed demo seed, but the live in-memory cache is not shared across instances. For a single demo user that's invisible; for real multi-instance traffic it would mean inconsistent cache hits and repeated bootstraps.
-
-So here's the counterfactual, with one trigger. *The moment I'm multi-instance or need to survive instance churn*, I add a shared store — Redis for the hot cache (the 60s tool-result cache and the bootstrap schema) and a persistent investigation store so a completed investigation is durable and shareable, not stranded on the instance that ran it. I would not add it preemptively; adding infrastructure I don't yet need is its own kind of mistake.
-
-┃ "No database was deliberate, not lazy. The cost is per-instance state — cold starts re-bootstrap, and an investigation cached on one instance isn't visible to another. At multi-user scale I'd add Redis plus a persistent investigation store."
-
-┌─ STRONG vs WEAK — "why no database?" ──────────────┬───────────────────────────────┐
-│ WEAK                                                │ STRONG                         │
-├─────────────────────────────────────────────────────┼───────────────────────────────┤
-│ "It's just a demo so I didn't really need a         │ "Deliberate. Single upstream,  │
-│  database, I could add one later if I needed to."    │  one demo user — in-memory     │
-│                                                      │  maps are the right size. The  │
-│                                                      │  cost is per-instance state:   │
-│                                                      │  cold starts re-bootstrap,     │
-│                                                      │  cache isn't shared. At        │
-│                                                      │  multi-user I'd add Redis +    │
-│                                                      │  a persistent investigation    │
-│                                                      │  store."                       │
-├─────────────────────────────────────────────────────┼───────────────────────────────┤
-│ Why it's weak: "didn't really need" sounds like you │ Why it works: names the mode   │
-│ avoided the work. "Later if I needed to" has no      │ (deliberate), the cost          │
-│ trigger and no cost. Sounds like an excuse.          │ (per-instance), and the trigger│
-│                                                      │ (multi-user) with a concrete   │
-│                                                      │ next step.                     │
-└─────────────────────────────────────────────────────┴───────────────────────────────┘
-
-### Follow-up decision tree
+The visual anchor. Left column is what you'd reconsider; right column is what you'd keep. Each row's bottom is the receipt or the trigger.
 
 ```
-"Why no database?"  → (deliberate, single upstream)
-   │
-   ├─ "What breaks first when you add a second user?"
-   │     └─► "Cache coherence. Two users hitting different instances see
-   │          different cached investigations and each triggers its own
-   │          bootstrap. First fix is a shared cache — Redis — so the 60s
-   │          tool-result cache and the schema are shared."
-   │
-   ├─ "Why not just add the DB now to be safe?"
-   │     └─► "Infra I don't need is a liability — another thing to provision,
-   │          secure, and keep in sync. For one upstream and one demo user the
-   │          map is correct. I add the store when there's a user to serve with
-   │          it."
-   │
-   └─ "How would you make a completed investigation durable?"
-         └─► "A persistent investigation store keyed by insight id — the cache
-              already produces a replayable AgentEvent[] per investigation, so
-              I'd persist that array and the demo seed shows the shape already
-              works for replay."
+  blooming insights — what you'd reconsider vs what you'd keep
+
+  ┌────────────────────────────────┬────────────────────────────────┐
+  │   WOULD RECONSIDER             │   WOULD KEEP                   │
+  │   (with named trigger)         │   (with the receipt)           │
+  ├────────────────────────────────┼────────────────────────────────┤
+  │                                │                                │
+  │ 1. No database                 │ A. NDJSON + readNdjson kernel  │
+  │    (in-process Map)            │    (lib/streaming/ndjson.ts,   │
+  │                                │     64 LOC, 4 surfaces)        │
+  │    Concurrent-user wipe is     │                                │
+  │    RESOLVED (session-keyed).   │    Receipt: one kernel, four   │
+  │    Open: cross-instance state. │    consumers, no duplication.  │
+  │    Trigger: multi-instance.    │                                │
+  │                                │                                │
+  ├────────────────────────────────┼────────────────────────────────┤
+  │                                │                                │
+  │ 2. Demo-replay as the          │ B. TypeScript                  │
+  │    reliability path            │                                │
+  │                                │    Receipt: every event-shape  │
+  │    Workaround for alpha        │    boundary in the system has  │
+  │    Bloomreach (revokes         │    a type and breaks loudly    │
+  │    tokens after minutes).      │    when violated. The bare-500 │
+  │    Trigger: stable upstream.   │    bug would have been worse   │
+  │                                │    without it.                 │
+  │                                │                                │
+  ├────────────────────────────────┼────────────────────────────────┤
+  │                                │                                │
+  │ 3. Fixed ~1.1s call spacing    │ C. DataSource seam + adapter   │
+  │    on BloomreachDataSource     │    pattern                     │
+  │                                │                                │
+  │    Conservative for ambiguous  │    Receipt: survived 2 adapter │
+  │    rate limit. Costs me real   │    swaps (Olist in then out,   │
+  │    latency on every live run.  │    Synthetic in) without       │
+  │    Trigger: stable headroom +  │    changing the caller surface.│
+  │    measurement.                │                                │
+  │                                │                                │
+  ├────────────────────────────────┼────────────────────────────────┤
+  │                                │                                │
+  │ 4. Coverage deps as exact      │ D. AptKit primitive boundary   │
+  │    event-name match (no        │    (3 small adapter classes)   │
+  │    alias layer)                │                                │
+  │                                │    Receipt: library owns the   │
+  │    Deliberate — alias indir-   │    loop, I own the boundary,   │
+  │    ection adds cost. Trigger:  │    legacy preserved at         │
+  │    workspaces with different   │    base-legacy.ts as the       │
+  │    event naming conventions.   │    rollback receipt.           │
+  │                                │                                │
+  └────────────────────────────────┴────────────────────────────────┘
 ```
 
----
+Walk left-then-right. The left column shows judgment; the right column shows discipline. Both halves are the senior signal.
 
-## Decision 2 — Demo-replay as the reliability path
+## What's NOT on the would-keep list (and why)
 
-┌──────────────────────────────────────────────────────────────────────────┐
-│ Surface: why is there a whole demo mode that replays a JSON file?           │
-│ Probe:   is this a real product feature or a workaround you're dressing up  │
-│          as one — and do you know which?                                    │
-└──────────────────────────────────────────────────────────────────────────┘
+One thing that *used to be* on the would-keep list is **the shared `runAgentLoop`**. It's not anymore. The hand-rolled loop is now legacy — preserved at `lib/agents/base-legacy.ts:86-176` as the rollback receipt, but no longer the active path. The active path is `@aptkit/core@0.3.0` behind three small adapter classes. That migration is the proudest part (Chapter 6) and a load-bearing decision-revisit; calling it out as a "would-keep" today would be defending a decision the project has already moved past.
 
-I'm going to call this honestly: demo-replay is *evaluated-and-accepted*, and it's a workaround for an unstable upstream, not a product feature. I say that plainly because dressing a workaround up as a feature is exactly the bluff the probe is hunting for.
+This kind of honesty — *that's what I kept, this is what I changed* — is the senior-shape of the counterfactuals chapter.
 
-The constraint that drove it: the loomi connect MCP server is alpha. It revokes tokens after minutes and rate-limits to roughly one request per second per user, globally. That makes a live agent run a fragile thing to stand on stage with — the token can die mid-investigation. So I built a demo mode (`localStorage` `bi:mode`, default demo) that replays a committed snapshot — `lib/state/demo-insights.json` and `demo-investigations.json` — as a *paced NDJSON stream*, so the presentation path is creds-free and reliable and looks exactly like a live run. The briefing route's demo branch reads the JSON and re-emits it event-by-event at `REPLAY_DELAY_MS`; the agent route does the same for investigations, filtered to the requested step. It's clever for the constraint, and I'm glad it exists, but I won't pretend the value is the replay itself.
-
-The counterfactual and its trigger: *if the upstream were stable* — durable tokens, a sane rate limit — I'd make live the default and demote replay to what it actually is, a fixture for tests and offline development. The replay code is genuinely useful as a deterministic fixture (it's how the UI gets exercised without a network), so I wouldn't delete it; I'd stop using it as the *reliability* path and let live carry the demo.
-
-What makes the answer strong is that I'm not claiming I designed a beautiful offline mode for its own sake. I'm saying: the upstream forced a recovery-oriented design, I met it with a paced replay, and the day the upstream is stable that crutch comes out.
-
-┃ "Demo-replay is a workaround for an alpha server that revokes tokens after minutes, not a feature. If the upstream were stable I'd default to live and keep the replay only as a test fixture."
-
-▸ The replay isn't fake data dressed as live — it's a real captured snapshot of a real run, re-streamed at a readable pace. That's the part I'm comfortable defending; the part I won't oversell is calling it a feature.
-
-### Follow-up decision tree
+## Reconsideration 1 — No database (in-process state)
 
 ```
-"Why replay a JSON file instead of running live?"  → (alpha upstream)
-   │
-   ├─ "So the demo isn't real?"
-   │     └─► "The snapshot is a real captured run — real schema, real EQL,
-   │          real insights. Replay re-streams it creds-free so a token
-   │          revocation mid-demo can't kill the presentation. Live mode runs
-   │          the agents for real; it's one localStorage flag away."
-   │
-   ├─ "Isn't that hiding that the live path is broken?"
-   │     └─► "The live path works — I've run it. It's fragile because the
-   │          upstream is alpha, not because my code is broken. The briefing
-   │          route returns honest 401/500s live; replay is the path I trust
-   │          on a stage, not the only path that works."
-   │
-   └─ "What changes if the upstream stabilizes?"
-         └─► "Live becomes the default mode, replay drops to a test fixture. I
-              don't rewrite anything — I flip the default and keep the snapshot
-              for deterministic UI tests."
+  ┌─────────────────────────────────────────────────┐
+  │ THEY ASK                                        │
+  │   "What would you do differently?"              │
+  │                                                 │
+  │ WHAT THEY'RE TESTING                            │
+  │   Will you volunteer your weakest decision and  │
+  │   name the trigger that would change it? Or     │
+  │   will you wait to be asked, and then defend?   │
+  └─────────────────────────────────────────────────┘
 ```
 
----
+> "Top of my reconsiderations list: the in-process state in `lib/state/insights.ts`. Today it's a `Map<sessionId, SessionFeed>` — session-keyed, which fixed the concurrent-user wipe bug I caught earlier (Chapter 6's defaulted-to story). So the *concurrency* problem is resolved. What's still open is **cross-instance state** — if a user's first request lands on Vercel instance A and their second request lands on instance B, B has no memory of the session.
+>
+> "For a portfolio project with no production traffic that's not a real problem. The trigger that would change my design is **multi-instance deployment**, which a single-region Vercel hobby tier doesn't have. The day there's a real second instance, I'd reach for Vercel KV or a small Postgres — the `lib/state/insights.ts` module is already the seam, so it's a substitution behind one interface, not a refactor.
+>
+> "The fake-regret version of this answer would be 'I'd add Postgres from day one because real systems need a database.' That's not true for this system. The right shape was deferring the database until I knew what state I needed. The concurrent-user bug was the lesson; session-keying fixed it; cross-instance is the next move *only when the trigger arrives*."
 
-## Decision 3 — Fixed ~1.1s inter-call spacing
+## Reconsideration 2 — Demo-replay as the reliability path
 
-┌──────────────────────────────────────────────────────────────────────────┐
-│ Surface: how do you handle the upstream rate limit?                         │
-│ Probe:   do you understand the limiter you built, and can you name a better │
-│          one without pretending the simple one was a mistake?               │
-└──────────────────────────────────────────────────────────────────────────┘
+> "Demo mode exists because the alpha Bloomreach server revokes tokens after minutes. That's a real constraint and demo mode is a real fix — but it shapes the design in ways I'd reconsider if the upstream got stable.
+>
+> "Specifically, the route handler for `/api/briefing` has a branch that switches between live and the committed snapshot in `lib/state/demo-insights.json`. There's machinery — the dev-only one-click capture in `useDemoCapture`, the per-step replay filter, the schema that lets older snapshots still validate. All of that is honest fallback machinery, but it's machinery I wouldn't need if the upstream were stable.
+>
+> "The trigger is **a stable upstream that doesn't revoke tokens**. The day Bloomreach's MCP server reaches GA with documented session lifetimes, demo-replay becomes a development convenience rather than a presentation necessity. I'd keep the capture path (it's a fast local dev loop), but I'd retire the demo-as-default branch in production. The default mode would flip from `'demo'` to `'live-bloomreach'`."
 
-This is *evaluated-and-accepted*: I picked the simple fixed interval on purpose, knowing it's conservative. `McpClient` enforces `minIntervalMs: 1100` between live calls (`lib/mcp/client.ts`, configured in `connect.ts`) — every call waits until at least 1.1 seconds have passed since the last one. On top of that there's a 60s response cache so repeats don't hit the network, and a retry path that parses the server-stated penalty window from the 429 text and waits it out (`retryDelayMs` 10s fallback, `retryCeilingMs` 20s cap, `maxRetries` 3).
+## Reconsideration 3 — Fixed ~1.1s call spacing on `BloomreachDataSource`
 
-The honest assessment: a fixed interval is conservative. It paces every call at 1.1s regardless of whether I have budget headroom — if I've made no calls for ten seconds, the next one still waits its 1.1s floor isn't quite right (the floor is measured against the *last* call, so an idle gap doesn't cost extra), but the deeper point stands: a fixed minimum interval can't *spend* accumulated headroom. A token-bucket or adaptive limiter would let me burst up to the window's real allowance and only throttle when I'm actually near the limit, using the budget better — which matters because the agent route has a hard time budget and every forced wait eats into it.
+> "This is the one I'd reconsider *the soonest* if I were operating the system. I'm spacing calls at roughly 1.1 seconds because the rate limit is documented ambiguously and I picked a conservative number to stay safe. That choice is costing me real latency on every live run — a multi-step diagnostic agent makes 10–15 tool calls, and at 1.1s spacing that's 10–15 seconds of artificial wait per investigation.
+>
+> "The trigger to change it is a **stable upstream with documented headroom plus measurement**. With a real production telemetry signal — per-call latency and 429-rate histograms — I'd find the actual ceiling and tighten the spacing to it. The fix is one constant in `BloomreachDataSource`; the courage to change it requires the measurement.
+>
+> "The reason this matters for the counterfactuals chapter is that it's a real cost being paid right now, not a hypothetical at scale. Volunteering it tells the interviewer I know where my own performance is being sacrificed for safety, and I know what would let me reclaim it."
 
-Why I accepted the simple version anyway, and this is the real defense: against an alpha limit that's been observed as *both* "1 per 1 second" and "1 per 10 second," a fixed conservative interval is predictable and won't get me throttled in a way a tuned bucket might if I mis-modeled the window. The connect.ts comment is explicit that spacing at the full 10s window would blow the route's time budget, so 1.1s is the chosen middle: proactive enough to mostly avoid 429s, fast enough to fit a multi-call investigation in budget, with the parsed-retry path as the backstop when a 429 does land. The counterfactual — a token bucket — wins *when I have stable rate-limit headroom and real traffic to optimize for*, neither of which an alpha demo has.
+## Reconsideration 4 — Coverage deps as exact event-name match
 
-I would *not* claim the fixed interval is wrong. I'd claim it's the right call for an unstable, ambiguous limit, and that I know exactly what I'd reach for once the limit is known and stable.
-
-╔══════════════════════════════════════════════════════════════════════════════╗
-║ "I DON'T KNOW" RECOVERY BOX — pushed on the exact backoff math                 ║
-║                                                                                ║
-║ The pushback: "Why 1.1 seconds and not 1.0 or 1.5? Why a 20s ceiling? Justify  ║
-║               the numbers."                                                     ║
-║                                                                                ║
-║ Say: "I'm not going to pretend those are tuned to an optimum — they're not.    ║
-║      1.1s is a small cushion over the observed 1-per-second window so I clear   ║
-║      it without racing the boundary; the 20s ceiling caps any single retry     ║
-║      wait so a slow penalty can't blow the route's time budget. They're        ║
-║      conservative defaults for an alpha limit I can't fully characterize, not  ║
-║      values I derived from a model. With real traffic I'd measure the 429 rate ║
-║      and tune them, or move to a token bucket."                                 ║
-║                                                                                ║
-║ What this signals: you know which of your numbers are principled and which are ║
-║      reasonable guesses, and you don't dress a guess up as math.               ║
-║                                                                                ║
-║ Do NOT say: "1.1 is optimal because…" and invent a derivation. There isn't     ║
-║      one in the code — it's a cushion over an observed window — and a fake     ║
-║      derivation is the easiest bluff in the room to catch.                     ║
-╚══════════════════════════════════════════════════════════════════════════════╝
-
-┃ "Fixed 1.1-second spacing is conservative on purpose — for an alpha limit observed as both 1-per-1s and 1-per-10s, predictable beats clever. A token bucket wins once the window is known and stable."
-
-### Follow-up decision tree
+> "This one's narrower. The monitoring agent's coverage logic — whether a given category has been confirmed checked — keys off exact Bloomreach event names. If a workspace happens to use `customer_session_start` instead of `session_start`, my coverage logic doesn't recognize it and the category stays empty.
+>
+> "I deliberately didn't build an alias layer. The alias layer would add a layer of indirection — a config or convention mapping workspace-specific names to my canonical names — and for the single workspace I've tested against (the standard Bloomreach ecommerce event taxonomy), it's overhead with no benefit.
+>
+> "The trigger is **a workspace with different event naming conventions**. The day I encounter one, the alias layer earns its keep — without one, I'd be hand-editing tool-coverage.ts for every new workspace, which doesn't scale and produces a worse user experience than 'this category isn't checked' (which currently surfaces honestly in the UI).
+>
+> "Naming this as a reconsideration rather than a current change is the right call — it's a real *future* fix triggered by a real *future* condition, not a regret I should fake today."
 
 ```
-"Why a fixed interval and not a token bucket?"  → (evaluated-and-accepted)
-   │
-   ├─ "A bucket would be faster — why not just do that?"
-   │     └─► "It would, when I have headroom to spend. But it needs a known,
-   │          stable window to size the bucket. The alpha limit reports two
-   │          different windows, so a bucket sized wrong gets me throttled. The
-   │          fixed floor can't burst, but it can't mis-burst either."
-   │
-   ├─ "What does the retry path do when you DO get rate-limited?"
-   │     └─► "Parses the stated window out of the 429 text — it says '1 per 10
-   │          second' — and waits that out plus a buffer, capped at 20s, up to
-   │          3 retries. Errors don't get cached, so a throttled call retries
-   │          clean."
-   │
-   └─ "How would you know the fixed interval is costing you?"
-         └─► "Measure the 429 rate and the idle time between calls. If 429s are
-              near zero and I'm leaving window unused, I'm too conservative and
-              a bucket would reclaim it."
+  ┌─────────────────────────┬─────────────────────────┐
+  │ WEAK COUNTERFACTUAL     │ STRONG COUNTERFACTUAL   │
+  ├─────────────────────────┼─────────────────────────┤
+  │ "If I were starting     │ "Top of my list: the    │
+  │ today I'd use Postgres  │ in-process insights map.│
+  │ from day one. And       │ Concurrent-user wipe is │
+  │ probably Redis. And     │ resolved with session-  │
+  │ proper monitoring. And  │ keying; cross-instance  │
+  │ maybe Kubernetes."      │ is still open. Trigger  │
+  │                         │ is multi-instance,      │
+  │                         │ which a portfolio       │
+  │                         │ project doesn't have."  │
+  ├─────────────────────────┼─────────────────────────┤
+  │ Why it's weak:          │ Why it works:           │
+  │ Fake regret menu. Lists │ Names the reconsider-   │
+  │ infrastructure the      │ ation, names the        │
+  │ project doesn't need.   │ trigger, names what's   │
+  │ Reads as "I think the   │ already done. No fake   │
+  │ interviewer wants to    │ regret. The interviewer │
+  │ hear about Postgres."   │ hears judgment, not     │
+  │                         │ performance.            │
+  └─────────────────────────┴─────────────────────────┘
 ```
 
----
+## The would-keep list — what earned its place
 
-## Decision 4 — Coverage deps couple to exact event names
+The right way to talk about each kept decision is **with the receipt that proves it earned its place**, not as a defense of why it was the right call originally. The receipts are what turn the answers into something the interviewer can verify.
 
-┌──────────────────────────────────────────────────────────────────────────┐
-│ Surface: how does the coverage gate decide a category is supported?         │
-│ Probe:   do you see the brittleness in your own gate — that it'll misfire   │
-│          on a workspace that names things slightly differently?             │
-└──────────────────────────────────────────────────────────────────────────┘
-
-This one I volunteer as a real limitation, and it's *deliberate* in the sense that I built it knowing it has no alias layer — I just didn't need one for the workspace I targeted. The coverage gate in `lib/agents/categories.ts` declares each category's dependencies as exact event-name strings — `conversion_drop` requires `['view_item', 'checkout', 'purchase']` — and `coverageFor()` checks them with a plain `available.has(dep)` against a `Set` built from the live schema. Exact string match, no normalization.
-
-The brittleness, stated plainly: a workspace that emits `product_view` instead of `view_item`, or `order_completed` instead of `purchase`, reads as *unavailable* — the category ghosts out even though the data is right there under a different name. The gate is honest (it won't fake a category), but it's honest about the *literal* names, not the semantic ones. For the demo workspace the names matched the registry, so it never bit me; for an arbitrary Bloomreach workspace it would.
-
-The counterfactual, with its trigger: *the moment this runs against workspaces I don't control*, I'd add a normalization/alias layer in `schemaCapabilities` — a mapping from canonical category deps to the workspace's actual event names, either a static alias table (`purchase` ← `order_completed`, `transaction`…) or a light LLM-assisted match at bootstrap that proposes mappings a human confirms. That keeps the gate's honesty — it still won't fake a missing capability — while stopping it from misfiring on a naming difference. I'd put it at the capability-set construction so the rest of the gate logic stays a pure exact-match function and only the *input* set gets enriched with aliases.
-
-The reason I frame it as deliberate-but-limited rather than a bug: for a single known workspace, exact match is simpler and has zero false positives — it never claims a capability the workspace doesn't have. The alias layer adds a place to be *wrong* (a bad alias claims a capability that isn't really equivalent). So I'd add it only when the multi-workspace need is real, and I'd make the aliases explicit and auditable, not magic.
-
-┃ "The gate matches event names exactly — `Set.has`, no aliasing. It's honest about literal names, so a workspace that calls it `order_completed` instead of `purchase` ghosts the category. The fix is an alias layer at capability-set construction, added when I'm running against workspaces I don't control."
-
-┌─ STRONG vs WEAK — owning the alias gap ────────────┬───────────────────────────────┐
-│ WEAK                                                │ STRONG                         │
-├─────────────────────────────────────────────────────┼───────────────────────────────┤
-│ "The coverage gate is pretty robust, it checks the  │ "It's exact event-name match — │
-│  schema before running anything."                    │  no alias layer. So a          │
-│                                                      │  workspace that names purchase │
-│                                                      │  'order_completed' ghosts the  │
-│                                                      │  category. Honest about        │
-│                                                      │  literal names, brittle about  │
-│                                                      │  semantic ones. I'd add a      │
-│                                                      │  normalization layer for       │
-│                                                      │  workspaces I don't control."  │
-├─────────────────────────────────────────────────────┼───────────────────────────────┤
-│ Why it's weak: "pretty robust" hides the exact-      │ Why it works: names the        │
-│ match brittleness — the one thing the probe is       │ mechanism, the failure mode,   │
-│ testing whether you see. Sounds like you don't.      │ and the scoped fix with its    │
-│                                                      │ trigger. You saw it first.     │
-└─────────────────────────────────────────────────────┴───────────────────────────────┘
-
-### Follow-up decision tree
+> **A. NDJSON + the `readNdjson` kernel.** The kernel is `lib/streaming/ndjson.ts`, 64 lines, and it's consumed by four streaming surfaces — `/api/briefing`, `/api/agent` for the diagnose step, `/api/agent` for the recommend step, and the free-form query. The receipt for keeping the design is that the same 64 lines serve four consumers without duplication and without a leak. If I had reached for SSE or a websocket I'd be paying for capabilities I don't use (SSE's framing convention, websocket's bidirectional surface) on every surface.
+>
+> **B. TypeScript.** Every event-shape boundary in the system has a type and breaks loudly when it's violated. The receipt: when I was debugging the bare-500 bug (Chapter 6), the type signature of the route handler told me where the error path was wrong before I even read the code. Without TS, that bug would have taken longer to find and fix.
+>
+> **C. The DataSource seam + adapter pattern.** The receipt is two adapter swaps. Olist was added; Olist was removed (when I retired the eval suite with it); Synthetic was added. Each swap kept the caller surface — `dataSource.executeEql(...)`, `dataSource.listTools()` — unchanged. *That's the test for whether a seam is real.* Future-proofing is when you add an abstraction "in case." Receipt-driven is when the abstraction has already paid for itself by absorbing real change.
+>
+> **D. The AptKit primitive boundary.** Three small adapter classes — `AnthropicModelProviderAdapter`, `BloomingToolRegistryAdapter`, `BloomingTraceSinkAdapter`. About 200 lines total. The receipt for keeping this design over the alternatives (own the whole loop / use a heavier framework) is that the legacy hand-rolled loop is preserved at `lib/agents/base-legacy.ts`, lines 86–176. If AptKit's API ever shifts in a way that breaks one of my disciplines, I peel back to the legacy and re-evaluate. The preservation is the receipt for the discipline being load-bearing in the first place.
 
 ```
-"How does the gate decide a category is supported?"  → (exact event-name match)
-   │
-   ├─ "What happens if the event is named differently?"
-   │     └─► "It ghosts — reads as unavailable. The gate is honest about the
-   │          literal names in the schema, not semantic equivalents. That's the
-   │          brittleness, and I'd fix it with an alias layer."
-   │
-   ├─ "Where would the alias layer go?"
-   │     └─► "In schemaCapabilities, where I build the available-capability Set.
-   │          I'd enrich that Set with aliases so the rest of the gate stays a
-   │          pure exact-match function — only the input changes."
-   │
-   └─ "Why not just fuzzy-match every event name?"
-         └─► "Fuzzy matching adds false positives — claiming a capability the
-              workspace doesn't really have, which breaks the honesty the gate
-              exists for. I'd use an explicit, auditable alias table or a
-              human-confirmed mapping, not silent fuzzy matching."
+  ┃ "Future-proofing is when you add an abstraction
+  ┃  in case. Receipt-driven is when the abstraction
+  ┃  has already paid for itself by absorbing real
+  ┃  change."
 ```
 
----
+## The follow-up tree
 
-## The decisions I would NOT change
+```
+  You volunteer the four reconsiderations.
+        │
+        ▼
+        ├─► "Why haven't you fixed those?"
+        │     Each reconsideration has a *trigger* —
+        │     multi-instance, stable upstream, measured
+        │     headroom, workspace with different naming.
+        │     The trigger isn't here yet for any of them.
+        │     Acting before the trigger is over-engineering;
+        │     acting after the trigger is on-time. Naming
+        │     the trigger explicitly is the senior signal.
+        │
+        ├─► "What about [thing I didn't list]?"
+        │     The honest answer for things you'd actually
+        │     keep is to defend the receipt. The honest
+        │     answer for things you've genuinely not
+        │     considered is "I haven't thought about that
+        │     one — walk me through what you'd reconsider
+        │     and why?" Re-route to a conversation.
+        │
+        ├─► "What's the would-not-change list?"
+        │     The four items in the right column. Each
+        │     defended with the receipt, not the original
+        │     justification.
+        │
+        └─► "What about the agent loop — would you write
+            it yourself again?"
+              The honest answer is *I already did, and
+              then I revisited the decision*. The hand-
+              roll is preserved as base-legacy.ts. The
+              active path is AptKit. That decision-revisit
+              is in Chapter 3 (Choice 2) and Chapter 6
+              (the proudest part).
+```
 
-This is the other half of the skill, and I say it crisply so I don't drift into manufactured regret. Three calls were right and I'd make them again:
+## When you don't know
 
-- **NDJSON over a fetch + ReadableStream reader, not EventSource.** I'm already doing a fetch; reading newline-delimited JSON off the body is the entire client, one `JSON.parse` per line. SSE would add framing, GET-only constraints, and auto-reconnect I don't want mid-investigation. Settled.
-- **TypeScript.** The whole system is type-driven — the `AgentEvent` contract, the `Diagnosis`/`Recommendation` shapes, the injected `McpCaller` interface that lets the 169-test suite (18 files) run with fakes and no network. Reconsidering this would be reconsidering the thing that makes the tests possible.
-- **The shared `runAgentLoop` abstraction.** One tool-use loop in `base.ts` drives all four agents — monitoring, diagnostic, recommendation, query — with the same budget, forced-synthesis, and error-handling behavior. Four copies of that loop would be four places to fix the next bug. Settled.
+The territory you're most likely to get pushed past your depth in this chapter is **decisions about technologies you didn't seriously evaluate**. If the interviewer says "would you reconsider using Anthropic vs OpenAI?" — and you only ever tried Anthropic — be honest.
 
-Naming these as non-issues is deliberate: if I "reconsidered" them, I'd be telling you I can't distinguish a real tradeoff from a non-issue, which is the worst signal I could send in a chapter about judgment.
+```
+  ╔═══════════════════════════════════════════════╗
+  ║ WHEN YOU DON'T KNOW                           ║
+  ║                                               ║
+  ║   They ask: "Would you reconsider using       ║
+  ║   Anthropic vs OpenAI for the agents?"        ║
+  ║                                               ║
+  ║   You didn't run a head-to-head. You picked   ║
+  ║   Anthropic and shipped against Sonnet 4.6.   ║
+  ║                                               ║
+  ║   Say:                                        ║
+  ║   "Honest answer: I didn't run a head-to-     ║
+  ║    head against OpenAI's models for this      ║
+  ║    project. I picked Anthropic because Sonnet ║
+  ║    4.6 worked well in earlier projects and    ║
+  ║    the SDK and tool-use story was clean       ║
+  ║    enough for me to focus on the system       ║
+  ║    rather than the provider. The reconsider-  ║
+  ║    ation I would do — and haven't — is a      ║
+  ║    real eval bake-off against a couple of     ║
+  ║    OpenAI's models on the diagnostic synth-   ║
+  ║    esis turn, because that's where reasoning  ║
+  ║    quality matters most. Without that eval    ║
+  ║    I can't tell you which one would be        ║
+  ║    better. What I can defend is the boundary  ║
+  ║    that lets me swap — the model provider     ║
+  ║    sits behind AnthropicModelProviderAdapter, ║
+  ║    so adding an OpenAI adapter is the same    ║
+  ║    shape as the existing one."                ║
+  ║                                               ║
+  ║   What this signals: honesty about the eval   ║
+  ║   you didn't run, awareness of the design     ║
+  ║   property (the swap-ability) that protects   ║
+  ║   the decision being reconsiderable.          ║
+  ║                                               ║
+  ║   Do NOT say:                                 ║
+  ║   "Anthropic is better for agentic tool use   ║
+  ║    than OpenAI, that's why I picked it."      ║
+  ║   This is a generalization you can't back up. ║
+  ║   The interviewer will ask "based on what     ║
+  ║   benchmark?" and you'll fold.                ║
+  ╚═══════════════════════════════════════════════╝
+```
 
-╔══════════════════════════════════════════════════════════════════════════════╗
-║ "I DON'T KNOW" RECOVERY BOX — "isn't every decision a tradeoff?"               ║
-║                                                                                ║
-║ The pushback: "Surely you'd reconsider NDJSON or the shared loop too — name a  ║
-║               downside."                                                        ║
-║                                                                                ║
-║ Say: "I can name a theoretical downside for anything, but I won't pretend it's ║
-║      a live tradeoff when it isn't. NDJSON-over-fetch and the shared loop are  ║
-║      settled for this system — the alternatives cost more for no payoff here.  ║
-║      The decisions genuinely worth reconsidering are the four I led with: the  ║
-║      DB, the replay path, the fixed limiter, and the exact-match coverage      ║
-║      deps. I'd rather spend the time on the real ones."                        ║
-║                                                                                ║
-║ What this signals: you can tell a settled call from an open one and you won't  ║
-║      manufacture regret to look humble. That's senior judgment.                ║
-║                                                                                ║
-║ Do NOT say: "Yeah, maybe I'd switch to SSE…" to seem agreeable. Inventing a    ║
-║      reconsideration for a right call reads as not understanding why it was    ║
-║      right.                                                                     ║
-╚══════════════════════════════════════════════════════════════════════════════╝
+## What you'd change about the counterfactuals practice itself
 
----
+The one meta-counterfactual: I'd be more aggressive about **writing the trigger down at the time of the decision**, not after. Right now the triggers for each reconsideration live in my head and in this chapter. If I were starting today I'd add a short "decisions and triggers" log — one paragraph per load-bearing decision, with the named trigger that would change it. That artifact would be useful to me in three months and useful to anyone who reads the repo.
 
-## What you'd change
+## One-page summary
 
-The senior framing of "what would you do differently" is to tell the eval story honestly, because the story has changed since the last refresh of this book. **The eval harness was built and used and then retired.** I shipped the 4-pillar suite in Phase 3 — detection precision/recall, diagnosis 5-criterion rubric, recommendation 3-criterion rubric, regression capture-and-score with LLM-as-judge calibrated by 8/8 + 3/3 manual spot-check agreement. The flywheel surfaced three real bugs in the system: a BRL cents-vs-Reais unit-narration bug that the recommendation judge caught at run 8 (the agent claimed implausible R$131,965 average order values), a binary calibration breakdown in 29 of 30 diagnosis runs, and conclusion instability at a 30% regression baseline. The substrate it scored against was the Olist MCP server. When I retired Olist (the in-process Synthetic adapter is a cleaner shape for the same job), the eval suite went with it — its scorer was hard-coded to Olist's seeded anomaly ids.
+**Core claim:** Volunteer the reconsiderations with named triggers. Defend the would-keeps with the receipts that prove they earned their place. Don't fake regret for decisions that were right.
 
-So the *current* gap is the same one I named before Phase 3 — but with three pieces of receipt I didn't have then: (1) I've built it once, end to end, including the LLM-as-judge calibration; (2) I've used the flywheel to surface bugs no unit test would have caught; (3) I know what the *next* version looks like — built against the Synthetic adapter rather than coupled to any one removed seed. That's the honest re-ranking: **rebuild the eval harness against the Synthetic substrate**, not as a confession of having never had one, but as version two of something I shipped, used, and learned from. The retired files carry RETIRED banners in `.aipe/study-*` as a paper trail.
+**The four reconsiderations in one line each:**
+- **No DB** → trigger is multi-instance deployment; concurrent-user wipe already fixed via session-keying.
+- **Demo-replay** → trigger is a stable upstream; today it's load-bearing because the alpha revokes tokens.
+- **1.1s call spacing** → trigger is stable headroom + measurement; today it costs real latency on every live run.
+- **Coverage exact-name match** → trigger is workspaces with different event naming; alias layer is overhead today.
 
-The other items on the afternoon list — (1) session-key `lib/state/insights.ts`, (2) `res.usage` logging at every Anthropic call site, (3) strip `e.stack` from the `/api/mcp/*` error JSON bodies — have all **shipped**. `insights.ts` is now session-keyed (`Map<sessionId, SessionFeed>`); AptKit's runtime logs `res.usage` on every model call (`lib/agents/aptkit-adapters.ts:60,65`); the `/api/mcp/*` routes return `{ error: e.message }` only, with the stack going to `console.error` for server logs. The afternoon list cleared itself.
+**The four would-keeps in one line each:**
+- **NDJSON + `readNdjson` kernel** → 64 LOC, 4 surfaces, no duplication.
+- **TypeScript** → every event-shape boundary types-and-breaks loudly.
+- **DataSource seam** → survived 2 adapter swaps without caller change.
+- **AptKit boundary** → library owns the loop, I own the boundary, legacy preserved as rollback.
 
-The alias/normalization layer for coverage deps is still the next-cheapest concrete fix beyond what's shipped — clearest trigger (a second workspace), fix contained to `schemaCapabilities`. The bigger DB and the limiter wait on scale or stable traffic I don't have yet, and the demo-replay waits on the upstream stabilizing — none of those are worth building speculatively. The honest through-line is that every one of these was the right call *for an alpha, single-upstream demo*, and each has a named trigger that flips the decision. That's the posture I'd want them to walk away with: not that I got everything right, but that I know precisely what would have to change for each call to be wrong — and that I've already done one full eval-flywheel pass and would do another against the cleaner Synthetic substrate next.
+**Pull quote:**
+```
+  ┃ "Future-proofing is when you add an abstraction
+  ┃  in case. Receipt-driven is when the abstraction
+  ┃  has already paid for itself by absorbing real
+  ┃  change."
+```
 
----
-
-## One-page summary — Chapter 7
-
-**Core claim:** I can volunteer the four genuinely reconsiderable decisions in this system, give the counterfactual and the trigger for each, and — just as importantly — name the calls I would NOT change without manufacturing regret.
-
-| Decision | Mode | One-line counterfactual |
-|---|---|---|
-| In-memory state, no DB | deliberate | Per-instance cache + cold-start re-bootstrap; add Redis + a persistent investigation store at multi-user scale. |
-| Demo-replay = reliability path | evaluated-and-accepted | A workaround for an alpha server that revokes tokens; default to live and demote replay to a fixture once the upstream is stable. |
-| Fixed ~1.1s call spacing | evaluated-and-accepted | Conservative on purpose for an ambiguous limit; a token bucket wins once the window is known and I have headroom. |
-| Coverage deps = exact event names | deliberate (no alias yet) | A differently-named workspace ghosts categories; add a normalization/alias layer in `schemaCapabilities` for workspaces I don't control. |
-| **Would NOT change** | — | NDJSON-over-fetch · TypeScript · the shared `runAgentLoop` — settled calls, not tradeoffs. |
-
-**Pull quotes:**
-- "No database was deliberate, not lazy — the cost is per-instance state, and at multi-user scale I'd add Redis plus a persistent investigation store."
-- "Demo-replay is a workaround for an alpha server that revokes tokens, not a feature."
-- "Fixed 1.1-second spacing is conservative on purpose — for a limit observed as both 1-per-1s and 1-per-10s, predictable beats clever."
-- "The gate matches event names exactly, so a workspace that calls it `order_completed` instead of `purchase` ghosts the category — the fix is an alias layer."
-
-**The "what you'd change" sentence:** **Rebuild the eval harness against the Synthetic substrate** (version two of something I shipped, used to surface 3 real bugs, and retired with its Olist substrate) — not a from-scratch keystone, a cleaner second pass against a substrate that isn't going anywhere. The previous afternoon list — session-key `insights.ts`, `res.usage` logging, strip `e.stack` — has shipped. Next concrete fix beyond that is the coverage alias layer in `schemaCapabilities` (trigger: a second workspace). The DB, the limiter, and the replay decisions wait for scale, stable traffic, or a stable upstream.
-
----
+**What you'd change:** keep a written "decisions and triggers" log alongside the code, not just in your head. The artifact is useful to your future self.

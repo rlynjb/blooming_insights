@@ -1,238 +1,313 @@
 # Chapter 8 — The AI question
 
-In 2026 every senior interviewer assumes you built this with heavy AI assistance, because everyone does. So "did you use AI to build this?" is not a trap and it is not asking for a confession. It's asking one thing: *do you understand what you shipped well enough to own it?* The candidates who fail this question fail by getting defensive or evasive — as if using AI were cheating. The candidates who pass are matter-of-fact about the tool, matter-of-fact about their own role, and specific about the line between the two.
+This is the chapter every senior interview in 2026 ends with. Sometimes it's the first question; sometimes it's the last. *"Did you use AI to build this?"* *"Can you explain this section line by line?"* *"What did AI get wrong?"* The candidates who collapse here lose the offer regardless of how well the previous seven chapters went. The candidates who land it well take *the very thing that should be a vulnerability* and turn it into the strongest signal in the loop.
 
-This chapter is about answering that cleanly, and about the follow-ups that do the real probing: "explain this section line by line," "what did the AI get wrong?" You built an AI product *with* AI — that's not awkward, it's the most natural thing in the room, as long as you can show where your judgment lived.
+You used AI heavily to build **blooming insights**. So did almost everyone interviewing alongside you. The interviewer knows this. What separates a strong answer from a weak one is not whether you used AI — it's whether you can **own what shipped**: which decisions were yours, which were the tool's suggestion that you evaluated, and which were defaults you accepted and have since interrogated.
 
-## What AI did, what you did
+This chapter teaches the calibrated-honest answer with one frame: **three decision modes**. Everything in your codebase is one of three. Naming which one each decision is, with examples, is the L5 move.
 
-The honest answer isn't "I did it" or "AI did it" — it's a split, and this is the picture of where the line falls.
+## The "what AI did, what I did" split — the chapter on one page
 
-```
-  WHAT AI DID                          WHAT YOU DID
-  ═══════════════════════════════      ═══════════════════════════════════
-
-  drafted boilerplate                  decided the PRODUCT — "an analyst
-  (route scaffolding, types,           that shows its work"; the three-
-  component shells)                    stage loop; reasoning as a
-        │                              first-class streamed surface
-        │                                    │
-  suggested library APIs               designed the CONTROL — maxToolCalls
-  (SDK call shapes, the                budget + forced synthesis; ~1.1s
-  tool-use loop skeleton)              spacing; no-cache-on-error
-        │                                    │
-  filled in the OAuth                  built the SCHEMA GATE — categories
-  PKCE+DCR flow from the               classified against the live schema
-  SDK defaults                         before spending budget
-        │                                    │
-        ▼                                    ▼
-  ┌──────────────────────┐            ┌──────────────────────────────────┐
-  │ DEFAULTED-TO          │            │ DELIBERATE + EVALUATED-AND-       │
-  │ accepted without      │            │ ACCEPTED                          │
-  │ deep evaluation       │            │ your judgment, named criteria     │
-  │ → own it AS a default │            │ → defend in depth                 │
-  └──────────────────────┘            └──────────────────────────────────┘
-
-  the debugging was YOURS either way:
-  the StrictMode double-fetch, the prod 500, the "all at once" coverage
-  reveal — AI wrote code that looked right; you found why it wasn't.
-```
-
-The line isn't "AI did the easy parts, I did the hard parts." It's "AI accelerated the typing; the decisions and the debugging were mine." Make that the shape of every answer in this chapter.
-
----
-
-## "Did you use AI to build this?"
-
-> ┌─────────────────────────────────────────────────────────────┐
-> │ THEY ASK                                                      │
-> │   "Did you use AI to build this?"                             │
-> │                                                               │
-> │ WHAT THEY'RE TESTING                                          │
-> │   Not whether you used it — they assume you did. Whether you  │
-> │   can talk about it without defensiveness, and whether you    │
-> │   can locate the boundary between what you delegated and what │
-> │   you decided.                                                │
-> └─────────────────────────────────────────────────────────────┘
-
-In your voice, flat and unbothered:
-
-"Yes, heavily — it's how I work, and building an AI product with AI tools felt like the right way to learn the domain. The useful way to answer is to split it. The decisions were mine: the product concept, the three-stage loop, making the reasoning a streamed first-class surface, the `maxToolCalls` budget that keeps an agent from wandering against a rate-limited server. Some choices I evaluated and accepted — the two-model split, NDJSON over SSE. And some I defaulted to the tool's suggestion without deeply evaluating — the OAuth PKCE flow is the SDK's, and I accepted it. I can tell you which bucket any part of this falls into, and I think that's the real question."
-
-That last line is the move. You're telling the interviewer you've already done the categorization they're about to probe for.
+The visual anchor. Three decision modes, each with examples from this codebase.
 
 ```
-┃ The decisions were mine; AI accelerated the typing. I can
-┃ tell you which bucket any part of this falls into.
+  blooming insights — what AI did and what I did,
+  organized by decision mode
+
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │  MODE 1 — DELIBERATE                                                  │
+  │  (my choice; alternatives considered; named criterion)                 │
+  ├──────────────────────────────────────────────────────────────────────┤
+  │                                                                       │
+  │  · The hand-rolled runAgentLoop (now legacy)                          │
+  │     I needed a hard maxToolCalls budget and a forced final            │
+  │     synthesis turn. Wrote both. Preserved at base-legacy.ts.          │
+  │                                                                       │
+  │  · The DataSource seam                                                │
+  │     One interface, two adapters. Survived two adapter swaps.          │
+  │                                                                       │
+  │  · NDJSON over fetch                                                  │
+  │     Append-only, single reader; simplest contract that fits.          │
+  │                                                                       │
+  │  · No database                                                        │
+  │     Deliberate, for the context. Cost named; trigger named.           │
+  │                                                                       │
+  │  · Demo mode as the reliable presentation path                        │
+  │     The alpha upstream revokes tokens; demo replays a snapshot.       │
+  │                                                                       │
+  └──────────────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │  MODE 2 — EVALUATED-AND-ACCEPTED                                      │
+  │  (AI or library suggested; I read it, tested it, accepted it)         │
+  ├──────────────────────────────────────────────────────────────────────┤
+  │                                                                       │
+  │  · The AptKit migration (the load-bearing example here)               │
+  │     @aptkit/core hit 0.3.0 with a clean primitive surface. I read     │
+  │     the source, confirmed my two disciplines survived in the new      │
+  │     shape, migrated. Three adapter classes (~200 LOC) on my side      │
+  │     of the boundary. Legacy preserved as rollback receipt.            │
+  │                                                                       │
+  │  · The page decomposition (app/page.tsx 461 LOC + 3 hooks)            │
+  │     AI suggested extracting the streaming/capture/reconnect logic     │
+  │     into hooks. I evaluated each extraction by reading the resulting  │
+  │     surface and accepted them — useBriefingStream, useDemoCapture,    │
+  │     useReconnectPolicy. Each has its own responsibility and tests.    │
+  │                                                                       │
+  │  · The shared readNdjson kernel                                       │
+  │     The pattern came from AI suggestion (read-line-by-line ND parse). │
+  │     I evaluated whether extracting it across the four streaming       │
+  │     surfaces was worth the indirection — it was; it's 64 lines and    │
+  │     four consumers, with no duplication.                              │
+  │                                                                       │
+  └──────────────────────────────────────────────────────────────────────┘
+
+  ╔══════════════════════════════════════════════════════════════════════╗
+  ║  MODE 3 — DEFAULTED-TO                                                ║
+  ║  (AI's default; I accepted without deeply evaluating at the time;     ║
+  ║   own that honestly, and name what I did about it later)              ║
+  ╠══════════════════════════════════════════════════════════════════════╣
+  ║                                                                       ║
+  ║  · OAuth PKCE + Dynamic Client Registration mechanics                 ║
+  ║     The MCP SDK provides the surface; I implemented the provider; I   ║
+  ║     didn't pick the protocol. I defend the wrapper around the SDK,    ║
+  ║     not the protocol choice. Where my knowledge ends is named.        ║
+  ║                                                                       ║
+  ║  · The original lib/state/insights.ts (the concurrent-user wipe)      ║
+  ║     AI suggested a global Map<id, Insight> with .clear() at the top   ║
+  ║     of every write. For one user, correct. For two concurrent users   ║
+  ║     on one warm instance, user A's clear wiped user B's mid-session.  ║
+  ║     I caught it on a concurrency re-read. Session-keyed the map.      ║
+  ║     SHIPPED. This is the strongest possible version of owning a       ║
+  ║     defaulted-to decision: AI wrote it, I accepted it, I later read   ║
+  ║     it as a real bug, here's the fix and it shipped.                  ║
+  ║                                                                       ║
+  ╚══════════════════════════════════════════════════════════════════════╝
+```
+
+That map is the chapter. The three modes are how you frame every answer in this chapter; the examples are what you anchor to. Burn the map; the rest is delivery.
+
+## The big question — "did you use AI to build this?"
+
+```
+  ┌─────────────────────────────────────────────────┐
+  │ THEY ASK                                        │
+  │   "Did you use AI to build this?"               │
+  │                                                 │
+  │ WHAT THEY'RE TESTING                            │
+  │   Will you be defensive (collapse) or evasive   │
+  │   (worse)? Or will you be matter-of-fact about  │
+  │   AI's role, matter-of-fact about your role,    │
+  │   and end with something thoughtful about       │
+  │   what the tools have actually taught you?      │
+  └─────────────────────────────────────────────────┘
+```
+
+The strong answer, in your voice, in two beats:
+
+> **(Beat 1, ~20s)** "Yes — heavily. Anyone shipping in 2026 who says otherwise is probably lying or working alone in a sealed room. The honest framing is that the **decisions are mine, the AI accelerated the typing**. I think about every decision in this codebase as one of three modes: deliberate (my choice, alternatives considered), evaluated-and-accepted (AI or a library suggested it, I read it, I tested it, I accepted), or defaulted-to (I took the default and didn't deeply evaluate at the time). I can give you examples in any of the three.
+>
+> **(Beat 2, ~25s)** "The mode I find most useful to talk about is the third one — the defaulted-to. The strongest version of owning a defaulted-to decision is: AI wrote it, I accepted it, I later read it as a real bug, here's the fix, and it shipped. I have one of those in this project. The original `lib/state/insights.ts` was a global `Map<id, Insight>` with a `.clear()` at the top of every briefing write. For one user, correct. For two concurrent users on one warm Vercel instance, user A's `.clear()` wiped user B's mid-session. AI suggested the original shape; I accepted it; I caught it on a concurrency re-read; the fix was to session-key the map. Shipped.
+>
+> "If you want, I can walk you through one of each mode."
+
+That hand-off at the end gives the interviewer four threads — *one of each mode* — and routes them to specific sections of this chapter. Walk whichever they pick.
+
+```
+  ┃ "The decisions are mine. The AI accelerated the
+  ┃  typing."
 ```
 
 ```
-┌──────────────────────────────────┬──────────────────────────────────┐
-│ WEAK ANSWER                       │ STRONG ANSWER                     │
-├──────────────────────────────────┼──────────────────────────────────┤
-│ "I mean, I used it for some       │ "Yes, heavily. The decisions were │
-│  boilerplate, but I wrote the     │  mine, AI accelerated the typing, │
-│  important parts myself and I     │  and I can tell you for any part  │
-│  understand all of it."           │  whether I decided it, evaluated  │
-│                                   │  and accepted it, or defaulted to │
-│                                   │  the tool. Pick a section."       │
-├──────────────────────────────────┼──────────────────────────────────┤
-│ Why it's weak:                    │ Why it works:                     │
-│ defensive ("but I wrote the       │ no defensiveness, an explicit     │
-│ important parts") and             │ framework for the boundary, and   │
-│ over-claims ("understand ALL of   │ an invitation to be tested. It    │
-│ it"). The next question — "okay,  │ signals you've already thought    │
-│ explain this part" — will catch   │ about exactly what the interviewer│
-│ the over-claim. You set your own  │ is probing for, so the follow-up  │
-│ trap.                             │ has nowhere surprising to go.     │
-└──────────────────────────────────┴──────────────────────────────────┘
+  ┃ "AI wrote this, I accepted it, I later read it
+  ┃  as a real bug, here's the fix, and it shipped."
 ```
 
----
+## The follow-ups, by decision mode
 
-## "Can you explain this section line by line?"
+### "Give me a deliberate one"
 
-> ┌─────────────────────────────────────────────────────────────┐
-> │ THEY ASK                                                      │
-> │   "Pick a file — can you explain it line by line?"            │
-> │   (or they pick the file)                                     │
-> │                                                               │
-> │ WHAT THEY'RE TESTING                                          │
-> │   The over-claim detector. If you said "I understand all of   │
-> │   it," this is where it breaks. They want to see whether your │
-> │   understanding is real or borrowed.                          │
-> └─────────────────────────────────────────────────────────────┘
+> "The hand-rolled `runAgentLoop`. It's still in the repo at `lib/agents/base-legacy.ts` lines 86–176. I wrote it myself because I needed two disciplines off-the-shelf libraries don't always give you: a hard `maxToolCalls` budget against a rate-limited upstream, and a forced final synthesis turn so the loop terminates with a structured answer instead of a half-finished tool call. AI helped me write the *code*; the *shape* — the budget, the forced-synthesis pattern — was my decision after thinking about how the alpha Bloomreach server's rate limits and token revokes would behave. That's the deliberate mode: the criteria are mine, the typing was accelerated."
 
-If you get to pick, pick something you own deliberately. In your voice:
+### "Give me an evaluated-and-accepted one"
 
-"Let me walk `runAgentLoop` — it's the core. It takes the Anthropic client and the MCP client as injected dependencies, which is what makes it testable with fakes. It calls the model with the agent's tool schema, runs whatever tool calls the model asks for through the MCP client, feeds the results back as tool-result messages, and repeats. The termination is the part I care about: there's a `maxToolCalls` budget, and once it's spent I stop passing tools on the next turn, which forces the model to synthesize a final answer instead of calling more tools. That's how I bound an agent against a server I can only hit about once a second."
-
-If *they* pick a file and it's one you defaulted to, do not bluff — pivot honestly. That's the recovery box below. The skill being tested is whether you can tell your deep regions from your shallow ones in real time.
+> "The AptKit migration — and this is the load-bearing example in the chapter. Once `@aptkit/core` hit version 0.3.0, the primitive surface got clean: `ModelProvider`, `ToolRegistry`, `CapabilityTraceSink`. I had the hand-rolled loop in front of me with the two disciplines I wasn't willing to give up. I read AptKit's source. I confirmed both disciplines were expressible in the new shape. I built three adapter classes on my side of the boundary — about 200 lines total — and migrated. The legacy is preserved as my rollback receipt.
+>
+> "What makes this evaluated-and-accepted instead of defaulted-to: it was the conclusion of a comparison, not a default. I owned the alternative (the hand-roll), I checked the new option against the disciplines I cared about, I made the call. And the boundary discipline is mine: *library owns the loop, I own the boundary*. Three small classes, two hundred lines, the legacy preserved for the day I need to peel back to it."
 
 ```
-"Did you use AI?" → "Yes."
+  ┃ "I own the boundary; AptKit owns the loop. Three
+  ┃  small adapter classes, about 200 lines, and the
+  ┃  legacy loop is preserved for the day I need to
+  ┃  peel back to it."
+```
+
+### "Give me a defaulted-to one (besides the wipe bug)"
+
+> "OAuth PKCE plus Dynamic Client Registration. The MCP SDK ships with an `OAuthClientProvider` interface that expects both, and the Bloomreach loomi connect server is configured for both. I implemented the provider, I didn't pick the protocol. When I defend PKCE and DCR, I'm defending the *mechanics of the wrapper* — the encrypted-cookie store in `lib/mcp/auth.ts`, the `AsyncLocalStorage` threading, the file-backed dev fallback — not the protocol choice.
+>
+> "What makes this the canonical defaulted-to: I didn't run a comparison against bearer-token-with-refresh or any other auth shape. The SDK said 'this is what you implement' and I implemented it. The senior move on a defaulted-to decision is to name exactly where my knowledge ends — I can defend the wrapper line by line; I can walk you through PKCE's code-verifier-and-S256 dance because I implemented the storage for both sides; but I can't tell you why the IETF chose S256 over the alternatives, and if you push past my implementation into the protocol's design choices, I'll be reading you the spec, not defending a decision I made."
+
+## The other AI questions — what AI got wrong
+
+```
+  ┌─────────────────────────────────────────────────┐
+  │ THEY ASK                                        │
+  │   "What did AI get wrong in this codebase?"     │
+  │                                                 │
+  │ WHAT THEY'RE TESTING                            │
+  │   Have you actually read your own code with a   │
+  │   critical eye, or do you trust whatever AI    │
+  │   produced? Can you point at real bugs that AI  │
+  │   contributed to, with the fix and the lesson?  │
+  └─────────────────────────────────────────────────┘
+```
+
+The strong answer is a list with specifics. You have four real bugs (covered across Chapters 5 and 6) that AI contributed to in one form or another, plus one AI-suggested decision you re-evaluated. Walk them quickly:
+
+> "Four bugs that AI contributed to and one decision I reconsidered. Quickly:
+>
+> 1. **The concurrent-user wipe in `lib/state/insights.ts`.** Already walked. AI's global-Map-with-clear pattern. Fix: session-keyed map. Shipped.
+>
+> 2. **The StrictMode double-fetch in `useInvestigation`.** AI suggested the AbortController cleanup pattern alongside the started-guard. Together they were solving for different lifetimes — in StrictMode, mount-cleanup-remount, the cleanup cancelled the only fetch and the guard blocked the remount from starting fresh. Fix: keep the guard, drop the cleanup-cancel. `setState` after unmount is a safe no-op.
+>
+> 3. **The bare 500 from `/api/briefing`.** Not strictly AI's fault — it was a missing env var. But the *pattern* of throwing in pre-stream setup without a try/catch was an AI default I'd accepted. The fix wraps the setup in a try/catch that returns a real error JSON.
+>
+> 4. **The all-at-once coverage reveal.** AI's first cut emitted a single bulk `coverage` event at the end. I wanted per-category reveal. Fix: emit `coverage_item` per category as the agent confirms it.
+>
+> "And the one **decision I revisited** that AI was on the wrong side of: the hand-rolled loop in `runAgentLoop`. Earlier in the project AI was nudging me toward off-the-shelf agent frameworks. I deliberately stayed hand-rolled because I needed the budget and the forced-synthesis discipline. Later — once `@aptkit/core` exposed a clean primitive surface and I could confirm both disciplines survived — I migrated. That's not AI getting it wrong; that's me being right at the time *and* right later, by different criteria. Important to distinguish those, because if I'd let AI nudge me into a framework at the start I would have ended up with the wrong shape for the constraint."
+
+## The hardest follow-up — "can you explain this section line by line?"
+
+This is the **drill-down probe**. The interviewer picks a file, scrolls to a function, and asks you to walk it. The trap is to wing it. The fix is to know which sections you've read carefully and which you haven't, and to be honest about the difference.
+
+```
+  ╔═══════════════════════════════════════════════╗
+  ║ WHEN YOU DON'T KNOW                           ║
+  ║                                               ║
+  ║   They open lib/mcp/auth.ts and point at the  ║
+  ║   AES-256-GCM encrypted-cookie store. "Walk   ║
+  ║   me through this line by line."              ║
+  ║                                               ║
+  ║   You implemented this wrapper. You wrote     ║
+  ║   the storage methods. You've debugged a      ║
+  ║   real bug in this file (the bare-500). But   ║
+  ║   if they push into the cryptographic         ║
+  ║   primitives — why GCM mode, what IV reuse    ║
+  ║   means, AEAD properties — you'll fold.       ║
+  ║                                               ║
+  ║   Say:                                        ║
+  ║   "I can walk you through the storage         ║
+  ║    methods, the AsyncLocalStorage threading,  ║
+  ║    and the dev-vs-prod store split. I can     ║
+  ║    tell you what aesKey() does and why it     ║
+  ║    throws on missing AUTH_SECRET — that's     ║
+  ║    the source of the bare-500 bug I fixed.    ║
+  ║    What I can't defend from first principles  ║
+  ║    is the choice of AES-256-GCM specifically  ║
+  ║    over alternatives — I implemented what     ║
+  ║    the Node crypto API surfaced. If you want  ║
+  ║    to push into AEAD properties or IV reuse   ║
+  ║    semantics, I'll be reading you the docs.   ║
+  ║    Which part would you like me to walk?"     ║
+  ║                                               ║
+  ║   What this signals: a precise map of what    ║
+  ║   you wrote vs what you delegated, no fake    ║
+  ║   confidence on cryptographic internals you   ║
+  ║   didn't design.                              ║
+  ║                                               ║
+  ║   Do NOT say:                                 ║
+  ║   "GCM is generally recommended for           ║
+  ║    encryption because it's authenticated."    ║
+  ║   This is a sentence you read on a blog. The  ║
+  ║   security interviewer will ask "authenticated║
+  ║   against what" and the conversation ends.    ║
+  ╚═══════════════════════════════════════════════╝
+```
+
+## The follow-up tree
+
+```
+  You give the "decisions mine, typing accelerated" frame.
         │
         ▼
-  ├─► IF THEY SAY "explain a section line by line"
-  │     → offer one you own: runAgentLoop, the coverage gate
-  │       (schemaCapabilities → coverageReport), or the NDJSON
-  │       reader's line-buffer. Walk it with the mechanism, not
-  │       a paraphrase.
-  │
-  ├─► IF THEY SAY "what did the AI get wrong?"
-  │     → you have THREE real bugs ready (below). This is a gift
-  │       question — it's where you look most senior.
-  │
-  └─► IF THEY SAY "how much of this could you have written
-        without AI?"
-        → "All of it, slower. The loop, the streaming, the gate
-           are concepts I understand. AI saved me typing and
-           lookup time, not understanding. The OAuth flow is the
-           one part I'd have had to actually learn to write."
+        ├─► "Give me an example of each mode"
+        │     Deliberate: hand-rolled loop.
+        │     Evaluated: AptKit migration.
+        │     Defaulted-to: OAuth PKCE (or the wipe bug).
+        │
+        ├─► "What did AI get wrong?"
+        │     Four real bugs, walked above. Each has
+        │     a file, a fix, a lesson.
+        │
+        ├─► "How much of this code did you write yourself
+        │    vs AI?"
+        │     Honest re-frame: that's the wrong metric.
+        │     The right metric is which decisions are
+        │     mine. Lines of code is noise; load-bearing
+        │     decisions is signal. The boundary in
+        │     aptkit-adapters.ts is 200 lines I co-wrote
+        │     with AI, but every shape in that file is
+        │     mine.
+        │
+        ├─► "Could you have built this without AI?"
+        │     Yes, slower. The hand-rolled loop predates
+        │     the migration. The eval suite I built and
+        │     retired predates the synthetic adapter.
+        │     AI accelerates the typing; the disciplines
+        │     are what make the code shippable.
+        │
+        └─► "Can you explain THIS section line by line?"
+              Pick. Honest about where the read is
+              careful (boundary code, the hooks, the
+              streaming kernel) vs where it's
+              implementation-of-a-spec (PKCE internals,
+              GCM choice). Re-route to a thread you can
+              walk in depth.
 ```
 
----
+## What AI got *right* — the one thing worth volunteering
 
-## "What did the AI get wrong?"
+The interviewer is rarely going to ask this. Volunteer it, because it shows the senior posture of separating signal from noise.
 
-This is the question that makes you look most senior, because the answer is a debugging story where *you* are the one who caught the machine. You have three real ones.
-
-> ┌─────────────────────────────────────────────────────────────┐
-> │ THEY ASK                                                      │
-> │   "What did the AI get wrong, or where did you have to        │
-> │    correct it?"                                               │
-> │                                                               │
-> │ WHAT THEY'RE TESTING                                          │
-> │   Whether you were driving or being driven. A candidate who   │
-> │   can't name a single thing AI got wrong was never really in  │
-> │   control — they accepted output they couldn't evaluate.      │
-> └─────────────────────────────────────────────────────────────┘
-
-In your voice — pick one, have all four ready (the fourth is the strongest):
-
-"Four come to mind. First, a React StrictMode bug: the investigation hook cancelled its in-flight fetch on effect cleanup, which combined with a run-once guard to abort the stream on the dev double-mount — the logs came up empty. The fix was to keep the run-once guard but stop cancelling on cleanup, since a `setState` after unmount is a safe no-op. AI-generated code that looked correct in isolation broke under StrictMode's intentional double-invoke.
-
-Second, a production-only 500: the briefing endpoint threw a bare 500 in prod but worked in demo. The cause was the auth cookie's encryption key throwing when an environment secret was unset, during the pre-stream setup, unguarded. I isolated it by noticing demo returned 200 and live returned 500 — so it was the auth path, before the stream. The fix wrapped setup so it returns the real error.
-
-Third, the coverage grid 'loaded all at once.' The per-category logs streamed fine, but the grid resolved from a single bulk event. I proved the server was streaming correctly by measuring per-line arrival timing, which told me the grid was the issue, not the stream — and switched to emitting coverage one category at a time.
-
-Fourth, and this is the one I'd actually open with if I had to pick — a correctness bug AI suggested *and* I accepted, which I caught later, not at write-time: `lib/state/insights.ts` held the insights `Map` as a module-level global, and `putInsights` called `insights.clear()` at the top of every briefing write. For one user that's correct; for two concurrent users on one warm Vercel instance, user A's briefing wiped user B's mid-session. The pattern is what AI assistance is *worst* at: it produces locally-correct code that breaks under a concurrency assumption never written down. I caught it on a later read for concurrency, not at write-time. The fix shipped — session-key the Map (`Map<sessionId, SessionFeed>`) — and the lesson is that an AI-suggested in-memory store needs a written concurrency model before it gets accepted, not after. Saying that out loud — 'AI wrote this, I accepted it, I later read it as a real bug, here's the fix and it shipped' — is the strongest possible version of owning a defaulted-to decision."
+> "One thing worth saying about the positive side: the **AptKit migration** is the single decision in this project that AI helped me make better. Not by suggesting AptKit — I found that on my own. But by helping me think through whether my two disciplines (the budget, the forced synthesis) survived in the new primitive surface. I'd read parts of AptKit's source, sketch how my discipline would map onto its `ToolRegistry` and `ModelProvider`, paste both into a conversation with AI, and ask 'what's the failure mode of this mapping I haven't thought of?' That's evaluated-and-accepted at its strongest — I'm using AI as a sounding board to pressure-test a decision I'm making, not as the decision-maker. The 200-line adapter file is the artifact of that process."
 
 ```
-        ▸ "What did the AI get wrong?" is a gift. It's the one
-          question where the honest answer is a story of you
-          catching the machine.
+  ┃ "Use AI as a sounding board to pressure-test a
+  ┃  decision you're making, not as the decision-
+  ┃  maker."
 ```
 
-Notice the honest nuance you can add to the third one: the tile-by-tile reveal you built is real in the *demo replay*, which is paced — on a live run the gate is instant, so the grid resolves at once and the genuinely incremental work is the EQL trace. Volunteering that distinction, unprompted, is a strong senior signal: you know the difference between a real-time effect and a replayed one in your own product.
+## What you'd change about your AI workflow
 
-There's a fifth one that's a different shape — not "AI got it wrong" but "AI helped me migrate a load-bearing decision I'd defended": the AptKit primitive boundary. I used AI heavily to migrate the active agent path from my own hand-rolled `runAgentLoop` to `@aptkit/core`'s runtime via three adapter classes in `lib/agents/aptkit-adapters.ts`. The migration moved Blooming's agent runtime from a thing I built into a thing I parameterize — and I evaluated AptKit's primitive surface before accepting it (the budget + forced-synthesis discipline survives, the adapter boundary is on my side, the legacy loop is preserved). That's **evaluated-and-accepted** mode, and it's worth naming specifically because it's the most consequential decision I've made *with AI* on this codebase: I revisited a deliberate decision I'd previously defended hard, picked a different shape, and kept the boundary clean enough that I can peel back to the legacy if I need to. That's the senior story to tell about AI as a tool — it accelerated the migration; the boundary discipline was mine.
+The one meta-counterfactual on AI use: I'd be more deliberate about **flagging defaulted-to code at write-time, not later**. The concurrent-user wipe in `insights.ts` was a defaulted-to decision I caught on a later re-read. The right shape is to mark the file at write-time — a comment like `// AI-suggested shape; concurrency reread needed` — and revisit it before shipping. That artifact would have caught the wipe before two concurrent users could trigger it. The trigger is any code path that touches shared state across requests; that's a small-enough surface to audit deliberately.
 
----
+## One-page summary
 
-╔═══════════════════════════════════════════════════════════════╗
-║ WHEN YOU DON'T KNOW                                           ║
-║                                                               ║
-║   They pick the file you defaulted to: "Walk me through the   ║
-║   OAuth provider — line by line, what's happening in the      ║
-║   PKCE exchange?"                                             ║
-║                                                               ║
-║   Say:                                                        ║
-║   "This is the part I defaulted to. The PKCE and Dynamic      ║
-║    Client Registration flow is the MCP SDK's OAuth provider;  ║
-║    I implemented the SDK's provider interface and accepted    ║
-║    its flow rather than writing the exchange myself. I know   ║
-║    the shape — code verifier and challenge, the redirect, the ║
-║    token exchange — but I can't walk you line by line through ║
-║    the SDK's exchange because I didn't write it. What I DID   ║
-║    write and can walk line by line is the token store around  ║
-║    it: the AES-256-GCM encrypted cookie in prod, the file     ║
-║    store in dev, and the AsyncLocalStorage seam that flushes  ║
-║    it per request. Want that?"                                ║
-║                                                               ║
-║   What this signals: you can locate a defaulted-to region     ║
-║   precisely, you're honest that you didn't write it, and you  ║
-║   immediately redirect to adjacent code you genuinely own.    ║
-║   That's the senior way to own a default.                     ║
-║                                                               ║
-║   Do NOT say:                                                 ║
-║   "Sure — so it generates a code verifier, hashes it for the  ║
-║    challenge, and then... um... sends that to the authorize   ║
-║    endpoint, and..." — narrating a flow you didn't write,     ║
-║    from memory of its shape, collapses on the first "and      ║
-║    then what does the server return?"                         ║
-╚═══════════════════════════════════════════════════════════════╝
+**Core claim:** The AI question rewards the calibrated-honest answer. Decisions in three modes — deliberate, evaluated-and-accepted, defaulted-to. The strongest version of owning a defaulted-to decision is: AI wrote it, I accepted it, I later read it as a real bug, here's the fix, and it shipped.
 
----
+**The frame in one line:** "The decisions are mine. The AI accelerated the typing."
 
-## What you'd change
+**Examples of each mode:**
+- **Deliberate** → the hand-rolled `runAgentLoop`; the DataSource seam; NDJSON over fetch.
+- **Evaluated-and-accepted** → the AptKit migration; the page decomposition into 3 hooks; the shared `readNdjson` kernel.
+- **Defaulted-to** → OAuth PKCE+DCR; the original `insights.ts` wipe (caught, fixed, shipped).
 
-Two answers here, and the second is the senior-grade one.
+**What AI got wrong (with fixes):** concurrent-user wipe, StrictMode double-fetch, bare-500 setup pattern, all-at-once coverage reveal.
 
-The first is about how you *used* AI, not about the code: you'd keep a tighter log of the defaulted-to decisions as you made them. The OAuth flow, the encryption parameters, the backoff constants — you can identify them as defaults now, in hindsight, but you reconstructed that boundary after the fact. The senior habit is to mark a decision as "accepted the tool's default, didn't evaluate" *at the moment you make it*, so the boundary between your judgment and the tool's is a record, not a reconstruction. Next project, that log is the thing you'd start on day one.
-
-The second, and the one a staff interviewer will hear as L5: **the eval harness I shipped, used, and then retired — and what I'd do with version two.** The bluntest version of "what would I do differently with more time" on an AI product used to be "I'd have shipped the eval harness alongside the agent loop." That's no longer the right framing, because I *did* ship it — the Phase 3 4-pillar suite (detection precision/recall, diagnosis 5-criterion rubric, recommendation 3-criterion rubric, regression capture-and-score), running K=10 against three seeded anomalies with LLM-as-judge calibrated by 8/8 + 3/3 manual spot-check agreement. The flywheel surfaced three real bugs the unit tests would never have caught: a BRL cents-vs-Reais unit-narration bug that the recommendation judge caught at run 8, a binary calibration breakdown in 29 of 30 diagnosis runs, and conclusion instability at a 30% regression baseline. When I retired Olist for the in-process Synthetic adapter, the eval suite went with it — its scorer was hard-coded to Olist's seeded anomaly ids.
-
-So the L5 answer is the version-two story: rebuild the eval harness against the Synthetic substrate (which isn't going anywhere), decoupled from any one adapter's seed data, carrying forward the calibration approach that already worked once. Today's repo has the same eval gap as before Phase 3 — but with three pieces of receipt I didn't have then: I've built it end-to-end, I've used it to find bugs, and I know what the next version should look like. Owning the gap *with the receipts of having done the work* is a stronger L5 answer than promising to build something.
-
----
-
-## One-page summary (night-before review)
-
-**Core claim:** The question isn't whether you used AI — it's whether you can locate the boundary between what you decided, what you evaluated, and what you defaulted to, and own each honestly.
-
-**The questions covered:**
-- *"Did you use AI?"* → "Yes, heavily. The decisions were mine; AI accelerated the typing. I can bucket any part as deliberate, evaluated-and-accepted, or defaulted-to."
-- *"Explain a section line by line."* → Offer one you own (the coverage gate, the AptKit adapter classes in `aptkit-adapters.ts`, the `readNdjson` kernel, the SyntheticDataSource); walk the mechanism, not a paraphrase.
-- *"What did the AI get wrong?"* → Four real ones you caught: the StrictMode double-fetch, the prod-only 500, the all-at-once coverage reveal, and the global-`Map` + `putInsights.clear()` concurrent-user wipe in `lib/state/insights.ts` (an AI-default I accepted at write-time and only caught later when reading for concurrency; the session-key fix has shipped).
-- *"What's the most consequential thing AI helped you do?"* → Migrate the active agent path from my hand-rolled `runAgentLoop` to `@aptkit/core`'s runtime via three adapter classes. Evaluated-and-accepted; legacy loop preserved; the boundary discipline was mine.
-- *"How much could you write without AI?"* → "All of it, slower — except the OAuth flow, which I'd have had to actually learn."
+**What AI got right (worth volunteering):** sounding-board for the AptKit migration — pressure-tested whether two disciplines survived.
 
 **Pull quotes:**
-- The decisions were mine; AI accelerated the typing. I can tell you which bucket any part falls into.
-- "What did the AI get wrong?" is a gift — the honest answer is a story of you catching the machine.
-- AI accelerated the AptKit migration; the boundary discipline was mine.
+```
+  ┃ "The decisions are mine. The AI accelerated the
+  ┃  typing."
 
-**What you'd change:** Two answers. (1) Keep a real-time log of defaulted-to decisions as you make them, so the judgment/default boundary is a record, not a reconstruction. (2) The L5 answer: rebuild the eval harness against the Synthetic substrate — version two of a thing I shipped in Phase 3, used to surface 3 real bugs (BRL cents-vs-Reais, calibration binary, conclusion instability), retired with the Olist substrate it scored against. Owning the gap with the receipt of having done the work once is a stronger L5 answer than promising to build it.
+  ┃ "AI wrote this, I accepted it, I later read it
+  ┃  as a real bug, here's the fix, and it shipped."
 
----
+  ┃ "Use AI as a sounding board to pressure-test a
+  ┃  decision you're making, not as the decision-
+  ┃  maker."
+```
+
+**What you'd change:** mark defaulted-to code at write-time with a flag for later re-read, especially anywhere touching shared state across requests. The artifact would catch defaulted-to bugs before users do.

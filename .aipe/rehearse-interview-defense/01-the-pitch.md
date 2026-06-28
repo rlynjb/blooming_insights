@@ -1,233 +1,249 @@
 # Chapter 1 — The pitch
 
-In the first five minutes of every interview, someone says "tell me about a project you built." How you answer the next ninety seconds sets the frame for everything after it. Get it tight and the interviewer leans in and starts asking *your* questions, on *your* terrain. Ramble and you spend the rest of the hour being rescued.
+In the first ninety seconds of every senior interview, someone says "tell me about a project you built." The candidates who fail this part don't fail by saying the wrong thing — they fail by saying *everything*. They list features. They explain their stack. They narrate two months of development. By the time they stop talking, the interviewer has stopped listening.
 
-This chapter gives you blooming insights in three lengths — ten seconds, thirty seconds, ninety seconds — and teaches the discipline of compression. You are a frontend engineer who built a multi-agent AI system; the pitch has to land both halves without drowning in either. The goal is not to say everything. It is to say the one shape that makes the interviewer want the rest.
+This chapter is about compression. You're going to learn the project in three lengths: ten seconds, thirty seconds, ninety seconds. Each is a different conversation. The ten-second pitch is the hallway. The thirty-second pitch is the recruiter screen. The ninety-second pitch is the actual answer to "walk me through what you built" — and it has a precise shape with a hook, a load-bearing detail, and a hand-off to the interviewer's next question.
 
 ## The project at a glance
 
-Before you can compress it, hold the whole thing in one picture — this is what every pitch length is carving down from.
+The visual anchor for everything that follows. If you only remember one picture from this chapter, remember this one — it's the shape of the pitch.
 
 ```
-  blooming insights — "an analyst that shows its work"
-  ════════════════════════════════════════════════════════════════════
+  blooming insights — the project on one page
 
-   THE LOOP a human analyst runs                  THE PRODUCT
-   ─────────────────────────────                  ───────────────────────
-     what changed?  ──►  monitoring   ─┐          a feed of ranked
-          │                            │           anomaly cards,
-          ▼                            │           each one click-through
-        why?       ──►  diagnosis     ─┼──►        to a streamed
-          │                            │           investigation +
-          ▼                            │           a recommended
-     what to do?   ──►  decision      ─┘           Bloomreach action
+  WHO USES IT
+  ┌────────────────────────────────────────────────────────────┐
+  │  A marketer/analyst on Bloomreach Engagement                │
+  │  (an ecommerce CDP — customers, events, revenue, catalogs)  │
+  └────────────────────────────────────────────────────────────┘
 
-   GROUNDED IN                       SHOWN AS
-   ───────────                       ────────
-     Bloomreach loomi MCP              every conclusion carries its
-     ad-hoc EQL queries                provenance — the exact queries,
-     (no saved dashboards)             the current-vs-prior numbers,
-     90d-vs-prior-90d method           a live-streamed log of the
-                                       agent's reasoning
+  THE LOOP IT AUTOMATES
+  ┌─── what changed ───┐  ┌─── why ────────┐  ┌─── what to do ──┐
+  │ monitoring agent   │→ │ diagnostic     │→ │ recommendation  │
+  │ 90-day window      │  │ agent (forms + │  │ agent (scenario │
+  │ period-over-period │  │ tests hypoth.) │  │ /segment/camp.) │
+  │ on EQL metrics     │  │ cites evidence │  │ + expected impact│
+  └────────────────────┘  └────────────────┘  └─────────────────┘
 
-   STACK                             SHAPE
-   ─────                             ─────
-     Next.js 16 · React 19            4 agents · shared runtime
-     Anthropic claude-sonnet-4-6      NDJSON streamed to the UI
-     MCP SDK · NDJSON · no DB         demo / live-bloomreach /
-                                      live-synthetic (3-way toggle)
+  THE INTERESTING TECHNICAL CLAIM
+  ┌────────────────────────────────────────────────────────────┐
+  │  Three agents · streamed reasoning trace as a               │
+  │  first-class UI surface (NDJSON over fetch)                 │
+  │  · two-adapter data-source seam (Bloomreach / Synthetic)    │
+  │  · third-party agent runtime (AptKit) behind a 3-class      │
+  │    adapter boundary I own                                   │
+  └────────────────────────────────────────────────────────────┘
+
+  THE STACK
+  ┌────────────────────────────────────────────────────────────┐
+  │  Next.js 16 (App Router) · React 19 · TS · Sonnet 4.6 ·    │
+  │  @aptkit/core@0.3.0 · MCP over OAuth PKCE+DCR · Vercel     │
+  └────────────────────────────────────────────────────────────┘
 ```
 
-Everything below is this picture, said at three zoom levels.
+That picture is the spine. Every pitch length below pulls from it.
 
----
+## The ten-second pitch
 
-## The 10-second version (the elevator)
-
-> ┌─────────────────────────────────────────────────────────────┐
-> │ THEY ASK                                                      │
-> │   "So what did you build?" (half-listening, still reading     │
-> │    your resume)                                               │
-> │                                                               │
-> │ WHAT THEY'RE TESTING                                          │
-> │   Can you compress? Do you know what the project actually     │
-> │   *is*, stripped of every feature you're proud of? The        │
-> │   ten-second answer is the hardest one to write.              │
-> └─────────────────────────────────────────────────────────────┘
-
-In your voice, out loud:
-
-▸ "blooming insights is an AI analyst for a Bloomreach ecommerce workspace. It watches the metrics, finds what changed, works out why, and proposes the fix — and it streams its reasoning to the screen, so you see *how* it got there, not just the answer."
-
-That's it. One sentence of what, one clause of what makes it different. You do not say "Next.js" in the ten-second version. You do not say "multi-agent." You say what it *does for a person*, then stop and let them pull.
+The hallway answer. Someone you've just met asks "what have you been working on." You have time for one sentence — two if the first lands well.
 
 ```
-┃ "An analyst that shows its work." If you only get one
-┃  sentence, that's the one. It's the whole product.
+  ┌─────────────────────────────────────────────────┐
+  │ THEY ASK                                        │
+  │   "What have you been working on?"              │
+  │                                                 │
+  │ WHAT THEY'RE TESTING                            │
+  │   Can you compress without losing the           │
+  │   load-bearing detail? Most engineers either    │
+  │   say "an AI app" (no signal) or open the dev   │
+  │   tools and read out their package.json.        │
+  └─────────────────────────────────────────────────┘
 ```
 
----
+Strong answer, in your voice:
 
-## The 30-second version (the hallway)
+> "I built **blooming insights** — a multi-agent AI analyst that sits on top of a Bloomreach ecommerce workspace and runs the loop a human analyst would: what changed, why, what to do."
 
-> ┌─────────────────────────────────────────────────────────────┐
-> │ THEY ASK                                                      │
-> │   "Tell me a bit more — how does it work?"                    │
-> │                                                               │
-> │ WHAT THEY'RE TESTING                                          │
-> │   Can you go one layer down without dumping the whole stack?  │
-> │   Do you have a *structure* in your head, or a pile of        │
-> │   features? They want to hear the shape, not the tour.        │
-> └─────────────────────────────────────────────────────────────┘
-
-In your voice:
-
-"It runs the loop a human analyst runs — *what changed, why, what to do* — as three stages. A monitoring agent scans the workspace for anomalies and ranks them by severity. Click one and a diagnostic agent investigates the cause, forming and testing hypotheses against the real data. Then a recommendation agent proposes a concrete Bloomreach action — a campaign, a segment, an experiment — with an expected impact. The thing I care most about is that every step streams its reasoning to the UI as it happens: which queries it ran, the actual numbers, the hypotheses it ruled out. It's an analyst that shows its work."
-
-Thirty seconds, three stages, one differentiator. Notice what you still haven't said: the framework, MCP, the agent loop, the demo toggle. You're holding those in reserve as answers to questions you *want* them to ask.
-
----
-
-## The 90-second version (the real answer)
-
-This is the one you rehearse until it's boring. Most candidates ramble here because they try to fit everything; you're going to deliver a structured arc — problem, shape, one hard part, one honest edge — and land it.
-
-> ┌─────────────────────────────────────────────────────────────┐
-> │ THEY ASK                                                      │
-> │   "Walk me through a project you're proud of."                │
-> │                                                               │
-> │ WHAT THEY'RE TESTING                                          │
-> │   Can you tell a complete story with a beginning (the         │
-> │   problem), a middle (what you built and why), and a          │
-> │   senior-flavored ending (a tradeoff you'd own)? Do you       │
-> │   sound like you understand it, or like you're reciting it?   │
-> └─────────────────────────────────────────────────────────────┘
-
-In your voice:
-
-"A marketer on Bloomreach has to do three things by hand: notice a metric moved, hunt for the cause, and figure out which Bloomreach feature to reach for. blooming insights does that loop end-to-end and proactively.
-
-It's a Next.js 16 app built on Bloomreach's loomi connect MCP server, with a Blooming-owned synthetic adapter behind the same interface so the live path works without the upstream. There are no saved dashboards in the workspace, so every metric is computed ad-hoc with EQL — which means the agents have to decide *what* to query. There are four agents — monitoring, diagnostic, recommendation, and a free-form query agent — running claude-sonnet-4-6 on a shared agent runtime; I started with a hand-rolled loop and migrated the active path to a generic agent library, keeping three small adapter classes on my side that hide the Anthropic SDK, the data source, and the streaming hooks behind library primitives. Monitoring runs a fixed checklist of ecommerce anomaly categories, but only after a gate checks which categories the workspace's event schema can actually support — so it never wastes a query on data that isn't there.
-
-The part I'm proudest of is that the reasoning is a first-class UI surface. As an agent works, the exact EQL it runs, the current-vs-prior numbers, and its hypotheses stream to a side panel over NDJSON. You're not looking at a spinner and then an answer — you watch the analysis happen.
-
-The honest edge: it has no database. State lives in memory, with a committed demo snapshot for a creds-free presentation path. That was the right call for a hackathon against an alpha MCP server that revokes tokens after a few minutes — but it's the first thing I'd change for real multi-user use."
-
-That last paragraph is the move. You volunteered the weakness *and* the reason it was right *and* what you'd change — in one breath, before they asked. That is the single highest-signal thing you can do in a pitch.
+That's it. One sentence, one cadence (`what changed → why → what to do`), one named system. If they want more, they'll ask. The strongest signal you can send in ten seconds is that you can stop talking.
 
 ```
-        ▸ End the 90-second pitch on a tradeoff you'd own.
-          It tells the interviewer you're senior before
-          they've asked a single follow-up.
+  ┃ "Run the loop a human analyst would: what
+  ┃  changed, why, what to do."
 ```
 
-### Weak vs strong: the same project, two pitches
+## The thirty-second pitch
 
-The difference between a pitch that works and one that sinks is almost never the project. It's the compression.
-
-```
-┌──────────────────────────────────┬──────────────────────────────────┐
-│ WEAK PITCH                        │ STRONG PITCH                      │
-├──────────────────────────────────┼──────────────────────────────────┤
-│ "It's a Next.js app that uses     │ "It's an AI analyst for a         │
-│  AI and the Bloomreach API and    │  Bloomreach ecommerce workspace.  │
-│  it has agents and streaming and  │  It finds what changed, diagnoses │
-│  a coverage grid and a demo mode  │  why, and proposes the fix — and  │
-│  and OAuth and it caches things   │  streams its reasoning so you see │
-│  and..."                          │  how it got there."               │
-├──────────────────────────────────┼──────────────────────────────────┤
-│ Why it's weak:                    │ Why it works:                     │
-│ a feature list, not a shape. The  │ leads with what it does for a     │
-│ interviewer can't tell what       │ person, names the one             │
-│ matters. Every noun has equal     │ differentiator, and stops. It     │
-│ weight, so none of them land.     │ invites the follow-up instead of  │
-│ You sound like you're listing     │ pre-empting it. You sound like    │
-│ your commit history.              │ you know what the project IS.     │
-└──────────────────────────────────┴──────────────────────────────────┘
-```
-
-### Where the conversation goes after the pitch
-
-A good 90-second pitch is bait. You've named four or five threads; the interviewer will pull one. Know where each leads so you're never surprised by your own pitch.
+The recruiter screen. The fly-by from a panel interviewer who hasn't read your resume. You have three or four sentences.
 
 ```
-You deliver the 90-second pitch.
+  ┌─────────────────────────────────────────────────┐
+  │ THEY ASK                                        │
+  │   "Tell me about a project from your portfolio."│
+  │                                                 │
+  │ WHAT THEY'RE TESTING                            │
+  │   Can you frame the technical interest in       │
+  │   under a minute? Do you know what's actually   │
+  │   novel about what you built vs the table       │
+  │   stakes?                                       │
+  └─────────────────────────────────────────────────┘
+```
+
+Strong answer:
+
+> "I built **blooming insights** — a multi-agent AI analyst for a Bloomreach ecommerce workspace. Three agents — monitoring, diagnostic, recommendation — run the analyst loop: what changed, why, what to do. The interesting piece is the streaming surface: the agents' reasoning trace is a first-class UI element, so the user sees not just the conclusion but every tool call and hypothesis along the way. Next.js 16, Anthropic Sonnet, MCP over OAuth — and the agent runtime is **AptKit** behind a small adapter boundary I own."
+
+Four sentences. Each one earns its place: the *what*, the *loop*, the *technical claim*, the *stack with the load-bearing detail*. Notice what's not there: the file layout, the data model, the test count, the demo mode. Save those for the ninety-second pitch.
+
+```
+  ┌─────────────────────────┬─────────────────────────┐
+  │ WEAK 30-SEC PITCH       │ STRONG 30-SEC PITCH     │
+  ├─────────────────────────┼─────────────────────────┤
+  │ "It's a Next.js app     │ "I built blooming        │
+  │ that uses Claude to     │ insights — a multi-      │
+  │ analyze ecommerce data. │ agent AI analyst for a   │
+  │ It's got monitoring     │ Bloomreach ecommerce     │
+  │ and recommendations and │ workspace. Three agents  │
+  │ a chat box. The agents  │ run the analyst loop:    │
+  │ stream their reasoning. │ what changed, why, what  │
+  │ It uses MCP to talk to  │ to do. The interesting   │
+  │ Bloomreach over OAuth.  │ piece is that the        │
+  │ I also have a demo mode │ reasoning trace is a     │
+  │ that replays a snapshot │ first-class UI surface."  │
+  │ for reliability..."     │                          │
+  ├─────────────────────────┼─────────────────────────┤
+  │ Why it's weak:          │ Why it works:           │
+  │ Feature list, no shape. │ Names the *loop*, then  │
+  │ The reader can't tell   │ the *technical claim*.  │
+  │ what's interesting from │ Compresses without      │
+  │ what's table-stakes.    │ losing what makes it    │
+  │ The "I also" reads as a │ worth talking about.    │
+  │ candidate who can't     │ Sets up the next        │
+  │ stop adding.            │ question.               │
+  └─────────────────────────┴─────────────────────────┘
+```
+
+The trap in the weak version is the urge to enumerate. Three agents, MCP, demo mode, reasoning trace — they're all real, but listed without a frame they sound like a brochure. The strong version puts one frame on top (the loop) and one technical claim underneath (the streamed trace as a UI surface). The interviewer now has a hook to pull on.
+
+## The ninety-second pitch — the real one
+
+This is the answer you give when an interviewer says "walk me through what you built." It has four parts, in order, each landing in roughly 20–25 seconds: **opener** (what and for whom), **the loop** (the analyst loop the system runs), **the interesting bit** (the technical claim that earns the conversation), and **the hand-off** (a sentence that hands the interviewer a thread to pull). Then you stop.
+
+```
+  ┌─────────────────────────────────────────────────┐
+  │ THEY ASK                                        │
+  │   "Walk me through a project you built."        │
+  │                                                 │
+  │ WHAT THEY'RE TESTING                            │
+  │   Can you hold the wide-opener for 90 seconds   │
+  │   without losing structure? Do you know what's  │
+  │   load-bearing vs decorative in your own work?  │
+  │   Will you hand me a thread to pull, or will I  │
+  │   have to find one?                             │
+  └─────────────────────────────────────────────────┘
+```
+
+The strong ninety-second answer, written so you can read it aloud and time it:
+
+> **(Opener, ~20s)** "I built **blooming insights** — a multi-agent AI analyst that runs on top of a Bloomreach Engagement workspace. The user is a marketer or analyst who normally has to notice a metric moved, hunt for why, and figure out which Bloomreach feature to reach for. blooming insights does that proactively and end-to-end.
+>
+> **(The loop, ~25s)** "It runs the loop a human analyst would run: **what changed, why, what to do**. There are three agents wired in series. The monitoring agent scans the workspace, runs period-over-period on a 90-day window, and surfaces anomalies. The diagnostic agent picks one and tests hypotheses against the data, citing evidence. The recommendation agent proposes a concrete Bloomreach action — a scenario or a segment or a campaign — with an expected impact and a confidence level.
+>
+> **(The interesting bit, ~25s)** "The technical piece I'm proudest of is that the agents' reasoning is a first-class UI surface, not a log file. As each agent runs, it streams NDJSON to the browser — every tool call, every hypothesis, every conclusion — and the UI renders it live in a sticky sidebar. So the product's pitch is *an analyst that shows its work*. Under the hood the agent runtime is a small library called **AptKit**, and I own the boundary to it through three adapter classes — about two hundred lines — so the loop is the library's and the boundary is mine.
+>
+> **(The hand-off, ~15s)** "There are a few corners I'd be happy to walk through — the data-source seam that lets me swap Bloomreach for a synthetic adapter, the eval suite I built and then retired, or the streaming kernel that's shared across four surfaces. Where would you like to start?"
+
+That's ninety seconds. The hand-off at the end is the most senior-feeling move in the whole pitch: it gives the interviewer three threads, each of which routes to a different chapter of this book. They pick one. You walk it.
+
+```
+  ┃ "The product's pitch is an analyst that shows
+  ┃  its work."
+```
+
+## The hand-off — where the interview goes next
+
+The last sentence of your ninety-second pitch determined the next ten minutes. Walk the branches so you're not surprised.
+
+```
+  Your hand-off offers three threads.
         │
         ▼
-  ├─► IF THEY PULL "four agents on one loop"
-  │     → go to Chapter 2 (architecture). Draw the shared
-  │       runAgentLoop and the four agents hanging off it.
-  │
-  ├─► IF THEY PULL "no database"
-  │     → go to Chapter 3 (choices) + Chapter 7 (counterfactuals).
-  │       This is the tradeoff you teed up on purpose — you have
-  │       a full answer ready.
-  │
-  ├─► IF THEY PULL "streams its reasoning"
-  │     → go to Chapter 2/3. NDJSON over a ReadableStream,
-  │       consumed by a fetch reader, not EventSource. Have the
-  │       "why not EventSource" answer loaded.
-  │
-  └─► IF THEY PULL "AI agents / did you use AI to build it"
-        → go to Chapter 8. Matter-of-fact, three decision modes,
-          no defensiveness.
+  Interviewer picks one of:
+        │
+        ├─► "The data-source seam"
+        │     → goes to Chapter 3, Choice 3 (DataSource)
+        │       and Chapter 4 (scale — what swap costs)
+        │
+        ├─► "The eval suite you retired"
+        │     → goes to Chapter 6 (hard parts — least
+        │       confident) and Chapter 8 (the AI
+        │       question)
+        │
+        └─► "The shared streaming kernel"
+              → goes to Chapter 2 (architecture)
+                and Chapter 6 (hard part — StrictMode)
 ```
 
-You are never caught off guard, because you chose the threads.
+If they don't pick — if they say "let's start with the architecture" — that's the gift answer. Go to Chapter 2.
 
----
+## When you don't know
 
-╔═══════════════════════════════════════════════════════════════╗
-║ WHEN YOU DON'T KNOW                                            ║
-║                                                               ║
-║   You say "it's built on the loomi connect MCP server" and    ║
-║   the interviewer asks, in the first two minutes, "what's     ║
-║   MCP exactly, at the protocol level?" — before you've even   ║
-║   finished the pitch.                                         ║
-║                                                               ║
-║   Say:                                                        ║
-║   "MCP is the Model Context Protocol — a standard way for an  ║
-║    LLM app to call external tools and data sources. I use     ║
-║    Anthropic's MCP SDK to talk to Bloomreach's server, so I   ║
-║    work at the SDK level — listing tools, calling them with   ║
-║    arguments, handling the OAuth. I haven't gone to the wire  ║
-║    format of the protocol itself. Want me to walk the SDK     ║
-║    layer I actually built on, or is the protocol the part     ║
-║    you're after?"                                             ║
-║                                                               ║
-║   What this signals: you know exactly where your knowledge    ║
-║   ends, you're fluent at the layer you actually worked, and   ║
-║   you hand the interviewer the choice instead of bluffing.    ║
-║                                                               ║
-║   Do NOT say:                                                 ║
-║   "It's like... a protocol for AI to use tools, with          ║
-║    messages back and forth, JSON-RPC I think, over a          ║
-║    stream..." — trailing into half-remembered protocol        ║
-║   detail in your opening minutes is the fastest way to lose   ║
-║   the frame you just built.                                   ║
-╚═══════════════════════════════════════════════════════════════╝
+Most "I don't know" moments in a pitch come from one of two places: a question about a number you don't have ("how many users?") or a question about a feature you cut ("what about real-time?"). Both have a clean recovery.
 
----
+```
+  ╔═══════════════════════════════════════════════╗
+  ║ WHEN YOU DON'T KNOW                           ║
+  ║                                               ║
+  ║   They ask: "How many users do you have?"     ║
+  ║                                               ║
+  ║   The honest answer is that you don't, and    ║
+  ║   the pitch is about the system, not about    ║
+  ║   traction. Don't invent a number.            ║
+  ║                                               ║
+  ║   Say:                                        ║
+  ║   "It's a portfolio project — no production   ║
+  ║    traffic. The interesting scale question    ║
+  ║    isn't user count, it's that the alpha      ║
+  ║    Bloomreach server is rate-limited and      ║
+  ║    revokes tokens after minutes. The system   ║
+  ║    is designed around that, not around user   ║
+  ║    load. Want me to walk you through what     ║
+  ║    that forced?"                              ║
+  ║                                               ║
+  ║   What this signals: you know the real        ║
+  ║   constraint, you don't fake traction, and    ║
+  ║   you re-route the question to a thread       ║
+  ║   you can actually defend.                    ║
+  ║                                               ║
+  ║   Do NOT say:                                 ║
+  ║   "It's still early but we're seeing strong   ║
+  ║    early adoption from the marketing teams    ║
+  ║    we've shown it to." This is fabrication.   ║
+  ║   An interviewer will hear it and stop        ║
+  ║   trusting the rest of the pitch.             ║
+  ╚═══════════════════════════════════════════════╝
+```
 
-## What you'd change
+## What you'd change in the pitch
 
-If you rebuilt the pitch itself, you'd cut the word "agents" from the thirty-second version. It's a magnet for "so what's an agent?" debates that pull you off the product and into definitions before you've established what the thing *does*. The strongest version of this pitch sells the analyst's loop first — what changed, why, what to do — and lets "multi-agent" arrive as the *answer* to "how is it built," not as part of the headline. Lead with the human job; let the architecture be something they have to ask for.
+If you were giving this pitch six months from now, the one thing you'd add is a real production number. Not a fake one — a real one from one of the synthetic-adapter eval runs. Something like "across N anomalies the diagnostic agent's recommendations cleared the rubric on M%." Right now the pitch is honest about being a portfolio project, and that's fine. The next version earns one more sentence of credibility by leading with a number you can defend down to the methodology.
 
----
+## One-page summary
 
-## One-page summary (night-before review)
+**Core claim:** A good pitch is the project compressed three ways — ten seconds for the hallway, thirty for the recruiter, ninety for the actual interview. Each version has a different job and a different stop point.
 
-**Core claim:** The pitch sells the *job* the product does for a person — find what changed, diagnose why, propose the fix, and show its work — and saves the architecture as bait for the follow-up.
-
-**The three lengths:**
-- **10s** — "An AI analyst for a Bloomreach ecommerce workspace that finds what changed, diagnoses why, proposes the fix, and streams its reasoning so you see how it got there."
-- **30s** — the above + the three-stage loop (monitoring → diagnosis → decision) and the "shows its work" differentiator. No stack names yet.
-- **90s** — problem (analysts do this by hand) → shape (4 agents on one loop, gated by schema coverage, claude-sonnet-4-6, MCP/EQL) → proudest part (reasoning as a first-class streamed surface) → honest edge (no DB; right for the context, first thing you'd change).
+**Questions covered:**
+- "What have you been working on?" → one-sentence answer naming the system and the loop.
+- "Tell me about a project from your portfolio." → four sentences: what, loop, technical claim, stack-with-detail.
+- "Walk me through what you built." → 90 seconds in four parts (opener · loop · interesting bit · hand-off).
+- "How many users do you have?" → honest "portfolio project," re-route to the real constraint.
 
 **Pull quotes:**
-- "An analyst that shows its work." — the whole product in one sentence.
-- End the 90-second pitch on a tradeoff you'd own — it signals senior before the first follow-up.
+```
+  ┃ "Run the loop a human analyst would: what
+  ┃  changed, why, what to do."
 
-**What you'd change:** Cut "agents" from the 30-second version; let "multi-agent" arrive as the answer to "how's it built," not part of the headline.
+  ┃ "The product's pitch is an analyst that shows
+  ┃  its work."
+```
 
----
+**What you'd change:** lead the next version of the pitch with one real number from the synthetic-adapter eval runs, defendable down to the methodology.

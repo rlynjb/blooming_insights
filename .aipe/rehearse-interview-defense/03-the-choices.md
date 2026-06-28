@@ -1,354 +1,357 @@
 # Chapter 3 — The choices
 
-This is where interviews get real. "Why this and not that?" is the question that separates someone who *made* decisions from someone who accepted defaults and can't tell the difference. The trap isn't having made a "wrong" choice — there are no wrong choices if you can name the criterion and the cost. The trap is the answer "it's good for this kind of thing," which tells the interviewer you don't remember why you picked it.
+Halfway through any senior interview, someone will start picking at your stack. *"Why Next.js? Why no database? Why this agent library? Why NDJSON and not server-sent events?"* The trap is to treat each one as a separate trivia question. They're not. They're all variations of one question: **do you know why you reached for what you reached for, or did you default into it?**
 
-This chapter defends every load-bearing choice in blooming insights — the framework, the agent-loop-over-a-framework call, the model split, the streaming transport, and the no-database decision. The trivial ones (Tailwind, Vitest) don't earn a section; nobody senior probes them. For each real choice you get the criterion, the alternative, and the cost you're paying — because naming the cost is what makes the defense land.
+This chapter walks five load-bearing choices. For each one, you'll get the alternatives you actually evaluated, the criterion that decided it, and the cost you're paying. The structure is the same every time, because that's the structure a senior answer has: *I picked X because Y, and the cost I'm watching is Z.*
 
-## The choices, with the picked option highlighted
+You'll also learn to name the **decision mode** every time. Three modes:
 
-Hold the whole decision set as one tree before defending any single branch — the highlighted path is what shipped.
+- **Deliberate** — you considered alternatives and chose this on a named criterion.
+- **Evaluated-and-accepted** — AI or a library suggested it, you read it, you tested it, you accepted.
+- **Defaulted-to** — you took the default and didn't deeply evaluate. Riskiest to own; strongest signal when owned well.
 
-```
-  DECISION                  ALTERNATIVES                  PICKED ▶ / cost
-  ════════════════════════════════════════════════════════════════════════
+Most of your choices are some mix. Naming the mode is the senior move.
 
-  framework            ┌─ plain React SPA + API
-                       ├─ Remix / SvelteKit
-                       └─ ▶ Next.js 16 App Router   ── route handlers +
-                                                       streaming + Vercel,
-                                                       cost: Vercel coupling
-
-  agent orchestration  ┌─ LangChain / agent framework
-                       ├─ own runAgentLoop          ── (started here; now
-                       │   on the MCP SDK              legacy at base-legacy.ts)
-                       └─ ▶ @aptkit/core's runtime  ── library owns the loop,
-                            + 3 Blooming-owned         I own the boundary;
-                            adapter classes            ~200 LOC of adapters;
-                                                       cost: depends on AptKit's
-                                                       generic-primitive shape
-
-  data source seam     ┌─ direct McpClient call
-                       │   from every agent
-                       └─ ▶ DataSource interface +  ── one abstract surface,
-                            adapter pattern             3 adapters today
-                                                        (Bloomreach + Synthetic
-                                                        + interface); cost: one
-                                                        more layer to think in
-
-  model                ┌─ one model for everything
-                       ├─ OpenAI GPT-4 class
-                       └─ ▶ sonnet-4-6 (agents)      ── tool-use quality +
-                            + haiku-4-5 (intent)        cheap classification,
-                                                         cost: Anthropic lock-in
-
-  streaming transport  ┌─ SSE / EventSource
-                       ├─ WebSocket
-                       ├─ poll
-                       └─ ▶ NDJSON over a            ── POST + simple line
-                            ReadableStream (fetch)      framing + one wire
-                                                         format (readNdjson
-                                                         hoisted to shared
-                                                         lib/streaming/ndjson.ts);
-                                                         cost: no auto-reconnect
-
-  state / storage      ┌─ Postgres / SQLite
-                       ├─ Redis
-                       └─ ▶ in-memory maps keyed     ── zero infra, creds-free
-                            by session +                demo path, no
-                            committed demo snapshot     concurrent-user wipe;
-                                                         cost: per-instance
-                                                         cache loss
-```
-
-Six branches, six highlighted picks, six costs. Walk them one at a time.
-
----
-
-## Choice 1 — Next.js 16 App Router
-
-> ┌─────────────────────────────────────────────────────────────┐
-> │ THEY ASK                                                      │
-> │   "Why Next.js? Why not a plain React SPA with a separate     │
-> │    API?"                                                      │
-> │                                                               │
-> │ WHAT THEY'RE TESTING                                          │
-> │   Did you pick the framework for a reason tied to THIS app,   │
-> │   or because it's what you'd use by default? Do you know what │
-> │   it actually buys you here?                                  │
-> └─────────────────────────────────────────────────────────────┘
-
-In your voice:
-
-"The load-bearing feature is streaming from a route handler. This app's whole identity is watching the agent reason in real time, so I needed first-class server-side streaming co-located with the UI. Next.js 16 route handlers let me return a `ReadableStream` of NDJSON directly, and the App Router puts the page and its data route in the same project with shared types. I'm a React engineer, so the component layer was home ground — the new surface I was learning was the agent and MCP layer, and Next let me keep the frontend boring so I could spend my attention there. The cost I'm paying is coupling to Vercel's serverless model: `maxDuration` caps a request at 300 seconds, and there's no long-lived process to hold state, which is why state is in-memory and per-instance."
-
-That last sentence matters — you connected the framework choice to the state choice. Senior answers show the decisions are *linked*, not a pile of independent picks.
-
-There's a second-order honesty here worth pre-loading, because a sharp interviewer will pull on it: I use Next.js 16 + React 19 as a *runtime*, not for its data primitives. Every routed page is `'use client'`; there are no Server Components in the routed surface, no Suspense boundaries, no `loading.tsx` / `error.tsx`, no server actions, no `use(promise)`. That's not an oversight — it's a fit-for-purpose call. React 19's marquee data features assume request-response: render once, suspend on a promise, resolve with data. This product is a 30-90s NDJSON stream, not a request-response shape. Suspense has nothing to suspend on; a Server Component can't hold a streaming reader loop. So the framework gives me the route-handler streaming, the file-based routing, the deploy story — and I drive the data layer with a hand-written fetch + `ReadableStream` reader, which is the right shape for this product. If they ask "why no Suspense?" the answer is one sentence: *Suspense is built for promises that resolve; mine never does — it streams.*
+## The decision tree — the chapter on one page
 
 ```
-"Why Next.js?"
+  Five load-bearing choices, with mode and the cost you're watching
+
+                                    decision
+                                       │
+              ┌────────────┬───────────┼───────────┬────────────┐
+              │            │           │           │            │
+              ▼            ▼           ▼           ▼            ▼
+        ┌─────────┐  ┌──────────┐ ┌─────────┐ ┌─────────┐ ┌────────┐
+        │ NO DB   │  │  APTKIT  │ │DATASOURCE│ │ NDJSON  │ │ OAUTH  │
+        │         │  │ MIGRATION│ │   SEAM   │ │ over    │ │ PKCE + │
+        │         │  │          │ │          │ │ fetch   │ │  DCR   │
+        └────┬────┘  └─────┬────┘ └─────┬────┘ └────┬────┘ └────┬───┘
+             │             │            │           │           │
+       mode: │       mode: │      mode: │     mode: │     mode: │
+   DELIBERATE│   EVAL-AND- │  DELIBERATE│   DELIB.  │  DEFAULTED│
+             │   ACCEPTED  │            │           │           │
+             ▼             ▼            ▼           ▼           ▼
+       cost: in-      cost: a thin   cost: 516    cost: no    cost: token
+       process         adapter        LOC of      bidir.      revoke
+       state (now     layer to        synthetic   stream      after
+       session-       maintain (~200  to keep     surface     minutes
+       keyed; cross-  LOC) when       in sync     yet         on alpha
+       instance       AptKit's API    with real                Bloomreach
+       still open)    shifts          data                     server
+```
+
+Each branch below gets its own treatment. Read them in order — they build on each other.
+
+## Choice 1 — No database (in-process state only)
+
+```
+  ┌─────────────────────────────────────────────────┐
+  │ THEY ASK                                        │
+  │   "Why no database? Where do you store state?"  │
+  │                                                 │
+  │ WHAT THEY'RE TESTING                            │
+  │   Do you reach for Postgres on reflex, or do    │
+  │   you actually know what state your system has  │
+  │   and where it needs to live? Are you honest    │
+  │   about the cost of skipping the database?      │
+  └─────────────────────────────────────────────────┘
+```
+
+The strong answer, in your voice:
+
+> "Deliberate choice, for the context. The state in this system is mostly ephemeral — the streamed reasoning trace, the in-flight insights for one session, the OAuth tokens in an encrypted cookie. The two pieces of *persistent* state I have are committed to the repo as JSON: `lib/state/demo-insights.json` and `lib/state/demo-investigations.json`. Those are the demo snapshot — the reliable presentation path. Everything else lives in `lib/state/insights.ts` as a `Map<sessionId, SessionFeed>`.
+>
+> "The cost I'm paying — and I'll be direct about this — is **cross-instance state**. One warm Vercel instance is fine. Two instances and a user's second request lands somewhere with no memory of the first. For a portfolio app with no production traffic that's a non-issue; the day I have two instances I'd reach for Vercel KV or a small Postgres. The seam is already there in the `lib/state/` module.
+>
+> "There's a real bug in this corner I should name. The original `insights.ts` was a global `Map<id, Insight>` with a `.clear()` at the top of every briefing write. For one user that's correct. For two concurrent users on one warm instance, user A's `.clear()` wiped user B's mid-session. AI had suggested the original shape; I accepted it; I caught it later on a concurrency re-read; the fix was to session-key the map. **Shipped.** That's the strongest version of owning a defaulted-to decision — AI wrote it, I accepted it, I read it again as a real bug, here's the fix and it shipped."
+
+```
+  ┌─────────────────────────┬─────────────────────────┐
+  │ WEAK "WHY NO DB" ANSWER │ STRONG "WHY NO DB"      │
+  ├─────────────────────────┼─────────────────────────┤
+  │ "I didn't need one for  │ "Deliberate, for the    │
+  │ a portfolio project."   │ context. Most state is  │
+  │                         │ ephemeral. The persist- │
+  │                         │ ent piece is the demo   │
+  │                         │ snapshot, committed as  │
+  │                         │ JSON. Cost I'm paying:  │
+  │                         │ cross-instance state.   │
+  │                         │ Seam's ready; trigger   │
+  │                         │ is multi-instance,      │
+  │                         │ which isn't here yet."  │
+  ├─────────────────────────┼─────────────────────────┤
+  │ Why it's weak:          │ Why it works:           │
+  │ Reads as "I cut corners │ Names the decision mode │
+  │ because it's a side     │ (deliberate). Names     │
+  │ project." No mention of │ what state exists and   │
+  │ what state actually     │ where it lives. Names   │
+  │ exists or where it      │ the cost. Names the     │
+  │ lives. No cost named.   │ trigger that would      │
+  │                         │ change it.              │
+  └─────────────────────────┴─────────────────────────┘
+```
+
+```
+  ┃ "AI wrote this, I accepted it, I later read it as
+  ┃  a real bug, here's the fix and it shipped."
+```
+
+## Choice 2 — The AptKit migration (and the legacy preserved)
+
+This is the single most consequential decision-revisit in the project. Get it right and you've shown the interviewer something most candidates can't — that you can revisit a decision you previously defended hard, and articulate what changed.
+
+```
+  ┌─────────────────────────────────────────────────┐
+  │ THEY ASK                                        │
+  │   "Why this agent library — why not write the   │
+  │    loop yourself? Or why not use LangChain?"    │
+  │                                                 │
+  │ WHAT THEY'RE TESTING                            │
+  │   Do you know what an agent loop actually does, │
+  │   or did you import a framework and pray? Can   │
+  │   you defend a decision that *changed* — that   │
+  │   was one thing six months ago and is something │
+  │   else today?                                   │
+  └─────────────────────────────────────────────────┘
+```
+
+The strong answer:
+
+> "I did write the loop myself first. The original `runAgentLoop` is still in the repo at `lib/agents/base-legacy.ts`, lines 86 to 176. That was a deliberate choice at the time, for two reasons. One: I needed a hard `maxToolCalls` budget against a rate-limited upstream that could revoke my token at any minute. Two: I needed a **forced final synthesis turn** — when the budget runs out, the agent has to produce a structured answer rather than a half-finished tool call. Both are disciplines that an off-the-shelf agent runtime might not give me out of the box.
+>
+> "Then `@aptkit/core` reached `0.3.0` and the primitive surface got clean — `ModelProvider`, `ToolRegistry`, `CapabilityTraceSink`. I read the source, confirmed that both disciplines survive — the budget can be configured, the forced-synthesis pattern is expressible — and migrated. The result is `lib/agents/aptkit-adapters.ts`, three Blooming-owned adapter classes, about two hundred lines: `AnthropicModelProviderAdapter`, `BloomingToolRegistryAdapter`, `BloomingTraceSinkAdapter`. **Library owns the loop. I own the boundary.**
+>
+> "That's a different decision-mode answer than the no-DB one. This one was **evaluated-and-accepted**. I didn't take AptKit on faith; I had the hand-rolled loop in front of me and a list of disciplines I wasn't willing to give up. The migration was the conclusion of a comparison, not a default. And the legacy is preserved — `base-legacy.ts` is my rollback receipt. The day AptKit's API shifts in a way that breaks one of my disciplines, I peel back to the legacy loop while I figure out how to express the discipline in the new shape."
+
+The line in `aptkit-adapters.ts` worth pointing at:
+
+```ts
+// lib/agents/aptkit-adapters.ts:60,65 — usage logged from the model adapter
+//   const res = await this.client.messages.create({ ... })
+//   logger.info({ usage: res.usage }, 'anthropic.usage')
+//   ...
+//   logger.info({ usage: res.usage }, 'anthropic.usage.final')
+```
+
+That `res.usage` log is the boundary doing its job — token accounting lives on my side of the adapter, not buried inside the library.
+
+```
+  ┃ "I own the boundary; AptKit owns the loop. Three
+  ┃  small adapter classes, about 200 lines, and the
+  ┃  legacy loop is preserved for the day I need to
+  ┃  peel back to it."
+```
+
+## Choice 3 — The DataSource seam (`lib/data-source/types.ts`)
+
+```
+  ┌─────────────────────────────────────────────────┐
+  │ THEY ASK                                        │
+  │   "Why an abstract DataSource interface? Isn't  │
+  │    that future-proofing?"                       │
+  │                                                 │
+  │ WHAT THEY'RE TESTING                            │
+  │   Do you understand the difference between a    │
+  │   seam that earns its cost (because something   │
+  │   real flips across it) and an abstraction      │
+  │   added "in case we need it"?                   │
+  └─────────────────────────────────────────────────┘
+```
+
+The strong answer:
+
+> "Not future-proofing — receipt-driven. The interface is `lib/data-source/types.ts`. Two adapters today: `BloomreachDataSource` does HTTPS over OAuth PKCE with about 1.1-second call spacing and rate-limit retry; `SyntheticDataSource` is in-process, deterministic, about 500 lines of Blooming-owned synthetic ecommerce data. The factory is `makeDataSource(mode, sessionId)`.
+>
+> "Here's the receipt for it being a real seam: it has already survived two adapter swaps without changing the caller surface. An Olist SQLite adapter was added and later removed; the Synthetic adapter replaced it. Each time, the agent code didn't change — it kept calling `dataSource.executeEql(...)` and `dataSource.listTools()`. That's the test for whether a seam is load-bearing or cosmetic: would the layers either side need to change if I swapped the implementation? In this case, demonstrably no.
+>
+> "The cost I'm paying is the synthetic adapter itself — 516 lines I have to keep semantically aligned with what real Bloomreach returns. That's real maintenance. It earns its place because it lets me run the system end-to-end without an alpha rate-limited upstream — which is the difference between being able to demo this on a flight and not."
+
+```
+  ┌─────────────────────────┬─────────────────────────┐
+  │ WEAK "WHY THE SEAM"     │ STRONG "WHY THE SEAM"   │
+  ├─────────────────────────┼─────────────────────────┤
+  │ "I added it so I could  │ "Not future-proofing.   │
+  │ swap data sources in    │ Receipt-driven. The     │
+  │ the future."            │ seam has survived two   │
+  │                         │ adapter swaps without   │
+  │                         │ the agent code changing │
+  │                         │ — Olist added, removed, │
+  │                         │ Synthetic in. That's    │
+  │                         │ the test."              │
+  ├─────────────────────────┼─────────────────────────┤
+  │ Why it's weak:          │ Why it works:           │
+  │ "In the future" is the  │ Names the *historical*  │
+  │ phrase senior engineers │ evidence (two swaps).   │
+  │ are trained to mistrust │ Defines the test for a  │
+  │ — it's how abstraction  │ real seam (no caller    │
+  │ debt enters codebases.  │ change). Names the cost.│
+  └─────────────────────────┴─────────────────────────┘
+```
+
+## Choice 4 — NDJSON over fetch (not SSE, not WebSocket)
+
+```
+  ┌─────────────────────────────────────────────────┐
+  │ THEY ASK                                        │
+  │   "Why NDJSON over fetch and not SSE? Or a      │
+  │    WebSocket?"                                  │
+  │                                                 │
+  │ WHAT THEY'RE TESTING                            │
+  │   Do you know what each transport actually      │
+  │   gives you, or did you copy the streaming      │
+  │   pattern from a tutorial? Did you pick the     │
+  │   simplest contract that meets your needs?      │
+  └─────────────────────────────────────────────────┘
+```
+
+The strong answer:
+
+> "Deliberate. The shape of the data is *append-only events from one writer to one reader*. NDJSON over fetch gives me exactly that — one line per event, `JSON.parse` each line, the browser's stream reader handles the chunking. The whole consumer is `lib/streaming/ndjson.ts`, 64 lines, and it's the kernel under four streaming surfaces — the briefing, the diagnose step, the recommend step, and the free-form query. One kernel, four call sites.
+>
+> "I didn't pick SSE because SSE adds a framing convention (`event:` and `data:` lines, `id:` for resumability) I don't need, and the browser `EventSource` API can't send a POST body or custom headers — and I need both, for the OAuth cookie and the `x-bi-mode` header. I didn't pick a WebSocket because the data flow is one-directional. A WebSocket buys me a bidirectional surface and asks me to pay for it with connection state, heartbeats, and reconnection logic. The system doesn't have a bidirectional case yet.
+>
+> "Cost I'm watching: if I ever need bidirectional — say, a 'cancel this investigation' message from the UI back to the agent — NDJSON over fetch doesn't help me. I'd add an out-of-band cancellation endpoint first; if that gets clunky, that's the trigger to consider a WebSocket. Not before."
+
+```
+  ┃ "I picked the simplest contract that meets the
+  ┃  shape of the data: append-only, one writer,
+  ┃  one reader. NDJSON over fetch is exactly that."
+```
+
+## Choice 5 — OAuth PKCE + Dynamic Client Registration
+
+This is the **defaulted-to** decision. Own it cleanly.
+
+```
+  ┌─────────────────────────────────────────────────┐
+  │ THEY ASK                                        │
+  │   "Walk me through your OAuth setup. PKCE? DCR? │
+  │    Why?"                                        │
+  │                                                 │
+  │ WHAT THEY'RE TESTING                            │
+  │   Do you understand what you implemented at the │
+  │   protocol level, or did you copy an MCP        │
+  │   example? Can you say "I defaulted to this"    │
+  │   without sounding like you don't know what     │
+  │   it does?                                      │
+  └─────────────────────────────────────────────────┘
+```
+
+The strong answer:
+
+> "Honest framing: this is the **defaulted-to** decision in the project. The MCP SDK ships with an `OAuthClientProvider` interface that expects PKCE and Dynamic Client Registration, and the Bloomreach loomi connect server is configured for both. I implemented the provider, I didn't pick the protocol. So when I defend PKCE and DCR, I'm defending the *mechanics* of the implementation, not the *choice* to use them.
+>
+> "What I do defend is the wrapper around the SDK's expectations. The auth state needs to survive a serverless cold start, so I built an encrypted-cookie store — `lib/mcp/auth.ts`, AES-256-GCM, the key derived from `AUTH_SECRET`. In dev it falls back to a gitignored JSON file so I don't have to set the secret. The provider's storage methods (`tokens()`, `saveTokens()`, `clientInformation()`, `saveClientInformation()`) all go through that store, threaded with `AsyncLocalStorage` so each request's cookie is in scope inside the SDK's callbacks.
+>
+> "The cost is that PKCE plus DCR is a multi-step dance and there are corner cases I haven't pushed on — for example, what happens if `saveClientInformation` is called twice with different client IDs in rapid succession. The wrapper would prefer the latest write, which is probably fine, but I haven't proven it. If you want to push on PKCE internals — the code-verifier hashing, the `S256` challenge, the back-channel exchange — I can walk through what the SDK does, but I'd be reading you the SDK, not defending a choice I made."
+
+That last sentence is the move. It hands the interviewer the truth — *here's where my knowledge ends* — without conceding the parts you do own.
+
+## When you don't know
+
+The question most likely to push you past your depth in this chapter is **a comparison to an agent framework you don't know well** — LangChain, LangGraph, CrewAI, AutoGen. You looked at the conceptual shapes, you didn't run them.
+
+```
+  ╔═══════════════════════════════════════════════╗
+  ║ WHEN YOU DON'T KNOW                           ║
+  ║                                               ║
+  ║   They ask: "How does AptKit compare to       ║
+  ║   LangGraph? Why not pick LangGraph?"         ║
+  ║                                               ║
+  ║   You haven't shipped on LangGraph. The       ║
+  ║   honest answer is to defend AptKit on its    ║
+  ║   own terms and not pretend to a comparison   ║
+  ║   you can't make.                             ║
+  ║                                               ║
+  ║   Say:                                        ║
+  ║   "I haven't shipped on LangGraph, so I can't ║
+  ║    give you a real comparison. What I can     ║
+  ║    tell you is what AptKit gave me that I     ║
+  ║    needed: a clean primitive surface — model  ║
+  ║    provider, tool registry, trace sink — that ║
+  ║    let me keep the two disciplines I wasn't   ║
+  ║    willing to give up: a hard tool-call       ║
+  ║    budget and a forced final-synthesis turn.  ║
+  ║    The migration from my hand-rolled loop was ║
+  ║    conditional on both surviving. If LangGraph║
+  ║    expresses those as cleanly I'd be open to  ║
+  ║    looking. Want me to walk through how the   ║
+  ║    forced-synthesis pattern works in my       ║
+  ║    code?"                                     ║
+  ║                                               ║
+  ║   What this signals: confidence about what    ║
+  ║   you chose, honesty about the comparison     ║
+  ║   you can't make, and a re-route to a thread  ║
+  ║   you can defend in depth.                    ║
+  ║                                               ║
+  ║   Do NOT say:                                 ║
+  ║   "LangGraph is more for stateful graphs and  ║
+  ║    AptKit is more for stateless flows."       ║
+  ║   Vague taxonomy you read on a blog. An       ║
+  ║   interviewer who has used LangGraph will     ║
+  ║   pull on it and you'll fall apart.           ║
+  ╚═══════════════════════════════════════════════╝
+```
+
+## Follow-up decision tree — choice questions usually come in chains
+
+```
+  Whichever choice they pick, the chain is usually the same:
+  "why" → "what's the cost" → "when would you change it" → "have you measured"
+
         │
         ▼
-  ├─► IF THEY ASK "why not Remix / SvelteKit?"
-  │     → "Either would stream fine. Next won on my familiarity
-  │        and the Vercel deploy story for a hackathon timeline.
-  │        I optimized for shipping the AI layer, not for
-  │        re-learning a framework."
-  │
-  ├─► IF THEY ASK "what does App Router give you over Pages?"
-  │     → "Route handlers returning a Web ReadableStream, and
-  │        co-located server code. The streaming ergonomics are
-  │        the reason."
-  │
-  └─► IF THEY ASK "the 300s cap — is that a problem?"
-        → "A live briefing runs well under it, but it's a real
-           ceiling: ~1.1s spacing × tool calls. It bounds how
-           much an agent can do in one request. I'd measure p95
-           run time before pushing more work into a single call."
-```
-
----
-
-## Choice 2 — Hand-rolled loop first, then a generic agent library + my own adapter boundary
-
-> ┌─────────────────────────────────────────────────────────────┐
-> │ THEY ASK                                                      │
-> │   "Why hand-roll the agent loop instead of LangChain or a     │
-> │    framework? — or did you end up using a framework after     │
-> │    all?"                                                      │
-> │                                                               │
-> │ WHAT THEY'RE TESTING                                          │
-> │   Do you understand what an agent loop actually is, or did    │
-> │   you reach for a framework to avoid understanding it? Can    │
-> │   you justify build-vs-buy on more than "I felt like it"?     │
-> │   And — the senior probe — can you tell a decision you've     │
-> │   revisited from one you've defended unchanged?               │
-> └─────────────────────────────────────────────────────────────┘
-
-In your voice:
-
-"Two-part answer, because this is a decision I made twice. First version: I built `runAgentLoop` myself. An agent loop is small when you write it for one purpose — call the model with a tool schema, run the tool calls it asks for, feed results back, repeat until it answers or you cut it off — and I needed two things a framework would have hidden. One, a hard `maxToolCalls` budget and a forced final synthesis turn so an agent couldn't wander against a rate-limited server. Two, testability — the loop takes the model client and the data source as injected dependencies, so every agent gets tested against fakes with no network.
-
-Second version: once `@aptkit/core` existed with a clean generic-primitive surface — `ModelProvider`, `ToolRegistry`, `CapabilityTraceSink` — I migrated the active path to it and kept my own adapter classes on this side of the boundary. `lib/agents/aptkit-adapters.ts` is three small classes: `AnthropicModelProviderAdapter` turns my Anthropic client into AptKit's `ModelProvider`, `BloomingToolRegistryAdapter` turns my `DataSource` into AptKit's `ToolRegistry`, `BloomingTraceSinkAdapter` turns AptKit's trace events back into my NDJSON streaming hooks. The Blooming agent classes (`monitoring.ts`, `diagnostic.ts`, …) collapsed to thin wrappers that hand AptKit a prompt + a tool subset + a validator. My original `runAgentLoop` is preserved at `lib/agents/base-legacy.ts` and the test suite that used to pin its contracts still runs.
-
-The decision-mode story is what matters here: the hand-roll was **deliberate** for the reasons above; the migration to AptKit was **evaluated-and-accepted** — I read its primitive surface, confirmed the budget + forced-synthesis discipline survives, kept the adapter boundary on my side. I didn't reach for a framework to avoid understanding the loop; I owned the loop first, then handed it off when there was a clean primitive to hand it to. The cost I'm paying is honest: I now depend on AptKit's generic-primitive shape continuing to be the right contract; if it drifts, I peel the adapter boundary off and the legacy loop is right there."
-
-```
-┃ I own the boundary; AptKit owns the loop. Three small
-┃ adapter classes, ~200 LOC, and the legacy loop is preserved
-┃ for the day I need to peel back to it.
-```
-
-This is the single most senior answer in the chapter, because it shows you've revisited a decision you originally defended hard and can name *why the revisit was the right move* — without burying the original work.
-
----
-
-## Choice 2.5 — DataSource seam + 3 adapters
-
-> ┌─────────────────────────────────────────────────────────────┐
-> │ THEY ASK                                                      │
-> │   "Why an abstract DataSource interface — couldn't your agents│
-> │    just call the MCP client directly?"                        │
-> │                                                               │
-> │ WHAT THEY'RE TESTING                                          │
-> │   Do you over-architect, or did you pay the abstraction cost  │
-> │   for a real reason? Can you point at the value the interface │
-> │   bought you — preferably with receipts, not "future-proofing"?│
-> └─────────────────────────────────────────────────────────────┘
-
-In your voice:
-
-"`lib/data-source/types.ts` defines a `DataSource` interface — `callTool(name, args, opts?)`, `listTools(opts?)`, `dispose()`. Three adapters live behind it today: `BloomreachDataSource` is the live MCP path (OAuth, ~1 req/s spacing, 60s TTL cache, bounded retry); `SyntheticDataSource` is in-process and Blooming-owned, a deterministic synthetic ecommerce dataset that lets the agent loop run without the upstream; and the interface itself, which is what the agents and the bootstrap helper hold a reference to. The route picks the adapter via `makeDataSource(mode, sessionId)` — `bi:mode` carries the choice.
-
-The defense is the receipt: this seam has survived two adapter swaps without changing the caller surface. I once added an Olist subprocess adapter behind it (a separately-spawned MCP server over stdio), measured what that bought me, then removed it when the in-process Synthetic adapter turned out to be the better shape — and *none of the agents, none of the route handlers, none of the prompts changed* across either swap. The interface didn't have to grow. That's the senior-grade payoff: the abstraction earned its weight by absorbing changes that would otherwise have been caller rewrites. The cost is real and small — one more layer to think in, plus the discipline to keep the interface tight enough not to leak adapter specifics. I'd defend the layer the same way today as the day I added it."
-
-```
-┃ The DataSource seam survived two adapter swaps without
-┃ changing the caller surface. That's the receipt; not
-┃ "future-proofing," but absorbed changes I can name.
-```
-
-This is **deliberate** mode. The probe is whether you can defend abstraction with concrete payoff — say what the seam absorbed, name the cost, and stop.
-
----
-
-## Choice 3 — claude-sonnet-4-6 for agents, claude-haiku for intent
-
-> ┌─────────────────────────────────────────────────────────────┐
-> │ THEY ASK                                                      │
-> │   "Why Anthropic? And why two different models?"              │
-> │                                                               │
-> │ WHAT THEY'RE TESTING                                          │
-> │   Do you match the model to the job, or use the biggest one   │
-> │   everywhere? Do you think about cost and latency per call,   │
-> │   or just capability?                                         │
-> └─────────────────────────────────────────────────────────────┘
-
-In your voice:
-
-"The agents do multi-step tool use against real data — that needs the stronger model, so they run `claude-sonnet-4-6`. But there's one job that's tiny and high-frequency: classifying a free-form question's intent before routing it. That doesn't need a reasoning model, so it runs `claude-haiku-4-5` — cheaper and faster for a one-shot classification. Matching the model to the job is the point: I don't pay sonnet prices to decide which agent should handle a query. And the agent model is a single exported constant, `AGENT_MODEL` in `base.ts`, so swapping it — or pointing it at a different provider's SDK — is a one-line change. I evaluated Anthropic against the OpenAI tool-use path and stayed with Anthropic because the MCP SDK and the tool-use ergonomics were the cleanest fit; that's a choice I'd re-run if pricing or capability shifted."
-
-That's **evaluated-and-accepted** mode, and you should name it that way in the room: "I evaluated the alternative and accepted this one for these reasons" is a stronger sentence than pretending there was never another option.
-
-```
-┌──────────────────────────────────┬──────────────────────────────────┐
-│ WEAK ANSWER                       │ STRONG ANSWER                     │
-├──────────────────────────────────┼──────────────────────────────────┤
-│ "I used Claude because it's good  │ "Agents run sonnet because they   │
-│  at agents and tool use."         │  do multi-step tool use; intent   │
-│                                   │  classification runs haiku        │
-│                                   │  because it's a one-shot, high-   │
-│                                   │  frequency call that doesn't need │
-│                                   │  a reasoning model. I match the   │
-│                                   │  model to the job."               │
-├──────────────────────────────────┼──────────────────────────────────┤
-│ Why it's weak:                    │ Why it works:                     │
-│ true but generic — it would       │ shows a cost/latency axis, not    │
-│ apply to any model. No cost       │ just a capability one. The two-   │
-│ axis, no per-job thinking. You    │ model split is evidence you       │
-│ sound like you used one model     │ thought about each call's actual  │
-│ for everything and rationalized.  │ requirements.                     │
-└──────────────────────────────────┴──────────────────────────────────┘
-```
-
----
-
-## Choice 4 — NDJSON over a ReadableStream, not SSE
-
-> ┌─────────────────────────────────────────────────────────────┐
-> │ THEY ASK                                                      │
-> │   "Why NDJSON over a fetch stream instead of Server-Sent      │
-> │    Events?"                                                   │
-> │                                                               │
-> │ WHAT THEY'RE TESTING                                          │
-> │   Do you know the difference, or did you copy a streaming     │
-> │   tutorial? Can you name what EventSource would have cost      │
-> │   you here specifically?                                      │
-> └─────────────────────────────────────────────────────────────┘
-
-In your voice:
-
-"EventSource forces GET and brings its own event framing and auto-reconnect. I wanted POST semantics, full control of the framing, and one wire format I could reuse across both routes and the demo replay. NDJSON — one JSON object per line — is the simplest thing that works: I emit `JSON.stringify(event) + '\n'` on the server, and on the client I read the stream, split on newlines, and keep the trailing partial line in a buffer until the next chunk completes it. The contract is a single `AgentEvent` union, so the same parser handles the briefing, the investigation, and the cached demo replay. The cost is that I gave up EventSource's free auto-reconnect — so I built reconnection at my own layer instead, which I needed anyway because the alpha server revokes tokens and EventSource's reconnect wouldn't re-auth."
-
-```
-┃ I gave up EventSource's free reconnect on purpose — it
-┃ wouldn't re-auth against a server that revokes tokens, so
-┃ I'd have had to build recovery at my layer regardless.
-```
-
-That's the senior move: you didn't just list why your choice is good, you named what you *gave up* and why the lost feature wouldn't have helped here anyway.
-
----
-
-## Choice 5 — No database
-
-> ┌─────────────────────────────────────────────────────────────┐
-> │ THEY ASK                                                      │
-> │   "No database at all? Where does anything persist?"          │
-> │                                                               │
-> │ WHAT THEY'RE TESTING                                          │
-> │   Is this a thoughtful choice or a missing piece? Do you      │
-> │   know the cost, and can you say when you'd add one — without │
-> │   getting defensive?                                          │
-> └─────────────────────────────────────────────────────────────┘
-
-In your voice:
-
-"There's no relational data to model here — the workspace data lives in Bloomreach (or in the in-process Synthetic adapter), and I read it ad-hoc. What I'd persist is the briefing results and investigations, and for the demo that's a committed JSON snapshot the app replays. Live state is in-memory maps, keyed by session — I had a concurrent-user wipe bug in an earlier version where a single global `Map` plus a `clear()` at the top of every briefing write meant user A's briefing would wipe user B's mid-session; I fixed that by session-keying (`Map<sessionId, SessionFeed>` in `lib/state/insights.ts`), so the per-instance state is correct at any current scale. I made the no-DB call deliberately for the context: a hackathon against an alpha MCP server that revokes tokens after a few minutes. The committed snapshot isn't just convenience — it's the *reliable* path, because it runs with no auth and no upstream at all. The cost I'm still paying is real and I'll name it: on Vercel, state is per-instance, so a cold start re-bootstraps the schema and investigations cached on one instance aren't visible to another. The moment this is genuinely multi-instance, the first thing I add is a shared store — Redis for the cache, a persistent store for investigations. That's my top counterfactual."
-
-You said the cost out loud and named the trigger for changing it. That converts "no database" from a gap into a decision. We come back to this in Chapter 7 — here you're defending the choice; there you're owning what you'd redo.
-
-```
-"No database?"
+  You give the named-criterion answer (mode + criterion).
         │
-        ▼
-  ├─► IF THEY ASK "isn't that fragile?"
-  │     → "For a single demo instance, no — it's simpler and has
-  │        fewer failure modes. For multi-user, yes, and I know
-  │        exactly what I'd add and when."
-  │
-  ├─► IF THEY ASK "why is the demo snapshot committed to git?"
-  │     → "It's the creds-free presentation path. The alpha
-  │        server revokes tokens mid-demo; the snapshot replays
-  │        real captured data with no upstream, so the demo never
-  │        depends on a flaky connection."
-  │
-  └─► IF THEY ASK "what would Redis actually fix?"
-        → "Shared cache across instances and a place to keep
-           investigations so they survive a cold start and are
-           visible to every instance. I'd measure cold-start
-           rate and cross-instance cache misses to size it."
+        ├─► "What's the cost?"
+        │     Always have one ready. Every choice in this
+        │     chapter has a cost named. Don't pretend it's
+        │     free.
+        │
+        ├─► "When would you reconsider?"
+        │     Always have a named trigger. "Multi-instance
+        │     deployment." "AptKit's API shifts." "Workspace
+        │     with different event naming." Real triggers,
+        │     not "more users."
+        │
+        └─► "Have you measured?"
+              The honest answer is usually no for portfolio
+              projects. Say so. Name what you'd measure first
+              if you had production traffic. (For the data
+              source seam: per-call latency by adapter. For
+              NDJSON: time-to-first-line and time-to-final-
+              event.)
 ```
 
----
+## What you'd change about the choices
 
-╔═══════════════════════════════════════════════════════════════╗
-║ WHEN YOU DON'T KNOW                                           ║
-║                                                               ║
-║   They go deep on a choice you defaulted to: "Your auth uses  ║
-║   PKCE and Dynamic Client Registration — why DCR over a       ║
-║   pre-registered client, and what's the threat model PKCE is  ║
-║   closing?"                                                   ║
-║                                                               ║
-║   Say:                                                        ║
-║   "Honest answer: the PKCE + DCR flow is what the MCP SDK's   ║
-║    OAuth provider does, and I accepted its default rather     ║
-║    than designing the flow myself. I understand the shape —   ║
-║    PKCE closes the auth-code interception attack on public    ║
-║    clients, and DCR registers a client dynamically instead    ║
-║    of pre-provisioning one — but I didn't choose DCR over     ║
-║    pre-registration as a decision; the server and SDK drove   ║
-║    it. What I *did* build deliberately is the token store     ║
-║    around it: an encrypted cookie in prod, a file in dev. I   ║
-║    can defend that part in depth."                            ║
-║                                                               ║
-║   What this signals: you can tell a decision you MADE from a  ║
-║   default you ACCEPTED, you know the shape of the thing you   ║
-║   defaulted to, and you redirect to the part you genuinely    ║
-║   own. That's the most senior thing you can do with a         ║
-║   defaulted-to choice.                                        ║
-║                                                               ║
-║   Do NOT say:                                                 ║
-║   "I chose DCR because it's more secure" — claiming a         ║
-║   default as a deliberate decision is the fastest way to get  ║
-║   exposed, because the next question assumes you chose it on  ║
-║   purpose and you won't have the why.                         ║
-╚═══════════════════════════════════════════════════════════════╝
+If you were doing this over today, the one choice you'd revisit hardest is **the rate-limit spacing on `BloomreachDataSource`**. I'm currently spacing calls at about 1.1 seconds because the alpha server is ambiguous about its real rate limit and I picked a conservative number to stay safe. That choice is costing me real latency on every live run — a multi-step diagnostic agent makes ten or fifteen tool calls, and at 1.1s spacing that's ten or fifteen seconds of artificial wait. If I had a stable upstream with documented headroom, I'd measure actual rate-limit responses and tighten the spacing. The trigger is *measurement plus a documented limit*, not a guess.
 
-This box is the most important one in the chapter. The three modes of decision-making — **deliberate**, **evaluated-and-accepted**, **defaulted-to** — run through every choice you defend. Owning a defaulted-to choice *as* a default, while pointing at the deliberate work you built around it, is a stronger signal than pretending you designed the OAuth flow from scratch.
+## One-page summary
 
-```
-        ▸ "It's good for this kind of thing" is the sound of a
-          forgotten reason. Every defense names a criterion and
-          a cost, or it isn't a defense.
-```
+**Core claim:** Every load-bearing choice has the same shape — *I picked X because Y, the cost I'm watching is Z, the trigger that would change it is W.* Name the decision mode every time (deliberate, evaluated-and-accepted, or defaulted-to).
 
----
-
-## What you'd change
-
-The most reconsiderable choice in this chapter is the fixed roughly-one-second spacing between MCP calls. It's simple and it's safe against the alpha server's rate limit, and I'd defend it for the context — but it's conservative. A token-bucket or adaptive limiter would use the budget better when the server has headroom, instead of always pausing the full interval. I picked the fixed interval deliberately because, against an alpha server I didn't fully trust, predictable-and-safe beat optimal-and-clever. If the rate limit were documented and stable, I'd move to an adaptive limiter and measure the throughput gain.
-
----
-
-## One-page summary (night-before review)
-
-**Core claim:** Every load-bearing choice has a named criterion and a named cost — and the choices are linked, not independent (the framework's serverless model is *why* state is in-memory).
-
-**The choices covered:**
-- **Next.js 16** — for first-class streaming from route handlers co-located with the UI; cost: Vercel coupling + the 300s cap.
-- **Hand-rolled loop → AptKit's runtime + my own adapter boundary** — deliberate first, evaluated-and-accepted second; ~200 LOC of adapters; legacy loop preserved.
-- **DataSource seam + 3 adapters** — abstraction paid off by absorbing two adapter swaps without changing caller surface; deliberate.
-- **sonnet-4-6 agents + haiku-4-5 intent** — match the model to the job; evaluated-and-accepted; one-line `AGENT_MODEL` swap.
-- **NDJSON over fetch, not SSE** — POST + simple framing + one wire format (shared `readNdjson` kernel); gave up auto-reconnect I'd have replaced anyway.
-- **No database** — in-memory maps keyed by session + committed demo snapshot; deliberate for the context; per-instance cache loss is the remaining cost; Redis is the trigger-based fix.
+**The five choices and their one-line defenses:**
+- **No DB** → deliberate; cost is cross-instance state (seam ready, trigger is multi-instance).
+- **AptKit migration** → evaluated-and-accepted; cost is adapter maintenance; legacy preserved as rollback.
+- **DataSource seam** → deliberate; cost is 516 LOC of synthetic; receipt is two adapter swaps without caller change.
+- **NDJSON over fetch** → deliberate; cost is no bidirectional surface; trigger is a real cancel-mid-stream need.
+- **OAuth PKCE+DCR** → defaulted-to; defend the wrapper, not the protocol choice.
 
 **Pull quotes:**
-- "It's good for this kind of thing" is the sound of a forgotten reason — every defense names a criterion and a cost.
-- I own the boundary; AptKit owns the loop. The legacy loop is preserved for the day I need to peel back to it.
-- The DataSource seam survived two adapter swaps without changing the caller surface.
-- I gave up EventSource's free reconnect on purpose — it wouldn't re-auth against a token-revoking server.
+```
+  ┃ "I own the boundary; AptKit owns the loop. Three
+  ┃  small adapter classes, about 200 lines, and the
+  ┃  legacy loop is preserved for the day I need to
+  ┃  peel back to it."
 
-**What you'd change:** Move the fixed ~1.1s Bloomreach spacing to an adaptive/token-bucket limiter if the rate limit were stable and documented.
+  ┃ "AI wrote this, I accepted it, I later read it as
+  ┃  a real bug, here's the fix and it shipped."
 
----
+  ┃ "I picked the simplest contract that meets the
+  ┃  shape of the data: append-only, one writer,
+  ┃  one reader. NDJSON over fetch is exactly that."
+```
+
+**What you'd change:** tighten the Bloomreach call spacing once the upstream is stable and documented; measure actual rate-limit responses rather than guessing conservative.

@@ -1,284 +1,168 @@
-# 05 — The close + the ask   (8:45–9:30, 45 seconds)
+# Chapter 5 — The close   (8:45 – 9:30, 45 seconds)
 
-  ## Opening hook
+## Opening hook
 
-Forty-five seconds to end on the beat that gets remembered. The
-worst hackathon demos end on "yeah so… that's it." The best end
-on a single clean line the judges repeat to each other on the
-way out. Your only job in chapter 5 is to deliver that line and
-stop talking.
+Forty-five seconds. The room is going to walk out remembering exactly one sentence from this slot, and the sentence they remember is the one you say at 9:25 — *if* you give it a clean landing. The single most common failure of this chapter is trailing off into "yeah, so, that's it, any questions?" That ending does not get repeated to anyone. The cleanly-landed last sentence gets repeated to the judge next to them on the way to coffee.
 
-Three beats. Where this goes next — clearly framed as future,
-never as if it exists. What you want from the room. The line
-they remember. In that order. Forty-five seconds for all three.
+You have three beats. Where it goes next — clearly framed as future, never demoed. The ask — what you want from the room. The last line — the sentence they repeat. **You end on the last line and you stop talking.** Hands at your sides. Eye contact with the back of the room. No "thanks for watching."
 
-The trap here is the opposite of every other chapter: in the
-close you'll be tempted to be vague, modest, hedging. Don't.
-This is the chapter that gets the most direct, most opinionated
-voice in the whole presentation. You shipped something real. You
-have a clear next step. You know what you want. Say it.
-
-  ## The time-budget bar
-
-Forty-five seconds. After this, 30s of buffer, then time. Use
-the buffer; don't fill it.
+## The time-budget bar
 
 ```
-  ┌──────────────────────────────────────────────────────────┐
-  │ ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░▓▓░░░░░░░░░░ │
-  │ 0:00 ───────────────────────────── 8:45 9:30 ──────10:00 │
-  │   THE CLOSE — you own 8:45 to 9:30 (45 seconds)          │
-  │   then 30 seconds of buffer · use it · don't fill it     │
-  └──────────────────────────────────────────────────────────┘
+  8:45 ┌─────────────────────────────────────────────────────────────┐
+       │ ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░▓▓▓░░░░░░░░░ │
+       │                                                              │
+       │ 05  THE CLOSE  ← you are here                  8:45 – 9:30   │
+       │                                                              │
+       │     three beats: vision, ask, last line                      │
+  9:30 ├─────────────────────────────────────────────────────────────┤
+       │     BUFFER — silence is fine                   9:30 – 10:00  │
+ 10:00 └─────────────────────────────────────────────────────────────┘
 ```
 
-  ## The chapter-opening diagram — the close, drawn
+That last bar is real. Thirty seconds of buffer. You finish at 9:30, the room holds, and the buzzer comes at 10:00 to clean cut into Q&A. **Do not fill the buffer.** Silence after a clean landing is the strongest possible close.
 
-The three beats and what each one is for. This is the only
-chapter where the diagram is for YOU, not the room.
+## The body — three beats
 
-```
-  the close · the shape of 45 seconds
+### Beat 1 — where it goes next   (8:45 – 9:05)
 
-  8:45 ┌─────────────────────────────────────────────────────┐
-       │ BEAT 1 — where this goes next                       │
-       │   "today: one workspace, the user clicks            │
-       │    investigate. next: scheduled briefings, slack    │
-       │    delivery, multi-workspace."                       │
-       │   ← framed clearly as FUTURE · not demoed             │
-       │                                            ~15 sec  │
-  9:00 ├─────────────────────────────────────────────────────┤
-       │ BEAT 2 — the ask                                     │
-       │   one specific thing you want from the room          │
-       │   (vote · feedback · conversation · partner intro)   │
-       │                                            ~10 sec  │
-  9:10 ├─────────────────────────────────────────────────────┤
-       │ BEAT 3 — the last line                               │
-       │   ONE sentence. close-line voice. no hedging.        │
-       │   the line they repeat to each other.                │
-       │                                            ~10 sec  │
-  9:20 ├─────────────────────────────────────────────────────┤
-       │   pause · thank you · step back · DONE               │
-       │                                            ~10 sec  │
-  9:30 └─────────────────────────────────────────────────────┘
-       buffer 9:30–10:00 · do nothing · let the room react
-```
-
-The pause at 9:20 is the second silence in this demo (the first
-was at 0:00). It's the one that signals "I'm done; your turn to
-react." Hold it. Don't fill it with "any questions?" — the
-moderator handles that.
-
-  ## Beat 1 — what's next   (8:45–9:00)
-
-Fifteen seconds. Frame the vision. Be specific about what's
-demoed vs what's next.
+Future framing. You are not demoing this — you are naming the shape of the next chapter. This is where you get to mention things the code does not yet do, *as long as you frame them as future*.
 
 ```
-  ┃ "today, blooming insights is one workspace, the user opens
-  ┃  the app, the briefing is right there. the next move is
-  ┃  scheduled briefings delivered to slack at 8am, multi-
-  ┃  workspace from one login, and a learning loop where the
-  ┃  user can tell the agent 'this isn't an anomaly, here's
-  ┃  why' and have the agent remember."
+  SHOW (on screen)                  SAY (out of your mouth)
+  ────────────────────────────────  ──────────────────────────────────────
+  recommendation card still on       "Where this goes next: the
+   screen from the demo               recommendation step closes the loop —
+                                      from 'here's what to do' to 'I just
+                                      ran the Bloomreach scenario for you.'
+                                      The agents become the marketer."
 ```
 
-Note what that sentence does NOT do. It does not say "we're
-going to scale this to ten thousand workspaces." It does not say
-"we'll launch on stripe and charge $99/month." It names three
-concrete features that don't exist yet, framed clearly as next.
-Judges sniff out vapor instantly; saying "today vs next" up
-front earns you the vision.
+That's twenty seconds. Notice what is *not* there. No "we plan to leverage AI to revolutionize." No roadmap of seven items. One forward sentence with one concrete next move (executing the recommendation, not just proposing it). That's the future you sketch.
 
-The features in beat 1 are real candidates: scheduled briefings
-fit the streaming-route pattern that already exists, Slack
-delivery is a webhook off the same agent output, multi-workspace
-is a session/auth scoping change. None of them exists in the
-current repo. All of them are buildable from the current
-foundation.
-
-An optional second-vision line, if the judges are infra-fluent
-and you have breath for it: the DataSource seam means a third
-adapter — Shopify, BigCommerce, a Postgres warehouse — is a
-new file, not a rewrite. The agents don't know what they're
-querying. That's a road to "the same agent on any ecommerce
-backend." Use it only if the room reads senior and you have
-the seconds to spare; skip it otherwise to keep the beat tight.
-
-  ## Beat 2 — the ask   (9:00–9:10)
-
-Ten seconds. ONE ask. Specific. Concrete. Not "any feedback is
-welcome."
+The script line:
 
 ```
-  ┃ "what i'd ask: if anyone in the room runs an ecommerce
-  ┃  workspace on bloomreach — i want fifteen minutes after
-  ┃  the demos to point this at your real data and show you
-  ┃  what it finds."
+┃ "From 'here's what to do' to 'I just ran it for you.'"
 ```
 
-That ask is specific. It targets a real subset of the audience
-(judges who work with Bloomreach customers or are Bloomreach
-themselves). It's a 15-minute commitment, not a partnership
-ask. It's actionable inside the post-demo window. And it ties
-back to the demo's core promise: real data, real findings.
+### Beat 2 — the ask   (9:05 – 9:20)
 
-If the audience is not a Bloomreach event, swap the ask to fit
-the room. For a general hackathon: "I want feedback from anyone
-who's spent a morning chasing an anomaly in an analytics tool."
-For an investor room: "I want introductions to anyone running
-ecommerce at scale."
+The ask is specific. Not "we appreciate your consideration." A real, narrow ask the room can act on in five seconds.
 
-  ## Beat 3 — the last line   (9:10–9:20)
+For a hackathon judging room, the ask is a vote. For a demo to potential users, it is a beta signup. For a demo to engineers, it is "open the repo." **Pick the one that matches the room you are in.**
 
-This is the line. Ten seconds. The whole demo lands on it.
+The default ask for judging:
 
 ```
-  ┃ "we built the dashboard that watches itself — so the owner
-  ┃  doesn't have to."
+  SHOW (on screen)                  SAY (out of your mouth)
+  ────────────────────────────────  ──────────────────────────────────────
+  same screen                        "If the streaming-trace UX is the
+                                      thing you want to see more of in
+                                      analyst tools, vote for it. That's
+                                      the bet I'm making."
 ```
 
-That's it. Don't elaborate. Don't restate the one-liner. Don't
-say "and yeah, that's blooming insights." Say the line, pause,
-step back from the mic.
-
-Why that line: it inverts the boring expectation. Dashboards are
-the thing the owner stares at. The line says the dashboard is
-now staring back. That inversion is what makes it repeatable —
-it's a small surprise the judges can hand to the next person.
-"They built the dashboard that watches itself" is the seed for
-the conversation that happens after you sit down.
-
-  ## The script lines to nail
-
-Three lines, in order. The last line is the most important
-single sentence in chapter 5 — more important than the ask, more
-important than the vision. Practice it until you can say it
-without breath.
+The script line:
 
 ```
-  ┃ "today: one workspace, the user clicks investigate. next:
-  ┃  scheduled briefings, slack delivery, multi-workspace."
+┃ "If the streaming-trace UX is what you want more of in analyst
+┃  tools, vote for it. That's the bet I'm making."
 ```
 
-```
-  ┃ "if anyone in the room runs an ecommerce workspace on
-  ┃  bloomreach — i want fifteen minutes after the demos."
-```
+That sentence does two things at once. It names the ask (vote) and it names the *thesis* (the trace as differentiator). Judges who would otherwise vote on "most features" or "most polish" get a frame for what to vote on.
+
+### Beat 3 — the last line   (9:20 – 9:30)
+
+The last line is the one sentence you want repeated. It is the eight-word pitch from the money shot, returned to the room at the end so it lands twice.
 
 ```
-  ┃ "we built the dashboard that watches itself — so the owner
-  ┃  doesn't have to."
+  SHOW (on screen)                  SAY (out of your mouth)
+  ────────────────────────────────  ──────────────────────────────────────
+  same screen                        [breath]
+                                     "An analyst that shows its work."
+                                     [silence — hands at sides — count to 5]
 ```
 
-  ## Strong vs weak — the closing failure mode
-
-The mistake is ending on a recap or a thanks. Recaps repeat
-content the room already heard. Thanks signal you're done before
-you've landed the line. Both leave the buzzer's last second to
-the wrong sentence.
+The script line — this is the line you nail and stop:
 
 ```
-  WEAK CLOSE                        STRONG CLOSE
-  ─────────────────────────────     ─────────────────────────────
-  "so to recap, blooming            (no recap. straight into
-   insights is an AI agent that      the vision: today vs next)
-   monitors your ecommerce
-   workspace, finds anomalies,      (one ask: 15 minutes with
-   diagnoses them, and proposes      a bloomreach customer)
-   actions, and we built it in
-   a hackathon, and yeah,           "we built the dashboard that
-   thanks so much for watching,      watches itself — so the
-   any questions?"                   owner doesn't have to."
-                                    (pause · step back · done)
-  ─────────────────────────────     ─────────────────────────────
-  judges' last memory:              judges' last memory:
-   the recap (which they             the line that inverts the
-   already heard)                    boring expectation
-  ─────────────────────────────     ─────────────────────────────
-  fades into silence                ends on the beat
+┃ "An analyst that shows its work."
 ```
 
-The pause after the last line does more work than the line
-itself. It marks the end. It tells the room: react. Without it,
-the line dissolves into the moderator saying "great, thank you
-Rein, any questions from the judges…" and the moment is gone.
+Six words. You said this same sentence at 2:00, after the money shot, in slightly different form. Returning to it at 9:30 closes the loop. **The room hearing the same sentence twice in ten minutes is what makes it the sentence they repeat.**
 
-  ## ╔══════════════════════════════════════════════════════════╗
-  ## ║ IF IT BREAKS — the close                                  ║
-  ## ║                                                            ║
-  ## ║ No live interaction here either. The only ways this        ║
-  ║ chapter breaks:                                                ║
-  ## ║                                                            ║
-  ║   1. You went long and have 15 seconds for chapter 5.         ║
-  ║      Skip beat 1 entirely. Go straight to: "I want 15         ║
-  ║      minutes with anyone here who runs bloomreach. we         ║
-  ║      built the dashboard that watches itself — so the         ║
-  ║      owner doesn't have to." Pause. Done.                     ║
-  ## ║                                                            ║
-  ║   2. You blank on the last line. The fallback close:          ║
-  ║      "this is what an agent looks like when it sits between   ║
-  ║      the data and the decision-maker. that's blooming         ║
-  ║      insights. thank you." Less sticky, still ends on a       ║
-  ║      thought, not a thanks.                                   ║
-  ## ║                                                            ║
-  ║   3. The buzzer goes off mid-sentence. STOP. Say the last     ║
-  ║      line as your full close, even if you skipped the vision  ║
-  ║      and the ask. The line is the chapter; the rest is        ║
-  ║      framing.                                                 ║
-  ## ╚══════════════════════════════════════════════════════════╝
+## Weak close versus strong close
 
-  ## Tighten it — if you're running long
-
-Forty-five seconds is already tight. Cut order:
+This is the chapter where presenters lose the wow they earned in chapter 02.
 
 ```
-  cut 1   drop beat 1 (the vision). go straight to the ask
-            and the close-line. saves 15s · costs the future
-            framing.
-
-  cut 2   drop beat 2 (the ask). vision + close-line only.
-            saves 10s · costs the audience action but keeps
-            the memorable line.
-
-  cut 3   skip directly to the close-line.
-            "we built the dashboard that watches itself — so
-             the owner doesn't have to."
-            saves 35s · costs everything except the anchor.
-            this is the irreducible close.
+WEAK CLOSE                            STRONG CLOSE (yours)
+──────────────────────────────────    ──────────────────────────────────
+"Yeah, so that's it. There's a        "Where this goes next: from 'here's
+ lot more we could do — we have a      what to do' to 'I just ran it for
+ roadmap with maybe eight things —     you.' If the streaming-trace UX is
+ happy to take any questions."         what you want more of in analyst
+                                       tools, vote for it. An analyst that
+                                       shows its work."
+trails off                             lands and stops
+no specific ask                        specific, narrow ask
+no memorable last line                 returns the pitch sentence
+"any questions" invites silence        silence + buzzer cuts to Q&A cleanly
+ends on a downbeat                     ends on the last word, hands down
 ```
 
-The floor: the last line. Always. Cut everything else before
-cutting the last line. The vision and the ask are the icing;
-the close-line is the cake.
+The "any questions?" ending is a reflex. Cut it out of your vocabulary for the day of. Q&A starts when the buzzer rings, not when you ask.
 
-  ## ────────────── RUN SHEET — chapter 5 ─────────────────────
+## If it breaks
+
+The close has no on-screen risk. The risk is you, in the moment, padding.
 
 ```
-  ┌───────────────────────────────────────────────────────────┐
-  │ THE CLOSE · 8:45–9:30 · 45 seconds                        │
-  ├───────────────────────────────────────────────────────────┤
-  │ 8:45   BEAT 1 — vision                                    │
-  │         "today: one workspace, user clicks investigate.   │
-  │          next: scheduled briefings, slack delivery,       │
-  │          multi-workspace."                                │
-  │ 9:00   BEAT 2 — the ask                                   │
-  │         "if anyone in the room runs an ecommerce          │
-  │          workspace on bloomreach — i want fifteen minutes │
-  │          after the demos."                                │
-  │ 9:10   BEAT 3 — THE LAST LINE                             │
-  │         "we built the dashboard that watches itself —     │
-  │          so the owner doesn't have to."                   │
-  │ 9:20   pause · step back · DONE                           │
-  │ 9:30   buffer · do nothing · let the room react           │
-  ├───────────────────────────────────────────────────────────┤
-  │ MUST NAIL   the last line · the pause after it            │
-  │ IF BREAKS   buzzer mid-sentence → say the last line as    │
-  │             your full close                                │
-  │ TIGHTEN     drop vision → drop ask → keep the last line   │
-  │             NEVER cut the last line                       │
-  └───────────────────────────────────────────────────────────┘
+╔══════════════════════════════════════════════════════════════════════════╗
+║ IF IT BREAKS                                                              ║
+║ You hear yourself starting to add a sentence after the last line →        ║
+║   1. Stop.                                                                 ║
+║   2. Mid-word if you have to.                                              ║
+║   3. The silence after is the close, not the words after the close.        ║
+║                                                                            ║
+║ Backup if you forget the last line completely →                            ║
+║   Say "an analyst that shows its work" — even if it sounds abrupt.        ║
+║   The abrupt version is better than padding.                               ║
+╚══════════════════════════════════════════════════════════════════════════╝
 ```
 
-Read chapter 6 for Q&A prep (post-clock — runs after the buzzer,
-not against the budget).
+## Tighten it
+
+The close is already 45 seconds. If you are forced to compress further:
+
+- **First cut: beat 1 (where it goes next) to one short clause.** "The next version closes the loop — agents execute the recommendation, not just propose it." Move to the ask.
+- **Floor:** the ask + the last line. "Vote for the streaming-trace UX. An analyst that shows its work." If the slot got cut in half, those two sentences are the close. The last line never goes.
+
+## The one-page run sheet
+
+```
+╭────────────────────── THE CLOSE — RUN SHEET ─────────────────────────╮
+│ Budget: 8:45 – 9:30 (45s)         Buffer: 9:30 – 10:00 (silence ok)  │
+│                                                                        │
+│ THREE BEATS:                                                           │
+│                                                                        │
+│   1. (8:45) Where next:                                               │
+│      "From 'here's what to do' to 'I just ran it for you.'"           │
+│                                                                        │
+│   2. (9:05) The ask:                                                  │
+│      "If the streaming-trace UX is what you want more of in           │
+│       analyst tools, vote for it. That's the bet I'm making."         │
+│                                                                        │
+│   3. (9:20) The last line (★ nail this):                              │
+│      "An analyst that shows its work."                                │
+│      [SILENCE — hands at sides — count to 5]                          │
+│                                                                        │
+│ NEVER SAY: "yeah so that's it" / "any questions?" / "thank you for    │
+│   listening" / "we'd love to hear your feedback"                      │
+│                                                                        │
+│ IF YOU PAD: stop mid-word. Silence > sentences after the close.        │
+│                                                                        │
+│ TIGHTEN IT: drop beat 1; floor = ask + last line.                     │
+╰────────────────────────────────────────────────────────────────────────╯
+```

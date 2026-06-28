@@ -1,201 +1,103 @@
-# 00 — Overview · the run-of-show
+# Overview — the run of show
 
-You have ten minutes. The judges have watched four demos before
-yours and will watch eight more after. They are tired. They are
-making a decision in the first ninety seconds about whether to
-listen properly, and another decision at the buzzer about whether
-to remember you.
+This book is the demo script for **blooming insights** — the multi-agent Bloomreach analyst that streams its reasoning to the screen. Seven files. One overview, six chapters, read front-to-back to rehearse and held as run sheets on stage. The clock is the boss of every page in here.
 
-This book is the choreography for those ten minutes. Read it
-front-to-back once to rehearse. Hold the one-page run sheets at
-the end of each chapter while you present. The money shot is
-named. The cut lines are named. The recovery for every on-screen
-beat is named.
+You are not preparing a talk. You are preparing a **ten-minute live demo** where a room of judges decides in the first ninety seconds whether the thing on screen is real. The book exists to make sure that decision goes your way.
 
-  ## The whole slot on one timeline
+## The whole slot on one timeline
 
-The shape of the presentation, every chapter against the clock,
-with the money-shot marker at 3:00. Look at this once a day until
-the demo.
+Here is the entire ten-minute window with every chapter sitting in its slice. The money shot lands at **2:00** — inside the first third, where it belongs.
 
 ```
-  THE TEN-MINUTE RUN-OF-SHOW
+THE TEN-MINUTE RUN OF SHOW
 
-  0:00 ┌───────────────────────────────────────────────────────────┐
-       │ 01  COLD OPEN + ONE-LINER                  0:00–1:00      │  1:00
-  1:00 ├───────────────────────────────────────────────────────────┤
-       │ 02  THE DEMO (centerpiece)                 1:00–6:00      │  5:00
-       │       ★ MONEY SHOT lands at ~3:00 ★                       │
-  6:00 ├───────────────────────────────────────────────────────────┤
-       │ 03  UNDER THE HOOD                         6:00–8:00      │  2:00
-  8:00 ├───────────────────────────────────────────────────────────┤
-       │ 04  BUILD STORY                            8:00–8:45      │  0:45
-  8:45 ├───────────────────────────────────────────────────────────┤
-       │ 05  THE CLOSE + ASK                        8:45–9:30      │  0:45
-  9:30 ├───────────────────────────────────────────────────────────┤
-       │     buffer / breathing room                9:30–10:00     │  0:30
- 10:00 └───────────────────────────────────────────────────────────┘
+  0:00 ┌─────────────────────────────────────────────────────────────┐
+       │ 01  COLD OPEN + ONE-LINER                       0:00 – 1:00 │  1:00
+  1:00 ├─────────────────────────────────────────────────────────────┤
+       │ 02  THE DEMO  (centerpiece)                     1:00 – 6:00 │  5:00
+       │      ★ MONEY SHOT — the trace fills the sidebar at 2:00 ★    │
+       │      (first anomaly card lands ~3:30; recommendation ~5:30) │
+  6:00 ├─────────────────────────────────────────────────────────────┤
+       │ 03  UNDER THE HOOD                              6:00 – 8:00 │  2:00
+       │      (the 4-agent loop + the DataSource seam, one diagram)  │
+  8:00 ├─────────────────────────────────────────────────────────────┤
+       │ 04  THE BUILD STORY  (Phases 1–4)               8:00 – 8:45 │  0:45
+  8:45 ├─────────────────────────────────────────────────────────────┤
+       │ 05  THE CLOSE + THE ASK                         8:45 – 9:30 │  0:45
+  9:30 ├─────────────────────────────────────────────────────────────┤
+       │     BUFFER (breathing room, do not fill)        9:30 –10:00 │  0:30
+ 10:00 └─────────────────────────────────────────────────────────────┘
 
-       06  THE Q&A  ← prep only, runs after the clock
+       06  THE Q&A  ← runs AFTER the clock. Prep only. Never eats the slot.
 ```
 
-The demo owns half the slot. Everything else is the frame around
-it. When you run long, you cut from chapters 3, 4, 5 first — in
-that order — never from the demo.
+Two things to internalize before any other reading. The demo owns half the slot — every other beat exists to make that five minutes land harder. And there is **thirty seconds of buffer**. You are not planning to use the full ten minutes. You are planning to finish at 9:30, hands off the keyboard, the last sentence hanging.
 
-  ## The master demo diagram — what blooming insights does
+## The master picture — what the app does
 
-One picture of the whole product, so the judges have a mental
-home for everything you show them. This recurs in chapter 2; come
-back here when you forget the shape.
+This is the one diagram you mentally hold while you present. Everything in chapter 02 is the audience watching this diagram come to life left-to-right.
 
 ```
-  blooming insights — what the user actually does
+WHAT BLOOMING INSIGHTS DOES — the analyst loop on one screen
 
-  ┌─ feed ──────────────────────────────────────────────────────┐
-  │  monitoring agent ran against the workspace schema           │
-  │                                                              │
-  │  10-category coverage grid  →  ✓ ✓ ✓ ◐ — — ◐ ✓ — ✓          │
-  │                                  (gated by what events       │
-  │                                   the workspace emits)       │
-  │                                                              │
-  │  insight cards (anomalies the agent actually flagged)        │
-  │    [critical]  purchases outnumber sessions 2:1              │
-  │    [critical]  revenue inflated 10× vs comparable period     │
-  │    [warning]   checkout-to-purchase = 89.7% (impossibly high)│
-  │       click ▼                                                │
-  └─────────────────────────────┬────────────────────────────────┘
-                                │
-  ┌─ investigate ───────────────▼────────────────────────────────┐
-  │  diagnostic agent runs LIVE — reasoning + tool calls stream  │
-  │                                                              │
-  │  status log (left)             │  diagnosis (right)           │
-  │   • thought                    │   conclusion                 │
-  │   • tool: execute_analytics_eql│   evidence: 4 queries        │
-  │     query: select count event… │   confidence: high           │
-  │   • tool: get_event_schema     │   hypotheses tested: 3       │
-  │   • hypothesis                 │                              │
-  │   • conclusion                 │                              │
-  │                                                              │
-  │   ★ MONEY SHOT: this whole thing materializes live ★         │
-  │       click ▼ "see recommendations"                          │
-  └─────────────────────────────┬────────────────────────────────┘
-                                │
-  ┌─ decide ────────────────────▼────────────────────────────────┐
-  │  recommendation agent: 3 typed actions, each with             │
-  │  bloomreach feature + steps + estimated impact + confidence  │
-  └──────────────────────────────────────────────────────────────┘
+  ┌─ 1. MONITORING ─────────┐  ┌─ 2. DIAGNOSIS ────────┐  ┌─ 3. RECOMMENDATION ─────┐
+  │  scans 90-day windows    │  │  picks one anomaly,   │  │  proposes Bloomreach    │
+  │  finds anomalies         │  │  forms hypotheses,    │  │  scenario / segment /   │
+  │  ranks by severity       │  │  tests against data,  │  │  campaign / voucher /   │
+  │  states why it matters   │  │  cites evidence       │  │  experiment + impact    │
+  └────────────┬─────────────┘  └───────────┬───────────┘  └─────────────┬───────────┘
+               │                            │                            │
+               ▼                            ▼                            ▼
+  ┌─────────────────────────────────────────────────────────────────────────────────┐
+  │  STREAMING REASONING TRACE — every step, every tool call, every number, live    │
+  │  (this is the product differentiator — "an analyst that shows its work")        │
+  └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Three surfaces, three agents, one straight line: see → diagnose →
-act. The judges see the line in their first thirty seconds with
-your app open, before you say a word about architecture.
+If a judge remembers one thing tomorrow morning, you want it to be that bottom band. The trace is the thing nobody else is shipping.
 
-  ## What this is — and what it is not
+## The mode you are demoing in
 
-Blooming insights is an AI agent that watches an ecommerce
-workspace and surfaces anomalies the business owner should care
-about. It calls real analytics tools, parses real schemas, and
-fires a diagnostic agent live when the user clicks a card. The
-money shot is the diagnostic agent's reasoning + tool calls
-materializing in front of the judges while a structured Diagnosis
-crystalizes on the right.
-
-It is not a SaaS product. It is not a multi-tenant deployment.
-The judges will assume both. Don't oversell. Demo what is real
-and frame what is next in chapter 5.
-
-  ## The mode you actually run for judges — live-synthetic
-
-The `bi:mode` toggle now has three values, not two:
+Three modes exist in the codebase. **You are using `live-synthetic`.** Memorize this.
 
 ```
-  demo              cached NDJSON snapshot replay · instant · no model
-                    call · creds-free · safe but obviously canned
-                    if a judge asks
+THE THREE MODES — pick one and stop second-guessing
 
-  live-bloomreach   real agents against the real Bloomreach MCP server ·
-                    requires OAuth · alpha server rate-limits 1 req/10s
-                    and revokes tokens after minutes · fragile on stage
-
-  live-synthetic    real agents · real Anthropic API calls · real
-                    reasoning trace · against Blooming-owned in-process
-                    deterministic ecommerce data (lib/data-source/
-                    synthetic-data-source.ts, 516 LOC) · no OAuth ·
-                    no upstream dependency · runs anywhere with just an
-                    ANTHROPIC_API_KEY ★ RECOMMENDED DEMO MODE ★
+  ┌─ demo ──────────────────┬─ live-bloomreach ───────┬─ live-synthetic ────────┐
+  │  cached snapshot         │  real Bloomreach + OAuth│  real agents + Claude    │
+  │  sub-second              │  alpha tokens revoke     │  in-process synthetic    │
+  │  no real agent work      │  unsafe on stage         │  creds-free, ~30–90s     │
+  │  ✗ no live reasoning     │  ✗ judges see auth fail  │  ★ THE DEMO PATH ★      │
+  └──────────────────────────┴──────────────────────────┴──────────────────────────┘
 ```
 
-For the slot, run **live-synthetic**. It is "live" in the meaningful
-sense — the agent loop actually runs, the model actually reasons, the
-tool calls are real (just against an in-process DataSource adapter
-instead of the Bloomreach MCP server). The trace materializing on the
-investigate page is the agent thinking right now, not a replay. And
-because the substrate is in-process, nothing can go down between you
-and the demo: no auth handshake, no rate-limit penalty window, no
-"the alpha server is having a moment."
+`live-synthetic` is what wins this room. It runs real agents, real Claude model, real reasoning trace — against in-process synthetic ecommerce data. No OAuth handshake. No upstream that can go down. **The fake is the data, not the agent behavior.** That distinction is the heart of the demo and you will say it out loud in chapter 02.
 
-When a judge asks "is this actually working?" in Q&A you answer
-honestly: yes, the agents are running live against synthetic data
-because the live workspace needs an OAuth dance I'm not going to do
-on stage. Same agent code path. Same model. Same reasoning. That
-answer is stronger than "cached replay" and more honest than
-"production live."
+`demo` is your fallback if Anthropic returns a 5xx on stage. `live-bloomreach` you do not touch in a room of judges.
 
-  ## The rehearsal order
+## How to rehearse — three passes
 
-```
-  pass 1   read every chapter front to back              ~40 min
-           run the demo once end-to-end with a timer
+You rehearse this book in three passes, escalating from comprehension to muscle memory.
 
-  pass 2   read only the one-page run sheets             ~15 min
-           run the demo again, hold the sheets while you go
-           confirm the money shot lands at ~3:00
+**Pass 1 — read it through.** Chapters 01 → 06 in order, in one sitting. No timer. The point is to learn the shape of the run and what each chapter is teaching you to do differently.
 
-  pass 3   night before / morning of                     ~10 min
-           run sheets only · say the money-shot line out loud
-           open the recorded clip in a tab as the recovery
-```
+**Pass 2 — run it end-to-end with a timer.** Open the app at `localhost:3000` in `live-synthetic`, hit start, run through every chapter's SAY/SHOW tracks out loud, look at the clock at every chapter boundary. If you are over time at any boundary, the chapter's "tighten it" treatment tells you the line to drop. Do this **at least three times** before the day of.
 
-If you have time for only one pass, make it pass 2. The sheets
-are what you actually hold. The chapters teach you why each beat
-exists; the sheets are what you do.
+**Pass 3 — night before and morning of.** Read only the **one-page run sheets** at the bottom of each chapter. Run the demo once on the morning, timed, in `live-synthetic`, in the venue's wifi if you can get there early. The run sheets are what you hold on stage.
 
-  ## How this book connects to the rest of the study system
+## The relationship to the rest of the book family
+
+This book is in a family. Each one is for a different room.
 
 ```
-  .aipe/rehearse-hackathon-demo/   ← this book — present the project
-                                     (run-of-show, choreography, recovery)
+THE THREE ROOMS
 
-  .aipe/rehearse-interview-defense/ ← answer "how does it actually work?"
-                                     (the follow-up after the buzzer)
-
-  .aipe/study-system-design/   ← the deepest follow-ups
-  .aipe/study-agent-architecture/    (open these if a judge presses on
-  .aipe/study-ai-engineering/        the agent loop, the MCP protocol,
-  .aipe/study-prompt-engineering/    or the prompt design)
+  ┌─ /aipe:study ────────┬─ /aipe:rehearse-interview-defense ─┬─ THIS BOOK ─────┐
+  │  understand the work │  defend the work                    │  show the work   │
+  │  (you, alone, deep)  │  (one interviewer, technical depth) │  (room + clock) │
+  └──────────────────────┴─────────────────────────────────────┴──────────────────┘
 ```
 
-The defense book and the concept files are not your job during
-the ten minutes. They are your job for the ninety seconds of Q&A
-after — read chapter 6 of THIS book for the prepped answers, and
-fall back to the defense book if a judge follows up harder than
-expected.
+This book lands the wow. The interview defense book — `.aipe/rehearse-interview-defense/` — answers the "okay so how does it actually work" questions that come after. Chapter 06 here is the **stage Q&A** subset (3 minutes of questions after the buzzer); the defense book is for the 45-minute follow-up loop.
 
-  ## The non-negotiables you carry into the room
-
-```
-  → the demo runs in LIVE-SYNTHETIC mode by default
-       (real agents · real model · creds-free · in-process data)
-       DEMO mode (cached snapshot) is the backup if the model
-       times out
-  → the money shot is the diagnostic agent streaming live
-       on the investigate page, NOT the coverage grid
-  → never narrate clicks ("now I click here")
-       speak value while the hands do the clicking
-  → if the live-synthetic run hangs, switch to DEMO mode or
-       the recorded clip and keep moving — never apologize twice
-  → end on the close line, not on "yeah so that's it"
-```
-
-Read chapter 1 next.
+If you only read one thing the night before: **chapter 02's run sheet**. The demo is the chapter that wins or loses this for you. Everything else is in service of it.

@@ -1,443 +1,270 @@
-# 02 — The demo   (1:00–6:00, 5 minutes)
+# Chapter 2 — The demo   (1:00 – 6:00, 5 minutes)
 
-  ## Opening hook
+## Opening hook
 
-This is the chapter that decides whether you win. You have five
-minutes and exactly one job: make the room watch the multi-agent
-pipeline run live and react when the diagnosis lands. Everything
-else in this demo — the feed, the coverage grid, the
-recommendation cards — is the frame around that single moment.
+This is the chapter. Half the slot. The room is going to remember exactly two things from the entire ten minutes — the **money shot** at 2:00, and whether the click-path that follows it felt real or staged. Everything else in the book is in service of these five minutes landing.
 
-You also have the largest budget you'll get, and the most ways
-to waste it. The wasteful patterns: narrating clicks, explaining
-the architecture inside the demo, hovering over UI to point out
-"isn't this nice." Don't. The architecture has its own chapter
-(03). Inside chapter 2 the rule is brutal: every beat either
-moves the click-path forward or earns the money shot.
+The trap of a five-minute live demo is the temptation to show every feature. **Don't.** You are showing one path — the analyst loop end-to-end on one anomaly — and the path was chosen because every screen on it earns the next one. The discipline is to resist the half-finished settings page, the secondary tab, the "oh and we also have…" detour. Five screens. One narrative. Hands off the keyboard at 6:00.
 
-The money shot lands at ~3:00 — the diagnostic agent's
-reasoning trace materializes line-by-line on the right, real
-analytics queries run in front of the room, and a typed
-Diagnosis with a real conclusion crystalizes in the main panel.
-The whole rest of the chapter exists to set that up and to land
-softly after it.
+The mode is `live-synthetic`. Repeat that out loud to yourself before you walk on. Not `demo` (no live agents), not `live-bloomreach` (alpha tokens revoke). `live-synthetic` runs the real four-agent loop, real Claude model, real reasoning trace, against in-process synthetic ecommerce data. Creds-free, deterministic, 30 to 90 seconds for a full briefing. **This mode exists because of this room.**
 
-  ## The time-budget bar
+## The time-budget bar
 
-Five minutes. Half the slot. The money shot lands at the 3:00
-mark — that's the 2-minute point inside this chapter.
+Five minutes. The money shot is at 2:00. By 6:00 your hands are off the keyboard.
 
 ```
-  ┌──────────────────────────────────────────────────────────┐
-  │ ░░░░▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │
-  │ 0:00 ─── 1:00 ─★3:00★ ─── 6:00 ────────────────────10:00 │
-  │   THE DEMO — you own 1:00 to 6:00 · ★ money shot ~3:00   │
-  └──────────────────────────────────────────────────────────┘
+  1:00 ┌─────────────────────────────────────────────────────────────┐
+       │ ░░░░▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░ │
+       │                                                              │
+       │ 02  THE DEMO  ← you are here                   1:00 – 6:00   │
+       │                                                              │
+       │     ★ money shot lands at 2:00 (trace fills the sidebar)     │
+       │     first insight card appears ~3:30                         │
+       │     recommendation lands ~5:30                                │
+  6:00 └─────────────────────────────────────────────────────────────┘
 ```
 
-  ## The chapter-opening diagram — the choreographed click-path
+The money shot is **the moment the streaming reasoning trace fills the right column with the agent's actual queries, hypotheses, and numbers.** Not the first card. Not the recommendation. The trace itself. That is the thing nobody else is shipping and the thing the room reacts to first.
 
-The exact path you walk through the app, with timing and the
-money-shot marker. Memorize this; everything else in the chapter
-is the script for executing it.
+## The click-path — five screens on one diagram
 
-```
-  the click-path · 1:00 → 6:00
-
-  1:00   FEED (app/page.tsx)
-   │     ↓ point at the coverage grid
-   │     ↓ point at the top-of-list critical card
-   │
-  1:30   ★ CLICK the critical insight card
-   │           → navigates to /investigate/[id]
-   │
-  1:35   INVESTIGATE PAGE (app/investigate/[id]/page.tsx)
-   │     ↓ status log opens on the right · empty
-   │     ↓ "diagnosing the issue…" appears
-   │     ↓ ProcessStepper shows step 2 active
-   │
-  1:50   the agent starts streaming reasoning steps
-   │     ↓ a "thought" line appears
-   │     ↓ a tool_call_start renders · "execute_analytics_eql"
-   │     ↓ the actual EQL query text fills the status log
-   │
-  2:30   tool_call_end · result appears · next thought streams
-   │     ↓ second query fires · third · hypothesis line
-   │
-  3:00   ★★★ MONEY SHOT ★★★
-   │     ↓ the Diagnosis materializes in EvidencePanel:
-   │       · the conclusion in the main callout
-   │       · evidence array filled with the real numbers
-   │       · confidence pill (high/medium/low) lights up
-   │       · GapChart renders if timeSeries is present
-   │     ↓ "cause identified" replaces "diagnosing the issue…"
-   │     ↓ "see recommendations →" button activates
-   │
-  3:30   pause · 3-second silence · let the room read the
-   │     ↓ conclusion
-   │
-  3:45   CLICK "see recommendations →"
-   │           → navigates to /investigate/[id]/recommend
-   │
-  3:50   DECIDE PAGE (.../recommend/page.tsx)
-   │     ↓ three recommendation cards stream in
-   │     ↓ each card has: bloomreach feature · steps ·
-   │       estimated impact · confidence · effort
-   │
-  5:30   navigate back to /  (browser back, or "feed" link)
-   │     ↓ show the second/third cards briefly · they exist
-   │       and behave the same way
-   │
-  6:00   end of chapter 2 · hand off to chapter 3
-```
-
-The marker at 3:00 is non-negotiable. Rehearse with a timer
-until you can hit it within ten seconds.
-
-  ## The mode you actually run — live-synthetic
-
-`bi:mode` has three values and the demo runs on **live-synthetic**.
-This is the killer demo path:
+This is the choreography. Memorize it. Every left-column event is something you do; every right-column event is what fills the screen and what you say.
 
 ```
-  demo              cached snapshot · instant · feels canned if
-                    a judge probes
-  live-bloomreach   real Bloomreach MCP server · OAuth dance ·
-                    rate-limited 1 req/10s · alpha-server fragile
-  live-synthetic    real agents · real model · real reasoning ·
-                    in-process synthetic data (no upstream) ★
+THE DEMO CLICK-PATH — five screens, five minutes
+
+  ┌─ SCREEN 1 ─ feed (empty) ─────────────────────┐   YOU: click "start briefing"
+  │  empty cards column, sticky StatusLog right    │   ▼  trace begins streaming
+  └────────────────────────────────────────────────┘
+                       │
+                       ▼  ~30 seconds of agent reasoning streams in
+  ┌─ SCREEN 1' ─ feed (trace filling) ────────────┐   ★ MONEY SHOT at ~2:00 ★
+  │  empty cards still | trace rolling in right    │   The room sees the agent's
+  │  - "scanning purchase events 90d vs prior 90d" │   actual work — queries,
+  │  - tool call: execute_analytics_eql (running)  │   numbers, hypotheses
+  │  - "purchase_revenue dropped 38% in USA"       │
+  │  - tool call complete (847ms)                  │
+  └────────────────────────────────────────────────┘
+                       │
+                       ▼  monitoring done → cards render
+  ┌─ SCREEN 2 ─ feed (cards) ─────────────────────┐   YOU: pause; let the room
+  │  3 InsightCards: severity dot, headline,       │   read one card
+  │  summary, why it matters, prior→now bars       │   ▼  click the critical one
+  └────────────────────────────────────────────────┘
+                       │
+                       ▼  navigate to investigate/[id]
+  ┌─ SCREEN 3 ─ investigate (step 2) ─────────────┐   diagnostic agent runs
+  │  InvestigationSubject banner top               │   trace streams right
+  │  EvidencePanel: conclusion, evidence,          │   YOU: read the conclusion
+  │  hypotheses, affected-customers callout        │   line out loud
+  │  "see recommendations →" button bottom         │   ▼
+  └────────────────────────────────────────────────┘
+                       │
+                       ▼  click "see recommendations →"
+  ┌─ SCREEN 4 ─ investigate (step 3) ─────────────┐   recommendation agent
+  │  RecommendationCards: feature chip,            │   runs, lands ~5:30
+  │  confidence dot, numbered steps,               │   YOU: point at the
+  │  highlighted "expected impact" callout         │   "expected impact" box
+  └────────────────────────────────────────────────┘
+                       │
+                       ▼  6:00 — hands off
+                  HAND OFF TO CHAPTER 03
 ```
 
-Live-synthetic gives you the property that wins this slot: the
-diagnostic trace materializing on screen is the model actually
-reasoning, not a recording. The EQL queries in the status log are
-the queries the model just generated. The conclusion in the
-EvidencePanel is what the model just synthesized. No OAuth, no
-rate-limit penalty, nothing between you and the demo except the
-Anthropic API. The investigation typically takes ~30-90 seconds
-of model latency — which fits cleanly inside beats 2 and 3's
-budget.
+Five screens. Notice the second screen is the same as the first — the *change* is the trace filling in. That is on purpose. The money shot is not a navigation. It is the right column coming alive while the left column is still empty.
 
-Set the toggle to "live · synthetic" before the slot. If a judge
-later asks "but is this against real Bloomreach data?", you have
-the answer in chapter 6 (probe 1).
+## The body — the five beats walked
 
-  ## Beat 1 — the feed orientation   (1:00–1:30)
+### Beat 1 — start the briefing   (1:00 – 1:30)
 
-You ended the cold open hovering over the critical card. Now you
-spend thirty seconds making the room understand what the feed
-IS, then you click.
+You are coming out of the cold open with the cursor already on "start briefing." The trace begins immediately. You stop talking and let the first three lines stream in before you say anything else.
 
 ```
-  SHOW (on screen)                  SAY (out loud)
-  ──────────────────────────        ───────────────────────────
-  point at the coverage grid        "the agent doesn't guess what
-   (the 10-tile checklist above       to look for. it checks ten
-    the cards)                        ecommerce anomaly categories
-                                      — conversion drops, cart
-                                      abandonment, revenue moves,
-                                      churn — and the green ones
-                                      are the ones it can actually
-                                      run against this workspace's
-                                      data."
-  ──────────────────────────        ───────────────────────────
-  point at a faded/ghost tile       "the faded ones are categories
-   if any are present                 the workspace can't support
-                                      yet — no return events, no
-                                      utm tracking. honest about
-                                      what it can and can't see."
-  ──────────────────────────        ───────────────────────────
-  drop back to the top card         "and here are the three things
-                                      it flagged. let's pull on
-                                      this one."
+  SHOW (on screen)                  SAY (out of your mouth)
+  ────────────────────────────────  ──────────────────────────────────────
+  trace line: "monitoring agent      "There it is — the monitoring agent is
+   scanning purchase events…"        scanning the workspace for what changed
+                                      in the last 90 days."
+  tool_call_start: execute_eql       "Every line you see is the agent's
+                                      actual reasoning streaming live —"
+  tool_call_end (847ms) →            "— and every tool call is real EQL
+                                      hitting the data, with the latency."
 ```
 
-That coverage-grid line is doing real work. It signals that the
-agent is gated, not guessing. Judges notice. Don't skip it.
+The trick: you are **labeling what the room is already watching**, not predicting it. The trace moves first; your sentence describes what just appeared.
 
-Then click.
+### Beat 2 — the money shot   (~2:00)
 
-  ## Beat 2 — the click that starts the money shot   (1:30–3:00)
-
-The click is the moment the demo actually starts. After this
-you talk less — the screen does the talking. Your job for
-ninety seconds is to point at things and let the room read.
+This is the moment. By around 2:00 the right column has five to eight trace lines visible, two or three tool calls expanded, real numbers showing, and the left column still empty. **Stop talking for three full seconds and let the room read it.**
 
 ```
-  SHOW (on screen)                  SAY (out loud)
-  ──────────────────────────        ───────────────────────────
-  CLICK the critical card           "watch the right side."
-   ↓ navigates to investigate
-  ──────────────────────────        ───────────────────────────
-  status log appears · empty        (point at the right panel · 2
-   "connecting to the agent…"         seconds silent)
-  ──────────────────────────        ───────────────────────────
-  first reasoning step streams      "that's the diagnostic agent.
-   "reading the workspace schema…"    it's thinking out loud — and
-                                      every blue line is a real
-                                      tool call the model just
-                                      generated."
-  ──────────────────────────        ───────────────────────────
-  first tool_call_start renders     "this is the actual analytics
-   "execute_analytics_eql"            query language the model just
-   the EQL query text fills the       wrote and ran against the
-   status line                        workspace data."
-  ──────────────────────────        ───────────────────────────
-  tool result lands · next          (silent · let them read the
-   reasoning step                     query and the result)
-   "checking session_start counts
-    across the same window…"
-  ──────────────────────────        ───────────────────────────
-  second tool fires · third         "every query is the agent
-                                      testing a hypothesis. it's
-                                      not retrieving a saved
-                                      answer — it's investigating
-                                      right now."
+  SHOW (on screen)                  SAY (out of your mouth)
+  ────────────────────────────────  ──────────────────────────────────────
+  trace fills sidebar with real       [silence — three seconds]
+  reasoning + numbers + tool calls
+                                      "This is the product. An analyst
+                                       that shows its work."
 ```
 
-The discipline here: do not narrate the clicks. Do not say "okay
-so now it's running another query." The status log already says
-that. Your job is to interpret, not duplicate.
-
-  ## Beat 3 — the money shot   (3:00–3:30)   ★★★
-
-This is the moment. Stop talking. Let it land.
+The script line you nail verbatim, after the silence:
 
 ```
-  SHOW (on screen)                  SAY (out loud)
-  ──────────────────────────        ───────────────────────────
-  the Diagnosis materializes        (silent · 3 seconds)
-   in EvidencePanel:
-   • conclusion callout fills
-   • evidence list renders
-   • confidence pill colors in
-   • the GapChart bars appear
-  ──────────────────────────        ───────────────────────────
-  the diagnostic step in            "there it is."
-   ProcessStepper flips green,
-   "cause identified"
-  ──────────────────────────        ───────────────────────────
-  cursor moves to the conclusion    "the agent investigated four
-   text                                hypotheses, ran four real
-                                      queries, and concluded —
-                                      with high confidence — that
-                                      this is double-firing of
-                                      checkout events. it didn't
-                                      just spot the anomaly. it
-                                      figured out WHY."
+┃ "This is the product. An analyst that shows its work."
 ```
 
-```
-  ┃ "it didn't just spot the anomaly. it figured out WHY."
-```
+That sentence is the entire pitch in eight words. You will hear yourself want to add to it. **Do not.** The silence + the eight words is the money shot. The room is doing the work of being impressed; you are not in the way.
 
-That line is the money-shot line. Say it once, with weight.
-Don't qualify it. Don't add "kind of" or "we think." Either it
-figured it out or it didn't, and on live-synthetic it just did.
-The trace the room saw stream in is the model that just ran. The
-conclusion in the EvidencePanel is the conclusion that model
-just produced — not a cached one.
+### Beat 3 — the cards land   (2:30 – 3:30)
 
-  ## Beat 4 — the action layer   (3:45–5:30)
-
-The money shot is the payoff for the click. The action layer is
-the payoff for the product. Without it you've shown a diagnosis
-tool; with it you've shown an agent that closes the loop.
+Monitoring finishes. Three `InsightCard`s render into the left column with severity dots, the headline like `usa purchase_revenue · -38.4%`, the agent-written "why it matters" line, and the prior-vs-now comparison bars. You pause again. Let the room scan one card.
 
 ```
-  SHOW (on screen)                  SAY (out loud)
-  ──────────────────────────        ───────────────────────────
-  CLICK "see recommendations →"     "and because it knows what's
-   ↓ /investigate/[id]/recommend      wrong, it can propose what
-                                      to do about it."
-  ──────────────────────────        ───────────────────────────
-  three RecommendationCard          "three recommendations. each
-   skeletons render briefly,          one tied to a bloomreach
-   then fill in (or replay              feature the workspace already
-   instantly in demo mode)             has — a segment, a campaign,
-                                      a scenario."
-  ──────────────────────────        ───────────────────────────
-  point at the "estimated impact"   "and they're sized. high
-   pill on a card                     confidence, low effort, this
-                                      one takes 20 minutes to set
-                                      up. the agent isn't just
-                                      saying 'fix it' — it's saying
-                                      'fix it this way, here's how
-                                      long it'll take, here's what
-                                      you'll get back.'"
+  SHOW (on screen)                  SAY (out of your mouth)
+  ────────────────────────────────  ──────────────────────────────────────
+  3 InsightCards render               "Three anomalies, ranked by severity.
+                                       The agent wrote the headline, wrote
+                                       why it matters for the business,
+                                       and showed the prior-vs-now numbers."
+  hover the top card                  "I'm going to drill into the worst
+                                       one — USA purchase revenue down 38%."
 ```
 
-  ## Beat 5 — the soft landing   (5:30–6:00)
+You do not read every card. You point at one. The card is `components/feed/InsightCard.tsx`; the agent wrote everything on it including the impact line.
 
-Navigate back to the feed. Show that the other cards are real
-and behave the same way. This is the "yes there are more, this
-is a system not a script" beat.
+### Beat 4 — diagnosis   (3:30 – 5:00)
 
-```
-  SHOW (on screen)                  SAY (out loud)
-  ──────────────────────────        ───────────────────────────
-  click "← feed" or browser back    "and there are two more
-   ↓ back at /                        anomalies on the feed,
-                                      ready to investigate the
-                                      same way."
-  ──────────────────────────        ───────────────────────────
-  hover over the second card,       (silent · 2 seconds · let
-   then the third                     them read the headlines)
-                                     "every one of these is the
-                                      same flow. click, watch,
-                                      decide."
-  ──────────────────────────        ───────────────────────────
-  hand off to chapter 3              "now let me show you how
-                                      that actually works."
-```
-
-That last line is your transition into under-the-hood. Don't
-fumble it; you want momentum into chapter 3.
-
-  ## The script lines to nail
-
-Three lines, verbatim. The money-shot line is the most important
-single sentence in the entire ten minutes.
+Click the card. The page navigates to `app/investigate/[id]/page.tsx`. A second agent — the diagnostic — picks up where monitoring left off. Trace streams again, this time forming and testing hypotheses against the data. The `EvidencePanel` lands.
 
 ```
-  ┃ "watch the right side."
+  SHOW (on screen)                  SAY (out of your mouth)
+  ────────────────────────────────  ──────────────────────────────────────
+  investigate page loads,             "A second agent picks up — diagnostic.
+   subject banner top                  Same workspace, different job."
+  trace streaming hypotheses          "Watch — it's forming hypotheses,
+                                       testing each one against the data,
+                                       sizing the affected customer segment."
+  EvidencePanel renders               "Conclusion, evidence list, what it
+                                       ruled out, and how many customers
+                                       are in the segment that's hurting."
+  hover the conclusion line           [read the one-sentence conclusion
+                                       verbatim from the screen]
 ```
 
-```
-  ┃ "it didn't just spot the anomaly. it figured out WHY."
-```
+The streaming hypotheses moment is the second-strongest beat in the demo. The trace shows the agent saying "maybe it's the checkout funnel — checking" then "no, conversion's flat — what about traffic?" — actual reasoning steps the room can read.
+
+### Beat 5 — recommendation   (5:00 – 6:00)
+
+Click "see recommendations →." Third agent runs — the recommendation agent — and gets the diagnosis handed to it. `RecommendationCard`s land with the Bloomreach feature chip, numbered steps, and the highlighted "expected impact" callout.
 
 ```
-  ┃ "every one of these is the same flow. click, watch, decide."
+  SHOW (on screen)                  SAY (out of your mouth)
+  ────────────────────────────────  ──────────────────────────────────────
+  recommend page loads                "Third agent — recommendation. Gets
+                                       the diagnosis handed to it."
+  trace streaming                     "It proposes Bloomreach actions —
+                                       scenarios, segments, campaigns —"
+  RecommendationCards land            "— each with steps a marketer can run,
+                                       a confidence dot, and —"
+  point at "expected impact" box      "— an expected impact, so they know
+                                       what they're buying."
+  pause — hands off keyboard at 6:00  [silence — hand off to chapter 03]
 ```
 
-  ## Strong vs weak — the demo move that kills demos
-
-The single most common failure inside a hackathon demo is the
-presenter narrating the clicks while the screen is doing the
-exact same narration in real time. The room hears it twice and
-disengages.
+The closing script line for the demo chapter:
 
 ```
-  WEAK DEMO MOVE                    STRONG DEMO MOVE
-  ─────────────────────────────     ─────────────────────────────
-  "okay so now i'm clicking on      (CLICK · then silent for 2s)
-   the critical card here, and       "watch the right side."
-   you can see it's loading…
-   and now there's a tool call,     (silent · let the trace
-   and another tool call, and        stream)
-   here's the query it ran…"
-                                    "that's the actual analytics
-                                     query language it just
-                                     wrote."
-  ─────────────────────────────     ─────────────────────────────
-  presenter and screen say the      presenter interprets · screen
-  same thing simultaneously         shows · room reads · both win
-  ─────────────────────────────     ─────────────────────────────
-  room disengages by 2:30           room is leaning in at 3:00
+┃ "Three agents, one continuous trace. What changed. Why. What to do."
 ```
 
-Your hands click. The screen narrates. Your voice interprets.
-Three jobs, three sources, no overlap.
+Hands off the keyboard at 6:00. The screen stays on the recommendation. You walk into chapter 03 with the recommendation card still visible behind you.
 
-  ## ╔══════════════════════════════════════════════════════════╗
-  ## ║ IF IT BREAKS — the demo                                   ║
-  ## ║                                                            ║
-  ## ║ Live-synthetic is the default. The toggle is set to        ║
-  ║ "live · synthetic" so the agents really run against the       ║
-  ║ in-process DataSource. No OAuth, no upstream dependency,      ║
-  ║ no rate-limit penalty. The only failure surface is model      ║
-  ║ latency or an Anthropic API hiccup.                           ║
-  ## ║                                                            ║
-  ## ║ The investigate page hangs (model slow / API hiccup) →    ║
-  ║ click "demo" in the mode toggle and click the card again.    ║
-  ║ The cached snapshot replays in ~3 seconds. Say: "let me       ║
-  ║ show you the diagnosis from an earlier run." Don't mention    ║
-  ║ the toggle switch — judges don't need to see the recovery.    ║
-  ║ Deliver the money-shot line over the cached replay and        ║
-  ║ continue to beat 4 normally.                                  ║
-  ## ║                                                            ║
-  ## ║ Both modes hang (rare — would mean Anthropic AND the       ║
-  ║ static snapshot route are both broken) → switch tabs to the   ║
-  ║ recorded screen capture, scrub to the money-shot frame, say   ║
-  ║ "here's the diagnosis from a run earlier today," deliver the  ║
-  ║ money-shot line over the recording, continue.                 ║
-  ## ║                                                            ║
-  ║ The diagnosis text is blank → the EvidencePanel renders       ║
-  ║ "no diagnosis yet" rather than crashing. If it appears, say:  ║
-  ║ "let me show you the one from earlier" and toggle to demo.    ║
-  ## ║                                                            ║
-  ## ║ A judge interrupts mid-stream with "is this live?" → say  ║
-  ║ "the agents are running live right now against deterministic  ║
-  ║ ecommerce data — no auth dance for the slot. live-bloomreach  ║
-  ║ in the toggle runs against the real workspace; happy to       ║
-  ║ show you after." Then keep going. Do NOT toggle to            ║
-  ║ live-bloomreach mid-demo — the OAuth dance eats your slot.    ║
-  ## ╚══════════════════════════════════════════════════════════╝
+## Weak demo move versus strong demo move
 
-  ## Tighten it — if you're running long
-
-The chapter has three cuts, in priority order:
+This is the failure pattern this chapter trains against. Both columns describe the same five screens; only the talk track differs.
 
 ```
-  cut 1   skip beat 5 (the soft landing back at the feed)
-            saves ~30s · costs the "system not a script" beat
-
-  cut 2   shorten beat 4 (recommendations) — show ONE card
-            instead of all three, name the bloomreach-feature
-            field, move on. saves ~30s · costs nothing
-            critical.
-
-  cut 3   skip beat 1's coverage-grid commentary — go straight
-            from "here are three flagged anomalies" to the
-            click. saves ~20s · costs the gated/honest framing.
+WEAK MOVE                             STRONG MOVE (yours)
+──────────────────────────────────    ──────────────────────────────────
+narrates the clicks:                  speaks value while hands click:
+"I'm clicking the start button…"      "Every line is the agent's actual
+"now I'm hovering over the card…"      reasoning, streaming live."
+"this navigates to investigate…"       "A second agent picks up — same
+                                       workspace, different job."
+talks over the trace                   pauses for the trace to fill
+fills every silence                    lets the screen do the work
+0:00 of silent reading time            ~12s of silent reading time across
+                                       the five beats — the moments the
+                                       room is doing the impressing
 ```
 
-The floor: the money shot at beat 3 is sacred. You cut from any
-beat before doing anything to the money shot. If you have ninety
-seconds left in chapter 2 and you're still in beat 1, jump
-straight to the click and ride the money shot in. The room
-remembers the money shot. The room does not remember the feed
-orientation.
+The narrate-the-clicks failure is so common it's almost a reflex. The SAY column in every beat above exists to give your mouth somewhere else to go.
 
-  ## ────────────── RUN SHEET — chapter 2 ─────────────────────
+## If it breaks
+
+The demo has three failure modes. Each one has a backup.
 
 ```
-  ┌───────────────────────────────────────────────────────────┐
-  │ THE DEMO · 1:00–6:00 · 5 minutes · ★ money shot ~3:00     │
-  ├───────────────────────────────────────────────────────────┤
-  │ 1:00   point at coverage grid · "ten categories, gated"   │
-  │ 1:15   "faded ones = can't support yet"                   │
-  │ 1:25   "let's pull on this one"                           │
-  │ 1:30   ★ CLICK the critical card                          │
-  │ 1:35   "watch the right side."                            │
-  │ 1:50   "that's the diagnostic agent. blue lines = real    │
-  │         tool calls the model just generated."             │
-  │ 2:10   "this is the actual analytics query language…"     │
-  │ 2:30   (let the trace stream · silent)                    │
-  │ 3:00   ★★★ MONEY SHOT — diagnosis materializes ★★★         │
-  │ 3:10   "there it is."                                     │
-  │ 3:15   THE MONEY-SHOT LINE (verbatim):                    │
-  │         "it didn't just spot the anomaly. it figured out  │
-  │          WHY."                                            │
-  │ 3:30   3-second silence · let them read                   │
-  │ 3:45   click "see recommendations →"                      │
-  │ 4:00   "three actions, each tied to a bloomreach          │
-  │         feature."                                         │
-  │ 4:30   point at confidence + effort pill                  │
-  │ 5:00   click "← feed"                                     │
-  │ 5:30   "every one of these is the same flow. click,       │
-  │         watch, decide."                                   │
-  │ 5:50   bridge: "now let me show you how that works."      │
-  ├───────────────────────────────────────────────────────────┤
-  │ PRE-ROLL    toggle = "live · synthetic" (real agents,     │
-  │             in-process data, no creds)                    │
-  │ MUST NAIL   money-shot line · 3s silence at 3:30          │
-  │ IF BREAKS   model hangs → toggle to "demo" (cached) and   │
-  │             reclick · NEVER toggle to live-bloomreach     │
-  │ TIGHTEN     cut beat 5 → beat 4 → beat 1's coverage line  │
-  │             NEVER cut the money shot                      │
-  └───────────────────────────────────────────────────────────┘
+╔══════════════════════════════════════════════════════════════════════════╗
+║ IF IT BREAKS — the three failure modes                                    ║
+║                                                                            ║
+║  1. Anthropic API returns a 5xx or rate-limits mid-trace                  ║
+║     → trace stalls past 15 seconds. Flip toggle to `demo` (top-right),    ║
+║       reload. The cached snapshot replays the same screens with the same  ║
+║       trace. Say: "I'm switching to a cached run so we don't burn the     ║
+║       clock — same agents, same outputs, just from earlier today."         ║
+║                                                                            ║
+║  2. Dev server crashed / page won't load                                  ║
+║     → `cmd-tab` to the recorded 90-second screen capture (saved in        ║
+║       ~/Desktop/blooming-demo-clip.mov). Say: "let me show you the run   ║
+║       from this morning" and narrate the same five beats over the clip.   ║
+║                                                                            ║
+║  3. Money shot doesn't land — trace is too sparse, room isn't reacting    ║
+║     → don't try to rescue it with words. Skip to clicking the first       ║
+║       card. The cards landing is the second-best money shot. Say:         ║
+║       "and here's what it found" and keep moving.                         ║
+║                                                                            ║
+║ Rule: never apologize twice. Never explain the error in detail. Keep      ║
+║ moving forward. The recovery line + the next click is enough.              ║
+╚══════════════════════════════════════════════════════════════════════════╝
 ```
 
-Read chapter 3 next.
+The `demo` mode backup is the load-bearing one. Test it the morning of by toggling and reloading — it should serve in under a second from `lib/state/demo-*.json`. If `demo` mode is broken, you should know that an hour before you walk on, not in beat 2.
+
+## Tighten it
+
+This is the chapter with the most fat. If the slot is 5 minutes instead of 10, you cut here first.
+
+- **First cut: beat 5 to 30 seconds.** Show only the first RecommendationCard, point at the impact line, hand off.
+- **Second cut: beat 3 to 30 seconds.** Three cards render — point at one, skip the prior-vs-now bars, click straight in.
+- **Floor — never cut below:** start click → trace fills sidebar → click a card → diagnosis EvidencePanel lands → click → first RecommendationCard. That's the irreducible path that proves the loop runs end-to-end. Three minutes minimum. Below that, the room doesn't see the agents do their thing, and there is no point in any other chapter.
+
+## The one-page run sheet
+
+This is what you hold on stage.
+
+```
+╭─────────────────────── THE DEMO — RUN SHEET ─────────────────────────╮
+│ Budget: 1:00 – 6:00 (5 min)       Money shot: ~2:00                   │
+│ Mode: live-synthetic              Hands off keyboard: 6:00            │
+│                                                                        │
+│ FIVE BEATS in order:                                                   │
+│   1. (1:00) start click → "monitoring agent is scanning…"             │
+│   2. (2:00) ★ PAUSE 3 SECONDS ★ "This is the product. An analyst      │
+│        that shows its work."                                           │
+│   3. (3:00) cards land → point at one → "drill into the worst one"    │
+│   4. (3:30) click card → diagnostic runs → read conclusion verbatim   │
+│   5. (5:00) "see recommendations →" → point at expected impact box    │
+│                                                                        │
+│ CLOSE: "Three agents, one continuous trace. What changed. Why.        │
+│         What to do." [silence — walk into chapter 03]                  │
+│                                                                        │
+│ IF IT BREAKS:                                                          │
+│   - trace stalls > 15s → toggle to `demo`, reload                     │
+│   - server crashed → cmd-tab to recorded clip                          │
+│   - money shot flat → skip to cards landing, keep moving               │
+│                                                                        │
+│ TIGHTEN IT:                                                            │
+│   cut order: beat 5 → beat 3 → beat 4 prior-vs-now hover               │
+│   FLOOR: start → trace → click card → diagnosis → recommendation       │
+╰────────────────────────────────────────────────────────────────────────╯
+```
