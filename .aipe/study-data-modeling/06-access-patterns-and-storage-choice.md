@@ -1,573 +1,441 @@
-# 06 — Access patterns and storage choice
+# Access patterns and storage choice
 
-**Storage-shape matching access-shape · Industry standard**
+*Storage-shape-to-access-pattern fit (industry standard) · Project-specific*
 
 ## Zoom out, then zoom in
 
-The classical question — *does the storage shape match the read/write
-pattern?* — is the seam to system design. **blooming_insights** answers
-it with "no database, because the access pattern doesn't ask for one."
-This file walks why that's right, names the ceiling, and shows the
-buildable target the day the access pattern shifts.
+The matching question every storage choice answers: **does the shape of the store match the shape of the queries?** Get this right and the storage almost disappears — every operation is one move. Get it wrong and the codebase is full of friction: joins to reassemble what should be one document, scans to find what should be one index, hand-rolled "would be a transaction in Postgres" logic.
+
+This repo deliberately doesn't use a database. The store is `Map`s + a couple of committed JSON files. Whether that's the right call depends entirely on the access pattern — so this file walks the access pattern first, then names why the storage shape is (or isn't) the right fit.
 
 ```
-  Zoom out — the storage tiers and what each one is for
+  Zoom out — what "storage" means here
 
-  ┌─ Browser ───────────────────────────────────────────────────────┐
-  │  localStorage 'bi:mode'    user preference (mode toggle)         │
-  │  sessionStorage 'inv:<id>' per-tab investigation hydration       │
-  └──────────────────┬──────────────────────────────────────────────┘
-                     │
-  ┌─ Vercel serverless ─────────────────────────────────────────────┐
-  │  Cookies: bi_session + bi_auth   per-user identity + tokens     │
-  │  in-process Maps                  the feed + investigations      │
-  │  60s response cache               substrate dedup                │
-  └──────────────────┬──────────────────────────────────────────────┘
-                     │
-  ┌─ Disk (dev only, gitignored) ───────────────────────────────────┐
-  │  .auth-cache.json                                                │
-  │  .investigation-cache.json     ★ THIS CONCEPT decides ★          │ ← we are here
-  │                                  do we need real persistence?    │
-  └──────────────────┬──────────────────────────────────────────────┘
-                     │
-  ┌─ Committed JSON (versioned) ────────────────────────────────────┐
-  │  lib/state/demo-{insights,investigations}.json                   │
-  │  the reliable presentation path                                  │
-  └──────────────────┬──────────────────────────────────────────────┘
-                     │
-  ┌─ External substrate ────────────────────────────────────────────┐
-  │  Bloomreach Engagement (events, customers, catalogs)             │
-  │  SyntheticDataSource (deterministic facts)                       │
-  └─────────────────────────────────────────────────────────────────┘
+  ┌─ UI layer ──────────────────────────────────────────┐
+  │  reads:  full Insight (1-shot, no joins)            │
+  │  reads:  full Investigation (1 id → 1 tree)         │
+  │  writes: none — UI is read-only over the agent loop │
+  └────────────────────────┬───────────────────────────┘
+                           │
+  ┌─ Service layer ────────▼───────────────────────────┐
+  │  writes: full feed at end of briefing (clear+rewrite) │
+  │  writes: full investigation at end of agent run      │
+  │  no incremental updates, no partial writes           │
+  └────────────────────────┬───────────────────────────┘
+                           │
+  ┌─ Storage layer ────────▼───────────────────────────┐
+  │  ★ THE STORE ★                                       │
+  │  Map<sessionId, SessionFeed> — RAM, ephemeral        │ ← we are here
+  │  + 4 JSON files — disk, ephemeral or committed       │
+  │  (no SQL, no KV, no document DB)                     │
+  └─────────────────────────────────────────────────────┘
 ```
 
-Zoom in. There are six storage tiers in the codebase, and exactly one
-choice was made deliberately: **no real persistence layer of our own.**
-The interesting question is how that choice survives — and what would
-break it.
+**Zoom in.** The access pattern is: **write a complete entity once at the end of an agent run; read it by primary key when the user navigates to it; drop everything when the warm instance dies.** That's a perfect document-shape access pattern with a session-scoped lifecycle and no concurrent writers. The `Map`-and-JSON store matches it. The day the pattern grows a "save this," "annotate this," or "find similar across all sessions," the fit breaks — and *that's* when storage choice changes. This file is about *why the fit holds today* and *what would break it*.
 
----
+## Structure pass
 
-## Structure pass — the axis is "who owns this data, and how long does it live?"
+**Layers.** Three altitudes of access:
+
+- **Within a request** — the agent loop reads `WorkspaceSchema`, writes `Insight[]` and `AgentEvent[]`. All synchronous, all in-process.
+- **Across requests, same session** — the feed page reads what the briefing wrote; the investigation page reads what the agent run wrote.
+- **Across instances / cold-start** — Vercel's warm-instance lifecycle means *no* in-memory state survives. Only the committed demo snapshot and (in dev) the file caches do.
+
+**Axis traced — "how does this fact survive between two reads?"** Hold that question through the layers:
 
 ```
-  Trace ONE axis — "ownership + lifetime" — across tiers
+  Trace the survival axis through the access tiers
 
-  tier                             | owner       | lifetime           | recoverable
-  ─────────────────────────────────┼─────────────┼────────────────────┼─────────────
-  browser localStorage             | user        | until they clear   | no — user pref
-  session cookie (bi_session)      | server      | session            | re-mint trivially
-  auth cookie (bi_auth, prod)      | server      | until re-auth      | re-auth flow
-  in-process Maps                  | warm server | until cold/restart | YES, recompute
-  dev JSON cache                   | dev box     | until rm           | YES, recompute
-  committed demo JSON              | repo        | git history        | YES, recapture
-  external substrate (Bloomreach)  | Bloomreach  | forever            | n/a — read-only
-  ─────────────────────────────────┴─────────────┴────────────────────┴─────────────
+  same request:
+    in-memory Map → survives (one process, one stack)
 
-  axis seam:  "do WE own data that we cannot recover from upstream?"
-  answer:     NO. every data tier owned by us is recomputable.
-  therefore:  no DB needed. the moment that answer flips, a DB earns its keep.
+  same session, same instance:
+    in-memory Map → survives (warm instance hasn't recycled)
+
+  same session, instance hop (Vercel):
+    in-memory Map → LOST  (different ephemeral process)
+    cookie:        survives (browser)
+    snapshot file: survives (read-only, deployed code)
+
+  cross-session:
+    nothing survives — by design (session isolation)
+    + demo snapshot survives (it's "everyone's seed")
+
+  cold start (instance died, request hits new one):
+    in-memory Map → LOST (gone with the process)
+    cookie:        survives
+    snapshot file: survives
 ```
 
-Each row's answer to "recoverable" is yes — except for the substrate,
-which we don't own. The recoverability of *our* data is the entire
-justification for the no-DB choice.
+**Seams.** Three places the storage shape touches the access shape:
 
----
+1. **The feed write at end-of-briefing** — `putInsights(sid, items)` writes the *entire* feed atomically (synchronously) by clearing and rewriting. Matches the access pattern (briefing IS the feed, no incremental).
+2. **The investigation cache as cross-session memo** — `mem.set(insightId, events)` is *not* session-scoped. Same insightId from a different session reads the same cached events. Matches the implicit assumption that investigation results are deterministic enough to share.
+3. **The demo snapshot as cold-start fallback** — `lib/state/demo-insights.json` is the safety net for "warm instance has nothing." Matches a presentation-reliability axis (the demo button always works, even cold).
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know the rule "pick the data structure that matches the access
-pattern"? That's `Array.push` vs `Set.add` vs `Map.get`. The same rule
-scales up to storage choice: pick the **storage system** that matches
-the access pattern. No-DB-because-no-need is a real answer — *if* the
-access pattern truly doesn't need one.
+You know how a frontend's localStorage works — set the key, read it by name, no joins, no queries, gone when the user clears their data? The runtime store in this repo is the same shape: `Map.set(id, value)` / `Map.get(id)`, ephemeral, single-process. The only difference is the lifecycle: warm-instance memory dies on cold start, where localStorage survives until the user clears it.
+
+The choice tree this repo walked:
 
 ```
-  The decision tree — what storage matches what access pattern?
+  The storage decision tree — what got picked and what got skipped
 
-  start: does the app OWN data the user creates?
-                                 │
-                ┌────────────────┴──────────────────┐
-              YES                                  NO
-                │                                   │
-                ▼                                   ▼
-  does it need to outlive a process restart?    in-memory cache works
-                │                                   │
-       ┌────────┴────────┐                          │  this codebase is here:
-      YES               NO                          │  every data tier we own
-       │                 │                          │  is recomputable from the
-       ▼                 ▼                          │  substrate (Bloomreach or
-  real DB           in-memory cache                 │   synthetic adapter).
-                                                    │
-                                                    ▼
-                                              done — no DB
+  Do you have persistent server-side data?
+       │
+       ├── NO  → in-memory Map + JSON snapshot      ← THIS REPO
+       │
+       └── YES → Is the access pattern document-shaped?
+                      │
+                      ├── YES → document store (Mongo, DynamoDB)
+                      │         or Postgres jsonb columns
+                      │
+                      └── NO  → Is it relational (multi-entity joins)?
+                                     │
+                                     ├── YES → Postgres / MySQL
+                                     │
+                                     └── NO  → KV (Redis, DynamoDB)
 ```
 
-The codebase sits firmly in the right branch. Every "store" it has is a
-**write-through cache of recomputable data**. Lose the cache, recompute.
-Done.
+The first fork is the load-bearing one. This repo answered NO because (a) the agents produce the data fresh on every briefing, (b) there's no user-created data to preserve, and (c) the only "long-lived" artifact is the demo snapshot (which is presentational, not transactional). Postgres would buy nothing here — and would cost a connection-per-instance, a deploy story, and a migration framework.
 
-### Move 2 — the storage tiers, one at a time
+### Move 2 — the access pattern, named
 
-Six tiers. Each one has a different lifetime and a different reason for
-existing.
+#### Pattern 1 — bulk-write at end-of-agent-run, point-read by id
 
-#### **Tier 1: browser localStorage `bi:mode`**
-
-User preference. The toggle between demo / live / live-synthetic
-modes persists across visits because users want it to.
+The shape every "write" follows:
 
 ```
-  bi:mode storage shape
+  The write pattern — bulk, end-of-run, no incremental
 
-  key:    'bi:mode'
-  value:  'demo' | 'live-bloomreach' | 'live-synthetic'
-  read:   on every page load (client-side)
-  write:  when user clicks the mode toggle
-
-  why localStorage and not a cookie?
-    - this is purely client-side UX state, never read by the server
-    - cookies would round-trip on every request — wasted bytes
-    - localStorage survives across sessions (user expects mode to stick)
+  agent run starts
+       │
+       │  agent does work (5-30 seconds for monitoring,
+       │  90-115s for full investigation)
+       │
+       │  emits events over NDJSON as it goes (UI stream)
+       │  collects events in a `collected: AgentEvent[]`
+       ▼
+  agent run ends
+       │
+       │  putInsights(sid, allInsights)  ← clear + bulk write
+       │  saveInvestigation(id, events)  ← bulk write
+       ▼
+  done
 ```
 
-Match score: ideal. User-scoped, client-only, persistent. localStorage
-exists for exactly this.
+The streaming output to the UI is *not* the write. The writes happen at the end, when the agent has produced its complete output. Everything in the store is "the latest complete run for this id." There's no append, no patch, no incremental update.
 
-#### **Tier 2: server session cookie `bi_session`**
-
-Per-user identity for scoping in-memory Maps. A UUID minted on first
-request:
-
-```typescript
-// lib/mcp/session.ts (snippet)
-export async function getOrCreateSessionId(): Promise<string> {
-  const jar = await cookies();
-  let id = jar.get(COOKIE)?.value;
-  if (!id) {
-    id = crypto.randomUUID();
-    jar.set(COOKIE, id, sessionCookieOpts());
-  }
-  return id;
-}
-```
-
-This is the join key for everything in the state layer (see
-`03-indexing-vs-query-patterns.md`). Without it, two users hitting the
-same warm Vercel instance would share a feed.
-
-#### **Tier 3: server auth cookie `bi_auth` (prod only)**
-
-The encrypted OAuth tokens for Bloomreach. AES-256-GCM under
-`AUTH_SECRET`, stored in an httpOnly cookie. In dev, the same tokens
-live in `.auth-cache.json` (gitignored, plaintext).
+The shape every "read" follows:
 
 ```
-  prod vs dev auth storage
+  The read pattern — single point lookup by primary key
 
-  prod (Vercel, serverless):              dev (local):
-  ────────────────────────                ───────────
-  encrypted cookie (bi_auth)              plaintext file (.auth-cache.json)
-  AsyncLocalStorage-scoped store          single-tenant
-  per-request decrypt + re-encrypt        load once, write on change
-
-  why the split? serverless filesystem is read-only in prod —
-  you can't write a file. cookies are the only writable store.
+  UI navigates to /investigate/[id]
+       │
+       │  resolveAnomaly(sid, id) — 1 Map.get
+       │  getCachedInvestigation(id) — 1 Map.get
+       ▼
+  full Investigation hydrates the page
+       │
+       │  no further reads — the page renders from this one tree
+       ▼
+  user reads it
 ```
 
-This is the only encrypted-at-rest data in the app. The choice (encrypted
-cookie vs server-side session store like Redis) is a system-design call,
-not a data-modeling one — but the *shape* of what's stored (a token bag
-keyed by user) is data-modeling.
+One id in, one entity tree out. No `WHERE`, no `JOIN`, no `ORDER BY`. The `Map<id, Entity>` store is *exactly* shaped for this access pattern — every other shape would be friction.
 
-#### **Tier 4: in-process Maps (the actual "database")**
+#### Pattern 2 — the WorkspaceSchema as singleton cache
 
-This is the load-bearing tier. The session-keyed `Map<sessionId,
-SessionFeed>` in `lib/state/insights.ts` and the
-`Map<insightId, AgentEvent[]>` in `lib/state/investigations.ts` are
-the entire "live" data layer.
-
-Lifetime: from process start to process death. Vercel keeps a warm
-serverless instance alive for ~minutes to ~hours; after that it cold-
-starts a new one and the Maps are empty. The next briefing call refills
-them from scratch (substrate query → agent loop → write).
+The MCP bootstrap is expensive (4 sequential calls, ~4-5s end-to-end under the ~1 req/s server limit). The pattern is:
 
 ```
-  the in-process Map as a write-through cache
+  WorkspaceSchema — read-mostly, write-once-per-process
 
-  request                    state layer                    substrate
-     │                            │                              │
-     │  GET /                     │                              │
-     │ ──────────────────────────►│                              │
-     │                            │  listInsights(sessionId)     │
-     │                            │  → []  (empty after cold)    │
-     │                            │                              │
-     │  POST /api/briefing        │                              │
-     │ ──────────────────────────►│                              │
-     │                            │  agent loop                  │
-     │                            │ ────────────────────────────►│ query
-     │                            │                              │
-     │                            │ ◄────────────────────────────│ events
-     │                            │  putInsights(sessionId, [...])│
-     │                            │  Maps now have the briefing  │
-     │                            │                              │
-     │  GET /                     │                              │
-     │ ──────────────────────────►│                              │
-     │                            │  listInsights → cached       │
-     │ ◄──────────────────────────│                              │
+  process start
+       │
+       │  cached = null
+       ▼
+  first request hits bootstrapSchema()
+       │
+       │  list_cloud_organizations  (1 req)
+       │  list_projects            (1 req, depends on orgs)
+       │  get_event_schema         (1 req, depends on project)
+       │  get_customer_property_schema (1 req)
+       │  list_catalogs            (1 req)
+       │  get_project_overview     (1 req)
+       │  → ~5 seconds total
+       ▼
+  cached = parseWorkspaceSchema(...)
+       │
+       │  subsequent requests on same process:
+       │  if (cached) return cached  → 0ms
+       ▼
+  process dies eventually, cycle repeats
 ```
 
-Match score: ideal **for this access pattern.** Every read is keyed.
-Every value is recomputable. The "store" is just the most recent
-briefing.
+The storage choice here is `let cached: WorkspaceSchema | null = null` — a module-level variable, no key, no map. That's a *singleton cache*, justified by the access pattern: one project per deployment (`BLOOMREACH_PROJECT_ID` is env-pinned, line 180), so there's only ever one valid schema. The day you serve two projects from one process, this singleton becomes a cross-tenant bug.
 
-#### **Tier 5: gitignored dev JSON caches**
+#### Pattern 3 — the investigation cache as cross-session memo
 
-`.auth-cache.json` and `.investigation-cache.json` exist for developer
-ergonomics: when you restart the dev server, you don't want to re-do
-OAuth or re-run a 30-second briefing. The cache lets you pick up where
-you left off.
+Investigations are cached by `insightId` only, NOT by `sessionId`:
 
-```typescript
-// lib/state/investigations.ts:6-9
-const PERSIST = process.env.NODE_ENV === 'development';
-const CACHE_FILE = join(process.cwd(), '.investigation-cache.json');
-const DEMO_FILE = join(process.cwd(), 'lib/state/demo-investigations.json');
+```ts
+// lib/state/investigations.ts:11
+const mem = new Map<string, AgentEvent[]>();
 ```
 
-`PERSIST` is the load-bearing flag — file writes only happen in dev,
-because Vercel's serverless filesystem is read-only in production.
+Compare to the insights store:
 
-#### **Tier 6: committed demo JSON snapshots (the presentation reliability layer)**
-
-`lib/state/demo-insights.json` (665 lines) and
-`lib/state/demo-investigations.json` (3,487 lines) are the reliable
-presentation path. They get checked into git, deployed with the app, and
-served when the user picks demo mode.
-
-```
-  demo JSON as the "fixed dataset" tier
-
-  ┌─ purpose ──────────────────────────────────────────────┐
-  │  - reliable demo for screenshots / interviews / pitches │
-  │  - no auth required, no rate limits, instant load       │
-  │  - same shape as live data (same types, same UI)        │
-  │  - regenerated via one-click capture (dev only)         │
-  └─────────────────────────────────────────────────────────┘
-
-  ┌─ what it ISN'T ────────────────────────────────────────┐
-  │  - not a database (no updates, no queries)              │
-  │  - not user data (it's frozen demo content)             │
-  │  - not the source of truth (the substrate is)           │
-  └─────────────────────────────────────────────────────────┘
+```ts
+// lib/state/insights.ts:14
+const state = new Map<string, SessionFeed>();  // outer keyed by sessionId
 ```
 
-Match score: ideal for "data that's part of the deploy." This is *content*,
-not *data* — it's versioned with the code because that's the right
-lifetime for it.
+**Why the asymmetry.** Insights are session-scoped because they're a current view of "what I'm investigating right now." Two users running parallel briefings have to see independent results. Investigations are insight-scoped because the diagnosis of insight X is deterministic-ish — once the agents have run it, the result is reusable.
 
-#### **Tier 7: external substrate (not ours)**
-
-Bloomreach Engagement (live) or `SyntheticDataSource` (in-process). We
-*never* write to either. The substrate is the source of truth for events,
-customers, catalogs — every metric the agents compute starts from a
-substrate query.
-
-```typescript
-// lib/data-source/synthetic-data-source.ts:85-108
-export const syntheticWorkspaceSchema: WorkspaceSchema = {
-  projectId: PROJECT_ID,
-  projectName: PROJECT_NAME,
-  events: syntheticEvents,
-  ...
-  totalCustomers: 126_420,
-  totalEvents: 757_710,
-  oldestTimestamp: Date.UTC(2025, 11, 1),
-  dataHorizon: { from: '2025-12-01', to: '2026-06-01', durationDays: 182 },
-};
-```
-
-The synthetic adapter is a 516-line JavaScript file. Every "row" is a
-JS object literal. Counts are hardcoded:
-52,840 purchases / 241,900 view_items / 198,400 session_starts /
-91,360 cart_updates. That's not a database either — it's a
-**deterministic fixture** that pretends to be one, satisfying the
-`DataSource` interface so the same agent code runs against it.
+That sharing across sessions is the whole reason the cache is one map, not nested. The trade: a user can read the cached investigation that *another user's* agent produced — fine for this product (the data is anonymous Bloomreach analytics, no PII in the insight body), problematic the day insights carry user-specific context.
 
 ```
-  why synthetic data is in-process (not in a DB)
+  Asymmetric scoping — why insights are session-keyed but investigations aren't
 
-  the access pattern: agent issues EQL-like query, gets back rows
-  the synthetic answer: pre-computed analytics result object
+  Map<sessionId, SessionFeed>  ← insights        (the "my current feed" view)
+     SessionFeed.insights       per-session
+     SessionFeed.anomalies      per-session
+     SessionFeed.investigations per-session  (legacy — duplicates `mem`)
 
-  any DB you'd reach for would be massive overkill — there's
-  exactly one fixed "row" per query type, all deterministic.
-  the simplest thing that satisfies the DataSource interface is
-  a function that switch()s on tool name and returns canned data.
+  Map<insightId, AgentEvent[]>  ← investigations (the "this id's result" memo)
+     process-wide, cross-session
+     deterministic results → safe to share
 ```
 
-Match score: ideal for fixtures. The data never changes; it's part of
-the code; agents can run against it offline with no setup.
+#### Pattern 4 — the demo snapshot as cold-start floor
+
+The demo path (`?demo=cached`) reads `lib/state/demo-insights.json` directly — no MCP, no agents, no Anthropic call. The access pattern:
+
+```
+  Demo path — bypass live tier, read straight from disk
+
+  /api/briefing?demo=cached
+       │
+       │  existsSync(DEMO_FILE)?
+       ▼
+  JSON.parse(readFileSync(DEMO_FILE))
+       │
+       │  replay as NDJSON stream with REPLAY_DELAY_MS pause
+       │  (so it feels live, even though it's static)
+       ▼
+  feed renders, user navigates to an investigation
+       │
+       ▼
+  /api/agent?insightId=...  (no &live=1)
+       │
+       │  getCachedInvestigation(id) — tier (c): demo file
+       ▼
+  Investigation replays the same way
+```
+
+This is **storage-as-source-of-truth for the demo path**. The committed JSON IS the canonical answer for `?demo=cached`. No agent runs, no MCP calls. That's why the snapshot has to stay valid across schema evolutions (covered in `05`) — it's not test data, it's production data for the demo lane.
+
+### Move 2 variant — relational vs document vs KV (the seam to system-design)
+
+The repo's storage is best described as **session-scoped document store** — every entity is read as a complete document, the only "query language" is `Map.get(id)`. A relational version would shred the same data into tables:
+
+```
+  Hypothetical relational rebuild — what changes
+
+  ┌─ document shape (today) ─────────┐
+  │  Insight {                       │
+  │    id, timestamp, severity,      │
+  │    metric, scope[], change{...}, │
+  │    evidence: [{tool, result},...]│
+  │    revenueImpact: {...},         │
+  │    funnel: {...},                │
+  │  }                                │
+  │  → 1 Map.get(id) returns all     │
+  └───────────────────────────────────┘
+
+                vs.
+
+  ┌─ relational shape (hypothetical) ────────────────────┐
+  │  insights        (id, timestamp, severity, metric)   │
+  │  insight_scope   (insight_id, scope, ordinal)        │
+  │  insight_change  (insight_id, value, direction, ...) │
+  │  evidence        (insight_id, tool, result_json)     │
+  │  revenue_impact  (insight_id, lost_usd, expected)    │
+  │  funnel          (insight_id, view, cart, ...)       │
+  │  → reading 1 insight = 6 SELECTs + assembly          │
+  │     OR 5 JOINs                                       │
+  └──────────────────────────────────────────────────────┘
+```
+
+Two things wrong with the relational version: (a) you never want any subset of these fields — the card always renders the whole thing — so the shred is pure overhead; (b) `evidence.result` is `unknown` (the LLM's tool output, arbitrary shape) and would have to land in a `jsonb` column anyway. Postgres-with-jsonb-everywhere is functionally the same as a document store, just with more setup.
+
+A KV version (Redis, DynamoDB) would be the right *cloud* analog to the `Map` model — write the whole document under a key, read by key, no queries. The day you outgrow in-memory (multi-instance read-after-write for the same session, or persistent investigation cache), KV is the natural next step. Postgres is not.
 
 ### Move 2.5 — current state vs future state
 
-This is the file where the buildable-target comparison matters most.
-
 ```
-  Current state vs future state — when would the no-DB choice break?
+  Phase A — today                  Phase B — if user data lands
+  ───────────────                  ─────────────────────────────
 
-  Phase A — current state                Phase B — buildable target
-  ─────────────────────                  ──────────────────────────
-  every data tier is recomputable        users can author content
-  no cross-session reads                 (saved insights, comments,
-  no cross-user analytics                 shared briefings, alerts)
-  no audit trail                                       │
-  no scheduled jobs                                    │
-            │                                          ▼
-            ▼                              the access pattern grows:
-  Map-of-Maps is enough                    - "all critical insights this week"
-  no DB needed                             - "this user's saved annotations"
-                                          - "send me an alert when X"
-                                                       │
-                                                       ▼
-                                          → PostgreSQL with:
-                                            users(id, email, ...)
-                                            insights(id, session_id, ...,
-                                                     created_at, severity)
-                                            annotations(id, insight_id,
-                                                        user_id, body)
-                                            alert_rules(id, user_id, metric, ...)
-                                          + indexes on (severity, created_at)
-                                          + Drizzle migrations
-                                          + transactions for multi-row writes
+  Storage:                         Storage:
+   • Map per session                • Postgres (or DynamoDB) for
+   • JSON snapshot                    user-owned rows
+                                    • Map per session STILL for
+                                      the agent's working state
 
-  the migration cost is ~real but bounded:
-  - types.ts stays the source of truth (Drizzle generates from types)
-  - the Map<id, Insight> wrapper becomes a Postgres query
-  - validate.ts still earns its keep at the LLM boundary
-  - the demo JSON tier could stay (frozen fixtures don't move to DB)
+  Survival:                        Survival:
+   • dies with the warm instance    • persists across instances
+   • demo snapshot survives          • per-user data survives
+
+  Concurrency:                     Concurrency:
+   • one writer per session         • multi-instance writers
+   • synchronous, no transactions    • requires real transactions
+                                       on the new tier
+
+  Migrations:                      Migrations:
+   • optional-field discipline      • migration framework + the
+   • recapture demo on breaks         optional-field discipline
+                                       (both, not either)
+
+  Cost of the change:
+   → adding user data costs you the entire Phase B column, all at once.
+     This is why "don't add a database until you have to" is the right
+     call: today's storage is appropriate because today's data has no
+     users. Tomorrow's storage will be different because tomorrow's
+     data will.
 ```
-
-The takeaway: **almost nothing has to change** to make this codebase
-ready for a real DB the day the access pattern demands it. The types
-are already the source of truth. The data layer is already abstracted
-behind `putInsights` / `getInsight` functions. Swapping the Map for a
-Postgres call is mechanical, not architectural.
-
-This is the **payoff** of the deliberate no-DB choice: you're not stuck
-when you outgrow it.
 
 ### Move 3 — the principle
 
-**The right storage is whatever matches the access pattern.** Most
-codebases reach for Postgres because that's the default, then discover
-they're paying for relational semantics they don't use. **blooming_insights**
-does it backwards (and right): identify the access pattern (keyed by
-session + insight ID, recomputable from upstream), pick the simplest
-thing that fits (in-process Maps), accept the ceiling (no cross-session
-reads), document the buildable target (Postgres when the ceiling
-becomes a wall).
-
-The generalisation: storage choice is a **product decision in disguise**.
-The day the product wants cross-user analytics, you need a DB. Until
-then, a Map is the entire data layer. Don't fight the access pattern;
-match it.
-
----
+Storage choice is the answer to *"what's the long-lived data and who owns it?"* — not to *"what database is cool right now."* When the long-lived data is the LLM's output (re-derivable on demand) and a demo snapshot (recapturable on demand), the answer is "a `Map` and a JSON file." When the long-lived data is something the user typed and would lose if you blew it away, the answer changes — and the optional-field discipline, the synchronous-write convention, the singleton schema cache all need a new home that can survive a deploy. The repo is *correctly* simple today because the data has no owner outside the system. The signal to migrate is the first feature that adds one.
 
 ## Primary diagram
 
-The six tiers, what each is for, what would force a change.
+The full storage map — every tier, every survival boundary, every access path.
 
 ```
-  Storage tier map — current state + buildable target
+  Every tier of the storage, every fact, every survival rule
 
-  ┌─ TIER ───────────────────┬─ FIT ─┬─ WOULD CHANGE WHEN ───────────────┐
-  │                          │       │                                   │
-  │ browser localStorage     │  ★★★  │ never (user pref, ideal use)      │
-  │   bi:mode                │       │                                   │
-  │                          │       │                                   │
-  │ session cookie           │  ★★★  │ never (per-user scoping)          │
-  │   bi_session             │       │                                   │
-  │                          │       │                                   │
-  │ auth cookie / dev file   │  ★★   │ if tokens needed to outlive       │
-  │   bi_auth                │       │   a single user's browser         │
-  │                          │       │   → server-side session store     │
-  │                          │       │                                   │
-  │ in-process Maps          │  ★★★  │ if access pattern grew secondary  │
-  │   state/{insights,       │       │   indexes (e.g. "all critical     │
-  │    investigations}.ts    │       │   insights across users")         │
-  │                          │       │   → Postgres + indexes            │
-  │                          │       │                                   │
-  │ dev JSON caches          │  ★★★  │ never relevant in prod            │
-  │   .investigation-cache   │       │                                   │
-  │                          │       │                                   │
-  │ committed demo JSON      │  ★★★  │ if demo data grew to MB or        │
-  │   lib/state/demo-*.json  │       │   needed updates between deploys  │
-  │                          │       │   → CMS / object storage          │
-  │                          │       │                                   │
-  │ external substrate       │  ★★★  │ never (not ours; we just read)    │
-  │   Bloomreach / Synthetic │       │                                   │
-  │                          │       │                                   │
-  └──────────────────────────┴───────┴───────────────────────────────────┘
+  ┌─ TIER 1: process memory (warm Vercel instance) ─────────────────────┐
+  │                                                                      │
+  │  Map<sessionId, SessionFeed>             insights/anomalies/         │
+  │                                          investigations              │
+  │  Map<insightId, AgentEvent[]>            investigation replay cache  │
+  │  let cached: WorkspaceSchema | null      project context cache       │
+  │                                                                      │
+  │  SURVIVES: same request, same warm-instance lifetime                 │
+  │  DIES:     cold start, instance recycle, deploy                      │
+  │                                                                      │
+  └──────────────────────────────────────────────────────────────────────┘
 
-  the load-bearing decision:
-  in-process Maps are fit-for-purpose IFF every data tier we own
-  is recomputable from the substrate. that property holds today;
-  the day it stops holding, Postgres earns its keep.
+  ┌─ TIER 2: dev-only disk caches (gitignored) ─────────────────────────┐
+  │                                                                      │
+  │  .auth-cache.json                        OAuth tokens, PKCE state    │
+  │  .investigation-cache.json               cached investigation events │
+  │                                                                      │
+  │  SURVIVES: dev server hot-reload (which wipes module memory)         │
+  │  DIES:     `rm` or NODE_ENV ≠ development                            │
+  │  PROD:     not used (Vercel filesystem is read-only)                 │
+  │                                                                      │
+  └──────────────────────────────────────────────────────────────────────┘
+
+  ┌─ TIER 3: committed JSON (deployed with the code) ───────────────────┐
+  │                                                                      │
+  │  lib/state/demo-insights.json            full demo feed snapshot     │
+  │  lib/state/demo-investigations.json      full demo investigations    │
+  │                                                                      │
+  │  SURVIVES: forever (until next commit / capture)                     │
+  │  WRITTEN:  dev-only via /api/mcp/capture-demo                        │
+  │  READ:     ?demo=cached path + cold-start fallback (tier c)          │
+  │                                                                      │
+  └──────────────────────────────────────────────────────────────────────┘
+
+  ┌─ TIER 4: encrypted browser cookie ──────────────────────────────────┐
+  │                                                                      │
+  │  bi_session         (uuid)               session identity            │
+  │  bi_auth            (AES-256-GCM)        OAuth tokens, prod only     │
+  │                                                                      │
+  │  SURVIVES: 10 days OR until user clears cookies                      │
+  │  WRITTEN:  /api/mcp/connect + /api/mcp/callback                      │
+  │  READ:     every API route                                           │
+  │                                                                      │
+  └──────────────────────────────────────────────────────────────────────┘
+
+  ┌─ ACCESS PATTERNS ────────────────────────────────────────────────────┐
+  │                                                                      │
+  │  feed render:                                                        │
+  │    1 Map lookup (sessionId) → SessionFeed                            │
+  │    .insights.values() → array                                        │
+  │                                                                      │
+  │  investigate render:                                                 │
+  │    1 Map lookup (insightId) → AgentEvent[]                           │
+  │    OR 4-tier fallback (resolveAnomaly)                               │
+  │                                                                      │
+  │  bootstrap schema:                                                   │
+  │    cached || (4 sequential MCP calls)                                │
+  │                                                                      │
+  │  demo path:                                                          │
+  │    readFileSync(demo-*.json) + JSON.parse                            │
+  │                                                                      │
+  └──────────────────────────────────────────────────────────────────────┘
 ```
-
----
 
 ## Elaborate
 
-Where this comes from: the **CQRS** (Command Query Responsibility
-Segregation) world makes this seam explicit — read models live wherever
-they're cheapest to read; write models live wherever they're authoritative.
-In **blooming_insights**, the "authoritative write model" is the
-substrate (Bloomreach), which the app never writes to. The "read model"
-is the in-process Maps, recomputed on every briefing. That's CQRS with
-the *commands* delegated to a third party.
+The closest portfolio analog is **dryrun's GitHub-as-backend**: no SQL server, content stored as files in a Git repo, reads are file fetches, writes are commits. The motive is the same — the data has no real "users" beyond the author, the access pattern is "load the whole document," and the persistence story is the deploy itself. The differences are scale (GitHub is durable forever, the Vercel warm instance is not) and the write path (Git commits vs JSON.stringify + writeFile), but the modeling decision is the same shape: skip the database because the data lifecycle doesn't need one.
 
-The seam to **system design** (`.aipe/study-system-design/`): the choice
-between "in-process Maps" and "Postgres on Supabase" is an architecture
-call — *which datastore.* That decision belongs in system-design, not
-here. This file's job was just to confirm that the *shape* of the data
-the app holds doesn't fight whatever store is chosen.
+The contrast with AdvntrCue (your RAG project): there, the data has structure (chunks, embeddings, sessions, messages) and the access pattern includes *vector similarity search*, which needs an index that a `Map` can't provide. Postgres + pgvector is the right call because (a) there's user-typed data (sessions, messages) that must survive, (b) the query is non-trivial (top-K nearest neighbors), and (c) the schema is relatively stable. Same engineer, opposite call — and the deciding factor was the access pattern, not "what's a good DB."
 
-What this codebase consciously doesn't do — and is right not to:
-
-- **No Redis / Memcached.** A second cache layer would buy nothing; the
-  Maps are already in-process and the rate limit on the substrate (not
-  on us) is the constraint that matters.
-- **No relational DB.** Until the access pattern grows beyond
-  primary-key Map lookups, Postgres-on-Supabase would add ops burden
-  with no read-path benefit.
-- **No S3 / object storage.** Demo JSON is small enough to live in
-  git; agent output is ephemeral.
-
-What it does consciously and right:
-
-- **Substrate-as-truth.** The app owns nothing the substrate doesn't.
-  This is the entire justification for the no-DB choice — and it's the
-  property that, if violated, would force the choice to change.
-- **DataSource interface.** The `DataSource` abstraction
-  (`lib/data-source/types.ts`) means both adapters (Bloomreach, synthetic)
-  satisfy the same shape. A third adapter — say, a Postgres-backed
-  fixture for tests — would slot in without touching any caller.
-
-What to read next: `audit.md` for the consolidated checklist; the
-system-design study guide for the "which datastore" complement to this
-file.
-
----
+What this repo trades away by skipping a database: **cross-session admin views** ("show me every critical insight surfaced this week"), **user-owned saved state** ("dismiss this insight," "annotate this recommendation"), **persistent investigation history** (today, the investigation cache dies with the warm instance unless captured to the snapshot). Each of those is a real product feature, and each would force a storage rethink. The repo correctly hasn't shipped any of them — and so the storage stays minimal.
 
 ## Interview defense
 
-**Q: "Why no database?"**
+**Q: Why no database?**
 
-Verdict first: because every data tier the app *owns* is recomputable
-from the substrate. The substrate (Bloomreach) is the source of truth for
-events, customers, catalogs; the app never writes to it; every metric
-the UI shows is recomputed on demand. There's nothing to persist.
+> Three reasons. First, the access pattern is document-shaped — every read is "give me the full Insight by id," every write is "store the whole agent output at end of run." A `Map<id, Entity>` matches that exactly; Postgres would shred each entity into 6 tables and pay 5 joins to assemble one card. Second, the data lifecycle is briefing-scoped — re-running the agents produces fresh anomalies; the only long-lived artifact is the demo snapshot, which is presentational. Third, serverless: no long-lived process means an ORM is fighting the runtime. The day the product adds user-typed data — annotations, dismissals, saved investigations — the storage rethinks, but today there's no user data to preserve.
 
 ```
-  the test that decides "DB or no DB"
+   why no DB today
 
-  question:  is the data RECOMPUTABLE from upstream?
-                          │
-                          ▼
-                ┌─────────┴─────────┐
-              YES                 NO
-                │                   │
-                ▼                   ▼
-  in-memory cache is enough    real DB earns its keep
-                │
-                ▼
-  this codebase is here:
-    every metric → fresh EQL query
-    every Insight → fresh agent emission
-    every Diagnosis → fresh agent emission
-    losing the cache → next request rebuilds it
+   document-shaped access  → Map<id, _> is the right index
+   briefing-scoped data    → no long-lived data to outlive the process
+   serverless runtime      → no ORM connection to amortize
 ```
 
-Anchor: "the day a user can edit an insight — annotate, save, share —
-the answer flips and Postgres earns its keep. Until then the substrate
-IS the database."
+**Q: What's the load-bearing detail people miss?**
 
-**Q: "What's the ceiling on this design?"**
-
-Verdict first: **cross-session reads.** The Map-of-Maps shape gives O(1)
-access within a session and nothing across sessions. The day the product
-wants "show me all critical insights from every customer today," that's
-a `WHERE severity = 'critical' AND created_at > ...` query — a full
-scan over every session's sub-map, with no secondary index to help.
-That's when I'd reach for Postgres.
+> The investigation cache is *not* session-scoped. The insights map is `Map<sessionId, SessionFeed>`, but the investigation memo is `Map<insightId, AgentEvent[]>` — flat, process-wide. That asymmetry is deliberate: investigations are deterministic enough to share, so one user's investigation result is cached for any other user that asks about the same insight id. It works because the insight bodies are anonymous Bloomreach analytics, no PII. It would break the day insights carried user context — and you'd want to re-key by `(sessionId, insightId)`.
 
 ```
-  the ceiling, sketched
+   the asymmetric scoping
 
-  current access pattern:            ceiling pattern:
-  ────────────────────────           ──────────────────
-  by (sessionId, insightId)          by attribute (severity, date)
-            │                                   │
-            ▼                                   ▼
-        Map.get(id)                  WHERE severity = ...
-        O(1)                         needs a sorted index or
-                                     a real query engine
+   insights:        Map<sessionId, ...>   per-user (privacy + concurrency)
+   investigations:  Map<insightId, ...>   process-wide (deterministic results)
 ```
 
-Anchor: "the buildable target is small — types.ts stays the source of
-truth, Drizzle generates the schema from it, the `putInsights` /
-`getInsight` functions become Postgres queries. Maybe a day of work
-when the access pattern flips, no architecture rewrite."
+**Q: What's the migration path if you grow into needing a database?**
 
-**Q: "What's the riskiest tier?"**
-
-Verdict first: **the committed demo JSON**, because there's no test
-that re-validates it against the current types. Adding a required field
-to `Insight` would silently break the demo replay — the JSON would
-parse, the UI would render with the field undefined, no crash. The fix
-is a 30-line Vitest test that runs `isInsight` over every entry. The
-audit recommends it.
+> KV first, not relational. The right next step is something like DynamoDB or Redis with `(sessionId, insightId)` as the composite key — same document shape, cross-instance persistence, no schema rework. Postgres would only be right if a new feature added a query that *isn't* a point lookup ("show all critical insights from the last 7 days") and that query needs an index that's not a primary key. Today no such query exists. The signal to move to Postgres would be the first product ask for cross-session filtering or sorting.
 
 ```
-  the silent-drift risk
+   the migration ladder
 
-  demo-insights.json (committed, frozen)
-            │
-            │  loaded via JSON.parse + cast (no validation)
-            ▼
-  rendered by UI assuming current Insight shape
-            │
-            │  if Insight.criticalNewField was added (required):
-            │    - JSON parses fine
-            │    - field is undefined
-            │    - UI renders with empty data
-            │    - no error logged
-            ▼
-  silent regression — only caught by manual inspection
+   Map (today)         in-memory, process-scoped
+       │
+       ▼
+   KV (tomorrow?)      cross-instance, point lookup only
+       │
+       ▼
+   Postgres (later?)   needed only when secondary queries arrive
 ```
-
-Anchor: "loud failures are easy; silent ones are dangerous. The
-codebase has strong validators on LLM output but no validator on the
-demo JSON snapshots. That's the gap I'd close first if I owned this."
-
----
 
 ## See also
 
-- [`00-overview.md`](./00-overview.md) — the whole storage picture in one
-  diagram
-- [`03-indexing-vs-query-patterns.md`](./03-indexing-vs-query-patterns.md)
-  — the Map shape that makes the in-process tier work
-- [`04-transactions-and-integrity.md`](./04-transactions-and-integrity.md)
-  — what enforces correctness without a DB-side check
-- [`05-migrations-and-evolution.md`](./05-migrations-and-evolution.md)
-  — type evolution as the migration story
-- [`audit.md`](./audit.md) — the consolidated checklist
-- `.aipe/study-system-design/` — the "which datastore" complement to
-  this file
+- `01-the-data-model-and-its-shape.md` — the document shape the storage is built around.
+- `03-indexing-vs-query-patterns.md` — why point-lookup-only is all the indexing the model needs today.
+- `05-migrations-and-evolution.md` — the optional-field discipline that makes the JSON snapshot safe as long-lived data.

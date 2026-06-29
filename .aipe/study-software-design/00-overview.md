@@ -1,116 +1,89 @@
-# Overview — where APOSD primitives live in this repo
+# 00 — overview
 
-One page. Where each design primitive shows up in the codebase, with the file that anchors it. Open `audit.md` for the lens-by-lens findings; open the numbered files for the deep walks on the patterns that earn one.
+One page. The big picture, the through-line, the load-bearing design moves this repo makes and the ones it doesn't.
 
----
-
-## The system, one diagram
-
-The picture before the primitives.
+## The system in one diagram
 
 ```
-  blooming insights — layers + APOSD anchor points
+  blooming insights — module layers + design seams
 
-  ┌─ UI layer ──────────────────────────────────────────────────┐
-  │  app/page.tsx (461 LOC, was 817)                            │
-  │   + useBriefingStream / useDemoCapture / useReconnectPolicy │  ← 04 shallow-resolved
-  │  app/investigate/[id]/page.tsx                              │
-  │  components/{feed,investigation,shared,chat}/*.tsx          │
-  └──────────────────────────┬──────────────────────────────────┘
-                             │  fetch + readNdjson
-                             │  (lib/streaming/ndjson.ts)        ← 03 pulled-complexity-down
-  ┌─ Service layer ──────────▼──────────────────────────────────┐
-  │  app/api/briefing/route.ts   336 LOC                        │
-  │  app/api/agent/route.ts      345 LOC                        │
-  │  app/api/mcp/{call,reset,callback,tools,capture,capture-demo│
-  └──────────────────────────┬──────────────────────────────────┘
-                             │  uses agent classes + DataSource
-  ┌─ Agent layer ────────────▼──────────────────────────────────┐
-  │  lib/agents/monitoring   diagnostic   recommendation  query │
-  │  lib/agents/aptkit-adapters.ts  (3 bridge classes, 206 LOC) │  ← 02 info-hiding bridge
-  │  lib/agents/base.ts  (McpCaller seam, AGENT_MODEL)          │
-  └──────────────────────────┬──────────────────────────────────┘
-                             │  callTool / listTools (DataSource)
-  ┌─ Data layer (the seam) ──▼──────────────────────────────────┐
-  │  lib/data-source/types.ts   73 LOC interface                │  ← 01 deep module
-  │   ├── bloomreach-data-source.ts   214 LOC (live MCP)        │
-  │   └── synthetic-data-source.ts    516 LOC (deterministic)   │
-  │  + lib/mcp/client.ts  (17-LOC compat shim, re-export)       │
-  └──────────────────────────┬──────────────────────────────────┘
-                             │  MCP SDK transport (HTTP + OAuth)
-  ┌─ Provider layer ─────────▼──────────────────────────────────┐
-  │  Bloomreach loomi-mcp-alpha     · Anthropic SDK             │
-  └─────────────────────────────────────────────────────────────┘
+  ┌─ UI (React 19, App Router) ─────────────────────────────────────────┐
+  │  app/page.tsx (461 LOC)   →   3 hooks                                │
+  │    Feed                        useBriefingStream                     │
+  │    InvestigateStep2/3          useDemoCapture                        │
+  │    QueryBox                    useReconnectPolicy                    │
+  └──────────────────────────────┬──────────────────────────────────────┘
+                                 │  fetch + NDJSON   (kernel: readNdjson)
+  ┌─ Route handlers (Next.js) ──▼──────────────────────────────────────┐
+  │  /api/briefing   /api/agent   /api/mcp/*                           │
+  │    stream events as NDJSON via encodeEvent                         │
+  └──────────────────────────────┬──────────────────────────────────────┘
+                                 │  agent.scan / .investigate / .propose
+  ┌─ Agent layer (AptKit-wrapped) ─▼──────────────────────────────────┐
+  │  MonitoringAgent  DiagnosticAgent  RecommendationAgent  QueryAgent│
+  │    each wraps @aptkit/core via 3 bridge adapters                  │
+  │    (AnthropicModelProviderAdapter ·                                │
+  │     BloomingToolRegistryAdapter ·                                  │
+  │     BloomingTraceSinkAdapter)                                      │
+  └──────────────────────────────┬──────────────────────────────────────┘
+                                 │  DataSource port (callTool · listTools)
+  ┌─ DataSource port ───────────▼──────────────────────────────────────┐
+  │  interface DataSource { callTool, listTools }                       │
+  │                                                                     │
+  │  BloomreachDataSource (216 LOC, live MCP)                           │
+  │  SyntheticDataSource  (516 LOC, in-process fixture)                 │
+  └──────────────────────────────┬──────────────────────────────────────┘
+                                 │  HTTP + OAuth (StreamableHTTPClientTransport)
+  ┌─ Outside the boundary ──────▼──────────────────────────────────────┐
+  │  Bloomreach loomi connect MCP   ·   Anthropic API                  │
+  └─────────────────────────────────────────────────────────────────────┘
 ```
 
----
+Four altitudes, two seams. The seams are where the design moves live: the upper seam (`DataSource`) lets the agent layer treat live Bloomreach and synthetic fixtures identically; the lower seam (`McpTransport`) lets `BloomreachDataSource` swap a real SDK transport for a fake in tests. Both are deep — small interfaces, large bodies behind them.
 
-## Where each APOSD primitive lives
+## The through-line
 
-Read the audit lens in `audit.md` for the full ranked finding list. This is the map view.
+**Complexity is the enemy.** The repo's biggest enemy is per-call rate limits + multi-minute agent loops + revoked OAuth tokens + a streamed UI surface that all have to compose without leaking concerns. The design moves below are how it's kept in hand.
+
+**Deep modules are the weapon.** The port (`DataSource`) is the canonical example — 4-method interface (counting overloads), 700+ LOC of behavior behind it (Bloomreach adapter + Synthetic adapter combined). The kernel (`readNdjson`) is another: ~30 lines of public surface, four streaming surfaces consume it.
+
+**Pull complexity down.** When the same `fetch → reader → split('\n') → JSON.parse → dispatch` loop showed up in 4 places, it got pulled into one kernel. When the agent layer needed an abort signal threaded through to Anthropic + MCP simultaneously, the composition lives in `composeSignals` inside `transport.ts` — every caller passes one signal, the transport composes it with its own 30s ceiling. Callers never see the OR.
+
+**Hide what would otherwise force two modules to change together.** The 3 AptKit bridge adapters in `lib/agents/aptkit-adapters.ts` exist so Blooming's `ToolCall` / `ReasoningStep` / `Anthropic.Messages.MessageParam` vocabularies never touch `@aptkit/core`'s `ModelProvider` / `ToolRegistry` / `CapabilityEvent` vocabularies. Swap the AptKit version, only the bridge changes.
+
+## The ranked findings — top 3 things to look at first
 
 ```
-  primitive (APOSD)              where it lives in THIS repo
-  ─────────────────────────      ───────────────────────────────────────
-  deep module                    lib/data-source/types.ts  (the interface)
-                                 + bloomreach-data-source.ts
-                                 + synthetic-data-source.ts
-                                 → see 01-deep-module-data-source.md
+  1. the deep port (DataSource)
+     → file: lib/data-source/types.ts (73 LOC)
+     → why it earns the top slot: 4-method interface, 700+ LOC behind it,
+       two adapters, zero callers know which one they hold.
+     → see 01-port-and-adapter-data-source.md
 
-  information hiding             lib/agents/aptkit-adapters.ts
-                                 (3 bridge classes hide AptKit shape)
-                                 → see 02-information-hiding-aptkit-bridge.md
+  2. the AptKit bridge (3 adapter classes in aptkit-adapters.ts)
+     → file: lib/agents/aptkit-adapters.ts (206 LOC)
+     → why it matters: the cleanest information-hiding seam in the repo.
+       Two vocabularies meet at a wall; neither leaks into the other's body.
+     → see 03-aptkit-bridge-information-hiding.md
 
-  pull complexity down           lib/streaming/ndjson.ts
-                                 one kernel, four consumers
-                                 → see 03-pulled-complexity-down-readndjson.md
-
-  shallow module (RESOLVED)      app/page.tsx — was 817 LOC, now 461
-                                 the worked negative example
-                                 → see 04-shallow-module-page-component-resolved.md
-
-  errors out of existence        lib/agents/base.ts via runRecoveryTurn /
-                                 AptKit's parseResult + recoveryPrompt
-                                 (a parse failure becomes one more turn,
-                                 not a special-case branch)
-                                 → audit.md lens 6
-
-  define errors low              lib/mcp/transport.ts redactSecrets +
-                                 formatError + composeSignals
-                                 (timeout, auth, transport) all collapsed
-                                 to one module
-                                 → audit.md lens 6
-
-  layered abstraction            UI → route → agent → data-source → MCP
-                                 each layer transforms; no layer just
-                                 forwards (one earned pass-through:
-                                 BloomreachDataSource.listTools)
-                                 → audit.md lens 4
-
-  readability                    >95% of names are precise; the holdouts
-                                 are `r` and `cp` in lib/insights/derive.ts
-                                 (low-severity)
-                                 → audit.md lens 7
+  3. the streaming kernel (readNdjson)
+     → file: lib/streaming/ndjson.ts (64 LOC)
+     → why it matters: the smallest deep-module example.
+       30-line public surface; consumed by 4 streaming surfaces unchanged.
+     → see 02-streaming-ndjson-kernel.md
 ```
 
----
+## What this repo does well
 
-## The single load-bearing lesson
+  → **Deep modules exist on purpose.** The port (`DataSource`), the kernel (`readNdjson`), the bridge (the 3 AptKit adapters) are all deliberate — the comments in each say what's being hidden and why.
+  → **Honest comment voice.** The longer files (`useBriefingStream`, `BloomreachDataSource`, `useReconnectPolicy`) carry comments that explain *why* a decision was made, including when the call was a compromise (the "two regex variants are preserved verbatim" comment in `useReconnectPolicy.ts` is exemplary).
+  → **A single NDJSON contract.** `AgentEvent` in `lib/mcp/events.ts` is the wire format. Both producers (routes) and consumers (hooks) typecheck against it; the dispatcher in `useBriefingStream` is exhaustive over the union.
+  → **Tests at the right altitude.** 24 test files, 221 passing — they exercise pure logic and the streaming + agent loops with injected fakes. No network in the test suite.
 
-If you take one thing away from this guide:
+## What it does less well — the 3 honest weaknesses
 
-> **The codebase teaches "small interface, fat body" TWICE.**
->
-> Once at the data layer: a 73-LOC port (`DataSource`) over ~730 LOC of two adapters (`BloomreachDataSource` + `SyntheticDataSource`). The agents see five methods; they never see OAuth, rate-limit retry, or synthetic dispatch.
->
-> Once at the agent layer: three ~200-LOC adapter classes (`AnthropicModelProviderAdapter`, `BloomingToolRegistryAdapter`, `BloomingTraceSinkAdapter`) over the AptKit primitive interfaces. The route handlers see Blooming's `Anomaly` / `Diagnosis` / `Recommendation` types; they never see AptKit's `ModelRequest` / `CapabilityEvent` shapes.
->
-> Same primitive, two altitudes. When a primitive reappears at two levels, it's signal — name it once and point at both occurrences. (The structure-pass move from `format.md`.)
+  → **Parallel `*-legacy.ts` files in `lib/agents/`.** Nine files with the `-legacy` suffix (`base-legacy.ts`, `diagnostic-legacy.ts`, etc., ~1000 LOC total) exist beside the new AptKit-wrapped versions. They're not imported by any production code — only by 2 test files. Either delete them or migrate those tests; the parallel structure is the most expensive thing in the repo to read past.
+  → **Two regex variants in `useReconnectPolicy.ts`.** The `AUTH_ERROR_RE_AUTO` and `AUTH_ERROR_RE_BUTTON` predicates are subtly different (the button version misses `invalid_token` and `reconnect`). The comment names this as a latent bug filed for later; in interview terms it's the textbook AOSD red flag of *two ways to do one thing*.
+  → **The `whyItMatters` regex chain in `InsightCard.tsx`.** Lines 41–71 dispatch on metric-name regexes to assemble a sentence. It's UI code carrying agent fallback logic — should live next to `deriveInsightFields` in `lib/insights/derive.ts` where the rest of the evidence-derivation lives.
 
----
-
-## Where the codebase still has a shallow module
-
-`audit.md` Lens 2 documents the historical `app/page.tsx` shallow-module case (RESOLVED — PRs #1–#4 lifted it to 461 LOC + 3 hooks). The walk lives in `04-shallow-module-page-component-resolved.md` as the negative-then-positive worked example.
-
-No active shallow-module debt today. Both routes (`/api/briefing` 336 LOC, `/api/agent` 345 LOC) are deep — each carries a coherent flow with phase boundaries; that depth is earning its keep. If a fifth flow ever lands in `/api/agent`, revisit.
+The audit (`audit.md`) walks each of these lenses in full with file:line citations. The Pass 2 files take the design moves worth a deep walk.

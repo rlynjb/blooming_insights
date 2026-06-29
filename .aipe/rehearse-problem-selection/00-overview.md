@@ -1,97 +1,67 @@
-# Problem selection — overview
+# Problem Selection — Overview
 
-**Industry name:** Problem brief / investment justification — Coach posture
-
-This is the **why this problem deserves investment** book. Before any design doc, before any roadmap, before any "let me show you the architecture" — a reviewer wants to hear that you picked the right problem. This bundle is the answer.
-
-You're going into a room where someone — staff engineer, hiring manager, design partner — is going to ask one of these in the first 90 seconds:
-
-- *"Why this and not something else?"*
-- *"Is the eval gap honest, or is that a planning excuse?"*
-- *"Why did you rewrite the agent loop after defending the hand-rolled one?"*
-- *"What did you cut, and would you cut it again?"*
-
-Each chapter rehearses one of those rooms.
-
----
-
-## The five chapters
+> Why this problem deserves investment, before any solution design.
 
 ```
-  The brief — what each chapter is for
+  THE BRIEF — five questions in dependency order
 
-  ┌─ 01 problem-brief ───────────────────────────────────┐
-  │  WHO hurts, WHAT proves it, WHY now                  │
-  │  the 90-second answer to "what is this for"          │
-  └─────────────────────────┬────────────────────────────┘
-                            │  once the pain is named,
-                            ▼
-  ┌─ 02 scope-cuts-and-non-goals ────────────────────────┐
-  │  what you DIDN'T build, and the receipts:            │
-  │    Cut 1: no live BigQuery — fakes for the seam      │
-  │    Cut 2: eval pipeline — built, ran, retired (L5)   │
-  │    Cut 3: no persistent storage — in-memory + JSON   │
-  └─────────────────────────┬────────────────────────────┘
-                            │  cuts justified, now compare
-                            ▼
-  ┌─ 03 options-and-opportunity-cost ────────────────────┐
-  │  what else you could have built with the same time   │
-  │  + the defer-then-migrate story:                     │
-  │    hand-rolled runAgentLoop  →  AptKit migration     │
-  │    (L5 evaluated-and-accepted revisit)               │
-  └─────────────────────────┬────────────────────────────┘
-                            │  the path picked, now measure
-                            ▼
-  ┌─ 04 success-metrics-and-feedback-loop ───────────────┐
-  │  Phase 3 eval portfolio — real measured numbers      │
-  │    K=10 per anomaly, 4 pillars, 8/8 + 3/3 calibration│
-  │    3 named bugs surfaced (BRL units, binary judge,   │
-  │    conclusion instability)                           │
-  │  retired with Olist; rebuild target = Synthetic      │
-  └─────────────────────────┬────────────────────────────┘
-                            │  metrics on table, now defend
-                            ▼
-  ┌─ 05 skeptical-reviewer-questions ────────────────────┐
-  │  the 4 probes that land hardest, with the answers    │
-  │  that hold under follow-up                           │
-  └──────────────────────────────────────────────────────┘
+  ┌─ 1. PROBLEM ────────────────────────────────────────┐
+  │  who experiences what pain, with what evidence?     │
+  └─────────────────────┬───────────────────────────────┘
+                        │  if no real pain — STOP
+  ┌─ 2. SCOPE ──────────▼───────────────────────────────┐
+  │  the narrowest slice that proves the premise        │
+  └─────────────────────┬───────────────────────────────┘
+                        │  if scope can't be cut — STOP
+  ┌─ 3. OPTIONS ────────▼───────────────────────────────┐
+  │  including `do nothing` — what's the opportunity    │
+  │  cost of building this vs not?                      │
+  └─────────────────────┬───────────────────────────────┘
+                        │  if `do nothing` wins — STOP
+  ┌─ 4. METRICS ────────▼───────────────────────────────┐
+  │  how do we know it worked? what's the feedback loop?│
+  └─────────────────────┬───────────────────────────────┘
+                        │
+  ┌─ 5. SKEPTIC ────────▼───────────────────────────────┐
+  │  the review-room questions that the brief survives  │
+  └─────────────────────────────────────────────────────┘
 ```
 
----
+## The thirty-second pitch
 
-## The one-line pitch for the project
+The job-to-be-done — a marketer on Bloomreach Engagement currently runs the human-analyst loop by hand: notice a metric moved, hunt for the cause, decide which Bloomreach feature to reach for. Three jobs, three contexts, no continuity between them. **blooming insights** runs that loop end-to-end and **streams the reasoning as a first-class surface** — "an analyst that shows its work."
 
-> An AI analyst for a Bloomreach Engagement ecommerce workspace that runs the loop a human analyst runs — **what changed → why → what to do** — and streams the agents' reasoning as a first-class UI surface, so every conclusion carries provenance (the exact tool calls, current-vs-prior numbers, streamed reasoning trace).
+The differentiator is not "AI for analytics" (commodity). It's the **show-your-work** seam: every conclusion carries the exact tool call, the current-vs-prior numbers, and a streamed log of the agent's thinking, visible in a sticky sidebar (`StatusLog`) on every page. That's the bet — that trust beats magic for an analyst persona who has to explain the decision to their boss.
 
-The differentiator is not "we built an agent." It's **an analyst that shows its work** — receipts, not assertions.
+## Why a problem-selection brief, not a feature spec
 
----
+The audit family already covers HOW the system is built. This brief defends WHY this problem deserves attention before anyone writes another line of agent code. Three things it has to do that a feature spec doesn't:
 
-## The strongest defense in this brief
+1. **Name the pain in the analyst's words, with repo evidence, not market vibes.** The repo proves the workflow (the three-stage stepper, the diagnose-then-recommend split, the EQL-only data path); the brief makes that evidence explicit.
+2. **Defend the scope cuts.** No persisted dashboards. No save/share. No multi-tenant. No write-back to Bloomreach. Each cut is a deliberate "not this version." A reviewer who doesn't see the cuts named will assume they were forgotten.
+3. **Include `do nothing` as a real option.** The brief loses credibility the moment `do nothing` isn't on the table — because in a real product review, it always is.
 
-If a reviewer has 30 seconds and you have to pick *one* thing to lead with, lead with **Cut 2 — the eval pipeline.**
+## What the brief is grounded in
 
-Most candidates at this level say "I didn't have time for evals" (L1 weakness) or "evals are on the roadmap" (L2). The honest answer here is L5 territory:
+Repo-visible evidence only. Where this brief talks about user pain, it points at the repo artifact that proves the workflow exists (the three-stage stepper, the dual-agent split, the EQL ad-hoc-only data model). Where it talks about constraints, it points at the code that enforces them (~1 req/s rate limit in `lib/mcp/client.ts`; token revocation handling in `lib/mcp/auth.ts`; in-memory state, no database). Where it makes a claim that the repo cannot prove, the brief labels it as **inference** or as a **discovery question** that must be answered before scaling investment.
 
-> "I cut evals in Phase 1 — hackathon scope, ship the loop first. Then in Phase 3 I shipped the suite anyway: 4 pillars, K=10 per anomaly, LLM-as-judge calibrated against 8/8 manual spot-check on detection and 3/3 on diagnosis. It surfaced three real bugs nothing else would have caught — BRL cents-vs-Reais misread (the judge flagged a R$131,965 AOV at run 8), binary calibration breakdown on 29/30 diagnosis runs, and 30% conclusion instability as the regression baseline. Then I retired the suite when the Olist MCP server it scored against was retired — the in-process Synthetic adapter is a cleaner shape for the same job. The receipt of having built it and used it to find bugs is stronger than promising to build it."
+## What this brief is NOT
 
-That's the shape every chapter in this brief is trying to teach you to land: **shipped, learned, made a call** — never "we plan to."
+- Not a market sizing exercise — the repo doesn't have the data to ground that, and pretending it does is the fastest way to lose a senior reviewer's trust.
+- Not a feature roadmap — the cuts are as important as the inclusions.
+- Not a defense of the implementation — that's what `rehearse-interview-defense` is for. This brief defends the **decision to invest at all.**
 
----
+## Reading order
 
-## How to use this book
+```
+  00-overview.md                          ← you are here
+  01-problem-brief.md                     pain + evidence + why now + beneficiaries
+  02-scope-cuts-and-non-goals.md          what NOT to build (and why)
+  03-options-and-opportunity-cost.md      do nothing · narrow · broad · what each costs
+  04-success-metrics-and-feedback-loop.md observable outcomes + how we'd know
+  05-skeptical-reviewer-questions.md      the review-room questions the brief survives
+```
 
-Read 01 first to refresh the problem framing. Read 02 next — it carries the most interview leverage. Then 03 (the AptKit migration story is the second-strongest defense). Use 04 as your numbers reference. Use 05 the night before the conversation.
+## The single sharpest defense
 
-Coach voice throughout. When you see "say this, not that" — that's the rep.
-
----
-
-## See also
-
-- `02-scope-cuts-and-non-goals.md` — the cuts (Cut 2 = the eval story)
-- `03-options-and-opportunity-cost.md` — the defer-then-migrate AptKit story
-- `04-success-metrics-and-feedback-loop.md` — the measured numbers from Phase 3
-- `05-skeptical-reviewer-questions.md` — the four probes and the answers
-- `.aipe/project/context.md` — the project framing this brief is built on
-- `.aipe/rehearse-interview-defense/` — sister book, defends the *technical* choices (this book defends the *problem choice*)
+If you can only carry one sentence into the review room: **"The differentiator isn't the agent — it's the reasoning trace, and the repo proves I built the trace as a first-class surface, not as an afterthought log."** Everything in this brief radiates from that claim.

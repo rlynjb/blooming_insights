@@ -1,299 +1,280 @@
 # Tool calling and MCP
 
-*Industry name: tool calling / function calling / MCP (Model Context Protocol) — Industry standard.*
+**Industry standard.** The connective tissue under every pattern. **Deeply exercised** in this repo — every agent runs over MCP, one server, ~33 tools.
 
-The connective tissue under every pattern in this guide. **This repo uses MCP directly** — `@modelcontextprotocol/sdk` over the Bloomreach loomi connect server, with per-agent tool policies enforced by AptKit. Tool calling is the substrate ReAct, agentic retrieval, and every multi-agent topology run on.
+## Zoom out, then zoom in
 
-## Zoom out — where this concept lives
-
-Tool calling is the bridge between the agent layer and the data layer. In this repo it goes through three abstractions: the AptKit tool-registry port (`ToolRegistry`), Blooming's adapter (`BloomingToolRegistryAdapter`), and the data-source port (`DataSource` — Bloomreach or Synthetic).
+Sits as the substrate every reasoning pattern, every retrieval, and every multi-agent topology runs on. The model emits typed `tool_use` blocks; the runtime dispatches them; results come back as `tool_result` blocks. MCP is the protocol that standardizes how the agent connects to tools — once a tool is defined on an MCP server, it's usable across any MCP-aware agent without per-agent integration.
 
 ```
-  Where tool calling lives in blooming insights
+  Zoom out — where this concept lives
 
-  ┌─ Agent layer ─────────────────────────────────────────────┐
-  │  model emits tool_use block (intent) ─────────┐           │
-  └────────────────────────────────────────────────┼──────────┘
-                                                   ▼
-  ┌─ AptKit layer ─ ToolRegistry interface ────────────────────┐
-  │  filterToolsForPolicy(allTools, agent's toolPolicy)        │ ← we are here
-  │  registry.callTool(name, args, {signal})                   │
-  └────────────────────────────┬───────────────────────────────┘
-                               ▼
-  ┌─ Blooming adapter ─ BloomingToolRegistryAdapter ───────────┐
-  │  delegates listTools + callTool to DataSource              │
-  └────────────────────────────┬───────────────────────────────┘
-                               ▼
-  ┌─ DataSource layer ─ BloomreachDataSource | SyntheticDataSource ┐
-  │  HTTPS over MCP transport (Bloomreach)                          │
-  │  in-process synthetic ecommerce store (Synthetic)               │
-  └─────────────────────────────────────────────────────────────────┘
+  ┌─ Agent loop ─────────────────────────────────────┐
+  │  emits tool_use, reads tool_result               │
+  └───────────────────────┬──────────────────────────┘
+                          │
+  ┌─ Tool registry ──────▼──────────────────────────┐
+  │  BloomingToolRegistryAdapter (the port)          │ ← we are here
+  │   → DataSource.callTool                          │
+  └───────────────────────┬──────────────────────────┘
+                          │
+  ┌─ Data source ────────▼──────────────────────────┐
+  │  BloomreachDataSource (the adapter)              │
+  │   → MCP transport → Bloomreach loomi connect     │
+  └──────────────────────────────────────────────────┘
 ```
 
 ## Structure pass
 
-The axis: **who decides what tools the model can see vs use?**
+Layers: tool schema (the model's contract — name, description, input_schema) → tool intent (the model's emitted `tool_use` block) → tool dispatch (the harness's `tools.callTool` call) → tool execution (the adapter's wire call) → tool result (the model's observed `tool_result` block).
 
-```
-  Layer                    Decision                                    Where
-  ─────                    ────────                                    ─────
-  MCP server (Bloomreach)  emits the FULL tool catalog (~30 tools)     external
-  Route handler            listTools() to populate allTools[]          /api/agent
-  AptKit per-agent policy  filterToolsForPolicy narrows to allowed     @aptkit/tools
-  Model                    picks one tool from the allowed list         inside loop
-  AptKit harness           validates name+args, runs via DataSource     runAgentLoop
-  DataSource               actually executes (HTTPS or in-process)      lib/data-source/
-```
+**Axis traced — "where does the model's tool intent become a network call?":** the model emits intent into the conversation; the harness reads it from the response; the tool registry's `callTool` is the seam where intent becomes execution; the data-source adapter is where the actual wire call happens.
 
-Three filters between the MCP catalog and the model's choice: tool policy (least privilege), the model's pick (per turn), the harness's validation (catches a hallucinated tool name).
+**Seam:** the `ToolRegistry` port (`@aptkit/tools`'s `ToolRegistry` type). On one side: the agent loop that knows nothing about MCP. On the other: the adapter that knows everything about MCP. Swap the adapter, swap the substrate.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know REST APIs — endpoints exposed, the client picks which one to call. Tool calling is the same shape, except the "client" is the model and the model gets a description of each endpoint to decide from. MCP is the *protocol* that standardizes how those endpoint descriptions and calls travel between any model and any tool server — so a tool defined once is usable across agents without per-agent integration.
+You know the dependency injection pattern — your code calls an interface, the framework injects a concrete implementation. Tool calling is the same: the model "calls" tools by emitting typed intents; the runtime injects the actual implementation via the registry. MCP is the wire protocol that lets the injection cross process boundaries — the registry on this side talks to an MCP server on the other side, which exposes a set of tools the client can list and call.
 
 ```
-  Tool calling — the path of one call, one turn
+  Tool calling — the typed intent dispatched through a port
 
-  ┌─ Model ─────────────────────────────────────────────────┐
-  │  reads tool catalog (filtered to its policy)             │
-  │  emits: { type: 'tool_use', name: 'execute_analytics_eql',│
-  │           input: { project_id, eql: '...' } }            │
-  └────────────────────────────┬─────────────────────────────┘
-                               ▼
-  ┌─ Harness (AptKit runAgentLoop) ─────────────────────────┐
-  │  catches the tool_use block                              │
-  │  delegates: tools.callTool(name, input, {signal})        │
-  └────────────────────────────┬─────────────────────────────┘
-                               ▼
-  ┌─ ToolRegistry adapter ──────────────────────────────────┐
-  │  calls underlying DataSource                             │
-  │  DataSource handles rate-limit + cache + retry           │
-  └────────────────────────────┬─────────────────────────────┘
-                               ▼
-  ┌─ MCP transport (Bloomreach mode) ───────────────────────┐
-  │  HTTPS POST with OAuth bearer token                      │
-  │  unwrap: prefer structuredContent over content[0].text   │
-  └────────────────────────────┬─────────────────────────────┘
-                               ▼
-  ┌─ Provider (Bloomreach loomi connect server) ────────────┐
-  │  runs the EQL query, returns the result envelope         │
-  └────────────────────────────┬─────────────────────────────┘
-                               ▼
-  ┌─ Back to the agent ─────────────────────────────────────┐
-  │  result becomes a tool_result block in the next user msg │
-  └──────────────────────────────────────────────────────────┘
+  agent loop
+       │  emits: tool_use { name, input }
+       ▼
+  ┌─ ToolRegistry port (interface) ──────────────────┐
+  │   listTools(): ToolDefinition[]                  │
+  │   callTool(name, args, options) → { result, ms } │
+  └─────────────────┬────────────────────────────────┘
+                    │  any conforming adapter
+       ┌────────────┼────────────┐
+       ▼            ▼            ▼
+  in-memory     Bloomreach    synthetic
+  (tests)       (production)  (fallback)
+       │            │             │
+       │            ▼             │
+       │      MCP transport       │
+       │      (HTTP + OAuth)      │
+       │            │             │
+       │            ▼             │
+       │      Bloomreach          │
+       │      loomi connect       │
+       │      server               │
+       │      (~33 tools)         │
+       │                          │
+   no wire call;             no wire call;
+   handlers run               in-process
+   inline                     synthetic data
 ```
 
-### Move 2 — walk this repo's tool layer
+The agent loop only knows the `ToolRegistry` interface. Three adapters conform: the in-memory `InMemoryToolRegistry` (from `@aptkit/tools`) for tests, the Blooming `BloomingToolRegistryAdapter` over `BloomreachDataSource` for production, and the same adapter over `SyntheticDataSource` for the `live-synthetic` mode.
 
-**Step 1: the MCP server exposes a tool catalog.**
+### Move 2 — step by step
 
-The Bloomreach loomi connect MCP server at `https://loomi-mcp-alpha.bloomreach.com/mcp` exposes ~30 tools — `execute_analytics_eql`, `get_metric_timeseries`, `list_scenarios`, `list_segmentations`, etc. The route handler fetches the full catalog:
+#### The tool schema — what the model sees
 
-```typescript
-// app/api/briefing/route.ts:250-253
-const raw = await dataSource.listTools({ signal: req.signal });
-const allTools: McpToolDef[] = Array.isArray((raw as { tools?: unknown })?.tools)
-  ? (raw as { tools: McpToolDef[] }).tools
-  : [];
+Open `lib/agents/tool-schemas.ts:3-7`:
+
+```ts
+export interface McpToolDef {
+  name: string;
+  description?: string;
+  inputSchema: object;
+}
 ```
 
-**Step 2: AptKit filters the catalog by the agent's policy.**
+Three fields. The model sees these in its system prompt's tool list:
 
-Each AptKit agent has a `toolPolicy` listing which tools it should see. Before the agent runs, AptKit calls `filterToolsForPolicy(allTools, policy)` to narrow the model's view:
+- `name` — the tool's callable identifier (`execute_analytics_eql`, `get_segments`, etc.).
+- `description` — natural-language description of when to use it; the model relies on this to pick between tools.
+- `inputSchema` — JSON Schema describing the tool's input. Anthropic's API uses this to constrain the model's `tool_use.input` to a valid shape.
 
-- `anomalyMonitoringToolPolicy.allowedTools`: 4 tools (analytics + metric timeseries + segments + anomaly context)
-- `diagnosticInvestigationToolPolicy.allowedTools`: 11 tools
-- `recommendationToolPolicy.allowedTools`: 13 tools (different set — feature discovery)
-- `queryToolPolicy.allowedTools`: 32 tools (the union)
+Bloomreach's MCP server exposes ~33 of these. `dataSource.listTools()` (in `app/api/agent/route.ts:239-243`) lists them all; `filterToolsForPolicy` narrows the list to each agent's allowlist before passing to `runAgentLoop`.
 
-The model only sees the filtered subset. Even if the MCP server adds a new tool, the agent won't use it until the policy is updated — that's the seam where capability changes get governed.
+#### The tool intent — what the model emits
 
-**Step 3: the agent's `BloomingToolRegistryAdapter` is the AptKit-side bridge.**
+The model's response content includes one or more `tool_use` blocks per turn:
 
-The adapter (`lib/agents/aptkit-adapters.ts:75-97`) is 23 lines:
+```ts
+// Anthropic's content block type (paraphrased)
+type ToolUseBlock = {
+  type: 'tool_use';
+  id: string;                    // for matching with the tool_result
+  name: string;                  // tool name from the allowlist
+  input: Record<string, unknown>; // matches the inputSchema
+};
+```
 
-```typescript
-export class BloomingToolRegistryAdapter implements ToolRegistry {
-  constructor(
-    private readonly dataSource: McpCaller,
-    private readonly allTools: McpToolDef[],
-  ) {}
+The harness reads these from `response.content` (`run-agent-loop.js:53-57`):
 
-  listTools(): ToolDefinition[] {
-    return this.allTools.map((tool) => ({
-      name: tool.name,
-      description: tool.description,
-      inputSchema: tool.inputSchema,
-    }));
+```js
+const toolUses = toolUsesFromContent(response.content);
+if (toolUses.length === 0) {
+  finalText = text;
+  break;
+}
+```
+
+If there are no `tool_use` blocks, the loop terminates (success exit). If there are, the harness dispatches each via the tool registry.
+
+#### The tool dispatch — the typed seam
+
+The dispatch is two layers. First, AptKit's runtime calls the registry (`run-agent-loop.js:76`):
+
+```js
+const { result, durationMs } = await tools.callTool(toolUse.name, toolUse.input, { signal });
+```
+
+Second, the Blooming registry adapter delegates to the data source (`lib/agents/aptkit-adapters.ts:89-96`):
+
+```ts
+async callTool(name, args, options?) {
+  const { result, durationMs } = await this.dataSource.callTool(name, args, options);
+  return { result, durationMs };
+}
+```
+
+The adapter strips the `fromCache` field from the data source's three-field envelope (`{result, durationMs, fromCache}`) — AptKit's `ToolRegistry` interface only wants two fields. The `fromCache` is still observable in the route handler's trace events (it gets passed through to the UI's "how this was gathered" panel separately).
+
+The seam is doing real work: the agent loop knows nothing about MCP, OAuth, rate-limiting, or caching. Everything below the registry call is data-source concern. This is the dependency-inversion pattern made concrete.
+
+#### The MCP transport — what's under the data source
+
+Open `lib/data-source/bloomreach-data-source.ts:190-205`:
+
+```ts
+private async liveCall(name, args, signal?): Promise<unknown> {
+  const elapsed = Date.now() - this.lastCallAt;
+  if (elapsed < this.minIntervalMs) {       // ~1 req/s proactive spacing
+    await new Promise((r) => setTimeout(r, this.minIntervalMs - elapsed));
   }
-
-  async callTool(
-    name: string,
-    args: Record<string, unknown>,
-    options?: { signal?: AbortSignal },
-  ): Promise<{ result: unknown; durationMs: number }> {
-    const { result, durationMs } = await this.dataSource.callTool(name, args, options);
-    return { result, durationMs };
+  try {
+    const result = await this.transport.callTool(name, args, { signal });
+    this.lastCallAt = Date.now();
+    return result;
+  } catch (err) {
+    this.lastCallAt = Date.now();
+    throw new McpToolError(name, errorDetail(err), { cause: err });
   }
 }
 ```
 
-What this is: the SEAM. AptKit talks to ToolRegistry; the adapter translates that into DataSource calls. Swap the DataSource (Bloomreach → Synthetic) and the adapter doesn't care.
+The `transport.callTool` is the actual MCP SDK call — `StreamableHTTPClientTransport` from `@modelcontextprotocol/sdk` wrapped with an OAuth client provider (`lib/mcp/auth.ts`) and the rate-limit retry ladder (lines 163-174 of `bloomreach-data-source.ts`).
 
-**Step 4: the DataSource actually runs the tool.**
+The MCP wire is HTTP — request goes to `https://loomi-mcp-alpha.bloomreach.com/mcp` carrying the OAuth bearer token + the tool call payload (JSON-RPC over HTTP); response comes back as a JSON-RPC envelope containing the tool result. The response envelope can be `{ structuredContent: {...} }` (the preferred shape) or `{ content: [{ type: 'text', text: '...' }] }` (the fallback shape); `lib/mcp/schema.ts:unwrap` handles both.
 
-For `live-bloomreach`: `BloomreachDataSource` makes an HTTPS POST through the MCP transport, with the OAuth bearer token in the header. The transport handles rate-limit retry, cache lookup, and the unwrap of the response envelope (prefer `structuredContent`, else parse `content[0].text` as JSON).
+#### Why MCP matters here — the standardization win
 
-For `live-synthetic`: `SyntheticDataSource` runs the tool in-process against Blooming-owned synthetic ecommerce data. Same DataSource interface, no network.
+MCP's value is that the same tool registry pattern works across MCP servers. If Bloomreach ever stood up a second MCP server (say, a campaigns-specific server), this repo would add a second `BloomreachDataSource` instance and a composite registry — the agent loop would not change. If the team wanted to add a non-Bloomreach MCP server (e.g. an internal docs server), same pattern.
 
-**Step 5: the result becomes a tool_result block on the next turn.**
+Without MCP, the alternative would be per-tool Anthropic adapters — one TypeScript function per Bloomreach API endpoint, each with a hand-written schema, each wired into the registry by name. MCP collapses 33 such adapters into one transport call.
 
-The harness wraps the DataSource's result as a `tool_result` block and appends it to the next user message. The model sees the result on its next turn and decides what to do.
+The token overhead trade-off MCP introduces: each tool definition takes ~200 tokens in the system prompt (the model sees all allowed tools' schemas). For 33 tools, that's ~6,600 tokens of overhead per turn for the query agent. The per-agent allowlist narrowing (`02-agentic-retrieval/03-retrieval-routing.md`) is the mitigation.
 
-### Move 2.5 — why MCP and not just direct tool definitions?
+#### MCP vs direct tool definitions vs a tool gateway — the decision
 
-This repo uses MCP as the protocol; the alternative would be defining tools inline in each agent class (the "direct tool definitions" approach LangChain and the OpenAI SDK have made common).
+Three deployment shapes, decision per shape:
 
-```
-  Comparison — MCP vs direct tool definitions vs tool gateway
+- **Direct tool definitions** (hand-coded TypeScript functions registered with the agent): cheapest if you have 5-10 tools and they're all in-process. No protocol overhead, no transport, no OAuth.
+- **MCP** (this repo): right when the tools live behind a service boundary, when the same tools need to be usable across agents/products, or when third-party providers expose MCP. Protocol overhead is real but the standardization win pays for it.
+- **Tool gateway** (a single in-process registry that dispatches to multiple MCP servers + direct tools): the production answer when you have multiple substrates. Composes MCP and direct tools behind one registry the agent sees.
 
-  Direct tool defs:                        MCP (this repo):
-  ─────────────────                        ──────────────────
-  tool schemas live in each agent's        tool schemas live on the MCP server
-  code                                      and are fetched at runtime
-                                            
-  pro: full control over each tool's       pro: tool catalog is governed by the
-       implementation                            server team; updates propagate
-                                                automatically
-  pro: zero protocol overhead               con: ~1 listTools call per request
-                                                (mitigated by the 60s cache)
-  con: each agent has to re-implement       pro: a tool defined once is usable
-       integration with each backend             across any MCP-aware client
-       (Bloomreach SDK, Salesforce SDK,         (Claude Desktop, Cursor, etc.)
-       …)
-  con: schema drift between agent and       pro: schema is the contract; drift is
-       backend                                   caught at the transport layer
-
-  Tool gateway:
-  ─────────────
-  one process that aggregates many tool sources
-  pro: single integration point
-  con: another moving piece, plus the gateway's own auth/rate-limit
-```
-
-The decision rationale for this repo: Bloomreach already runs the MCP server; consuming it via the protocol is cheaper than building a custom SDK. The 60s cache absorbs the cost of repeated `listTools` calls. The seam at `BloomingToolRegistryAdapter` means the agents don't even know they're talking to MCP — same code would work for direct tool definitions if MCP went away.
+This repo lands on MCP because (a) Bloomreach exposes its analytics via MCP and (b) the team didn't want to maintain 33 hand-coded adapter functions for a third-party API surface that changes with the alpha. The trade-off was the right call.
 
 ### Move 3 — the principle
 
-Tool calling is the substrate every pattern in this guide runs on. The model never executes a tool itself — it emits intent (a `tool_use` block) and the harness validates and runs it. That boundary IS the safety story: the model can hallucinate a tool call to `delete_everything`, but if the tool isn't in the policy, the harness rejects it. **Tool policies are the most underappreciated security primitive in agent systems**; they're the agent-architecture version of "principle of least privilege."
-
-MCP is THE protocol for standardizing this across vendors. It's worth knowing because the trend is clearly toward "your model can use any MCP server's tools" — Claude Desktop, Cursor, and many AI products are converging on MCP as the integration point. A skill in MCP transfers more broadly than a skill in LangChain's tool-definition API.
-
-## In this codebase
-
-**Yes — load-bearing.** Tool calling is the substrate every agent runs on; MCP is the protocol; per-agent tool policies are the access control. The relevant files:
-
-- `lib/agents/aptkit-adapters.ts` — `BloomingToolRegistryAdapter` bridges AptKit ↔ DataSource
-- `lib/agents/tool-schemas.ts` — `filterToolSchemas(all, allowed)` is the per-agent filter for the legacy path
-- `lib/data-source/bloomreach-data-source.ts` — the MCP-over-HTTPS adapter with rate-limit + cache
-- `lib/data-source/synthetic-data-source.ts` — the in-process alternative
-- `lib/mcp/transport.ts` — the actual HTTPS transport
-- `lib/mcp/auth.ts` + `lib/mcp/connect.ts` — OAuth/PKCE/DCR handshake
-
-The MCP server it talks to: `https://loomi-mcp-alpha.bloomreach.com/mcp` (Bloomreach loomi connect, alpha).
+**Tool calling is the substrate, MCP is the protocol that makes the substrate composable.** The two are inseparable in practice — the model needs to emit typed intents (tool calling), the runtime needs to dispatch them somewhere (MCP gives that somewhere a standard interface). The decision to make MCP-aware is one of those small architectural calls that pays off later: any future agent in this repo gets the same tool surface for free, any future MCP server slots in via a new `DataSource` adapter without touching the agents.
 
 ## Primary diagram
 
-The full tool-call path, every layer:
-
 ```
-  Tool calling in blooming insights — one call, end to end
+  Full tool-call path — model intent to MCP wire and back
 
-  ┌─ Agent layer ────────────────────────────────────────────┐
-  │  model emits:                                             │
-  │   { type: 'tool_use', name: 'execute_analytics_eql',      │
-  │     input: { project_id: 'wobbly-ukulele',                │
-  │              eql: 'select count event purchase ...' } }   │
-  └────────────────────────────┬─────────────────────────────┘
-                               ▼
-  ┌─ AptKit runAgentLoop ────────────────────────────────────┐
-  │  for each tool_use: tools.callTool(name, input, {signal}) │
-  └────────────────────────────┬─────────────────────────────┘
-                               ▼
-  ┌─ BloomingToolRegistryAdapter ────────────────────────────┐
-  │  this.dataSource.callTool(name, args, options)            │
-  └────────────────────────────┬─────────────────────────────┘
-                               ▼ (Bloomreach mode)
-  ┌─ BloomreachDataSource ───────────────────────────────────┐
-  │  - cache lookup (60s, per name+args)                      │
-  │  - proactive ~1 req/s spacing                             │
-  │  - rate-limit retry ladder                                │
-  │  - MCP transport via @modelcontextprotocol/sdk            │
-  └────────────────────────────┬─────────────────────────────┘
-                               ▼
-  ┌─ MCP transport (SdkTransport) ───────────────────────────┐
-  │  HTTPS POST to https://loomi-mcp-alpha.bloomreach.com/mcp │
-  │  with OAuth Bearer token (PKCE + DCR)                     │
-  └────────────────────────────┬─────────────────────────────┘
-                               ▼
-  ┌─ Bloomreach loomi connect server ────────────────────────┐
-  │  runs the EQL query, returns                              │
-  │  { result: {...}, structuredContent: {...} | content[]: } │
-  └────────────────────────────┬─────────────────────────────┘
-                               ▲ (response unwrapping)
-  ┌─ unwrap (lib/mcp/schema.ts) ─────────────────────────────┐
-  │  prefer structuredContent if non-null                     │
-  │  else JSON.parse(content[0].text)                         │
-  └────────────────────────────┬─────────────────────────────┘
-                               ▼
-  ┌─ back into the loop's message array ─────────────────────┐
-  │  { type: 'tool_result', tool_use_id, content: <JSON> }    │
-  └──────────────────────────────────────────────────────────┘
+  ┌─ agent loop turn N (assistant response) ──────────────────────┐
+  │   content: [                                                    │
+  │     { type: 'text', text: 'Thought: ...' },                    │
+  │     { type: 'tool_use', id: 'toolu_abc', name:                 │
+  │       'execute_analytics_eql', input: { project_id: '...',     │
+  │       eql: '...' } }                                            │
+  │   ]                                                              │
+  └────────────────────────────────────┬───────────────────────────┘
+                                       │
+                                       ▼
+  ┌─ run-agent-loop.js:53-76 ──────────────────────────────────────┐
+  │   const toolUses = toolUsesFromContent(response.content);       │
+  │   for (const toolUse of toolUses):                              │
+  │     const { result, durationMs } = await tools.callTool(        │
+  │       toolUse.name, toolUse.input, { signal }                   │
+  │     );                                                           │
+  └────────────────────────────────────┬───────────────────────────┘
+                                       │ ToolRegistry port
+                                       ▼
+  ┌─ lib/agents/aptkit-adapters.ts:75-97 ──────────────────────────┐
+  │   BloomingToolRegistryAdapter.callTool(name, args, opts):       │
+  │     return this.dataSource.callTool(name, args, opts);          │
+  └────────────────────────────────────┬───────────────────────────┘
+                                       │ DataSource port
+                                       ▼
+  ┌─ lib/data-source/bloomreach-data-source.ts:139-188 ────────────┐
+  │   BloomreachDataSource.callTool:                                │
+  │     1. cache key = name:JSON.stringify(args)                    │
+  │     2. cache hit (60s TTL)? return                              │
+  │     3. liveCall: 200ms spacing → transport.callTool             │
+  │     4. is rate-limited? sleep + retry (up to 3x, parsed retry- │
+  │        after window honored)                                    │
+  │     5. cache result if not error                                │
+  │     6. return { result, durationMs, fromCache: false }          │
+  └────────────────────────────────────┬───────────────────────────┘
+                                       │ MCP transport
+                                       ▼
+  ┌─ lib/mcp/transport.ts → @modelcontextprotocol/sdk ─────────────┐
+  │   StreamableHTTPClientTransport (HTTP + OAuth bearer)           │
+  │   POST https://loomi-mcp-alpha.bloomreach.com/mcp               │
+  │   Body: JSON-RPC { method: 'tools/call', params: {...} }        │
+  │   Response: JSON-RPC envelope                                   │
+  │     { structuredContent: {...} } OR                              │
+  │     { content: [{ type: 'text', text: '...' }] }                │
+  └────────────────────────────────────┬───────────────────────────┘
+                                       │ result
+                                       ▼
+  ┌─ back up the stack ────────────────────────────────────────────┐
+  │   run-agent-loop.js:97-104:                                     │
+  │     toolResults.push({ type: 'tool_result', toolUseId: id,     │
+  │                        content: truncate(JSON.stringify(result))│
+  │                      });                                         │
+  │     messages.push({ role: 'user', content: toolResults });      │
+  │   loop back to turn N+1                                         │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-MCP (Model Context Protocol) was announced by Anthropic in late 2024 as an open standard for connecting models to tools and data. The motivation: every AI product was building its own version of "function calling against my tools," and the protocols were drifting (OpenAI function calling, Anthropic tool_use, LangChain tools, ...). MCP fills that gap with a standard wire format and a standard client/server SDK.
+The Model Context Protocol (MCP) was introduced by Anthropic in November 2024 to standardize the interface between LLM agents and external tools/data sources. Before MCP, every team built per-tool adapters in their agent framework of choice; MCP makes the adapter the protocol's job, not the agent framework's job. The win shows up in cross-product reuse: Anthropic Desktop, Cursor, Cline, this repo — all consume MCP servers using compatible clients.
 
-The production wisdom on MCP: the win is when you have many tools and many clients (Claude Desktop + Cursor + your custom app all using the same tool set) — defining the tool once on the server side saves N integrations. The cost is the protocol overhead: each request includes a `listTools` round-trip unless cached, and the response envelope (`content[]` + optional `structuredContent`) requires an unwrap helper.
+The Bloomreach team's choice to expose loomi connect over MCP (rather than a REST API the Blooming team would have to hand-wrap) is exactly the standardization win — by speaking MCP they make their analytics surface usable in any MCP-aware agent system. This repo benefits directly: zero hand-written adapter code for the 33 tools.
 
-For this repo, the win was that Bloomreach already ran the MCP server. Building a custom Bloomreach SDK would have been weeks of work; consuming the existing MCP server was hours. The seam at `BloomingToolRegistryAdapter` means we're not locked in — if MCP went away, the DataSource interface stays and the adapter swaps.
-
-The pattern that pairs naturally with MCP: *capability gating* (`lib/agents/categories.ts`). Each tool policy is a capability declaration; each schema-capability check is a runtime guard that the model won't ask for a tool it can't actually use. Tools + policies + capabilities together form the agent's "least privilege" surface.
+The token overhead of carrying tool definitions in the system prompt is the cost everyone pays for tool calling, MCP or not. The mitigation strategies are: narrow allowlists per agent (this repo's choice), tool-gateway summarization (a wrapper that compresses tool descriptions), or per-turn dynamic tool selection (the model first picks a tool *category*, then the harness exposes only that category's tools for the next turn). For 33 tools in this repo, narrow allowlists are the right answer; for 200+ tools, dynamic selection becomes the production pattern.
 
 ## Interview defense
 
-**Q: "How does your agent call tools?"**
+> **Q: Walk through what happens when the diagnostic agent calls a tool.**
+>
+> Four layers. The model emits a `tool_use` content block in its response — `{ type: 'tool_use', name: 'execute_analytics_eql', input: { ... } }`. The harness in `runAgentLoop` reads it and calls `tools.callTool(name, input, options)` against the `ToolRegistry` port. The port is implemented by `BloomingToolRegistryAdapter` in `lib/agents/aptkit-adapters.ts:75-97`, which delegates to the `DataSource` port. The data source is `BloomreachDataSource` (`lib/data-source/bloomreach-data-source.ts`), which checks the 60s cache, enforces the 200ms minimum interval, runs the rate-limit retry ladder, and ultimately calls the MCP transport — `StreamableHTTPClientTransport` from `@modelcontextprotocol/sdk` — which POSTs JSON-RPC to `https://loomi-mcp-alpha.bloomreach.com/mcp` with an OAuth bearer token. The response comes back as a JSON-RPC envelope; the data source returns `{result, durationMs, fromCache}`; the adapter drops the `fromCache`; the harness packages the result as a `tool_result` content block for the next turn.
 
-A: Through MCP — `@modelcontextprotocol/sdk` over the Bloomreach loomi connect server at `https://loomi-mcp-alpha.bloomreach.com/mcp`. The path is: model emits a `tool_use` block (intent only — never runs the tool itself) → AptKit's runAgentLoop catches it → BloomingToolRegistryAdapter delegates to the DataSource → BloomreachDataSource handles cache + ~1 req/s spacing + rate-limit retry → HTTPS POST with OAuth bearer to the MCP server → response unwrapped (prefer `structuredContent`, else parse `content[0].text`) → result becomes a `tool_result` block on the next turn. Per-agent tool policies (`anomalyMonitoringToolPolicy.allowedTools`, etc.) filter the catalog before the model sees it — least privilege at the tool layer. The seam at `BloomingToolRegistryAdapter` (`lib/agents/aptkit-adapters.ts:75`) means the agents don't know they're talking to MCP — if MCP went away, the same code works against direct tool definitions.
+> **Q: Why MCP instead of hand-coding 33 TypeScript tool adapters?**
+>
+> Standardization and cross-product reuse. Bloomreach exposes their analytics surface via MCP (the loomi connect server), and any MCP-aware agent client can consume it without per-product integration work. If we hand-coded 33 adapters, every API change on Bloomreach's side would require a Blooming PR; with MCP, the server's tool schemas are the source of truth and the client picks them up on `listTools()` automatically. The cost is the protocol overhead (tool definitions live in the system prompt, ~200 tokens each; 33 tools × 200 = ~6.6K token overhead per turn for the query agent). The mitigation is per-agent allowlist narrowing — the monitoring agent only sees 4 of the 33 tools, saving ~5.8K tokens per turn.
 
-Diagram I'd sketch:
-
-```
-  model emits tool_use ─► AptKit catches ─► BloomingToolRegistryAdapter
-                                                       │
-                                                       ▼
-                                           BloomreachDataSource (cache + retry)
-                                                       │
-                                                       ▼
-                                           MCP transport (HTTPS + OAuth)
-                                                       │
-                                                       ▼
-                                           Bloomreach loomi connect server
-```
-
-Anchor: "the boundary is `tool_use` from the model vs `callTool` in the harness. The model never touches the network; the harness does. That's the safety story — a hallucinated tool name fails at the policy filter, not at the network."
-
-**Q: "Why MCP and not a custom SDK?"**
-
-A: Two reasons. First, Bloomreach already ran the MCP server — building a custom Bloomreach SDK would have been weeks; consuming MCP was hours. Second, MCP is the trend — Claude Desktop, Cursor, and many AI products are converging on MCP as the integration point. A skill in MCP transfers more broadly than a skill in any vendor's tool-definition API. The cost is the protocol overhead (a `listTools` per request, the response-envelope unwrap), but the 60s cache absorbs most of it. The seam at `BloomingToolRegistryAdapter` keeps us un-locked-in: if we ever wanted direct tool definitions, the DataSource interface stays, the adapter swaps.
+> **Q: What's the trade-off between MCP, direct definitions, and a tool gateway?**
+>
+> Direct definitions (hand-coded TypeScript functions) are cheapest for small in-process tool sets — no protocol overhead, no transport. MCP is right when tools live behind a service boundary, when the same tools need to be usable across multiple agents, or when third-party providers expose MCP. A tool gateway is the production answer when you have multiple substrates — a single in-process registry that dispatches to direct tools, MCP servers A and B, etc., behind one interface the agent sees. This repo is MCP-only because (a) Bloomreach exposes one MCP server and (b) we didn't want to maintain 33 hand-coded adapters for a third-party API surface. If we added an internal docs MCP server later, we'd evolve into a tool-gateway shape — `CompositeDataSource` over multiple data sources.
 
 ## See also
 
-- [`01-context-engineering.md`](./01-context-engineering.md) — tool grants are context engineering at the tool layer
-- [`05-guardrails-and-control.md`](./05-guardrails-and-control.md) — tool policies are part of the control envelope
-- [`../03-multi-agent-orchestration/02-supervisor-worker.md`](../03-multi-agent-orchestration/02-supervisor-worker.md) — tool calling is what the workers do
-- ai-engineering's `tool-calling` file (cross-ref) — the mechanics, if generated
+- → `01-reasoning-patterns/02-agent-loop-skeleton.md` — the harness that dispatches the tool calls
+- → `01-reasoning-patterns/03-react.md` — the prompting strategy that produces tool_use blocks
+- → `02-agentic-retrieval/03-retrieval-routing.md` — the per-agent allowlist narrowing
+- → `05-production-serving/03-per-tool-circuit-breaking.md` — the retry/cache behavior inside `BloomreachDataSource`
+- → cross-reference (when generated): `study-system-design`'s provider-abstraction file — the same `DataSource` port from a system-design lens

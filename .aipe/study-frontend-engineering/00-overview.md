@@ -1,114 +1,111 @@
-# Frontend Engineering — Overview
+# 00 — overview
 
-One-page orientation. The reader who skims only this file knows what the frontend of this repo is.
+The frontend-engineering layer of `blooming_insights` in one page. Read this first; open `audit.md` for the 8-lens walk; open the `01-…` / `02-…` files for the two patterns that earn their own walkthrough.
 
-## What this repo is, at the frontend layer
+## What this repo is, in one sentence
 
-A Next.js 16 App Router app that puts **a long-running multi-agent process on the screen as a first-class surface**. The product isn't "show the answer when the answer arrives" — it's "show the work happening, line by line, while the agents run." Every routed page is `'use client'`; the entire interactive surface ships as one client bundle. The framework's server-rendering and streaming primitives (RSC, Suspense, `loading.tsx`, `error.tsx`) are deliberately not used — those serve request-response, and this product is a stream.
+**Next.js 16 App Router app with a server shell and a fully client-side interactive tree, streaming agent events from serverless routes via NDJSON over `fetch` + `ReadableStream`, with progressive loading composed across four reveal surfaces.**
 
-The rendering mode in one sentence: **a client SPA inside Next.js, hand-feeding itself NDJSON from Route Handlers.**
+## Rendering mode, in one sentence
 
-## State architecture in one diagram
+An SPA wearing an App Router shell: `app/layout.tsx` is the only server component in the user-facing tree (it boots `next/font/google` and renders children); every route page opens with `'use client'`; no `<Suspense>`, no RSC streaming, no route loaders. Streaming UX is hand-rolled in the browser, not delivered by React server rendering.
 
-State doesn't live in a global store. It lives in three concentric rings, each owned by exactly one place — and almost everything that crosses pages is carried by the browser, not the server.
-
-```
-  State ownership — three concentric rings, one owner per ring
-
-  ┌─ Page-local (React state) ─────────────────────────────────┐
-  │  useBriefingStream → 9 useState slots (insights, coverage, │
-  │                       trace, status, errorMessage, …)      │
-  │  useInvestigation  → 5 useState slots (items, diagnosis,   │
-  │                       recommendations, complete, error)    │
-  │  app/page.tsx      → 3 (mode, ready, activeQuery)          │
-  └──────────────────────────────┬─────────────────────────────┘
-                                 │ result stashed on `done`
-                                 ▼
-  ┌─ Cross-page (sessionStorage, per-tab) ─────────────────────┐
-  │  bi:insight:<id>     feed → investigate (the subject)      │
-  │  bi:diag:<id>        step 2 → step 3 (the diagnosis)       │
-  │  bi:inv:<step>:<id>  re-visit / back-nav (instant hydrate) │
-  │  bi:reconnecting     one-shot guard against reload loops   │
-  └──────────────────────────────┬─────────────────────────────┘
-                                 │
-                                 ▼
-  ┌─ Cross-session (localStorage) ─────────────────────────────┐
-  │  bi:mode             demo · live-bloomreach · live-synth   │
-  └────────────────────────────────────────────────────────────┘
-
-  No Redux. No Zustand. No React Query. No Context. No global store.
-  Each ring has exactly one writer and a documented invalidation rule.
-```
-
-The thing to notice: there is **no client-side data layer**. The hook IS the data layer. Each streaming surface (briefing, investigation, free-form query, capture) owns its own `fetch + readNdjson + dispatch + setState + stash` pipeline.
-
-## Network seam in one diagram
-
-The wire format isn't JSON. It isn't SSE either. It's newline-delimited JSON over a plain `fetch` `ReadableStream`, with a 64-LOC kernel that every consumer reuses.
+## State architecture, in one diagram
 
 ```
-  Network seam — one kernel, four consumers
+  State graph — one slot per owner, no global store
 
-  ┌─ UI layer (browser) ───────────────────────────────────────┐
-  │  useBriefingStream    useInvestigation                     │
-  │  useDemoCapture       StreamingResponse                    │
-  │       │       │       │       │                            │
-  │       └───────┴───┬───┴───────┘                            │
-  │                   ▼                                        │
-  │  lib/streaming/ndjson.ts — readNdjson<E>(body, onEvent)    │
-  │    fetch → reader → TextDecoder → split('\n') →            │
-  │    JSON.parse → onEvent → poll cancelOn between reads      │
-  └───────────────────────────┬────────────────────────────────┘
-                              │  HTTP/1.1 chunked, ndjson body
-  ┌─ Service layer (Next Route Handlers) ──────────────────────┐
-  │  GET /api/briefing  GET /api/agent  POST /api/mcp/*        │
-  │  → ReadableStream that writes `JSON.stringify(evt) + '\n'` │
-  └────────────────────────────────────────────────────────────┘
+  ┌─ Local hook state (useState in custom hooks) ─────────────────────────┐
+  │  useBriefingStream      9 slots — status, insights, workspace,         │
+  │                                  coverage, traceItems, errorMessage,   │
+  │                                  stepStatus, queryCount, demoSuffix    │
+  │  useInvestigation       5 slots — items, diagnosis, recommendations,   │
+  │                                  complete, error                       │
+  │  useReconnectPolicy     1 slot  — reconnecting                         │
+  │  useDemoCapture         1 slot  — capturing                            │
+  │  app/page.tsx           2 slots — activeQuery, mode, ready             │
+  └────────────────────────────────┬──────────────────────────────────────┘
+                                   │ composes via callbacks
+                                   │  (no Context, no Redux, no Zustand)
+                                   ▼
+  ┌─ Browser-side persistence (the cross-page handoff layer) ─────────────┐
+  │  sessionStorage         bi:insight:<id>    feed → investigate          │
+  │                         bi:inv:<step>:<id> stash per step              │
+  │                         bi:diag:<id>       diagnosis → recommend       │
+  │                         bi:reconnecting    one-shot auto-reconnect    │
+  │  localStorage           bi:mode            persisted demo/live toggle  │
+  └───────────────────────────────────────────────────────────────────────┘
+
+  no React Context. no Redux. the hooks own the state; the page consumes
+  their return values; sessionStorage carries state across pages because
+  on Vercel different requests can hit different instances.
 ```
 
-Producer always terminates events with `\n`; consumer always flushes a trailing partial buffer; malformed lines are silently skipped. The kernel is the canonical place this lives — see `01-ndjson-stream-reader-hook.md`.
+## Network seam, in one diagram
 
-## The three highest-leverage frontend patterns
+```
+  Network seam — fetch + NDJSON, four consumers, one kernel
 
-If you only learn three things about this frontend, learn these:
+  ┌─ Client / components & hooks ──────────────────────────────────────────┐
+  │                                                                        │
+  │  useBriefingStream     useInvestigation     useDemoCapture (drain)     │
+  │  StreamingResponse                                                     │
+  │       │                       │                       │                │
+  │       └────────────┬──────────┴───────────┬───────────┘                │
+  │                    │                      │                            │
+  │                    ▼                      ▼                            │
+  │                ┌──────────────────────────────┐                        │
+  │                │  readNdjson(body, onEvent,   │  ← lib/streaming/      │
+  │                │             { cancelOn? })   │    ndjson.ts (64 LOC)  │
+  │                └──────────────┬───────────────┘                        │
+  └───────────────────────────────┼────────────────────────────────────────┘
+                                  │  HTTP, application/x-ndjson, chunked
+                                  ▼
+  ┌─ Server / Next.js route handlers ──────────────────────────────────────┐
+  │                                                                        │
+  │  /api/briefing       /api/agent                                        │
+  │   (monitoring)        (diagnose | recommend | combined | q=…)          │
+  │                                                                        │
+  │   new ReadableStream({ start(controller) {                             │
+  │     for await (const evt of agent) {                                   │
+  │       controller.enqueue(encoder.encode(encodeEvent(evt)))             │
+  │     }                                                                  │
+  │   }})                                                                  │
+  │                                                                        │
+  └────────────────────────────────────────────────────────────────────────┘
 
-1. **NDJSON stream-reader hook** — `lib/streaming/ndjson.ts` (64 LOC) consumed by 4 hooks/components. Pinned in `01-ndjson-stream-reader-hook.md`. This is the load-bearing primitive — it is what makes the product "an analyst that shows its work" technically tractable.
+  the wire contract is the BriefingEvent / AgentEvent union — "what must
+  not change" per the project context.
+```
 
-2. **Progressive composition (4 tiers)** — `Skeleton` + `ProcessStepper` + `CoverageGrid` + `StatusLog`. Turns a 30-90s agent run from "blank screen until done" into a UI that animates from the first 100ms. Pinned in `02-progressive-skeleton-with-stepper.md`.
+## Three highest-leverage frontend patterns
 
-3. **sessionStorage cross-step handoff** — the feed stashes each `Insight` under `bi:insight:<id>`; step 2 stashes the `Diagnosis` under `bi:diag:<id>`; step 3 reads it and passes it to the agent via URL param. The browser carries the data across, because on Vercel the feed and the investigation request can hit different serverless instances and server-side in-memory lookup is unreliable.
+The whole guide ranks the frontend patterns the repo *actually* exercises. Three carry the most weight; the first two earn their own pattern files in this folder.
 
-## What this frontend deliberately does NOT do
+**1. NDJSON stream reader hook → `01-ndjson-stream-reader-hook.md`.** The browser-side consumer for streaming agent events. One kernel (`lib/streaming/ndjson.ts`, 64 LOC), four consumers (`lib/hooks/useBriefingStream.ts:288`, `lib/hooks/useInvestigation.ts:194`, `lib/hooks/useDemoCapture.ts:84`, `components/chat/StreamingResponse.tsx:108`). The whole "the agent is working" UX surface depends on this — strip it out and the trace, the streamed insights, and the progressive coverage tiles all vanish. The pattern earns extra weight from the two distinct StrictMode adaptations: `useBriefingStream` cancels on cleanup (mode toggles re-fire); `useInvestigation` deliberately does NOT cancel (a started-guard makes the effect idempotent against the dev double-mount).
 
-Calling these out is the lesson — each absence is a deliberate tradeoff, not an oversight.
+**2. Progressive skeleton with stepper → `02-progressive-skeleton-with-stepper.md`.** The four-tier composition that fills the 30-60 second monitoring runtime with information instead of a spinner. Stepper says where in the pipeline (`components/shared/ProcessStepper.tsx`); coverage grid says which category just checked in (`components/feed/CoverageGrid.tsx`); skeletons reserve the card shapes (`components/shared/Skeleton.tsx`); status log streams the agent's tool calls in real time (`components/shared/StatusLog.tsx`). Three custom keyframes (`bi-fade-up`, `bi-progress`, `bi-dots`) own the polish, and all three respect `prefers-reduced-motion`. The pattern is the perceived-performance story — without it the page reads as broken at t=5s.
 
-- **No Server Components.** Every page is `'use client'`. The interactivity surface is the whole page; SSR-vs-CSR boundaries would split work that wants to stay together.
-- **No Suspense / `loading.tsx` / `error.tsx`.** Those are request-response primitives. A stream needs progressive composition, not a single fallback state.
-- **No React Query / SWR.** No cache key, no stale-while-revalidate, no retry policy. The data is a stream, not a request — query libraries don't model the shape.
-- **No Context, no global store.** State sits inside hooks; cross-page handoff is sessionStorage. The result is that you can read any page top-to-bottom without chasing a provider chain.
-- **No `next/image`.** The UI is text, chips, sparklines, and inline SVG (`Sparkline`, `GapChart`). Lucide icons are tree-shaken React components, not raster images.
+**3. Custom-hook decomposition with callback composition.** Not a Pass 2 file because it's an organizational pattern more than an architectural one — but it's the third-most-load-bearing move. `app/page.tsx` was 1000+ LOC before the lift; three hooks (`useBriefingStream` 313 LOC, `useDemoCapture` 146 LOC, `useReconnectPolicy` 123 LOC) plus the cross-page `useInvestigation` (202 LOC) extract the streaming, the capture loop, and the auth-reconnect dance into ownership-clear units. The page composes them via callbacks (`app/page.tsx:110-113`) — `useBriefingStream` is handed `reconnectPolicy.handle` as `onAuthError` and `reconnectPolicy.clearFlag` as `onStreamComplete`. No global event bus, no provider tree; the page glues the hooks together by passing functions. See `audit.md` → `component-architecture` for the boundary placement, and `.aipe/audits/refactors/design-frontend-extract-usereconnectpolicy.md` for the lift rationale.
 
-## Stack at the frontend layer
+## What's NOT in this layer (and where it lives)
 
-- Next.js 16.2.6 (App Router) + React 19.2.4 + TypeScript 5
-- Tailwind v4 (CSS-first, via `@import "tailwindcss"` in `app/globals.css`), dark mode only (`<html class="dark">` in `app/layout.tsx:20`)
-- Custom CSS keyframes for streaming UI: `bi-fade-up`, `bi-progress` (indeterminate bar), `bi-dots` (pulsing thinking dots) — all gated on `prefers-reduced-motion`
-- Design tokens as CSS custom properties on `:root` (`--bg-base`, `--text-primary`, `--accent-teal`, etc.) — every component reads from `var(--token)` inline; Tailwind utilities are used sparingly for layout
-- Fonts: Syne (display) + Inter (body) + JetBrains Mono via `next/font/google` in `app/layout.tsx`
-- Icons: `lucide-react` (tree-shaken), inline SVG for charts
-- Routing: file-based App Router, three routes total (`/`, `/investigate/[id]`, `/investigate/[id]/recommend`) + a `/debug` page
+- The `runtime` semantics of the `ReadableStream` reader loop (event loop, async scheduling) → `study-runtime-systems`.
+- The wire format and HTTP/1.1 chunked-encoding mechanics → `study-networking`.
+- FCP / LCP / CLS / bundle-size measurement → `study-performance-engineering`.
+- XSS / CSP / token-storage trust boundaries → `study-security`.
+- The `AgentEvent` / `BriefingEvent` contract as a system seam; the multi-agent orchestration upstream of the stream → `study-system-design`.
+- Module / interface depth, the "deep modules" lens on `readNdjson` and the hooks → `study-software-design`.
+- Test design + the AI-eval seam → `study-testing` (221 passing tests across the repo).
 
-## Where to read next
+## Reading order
 
-- `audit.md` — the 8-lens frontend audit with `file:line` grounding for every claim
-- `01-ndjson-stream-reader-hook.md` — the deep walk on `useInvestigation` + the shared `readNdjson` kernel
-- `02-progressive-skeleton-with-stepper.md` — the deep walk on the 4-tier progressive composition
-
-Cross-links to neighboring guides:
-
-- Wire semantics / chunked transport / `EventSource` vs `fetch+ReadableStream` → `study-networking`
-- The event loop, scheduling, async cancellation under the hood → `study-runtime-systems`
-- FCP / LCP / TTI / bundle size as numbers → `study-performance-engineering`
-- XSS / CSP / token storage trust boundaries → `study-security`
-- Module depth / interface design (Ousterhout primitives applied to these hooks) → `study-software-design`
-- System-level state ownership / multi-agent orchestration → `study-system-design`
+```
+  00-overview.md (this file)
+    ↓
+  audit.md                                  ← 8 lenses, full inventory
+    ↓
+  01-ndjson-stream-reader-hook.md           ← the streaming substrate
+    ↓
+  02-progressive-skeleton-with-stepper.md   ← the perceived-performance pattern
+```

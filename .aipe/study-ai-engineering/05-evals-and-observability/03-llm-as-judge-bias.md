@@ -1,218 +1,200 @@
-# 03 — LLM-as-judge bias
+# LLM-as-judge bias
 
-**Subtitle:** Position / verbosity / self-preference biases · Industry standard (Case B)
+*Industry standard — position / verbosity / self-preference bias*
 
-## Zoom out, then zoom in
+## Zoom out — where this concept lives
 
-**Case B.** When you use an LLM to score another LLM's outputs, three
-biases reliably show up. Knowing them lets you design around them.
+LLM-as-judge is cheap and scales (`02-eval-methods.md`), but it has known biases. The retired Phase 3 suite calibrated against these biases via an 8/8 + 3/3 manual spot-check before trusting the judge at scale. This file walks the three biases + the Phase 3 calibration pattern + what the next iteration would do differently.
 
 ```
-  Zoom out — biases live inside the judge
+  Zoom out — three biases to defend against
 
-  ┌─ Eval harness ─────────────────────────────────────┐
-  │  for each (input, golden) in eval set:             │
-  │    agent_output = agent(input)                     │
-  │    score = judge(input, golden, agent_output)      │  ← we are here
-  │           ↑ THIS is where bias enters              │   (Case B)
-  └────────────────────────────────────────────────────┘
+  ┌─ Position bias ─────────────────────────────────────────┐
+  │  Judge prefers whichever variant appears first          │
+  │  Defense: randomize order per evaluation                │
+  └─────────────────────────────────────────────────────────┘
+  ┌─ Verbosity bias ────────────────────────────────────────┐
+  │  Judge prefers longer responses                         │
+  │  Defense: cap length OR include length as a rubric item │
+  └─────────────────────────────────────────────────────────┘
+  ┌─ Self-preference bias ──────────────────────────────────┐
+  │  Judge prefers outputs from the same model family       │
+  │  Defense: use a different family as judge               │
+  │  (Phase 3 used same family — known limitation)          │
+  └─────────────────────────────────────────────────────────┘
+  ┌─ ★ Calibration via manual spot-check ★ ─────────────────┐ ← we are here
+  │  Phase 3 used 8/8 + 3/3 — manual review agreed on all   │
+  │  Trust threshold met → run at scale                     │
+  └─────────────────────────────────────────────────────────┘
 ```
 
-## Structure pass
+**Zoom in.** The biases are real but not insurmountable — the calibration check is the load-bearing defense. Phase 3's 8/8 + 3/3 was the right shape; the next iteration should use a different judge family (Haiku judging Sonnet) to defend self-preference.
 
-  → **One axis to trace — bias source.** Each bias comes from a
-    different mechanism: position bias from attention, verbosity bias
-    from training reward, self-preference from in-family fluency.
-    Different mitigations per source.
+## Structure pass — layers · axes · seams
+
+**Layers:** evaluator → judge → score.
+
+**Axis: where does each bias originate / propagate / get caught?**
+  → Position: in pairwise prompts; defended by randomization.
+  → Verbosity: in any rubric where length isn't scored; defended by rubric design.
+  → Self-preference: in the choice of judge model; defended by family swap.
+  → Calibration drift: between the human spot-check and the at-scale run; defended by re-spot-checking on rubric changes.
+
+**Seam:** the rubric prompt. That's where every bias defense lives — randomized order, length-as-rubric-item, judge model choice.
 
 ## How it works
 
 ### Move 1 — the mental model
 
+You know how a human reviewer can have biases — preferring confident answers, longer essays, familiar phrasing — and a good review process compensates by structuring the rubric? Same shape. The LLM judge has known biases; the rubric design + calibration check is the structural compensation.
+
 ```
-  Three known biases
+  Three known biases, three structural defenses
 
-  ┌─ Position bias ───────────────────────────────┐
-  │  Judge prefers whichever variant appears      │
-  │  first (or last) in the prompt.               │
-  │  Fix: randomize order per eval; aggregate     │
-  │  across orderings.                            │
-  └────────────────────────────────────────────────┘
+  bias                                defense
+  ────                                ───────
+  position (A vs B → prefers A)        randomize per-eval
 
-  ┌─ Verbosity bias ──────────────────────────────┐
-  │  Judge prefers longer responses, even when    │
-  │  longer doesn't mean better.                  │
-  │  Fix: cap length OR include length as a       │
-  │  scored dimension (penalize verbosity).       │
-  └────────────────────────────────────────────────┘
+  verbosity (long > short)             cap length OR rubric-score length
 
-  ┌─ Self-preference bias ────────────────────────┐
-  │  Judge prefers outputs from the same model    │
-  │  family as itself (Claude judges Claude       │
-  │  favorably).                                  │
-  │  Fix: use a different model family for judge  │
-  │  than for the agent being judged.             │
-  └────────────────────────────────────────────────┘
+  self-preference (Sonnet rates        use different family as judge
+   Sonnet output higher)                (Haiku judges Sonnet, GPT-4o
+                                         judges Claude, etc.)
+
+  → Plus: manual spot-check on N samples to catch any bias
+          the rubric design missed.
 ```
 
 ### Move 2 — the step-by-step walkthrough
 
-**For blooming insights' hypothetical evals, the mitigation set is:**
+**Part 1 — position bias and the randomization defense.**
 
-  → **Position bias mitigation.** For absolute scoring (one output at
-    a time), position isn't an issue. For pairwise comparisons (which
-    *could* land if the team A/B tests prompts), shuffle the order of
-    A and B per eval item, OR run both orderings and average. The
-    canonical pattern:
+When the judge sees two variants ("Is response A better, or response B?"), it tends to prefer whichever appears first. Defense: randomize the order per evaluation. Half the time A appears first; half the time B does. Aggregate the scores by which-was-actually-A (using a hidden label), not by position.
 
-    ```typescript
-    // Hypothetical test/evals/pairwise.ts
-    async function pairwiseScore(input, outputA, outputB) {
-      const scoreAB = await judge(input, outputA, outputB);  // A first
-      const scoreBA = await judge(input, outputB, outputA);  // B first
-      return (scoreAB + (1 - scoreBA)) / 2;  // averaged, position-debiased
-    }
-    ```
+Phase 3 didn't run pairwise eval (it scored each output independently against a rubric), so position bias wasn't a concern. The next iteration WILL include pairwise (prompt variant testing), and randomization needs to land there.
 
-  → **Verbosity bias mitigation.** Anthropic-side: the diagnostic
-    agent's output is already structured JSON with bounded prose
-    fields. The `conclusion` field is one sentence; `evidence` is a
-    list of strings. The agent doesn't have headroom to be verbose.
-    Judge-side: the rubric explicitly says "score based on accuracy
-    and specificity, not length."
+**Part 2 — verbosity bias and the rubric-design defense.**
 
-  → **Self-preference bias mitigation.** Use a different model family
-    for the judge. blooming insights uses `claude-sonnet-4-6` for
-    agents; the judge should be a non-Anthropic model — GPT-4o,
-    `gemini-2.5-pro`, Llama 3.1 70B. The eval harness exercise from
-    `01-eval-set-types.md` already specifies this.
+The judge tends to prefer longer responses, treating "more words" as "more thoroughness." Two defenses:
 
-**A subtler bias not in the canonical list: rubric drift.** If the
-rubric's wording changes between eval runs, scores aren't comparable.
-Pin the rubric prompt to git; treat the rubric file
-(`test/evals/judge-prompt.ts`) as the source of truth, version it,
-note rubric changes in CHANGELOG.
+  → **Cap length.** Tell the judge "ignore anything past 500 tokens." Crude but effective.
+  → **Rubric-score length.** Include "is the response appropriately concise?" as a rubric dimension. The judge can't reward verbosity without explicitly losing points on the conciseness dimension.
 
-**Another subtle one: input-shaped bias.** The judge sees the input
-along with the output, and can be biased by hints in the input. For
-example, if a golden-set anomaly is labeled "critical" and the judge
-sees that, it might score outputs that match "critical" higher than
-outputs that match the actual cause. Mitigation: separate "context for
-the judge to understand the input" from "context the judge should be
-blind to" — pass only what's needed.
+The second is better-shaped: it makes length an explicit signal, not an implicit one. The Phase 3 recommendation rubric should have had a conciseness dimension; it didn't, which may have contributed to recommendations getting verbose over the eval iterations.
 
-**Calibration check.** Once in a while (monthly?), have a human re-
-score 5-10 items from a recent eval and compare to the LLM judge.
-If LLM-judge scores correlate >0.7 with human scores, the judge is
-reliable. If <0.5, the rubric needs work or the judge model needs
-swapping.
+**Part 3 — self-preference and the family-swap defense.**
+
+The Phase 3 suite used **Sonnet 4.6 as both agent and judge**. That's self-preference territory by construction — the judge has structural reasons to prefer outputs from its own family. The 8/8 + 3/3 manual spot-check provided some defense (the human caught any egregious bias), but the design was a known limitation.
+
+The next iteration should use **Haiku as judge for the simpler rubric items** (especially the structured-output dimensions) and a different-family model where available. Haiku judging Sonnet is cross-family-enough (different model size, different training emphasis) to reduce self-preference, even if both are Anthropic.
+
+**Part 4 — the calibration pattern in detail.**
+
+Phase 3's 8/8 + 3/3 manual spot-check:
+
+```
+  Calibration shape
+
+  1. Run the eval suite at scale.
+  2. Random-sample N items (Phase 3: 8 diagnoses, 3 recommendations).
+  3. Manually score each by a human reviewer.
+  4. Compare LLM-judge scores to human scores.
+  5. If agreement is high (Phase 3: 100% — 8 of 8, 3 of 3),
+     trust the LLM-judge for the at-scale run.
+  6. If agreement is low, debug the rubric: is the judge
+     misreading some dimension? Is the rubric ambiguous?
+
+  Re-spot-check whenever:
+   - the rubric changes
+   - the agent's prompt changes meaningfully
+   - the underlying model is upgraded
+```
+
+The 8/8 + 3/3 numbers are small but defensible because Phase 3 was small (3 seeded anomalies, K=10). For a bigger eval (say 50 seeded anomalies, K=20), you'd want bigger spot-check samples (~10-20 each).
+
+**Part 5 — what's NOT a bias but feels like one.**
+
+Some "biases" people report on LLM-judges are actually rubric ambiguity, not judge bias. If the rubric says "is the conclusion well-reasoned?" without defining "well-reasoned," different judges (or the same judge on different runs) will score inconsistently. The defense is rubric precision, not bias mitigation. A good rubric is concrete: "does the conclusion name a specific cause? does it cite specific tool results? does it acknowledge alternative hypotheses?"
+
+The Phase 3 rubric had this discipline; rubric ambiguity wasn't the bottleneck.
 
 ### Move 3 — the principle
 
-**LLM-as-judge is biased; biased scoring is still useful for *relative*
-tracking ("did this PR regress?") but not for *absolute* claims ("our
-agent is 92% accurate").** Design the eval for relative use, mitigate
-known biases, calibrate against human scoring periodically.
+**LLM-as-judge is cheap, biased, and defensible *with calibration*.** The biases are predictable (position, verbosity, self-preference) and have structural defenses (randomization, rubric design, family swap). The calibration check (manual spot-check) is the load-bearing trust mechanism. Skip the calibration and you have a fast eval that you can't actually trust.
 
-## Primary diagram
+## Primary diagram — the full recap
 
 ```
-  The three biases and their mitigations
+  LLM-as-judge bias mitigation in this codebase
 
-  ┌─ POSITION BIAS ───────────────────────────────┐
-  │  source: attention weights favor edges        │
-  │  affects: pairwise comparisons primarily      │
-  │  fix: randomize / run both orderings / avg    │
-  └────────────────────────────────────────────────┘
+  ┌─ Phase 3 (retired) ────────────────────────────────────────┐
+  │  Judge: Sonnet 4.6 (same as agent — self-preference risk)  │
+  │  Position bias: not applicable (no pairwise)               │
+  │  Verbosity bias: NOT explicitly defended (no length rubric)│
+  │  Self-preference: defended only by manual spot-check       │
+  │  Calibration: 8/8 + 3/3 manual review                      │
+  │  Status: retired with Olist substrate (PR #8)              │
+  └────────────────────────────────────────────────────────────┘
 
-  ┌─ VERBOSITY BIAS ──────────────────────────────┐
-  │  source: training rewards detailed responses  │
-  │  affects: absolute and pairwise               │
-  │  fix: cap length in prompt OR penalize length │
-  │   in rubric                                    │
-  └────────────────────────────────────────────────┘
-
-  ┌─ SELF-PREFERENCE BIAS ────────────────────────┐
-  │  source: in-family fluency / familiar phrasing│
-  │  affects: any cross-model evaluation           │
-  │  fix: use different model family for judge    │
-  │   (GPT-4o judges Claude; Claude judges GPT)   │
-  └────────────────────────────────────────────────┘
-
-  PLUS: rubric drift (pin to git), input bias (limit context to judge)
+  ┌─ Next iteration (planned, against Synthetic) ──────────────┐
+  │  Judge model: Haiku for structured rubric items            │
+  │                Sonnet for prose rubric items                 │
+  │                cross-family where available                  │
+  │  Position bias: randomize pairwise comparisons              │
+  │  Verbosity bias: add "is the response concise?" rubric item │
+  │  Self-preference: Haiku judges Sonnet (cross-size)          │
+  │  Calibration: ~10-20 manual samples per pillar, recheck    │
+  │                on rubric/prompt changes                       │
+  └────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The three biases were first cataloged in "Judging LLM-as-a-Judge with
-MT-Bench and Chatbot Arena" (Zheng et al., 2023). The paper showed
-that GPT-4-as-judge had measurable position bias (~5-10 pp shift based
-on order), verbosity bias (~10-15 pp preference for longer responses),
-and self-preference (GPT-4 favored GPT-4 outputs by ~5 pp over
-equivalently good outputs from other models).
+**Why this matters even though there's no eval today.** The Phase 3 retirement is recent (2026-06-18). When the next iteration lands (`B5.1` in `01-eval-set-types.md`), the bias defenses have to be designed in from the start. Bolting them on after — discovering the judge prefers verbose recommendations 3 months in — means throwing out months of eval data.
 
-Subsequent work has shown these biases are mitigatable but not
-eliminatable. The mainstream production practice: use LLM-as-judge for
-relative tracking, calibrate against humans periodically, treat
-absolute scores as approximate.
+The discipline is to design the rubric + judge model + calibration plan BEFORE running the first at-scale eval. Phase 3 did this; the next iteration should too.
 
-For blooming insights specifically: the most important mitigation is
-*using a non-Anthropic judge for Anthropic-produced outputs*. Without
-this, the judge will systematically inflate scores. GPT-4o or
-Gemini-2.5-Pro are the standard choices; both have strong rubric-eval
-performance.
+**The cross-family-judge cost.** Using a different model family as judge (e.g. GPT-4o judging Claude) means adding an OpenAI dependency. Not free; possibly not worth it for this codebase. The reasonable compromise is cross-size (Haiku judging Sonnet) — still same family, but the model is smaller and trained with different emphasis, which reduces (not eliminates) self-preference.
+
+If a future product release REALLY needs strong self-preference defense (regulatory, etc.), bring in the cross-family judge despite the dependency cost.
+
+**Why the rubric is the load-bearing defense, not the judge model.** Three reasons:
+
+  1. **Rubric ambiguity is your largest source of variance.** A precise rubric ("does the conclusion cite at least one tool result?") gets consistent scores from almost any judge. A vague rubric ("is it good?") gets inconsistent scores from even the best judge.
+  2. **Rubric is portable across judge changes.** Swap from Sonnet-judge to Haiku-judge tomorrow; if the rubric is precise, the scores stay comparable.
+  3. **Rubric is debuggable.** When the judge disagrees with the human spot-check, you can trace exactly which rubric dimension was misread. With a vague rubric, you can't.
 
 ## Project exercises
 
-### Exercise — calibration check between LLM judge and human
+### Exercise — Haiku-as-judge with rubric precision and randomized pairwise
 
-  → **Exercise ID:** `study-ai-eng-05-03.1`
-  → **What to build:** After the LLM-as-judge from `02-eval-methods.md`
-    exercise is running, hand-score 5-10 recent eval items yourself.
-    Compute the correlation (Pearson or Spearman) between LLM-judge
-    scores and your human scores. Document the result in the eval
-    README; if correlation < 0.5, iterate on the rubric.
-  → **Why it earns its place:** "How do you know your LLM judge is
-    reliable?" is the second-question follow-up in any eval interview.
-    Calibration is the answer; without it the claim is theoretical.
-  → **Files to touch:** new `test/evals/calibration.md` (note pad +
-    correlation result), no code changes.
-  → **Done when:** Correlation number is documented; iteration on
-    rubric or judge model captured.
-  → **Estimated effort:** `1–4hr`
+  → **Exercise ID:** B5.3
+  → **What to build:** Extend the eval runner (`B5.2` in `02-eval-methods.md`) to use Haiku as judge for the structured dimensions (`feature` enum, `severity`, `metric`) and Sonnet for prose dimensions (`conclusion`, `rationale`). For any pairwise comparison (prompt v1 vs v2), randomize the order per evaluation and aggregate by hidden label. Add a "conciseness" rubric dimension to the recommendation scorer to defend verbosity bias.
+  → **Why it earns its place:** lands all three bias defenses (family swap via Haiku-as-structured-judge, randomization for pairwise, conciseness rubric item) from the start. Codifies the lessons from Phase 3's known limitation (Sonnet-judging-Sonnet) into the next iteration's design.
+  → **Files to touch:** `eval/judge.ts` (per-method model selection), `eval/methods.ts` (randomized-order pairwise), `eval/seeds.ts` (add conciseness as a rubric dimension on recommendations).
+  → **Done when:** running `npm run eval` shows per-judge-model cost in the report, pairwise comparisons report a hidden-label-balanced score, the conciseness dimension fires on artificially-verbose outputs, and the calibration spot-check passes against the new design.
+  → **Estimated effort:** 1–2 days.
 
 ## Interview defense
 
-**Q: What biases would your LLM-as-judge eval be subject to?**
+**Q: "Why was Sonnet judging Sonnet a limitation in your Phase 3 eval?"**
 
-Three canonical ones plus subtler ones:
+Self-preference bias by construction — when a model judges output from its own family, it tends to score those outputs higher than equally-good outputs from another family. Phase 3 used Sonnet 4.6 as both agent and judge. The defense was the 8/8 + 3/3 manual spot-check — every sample the human reviewed agreed with the judge — but the structural bias was still there. The next iteration uses Haiku as judge for structured rubric items (cross-size defense), keeping Sonnet only for prose rubric items where the smaller model's reasoning isn't enough.
 
-```
-  position bias     — pairwise comparisons; fix by randomize+average
-  verbosity bias    — judge prefers longer; fix by length cap or rubric
-  self-preference   — Claude favors Claude; fix by non-Anthropic judge
+True cross-family (e.g. GPT-4o judging Claude) is the strongest defense; not worth the OpenAI dependency for this codebase.
 
-  + rubric drift    — pin rubric to git
-  + input bias      — limit context the judge sees
-```
+*Anchor: "Phase 3 known limitation: Sonnet self-judging. Next iteration: Haiku for structured rubric items."*
 
-For blooming insights specifically, the biggest one is self-preference
-— since the agents are Claude, the judge should be non-Anthropic
-(GPT-4o is the canonical choice). The harness exercise from
-`01-eval-set-types.md` already specifies this.
+**Q: "How would you defend against verbosity bias?"**
 
-**Anchor line:** "Judge model from different family than agent. Without
-this single move, scores systematically inflate."
+Two defenses, layered. First, add a concise rubric dimension: "is the response appropriately concise?" scored 1-5. Now the judge can't reward verbosity without losing points on conciseness. Second, cap effective length in the prompt: "ignore anything past 500 tokens" (crude but works). The Phase 3 recommendation rubric didn't have a conciseness item — possibly why recommendations got verbose over iterations. The next iteration adds it.
 
-**Q: How do you know your LLM judge is reliable?**
+The bigger principle: don't hope the judge ignores verbosity. Make verbosity an explicit dimension that's scored against, so verbosity becomes a known cost.
 
-Calibrate against human scoring periodically. Hand-score 5-10 recent
-eval items, compute correlation with the LLM judge. Aim for >0.7
-correlation. If <0.5, iterate on the rubric or swap judge models.
-Treat LLM-as-judge scores as approximate; don't make absolute
-claims like "92% accurate" from them.
+*Anchor: "Rubric-score length explicitly. Implicit ignorance of bias fails."*
 
 ## See also
 
-  → `02-eval-methods.md` — when LLM-as-judge is the right method
-  → `01-eval-set-types.md` — the eval sets the judge scores against
+  → `02-eval-methods.md` — the LLM-as-judge method this file calibrates
+  → `01-eval-set-types.md` — the sets these calibration patterns apply to
+  → `01-llm-foundations/03-sampling-parameters.md` — adjacent: how sampling defaults contributed to Phase 3's conclusion-instability finding

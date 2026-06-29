@@ -1,337 +1,247 @@
-# 07 — heuristic-before-LLM
+# Heuristic-before-LLM
 
-**Subtitle:** Deterministic gates before the model call · Industry standard
+*Industry standard — heuristic-before-LLM routing · here: intent-layer variant*
 
-## Zoom out, then zoom in
+## Zoom out — where this concept lives
 
-Before the LLM ever runs, deterministic code gates what it sees. In this
-codebase the heuristic-before-LLM pattern shows up in three places:
-
-  1. **Bootstrap.** Fixed MCP tool sequence resolves the project + schema
-     BEFORE any agent runs. The LLM never picks `list_cloud_organizations`.
-  2. **Coverage gating.** `runnableCategories(available)` filters the
-     monitoring category checklist down to ones whose required signals are
-     in the workspace's schema — the LLM only sees categories it can
-     actually run.
-  3. **Intent classification routing.** A cheap haiku call routes a
-     free-form query to one of three agent shapes BEFORE the expensive
-     sonnet loop starts.
+The classic pattern uses a regex or rule to skip the LLM when an input is predictable. This codebase applies the pattern at a higher altitude: not skipping the LLM, but choosing between a *cheap* LLM (Haiku) for intent classification and the *expensive* LLM (Sonnet) for the actual answer. Same shape, different layer.
 
 ```
-  Zoom out — heuristics gate the LLM, not vice versa
+  Zoom out — heuristic-before-LLM at the intent layer
 
-  ┌─ Route handler ──────────────────────────────────────┐
-  │  1. resolveAnomaly        (deterministic — sessionStorage > │
-  │                            in-memory > demo file)    │
-  │  2. bootstrap schema      (deterministic — fixed MCP │
-  │                            tool chain)               │
-  │  3. listTools             (deterministic)            │
-  │  4. coverage filter       (deterministic — runnable- │
-  │                            Categories vs schema caps)│
-  │  5. classifyIntent        (cheap LLM — haiku)         │  ← guard layer
-  │  ───────────────────────────────────────────────────  │
-  │  6. ★ EXPENSIVE LLM ★     (sonnet agent loop)        │  ← what we protect
-  └──────────────────────────────────────────────────────┘
+  ┌─ Browser ────────────────────────────────────────────────┐
+  │  user types into QueryBox                                │
+  └──────────────────────┬───────────────────────────────────┘
+                         │  fetch('/api/agent?q=…')
+                         ▼
+  ┌─ Route (app/api/agent/route.ts:250) ─────────────────────┐
+  │  ┌─ Intent classify ─────────────────────────────────┐  │
+  │  │  ★ CHEAP: claude-haiku-4-5  ★                     │  │ ← we are here
+  │  │  ~500 input tokens, ~10 output, ~$0.0003          │  │
+  │  │  → 'monitoring' | 'diagnostic' | 'recommendation' │  │
+  │  │    | 'generic'                                    │  │
+  │  └──────────────────────┬────────────────────────────┘  │
+  └─────────────────────────┼──────────────────────────────────┘
+                            ▼  routes to the right Sonnet agent
+  ┌─ ★ EXPENSIVE: claude-sonnet-4-6 ★ ───────────────────────┐
+  │  the matching agent runs the full tool loop              │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-## Structure pass
+**Zoom in.** The classifier is the only non-Sonnet call in the codebase. It exists for two reasons: pick the right downstream agent (routing), and avoid spinning up Sonnet on generic questions (cost).
 
-  → **One axis to trace — cost.** Steps 1-4 are free (no LLM tokens). Step
-    5 is cheap (~$0.0003, haiku). Step 6 is expensive (~$0.20). The
-    pattern is: cheap-first, expensive-second. Every step that can resolve
-    the request without calling the expensive layer is worth taking.
+## Structure pass — layers · axes · seams
 
-  → **The seam:** between "what the route handler does" and "what AptKit's
-    agent classes do." Blooming owns everything *up to* and *including*
-    intent classification; AptKit owns everything from "agent.investigate"
-    onward.
+**Layers:** user input → routing decision → downstream agent.
+
+**Axis: who decides?** Classic heuristic-before-LLM has CODE (regex) decide the easy cases. This codebase has a CHEAP LLM decide the routing — but the underlying tradeoff is the same: do the cheap thing first, only spend the expensive thing when needed.
+
+**Seam:** the `Intent` return value at `lib/agents/intent.ts:8`. Once classified, the route's switch (`leadAgent` selection at `app/api/agent/route.ts:228-229`) picks the downstream agent. The seam is small and one-directional.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You already use this pattern: a typed router (Next.js App Router, Express) is
-a heuristic-before-handler — the path / method / params determine which
-handler runs *before* the handler runs. Heuristic-before-LLM is the same
-shape one layer down: the *content* of the request determines which agent
-shape runs before the agent.
+You know how a load balancer in front of expensive backends routes requests cheaply before any backend pays the cost? Intent classification is that, for LLM agents. Cheap router up front; the expensive agent only runs once we know which one should run.
 
 ```
-  Heuristic-before-LLM — three gates in this codebase
+  Cheap-first routing pattern
 
-  request
-    │
-    ▼
-  ┌─ gate 1: resolveAnomaly ──┐  (deterministic lookup)
-  │  insightId → Anomaly      │
-  └───────────┬───────────────┘  miss → 404 (no LLM)
-              │ hit
-              ▼
-  ┌─ gate 2: bootstrap ────────┐  (deterministic MCP chain)
-  │  list_cloud_organizations  │
-  │  → list_projects           │
-  │  → get_event_schema → …    │
-  └───────────┬────────────────┘  miss → 500 (no LLM)
-              │ ok
-              ▼
-  ┌─ gate 3: runnableCategories ┐  (deterministic schema-vs-caps)
-  │  Set<available signals> ∩   │
-  │  category.requires           │
-  └───────────┬─────────────────┘  empty → fall back to canonical metrics
-              │ filtered list
-              ▼
-  ┌─ gate 4 (free-form only):    ┐
-  │  classifyIntent (haiku, ~$0.0003)│
-  └───────────┬─────────────────┘
-              │ intent
-              ▼
-  ┌─ EXPENSIVE: agent loop (sonnet) ─┐
-  └───────────────────────────────────┘
+  user query
+       │
+       ▼
+  ┌─ Cheap classifier ─────────────────────┐
+  │  Haiku, ~500 input tokens              │  ~$0.0003 per call
+  │  → fast: <500ms p50                    │
+  │  → constrained output: 4-way enum       │
+  └────────────┬───────────────────────────┘
+               │
+               ▼
+        ┌──── intent ────┐
+        │                │
+        ▼ monitoring     ▼ diagnostic, recommendation, or generic
+   MonitoringAgent   the matching Sonnet agent
+   (full tool loop)  (full tool loop)
 ```
 
 ### Move 2 — the step-by-step walkthrough
 
-**Gate 1 — anomaly resolution.** `resolveAnomaly()` in
-`app/api/agent/route.ts:35-60`:
+**Part 1 — the classifier is one small file.**
+
+`lib/agents/intent.ts` is 38 lines total. The Haiku call lives at line 16:
 
 ```typescript
-function resolveAnomaly(sessionId: string, insightId: string, insightParam?: string | null): Anomaly | null {
-  if (insightParam) {                          // 1. try the client-handed insight (best)
-    try {
-      const i = JSON.parse(insightParam) as Insight;
-      if (i && typeof i.metric === 'string' && i.change && Array.isArray(i.scope) && i.severity) {
-        return insightToAnomaly(i);
-      }
-    } catch { /* fall through */ }
-  }
-  const a = getAnomaly(sessionId, insightId); // 2. same-instance in-memory
-  if (a) return a;
-  const i = getInsight(sessionId, insightId); // 3. same-instance insight cache
-  if (i) return insightToAnomaly(i);
-  try {                                        // 4. fall back to the demo snapshot
-    if (existsSync(DEMO_FILE)) {
-      const snap = JSON.parse(readFileSync(DEMO_FILE, 'utf8')) as { insights?: Insight[] };
-      const di = (snap.insights ?? []).find((x) => x.id === insightId);
-      if (di) return insightToAnomaly(di);
-    }
-  } catch { /* ignore */ }
-  return null;
+const CLASSIFIER_MODEL = 'claude-haiku-4-5-20251001';
+
+export async function classifyIntent(
+  anthropic: Anthropic,
+  query: string,
+  sessionId?: string,
+  signal?: AbortSignal,
+): Promise<Intent> {
+  return classifyAptKitIntent(
+    new AnthropicModelProviderAdapter(
+      anthropic,
+      'coordinator',                                  // agent label for logs
+      sessionId,
+      CLASSIFIER_MODEL,                               // ← Haiku override
+      'agents/intent:classifyIntent',                 // distinct logSite
+    ),
+    query,
+    { signal },
+  );
 }
 ```
 
-The pattern: try the cheapest, most-trusted source first; fall through to the
-next. The most-trusted source is the client-handed insight (passed via
-`?insight=` from `sessionStorage`) — it survives Vercel's per-instance memory
-boundary. The fallback chain handles the cases where session is fresh, the
-demo is loaded, or the lookup is happening on a different Vercel instance
-than the one that produced the briefing.
+Two things to notice:
 
-**No LLM ran to find this anomaly.** The page click → query parameter →
-lookup is pure data plumbing.
+  → `CLASSIFIER_MODEL` is hard-coded — the classifier is contractually cheap. If you ever wanted to A/B Sonnet vs Haiku for intent, this is the seam.
+  → `'agents/intent:classifyIntent'` is the distinct log site, so Vercel filters separate intent costs from agent costs cleanly.
 
-**Gate 2 — bootstrap schema.** Inside `bootstrapSchema()`
-(`lib/mcp/schema.ts`, called from the route at line 235), the *fixed* MCP
-tool chain is:
+**Part 2 — the route fires it only on the free-form path.**
 
-```
-  list_cloud_organizations   →  get the org list
-  list_projects              →  get projects under the org
-  get_event_schema           →  get events + properties
-  get_customer_property_schema → get customer props
-  list_catalogs              →  get catalog list
-  get_project_overview       →  get totals + oldest timestamp
-```
-
-These six calls run in a fixed sequence (with parallelization where the
-results don't depend). The LLM never picks any of them. They're listed in
-`lib/mcp/tools.ts:55-59` as `bootstrapTools`. The comment in that file is
-explicit:
+The intent classifier runs only when the user supplies a free-form `q` (the chat surface), not when they click an anomaly card. From `app/api/agent/route.ts:247-253`:
 
 ```typescript
-// The exact tools the bootstrap path calls (see lib/mcp/schema.ts):
-//   resolveProject  → list_cloud_organizations, list_projects
-//   bootstrapSchema → get_event_schema, get_customer_property_schema,
-//                     list_catalogs, get_project_overview
-```
-
-The agents never see these tools in their allowlists. The schema arrives
-pre-parsed as `WorkspaceSchema`; that's what the LLM gets.
-
-**Gate 3 — coverage gating.** `runnableCategories()` in
-`lib/agents/categories.ts:44-46`:
-
-```typescript
-export function runnableCategories(available: Set<string>): AnomalyCategory[] {
-  return aptKitRunnableCategories(CATEGORIES.map(toAptKitCategory), available)
-    .map(toBloomingCategory);
-}
-```
-
-The set of "available" signals comes from `schemaCapabilities(schema)` —
-deterministic analysis of which events + properties exist. Each category
-declares `requires: string[]` (e.g. `revenue_drop` requires
-`purchase.total_price`); if the workspace doesn't emit that property, the
-category is dropped from the checklist. The monitoring agent then sees only
-runnable categories in its prompt, and *cannot* try to run a category whose
-data isn't there.
-
-This is the load-bearing version of heuristic-before-LLM in this codebase.
-Without it, the model would burn tool calls testing for data that doesn't
-exist, get empty results, and have to figure out from the absence whether to
-report `no signal` or `bad query`. With the gate, the prompt only mentions
-categories that *will* return data.
-
-**Gate 4 — intent classification.** Inside the free-form query branch
-(`app/api/agent/route.ts:247-260`):
-
-```typescript
-if (q && !insightId) {
+if (q && !insightId) {                                 // free-form path only
   req.signal.throwIfAborted();
   const t_intent = performance.now();
-  const intent = await classifyIntent(anthropic, q, sid, req.signal); // ← haiku
-  recordPhase('intent_classify', t_intent);
+  const intent = await classifyIntent(anthropic, q, sid, req.signal);
+  recordPhase('intent_classify', t_intent);            // wall-clock log
   stepFor('coordinator', 'thought', `interpreting your question as a ${intent} query…`);
   const queryAgent = new QueryAgent(anthropic, dataSource, schema, allTools, sid);
-  // … sonnet agent loop using `intent` to shape the prompt
+  // ... QueryAgent.answer(q, intent, hooks)
 }
 ```
 
-The intent classify is the cheap LLM gate — a haiku call (~$0.0003) routes
-the query before the expensive sonnet loop. If the user asks "what's our
-purchase trend?", the classify returns `diagnostic`, and the query agent
-knows to lean on diagnostic-style tools. If the user asks "give me revenue
-last month", classify returns `monitoring`, and the agent picks monitoring
-tools.
+When the user clicked a card, the route already knows the agent path (diagnose, then recommend). No classify needed. When the user types a question, the classifier picks the right downstream tool surface.
 
-The classify itself is heuristic-before-LLM in miniature: a one-shot, no-tools
-call with a tight prompt. `parseIntent` (`lib/agents/intent.ts:12-14`) is
-lenient — defaults to `diagnostic` on parse failure, so a junky model
-response doesn't 500 the request.
+**Part 3 — the parser is forgiving.**
+
+Haiku is fast and cheap but occasionally returns text that's not a clean enum value. `parseIntent()` at `lib/agents/intent.ts:13` defends:
+
+```typescript
+export function parseIntent(raw: string): Intent {
+  return parseAptKitIntent(raw);                     // defaults to 'diagnostic'
+                                                      //  if no match
+}
+```
+
+The default of `'diagnostic'` is deliberate: when Haiku is ambiguous, treat the query as needing investigation (the safer assumption than treating it as generic).
+
+**Part 4 — the savings shape.**
+
+```
+  Cost shape: with vs without intent classifier
+
+  ┌── Without classifier ──────────────────────────┐
+  │  every query → query agent (Sonnet)             │
+  │  generic "hi" → ~$0.005 (small Sonnet call)     │
+  │  legit query → ~$0.05  (full Sonnet investigation)│
+  └─────────────────────────────────────────────────┘
+
+  ┌── With classifier ──────────────────────────────┐
+  │  every query → Haiku classify (~$0.0003)        │
+  │   → 'generic' → small Sonnet  (~$0.005)         │
+  │   → 'monitoring' / 'diagnostic' / etc.          │
+  │     → matching Sonnet agent (~$0.05)            │
+  │                                                 │
+  │  Marginal cost of classifier: $0.0003 per query │
+  │  Marginal value: routing + safety default       │
+  │  Cost saved on "generic" path: nothing — the   │
+  │   savings here are routing (right agent), not  │
+  │   skipping the LLM entirely                     │
+  └─────────────────────────────────────────────────┘
+```
+
+Important honesty: the classifier doesn't *skip* the expensive LLM. It picks *which* expensive LLM call to make. The "cost saved" framing only applies if you compare to a baseline where the wrong agent runs first, fails, then the right agent runs as a fallback — which isn't what the without-classifier path looks like.
 
 ### Move 3 — the principle
 
-**Gate the expensive layer with cheaper layers above it.** Anything you can
-resolve with a lookup, a deterministic schema-cap intersection, or a haiku
-classify is work the sonnet loop doesn't have to do. Each gate is a place
-where you converted "the model figures it out at $0.05 / call" into "the
-code or the cheap model figures it out at ~$0 / call."
+**Use a cheap call when you need a quick decision; use the expensive call when you need the answer.** Two altitudes of the same pattern. Classic heuristic-before-LLM uses code for the decision; this codebase uses a cheap LLM. Either works as long as the cheap layer's failure modes are cheap to recover from (here: the parser defaults safely).
 
-The reverse anti-pattern is common: handing the LLM the whole problem and
-hoping it sorts out what's relevant. Cheap, fast, and wrong, in that order.
-
-## Primary diagram
+## Primary diagram — the full recap
 
 ```
-  Three heuristic gates, one LLM loop — blooming insights' layering
+  The intent-classifier seam end to end
 
-  request
-    │
-    ▼
-  ┌────────────────────────────────────────────────────────┐
-  │ GATE 1 — resolveAnomaly (deterministic)                │
-  │ - try ?insight= JSON                                   │
-  │ - try in-memory by sessionId                           │
-  │ - try demo snapshot                                    │
-  │ → null = 404, no LLM                                   │
-  └──────────────────────┬─────────────────────────────────┘
-                         │ Anomaly
+  ┌─ Browser ─────────────────────────────────────────────┐
+  │  QueryBox: user types "why did revenue drop in USA?"  │
+  └──────────────────────┬────────────────────────────────┘
+                         │  GET /api/agent?q=…
                          ▼
-  ┌────────────────────────────────────────────────────────┐
-  │ GATE 2 — bootstrap (deterministic MCP chain)           │
-  │ list_cloud_organizations → list_projects →             │
-  │ get_event_schema → get_customer_property_schema →      │
-  │ list_catalogs → get_project_overview                   │
-  │ → WorkspaceSchema (~30k chars raw, summarised to ~1.5k)│
-  └──────────────────────┬─────────────────────────────────┘
-                         │ schema
+  ┌─ Route ───────────────────────────────────────────────┐
+  │  if (q && !insightId):                                │
+  │    classifyIntent(anthropic, q, sid, signal)          │
+  │      → new AnthropicModelProviderAdapter(             │
+  │          anthropic, 'coordinator', sid,               │
+  │          CLASSIFIER_MODEL (Haiku),                    │
+  │          'agents/intent:classifyIntent')              │
+  │      → classifyAptKitIntent(adapter, q, { signal })   │
+  │      ────────────────────────────────                 │
+  │      log line: { site:'agents/intent:classifyIntent',│
+  │                  sessionId, usage:{ input_tokens:~500│
+  │                                     output_tokens:~10│
+  │                                   } }                 │
+  │                                                       │
+  │    intent = 'diagnostic'                              │
+  │    stepFor('coordinator', 'thought',                  │
+  │      'interpreting your question as a diagnostic q…')│
+  │                                                       │
+  │    new QueryAgent(...).answer(q, intent, hooks)       │
+  └──────────────────────┬────────────────────────────────┘
+                         │  Sonnet, full tool loop
                          ▼
-  ┌────────────────────────────────────────────────────────┐
-  │ GATE 3 — runnableCategories (deterministic schema cap) │
-  │ available = schemaCapabilities(schema)                 │
-  │ checklist = CATEGORIES.filter(c =>                     │
-  │   c.requires.every(r => available.has(r)))              │
-  │ → only categories whose data is present                │
-  └──────────────────────┬─────────────────────────────────┘
-                         │ checklist
-                         ▼
-  ┌────────────────────────────────────────────────────────┐
-  │ GATE 4 (free-form only) — classifyIntent (haiku)       │
-  │ ~$0.0003 routes query to monitoring/diagnostic/        │
-  │ recommendation shape                                   │
-  └──────────────────────┬─────────────────────────────────┘
-                         │ intent
-                         ▼
-  ┌────────────────────────────────────────────────────────┐
-  │ EXPENSIVE — agent loop (sonnet, ~$0.20)                │
-  │ Now operating on filtered data, a known schema, and a  │
-  │ confirmed shape.                                       │
-  └────────────────────────────────────────────────────────┘
+  ┌─ Anthropic API: Sonnet ───────────────────────────────┐
+  │  the matching agent runs                              │
+  └───────────────────────────────────────────────────────┘
+
+  One Haiku call + one Sonnet investigation,
+   instead of a single Sonnet call that has to
+   first decide which kind of question this is.
 ```
 
 ## Elaborate
 
-The pattern transcends LLM apps. Caching is heuristic-before-DB. Rate limiting
-is heuristic-before-handler. ETag validation is heuristic-before-render. In
-LLM-shaped systems the pattern is louder because the expensive layer is
-*expensive*, and because the expensive layer is *unreliable* — gating it
-both saves money and keeps your error surface small.
+**Why a cheap LLM and not a regex.** Three reasons:
 
-The case for *removing* a gate is when it's filtering wrong — when
-`runnableCategories` excludes a category that the model could have stretched
-to fit (e.g. proxying for missing `event.category` with `event.product_id`).
-In blooming insights this hasn't happened; the categories were designed
-conservatively. If it did, the move would be to relax the `requires` list and
-let the monitoring prompt note the substitution, not to remove the gate.
+  1. **Intent labels need natural-language understanding.** "Show me the revenue trend" is monitoring; "why did revenue drop" is diagnostic; "what should I do about it" is recommendation. Regex on keywords would get most of these but fail on rewrites ("revenue went down" vs "revenue declined").
+  2. **The intent classifier already exists in AptKit.** `classifyAptKitIntent` is a library function; this codebase pays the integration cost (the `CLASSIFIER_MODEL` override + the log site) rather than building its own classifier.
+  3. **Cost is genuinely negligible.** ~$0.0003 per query is below the rate of any cost concern. The classifier saves nothing in dollars; it saves *errors* (routing to the wrong agent).
+
+**Where this codebase doesn't apply the pattern.** Inside the monitoring agent's 6-call tool loop, every tool selection is made by Sonnet. A heuristic-before-LLM pattern *inside* the loop — for example, "if the user's anomaly is `revenue_drop`, the first tool call should be `execute_analytics_eql` with a hard-coded recipe" — isn't wired. The agent decides every tool every time.
+
+That's a deliberate gap. The 10-category checklist + `runnableCategories()` filter at `lib/agents/categories.ts:46` is the closest analog: the *categories* are gated by rules, but the *queries within a category* are agent-decided.
 
 ## Project exercises
 
-### Exercise — add a "free-form query is actually a saved-insight click" heuristic
+### Exercise — Pre-cache first-tool-call for the monitoring agent
 
-  → **Exercise ID:** `study-ai-eng-07.1`
-  → **What to build:** Before running `classifyIntent`, check whether `q`
-    matches a saved insight's `headline` (e.g. user pasted back the
-    headline). If so, redirect to the investigation flow with the matching
-    `insightId`. Saves an entire LLM loop.
-  → **Why it earns its place:** Demonstrates "another cheap gate" thinking
-    — every time a user does something the deterministic layer can recognize,
-    we should bypass the model.
-  → **Files to touch:** `app/api/agent/route.ts:247-260`, plus a helper in
-    `lib/state/insights.ts` to do the headline lookup.
-  → **Done when:** Typing an insight's headline verbatim into QueryBox
-    triggers an investigation, not a query loop. Verified by a unit test.
-  → **Estimated effort:** `1–4hr`
+  → **Exercise ID:** B1.7
+  → **What to build:** For the monitoring agent's *first* tool call per category, skip the LLM entirely. The category's `eql(projectId)` recipe at `lib/agents/categories.ts:53` already names the canonical query. Run that query directly, hand the result to the agent as a pre-populated first `tool_result`, and let the model decide what to do from there.
+  → **Why it earns its place:** cuts one full LLM call per category from the monitoring scan. With ~6 categories runnable typically, that's 6 LLM calls saved per scan — ~50% of the input cost. Same idea as the intent classifier, applied inside the agent loop.
+  → **Files to touch:** `lib/agents/monitoring.ts` (pre-populate the AptKit agent's initial message history with synthetic `tool_use` + `tool_result` pairs), or extend the AptKit agent surface to accept "starter context", `test/agents/monitoring.test.ts` (assert the first LLM call sees the pre-populated context and skips the redundant query).
+  → **Done when:** `usage.input_tokens` on the first model call of each category drops by the size of the pre-populated tool result while still showing a valid scan output, and an integration test confirms the EQL recipe matches what the LLM would have called anyway.
+  → **Estimated effort:** 1–2 days.
 
 ## Interview defense
 
-**Q: Where do you avoid calling the LLM in this codebase?**
+**Q: "Why do you have a Haiku call in front of your Sonnet agents?"**
 
-Four gates before the expensive layer:
+Two reasons, both at the *intent* layer. First, routing: the user's free-form question could be a monitoring question, a diagnostic, a recommendation, or generic. Haiku picks the right downstream agent at ~$0.0003 per call. Second, structural safety: the parser defaults to `'diagnostic'` if Haiku returns ambiguous output, so even a misclassification routes to a safe agent that can investigate.
 
-  1. **`resolveAnomaly`** — lookup-only; the anomaly already exists.
-  2. **Bootstrap** — fixed MCP tool chain; the LLM never picks
-     `list_cloud_organizations`.
-  3. **`runnableCategories`** — schema-vs-capability intersection filters the
-     category checklist deterministically.
-  4. **`classifyIntent`** — cheap haiku gate (~$0.0003) routes free-form
-     queries before the sonnet agent loop.
+The classifier doesn't *skip* an expensive LLM — it picks *which* expensive LLM. The cost framing is honest about that.
 
-Then the LLM runs.
+*Anchor: "Cheap router up front; expensive agent only runs once we know which one should run. `lib/agents/intent.ts:16`."*
 
-**Anchor line:** "Cheap-first, expensive-second. Each gate is a place where
-deterministic code saves a sonnet call."
+**Q: "When would you push more rules in front of the LLM?"**
 
-**Q: What's the load-bearing gate of the four?**
+When two conditions are true: the rule's hit rate is high (covers >50% of cases), and the rule's failure mode is cheap to recover from. The first-tool-call-per-monitoring-category exercise hits both — the category's `eql()` recipe is the right query 90%+ of the time, and the fallback (let the agent override) is exactly what would have happened without the pre-cache.
 
-`runnableCategories`. Without it, the monitoring agent would burn tool calls
-testing for properties that don't exist in the workspace and have to
-distinguish "no signal" from "bad query." With it, the prompt only mentions
-categories whose required signals are in the schema, and the agent operates
-on data that's guaranteed to be there.
-
-**Anchor line:** "Filter the model's options before it picks. The cheapest
-gate is the one that prevents wasted tool calls."
+*Anchor: "High-coverage, cheap-recovery rule → push in front of the LLM. Otherwise let the agent decide."*
 
 ## See also
 
-  → `04-agents-and-tool-use/04-tool-routing.md` — heuristic-vs-LLM tool routing within the agent
-  → `06-token-economics.md` — what the gates save in dollars
+  → `04-agents-and-tool-use/04-tool-routing.md` — the broader tool-routing story this slots into
+  → `06-production-serving/02-llm-cost-optimization.md` — the cost-optimization framing this contributes to
+  → `01-what-an-llm-is.md` — the function this pattern decides whether to invoke

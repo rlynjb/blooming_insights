@@ -1,299 +1,299 @@
-# Event loop and async I/O
+# Event Loop and Async I/O
 
-**Industry name:** libuv event loop · V8 microtask queue · `AsyncLocalStorage` context propagation · **Type:** Language-specific (Node.js)
+**Industry name:** event loop, microtask queue, async I/O · **Type:** Industry standard
 
-## Zoom out, then zoom in
+## Zoom out — where this concept lives
 
-You've seen the runtime map. Now zoom into the engine that actually decides what runs next on band 2. The event loop is what threads two concurrent requests through one thread without colliding their auth state — and the two pieces of this codebase that hang off it are **`AsyncLocalStorage`** and **the spacing-gate microtask**.
+The event loop is the engine the previous file (`02-processes-threads-and-tasks.md`) named. This file walks what's actually on it: which queues, which scheduling rules, where the repo reaches each scheduling primitive.
 
 ```
-  Zoom out — the event loop's place
+  Zoom out — the event loop sits under everything in the Node band
 
-  ┌─ band 2: Node process ──────────────────────────────────────┐
-  │                                                              │
-  │  Next.js handler  ──┐                                        │
-  │  Next.js handler  ──┤                                        │
-  │  setTimeout cbs   ──┼──►  ★ EVENT LOOP ★  ──► whichever      │
-  │  fetch resolves   ──┤                          callback      │
-  │  AbortSignal fired──┘                          drains next   │
-  │                                                              │
-  │  ALS propagates the per-request context across each await    │
-  └──────────────────────────────────────────────────────────────┘
+  ┌─ Browser tab ────────────────────────────────────────────────────────┐
+  │  React 19 · async fetch · ReadableStreamDefaultReader.read()         │
+  └──────────────────────────────────────────────────────────────────────┘
+                            │
+  ┌─ Node 20+ process ─────────────────────────────────────────────────┐
+  │                                                                    │
+  │   route handlers · agent loops · MCP transport · NDJSON emission   │
+  │                            │                                       │
+  │                            ▼                                       │
+  │   ┌─ ★ THE EVENT LOOP ★ ──────────────────────────────────────┐   │
+  │   │   microtask queue (Promise callbacks, queueMicrotask)     │   │
+  │   │   macrotask queue (setTimeout, setImmediate, I/O callbacks)│   │
+  │   │   libuv phases (timers, poll, check, close)               │   │
+  │   └────────────────────────────────────────────────────────────┘   │
+  └────────────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in — there are two stories this file tells:
-
-  1. How `AsyncLocalStorage` (`lib/mcp/auth.ts:47`) survives every `await` in a handler so the per-request auth context never bleeds into another request.
-  2. How the `await new Promise(r => setTimeout(r, …))` in the spacing gate (`lib/data-source/bloomreach-data-source.ts:193`) cooperates with the event loop instead of blocking it.
+Nothing in the repo touches `process.nextTick`, `queueMicrotask`, or `setImmediate` directly — grep confirms zero hits across `lib/` and `app/`. The only scheduling primitives the app code reaches for are `setTimeout` (for sleeps and replay delays) and the implicit microtask queue (every `await`). That's a deliberately small surface. The rest is handled by what the SDKs do underneath: `fetch` schedules I/O completions, `AbortSignal.timeout` schedules a timer, the React reconciler schedules its own work.
 
 ## Structure pass
 
-**Axis: where does control go between two lines of my code?**
+### Axis: who schedules this work?
 
 ```
-  Three altitudes, one question
-
-  ┌─ sync code ────────────────────────────────────────────────┐
-  │  line 1 → line 2 → line 3                                  │  → caller decides
-  │  (no yield possible — nothing else can run)                │     (the runtime
-  │                                                            │      can't preempt)
-  └────────────────────┬───────────────────────────────────────┘
-                       │  await happens
-  ┌─ microtask boundary ▼─────────────────────────────────────┐
-  │  Promise.then continuation is queued                       │  → V8 microtask
-  │  (drains before next timer/I/O)                            │     queue decides
-  └────────────────────┬───────────────────────────────────────┘
-                       │  longer wait (setTimeout / fetch / signal)
-  ┌─ libuv phases ─────▼──────────────────────────────────────┐
-  │  timers / I/O callbacks / close callbacks                  │  → libuv decides
-  │  (multiple per "tick" of the event loop)                   │     (FIFO per phase)
-  └────────────────────────────────────────────────────────────┘
+  Plain function call          → caller runs it on the spot, no queue
+  await foo()                  → microtask queue when foo's Promise settles
+  setTimeout(cb, ms)           → macrotask queue after ms milliseconds
+  network I/O completion       → macrotask queue when libuv polls and finds it
+  AbortSignal.timeout(ms)      → setTimeout under the hood; macrotask
 ```
 
-**Seam: every `await`.** Before it, your code owns the thread. After it, the event loop owns it. ALS exists precisely because the function continuation after an `await` is a *separate stack frame* — without ALS, anything that wants to know "which request am I in?" would have to thread that ID through every call argument.
+The repo only chooses between "plain await" and "setTimeout". Everything else (network completions, abort firings) is scheduled by primitives the app calls but doesn't manage directly.
 
-That's the load-bearing insight. The mechanics below hang on it.
+### Seams
+
+The seam that matters is **microtask ↔ macrotask** drain order:
+
+```
+  Where the seam flips — microtasks drain to empty before any macrotask
+
+  current macrotask runs
+        │
+        ▼
+  drain ALL queued microtasks (Promise resolutions, await continuations)
+        │
+        ▼
+  drain ALL again if microtasks queued more microtasks
+        │
+        ▼
+  pick ONE macrotask (next setTimeout fire, next I/O callback)
+        │
+        ▼
+  loop
+```
+
+This matters in exactly one place in the repo: the `setTimeout` sleeps in `lib/data-source/bloomreach-data-source.ts` and the replay loops in the route handlers. Each `setTimeout(r, ms)` queues a macrotask after `ms` milliseconds; before that macrotask runs, every currently-pending await continuation gets a turn. In practice this means a 1.1s `sleep(minIntervalMs)` is at least 1.1s but never noticeably more — there's no microtask starvation risk because the repo doesn't generate huge chains of microtasks per turn.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know how a `then(...)` callback runs *after* the Promise settles? Same shape, scaled up: every `await` is sugar over `then`, and the function suspends at that point. When the Promise resolves, the runtime queues your continuation in the **microtask queue**. The event loop drains that queue at the next safe point.
+You know how `await fetch(url)` doesn't actually pause the thread — it pauses YOUR FUNCTION while the thread keeps running other work? The event loop is the engine that decides what to run next. It has two queues: microtasks (Promise callbacks, the things `.then()` and `await` resume) and macrotasks (timer fires, network I/O completions). The rule is brutal and simple: drain ALL microtasks before picking even ONE macrotask. That's why `await` continuations feel "immediate" after the awaited Promise settles — they're at the front of the queue, ahead of any timer.
 
 ```
-  Pattern — the await/microtask sandwich
+  The microtask-first rule — what runs in what order
 
-  ┌─ handler stack frame ──────────────────────────────────────┐
-  │  ... synchronous code ...                                  │
-  │  ── line N: await dataSource.callTool(...)  ──►            │
-  │                          │ Promise pending                  │
-  │                          │                                  │
-  │                          ▼                                  │
-  │                 [event loop runs OTHER things]              │
-  │                          │                                  │
-  │                          │ Promise resolves                 │
-  │                          ▼                                  │
-  │                 [microtask queue: this continuation]        │
-  │                          │                                  │
-  │                          ▼                                  │
-  │  ── line N+1: const result = ... resumes here ──            │
-  │  ... synchronous code ...                                  │
-  └────────────────────────────────────────────────────────────┘
+  ──────────────────────────────────────────────────────────────────
+  TASK START: someFn() runs from the top
+  │
+  │   await foo()              ← parks someFn; queues continuation
+  │                              for when foo's Promise settles
+  │
+  │   meanwhile other stuff runs on the loop...
+  │
+  │   foo's Promise settles    ← someFn's continuation queued
+  │                              as MICROTASK
+  │
+  │   (microtask queue drains BEFORE next macrotask)
+  │
+  │   someFn continues from the await    ← microtask runs
+  │
+  TASK END
+  ──────────────────────────────────────────────────────────────────
 ```
 
-The "OTHER things" between the two lines is the entire universe of concurrent requests, timers, and I/O on this instance. Your two adjacent lines of code — across an `await` — are not adjacent in wall time.
+If you only remember one thing about the event loop, remember this: `await` resumes via a microtask, and microtasks always run before timers. That's why `Promise.resolve().then(...)` is "faster" than `setTimeout(..., 0)`.
 
 ### Move 2 — the moving parts
 
-#### Move 2.1 — the microtask queue vs the timer queue
+#### Every `await` in this codebase is a microtask park
 
-`Promise.then` continuations go in the **microtask queue**, which drains in full before the event loop moves to the next phase. `setTimeout` callbacks go in the **timer queue**, which only fires when libuv reaches the timers phase.
-
-This matters in the spacing-gate code:
+The agent loop in `lib/agents/base-legacy.ts:114-206` is a tight `for (let turn = 0; turn < maxTurns; turn++)` loop with TWO awaits per turn: one for the model call, one (or more) for tool execution. Each await parks the loop function and schedules its continuation as a microtask.
 
 ```ts
-// lib/data-source/bloomreach-data-source.ts:191-194
+// lib/agents/base-legacy.ts:114-206 (the inner shape, abridged)
+for (let turn = 0; turn < maxTurns; turn++) {
+  signal?.throwIfAborted();
+  // ...
+  const res = await anthropic.messages.create(params, signal ? { signal } : undefined);
+  //          ↑ parks the loop until Anthropic responds (typically 1-5s)
+
+  for (const tu of toolUses) {
+    // ...
+    const { result, durationMs } = await dataSource.callTool(
+      tu.name,
+      tu.input as Record<string, unknown>,
+      signal ? { signal } : undefined,
+    );
+    //          ↑ parks the loop until MCP responds (1-10s with rate-limit retries)
+  }
+}
+```
+
+While the loop is parked at either `await`, the Node process is free to handle other requests. This is the entire reason the app can serve concurrent users on one warm Vercel instance — each request's agent loop spends most of its wall-clock time parked, and the event loop multiplexes between them.
+
+#### `setTimeout` is the only macrotask the repo schedules
+
+Three places use `setTimeout`, all for sleeps:
+
+```ts
+// lib/data-source/bloomreach-data-source.ts:73-75 — the rate-limit-retry sleep
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// lib/data-source/bloomreach-data-source.ts:191-194 — the ~1 req/s spacing
 const elapsed = Date.now() - this.lastCallAt;
 if (elapsed < this.minIntervalMs) {
   await new Promise((r) => setTimeout(r, this.minIntervalMs - elapsed));
 }
+
+// app/api/agent/route.ts:136 and app/api/briefing/route.ts:103, 119 — replay pacing
+await new Promise((r) => setTimeout(r, REPLAY_DELAY_MS));
 ```
 
-The `await new Promise(r => setTimeout(r, …))` does two things:
-  1. Schedules `setTimeout` for `minIntervalMs - elapsed` ms (timer queue).
-  2. Suspends the current async frame, putting its continuation behind the Promise's `then`.
-
-While we wait, libuv runs other I/O callbacks. When the timer fires, the Promise resolves, and the microtask queue puts our continuation back on the thread. We resume with the rate-limit budget reset.
+The pattern `new Promise((r) => setTimeout(r, ms))` is the standard "Promise-ify a timer" idiom. The Promise resolves when the timer fires (a macrotask); the awaiter's continuation then runs as a microtask. So the actual sequence for `await sleep(10_000)` is:
 
 ```
-  Execution trace — spacing gate yielding
-
-  state:   lastCallAt = 1000ms, elapsed = 300ms, gap = 800ms
-  ──────   ──────────────────────────────────────────────────
-  t=1300   liveCall enters, computes 800ms wait
-  t=1300   setTimeout(r, 800) scheduled
-  t=1300   await yields → event loop free
-  t=1300   ... handler B runs sync code, yields on its own fetch
-  t=1300   ... NDJSON chunk for stream X arrives, enqueued
-  t=1450   ... another handler's continuation drains
-  t=2100   libuv timers phase: our setTimeout fires → r()
-  t=2100   microtask drain: our continuation runs
-  t=2100   transport.callTool(...) goes out, lastCallAt = 2100
+  T = 0ms:   await suspends caller
+  T = ~10000ms: timer fires (macrotask)
+  T = ~10000ms: setTimeout's callback (r) runs → resolves the Promise
+  T = ~10000ms: microtask queue drains; awaiter's continuation runs
 ```
 
-The crucial detail: `setTimeout` for 800ms means "**at least** 800ms" — not exactly. If the event loop is busy at t=2100, the timer drains later. This is fine for rate-limiting (we want at-least spacing). It would not be fine for "fire at exactly t=2100" use cases — there are none of those in this repo.
+The replay-pacing sleeps (`REPLAY_DELAY_MS = 180` in agent, `140` in briefing) are deliberately small — they exist to make the demo snapshot reveal at a human-readable pace, not to throttle.
 
-#### Move 2.2 — `AsyncLocalStorage`: how context survives an await
+#### Network I/O completes via libuv, surfaces as a Promise
 
-`AsyncLocalStorage` (Node 14+) lets you set a value once at the top of an async chain and retrieve it from any descendant — including after arbitrary `await`s. Without it, you'd have to thread the value through every function argument.
+When `anthropic.messages.create(...)` fires, the SDK eventually calls `fetch()`, which hands the request to Node's libuv-backed HTTP client. libuv polls the OS for the response without blocking the JS thread; when bytes arrive, libuv queues a callback that resolves the fetch's Promise. The awaiter's continuation then runs as a microtask.
 
-In `lib/mcp/auth.ts`, the per-request store is created on entry to `withAuthCookies`:
+The app never sees libuv directly — it just sees Promises settling. But the lifecycle is: a `fetch()` call uses libuv I/O under the hood, and the rest of the event loop is free during the wait.
+
+#### `AbortSignal.timeout(ms)` is `setTimeout` wearing a signal hat
 
 ```ts
-// lib/mcp/auth.ts:46-47
-interface RequestStore { store: Store; dirty: boolean }
-const requestStore = new AsyncLocalStorage<RequestStore>();
-
-// lib/mcp/auth.ts:86-104  (annotated)
-export async function withAuthCookies<T>(fn: () => Promise<T>): Promise<T> {
-  if (process.env.NODE_ENV !== 'production') return fn();
-  const raw = (await cookies()).get(AUTH_COOKIE)?.value;
-  const ctx: RequestStore = { store: raw ? decryptStore(raw) : {}, dirty: false };
-  const result = await requestStore.run(ctx, fn);              // ← establish ALS frame
-  if (ctx.dirty) {                                              // ← read it back after fn done
-    (await cookies()).set(AUTH_COOKIE, encryptStore(ctx.store), {
-      httpOnly: true, secure: true, sameSite: 'none', path: '/',
-      maxAge: AUTH_COOKIE_MAX_AGE,
-    });
-  }
-  return result;
-}
+// lib/mcp/transport.ts:38, 131
+const TOOL_TIMEOUT_MS = 30_000;
+// ...
+const signal = composeSignals(opts?.signal, AbortSignal.timeout(TOOL_TIMEOUT_MS));
 ```
 
-Inside `fn`, anywhere that does `requestStore.getStore()` sees the *same* `ctx` object — even across many `await`s, across deep tool-call chains, across the BloomreachDataSource's spacing gate. Concurrent requests get their own ALS frames; the runtime keeps them apart automatically.
+`AbortSignal.timeout(30_000)` schedules an internal `setTimeout` for 30 seconds; when it fires, the returned signal's `.aborted` flag flips and its `.onabort` listeners fire. The MCP SDK is listening, so an in-flight `client.callTool` aborts. From the event loop's perspective it's just another macrotask: at T+30s, the timer fires, microtasks drain, the SDK's abort handler runs, the await chain rejects with `AbortError`.
 
-```
-  Pattern — ALS context propagation through awaits
+The composition with `req.signal` (`AbortSignal.any([opts?.signal, AbortSignal.timeout(30_000)])`) is the "first to fire wins" trick — `07-backpressure-bounded-work-and-cancellation.md` walks why both are needed.
 
-  request A frame                request B frame
-  ──────────────                 ──────────────
-  ALS.run({store: A_store}, ──   ALS.run({store: B_store}, ──
-   async () => {                   async () => {
-     await op1();                    await op1();
-     // ALS.getStore() === A_store   // ALS.getStore() === B_store
-     await op2();                    await op2();
-     // STILL A_store                // STILL B_store
-   })                              })
-```
+#### `ReadableStream` is pull-based, not push-based
 
-If you remove the `ALS.run` wrapper, every `getStore()` returns `undefined` and the code falls through to the dev-file or memory backend — which in production would mean *no* auth state, and the OAuth flow would fail on the first redirect.
-
-#### Move 2.3 — what BREAKS without each part
-
-Strip each piece out and name what fails:
-
-  → **Drop `AsyncLocalStorage`, keep the request-store object.** Two concurrent OAuth flows on one warm instance: A and B both `writeAll` to the same dev-file backend (in dev) or both miss the production cookie path entirely. PKCE verifiers stomped. Auth fails for one of them.
-  → **Drop `await` from the spacing-gate Promise.** The `setTimeout` fires later, but the function doesn't suspend — it returns immediately and the next `transport.callTool` goes out without the gap. Bloomreach 429s after the second call.
-  → **Replace the spacing-gate Promise with a sync `while (Date.now() - start < ms) {}` spin-wait.** The entire event loop blocks for 1.1s. No other request makes progress, no NDJSON chunk drains, no fetch resolves. Catastrophic.
-
-The pattern: in a single-threaded async runtime, sync work is the enemy. Every long wait must be a Promise that yields.
-
-#### Move 2.4 — the NDJSON read loop as event-loop citizen
-
-Same shape on the client side. `lib/streaming/ndjson.ts:31-51`:
+The route handlers create a `ReadableStream` (`app/api/agent/route.ts:184`, `app/api/briefing/route.ts:191`) with an `async start(controller)` function. The `start` function is called ONCE, when the stream is being read. It owns the entire lifetime of the work and emits chunks via `controller.enqueue(...)`.
 
 ```ts
-// lib/streaming/ndjson.ts:31-51 (excerpted, annotated)
+// app/api/briefing/route.ts:191-329 (the shape)
+const stream = new ReadableStream<Uint8Array>({
+  async start(controller) {
+    // ...
+    try {
+      // ... await schema bootstrap ...
+      // ... await coverage gate ...
+      // ... await agent.scan(...) which awaits many tool calls ...
+      send({ type: 'done' });
+    } catch (e) {
+      // ...
+    } finally {
+      controller.close();   // ← MUST fire to release the browser's reader
+    }
+  },
+});
+```
+
+The stream is pull-based: the platform's HTTP layer reads from it as the client pulls. Backpressure is implicit — if the client pulls slowly, `controller.enqueue` doesn't apply pressure here because the route emits messages bounded by agent turns (small, infrequent). For high-volume streams you'd reach for `pull(controller)` and `enqueue`'s `desiredSize`; this app doesn't need to.
+
+The READER side is in `lib/streaming/ndjson.ts:28-64`:
+
+```ts
+// lib/streaming/ndjson.ts:28-64 — the pull-loop
 const reader = body.getReader();
 const decoder = new TextDecoder();
 let buf = '';
-while (true) {
-  if (opts?.cancelOn?.()) {
-    await reader.cancel();             // ← yields
-    return;
-  }
-  const { value, done } = await reader.read();    // ← yields per chunk
-  if (done) break;
-  buf += decoder.decode(value, { stream: true }); // ← sync, fast
-  const lines = buf.split('\n');                  // ← sync, fast
-  buf = lines.pop() ?? '';
-  for (const raw of lines) {
-    ...
-    onEvent(JSON.parse(line) as E);               // ← sync — caller's setState fires here
+try {
+  while (true) {
+    if (opts?.cancelOn?.()) {
+      await reader.cancel();   // ← propagates cancel back to the producer
+      return;
+    }
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    // ... split on '\n', parse, dispatch ...
   }
 }
 ```
 
-Each `await reader.read()` yields the browser's main thread, letting React render whatever was queued from the previous chunk. The sync work between chunks (parse, split, dispatch) had better be cheap — and it is; one chunk is one NDJSON line, one JSON parse, one event dispatch.
-
-If we did heavy sync work between reads, we'd jank the browser's rendering. We don't.
+Each `await reader.read()` parks until the next chunk arrives over the network or the stream closes. Between reads, the loop checks `cancelOn()` — that's the integration point with React's effect cleanup (the `cancelledRef` in `useBriefingStream.ts:130, 152`).
 
 ### Move 3 — the principle
 
-The event loop is a **cooperative scheduler**: it can only switch tasks at points your code voluntarily yields. Everything you await is a yield point; nothing you don't await is. Master that one rule and you can reason about every concurrency question this codebase raises without ever reaching for a lock.
+A single-threaded event loop turns "concurrent execution" into "concurrent parking." The skill is knowing what parks (any `await` on I/O) and what doesn't (any synchronous computation between awaits). The repo's hot path is almost pure await — model call, tool call, model call, tool call — so the thread stays available. The risk is anywhere code does meaningful CPU work between awaits without yielding, which is why the truncation in `lib/agents/base-legacy.ts:32-37` matters: a 100MB tool result that we tried to `JSON.stringify` in full would block the loop for hundreds of milliseconds.
 
 ## Primary diagram
 
 ```
-  Event loop + AsyncLocalStorage + microtask queue — the whole picture
+  One agent loop turn on the event loop — the parking schedule
 
-  ┌─ Node main thread ─────────────────────────────────────────────────┐
-  │                                                                     │
-  │  ┌─ ALS frame: request A ──────────┐  ┌─ ALS frame: request B ──┐   │
-  │  │  ctx = {store: A_state, dirty}  │  │  ctx = {store: B_state} │   │
-  │  └────────────┬───────────────────┘  └────────────┬───────────┘   │
-  │               │                                    │                │
-  │               ▼ (handler async work)               ▼                │
-  │      ┌────────────────┐                  ┌────────────────┐         │
-  │      │ await fetch()  │                  │ await call()   │         │
-  │      │ (yield)        │                  │ (yield)        │         │
-  │      └────────┬───────┘                  └────────┬───────┘         │
-  │               │                                    │                │
-  │               ▼ resolved                           ▼ resolved       │
-  │       ┌─────────────────────────────────────────────────┐           │
-  │       │  microtask queue:                                │           │
-  │       │   ─ A's continuation (carries A's ALS ctx)       │           │
-  │       │   ─ B's continuation (carries B's ALS ctx)       │           │
-  │       │   ─ NDJSON onEvent dispatch                      │           │
-  │       └────────────────┬────────────────────────────────┘           │
-  │                        │ drain first                                │
-  │                        ▼                                            │
-  │       ┌─────────────────────────────────────────────────┐           │
-  │       │  libuv timers phase:                             │           │
-  │       │   ─ spacing gate setTimeout fires                │           │
-  │       │   ─ retry sleep fires                            │           │
-  │       └─────────────────────────────────────────────────┘           │
-  │                                                                     │
-  └─────────────────────────────────────────────────────────────────────┘
+  ┌─ Node event loop ────────────────────────────────────────────────────┐
+  │                                                                      │
+  │   T=0       runAgentLoop turn starts (TASK)                          │
+  │             │                                                        │
+  │             ▼                                                        │
+  │             await anthropic.messages.create(...)                     │
+  │             │                                                        │
+  │   T=0+      parked → loop free for other requests                    │
+  │             │                                                        │
+  │             ▼ (T = ~2s)                                              │
+  │             Anthropic HTTP response arrives (MACROTASK via libuv)    │
+  │             │                                                        │
+  │             ▼ (microtasks drain)                                     │
+  │             continuation runs; tool_use extracted                    │
+  │             │                                                        │
+  │             ▼                                                        │
+  │             for tu of toolUses:                                      │
+  │               await dataSource.callTool(...)                         │
+  │               │                                                      │
+  │               ├─ liveCall: elapsed < minIntervalMs                   │
+  │               │     await sleep(...)  (~1.1s, MACROTASK timer)       │
+  │               │                                                      │
+  │               ├─ transport.callTool with composed AbortSignal        │
+  │               │     (network I/O via libuv; up to 30s timeout)       │
+  │               │                                                      │
+  │               └─ result returned                                     │
+  │             │                                                        │
+  │             ▼                                                        │
+  │             tool result sent to controller.enqueue (NDJSON byte)     │
+  │             │                                                        │
+  │             ▼                                                        │
+  │             next turn or break                                       │
+  │                                                                      │
+  └──────────────────────────────────────────────────────────────────────┘
+
+  the thread is busy maybe 5% of this turn's wall-clock; the rest is parked.
+  that's why the route handles concurrent requests without queueing.
 ```
 
 ## Elaborate
 
-`AsyncLocalStorage` is Node's answer to a problem every async server eventually hits: "how do I correlate logs, propagate request IDs, or carry per-request context without threading it through every function argument?" Java solved it with `ThreadLocal`; Go solved it with `context.Context` as the first argument to every function; Node landed on `AsyncLocalStorage` after several iterations (originally `domain` module, then `async_hooks`, finally the high-level ALS wrapper).
+The event loop is the most-misunderstood part of Node. People assume "single-threaded" means "no concurrency." It means the OPPOSITE: it concurrently HANDLES many things by parking each and resuming whichever is ready next. The thread isn't a worker; it's a dispatcher.
 
-The microtask vs timer distinction (ECMAScript microtasks vs libuv timers) is the source of a lot of subtle ordering bugs. `Promise.resolve().then(fn)` runs *before* any pending `setTimeout(fn, 0)`. If you ever need to "yield to the next macro tick" without a delay, `setImmediate` (or `setTimeout(..., 0)`) is the lever; `await Promise.resolve()` only drains the microtask queue.
+Where this model breaks: CPU-bound work between awaits. The repo gets close to this with `JSON.stringify` of tool results — the truncation at 16K chars (`lib/agents/base-legacy.ts:32`) is the guard. A worst-case tool result without truncation could stringify a multi-megabyte object and block the loop for tens of milliseconds, which would stall every other request on the process.
 
-Worth reading: the Node.js docs page on the event loop phases (`docs/guides/event-loop-timers-and-nexttick.md`); the V8 blog post on how microtasks compose with Promises; Bert Belder's "Everything you need to know about the libuv event loop" talk.
+The microtask vs macrotask distinction matters more for understanding than for daily code. The one place it would surface is if the repo started using `process.nextTick` (Node-only, runs BEFORE Promise microtasks, can starve I/O if abused) — but the repo doesn't, so this stays academic.
 
 ## Interview defense
 
-**Q: Why does `BloomreachDataSource` use `await new Promise(r => setTimeout(r, x))` instead of a `while` loop spinning until the time is up?**
+> Q: "Walk me through what happens when a request hits /api/briefing on a warm instance."
 
-Because a spin-wait blocks the entire Node event loop for the duration. There's one thread; if I burn 1.1s in a tight loop, every other concurrent request stalls, every NDJSON chunk waiting to drain hangs, every fetch resolves into a queue with no consumer.
+The route handler runs, returns a `ReadableStream` with an `async start(controller)`. The platform begins reading the stream; that triggers `start`. Inside `start`, `await bootstrap()` parks the function while four MCP calls happen sequentially. Each MCP call awaits the rate-limit sleep, then awaits the network response. Between awaits, the event loop is free to handle other requests. When events come back, microtasks drain, the function resumes, emits via `controller.enqueue`, and continues. The whole thing is bounded by `maxDuration = 300`.
 
-The Promise+setTimeout pattern yields. The current frame suspends, libuv runs other I/O callbacks, the timer fires, the microtask queue puts our continuation back. We've slept without blocking.
+> Q: "What's the load-bearing part most people forget about the event loop?"
 
-Anchor: "every long wait must yield — sync wait blocks one thread, async wait blocks one task."
+The microtask-first rule: every `await` continuation runs as a microtask, and microtasks all drain before any macrotask. That's why a `setTimeout(..., 0)` after a chain of `Promise.resolve().then()` always loses — the Promise chain finishes first. People who think of `await` as "wait" rather than "park-and-microtask" get tripped up by ordering bugs.
 
-```
-  sync wait                 async wait
-  ─────────                 ──────────
-  while (t < deadline) {}   await new Promise(r => setTimeout(r, ms))
-       ↓                          ↓
-  thread blocked            ONE task suspended
-  no other work runs        other tasks free to run
-```
+> Q: "What would block the event loop in this codebase, hypothetically?"
 
-**Q: What does `AsyncLocalStorage` actually do, and what would break without it?**
-
-It threads a per-request object through every `await` inside an async chain, so any deep callee can call `ALS.getStore()` and see the *same* object the request handler set up — even though the call stack has been torn down and rebuilt across many awaits.
-
-In this codebase it's used in `lib/mcp/auth.ts:47` to carry the OAuth cookie's decrypted contents through the entire request. The MCP SDK's OAuth provider calls `clientInformation()`, `tokens()`, `saveTokens()`, etc. from inside `client.connect(transport)` — many awaits deep. Without ALS, every one of those calls would have to be passed the request-scoped store explicitly. With ALS, they just call `requestStore.getStore()`.
-
-If you removed it: two concurrent OAuth flows on one warm instance would either share state (security disaster — A could see B's tokens) or one would silently see no auth context at all (the cookie wouldn't be read, the OAuth flow would restart). The codebase comment at `lib/mcp/auth.ts:42-45` spells out the "each request gets its own ALS context, so concurrent requests on one instance never share state" guarantee.
-
-```
-  without ALS:  every call needs the sid as an argument
-   handler(sid) → connectMcp(sid) → provider.tokens(sid) → readState(sid)
-                                          (3 hops, every one needs sid)
-
-  with ALS:     sid lives in the implicit per-request store
-   handler() → connectMcp() → provider.tokens() → readState()
-                                          (zero hops, all share via getStore())
-```
+A huge synchronous `JSON.parse` or `JSON.stringify`. The truncation at `lib/agents/base-legacy.ts:32` (16K cap on tool result strings) is the guard. Also: a runaway regex on a huge string, or any tight CPU loop. The repo doesn't have those, but if you added one without a `setImmediate` yield, you'd stall the entire process.
 
 ## See also
 
-  → `02-processes-threads-and-tasks.md` for the single-threaded model this event loop drives.
-  → `04-shared-state-races-and-synchronization.md` for what awaits mean for shared `Map`s.
-  → `07-backpressure-bounded-work-and-cancellation.md` for how `AbortSignal.timeout` rides the same event loop.
+- `02-processes-threads-and-tasks.md` — the one-thread context this loop runs in.
+- `07-backpressure-bounded-work-and-cancellation.md` — how `AbortSignal.timeout` and `req.signal` use the same scheduling primitive to bound work.
+- `06-filesystem-streams-and-resource-lifecycle.md` — `ReadableStream` lifecycle and the pull-based read loop.

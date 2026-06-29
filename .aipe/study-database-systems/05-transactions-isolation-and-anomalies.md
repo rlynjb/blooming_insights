@@ -1,110 +1,108 @@
-# Transactions, isolation, and anomalies
+# Transactions, isolation, and anomalies — the one multi-step write
 
-Industry standard · Concurrency correctness
+*Industry standard / Project-specific* — there are no transactions. The only multi-step write in the whole repo is `putInsights`, and the failure window is so small that it's not currently a real risk — but it IS the only place where the concept applies.
 
-## Zoom out — where transactions would live, and what's there
+## Zoom out, then zoom in
 
-A transaction is a group of operations that either all happen or none do, observed by other readers as one atomic event. Isolation levels (read-uncommitted, read-committed, repeatable-read, serializable) define what concurrent transactions can see of each other's in-flight work. This codebase has **no transactional boundary anywhere.** Every state write is a single `Map.set`; every read is a single `Map.get`. There's no commit, no rollback, no isolation guarantee — only the JavaScript event loop's run-to-completion semantics.
-
-```
-  Zoom out — where transactions would live (and what's there)
-
-  ┌─ Service layer ──────────────────────────────────────────────┐
-  │  putInsights(sessionId, items, rawAnomalies?)                 │
-  │     clears insights + anomalies for the session               │
-  │     then writes both back, one by one                         │
-  └───────────────────────────────┬──────────────────────────────┘
-                                  │ Map.clear + Map.set (in loop)
-  ┌─ State layer ──────────────────▼──────────────────────────────┐
-  │  ★ THIS CONCEPT ★                                              │
-  │  no BEGIN, no COMMIT, no ROLLBACK                              │
-  │  no isolation level configurable                               │
-  │  the JS event loop is the ONLY ordering guarantee              │
-  │  consequence: a second writer mid-flight could "tear" reads    │
-  └────────────────────────────────────────────────────────────────┘
-```
-
-## Zoom in — the question this concept answers
-
-In a real DB: "if two operations run concurrently, what does each see of the other, and how do I make multi-step writes safe?" Here: "is there any guarantee that the briefing the UI reads is consistent with what was just written?" Short answer: yes for single-Map-operation reads (the event loop guarantees that), no for any read that spans multiple operations — but the architecture mostly avoids those reads on purpose.
-
-## Structure pass — the skeleton
-
-### The four ACID properties — and which ones we have
-
-  - **Atomicity** — all-or-nothing. **NOT GUARANTEED.** `putInsights` is a `clear` + loop of `set`s. If the process dies mid-loop, the Map is half-populated.
-  - **Consistency** — invariants preserved. **APPLICATION-ENFORCED.** No DB to enforce; TypeScript types + validator (`lib/mcp/validate.ts`) do shallow checks.
-  - **Isolation** — concurrent ops don't see each other's partial state. **PARTIAL.** Single Map operations are isolated (JS event loop); multi-step write sequences are not.
-  - **Durability** — committed writes survive crashes. **NONE.** No disk. → see `07-wal-durability-and-recovery.md`.
-
-### The classical isolation anomalies
+A transaction's job is to make a sequence of writes look atomic to anyone reading. The repo has effectively no concurrent readers of in-memory state (every session is partitioned; see `02`), so the "isolation" half of the concept is mostly absent. What is *not* absent is **atomicity** — and there's exactly one place where it matters: `putInsights` does a `.clear()` followed by a loop of `.set()`, and a crash between those two would leave the session's feed half-written.
 
 ```
-  anomaly             what it is                              can it happen here?
-  ─────────           ───────────────────────────────         ────────────────────
-  dirty read          reading another tx's uncommitted writes Maybe — see putInsights
-  non-repeatable read same row, second read returns different Yes — between calls
-  phantom read        same WHERE, new rows appear             Yes — between calls
-  lost update         your write overwrites mine              Yes — last-write-wins
-  write skew          two writes that race on a constraint    N/A — no constraint
+  Zoom out — where this concept lives
+
+  ┌─ UI layer ───────────────────────────────────────────────┐
+  │  feed reads insights via /api/briefing                    │
+  └────────────────────────────┬─────────────────────────────┘
+                               │  HTTP / NDJSON
+  ┌─ Service layer ────────────▼─────────────────────────────┐
+  │  app/api/briefing/route.ts emits insights to stream       │
+  │      │                                                    │
+  │      ▼                                                    │
+  │  putInsights(sid, insights, anomalies)                    │
+  │    s.insights.clear()                                     │
+  │    s.anomalies.clear()      ★ THE MULTI-STEP WRITE ★      │ ← we are here
+  │    items.forEach((i, idx) => {                            │
+  │      s.insights.set(i.id, i)                              │
+  │      if (rawAnomalies[idx]) s.anomalies.set(i.id, ...)    │
+  │    })                                                     │
+  └────────────────────────────┬─────────────────────────────┘
+                               │
+  ┌─ Storage layer ────────────▼─────────────────────────────┐
+  │  sessionState(sid) (the Map partition)                    │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-### Axis: where does the ordering guarantee come from?
+Zoom in: this is a 3-statement sequence that should be atomic ("replace the session's feed"). It isn't — JavaScript has no transaction primitive over `Map` — and the visibility window is tiny but non-zero.
+
+## Structure pass
+
+**Layers:**
 
 ```
-  The "ordering" axis, traced through the stack
-
-  ┌─ HTTP / Vercel ─────────────────────────────────────────┐
-  │  no ordering — independent requests on independent      │
-  │  ephemeral instances; the same session can land on      │
-  │  different processes at the same time                   │
-  └─────────────────────────────────────────────────────────┘
-       ┌─ Node event loop ───────────────────────────────────┐
-       │  run-to-completion: ONE microtask at a time         │
-       │  → individual sync ops on a Map are atomic relative │
-       │    to other code on the same loop                   │
-       └─────────────────────────────────────────────────────┘
-            ┌─ Map operations ──────────────────────────────┐
-            │  one Map.set or Map.get is a single statement │
-            │  → no interleaving WITHIN one op              │
-            └───────────────────────────────────────────────┘
+  L1  HTTP request                  one /api/briefing call
+  L2  putInsights() function        the multi-step write
+  L3  Map operations                 .clear() + .set() per item
 ```
 
-The ordering guarantee is *per-operation* (JS atomicity) and *per-instance* (the Map only sees its own process). There is no cross-instance ordering, no cross-request transactional grouping.
+**Axis traced: atomicity — is the operation visible as all-or-nothing?**
 
-### Seams
+```
+  Trace one axis: is the write atomic from a reader's perspective?
 
-The seam that matters most: **between writes that look atomic and aren't.** `putInsights` looks like one call from the outside; inside, it's a clear + loop. A reader hitting between the clear and the writes sees an empty session. That's the dirty-read shape — accidentally exposed.
+  ┌─ L1: HTTP boundary ──────────────────┐
+  │  request begins, ends                 │   → atomic from the client
+  └──────────────────────────────────────┘
+                  (it flips)
+  ┌─ L2: putInsights() ──────────────────┐
+  │  3 statements, no try/catch wrapper   │   → NOT atomic mid-function
+  └──────────────────────────────────────┘
+                  (it flips)
+  ┌─ L3: Map operations ─────────────────┐
+  │  each .clear() / .set() is atomic     │   → atomic per statement
+  └──────────────────────────────────────┘
+
+  the seam at L2 is where atomicity disappears
+```
+
+**Seams** — one matters:
+
+- The L2 boundary is where the contract should be "replace the feed atomically" and is instead "do these three things in order." The repo doesn't suffer because nothing reads concurrently within a session — but the contract gap is real.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-If you've ever shipped a React component that does `setUsers([]); users.forEach(u => addUser(u))` and watched the UI flash empty for a frame — you've felt the no-transaction problem. Same shape here. The flash is the moment between "everything cleared" and "everything re-populated," and a reader who arrives during the flash sees the empty state as if it were final.
+You've used `BEGIN ... COMMIT` before — wrap a sequence so partial writes never become visible. The shape here is the same idea, except there's no `BEGIN`. The visibility model is "every `Map` operation is instantly visible; the function is just three sequential operations."
 
 ```
-  The shape — the no-transaction "window"
+  No transaction wrapper — three independent statements
 
-  time ────────────────────────────────────────────────────►
+       putInsights(sid, items, rawAnomalies)
+              │
+              ▼
+       ┌──────────────┐
+       │ insights.clear() │   ← visible immediately to any reader
+       └──────┬───────┘
+              │
+              ▼
+       ┌──────────────┐
+       │ anomalies.clear() │  ← visible immediately
+       └──────┬───────┘
+              │
+              ▼
+       ┌──────────────────────────┐
+       │ for each item: set(i.id, i) │  ← visible per iteration
+       └──────────────────────────┘
 
-  putInsights():
-    [Map.clear]                                  ← window opens
-                [Map.set #1]
-                              [Map.set #2]
-                                            …
-                                                [Map.set #N]    ← window closes
-
-  a concurrent read that arrives anywhere in the window
-  sees a PARTIAL truth — not "before" and not "after"
+       a reader landing between any two statements sees a partial state
 ```
 
-In a real DB, the whole sequence would be wrapped in a transaction and the reader's snapshot would either be "before the BEGIN" or "after the COMMIT." Here, the reader can land in the middle.
+That's the kernel: no atomicity, no isolation level to pick. The rest is "where does that actually bite, and where is it safe?"
 
-### Move 2 — the walkthrough
+### Move 2 — the multi-step write, one part at a time
 
-#### The "transaction" boundary: there isn't one
+#### The function itself
 
-```ts
+```typescript
 // lib/state/insights.ts:57-71
 export function putInsights(sessionId: string, items: Insight[], rawAnomalies?: Anomaly[]): void {
   // Replace the previous briefing for THIS session — each run IS the current
@@ -123,117 +121,127 @@ export function putInsights(sessionId: string, items: Insight[], rawAnomalies?: 
 }
 ```
 
-Annotation:
-  - **Line 64** — `sessionState` returns (or creates) the per-session sub-maps. This is the "namespace" boundary; the function never touches another session's data.
-  - **Lines 65-66** — `clear()` on insights and anomalies. After these two lines run, the session's insights table is empty.
-  - **Lines 67-70** — re-populate, one row at a time. The Map grows from 0 to N entries one entry per loop iteration.
-  - **No BEGIN, no COMMIT.** If you wrapped this in `try { ... } catch { rollback() }`, there's no rollback to call. If the loop throws partway, the session ends with a partial Map and no way to undo.
+Three things in order: clear insights, clear anomalies, set each. The comment is honest about the intent ("each run IS the current feed") but doesn't address atomicity.
 
-The function is *idempotent at the granularity of the whole call* — if you run it twice with the same input you get the same end state. But it is NOT atomic — a concurrent reader can see the intermediate states.
+#### Why it's not (currently) a real anomaly
 
-#### Why the JavaScript event loop saves you (mostly)
+Node.js is single-threaded for JS code. `putInsights` runs synchronously — there's no `await` between the `.clear()` and the `.forEach()` — so no other JS code on the same instance can interleave between the three statements. The only way to land in the "half-written" state is:
+
+1. The process dies between `.clear()` and the end of `.forEach()` (instance recycle, OOM, fatal error). Probability: near-zero — the function takes microseconds and there's no I/O in the middle.
+2. A bug in `.forEach()` throws midway. Probability: also near-zero — the body only does `Map.set()` calls.
+
+So in practice the function behaves atomically. The contract that says it MUST be atomic is just... absent.
+
+#### Where it WOULD bite if anything changed
+
+Two changes would turn this from latent to live:
+
+- **Adding an `await` between the clear and the loop.** A network call, a `crypto` operation, anything that yields the event loop. A reader landing in that window sees an empty feed.
+- **A second writer for the same session.** If two concurrent `/api/briefing` requests for the same sessionId interleaved their `putInsights` calls, the second's `.clear()` could wipe the first's `.set()` calls mid-flight. The repo prevents this by serializing per-session at the HTTP layer (each request is a new function invocation; the model loop is awaited) and by the fact that the UI doesn't trigger two briefings at once.
+
+#### The isolation level (such as it is)
+
+Borrowing the SQL vocabulary: this is **read-uncommitted within the function, read-committed across functions.** Inside `putInsights` a hypothetical reader would see dirty intermediate state. Outside `putInsights` (between two completed calls) readers always see the final state of whichever call completed last. There's no snapshot isolation because there's no version chain — every read is from the live `Map`.
+
+#### Dirty-read example (constructed, not observed)
 
 ```
-  The event loop's safety net
+  A reader landing mid-putInsights would see:
 
-  task 1: putInsights(sessionA, [...])      ← starts, runs SYNCHRONOUSLY
-            clear · set · set · set · ... · set
-            └────────────────────────────┘
-                  one synchronous block
+  t0: insights = { a, b, c }                       (previous briefing)
 
-  task 2: getInsight(sessionA, "abc")       ← cannot interrupt task 1
-            waits until task 1 yields the loop
+  t1: putInsights starts
+      insights.clear()           ◄── reader at t1.5 sees empty feed
+      anomalies.clear()
+      forEach iteration 1: set('x', X)  ◄── reader at t1.8 sees { x }
+      forEach iteration 2: set('y', Y)
+      forEach iteration 3: set('z', Z)
+
+  t2: putInsights returns
+      insights = { x, y, z }                       (new briefing)
+
+  reader at t1.5 → empty feed (dirty read)
+  reader at t1.8 → { x }       (dirty read)
+  reader at t2+  → { x, y, z } (consistent)
 ```
 
-`putInsights` is synchronous from top to bottom — there's no `await`, no `setTimeout`, no `process.nextTick`. So while `putInsights` is mid-loop, *no other code on the same event loop runs*. A `getInsight` request that arrives during `putInsights` gets queued and runs *after* `putInsights` returns.
-
-That's where the practical safety comes from. NOT from a transaction. From the event loop.
-
-The cases where this safety net leaks:
-  - **Two warm Vercel instances serving the same session.** Each has its own event loop; they cannot block each other. → see F3 in `audit.md`.
-  - **An `async` write path with an `await` inside.** Today `putInsights` has no `await`. The day one is added (say, to write to a real DB), the safety disappears and the function needs real transactional discipline.
-
-#### Reads that span multiple operations
-
-The risky pattern in any no-transaction system: read A, do something based on it, read B, write a decision. Between A and B, the world can change. The repo mostly *avoids* this pattern. Two examples worth pointing at:
-
-  - **`/api/agent` reads the insight, then runs the diagnostic agent against it, then writes the investigation back.** Between read and write, several seconds elapse and several Bloomreach round-trips happen. If a *new* briefing replaces the insights in that window, the investigation still refers to the *old* insight by ID — and the old insight is gone from the Map. The handler defends against this by stashing the insight in `sessionStorage` on the client (`useInvestigation.ts`, `lib/hooks/useBriefingStream.ts:56`) so the client can re-supply it; the server doesn't need to keep it around.
-  - **`putInsights` is called from a streaming handler.** The whole briefing is built incrementally; only at the end does `putInsights` get called with the final array. There is no per-anomaly write that a reader could observe mid-build.
-
-Both are *architectural* defenses against the missing transactional guarantee, not engine-level ones.
-
-#### Isolation level — implicit "read-uncommitted" with intra-call atomicity
-
-If we had to label what we have on the classical isolation hierarchy: read-uncommitted with *the modifier that any single Map op is atomic*. A reader can see any synchronous step's intermediate state, but cannot see a half-completed Map.set (because Map.set itself is a single op).
-
-In practice: it would feel like read-committed for the patterns the app actually exercises, because nothing async-yields mid-write. But the *guarantee* is much weaker than read-committed, and the day someone adds an `await` to `putInsights` without thinking, the guarantee silently drops.
+Today there is no concurrent reader, so this scenario doesn't happen. If `listInsights` were ever called from an async context that could interleave (e.g. a separate request for the same session firing during a briefing), this is the bug it would hit.
 
 ### Move 3 — the principle
 
-A transaction is two things: a *grouping* (these N operations are one logical event) and a *guarantee* (other observers see all or none of them). When you have neither, every multi-step write is a potential consistency bug, and the only defense is to *not write that way* — to make state updates idempotent, replaceable, and small enough that they happen in one synchronous burst. That's what this repo does. The transactional discipline lives in the architecture (full re-compute, single-shot replace) rather than in the engine (there is none). It works at this scale; it would not survive any meaningful concurrent write workload.
+"Transactions" sound like a feature only databases have, but the underlying need — make a multi-step write look atomic to readers — applies whenever you have shared mutable state. Even with a single-threaded runtime, you can lose the property by adding an `await` between two writes. The honest test is not "do I have a `BEGIN`?" but "if a reader landed between any two of my writes, would the state make sense?" Here, today, no reader can land — so the property holds by construction, not by design.
 
 ## Primary diagram
 
 ```
-  The transaction story — what guarantees, where they come from
+  putInsights — the only multi-step write, and its window
 
-  ┌─ "transaction-like" guarantees this codebase has ────────────┐
-  │                                                                │
-  │  • single Map.set is atomic            (from V8)              │
-  │  • synchronous block on one event loop  (from Node)            │
-  │  • per-session namespace isolation      (from sessionState)    │
-  │                                                                │
-  │  → in practice: writes within one putInsights() are atomic    │
-  │    relative to reads ON THE SAME INSTANCE on the same loop     │
-  └────────────────────────────────────────────────────────────────┘
+  ┌─ caller: /api/briefing stream's .start() ────────────────┐
+  │  const insights = anomalies.map(anomalyToInsight)         │
+  │  putInsights(sid, insights, anomalies)  ◄── 3 statements │
+  └────────────────────────────┬─────────────────────────────┘
+                               │
+  ┌─ putInsights ──────────────▼─────────────────────────────┐
+  │                                                            │
+  │  s = sessionState(sessionId)                               │
+  │                                                            │
+  │  ┌─ atomic-by-language (single statement) ──┐             │
+  │  │  s.insights.clear()                        │             │
+  │  └────────────────────────────────────────────┘             │
+  │  ┌─ atomic-by-language ──┐                                  │
+  │  │  s.anomalies.clear()  │                                  │
+  │  └────────────────────────┘                                  │
+  │  ┌─ N iterations, each atomic, sequence is not ─┐           │
+  │  │  for each item:                                │           │
+  │  │    s.insights.set(i.id, i)                     │           │
+  │  │    if (rawAnomalies[idx]) s.anomalies.set(...)│           │
+  │  └────────────────────────────────────────────────┘           │
+  │                                                            │
+  │  ← function returns; full new state visible                │
+  └────────────────────────────────────────────────────────────┘
 
-  ┌─ guarantees this codebase does NOT have ─────────────────────┐
-  │                                                                │
-  │  • atomicity across instances          (no shared substrate)   │
-  │  • atomicity across async boundaries   (no await in writers)   │
-  │  • durable commit                      (no disk)               │
-  │  • rollback on error                   (no log)                │
-  │  • repeatable read                     (re-read can differ)    │
-  │  • serializability                     (no concurrency control)│
-  │                                                                │
-  │  → in practice: this is fine because writes are full          │
-  │    replaces, never partial updates, and clients stash the      │
-  │    insight they need on their side                             │
-  └────────────────────────────────────────────────────────────────┘
+  window-of-inconsistency: nanoseconds, no awaits, no concurrent readers today
+  contract risk: a future await between statements would expose this
 ```
 
 ## Elaborate
 
-The classical reference for isolation is the SQL standard's four levels and Berenson et al.'s "A Critique of ANSI SQL Isolation Levels" (1995), which catalogued the anomalies each level allows. PostgreSQL's MVCC implementation gives you read-committed by default and serializable on request; many embedded engines serialize all writes globally. In-memory KV stores (Redis, Memcached) usually offer per-key atomicity and nothing larger; transactional KV (FoundationDB, etcd) brings serializability with a coordination cost.
+This is the textbook case for `read-modify-write` discipline in a single-threaded runtime: as long as the modify is fully synchronous, you get atomicity for free. The discipline breaks the moment you add an `await` — and the easiest way to add one accidentally is to introduce telemetry, validation, or a derived-fields recomputation that does I/O. The comment at `lib/state/insights.ts:57-63` warns the developer about the WHY of `.clear()` but not about the atomicity contract; a "DO NOT add `await` here" comment would harden it.
 
-This codebase sits at the "per-op atomicity" floor — it's structurally similar to Memcached's contract, just without the network. The interesting move when you finally need transactions is: are they SINGLE-key (`Map.set` is fine), MULTI-key inside one namespace (need a write lock or MVCC), or CROSS-namespace (need a distributed transaction)? The product hasn't asked for any of these yet. When it does, the answer points at a real datastore.
+Compare to Postgres: this is the equivalent of a session-scoped UPDATE with no explicit BEGIN, in a system where there's only one connection per session. The implicit transaction is the whole statement. Adding a second statement loses you that — which is exactly the situation here at the function level.
+
+If durability ever matters (someone moves the feed to a real store), this function turns into "begin; delete from insights where session = ?; insert ...; commit." That's a natural mapping; the shape doesn't change, only the substrate.
 
 ## Interview defense
 
-> Q: "How does this app handle transactional updates?"
+**Q: Does this app have transactions?**
 
-Verdict: it doesn't, because it doesn't have any multi-step writes that need to be atomic. Every "write" is either a single `Map.set` (which V8 makes atomic) or a `putInsights` call that's a clear-then-loop happening synchronously on one event loop. The architecture avoids the partial-write problem by making every state update a full replace — there are no patch-style mutations to interleave.
+No — and it mostly doesn't need them, because every session is partitioned in-memory and there's effectively no concurrent reader of a session's state. The one place the concept applies is `putInsights` in `lib/state/insights.ts:57`, which does `.clear()` followed by `.forEach((i) => set(...))`. That's three statements with no atomicity wrapper. Today it's safe because (a) the function is synchronous — no `await` between statements — and (b) the partition prevents two writers for the same session from interleaving.
 
+**Q: What would break that?**
+
+Adding any `await` between the clear and the forEach. A telemetry call, a validation step that does I/O, anything that yields the event loop. A concurrent reader landing in that window would see an empty feed during a briefing. The fix is either "make the function atomic by construction" (build the new state in a local Map, then swap in one assignment) or "wrap it in a per-session async lock." Today, neither is needed.
+
+**Q: How would you make `putInsights` atomic by construction?**
+
+Build the new sub-maps as locals, then swap them in:
+
+```typescript
+const newInsights = new Map<string, Insight>();
+const newAnomalies = new Map<string, Anomaly>();
+items.forEach((i, idx) => {
+  newInsights.set(i.id, i);
+  if (rawAnomalies?.[idx]) newAnomalies.set(i.id, rawAnomalies[idx]);
+});
+s.insights = newInsights;
+s.anomalies = newAnomalies;
 ```
-  the picture you draw — the no-transaction safety net
 
-   putInsights()  ──synchronous──►  clear · set · set · … · set
-                  └────────────── one tick of the loop ──────────┘
-                                       readers wait
-```
-
-The load-bearing point: this works because the write path is synchronous AND the dataset is computed-from-scratch. Both have to be true. The day either changes — an `await` is added, or partial updates become a pattern — the safety net is gone and we need a real transactional substrate.
-
-> Q: "What's the worst anomaly you could see?"
-
-Two warm Vercel instances serving the same session concurrently can produce torn reads, because each instance has its own Map and event loop. Instance A writes one set of insights; instance B writes another; whichever instance the next request lands on determines what the UI sees. The mitigation is that briefings always replace fully, so eventual divergence resolves on the next run.
-
-> Q: "What's the isolation level?"
-
-If forced onto the SQL hierarchy, read-uncommitted with the caveat that single Map ops are atomic. In practice it behaves like read-committed for the patterns the app actually exercises, because no writer yields the loop mid-write. The guarantee is much weaker than the felt behavior, which is a risk if someone adds an `await` to a writer without realizing what the implicit contract was.
+Two assignments at the end; readers see either the old maps or the new, never a mix. The catch: `SessionFeed.insights` is typed as `Map<string, Insight>`, not `readonly`, so the swap typechecks — but it would change the reference identity, which would break code that holds onto a reference to the old map. None of the current callers do that. This is the kind of refactor you'd do *before* adding an `await` to the function, not after.
 
 ## See also
 
-  - [`06-locks-mvcc-and-concurrency-control.md`](./06-locks-mvcc-and-concurrency-control.md) — what isolation is implemented with, in real DBs
-  - [`07-wal-durability-and-recovery.md`](./07-wal-durability-and-recovery.md) — the durability half of ACID
-  - [`audit.md`](./audit.md) — F3 (concurrent writes), the operational consequence
+- `02-records-pages-and-storage-layout.md` — the partition that makes "no concurrent writers" hold
+- `06-locks-mvcc-and-concurrency-control.md` — why there are no locks despite this contract gap
+- `07-wal-durability-and-recovery.md` — what happens on a crash mid-`putInsights`
+- `09-database-systems-red-flags-audit.md` — this is finding #1

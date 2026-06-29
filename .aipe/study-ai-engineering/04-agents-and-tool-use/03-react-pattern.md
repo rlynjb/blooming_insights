@@ -1,277 +1,265 @@
-# 03 — ReAct pattern
+# ReAct pattern
 
-**Subtitle:** Thought / Action / Observation interleaving · Industry standard
+*Industry standard — Thought → Action → Observation loop*
 
-## Zoom out, then zoom in
+## Zoom out — where this concept lives
 
-ReAct (Yao et al., 2022) is the interleaving pattern that makes the
-agent loop debuggable: the model emits a *thought* (free-form text
-explaining its reasoning), then an *action* (a tool call), then receives
-an *observation* (the tool result), then another thought, until done.
-AptKit's agent loop is ReAct-shaped; the trace shows it directly.
+Inside each agent in this codebase, the LLM doesn't make a single call and stop. It loops: think → call a tool → observe the result → think again, until it has enough to answer. That's the ReAct pattern. The loop itself lives in `@aptkit/core`; this codebase observes it via the trace hooks that turn each loop iteration into a UI event.
 
 ```
-  Zoom out — ReAct is the pattern WITHIN one agent loop
+  Zoom out — ReAct inside each agent
 
-  ┌─ Diagnostic agent loop (AptKit) ───────────────────────┐
-  │                                                        │
-  │  Thought:    "Conversion dropped 30%. Let me check     │  ← we are here
-  │               which device type is responsible."       │   (the trace
-  │  Action:     execute_analytics_eql(by device)          │    surface)
-  │  Observation: { mobile: -50%, desktop: -5% }           │
-  │                                                        │
-  │  Thought:    "Mobile is the cause. Let me check        │
-  │               campaigns targeting mobile."             │
-  │  Action:     list_email_campaigns(filter=mobile)       │
-  │  Observation: { campaigns: [{id: ..., sent_to: mob}] } │
-  │                                                        │
-  │  Thought:    "Found it — campaign 7 broke the funnel"  │
-  │  Final:      Diagnosis JSON                             │
-  └────────────────────────────────────────────────────────┘
+  ┌─ Agent invocation ──────────────────────────────────────┐
+  │  diagAgent.investigate(anomaly) returns one Diagnosis   │
+  └──────────────────────┬──────────────────────────────────┘
+                         │  inside this call:
+                         ▼
+  ┌─ ★ ReAct loop ★ (inside @aptkit/core) ──────────────────┐ ← we are here
+  │                                                          │
+  │  ┌────────────────────────────────────────────────────┐ │
+  │  │  Thought    (LLM emits text reasoning)              │ │
+  │  │  Action     (LLM emits tool_use block)              │ │
+  │  │  Observation (your code executes tool → tool_result)│ │
+  │  └─────────────────┬──────────────────────────────────┘ │
+  │                    │  loop until LLM emits no tool_use   │
+  │                    ▼  or call budget hits                │
+  │  ┌────────────────────────────────────────────────────┐ │
+  │  │  Final synthesis (LLM emits structured output)     │ │
+  │  └────────────────────────────────────────────────────┘ │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-## Structure pass
+**Zoom in.** ReAct is the dominant inner loop for LLM agents — externalize reasoning between actions, so you can debug WHY the agent chose action N when the result of action N-1 came back the way it did.
 
-  → **One axis to trace — externalization.** Each thought makes the
-    model's *reasoning* visible to your code, your trace, your eval. A
-    bad reasoning trace points to a prompt bug; a good trace that ended
-    in the wrong answer points to a model bug. Without ReAct, you only
-    see the final answer and have no debugging surface.
+## Structure pass — layers · axes · seams
+
+**Layers:** Thought → Action → Observation → repeat.
+
+**Axis: what's externalized to the message history?** All three. Thoughts become assistant `text` blocks. Actions become `tool_use` blocks. Observations become `tool_result` blocks. By the end of an N-iteration loop, the message history has every step the agent took, in order.
+
+**Seam:** the LLM call boundary. After every `model.complete()` call, the loop inspects the response: if it contains a `tool_use`, execute it and append a `tool_result`, then loop. If not, the loop exits and the agent synthesizes its final answer.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You've debugged code with print statements at every step: `console.log
-('checking input'); console.log('result:', x); console.log('next step')`.
-ReAct is the same shape, except the model prints its own reasoning.
+You know how a debugger lets you step through a function and watch the variables change? ReAct is that, externalized into the LLM's own message history. Each Thought is what the agent was thinking; each Action is what it did; each Observation is what it learned. The trace is a record of the agent's reasoning *as it happened*, not after the fact.
 
 ```
-  ReAct interleaving (one investigation, six turns)
+  The ReAct loop — kernel
 
-  Thought 1:    "Need to find which device is causing the drop"
-  Action 1:     execute_analytics_eql(by device_type)
-  Observation 1: { mobile: -50%, desktop: -5%, tablet: -10% }
+  initialize: messages = [system + initial user task]
 
-  Thought 2:    "Mobile is the cause. Check what changed for mobile."
-  Action 2:     execute_analytics_eql(mobile checkout funnel by day)
-  Observation 2: { day 1-5: normal, day 6+: 50% drop in checkout step }
+  ┌─── while not done ──────────────────────────────────────┐
+  │                                                          │
+  │   response = model.complete(messages, tools)             │
+  │                                                          │
+  │   for each block in response.content:                    │
+  │     if block.type == 'text':                             │
+  │       remember the Thought (assistant message)           │
+  │     if block.type == 'tool_use':                         │
+  │       result = tool_registry.callTool(block.name, block.input)│
+  │       append { tool_use_id, content: result } as tool_result │
+  │                                                          │
+  │   if no tool_use blocks this turn:                       │
+  │     done = true   (LLM declined to act → final answer)   │
+  │                                                          │
+  │   if iterations >= budget:                               │
+  │     done = true   (forced — see Move 2 Part 4)           │
+  │                                                          │
+  └──────────────────────────────────────────────────────────┘
 
-  Thought 3:    "Day 6 onward. Check what campaign launched."
-  Action 3:     list_email_campaigns(launched after day 6, mobile)
-  Observation 3: [{ id: 'camp7', launch: day 6, targeting: mobile }]
-
-  Final:        Diagnosis JSON {
-                  conclusion: "campaign 7 launched day 6 broke mobile checkout",
-                  evidence: ["...", "..."],
-                  hypothesesConsidered: [...],
-                  affectedCustomers: { count: ~50k, segment: "mobile" }
-                }
+  return synthesized final output (Anomaly[], Diagnosis, etc.)
 ```
+
+The kernel is **5 parts**, each one breaks the loop if you remove it:
+
+  1. **Message history that accumulates.** Without it, each `complete()` call has no memory of what happened before; the loop just makes the same call forever.
+  2. **Tool execution + result feedback.** Without it, the LLM emits `tool_use` but never sees the result; it can't make progress.
+  3. **Done-condition (no tool_use this turn).** Without it, the loop runs forever once the LLM decides it's done.
+  4. **Budget cap.** Without it, an LLM that gets stuck calling the same tool repeatedly burns infinite tokens.
+  5. **Final synthesis.** Without it, you have a trace but no typed output for the caller.
 
 ### Move 2 — the step-by-step walkthrough
 
-**Where the thought lives in this codebase.** In Anthropic's `tool_use`
-flow, "thought" is any text content block emitted in the same response
-as a `tool_use` block (or just before one). It's prose the model writes
-about what it's doing.
+**Part 1 — the loop runs in AptKit; this codebase observes it.**
 
-In Blooming's adapter, text blocks become `step` events via the trace
-sink (`lib/agents/aptkit-adapters.ts:109-112`):
+The actual loop code is inside `@aptkit/core`. From this codebase's vantage point, you can see the loop happen through the trace events. `BloomingTraceSinkAdapter.emit()` at `lib/agents/aptkit-adapters.ts:108-128` translates each loop iteration's events:
 
 ```typescript
-if (event.type === 'step') {
-  this.hooks.onText?.(event.content);
-  return;
+emit(event: CapabilityEvent): void {
+  if (event.type === 'step') {
+    this.hooks.onText?.(event.content);                    // ← Thought (text)
+    return;
+  }
+
+  if (event.type === 'tool_call_start') {                  // ← Action (tool_use)
+    const toolCall = this.toBloomingToolCall(event);
+    // ...
+    this.hooks.onToolCall?.(toolCall);
+    return;
+  }
+
+  if (event.type === 'tool_call_end') {                    // ← Observation (tool_result)
+    const toolCall = this.activeToolCalls.get(event.toolName)?.shift() ?? this.toBloomingToolCall(event);
+    toolCall.durationMs = event.durationMs;
+    toolCall.result = event.result;
+    toolCall.error = event.error;
+    this.hooks.onToolResult?.(toolCall);
+  }
 }
 ```
 
-The route's `hooksFor()` converts these to `reasoning_step` events on
-the NDJSON wire:
+Three event types correspond to ReAct's three steps: `step` (Thought), `tool_call_start` (Action), `tool_call_end` (Observation).
+
+**Part 2 — the trace is the product.**
+
+The UI's `StatusLog` panel renders the trace as it streams. From `app/api/agent/route.ts:193-211`:
 
 ```typescript
-onText: (t: string) => { if (t.trim()) stepFor(agent, 'thought', t); },
+const hooksFor = (agent: AgentName) => ({
+  onText: (t: string) => {
+    if (t.trim()) stepFor(agent, 'thought', t);             // → 'reasoning_step' event
+  },
+  onToolCall: (tc: ToolCall) => send({
+    type: 'tool_call_start', toolName: tc.toolName, agent,  // → 'tool_call_start' event
+  }),
+  onToolResult: (tc: ToolCall) => send({
+    type: 'tool_call_end', toolName: tc.toolName, agent,    // → 'tool_call_end' event
+    durationMs: tc.durationMs ?? 0,
+    result: trunc(tc.result),
+    error: tc.error,
+  }),
+});
 ```
 
-Each thought becomes a line in the StatusLog UI, tagged with the agent
-name and timestamp.
+Each agent loop iteration produces 2-3 NDJSON events on the wire (one or more `reasoning_step`, one `tool_call_start`, one `tool_call_end`). The user sees the agent's reasoning happen.
 
-**Where the action lives.** Same response as the thought, but a
-`tool_use` block instead of (or alongside) the text. The
-`BloomingToolRegistryAdapter.callTool` dispatches; the trace emits
-`tool_call_start` / `tool_call_end` events.
+**Part 3 — an example trace, walked.**
 
-**Where the observation lives.** The tool result, passed back to AptKit
-as the next user message's `tool_result` content block. The trace shows
-the result inline:
+```
+  One diagnostic investigation, ReAct trace
 
-```typescript
-onToolResult: (tc: ToolCall) => send({
-  type: 'tool_call_end',
-  toolName: tc.toolName,
-  agent,
-  durationMs: tc.durationMs ?? 0,
-  result: trunc(tc.result),    // ← truncated for the wire
-  error: tc.error,
-}),
+  iter 1 ─ Thought:    "I need to check if revenue dropped globally or in a specific country…"
+        ─ Action:     execute_analytics_eql(eql='select count event purchase by customer.country…')
+        ─ Observation: { 'USA': 1024, 'CAN': 220, 'GBR': 180, ... }
+
+  iter 2 ─ Thought:    "USA stands out. Let me check the funnel for USA users…"
+        ─ Action:     get_funnel(funnel_id='checkout', segment={ country='USA' })
+        ─ Observation: { view: 14200, cart: 2100, checkout: 800, purchase: 200 }
+
+  iter 3 ─ Thought:    "Cart-to-checkout dropped from typical 50% to 38%. Let me check if a campaign changed…"
+        ─ Action:     list_email_campaigns(start_date='2026-04-01', end_date='2026-06-28')
+        ─ Observation: [{ name:'Spring USA promo', end_date:'2026-05-15' }, ...]
+
+  iter 4 ─ Thought:    "Spring USA promo ended May 15. Cart-to-checkout drop started June 1. Likely related."
+        ─ (no tool_use) → loop exits
+
+  Final synthesis: Diagnosis { conclusion: "Cart abandonment in USA spiked
+                               after the Spring promo ended…",
+                               hypothesesConsidered: [...] }
 ```
 
-The UI's `ToolCallBlock` component shows the tool name, duration, and
-an expandable JSON result — that's the observation made visible.
+Four iterations, three tool calls, one final synthesis. The trace shows WHY each tool was called — the agent's reasoning is externalized.
 
-**Why this pattern is debuggable.** When an investigation produces a
-wrong diagnosis, you can scroll back through the trace and see:
+**Part 4 — the budget cap is load-bearing.**
 
-  - *Did the model think the right thought?* (If thought 1 was "let me
-    check pricing" when the right move was "let me check devices," the
-    prompt is steering wrong.)
-  - *Did the right tool get called?* (If thought said "check devices"
-    but action called a campaign tool, the model has a prompt bug.)
-  - *Did the tool return the right data?* (If the observation was an
-    empty result, the EQL query was wrong — separate problem.)
-  - *Did the model interpret the observation correctly?* (If the next
-    thought ignored the data, the model has an attention bug.)
+The monitoring agent's prompt at `lib/agents/legacy-prompts/monitoring.md:18` enforces a hard cap:
 
-Without the interleaved trace, you'd see only the final diagnosis and
-have to guess where it went wrong.
+```
+3. Make at most 6 tool calls total, then stop and return your JSON answer. Be decisive — do NOT re-run variations of the same query. After 6 calls you will be forced to answer with whatever you have.
+```
 
-**The pattern in this codebase's prompts.** The monitoring prompt
-explicitly structures the model's behavior in ReAct shape — see
-`lib/agents/legacy-prompts/monitoring.md`, the "Suggested query plan"
-section, which walks the model through 5 expected actions. The model
-mostly follows it, emitting brief thoughts before each query and a
-final synthesis. Same for diagnostic ("Investigation approach: 1.
-Generate 2–3 hypotheses BEFORE your first tool call…").
+Without the cap, an agent that gets stuck in a "let me try one more variation" pattern burns tokens forever. With it, the loop exits at iteration 6 even if the LLM wants to keep going.
+
+This is the kernel's part-4: drop the budget cap and any LLM that gets stuck calling the same tool repeatedly burns infinite tokens. AptKit's reusable agents each carry their own internal budget; the prompt cap is belt-and-suspenders.
 
 ### Move 3 — the principle
 
-**Force the model to externalize its reasoning between actions, so the
-trace becomes your debugging surface.** Without ReAct, when something
-goes wrong you have a final answer and no way to know where the
-reasoning broke. With ReAct, the trace tells you which turn the model
-made the wrong move. The cost is more output tokens (the thoughts
-aren't free) and slightly slower loops; the benefit is debuggability.
+**Externalize reasoning between actions and you can debug WHY.** The trace turns a black-box agent into a glass-box agent. When the diagnosis is wrong, you can read the trace and see exactly which observation the agent misread. ReAct is the structural commitment to "no decision is made without leaving a record."
 
-## Primary diagram
+## Primary diagram — the full recap
 
 ```
-  ReAct in this codebase — what each block becomes on the wire
+  ReAct loop in this codebase, with the trace hooks attached
 
-  ┌─ Anthropic response ──────────────┐
-  │  content: [                       │
-  │    {type: 'text', text: 'thought'},  ← reasoning_step (thought)
-  │    {type: 'tool_use', name, input},  ← tool_call_start
-  │  ]                                │
-  └─────────────┬─────────────────────┘
-                │
-                ▼  AptKit runs tool
-                │
-                ▼
-  ┌─ tool result ─────────────────────┐
-  │  AptKit prepends to next turn's   │  ← tool_call_end
-  │  messages as tool_result block    │     (observation in UI)
-  └─────────────┬─────────────────────┘
-                │
-                ▼  next turn
-  ┌─ Anthropic response ──────────────┐
-  │  content: [                       │
-  │    {type: 'text', text: 'next thought'},
-  │    {type: 'tool_use'},            │
-  │  ]                                │
-  └─────────────┬─────────────────────┘
-                ⋯ repeat until model emits text-only (final answer)
-
-  Final turn:
-  ┌─ Anthropic response ──────────────┐
-  │  content: [                       │
-  │    {type: 'text', text: 'JSON: …'} │  ← parsed by parseAgentJson,
-  │  ]                                │     validated by isDiagnosis
-  └────────────────────────────────────┘
+  ┌─ Caller (e.g. diagAgent.investigate(anomaly)) ──────────────┐
+  │  initial messages = [system + user "investigate this"]      │
+  └──────────────────────┬──────────────────────────────────────┘
+                         │  AptKit loop starts
+                         ▼
+  ┌─ ReAct iteration ───────────────────────────────────────────┐
+  │                                                              │
+  │  ┌─ model.complete(messages, tools) ─┐                      │
+  │  │                                    │                      │
+  │  │  response: ContentBlock[]          │                      │
+  │  │   - text  ("I need to check…")     │ → trace.emit({ type:'step', content:'I need to…' })
+  │  │   - tool_use { name, input }       │ → trace.emit({ type:'tool_call_start', ... })
+  │  └────────────────────────────────────┘                      │
+  │                  ↓                                            │
+  │  for each tool_use:                                           │
+  │     toolRegistry.callTool(name, input)                        │
+  │       → durationMs, result                  │ → trace.emit({ type:'tool_call_end', ... })
+  │     append { type:'tool_result', content } to messages        │
+  │                  ↓                                            │
+  │  if no tool_use this turn OR budget hit → break loop          │
+  │  else loop again                                              │
+  └──────────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+  ┌─ Final synthesis ───────────────────────────────────────────┐
+  │  reduce accumulated tool results into typed output          │
+  │  (Anomaly[], Diagnosis, Recommendation[], string)           │
+  └─────────────────────────────────────────────────────────────┘
+                         │
+                         ▼  through BloomingTraceSinkAdapter
+                         ▼  through hooks
+                         ▼  through route layer NDJSON
+                         ▼  to UI StatusLog
 ```
 
 ## Elaborate
 
-ReAct was introduced in 2022 (Yao et al., "ReAct: Synergizing Reasoning
-and Acting in Language Models"). Before ReAct, agent papers either had
-the model emit pure actions (no reasoning visible — hard to debug) or
-pure reasoning chains (no actions — couldn't interact with tools).
-Interleaving both turned out to dramatically improve both interpretability
-AND task performance.
+**Why ReAct's reasoning text matters even if it's not "real" reasoning.** The model isn't actually reasoning — it's predicting tokens that look like reasoning. But empirically, *forcing* the model to emit those tokens before its action improves action quality (the "let's think step by step" finding from CoT prompting). The reasoning text is a structural lever: it gets the model to write into its own context what it's about to do, which constrains the action that follows.
 
-The pattern is now baked into every modern tool-using LLM — Anthropic's
-`tool_use` format encourages it (the model naturally emits text
-alongside tool calls), OpenAI's function calling supports it via
-`tool_calls` + content text. AptKit doesn't have to do anything special
-to enable ReAct; just expose tools and the model emits the pattern.
+**Why this codebase doesn't roll its own ReAct loop.** Three reasons:
 
-For this codebase's debuggability, ReAct is the reason the StatusLog UI
-exists. Without externalized thoughts, the panel would just be "tool
-call 1, tool call 2, tool call 3, done." With thoughts, you see the
-model's narrative — "monitoring agent: scanning revenue / conversion /
-traffic; revenue drop detected, computing impact estimate; classifying
-as critical." That narrative is the product's *trustworthiness signal*.
+  1. **The loop is non-trivial to get right.** Budget enforcement, error recovery, infinite-loop detection, tool-result truncation — all need to live in the loop. AptKit's agents (`AnomalyMonitoringAgent`, `DiagnosticInvestigationAgent`, etc.) implement all of it.
+  2. **Per-agent variants.** Monitoring's loop is checklist-driven; diagnostic's is hypothesis-testing; recommendation's is feature-selection. Each tuned variant is a class in AptKit.
+  3. **Adapter glue is cheap.** 206 LOC in `aptkit-adapters.ts` is the entire boundary between this codebase and the loop machinery.
+
+**Where the trace would mislead you.** The reasoning text is the LLM's *narration*, not a guaranteed cause-and-effect explanation. If the agent says "I need to check X" and then calls tool Y, both came from the same model call — the reasoning isn't necessarily what *drove* the tool choice. Read the trace as "what the model decided to externalize about its decision," not as a deterministic explanation.
 
 ## Project exercises
 
-### Exercise — add hypothesis-tagging to diagnostic thoughts
+### Exercise — Surface ReAct iteration count in the per-call log
 
-  → **Exercise ID:** `study-ai-eng-04-03.1`
-  → **What to build:** Modify the diagnostic prompt to require each
-    thought to be tagged with the hypothesis it's testing (e.g.
-    "Hypothesis 1 (device cause): checking…"). Parse the tags in
-    `hooksFor()` and emit a structured `{ type: 'reasoning_step', kind:
-    'hypothesis', tag: 'H1', content }` event. UI renders hypothesis-
-    tagged thoughts grouped.
-  → **Why it earns its place:** Makes the model's hypothesis testing
-    structurally visible — debuggable per hypothesis, not as a flat
-    sequence.
-  → **Files to touch:** `lib/agents/legacy-prompts/diagnostic.md`,
-    `lib/mcp/events.ts` (extend reasoning_step), route's `hooksFor`,
-    `components/investigation/ReasoningTrace.tsx`.
-  → **Done when:** UI shows "H1: device cause (3 thoughts) / H2: campaign
-    cause (2 thoughts) / H3: pricing cause (1 thought)" grouping.
-  → **Estimated effort:** `1–2 days`
+  → **Exercise ID:** B4.3
+  → **What to build:** Track per-agent-invocation iteration count via the trace sink (count `tool_call_start` events) and emit it in the per-phase log line at the end of the agent's run. Surface as `{ iterations: 6 }` alongside the existing `durationMs`.
+  → **Why it earns its place:** budget cap is enforced in the prompt and the library, but the codebase has no visibility into "did the agent hit the cap?" Knowing the iteration count distribution per-agent tells you whether the budget is tight (consistently hits cap → raise it or split the task) or loose (rarely uses 3+ iterations → maybe consolidate).
+  → **Files to touch:** `lib/agents/aptkit-adapters.ts` (extend `BloomingTraceSinkAdapter` to count iterations and expose via getter), `app/api/agent/route.ts` + `app/api/briefing/route.ts` (read iteration count and add to the phase log).
+  → **Done when:** the per-route summary log line now carries `{ iterations: N }` for each agent invocation, and the test suite has a unit test for the counter logic.
+  → **Estimated effort:** 1–4hr.
 
 ## Interview defense
 
-**Q: How does the agent's reasoning surface in the UI?**
+**Q: "What's actually inside your agent loop?"**
 
-Through the ReAct interleaving. Each model turn emits a thought (text
-content block) and an action (`tool_use` block). The thought becomes a
-`reasoning_step` event on the NDJSON wire; the action becomes a
-`tool_call_start` event. The result of running the tool becomes a
-`tool_call_end` event with the data. The StatusLog renders all of them
-in timestamp order — so the user sees the model's narrative, not just
-the final answer.
+ReAct — Thought, Action, Observation, repeat. Each LLM call returns content blocks: text becomes Thought (assistant message), `tool_use` blocks become Action (executed by my code), the result feeds back as Observation (`tool_result` block) on the next call. The loop exits when the LLM emits no `tool_use` (it's done) or when the budget cap fires (6 calls for monitoring, varies per agent). The loop itself lives in `@aptkit/core`; this codebase observes it via trace hooks that turn each iteration into UI events streamed to the browser.
 
-```
-  trace shows:
-    "monitoring agent: scanning revenue, conversion, traffic"  ← thought
-    [tool: execute_analytics_eql ✓ 1.2s]                       ← action+obs
-    "found revenue down 30% — classifying as critical"         ← thought
-    ...
-    "[10 anomalies emitted]"                                    ← final
-```
+The trace is the product surface — users watch the agent's reasoning happen in `StatusLog`.
 
-**Anchor line:** "ReAct makes the model debuggable. The thoughts are
-the debugging surface — without them, you have a final answer and no
-way to know where reasoning broke."
+*Anchor: "Loop in AptKit; trace hooks at `aptkit-adapters.ts:108`; budget caps in the prompt + library."*
 
-**Q: What's the load-bearing thing about ReAct people forget?**
+**Q: "What's the most-forgotten part of a ReAct loop?"**
 
-It costs output tokens. The thoughts aren't free — each turn pays for
-"~50-200 tokens of model talking about what it's doing." For high-
-volume systems that's real money. The tradeoff is debuggability vs cost;
-this codebase pays the cost because the trace IS part of the product
-("an analyst that shows its work").
+The budget cap. People remember "loop until LLM emits no tool_use" — that's the common-case exit. They forget the LLM can get stuck in a "let me try one more variation" pattern, calling the same tool with slightly different args forever. Without a hard iteration cap, that's infinite tokens. Monitoring's prompt enforces 6 max calls; AptKit's library carries its own internal cap. Belt-and-suspenders is the right shape — neither alone is enough.
 
-For a backend-only agent where nobody reads the trace, you could prompt
-the model to emit *less* thought between actions. Saves tokens, costs
-debuggability.
+*Anchor: "Budget cap is the load-bearing part people forget. Prompt + library both enforce."*
 
 ## See also
 
-  → `01-agents-vs-chains.md` — the loop ReAct happens inside
-  → `02-tool-calling.md` — the action half of the pattern
-  → `05-evals-and-observability/04-llm-observability.md` — how thoughts
-    feed observability
+  → `02-tool-calling.md` — the Action part of the loop in detail
+  → `06-error-recovery.md` — what happens when an Observation comes back as an error
+  → `05-evals-and-observability/04-llm-observability.md` — the trace as telemetry
+  → `01-llm-foundations/05-streaming.md` — how trace events stream live to the UI

@@ -1,247 +1,245 @@
 # Per-tool circuit breaking
 
-*Industry name: circuit breaker / per-dependency breaker — Industry standard.*
+**Industry standard.** Single-call retry handles one flaky request; agent loops can call the same flaky tool every turn. **Partially exercised** in this repo — retry-and-feed-back, not a full circuit-state machine.
 
-Single-call retry handles one flaky request. An agent loop can call the *same flaky tool* on every turn — retrying a dead tool inside a loop multiplies the failure by the iteration count and burns the whole budget on a tool that isn't coming back. **Not in this repo — the named gap.** This is the most concrete production-serving addition the repo should make.
+## Zoom out, then zoom in
 
-## Zoom out — where this concept would live
-
-A per-tool breaker lives at the DataSource layer (where the tool calls happen) with hooks into the agent layer (so the open-circuit state can be fed back as an observation). Today there's general retry but no per-tool state.
+Sits at the data-source layer, between the agent's tool call and the wire. The single-call version protects your service from a dead dependency; the agent version does that *and* feeds the failure back to the agent so the agent can route around it.
 
 ```
-  Where per-tool circuit breaking WOULD live
+  Zoom out — where this concept lives
 
-  ┌─ Agent layer ──────────────────────────────────────────────┐
-  │  receives "tool X unavailable" as observation               │ ← would receive
-  │  reasoning routes around it (picks different tool / degrades)│   feedback
-  └─────────────────────┬──────────────────────────────────────┘
-                        ▼
-  ┌─ DataSource layer ─────────────────────────────────────────┐
-  │  per-tool breaker state: { closed | open | half-open }     │ ← new (this file)
-  │  on N consecutive failures: OPEN; fail fast                 │
-  │  after T cooldown: HALF-OPEN; try one                       │
-  │  + existing: cache, spacing, rate-limit retry               │
-  └─────────────────────────────────────────────────────────────┘
+  ┌─ Agent loop ─────────────────────────────────────┐
+  │  tool_use → tools.callTool                       │
+  └───────────────────────┬──────────────────────────┘
+                          ▼
+  ┌─ Data source layer ──────────────────────────────┐
+  │  ★ retry + cache + (no formal breaker) ★         │ ← we are here
+  │  failure surfaces to the agent as tool_result    │
+  │  with is_error: true                              │
+  └───────────────────────┬──────────────────────────┘
+                          ▼
+  ┌─ Wire ───────────────────────────────────────────┐
+  │  MCP transport → Bloomreach server                │
+  └──────────────────────────────────────────────────┘
 ```
 
 ## Structure pass
 
-The axis: **what's the failure cost as the iteration count grows?**
+Layers: tool call → cache check → spacing → wire call → retry on rate-limit → error envelope → tool_result back to agent.
 
-```
-  Without per-tool breaker:
-  ─────────────────────────
-  agent calls tool X → fails (10s timeout)
-  agent retries tool X → fails (10s timeout)
-  agent retries tool X → fails (10s timeout)
-  ...
-  6 attempts × 10s = 60s burned on a dead tool
-  + full per-agent budget spent, agent returns empty fallback
+**Axis traced — "what happens when a tool is unavailable?":** in this repo, the data source retries on rate-limit (up to 3x with the server-stated retry-after window), then surfaces failure to the agent as a `tool_result` with `is_error: true`. The agent reads that and can route around the dead tool in subsequent turns. No formal circuit-state machine (closed/open/half-open) is implemented.
 
-  With per-tool breaker:
-  ──────────────────────
-  agent calls tool X → fails (10s)
-  breaker counts failures (now 1)
-  agent calls tool X → fails (10s)
-  breaker counts failures (now 2)
-  agent calls tool X → fails → OPEN circuit, fail fast (50ms)
-  agent observes "tool X unavailable" → reasons around it
-  total burn: 2 × 10s + 50ms × 4 = ~20s; tool budget mostly preserved
-```
-
-The breaker turns "the entire iteration budget spent on retries" into "two failed attempts and the agent routes around it."
+**Seam:** the `tool_result` block with `isError: true`. That's the boundary where infrastructure failure becomes agent observation.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know the circuit breaker from microservices — Netflix's Hystrix made it famous. State machine with three positions: **closed** (calls pass through), **open** (calls fail fast without hitting the dependency), **half-open** (one trial call to see if the dependency recovered). Per-tool circuit breaking is that primitive scoped to one tool name, not one whole service.
+You know circuit breakers from microservices — if a downstream service is failing, fail fast locally instead of waiting on every call. Three states: closed (calls pass through), open (calls fail fast), half-open (try one to see if it recovered).
+
+The agent version layers one extra thing on top: when the breaker is open, *tell the agent*. A breaker that just fails fast without informing the agent leaves the agent retrying the same dead path every turn. The agent observes the failure as a `tool_result` and reasons about whether to try a different tool.
 
 ```
-  Per-tool circuit breaker — state machine per tool
+  Per-tool breaker with feedback to the agent
 
-  ┌─ closed ─────┐  N consecutive  ┌─ open ─────┐  after T  ┌─ half-open ───┐
-  │  calls pass  │ ──── fails ────► │ fail fast  │ ──────── ►│  try one call  │
-  │  through     │                  │  no actual │ cooldown  │                │
-  │              │  any success      │  call      │           │                │
-  │              │ ◄──────────────── │            │           │                │
-  └──────────────┘                  └────────────┘           └────────┬───────┘
-        ▲                                                              │
-        │ success                                                      │
-        └──────────────────────────────────────────────────────────────┘
-                                  back to closed
+  Agent calls tool X
+       │
+       ▼
+  ┌───────────────────────────────────────────────┐
+  │  Circuit breaker (per tool)                   │
+  │   closed:    calls pass through               │
+  │   N fails →  OPEN: fail fast, don't call tool │
+  │   after T:   half-open, try one               │
+  └───────────────────────────────────────────────┘
+       │ tool X open?
+       ▼
+  Agent observes "tool X unavailable" and routes
+  around it (picks a different tool / degrades /
+  escalates) — instead of retrying it every turn
 ```
 
-### Move 2 — what it would look like in this repo
+### Move 2 — step by step
 
-The implementation would live in `BloomreachDataSource`, alongside the existing cache and retry. The state shape:
+#### What this repo has — retry, not break
 
-```typescript
-// hypothetical addition
-type BreakerState = 'closed' | 'open' | 'half-open';
-private breakers = new Map<string, {
-  state: BreakerState;
-  consecutiveFailures: number;
-  openedAt: number;
-}>();
+Open `lib/data-source/bloomreach-data-source.ts:139-188`. The retry ladder:
 
-private readonly FAILURE_THRESHOLD = 3;
-private readonly COOLDOWN_MS = 30_000;
-```
+```ts
+// lib/data-source/bloomreach-data-source.ts:154-174
+const start = Date.now();
+let result = await this.liveCall(name, args, options.signal);
 
-The check inside `callTool`:
+let retries = 0;
+while (isRateLimited(result) && retries < this.maxRetries) {
+  retries++;
+  const hintMs = parseRetryAfterMs(result);             // parse "retry after N seconds"
+  const backoffMs = this.retryDelayMs * 2 ** (retries - 1);  // exponential fallback
+  const waitMs = Math.min(
+    hintMs != null ? hintMs + RETRY_BUFFER_MS : backoffMs,
+    this.retryCeilingMs,
+  );
+  await sleep(waitMs);
+  result = await this.liveCall(name, args, options.signal);
+}
 
-```typescript
-async callTool(name, args, opts) {
-  const breaker = this.breakers.get(name) ?? { state: 'closed', consecutiveFailures: 0, openedAt: 0 };
-  
-  // check breaker state
-  if (breaker.state === 'open') {
-    if (Date.now() - breaker.openedAt > this.COOLDOWN_MS) {
-      breaker.state = 'half-open';
-    } else {
-      // FAIL FAST — no actual call
-      throw new Error(`Tool ${name} unavailable (circuit open)`);
-    }
-  }
-
-  try {
-    const result = await this.actualCall(name, args, opts);
-    // success → close circuit
-    breaker.state = 'closed';
-    breaker.consecutiveFailures = 0;
-    this.breakers.set(name, breaker);
-    return result;
-  } catch (err) {
-    breaker.consecutiveFailures++;
-    if (breaker.consecutiveFailures >= this.FAILURE_THRESHOLD) {
-      breaker.state = 'open';
-      breaker.openedAt = Date.now();
-    }
-    this.breakers.set(name, breaker);
-    throw err;
-  }
+const durationMs = Date.now() - start;
+if ((result as any)?.isError === true) {
+  return { result: result as T, durationMs, fromCache: false };  // surface error
 }
 ```
 
-**The crucial second half: feed the open-circuit state back to the agent.**
+The logic:
 
-In a standard circuit breaker, the breaker just fails fast — protecting *your* service from hammering a broken dependency. For agents, that's not enough. The agent needs to know "this tool is down" so its reasoning can route around it; otherwise the agent keeps trying the dead path and the breaker just fails fast every time, still burning budget on attempts.
+1. **Make the call.** First attempt against the wire.
+2. **Is the response rate-limited?** `isRateLimited` (`bloomreach-data-source.ts:51-55`) checks `result.isError === true` AND the content text matches `/rate limit|too many requests/i`.
+3. **Parse the server's stated retry window.** `parseRetryAfterMs` (`bloomreach-data-source.ts:64-71`) handles two observed shapes — "Retry after ~N second(s)" and "rate limit reached (1 per N second)" — extracting the wait time.
+4. **Sleep and retry.** Use the parsed hint if available; fall back to exponential backoff (`retryDelayMs * 2^(retries-1)`). Cap the wait at `retryCeilingMs` (20s default).
+5. **Try up to maxRetries times.** Default 3. If still rate-limited after 3 retries, surface the error to the agent.
+6. **On non-error: cache and return.** On error: skip the cache (don't poison it), return the error envelope with `fromCache: false`.
 
-The fix: when the breaker is open, the harness should still emit a tool_result block to the model — but with an error message that says "tool X is currently unavailable; try a different approach." The agent's next turn sees this as feedback and can pick a different tool. Sketch:
+This is the retry-and-feed-back pattern. The agent receives the failure as a `tool_result` with `isError: true`; the model on the next turn can decide to (a) try the same tool again with different args, (b) try a different tool, or (c) give up and synthesize from what it has.
 
-```typescript
-// in runAgentLoop's tool execution path
+What's *missing* is the formal circuit-state machine. There's no `closed` → `open` → `half-open` state tracked per tool. The retry ladder treats every call as a fresh attempt; a tool that's been down for 5 minutes will still pay the retry cost on every new agent call rather than failing fast.
+
+#### Why the missing breaker is okay (for now)
+
+The retry-and-surface pattern handles the dominant failure mode in this repo (transient rate-limit errors) well. A circuit-state machine would help for *persistent* failures (Bloomreach's server is down for an hour) by failing fast instead of paying retry cost. For this repo's use pattern (low-volume, demo-cadence), persistent failures are rare and the retry cost is acceptable.
+
+The threshold where the formal breaker would earn its place: high-volume use where retries-during-outages would meaningfully spike cost and latency. At that point, tracking per-tool state (consecutive failure count, cooldown timer) and short-circuiting calls during the open state is the standard pattern.
+
+#### The feedback to the agent — the load-bearing detail
+
+The most important behavior is the failure flowing back to the agent as a `tool_result` with `is_error: true`. The agent loop's harness handles this in `run-agent-loop.js:73-86`:
+
+```js
+let isError = false;
+let resultContent;
 try {
-  result = await dataSource.callTool(name, args, { signal });
-} catch (err) {
-  // existing path
+  const { result, durationMs } = await tools.callTool(toolUse.name, toolUse.input, { signal });
+  toolCall.result = result;
+  toolCall.durationMs = durationMs;
+  resultContent = truncate(JSON.stringify(result));
+} catch (error) {
   isError = true;
-  resultContent = JSON.stringify({ error: err.message });
+  const message = error instanceof Error ? error.message : String(error);
+  toolCall.error = message;
+  resultContent = truncate(JSON.stringify({ error: message }));
 }
-// agent sees the error as a tool_result; reasoning can route around
+toolCalls.push(toolCall);
+// emit trace event with the error
+toolResults.push({
+  type: 'tool_result',
+  toolUseId: toolUse.id,
+  content: resultContent,
+  ...(isError ? { isError: true } : {}),
+});
 ```
 
-The existing `runAgentLoop` already wraps tool errors as `tool_result` blocks with `is_error: true` — so the agent already gets the feedback. The breaker adds *fast failure* (no 10s wait per attempt) and *persistent state* (the breaker stays open across the agent's subsequent turns, so the agent reliably stops trying).
+Two error paths:
 
-### Move 2.5 — the trade
+1. **`tools.callTool` throws.** The `try/catch` catches it, sets `isError = true`, packages the error message in the `content` string, marks the `tool_result` block with `isError: true`.
+2. **`tools.callTool` returns an error result.** The `BloomreachDataSource` already returned `{result: errorEnvelope, ...}`; the result's `isError: true` is in the result object, the harness packages it as `tool_result` content as usual. The model sees the error content.
 
-A per-tool breaker adds state the agent runtime has to carry across turns (which tools are open, their cooldown timers). The state has to be carefully scoped — per-process in the simple case, per-session in the Vercel case (since instances are ephemeral).
-
-The failure this prevents is the expensive one: without it, one dead tool plus an agent loop equals the entire iteration budget spent on retries — the worst kind of cost blowup because it produces nothing. This is the control that turns the "tool-call cascade" failure mode from a budget-ending event into a routed-around inconvenience.
+Both paths feed the failure back to the model. The model on the next turn reads the error and can adapt — this is the "agent reasons around a dead tool" capability the per-tool breaker pattern unlocks. Without this feedback (a breaker that fails fast without telling the agent), the agent would retry the same dead path every turn.
 
 ### Move 3 — the principle
 
-The shift from single-call's circuit breaker: there, the breaker protects *your* service from hammering a broken dependency. For agents, it does that AND feeds the open-circuit state back to the agent as an observation, so the agent's reasoning can route around the dead tool rather than looping on it. A breaker that just fails fast without telling the agent leaves the agent retrying the same dead path. The agent-architecture version is **breaker + feedback** — both halves matter.
-
-## In this codebase
-
-**Not implemented.** The current `BloomreachDataSource` has rate-limit retry (handles 429s with backoff) and a 60s response cache, but no per-tool failure tracking. A flaky tool today wastes calls until the per-agent `maxToolCalls` budget is spent (`../01-reasoning-patterns/02-agent-loop-skeleton.md`); the budget exit then forces synthesis with the partial data.
-
-The natural opportunity: when an MCP tool becomes consistently flaky (the Bloomreach alpha server has had real instability — this isn't hypothetical), the agent today burns its whole budget on retries. Adding a per-tool breaker would cut that to 2-3 attempts and let the agent route around the dead tool.
-
-The work:
-1. Add breaker state to `BloomreachDataSource` (~50 lines)
-2. Test fakes that simulate flaky tools (the `SyntheticDataSource` is the seam — it can already be wired to fail deterministically)
-3. Update the agent prompts to encourage "if a tool is unavailable, try a different approach"
+**An agent's retry story is different from a service's retry story because the agent can reason about the failure.** A service that retries a dead dependency is just waiting; an agent that receives the failure as a `tool_result` can change its strategy. The control that matters most isn't the retry count or the backoff — it's the *failure-as-observation* feedback that lets the agent route around the dead path. Add the formal circuit-state machine when the volume justifies the persistent-failure cost savings; until then, retry-and-surface covers the dominant pattern.
 
 ## Primary diagram
 
-The contrast — today vs with per-tool breaker:
-
 ```
-  Comparison — flaky tool with vs without per-tool breaker
+  The retry ladder + agent feedback path in this repo
 
-  TODAY (no breaker):
-  ┌──────────┐ tool X call → fails ┌──────────┐
-  │ agent    │ ──────────────────► │ MCP      │ ── 10s timeout
-  └──────────┘   (retry, wait, etc)└──────────┘
-       │
-       ▼ next turn
-  ┌──────────┐ tool X call → fails ┌──────────┐
-  │ agent    │ ──────────────────► │ MCP      │ ── 10s timeout
-  └──────────┘                     └──────────┘
-       │
-       ▼ ... repeat until maxToolCalls=6 is spent
-  total: ~60s burned on a dead tool, agent returns empty fallback
+  ┌─ Agent emits tool_use(execute_analytics_eql, args) ──────────────┐
+  └────────────────────────────────────┬──────────────────────────────┘
+                                       ▼
+  ┌─ tools.callTool → BloomreachDataSource.callTool ──────────────────┐
+  │                                                                     │
+  │   1. cache check                                                    │
+  │       cacheKey = name:JSON.stringify(args), TTL 60s                 │
+  │       hit + not expired? return { result, durationMs:0,            │
+  │                                    fromCache: true }                │
+  │                                                                     │
+  │   2. liveCall                                                        │
+  │       spacing: wait until 200ms since last call                     │
+  │       transport.callTool → MCP wire → loomi connect server          │
+  │       on transport error: throw McpToolError                        │
+  │       on response: return result envelope                            │
+  │                                                                     │
+  │   3. retry on rate-limit (up to 3x)                                  │
+  │       isRateLimited(result)?                                         │
+  │         yes → parseRetryAfterMs(result)                             │
+  │               sleep min(hint+500ms, backoff, ceiling 20s)           │
+  │               liveCall again                                         │
+  │                                                                     │
+  │   4. on non-error: cache + return                                    │
+  │      on still-error after retries: return error envelope            │
+  │       (DO NOT cache errors — would poison)                          │
+  └────────────────────────────────────┬──────────────────────────────┘
+                                       ▼
+  ┌─ run-agent-loop.js packages the response ─────────────────────────┐
+  │   if catch: { type: 'tool_result', isError: true,                   │
+  │              content: JSON.stringify({error: e.message}) }          │
+  │   if isError result: { type: 'tool_result', isError: true,          │
+  │                        content: JSON.stringify(result) }            │
+  │   if success: { type: 'tool_result', content: ... }                 │
+  └────────────────────────────────────┬──────────────────────────────┘
+                                       ▼
+  ┌─ Next turn: model reads the tool_result ──────────────────────────┐
+  │   if isError visible in content:                                    │
+  │     model can: retry with different args                            │
+  │                try a different tool                                  │
+  │                give up and synthesize from what it has              │
+  │   the agent reasons AROUND the failure, not THROUGH it              │
+  └────────────────────────────────────────────────────────────────────┘
 
-  WITH per-tool breaker:
-  ┌──────────┐ tool X call → fails ┌──────────┐
-  │ agent    │ ──────────────────► │ breaker  │ → MCP → 10s fail
-  └──────────┘                     │ count:1  │
-       │                            └──────────┘
-       ▼ next turn → fails
-  ┌──────────┐                     ┌──────────┐
-  │ agent    │ ──────────────────► │ count:2  │ → MCP → 10s fail
-  └──────────┘                     └──────────┘
-       │                            
-       ▼ next turn → breaker OPEN
-  ┌──────────┐                     ┌──────────┐
-  │ agent    │ ──────────────────► │ OPEN —   │ ── 50ms fail-fast
-  │ observes │                     │ fail fast│   "tool X unavailable"
-  │ "X dead, │ ◄─────────────────  │          │
-  │  use Y"  │                     └──────────┘
-  └──────────┘
-       │
-       ▼ next turn — agent calls tool Y instead
-  ┌──────────┐ tool Y call → succeeds
-  │ agent    │ ──────────────────► [happy path]
-  └──────────┘
-
-  total: ~20s + agent successfully routes around the dead tool
+  MISSING: formal circuit-state machine (closed / open / half-open).
+  Persistent failures pay the retry cost on every new agent call.
+  Adequate for low-volume use; would warrant the formal breaker at
+  high-volume cost-sensitive scale.
 ```
+
+## Elaborate
+
+The retry-and-surface pattern this repo runs is the lower-complexity end of a spectrum that ends with a full Hystrix-style circuit breaker. The progression:
+
+1. **No retry.** First-class failure — the agent just sees the error.
+2. **Retry with backoff.** What this repo has. Bounded attempts, server-aware retry-after window honored.
+3. **Per-tool circuit breaker.** Adds persistent-failure state — fail fast for a cooldown window when a tool has been failing repeatedly.
+4. **Hierarchical breaker.** Per-tool AND per-host AND per-service. Coordinated across many call sites.
+5. **Adaptive concurrency + breaker.** Dynamic concurrency limits driven by observed latency/error rates.
+
+Most production agent systems land at step 2 or 3. Step 4 and beyond is microservices-scale infrastructure that doesn't pay off until you have many call sites coordinating against shared dependencies.
+
+The "feed the failure back to the agent" piece is what makes the agent retry pattern qualitatively different from a service retry pattern. In a service, retry is a transparent wrapper — the caller doesn't know the call was retried. In an agent, the failure becoming an observation IS the safety mechanism — the model can adapt its strategy. A breaker that fails fast but doesn't tell the agent is worse than no breaker at all (the agent retries the same dead path on every turn).
+
+The 16,000-char tool-result truncation (`run-agent-loop.js:2-7`) interacts with error feedback: a very long error message can still be truncated. The current shape (`{error: e.message}` JSON) is short enough this isn't a concern; if errors started carrying server stack traces or full request bodies, the truncation could cut the model's view of the error mid-sentence. The mitigation is keeping error envelopes structured and short.
 
 ## Interview defense
 
-**Q: "How do you handle a flaky tool in an agent loop?"**
+> **Q: How does this codebase handle tool failures?**
+>
+> Retry-and-surface, no formal circuit breaker. `BloomreachDataSource.callTool` (`lib/data-source/bloomreach-data-source.ts:139-188`) catches rate-limit errors from the MCP response, parses the server's stated retry window (handles two formats: "retry after N seconds" and "rate limit reached (1 per N second)"), sleeps the parsed window plus a 500ms buffer (capped at 20s ceiling), and retries up to 3 times. If still rate-limited after retries OR if the transport throws, the error surfaces to the agent as a `tool_result` block with `isError: true`. The agent reads that on the next turn and can adapt — try the same tool with different args, try a different tool, or synthesize from what it has.
 
-A: Today, badly — the agent retries the flaky tool every turn until the `maxToolCalls` budget is spent (6 attempts × 10s timeout = 60s burned on a dead tool, agent returns empty fallback). The named gap in this repo. The fix is a per-tool circuit breaker at the DataSource layer: state machine per tool name (closed / open / half-open), N consecutive failures opens the circuit, T-second cooldown half-opens it, success closes it. The crucial second half is feeding the open-circuit state back to the agent as a tool_result error so the agent's reasoning can route around it. A breaker that just fails fast without telling the agent leaves the agent retrying the same dead path — the agent-architecture version is **breaker + feedback**, both halves matter.
+> **Q: Why not a formal circuit-state machine?**
+>
+> The retry-and-surface pattern handles the dominant failure mode in this repo (transient rate-limit errors from Bloomreach's alpha server) well. The formal circuit breaker — closed/open/half-open with cooldown timers — would help for *persistent* failures by failing fast instead of paying retry cost on every call. At this repo's volume (low traffic, demo cadence), persistent failures are rare and the retry cost is acceptable. The threshold where the formal breaker earns its place is high-volume use where retries-during-outages would spike cost and latency meaningfully. That's the escalation point worth naming.
 
-Implementation is ~50 lines in `BloomreachDataSource`, and the test seam already exists — `SyntheticDataSource` can be wired to fail deterministically, so the breaker can be tested without touching real Bloomreach. The work the team hasn't done is just prioritization — the Bloomreach alpha server's instability has caused real burn, but the per-agent budget caps a single bad run, so the issue surfaces as "users see a fallback" rather than "users see a runaway." A breaker would make the failure mode "users see degraded output but the agent stays in budget."
+> **Q: What makes the agent retry story different from a service retry story?**
+>
+> The failure becoming an observation. In a service, retry is a transparent wrapper — the caller doesn't know the call was retried. In an agent, the model receives the error as a `tool_result` and can *reason* about it: try a different tool, change the args, give up gracefully. A breaker that fails fast without telling the agent leaves the agent retrying the same dead path on every turn. The "failure-as-observation" piece is the load-bearing addition that single-call retry libraries don't have. This repo gets it for free because the harness in `run-agent-loop.js:73-86` packages caught errors as `tool_result` blocks with `isError: true`.
 
-Diagram I'd sketch:
-
-```
-  ┌─ closed ─┐ N fails ┌─ open ─┐  T  ┌─ half-open ─┐
-  │ pass thru│ ──────► │fail fast│ ──► │ try one      │
-  └──────────┘         └─────────┘     └──────┬──────┘
-       ▲                                       │
-       │ success                               │
-       └───────────────────────────────────────┘
-
-  + critical: agent receives tool_result with error so reasoning routes around
-```
-
-Anchor: "without the breaker, one flaky tool burns the whole 6-call budget on retries — the worst kind of cost blowup because it produces nothing. With it, the budget is mostly preserved and the agent can degrade gracefully."
-
-**Q: "What state lifetime would the breaker use?"**
-
-A: Per-process in the simple version (the breakers Map lives on the DataSource instance, which is per-request on Vercel). That means each new request starts with a fresh breaker — a tool that's been failing for 10 minutes still gets retried on the next request. The honest tradeoff: Vercel's ephemeral instance lifecycle makes per-session breaker state hard; the right answer is either an external store (Redis, Postgres) or accepting per-request fresh state. For this repo's traffic volume, per-request fresh state is probably acceptable — the breaker still saves the current request from the full budget burn, even if it doesn't persist across requests. If usage grew, an external breaker store would be the next investment.
+> **Q: What's the failure mode of caching errors?**
+>
+> Cache poisoning. If a transient rate-limit error got cached, every subsequent agent call to the same tool + args would get the cached error envelope for 60s, even after the actual error condition cleared. The agent would observe a persistent failure when the underlying problem was transient. `BloomreachDataSource.callTool` (`bloomreach-data-source.ts:179-182`) explicitly checks for `isError === true` and returns without caching when it sees one. Errors die at the source; the next call retries fresh.
 
 ## See also
 
-- [`../01-reasoning-patterns/02-agent-loop-skeleton.md`](../01-reasoning-patterns/02-agent-loop-skeleton.md) — the kernel where the budget exit fires (without breaker, this fires after the full 6-call burn)
-- [`../03-multi-agent-orchestration/09-coordination-failure-modes.md`](../03-multi-agent-orchestration/09-coordination-failure-modes.md) — tool-call cascade is exactly what this prevents
-- [`02-fan-out-backpressure.md`](./02-fan-out-backpressure.md) — the sibling flow-control primitive at the same layer
-- [`../04-agent-infrastructure/05-guardrails-and-control.md`](../04-agent-infrastructure/05-guardrails-and-control.md) — this is the named gap in the control envelope
-- ai-engineering's circuit-breaker file (cross-ref) — the single-call version of the same primitive
+- → `04-agent-infrastructure/03-tool-calling-and-mcp.md` — the wire path the retry ladder protects
+- → `01-cross-turn-caching.md` — what the retry ladder explicitly does NOT cache
+- → `02-fan-out-backpressure.md` — the rate-limit signal both the retry and the cap respond to
+- → `03-multi-agent-orchestration/09-coordination-failure-modes.md` — the "tool-call cascade" failure this controls in single-agent loops
+- → cross-reference (when generated): `study-ai-engineering`'s retry-and-circuit-breaker file — the single-call mechanics this builds on
+- → cross-reference (when generated): `study-system-design`'s caching-and-rate-limiting file — the same `BloomreachDataSource` from a system-design lens

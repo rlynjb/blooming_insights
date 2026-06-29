@@ -1,343 +1,234 @@
-# 01 — agents vs chains
+# Agents vs chains
 
-**Subtitle:** Loop vs pipeline · Industry standard (load-bearing for this codebase)
+*Industry standard — agent (loop, LLM-decided) vs chain (linear, code-decided)*
 
-## Zoom out, then zoom in
+## Zoom out — where this concept lives
 
-blooming insights is *both*. The product is a **chain** at the top
-(monitoring → diagnostic → recommendation; see
-`02-context-and-prompts/03-prompt-chaining.md`). Inside each step is an
-**agent loop** — the model decides which tools to call, how many turns to
-take, when to stop. The chain is in Blooming; the loops are in AptKit.
+This codebase has both shapes. **Agents** (monitoring, diagnostic, recommendation, query) each run a ReAct-style loop where the LLM decides which tool to call next. **A chain** sits *between* them: the route layer runs `bootstrap → diagnose → recommend` in fixed order, where the LLM never picks the next step. Hybrid: pipeline outside, loop inside.
 
 ```
-  Zoom out — outer chain, inner loops
+  Zoom out — where the loop and the chain sit
 
-  ┌─ /api/agent route ──────────────────────────────────────┐
-  │                                                         │
-  │  diagnose step                                          │
-  │    ┌─ DiagnosticAgent.investigate(anomaly) ──────────┐  │
-  │    │  ┌─ AptKit DiagnosticInvestigationAgent loop ─┐ │  │  ← we are here
-  │    │  │  while (not done) {                        │ │  │
-  │    │  │    model decides → tool_use OR text       │ │  │
-  │    │  │    if tool_use: run, append result        │ │  │
-  │    │  │    if text: parse JSON, return            │ │  │
-  │    │  │  }                                         │ │  │
-  │    │  └────────────────────────────────────────────┘ │  │
-  │    └──────────────────────────────────────────────────┘  │
-  │                                                         │
-  │  recommend step (next route call)                       │
-  │    └─ same shape, RecommendationAgent.propose          │
-  │                                                         │
+  ┌─ Route layer (the CHAIN — code-decided) ────────────────┐
+  │  bootstrap → scan (monitoring) → click card →           │
+  │  → diagnose → click "see recs" → recommend              │
+  │  every transition between agents is YOUR code's call    │
+  └────────────────────┬────────────────────────────────────┘
+                       │  invokes one agent per step
+                       ▼
+  ┌─ Inside each agent (the LOOP — LLM-decided) ────────────┐
+  │  while not done:                                         │
+  │    LLM thinks                                            │
+  │    LLM picks a tool from the allowlist                   │
+  │    YOUR code runs the tool                               │
+  │    LLM sees the result                                   │
+  │  done = LLM emits final synthesis OR call budget hit     │
   └─────────────────────────────────────────────────────────┘
 ```
 
-## Structure pass
+**Zoom in.** Pipeline outside, loop inside. The pipeline's fixed because the user's mental model is fixed (`what changed → why → what to do`). The loop's flexible because each "why" investigation needs different EQL depending on the anomaly.
 
-  → **One axis to trace — control flow ownership.** *Chain layer:* CODE
-    decides which step runs next (the route's `if (step === 'recommend')`
-    branch). *Loop layer:* LLM decides which tool to call next, when to
-    stop. The axis FLIPS at the boundary between Blooming's route handler
-    and AptKit's agent class.
+## Structure pass — layers · axes · seams
 
-  → **Two layers, one mechanism repeated:** at the outer level, "next step
-    in the chain" is determined by a URL param + route logic. At the
-    inner level, "next move in the loop" is determined by the model's
-    next-token prediction. *Same shape (sequence of moves), different
-    decider, different ownership.*
+**Layers:** product flow (chain) → agent (loop) → tool call.
 
-  → **The load-bearing seam:** the boundary between Blooming's
-    `DiagnosticAgent.investigate()` and AptKit's
-    `DiagnosticInvestigationAgent.investigate()`. Above: a single method
-    call from a route handler. Below: an entire model loop with its own
-    cancellation, error handling, and tool dispatch. Without this seam,
-    Blooming would re-implement the loop in every agent file.
+**Axis: who decides what happens next?** Chain layer: CODE decides. Loop layer (inside each agent): LLM decides. The decision-flip lives at the agent entry point.
+
+**Seam:** the agent constructor call (`new MonitoringAgent(...).scan(...)`, `new DiagnosticAgent(...).investigate(anomaly)`). Outside that call, your code is in control. Inside, the LLM is.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You already know both shapes. A chain is `f().then(g).then(h)` — predicable
-sequence, each step's output is the next step's input. An agent is a
-`while (true) { ... }` — the LLM decides when to break.
+You know how a `for` loop runs a fixed number of times but a `while` loop runs until a condition? Same shape — chains have a fixed step list (`for step of steps`); agents loop until a condition (`while not done`).
 
 ```
-  Chain (linear, predictable)
+  Chains vs agents — the loop structure
 
-  Input → Step 1 → Step 2 → Step 3 → Output
-   you defined the steps; LLM executes each one
+  Chain (fixed steps):
+   ─────────────────
+   input  →  step 1  →  step 2  →  step 3  →  output
+            (LLM)      (LLM)       (LLM)
 
+   YOU define the steps; the LLM only chooses what to write within each.
 
-  Agent (loop, variable count)
-
-  Input → Thought → Action → Observation → Thought → … → Output
-   LLM decides the steps AND when to stop
-
-
-  THIS CODEBASE — both, nested:
-
-   Chain LEVEL (Blooming owns):
-     /api/briefing → monitoring chain step
-     /api/agent?step=diagnose → diagnostic chain step
-     /api/agent?step=recommend → recommendation chain step
-
-   Loop LEVEL (AptKit owns, inside each chain step):
-     Thought → tool_use → tool_result → … → final JSON
+  Agent (loop, unpredictable count):
+   ──────────────────────────────────
+   input  →  ┌──────────────────────────┐
+             │  thought → action → obs   │
+             │  thought → action → obs   │
+             │  thought → action → obs   │  ← LLM decides each iteration
+             │     ...                   │
+             │  thought → final answer   │
+             └──────────────────────────┘
+                       │
+                       ▼
+                     output
 ```
 
 ### Move 2 — the step-by-step walkthrough
 
-**Step 1 — Blooming's chain step is a method call.**
-`DiagnosticAgent.investigate()` (`lib/agents/diagnostic.ts:35-44`):
+**Part 1 — the chain lives in the route.**
+
+`app/api/agent/route.ts:280-296` is the chain. It runs the diagnostic agent, emits the diagnosis, then runs the recommendation agent. No LLM is involved in deciding "should I run recommendation next?" — that's hardcoded:
 
 ```typescript
-async investigate(anomaly: Anomaly, hooks: AgentHooks = {}): Promise<Diagnosis> {
-  const agent = new AptKitDiagnosticInvestigationAgent({
-    model: new AnthropicModelProviderAdapter(this.anthropic, 'diagnostic', this.sessionId),
-    tools: new BloomingToolRegistryAdapter(this.dataSource, this.allTools),
-    workspace: this.schema,
-    trace: new BloomingTraceSinkAdapter(hooks, 'diagnostic'),
-  });
+// STEP 2 (diagnose) or the combined run: run the diagnostic agent.
+if (step === 'recommend') {
+  diagnosis = parseDiagnosis(diagnosisParam);
+  if (!diagnosis) throw new Error('no diagnosis was handed over — open the diagnosis step first');
+} else {
+  const diagAgent = new DiagnosticAgent(anthropic, dataSource, schema, allTools, sid);
+  diagnosis = await diagAgent.investigate(inv, hooksFor('diagnostic'));
+  send({ type: 'diagnosis', diagnosis });
+}
 
-  return toBloomingDiagnosis(await agent.investigate(anomaly, { signal: hooks.signal }));
+// STEP 3 (recommend) or the combined run: run the recommendation agent.
+if (step !== 'diagnose') {
+  const recAgent = new RecommendationAgent(anthropic, dataSource, schema, allTools, sid);
+  const recommendations = await recAgent.propose(inv, diagnosis!, hooksFor('recommendation'));
+  for (const r of recommendations) send({ type: 'recommendation', recommendation: r });
 }
 ```
 
-This is the entire wrapper. Three things happen:
-  1. Construct the AptKit agent with four injected adapters (model,
-     tools, workspace context, trace).
-  2. Call `agent.investigate(anomaly)` and await the diagnosis.
-  3. Convert AptKit's diagnosis type to Blooming's diagnosis type
-     (currently a passthrough — see `toBloomingDiagnosis` line 47).
+Fixed two-step pipeline. The conditional is on `step` (the user-facing UX choice), not on any LLM decision.
 
-**Step 2 — AptKit's loop is what actually runs.** Blooming doesn't see
-the loop. It calls `agent.investigate()` and awaits the result. Inside
-AptKit, the loop looks something like (pseudocode based on observed
-behavior):
+**Part 2 — the loop lives inside each agent (in AptKit).**
+
+When `diagAgent.investigate(anomaly)` runs, it doesn't return on the first LLM call. It enters a ReAct loop:
 
 ```
-loop:
-  request = build_model_request(history, system_prompt, tools)
-  response = await modelProvider.complete(request)
-  for each block in response.content:
-    if block.type == 'text':
-      traceSink.emit({type: 'step', content: block.text})
-      // accumulate as a "thought" — appended to history as assistant message
-    elif block.type == 'tool_use':
-      traceSink.emit({type: 'tool_call_start', toolName, args, toolUseId})
-      result = await toolRegistry.callTool(block.name, block.input, {signal})
-      traceSink.emit({type: 'tool_call_end', toolName, durationMs, result})
-      history.append(assistant: block)         // the tool_use
-      history.append(user: tool_result(block.id, result))
-  if response.stop_reason == 'end_turn' or no tool_use blocks:
-    final_text = extract_text(response)
-    parsed = parseAgentJson(final_text)
-    if !isDiagnosis(parsed): retry or throw
-    return parsed
+  LLM call 1 (system + user "investigate this anomaly"):
+    → output: { text: "I need to check…", tool_use: 'execute_analytics_eql' }
+   Your code executes the EQL via DataSource.callTool.
+   The result becomes a 'tool_result' content block.
+
+  LLM call 2 (system + user + assistant + tool_result):
+    → output: { text: "now let me check…", tool_use: 'get_funnel' }
+   Your code runs the tool. Result fed back.
+
+  LLM call 3 (... + tool_result + tool_result):
+    → output: { text: "Cart abandonment is up because…", tool_use: null }
+   No tool call this turn → done.
+
+  Loop exits. Final synthesized Diagnosis returned.
 ```
 
-**The three callbacks Blooming provides.** When AptKit calls the model
-provider, tool registry, or trace sink, it's calling Blooming code:
+The number of calls is LLM-decided, capped at the agent's budget (`monitoring.md:18` enforces 6; diagnostic has its own cap inside AptKit). This codebase's agents typically run 5-8 tool calls per investigation.
 
-  → `AnthropicModelProviderAdapter.complete(req)` — Blooming's bridge to
-    the Anthropic SDK. AptKit doesn't know about Anthropic.
-  → `BloomingToolRegistryAdapter.callTool(name, args, {signal})` —
-    Blooming's bridge to `dataSource.callTool` (which is
-    `BloomreachDataSource.callTool` in live mode). AptKit doesn't know
-    about MCP or Bloomreach.
-  → `BloomingTraceSinkAdapter.emit(event)` — Blooming's bridge to the
-    NDJSON stream. AptKit emits `CapabilityEvent`s; Blooming converts
-    them to `AgentEvent`s and writes them on the wire.
-
-**Why the layering matters.** When the user navigates away mid-
-investigation:
-
-  - The browser's `fetch` request aborts.
-  - The route handler's `req.signal.aborted` becomes true.
-  - The agent loop's next `signal.throwIfAborted()` throws.
-  - The throw propagates up through `agent.investigate`, through
-    `complete()`'s pending `messages.create`, through
-    `callTool`'s pending MCP request.
-  - The route catches the AbortError, skips the error emission, and
-    closes the stream.
-
-This works because the cancellation signal threads through *both layers*:
-the chain's `if (step === 'recommend')` doesn't run a new agent if
-already aborted; the loop's per-turn `throwIfAborted` halts AptKit; the
-adapter passes `signal` into the Anthropic SDK and MCP transport. One
-signal, two layers, full cancellability.
-
-### Move 2 variant — the load-bearing skeleton
-
-The agent loop's irreducible kernel:
+**Part 3 — both shapes are valid; pick by the decision shape.**
 
 ```
-  loop:
-    request  = (messages, system, tools)        ← grows per turn
-    response = model(request)                   ← THE LLM CALL
-    if response has tool_use:
-      result  = run(tool)
-      append (tool_use, tool_result) to messages
-    else:
-      return text                                ← TERMINATION
+  When to use a chain                When to use an agent
+   ─────────────────────              ─────────────────────
+   Steps known in advance              Steps depend on results
+
+   Latency matters (fewer LLM calls)   Coverage matters more than latency
+
+   Each step has one clear job         Each "step" is "do whatever it takes"
+
+   Deterministic UX                    Open-ended investigation
+
+   Example: bootstrap →                Example: diagnose anomaly
+            scan →                              (which EQL? depends on
+            insight                              anomaly shape, depends
+                                                  on results so far)
 ```
 
-**What breaks when each part is missing:**
+**Part 4 — this codebase's choice, named.**
 
-  → **No accumulator (`messages` not appended).** Each turn would see
-    only the system prompt; the model loops forever requesting the same
-    tool, never knowing it already ran.
+Chain at the product flow: the user thinks `what → why → what to do`, in that order, always. No LLM should decide whether to "skip diagnosis." The fixed three-step shape *is* the product.
 
-  → **No tool dispatch.** The model emits a `tool_use` block; Blooming
-    ignores it; the model never gets the data it asked for; it gives up
-    or hallucinates.
-
-  → **No termination check.** The model emits text (its final answer);
-    Blooming treats it as another input; the loop never ends. AptKit
-    detects this via `stop_reason: end_turn` OR absence of `tool_use`
-    blocks.
-
-  → **No hard iteration cap.** The model loops on the same tool
-    indefinitely (rare but happens with confused prompts). AptKit
-    enforces a max iteration count; Blooming's prompts add explicit
-    tool-call caps ("at most 6 tool calls") as a softer earlier bound.
-
-**Optional hardening (not in the kernel):** retry-with-backoff on
-transient errors, observability hooks, cancellation signal threading,
-token budget tracking. All exist in this codebase but aren't part of
-the loop's reducible shape.
+Loop inside each agent: each "what" or "why" is open-ended. Different anomalies need different tool sequences. The 10 anomaly categories share one agent because the categories are reference material; the EQL choices are not.
 
 ### Move 3 — the principle
 
-**Use a chain when you know the steps in advance; use an agent loop when
-the steps depend on what the model finds. Nest them — outer chain,
-inner loops — when both are true.** That's exactly the shape blooming
-insights uses: the *kinds* of work (detect / diagnose / recommend) are
-known up front (chain); the *specific moves* within each kind depend on
-the data (loop). The chain composes deterministically; the loops handle
-the variability.
+**Pipeline outside, loop inside.** The outer shape (product flow) is what you design; the inner shape (per-agent reasoning) is what the LLM is good at. Where the line falls between them is the load-bearing design decision. Get the line right and your app is testable, debuggable, and fast; get it wrong and either the user sees a black box or the agent makes brittle structural decisions.
 
-## Primary diagram
+## Primary diagram — the full recap
 
 ```
-  Two layers, one mechanism — the chain-of-loops
+  Pipeline outside, loop inside
 
-  ┌─ Blooming chain layer (route handler) ──────────────────┐
-  │  ┌─ CODE decides ────────────────────────────────────┐  │
-  │  │  if (step === 'diagnose') runDiagnostic()         │  │
-  │  │  if (step === 'recommend') runRecommendation()    │  │
-  │  └────────────────────────────────────────────────────┘  │
-  │                                                         │
-  │  inside runDiagnostic:                                  │
-  │    diagAgent.investigate(anomaly, {signal})             │
-  │           │                                             │
-  │           ▼                                             │
-  │  ┌─ AptKit loop layer ──────────────────────────────┐  │
-  │  │  ┌─ LLM decides ─────────────────────────────┐  │  │
-  │  │  │  while (not done) {                       │  │  │
-  │  │  │    model picks: tool_use or final text    │  │  │
-  │  │  │    if tool_use: run, append result        │  │  │
-  │  │  │    if text: parse, validate, return        │  │  │
-  │  │  │  }                                         │  │  │
-  │  │  └────────────────────────────────────────────┘  │  │
-  │  │  callbacks back to Blooming:                     │  │
-  │  │    modelProvider.complete(req)                   │  │
-  │  │    toolRegistry.callTool(name, args)             │  │
-  │  │    traceSink.emit(event)                         │  │
-  │  └───────────────────────────────────────────────────┘  │
-  └─────────────────────────────────────────────────────────┘
-
-  axis = "who decides what happens next?"
-  chain layer:   CODE decides
-  loop layer:    LLM decides
-  flip happens at agent.investigate() boundary
+  ┌─ Pipeline (chain) — code-decided ───────────────────────────┐
+  │                                                              │
+  │   bootstrap                                                  │
+  │       │                                                      │
+  │       ▼                                                      │
+  │   monitoring scan (briefing) ─────► insight list             │
+  │       │ user clicks a card                                   │
+  │       ▼                                                      │
+  │   diagnostic investigation ───────► Diagnosis                │
+  │       │ user clicks "see recs"                               │
+  │       ▼                                                      │
+  │   recommendation proposal ────────► Recommendation[]         │
+  │                                                              │
+  └─────────┬────────────────────────────────────────────────────┘
+            │  for each pipeline step, invoke one agent
+            ▼
+  ┌─ Agent loop — LLM-decided ──────────────────────────────────┐
+  │                                                              │
+  │  ┌──── while not done ──────────────────────────────────┐    │
+  │  │                                                      │    │
+  │  │   model.complete(prompt + history)                   │    │
+  │  │      ↓                                               │    │
+  │  │   ContentBlock[] — text and/or tool_use blocks       │    │
+  │  │      ↓                                               │    │
+  │  │   for each tool_use:                                 │    │
+  │  │     dataSource.callTool(name, input)                 │    │
+  │  │     append tool_result to history                    │    │
+  │  │                                                      │    │
+  │  │   if no tool_use this turn:                          │    │
+  │  │     extract final structured output                  │    │
+  │  │     break                                            │    │
+  │  │                                                      │    │
+  │  │   if call budget hit:                                │    │
+  │  │     force final answer                               │    │
+  │  │     break                                            │    │
+  │  │                                                      │    │
+  │  └──────────────────────────────────────────────────────┘    │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The chain-of-loops pattern is *the* dominant shape for production LLM
-applications past toy scale. Pure chains are too rigid; pure agents are
-too unpredictable. Nesting gives you the predictability where you need
-it (chain ordering, eval boundaries) and flexibility where you need it
-(within-step exploration).
+**Why both, not just one.** Pure chain would force the codebase to hard-code which EQL to run for each anomaly category — brittle, doesn't scale to 10+ categories. Pure agent would let the LLM decide "should I diagnose before recommending?" — wrong call, because the user already decided that by clicking "see recs."
 
-LangChain's `AgentExecutor` and OpenAI's Assistants both implement the
-loop layer. AptKit is in the same shape, with a smaller surface area
-(no LangChain-style serialization, no graph orchestration, no callbacks
-hierarchy — just the four-port `ModelProvider` / `ToolRegistry` /
-workspace / `TraceSink` interface).
+The hybrid lands where the decisions live: structural at the chain level, semantic at the loop level.
 
-The decision to put the chain in Blooming and the loop in AptKit
-reflects what's reusable. The loop logic is generic across products;
-the chain composition is product-specific. Putting the loop in AptKit
-means a second product (loopd, contrl-mo, etc.) can adopt the same
-agent shapes by writing its own adapters + its own chain.
+**Why the agent loop lives in AptKit, not this repo.** AptKit's `AnomalyMonitoringAgent`, `DiagnosticInvestigationAgent`, etc. each implement a tuned version of the ReAct loop for their domain (monitoring has 6-call budget + category checklist; diagnostic has hypothesis-testing structure; recommendation has feature-selection logic). Building those loops correctly is a library's job — testing, error recovery, budget enforcement, prompt design — and this codebase delegates by depending on the abstraction (`@aptkit/core`).
+
+The 206 LOC of adapter glue at `lib/agents/aptkit-adapters.ts` is the entire boundary between "this codebase" and "the agent runtime."
 
 ## Project exercises
 
-### Exercise — emit `iteration_count` per loop on the trace
+### Exercise — Turn the briefing scan from "always monitor" to LLM-decided category prioritization
 
-  → **Exercise ID:** `study-ai-eng-04-01.1`
-  → **What to build:** Add an `iteration` counter to
-    `BloomingTraceSinkAdapter` that increments on every `step` event
-    (each text emission corresponds to one model turn). Emit a final
-    `{ type: 'loop_done', iterations, agent }` event so the UI shows
-    "investigated in 4 turns" per agent.
-  → **Why it earns its place:** Makes the loop layer visible. Today
-    iteration count is hidden — you only see tool calls + final
-    diagnosis. Showing the turn count signals "this is a multi-turn
-    loop" to anyone watching.
-  → **Files to touch:** `lib/agents/aptkit-adapters.ts:100-130`,
-    `lib/mcp/events.ts`, `components/investigation/ReasoningTrace.tsx`.
-  → **Done when:** A live investigation surfaces "4 turns" in the
-    diagnosis footer.
-  → **Estimated effort:** `1–4hr`
+  → **Exercise ID:** B4.1
+  → **What to build:** Add an *outer* LLM call before the monitoring scan that prioritizes which categories to run based on recent activity (e.g. "the last 3 anomalies were revenue-related — prioritize revenue_drop and conversion_drop over inventory and fraud this scan"). Pass the prioritized order to `MonitoringAgent.scan()`. Pure agent layer added in front of the existing chain.
+  → **Why it earns its place:** demonstrates pushing decision-making from the chain layer (today: run all runnable categories) to a thin LLM layer (smart-prioritize before scanning). The pattern transfers to any chain step where the "always do all of these" rule is wasteful.
+  → **Files to touch:** new `lib/agents/category-prioritizer.ts` (a small Haiku-backed prioritizer), `lib/agents/monitoring.ts` (accept a prioritized order), `app/api/briefing/route.ts` (run the prioritizer before scan), `test/agents/category-prioritizer.test.ts` (cover the prioritization shape).
+  → **Done when:** the briefing scan now runs categories in a prioritized order (typically 4-5 in the front, others at the back), the per-call log shows the prioritization step costs ~$0.0003 (Haiku), and the existing scan behavior is preserved when the prioritizer falls back.
+  → **Estimated effort:** 1–2 days.
 
 ## Interview defense
 
-**Q: Is blooming insights a chain or an agent?**
+**Q: "Are your agents chains or agents?"**
 
-Both. The product is a chain at the top: **monitoring → diagnostic →
-recommendation**, where the route handler owns the ordering. Inside each
-step is an agent loop (AptKit owns it) where the model picks tools and
-decides when to stop.
+Both. The product flow is a chain — bootstrap → scan → diagnose → recommend, in fixed order, decided by the user's clicks and the route's hardcoded sequence. Inside each step, an agent runs a ReAct-style loop: the LLM picks a tool from its allowlist, my code executes it, the result feeds back, the LLM decides next. Pipeline outside, loop inside. The outer chain is the product; the inner loop is what the LLM is good at.
 
-```
-  Chain layer (Blooming): CODE decides which step runs
-  Loop  layer (AptKit):   LLM decides which tool to call
-                          and when to terminate
+*Anchor: "Pipeline outside, loop inside. Decision-flip at the agent constructor call."*
 
-  axis "who decides the next move" flips at agent.investigate()
-```
+**Q: "Why isn't the recommendation agent allowed to call diagnostic tools?"**
 
-**Anchor line:** "Outer chain, inner loops. The chain is in the route
-handler; the loops are in AptKit. The chain gives me predictable
-ordering and clean eval boundaries; the loops give the model room to
-explore within each step."
+Allowlist at `lib/mcp/tools.ts:28-36`. The recommendation agent has 7 tools, all for proposing Bloomreach actions (`list_scenarios`, `list_segmentations`, `list_voucher_pools`, etc.). It can't call `execute_analytics_eql` because that's a diagnostic-shaped tool — once you're recommending, you've already accepted the diagnosis. If the agent's allowed to re-diagnose mid-recommendation, it'll spend its budget questioning the handoff instead of proposing actions.
 
-**Q: What's the load-bearing part of the loop layer people forget?**
+This is the chain layer's job (deciding "we're past diagnosis now"); the agent layer respects it by tool-list narrowing.
 
-The **terminating condition**. The kernel is: model picks tool_use →
-run tool → append → repeat, UNTIL the model emits text instead of a
-tool_use OR the iteration cap is hit. Drop the termination check and
-the loop runs forever. The cap is the safety net; the model's natural
-"I'm done" (no tool_use block) is the normal path. Both have to be
-right.
-
-**Anchor line:** "No termination = infinite loop. The model's text-only
-turn is the normal stop; the hard iteration cap is the safety net."
-
-**Q: Why is AptKit a separate library?**
-
-The loop logic is generic across products. The model adapter, tool
-registry, workspace context, trace sink — all four ports could be
-reimplemented in a different product (loopd journaling, contrl-mo
-fitness coaching) without changing the loop logic. Pulling the loop into
-its own package makes that explicit. Blooming is one consumer of AptKit;
-others can be added without coupling.
+*Anchor: "Chain decides which agent runs; agent's tool allowlist narrows what the LLM can pick."*
 
 ## See also
 
-  → `02-tool-calling.md` — what one turn's tool_use → tool_result hop looks like
-  → `02-context-and-prompts/03-prompt-chaining.md` — the OUTER chain layer
-  → `06-error-recovery.md` — what happens when a tool call fails mid-loop
+  → `02-tool-calling.md` — the per-tool mechanics
+  → `03-react-pattern.md` — the loop's inner shape
+  → `02-context-and-prompts/03-prompt-chaining.md` — the same pattern from the prompt-chain lens

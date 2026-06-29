@@ -1,121 +1,87 @@
-# Streaming NDJSON — one event per line, four producers, one reader kernel
+# streaming-ndjson
 
-**Industry name:** newline-delimited JSON / NDJSON / JSON Lines (JSONL) · Industry standard
+## Newline-delimited JSON streaming (industry standard)
 
-## Zoom out, then zoom in
+The wire format every dynamic surface in this app uses. One framing rule (`\n` terminates an event), one shared kernel (`readNdjson` in `lib/streaming/ndjson.ts`, 64 LOC), one typed event union (`AgentEvent`), four streaming consumers (briefing, investigation, capture loop, query). Producers always terminate with `\n`; the kernel splits on `\n` and `JSON.parse` each line.
 
-Every streaming surface in this app — briefing, agent investigation, query
-chat, dev capture — speaks the same wire format: one JSON object per line,
-terminated with `\n`. The server uses `encodeEvent()` (or the inline
-equivalent in `/api/briefing`); the client uses `readNdjson()` — one
-64-line kernel that all four surfaces share.
+## Zoom out — where this pattern lives
 
-You know how `fetch().then(res => res.json())` waits for the whole body
-before resolving? That's wrong for our use case: a monitoring scan can take
-20-90 seconds, and the user needs to see progress (the agent's reasoning
-steps, each tool call as it starts, each insight as it lands). NDJSON is
-the answer: stream the body, parse one line at a time, dispatch each event
-as it arrives.
+The streaming pattern is the *wire format* — the contract between the route's `ReadableStream` body and the hook's `readNdjson` consumer.
 
 ```
-  Zoom out — where NDJSON streaming lives
+  Zoom out — NDJSON as the wire between routes and hooks
 
-  ┌─ Server ─────────────────────────────────────────────────────────────┐
-  │  /api/briefing  /api/agent  /api/mcp/capture  /api/agent?q=…          │
-  │       │              │              │              │                  │
-  │       └──────────────┴──────┬───────┴──────────────┘                  │
-  │                             │  encodeEvent(e) = JSON.stringify(e)+'\n'│
-  │                             ▼                                          │
-  │                  ★ ReadableStream<Uint8Array> ★                       │
-  │                  controller.enqueue(encoder.encode(...))               │
-  └─────────────────────────────┬────────────────────────────────────────┘
-                                │ HTTP, content-type: application/x-ndjson
-  ┌─ Client ───────────────────▼─────────────────────────────────────────┐
-  │  body.getReader() → TextDecoder → split('\n') → JSON.parse → dispatch │
-  │  ★ lib/streaming/ndjson.ts:17-64 ★ — ONE kernel, four consumers       │ ← we are here
-  │  useBriefingStream / useInvestigation / useDemoCapture /              │
-  │  StreamingResponse                                                    │
-  └──────────────────────────────────────────────────────────────────────┘
+  ┌─ UI layer ─────────────────────────────────────────────────────────┐
+  │  useBriefingStream      useInvestigation      useDemoCapture        │
+  │     │                          │                       │            │
+  │     └────── all use ────────── readNdjson ─────────────┘            │
+  │                                    │                                 │
+  │                                    │  fetch() + reader.read()        │
+  └────────────────────────────────────┼─────────────────────────────────┘
+                                       │  HTTP, content-type: application/x-ndjson
+  ┌─ Service layer ───────────────────▼─────────────────────────────────┐
+  │  ★ NDJSON STREAMING ★                                                │ ← we are here
+  │   /api/briefing  /api/agent  /api/mcp/capture-demo  ...              │
+  │     ReadableStream<Uint8Array> body                                  │
+  │     controller.enqueue(encoder.encode(JSON.stringify(evt) + '\n'))   │
+  │     AgentEvent (lib/mcp/events.ts) — typed wire contract             │
+  └─────────────────────────────────────────────────────────────────────┘
 ```
 
-The point of this file: explain the wire format, the kernel, and the
-discriminated-union event contract that makes the dispatch a switch
-statement.
+## Structure pass
 
-## Structure pass — layers, axis, seams
-
-**Layers:** Producer code → `ReadableStream` controller → HTTP body →
-network → browser `fetch` → reader loop → event handler.
-
-**Axis (held constant): "what's on the wire at this layer?"** This is
-the right axis because the whole pattern is about format negotiation —
-each layer adds or removes framing.
+Three layers carry this pattern: the **producer** layer (the route emitting events), the **wire** layer (the framing rule `\n`), the **consumer** layer (the hook running `readNdjson`). One axis worth tracing: **who owns the framing?**
 
 ```
-  Axis: what's on the wire?
+  Axis: who is responsible for the '\n' framing?
 
-  ┌─ Producer (route handler) ──────────────────────┐
-  │  AgentEvent object — typed discriminated union   │   → OBJECT
-  └─────────────────────┬───────────────────────────┘
-                        │ encodeEvent(e)
-  ┌─ HTTP body bytes ───▼───────────────────────────┐
-  │  "{\"type\":\"tool_call_start\",...}\n"          │   → BYTES with line framing
-  └─────────────────────┬───────────────────────────┘
-                        │ TCP/TLS
-  ┌─ Browser body bytes ▼───────────────────────────┐
-  │  Uint8Array chunks (may split mid-line)          │   → BYTES, no boundary guarantees
-  └─────────────────────┬───────────────────────────┘
-                        │ readNdjson loop
-  ┌─ Consumer (hook) ───▼───────────────────────────┐
-  │  AgentEvent object — same type back              │   → OBJECT (round-tripped)
-  └─────────────────────────────────────────────────┘
+  ┌─ producer (route) ─────┐    encodes JSON + '\n', always
+  │  encodeEvent(e) →       │   ═════╪═════►
+  │  JSON.stringify(e)+'\n'│
+  └────────────────────────┘
+       ┌─ wire (HTTP body) ────────┐    just bytes; no semantics
+       │  chunked transfer encoding│
+       │  application/x-ndjson      │
+       └────────────────────────────┘
+            ┌─ consumer (readNdjson) ┐    splits on '\n'
+            │  TextDecoder + buffer  │    parses each line
+            │  + buf.split('\n')     │
+            └────────────────────────┘
 ```
 
-**Seams (boundaries where the on-wire answer flips):**
-
-- **Object ↔ bytes (producer side)** — `encodeEvent()` is the seam.
-  After it, errors are unrecoverable in-band; before it, they're
-  type-checked at compile time.
-- **HTTP boundary** — the network adds no framing of its own. NDJSON's
-  `\n` IS the framing. The browser may receive a single line split
-  across multiple chunks; the reader has to buffer.
-- **Bytes ↔ object (consumer side)** — `JSON.parse(line)` is the seam.
-  After it, the handler can `switch(event.type)` with full type safety;
-  before it, it's a `Uint8Array`.
+The producer owns the framing; the wire owns nothing semantic; the consumer trusts the framing. The seam where this could break is the wire: a malformed line (a chunk that arrived mid-event without a terminating newline) is the most common bug. The consumer handles it by buffering the trailing partial line and prepending it to the next chunk — and by silently skipping a parse failure (so one bad event doesn't tear down the whole stream). → see Move 2's `step-by-step` for how.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-The shape: one object per line, terminated with `\n`. That's the entire
-spec.
+You've used `fetch` with `await res.json()`. The browser buffers the whole response body, then `JSON.parse` it once. NDJSON is the same idea, run incrementally: the body is *many* JSONs separated by newlines, and the reader parses each one as it arrives. The output is a sequence of events, not a single object.
 
 ```
-  Pattern — NDJSON on the wire
+  The pattern: many JSONs, one per line, framed by \n
 
-  {"type":"reasoning_step","step":{"id":"...","agent":"monitoring","kind":"thought","content":"reading the workspace schema…"}}
-  {"type":"workspace","workspace":{"projectName":"wobbly-ukulele","totalCustomers":12450,"totalEvents":2840127}}
-  {"type":"coverage_item","item":{"category":"conversion_drop","label":"conversion drop","coverage":"full"}}
-  {"type":"tool_call_start","toolName":"execute_analytics_eql","agent":"monitoring"}
-  {"type":"tool_call_end","toolName":"execute_analytics_eql","agent":"monitoring","durationMs":847,"result":{...}}
-  {"type":"insight","insight":{"id":"...","severity":"warning","headline":"...","change":{...}}}
-  {"type":"done"}
+  wire bytes:    {"type":"workspace","workspace":{…}}\n
+                 {"type":"reasoning_step","step":{…}}\n
+                 {"type":"tool_call_start","toolName":"execute_analytics_eql",…}\n
+                 {"type":"tool_call_end","toolName":"execute_analytics_eql",…}\n
+                 {"type":"insight","insight":{…}}\n
+                 …
+                 {"type":"done"}\n
+
+  consumer:      for each line:
+                   JSON.parse(line) → AgentEvent
+                   handle(event)
 ```
 
-Each line is independent. A client can join late and miss the early
-ones; the events are self-describing (each carries its `type`
-discriminator). A line that fails to parse can be silently dropped
-without corrupting the rest of the stream.
+Two properties matter. (a) Events are *independent* — each line is a complete JSON object; you don't have to wait for the next line to make sense of this one. (b) Events are *progressive* — the consumer can render as it reads; nothing requires waiting for the stream to end.
 
 ### Move 2 — the step-by-step walkthrough
 
-#### Step 1 — the AgentEvent contract (the discriminated union)
+#### the typed wire contract — `AgentEvent`
 
-The wire format is typed by a TypeScript discriminated union. The
-producer and consumer both reference the same type, so a change to one
-breaks the other at compile time.
+The whole wire is one TypeScript union:
 
-```typescript
+```ts
 // lib/mcp/events.ts:4-12
 export type AgentEvent =
   | { type: 'reasoning_step'; step: ReasoningStep }
@@ -126,92 +92,59 @@ export type AgentEvent =
   | { type: 'recommendation'; recommendation: Recommendation }
   | { type: 'done' }
   | { type: 'error'; message: string };
+```
 
+Eight cases. `type` is the discriminator. Producers and consumers agree on this union — TypeScript will catch a missing case in either direction at compile time. Briefing-specific extensions (`workspace`, `coverage_item`, `coverage`) are declared locally in the briefing route as a *superset* of `AgentEvent`, so investigation and chat surfaces stay on the shared contract while briefing can have its own opening events. The shared union is the contract; the local supersets are scoped variations.
+
+The producer-side helper is one line:
+
+```ts
+// lib/mcp/events.ts:14-17
 export function encodeEvent(e: AgentEvent): string {
   return JSON.stringify(e) + '\n';
 }
 ```
 
-`/api/briefing` adds two more event types not in this union
-(`workspace` and `coverage_item`) because they're briefing-specific.
-This is a deliberate tradeoff: keep the `AgentEvent` shared contract
-narrow; let one route extend it locally for its own surface. The
-client consumer (`useBriefingStream.ts:36-45`) types the extended union
-as `BriefingEvent`.
+That's the framing rule, in code. Every producer either calls `encodeEvent(e)` or inlines the same `JSON.stringify(e) + '\n'`. The `\n` is the contract — the consumer cannot split without it.
 
-```
-  The shared contract vs the per-route extension
+#### the producer — route enqueues into a ReadableStream
 
-  shared AgentEvent (lib/mcp/events.ts):
-    reasoning_step | tool_call_start | tool_call_end | insight |
-    diagnosis | recommendation | done | error
-                            │
-                            └────► consumed by useInvestigation,
-                                   useDemoCapture, StreamingResponse,
-                                   /api/agent
-
-  briefing-only extension (app/api/briefing/route.ts:56-60,
-                           lib/hooks/useBriefingStream.ts:36-45):
-    AgentEvent ∪ workspace ∪ coverage_item ∪ coverage
-                            │
-                            └────► consumed only by useBriefingStream
-```
-
-#### Step 2 — the producer side (writing NDJSON)
-
-The producer pattern is `controller.enqueue(encoder.encode(...))`:
-
-```typescript
-// /api/agent — uses the named helper (app/api/agent/route.ts:183-190)
+```ts
+// app/api/briefing/route.ts:190-200
 const encoder = new TextEncoder();
 const stream = new ReadableStream<Uint8Array>({
   async start(controller) {
-    const send = (e: AgentEvent) => {
-      collected.push(e);
-      controller.enqueue(encoder.encode(encodeEvent(e)));
-    };
-    // ... use send(...) throughout the agent run ...
-  }
+    const send = (e: BriefingEvent) =>
+      controller.enqueue(encoder.encode(JSON.stringify(e) + '\n'));
+    …
+```
+
+Three layers compose here. (a) `JSON.stringify(e) + '\n'` produces a string. (b) `TextEncoder.encode` produces a `Uint8Array`. (c) `controller.enqueue(...)` hands the bytes to the framework, which writes them as a chunk on the wire. The browser side reads bytes; the kernel decodes them; the contract holds.
+
+The response opts make the streaming explicit:
+
+```ts
+// app/api/briefing/route.ts:330-334
+return new Response(stream, {
+  headers: {
+    'content-type': 'application/x-ndjson; charset=utf-8',
+    'cache-control': 'no-store, no-transform',
+  },
 });
-return new Response(stream, { headers: NDJSON_HEADERS });
 ```
 
-`/api/briefing` inlines the encoding (because its event union has
-extra types not in the shared `AgentEvent`):
+`application/x-ndjson` is the registered media type; `no-store, no-transform` prevents any caching proxy from buffering or chunk-rewriting. The latter is load-bearing on networks with intermediate proxies that re-frame chunks.
 
-```typescript
-// app/api/briefing/route.ts:193-194
-const send = (e: BriefingEvent) =>
-  controller.enqueue(encoder.encode(JSON.stringify(e) + '\n'));
-```
+#### the kernel — `readNdjson`, 64 LOC, the whole pattern
 
-Both routes set the same headers:
+This is the *only* NDJSON parser in the codebase. Four streaming surfaces consume it.
 
-```typescript
-// app/api/agent/route.ts:105-108
-const NDJSON_HEADERS = {
-  'Content-Type': 'application/x-ndjson; charset=utf-8',
-  'Cache-Control': 'no-cache, no-transform',
-};
-```
-
-The `no-transform` part matters: some proxies aggressively compress or
-buffer streaming responses, defeating the progressive-delivery point.
-`no-transform` tells them to leave the bytes alone.
-
-#### Step 3 — the reader kernel (`readNdjson`)
-
-This is the one piece shared across all four surfaces.
-
-```typescript
+```ts
 // lib/streaming/ndjson.ts:17-64
 export async function readNdjson<E>(
   body: ReadableStream<Uint8Array>,
   onEvent: (event: E) => void,
-  opts?: {
-    cancelOn?: () => boolean;
-    onMalformed?: (line: string, err: unknown) => void;
-  },
+  opts?: { cancelOn?: () => boolean; onMalformed?: (line: string, err: unknown) => void },
 ): Promise<void> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
@@ -226,18 +159,18 @@ export async function readNdjson<E>(
       if (done) break;
       buf += decoder.decode(value, { stream: true });
       const lines = buf.split('\n');
-      buf = lines.pop() ?? '';
+      buf = lines.pop() ?? '';                        // last line might be partial
       for (const raw of lines) {
         const line = raw.trim();
         if (!line) continue;
         try {
           onEvent(JSON.parse(line) as E);
         } catch (err) {
-          opts?.onMalformed?.(line, err);
+          opts?.onMalformed?.(line, err);             // silent by default
         }
       }
     }
-    // flush trailing buffer — a no-op when the producer always terminates with '\n'
+    // flush trailing buffer — no-op when the producer always terminates with '\n'
     const tail = buf.trim();
     if (tail) {
       try { onEvent(JSON.parse(tail) as E); }
@@ -249,338 +182,261 @@ export async function readNdjson<E>(
 }
 ```
 
-Six load-bearing pieces:
+Six load-bearing pieces inside 64 LOC:
 
-  → `TextDecoder({ stream: true })` — chunks may split a multi-byte
-    UTF-8 character mid-byte; `stream: true` defers the split character
-    to the next chunk instead of emitting `�`
-  → `let buf = ''` + `lines.pop()` — chunks may split a line mid-text;
-    the last partial line stays in `buf` for the next chunk
-  → `if (opts?.cancelOn?.())` — the consumer can signal "I'm gone"
-    (an unmounted React effect, a navigated-away tab); `reader.cancel()`
-    cleans up
-  → `try { JSON.parse } catch` — a malformed line doesn't kill the
-    stream; the default is silent skip, with an optional `onMalformed`
-    callback for tests
-  → end-of-stream flush — handles a producer that didn't terminate
-    with `\n` (no current producer does this, but the contract is
-    defensive)
-  → `finally { reader.releaseLock() }` — the ReadableStream reader
-    holds an exclusive lock on the body; releasing it lets the body be
-    re-used (in practice we don't, but the contract requires it)
+1. **`TextDecoder({ stream: true })`** — handles multi-byte UTF-8 characters that span chunk boundaries. Without `{ stream: true }`, a JSON containing a multi-byte char split across two reads would corrupt the string.
+2. **`buf = lines.pop() ?? ''`** — `split('\n')` produces N parts from N-1 newlines; the last part is *either* an empty string (if the chunk ended on `\n`) or a partial event (if it didn't). Pop it back into `buf` so the next read prepends it.
+3. **`if (!line) continue`** — empty lines are ignored. A producer that emitted `\n\n` by mistake wouldn't crash the parser.
+4. **`try { onEvent(JSON.parse(line)) } catch ...`** — a single malformed event does not tear down the whole stream. Default behavior is silent; the optional `onMalformed` hook lets a caller log.
+5. **The trailing-buffer flush** — if the producer omits the final `\n`, the last event would otherwise stay in `buf` and never be parsed. This branch flushes it after the stream ends. In practice all producers in this repo terminate with `\n`, so this is a no-op, but keeping it preserves the contract for any future producer.
+6. **`opts.cancelOn` polled between reads** — the consumer can break out cleanly without waiting for the next chunk. `useBriefingStream` passes a `cancelOn: () => cancelledRef.current` so unmount or mode-flip aborts within one read cycle.
 
 ```
-  Execution trace — chunked NDJSON arriving over network
+  Pattern — the kernel's loop
 
-  state                                   chunk arrived
-  ─────                                   ─────────────
-  buf = ""                                "{\"type\":\"tool_call_st"
-  buf = "{\"type\":\"tool_call_st"        — no '\n' yet, keep buffering
-
-  buf = "{\"type\":\"tool_call_st"        "art\",\"toolName\":\"X\"}\n{\"type\":\""
-  buf = "...tool_call_start...X\"}\n{\"type\":\""
-    split('\n') = [ "{...complete line...}", "{\"type\":\"" ]
-    pop → buf = "{\"type\":\""
-    parse "{...complete line...}" → onEvent(tool_call_start)
-
-  buf = "{\"type\":\""                    "done\"}\n"
-  buf = "{\"type\":\"done\"}\n"
-    split('\n') = [ "{\"type\":\"done\"}", "" ]
-    pop → buf = ""
-    parse "{\"type\":\"done\"}" → onEvent(done)
+  ┌─ loop ─────────────────────────────────────────────────────────────┐
+  │  read chunk → decode (streaming UTF-8)                              │
+  │     │                                                                │
+  │     ▼                                                                │
+  │  buf += text                                                         │
+  │     │                                                                │
+  │     ▼                                                                │
+  │  lines = buf.split('\n')                                             │
+  │  buf   = lines.pop()         ← keep partial tail for next read       │
+  │     │                                                                │
+  │     ▼                                                                │
+  │  for each non-empty line:                                            │
+  │    try JSON.parse → onEvent(event)                                   │
+  │    catch         → onMalformed(line, err)  // silent by default      │
+  │     │                                                                │
+  │     ▼                                                                │
+  │  poll cancelOn() → cancel + return if true                           │
+  │     │                                                                │
+  │     ▼                                                                │
+  │  (loop until done) → flush trailing buf if any                       │
+  └──────────────────────────────────────────────────────────────────────┘
 ```
 
-#### Step 4 — the consumer dispatch (`switch(event.type)`)
+#### execution trace — one chunk split across two reads
 
-Every consumer follows the same shape: fetch, get reader, `readNdjson`
-with an event handler that does a `switch` on `event.type`. Here's the
-briefing consumer (`useBriefingStream.ts:204-286`, abridged):
+A concrete walkthrough of why the partial-tail handling matters.
 
-```typescript
-const handle = (evt: BriefingEvent) => {
-  switch (evt.type) {
-    case 'workspace':       setWorkspace(evt.workspace); break;
-    case 'coverage_item':   setCoverage((prev) => [...]); break;
-    case 'tool_call_start': setQueryCount((n) => n + 1);
-                            setTraceItems((prev) => [...]);
-                            break;
-    case 'reasoning_step':  /* push to trace + statusText */ break;
-    case 'tool_call_end':   /* fill in result on last running tool item */ break;
-    case 'insight':         collected.push(evt.insight); break;
-    case 'done':             setInsights(collected);
-                             stashInsights(collected);
-                             callbacksRef.current?.onStreamComplete?.();
-                             setStatus(collected.length === 0 ? 'empty' : 'loaded');
-                             break;
-    case 'error':            /* check reconnect policy, else setError */ break;
-  }
-};
+```
+  Execution trace — partial event spanning two chunks
+
+  state: buf = ''
+
+  ── read 1 ──
+  value (bytes): {"type":"insi
+  decode:        '{"type":"insi'
+  buf:           '{"type":"insi'
+  lines:         ['{"type":"insi']                 // no '\n' anywhere
+  pop:           buf = '{"type":"insi', lines = []
+  for: nothing to parse
+
+  ── read 2 ──
+  value (bytes): ght","insight":{"id":"a1"}}\n{"type":"done"}\n
+  decode:        'ght","insight":{"id":"a1"}}\n{"type":"done"}\n'
+  buf:           '{"type":"insight","insight":{"id":"a1"}}\n{"type":"done"}\n'
+  lines:         ['{"type":"insight","insight":{"id":"a1"}}', '{"type":"done"}', '']
+  pop:           buf = '', lines = ['{"type":"insight",…}', '{"type":"done"}']
+  for:
+    line 1: parse → { type: 'insight', insight: { id: 'a1' } } → onEvent
+    line 2: parse → { type: 'done' } → onEvent
+
+  ── read 3 ──
+  done = true → break
+  flush: buf = '' → nothing to flush
+  return
+```
+
+This is the bug the partial-tail handling prevents: chunk boundaries are arbitrary; the parser must not assume one event per chunk.
+
+#### the four consumers
+
+```ts
+// lib/hooks/useBriefingStream.ts:288
 await readNdjson<BriefingEvent>(res.body, handle, { cancelOn: () => cancelledRef.current });
 ```
 
-TypeScript narrows the type inside each `case` arm based on the
-discriminator. The compiler enforces: if you add a new `type` to the
-union, every `switch` that needs to handle it gets a type error
-(when using `--strict` and `noFallthroughCasesInSwitch` — which this
-project does, see `tsconfig.json`). The contract is self-policing.
-
-#### Step 5 — the four consumers, what they share
-
-```
-  Four streaming surfaces, one kernel
-
-  surface                            consumer file                          event union
-  ───────                            ─────────────                          ───────────
-  feed (briefing)                    lib/hooks/useBriefingStream.ts:288    BriefingEvent (AgentEvent ∪ {workspace, coverage_item, coverage})
-  investigation (step 2, 3)          lib/hooks/useInvestigation.ts:194     AgentEvent
-  dev capture (drains for cache)     lib/hooks/useDemoCapture.ts:84        {type?: string, message?: string}  (only checks 'done' and 'error')
-  free-form query                    components/chat/StreamingResponse.tsx AgentEvent
+```ts
+// lib/hooks/useInvestigation.ts (uses the same kernel; reads `bi:diag:<id>`-handoff and emits per-step events)
+…readNdjson<AgentEvent>(res.body!, (evt) => { … });
 ```
 
-What's identical: `await readNdjson(res.body, handle)` with a per-surface
-handler. What differs: which event types each surface dispatches on. The
-dev capture is the minimal consumer — it doesn't render anything; it just
-drains the stream so the server's `saveInvestigation` runs.
+```ts
+// lib/hooks/useDemoCapture.ts — captures the briefing + each investigation into the snapshot file
+…readNdjson(…);
+```
+
+```ts
+// components/chat/StreamingResponse.tsx (or query hook) — free-form chat surface, same kernel
+…readNdjson(…);
+```
+
+All four use the same parser. The producer always terminates with `\n`. The contract holds.
+
+```
+  Layers-and-hops — four consumers, one kernel, one wire contract
+
+  ┌─ briefing ─┐  ┌─ investigation ┐  ┌─ capture ─┐  ┌─ chat ─┐
+  │ hook       │  │ hook            │  │ loop      │  │ hook   │
+  └─────┬──────┘  └────────┬───────┘  └─────┬─────┘  └───┬────┘
+        │                  │                │            │
+        │  all consume      │                │            │
+        ▼                   ▼                ▼            ▼
+                  ┌─ lib/streaming/ndjson.ts ─┐
+                  │  readNdjson<E>(body, …)   │
+                  └─────────────┬──────────────┘
+                                │  reads bytes from ReadableStream
+                                ▼
+                  ┌─ HTTP wire (NDJSON) ──────┐
+                  │  application/x-ndjson      │
+                  │  one JSON per line         │
+                  │  '\n' terminates every     │
+                  └─────────────┬──────────────┘
+                                │  produced by:
+            ┌───────────────────┼───────────────────┐
+            ▼                   ▼                   ▼
+    /api/briefing         /api/agent          /api/mcp/capture-demo
+    encodeEvent(e)        encodeEvent(e)      encodeEvent(e)
+```
 
 ### Move 3 — the principle
 
-**Pick a wire format that's degradable.** NDJSON's defining property:
-a stream half-read is still useful. A client that times out at line 47
-of 60 still has 47 events worth of useful state — every `tool_call_*`
-that completed, every `insight` that landed, every `reasoning_step`
-that was emitted. Compare to a single JSON document: parsing fails on
-incomplete input; nothing recoverable.
+NDJSON is *the simplest streaming format that still has structure*. Compared to Server-Sent Events: no event-type discriminator at the transport layer, no `Last-Event-ID` reconnect semantics, no protocol overhead. Compared to WebSockets: no socket lifecycle to manage, no bidirectional channel, no upgrade handshake. Compared to gRPC streaming: no schema, no codegen, no transport coupling. The cost is that you write the framing and the reconnect yourself.
 
-The same principle, generalized: when output is a sequence of
-independent items, frame the items at the smallest unit that's
-independently useful. For logs, it's lines (NDJSON is its sibling).
-For text generation, it's tokens (SSE for streaming text completions).
-For binary data, it's chunks (HTTP chunked encoding). The shape is
-always: "each unit is meaningful alone, the boundary is explicit."
-
-NDJSON beats SSE for our case because (a) we don't need named event
-types beyond a JSON discriminator, (b) we don't want the EventSource
-auto-reconnect (we handle reconnect at the app level via
-`useReconnectPolicy`), and (c) the fetch + reader API is simpler than
-EventSource for cancellation.
+The transferable lesson: pick the wire format that minimizes coupling. NDJSON over `fetch` works in any browser, any test runner, any HTTP client; it requires no library on either side. A 64-LOC kernel — buffer + split + parse — is the entire client; the typed union (`AgentEvent`) is the entire schema. When the producer is your own route and the consumer is your own hook, the format should be the thinnest thing that gets the bytes across with structure.
 
 ## Primary diagram
 
 ```
-  NDJSON streaming — producer to consumer, end to end
+  streaming-ndjson — full picture
 
-  ┌─ Producer (Next.js route handler) ─────────────────────────────────────┐
+  ┌─ Producers ────────────────────────────────────────────────────────────┐
+  │                                                                         │
+  │  app/api/briefing/route.ts                                              │
+  │    const send = (e) => controller.enqueue(encoder.encode(JSON.stringify(e)+'\n'))│
+  │    Response(stream, { 'content-type': 'application/x-ndjson; charset=utf-8' })│
+  │                                                                         │
+  │  app/api/agent/route.ts                same encode pattern              │
+  │  app/api/mcp/capture-demo/route.ts     same encode pattern              │
+  │                                                                         │
+  │  lib/mcp/events.ts                                                      │
+  │    encodeEvent(e: AgentEvent) → JSON.stringify(e) + '\n'                │
+  │    decodeEvent(line)         → JSON.parse(line) as AgentEvent           │
+  │    type AgentEvent = reasoning_step | tool_call_start | tool_call_end   │
+  │                   | insight | diagnosis | recommendation | done | error │
+  └────────────────────────────┬────────────────────────────────────────────┘
+                               │
+  ┌─ Wire ────────────────────▼─────────────────────────────────────────────┐
+  │  HTTP/1.1 chunked transfer encoding                                      │
+  │  content-type: application/x-ndjson; charset=utf-8                       │
+  │  cache-control: no-store, no-transform   ← prevents intermediate re-frame│
+  └────────────────────────────┬────────────────────────────────────────────┘
+                               │
+  ┌─ Kernel ──────────────────▼─────────────────────────────────────────────┐
+  │  lib/streaming/ndjson.ts (64 LOC)                                        │
+  │  readNdjson<E>(body, onEvent, { cancelOn, onMalformed })                 │
+  │    reader = body.getReader()                                             │
+  │    decoder = new TextDecoder()                                           │
+  │    buf = ''                                                              │
+  │    loop:                                                                 │
+  │      if cancelOn() → reader.cancel(); return                             │
+  │      read chunk; buf += decoder.decode(value, { stream: true })           │
+  │      lines = buf.split('\n'); buf = lines.pop() ?? ''                    │
+  │      for each non-empty line:                                            │
+  │        try JSON.parse → onEvent                                          │
+  │        catch         → onMalformed (silent default)                      │
+  │    on end: flush trailing buf (no-op when producer always terminates)    │
+  └────────────────────────────┬────────────────────────────────────────────┘
+                               │
+  ┌─ Consumers ───────────────▼─────────────────────────────────────────────┐
   │                                                                          │
-  │  const encoder = new TextEncoder();                                      │
-  │  const stream = new ReadableStream<Uint8Array>({                         │
-  │    async start(controller) {                                              │
-  │      const send = (e) => controller.enqueue(                              │
-  │        encoder.encode(JSON.stringify(e) + '\n'));                         │
-  │                                                                            │
-  │      // each agent hook becomes one send():                              │
-  │      send({ type: 'reasoning_step', step: {...} });                       │
-  │      send({ type: 'tool_call_start', toolName: 'X', agent: 'monitoring'});│
-  │      send({ type: 'tool_call_end', toolName: 'X', durationMs: 847, ...});│
-  │      send({ type: 'insight', insight: {...} });                           │
-  │      send({ type: 'done' });                                              │
-  │      controller.close();                                                  │
-  │    }                                                                       │
-  │  });                                                                       │
-  │  return new Response(stream, {                                             │
-  │    headers: { 'content-type': 'application/x-ndjson; charset=utf-8',     │
-  │               'cache-control': 'no-cache, no-transform' }                 │
-  │  });                                                                       │
-  └──────────────────────────────┬─────────────────────────────────────────┘
-                                 │ HTTP body
-                                 ▼
-                              network
-                                 │
-                                 ▼
-  ┌─ Consumer (React hook) ────────────────────────────────────────────────┐
+  │  useBriefingStream      9-case switch:                                   │
+  │   (313 LOC)              workspace / coverage_item / coverage /          │
+  │                          tool_call_start / reasoning_step /              │
+  │                          tool_call_end / insight / done / error          │
   │                                                                          │
-  │  const res = await fetch(url);                                           │
-  │  await readNdjson<AgentEvent>(res.body, (e) => {                          │
-  │    switch (e.type) {                                                      │
-  │      case 'reasoning_step':  setItems(p => [...p, traceFromStep(e)]); break;
-  │      case 'tool_call_start': setItems(p => [...p, traceFromStart(e)]); break;
-  │      case 'tool_call_end':   setItems(p => replaceRunning(p, e)); break; │
-  │      case 'insight':         collected.push(e.insight); break;           │
-  │      case 'done':            setComplete(true); break;                   │
-  │      case 'error':           setError(e.message); break;                  │
-  │    }                                                                      │
-  │  }, { cancelOn: () => cancelledRef.current });                            │
-  │                                                                            │
-  └──────────────────────────────────────────────────────────────────────────┘
-
-  Inside readNdjson — the buffering + dispatch loop:
-
-  buf = ''
-  while (!done):
-    if cancelOn(): reader.cancel(); return
-    { value, done } = await reader.read()
-    buf += decoder.decode(value, { stream: true })   // handles mid-byte UTF-8
-    lines = buf.split('\n')
-    buf = lines.pop()                                // keep partial line
-    for line in lines:
-      if line.trim():
-        try: onEvent(JSON.parse(line))               // dispatch
-        catch: onMalformed(line, err)                // silent default
-  flush trailing buf (no-op for properly-terminated producers)
+  │  useInvestigation       step-filtered: diagnose vs recommend             │
+  │   (202 LOC)              writes diagnosis to sessionStorage handoff       │
+  │                                                                          │
+  │  useDemoCapture         dev-only: captures live trace + insights →       │
+  │   (146 LOC)              writes lib/state/demo-*.json                    │
+  │                                                                          │
+  │  StreamingResponse      free-form chat surface (live-only)               │
+  │  (chat component)                                                        │
+  └─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-**Where this pattern comes from.** NDJSON / JSON Lines emerged from the
-logging world (~2010-2014): tools like Elasticsearch's bulk API, Splunk's
-HTTP event collector, and the `jq` ecosystem all needed a streamable
-JSON format that wasn't a single giant array. The format is so simple
-it doesn't even have a formal specification — `jsonlines.org` is a
-single page that says "one JSON value per line, separated by `\n`."
+**Why not Server-Sent Events.** SSE has event-type framing and automatic reconnect with `Last-Event-ID`. Both are wrong here. The event-type framing is redundant — our events already carry `type` in the JSON payload, and the wire is one parser, not a per-type dispatch. The automatic reconnect is *actively harmful*: a reconnect mid-scan would either re-run the scan (duplicating work + cost) or skip events the resumed stream doesn't know about. The hand-rolled NDJSON + `useReconnectPolicy` gives us explicit control over when to reconnect (only on auth-shaped errors, once per session, after a full reset). → see `02-auth-boundary.md`.
 
-**The deeper principle.** Frame at the boundary of independent
-meaning. Single-JSON requires the whole document to be parsed
-atomically; NDJSON makes each line independently parseable.
+**Why not WebSockets.** WebSockets buy bidirectional streaming and lower per-message overhead. Neither matters here — the wire is one-way (route → UI), and the messages are JSON (the per-event overhead is `JSON.stringify`, not protocol framing). The cost of WebSockets is the socket lifecycle: connection upgrade, ping/pong, reconnect logic, framework support. Vercel's serverless functions don't support long-lived WebSockets in the default runtime, so adding them would force a runtime change (Edge or a different platform) for no win.
 
-The class of streaming wire formats:
+**The malformed-line policy.** Silent by default, with an optional hook. The reasoning: a single corrupted line is almost always a transient wire issue (a CDN re-framing artifact, an unfortunate test fixture). Crashing the whole stream on one bad line would turn a recoverable hiccup into a fatal error. Logging the bad line via `onMalformed` is available when a caller wants to surface it; in production, callers don't pass the hook, which is the explicit decision to swallow.
 
-  → SSE (Server-Sent Events) — `event:`/`data:` prefixed lines,
-    auto-reconnect via EventSource, used for tokens/notifications
-  → NDJSON / JSONL — one JSON value per line, used for logs, agent
-    traces, bulk operations
-  → HTTP chunked encoding — bytes as the unit, used for raw streaming
-    (file downloads, audio/video)
-  → WebSocket frames — bidirectional, used for true duplex
-    (chat, multiplayer, collaborative editing)
-
-We pick NDJSON because the request is one-way (server → client) and the
-events are structured. SSE would work too; the tiebreaker is the
-fetch+reader API being simpler than EventSource for our cancellation
-story.
-
-**Where it breaks.**
-
-- **Proxies that buffer.** Some CDN configurations buffer responses
-  until they're complete, defeating the progressive-delivery point.
-  We mitigate with `cache-control: no-transform` and `content-type:
-  application/x-ndjson` (which most CDNs treat as "don't transform"),
-  but a misconfigured proxy could still break it.
-- **JSON.stringify cost on the producer.** Each event is stringified
-  on the hot path. For a 60-line briefing this is fine; for a 60,000-
-  line scan it'd matter. Today's volumes are tiny.
-- **The producer can run out of memory on `collected.push(e)`.** The
-  `/api/agent` route keeps every event in a `collected` array
-  (`app/api/agent/route.ts:186`) so it can be cached for replay. A
-  long investigation with many tool calls grows this without bound.
-  The 300s ceiling caps total accumulation, but a hostile prompt
-  could fill memory.
-- **Each line must be valid JSON.** A bug that emits a non-JSON line
-  is silently swallowed by `onMalformed`. Default behavior is silent,
-  which is friendly to clients but unfriendly to producers — a
-  bug-in-the-encoder might never surface. The `onMalformed` callback
-  is the test-time hook.
-
-**What to explore next.**
-
-- `01-request-flow.md` — the route handler that drives this stream
-- `08-client-stream-handoff.md` — how the stream survives a tab close
-  (it doesn't — but the result hand-off does)
-- `study-networking` — HTTP chunked encoding, SSE vs NDJSON vs WebSocket
-- `study-runtime-systems` — ReadableStream, TextDecoder, async iteration
+**The forward-compat shape.** New event types can be added to `AgentEvent` (or to a local superset like `BriefingEvent`) without breaking existing consumers — TypeScript's exhaustive-switch warnings appear at compile time in the consumer, the runtime ignores unknown event types silently (the `switch` falls through, no `default` throws). The dual rule: existing event types' *required* fields must not change; optional fields can grow. The data-model fields on `Insight` / `Anomaly` / `Diagnosis` / `Recommendation` are kept optional for the same reason (so older demo snapshots still validate).
 
 ## Interview defense
 
-#### Q: "Why NDJSON instead of SSE for streaming the agent's reasoning?"
+**Q: Why NDJSON over Server-Sent Events or WebSockets?**
 
-Three reasons, in order. **One**: the data is structured. Each event is
-a typed discriminated union; JSON-per-line is the most natural fit. SSE
-treats data as opaque text and you'd JSON.parse inside the `message`
-handler anyway. **Two**: we own the reconnect story. The Bloomreach
-alpha revokes tokens after minutes and we want a single one-shot
-reset+reload on auth errors — EventSource's auto-reconnect would fight
-that. **Three**: fetch + ReadableStream + a tiny `readNdjson` kernel is
-simpler than EventSource for cancellation; we already use AbortSignal
-everywhere, so reusing it for the stream consumer means one cancellation
-model instead of two.
+> NDJSON is the thinnest format that still has structure. SSE has features I don't want — its `Last-Event-ID` reconnect would either duplicate the agent scan or skip events; the event-type framing is redundant when the JSON already carries `type`. WebSockets are heavier — connection lifecycle, bidirectional channel I don't need, and Vercel's default serverless runtime doesn't support long-lived sockets. NDJSON over `fetch` works in any browser, requires no library, and the entire kernel is 64 lines. The producer terminates every event with `\n`; the consumer splits on `\n` and `JSON.parse` each line. That's the whole protocol.
 
 ```
-  SSE                      NDJSON (what we pick)
-  ───                      ─────────────────────
-  EventSource API          fetch + ReadableStream
-  auto-reconnect built-in  app owns reconnect
-  named event types        types via JSON discriminator
-  text framing             line framing
-  no Authorization headers can carry any headers via fetch
+  format comparison
+
+  NDJSON   ──► 64-LOC kernel, plain fetch, no library
+  SSE      ──► event-type framing (redundant), auto-reconnect (harmful here)
+  WebSocket ─► socket lifecycle, bidirectional (unused), runtime change
+  gRPC     ──► schema, codegen, transport coupling
 ```
 
-**Surface:** "structured data + we own reconnect + simpler cancellation."
-**Probe:** if pressed — name `useReconnectPolicy.ts:33-123` as the
-proof we want app-level reconnect, not EventSource's auto-retry.
+**Anchor:** `lib/streaming/ndjson.ts:17-64`, `lib/mcp/events.ts:4-12`.
 
-#### Q: "What's the load-bearing part of this — what breaks if you remove it?"
+**Q: What's the load-bearing skeleton of `readNdjson`? What breaks if I remove a piece?**
 
-The `let buf = '' + lines.pop()` pattern in the reader kernel
-(`lib/streaming/ndjson.ts:30, 41`). It's the kernel: chunks from the
-network can split a line mid-text, so the reader has to keep the
-trailing partial line as `buf` and prepend it to the next chunk
-before splitting again.
+> The kernel is four parts: the read loop, the buffer that survives chunk boundaries, the split-and-pop on `\n`, and the try/catch around `JSON.parse`. The buffer (`buf` initialized to `''`, prepended to each new chunk's decoded text) is the part most people forget — without it, an event split across two TCP chunks would be parsed as two malformed lines instead of one valid event. The `lines.pop()` after `split('\n')` is the partner: it keeps the last (possibly partial) line in the buffer for the next read. The try/catch around `JSON.parse` is what makes a single bad line a logged-and-skipped event instead of a stream-killing throw. The `cancelOn` poll is hardening — useful but not load-bearing for correctness.
 
 ```
-  load-bearing skeleton — line reassembly across chunks
+  the kernel
 
-  buf = ''
-  for each chunk arriving:
-    buf += decoder.decode(chunk, { stream: true })
-    lines = buf.split('\n')
-    buf = lines.pop()                          ← LOAD-BEARING: keep partial line
-    for each complete line: onEvent(JSON.parse(line))
+  let buf = ''                              ← survives chunk boundaries
+  read chunk → buf += decode(chunk)
+  lines = buf.split('\n')
+  buf = lines.pop() ?? ''                   ← keep partial tail
+  for each non-empty line:
+    try JSON.parse → onEvent                 ← per-event isolation
+    catch         → onMalformed (silent)
 
-  at end-of-stream:
-    if buf.trim(): try JSON.parse(buf) one more time
+  hardening (not the kernel):
+    cancelOn poll, trailing-buffer flush, TextDecoder({stream:true})
 ```
 
-Drop the `pop()` and you'd attempt to JSON.parse a half-line on every
-chunk boundary. The reader would emit `onMalformed` constantly and
-miss real events.
+**Anchor:** `lib/streaming/ndjson.ts:30-50`.
 
-Other load-bearing parts:
+**Q: How does the producer guarantee the consumer can parse what arrives?**
 
-  → `TextDecoder({ stream: true })` — multi-byte UTF-8 character
-    handling across chunks
-  → `try { JSON.parse } catch` around dispatch — one malformed line
-    must not kill the stream
-  → `if (opts?.cancelOn?.())` polling — without it, an unmounted
-    React component holds the reader forever
-  → `reader.releaseLock()` in `finally` — required by the
-    ReadableStream contract
+> The producer ALWAYS terminates each event with `\n`. The `encodeEvent` helper in `lib/mcp/events.ts` literally returns `JSON.stringify(e) + '\n'`, and every inline `controller.enqueue(...)` follows the same shape. The contract on the wire is: every newline marks a complete JSON object; everything between two newlines is a parseable JSON. The consumer trusts this. If a future producer ever omitted the final `\n`, the kernel's trailing-buffer flush would still emit the last event from `buf` on stream end — but that's a safety net, not the contract. The intent is "always terminate," documented in the kernel's header comment: "Producers always terminate each event with '\n', so in practice the trailing-buffer flush is a no-op."
 
-Optional hardening:
+```
+  the contract
 
-  → end-of-stream flush of trailing `buf` — defensive against
-    producers that don't terminate with `\n` (none of ours do this)
-  → `onMalformed` callback — testing hook; default is silent skip
+  producer:   JSON.stringify(event) + '\n'    ← always
+  wire:       chunked bytes, framing-agnostic
+  consumer:   split('\n'), parse each line     ← assumes the contract holds
 
-#### Q: "What changes if you need bi-directional streaming (chat-like)?"
+  safety net (not the contract):
+    consumer flushes trailing buf on stream end
+```
 
-NDJSON wouldn't work — it's one-way (server → client only). The right
-move is WebSockets, but you'd give up the simple HTTP semantics (auth
-header on the connect, retry on 401, graceful degradation through
-CDNs). A pragmatic middle: keep the NDJSON server-push, add a separate
-POST endpoint for client-to-server messages that returns its own
-NDJSON stream for the response. That's effectively what the chat
-surface does today — `QueryBox` POSTs (well, GETs with a `q` param),
-the response is one NDJSON stream of agent events ending in `done`.
-
-True bi-directional (server can ask the client mid-stream for more
-context) would need WebSockets or a long-polling pattern. We don't have
-that use case today; the agent has all the context it needs at request
-time.
+**Anchor:** `lib/mcp/events.ts:14-17`, `app/api/briefing/route.ts:193-194`, `lib/streaming/ndjson.ts:52-60`.
 
 ## See also
 
-- `00-overview.md` — where this sits in the whole system
-- `01-request-flow.md` — the route handler that drives the stream
-- `08-client-stream-handoff.md` — what happens across the request boundary
-- `04-aptkit-primitive-boundary.md` — how the trace adapter produces these
-  events
-- `study-networking` — SSE vs NDJSON vs WebSocket on the wire
-- `study-runtime-systems` — ReadableStream + TextDecoder mechanics
+- `01-request-flow.md` — how the briefing route emits events into the wire
+- `04-aptkit-primitive-boundary.md` — the trace sink that produces tool_call_start / tool_call_end
+- `05-framework-runtime-only.md` — `ReadableStream` as a `Response` body is the runtime feature this stands on
+- `08-demo-replay-as-reliability.md` — the demo branch produces NDJSON from a static snapshot, identically

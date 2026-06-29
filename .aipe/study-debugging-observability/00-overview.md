@@ -1,100 +1,54 @@
-# Overview — Debugging & Observability in blooming insights
+# Overview — debugging & observability in blooming_insights
 
-## The shape, in one frame
+The verdict first: **this repo's observability story is unusually well-shaped for its size, because the live trace is a product feature, not an afterthought.** The user *sees* the agent's reasoning, the EQL queries it ran, and the tool results — so the evidence to debug a wrong answer is the same evidence the UI renders. That single design choice does most of the work. Three smaller mechanisms ride on top: a structured per-request phase log, token redaction at the error edge, and committed JSON snapshots that replay the live wire format. Together they cover the "explain unknown behavior with evidence" question end-to-end inside the repo. They do *not* cover cross-service correlation, metrics, alerting, or production tracing — none of those exist yet, and several wouldn't earn their keep until the system grows past a single Vercel deployment.
 
-The product is "an analyst that shows its work." The same NDJSON event pipe that streams reasoning to the user *is* the developer's primary debugging surface. So the on-call evidence trail and the demo's "watch the agent think" UI are the same wire.
+## The three observability surfaces
 
 ```
-  How this repo reveals its behavior — three surfaces
+  Surfaces, by who emits and who reads
 
-  ┌─ UI layer ─────────────────────────────────────────────────┐
-  │  StatusLog / ReasoningTrace                                │
-  │     ▲                                                       │
-  │     │ TraceItem (step | tool, ts)                           │
-  └─────┼───────────────────────────────────────────────────────┘
-        │
-  ┌─ Service layer ─────────────────────────────────────────────┐
-  │  GET /api/briefing  ──┐                                     │
-  │  GET /api/agent     ──┤                                     │
-  │                       │  encodeEvent(AgentEvent)            │
-  │                       ▼                                     │
-  │                ╔═══════════════════════╗                    │
-  │                ║  ★ NDJSON stream ★    ║  ← SURFACE 1       │
-  │                ╚═══════════════════════╝     (live trace)   │
-  │                       │                                     │
-  │                       ├─► console.log({route,phases,…})     │
-  │                       │   (Vercel logs, per-request summary)│
-  │                       ▼                                     │
-  │                 saveInvestigation(id, collected)            │
-  └─────────────────────────────────────────────────────────────┘
-                          │
-  ┌─ Storage layer ───────▼─────────────────────────────────────┐
-  │  in-memory Map → .investigation-cache.json (dev only)        │
-  │                → lib/state/demo-investigations.json (seed)   │
-  │  ╔══════════════════════════════════════════╗               │
-  │  ║  ★ Recoverable post-mortem evidence ★    ║  ← SURFACE 3  │
-  │  ╚══════════════════════════════════════════╝               │
-  └─────────────────────────────────────────────────────────────┘
-
-  Plus: ★ Vitest test output ★  ← SURFACE 2
-        24 files / 221 passing — the deterministic correctness gate
+  ┌─ surface ─────────────┬─ emitter ────────────────┬─ reader ─────────────────────┐
+  │ 1. live trace         │ /api/briefing,           │ the UI (StatusLog +          │
+  │    (NDJSON over fetch)│ /api/agent — every       │ ReasoningTrace) — also       │
+  │                       │ phase, every tool call,  │ the dev who opens the        │
+  │                       │ every agent step         │ network panel               │
+  ├───────────────────────┼──────────────────────────┼──────────────────────────────┤
+  │ 2. vitest output      │ test/**.test.ts          │ the dev running `npm test`  │
+  │    (test runner)      │ (221 tests, 24 files)    │ — also CI when it lands     │
+  ├───────────────────────┼──────────────────────────┼──────────────────────────────┤
+  │ 3. dev cache files    │ saveInvestigation,       │ the dev who opens the file  │
+  │    (gitignored JSON)  │ auth-cache.json,         │ — survives hot reload, so   │
+  │                       │ committed demo-*.json    │ state is inspectable at rest│
+  └───────────────────────┴──────────────────────────┴──────────────────────────────┘
 ```
 
-Three surfaces, not four. The fourth (an `eval/results/<date>/` paper trail) existed briefly and was retired with the Olist work — be honest about that when defending this in an interview.
+The live trace is the load-bearing surface — it's what the user pays attention to *and* what the developer reaches for first when something is wrong. Tests are the second-strongest signal (they prove a change didn't break anything, but only against scenarios someone wrote down). Dev cache files are a fallback for state-at-rest inspection.
 
-## The three surfaces
+What is not here, and would matter if it were: metrics (a counter on `tool_call_end.error`), alerting (a page when `monitoring_scan.durationMs` crosses a budget), distributed tracing (a `traceparent` header propagating across the Bloomreach hop), production log aggregation beyond Vercel's built-in retention. Those become relevant only as the system grows past a single Vercel deployment talking to a single Bloomreach project.
 
-### 1. NDJSON streaming trace (live)
+## Ranked findings — by consequence
 
-The discriminated union (`AgentEvent`) at **`lib/mcp/events.ts:4-12`** is the wire contract. Eight variants: `reasoning_step | tool_call_start | tool_call_end | insight | diagnosis | recommendation | done | error`. Encoded one-per-line, terminated with `'\n'`.
+1. **The discriminated union (`AgentEvent`) is the wire contract for both the UI render and the debugging signal at once.** `lib/mcp/events.ts:4-12`. Eight variants: `reasoning_step | tool_call_start | tool_call_end | insight | diagnosis | recommendation | done | error`. Strip this and the UI breaks, the dev's network-panel debugging breaks, the demo-replay reproduction breaks, the test-replay sister hook (`test/api/_helpers.ts`) breaks. One contract, four consumers. → see `01-ndjson-reasoning-trace.md`.
 
-Two routes produce it: `app/api/briefing/route.ts` (monitoring scan) and `app/api/agent/route.ts` (diagnostic + recommendation + free-form query). Four client consumers read it via the shared kernel at **`lib/streaming/ndjson.ts:17-64`**: `useBriefingStream.ts`, `useInvestigation.ts`, `useDemoCapture.ts`, and `StreamingResponse.tsx`. One wire, two producers, four consumers, one kernel.
+2. **The per-request phase log fires in `finally`, so the budget record survives the failure.** `app/api/briefing/route.ts:317-324`, `app/api/agent/route.ts:331-338`. One `console.log(JSON.stringify(…))` line per request, shared shape across both routes (`route`, `sessionId`, `mode`, `totalMs`, `phases[]`, `aborted`). When the 300s Vercel ceiling fires mid-`monitoring_scan`, the log still records how much budget each completed phase burned. → see `02-per-request-phase-log.md`.
 
-When the LLM picks a wrong tool, when a Bloomreach call times out, when an anomaly is mis-categorised — you see it live in `StatusLog` because that's the same data the agent emitted. There's no separate debug log to consult.
+3. **Token redaction happens BEFORE the log line, not after.** `lib/mcp/transport.ts:66-76`, called from every `console.error` site in the routes. Bearer headers and OAuth body tokens are stripped at the moment the error is formatted, not at log ingestion. This is the right place — Vercel's log retention can never hold a token that was never written to the log. → see `03-redaction-at-the-error-edge.md`.
 
-### 2. Vitest test output
+4. **The capturing fetch records each non-OK MCP response body so the thrown error carries the REAL server detail.** `lib/mcp/transport.ts:103-118` + `SdkTransport.callTool` at `lib/mcp/transport.ts:129-146`. Without this, the SDK surfaces "Unauthorized" with no body and a debugger can't tell `invalid_token` from `expired_token` from `rate_limited`. → see `04-server-error-body-capture.md`.
 
-24 test files / 221 tests. `test/mcp/events.test.ts` pins the NDJSON encode/decode round-trip. `test/streaming/ndjson.test.ts` pins the line-buffered parse semantics (including the trailing-buffer flush). `test/api/briefing.integration.test.ts` (7 cases) pins the 9-case event dispatcher the briefing hook depends on. This is the *correctness gate before behavior gets weird in production* — neighbor to this guide, owned by `study-testing`.
+5. **The demo snapshot replays as NDJSON over the SAME wire contract.** `app/api/briefing/route.ts:86-152`, `app/api/agent/route.ts:125-142`. The committed `lib/state/demo-*.json` files are not just static JSON — they're replayed event-by-event through the same `AgentEvent` encoder the live run uses, with a `REPLAY_DELAY_MS` pause so the UI reveals progressively. The same stream that observes a live run reproduces a recorded one. → see `05-replay-snapshot-as-fixture.md`.
 
-### 3. Dev cache files (gitignored) + committed seed
+## What's missing — honest
 
-Three-rung store at **`lib/state/investigations.ts:11-28`**: in-memory `Map` → `.investigation-cache.json` (dev only) → `lib/state/demo-investigations.json` (committed seed). The same lookup walks all three. Same idea for OAuth state at `lib/mcp/auth.ts:34-36` and the in-memory `memStore`.
+- **No metrics.** No counter on errors per minute, no histogram on `tool_call_end.durationMs`, no gauge on cache hit rate. The phase log captures latency *per request*, but nothing aggregates across requests.
+- **No alerting.** The 300s ceiling has no SLO around it. The `aborted: true` field in the phase log is the only signal that a client cancellation or a budget timeout happened, and nothing watches for it.
+- **No cross-service correlation.** A request has a `sessionId` (the cookie) but no per-request `requestId`. The Bloomreach hop is opaque — no `traceparent`, no trace continuation. When a Bloomreach error happens, the only correlation is timestamp + sessionId in two log streams.
+- **No production log aggregation.** The repo writes to `console.log` / `console.error`, and Vercel retains the lines. There is no Datadog, no Sentry, no OpenTelemetry collector. Search is grep-by-substring inside Vercel's UI.
+- **No runbook.** When OAuth tokens revoke (the alpha-server scar tissue: tokens die after minutes), the UI auto-reconnects (`app/page.tsx` reconnect button) but there is no document for "what to do when monitoring_scan times out" or "what to do when capture-demo fails." The reconnect button is the only operational lever.
 
-When a live run produces a useful failure, the dev cache *already saved it*. You can re-open the page and the cached events replay — the bug is reproducible without re-running the agent.
+These are real gaps, not gaps the repo should pretend to have filled. Several would not earn their keep at the current scale (one Vercel deployment, one Bloomreach project, no users beyond the demo). Tracing would matter if a second backend were added; metrics would matter if budgets started being missed regularly; alerting would matter if anyone other than the developer cared when a request fails.
 
-## Ranked findings (what's interesting first)
+## Reading order from here
 
-1. **The NDJSON wire is both the UX and the debug surface.** This is the load-bearing decision. It eliminates the divergence problem (the dev log saying one thing while the user sees another) because there's only one pipe. → `01-ndjson-agent-event-discriminated-union.md`.
-
-2. **Replay is built in.** The demo path isn't a fixture jig bolted on for tests — it's a real route (`/api/briefing?demo=cached`, `/api/agent` cache-first branch at `app/api/agent/route.ts:125-142`) that emits the snapshot at a paced 180ms/event so it *feels* like the live run. That gives you a reproducible debugging fixture per investigation. → `02-replay-from-snapshot-with-paced-emission.md`.
-
-3. **The three-rung store is the post-mortem evidence trail.** A failure on the live route writes to in-memory and (in dev) `.investigation-cache.json`. Recovery is reload-the-page; investigation is open-the-JSON-file. → `03-three-rung-mem-file-seed-store.md`.
-
-4. **The collected/send dual-write is the seam between live and replay.** Every emitted event is pushed into `collected` so `saveInvestigation(insightId, collected)` writes the same shape the live stream produced — no separate "snapshot format." → `04-dual-write-send-to-stream-and-store.md`.
-
-5. **The `AUTH_SECRET` flake was the postmortem that named the pattern: "wrap setup in try/catch and surface the message."** Production-only 500 because `aesKey()` threw before the route could send a JSON body. Fixed by `app/api/briefing/route.ts:170-179` + `app/api/agent/route.ts:166-174`. → `05-auth-secret-flake-postmortem.md`.
-
-## Per-phase wall-clock log line
-
-Server-side `console.log` (Vercel logs only — not on the NDJSON wire), emitted once per request from the `finally` block at **`app/api/briefing/route.ts:317-324`** and **`app/api/agent/route.ts:331-338`**:
-
-```json
-{"route":"/api/briefing","sessionId":"…","mode":"live-bloomreach",
- "totalMs":118433,"phases":[
-   {"phase":"schema_bootstrap","durationMs":2104},
-   {"phase":"coverage_gate","durationMs":3},
-   {"phase":"list_tools","durationMs":611},
-   {"phase":"monitoring_scan","durationMs":115714}
- ],"aborted":false}
-```
-
-Shared shape across both routes so a single Vercel filter (`phases.phase = "schema_bootstrap"`) reads both. Fires on error too, so when the 300s ceiling kills a request you can see exactly which phase burned the budget. The Anthropic `res.usage` cost meter lives in a sibling line, logged on every model call at **`lib/agents/aptkit-adapters.ts:57-61`**.
-
-## What's not yet exercised (be honest)
-
-- **No SLI/SLO/alerting infra.** No metrics endpoint, no Sentry, no PagerDuty, no synthetic monitoring. The phase log is the closest thing to an SLI ("did the route finish under 300s"); nobody pages on it.
-- **No distributed tracing.** No OpenTelemetry, no spans, no trace IDs propagated cross-service. The session ID at `lib/mcp/session.ts` is the closest thing to a correlation ID — it threads through `console.log` lines but nothing collects them into a trace tree.
-- **No structured-log redaction beyond auth tokens.** `redactSecrets` at `lib/mcp/transport.ts:55-76` scrubs `Bearer …`, `access_token`, `refresh_token`, `id_token`, `code_verifier`. Customer PII in EQL results is NOT redacted — see audit lens 3.
-- **No runbook documentation.** The auth-secret postmortem is preserved here (file 05), but there's no `/runbooks/` directory; the next incident has to rediscover the pattern.
-
-The honest framing: this repo has *strong* observability on its own loop (the agents' reasoning) and *weak* observability on the surrounding infrastructure (the platform, the third-party MCP server, the user's session). The next layer of debugging investment is alerting + tracing, not more logs.
+→ `audit.md` — the 8-lens walk against this repo's evidence
+→ Pattern files in order, `01` through `05` — each names a mechanism and walks why it earns its place

@@ -1,494 +1,390 @@
-# Schema-gated coverage — only run categories the workspace can answer
+# schema-gated-coverage
 
-**Industry name:** capability-based feature gating · Project-specific (ecommerce monitoring shape)
+## Capability-gated work (project-specific)
 
-## Zoom out, then zoom in
+A 10-category anomaly checklist (the `CategoryId` union in `lib/mcp/types.ts`) is matched against the live workspace's event schema *before* the monitoring agent runs. Categories whose required signals aren't present are surfaced honestly in the UI as `no data source` or `limited` and the agent never spends an EQL query on them. The gate runs in the briefing route between the schema bootstrap and the agent scan; it both shapes the user-visible coverage grid and trims the work the agent is allowed to do.
 
-The monitoring agent has a fixed checklist of 10 ecommerce anomaly
-categories (`conversion_drop`, `cart_abandonment`, `product_demand`,
-`revenue_drop`, `customer_churn`, `inventory`, `campaign_perf`,
-`search_failure`, `return_spike`, `fraud`). Each requires specific events
-to be present in the workspace's schema. Before the agent runs, the route
-computes which categories this workspace can answer — and only those
-reach the agent.
+## Zoom out — where this pattern lives
 
-You know how a feature flag prevents a feature from running if the
-backend doesn't support it? Same shape here, but the gate is computed
-from the workspace's actual event schema, not from a static flag. The
-agent never even sees the categories that can't be answered, so it can't
-waste a single MCP call trying.
+The gate sits inside the briefing route, after the schema is loaded and before the agent is built.
 
 ```
-  Zoom out — where the schema gate lives
+  Zoom out — the gate as a junction between schema and agent
 
-  ┌─ Service layer ──────────────────────────────────────────────────────┐
-  │                                                                       │
-  │  /api/briefing                                                        │
-  │   schema bootstrap → workspace                                        │
-  │           │                                                            │
-  │           ▼                                                            │
-  │   schemaCapabilities(schema) → Set<string> of available event types   │
-  │           │                                                            │
-  │           ▼                                                            │
-  │   coverageReport(...)        → CoverageItem[] (the UI grid)           │
-  │   runnableCategories(...)    → AnomalyCategory[] (what monitoring runs)│
-  │           │                                                            │
-  │           ▼                                                            │
-  │   ★ ONLY runnable categories reach MonitoringAgent.scan(...) ★         │ ← we are here
-  │                                                                       │
+  ┌─ Service layer (briefing route) ────────────────────────────────────┐
+  │                                                                      │
+  │  bootstrap → WorkspaceSchema  (events, customer properties, …)       │
+  │       │                                                              │
+  │       ▼                                                              │
+  │  ★ SCHEMA-GATED COVERAGE ★                                           │ ← we are here
+  │    schemaCapabilities(schema) → Set<signal>                          │
+  │    coverageReport(capabilities) → CoverageReport (UI grid + log)     │
+  │    runnableCategories(capabilities) → AnomalyCategory[] (agent input)│
+  │       │                                                              │
+  │       ▼                                                              │
+  │  MonitoringAgent.scan(runnable)   ← agent never sees skipped cats    │
+  │                                                                      │
   └──────────────────────────────────────────────────────────────────────┘
 ```
 
-This is the cheapest defence in the whole codebase — a few hundred
-microseconds of set arithmetic that saves several seconds of EQL budget
-per briefing.
+The gate is the *junction* between the schema (the workspace's reality) and the agent (the work to do). Without it, the monitoring agent would spend rate-limit budget on EQL queries for categories the workspace can't answer (no `purchase` events → no revenue category) and the UI would show inferred-not-real answers.
 
-## Structure pass — layers, axis, seams
+## Structure pass
 
-**Layers:** Workspace schema → capability extraction → coverage report →
-monitoring agent.
-
-**Axis (held constant): "what does this workspace have, and what does
-the category need?"** This is the right axis because the whole gate is
-a set-intersection problem.
+Three layers carry this pattern: the **schema** layer (the workspace shape from Bloomreach), the **gate** layer (the three pure functions in `lib/agents/categories.ts`), the **agent** layer (the scan that runs only on runnable categories). One axis worth tracing: **what does the system promise about each category?**
 
 ```
-  Axis: what's in the workspace vs what each category needs?
+  Axis: what does the system promise per category?
 
-  ┌─ workspace.events  (set A) ────────────────────────────────────┐
-  │  { 'purchase', 'view_item', 'session_start', 'cart_update',     │
-  │    'checkout', ... }                                            │
-  └────────────────────────────────────────────────────────────────┘
-
-  ┌─ category.requires  (set B per category) ──────────────────────┐
-  │  conversion_drop: { 'view_item', 'cart_update', 'purchase' }   │
-  │  cart_abandonment: { 'cart_update', 'checkout' }               │
-  │  ... 8 more                                                     │
-  └────────────────────────────────────────────────────────────────┘
-
-  decision: B ⊆ A ?
-    full       — all required + all enriching present
-    limited    — required present, some enriching missing
-    unavailable — at least one required absent
+  ┌─ schema layer ───────────────┐    raw signals (event names, properties)
+  │  WorkspaceSchema             │   ═════╪═════►
+  │    events[], customerProps[] │
+  └──────────────────────────────┘
+       ┌─ gate layer ──────────────┐    one promise per category:
+       │  full / limited /         │      full → answer with confidence
+       │  unavailable               │      limited → answer with caveat
+       └────────────────────────────┘      unavailable → cannot answer
+            ┌─ agent layer ─────────┐    runs only runnable (full + limited)
+            │  scan(runnable)        │    unavailable: surfaced, not asked
+            └────────────────────────┘
 ```
 
-**Seams (boundaries where the gate flips behavior):**
-
-- **Schema → capabilities** — workspace events become a `Set<string>`.
-  Set membership is O(1); the dozens of intersections that follow are
-  cheap.
-- **Capabilities → coverage** — each category gets a `CategoryCoverage`
-  label (`full` | `limited` | `unavailable`). UI shows all three; agent
-  runs only the first two.
-- **Coverage → agent input** — only `full` and `limited` categories
-  reach the agent (`runnableCategories`). The `unavailable` ones never
-  consume a Bloomreach call.
+The axis flips at the gate: above it, the schema is just raw signals; below it, every category has a definite promise the system honours. The seam is the `CategoryCoverage` enum (`'full' | 'limited' | 'unavailable'`) — three categories of promise that drive both UI rendering and agent input.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-The shape is a fixed checklist with per-row capability tests. Each row
-is one anomaly category; each test is "do you have the events I need?"
+You've used a feature-detection pattern in the browser — `if ('serviceWorker' in navigator) { … }`. Capability check first, then run the feature. Schema-gated coverage is the same shape, applied to a *checklist* of features. The system has 10 anomaly categories (the checklist). Each category requires certain event types and properties (its capabilities). The schema gate asks, for each category, "does this workspace emit what I need?" — and routes the answer into one of three buckets.
 
 ```
-  Pattern — capability-based feature gating
+  The pattern: feature detection per category, three buckets
 
-  for each category in CATEGORIES:               UI shows this regardless
-     coverage = test(category, workspace.events)
-     ───────────────────────────────────────
-     full        → render tile + run agent
-     limited     → render tile + run agent (with caveat)
-     unavailable → render tile (greyed) + skip agent
+  10 anomaly categories (the checklist):
+    conversion_drop · cart_abandonment · product_demand · revenue_drop ·
+    customer_churn · inventory · campaign_perf · search_failure ·
+    return_spike · fraud
 
-  monitoringAgent.scan(runnableCategories)       ← agent never sees the rest
+  for each category:
+    if all required signals present + all enriching signals present:
+      bucket = 'full'        → grid tile green, runnable
+    else if all required signals present but enriching missing:
+      bucket = 'limited'     → grid tile amber, runnable with caveat
+    else (a required signal absent):
+      bucket = 'unavailable' → grid tile gray, NOT runnable
+
+  runnable = { 'full', 'limited' }  → input to MonitoringAgent.scan
+  unavailable → never reaches the agent, surfaced in coverage grid only
 ```
-
-The gate is two-faced: the UI shows the FULL checklist (so the user
-understands what the system would monitor with more data) AND the agent
-gets the FILTERED list (so it doesn't burn budget on impossible
-queries). Same source of truth, two consumers.
 
 ### Move 2 — the step-by-step walkthrough
 
-#### Step 1 — the 10-category checklist
+#### the inputs — `CategoryId`, `AnomalyCategory`, the 10-category list
 
-The categories live in AptKit (`@aptkit/core@0.3.0`) under
-`ECOMMERCE_ANOMALY_CATEGORIES`. Blooming wraps them with a
-compatibility shape that older callers expect (`eql(projectId)` as a
-function instead of a static `queryRecipe` string):
+The checklist is fixed in code, sourced from `@aptkit/core` as `ECOMMERCE_ANOMALY_CATEGORIES`. The Blooming compatibility shape is in `lib/agents/categories.ts`:
 
-```typescript
+```ts
 // lib/agents/categories.ts:14-24
 export interface AnomalyCategory {
   id: CategoryId;
   label: string;
-  requires: string[];               // ← event types that MUST be in the workspace
-  enriches?: string[];              // ← event types that improve quality (optional)
-  whyItMatters: string;
-  eql: (projectId: string) => string;
+  requires: string[];                              // required signals (e.g. ['purchase', 'customer.country'])
+  enriches?: string[];                             // enriching signals (soft-fail to 'limited' if missing)
+  whyItMatters: string;                            // business-language reason
+  eql: (projectId: string) => string;              // the EQL recipe to run
   thresholds: { critical: number; warning: number };
 }
 
 export const CATEGORIES: AnomalyCategory[] = ECOMMERCE_ANOMALY_CATEGORIES.map(toBloomingCategory);
 ```
 
-The 10 categories (from `lib/mcp/types.ts:8-18`):
+The `CategoryId` union (`lib/mcp/types.ts:8-18`) enumerates the ten:
 
-```
-  CategoryId (lib/mcp/types.ts:8-18)
-  ───────────────────────────────
-  conversion_drop       cart_abandonment    product_demand
-  revenue_drop          customer_churn       inventory
-  campaign_perf         search_failure       return_spike
-  fraud
+```ts
+export type CategoryId =
+  | 'conversion_drop' | 'cart_abandonment' | 'product_demand' | 'revenue_drop'
+  | 'customer_churn' | 'inventory' | 'campaign_perf' | 'search_failure'
+  | 'return_spike' | 'fraud';
 ```
 
-Each has a required-events set and an optional enriching-events set.
-`conversion_drop` needs `view_item`, `cart_update`, `purchase`;
-`fraud` needs `payment_failure`. If a workspace doesn't emit
-`payment_failure`, fraud is `unavailable` and no agent call gets
-made for it.
+Each category names what it `requires` (must have to even attempt the category) and what it `enriches` (would refine the answer if present). The `requires` vs `enriches` split is the load-bearing piece — it's what lets the coverage be three-bucket instead of two-bucket.
 
-#### Step 2 — extracting capabilities from the schema
+#### the gate — three pure functions
 
-`schemaCapabilities` (re-exported from AptKit via
-`lib/agents/categories.ts:10`) takes the `WorkspaceSchema` and returns a
-`Set<string>` of available event type names:
+The gate has three entry points, all pure functions:
 
-```typescript
-// (logical body — implementation in @aptkit/core)
-function schemaCapabilities(schema: WorkspaceSchema): Set<string> {
-  return new Set(schema.events.map((e) => e.name));
-}
-```
+```ts
+// lib/agents/categories.ts:10
+export { schemaCapabilities };     // re-exported from @aptkit/core
 
-This is the lookup table for everything that follows. A `Set` (rather
-than an array) because the next step does dozens of membership tests
-(`.has(...)`), and `O(1)` matters when you're testing 10 categories ×
-~10 required+enriching each.
-
-#### Step 3 — building the coverage report
-
-`coverageReport` walks every category, intersects its `requires` +
-`enriches` against the available set, and labels each as `full` |
-`limited` | `unavailable`:
-
-```typescript
-// lib/agents/categories.ts:35-42
+// lib/agents/categories.ts:35-46
 export function coverageReport(available: Set<string>): CoverageReport {
   return aptKitCoverageReport(CATEGORIES.map(toAptKitCategory), available).map((item) => ({
     category: item.category as CategoryId,
     label: item.label,
-    coverage: item.coverage,            // 'full' | 'limited' | 'unavailable'
+    coverage: item.coverage,
     ...(item.missing && item.missing.length ? { missing: item.missing } : {}),
   }));
 }
-```
 
-The result is the data structure the UI's coverage grid renders. Each
-item carries `missing: string[]` listing the absent required/enriching
-events — surfaced in the UI tile so the user knows *why* a category is
-unavailable.
-
-```
-  Execution trace — one category's coverage check
-
-  state                                              value
-  ─────                                              ─────
-  category = conversion_drop
-  requires = ['view_item', 'cart_update', 'purchase']
-  enriches = []  (none in this example)
-  available = {'purchase', 'view_item', 'session_start', 'cart_update',
-               'checkout', 'search', 'email_open', 'voucher_redeemed',
-               'return', 'payment_failure'}
-
-  test 1: every (requires) in available?
-          'view_item' ∈ available  →  true
-          'cart_update' ∈ available →  true
-          'purchase' ∈ available    →  true
-          → all present → not 'unavailable'
-
-  test 2: every (enriches) in available?
-          [] → vacuously true
-          → coverage = 'full'
-
-  missing = []
-  return { category: 'conversion_drop', label: '...', coverage: 'full' }
-```
-
-#### Step 4 — filtering down to runnable categories
-
-`runnableCategories` is the gate that actually feeds the agent:
-
-```typescript
-// lib/agents/categories.ts:44-46
 export function runnableCategories(available: Set<string>): AnomalyCategory[] {
   return aptKitRunnableCategories(CATEGORIES.map(toAptKitCategory), available).map(toBloomingCategory);
 }
 ```
 
-In practice, this returns the categories whose coverage is `full` or
-`limited` — anything where the REQUIRED events are present (enriching
-events can be missing without disqualifying the category).
+Three functions, three jobs:
 
-#### Step 5 — the route's three-step gate
+- **`schemaCapabilities(schema)`** — extracts the `Set<signal>` from the workspace schema. The signals are strings like `'purchase'`, `'customer.country'`, `'cart_update.cart_value'`. The library owns the extraction logic; this repo just re-exports.
+- **`coverageReport(capabilities)`** — for the UI. Returns one `CoverageItem` per category with its bucket and (if any) the missing signals. Drives the coverage grid + the checklist log.
+- **`runnableCategories(capabilities)`** — for the agent. Returns only the categories whose `requires` are met (the `'full'` and `'limited'` buckets). The `'unavailable'` bucket is dropped.
 
-The /api/briefing route uses all three functions in sequence:
+The two outputs are *consistent* — every category in `runnableCategories` appears as `'full'` or `'limited'` in `coverageReport`; every category in `'unavailable'` in `coverageReport` is absent from `runnableCategories`. The two come from the same underlying check; the API just exposes both views.
 
-```typescript
-// app/api/briefing/route.ts:234-246 (abridged)
+```
+  Pattern — one check, two views
+
+  schemaCapabilities(schema) → Set<signal>
+                │
+       ┌────────┴────────┐
+       │                 │
+       ▼                 ▼
+  coverageReport()   runnableCategories()
+   for UI grid        for agent scan
+   { full, limited,    [ {AnomalyCategory}, … ]
+     unavailable }     only full + limited
+
+   both consistent: same underlying check, different shapes
+```
+
+#### the route — calls all three in sequence
+
+The briefing route calls the gate between schema bootstrap and agent scan:
+
+```ts
+// app/api/briefing/route.ts:234-246
 const t_coverage = performance.now();
 const capabilities = schemaCapabilities(schema);
 const coverage = coverageReport(capabilities);
 const runnable = runnableCategories(capabilities);
-
+// narrate the gate as a per-category checklist, resolving each tile as
+// its line is logged (the grid fills in step with the checklist).
 step('matching the workspace schema to the 10-category anomaly checklist…');
 const coverageLines = coverageChecklistSteps(coverage);
 coverage.forEach((item, i) => {
   step(coverageLines[i]);
-  send({ type: 'coverage_item', item });    // ← UI gets EVERY category, tile by tile
+  send({ type: 'coverage_item', item });
 });
 recordPhase('coverage_gate', t_coverage);
-// ...
-step(`checking ${runnable.length} of 10 anomaly categories against this workspace…`);
-const anomalies = await agent.scan({ ... }, runnable);    // ← agent only sees RUNNABLE
 ```
 
-The split here is the load-bearing part. The UI receives all 10
-categories via `coverage_item` events (so the grid renders all 10
-tiles, each with its coverage state); the agent receives only the
-runnable subset (so it never sees a category it can't answer).
+Three observations on this block:
+
+- **The narration is part of the contract.** Each `step(...)` call emits a `reasoning_step` event; each `send({ type: 'coverage_item', ... })` emits a coverage tile. Both stream to the UI immediately. The user *sees* the gate happening, line by line and tile by tile, in the live status panel. → see `06-streaming-ndjson.md`.
+- **`coverageChecklistSteps`** (`app/api/briefing/route.ts:40-48`) turns each `CoverageItem` into a human-readable line: `revenue · monitored`, `cart abandonment · limited — missing cart_value`, `fraud · no data source — needs payment_event, …`. The line is the per-category truth, no hedging.
+- **Phase is timed.** `recordPhase('coverage_gate', t_coverage)` adds the gate's wall-clock to the request log. The gate is fast (it's all in-process set operations against the schema), so the timing is mostly for proportionality with the slower phases (`schema_bootstrap`, `monitoring_scan`).
+
+#### the agent receives only the runnable categories
+
+The agent's `scan` method takes the runnable list:
+
+```ts
+// app/api/briefing/route.ts:259-281 (key call)
+const anomalies = await agent.scan({
+  onToolCall: (tc) => { send({ type: 'tool_call_start', toolName: tc.toolName, agent: 'monitoring' }); … },
+  onToolResult: (tc) => send({ type: 'tool_call_end', … }),
+  onText: (t) => { if (t.trim()) step(t.trim()); },
+  signal: req.signal,
+}, runnable);
+```
+
+```ts
+// lib/agents/monitoring.ts:82-93
+async scan(hooks?: MonitorHooks, categories: AnomalyCategory[] = []): Promise<Anomaly[]> {
+  const toolRegistry = new BloomingToolRegistryAdapter(this.dataSource, this.allTools);
+  const agent = new AptKitAnomalyMonitoringAgent({
+    model: new AnthropicModelProviderAdapter(this.anthropic, 'monitoring', this.sessionId),
+    tools: toolRegistry,
+    workspace: this.schema,
+    trace: new BloomingTraceSinkAdapter(hooks ?? {}, 'monitoring'),
+    categories: categories.length ? toAptKitCategories(categories, this.schema.projectId) : [],
+  });
+  return (await agent.scan({ signal: hooks?.signal })).map(toBloomingAnomaly);
+}
+```
+
+The library agent never sees the `'unavailable'` categories. The agent's prompt mentions only the categories it can answer, the agent's tool loop runs only EQL the schema supports, and the rate-limit budget is spent only on work that can produce results.
 
 ```
-  Pattern — split fan-out: UI sees all, agent sees subset
+  Layers-and-hops — gate trims the agent's input
 
-  schemaCapabilities ─► coverage  ─►  ┌─ send 'coverage_item' for each (UI side)
-                                       │
-                                       └─ runnableCategories ─► agent.scan(runnable)
-                                                                 (agent side)
+  ┌─ schema ──────┐  10 categories total
+  │  WorkspaceSchema│ ─────────────────────────┐
+  └────────────────┘                            │
+                                                ▼
+                              ┌─ gate ─────────────────────────┐
+                              │  schemaCapabilities → 6 signals │
+                              │  coverageReport  → 10 items     │
+                              │  runnableCategories → 7         │
+                              └─────────────┬───────────────────┘
+                                            │  hop: only runnable goes forward
+                                            ▼
+                              ┌─ agent ─────────────────────────┐
+                              │  agent.scan(runnable)            │
+                              │  prompt mentions only 7          │
+                              │  EQL spent only on 7             │
+                              └─────────────┬───────────────────┘
+                                            │
+                                            ▼
+                              ┌─ result ────────────────────────┐
+                              │  anomalies for runnable subset   │
+                              │  3 unavailable: visible in UI    │
+                              │   coverage grid, NOT in agent log│
+                              └──────────────────────────────────┘
 ```
 
-#### Step 6 — what this saves
+#### the three buckets — what the user sees and what the system does
 
-The Bloomreach side rate-limits at ~1 req/s globally per user. Each
-category the agent investigates costs at least one EQL call (often
-more, when the agent decides to drill into subsegments). On a
-workspace where only 6 of 10 categories are runnable, the gate saves
-~4-12 EQL calls per briefing — at ~1-2 seconds each (cached or not),
-that's 4-24 seconds of route budget that's NOT spent on impossible
-queries.
+```
+  Comparison — three buckets, what each means in practice
 
-The 300s `maxDuration` ceiling makes this meaningful — without the
-gate, a workspace with poor schema coverage could burn enough budget
-on unrunnable categories that the categories which SHOULD work get
-cut off mid-scan.
+  ┌─ 'full' ─────────────────────────┬─ tile color ─┬─ agent runs? ─┬─ caveat ──┐
+  │ all required + all enriching     │ green        │ yes           │ none       │
+  │ "revenue · monitored"            │              │               │            │
+  ├──────────────────────────────────┼──────────────┼───────────────┼────────────┤
+  │ 'limited'                        │              │               │            │
+  │ all required, some enriching     │ amber        │ yes           │ "limited —│
+  │ missing                          │              │               │ missing X" │
+  │ "cart_abandonment · limited"     │              │               │            │
+  ├──────────────────────────────────┼──────────────┼───────────────┼────────────┤
+  │ 'unavailable'                    │              │               │            │
+  │ a required signal missing        │ gray         │ NO            │ "no data   │
+  │ "fraud · no data source"         │              │               │  source —  │
+  │                                  │              │               │  needs X"  │
+  └──────────────────────────────────┴──────────────┴───────────────┴────────────┘
+```
+
+The three buckets are the entire surface of the gate. Three categories of UX, three categories of agent behavior, all encoded in one enum.
+
+#### the gate's invariants — what guarantees what
+
+Two invariants make this work:
+
+1. **Determinism.** `schemaCapabilities` is a pure function of the schema; `coverageReport` and `runnableCategories` are pure functions of the capability set. The same schema produces the same coverage every time. This is why the demo path can simply *write the coverage into the snapshot* and replay it identically — there's no live "what's available right now" element.
+2. **Consistency between the two outputs.** A category surfaces as `'unavailable'` in the UI grid *exactly when* it's absent from the agent's input. The user can never see "revenue is unavailable" in the grid while the agent's log shows the agent running a revenue query. The gate is the single source of truth for both.
 
 ### Move 3 — the principle
 
-**Gate at the cheapest layer.** This gate is set arithmetic — a few
-hundred microseconds of work. The alternative (let the agent try
-every category and discover at tool-call time that there's no data) is
-seconds of work for the same negative answer. When you can compute a
-"don't bother" answer from static metadata, do it as early as possible
-in the request pipeline.
+When work is parameterised by capabilities of an external system, check capabilities *first* and only then dispatch work. The check produces two artifacts: a *narration* for the user (what we can and can't do, why, with what's missing named honestly), and a *filter* for the system (the trimmed input the worker actually runs against). Both come from one decision; both are consistent because they share the decision.
 
-The general principle: **separate capability discovery from
-execution.** Capability discovery is cheap, deterministic, and
-testable; execution is expensive, non-deterministic, and racy. The
-gate moves a yes/no decision from execution time (expensive) to
-discovery time (cheap), and that's the whole win.
-
-You'll see the same pattern in any system with a fixed-feature catalog
-gated by per-instance capability: SQL DBMS query planners that prune
-unindexed tables, Kubernetes admission controllers that reject pods
-that can't be scheduled, browser feature-detection that swaps
-implementations before calling a missing API. The shape is always:
-"compute the answer cheaply, route around the expensive failure
-before it happens."
+The transferable lesson: capability gating beats request-and-recover for any expensive or rate-limited workload. The naive shape is "ask the agent to scan all 10 categories; the agent's tool calls fail when the schema doesn't support them; the agent moves on." That shape burns rate-limit budget on calls that can't succeed and produces a "we tried everything" UX that's worse than "we knew not to try X." The gated shape is "check what's possible, run only that, tell the user about the gaps." The user gets an honest answer faster.
 
 ## Primary diagram
 
 ```
-  Schema-gated coverage — one full briefing's gate pass
+  schema-gated-coverage — full picture
 
-  ┌─ schema bootstrap (4 Bloomreach calls) ────────────────────────────────┐
-  │  WorkspaceSchema { events: [{name, properties, eventCount}, ...], ... }│
-  └──────────────────────────────────┬─────────────────────────────────────┘
-                                     │
-  ┌─ schemaCapabilities(schema) ─────▼─────────────────────────────────────┐
-  │  return new Set(schema.events.map(e => e.name))                         │
-  │  → Set { 'purchase', 'view_item', 'session_start', ... }                │
-  └──────────────────────────────────┬─────────────────────────────────────┘
-                                     │
-  ┌─ coverageReport(capabilities) ───▼─────────────────────────────────────┐
-  │  for each category in CATEGORIES (10 total):                            │
-  │     missing = [...requires, ...enriches].filter(d => !cap.has(d))       │
-  │     if any required missing → 'unavailable'                              │
-  │     else if any enriching missing → 'limited'                            │
-  │     else → 'full'                                                        │
-  │  → CoverageReport [10 items, each with coverage label + missing[]]      │
-  └──────────────────────────────────┬─────────────────────────────────────┘
-                                     │
-              ┌──────────────────────┴─────────────────────┐
-              │                                              │
-              ▼                                              ▼
-  ┌─ to UI (all 10 tiles) ─────────────┐    ┌─ runnableCategories ─────────────┐
-  │  coverage.forEach(item =>            │    │  filter(c => c.coverage !==       │
-  │    send({type:'coverage_item',item}))│    │    'unavailable')                 │
-  │  → grid fills tile-by-tile           │    │  → AnomalyCategory[] (e.g. 6 of 10)│
-  └──────────────────────────────────────┘    └──────────────────────┬─────────┘
-                                                                     │
-                                                                     ▼
-                                              ┌─ MonitoringAgent.scan(runnable) ─┐
-                                              │  agent never sees the other 4    │
-                                              │  → saves ~4-12 EQL calls          │
-                                              │  → saves ~4-24s of route budget   │
-                                              └───────────────────────────────────┘
+  ┌─ Inputs ──────────────────────────────────────────────────────────────┐
+  │                                                                        │
+  │  WorkspaceSchema (from bootstrap)                                      │
+  │    { projectId, events[], customerProperties[], … }                    │
+  │                                                                        │
+  │  CATEGORIES (the fixed 10-category checklist)                          │
+  │    from @aptkit/core ECOMMERCE_ANOMALY_CATEGORIES                      │
+  │    each: { id, label, requires[], enriches[], whyItMatters, eql,      │
+  │            thresholds }                                                │
+  └────────────────────────────┬──────────────────────────────────────────┘
+                               │
+  ┌─ Gate (lib/agents/categories.ts) ─▼──────────────────────────────────┐
+  │                                                                        │
+  │  schemaCapabilities(schema) → Set<signal>                              │
+  │     e.g. { 'purchase', 'view_item', 'customer.country',                │
+  │            'cart_update.cart_value', 'session_start' }                 │
+  │                                                                        │
+  │  coverageReport(capabilities) → CoverageReport                         │
+  │     [                                                                  │
+  │       { category: 'revenue_drop',     coverage: 'full' },              │
+  │       { category: 'cart_abandonment', coverage: 'limited',             │
+  │         missing: ['cart_value'] },                                     │
+  │       { category: 'fraud',            coverage: 'unavailable',         │
+  │         missing: ['payment_event', 'chargeback_event'] },              │
+  │       …                                                                │
+  │     ]                                                                  │
+  │                                                                        │
+  │  runnableCategories(capabilities) → AnomalyCategory[]                  │
+  │     only 'full' + 'limited' — 'unavailable' dropped                    │
+  └────────────────────────────┬──────────────────────────────────────────┘
+                               │
+  ┌─ Outputs ─────────────────▼──────────────────────────────────────────┐
+  │                                                                        │
+  │  to UI (via NDJSON):                                                   │
+  │    coverage_item events → fill the grid tile-by-tile                   │
+  │    reasoning_step events → narrate the checklist line-by-line          │
+  │                                                                        │
+  │  to agent (in-process):                                                │
+  │    runnable list → MonitoringAgent.scan(runnable)                      │
+  │    agent prompt + tool loop see ONLY the runnable categories           │
+  │    EQL budget spent only on categories the schema supports             │
+  └────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-**Where this pattern comes from.** Two parents:
+**The `requires` vs `enriches` split.** Many categories have a *core* signal that determines whether the category can be checked at all (`purchase` for revenue, `cart_update` for cart abandonment) and *enriching* signals that refine the answer (`payment_type` for fraud-flavored breakdowns of revenue drops, `cart_value` for cart-abandonment dollar exposure). The split lets the gate be three-bucket: enriching-missing is *limited* (run with a caveat), required-missing is *unavailable* (don't run). A two-bucket gate would either over-trim (drop categories that could still produce useful answers without the enrichment) or over-trust (run categories that produce wrong answers from missing inputs).
 
-  → **Feature flags** (Etsy, ~2010; LaunchDarkly, ~2014) — gave us
-    the "compute a yes/no decision before running the feature" frame,
-    typically driven by a static configuration store.
-  → **Capability-based security / capability discovery** (E rights,
-    Plan 9 file capabilities; HTTP `Allow:` header; SQL `INFORMATION_
-    SCHEMA`) — gave us the "compute capability from observable state"
-    frame, where the decision input is what the system actually has,
-    not a flag.
+**Why fixed-in-code categories.** The category list is not data — it's code, defined in `@aptkit/core` and re-exported here. The reason: the category determines the EQL recipe, the thresholds, the business-language explanation, and the agent prompt context. A category isn't just a string; it's a bundle of behavior. Making it data would push that behavior into a config file with no type checks; making it code lets TypeScript catch typos and forces the prompt-writers to update behavior when adding a category. The trade is that a new category requires a code change — which is the correct cost because adding a category is rarely a config-shaped task.
 
-The combination here — static category catalog + runtime capability
-discovery — is the pragmatic shape for any system where the feature
-set is bounded but the data shape is per-instance variable. SaaS apps
-with optional integrations, multi-tenant analytics tools, ETL pipelines
-with per-source schemas all fit this shape.
+**The narration is the audit.** A user looking at the coverage grid sees, for each of 10 tiles, exactly what the system can and cannot do for them. `fraud · no data source — needs payment_event, chargeback_event` tells the user *what data they would have to add* to unlock the category. This is the "shows its work" pitch applied to capability gating — the gate isn't a hidden filter; it's a visible commitment.
 
-**The deeper principle.** Compute negation cheaply. Knowing what you
-DON'T have (the missing event types) is structurally easier than
-finding out what you DO have (running every query and seeing which
-ones return data). The schema is the description; the queries are the
-discovery. The schema is fast; the queries are slow. Compute the
-"don't bother" answer from the description, not the discovery.
-
-**Where it breaks.**
-
-- **Schema cache staleness.** The workspace schema is module-cached
-  (`lib/mcp/schema.ts:138`). If the customer's Bloomreach project
-  adds a new event type mid-deploy, our gate sees it as
-  `unavailable` until the next instance cold-start. Acceptable
-  for an alpha product; would need a TTL or webhook invalidation
-  for a real one.
-- **Required vs enriching is binary.** A category that needs 3
-  required events and 5 enriching events is `limited` whether 1
-  enriching is missing or all 5. We don't surface the QUALITY
-  gradient — only the binary "all required + all enriching" vs
-  "all required + some enriching missing." This is fine for the
-  current UI but limits future "this category will be lower
-  quality" messaging.
-- **The category requires aren't validated.** If a category's
-  `requires: ['foo']` mentions a non-existent event type, the
-  category is always `unavailable` and nothing in the system
-  notices. Same shape as a typo in a feature flag name —
-  silently disables the feature.
-- **Coverage runs once per briefing, not per query.** A workspace
-  whose schema changes WITHIN a briefing (e.g. an event type
-  starts emitting halfway through a 60-second scan) won't have
-  its categories upgraded mid-scan. The gate decision is locked
-  at briefing start.
-
-**What to explore next.**
-
-- `07-multi-agent-orchestration.md` — the agent that consumes
-  the runnable list
-- `01-request-flow.md` — where the gate sits in the route pipeline
-- `05-caching-and-rate-limiting.md` — what the gate's savings buy
-- `study-data-modeling` — the `WorkspaceSchema` shape this gate reads
+**Demo replay of the gate.** The demo snapshot captures the coverage grid (`snapshot.coverage`) at capture time. On replay, the route emits the captured coverage tile-by-tile (`app/api/briefing/route.ts:111-121`). There's no live gate decision; the demo replays the gate that ran when the snapshot was captured. This is why the demo path can show a realistic coverage grid without any schema bootstrap.
 
 ## Interview defense
 
-#### Q: "Why gate before the agent runs instead of letting it skip unavailable categories itself?"
+**Q: Why gate the agent's work against the schema before the scan? Why not let the agent figure out which categories are answerable?**
 
-Two reasons. **One**: the model would burn tokens and tool calls
-just discovering "there's no `payment_failure` event" — and at
-~1 req/s, that discovery is several seconds of route budget for an
-answer the schema already has statically. **Two**: the UI needs to
-show all 10 categories regardless (greyed out for unavailable), and
-the gate's output is the natural data structure for that — same
-source of truth, two consumers.
+> Three reasons. First, cost — the Bloomreach upstream rate-limits at ~1 req/s; an agent that runs all 10 categories and lets the tool calls fail on missing data burns budget on calls that can't succeed. Second, honesty — the user looking at the coverage grid sees "revenue · monitored" or "fraud · no data source — needs payment_event" up front, not "we tried fraud, here are some inferences." Third, prompt clarity — the agent's system prompt mentions only the runnable categories, so the model isn't tempted to fabricate an answer for one that's gated out. The gate is one function, three pure operations: `schemaCapabilities(schema)` returns the available signals, `coverageReport` produces the UI grid, `runnableCategories` produces the agent's input. Both outputs come from the same underlying check, so the user-facing story always matches what the agent did.
 
 ```
-  Gate at request edge                 Let the agent decide
-  ───────────────────                  ────────────────────
-  computed in microseconds             computed in seconds (model + tool call)
-  deterministic                        non-deterministic (model may or may not skip)
-  saves route budget                   burns route budget on negative discovery
-  UI consumes same data                UI would need separate computation
+  cost-honesty-clarity triad
+
+  cost      → rate-limit budget not spent on impossible work
+  honesty   → user sees what's missing, not "best guess"
+  clarity   → agent prompt sees only categories it can answer
 ```
 
-**Surface:** "static answer beats discovered answer, every time."
-**Probe:** if pressed, name the `runnable` array passed to
-`MonitoringAgent.scan(runnable)` as the proof that the agent never
-sees the unavailable categories — it can't even decide to try them.
+**Anchor:** `lib/agents/categories.ts:35-46`, `app/api/briefing/route.ts:234-246`.
 
-#### Q: "What's the load-bearing part — what breaks if you remove this gate?"
+**Q: What's the load-bearing distinction between `requires` and `enriches`? What changes if you collapse them?**
 
-The `runnableCategories(capabilities)` → `agent.scan(runnable)` wire.
-It's the kernel: without filtering, the agent gets the full 10-category
-catalog and tries each. At ~1 second per EQL call (cached) and 1-3
-calls per category, that's an extra 4-12 seconds per briefing on a
-poorly-covered workspace — and on a 300s budget with retry storms, it
-could push the briefing past the ceiling.
+> The three-bucket coverage. `requires` is the *can we attempt this at all* signal — the EQL recipe will produce nothing useful without the required event types and properties. `enriches` is the *would this make the answer richer* signal — the recipe runs, the answer is correct, but a refinement is missing. If you collapse them into one list, the gate becomes two-bucket: either you treat every missing signal as fatal (over-trim, lose categories that would still produce useful answers) or you treat every missing signal as a caveat (over-trust, run categories whose core inputs are absent and watch the agent fabricate). The split gives you three buckets and three honest UX strings: `'full'` (run, no caveat), `'limited'` (run with named caveat), `'unavailable'` (don't run, name the missing inputs the user would have to add). It's a small distinction that's load-bearing for the UX.
 
-Other load-bearing parts:
+```
+  the three-bucket gate
 
-  → `schemaCapabilities` returning a `Set<string>` — O(1) membership
-    is what makes the 10 × ~10 intersection cheap. An array would
-    work but for the wrong reason; the contract is "set membership,
-    cheap"
-  → the `requires` vs `enriches` distinction per category — without
-    it, a missing optional event would disqualify a category from
-    running at all, when actually we want to run it with a caveat
-  → splitting `coverage` (10 items, all → UI) from `runnable` (subset
-    → agent) — without it, the UI loses the "this category is
-    available but not in your workspace" messaging
+  required ∪ enriching all present     → 'full'         → run
+  required present, enriching missing  → 'limited'      → run, narrate caveat
+  required missing                     → 'unavailable'  → don't run, narrate gap
+```
 
-Optional hardening:
+**Anchor:** `lib/agents/categories.ts:14-22` (the `requires` / `enriches` split on `AnomalyCategory`).
 
-  → the `missing: string[]` field on each CoverageItem — surfaces
-    WHY a category is unavailable; the gate works without it but the
-    UX gets less informative
-  → the live narration (`coverageChecklistSteps`) — quality-of-life;
-    streams one line per category as the gate runs
+**Q: How does the demo snapshot interact with the gate?**
 
-#### Q: "Could the categories themselves be data-driven instead of code?"
+> The demo path *replays* the gate's output from the captured snapshot — it doesn't re-decide. When the live capture runs, the route runs the real gate (schema → coverage → runnable), emits each `coverage_item` event, and writes the resulting `CoverageReport` into the snapshot file. When the demo branch replays, it reads `snapshot.coverage` and emits the same tile events with the same spacing. So the demo's coverage grid is whatever the gate said at capture time, not a live decision against a synthetic schema. That's correct semantically — the demo is a recording of a real run; the gate's decision was part of that run, so it gets replayed verbatim. If the underlying gate logic changes (a new category added, a `requires` set tightened), the demo doesn't reflect the change until someone re-captures.
 
-Yes, and that's the natural evolution. Today the categories live in
-`@aptkit/core` (`ECOMMERCE_ANOMALY_CATEGORIES`) — code on a fixed
-deploy cycle. A real product would put them in a config (JSON, YAML,
-a CMS) so non-engineers could add new categories without a deploy.
-The shape doesn't change; only the source.
+```
+  gate in the live vs demo path
 
-The reason we haven't moved them is the validation question: a
-data-driven catalog needs schema validation, version-pinning, and a
-review workflow before it ships. Today's small catalog + code-as-config
-is the right tradeoff; once we have 30+ categories or non-engineer
-contributors, it'd flip.
+  LIVE:  schema → gate → coverage_item events + agent scan
+  DEMO:  snapshot.coverage → emit same events (no live gate)
+                ↑
+                captured when the demo was recorded
+```
 
-A latent concern: the EQL query for each category (the actual
-analytics expression the agent runs) is also in
-`ECOMMERCE_ANOMALY_CATEGORIES`. Moving this to data means treating
-EQL strings as user-supplied — which raises injection concerns even
-though Bloomreach validates EQL server-side. Worth weighing.
+**Anchor:** `app/api/briefing/route.ts:96, 111-121` (the demo branch reading `snapshot.coverage`).
 
 ## See also
 
-- `00-overview.md` — where this sits in the system
-- `07-multi-agent-orchestration.md` — the monitoring agent that
-  consumes the runnable list
-- `01-request-flow.md` — the route pipeline that runs the gate
-- `05-caching-and-rate-limiting.md` — what the saved budget buys
-- `study-data-modeling` — the `WorkspaceSchema` shape this reads
-- `study-ai-engineering` — pre-flight gating vs in-loop discovery
+- `01-request-flow.md` — where the gate runs in the briefing pipeline (phase 2)
+- `04-aptkit-primitive-boundary.md` — `MonitoringAgent` receives the runnable list
+- `06-streaming-ndjson.md` — the `coverage_item` events the gate emits on the wire
+- `08-demo-replay-as-reliability.md` — how the gate's output rides into the demo snapshot

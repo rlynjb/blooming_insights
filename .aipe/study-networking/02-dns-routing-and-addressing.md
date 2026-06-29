@@ -1,292 +1,250 @@
-# DNS, routing, and addressing
+# 02 · DNS, routing, and addressing
 
-**Name resolution and request routing** · Language-agnostic
+## Subtitle
 
-## Zoom out — where this concept lives
+Names, addresses, and the path from a URL to a TCP connection — Industry standard.
 
-DNS happens at the bottom of every outbound `fetch`. It's the layer below TLS, below TCP — the layer that turns `loomi-mcp-alpha.bloomreach.com` into an IP address before any of the rest of the stack can start.
+## Zoom out, then zoom in
+
+DNS is the layer most engineers never see until it bites them — a wrong host, a stale cache, a misconfigured preview domain. This repo touches DNS in exactly three places, all of them implicit (no custom resolver, no DNS-over-HTTPS, no per-request override). So this file is short and largely about *which names exist* and *what resolves them* rather than mechanics the app implements.
 
 ```
-  Zoom out — DNS sits below every wire
+  Zoom out — where DNS lives in this stack
 
-  ┌─ UI band ──────────────────────────────────────────┐
-  │  fetch('/api/briefing')   ← same-origin, no DNS    │
-  └────────────────────┬───────────────────────────────┘
-                       │
-  ┌─ Service band ─────▼───────────────────────────────┐
-  │  fetch('https://loomi-mcp-alpha.bloomreach.com/…') │ ← we are here
-  │  fetch('https://api.anthropic.com/v1/messages')    │ ← we are here
-  └────────────────────┬───────────────────────────────┘
-                       │
-  ┌─ Transport stack ──▼───────────────────────────────┐
-  │  DNS → TCP connect → TLS handshake → HTTP request   │
-  │  ★ DNS ★                                            │
-  └─────────────────────────────────────────────────────┘
+  ┌─ UI layer ──────────────────────────────────────────────────┐
+  │  browser → resolves the page origin once on navigation       │
+  │            (e.g. blooming-insights.vercel.app)              │
+  └────────────────────────────────────────────────────────────┘
+                            │ same-origin fetch
+                            ▼
+  ┌─ Service layer ─────────────────────────────────────────────┐
+  │  Vercel edge → routes /api/* to the Node runtime             │
+  │  (no DNS hop — the edge fronts both the page and the routes)│
+  └────────────────────────────────────────────────────────────┘
+                            │
+                ┌───────────┴───────────┐
+                ▼                       ▼
+  ┌─ Provider ───────────────┐ ┌─ Provider ─────────────────────┐
+  │ loomi-mcp-alpha           │ │ api.anthropic.com              │
+  │ .bloomreach.com           │ │                                │
+  │ ← Node fetch resolves     │ │ ← @anthropic-ai/sdk resolves   │
+  │   each connection         │ │   via the same Node fetch      │
+  └───────────────────────────┘ └────────────────────────────────┘
 ```
 
-## Zoom in — the concept
-
-Three hostnames matter to this app. Two are owned by external providers (`loomi-mcp-alpha.bloomreach.com`, `api.anthropic.com`). One is owned by us, set on Vercel (`<app-host>` — typically `bloominginsights.vercel.app` or a custom alias). Everything else is same-origin or doesn't make network calls.
+The repo doesn't *do* DNS — it depends on it. What it *does* is decide which hostname to talk to, and that one decision (deriving the OAuth redirect from the actual request host) is the only piece of name-handling the app code owns.
 
 ## Structure pass
 
-### Layers
-
-- **Application** — where the hostname appears as a string in code (`lib/mcp/connect.ts:32`, `Anthropic` SDK constant, browser-side `/api/*`).
-- **Resolver** — Node's `dns` module on the server; the browser's resolver on the client. We don't configure either.
-- **Transport** — the IP+port pair the connection actually opens against.
-
-### One axis held constant — `who owns the name?`
-
-```
-  axis = "who owns the hostname and controls the IP it resolves to?"
-
-  ┌─ /api/* ──────────────────────┐  WE own it (via Vercel DNS)
-  │  same-origin                   │  → no DNS query at all in the browser:
-  │                                │    relative URL resolves to current origin
-  └────────────────────────────────┘
-
-  ┌─ loomi-mcp-alpha.bloomreach.com ┐  BLOOMREACH owns it
-  │  resolved server-side by Node    │  → we cannot pin the IP, control TLS SNI,
-  │                                  │    or fall over to a backup
-  └─────────────────────────────────┘
-
-  ┌─ api.anthropic.com ─────────────┐  ANTHROPIC owns it
-  │  resolved server-side by Node    │  → same constraint
-  │                                  │
-  └─────────────────────────────────┘
-```
-
-Trace the axis and the asymmetry becomes obvious: our own routes carry zero DNS cost on wire #1, and we eat full DNS round-trips on wires #2 and #3 every time the resolver cache misses.
-
-### Seams
-
-- **App-string ↔ resolver** — the URL is a string until `fetch()` hands it to the platform; from there, resolution is opaque.
-- **Cold-start ↔ warm-start** — the first call out of a fresh Vercel function pays full DNS; subsequent calls on the same warm instance hit the OS resolver cache (typically TTL-bound).
+  - **Layers** — the page origin (browser sees one), Vercel's edge (routes paths under one origin), and the two upstream provider origins.
+  - **Axis traced — "who picks the hostname?"** It flips:
+      - the page origin: chosen by the user (typing/clicking the URL).
+      - the API route paths: not a separate hostname — same origin as the page.
+      - the upstream hosts: hardcoded with env-override (`BLOOMREACH_MCP_URL`) or the SDK's default.
+      - the OAuth redirect URI: **derived at request time** from `x-forwarded-host` (`lib/mcp/connect.ts:43-56`) so each preview deploy uses its own hostname.
+  - **Seams** — the request-time host derivation is the load-bearing seam: it's the only place app code reads inbound network identity and writes it into an outbound address. Get that wrong and OAuth callbacks land at the wrong origin and the cookie doesn't match.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-A hostname is a label for an IP. DNS is the phonebook. You hand it `api.anthropic.com`, it hands you back something like `160.79.104.10` plus a TTL. After that, TCP doesn't know what a hostname is — it talks to the IP.
+DNS is "you have a name, you need an IP, somebody resolves it." For this app, somebody is always the runtime — the browser, Node's `fetch`, or the MCP SDK underneath. The app's job is only to hand the right name to the right caller.
 
 ```
-  the lookup — one query per cold hostname
+  Pattern — name → address handoff
 
-  "https://api.anthropic.com/v1/messages"
-                │
-                │  app calls fetch(URL)
-                ▼
-       ┌──────────────────┐
-       │  parse URL       │  → host = "api.anthropic.com"
-       └────────┬─────────┘    port = 443 (default for https)
-                ▼
-       ┌──────────────────┐
-       │  resolver cache  │  → hit? skip the query
-       │  (OS / process)  │
-       └────────┬─────────┘
-                │  miss
-                ▼
-       ┌──────────────────┐
-       │  recursive DNS   │  → returns "160.x.x.x" + TTL
-       │  (usually UDP)   │
-       └────────┬─────────┘
-                ▼
-       ┌──────────────────┐
-       │  TCP connect     │  → opens to 160.x.x.x:443
-       └──────────────────┘
+  app code says:      "talk to loomi-mcp-alpha.bloomreach.com"
+                                  │
+                                  ▼
+  fetch / SDK says:   "I need an IP" → libc / undici → OS resolver
+                                  │
+                                  ▼
+  resolver says:      "1.2.3.4"  (or fails — ENOTFOUND, ETIMEDOUT)
+                                  │
+                                  ▼
+  TCP layer:          opens connection to 1.2.3.4:443
 ```
 
-### Move 2 — walk the cases
+There's no DNS cache the app maintains. There's no `dns.lookup()` call anywhere in the app code. The resolution happens inside the runtime each time a connection opens; everything above it just sees "the call succeeded" or "the call failed with a network-shaped error."
 
-#### Case 1 — `fetch('/api/briefing')` from the browser
+### Move 2 — the moving parts
 
-No DNS query. The URL is relative; the browser resolves it against `window.location.origin`. If the user is on `https://bloominginsights.vercel.app`, the request goes to that same origin over an already-warm TCP/TLS connection (or one that needs to be opened to the origin the user just navigated to — at which point the browser has DNS for that origin from the page load itself).
+#### The page origin (browser-side)
 
-The cost: zero per-request DNS overhead on wire #1.
+The browser resolves the page origin when the user navigates to it. After that, every fetch in the app is same-origin (`/api/briefing`, `/api/agent`, `/api/mcp/...`) — same hostname, same protocol, same port. No additional DNS lookups, no CORS preflight, no cross-origin policy to navigate. The same-origin model is the implicit choice the entire frontend rides on.
 
-```ts
-// lib/hooks/useBriefingStream.ts:154
-const url = `/api/briefing${search}`;
-// ↑ relative URL — browser resolves to current origin, no DNS query needed
+```
+  Same-origin requests — one DNS lookup, many fetches
+
+  navigate → resolve blooming-insights.vercel.app → 1.2.3.4
+       │
+       ├─ fetch('/api/briefing')          ─→ 1.2.3.4:443  (same conn)
+       ├─ fetch('/api/agent?step=...')    ─→ 1.2.3.4:443  (same conn)
+       └─ fetch('/api/mcp/reset', POST)   ─→ 1.2.3.4:443  (same conn)
 ```
 
-The benefit isn't just latency. Same-origin means the browser also sends cookies (`bi_session`, `bi_auth`) automatically and skips the CORS preflight machinery. Three things you get for free by keeping wire #1 same-origin.
+No `Access-Control-Allow-Origin` headers anywhere in `app/` or `lib/` because none of the browser fetches are cross-origin. The CORS rule that fires is "same-origin requests skip the entire CORS layer."
 
-#### Case 2 — Server-side `fetch` to `loomi-mcp-alpha.bloomreach.com`
+#### The Bloomreach MCP origin (server-side)
 
-DNS happens in Node, using the platform resolver. The hostname is hardcoded into the URL we construct:
+Hardcoded with env override at `lib/mcp/connect.ts:30-34`:
 
 ```ts
 // lib/mcp/connect.ts:30-34
 function mcpUrl(): URL {
   const raw =
     process.env.BLOOMREACH_MCP_URL ?? 'https://loomi-mcp-alpha.bloomreach.com/mcp/';
-  return new URL(raw.replace(/\/+$/, '')); // strip trailing slash(es) — avoids a 307
+  return new URL(raw.replace(/\/+$/, '')); // ← strip trailing slash; avoids a 307
 }
 ```
 
-The trailing-slash dance is worth pausing on: it's not about DNS at all, it's about path routing on the server. With a trailing slash on the URL, the Bloomreach server responds `307 Temporary Redirect` to the no-slash version, costing a round-trip. Stripping the slash up-front avoids the redirect. **A "DNS and addressing" file is the right place to land this — the line between hostname and path is the line between DNS routing and HTTP routing, and we exercise both.**
+Two things to notice. First, the default uses the *alpha* environment — there is no production Bloomreach loomi connect MCP yet; the env var is the swap point. Second, the trailing-slash strip is a real bug-class avoided in advance: many HTTP servers respond to `/mcp/` with a 307 redirect to `/mcp`, which the MCP SDK doesn't always follow cleanly. Stripping it removes the redirect hop entirely.
 
-```
-  Layers-and-hops — what the trailing slash actually changes
+The actual DNS lookup happens inside `StreamableHTTPClientTransport` → Node's global `fetch` → undici → libc. The app never touches it.
 
-  ┌─ Service ────┐  POST /mcp/      ┌─ Bloomreach ──┐
-  │ (with /)     │ ───────────────► │                │
-  │              │   307 Location:  │                │
-  │              │ ◄─────────────── │                │
-  │              │   /mcp           │                │
-  │              │                  │                │
-  │              │  POST /mcp       │                │
-  │              │ ───────────────► │  200           │
-  └──────────────┘                  └────────────────┘
-       costs one extra HTTPS round-trip per cold connection
-```
+#### The Anthropic origin (server-side)
 
-Stripping the slash at the URL-construction layer eliminates that. No DNS query saved (same hostname), but the wire round-trip pattern improves.
+Even more implicit: the `@anthropic-ai/sdk` Client knows its own base URL (`https://api.anthropic.com`). The app constructs `new Anthropic({ apiKey: ... })` and never passes a URL. DNS happens inside the SDK's HTTP layer.
 
-#### Case 3 — Server-side `fetch` to `api.anthropic.com`
+#### The redirect URI — the only piece the app derives at runtime
 
-We never construct this URL ourselves. The `@anthropic-ai/sdk` does it. The hostname is baked into the SDK's default `baseURL`. We pass `new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })` and the SDK takes care of `https://api.anthropic.com/v1/messages`.
+The OAuth callback URL has to be on the *same origin* as the page that started the flow. On Vercel, that origin can be:
+
+  - The production alias: `blooming-insights.vercel.app`
+  - A preview alias: `blooming-insights-git-some-branch-rein.vercel.app`
+  - The per-deploy URL: `blooming-insights-abc123-rein.vercel.app`
+  - Locally: `http://localhost:3000`
+
+If the redirect URI is hardcoded to one of these, opening a preview deploy and clicking 'live' starts the OAuth flow on the preview hostname, hands the IdP a callback pointing at the production hostname, and the IdP sends the user there — losing the session cookie that was set on the preview hostname. The fix is to derive the redirect from the actual request:
 
 ```ts
-// app/api/agent/route.ts:244
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-// ↑ no baseURL override; default is api.anthropic.com
-```
-
-DNS treatment is identical to case 2. The difference is that we don't have a knob to point this at a different host without subclassing the SDK or setting `ANTHROPIC_BASE_URL` (which we don't).
-
-#### Case 4 — The OAuth callback's `redirect_uri`
-
-The one place DNS-style routing logic lives in our application code is the callback URL builder (`redirectUri()`) in `lib/mcp/connect.ts:36-57`. It picks the host for the OAuth callback dynamically:
-
-```ts
-// lib/mcp/connect.ts:42-56
+// lib/mcp/connect.ts:43-57
 if (process.env.NODE_ENV === 'production') {
   try {
     const { headers } = await import('next/headers');
     const h = await headers();
-    const host = h.get('x-forwarded-host') ?? h.get('host');
+    const host = h.get('x-forwarded-host') ?? h.get('host');  // ← Vercel sets this
     if (host) {
       const proto = h.get('x-forwarded-proto') ?? 'https';
       return `${proto}://${host}/api/mcp/callback`;
     }
   } catch {
-    /* not in a request scope — fall through to APP_ORIGIN */
+    /* not in a request scope — fall through */
   }
 }
 return `${process.env.APP_ORIGIN ?? 'http://localhost:3000'}/api/mcp/callback`;
 ```
 
-Why: Vercel ships every deploy at a unique host (`<branch>-<sha>-<team>.vercel.app`) PLUS the production alias. If we hardcoded `APP_ORIGIN`, opening a per-deploy URL while the OAuth callback came back to the production host would drop the session cookie — the cookie is bound to the host that *set* it. So we look at the actual `x-forwarded-host` header Vercel injects and use *that* host for the callback. Dynamic Client Registration on the Bloomreach side accepts a new redirect URI per host as we register, so this works.
+```
+  Layers-and-hops — request-host-derived redirect
 
-This is "routing" in the application sense, not the IP sense — picking the right hostname for an in-band redirect.
+  ┌─ Browser ───────────────┐                    ┌─ Vercel edge ───────┐
+  │ navigates to            │                    │ adds                │
+  │ preview-x.vercel.app    │ ──── HTTPS ─────►  │ x-forwarded-host:   │
+  │                         │                    │   preview-x.vercel  │
+  └─────────────────────────┘                    └──────────┬──────────┘
+                                                            │ proxies to
+                                                            ▼
+                                                ┌─ Node runtime ───────┐
+                                                │ connect.ts reads     │
+                                                │ x-forwarded-host     │
+                                                │ → redirect_uri =     │
+                                                │   preview-x.vercel/  │
+                                                │   api/mcp/callback   │
+                                                └──────────┬───────────┘
+                                                           │ uses in DCR
+                                                           ▼
+                                                ┌─ Bloomreach IdP ─────┐
+                                                │ registers the URL    │
+                                                │ for THIS deploy      │
+                                                └──────────────────────┘
+```
 
-#### Case 5 — Local dev
+Two side-effects worth knowing:
 
-`http://localhost:3000`. No real DNS — the OS resolves `localhost` from `/etc/hosts` to `127.0.0.1`. The session cookie drops the `Secure` flag (`lib/mcp/session.ts:12-13`) because the loopback isn't HTTPS.
+  - Each new Vercel preview alias triggers a **fresh Dynamic Client Registration** with Bloomreach the first time a user authenticates there (different redirect URI → different DCR record).
+  - The IdP must support that — Bloomreach loomi connect does, because RFC 7591 (Dynamic Client Registration) is what makes this whole shape work without a pre-registered client.
+
+#### What's NOT exercised
+
+  - **No custom DNS resolver.** No `dns.lookup`, no `dns.promises`, no `lookup:` option passed to `fetch`. Whatever Node + the underlying OS + Vercel's network do.
+  - **No DNS-over-HTTPS or DNS-over-TLS.** Standard system resolver.
+  - **No DNS cache the app maintains.** Each new HTTPS connection pulls a fresh resolution (which undici may keep alive — but that's transport, not DNS).
+  - **No SRV records, no service discovery.** The product is three boxes; there's nothing to discover.
+  - **No reverse proxy or custom edge layer.** Vercel terminates TLS and routes paths; the app does not configure that.
 
 ### Move 3 — the principle
 
-**Same-origin is the cheapest network primitive in the browser.** It buys you free cookies, no CORS preflight, no DNS query, and often an already-warm TLS session. Every API route at `/api/*` in this app pays that zero cost. The two cross-origin hops (Bloomreach, Anthropic) live on the server side, where the cost is amortized over warm-instance DNS cache, but you still pay it at cold start.
+When you don't own DNS, the only DNS work your app code does is *deciding which hostname to hand to the runtime*. The interesting code is always at the boundary where you read a name in (from the request, from env, from a token) and write it out (into an HTTPS URL, into an OAuth redirect, into a token audience). The Bloomreach redirect URI derivation is the canonical version of that move in this repo.
 
 ## Primary diagram
 
 ```
-  the recap — three hostnames, three resolution paths
+  All DNS / address decisions in the repo
 
-  ┌─ Browser ─────────────────────────────────────────────────┐
-  │  fetch('/api/briefing')                                   │
-  │     └─ relative → no DNS                                  │
-  │                                                            │
-  │  fetch('https://api.anthropic.com/…')  ← never happens     │
-  │     (Anthropic SDK runs server-side only)                  │
-  └──────────────────────────┬────────────────────────────────┘
-                             │
-  ┌─ Service (Vercel fn) ────▼────────────────────────────────┐
-  │                                                            │
-  │  process.env.BLOOMREACH_MCP_URL                            │
-  │     │                                                       │
-  │     ▼                                                       │
-  │  "https://loomi-mcp-alpha.bloomreach.com/mcp"               │
-  │     │                                                       │
-  │     ▼                                                       │
-  │  Node resolver (OS cache + recursive DNS, TTL-bound)        │
-  │     │                                                       │
-  │     ▼  IP                                                   │
-  │  TCP+TLS to <IP>:443                                        │
-  │                                                            │
-  │  Anthropic SDK default baseURL → api.anthropic.com          │
-  │  same Node resolver path                                    │
-  └────────────────────────────────────────────────────────────┘
+  ┌─ UI layer ───────────────────────────────────────────────────┐
+  │  page origin     ← user types/clicks; browser resolves once  │
+  │  /api/* fetches  ← same origin; no additional DNS            │
+  └──────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+  ┌─ Service layer (Vercel) ─────────────────────────────────────┐
+  │  reads x-forwarded-host      ← derive OAuth redirect from    │
+  │   (lib/mcp/connect.ts:48)      the actual hostname           │
+  │                                                              │
+  │  outbound name handoffs:                                     │
+  │   • BLOOMREACH_MCP_URL or                                    │
+  │     loomi-mcp-alpha.bloomreach.com/mcp                       │
+  │     (lib/mcp/connect.ts:32)                                  │
+  │   • api.anthropic.com (SDK default)                          │
+  └──────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+  ┌─ Resolver (Node / OS / Vercel) ──────────────────────────────┐
+  │  hostname → IP → TCP connect (transparent to app code)       │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-**What `not yet exercised`:**
+The reason DNS is *quiet* in this codebase is that the architecture is quiet about distribution. There are three named services (the app, Bloomreach MCP, Anthropic). There is no internal mesh, no broker, no per-tenant subdomain, no edge-computed routing. When DNS becomes a thing you have to manage, it's usually because one of those was true.
 
-- No custom DNS configuration. We don't override `/etc/resolv.conf`, don't use DNS-over-HTTPS, don't have a service mesh sidecar.
-- No IP pinning, no certificate pinning. If Bloomreach changes their IP or rotates their CA, we follow them transparently.
-- No multi-region failover at our layer. Vercel handles edge routing for `<app-host>`; the upstream providers handle their own.
-- No internal hostnames. No service discovery. Nothing like Consul / Eureka / Kubernetes DNS — because the architecture is "two outbound providers and a serverless function."
+The one place to watch in the future: if blooming insights ever gets a real backend (a database, a queue, a worker pool), each of those becomes a hostname someone has to configure, secure (TLS), and surface a failure mode for (timeout, retry, circuit-break). The seam to extend is the same one already in `connect.ts` — read identity at the boundary, write it into an URL, prefer env override for swap-ability.
 
-**Where this would matter at scale:** if Bloomreach moved off `loomi-mcp-alpha.*` to a regional set of endpoints (`loomi-mcp-us-east.*`, `loomi-mcp-eu-west.*`), we'd need to choose. Right now there's nothing to choose. The `BLOOMREACH_MCP_URL` env var is the entire surface for that future decision.
+A note on the alpha environment: `loomi-mcp-alpha.bloomreach.com` is a deliberate signal. It's an alpha-band hostname that may get retired or moved; the env var makes that a 1-line config change rather than a code change. The same shape will likely apply when Bloomreach ships GA.
 
 ## Interview defense
 
-**Q: What DNS resolution does the browser do for this app?**
-
-> None for `/api/*` calls — they're same-origin relative URLs. The browser resolved the app's hostname when it loaded the page; every API call rides that same origin. The two cross-origin hops (Bloomreach, Anthropic) are server-to-server, so the browser never sees them.
+**Q: How does the OAuth redirect URI get computed, and why does it matter?**
 
 ```
-  on the whiteboard:
-
-  Browser ─/api/*─► same-origin (no DNS)
-              └────► server side does the cross-origin DNS
+  request                          response
+  ───────                          ────────
+  X-Forwarded-Host: preview-x...   redirect_uri = preview-x.../api/mcp/callback
+  X-Forwarded-Proto: https
+              │
+              ▼
+  derived once per connect()
+              │
+              ▼
+  passed to DCR → registered with IdP
+              │
+              ▼
+  IdP sends user back to the SAME hostname → cookie matches
 ```
 
-Anchor: relative URLs cost zero DNS in the browser.
+**Anchor:** if the redirect URI doesn't match the page origin that set the cookie, the cookie isn't sent on the return and "no session" happens. Deriving from `x-forwarded-host` is the fix.
 
-**Q: Why strip the trailing slash from `BLOOMREACH_MCP_URL`?**
+**Q: Does the app cache DNS?**
 
-> The Bloomreach server responds `307` to the trailing-slash form, redirecting to the no-slash version. Each redirect is one extra HTTPS round-trip on a connection that's already paying full TCP+TLS cost. `lib/mcp/connect.ts:32` does `.replace(/\/+$/, '')` so we never trigger that.
+No. Every outbound connection lets Node's `fetch` (and through it, undici's connection pool + the OS resolver) decide. Inbound DNS happens once at the browser when the user navigates. No app-level cache to invalidate.
 
-```
-  on the whiteboard:
+**Q: What's the load-bearing piece of the addressing story?**
 
-  POST /mcp/   →  307  →  POST /mcp   →  200
-       ────────────  redirect costs one RTT
-  vs
-  POST /mcp    →  200
-```
-
-Anchor: addressing is HTTP-routing semantics, not just DNS.
-
-**Q: How does the OAuth callback URL get computed?**
-
-> `redirectUri()` in `lib/mcp/connect.ts:36`. In production it reads `x-forwarded-host` off the request — the Vercel-injected header naming the actual host the user is on, which can be a preview deploy or the production alias. Then it builds `${proto}://${host}/api/mcp/callback`. The Dynamic Client Registration step registers that exact URI per host. Without this, opening a per-deploy URL while the callback returns to a different host drops the session cookie.
-
-```
-  on the whiteboard:
-
-  user on preview-abc.vercel.app
-       │
-       ▼
-  connectMcp() → reads x-forwarded-host = "preview-abc.vercel.app"
-       │
-       ▼
-  redirect_uri = https://preview-abc.vercel.app/api/mcp/callback
-       │
-       ▼
-  Bloomreach IdP redirects browser back to THAT host
-       → bi_session cookie matches → auth completes
-```
-
-Anchor: dynamic host = per-deploy correctness.
+The `x-forwarded-host` derivation in `connect.ts`. Drop it and only one deploy hostname can complete OAuth — every preview alias fails silently because the cookie set on the preview origin doesn't ride back through a callback on the production alias.
 
 ## See also
 
-- `01-network-map.md` — where each hostname sits on the map
-- `03-tcp-udp-connections-and-sockets.md` — what happens after DNS returns an IP
-- `05-http-semantics-caching-and-cors.md` — same-origin's other free gifts
+  - `04-tls-and-trust-establishment.md` — for what happens once DNS resolves: the TLS handshake on each origin.
+  - `05-http-semantics-caching-and-cors.md` — for why same-origin requests skip CORS, and what cache-control directives the routes set.
+  - `.aipe/study-security/` — for the trust-boundary version: who can tamper with `x-forwarded-host` and how Vercel guarantees it.

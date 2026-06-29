@@ -1,25 +1,17 @@
-# 02 · Agentic retrieval
+# 02 — Agentic retrieval
 
-How a model uses retrieval as a control loop rather than a one-shot pipeline step.
+Anchor: single-agent (primary)
 
-**None of the patterns in this sub-section are in this repo.** This codebase does not use RAG. It has no embeddings, no vector store, no chunking, no similarity search. Retrieval is via MCP tool calls (Bloomreach EQL) — the model writes a query, the harness runs it, the result comes back as a `tool_result` block. That's tool-use, not retrieval.
+Retrieval-as-a-control-loop. This sub-section does **not** re-teach retrieval mechanics — those would live in `study-ai-engineering`'s `03-retrieval-and-rag/`. What lives here is the shift from retrieval as a one-shot pipeline step to retrieval as a loop the agent drives.
 
-These files are included for completeness and to make the "where would RAG go" question answerable. Each one names what would change in this repo to adopt the pattern.
+## How this maps to the repo
 
-## Files
+This repo does **agentic data-retrieval** but **not vector RAG**. There's no embedding index, no chunking, no vector DB. The agents drive their own EQL queries against Bloomreach via MCP — the *mechanic* is agentic (the model picks each query, observes the result, decides whether to query again), the *substrate* is structured-data retrieval over a tool-calling MCP server, not vector retrieval over embedded documents.
 
-1. [`01-agentic-rag.md`](./01-agentic-rag.md) — ReAct whose primary tool is retrieval
-2. [`02-self-corrective-rag.md`](./02-self-corrective-rag.md) — grade retrieved chunks before generating
-3. [`03-retrieval-routing.md`](./03-retrieval-routing.md) — pick the source before retrieving
+This distinction matters because the canonical agentic RAG vocabulary (re-ranker, BM25 + dense fusion, RRF, semantic cache) doesn't apply here — but the *control loop* part does. The files below cover the control loop and call the vector-store mechanics out as "not in this repo, lives in `study-ai-engineering` when generated."
 
-## How this maps to the codebase
+## Reading order
 
-| File | In this codebase? |
-|---|---|
-| Agentic RAG | **No** — retrieval is via MCP tools, not embeddings. The agent loop drives tool calls; "agentic RAG" would mean the tools were similarity-search backed. |
-| Self-corrective RAG | **No** — there's no retrieved-chunk grading step because there are no retrieved chunks. |
-| Retrieval routing | **Partial** — the URL router + intent classifier already do *tool routing* (`07-routing.md`). Real retrieval routing would mean picking between, say, Bloomreach EQL vs a vector store vs live web search — none of which exist here. |
-
-## Cross-reference
-
-For retrieval mechanics in general (embeddings, chunking, vector DBs, dense/sparse, RRF, reranking, classic RAG, GraphRAG), see ai-engineering's `03-retrieval-and-rag/` if generated. This sub-section assumes you know those mechanics and covers only the *control loop* angle — retrieval driven by an agent.
+1. `01-agentic-rag.md` — the loop shape, applied to this repo's MCP retrieval
+2. `02-self-corrective-rag.md` — the grader pattern; not in this repo
+3. `03-retrieval-routing.md` — picking the right source; this repo has one source so the pattern is at the tool-allowlist level

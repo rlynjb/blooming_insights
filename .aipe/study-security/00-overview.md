@@ -1,141 +1,68 @@
-# 00 · overview
+# Overview — security at a glance
 
-The whole system in one frame, with the trust axis traced across it.
+## Verdict per primitive
 
-## Zoom out — three boundaries, one map
+- **Authentication.** OAuth 2.1 + PKCE + DCR against Bloomreach loomi connect. Tokens persist in an AES-256-GCM `bi_auth` cookie (production) or a gitignored file (dev). The IdP is the authority; the app stores no passwords.
+- **Authorization.** No per-user role/permission model — the app inherits whatever the OAuth-bound Bloomreach user can do, scoped per session cookie. There's no app-side authz check; if you have the cookie, you have the access. Acceptable for a single-tenant analyst tool; load-bearing assumption.
+- **Session.** httpOnly + Secure + SameSite=None `bi_session` cookie, per-session ALS-scoped store, per-session in-memory feed state.
+- **Encryption.** AES-256-GCM (AEAD) for the production token cookie; key derived by SHA-256 of `AUTH_SECRET`. No TLS termination in app — relies on Vercel's edge.
+- **Capability gating.** Two layers — a union allowlist on `POST /api/mcp/call` (`ALL_KNOWN`), and a per-agent tool-subset constant (`monitoringTools` / `diagnosticTools` / `recommendationTools`). The per-agent subset is **wired into the legacy code paths but not into the live AptKit-based agents** — see finding 1 below.
+- **Input validation.** A defensive parser (`parseAgentJson`) + three type guards (`isAnomalyArray`, `isDiagnosis`, `isRecommendationArray`) at the model-output boundary. Only the legacy agent files call them; the AptKit-based path returns typed objects from the SDK without re-validating at the seam.
+- **Secret hygiene.** `redactSecrets` rewrites Bearer/access_token/refresh_token/id_token/code_verifier shapes before logging or stuffing into error envelopes; `.auth-cache.json` + `.investigation-cache.json` are gitignored; `AUTH_SECRET` only enforced in production.
+- **LLM / agent security.** Model output flows into the UI through a type-guard at the legacy boundary and through the SDK's typed response at the AptKit boundary. Tool results from MCP feed straight into the model context (truncated at 4KB on the wire; no provenance check on the model's tool choice beyond the union allowlist).
 
-```
-  blooming insights — trust map
-
-  ┌─ UI ─────────────────────────────────────────────────────────────┐
-  │ React 19 (app/page.tsx, components/*)                            │
-  │   • renders agent answer via {expression} (auto-escape)          │
-  │   • no dangerouslySetInnerHTML in the answer path                │
-  └─────────────────────────────┬────────────────────────────────────┘
-                                │
-                                │ hop 1 — fetch('/api/agent?q=…')
-                                │ cookies: bi_session, bi_auth
-                                ▼
-  ╔═══ trust boundary 1 ═══════════════════════════════════════════╗
-  ║ browser → API route                                              ║
-  ║   • query params (q, insightId, insight, diagnosis, step)        ║
-  ║   • POST bodies (capture-demo, mcp/call)                         ║
-  ║   • session cookie identifies but does NOT authorize per-resource║
-  ╚═══════════════════════════════════════════════════════════════════╝
-                                │
-  ┌─ Service ────────────────── ▼ ───────────────────────────────────┐
-  │ Next.js 16 route handlers (app/api/**)                            │
-  │   • per-session in-memory map (lib/state/insights.ts) — session-  │
-  │     scoped so concurrent users can't read each other's anomalies  │
-  │   • console.error logs full stack; JSON response carries .message │
-  │     only (no .stack on the wire); secrets redacted before logging │
-  └─────────────────────────────┬────────────────────────────────────┘
-                                │
-                                │ hop 2 — MCP over HTTPS
-                                │ Bearer <access_token> (OAuth 2.1)
-                                ▼
-  ╔═══ trust boundary 2 ═══════════════════════════════════════════╗
-  ║ route → Bloomreach MCP                                           ║
-  ║   • OAuth 2.1 + PKCE + Dynamic Client Registration               ║
-  ║   • token store: AES-256-GCM in httpOnly bi_auth cookie (prod)   ║
-  ║   • per-call: ~1 req/s, 30s timeout, retry on 429                ║
-  ╚═══════════════════════════════════════════════════════════════════╝
-                                │
-  ┌─ Provider ───────────────── ▼ ───────────────────────────────────┐
-  │ loomi-mcp-alpha.bloomreach.com — black box                        │
-  └─────────────────────────────┬────────────────────────────────────┘
-                                │
-                                │ hop 3 — tool result (JSON)
-                                │ + Claude reads/decides
-                                ▼
-  ╔═══ trust boundary 3 ═══════════════════════════════════════════╗
-  ║ model output → typed value                                       ║
-  ║   • parseAgentJson tolerates fences / wrapper prose              ║
-  ║   • per-shape type guards (isAnomalyArray, isDiagnosis, …)       ║
-  ║   • FALLBACK constants when the model returns garbage            ║
-  ╚═══════════════════════════════════════════════════════════════════╝
-                                │
-                                ▼
-                        back to UI (auto-escaped)
-```
-
-Three boundaries. Read the trust axis across them and the same question
-gets three different answers:
+## Trust map
 
 ```
-  axis = "what can each side see or tamper with?"
+  Trust boundaries — 3 hops, every cookie/header labelled
 
-  ┌─ browser ─┐         ┌─ route ─┐         ┌─ Bloomreach ─┐         ┌─ Claude ─┐
-  │ everything│ ──────► │ session │ ──────► │ tenant       │ ──────► │ tool     │
-  │ the user  │  cookie │ scoped  │  bearer │ scoped       │ result  │ output   │
-  │ types     │         │ in-mem  │         │ by token     │         │ as JSON  │
-  └───────────┘         └─────────┘         └──────────────┘         └──────────┘
-        ▲                    ▲                     ▲                      ▲
-        │                    │                     │                      │
-   untrusted            partial trust          provider trust         untrusted
-   (input)              (per-session)          (the token vouches)    (output)
+  ┌─ Browser (untrusted) ─────────────────────────────────┐
+  │  React UI · bi_session cookie · bi_auth cookie         │
+  └──────────────┬─────────────────────────────────────────┘
+                 │   hop 1: HTTPS · GET/POST /api/...
+                 │   (SameSite=None cookies survive IdP return)
+  ┌─ Next.js routes (trusted boundary) ───────────────────▼┐
+  │  /api/briefing  /api/agent  /api/mcp/{call,callback,...}│
+  │  · per-session ALS store (RequestStore)                 │
+  │  · ANTHROPIC_API_KEY · AUTH_SECRET in env               │
+  └──────┬────────────────────────────────────┬─────────────┘
+         │ hop 2: HTTPS Bearer                │ hop 3: HTTPS x-api-key
+         │ (OAuth access token)               │ (Anthropic key)
+         ▼                                    ▼
+  ┌─ Bloomreach MCP server ──────┐    ┌─ Anthropic API ─────────┐
+  │  loomi connect alpha          │    │  Claude sonnet + haiku  │
+  │  (third-party, rate-limited)  │    │                         │
+  └──────────────────────────────┘    └────────────────────────┘
 ```
 
-The boundary that flips trust hardest: the **first** one (browser →
-route). Past it, the route runs Node with whatever permissions the
-deployment grants, talking to a third-party API over a token the cookie
-unlocks. Every other boundary's strength depends on that first one
-holding.
+**The most exposed boundary:** hop 1, the browser → Next routes seam. Cookie theft (XSS on a different deployment, malicious browser extension, exfiltrated `bi_auth`) hands an attacker the OAuth-bound Bloomreach session of whoever owned the cookie. SameSite=None is necessary for the OAuth round-trip but widens CSRF exposure on state-changing GETs (the streaming routes are GETs).
 
-## Zoom in — the one load-bearing control at each boundary
+## The three highest-risk findings
 
-  → **Boundary 1.** The session cookie (`bi_session`) scopes
-    per-session state (`lib/state/insights.ts:14`,
-    `lib/mcp/session.ts:11`). Two users on the same warm Vercel
-    instance can't see each other's insights or investigations — but a
-    logged-in user can still call any tool the union allowlist covers
-    (see boundary-2 caveat).
+### 1. Per-agent capability gate has regressed in the AptKit path
 
-  → **Boundary 2.** The encrypted-session cookie (`bi_auth`) holds the
-    OAuth tokens, AES-256-GCM-encrypted under `AUTH_SECRET`
-    (`lib/mcp/auth.ts:51-67`). Tampering corrupts the GCM auth tag,
-    `decryptStore` swallows the throw and returns `{}` —
-    re-authentication, not impersonation
-    (`lib/mcp/auth.ts:69-79`). The cookie is the only thing the SDK and
-    the route share across requests on Vercel; without it, the PKCE
-    verifier and DCR (Dynamic Client Registration) client info would be
-    lost between `/connect` and `/callback`.
+**File:** `lib/agents/diagnostic.ts:38`, `lib/agents/monitoring.ts:83`, `lib/agents/recommendation.ts:33`, `lib/agents/query.ts:27`
+**Trust assumption broken:** *"each agent only sees the tools it needs."* The legacy classes built the Anthropic tool list with `filterToolSchemas(this.allTools, monitoringTools)` etc. (`lib/agents/monitoring-legacy.ts:108`, `lib/agents/diagnostic-legacy.ts:62`, `lib/agents/recommendation-legacy.ts:54`, `lib/agents/query-legacy.ts:37`). The new AptKit-based classes pass `this.allTools` straight into `BloomingToolRegistryAdapter`, and the adapter's `listTools()` returns every tool the Bloomreach server exposes (`lib/agents/aptkit-adapters.ts:81-87`). The per-agent constants in `lib/mcp/tools.ts` are now only consumed by the union allowlist on `/api/mcp/call` and by `tool-coverage.ts` — not by any live agent loop.
+**What an attacker reaches:** the diagnostic agent (which should only read events) can now be steered by a crafted prompt to call any tool the server lists — including write/admin tools if the OAuth scope grants them. Prompt-injection blast radius widens from each agent's task surface to the union surface.
+**Fix:** thread an `allowedTools: readonly string[]` argument into `BloomingToolRegistryAdapter`, call `filterToolSchemas` (or its equivalent) in each agent class, and pass `monitoringTools` / `diagnosticTools` / `recommendationTools` / `queryTools` respectively. See `03-per-agent-tool-allowlist.md` for the walk.
 
-  → **Boundary 3.** Defensive parsing (`parseAgentJson`) + per-shape
-    type guards (`lib/mcp/validate.ts:3-13`, `17-57`). The agent can
-    return malformed JSON, an extra prose tail, a fence, or the wrong
-    shape — every path falls back to a typed `FALLBACK` instead of
-    crashing the route or flowing junk into the UI.
+### 2. SameSite=None on the session cookie + state-changing GETs
 
-## The single finding that earns the headline
+**File:** `lib/mcp/session.ts:10-14`, `app/api/agent/route.ts:110`, `app/api/briefing/route.ts:77`
+**Trust assumption broken:** *"a cross-site request can't drive a write."* `bi_session` and `bi_auth` are `SameSite=None` so the OAuth callback round-trip survives (`lib/mcp/auth.ts:96-98`). Both `/api/agent` and `/api/briefing` are **GET** endpoints that consume real budget (Anthropic tokens, Bloomreach rate-limit quota) per call. A cross-origin `<img src="https://your-app/api/briefing?demo=cached">` from any site the user has open in another tab will burn budget — and `/api/agent?insightId=...` will spend ~100s of investigation budget per hit while leaking the streaming response back-channel-style.
+**What an attacker reaches:** budget exhaustion (cost-based DoS) and forced re-investigation of arbitrary insight IDs without user intent. The streaming response itself isn't exfiltrated cross-origin (the browser blocks the read), but the side effects fire.
+**Fix:** add a `Sec-Fetch-Site` check (or a short-lived CSRF token in the cookie validated against a request header) on `/api/briefing` and `/api/agent`. The OAuth callback at `/api/mcp/callback` still needs SameSite=None for the cookie return, so the fix is application-layer, not cookie-layer.
 
-`POST /api/mcp/call` is the proxy seam: the browser names a tool, the
-route calls it on the (token-bound) MCP server, the response comes back
-as JSON. The original version of this route accepted any string for
-`name`. The current version (`app/api/mcp/call/route.ts:14-27`) gates
-against a union allowlist (`ALL_KNOWN = monitoringTools ∪
-diagnosticTools ∪ recommendationTools ∪ bootstrapTools`), returning 403
-for anything else.
+### 3. OAuth `state` validation is intentionally disabled at the callback
 
-**That closes the worst leak** — an attacker can no longer name an
-arbitrary write tool like `delete_customer`. What's still open: the
-allowlist is the **union** across every agent, not scoped per-agent or
-per-args. A session-auth'd caller (or a stolen `bi_session` + `bi_auth`
-pair) can:
+**File:** `app/api/mcp/callback/route.ts:22-26`, `lib/mcp/auth.ts:225-235`
+**Trust assumption broken:** *"the callback `code` belongs to the auth request this session started."* The MCP SDK calls `provider.state()` more than once per flow, which broke a naive "store-last, compare-on-callback" check, so the route comment notes the recheck was removed and a comment in `lib/mcp/auth.ts:227-228` says the SDK "performs its own state handling." The SDK does generate a `state` parameter and sends it on the authorize URL — but a re-verification at the callback layer would catch a forged callback that the SDK's own equality check might not surface to the application.
+**What an attacker reaches:** a CSRF login attack — a victim clicks an attacker's pre-signed authorize URL, the callback lands on the victim's session, and the attacker's OAuth-bound Bloomreach identity gets persisted in the victim's `bi_auth` cookie. Now the victim's "live" briefings query the attacker's workspace, and any per-session in-memory state mingles. The attack surface is narrow (the victim has to click a malicious authorize link), but the consequence is full session takeover.
+**Fix:** implement a state store that survives the SDK calling `state()` multiple times (return the same value within a flow, then consume-and-clear at the callback). The skeleton `consumeState` is already exported and tested but unwired.
 
-  → call `list_cloud_organizations` (bootstrap-only in the agent path)
-    even though the user-facing UI never reaches it,
-  → call `execute_analytics_eql` with arbitrary EQL (no shape
-    validation on `args`), constrained only by the rate limit and the
-    server's tenant scope on the OAuth token.
+## Where to next
 
-The fix is one of (a) drop `/api/mcp/call` (the agent path covers
-production needs), (b) tighten the allowlist to the small set the UI
-actually invokes outside the agent, or (c) require the caller to name
-which agent role they're acting under and intersect. Pattern walk in
-`05-open-tool-surface-gap.md`.
-
-## Where to read next
-
-  → `audit.md` — the 8-lens pass with `file:line` evidence.
-  → Then the five pattern files in the README's reading order.
+- **`audit.md`** for the full 8-lens walk.
+- **`01-encrypted-auth-cookie.md`** for why the cookie is the way it is.
+- **`03-per-agent-tool-allowlist.md`** for the regression's full deep walk + fix sketch.
+- **`04-model-output-type-guard.md`** for the model-output boundary.

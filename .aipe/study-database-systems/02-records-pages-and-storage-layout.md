@@ -1,90 +1,146 @@
-# Records, pages, and storage layout
+# Records, pages, and storage layout — what a row looks like here
 
-Industry standard · Storage engine internals
+*Industry standard / Project-specific* — there are no pages on disk; instead a row is a JS object inside a per-session `Map`, and the "table" is partitioned by a session-id primary key.
 
-## Zoom out — where storage layout would live, and what's there instead
+## Zoom out, then zoom in
 
-Real database engines spend most of their cleverness on storage layout — how rows pack into pages, how pages live on disk, how the buffer pool warms them into memory, what gets read together. None of that exists here. The "table" is a JavaScript `Map`; the "page" is whatever V8 happens to allocate; the "buffer pool" is the heap.
-
-```
-  Zoom out — where storage layout would matter (and what's there)
-
-  ┌─ Service layer ──────────────────────────────────────────────┐
-  │  putInsights · getInsight · listInsights                      │
-  └───────────────────────────────┬──────────────────────────────┘
-                                  │ Map.get / Map.set
-  ┌─ "Storage" layer ──────────────▼──────────────────────────────┐
-  │  ★ THIS CONCEPT ★                                              │
-  │  Map<sessionId, SessionFeed>           ← the "namespace"       │
-  │    Map<string, Insight>      insights   ← the "table"          │
-  │    Map<string, Investigation> investigations                   │
-  │    Map<string, Anomaly>      anomalies                         │
-  │                                                                │
-  │  no page layout, no row format, no buffer pool                 │
-  │  every Insight is a JS object living wherever V8 put it        │
-  └────────────────────────────────────────────────────────────────┘
-                                  │ (provider owns real storage)
-                                  ▼
-                       Bloomreach Engagement
-```
-
-## Zoom in — the question this concept answers
-
-In a real engine: "what's on disk and how does it get into memory efficiently?" Here: "what does a 'row' look like, what does a 'table' look like, and what guarantees do we have about layout?" Answer: a row is a TypeScript object, a table is a `Map<string, T>`, and the only layout guarantee is insertion order. That's it.
-
-## Structure pass — the skeleton
-
-### Layers in a real engine vs this repo
+In a real database the storage layout matters because rows are packed into fixed-size pages, pages live on disk, and locality determines how many disk pages a query has to touch. None of that applies here — rows are heap objects, "pages" are however JavaScript's `Map` lays things out internally, and locality is whatever V8 decides. So the version of this concept that *does* apply is the one about **partitioning**: how is the data sliced so two users don't collide?
 
 ```
-  layer                  real RDBMS                  this repo
-  ─────────────────      ─────────────────           ─────────────────────
-  table                  named relation, schema      Map<string, T>
-  row format             tuple bytes (NULL bitmap,   JS object reference
-                         varlen, fixed cols)
-  page                   8KB block, header + slots   N/A (heap allocation)
-  buffer pool            page cache in RAM           N/A (heap is the cache)
-  on-disk file           .ibd / heap file            N/A (no persistence)
-  free space mgmt        FSM page, vacuum            N/A (GC handles it)
+  Zoom out — where this concept lives
+
+  ┌─ UI layer ───────────────────────────────────────────────┐
+  │  InsightCard reads from /api/briefing's stream            │
+  └────────────────────────────┬─────────────────────────────┘
+                               │  HTTP
+  ┌─ Service layer ────────────▼─────────────────────────────┐
+  │  putInsights(sid, items)                                  │
+  │  listInsights(sid) → ★ THE STORAGE LAYOUT ★                │ ← we are here
+  └────────────────────────────┬─────────────────────────────┘
+                               │
+  ┌─ Storage layer ────────────▼─────────────────────────────┐
+  │  state: Map<sessionId, { insights, investigations,        │
+  │                          anomalies }>                     │
+  │  └─ partitioned per-session                               │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-### Axis: where does locality come from?
+Zoom in: a "row" is an `Insight` object (see `lib/mcp/types.ts:36`). A "table" is `sessionState(sid).insights`. The primary key is `Insight.id`. The partition key is `sessionId`. The thing worth studying here is the partition — the rest is incidental to the language.
 
-In a real engine: from co-locating related rows on the same page (clustered index, table partitioning, columnar layout). Here: from nothing. `Map` insertion order is the only layout discipline, and the iteration order it gives you is the only "scan" you get.
+## Structure pass
 
-### Seams
+**Layers:**
 
-The interesting seam is between **the type** (`Insight`, `Investigation`, `Anomaly`) and **the storage** (the `Map`). In a real engine that seam is the row-format codec. Here it's `JSON.stringify`/`JSON.parse` for serialization (when we cross to disk for the demo snapshot) and *nothing* for in-memory storage — the type IS the layout.
+```
+  L1  state: Map<sessionId, SessionFeed>     ← partition layer
+  L2  SessionFeed.insights: Map<id, Insight>  ← table layer
+  L3  Insight object                          ← row layer
+```
+
+**Axis traced: who can read/write which row?**
+
+```
+  Trace one axis: who can read or mutate row R?
+
+  ┌─ L1 outer Map ────────────────────┐
+  │  no scope — module global         │   → any code can `state.get(...)`
+  └───────────────────────────────────┘
+                  (it flips)
+  ┌─ L2 SessionFeed ──────────────────┐
+  │  scoped to one sessionId          │   → only code with the matching sid
+  └───────────────────────────────────┘
+                  (it flips)
+  ┌─ L3 Insight row ──────────────────┐
+  │  scoped to one id within feed     │   → only code with sid AND id
+  └───────────────────────────────────┘
+
+  the partition seam is between L1 and L2 — that's the load-bearing one
+```
+
+**Seams** — one matters:
+
+- The L1 → L2 boundary is the partition. Cross it without the right `sessionId` and you read someone else's data. Every read/write helper in `lib/state/insights.ts` takes `sessionId` as its first parameter and goes through `sessionState(sid)` — that's the contract.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-If you've ever done `const users = new Map<string, User>(); users.set(u.id, u);` — that's literally the storage layer of this codebase. There's no second tier, no page cache, no flush. The `User` object lives in the heap wherever V8 put it; the `Map` holds a reference.
+You've built a primary-key lookup before: `users.find(u => u.id === id)`. The shape here is the same, with one extra dimension on top — a partition key that selects which *bucket* of rows to search.
 
 ```
-  The shape — table-as-Map
+  Two-level keying — partition, then primary
 
-      Map<string, Insight>
-   ┌──────────────────────────────────┐
-   │  "abc-123" ───► { id, summary, … }│  ← row 1: reference to heap object
-   │  "def-456" ───► { id, summary, … }│  ← row 2: somewhere else in heap
-   │  "ghi-789" ───► { id, summary, … }│  ← row 3
-   └──────────────────────────────────┘
-       ▲                ▲
-       │                │
-       primary key      "row" = JS object reference
-       (hash-indexed)   no co-location guarantees
+  state          (outer Map)
+    │
+    ├─ sessionId "abc" ──► insights (Map)
+    │                        ├─ id "ins-1" → Insight
+    │                        └─ id "ins-2" → Insight
+    │
+    └─ sessionId "def" ──► insights (Map)
+                             ├─ id "ins-3" → Insight
+                             └─ id "ins-4" → Insight
+
+  lookup(sid, id) = state.get(sid)?.insights.get(id)
+  → O(1) outer + O(1) inner
 ```
 
-### Move 2 — the walkthrough
+That's the kernel. The rest is what the row shape looks like and why the partition matters.
 
-#### A "row" is a TypeScript interface
+### Move 2 — the layout, one part at a time
 
-The schema lives in `lib/mcp/types.ts`:
+#### The outer `Map` (the partition / shard)
 
-```ts
-// lib/mcp/types.ts (Insight shape)
+```typescript
+// lib/state/insights.ts:14
+const state = new Map<string, SessionFeed>();
+
+function sessionState(sessionId: string): SessionFeed {
+  let s = state.get(sessionId);
+  if (!s) {
+    s = { insights: new Map(), investigations: new Map(), anomalies: new Map() };
+    state.set(sessionId, s);
+  }
+  return s;
+}
+```
+
+Every `getInsight`, `putInsight`, `listInsights`, `putInvestigation` goes through `sessionState(sid)`. The function lazily creates a sub-feed on first touch — same shape as auto-creating a partition on first write.
+
+**What breaks if you flatten this to one Map.** The comment at `lib/state/insights.ts:5-7` tells the story: `putInsights` calls `.clear()` to replace the previous briefing. With one shared Map, `clear()` wipes every user's feed mid-briefing. The partition isn't a performance choice; it's a correctness fix.
+
+```
+  Why the partition is load-bearing
+
+  WITHOUT partition (one shared Map):
+    user A: putInsights(items_A)         insights = items_A
+    user B: putInsights([...])           insights.clear() — A's data gone
+                                         insights = items_B
+    user A: GET /feed                    sees items_B (B's data) ← bug
+
+  WITH partition (outer Map keyed by sid):
+    user A: putInsights("sid-A", items_A)   state.get("sid-A").insights = items_A
+    user B: putInsights("sid-B", items_B)   state.get("sid-B").insights.clear()
+                                            state.get("sid-B").insights = items_B
+    user A: GET /feed (sid-A)               state.get("sid-A").insights → items_A ✓
+```
+
+#### The inner `Map` (the table)
+
+```typescript
+// lib/state/insights.ts:9-12
+type SessionFeed = {
+  insights: Map<string, Insight>;
+  investigations: Map<string, Investigation>;
+  anomalies: Map<string, Anomaly>;
+};
+```
+
+Three sibling tables per session. They don't share keys (insights and investigations use different `id` namespaces — see `Insight.id` vs `Investigation.insightId` at `lib/mcp/types.ts:132-134`). The shape is "all of this user's stuff lives in one struct of typed maps" — the closest the codebase gets to a schema declaration.
+
+#### The row (the Insight)
+
+```typescript
+// lib/mcp/types.ts:36-62
 export interface Insight {
   id: string;
   timestamp: string;
@@ -94,143 +150,97 @@ export interface Insight {
   metric: string;
   change: { value: number; direction: 'up' | 'down'; baseline: string };
   scope: string[];
-  source: 'monitoring';
-  evidence?: Array<{ tool: string; result: unknown }>;
+  source: 'monitoring' | 'query';
+  evidence?: { tool: string; result: unknown }[];
   impact?: string;
-  history?: unknown;
-  category?: string;
+  // ... business-owner enrichments, all optional
+  revenueImpact?: { ... };
+  aov?: { ... };
+  funnel?: { ... };
+  affectedCustomers?: number;
+  history?: number[];
+  category?: CategoryId;
 }
 ```
 
-In a real engine the row format would specify byte offsets per column, NULL bitmap position, varchar length prefix. Here it specifies *only* what TypeScript checks at compile time — at runtime the object is a plain V8 hidden-class instance. Optional fields (`?`) are absent properties, not NULL markers.
+Two things to notice about the row shape:
 
-The deliberate convention in this repo: **new fields stay optional so older snapshots still validate.** From the project context: "new fields stay optional so older snapshots still validate." That's the schema-evolution discipline that substitutes for a migration system.
+1. **The primary key is `id`** — a `crypto.randomUUID()` minted in `anomalyToInsight` at `lib/state/insights.ts:26`. No surrogate / autoincrement, no composite key — just a UUID.
+2. **Most enrichment fields are optional.** The `// new fields stay optional so older snapshots still validate` comment in `.aipe/project/context.md`'s "What must not change" section explains why: the row shape evolves additively because the demo JSON snapshots have to keep validating after the type grows.
 
-#### The table (`Map<string, T>`) — keyed by primary key
+That last point is the JSON-snapshot version of schema migration: you cannot rename or remove a field without invalidating committed snapshots, so the schema only grows.
 
-```ts
-// lib/state/insights.ts:8-12
-type SessionFeed = {
-  insights: Map<string, Insight>;
-  investigations: Map<string, Investigation>;
-  anomalies: Map<string, Anomaly>;
-};
-```
+#### The `category` and `coverage` fields — almost a secondary index
 
-Annotation:
-  - The key type is `string` — always the `id` (or `insightId` for investigations). No composite keys, no autoincrement, no surrogate-vs-natural choice. The key is supplied by the row.
-  - The value type is the row type directly. There's no row codec, no serialization, no buffer pool. The value is a heap reference.
-  - There's *no* secondary structure — no separate index Map, no sorted view, no by-severity bucket. If you want insights-by-severity, you iterate the whole Map and filter. That's a full scan. → see `03-btree-hash-and-secondary-indexes.md`.
-
-#### The full table scan (`Map.values()`)
-
-```ts
-// lib/state/insights.ts:81-84
-export function listInsights(sessionId: string): Insight[] {
-  const s = state.get(sessionId);
-  return s ? [...s.insights.values()] : [];
-}
-```
-
-Annotation:
-  - `Map.values()` returns an iterator in **insertion order**. That is the entire scan story.
-  - Spreading into an array materializes the full result set every call — no streaming, no cursor, no LIMIT/OFFSET pagination. The dataset is small enough (today's briefing is ~6–12 insights) that this is fine.
-  - There is no equivalent of an index-only scan, a covering index, or a sequential scan with a WHERE pushdown. The filter, if any, happens in JS on the array.
-
-#### Pages don't exist — the V8 heap is the only layout
-
-In a real engine, the moment you store thousands of rows you start caring about which rows share a page, because reading one row brings the rest of its page into the buffer pool. Here, every `Insight` is a separate heap allocation. There is no spatial locality, no read-ahead, no page-level eviction.
-
-```
-  Real engine                       This repo
-
-   ┌─ page (8KB) ─────┐                heap (V8-managed)
-   │ row 1 │ row 2 │  │             ┌──────────────────────┐
-   │ row 3 │ row 4 │  │             │ obj1                 │
-   │ row 5 │ row 6 │  │             │       obj2           │
-   └──────────────────┘             │              obj3    │
-   read one → all in RAM            │  obj4                │
-                                    └──────────────────────┘
-                                    references in a Map; no co-location
-```
-
-The cost difference doesn't matter at the scale this app runs at. The conceptual difference matters when you try to reason about *why* a real database is fast at things like "give me all insights from the last hour" — the answer is "they're on adjacent pages," and the equivalent here is "you iterate every entry."
-
-#### The committed demo snapshot is the only "on-disk format"
-
-When state actually has to cross to disk, the format is JSON:
-
-```ts
-// lib/state/investigations.ts:34-37
-const all = readJson(CACHE_FILE);
-all[insightId] = events;
-try {
-  writeFileSync(CACHE_FILE, JSON.stringify(all));
-```
-
-Annotation:
-  - Format: a single JSON object, keyed by primary key, value is the row. Same shape as the in-memory Map.
-  - Write: whole-file rewrite. Every save reads the entire file, mutates the in-memory object, writes it back. That's `O(n)` per write — fine for tens of investigations, would be a disaster for thousands. Real DBs solved this with append-only files + checkpointing (→ see `07-wal-durability-and-recovery.md`).
-  - No row-level locking, no fsync discipline, no atomic rename. A crash mid-write leaves a truncated JSON file (which the read-side handles with `try/catch` → returns `{}`).
-
-This is the closest the codebase gets to a "storage format," and it's a dev-only convenience, not a production path.
+`category?: CategoryId` on `Insight` is the closest the codebase gets to a secondary index — it tags each insight with which of the 10 coverage-grid categories it belongs to. Nothing actually indexes by it (there's no `Map<CategoryId, Insight[]>`); the UI just filters on read. But conceptually it's the shape a secondary index would take.
 
 ### Move 3 — the principle
 
-Storage layout matters when *getting bytes from disk to CPU* is the bottleneck. When your dataset fits in RAM and your durability requirement is zero, the layout question collapses: store whatever object you have, in whatever order you got it. The discipline of database storage engines is what you reach for the moment one of those two assumptions breaks.
+When you have no real storage engine, "storage layout" reduces to one decision: **what's the partition key?** Pick wrong (or skip it) and a multi-tenant in-memory store leaks one tenant's writes into another tenant's reads. Pick right (sessionId here) and the lack of any other storage machinery costs nothing for correctness — only durability, which is a separate problem.
 
 ## Primary diagram
 
 ```
-  Storage layout for this repo — flat and reference-shaped
+  Storage layout — partitioned in-memory tables
 
-  ┌─ Map<sessionId, SessionFeed> ────────────────────────────┐
+  ┌─ state: Map<sessionId, SessionFeed> ──────────────────────┐
   │                                                            │
-  │  "session-A" ──► SessionFeed                              │
-  │                  ├── insights:       Map<string, Insight> │
-  │                  │     "ins-1" ─► { id, ... }             │
-  │                  │     "ins-2" ─► { id, ... }             │
-  │                  ├── investigations: Map<string, Inv>     │
-  │                  └── anomalies:      Map<string, Anomaly> │
-  │                                                            │
-  │  "session-B" ──► SessionFeed                              │
-  │                  ├── insights                              │
-  │                  ├── investigations                        │
-  │                  └── anomalies                             │
+  │   key="sess-abc" ──► SessionFeed ─┐                        │
+  │   key="sess-def" ──► SessionFeed ─┤                        │
+  │   key="sess-xyz" ──► SessionFeed ─┘                        │
+  │                                  │                         │
+  │                                  ▼                         │
+  │              ┌─ SessionFeed ────────────────────────┐      │
+  │              │  insights:        Map<id, Insight>    │      │
+  │              │  investigations:  Map<id, Inv>        │      │
+  │              │  anomalies:       Map<id, Anomaly>    │      │
+  │              └───────────────────────────────────────┘      │
+  │                                  │                          │
+  │                                  ▼                          │
+  │              ┌─ Insight (row) ──────────────────────┐      │
+  │              │  id (PK), timestamp, severity,       │      │
+  │              │  headline, summary, metric,          │      │
+  │              │  change{value,direction,baseline},   │      │
+  │              │  scope[], source,                    │      │
+  │              │  evidence?[], impact?,               │      │
+  │              │  + enrichments (all optional)        │      │
+  │              └──────────────────────────────────────┘      │
   └────────────────────────────────────────────────────────────┘
-       ▲             ▲                ▲
-       │             │                │
-   namespace     "table"          "row" (JS object reference)
-   (sessionId)   (named Map)      (heap-allocated, no layout discipline)
+
+  partition key: sessionId       (outer Map)
+  primary key:   Insight.id      (inner Map)
+  durability:    process-scoped  (dies on restart)
 ```
 
 ## Elaborate
 
-The classical references for storage layout (Hellerstein & Stonebraker's "Anatomy of a Database System," Pavlo's CMU 15-445) treat the page as the atomic unit because disk I/O is the dominant cost. When your "disk" is RAM and your "page" is a heap allocation, those lessons reshape: you start caring about *cache lines* (CPU L1/L2/L3) and *allocator behavior* instead of page layout. Columnar engines like DuckDB and ClickHouse push this further — they rearrange data by column to maximize SIMD throughput. None of that is relevant for ~12 insights in a Map, but it's the next altitude of "storage layout matters" if the local dataset ever grew.
+The `_clear(sessionId?: string)` test helper at `lib/state/insights.ts:95-101` makes the partition contract explicit: pass a sid to clear one partition, pass nothing to wipe the whole outer map. Tests using "wipe everything" cannot run against production semantics — they're test-only because they violate the partition.
 
-For this codebase, the actionable read is: the storage layout question gets *answered when product asks for a feature that requires it.* "Show me yesterday's briefing" requires persistence + a time index. "Show me which insights I've already investigated" requires either a flag column or a join. Neither has been asked for. When they are, the storage layout decision lands at the same time as the datastore decision.
+Compare to a real OLTP database: this is the same pattern as a per-tenant schema in Postgres, or a sharded Redis with `{tenant}:` key prefixes. The difference is that in those systems the partition is enforced at the connection or namespace level; here it's enforced by *convention plus a helper function*. There's nothing physically stopping a buggy caller from writing `state.get('sid-A').insights.set(id, otherSidsInsight)`. The whole correctness story rests on every caller going through `sessionState(sid)`.
+
+If this ever moves to a real store, the partition key becomes a tenant-id column with a row-level security policy or a per-tenant schema. The shape doesn't change; only the enforcement does.
 
 ## Interview defense
 
-> Q: "What's the storage layout in this app?"
+**Q: How is the in-memory state structured for multi-tenancy?**
 
-Verdict: there isn't one in the database-engine sense. The "tables" are `Map<string, T>` keyed by primary key; the "rows" are TypeScript interfaces; every value is a V8 heap reference with no co-location guarantees. The only on-disk format is JSON — used dev-only for the auth cache and investigation cache, and for the committed demo snapshot.
+Two-level Map: outer keyed by sessionId, inner keyed by the row id. The outer Map is the partition; the inner Map is the table. Helper functions (`sessionState`, `getInsight(sid, id)`, `listInsights(sid)`) enforce that every access goes through the partition.
 
 ```
-  the picture you draw — Map → row reference
-
-   Map<"id", Insight>  ──►  { id, summary, change, ... }
-       (hash index)             (V8 heap object)
+  state ─► sessionId ─► { insights, investigations, anomalies } ─► id ─► row
 ```
 
-The load-bearing point: this app's working dataset is tiny (~12 insights per briefing), it fits trivially in RAM, and it's all derivative from upstream Bloomreach. There's no I/O bottleneck to optimize against, so the storage engine machinery doesn't earn its weight.
+**Q: What's the load-bearing detail in this layout?**
 
-> Q: "What changes the day you need real storage?"
+The outer Map. The first version of this code was a module-level `Map<id, Insight>` — `putInsights` called `.clear()` to replace the previous briefing, and that wiped every user's feed on a warm Vercel instance. The fix was to add the outer partition Map and key everything by sessionId. The comment at `lib/state/insights.ts:5-7` explains it.
 
-Two things land together: a datastore decision (Postgres? a KV like Redis? a managed serverless DB?) and a row format (do we serialize the JS object as JSON in a `jsonb` column, or do we shred it into typed columns?). The current `Insight` type is JSON-shaped — variant by source, optional fields — so the first cut is almost certainly a `jsonb` column with a few indexed top-level fields (`severity`, `timestamp`). Real schema-shred comes later if query patterns demand it.
+**Q: What happens if you add a new field to `Insight`?**
+
+It has to be optional, because the committed JSON snapshots in `lib/state/demo-*.json` were captured against the older shape and have to keep validating. The schema grows additively only. That's the migration discipline — there's no `ALTER TABLE`, but there is a "don't break older snapshots" invariant. Adding a required field is a generation failure for the demo replay path.
 
 ## See also
 
-  - [`03-btree-hash-and-secondary-indexes.md`](./03-btree-hash-and-secondary-indexes.md) — what indexes you'd add on top of these "tables"
-  - [`07-wal-durability-and-recovery.md`](./07-wal-durability-and-recovery.md) — what "no on-disk format" means for restart
-  - `.aipe/study-data-modeling/` — the schema shape and access patterns
+- `01-database-systems-map.md` — where this Map sits among the four storage analogs
+- `05-transactions-isolation-and-anomalies.md` — the one multi-step write that touches this layout
+- `06-locks-mvcc-and-concurrency-control.md` — why the partition makes locks unnecessary
+- `09-database-systems-red-flags-audit.md` — what could go wrong with this layout

@@ -1,241 +1,164 @@
-# Sorting, searching, and selection
+# Sorting, Searching, and Selection
 
-*Comparator-based sort, binary search, partitioning, top-K — Industry standard · sort ★★★ exercised, binary search Case B*
+Comparator sort · binary search · top-K selection · linear scan — Industry standard
 
-## Zoom out — sorting and searching in this repo
+## Zoom out — where this concept lives
 
-```
-  Where sort and search live in this codebase
-  ───────────────────────────────────────────
-
-  ┌─ UI layer ────────────────────────────────────┐
-  │  funnel.reduce(argmin)  — single-pass min      │
-  │    components/feed/InsightCard.tsx:160         │
-  └────────────────────────┬──────────────────────┘
-                           │
-  ┌─ Service layer ────────▼──────────────────────┐
-  │  ★ SORT BY COMPARATOR + SLICE TOP-K            │
-  │    [...parsed].sort(SEV_RANK cmp).slice(0, 10) │
-  │    lib/agents/monitoring-legacy.ts:136         │
-  │                                                │
-  │  ★ SORT BY ASCENDING (Set → sorted array)      │
-  │    [...server].sort()                          │
-  │    lib/mcp/tool-coverage.ts:58, 61             │
-  │                                                │
-  │  ★ SORT BY NUMERIC FIELD DESC                  │
-  │    events.sort((a,b) => b.eventCount - a.eventCount)│
-  │    lib/mcp/schema.ts:107                       │
-  │                                                │
-  │  NO BINARY SEARCH (every lookup is hash-keyed) │
-  └────────────────────────┬──────────────────────┘
-                           │
-  ┌─ Provider boundary ────▼──────────────────────┐
-  │  Bloomreach sorts on the server (EQL ORDER BY) │
-  │  → search algorithms live there, opaque to us  │
-  └───────────────────────────────────────────────┘
-```
-
-Verdict-first: this repo uses **`Array.prototype.sort`
-with a comparator three times** and **never reaches
-for binary search**. The reason for the asymmetry:
-every lookup in this codebase is *keyed* (Map.get) or
-*short-scan* (filter over a ≤ 30 element array), so
-the O(log N) win of binary search never pays for the
-"keep the array sorted" cost. If a workload changed
-— say, you started looking up event names in a
-10,000-item alphabetical list — binary search would
-suddenly be the right move. It isn't, today.
-
-## Structure pass — sort and search seams
-
-Two operations, one question held constant: *"what
-property of the input does the algorithm exploit?"*
+One comparator sort in the service layer (the anomaly top-10 in the monitoring agent), one argmin reduce in the UI (the funnel-stage leak), and a lot of linear scans. **No binary search anywhere.** No quickselect, no merge-K-sorted-lists, no external sorting. The diagram marks the one real sort.
 
 ```
-  One question, two algorithms, two property answers
-  ──────────────────────────────────────────────────
+  Zoom out — where ordering and lookup happen
 
-  "what input property does this algorithm exploit?"
-
-  ┌─ Sorting ──────────────────────┐
-  │ exploits: a TOTAL ORDER on     │
-  │   elements (comparator)        │
-  │ produces: arr in that order    │
-  │ cost: O(N log N) comparator    │
-  │       O(N) for special cases   │
-  │       (counting/radix sort)    │
-  └────────────────────────────────┘
-
-  ┌─ Binary search ────────────────┐
-  │ exploits: array IS ALREADY     │
-  │   sorted                       │
-  │ produces: index (or -1)        │
-  │ cost: O(log N)                 │
-  │ break case: array not sorted   │
-  │   → returns garbage silently   │
-  └────────────────────────────────┘
+  ┌─ UI (browser) ─────────────────────────────────────────────────┐
+  │  argmin reduce over 4 funnel stages                             │
+  │   funnelStages.reduce((a, b) => (b.v < a.v ? b : a))            │
+  │   (InsightCard.tsx:160 — picks the smallest-v stage as "leak")  │
+  └────────────────────────────────────────────────────────────────┘
+                          ▼
+  ┌─ Service (Next API) ───────────────────────────────────────────┐
+  │  ★ comparator sort + slice (top-K with K=n) ★                  │
+  │  monitoring-legacy.ts:136                                       │
+  │  [...parsed]                                                    │
+  │    .sort((a, b) => SEV_RANK[b.severity] - SEV_RANK[a.severity]) │
+  │    .slice(0, 10)                                                │
+  │                                                                 │
+  │  linear filter+map all over: tool-schemas, categories,          │
+  │  evidence pulls, parseAgentJson candidate scan                  │
+  │                                                                 │
+  │  NO binary search.                                              │
+  │  NO quickselect.                                                │
+  └────────────────────────────────────────────────────────────────┘
+                          ▼
+  ┌─ Storage (Bloomreach) ─────────────────────────────────────────┐
+  │  the EQL engine almost certainly sorts internally (ORDER BY)    │
+  │  — but we don't see it from this codebase.                      │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
-The seam these share: **a total order on elements**.
-Sort builds the order; binary search exploits it. The
-two compose: if you binary-search the same array many
-times, the O(N log N) sort cost amortises over the
-many O(log N) lookups, beating Map.get's O(1) only
-when... never, in JavaScript. (Maps are always
-cheaper for single-key lookup. Binary search shines
-for *range queries* — "all elements between X and Y" —
-which Maps can't answer in sub-O(N).)
+## Zoom in — the concept
 
-Hand off to How it works.
+Sorting puts things in order; searching finds one of them; selection finds the k-th by some criterion (the median, the top-K, the smallest). These are three different jobs, and the right algorithm depends on which one you actually need.
+
+The honest take on this repo: **the data is always tiny (≤10 items at any sort site), the keys are always hashable strings, and ordered queries don't happen.** So sorting is one comparator call, searching is `Map.get`, and selection is `sort+slice`. There's nothing wrong with that — it's the right code for the scale. The interview surface is everything *not* exercised: binary search, quickselect, merge sort, the stability question.
+
+## Structure pass — layers · axes · seams
+
+One axis traced: **what cost does each ordering operation pay, and at what input size does the cost stop being free?**
+
+```
+  one axis — "when does the cheap version stop being fine?"
+
+  ┌─ linear scan (find / filter / map) ──────────────────────────┐
+  │   cost: O(n)                                                   │
+  │   fine when: n is small OR you only do it once                 │
+  │   stops being fine when: you repeat the scan in a loop         │
+  │     → build a Map / Set once, lookup O(1) thereafter (file 02) │
+  └──────────────────────────────────────────────────────────────┘
+  ┌─ argmin / argmax via reduce ─────────────────────────────────┐
+  │   cost: O(n), one pass                                         │
+  │   fine when: you need ONE extreme value, not a sorted list     │
+  │   stops being fine when: you need the top K → sort or heap     │
+  └──────────────────────────────────────────────────────────────┘
+  ┌─ comparator sort ────────────────────────────────────────────┐
+  │   cost: O(n log n)                                             │
+  │   fine when: n is reasonable AND you need order, not just one  │
+  │   stops being fine when: n is huge AND K << n → reach for heap │
+  └──────────────────────────────────────────────────────────────┘
+  ┌─ binary search ──────────────────────────────────────────────┐
+  │   cost: O(log n)                                               │
+  │   fine when: data is already sorted AND queries are repeated   │
+  │   stops being fine when: data mutates between queries          │
+  │     → balanced BST (file 04) for query+mutate workloads        │
+  └──────────────────────────────────────────────────────────────┘
+
+  the seam in this repo: every site sits at "n is small, linear is fine."
+```
+
+- **layers**: same three. The work lives in the service layer (one sort) and the UI (one argmin).
+- **axis**: cost vs scale. Each row names when the cheap option breaks.
+- **seam**: when `n` crosses the threshold where the asymptotic cost matters. In this repo, it never does — but the interview surface assumes it will.
 
 ## How it works
 
-#### Move 1 — the mental model
+### Move 1 — the mental model
 
-You know `Array.prototype.sort` already, but probably
-not what it does under the hood. The mental model:
-**sort with a comparator is a "give me a total order
-function, I'll return the array in that order"
-contract.** The comparator returns negative (a
-before b), zero (tie), or positive (b before a).
-V8's implementation is TimSort — a hybrid of merge
-sort and insertion sort, stable, O(N log N).
+A comparator sort is a function that says "given any two elements, which one comes first?" The sort algorithm shuffles the array until every pair is in agreement. **What makes it O(n log n)** is the divide-and-conquer structure: you can't avoid `n` comparisons (every element must be looked at) and the log n comes from halving the problem repeatedly (merge sort splits in half; quicksort partitions; heapsort builds and tears down a heap, where heap operations are log n).
+
+Binary search is the same divide-and-conquer instinct on lookup: at each step, halve the search range. **Requires the array to be sorted** — that's the precondition that makes it work. Without sortedness, you fall back to linear scan.
 
 ```
-  Comparator — three return values, three meanings
-  ────────────────────────────────────────────────
+  binary search — the pattern
 
-  cmp(a, b) returns:
-    < 0    → a should come before b
-    = 0    → order doesn't matter (stable sort
-                  preserves original order)
-    > 0    → b should come before a
+  sorted array:  [ 1, 4, 7, 12, 23, 47, 51, 88, 100 ]
+  target = 23
 
-  examples:
-    ascending numbers:  (a, b) => a - b
-    descending numbers: (a, b) => b - a
-    by string field:    (a, b) => a.name.localeCompare(b.name)
-    by severity rank:   (a, b) => SEV_RANK[b.sev] - SEV_RANK[a.sev]
-                                      ↑
-                              note: b first → descending
+  step 1:  lo=0, hi=8, mid=4 → array[4]=23 → found!  done in 1 step.
+
+  target = 50
+
+  step 1:  lo=0, hi=8, mid=4 → array[4]=23  → 50 > 23, go right
+                                              lo=5, hi=8
+  step 2:  lo=5, hi=8, mid=6 → array[6]=51  → 50 < 51, go left
+                                              lo=5, hi=5
+  step 3:  lo=5, hi=5, mid=5 → array[5]=47  → 50 > 47, go right
+                                              lo=6, hi=5 → not found
+
+  total comparisons: 3 for an array of 9 → log₂(9) ≈ 3.2  ✓
 ```
 
-The interview tell: people who write `(a, b) => true`
-or `(a, b) => a > b` are returning booleans, which
-coerce wrong. The comparator MUST be numeric.
+Selection (top-K, k-th smallest) sits between sort and search. You can implement it by **sort then take K** (O(n log n)) or by **quickselect** (average O(n)) or by a **fixed-size heap of K** (O(n log K)). The right one depends on whether `K` is small, whether `n` is known, and whether streaming.
 
-Binary search's mental model: **eliminate half the
-remaining space per step**. You start with [0, N),
-check the middle, narrow to [lo, mid) or [mid+1, hi).
-After log N steps, the range is empty (not found) or
-one element (found).
+### Move 2 — the moving parts
 
-```
-  Binary search — halving the search space
-  ────────────────────────────────────────
+#### the one comparator sort — anomaly ranking
 
-  sorted array (10 elements):
-    [1, 3, 5, 7, 9, 11, 13, 15, 17, 19]
-     ▲                                ▲
-     lo = 0                          hi = 10
-                  ↓
-              mid = 5                  ← arr[5] = 11
-                  ↓
-  search for 7:  7 < 11 → discard right half
-    [1, 3, 5, 7, 9]                    hi = 5
-     ▲           ▲
-     lo = 0     hi = 5
-              ↓
-              mid = 2                  ← arr[2] = 5
-                  ↓
-                7 > 5 → discard left half
-            [7, 9]                     lo = 3
-             ▲   ▲
-             lo = 3  hi = 5
-                  ↓
-              mid = 4                  ← arr[4] = 9
-                  ↓
-                7 < 9 → discard right half
-              [7]                      hi = 4
-               ▲ ▲
-               lo = 3
-                  ↓
-              mid = 3                  ← arr[3] = 7  ✓
-```
-
-Three comparisons for a 10-element array. For
-1,000,000 elements: 20 comparisons. That's the win,
-and it's why binary search is the canonical "log N
-algorithm" everyone has to know.
-
-#### Move 2 — the operations, anchored to your code
-
-**Comparator-based sort — three live examples**
+The monitoring agent gets back an array of anomalies in arbitrary order. It ranks them by severity and takes the top 10:
 
 ```ts
-// lib/mcp/schema.ts:99-107
-const events = (eventPayload?.events ?? [])
-  .map((e) => ({
-    name: e.type,
-    properties: (e.properties?.default_group?.properties ?? []).map((p) => p.property),
-    eventCount: eventTypesOverview[e.type]?.event_count ?? 0,
-  }))
-  .sort((a, b) => b.eventCount - a.eventCount);
-//                ▲      ▲
-//                │      └── b first → descending
-//                └── numeric subtraction is the comparator idiom
-//                    (also works for floats; for strings use localeCompare)
+// lib/agents/monitoring-legacy.ts:59 + 136
+const SEV_RANK: Record<Severity, number> = { critical: 3, warning: 2, info: 1, positive: 0 };
+
+// ...
+
+return [...parsed].sort((a, b) => SEV_RANK[b.severity] - SEV_RANK[a.severity]).slice(0, 10);
 ```
 
-**Why descending by eventCount:** the schema summary
-takes `slice(0, 20)` — top 20 events by activity.
-Sorting first and slicing is the simplest "top-K"
-move. The cost is O(N log N) over typically 50-200
-events; the slice is O(K). For the actual N here, the
-sort is invisible.
+Read line by line:
 
-```ts
-// lib/agents/monitoring-legacy.ts:136
-return [...parsed]
-  .sort((a, b) => SEV_RANK[b.severity] - SEV_RANK[a.severity])
-  .slice(0, 10);
-//                ▲      ▲
-//                b      a     ← descending by rank
-//                              (critical > warning > info > positive)
+- **`SEV_RANK`** is the comparator's lookup. Mapping severities to integers so `b - a` gives the comparator signal `Array.prototype.sort` expects (negative = a first, positive = b first).
+- **`[...parsed]`** — spread to a new array. The sort is in-place, so spreading avoids mutating the agent's output.
+- **`.sort((a, b) => SEV_RANK[b.severity] - SEV_RANK[a.severity])`** — comparator order is `b - a` for descending. `b` first → larger SEV_RANK first → critical above warning above info above positive.
+- **`.slice(0, 10)`** — take the first 10. Top-K via sort+slice.
+
+Total cost: O(n) spread + O(n log n) sort + O(k) slice. **For n ≤ 10 (the prompt's cap), it's microseconds.** The whole expression runs after a multi-second LLM call; the sort isn't the bottleneck.
+
+```
+  execution trace — 4 anomalies in, ranked + sliced
+
+  parsed = [
+    { metric: "x", severity: "warning" },   // SEV_RANK = 2
+    { metric: "y", severity: "critical" },  // SEV_RANK = 3
+    { metric: "z", severity: "info" },      // SEV_RANK = 1
+    { metric: "w", severity: "critical" },  // SEV_RANK = 3
+  ]
+
+  spread:    [...parsed] = same 4 items, new array
+  sort by (b - a) of SEV_RANK:
+    critical (3), critical (3), warning (2), info (1)
+    → [y, w, x, z]    (y and w tie; stable sort keeps original order)
+
+  slice(0, 10):   [y, w, x, z]   (k=10, n=4, returns all)
 ```
 
-The rank table (`SEV_RANK`) is a `Map<Severity,
-number>` (or a plain object indexed by string). The
-comparator reads both ranks and subtracts. **The
-pattern to internalise:** when sorting by a
-categorical field, build a rank table once, then
-compare *ranks* in the comparator.
-Comparing strings directly with `localeCompare` would
-give alphabetical order ("critical, info, positive,
-warning"), not severity order.
+**The stability note** — JS `Array.prototype.sort` is guaranteed stable since ES2019. That matters here: two `critical` anomalies stay in the order Claude emitted them. If sort were unstable, you'd get nondeterministic ranking among ties — bad for screenshots, bad for snapshot tests, bad for the demo path.
 
-```ts
-// lib/mcp/tool-coverage.ts:58, 61
-return {
-  serverTools: [...server].sort(),                        // ← default lexicographic
-  // ...
-  unusedOnServer: serverToolNames.filter((n) => !configured.has(n)).sort(),
-};
-```
+#### the argmin reduce — the funnel leak
 
-**The default `Array.prototype.sort()` (no comparator)
-sorts by Unicode code-point, treating elements as
-strings.** That's fine here because tool names are
-strings. **The break case:** `[10, 2, 1].sort()`
-returns `[1, 10, 2]`, not `[1, 2, 10]`, because "10"
-< "2" lexicographically. Numbers always need an
-explicit comparator. This is the most common JS
-interview gotcha around sort.
-
-**Argmin via reduce — single-pass selection**
+The `InsightCard` finds the funnel stage with the smallest value (the "leak point"):
 
 ```ts
 // components/feed/InsightCard.tsx:155-161
+const funnel = insight.funnel;
 const funnelStages = funnel
   ? (['view', 'cart', 'checkout', 'purchase'] as const).map((k) => ({ k, v: funnel[k] }))
   : [];
@@ -244,242 +167,271 @@ const leakKey = funnelStages.length
   : null;
 ```
 
+- **`reduce((a, b) => (b.v < a.v ? b : a))`** — argmin via reduce. `a` is the running smallest; if the new `b` is smaller, swap. End of pass, `a` is the smallest.
+- The starting accumulator is implicit — calling `reduce` without an initial value uses the first array element as the seed and starts iterating from the second.
+- Returns the stage object; `.k` extracts the stage name (`'view'` | `'cart'` | `'checkout'` | `'purchase'`).
+
+Cost: O(n), n = 4. One pass, no allocation beyond the closure. This is the **right primitive when you need ONE extreme** — sorting would waste work, building a heap would be theater.
+
 ```
-  Argmin via reduce — one pass over 4 elements
-  ────────────────────────────────────────────
+  argmin via reduce — execution trace
 
   funnelStages = [
-    {k: 'view',     v: 1000},   ← step 1
-    {k: 'cart',     v:  300},   ← step 2
-    {k: 'checkout', v:  150},   ← step 3
-    {k: 'purchase', v:  100},   ← step 4
+    { k: 'view',     v: 1000 },
+    { k: 'cart',     v: 600 },
+    { k: 'checkout', v: 200 },   ← leak
+    { k: 'purchase', v: 180 },   ← actually the smallest
   ]
 
-  reduce trace:
-    init:   a = {k: 'view', v: 1000}
-    step 1: b = {k: 'cart', v: 300}      → 300 < 1000 → a = b
-            a = {k: 'cart', v: 300}
-    step 2: b = {k: 'checkout', v: 150}  → 150 < 300  → a = b
-            a = {k: 'checkout', v: 150}
-    step 3: b = {k: 'purchase', v: 100}  → 100 < 150  → a = b
-            a = {k: 'purchase', v: 100}
+  reduce:
+    a = {k: 'view', v: 1000}, b = {k: 'cart', v: 600}
+      → b.v < a.v (600 < 1000) → a = {k: 'cart', v: 600}
+    a = {k: 'cart', v: 600},  b = {k: 'checkout', v: 200}
+      → 200 < 600 → a = {k: 'checkout', v: 200}
+    a = {k: 'checkout', v: 200}, b = {k: 'purchase', v: 180}
+      → 180 < 200 → a = {k: 'purchase', v: 180}
 
-  result: leakKey = 'purchase'
-                    ↑ the funnel stage with the smallest count
-                    → "where the funnel leaks the most"
+  leakKey = 'purchase'    ← O(n) pass picked the smallest
 ```
 
-This is the *correct* O(N) algorithm for "find the
-minimum element." Sorting and taking `[0]` is O(N
-log N) — wasteful. The `reduce` does it in one pass.
-**The skeleton:** keep a running best, compare each
-new element, update if better. Generalises to argmax,
-min-with-tiebreak, top-K (using a small heap).
+The interview hook: **argmin/argmax via reduce is the right move when you need ONE extreme, not a sorted list.** Sorting to get the smallest is O(n log n) when O(n) does the job. The same lesson applies to argmax — flip the comparator.
 
-**The selection problem — what this *would* use a
-heap for**
+#### linear filters everywhere — and when they'd stop being fine
 
-If the question changed from "single argmin" to
-"three lowest funnel stages," the comparable approach
-is `sort(asc).slice(0, 3)` for small N, or a max-heap
-of size 3 for streaming/large N. (The full top-K
-heap walk lives in `03-stacks-queues-deques-and-
-heaps.md`.)
+The codebase filters arrays in dozens of places: tool-schemas filtering by allowed-set, evidence-pulling for current/prior numbers, hypotheses-tested counts. Each is one pass over a small array. The pattern:
 
-**Binary search — not used, but here's when you'd
-reach for it**
+```ts
+// lib/agents/tool-schemas.ts:13-16
+const set = new Set(allowed);
+return all
+  .filter((t) => set.has(t.name))
+  .map((t) => ({ name: t.name, ... }));
+```
+
+The interesting part is the **Set built once, used in the filter callback** — same pattern as the categories one (file 02). Without the Set, `filter` would call `allowed.includes(t.name)` for each tool, which is O(allowed.length) per call, making the total O(n × m). The Set turns it into O(n + m). At n=m=20 it doesn't matter; the discipline matters because it's the right shape.
+
+When linear scan stops being fine:
 
 ```
-  PSEUDOCODE — binary search on a sorted array
-  ────────────────────────────────────────────
+  the seam — scan once vs scan in a loop
 
-  function binarySearch(arr, target):
+  one-shot scan:           array.filter / map / reduce — fine
+  scan in a tight loop:    pre-build a Map/Set (file 02), or sort
+                           the array once and binary-search per query
+  data mutates + queries:  balanced BST (file 04) — beats both above
+```
+
+This codebase only ever does one-shot scans, so the linear pattern is right.
+
+#### binary search — the one you don't have
+
+No binary search anywhere in `blooming_insights`. **When would you reach for it?**
+
+```
+  binary search — the pattern (pseudocode)
+
+  function binarySearch(sortedArr, target):
     lo = 0
-    hi = arr.length
-    while lo < hi:                      // ← half-open interval [lo, hi)
-      mid = lo + (hi - lo) >> 1         // ← avoid (lo+hi) overflow in
-                                        //   languages where int wraps
-      if arr[mid] == target:
+    hi = sortedArr.length - 1
+    while lo <= hi:
+      mid = (lo + hi) >> 1           // bit-shift for integer division
+      if sortedArr[mid] == target:
         return mid
-      elif arr[mid] < target:
+      if sortedArr[mid] < target:
         lo = mid + 1
       else:
-        hi = mid
-    return -1                           // ← not found
+        hi = mid - 1
+    return -1                        // not found
 
-  load-bearing parts (what breaks if you remove each):
-    - the interval invariant (half-open vs closed) ← gets off-by-one wrong
-    - lo + (hi - lo) >> 1                          ← Java/C++ overflow bug
-    - the equality check                          ← infinite loop if missing
-    - the < vs > direction                        ← wrong half discarded
+  termination: when lo > hi (range collapsed without a match)
+  cost:        O(log n)              — halve the range each step
 ```
 
-This repo doesn't reach for binary search because
-every lookup target is hash-keyed (Map) or short-
-scanned. Where binary search comes back: range
-queries on sorted arrays ("all elements between X
-and Y"), binary search on the *answer* (parametric
-search, e.g. "smallest K such that ..."), and the
-canonical "first/last occurrence" variants that show
-up in interviews constantly.
+**The kernel** (Move 2 variant): three load-bearing parts.
 
-#### Move 3 — the principle
+```
+  binary search kernel — what BREAKS when each part is missing
 
-Sort is the operation that *creates* a total order;
-binary search is the operation that *exploits* one.
-Reach for sort when you need ranked output or a top-K
-slice. Reach for binary search when the same sorted
-array is queried many times *and* hash-keyed lookup
-doesn't fit (e.g. range queries). For single-key
-lookups in JavaScript, a Map always wins — binary
-search shines for ranges, not points.
+  1. lo, hi (the search range)    — without them: no notion of where
+                                    to look next
+
+  2. mid = (lo + hi) >> 1         — the halving move; the >> 1 is the
+                                    integer-overflow-safe form of /2
+                                    (in JS we don't have int overflow,
+                                    but in C/Java the (lo+hi)/2 overflows
+                                    on huge arrays — this is the canonical
+                                    interview catch)
+
+  3. termination test (lo > hi)   — without it: infinite loop on misses
+                                    (lo and hi keep crossing each other)
+
+  + the precondition: the array MUST be sorted by the same comparator
+    you're searching with. unsorted → undefined behavior, not even O(n).
+```
+
+The interview hook: **the off-by-one in the termination condition.** `while (lo <= hi)` with `hi = mid - 1` and `lo = mid + 1` is one correct formulation; `while (lo < hi)` with `hi = mid` (or `lo = mid + 1`) is another. They're not interchangeable — get the pair wrong and you either infinite-loop or skip the last element. Most BS bugs are in this corner.
+
+Where it would land here if the surface grew: a sorted insights timeline indexed by `timestamp`, binary-searched for "the insight just before this time." Today the insights are a Map keyed by id and a small array; no use case.
+
+#### quickselect — the K-th smallest in O(n)
+
+Not in this codebase, worth knowing for interviews. **Quickselect is quicksort but you only recurse into the side that contains the K-th element.** Average O(n) instead of O(n log n); worst case O(n²) (same as quicksort) but mitigated with random pivot.
+
+```
+  quickselect — the pattern, sketch
+
+  function quickselect(arr, k):
+    pivot = pick random element
+    less, equal, greater = partition arr by pivot
+    if k < less.length:                    return quickselect(less, k)
+    if k < less.length + equal.length:     return pivot
+    return quickselect(greater, k - less.length - equal.length)
+
+  unlike sort, we DON'T recurse into both sides — only the side
+  containing the k-th element. that's where the O(n) average comes from.
+```
+
+When to reach for it: when you need the median, the K-th smallest by some criterion, or the top-K but you don't care about the order within the top K. Real use cases: anomaly detection (find the top 1% by severity score), feature selection (top K features by importance), load balancing (the median latency).
+
+### Move 3 — the principle
+
+Sorting answers "in what order?" Searching answers "where is this one?" Selection answers "which one is at position k?" **Different questions get different algorithms** — the mistake is reaching for sort when argmin would do, or for sort when binary search over a stable sorted array would do, or for a hand-rolled K-th when a fixed-size heap is one library call away. The cost ceiling is the same vocabulary as file 01: pick the right ruler, then pick the algorithm that minimizes the right cost.
 
 ## Primary diagram
 
-```
-  The sort/search decision tree for this repo
-  ───────────────────────────────────────────
+The recap — the one sort, the one argmin, and the gap.
 
-  ┌─ what are you trying to do? ──────────────────────────┐
-  │                                                        │
-  │  rank N items by score?                                │
-  │    N small (≤ 100):    arr.sort(cmp).slice(0, K)       │
-  │    N large/streaming:  min-heap of size K              │
-  │                                                        │
-  │  find the min / max / argmin?                          │
-  │    arr.reduce((best, x) => cmp(x, best) ? x : best)    │
-  │    → O(N), one pass, no sort needed                    │
-  │                                                        │
-  │  lookup one item by key?                               │
-  │    Map.get(key)  → O(1)                                │
-  │    arr.find / .filter → O(N), only fine for tiny N     │
-  │                                                        │
-  │  lookup range of items?                                │
-  │    sort array, then binary search bounds → O(log N)    │
-  │    (or use a sorted structure: TreeMap, B-tree)        │
-  │                                                        │
-  │  check membership?                                     │
-  │    Set.has(key) → O(1)                                 │
-  │    arr.includes → O(N), break-even at N ≈ 5-10         │
-  └────────────────────────────────────────────────────────┘
+```
+  ordering and lookup in blooming_insights
+
+  EXERCISED ─────────────────────────────────────────────────────────
+  comparator sort + slice (top-K with K ≥ n)
+   monitoring-legacy.ts:136
+   [...parsed].sort((a,b) => SEV_RANK[b.severity] - SEV_RANK[a.severity])
+              .slice(0, 10)
+   n ≤ 10, k = 10 — sort+slice is the right code at this scale.
+
+  argmin via reduce (single extreme, one pass)
+   InsightCard.tsx:160
+   funnelStages.reduce((a, b) => (b.v < a.v ? b : a)).k
+   n = 4, returning ONE extreme — sorting would be wasted work.
+
+  linear filter / map / reduce (one-shot scans)
+   tool-schemas, categories, evidence pulls, parseAgentJson search
+   n always small, pattern always one-pass — linear is right.
+
+  NOT YET EXERCISED ─────────────────────────────────────────────────
+  binary search        — would land where a sorted timeline is queried
+                         repeatedly; no such surface today
+  quickselect          — would land for K-th smallest at scale
+  merge sort           — would land for external sort / streaming sort
+  fixed-size top-K heap — the upgrade path for sort+slice at large n
+
+  the decision matrix ────────────────────────────────────────────────
+  one extreme:              argmin reduce          (this code)
+  full order, small n:      comparator sort        (this code)
+  top K, large n:           fixed-size heap        (not here)
+  lookup, sorted + stable:  binary search          (not here)
+  k-th element:             quickselect            (not here)
+  external / streaming:     merge sort variants    (not here)
 ```
 
 ## Elaborate
 
-JavaScript's `Array.prototype.sort` is required by
-the spec to be stable as of ES2019 (V8's TimSort
-already was). Stability means "elements that compare
-equal preserve their original order." That matters
-when you sort by one key first, then by another to
-break ties — the first sort's order survives where
-the second sort says "equal."
+Sorting is the most-studied algorithm in computer science. The O(n log n) lower bound for comparison-based sorting is information-theoretic — n elements have n! permutations, and binary comparisons distinguish 2 per step, so log₂(n!) ≈ n log n comparisons are necessary. **You can beat it only by giving up generality**: counting sort (O(n) when keys are bounded integers), radix sort (O(nk) for k-digit keys), bucket sort (O(n) when keys are uniformly distributed).
 
-The comparison-based lower bound for sort is O(N log
-N): any algorithm that sorts by comparing pairs of
-elements cannot beat it. The way to beat it: don't
-compare. Counting sort (O(N + K) for K distinct
-values), radix sort (O(N × W) for W-character keys)
-both beat O(N log N) by exploiting structure in the
-keys. Not exercised here; worth knowing for the
-"sort 1 billion integers in O(N)" interview question.
+The named comparison sorts:
+- **mergesort** — divide, recurse, merge. Stable. Worst case O(n log n). Used in Python's Timsort, V8 for `Array.prototype.sort`. Allocates O(n) extra.
+- **quicksort** — pick pivot, partition, recurse. Average O(n log n), worst O(n²). In-place. Cache-friendly. Unstable in the textbook version.
+- **heapsort** — build a heap (O(n)), extract-min n times (O(log n) each). Worst case O(n log n). In-place. Unstable.
 
-Binary search has *families*: lower-bound (first
-index ≥ target), upper-bound (first index > target),
-exact match. Each has subtle invariant differences;
-the C++ STL exposes `lower_bound` / `upper_bound`
-exactly for this reason. The "binary search on the
-answer" pattern (parametric search) shows up in
-"capacity to ship within D days" and "minimum number
-of x's such that condition Y holds" problems.
+**JavaScript's `Array.prototype.sort`** is V8's `Timsort` (a hybrid of mergesort + insertion sort) since 2018; it's stable, adaptive (faster on partially-sorted input), and worst-case O(n log n).
 
-The selection problem (find the K-th smallest in O(N)
-average) is solved by Quickselect — partition like
-QuickSort but recurse into only the side containing
-K. Average O(N), worst O(N²); the median-of-medians
-trick makes it O(N) worst-case at the cost of bigger
-constants. Not reached for in this repo, on the
-practice list.
+**Binary search** appears in Mauchly's 1946 lectures and was published by Bottenbruch in 1962, but Bentley's 1986 *Programming Pearls* observed that an estimated 90% of programmers can't write it correctly on the first try — the off-by-one in the loop bounds is the canonical bug. **Always test with [empty, single-element, target-at-edges, target-missing] inputs.**
 
-For deep grounding: CLRS Chapter 8 (sorting in linear
-time), Chapter 9 (medians and order statistics).
-Sedgewick *Algorithms 4th Ed* §2.1-2.5.
+**Quickselect** is Hoare 1961 (same paper as quicksort). The introselect variant (Musser, 1997) guarantees worst-case O(n) by switching to median-of-medians on bad pivots; it's what most standard libraries ship as their `nth_element`.
+
+Read next: file 03 (the heap-based top-K that would replace sort+slice at scale), file 04 (the BST that wins over binary search when the data mutates), file 08 (where binary search ranks in your practice plan — high; it's the most commonly-asked easy/medium problem in tech interviews).
 
 ## Interview defense
 
-**Q: Walk me through `[10, 2, 1].sort()`. What does
-it return?**
+### Q: Walk me through the monitoring agent's anomaly ranking.
 
-```
-  Default sort gotcha
-  ───────────────────
+It's a comparator sort with a fixed integer lookup, then a slice for the top 10:
 
-  [10, 2, 1].sort()                returns [1, 10, 2]
-                                            ↑
-  why: default sort treats elements as STRINGS
-       "1" < "10" < "2" by Unicode code point
-
-  [10, 2, 1].sort((a, b) => a - b) returns [1, 2, 10]
-                          ▲
-                          numeric comparator: ALWAYS use
-                          one for numbers
+```ts
+const SEV_RANK: Record<Severity, number> = { critical: 3, warning: 2, info: 1, positive: 0 };
+return [...parsed].sort((a, b) => SEV_RANK[b.severity] - SEV_RANK[a.severity]).slice(0, 10);
 ```
 
-Model answer: "Returns `[1, 10, 2]`, not `[1, 2, 10]`
-— default sort treats elements as strings and
-compares Unicode code points. '10' < '2' < '1' is
-false; '1' < '10' < '2' lexicographically because '1'
-comes before '2'. The fix is always pass a numeric
-comparator: `.sort((a, b) => a - b)`. This is the JS
-sort gotcha — biting it is a one-second tell that
-someone hasn't actually used sort in production."
+- `SEV_RANK` is the comparator lookup — `critical > warning > info > positive`.
+- The comparator returns `b - a` for descending: when `b` has higher rank, the return is positive, which `sort` reads as "b comes first."
+- `[...parsed]` is a defensive copy so the sort doesn't mutate the agent's output array.
+- `slice(0, 10)` is top-K with K=10.
 
-**Q: How would you find the top-10 anomalies by
-severity?**
+Cost is O(n log n) for the sort + O(k) for the slice. **n is at most 10 by the prompt's cap, so it's microseconds.** The real cost was the multi-second LLM call that produced `parsed`.
 
-Model answer: "Build a severity rank table — `SEV_RANK
-= {critical:4, warning:3, info:2, positive:1}` — then
-`[...arr].sort((a, b) => SEV_RANK[b.severity] -
-SEV_RANK[a.severity]).slice(0, 10)`. Note `b` first
-for descending. For N ≤ 30 this is one line and O(N
-log N); for streaming or N >> 10, switch to a min-
-heap of size K at O(N log K). Anchor:
-`lib/agents/monitoring-legacy.ts:136`."
+The stability point: V8's sort has been stable since ES2019, so two `critical` anomalies stay in the order Claude emitted them. That's load-bearing for the demo path — instability would mean nondeterministic ordering among ties, which breaks snapshot tests and reproducible screenshots.
 
-**Q: What does binary search need that this codebase
-doesn't have?**
+The upgrade: if `n` ever grew to thousands of candidates (Claude producing exploratory anomalies, then picking the top 10), I'd switch to a **fixed-size min-heap of K=10**. Walk the array, push each, pop when size > K. End cost O(n log K) — at n=10⁶ that's ~3.3 million operations vs ~20 million for a full sort, and you never hold the full sorted array.
 
-Model answer: "A sorted array of meaningful size
-that's queried many times. Every lookup here is
-hash-keyed (Map.get) or short-scanned (≤ 30 element
-arrays), so binary search's O(log N) win never pays
-the 'keep sorted' cost. Binary search comes back when
-the question is *range*: 'all elements between X and
-Y', or 'first occurrence of K', or parametric search
-('smallest D such that ...'). Maps can't answer
-range questions in sub-O(N); binary search on a
-sorted array can. Different shapes, different
-algorithms."
+Anchor: `lib/agents/monitoring-legacy.ts:59, 136`.
 
-**Q: How does `arr.reduce` find the minimum, and why
-not just `arr.sort()[0]`?**
+### Q: When would binary search beat a hash map?
 
-Model answer: "Reduce is O(N) — one pass, comparing
-each element against the running best. Sort is O(N
-log N) — does a lot of work you throw away. For
-single-min, reduce is strictly better; for sorted
-output, sort wins. The funnel-leak code uses reduce
-because it only needs the single minimum stage:
-`funnelStages.reduce((a, b) => b.v < a.v ? b : a).k`.
-That's the textbook 'argmin in one pass.' Anchor:
-`components/feed/InsightCard.tsx:160`."
+Two cases:
+
+- **range queries.** Hash maps answer "is this exact key in the set?" Binary search on a sorted array answers "find the smallest key ≥ X" or "all keys between A and B" — the hash map can't do this cheaply (you'd scan all keys). A timeline of insights sorted by `timestamp` lets you binary-search for "the insight just before noon" in O(log n).
+- **memory locality.** A sorted array is contiguous bytes; a hash map is buckets with pointer hops. For read-mostly data that fits in L2 cache, binary search over a sorted array can beat a hash map's O(1) by a constant factor because the cache lines are friendlier.
+
+The cost of binary search is O(log n) per query but requires the precondition that the array is sorted. **If the data mutates between queries, you pay O(n) per insert** (shift to keep sorted), and at that point you reach for a balanced BST (file 04) which gives O(log n) for both.
+
+```
+  the decision matrix
+
+  read mostly, fits in memory:       sorted array + binary search
+  read + write mixed:                balanced BST
+  exact-key lookups only, mutating:  hash map (O(1))
+  point lookups + range queries:     balanced BST or sorted array
+```
+
+In `blooming_insights` neither shows up — every data set is either tiny (10 anomalies) or hash-keyed by string id. The binary-search practice is for the interview surface, not the codebase.
+
+Anchor: none here (binary search is `not yet exercised`); pattern lives in your DSA portfolio's `BinarySearchTree.ts` as the tree-flavored cousin.
+
+### Q: Why use `reduce` for argmin instead of `Math.min` or `sort`?
+
+Three reasons in order:
+
+1. **`Math.min` returns the value, not the index/key.** I need the funnel stage *name* (`'view'`, `'cart'`, `'checkout'`, `'purchase'`), not the raw number. `Math.min(...funnelStages.map(s => s.v))` would give me 180 — I'd then have to scan again to find which stage had that value. Two passes for what reduce does in one.
+
+2. **`sort` is O(n log n); reduce-as-argmin is O(n).** Sorting the array to take the first element wastes work — I only need one extreme, not full order. At n=4 it doesn't matter, but the *instinct* matters.
+
+3. **Reduce stays a one-pass functional expression.** It composes inside the JSX render code cleanly; sort would force mutation or an extra spread.
+
+```
+  three options, ranked
+
+  funnelStages.reduce((a, b) => (b.v < a.v ? b : a)).k   ← this code
+     O(n), one pass, returns the OBJECT
+
+  funnelStages.sort((a, b) => a.v - b.v)[0].k
+     O(n log n), mutates, returns the OBJECT
+
+  funnelStages.find(s => s.v === Math.min(...funnelStages.map(x => x.v))).k
+     O(n²) (the find scans, the inner map+min scans), returns the OBJECT
+
+  the reduce wins on all three.
+```
+
+The general principle: **argmin/argmax via reduce is the right tool when you need one extreme element, not a sorted list.** Same lesson for argmax — flip the comparator.
+
+Anchor: `components/feed/InsightCard.tsx:159-161`.
 
 ## See also
 
-- `01-complexity-and-cost-models.md` — when O(N log
-  N) is invisible and when it isn't
-- `02-arrays-strings-and-hash-maps.md` — Map for
-  point lookup vs binary search for range
-- `03-stacks-queues-deques-and-heaps.md` — heap for
-  top-K when N is large or streaming
-- `08-dsa-foundations-practice-map.md` — Quickselect,
-  parametric binary search on the practice plan
+- 01-complexity-and-cost-models.md — for the n-log-n vs n decision matrix.
+- 02-arrays-strings-and-hash-maps.md — for the "build a Set before filter" pattern that turns scan-in-loop into one O(n) prep.
+- 03-stacks-queues-deques-and-heaps.md — for the fixed-size heap that replaces sort+slice at scale.
+- 04-trees-tries-and-balanced-indexes.md — for the BST that beats binary search when the data mutates.
+- 08-dsa-foundations-practice-map.md — for where binary search and quickselect rank in the practice plan.

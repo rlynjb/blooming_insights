@@ -1,15 +1,15 @@
-# 06 · Orchestration system design templates
+# 06 — Orchestration system design templates
 
-Three generic interview-style design prompts, each reframed against the codebase. Same nine-bullet template per prompt: the prompt, standard architecture, data model, key components, scale concerns, eval framing, common failure modes, applies to this codebase, how to make it apply.
+Anchor: codebases reframed as interview templates
 
-## Files
+Three generic system-design templates that mirror the same template-shape used in `study-ai-engineering`'s system-design sub-section. Each follows a fixed nine-bullet structure (prompt / standard architecture / data model / key components / scale concerns / eval framing / common failure modes / applies to this codebase / how to make it apply). The first seven bullets are generic to the template; the last two are answered against this repo.
 
-1. [`01-multi-agent-research-assistant.md`](./01-multi-agent-research-assistant.md) — "answer a research question by gathering from multiple sources and synthesizing"
-2. [`02-agentic-support-system.md`](./02-agentic-support-system.md) — "resolve user requests by taking real actions across tools, escalating when it can't" — **closest match to this repo**
-3. [`03-agentic-coding-system.md`](./03-agentic-coding-system.md) — "complete a coding task across a repo — read, plan, edit, verify"
+The point: same code, interview framing. The exercise of asking "could I describe this codebase as the canonical answer to template X?" surfaces what's there, what's partially there, and what the refactor would look like.
 
-## How to read
+## The three templates and how they fit
 
-Each template is generic — the "standard architecture" and "scale concerns" bullets describe the canonical shape independent of any codebase. The last two bullets — **Applies to this codebase** and **How to make it apply** — are answered specifically about *this* repo.
+1. **`01-multi-agent-research-assistant.md`** — partial fit. The investigation pipeline does decompose-query → retrieve-evidence, but the synthesis is missing (no LLM merger; each agent's output is the final word for its stage).
 
-The point: in an interview where the prompt is "design an agentic X system," you walk the standard architecture; in defense, you anchor to your repo. The applies/how-to bullets are the bridge.
+2. **`02-agentic-support-system.md`** — partial fit. The QueryBox path is the closest match; the diagnostic agent + recommendation pipeline is a different shape. The "takes real actions" piece doesn't apply (recommendations are proposals, not auto-executed actions).
+
+3. **`03-agentic-coding-system.md`** — no fit. The repo isn't a coding agent. Included for completeness because the spec ships all three regardless of shape.

@@ -1,297 +1,235 @@
-# 05 — retry and circuit breaker
+# Retry and circuit breaker
 
-**Subtitle:** Retry-with-backoff (present) + circuit breaker (Case B) · Industry standard
+*Industry standard — exponential backoff with jitter · circuit breaker*
 
-## Zoom out, then zoom in
+## Zoom out — where this concept lives
 
-**Retry is present** (in `BloomreachDataSource`, see previous file).
-**Circuit breaker is Case B** — there's no "is the provider currently
-broken?" gate that fast-fails the rest of the request when it knows
-the provider is down. Today, every tool call to a down provider
-incurs the full retry budget before failing.
+Two patterns that layer for production resilience. **Retry with backoff** is shipped today inside `BloomreachDataSource` — exponential fallback when no hint is parseable, parsed-window when one is, with a 20s ceiling and 3-attempt max. **Circuit breaker is NOT shipped.** When Bloomreach is down for sustained minutes, every new request burns up to 60s in retries before failing.
 
 ```
-  Zoom out — retry catches transient failures; circuit catches sustained
+  Zoom out — two patterns, layered
 
-  ┌─ tool call ────────────────────────────────────┐
-  │  ┌─ retry (present) ──────────────────────────┐ │  ← we covered in 04
-  │  │  parse retry-after, sleep, retry up to 3x  │ │
-  │  └────────────────────────────────────────────┘ │
-  │  ┌─ circuit breaker (Case B) ─────────────────┐ │  ← we are here
-  │  │  if N recent failures: OPEN — fail fast    │ │
-  │  │  after T: HALF-OPEN — try one              │ │
-  │  │  succeed: CLOSED; fail: OPEN again         │ │
-  │  └────────────────────────────────────────────┘ │
-  └─────────────────────────────────────────────────┘
+  ┌─ Retry with backoff (shipped) ───────────────────────────┐
+  │  Where: BloomreachDataSource.callTool line 153-170       │
+  │  Hint-first (parsed window) → backoff fallback           │
+  │  Max 3 retries, 20s ceiling                              │
+  │  Handles: transient failures (network blips, rate limit) │
+  └──────────────────────────────────────────────────────────┘
+  ┌─ ★ Circuit breaker (not shipped) ★ ──────────────────────┐ ← we are here
+  │  Would handle: sustained failures (server down 5+ min)   │
+  │  Without it: every new request burns retries before      │
+  │              failing → bad user experience               │
+  │  Exercise: B4.6 in 04-agents-and-tool-use/06-error-      │
+  │             recovery.md                                  │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-## Structure pass
+**Zoom in.** Retry handles "the server hiccupped." Circuit breaker handles "the server is having a bad time and hammering it isn't helping." Both are needed for full production resilience; this codebase has the first and not the second.
 
-  → **One axis to trace — failure shape.** Retry handles *transient*
-    failures (a single rate-limit error, a temporary network blip).
-    Circuit breaker handles *sustained* failures (provider down for
-    minutes). Different mechanisms for different failure profiles.
+## Structure pass — layers · axes · seams
+
+**Layers:** call → fail → retry decision → wait → retry / fail-fast.
+
+**Axis: when do you keep trying vs give up?** Retry: when failures might be transient. Circuit breaker: when failures are clearly sustained (N consecutive fails in M seconds).
+
+**Seam:** the retry loop at `lib/data-source/bloomreach-data-source.ts:153-170`. Adding a circuit breaker would wrap this loop with a check ("circuit open? fail fast"); see the `B4.6` exercise.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You've seen this pattern in resilient HTTP clients (Polly for .NET,
-Hystrix for Java, Resilience4j). Two layers, layered:
+You know how a smart user retries clicking a button once or twice when a page errors, but stops trying after the third time because they realize the site is down? Retry is the first two clicks; circuit breaker is the third-click recognition.
 
 ```
-  Retry — handles transient
-  ──────────────────────────
-  attempt 1: fail
-  attempt 2: fail
-  attempt 3: succeed → return
-  (most failures clear within 3 tries)
+  Retry (shipped) and circuit breaker (not) — layered patterns
 
-  Circuit breaker — handles sustained
-  ───────────────────────────────────
-  attempt 1: fail
-  attempt 2: fail
-  attempt 3: fail
-  attempt 4: fail
-  attempt 5: fail → OPEN CIRCUIT (provider seems down)
-  next 30s of calls: fail fast (no provider attempt)
-  attempt at 30s mark: HALF-OPEN, try one
-   success → CLOSE (normal operation resumes)
-   failure → OPEN again, wait another 30s
+  Retry with backoff:
+   ──────────────────
+   attempt 1 fails → wait W1 → attempt 2
+   attempt 2 fails → wait W2 → attempt 3
+   attempt 3 fails → throw
+
+   For transient failures: brief windows, network blips, the
+    server is briefly unhappy. Three attempts usually resolve it.
+
+  Circuit breaker:
+   ────────────────
+   after N consecutive failures across requests (e.g. 5 in 60s),
+   OPEN the circuit. New requests fail FAST (~1ms) without trying.
+
+   After T seconds (e.g. 60s), HALF-OPEN. Try one request.
+    If it succeeds, CLOSE.
+    If it fails, re-OPEN.
+
+   For sustained failures: server down for minutes/hours.
+    Stops hammering a broken service and gives the user a
+    fast error instead of a long wait.
 ```
 
 ### Move 2 — the step-by-step walkthrough
 
-**The retry side is in place.** See
-`04-rate-limiting-backpressure.md` for the full walkthrough of
-`BloomreachDataSource.callTool`'s retry ladder. Three attempts max,
-each capped at 20s wait, server-stated hint preferred over backoff.
+**Part 1 — retry, shipped.**
 
-**What retry alone doesn't solve.** Three scenarios where retry-only
-hurts:
-
-  1. **Provider is down for several minutes.** Every tool call burns
-     ~30s (3 retries × 10s avg) before failing. A 6-tool diagnostic
-     loop takes ~180s instead of failing fast at ~5s.
-
-  2. **OAuth token revoked.** Bloomreach's alpha server revokes tokens
-     after minutes; the next tool call returns auth error, retry
-     loops through attempts (auth doesn't fix during the wait), eats
-     budget, returns auth error. Today's mitigation is
-     `useReconnectPolicy` on the client side — on `invalid_token` error,
-     reset and reload. This is *application-level circuit breaking*,
-     not a generic circuit breaker.
-
-  3. **Anthropic API outage.** Rare but happens. Every model call would
-     retry (via the SDK's built-in retry), each taking ~30s, until the
-     whole route times out. A circuit breaker would detect the pattern
-     and fail fast.
-
-**The hypothetical circuit breaker** for `BloomreachDataSource`:
+`BloomreachDataSource.callTool` at `lib/data-source/bloomreach-data-source.ts:153-170`:
 
 ```typescript
-// lib/data-source/circuit-breaker.ts (Case B)
-type CircuitState = 'closed' | 'open' | 'half_open';
-
-class CircuitBreaker {
-  private state: CircuitState = 'closed';
-  private failureCount = 0;
-  private openedAt: number = 0;
-  private readonly failureThreshold = 5;
-  private readonly openDurationMs = 30_000;
-
-  async call<T>(fn: () => Promise<T>): Promise<T> {
-    if (this.state === 'open') {
-      if (Date.now() - this.openedAt < this.openDurationMs) {
-        throw new Error('circuit open — failing fast');
-      }
-      this.state = 'half_open';   // time to try
-    }
-
-    try {
-      const result = await fn();
-      if (this.state === 'half_open') this.state = 'closed';
-      this.failureCount = 0;
-      return result;
-    } catch (e) {
-      this.failureCount++;
-      if (this.failureCount >= this.failureThreshold) {
-        this.state = 'open';
-        this.openedAt = Date.now();
-      }
-      throw e;
-    }
-  }
+let retries = 0;
+while (isRateLimited(result) && retries < this.maxRetries) {
+  retries++;
+  const hintMs = parseRetryAfterMs(result);
+  const backoffMs = this.retryDelayMs * 2 ** (retries - 1);
+  const waitMs = Math.min(
+    hintMs != null ? hintMs + RETRY_BUFFER_MS : backoffMs,
+    this.retryCeilingMs,
+  );
+  await sleep(waitMs);
+  result = await this.liveCall(name, args, options.signal);
 }
 ```
 
-Wired into `BloomreachDataSource`:
+Six properties:
 
-```typescript
-// hypothetical wiring
-private breaker = new CircuitBreaker();
+  → **`maxRetries = 3`** — bounded number of attempts.
+  → **Hint-first.** If the server says "retry after 12s," wait 12.5s. If not, exponential backoff.
+  → **Exponential backoff** with `retryDelayMs * 2^(retries-1)`. Default `retryDelayMs = 10_000ms`. So waits are 10s, 20s, 40s.
+  → **`retryCeilingMs = 20_000`** caps any wait at 20s.
+  → **No jitter today.** Classical retry-with-backoff adds random jitter (±20%) to avoid synchronized retries from many clients. This codebase doesn't, because there's only one client per `BloomreachDataSource` instance (per-session). When the cross-session rate limiter (`B6.4`) lands, jitter becomes more relevant.
+  → **`AbortSignal` threaded** — each `sleep(waitMs)` and `liveCall` respects the route's cancellation. Tab closes mid-retry, the route exits cleanly.
 
-async callTool(...) {
-  return this.breaker.call(() => this.actualCallTool(...));
-}
+**Part 2 — circuit breaker, not shipped.**
+
+There is no circuit breaker today. When Bloomreach is down for sustained minutes, every new request:
+
+```
+  Today's behavior on Bloomreach outage:
+   ──────────────────────────────────────
+   User request 1 → live call fails → wait 10s → retry fails → wait 20s →
+                    retry fails → throw → route emits 'error' event → user sees error
+   Total: ~30s wall-clock to surface an error.
+
+   User request 2 (immediately after) → same path → another 30s.
+   User request 3 → same path → another 30s.
+
+   The server doesn't care about retries; users wait 30s per attempt
+    just to get told "service unavailable."
 ```
 
-**Per-instance vs distributed state.** On Vercel, every instance has
-its own circuit-breaker state. A circuit that opens on instance A
-doesn't tell instance B. For per-user circuit breaking
-(distributed), you'd need Vercel KV / Upstash Redis to share state.
-For per-instance, in-memory is fine — each instance will independently
-detect "provider down" within 5 failures.
+The desired behavior with a circuit breaker:
 
-**Why this isn't built today.** Three reasons:
+```
+  With circuit breaker:
+   ────────────────────
+   Request 1: fails after 30s (3 retries). Failure counter += 1.
+   Request 2: fails after 30s. Failure counter += 1.
+   Request 3: fails after 30s. Failure counter += 1.
+   ... at 5 consecutive failures in 60s → OPEN the circuit.
 
-  → The dominant failure mode (rate limit) is handled by retry — the
-    server is *intentionally* slow, not broken.
-  → The OAuth-revocation failure is handled by client-side reconnect —
-    detection lives in the UI, not the data source.
-  → A general Anthropic outage hasn't happened during development;
-    when it does, the route's 300s budget eventually expires and the
-    user sees a generic error.
+   Request 6 → CircuitOpenError immediately (<5ms).
+   ... 60 seconds later, HALF-OPEN → try one.
+     If success: CLOSE, all requests resume normally.
+     If failure: OPEN again, fail fast for another 60s.
+```
 
-It's a real Case B — would land in a more mature production
-deployment but doesn't earn its place yet.
+The benefit: after 5 failures, users get errors in <100ms instead of 30s. Big UX improvement during sustained outages.
+
+**Part 3 — where the breaker would land.**
+
+`B4.6` (in `04-agents-and-tool-use/06-error-recovery.md`) sketches the implementation: a `lib/agents/circuit-breaker.ts` that wraps `AnthropicModelProviderAdapter.complete()` with state (CLOSED / OPEN / HALF-OPEN) + counter + timer. A second instance could wrap `BloomreachDataSource.callTool` for the Bloomreach outage case.
+
+Two breakers, two failure modes:
+
+  → **Anthropic breaker.** Anthropic API outage. Sonnet returns 5xx; breaker opens after N consecutive failures.
+  → **Bloomreach breaker.** Bloomreach MCP server outage. `McpToolError` thrown N times consecutively; breaker opens.
+
+Each breaker is independent — Bloomreach down doesn't open Anthropic's breaker.
+
+**Part 4 — why not just lower `maxRetries` to 1?**
+
+Lowering retries to 1 reduces the worst-case wall-clock (30s → 10s) but loses the transient-failure recovery. A circuit breaker keeps `maxRetries = 3` (good for transient failures) AND avoids hammering during sustained failures. The patterns layer; they don't substitute.
 
 ### Move 3 — the principle
 
-**Retry handles transient failures (a single bad response). Circuit
-breakers handle sustained failures (provider down for minutes). Layer
-them — retry inside the breaker, breaker outside the retry — so each
-operates at its right scope.** A retry-only system burns budget when
-the provider is down; a circuit-breaker-only system retries less than
-it should on a single transient error.
+**Retry handles brief; circuit breaker handles sustained.** Each pattern alone is incomplete — pure retry burns time on every request during an outage; pure circuit breaker fails too easily on a single transient blip. Layered, you get fast recovery from blips AND fast errors from outages. This codebase has the first half; `B4.6` is the second half.
 
-## Primary diagram
+## Primary diagram — the full recap
 
 ```
   Retry + circuit breaker, layered
 
-  call site
-       │
-       ▼
-  ┌─ Circuit breaker check ──────────────────────────┐
-  │  state == 'open' AND (now - openedAt) < T?       │
-  │  YES → throw 'circuit open' (fail fast)          │
-  │  NO → continue                                   │
-  └──────────────────────┬───────────────────────────┘
+  ┌─ Circuit state check (would be here, not shipped) ───────────┐
+  │  if state == OPEN: throw CircuitOpenError immediately        │
+  │  if state == HALF-OPEN: allow one trial                      │
+  │  if state == CLOSED: proceed                                 │
+  └──────────────────────────────────────────────────────────────┘
                          │
                          ▼
-  ┌─ Retry ladder (existing — 04-rate-limiting-…) ──┐
-  │  attempt 1: ok? → return                        │
-  │  attempt 2: ok? → return; reset failure count   │
-  │  attempt 3: ok? → return                        │
-  │  all 3 failed → throw                           │
-  └──────────────────────┬───────────────────────────┘
+  ┌─ Live call (shipped) ────────────────────────────────────────┐
+  │  proactive spacing (1.1s)                                     │
+  │  transport.callTool(name, args)                              │
+  │  if rate-limited: retry up to 3 times                         │
+  │  if other error: throw                                       │
+  └──────────────────────────────────────────────────────────────┘
                          │
                          ▼
-  ┌─ Circuit breaker outcome ────────────────────────┐
-  │  success → failureCount = 0; state = 'closed'   │
-  │  failure → failureCount++; if >= threshold:     │
-  │             state = 'open'; openedAt = now      │
-  └───────────────────────────────────────────────────┘
+  ┌─ Result envelope ────────────────────────────────────────────┐
+  │  { result, durationMs, fromCache }                           │
+  └──────────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+  ┌─ Circuit state update (would be here, not shipped) ──────────┐
+  │  on success: failure_count = 0; if HALF-OPEN → CLOSED        │
+  │  on failure: failure_count++;                                │
+  │   if failure_count >= threshold and within window:           │
+  │     state = OPEN; schedule HALF-OPEN after T seconds         │
+  └──────────────────────────────────────────────────────────────┘
+
+  Shipped today: the middle block only (retry layer).
+  Missing: the wrapping circuit-state checks above and below.
 ```
 
 ## Elaborate
 
-The circuit breaker pattern is canonical in distributed systems
-(Hystrix popularized it; the AWS Well-Architected Framework prescribes
-it). The Netflix-style implementation has more nuance (rolling
-windows, half-open trial volume, fallback functions) but the kernel
-is the three-state machine above.
+**Why exponential backoff specifically.** Constant-interval retry (wait 5s every time) is bad because if the server is overloaded, you join a synchronized chorus of clients retrying every 5 seconds — making things worse. Exponential backoff spreads out retries over time, reducing the chance of synchronized waves. The `2^retry` doubling is the standard shape.
 
-For LLM-shaped systems specifically, circuit breaking matters at TWO
-boundaries: the model provider (Anthropic) and the data source
-(Bloomreach MCP, or whoever). blooming insights' data-source side is
-the more pressing one because Bloomreach's alpha is less reliable
-than Anthropic. The Anthropic SDK has built-in retry but not breaker
-behavior — adding one on the Blooming side would catch sustained
-Anthropic outages.
+**Where jitter would help.** Multiple agents in the same `BloomreachDataSource` instance won't have synchronized retries (the retry happens inside one `callTool` invocation, which is sequential). But once `B6.4` (cross-session rate limiter) lands, multiple instances could synchronize on the shared KV-based timer. Adding ±20% jitter to retry waits is a small change that defends against this.
+
+**Where this codebase's retry might bite.** Three known cases:
+
+  1. **Bloomreach OAuth expiry.** A 401 from "token expired" isn't a rate limit, isn't transient — retry doesn't help. The McpToolError is thrown immediately and the route's auto-reconnect logic kicks in.
+  2. **Schema validation failures.** If the model emits malformed `tool_use.input`, the MCP server rejects it. Retry doesn't help — the same malformed input on retry fails identically. Today, this just times out 3 retries and throws. A smarter pattern would skip retry for `4xx`-like errors (caller's fault, not server's fault). Not currently distinguished.
+  3. **The route's 300s budget.** If 6 tool calls × 3 retries × 10-20s each occur, the route can hit 300s and Vercel terminates. The per-phase log catches this in `finally`.
 
 ## Project exercises
 
-### Exercise — add a per-instance circuit breaker to BloomreachDataSource
+### Exercise — Distinguish 4xx (caller fault) from 5xx (server fault) in retry logic
 
-  → **Exercise ID:** `study-ai-eng-06-05.1`
-  → **What to build:** New `lib/data-source/circuit-breaker.ts` with
-    the three-state machine. Wire into `BloomreachDataSource` so every
-    `callTool` flows through `breaker.call(() => this.actualCallTool(...))`.
-    Add a trace event when the circuit opens / closes / half-opens so
-    the UI can show "circuit open — failing fast" instead of just
-    "error."
-  → **Why it earns its place:** Industry-standard resilience pattern.
-    Today a sustained Bloomreach outage burns the full route budget
-    before failing; with a breaker it fails in <10ms after threshold.
-  → **Files to touch:** new `lib/data-source/circuit-breaker.ts`,
-    `lib/data-source/bloomreach-data-source.ts` (wrap callTool),
-    `lib/mcp/events.ts`, `test/data-source/circuit-breaker.test.ts`.
-  → **Done when:** Force-failing 5 consecutive calls trips the breaker
-    open; calls within the next 30s fail in <10ms; after 30s the
-    breaker tries once and either re-opens or closes.
-  → **Estimated effort:** `1–2 days`
-
-### Exercise — add the same breaker to AnthropicModelProviderAdapter
-
-  → **Exercise ID:** `study-ai-eng-06-05.2`
-  → **What to build:** Wrap `complete()` in a circuit breaker (shared
-    instance per provider). Differentiates "provider quirks
-    transient" (rate limit, single 5xx) from "provider down."
-  → **Why it earns its place:** Defense in depth at the OTHER provider
-    boundary. Anthropic outages should fail fast, not burn the full
-    route budget.
-  → **Files to touch:** `lib/agents/aptkit-adapters.ts:42-71`,
-    shared breaker instance.
-  → **Done when:** Force-failing 5 consecutive Anthropic calls trips
-    the breaker; subsequent calls fail in <10ms until reset.
-  → **Estimated effort:** `1–4hr` (once the breaker lib from
-    exercise 1 exists).
+  → **Exercise ID:** B6.5
+  → **What to build:** Extend `BloomreachDataSource.callTool` to inspect the error envelope. If the error is a 4xx-shaped failure (malformed request, schema validation), skip retry — throw immediately. If 5xx-shaped (server error, rate limit), retry as today. Surface the distinction in the McpToolError detail.
+  → **Why it earns its place:** today, an LLM hallucinating a bad tool input pays 30s of retry wall-clock per call before failing. A 4xx-skip-retry policy collapses that to ~1s. Small change with real latency payoff on a known failure mode.
+  → **Files to touch:** `lib/data-source/bloomreach-data-source.ts` (extend `isRateLimited` to a more nuanced `shouldRetry` check), `test/data-source/bloomreach-data-source.test.ts` (cover 4xx-no-retry, 5xx-retry, rate-limit-retry).
+  → **Done when:** a synthetic 4xx failure (bad schema) throws within 1s, a 5xx failure still gets 3 retries, a rate-limit failure still gets the parsed-window retry, and the per-call telemetry distinguishes the three outcomes.
+  → **Estimated effort:** 1–4hr.
 
 ## Interview defense
 
-**Q: Does this codebase have a circuit breaker?**
+**Q: "What's your retry logic?"**
 
-Not yet. Retry is in place
-(`BloomreachDataSource.callTool` — see
-`04-rate-limiting-backpressure.md`); circuit breaker isn't. Today, a
-sustained provider failure burns the full retry budget on every tool
-call — 30s+ per call. A circuit breaker would detect the pattern
-(N consecutive failures) and fail fast for T seconds, sparing the
-route budget.
+Inside `BloomreachDataSource.callTool`: when a result comes back as rate-limited (parsed from the error text), retry up to 3 times. Each wait is the *hint-first* — if the server says "retry after 12 seconds," wait 12.5s. If no parseable hint, exponential backoff starting at 10s (Bloomreach's observed penalty window). Every wait is capped at 20s. No jitter today because there's only one client per `BloomreachDataSource` instance (per-session). When the cross-session rate limiter lands (`B6.4`), jitter becomes relevant.
 
-```
-  layered resilience:
+No circuit breaker. Sustained outages cost users 30s per request before failing — bad UX. `B4.6` is the circuit breaker design.
 
-   retry (present):    handles transient failures
-                        one rate-limit, one network blip
-   breaker (Case B):   handles sustained failures
-                        provider down for minutes
-```
+*Anchor: "Hint-first retry with 20s ceiling; no jitter today; circuit breaker is `B4.6`."*
 
-**Anchor line:** "Retry catches transient, breaker catches sustained.
-We have one of the two. The breaker is on the next-up list when live
-traffic justifies it."
+**Q: "What's missing from your production resilience?"**
 
-**Q: Why isn't circuit breaker built yet?**
+Circuit breaker. Today, when Bloomreach is down for 5 minutes, every new request burns ~30s in retries before failing — the user waits and then sees the error. With a circuit breaker, after 5 consecutive failures the circuit opens and new requests fail fast (<100ms) for the next 60s. After the 60s timeout, half-open: try one. Success → close. Failure → re-open. Big UX improvement during sustained outages; small wall-clock change during transient blips.
 
-Three reasons. (1) The dominant failure mode (Bloomreach rate limit)
-is intentional throttling, not provider brokenness — retry handles it
-correctly. (2) OAuth-revocation has its own client-side reconnect
-mitigation (`useReconnectPolicy`). (3) A general Anthropic outage
-hasn't actually hurt during development. It's real Case B — earns its
-place at higher user volume or when Anthropic outages start eating
-route budget.
+The design lives in `B4.6`. I'd implement two breakers: one wrapping the Anthropic call (handles Anthropic outages), one wrapping the Bloomreach call (handles Bloomreach outages). Independent failure modes; independent breakers.
 
-The build is straightforward: three-state machine wrapping
-`callTool` and `complete`. Per-instance state on Vercel is acceptable
-(each instance independently detects the outage); distributed state
-via KV would be the upgrade if cross-instance coordination matters.
+*Anchor: "Circuit breaker is the big missing piece; two breakers (Anthropic + Bloomreach), independent."*
 
 ## See also
 
-  → `04-rate-limiting-backpressure.md` — the retry layer this would
-    sit on top of
-  → `04-agents-and-tool-use/06-error-recovery.md` — where breaker
-    "circuit open" errors would surface to the user
+  → `04-rate-limiting-backpressure.md` — the rate-limit story this retry serves
+  → `04-agents-and-tool-use/06-error-recovery.md` — the broader error-recovery framing; `B4.6` lives here
+  → `study-system-design/10-rate-limit-aware-mcp-client.md` — the same retry logic from the system-design lens

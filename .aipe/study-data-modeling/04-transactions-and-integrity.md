@@ -1,164 +1,131 @@
-# 04 — Transactions and integrity
+# Transactions and integrity
 
-**Atomicity / invariants enforcement · Industry standard**
+*Invariant enforcement at the trust boundary (industry standard) · Language-agnostic*
 
 ## Zoom out, then zoom in
 
-The classical question — *if two writes must succeed together, what makes
-that atomic?* — usually answers with `BEGIN ... COMMIT`. In
-**blooming_insights** there's no DB, no transaction primitive, and no
-SQL-style `CHECK` constraints. So the question becomes: **what enforces
-the invariants the app needs, and where can they drift?**
+In a SQL database, integrity is enforced by the engine: `NOT NULL`, `UNIQUE`, foreign keys, `CHECK` constraints, and atomic transactions. The database is the *last* line of defense — even if every app layer is buggy, an `INSERT` that violates a constraint fails loudly. The schema is the contract no app code can route around.
+
+This repo has none of that. No FK enforcement, no `UNIQUE` index, no transactional boundary that fences a multi-write into all-or-nothing. The integrity story has to live somewhere else: in **type guards at the trust boundary** (LLM output, JSON file, query string) and in **single-writer conventions** that mean atomicity doesn't matter.
 
 ```
-  Zoom out — where invariants live in this codebase
+  Zoom out — where integrity is enforced
 
-  ┌─ UI ──────────────────────────────────────────────────────────────┐
-  │  TypeScript types are the compile-time contract                   │
-  │  (Insight, Diagnosis, Recommendation — UI can't render an off-    │
-  │   shape value because tsc rejects the code)                       │
-  └─────────────────┬─────────────────────────────────────────────────┘
-                    │  NDJSON over fetch
-  ┌─ Route layer ───▼─────────────────────────────────────────────────┐
-  │  lib/mcp/validate.ts — runtime type guards                        │
-  │  (isAnomalyArray / isDiagnosis / isRecommendationArray)           │
-  │  the LLM emits text → parsed JSON → validated → stored            │
-  └─────────────────┬─────────────────────────────────────────────────┘
-                    │
-  ┌─ State layer ───▼──── ★ THIS CONCEPT ★ ──────────────────────────┐
-  │  per-session Map isolation                                        │ ← we are here
-  │  putInsights clear-and-fill (not atomic, but isolated)            │
-  │  no rollback if a write throws mid-sequence                       │
-  └─────────────────┬─────────────────────────────────────────────────┘
-                    │  callTool
-  ┌─ Substrate ─────▼─────────────────────────────────────────────────┐
-  │  Bloomreach has its own consistency story — we don't write to it  │
-  │  (every write would be an EQL UPDATE; the app only READS)         │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌─ UI layer (consumer) ───────────────────────────────┐
+  │  trusts: every Insight has metric/scope/change      │
+  │  trusts: every Diagnosis has the 3 required fields  │
+  └────────────────────────┬───────────────────────────┘
+                           │ NDJSON of AgentEvents
+  ┌─ Service layer (writer) ▼──────────────────────────┐
+  │  ★ THE INTEGRITY LAYER ★                            │ ← we are here
+  │  isAnomalyArray(v)         ┌─ LLM JSON              │
+  │  isDiagnosis(v)            ├─ JSON.parse boundary   │
+  │  isRecommendationArray(v)  ├─ ?insight= URL param   │
+  │  parseAgentJson(text)      └─ demo snapshot file    │
+  └────────────────────────┬───────────────────────────┘
+                           │
+  ┌─ Storage layer ────────▼───────────────────────────┐
+  │  Map<id, Entity> — no constraints, no checks       │
+  │  putInsights(sid, items, anomalies) — write both    │
+  │  but no atomicity between the two maps              │
+  └─────────────────────────────────────────────────────┘
 ```
 
-Zoom in. Three layers enforce things: **TypeScript at compile time**,
-**`validate.ts` at runtime**, and **per-session Map scoping** at the data
-layer. None of the three is a transaction. The audit needs to call out
-where the *absence* of a transaction matters.
+**Zoom in.** The integrity model rests on **type guards at every untrusted input** and **conventions that sidestep atomicity**. The trust boundaries you need to name: anything the LLM emits, anything that comes from a URL param, anything read from a JSON file. The atomicity questions you need to answer: when `putInsights` writes both `.insights` and `.anomalies` maps, what if it crashes between them? The answer here is *single-writer, no concurrency, no rollback needed* — and that's defensible only as long as it's true.
 
----
+## Structure pass
 
-## Structure pass — the axis is "what could go wrong, and what catches it?"
+**Layers.** Integrity enforcement lives at three altitudes:
+
+- **Compile-time** (type layer) — TypeScript types reject malformed values at build. `bloomreachFeature: 'scenario' | 'segment' | …` rejects `'newsletter'` before the code runs.
+- **Run-time at the trust boundary** (service layer) — type guards (`isAnomalyArray`, `isDiagnosis`, `isRecommendationArray`) validate JSON the moment it crosses an untrusted seam.
+- **Run-time inside the system** (storage layer) — almost nothing. The `Map`s accept whatever you put in.
+
+**Axis traced — "what stops an invalid value from reaching the UI?"** Hold that question across the layers:
 
 ```
-  Trace ONE axis — "what catches a corrupt write?" — across layers
+  Trace the integrity axis through the boundaries
 
-  axis: validation / containment
+  compile-time:    TypeScript rejects wrong shape AT BUILD
+                   (but the LLM emits JSON at runtime → TS can't help)
 
-  ┌─ compile time ─────────────────┐
-  │  TypeScript types: hand-written │   ← guards code that mutates
-  │  code can't construct a bad     │     internal shapes
-  │  Insight                        │
-  └────────────┬───────────────────┘
-               │  seam: LLM output is `string`, not Insight
-  ┌────────────▼───────────────────┐
-  │  runtime validators (validate.ts)│   ← guards untrusted JSON
-  │  parse → guard → reject         │     from the model
-  └────────────┬───────────────────┘
-               │  seam: agent emits, route writes
-  ┌────────────▼───────────────────┐
-  │  state layer write              │   ← no further check; assumes
-  │  putInsights clears + sets      │     validated data arrives
-  └────────────┬───────────────────┘
-               │  seam: cross-session contamination
-  ┌────────────▼───────────────────┐
-  │  per-session Map scoping        │   ← prevents Session A from
-  │  outer Map keyed by sessionId   │     reading/clobbering Session B
-  └────────────────────────────────┘
+  run-time guard:  isAnomalyArray / isDiagnosis / isRecommendationArray
+                   throw / return false → caller bails before write
+                   (THIS IS WHERE INTEGRITY ACTUALLY LIVES)
+
+  storage:         Map.set() takes anything
+                   no constraint, no validation, no rollback
+                   (relies on the run-time guard above)
 ```
 
-Three seams; each one a different kind of integrity question. The axis
-flips at each: compile-time guards code shape; runtime guards model
-output; isolation guards multi-tenant coexistence.
+**Seams.** Four trust boundaries:
 
----
+1. **LLM output** — text from `anthropic.messages.create`. The agent loop calls `parseAgentJson` to extract JSON from a maybe-fenced code block, then runs `isAnomalyArray` / `isDiagnosis` / `isRecommendationArray` to validate the shape.
+2. **URL params** — `?insight=` and `?diagnosis=` on `/api/agent`. Validated by inline shape checks in `resolveAnomaly` and `parseDiagnosis`.
+3. **JSON files on disk** — `demo-insights.json`, `demo-investigations.json`, `.investigation-cache.json`, `.auth-cache.json`. Validated implicitly: the optional-field discipline (every additive field is `?`) means old files keep passing.
+4. **The encrypted auth cookie** — AES-256-GCM with auth tag verification. A tampered cookie decrypts to `{}` (treated as no auth) rather than letting bad state through.
+
+The OAuth cookie's tampering check is the *one* place this codebase has a real "constraint" — and it's a cryptographic one, not a schema one.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-Think of it like `fetch().then(res => res.json())` in a frontend app. You
-know the response *should* match a shape, but it came from over the
-network so you treat it as untrusted. You either validate it with a
-schema library (Zod, Yup) or `as` cast and hope. Same setup here: the
-agent's output is *string*, parsed into untrusted JSON, then validated
-before it touches the store. The store itself is trusted (only this
-codebase writes to it).
+You know how `Number.parseInt('abc')` returns `NaN` instead of throwing? That's a type-coercion failure with no boundary — the bad value just propagates as `NaN` and you find the bug three frames later. Type guards in this codebase are the opposite: they're a **hard boundary at the JSON-parse step** where bad input gets caught and rejected *before* it enters the system.
 
 ```
-  The three layers of "is this data OK?"
+  The pattern — type guards as the boundary
 
-  TRUSTED                                    UNTRUSTED
-                                                │
-  TypeScript types ◄─── compile-time guard ─────┤
-  (handwritten code can't construct bad data)   │
-                                                │
-  validate.ts      ◄─── runtime guard ──────────┤
-  (LLM output is JSON.parse()'d, then           │
-   shape-checked before storage)                │
-                                                │
-  per-session      ◄─── isolation guard ────────┤
-  Map scoping      (no other session can        │
-  (clear+fill writes never cross sessions)      │
-                                                ▼
-  store ── trusted region ── write is just .set(k, v)
+  untrusted input
+       │
+       ▼
+  ┌─────────────────┐
+  │  JSON.parse     │  → unknown
+  └────────┬────────┘
+           │
+           ▼
+  ┌─────────────────┐
+  │  TYPE GUARD     │  isAnomalyArray(v): v is Anomaly[]
+  │  the boundary   │  → narrows or rejects
+  └────────┬────────┘
+           │ passes ──► entity ── flows into Map
+           │ fails  ──► throw / return null
+           ▼
+  the system never sees an invalid value
 ```
 
-There's no fourth layer (no DB-side `CHECK`, no FK enforcement). If
-anything corrupt makes it past the runtime guard, it lands in the store
-and the next reader sees it.
+The thing to notice: the guard returns `v is Anomaly[]` — a TypeScript type predicate. Once `isAnomalyArray(v)` returns true, the compiler *narrows* `v` to `Anomaly[]` for the rest of the function. So the guard is doing double duty: runtime gate AND compile-time proof. This is the cheapest, smallest integrity layer that still catches the failure modes that matter — LLM output drift, malformed snapshots, query param tampering.
 
-### Move 2 — the integrity mechanisms, one at a time
+### Move 2 — the guards and the conventions
 
-#### **Mechanism 1: TypeScript types as the compile-time contract**
+#### Guard 1 — `parseAgentJson` (the parse-then-validate step)
 
-This is the cheapest layer — it catches every bug where the *code*
-constructs the wrong shape. You can't write:
+The LLM is asked to emit JSON, but it often wraps it in a markdown code fence (\`\`\`json … \`\`\`) or adds prose around it. `parseAgentJson` is the lenient front-door:
 
-```typescript
-const i: Insight = { id: 'x' }; // Property 'severity' is missing
+```ts
+// lib/mcp/validate.ts:3-13
+export function parseAgentJson(text: string): unknown {
+  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = (fence ? fence[1] : text).trim();
+  try { return JSON.parse(candidate); } catch { /* fall through to substring scan */ }
+  const start = candidate.search(/[[{]/);
+  const end = Math.max(candidate.lastIndexOf(']'), candidate.lastIndexOf('}'));
+  if (start >= 0 && end > start) {
+    return JSON.parse(candidate.slice(start, end + 1));
+  }
+  throw new Error('no parseable json in agent output');
+}
 ```
 
-…and get past `tsc`. So every code path that builds an `Insight` is
-guarded by the type system. `anomalyToInsight` returns `Insight`, so the
-return statement must include every required field — the compiler
-catches a missed field before the code ever runs.
+Three attempts, in order: (1) try the fenced block, (2) try the whole text, (3) substring-scan from the first `[`/`{` to the last `]`/`}`. The return type is `unknown` — not `Anomaly[]` — which forces the caller to validate. The function throws if no JSON is extractable; everything else gets a chance.
 
-The hole this layer leaves: **anything that came from outside the type
-system.** Three sources:
+This is **integrity at the lexical boundary** — it ensures the bytes coming out parse as JSON, but says nothing about whether the parsed value is an Anomaly. That's the next guard.
 
-```
-  Sources outside the TypeScript guarantee
+#### Guard 2 — `isAnomalyArray` (the shape gate)
 
-  ┌─ LLM output ────────────┐    JSON.parse → unknown
-  │  agent emits a string   │ ──────────────────────► must validate
-  └─────────────────────────┘
-  ┌─ committed JSON ────────┐    JSON.parse → unknown
-  │  demo-insights.json     │ ──────────────────────► trusted (we wrote it)
-  └─────────────────────────┘                          but no test enforces shape
-  ┌─ MCP tool result ───────┐    `unknown` field
-  │  evidence[].result      │ ──────────────────────► UI defensively scans
-  └─────────────────────────┘
-```
+The shape validator. Returns a type predicate.
 
-The LLM output gets a runtime guard (next mechanism). The committed JSON
-is *discipline-trusted* (humans regenerate it via the capture script and
-the script writes proper shapes). The MCP `result: unknown` is the
-intentional escape hatch — the UI degrades silently if the shape isn't
-what it expected.
-
-#### **Mechanism 2: `validate.ts` runtime guards on agent output**
-
-The agents emit *text* — they're LLMs talking to JSON. The parsed JSON
-has to be checked before it can be cast to `Anomaly[]` or `Diagnosis`.
-
-```typescript
+```ts
 // lib/mcp/validate.ts:17-27
 export function isAnomalyArray(v: unknown): v is Anomaly[] {
   return Array.isArray(v) && v.every((a) =>
@@ -173,352 +140,287 @@ export function isAnomalyArray(v: unknown): v is Anomaly[] {
 }
 ```
 
-Annotation by line:
-
-- **L18 `Array.isArray(v)`** — first defense, since the agent might emit
-  a single object or a string by mistake.
-- **L20–22** — checks each required field individually. **Optional fields
-  are not checked here** (`impact`, `history`, `category`, all enrichments)
-  — they're allowed to be missing or *malformed* and the UI just doesn't
-  render them.
-- **L23–26 `change`** — checks the whole nested object. If `change.value`
-  isn't a number, the entire anomaly is rejected.
+The guard checks **only required fields**. `evidence`, `impact`, `history`, `category` are all skipped — they're optional on `Anomaly` and the snapshot-survival rules in `05` mean the validator can't reject missing optional fields. That's the deliberate trade: the gate is permissive about optional fields and strict about the four invariants that make a row an Anomaly at all.
 
 ```
-  validation flow for monitoring agent output
+  isAnomalyArray — what it checks, what it doesn't
 
-  LLM emits text
-       │
-       ▼
-  parseAgentJson(text)         lib/mcp/validate.ts:3
-   ├─ strips ```json fences
-   ├─ JSON.parse
-   └─ falls back to substring scan if parse fails
-       │
-       ▼
-  isAnomalyArray(parsed)?
-       │
-   ┌───┴────┐
-   │        │
-   no       yes
-   │        │
-   ▼        ▼
-  retry     putInsights(sessionId, items)
-  loop      → enters the store
-  in agent
+  ┌─ required (rejects if missing/wrong type) ──────┐
+  │   metric: string                                 │
+  │   scope: array                                   │
+  │   change: { value: number,                       │
+  │             direction: 'up' | 'down',            │
+  │             baseline: string }                   │
+  │   severity: 'critical' | 'warning'               │
+  │           | 'info' | 'positive'                  │
+  └──────────────────────────────────────────────────┘
+
+  ┌─ optional (NOT checked) ────────────────────────┐
+  │   evidence  · impact  · history  · category     │
+  │   (snapshot-survival: must accept absence)       │
+  └──────────────────────────────────────────────────┘
 ```
 
-What this gets right: the validators check the *required* shape and let
-optional fields slide. If the agent emits a malformed `revenueImpact`
-the system doesn't crash — the UI just shows the fallback.
+Two more guards in the same file do the same job for `Diagnosis` (`validate.ts:29-35`) and `Recommendation[]` (`validate.ts:42-57`). `isRecommendationArray` also encodes the **dual-shape `estimatedImpact`** check:
 
-What this misses (audit flag): there's no **value-range check**. An
-`Anomaly` with `change.value = -10000` (impossibly large %) passes the
-type guard. A `change.direction = 'up'` with `change.value = -5` is
-internally inconsistent and passes. The DB analog would be a `CHECK`
-constraint; here the discipline is "trust the agent prompt to emit
-sane numbers." A real DB would refuse the row; this layer doesn't.
-
-#### **Mechanism 3: per-session Map isolation**
-
-This is the most important integrity mechanism in the codebase, and it's
-called out in a load-bearing comment:
-
-```typescript
-// lib/state/insights.ts:7-13
-// Session-scoped feed state. A single warm Vercel instance serves many users
-// concurrently, so module-level Maps would bleed between sessions — and
-// putInsights' clear() would wipe another user's feed mid-briefing. Each
-// session gets its own sub-feed; the outer map is never cleared by a request.
-type SessionFeed = {
-  insights: Map<string, Insight>;
-  investigations: Map<string, Investigation>;
-  anomalies: Map<string, Anomaly>;
-};
+```ts
+// lib/mcp/validate.ts:46-48
+const impactOk =
+  typeof x.estimatedImpact === 'string' ||
+  (!!x.estimatedImpact && typeof x.estimatedImpact === 'object' && typeof x.estimatedImpact.range === 'string');
 ```
 
-The invariant: **Session A's writes never touch Session B's data.** The
-mechanism: the outer `Map<sessionId, SessionFeed>` is keyed by the
-`bi_session` cookie UUID, and **only** the sub-map for that session is
-ever cleared or written to.
+— either the legacy string form OR the rich `{ range, ... }` object. That's the integrity layer accommodating schema evolution. Covered in `05`.
 
-```
-  Per-session isolation as the integrity boundary
+#### Guard 3 — inline URL param validation (`resolveAnomaly`)
 
-  WITHOUT isolation:                  WITH isolation (this codebase):
+The `/api/agent` route accepts `?insight=<JSON>` so the client can hand the route an Insight that survives a Vercel instance hop. The route validates the shape inline before trusting it:
 
-  state: Map<insightId, Insight>      state: Map<sessionId, SessionFeed>
-       │                                   │
-       │  user A's briefing                │  user A's briefing
-       │  → clear() wipes EVERYONE         │  → sessionState(A).insights.clear()
-       │                                   │     only A's sub-map is wiped
-       ▼                                   ▼
-  CROSS-USER DATA LOSS                  ISOLATION PRESERVED
-```
-
-The comment is doing real work — it's the explanation for why the data
-layer is two-level Maps instead of one flat Map. Anyone refactoring this
-file has to see the comment first and understand the invariant before
-flattening it "for simplicity."
-
-#### **Mechanism 4: the clear-then-fill write (NOT a transaction, but isolated)**
-
-The closest the app gets to a multi-write operation is `putInsights`:
-
-```typescript
-// lib/state/insights.ts:64-71
-const s = sessionState(sessionId);
-s.insights.clear();
-s.anomalies.clear();
-items.forEach((i, idx) => {
-  s.insights.set(i.id, i);
-  if (rawAnomalies?.[idx]) s.anomalies.set(i.id, rawAnomalies[idx]);
-});
+```ts
+// app/api/agent/route.ts:35-44 (inside resolveAnomaly)
+if (insightParam) {
+  try {
+    const i = JSON.parse(insightParam) as Insight;
+    if (i && typeof i.metric === 'string' && i.change && Array.isArray(i.scope) && i.severity) {
+      return insightToAnomaly(i);
+    }
+  } catch {
+    /* malformed param — fall through to the server-side lookup */
+  }
+}
 ```
 
-This is **NOT atomic.** If `items.forEach` throws midway through, the
-session is left with a *partial* feed — the first few insights set, the
-rest missing, but `s.insights.clear()` already ran so the *previous*
-briefing is gone too. The data is in a degraded state until the next
-briefing repairs it.
+Same shape rules as `isAnomalyArray`, inlined because the surrounding fallback ladder (4 tiers — see `03-indexing-vs-query-patterns.md`) makes it easy to just *fall through* on validation failure rather than throw. The `parseDiagnosis` validator at `route.ts:84-95` does the same for `?diagnosis=`:
 
-```
-  What "no transaction" looks like in practice
-
-  t=0: putInsights called with [i1, i2, i3, i4, i5]
-  t=1: clear() — previous briefing gone
-  t=2: set(i1) — OK
-  t=3: set(i2) — OK
-  t=4: set(i3) — throws (e.g. crypto.randomUUID rejection, OOM)
-  t=5: → exception bubbles up
-  t=6: state is now { i1, i2 } — partial briefing, no rollback
-
-  with a transaction:
-  t=5: rollback — state back to previous briefing
-  t=6: error propagates, state intact
+```ts
+// app/api/agent/route.ts:84-95
+function parseDiagnosis(param: string | null): Diagnosis | null {
+  if (!param) return null;
+  try {
+    const d = JSON.parse(param);
+    if (d && typeof d.conclusion === 'string' && Array.isArray(d.evidence) && Array.isArray(d.hypothesesConsidered)) {
+      return d as Diagnosis;
+    }
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
 ```
 
-How serious is this? **In practice, not very.** The next briefing call
-will run `clear()` again and start fresh. The user sees a half-empty feed
-for one render cycle, then either retries (auto-reconnect path) or
-refreshes. There's no permanent corruption because the data isn't
-durable in the first place — it's all recomputable from the substrate.
+Fail-silent-then-fall-through is the integrity stance for URL params: a tampered param doesn't crash the request, it just degrades to the next tier of the lookup ladder.
 
-But the *principle* matters for the audit: if this state ever became
-durable (e.g. you moved insights to Postgres), the same code pattern
-would leave you with permanent partial state. The fix at that point
-would be a real transaction.
+#### Guard 4 — the encrypted cookie (cryptographic integrity)
 
-#### **Mechanism 5: invariant gaps — what nothing enforces**
+The OAuth state in production lives in an encrypted httpOnly cookie. Tampering is caught by the AES-GCM auth tag at decryption:
 
-These are real:
-
-- **`Insight.affectedCustomers` agrees with `Diagnosis.affectedCustomers.count`.**
-  Two independent writers, no reconciliation. See
-  `02-normalization-and-duplication.md` policy 2.
-- **`change.direction = 'up'` implies `change.value > 0`** (and vice
-  versa). Type system says both are allowed values; `validate.ts` doesn't
-  cross-check them. An agent emitting `{ direction: 'up', value: -5 }`
-  would pass.
-- **`evidence[].tool` is a known tool name.** Anything string-shaped
-  passes. A typo in the agent's emission (e.g. `executes_analytics_eql`)
-  wouldn't be caught at validation; it'd show as an unrenderable evidence
-  bullet on the card.
-- **`demo-insights.json` matches the current `Insight` type.** No test
-  re-validates the demo against the type on every commit.
-
-```
-  invariants that nothing enforces today
-
-  invariant                                     | enforced by
-  ──────────────────────────────────────────────┼───────────────────────
-  type shape of Insight (compile)               | TypeScript ✓
-  required fields present (runtime, LLM output) | validate.ts ✓
-  per-session write isolation                   | Map scoping ✓
-  ────────────────────────────────────────────────────────────────────
-  affectedCustomers consistent across Insight   | NOTHING (audit flag)
-   and Diagnosis                                |
-  change.direction ↔ sign(change.value)         | NOTHING
-  evidence[].tool ∈ known tool names            | NOTHING
-  demo JSON matches current type                | discipline only
-  putInsights atomicity                         | NOTHING (acceptable
-                                                | because state is
-                                                | recomputable)
+```ts
+// lib/mcp/auth.ts:69-79
+function decryptStore(token: string): Store {
+  try {
+    const buf = Buffer.from(token, 'base64url');
+    const decipher = createDecipheriv('aes-256-gcm', aesKey(), buf.subarray(0, 12));
+    decipher.setAuthTag(buf.subarray(12, 28));
+    const plain = Buffer.concat([decipher.update(buf.subarray(28)), decipher.final()]).toString('utf8');
+    return JSON.parse(plain) as Store;
+  } catch {
+    return {}; // tampered, rotated-secret, or corrupt cookie → treat as no auth
+  }
+}
 ```
 
-Each gap has a different cost. The first three are real (would cause UI
-weirdness if violated); the demo-JSON one is a CI-test-shaped problem;
-the atomicity one is acceptable because of the recomputability story.
+This is the one place in the codebase with a *real* integrity constraint: the auth tag verifies that the ciphertext wasn't modified and was encrypted with `aesKey()`. Any tampering decrypts to `{}` — the user is treated as logged out, not granted spurious auth.
+
+```
+  Cookie integrity — AES-256-GCM auth tag
+
+  cookie:   [ 12 bytes IV │ 16 bytes tag │ ciphertext ]
+                                  │
+                                  │ verifyTag(tag, ciphertext, aesKey)
+                                  ▼
+                          ┌── valid ──┐    ┌── invalid ──┐
+                          ▼            ▼    ▼              ▼
+                    plain JSON      decrypt fails       throw
+                    Store           catch ── return {}    ↓
+                                                    no auth state
+                                                    (safe fallback)
+```
+
+### Move 2 — atomicity (the part that isn't there)
+
+#### Multi-write 1 — `putInsights` (writes two maps)
+
+The feed write touches both `insights` and `anomalies`:
+
+```ts
+// lib/state/insights.ts:57-71
+export function putInsights(sessionId: string, items: Insight[], rawAnomalies?: Anomaly[]): void {
+  const s = sessionState(sessionId);
+  s.insights.clear();          // ← side effect 1: wipe insights
+  s.anomalies.clear();         // ← side effect 2: wipe anomalies
+  items.forEach((i, idx) => {
+    s.insights.set(i.id, i);   // ← side effect 3: write insight N
+    if (rawAnomalies?.[idx]) s.anomalies.set(i.id, rawAnomalies[idx]);  // ← side effect 4
+  });
+}
+```
+
+Four side effects, no transaction. If the process crashed between `s.insights.clear()` and the first `set`, you'd have an empty feed and orphaned (cleared) anomalies. **Why this doesn't matter here:**
+
+1. **The writes are synchronous.** No `await` between them, so no interleaving point. The Node event loop doesn't preempt mid-function.
+2. **The "crash" mode that matters in serverless is the warm instance dying.** When that happens, the *whole* `Map<sessionId, SessionFeed>` is gone — there's no partial state to recover, the next request starts from scratch.
+3. **There's a single writer.** Only `/api/briefing` calls `putInsights`. A client can't trigger two briefings that run concurrently on the same instance because the route holds the cookie's session id and the user has one browser tab.
+
+The closest analog is a database's `BEGIN; DELETE ...; INSERT ...; COMMIT;` — and the move here is "skip the wrapper because the process model gives you the same guarantee for free." It works because (a) the operation is synchronous, (b) the failure mode is whole-process, and (c) there's no concurrent writer.
+
+#### Multi-write 2 — `saveInvestigation` (memory + disk)
+
+The investigation cache writes mem first, then file:
+
+```ts
+// lib/state/investigations.ts:30-41
+export function saveInvestigation(insightId: string, events: AgentEvent[]): void {
+  mem.set(insightId, events);
+  if (PERSIST) {
+    const all = readJson(CACHE_FILE);
+    all[insightId] = events;
+    try {
+      writeFileSync(CACHE_FILE, JSON.stringify(all));
+    } catch {
+      /* best effort */
+    }
+  }
+}
+```
+
+Three side effects: `mem.set`, then `readJson + JSON.stringify + writeFileSync`. The disk write is **best-effort, in dev only** (`PERSIST = process.env.NODE_ENV === 'development'`). If the file write fails (disk full, permission, concurrent writer corrupting JSON), the in-memory write survives. The atomicity that matters — "the user sees the investigation they just ran" — is met by the mem write alone. The file write is a *bonus* for surviving the dev server restart.
+
+The risk that's accepted: **two dev processes writing the same file** can produce a corrupt JSON (one's write half-overwrites the other's). The mitigation is "you don't run two dev servers at once" — a convention, not a check.
+
+### Move 2 variant — the integrity skeleton
+
+Three load-bearing parts. Strip any one and a real failure mode emerges:
+
+1. **The type guards at the trust boundary** (`validate.ts` + inline checks). Drop these and the LLM's "creative" JSON propagates into the Map — a missing `change.direction` field becomes a runtime `undefined.value` somewhere deep in the UI. The test that pins this is `test/mcp/validate.test.ts` (covers the four required-field validators).
+
+2. **The optional-field discipline on entities** (every added field is `?`). Drop this and the validators reject perfectly good old snapshots the moment you add a new field. The discipline is what lets the guards stay strict on required fields and forgiving on additive ones. Covered in `05`.
+
+3. **The "single writer, synchronous write" convention.** Drop this — say, by making `putInsights` async and `await`-ing between map writes — and you reopen the half-written-state failure mode that databases use transactions to prevent. The Node event loop's synchronous-block guarantee is the substitute for `BEGIN/COMMIT`.
+
+Hardening on top: the AES-GCM tag on the auth cookie is hardening (the cookie *is* tamper-resistant); the four-tier `resolveAnomaly` fallback is hardening (multiple paths to find the same fact).
 
 ### Move 3 — the principle
 
-**Without transactions, integrity comes from three places: the type
-system, runtime validators, and access discipline (who can write what,
-where).** In a SQL database, the DB enforces all three. In an in-memory
-app, you have to write the enforcement yourself, and the choice of
-*what* to enforce is a design call.
-
-The generalisation: when you read someone's "no-database" codebase, ask
-three questions in order — (1) does the type system describe the data?
-(2) is there a runtime guard at every untrusted boundary? (3) is
-concurrent access bounded so writers don't step on each other? If yes
-to all three, the absence of a DB isn't a bug. If no to any one, the
-absence is a latent disaster waiting for the first concurrent user.
-
----
+The DB-equivalent of "no schema constraints" isn't "no integrity" — it's "integrity enforced at the trust boundary, not inside the store." Every system that doesn't have a transactional database has to pick *some* layer to enforce its invariants. The choice this repo makes — type guards at the JSON-parse step + single-writer conventions — is defensible *as long as* the inputs are limited (LLM, URL param, JSON file) and the writers are few (one per route). The moment user-generated data lands or concurrent writers show up, the same layer stops being enough — and you're rebuilding `BEGIN/COMMIT` from scratch.
 
 ## Primary diagram
 
-The full integrity story in one frame.
+The full integrity map: every trust boundary, every guard, every multi-write that skips atomicity on purpose.
 
 ```
-  Integrity layers in blooming_insights
+  Integrity boundaries — every untrusted input, every guard, every multi-write
 
-  ┌─ UNTRUSTED EDGE ──────────────────────────────────────────────────┐
-  │                                                                   │
-  │   LLM output (string)             Committed demo JSON              │
-  │   ──────────────────              ─────────────────────            │
-  │           │                                │                       │
-  │           ▼                                ▼                       │
-  │   parseAgentJson + validate.ts        readJson (no validation)     │
-  │   ┌────────────────────────────┐      ┌────────────────────────┐  │
-  │   │ isAnomalyArray             │      │ trusted by discipline; │  │
-  │   │ isDiagnosis                │      │ no test re-validates   │  │
-  │   │ isRecommendationArray      │      │ → LATENT RISK          │  │
-  │   │ → rejects bad shapes       │      └────────────────────────┘  │
-  │   └─────────────┬──────────────┘                                  │
-  │                 │ valid shape                                      │
-  │                 ▼                                                  │
-  │                                                                   │
-  └─ TRUSTED REGION ──────────────────────────────────────────────────┘
-                    │
-                    ▼
-  ┌─ STATE LAYER (per-session Map) ───────────────────────────────────┐
-  │                                                                   │
-  │   sessionState(sessionId).insights.set(id, insight)                │
-  │   ★ ISOLATION GUARANTEE: writes scoped to this session             │
-  │                                                                   │
-  │   putInsights: clear + fill, NOT atomic                            │
-  │   acceptable because state is recomputable from substrate          │
-  │                                                                   │
-  │   GAPS:                                                            │
-  │     - no cross-write check on affectedCustomers                    │
-  │     - no value-range check on change.value                         │
-  │     - no whitelist on evidence[].tool                              │
-  │                                                                   │
-  └─────────────────┬─────────────────────────────────────────────────┘
-                    │  read
-                    ▼
-  ┌─ UI ──────────────────────────────────────────────────────────────┐
-  │  TypeScript types catch construction errors at compile time       │
-  │  defensive helpers (findCurrentPrior, impactRange) handle missing  │
-  │  optional fields gracefully                                        │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌─ TRUST BOUNDARIES ──────────────────────────────────────────────────┐
+  │                                                                      │
+  │  1. LLM output                                                       │
+  │     anthropic.messages.create                                        │
+  │           │                                                          │
+  │           ▼                                                          │
+  │     parseAgentJson(text)               ← lexical guard               │
+  │     isAnomalyArray(v)                  ← shape guard                 │
+  │     isDiagnosis(v)                     ← shape guard                 │
+  │     isRecommendationArray(v)           ← shape guard                 │
+  │                                                                      │
+  │  2. URL params                                                       │
+  │     /api/agent ?insight=... ?diagnosis=...                           │
+  │           │                                                          │
+  │           ▼                                                          │
+  │     inline shape checks in resolveAnomaly / parseDiagnosis           │
+  │     fail-silent → fall through to next lookup tier                   │
+  │                                                                      │
+  │  3. JSON files on disk                                               │
+  │     demo-*.json · .investigation-cache.json · .auth-cache.json       │
+  │           │                                                          │
+  │           ▼                                                          │
+  │     implicit: optional-field discipline lets old shapes pass         │
+  │     (no explicit re-validation on read)                              │
+  │                                                                      │
+  │  4. Encrypted auth cookie                                            │
+  │     bi_auth (production only)                                        │
+  │           │                                                          │
+  │           ▼                                                          │
+  │     AES-256-GCM auth tag verifies ciphertext + key                   │
+  │     fail → decryptStore returns {} (no auth)                         │
+  │                                                                      │
+  └──────────────────────────────────────────────────────────────────────┘
+
+  ┌─ MULTI-WRITE WITHOUT TRANSACTIONS ──────────────────────────────────┐
+  │                                                                      │
+  │  putInsights(sid, items, anomalies)                                  │
+  │     s.insights.clear()                                               │
+  │     s.anomalies.clear()                                              │
+  │     forEach: insights.set + anomalies.set                            │
+  │                                                                      │
+  │     SAFE BECAUSE: synchronous (no await between writes),             │
+  │                   single writer per session,                         │
+  │                   crash = whole process gone, not partial state      │
+  │                                                                      │
+  │  saveInvestigation(insightId, events)                                │
+  │     mem.set                                                          │
+  │     PERSIST: readJson + writeFileSync                                │
+  │                                                                      │
+  │     SAFE BECAUSE: mem.set is the source of truth for the request;    │
+  │                   disk write is best-effort, dev-only                │
+  │                                                                      │
+  └──────────────────────────────────────────────────────────────────────┘
 ```
-
----
 
 ## Elaborate
 
-Where this comes from: the ACID properties (Atomicity, Consistency,
-Isolation, Durability) define what a DB transaction promises. This
-codebase has **Isolation** (per-session Maps) but skips the other three —
-no atomicity, weaker consistency (cross-shape invariants unenforced), no
-durability. That's a deliberate tradeoff: the data is recomputable, so
-losing it doesn't matter; the consistency gaps haven't been load-bearing.
+The integrity model here is "validation at the door, conventions inside." That's a defensible posture for any system where (a) inputs are well-bounded (no user-generated rows), (b) writers are few and uncoordinated writes are impossible (one client per session, one route per writer), and (c) crashes destroy whole-process state rather than corrupting persistent state. The moment any of those three premises break, you need real transactions and real constraints. In this repo, the only premise that's *close* to breaking is (c) — the dev-mode JSON file *is* persistent state, and two concurrent dev processes would corrupt it. The mitigation is convention ("don't run two dev servers").
 
-The seam to **distributed systems**: the substrate is a third-party
-system (Bloomreach), so the app inherits *its* consistency story for
-reads. The agent loops are read-only against the substrate — no writes,
-no need to reason about substrate transactions.
+The closest analog to the type-guards-as-boundary pattern is **Zod / Yup / io-ts in TypeScript apps** — schema-validation libraries that produce a runtime check AND a TypeScript type from one declaration. This codebase hand-rolls the same idea with `v is X` predicates. The reason not to pull in Zod: the validation surface is *four functions*, and the cost of a runtime dep at every API route's edge would dwarf the win. When the validation surface grows to ten+ shapes, the calculus flips.
 
-What this codebase consciously doesn't do — and is right not to:
-
-- **No `BEGIN ... COMMIT` simulation.** Building a transaction primitive
-  for the in-memory Maps would be theatre — restart kills all state
-  anyway.
-- **No write-ahead log.** Again, restart kills state; logging it would
-  buy nothing.
-
-What it consciously does — and would still be right at scale:
-
-- **Type-first contracts.** Even with a real DB, the TypeScript types in
-  `lib/mcp/types.ts` would still be the right place for the schema
-  source of truth (you'd generate migrations from them, not the other
-  way around).
-- **Runtime validators on untrusted boundaries.** LLM output is always
-  untrusted, even with a DB underneath; `validate.ts` still earns its
-  keep.
-
-What to read next: `05-migrations-and-evolution.md` walks the "new fields
-are optional" discipline that keeps the demo JSON valid as types grow.
-
----
+For the atomicity story: the closest contrast is buffr's SQLite (where multi-step writes wrap in `BEGIN/COMMIT` because SQLite is a real database with real concurrency). Here, the "transaction" is the synchronous block — and the proof it's enough is that the writes don't `await` anywhere mid-sequence. If you ever added `await` inside `putInsights` (say, to persist to disk), you'd reopen the partial-state window and have to think about it.
 
 ## Interview defense
 
-**Q: "How do you handle atomicity when multiple writes have to succeed
-together?"**
+**Q: How do you enforce data integrity without a database?**
 
-Verdict first: today, **I don't**, and that's deliberate. The state layer
-is in-process Maps that get cleared and rebuilt every briefing. If a
-write throws midway through `putInsights`, the session is left with a
-partial feed — the next briefing repairs it. The data is recomputable
-from the substrate, so a partial state isn't permanent corruption.
+> Three layers. First, **type guards at the trust boundary** — `isAnomalyArray`, `isDiagnosis`, `isRecommendationArray` in `lib/mcp/validate.ts`. They validate the LLM's JSON output the moment it crosses out of the agent loop. Type predicates (`v is Anomaly[]`) make them runtime gates AND compile-time proofs. Second, **inline shape checks on URL params** in `/api/agent` — same idea, fail-silent so the lookup ladder falls through to the next tier. Third, **the encrypted auth cookie's AES-GCM auth tag** — the one cryptographic integrity check in the codebase.
+>
+> The thing I lose without a DB: referential integrity across entities. If an `Investigation` references an `insightId` that doesn't exist, nothing catches it. The substitute is the `Investigation` envelope structure — `Diagnosis` literally cannot exist without an `insightId` because it lives inside an `Investigation` object.
 
 ```
-  what makes the no-atomicity choice OK here
+   integrity layers
 
-  durable store with no transactions:  unrecoverable partial state
-       │
-       ▼
-  ephemeral store, recomputable input: partial state is repaired by
-                                       the next briefing — no permanence,
-                                       no corruption.
-  the app doesn't OWN data; the substrate does. losing the cache
-  costs a re-run, not data.
+   compile-time:      TypeScript types
+   run-time gate:     isAnomalyArray / isDiagnosis / isRecommendationArray
+   crypto integrity:  AES-GCM auth tag on the auth cookie
+   structural:        Diagnosis can't exist outside an Investigation envelope
 ```
 
-Anchor: "the load-bearing thing here is *recomputability* — if the
-substrate owns the truth, the cache layer doesn't need atomicity. The
-moment the app owns any user-authored data, atomicity becomes mandatory
-— and at that point I'd reach for a real DB, not simulate transactions
-in memory."
+**Q: `putInsights` writes two maps and doesn't wrap them in anything. What if it crashes mid-write?**
 
-**Q: "What's the strongest integrity guarantee in the codebase?"**
+> The writes are synchronous — no `await` between `insights.set` and `anomalies.set` in the same iteration. The Node event loop doesn't preempt inside a synchronous block, so there's no interleaving point where a partial state is visible to another request. The failure mode that matters in serverless is the whole instance dying, and when that happens the entire `Map<sessionId, SessionFeed>` is gone — there's no "partial state on disk" to recover.
+>
+> The day this stops being safe is the day someone makes `putInsights` async — say, to persist to disk between maps. Then you've reopened the partial-state window and need a real transaction.
 
-Verdict first: **per-session Map isolation.** It's the only real
-multi-tenant safety guarantee — without it, a warm Vercel instance
-serving many users would let Session A's `putInsights().clear()` wipe
-Session B's feed mid-render. The comment in `lib/state/insights.ts:7-13`
-is the load-bearing explanation; the Map-of-Maps shape is the
-enforcement.
+**Q: What's the load-bearing detail people miss about the type guards?**
+
+> They check **only required fields**. The optional fields on `Anomaly` — `evidence`, `impact`, `history`, `category` — are not validated. That's deliberate, and it pairs with the `?` discipline on every added field: every new entity field is optional so old demo snapshots keep passing the same validator. If the guard rejected snapshots that lacked a newly-added field, the committed demo would break on every release. The forgiveness on optional fields is what lets the schema evolve.
 
 ```
-  isolation as the integrity guarantee
+   the trade
 
-  ┌─ WITHOUT isolation ─────┐    ┌─ WITH isolation ───────────┐
-  │  flat Map<id, Insight>  │    │  Map<sessionId, SessionFeed>│
-  │                         │    │                             │
-  │  Session A briefing     │    │  Session A briefing         │
-  │  → .clear() wipes ALL   │    │  → clears A's sub-map only  │
-  │                         │    │  → B is untouched           │
-  └─────────────────────────┘    └─────────────────────────────┘
-       cross-user data loss              correct multi-tenant
+   required fields → strict (must be present and well-typed)
+   optional fields → permissive (absence is allowed, presence is unchecked)
+
+   this is what makes the validator survive schema evolution
 ```
-
-Anchor: "the strongest guarantee isn't a `CHECK` constraint — it's the
-*scoping* that prevents one writer from being able to see another's
-data at all."
-
----
 
 ## See also
 
-- [`02-normalization-and-duplication.md`](./02-normalization-and-duplication.md)
-  — the `affectedCustomers` duplication that nothing enforces
-- [`03-indexing-vs-query-patterns.md`](./03-indexing-vs-query-patterns.md)
-  — the Map shape that makes isolation cheap
-- [`05-migrations-and-evolution.md`](./05-migrations-and-evolution.md)
-  — type evolution as the migration story
-- [`audit.md`](./audit.md) — checklist with this file's findings
+- `02-normalization-and-duplication.md` — the "never mutate" convention that makes denormalization safe in the absence of triggers.
+- `05-migrations-and-evolution.md` — why every additive field is `?` and what that buys for the validators.
+- `06-access-patterns-and-storage-choice.md` — when this integrity layer stops being enough.

@@ -1,110 +1,144 @@
-# Tree of Thoughts
+# Tree of thoughts
 
-*Industry name: Tree of Thoughts (ToT) — Industry standard. Mostly research, rarely production.*
+**Industry standard.** A branching reasoning pattern. **Not implemented** in this codebase and unlikely to earn its place here.
 
-Explore multiple reasoning branches, score them, pick the best. Not in this repo and almost certainly not worth it for this product. Covered here so you can name *why* you didn't use it.
+## Zoom out, then zoom in
 
-## Zoom out — where this concept would live
+Sits at the reasoning layer, like every other named pattern. The difference is it doesn't run *one* loop — it branches into N parallel reasoning paths, scores them, and picks a winner.
 
-If adopted, it'd replace the per-turn step inside a single agent's loop — instead of one `step → execute` per turn, the loop would emit N branches, score each, and continue down the best. It would sit *inside* one of the existing agents, not as a new agent.
+```
+  Zoom out — where this would sit
+
+  ┌─ Reasoning layer ───────────────────────────────┐
+  │  ReAct (today, everywhere)                       │
+  │  ★ Tree of thoughts (branch + score + pick) ★   │ ← we are here
+  │  (rarely worth the cost in production)           │
+  └──────────────────────────────────────────────────┘
+```
+
+The honest framing: this is covered so the reader recognizes the pattern and can explain *why they didn't use it.* In a real interview, "I considered tree-of-thoughts and chose not to because [reason]" is more common than the rare "I used tree-of-thoughts because…"
 
 ## Structure pass
 
-The axis: **how many candidate next-moves does the model consider on each turn?**
+Layers: branching strategy (how many paths, how deep) → per-path execution → scoring (a judge model rates each path) → selection (pick the best).
 
-```
-  ReAct                              ToT
-  ─────                              ───
-  1 candidate per turn               N candidates per turn
-  pick & commit                      score → pick best → continue
-  cost: 1 LLM call/turn              cost: N+1 LLM calls/turn (the +1 is scoring)
-```
+**Axis traced — "what's being multiplied?":** tokens, primarily. Cost is roughly proportional to branch_factor × depth × per-step-cost. A 3-branch, 4-deep tree is 12 reasoning steps where ReAct would have 4.
+
+**Seam:** the scoring function. Same problem as reflexion — if the scorer shares blind spots with the producers, the winning branch is the one that fooled the scorer, not the right one.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know breadth-first search over a tree — explore neighbors, score them, expand the best. ToT is BFS over reasoning paths: at each step the model emits multiple candidate next-thoughts, the model (or a separate scoring step) ranks them, and the loop continues down the highest-scoring branch.
+You know the difference between a forward-only search and a beam search. ReAct is forward-only — pick the next step, commit. Tree-of-thoughts is beam search — explore several next steps in parallel, score them, prune the bad ones, recurse.
 
 ```
-  Tree of Thoughts — branching reasoning
+  The tree-of-thoughts shape
 
            root question
-          ┌──────┼──────┐
-          ▼      ▼      ▼
-        path A  path B  path C    ← N candidate next-moves
-          │      │      │
-        score  score  score        ← model scores each
-          └──────┼──────┘
-                 ▼
-            best path wins         ← only the winner continues
-            (recurse or commit)
+             │
+       ┌─────┼─────┐
+       ▼     ▼     ▼
+     path A path B path C    ← branch (3 paths)
+       │     │     │
+       │     │     │           per-path: one ReAct loop
+       ▼     ▼     ▼
+     score score score        ← judge each path
+       └─────┼─────┘
+             ▼
+       best path wins         ← selection
+       (or continue branching
+        from the best)
 ```
 
-### Move 2 — why it's rarely worth it in production
+In the simplest form, you branch once at the root, run N independent ReAct loops, score them, return the best. In the recursive form, you branch at every step — N branches at depth 1, M per branch at depth 2, etc. — exploring a tree of partial reasoning paths.
 
-The token cost multiplies by the branch factor. Three branches per step = 3x the tokens of ReAct. And the scoring step is itself an LLM call. So a 6-tool-call ReAct loop becomes (6 turns × 3 branches × 2 calls/branch) = 36 LLM calls vs ReAct's 6. That's 6x cost for an improvement that rarely shows up on real tasks — the paper's wins were on game-of-24 and creative-writing benchmarks, not data analysis or tool use.
+### Move 2 — step by step
 
-For this repo's workload (anomaly detection, diagnosis, recommendation) there's no documented case where ToT beats ReAct enough to justify 6x the cost. The diagnostic agent's "generate 2-3 hypotheses up front" is a one-level ToT with no scoring — you commit to all three hypotheses and test each, which is cheaper and works as well.
+#### Why it's expensive
 
-## In this codebase
+The token cost multiplies by the branch factor and the depth. A 3-branch tree of depth 3 is 9 leaf paths, each running a full ReAct loop, plus the scorer call per leaf, plus the final selection. Compared to a single ReAct run of comparable depth, that's roughly 10x the token cost for one answer. The bet you're making is that one of those 9 paths is meaningfully better than what plain ReAct would have produced.
 
-**Not implemented and not planned.** The diagnostic prompt's "2-3 hypotheses" instruction is a degenerate case of one-level ToT (consider multiple paths) without the branching cost (test them in sequence rather than scoring and pruning).
+#### Why it rarely pays off in production
+
+Two reasons that show up empirically:
+
+1. **The right path is usually obvious by turn 2.** For most production agent tasks, the model gets to a good trajectory quickly. The 9 branches end up exploring 9 minor variations of the same path; the "best" one isn't meaningfully different from any of the others.
+2. **The scorer is the bottleneck.** Same problem as reflexion — a model scoring model-generated paths shares the blind spots that produced them. The branch that wins the score is often the one that *sounds* most confident, not the one that's most correct.
+
+For research benchmarks where the task is genuinely hard (the original ToT paper used Game of 24, creative writing, mini crosswords), the multiplier earns its overhead. For "find the cause of this revenue drop" or "propose a recommendation" — tasks where ReAct's first trajectory is usually correct — the multiplier is wasted.
+
+#### Why this repo doesn't run it
+
+The agent tasks here are bounded and the right path is usually clear by turn 2:
+
+- Monitoring scan: the categories are enumerated, the EQL queries are templated, the model picks which categories to query first. There's no "branch on strategy."
+- Diagnostic investigation: hypotheses are tested sequentially; if hypothesis A doesn't pan out, the agent tests hypothesis B. That's ReAct's strength.
+- Recommendation: read scenarios, read segments, propose. The path is structured by the Bloomreach feature taxonomy.
+
+None of these benefit from exploring multiple parallel paths because the *correct* path doesn't have meaningful alternatives.
+
+### Move 3 — the principle
+
+**The honest framing for tree-of-thoughts is "cover so you can explain why you didn't use it."** In production agent work, the canonical answer is: "I considered ToT, but the failure modes in my domain weren't 'the model picks a bad initial strategy and commits' — they were 'tool calls fail intermittently' and 'the structured output drifts.' Those are handled by retry/backoff and structured-output recovery, not by branching."
 
 ## Primary diagram
 
-The cost contrast:
-
 ```
-  Cost comparison — 6-step task across reasoning patterns
+  Tree-of-thoughts — full shape, with cost annotation
 
-  ReAct:        ●━━●━━●━━●━━●━━●           6 LLM calls
-                turn1 turn2 ... turn6
+           question
+              │
+        ┌─────┼─────┐
+        ▼     ▼     ▼
+      branch branch branch        depth 1: 3 paths
+        │     │     │             COST: 3x baseline ReAct
+        │     │     │
+     ┌──┼──┐  │  ┌──┼──┐
+     ▼  ▼  ▼  ▼  ▼  ▼  ▼
+     l  l  l  l  l  l  l         depth 2: ~9 leaf paths
+                                  COST: 9x baseline ReAct
+        ▼     ▼     ▼            each leaf: full ReAct loop
+      score score score          + judge/scorer call
+        └─────┼─────┘
+              ▼
+        selection                 + selection call
+              │
+              ▼
+         final answer
 
-  Plan-execute: ●━━━┓
-                     ┣━━●━━●━━●━━●━━●     1 plan + 5 exec = 6 calls
-                     ┗━━(cheap model)
-
-  ToT (3 branches):
-                ●───●───●                   per turn:
-                ●───●───●  → score → pick    3 branches + 1 score
-                ●───●───●                   = 4 calls/turn × 6 turns = 24 calls
-
-                                            (and 6 of those scoring calls
-                                             are themselves expensive)
+  Total: ~10-12x token cost for one answer.
+  Wins: if the "correct" trajectory isn't the
+        first one the model would pick.
+  Loses: if the first ReAct trajectory was already
+         going to be correct (the common case in
+         production agent work).
 ```
 
 ## Elaborate
 
-ToT was introduced by Yao et al. (2023). The genuine contribution: for tasks where the right answer is one of a discrete set of plans (game-of-24, creative writing prompts, crossword puzzles), exploring multiple branches and scoring beats committing to one path. The cited improvements were 70%+ on game-of-24 vs ReAct's 4%.
+The original Tree of Thoughts paper (Yao et al., 2023) showed strong gains on tasks where the search space has many wrong-but-locally-plausible paths — Game of 24 (many wrong arithmetic sequences look fine for several steps before failing), creative writing (the first draft is usually local-optimum), and crosswords (lots of plausibly-fitting words that lock out the right one). The shared property: a greedy search commits to a bad path early and can't recover.
 
-The cited failure mode: on open-ended tasks with continuous output spaces (analysis, summarization, tool-driven Q&A), the branching cost dominates and the quality gains evaporate. Production teams generally land on "ToT for narrow puzzle-shaped tasks, ReAct for everything else."
+The production-agent failure modes don't have that shape. When a monitoring agent picks the wrong category to query first, the recovery is cheap (it tries another category next turn). When a diagnostic agent tests a hypothesis that doesn't pan out, the recovery is also cheap (test another hypothesis). The greedy-commits-to-bad-path failure that ToT solves doesn't dominate; the failure modes that do dominate (tool errors, structured output drift) have their own cheaper fixes.
 
-The pattern that *did* survive into production is one-level "self-consistency" — generate N candidate answers, pick the most common — which is cheaper and often delivers most of ToT's win without the recursive scoring.
+There's a less-discussed cousin pattern: *self-consistency*, which runs ReAct N times in parallel with sampling temperature > 0 and takes the majority answer. That's a degenerate ToT (no scorer, vote instead) and it does sometimes earn its overhead for arithmetic/code-generation tasks where the right answer is rare-but-recognizable. The repo doesn't use this either, for the same reason — the costly branch multiplier doesn't pay off when the first trajectory is usually correct.
 
 ## Interview defense
 
-**Q: "Did you consider Tree of Thoughts?"**
+> **Q: Have you considered tree-of-thoughts for this repo?**
+>
+> Considered and didn't ship. ToT earns its 10x cost when the agent's failure mode is "greedy commits to a locally-plausible but wrong path early." The investigations in this repo don't have that shape — when the diagnostic agent picks the wrong hypothesis first, the recovery is cheap (it tests another hypothesis next turn) because the search space is shallow and the wrong-but-plausible problem doesn't bite. The failure modes that actually dominate are tool-call errors and structured-output drift, which are handled by `BloomreachDataSource`'s retry ladder and `tryParseAnomalies`'s recovery prompt respectively. Both are cheaper than ToT and address the actual failure modes.
 
-A: Considered, ruled out. ToT's win profile is narrow-puzzle tasks (game-of-24, crosswords) where the right answer is one of a discrete set. Data analysis and diagnosis are continuous output spaces — the cost multiplies (3 branches × scoring = 4x ReAct per turn) without proportional quality gain. The diagnostic prompt does the cheap version: "generate 2-3 hypotheses then test each" gives you path diversity without the recursive scoring overhead. If we ever needed it, self-consistency (sample N answers, take majority) is the production-friendly version — much cheaper, often most of the win.
+> **Q: When *would* you reach for tree-of-thoughts?**
+>
+> When the task has many locally-plausible-but-globally-wrong paths and the wrong ones don't reveal themselves until many steps in. Code generation with implicit constraints is the canonical example: the model writes a function, three out of four implementations look fine until you test the edge case the fourth one handles. ToT (or self-consistency with a test-based scorer) is the right shape because the per-leaf cost is justified by the cost of shipping the wrong code. Bloomreach anomaly investigation isn't this shape — the cost of "we tested the wrong hypothesis first" is one extra tool call, not a customer outage.
 
-Diagram I'd sketch:
-
-```
-  ToT cost:                            ReAct cost:
-  ┌──┬──┬──┐                           ┌──┐
-  │A │B │C │  per turn → 3 calls       │A │  per turn → 1 call
-  └─┬┴─┬┴─┬┘     + 1 scoring call      └──┘
-    └──┼──┘
-       ▼ pick                          6 turns = 6 calls
-  N turns × 4 = 4N total
-
-  4-6x cost for narrow-puzzle wins; not our workload.
-```
-
-Anchor: "the diagnostic prompt's '2-3 hypotheses up front' captures ToT's diversity without ToT's scoring cost. That's the cheap version that works for our task shape."
+> **Q: Tree-of-thoughts vs reflexion — both add cost. When each?**
+>
+> Different escalations from baseline ReAct. ToT diversifies the *search* — explore N parallel paths, pick the best. Reflexion adds a *gate* — run one path, judge the output, revise if flawed. ToT pays for exploring paths you might not have considered; reflexion pays for catching errors in the path you committed to. They address different failure modes. Stack them only at the top of the cost ladder when the stakes justify 5-10x baseline cost.
 
 ## See also
 
-- [`03-react.md`](./03-react.md) — the pattern we actually use
-- [`05-reflexion-self-critique.md`](./05-reflexion-self-critique.md) — the other "spend more tokens for quality" escalation
+- → `03-react.md` — the baseline ToT branches from
+- → `05-reflexion-self-critique.md` — the orthogonal "catch errors after committing" pattern
+- → cross-reference (when generated): `study-ai-engineering`'s sampling file — the temperature + self-consistency mechanics

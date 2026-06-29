@@ -1,250 +1,235 @@
-# Locks, MVCC, and concurrency control
+# Locks, MVCC, and concurrency control — none, by partition
 
-Industry standard · Concurrency control internals
+*Industry standard / Project-specific* — there are zero locks and no MVCC. The repo gets away with this by partitioning state per-session and by relying on Node's single-threaded execution to serialize writes within a session.
 
-## Zoom out — where concurrency control would live, and what's there
+## Zoom out, then zoom in
 
-In a real database, concurrency control is the mechanism that enforces isolation: row locks, page locks, table locks, or MVCC (multi-version concurrency control) where each transaction sees a snapshot of the database as it was when the transaction started. This codebase has **none of these mechanisms.** Concurrency is "handled" by being single-threaded inside a Node process and by partitioning state per session — there's no contested resource because writers don't share enough state to contest.
-
-```
-  Zoom out — where concurrency control would live (and what's there)
-
-  ┌─ Multiple concurrent requests ───────────────────────────────┐
-  │  user A · briefing run                                        │
-  │  user B · investigation                                       │
-  │  user A · second briefing run (rapid)                         │
-  └───────────────────────────────┬──────────────────────────────┘
-                                  │ each request → its own event-loop tick
-  ┌─ Node event loop ──────────────▼──────────────────────────────┐
-  │  ★ THIS CONCEPT ★                                              │
-  │  single-threaded run-to-completion                             │
-  │  → no two writers execute simultaneously on one instance       │
-  │  → no need for row locks, page locks, MVCC                     │
-  │  → BUT also no protection across instances                     │
-  └────────────────────────────────────────────────────────────────┘
-                                  │
-  ┌─ State (partitioned by session) ▼─────────────────────────────┐
-  │  Map<sessionId, SessionFeed>                                  │
-  │  → cross-session "concurrency" is structurally impossible:    │
-  │    writer A and writer B touch different sub-maps             │
-  │  → intra-session concurrency: last-write-wins                 │
-  └────────────────────────────────────────────────────────────────┘
-```
-
-## Zoom in — the question this concept answers
-
-In a real DB: "when two transactions want the same row, who waits, and what does the other see while it waits?" Here: "is there any situation where two writes step on each other?" Short answer: only when two warm Vercel instances serve the same session at the same time, and even then, the consequence is "the second briefing wins" — not a corruption, not a deadlock, not a phantom.
-
-## Structure pass — the skeleton
-
-### Two concurrency-control families to know
-
-  - **Pessimistic (locks).** Acquire a lock before touching the row; other writers block until you release. Defaults in MySQL InnoDB's older isolation modes, SQL Server. Avoids conflicts by preventing them. Cost: contention, potential deadlocks.
-  - **Optimistic (MVCC).** Each writer creates a new version of the row; readers see the version that existed at their transaction start. Conflicts detected at commit time. Defaults in PostgreSQL, Oracle, modern SQL Server (snapshot isolation). Cost: storage for old versions, vacuum overhead.
-
-### What this codebase uses: neither — structural avoidance
-
-The codebase's concurrency story isn't a third strategy. It's the absence of contention by design:
-
-  - **Per-session partitioning.** Different sessions write to different sub-maps. No lock needed; the resource isn't shared.
-  - **Single event loop.** Within one instance, no two writers execute at the same instant. The loop itself is the lock.
-  - **Last-write-wins on the rare collision.** Two writers on the same session on different instances: whoever wrote most recently to the local Map of the instance that serves the next read wins. No coordination, no detection, no recovery.
-
-### Axis: where does the conflict prevention come from?
+Concurrency control becomes interesting the moment two callers can touch the same row. The repo's whole design is that they can't: every session owns its own sub-maps, every request is its own function invocation, and JavaScript is single-threaded. The one place where two callers *could* hit the same row is the rate-limit-spacing path inside `BloomreachDataSource` — and that's not protected by a lock, it's protected by a single timestamp variable that every caller reads and updates.
 
 ```
-  The "conflict prevention" axis
+  Zoom out — where this concept lives
 
-  ┌─ cross-session ─────────────────────────────────────────────┐
-  │  prevention: partitioning (different sub-maps)              │
-  └─────────────────────────────────────────────────────────────┘
-       ┌─ same session, same instance ───────────────────────────┐
-       │  prevention: event-loop serialization                   │
-       └─────────────────────────────────────────────────────────┘
-            ┌─ same session, different instances ─────────────────┐
-            │  prevention: NONE — last-write-wins, instance-local │
-            └─────────────────────────────────────────────────────┘
+  ┌─ UI layer ───────────────────────────────────────────────┐
+  │  feed + investigation may run in the same browser tab     │
+  └────────────────────────────┬─────────────────────────────┘
+                               │  HTTP (potentially parallel)
+  ┌─ Service layer ────────────▼─────────────────────────────┐
+  │  /api/briefing  ──┐                                      │
+  │                   │  same Node process, different fn      │
+  │  /api/agent     ──┤                                      │
+  │                   ▼                                      │
+  │  BloomreachDataSource.liveCall                            │
+  │    lastCallAt ★ THE ONLY SHARED MUTABLE ★                  │ ← we are here
+  └────────────────────────────┬─────────────────────────────┘
+                               │
+  ┌─ Storage layer ────────────▼─────────────────────────────┐
+  │  sessionState (partitioned per sid — no contention)       │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-The leftmost two layers are bulletproof. The third layer is the one where a real DB would step in with locks or MVCC — and where this codebase relies on the architectural choice that every briefing fully replaces the previous one.
+Zoom in: there are two questions worth asking. (1) Why are there no locks on the session state? Because the partition guarantees one writer at a time per session. (2) Why is `lastCallAt` safe without a lock? Because the worst case is "two callers under-space their requests and the second gets a 429 the retry path handles."
 
-### Seams
+## Structure pass
 
-The seam that matters: **the gap between "two requests from one user" and "two instances serving them."** Vercel does not pin a session to an instance. The user can't tell which instance answered their last request. If two requests land on different instances, the in-memory Maps are independent — they don't see each other's writes at all.
+**Layers:**
+
+```
+  L1  per-session state          partitioned, no contention
+  L2  per-DataSource cache       single-writer per instance
+  L3  lastCallAt timestamp        read-modify-write, no lock
+```
+
+**Axis traced: where could two writers race?**
+
+```
+  Trace one axis: can two writers race for this state?
+
+  ┌─ L1: sessionState ───────────────────┐
+  │  outer Map keyed by sessionId         │   → no race: one sid, one request
+  └───────────────────────────────────────┘
+                  (it flips)
+  ┌─ L2: cache Map ──────────────────────┐
+  │  one cache per DataSource instance    │   → races possible but benign
+  └───────────────────────────────────────┘
+                  (it flips)
+  ┌─ L3: lastCallAt number ──────────────┐
+  │  one var, every caller reads + writes │   → races possible, handled by retry
+  └───────────────────────────────────────┘
+
+  the seam at L3 is where contention is theoretically real and pragmatically absorbed
+```
+
+**Seams** — one matters:
+
+- The L2 → L3 boundary is where "no race possible" becomes "race possible but cheap." Above this line you don't need a lock; below it you might, and the repo chose to absorb the cost in the retry path instead.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-If you've ever written a React `useState` setter and not worried about two setters racing — you already have the intuition. JavaScript's single-threaded event loop gives you that for free *inside one tick*. This codebase's local state writes are essentially the same shape: synchronous, single-loop, no races. The complication is just that "the loop" is per-instance, and there can be multiple instances.
+You've used a `Map.get()` then `Map.set()` pattern before — read a value, modify it, write it back. In a single-threaded runtime this is atomic *as long as nothing yields*. As soon as there's an `await` between the read and the write, two callers can interleave. The whole concurrency-control story here is "where are the read-modify-writes, and do any of them have an `await` in the middle?"
 
 ```
-  The shape — three layers of concurrency, three answers
+  The two patterns side by side
 
-  ┌─ different sessions ─────────┐
-  │  writer A → SessionFeed A    │   no shared resource
-  │  writer B → SessionFeed B    │   → no possible conflict
-  └──────────────────────────────┘
+  SAFE — fully synchronous:                  RACEY — await in the middle:
 
-  ┌─ same session, one instance ─┐
-  │  writer A · writer B         │   event loop serializes them
-  │  one finishes before the     │   → no concurrent access
-  │  other starts                │
-  └──────────────────────────────┘
+  let x = state.get(k)                       let x = state.get(k)
+  x.count++                                  x = await fetchUpdated(k)   ◄── yields
+  state.set(k, x)                            state.set(k, x)
 
-  ┌─ same session, two instances ┐
-  │  instance 1 Map · instance 2 │   two independent Maps
-  │  Map don't see each other     │   → "concurrency" by divergence
-  └──────────────────────────────┘
+  no other JS can interleave                 another caller can run between
+  here — Node serializes by                  the get and the set, write the
+  default                                    same key, and lose updates
 ```
 
-### Move 2 — the walkthrough
+That's the mental model. The rest is finding the places in the repo where each pattern lives.
 
-#### Cross-session partitioning is the first line of defense
+### Move 2 — the concurrency story, one part at a time
 
-```ts
-// lib/state/insights.ts:14-23
-const state = new Map<string, SessionFeed>();
+#### Session state — no contention because of the partition
 
-function sessionState(sessionId: string): SessionFeed {
-  let s = state.get(sessionId);
-  if (!s) {
-    s = { insights: new Map(), investigations: new Map(), anomalies: new Map() };
-    state.set(sessionId, s);
+`sessionState(sid)` returns a per-session sub-feed. Two different sessions never touch the same `Map`. The same session (same `sid`) can in principle make two concurrent requests — e.g. a tab firing `/api/briefing` while another tab fires `/api/agent` — but they touch *different* sub-maps:
+
+- briefing writes `s.insights` and `s.anomalies`
+- agent writes `s.investigations`
+
+```
+  Per-session sub-feed — three sibling tables, different writers
+
+  s = sessionState(sid)
+       │
+       ├─ s.insights         ◄── /api/briefing writes (via putInsights)
+       ├─ s.investigations   ◄── /api/agent writes (via putInvestigation)
+       └─ s.anomalies        ◄── /api/briefing writes (via putInsights)
+```
+
+So even within one session there's no shared-row contention. Two writers, two different inner maps. No lock needed.
+
+What *would* contend: two simultaneous `/api/briefing` calls for the same session, both racing into `putInsights`. The second's `.clear()` could land mid-way through the first's `.forEach()`. The UI doesn't trigger this (briefing is a single-button action and the button disables while running) but nothing in the server prevents it. The fix, if it ever became real, would be a per-session `Promise` lock — but again, today it's not happening.
+
+#### Cache — single writer per instance, benign races
+
+The 60s response cache (`bloomreach-data-source.ts:122`) lives on a per-DataSource instance. There's one instance per session at most (constructed by `connectMcp`), so two requests for the same session share a cache. Two concurrent `callTool` calls for the same key can race:
+
+```
+  Two concurrent calls with the same key — what happens
+
+  T0: callA: cache.get(k) → MISS
+  T0: callB: cache.get(k) → MISS    ← B doesn't see A's pending work
+  T1: callA: liveCall → result A
+  T2: callB: liveCall → result B    ← duplicate network call
+  T3: callA: cache.set(k, resultA)
+  T4: callB: cache.set(k, resultB)  ← overwrites A; readers from T4+ see B
+```
+
+The race is real and the cost is "one extra upstream call." Both callers get a valid result (whichever one returned for them), the cache ends up holding the most-recent result, and there's no correctness violation — only a missed dedup. The repo accepts this rather than adding a "request coalescing" layer because the two-concurrent-call case is rare (each agent runs sequentially per session).
+
+#### `lastCallAt` — the only true race condition, absorbed by retry
+
+```typescript
+// lib/data-source/bloomreach-data-source.ts:190-205
+private async liveCall(name, args, signal) {
+  const elapsed = Date.now() - this.lastCallAt;
+  if (elapsed < this.minIntervalMs) {
+    await new Promise((r) => setTimeout(r, this.minIntervalMs - elapsed));  // ◄── yields
   }
-  return s;
+  try {
+    const result = await this.transport.callTool(name, args, { signal });   // ◄── yields
+    this.lastCallAt = Date.now();
+    return result;
+  } catch (err) {
+    this.lastCallAt = Date.now();
+    throw new McpToolError(name, errorDetail(err), { cause: err });
+  }
 }
 ```
 
-Annotation:
-  - Each session gets its OWN inner `SessionFeed` with its own three inner Maps.
-  - Two concurrent writers on different sessions touch *different* sub-maps. There's literally no shared resource for them to contend over.
-  - The outer Map is *never cleared* by request code (`_clear` is test-only at `lib/state/insights.ts:95-101`). So one session's writes can't accidentally invalidate another's namespace.
+Two `await`s and a read-modify-write of `this.lastCallAt`. Two concurrent callers can both see "elapsed > minIntervalMs," both skip the wait, both fire — and the upstream returns a 429 to whichever one violated the rate limit. The retry path (`bloomreach-data-source.ts:163-174`) parses the wait hint, sleeps, and retries.
 
-This is the strongest concurrency-control move in the codebase — and it's not a control mechanism, it's an architectural one. The contention doesn't exist because the resource was split.
-
-#### Within one instance, the lock (the Node event loop) is implicit
-
-Every state-mutating function in `lib/state/insights.ts` is synchronous. Look at `putInsights` (`lib/state/insights.ts:57-71`), `putInvestigation` (`lib/state/insights.ts:86-88`), `getInsight` (`lib/state/insights.ts:73-75`) — no `await`, no `Promise`, no `setTimeout`. Each runs as one synchronous block.
+**This is the only place in the repo where concurrent execution can produce a wrong-looking result, and it's deliberately absorbed by the retry rather than locked.** The reasoning: a lock would serialize all in-flight calls and cost more than the occasional retry penalty.
 
 ```
-  Per-instance concurrency, illustrated
+  lastCallAt — race, then retry absorbs it
 
-  time ───────────────────────────────────────────►
-
-  request 1:  [ putInsights starts ─── ends ]
-  request 2:                                  [ getInsight ]   ← waits for request 1 to yield
-  request 3:                                                [ putInsights starts ─── ends ]
+  T0: caller1 reads lastCallAt = 0,  elapsed = ∞,  skips wait
+  T0: caller2 reads lastCallAt = 0,  elapsed = ∞,  skips wait
+  T1: caller1 transport.callTool → ok
+  T1: caller2 transport.callTool → 429 rate-limited
+  T2: caller1: lastCallAt = T1
+  T2: caller2: lastCallAt = T1
+  T3: caller2 retry loop sees isRateLimited(result), parses wait,
+      sleeps, retries → success on T4
 ```
 
-JavaScript's run-to-completion guarantee means: while `request 1`'s `putInsights` is executing, no other request handler can touch the Maps. The event loop doesn't preempt. So even though `putInsights` does `clear() + N×set()`, no concurrent reader observes the intermediate state — they wait.
+No lock, no MVCC, no version chain. The mechanism is "let it race, detect the failure, retry with a backoff."
 
-This is the closest thing in the codebase to a database "lock," and it comes for free from the runtime.
+#### MVCC — none
 
-#### Across instances, there's no shared substrate at all
+There are no version chains in this repo. `Map` stores one value per key; an update replaces the previous value. No `xmin`/`xmax`, no readers seeing stale snapshots while a writer commits. The closest thing to a snapshot is the committed JSON in `lib/state/demo-*.json` (frozen at capture time) and the encrypted cookie (one version per request via the dirty bit) — neither of those is MVCC, they're just point-in-time snapshots.
 
-Vercel serverless functions are ephemeral. A briefing kicked off at T=0 may land on instance A; the same session's investigation at T=5 may land on instance B. Each has its own process, its own heap, its own `Map<sessionId, SessionFeed>`.
+#### Optimistic vs pessimistic — neither applies
 
-```
-  Two-instance divergence
-
-  instance A's Map                      instance B's Map
-  ┌────────────────────────┐            ┌────────────────────────┐
-  │ session-X: SessionFeed │            │ session-X: SessionFeed │
-  │   insights: { A1, A2 } │            │   insights: { } (empty)│
-  └────────────────────────┘            └────────────────────────┘
-       (just ran briefing)                   (cold start, hasn't seen this session)
-```
-
-If the next request from session-X lands on instance B, `getInsight` returns `null` even though instance A has the data. The user sees "no insights" and re-runs the briefing. That's the operational consequence of having no shared store.
-
-Two things make this tolerable:
-  1. The client stashes insights in `sessionStorage` on the browser side (`lib/hooks/useBriefingStream.ts:56` — `bi:insight:<id>`). When the user navigates to investigate, the client re-supplies the insight via the request, so the server doesn't need to find it in its own Map.
-  2. Briefings are cheap to re-run. A full re-compute is the architectural fallback for "this instance doesn't have it."
-
-#### Last-write-wins on the response cache too
-
-```ts
-// lib/data-source/bloomreach-data-source.ts:185-187
-const now = Date.now();
-this.cache.set(cacheKey, { result, expiresAt: now + ttl });
-return { result: result as T, durationMs: 0, fromCache: false };
-```
-
-Annotation:
-  - Two concurrent calls with the same `cacheKey` may both pass the cache miss check and both issue live calls. Both will write their result to the cache. Last write wins.
-  - The cache key includes `JSON.stringify(args)`, so this only happens for *identical* concurrent calls. With ~1 req/s spacing (`minIntervalMs = 200`), the window is small.
-  - There's no cache stampede protection (no "single-flight" mechanism). For a hot identical query, two parallel requests both pay the upstream cost. Acceptable at this scale; would be a real problem at higher concurrency.
-
-This is a deliberate trade. The complexity of single-flight (a `Map<key, Promise<result>>` to coalesce in-flight requests) wasn't earned at the current rate-limit-throttled scale.
-
-#### Deadlocks — not possible by construction
-
-Deadlocks require two writers each holding a lock the other wants. There are no locks here. There is no waiting state. A writer either runs (synchronously) or doesn't run yet (the event loop hasn't reached it). Two writers can't be in a "waiting for each other" state because no acquisition step exists.
-
-That's a quiet win — no deadlock detection logic, no deadlock victim selection, no timeout-and-retry on lock acquisition. None of it is needed.
+Both concurrency models assume contention that needs detection (optimistic) or prevention (pessimistic). The repo doesn't have contention worth either. The cache race is benign; the `lastCallAt` race is absorbed by retry; the session-state writes don't share rows.
 
 ### Move 3 — the principle
 
-Concurrency control exists to mediate access to a *shared resource*. When the design eliminates sharing — partition the state, run single-threaded within a partition, accept that cross-partition state can diverge — the need for explicit control disappears. The cost is paid elsewhere: in the architecture (full re-compute as the recovery path), in the UX (occasionally re-running a briefing after a cold start), in the limits of what the system can offer (no consistent global view of any session). It's the right shape for a stateless service whose canonical data lives upstream; it would be the wrong shape for a system of record.
+The strongest concurrency-control technique is **eliminating the contention**. When you partition state by tenant (here: sessionId), one writer at a time per tenant becomes a structural property — no lock needed because no race possible. The remaining races (cache fill, rate-limit spacing) become "benign vs absorbed" decisions you can make explicitly. Locks are what you reach for when the partition can't be drawn cleanly; this repo could draw it cleanly, so it doesn't reach.
 
 ## Primary diagram
 
 ```
-  Concurrency control — the three layers and their guarantees
+  Concurrency story — three layers, one race that matters
 
-  ┌─ cross-session ──────────────────────────────────────────────┐
-  │  guarantee: NO conflict possible                              │
-  │  mechanism: partitioning (different sub-maps in outer Map)    │
-  │  evidence:  lib/state/insights.ts:14-23 (sessionState)        │
-  └────────────────────────────────────────────────────────────────┘
-       ┌─ same session, same instance ───────────────────────────┐
-       │  guarantee: serialized writes, atomic reads/writes      │
-       │  mechanism: Node event loop (run-to-completion)          │
-       │  evidence:  no `await` in any state-mutating function    │
-       └─────────────────────────────────────────────────────────┘
-            ┌─ same session, different instances ─────────────────┐
-            │  guarantee: NONE — last-write-wins, instance-local  │
-            │  mechanism: client stashes data in sessionStorage,  │
-            │             briefings are full re-computes          │
-            │  evidence:  useBriefingStream.ts:56 (bi:insight:<id>)│
-            └─────────────────────────────────────────────────────┘
+  ┌─ session state ─────────────────────────────────────────┐
+  │  partition by sessionId                                  │
+  │  no race: outer Map keyed, inner Maps per session         │
+  │  contract gap: two same-sid /api/briefing calls could     │
+  │                race in putInsights (today, not triggered) │
+  └──────────────────────────────────────────────────────────┘
+
+  ┌─ response cache ────────────────────────────────────────┐
+  │  per-DataSource Map                                      │
+  │  race possible: 2 concurrent miss → 2 live calls → last  │
+  │                 writer wins, both callers get valid data │
+  │  cost: 1 extra upstream call (benign)                    │
+  └──────────────────────────────────────────────────────────┘
+
+  ┌─ lastCallAt timestamp ──────────────────────────────────┐
+  │  single number, read-modify-write across awaits          │
+  │  race possible: 2 callers skip spacing, 1 gets 429       │
+  │  recovery: retry path parses wait hint, sleeps, retries   │
+  │  cost: ~10s on the second caller's retry                  │
+  └──────────────────────────────────────────────────────────┘
+
+  no locks, no MVCC, no snapshot isolation — by design
 ```
 
 ## Elaborate
 
-The canonical reference for concurrency control is Gray & Reuter ("Transaction Processing"). The two-strategy split (locking vs MVCC) maps to where the cost falls: locks pay at acquisition time and risk contention; MVCC pays in storage and vacuum but lets readers never block writers (and vice versa). Modern engines (Postgres, Oracle, SQL Server snapshot isolation) lean MVCC because the readers-don't-block-writers property dominates the operational story.
+The hidden assumption is "Node is single-threaded." That's true for JS execution but not for I/O completions — when two `await`s complete out of order, the order in which the resumed coroutines run is the JS scheduler's call. The repo relies on this for `putInsights` to be atomic (no `await` between the clear and the forEach), and on the retry path to absorb `lastCallAt` races. Both are correct, both are fragile to refactors that add `await`s where there were none.
 
-The "structural avoidance" pattern this codebase uses has its own lineage. Akka actors, Elixir/Erlang processes, and CRDTs all share a similar shape: avoid sharing the resource so contention can't arise. The CRDT angle is particularly relevant for the multi-instance case — if you wanted the two-instance Maps to converge without a single source of truth, you'd reach for a CRDT (something like LWW-Element-Set). The architecture today says: don't try. Use a single source of truth (the provider) and treat local state as ephemeral.
+Compare to a Postgres-backed equivalent: `putInsights` would be `DELETE ... WHERE sid = ?; INSERT ...` inside a transaction. The cache race would be solved by `INSERT ... ON CONFLICT DO NOTHING`. The rate-limit race would be solved by the upstream itself (or a token bucket in a Redis-backed shared store). All of those involve more infrastructure than the current design; the current design is "single-process, single-tenant-per-key, absorb the rest with retries."
 
-For this codebase, the actionable note: if Vercel-style multi-instance becomes a felt problem (users repeatedly seeing "no insights, run again"), the right fix is *not* to add locking — it's to add a shared store (Redis, KV, Postgres) so both instances see the same data. That's a datastore decision, which traces back to audit finding F1.
+The interesting design move is the explicit **"absorb the race rather than lock it"** choice for `lastCallAt`. A lock would serialize every tool call across every session sharing one Bloomreach client — which would multiply the rate-limit cost by the concurrency count. Accepting the occasional 429 + retry is cheaper.
 
 ## Interview defense
 
-> Q: "How does this app handle concurrent writes?"
+**Q: How does this app handle concurrent writes to the same state?**
 
-Verdict: by avoiding contention rather than mediating it. State is partitioned per session, so concurrent writers on different sessions touch different sub-maps. Within a single instance, the Node event loop serializes writers automatically — every state mutation is synchronous, so no two writers can execute at the same instant. The unmitigated case is two warm Vercel instances serving the same session, where each instance has its own Map; last-write-wins, and the client mitigates by stashing data in `sessionStorage` and the architecture mitigates by making briefings cheap to re-run.
+It doesn't, because there's no shared state to contend for. State is partitioned per-session via the outer `Map` in `sessionState(sid)`, and within a session the three sub-maps (`insights`, `investigations`, `anomalies`) have different writers (briefing writes the first two, agent writes the third). No row is ever the target of two simultaneous writers in any normal flow.
 
-```
-  the picture you draw — three layers, three guarantees
+**Q: Is there any place where a race condition is possible?**
 
-   cross-session    │ partitioning           │ rock-solid
-   same instance    │ event loop             │ serialized
-   diff instances   │ NONE                   │ last-write-wins
-```
+Two. The 60s response cache can have two concurrent misses for the same key produce two upstream calls — benign, last writer wins, both callers get valid data. And `lastCallAt` in `BloomreachDataSource.liveCall` is a read-modify-write across `await`s — two concurrent callers can both skip the spacing wait, the second gets a 429, and the retry path absorbs it. The repo deliberately chose retry-absorption over locking because a lock would serialize every tool call across every concurrent session.
 
-The load-bearing point: there's no lock manager and no MVCC because there's no contested resource. The session-keying eliminates the contention; the event loop handles what remains; the multi-instance case is accepted as a UX cost the architecture is built around.
+**Q: What's the load-bearing assumption?**
 
-> Q: "Could you deadlock this thing?"
-
-No, by construction. Deadlocks require two writers each holding a lock the other wants. There are no locks. There is no waiting state. A writer either runs synchronously or hasn't been scheduled yet.
-
-> Q: "When would MVCC enter the picture?"
-
-The day a shared datastore lands. Postgres for the datastore means MVCC for free; an embedded file-backed engine means serialized writes; Redis means single-threaded per-key ops. Each of those brings its own concurrency-control model that you'd inherit rather than build. Building MVCC in JavaScript is not on the path — the path is "use a database that does it for you."
+That Node executes JS synchronously between `await` points. `putInsights` (the only multi-step write on session state) has no `await` between `.clear()` and `.forEach()`, so it's effectively atomic. Add an `await` there and the partition stops being sufficient — you'd need a per-session lock. Today the comment at `lib/state/insights.ts:57-63` warns about WHY of `.clear()` but not the atomicity contract; that's the latent risk.
 
 ## See also
 
-  - [`05-transactions-isolation-and-anomalies.md`](./05-transactions-isolation-and-anomalies.md) — the isolation guarantees concurrency control enforces
-  - [`08-replication-and-read-consistency.md`](./08-replication-and-read-consistency.md) — the multi-instance divergence case in detail
-  - [`audit.md`](./audit.md) — F3 (concurrent writes on the same session)
+- `02-records-pages-and-storage-layout.md` — the partition that makes locks unnecessary
+- `05-transactions-isolation-and-anomalies.md` — the multi-step write this concurrency story rests on
+- `04-query-planning-and-execution.md` — the retry path that absorbs the `lastCallAt` race
+- `09-database-systems-red-flags-audit.md` — the latent risks if these assumptions ever break

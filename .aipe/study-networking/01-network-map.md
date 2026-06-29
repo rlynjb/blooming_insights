@@ -1,319 +1,294 @@
-# Network map
+# 01 · Network map
 
-**The on-the-wire path, every hop labelled** · Project-specific
+## Subtitle
 
-## Zoom out — where this concept lives
+The wire topology (the three boundaries) — Project-specific.
 
-This file IS the bigger picture. Every later file in the folder zooms into one box drawn here.
+## Zoom out, then zoom in
 
-```
-  Zoom out — the whole system as labelled bands
-
-  ┌─ UI band ──────────────────────────────────────────────────┐
-  │  React 19 in the browser                                    │
-  │  app/page.tsx · app/investigate/[id]/page.tsx               │
-  │  ★ useBriefingStream · useInvestigation · StreamingResponse│ ← we are here
-  └───────────────────────┬─────────────────────────────────────┘
-                          │  hop 1: HTTPS, same-origin
-                          │  GET /api/briefing , GET /api/agent → NDJSON
-                          │  POST /api/mcp/*                    → JSON
-                          ▼
-  ┌─ Service band (Next.js route handlers on Vercel Pro) ──────┐
-  │  app/api/briefing/route.ts · app/api/agent/route.ts        │
-  │  app/api/mcp/{call,callback,reset,tools,…}/route.ts        │
-  │  per-route maxDuration = 300                                │
-  └─────────────┬─────────────────────────┬─────────────────────┘
-                │                         │
-        hop 2   │  HTTPS                  │  HTTPS    hop 3
-        ──────  │  StreamableHTTP         │  POST     ──────
-                │  Client Transport       │  /v1/messages
-                ▼                         ▼
-  ┌─ Provider band ──────────────────┐  ┌─ Provider band ──────────────────┐
-  │  loomi-mcp-alpha.bloomreach.com  │  │  api.anthropic.com                │
-  │  Bloomreach MCP server (alpha)   │  │  claude-sonnet-4-6 · haiku-4-5    │
-  └──────────────────────────────────┘  └───────────────────────────────────┘
-```
-
-Three wires. Every line that leaves the Service band is HTTPS over TCP+TLS. Nothing leaves the Service band that isn't HTTPS.
-
-## Zoom in — the concept
-
-The thing being named here: **the network map** — every wire surface this app exposes or consumes, with every hop between bands labelled. If a finding in this folder doesn't anchor to one of the hops above, the finding is off-map.
-
-## Structure pass — skeleton before mechanics
-
-### Layers
-
-- **UI band** — the browser. Owns: cookies, `fetch()` calls, `ReadableStream` consumers, sessionStorage handoff.
-- **Service band** — Next.js route handlers on Vercel. Owns: NDJSON producers, MCP/Anthropic clients, the encrypted cookie store.
-- **Provider band** — Bloomreach loomi-MCP and Anthropic. We don't own them; we obey their contracts (rate limits, token expiry, response shapes).
-
-### One axis held constant — `who originates the request?`
+The whole product is three boxes talking over HTTPS. That's it. No internal services, no peer-to-peer, no broker. Once you see the three boxes, every networking decision in the rest of this guide is a property of one of them.
 
 ```
-  axis = "who originates the request?"
+  Zoom out — the entire wire surface
 
-  ┌─ UI ──────────┐   the browser originates
-  │ user clicks    │   ───────────────────────────────►  hop 1
-  └────────────────┘   "GET /api/briefing"
-
-  ┌─ Service ─────┐   the route handler originates
-  │ NDJSON loop   │   ───────────────────────────────►  hop 2
-  │ MonitoringAgent│   "tools/call execute_analytics_eql"
-  └────────────────┘
-                      ───────────────────────────────►  hop 3
-                      "POST /v1/messages"
-
-  ┌─ Provider ────┐   never originates inbound to us.
-  │ Bloomreach     │   the alpha server CAN revoke tokens at
-  │ Anthropic      │   any time, but it does so by responding
-  └────────────────┘   401 to OUR next call, not by ringing us.
+  ┌─ UI layer ─────────────────────────────────────────────────────┐
+  │   Browser:  React 19 + Next 16 client                           │
+  │   pages: /, /investigate/[id], /investigate/[id]/recommend      │
+  │   hooks: useBriefingStream, useInvestigation, useDemoCapture    │
+  └────────────────────────────┬───────────────────────────────────┘
+                               │   ★ wire 1 ★
+                               │   HTTPS · same-origin · NDJSON
+                               ▼
+  ┌─ Service layer (this is where the wire surface lives) ─────────┐
+  │   Next.js route handlers (Node runtime, Vercel)                 │
+  │   /api/briefing  /api/agent  /api/mcp/{call,tools,reset,...}    │
+  │   maxDuration = 300 (Pro)                                       │
+  └──────────────┬─────────────────────────────────┬───────────────┘
+                 │ ★ wire 2 ★                     │ ★ wire 3 ★
+                 │ HTTPS · OAuth Bearer            │ HTTPS · x-api-key
+                 │ MCP over StreamableHTTPClient   │ Anthropic SDK
+                 ▼                                 ▼
+  ┌─ Provider layer ──────────────┐  ┌─ Provider layer ─────────────┐
+  │  loomi-mcp-alpha.bloomreach   │  │  api.anthropic.com           │
+  │  .com/mcp  (Bloomreach)       │  │                              │
+  └───────────────────────────────┘  └──────────────────────────────┘
 ```
 
-The codebase has no inbound provider webhook. No push. No long-poll FROM Bloomreach. Every conversation is `we ask → they answer`. The OAuth callback is the only inbound HTTPS request that isn't kicked off by our client code — and it's still kicked off by *our* `redirectToAuthorization` URL, just routed back through the user's browser.
+What we're talking about: the three wires labelled ★. Each one has its own transport choice, its own auth model, its own failure mode. The rest of this guide walks them one at a time; this file just names them and gets the picture into your head.
 
-### Seams — where the axis flips
+## Structure pass
 
-- **Browser ↔ Service** (`fetch('/api/briefing')` → `app/api/briefing/route.ts`). The axis flips from "client originates" to "server originates the next two hops." Same-origin, so cookies ride free; no CORS preflight.
-- **Service ↔ Bloomreach** — the MCP HTTP transport (`StreamableHTTPClientTransport`) → `https://loomi-mcp-alpha.bloomreach.com/mcp`. Trust flips: from the browser's session cookies (`bi_session`/`bi_auth`) to an OAuth Bearer token in an `Authorization` header. Cookies don't leave the Service band.
-- **Service ↔ Anthropic** (`anthropic.messages.create`). Trust flips again: from session cookie to `ANTHROPIC_API_KEY` Bearer. Different secret per provider, never reused.
-- **Browser ↔ OAuth IdP ↔ /api/mcp/callback**. The one cross-origin hop the *browser* makes — Bloomreach redirects the user back to us with `?code=…`. This is why the session cookie (`bi_session`) is `SameSite=None; Secure` in production (`lib/mcp/session.ts:12`): a Lax cookie would drop on the cross-site return.
+  - **Layers** — UI (browser), Service (Next route handlers), Provider (Bloomreach MCP, Anthropic API). Storage is **not** a wire — there's no database; state lives in in-memory maps + cookies + sessionStorage + committed JSON snapshots.
+  - **Axis traced — "what kind of HTTP exchange is this?"** Hold that one question across all three wires and the answer flips at each boundary:
+      - wire 1 (browser → route): **long-lived response streaming** (one request, many JSON lines back over chunked transfer until the agent finishes).
+      - wire 2 (route → Bloomreach MCP): **short-lived RPC** (one tool call, one JSON-RPC response, bounded by a 30s per-call timeout).
+      - wire 3 (route → Anthropic): **short-lived RPC** plus an internal SDK-managed stream the route consumes synchronously before emitting its own NDJSON events.
+  - **Seams** — three of them, one per wire. Each one carries a contract:
+      1. **The NDJSON contract** (`AgentEvent` in `lib/mcp/events.ts:4-12`) — the union type both `/api/briefing` and `/api/agent` write and both `useBriefingStream` + `useInvestigation` read. The most load-bearing seam in the repo.
+      2. **The MCP protocol** (JSON-RPC 2.0 over HTTP, via `@modelcontextprotocol/sdk`) — the route doesn't speak HTTP directly to Bloomreach; the SDK does.
+      3. **The Anthropic SDK** — same shape: the route doesn't speak HTTP directly to api.anthropic.com; `@anthropic-ai/sdk` does.
+
+The interesting thing about this axis-trace: only ONE of the three wires is the long-lived stream the user actually experiences as "the AI is thinking." The other two are short, synchronous round-trips inside the route handler. The streaming feeling is entirely on wire 1.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-Picture the app as a hub with three spokes. The hub is the Next.js route handler running on Vercel. Each spoke is one wire surface. Every spoke carries HTTPS, but each one carries it under a different protocol contract.
+Think of it like a `fetch()` on the client and a `fetch()` on the server, with the server's `fetch()` calling another server's `fetch()`. The browser makes ONE long request to the route; the route makes MANY short requests to Bloomreach and Anthropic; the route streams a transformed result back over the already-open response.
 
 ```
-  the hub-and-spoke pattern
+  Pattern — one long stream out, many short calls in
 
-                          ┌─ Browser ─┐
-                          │   React    │  spoke 1: NDJSON or JSON
-                          └─────┬──────┘  over chunked HTTP
-                                │  ▲
-                  cookies +     │  │
-                  user-clicks   ▼  │
-                          ┌─ Service ─┐
-                ┌─────────┤  Next.js   ├─────────┐
-                │         │  route     │         │
-                ▼         └────────────┘         ▼
-       ┌─ Bloomreach ─┐                 ┌─ Anthropic ─┐
-       │  spoke 2:    │                 │  spoke 3:    │
-       │  MCP / JSON-RPC               │  /v1/messages │
-       │  OAuth 2.1   │                 │  API key      │
-       └──────────────┘                 └───────────────┘
-
-  one hub. three spokes. each spoke has its own auth, its own
-  rate limit, its own failure mode.
+  browser ──────long request────────►  route
+            ▲                            │
+            │                            ├──► Anthropic (short)
+            │                            │
+            │  many NDJSON lines back    ├──► Bloomreach MCP (short)
+            └────────────────────────────┤    Bloomreach MCP (short)
+                       over the          │    Bloomreach MCP (short)
+                       single open       │    … 1.1s spacing between
+                       response          │
+                                         ▼
+                                       send 'done' line, close stream
 ```
 
-The hub matters because most of the protocol semantics in this codebase live there — the NDJSON encoding, the OAuth dance, the rate-limit retry ladder, the AbortSignal composition. The spokes are just transport.
+The browser's HTTP request never closes until the agent loop is done. The route writes one JSON line into the response body every time the agent emits a reasoning step, starts a tool call, finishes a tool call, or produces an insight. The browser parses one line at a time and updates state. That's the entire interaction model.
 
-### Move 2 — walk each hop
+### Move 2 — the step-by-step walkthrough
 
-#### Hop 1 — Browser to /api/briefing
+#### Wire 1 — browser to Next.js route (the streaming wire)
 
-The canonical example. The user lands on `app/page.tsx`, the briefing-stream hook (`useBriefingStream`) fires `fetch('/api/briefing?mode=live-bloomreach')`, and the response body is an NDJSON stream the hook reads with the NDJSON parser (`readNdjson`).
+Same-origin HTTPS. Always a GET. The route returns a `ReadableStream<Uint8Array>` with `Content-Type: application/x-ndjson; charset=utf-8` and `Cache-Control: no-store, no-transform` so Vercel's edge doesn't try to buffer or recompress the stream.
 
 ```
-  Layers-and-hops — Browser to /api/briefing (live mode)
+  Layers-and-hops — wire 1
 
-  ┌─ Browser ────────────┐                                     ┌─ Service ────────────┐
-  │  useBriefingStream   │   hop 1a: GET /api/briefing         │ app/api/briefing/    │
-  │  (fetch + reader)    │ ──────────────────────────────────► │   route.ts           │
-  │                      │   • cookies: bi_session, bi_auth    │ • maxDuration = 300  │
-  │                      │   • content negotiation: implicit   │ • content-type:      │
-  │                      │     (server picks NDJSON for live)  │   application/       │
-  │                      │                                     │   x-ndjson           │
-  │                      │   hop 1b: chunked response body     │                      │
-  │                      │ ◄────────────────────────────────── │ ReadableStream of    │
-  │                      │   {"type":"workspace",…}\n          │ Uint8Array chunks    │
-  │                      │   {"type":"reasoning_step",…}\n     │                      │
-  │                      │   {"type":"tool_call_start",…}\n    │                      │
-  │                      │   …                                 │                      │
-  │                      │   {"type":"done"}\n                 │                      │
-  └──────────────────────┘                                     └──────────────────────┘
+  ┌─ Browser ─────────────────┐                 ┌─ Vercel edge ────┐
+  │  fetch('/api/briefing')   │ ──── HTTPS ──► │  TLS termination  │
+  │  res.body.getReader()     │      GET        │  routes /api/*    │
+  │  TextDecoder + split('\n')│                 │  to handler       │
+  └───────────────────────────┘                 └─────────┬─────────┘
+                                                          │ HTTP
+                                                          │ (internal)
+                                                          ▼
+                                                ┌─ Node runtime ───┐
+                                                │  briefing/route  │
+                                                │  ReadableStream  │
+                                                │  controller.enqueue
+                                                │  ('insight\n')   │
+                                                └──────────────────┘
 ```
 
-The code that does this:
+The actual code that owns the read side is the briefing-stream hook (`useBriefingStream`):
 
 ```ts
-// lib/hooks/useBriefingStream.ts:158-159, 188-199, 288
-const res = await fetch(url);           // ← hop 1a — plain GET, no special headers
+// lib/hooks/useBriefingStream.ts:158, 288
+const res = await fetch(url);                                      // ← opens the long-lived stream
 // …
-const ct = res.headers.get('content-type') ?? '';
-if (!ct.includes('ndjson') || !res.body) {
-  // demo path: plain JSON, no stream
-}
-// …
-await readNdjson<BriefingEvent>(res.body, handle, { cancelOn: () => cancelledRef.current });
-// ↑ the shared NDJSON kernel — see lib/streaming/ndjson.ts:17
+await readNdjson<BriefingEvent>(res.body, handle,                  // ← parses line-by-line
+  { cancelOn: () => cancelledRef.current });                       // ← polled between reads
 ```
 
-Cookies travel because the request is same-origin. The route reads them in `lib/mcp/session.ts:17` (`bi_session`) and `lib/mcp/auth.ts:88` (`bi_auth`) without any explicit `credentials: 'include'` on the client. That's the same-origin payoff.
-
-#### Hop 2 — Service to Bloomreach MCP
-
-The MCP SDK opens this hop on first tool call. It's an HTTPS POST to `https://loomi-mcp-alpha.bloomreach.com/mcp/` carrying a JSON-RPC envelope and a Bearer token.
-
-```
-  Layers-and-hops — Service to Bloomreach (one tool call)
-
-  ┌─ Service ──────────────┐                                  ┌─ Provider ──────────┐
-  │ BloomreachDataSource   │  hop 2a: POST /mcp/              │ loomi-mcp-alpha     │
-  │   .callTool(…)         │ ────────────────────────────────►│ .bloomreach.com     │
-  │                        │  • Authorization: Bearer eyJ…    │                     │
-  │ SdkTransport           │  • Content-Type: application/json│ rate-limit:         │
-  │   ↳ MCP SDK Client     │  • body: {jsonrpc:"2.0",         │   ~1 req/s/user     │
-  │   ↳ StreamableHTTP-    │           method:"tools/call",   │   (alpha)           │
-  │     ClientTransport    │           params:{name,arguments}}│                     │
-  │   ↳ capturing fetch    │                                  │ token TTL:          │
-  │     (transport.ts:103) │  hop 2b: response                │   minutes (revoked) │
-  │                        │ ◄────────────────────────────────│                     │
-  │                        │  200 OK · application/json       │                     │
-  │                        │  or 401 invalid_token            │                     │
-  │                        │  or 429 "1 per 10 second"        │                     │
-  └────────────────────────┘                                  └─────────────────────┘
-```
-
-The code:
+And the write side is the route's `ReadableStream`:
 
 ```ts
-// lib/mcp/connect.ts:76-79
-const transport = new StreamableHTTPClientTransport(mcpUrl(), {
-  authProvider: provider,                            // ← OAuth/PKCE/DCR (auth.ts)
-  fetch: makeCapturingFetch(httpErrors),             // ← captures real error bodies
-});
+// app/api/briefing/route.ts:191-194
+const stream = new ReadableStream<Uint8Array>({
+  async start(controller) {
+    const send = (e: BriefingEvent) =>
+      controller.enqueue(encoder.encode(JSON.stringify(e) + '\n'));  // ← one event = one line
 ```
 
-The SDK does the actual `fetch` for hop 2a internally; we inject a capturing fetch wrapper (`makeCapturingFetch`) (`lib/mcp/transport.ts:103`) so we can keep the body of any non-2xx response and reattach it to the thrown error — without that, the SDK collapses every 401 into a generic "Unauthorized" and we lose the real `invalid_token` text.
+The fact that this is HTTPS — not WebSocket, not SSE — is a deliberate choice. See `06-websockets-sse-streaming-and-realtime.md` for why.
 
-#### Hop 3 — Service to Anthropic
+#### Wire 2 — Next.js route to Bloomreach MCP
+
+HTTPS to `https://loomi-mcp-alpha.bloomreach.com/mcp` (`lib/mcp/connect.ts:30-34`). The MCP SDK's `StreamableHTTPClientTransport` wraps this. From the route's perspective, you call `client.callTool(...)` and a Promise resolves with the result — under the hood it's a POST with an OAuth Bearer header and a JSON-RPC 2.0 body.
 
 ```
-  Layers-and-hops — Service to Anthropic
+  Layers-and-hops — wire 2
 
-  ┌─ Service ────────────────┐                                  ┌─ Provider ──────────┐
-  │ new Anthropic({          │  hop 3a: POST /v1/messages       │ api.anthropic.com   │
-  │   apiKey: process.env    │ ────────────────────────────────►│                     │
-  │     .ANTHROPIC_API_KEY }) │  • x-api-key: sk-ant-…            │ model:              │
-  │                          │  • anthropic-version: 2023-06-01  │   claude-sonnet-4-6 │
-  │ anthropic.messages       │  • body: {model, messages, tools} │   claude-haiku-4-5  │
-  │   .create({ signal })    │                                  │                     │
-  │   (aptkit-adapters.ts:52)│  hop 3b: response                 │ (intent classifier  │
-  │                          │ ◄────────────────────────────────│  uses haiku for $$)│
-  │                          │  200 OK · application/json       │                     │
-  └──────────────────────────┘                                  └─────────────────────┘
+  ┌─ Node runtime ──────────────┐               ┌─ Bloomreach ─────┐
+  │ dataSource.callTool('...')  │  HTTPS POST   │ loomi-mcp-alpha  │
+  │ ↓                           │ ─────────────►│ .bloomreach.com  │
+  │ BloomreachDataSource        │ Bearer token  │ /mcp             │
+  │ ↓ ~1.1s spacing             │ JSON-RPC body │                  │
+  │ SdkTransport                │ ◄─────────────│ JSON-RPC reply   │
+  │ ↓ 30s AbortSignal.timeout   │ 200 / 401 /   │                  │
+  │ MCP SDK Client              │ 429           │                  │
+  │ ↓ capturing fetch wrapper   │               │                  │
+  │ global fetch (undici)       │               │                  │
+  └─────────────────────────────┘               └──────────────────┘
 ```
 
-The SDK handles the actual fetch; we hand it a `signal` so the route's cancel/timeout chain propagates here too (`app/api/agent/route.ts:255` weaves `req.signal` into every Claude call).
+Two things worth noting on this wire:
+
+  - **The fetch wrapper is custom.** `makeCapturingFetch` (`lib/mcp/transport.ts:103`) is passed as the SDK's `fetch` option so the route can record the raw body of any non-OK response into a holder, redact bearer tokens, and attach the real server error to the thrown `McpToolError`. The SDK otherwise surfaces only a generic "Unauthorized."
+  - **There's no connection pool the app tunes.** The MCP SDK opens its own persistent HTTPS connection per session; the Node `fetch` global delegates to undici's default keep-alive pool. Both are good defaults for this volume.
+
+#### Wire 3 — Next.js route to Anthropic
+
+HTTPS to `api.anthropic.com` via the `@anthropic-ai/sdk` Client. The SDK handles auth (the `ANTHROPIC_API_KEY` env var becomes an `x-api-key` header), retries, and streaming. The route uses the SDK's streaming response API internally inside `runAgentLoop` (`lib/agents/base.ts`) to get model output token-by-token, but the route transforms that into its own NDJSON events before writing them onto wire 1.
+
+```
+  Layers-and-hops — wire 3
+
+  ┌─ Node runtime ──────────────┐               ┌─ Anthropic ──────┐
+  │ runAgentLoop in base.ts     │  HTTPS POST   │ api.anthropic    │
+  │ ↓                           │ ─────────────►│ .com             │
+  │ anthropic.messages.stream() │ x-api-key     │ /v1/messages     │
+  │ ↓                           │ JSON body     │                  │
+  │ SDK reads its own SSE       │ ◄─────────────│ event-stream     │
+  │ stream from Anthropic       │ chunked       │ (Anthropic's     │
+  │ (internal — not on our wire)│               │  internal SSE)   │
+  └─────────────────────────────┘               └──────────────────┘
+```
+
+Note: Anthropic's own response IS Server-Sent Events; the SDK consumes it on the route's behalf. That SSE never reaches the browser — by the time bytes hit wire 1, the route has re-shaped them into the `AgentEvent` NDJSON contract.
+
+#### The three wires together
+
+```
+  All three wires, one timeline
+
+  t=0     browser fetch('/api/briefing')
+          ↓
+  t=0.1s  route accepted; starts the stream
+          ├──► wire 3: Anthropic message #1 (with tool definitions)
+          │    ◄── tool_use response: "call execute_analytics_eql(...)"
+          ├──► wire 1: enqueue 'tool_call_start' line
+          ├──► wire 2: Bloomreach callTool(execute_analytics_eql, ...)
+          │    ◄── result
+          ├──► wire 1: enqueue 'tool_call_end' line
+          ├──► wire 3: Anthropic message #2 (with tool result)
+          │    ◄── more tool_use OR a final text block
+          ├──► wire 1: enqueue 'reasoning_step' line(s)
+          │    (loop until the agent stops calling tools)
+          ├──► wire 1: enqueue 'insight' line for each anomaly
+          └──► wire 1: enqueue 'done' line; close stream
+  t=~30s  browser sees 'done'; renders the feed
+```
+
+One open browser request, many short server-to-server calls, one stream of NDJSON events out.
 
 ### Move 3 — the principle
 
-**A network map is worth drawing because each wire carries a different contract.** Same-origin browser HTTP gives you cookies for free and no CORS friction; cross-origin server HTTP needs an OAuth provider plus a rate-limit playbook plus a token-expiry recovery dance. Same-origin and cross-origin look identical in `fetch()` syntax; the operational reality is completely different. Drawing the map exposes the contracts.
+A streaming product is not "the network is open both ways the whole time." It's "one HTTP response is open one way for a long time, and we never broke it." Everything the user perceives as real-time is happening because a single fetch stays open while the server does the slow work and writes intermediate results into the response body. The choice of NDJSON over SSE or WebSocket is downstream of that.
 
-## Primary diagram — the recap
+## Primary diagram
 
 ```
-  the recap — three wires, every hop, every protocol contract
+  The full network surface — one frame
 
-  ┌─ Browser ──────────────────────────────────────────────────┐
-  │  React · useBriefingStream · useInvestigation              │
-  │  cookies: bi_session (UUID, SameSite=None) · bi_auth (AES-256-GCM)
-  └─────────────────┬──────────────────────────────────────────┘
-                    │
-   ━━━━━━━━━━━━━━━━━│━━━━━━━━━━━━━━━ same-origin · HTTPS · TCP+TLS ━━━
-                    │
-                    │  WIRE #1
-                    │  GET  /api/briefing  → 200 application/x-ndjson  (chunked, 300s budget)
-                    │  GET  /api/agent     → 200 application/x-ndjson  (chunked, 300s budget)
-                    │  POST /api/mcp/call  → 200 application/json
-                    │  GET  /api/mcp/callback?code=…  ← OAuth redirect
-                    ▼
-  ┌─ Service ──────────────────────────────────────────────────┐
-  │  Next.js 16 route handlers · Vercel Pro · maxDuration=300  │
-  │  BloomreachDataSource  ·  Anthropic SDK                    │
-  └──┬──────────────────────────────────────────┬──────────────┘
-     │                                          │
-   cross-origin · HTTPS                         │  cross-origin · HTTPS
-     │                                          │
-     │  WIRE #2                                 │  WIRE #3
-     │  POST https://loomi-mcp-alpha            │  POST https://api.anthropic.com
-     │       .bloomreach.com/mcp/               │       /v1/messages
-     │  Authorization: Bearer (OAuth 2.1)       │  x-api-key: sk-ant-…
-     │  ~1 req/s/user · tokens expire mins      │  per-account rate limit
-     │  29-tool MCP server                      │  claude-sonnet-4-6 · haiku-4-5
-     ▼                                          ▼
-  ┌─ Bloomreach loomi-MCP ─┐         ┌─ Anthropic API ─────────────┐
-  │  alpha server          │         │  model providers             │
-  └────────────────────────┘         └──────────────────────────────┘
+  ┌────────────────────────────────────────────────────────────────────┐
+  │                          UI LAYER                                  │
+  │  ┌─ browser ──────────────────────────────────────────────────┐    │
+  │  │  useBriefingStream  →  fetch('/api/briefing')              │    │
+  │  │  useInvestigation   →  fetch('/api/agent?...')             │    │
+  │  │  StreamingResponse  →  fetch('/api/agent?q=...')           │    │
+  │  │                     all consume NDJSON via readNdjson()    │    │
+  │  └────────────────────────────────────────────────────────────┘    │
+  └──────────────────────────────┬─────────────────────────────────────┘
+                                 │  wire 1: HTTPS same-origin
+                                 │          fetch + ReadableStream
+                                 │          NDJSON down, GET up
+                                 │          bi_session cookie
+                                 ▼
+  ┌────────────────────────────────────────────────────────────────────┐
+  │                       SERVICE LAYER                                │
+  │  ┌─ Next.js route handlers (Vercel, Node runtime) ────────────┐    │
+  │  │  /api/briefing      maxDuration = 300                      │    │
+  │  │  /api/agent         maxDuration = 300                      │    │
+  │  │  /api/mcp/callback  /api/mcp/reset  /api/mcp/call          │    │
+  │  │                                                            │    │
+  │  │  ReadableStream<Uint8Array> writers · Content-Type: ndjson │    │
+  │  │  Cache-Control: no-store/no-cache, no-transform            │    │
+  │  └─────────────┬─────────────────────────────────┬────────────┘    │
+  └────────────────┼─────────────────────────────────┼─────────────────┘
+                   │ wire 2                          │ wire 3
+                   │ HTTPS · OAuth Bearer            │ HTTPS · x-api-key
+                   │ MCP over JSON-RPC 2.0           │ Anthropic SDK
+                   │ via @modelcontextprotocol/sdk   │ via @anthropic-ai/sdk
+                   │ 30s AbortSignal.timeout         │ SDK-managed
+                   │ 1.1s proactive spacing          │
+                   ▼                                 ▼
+  ┌──────────────────────────────────┐  ┌──────────────────────────────┐
+  │           PROVIDER LAYER          │  │       PROVIDER LAYER         │
+  │  loomi-mcp-alpha.bloomreach.com   │  │  api.anthropic.com           │
+  │  /mcp                             │  │  /v1/messages (SSE in)       │
+  └──────────────────────────────────┘  └──────────────────────────────┘
 ```
 
 ## Elaborate
 
-Where the map comes from: blooming insights is structurally a **classic three-tier serverless web app with two external providers**. The novelty isn't the topology — it's the protocol stack on wire #2 (MCP-over-HTTPS with OAuth 2.1 + PKCE + Dynamic Client Registration) and the choice on wire #1 (NDJSON over chunked HTTP instead of SSE/WebSocket).
+The three-wire topology is a direct consequence of the product's pitch — "an analyst that shows its work." The streaming on wire 1 is not a performance optimization; it's the surface. Users see the agent thinking because the response body is the trace. Take wire 1 out and the product collapses to "wait 30 seconds, see a list of insights" — same data, no story.
 
-Today every external hop is HTTPS. The Service band has one outbound transport shape — `fetch` (via undici on the server, via the platform on the client) — wrapped by the SDKs that ride on top of it.
+The two server-to-server wires (2 and 3) are the data layer. Bloomreach owns the workspace data; Anthropic owns the reasoning. The route is the choreographer that asks Anthropic what to ask Bloomreach, runs the calls, feeds the results back to Anthropic, and writes the running narrative out to the browser.
 
-Adjacent reading:
-
-- File 02 — what name resolution actually happens (DNS for three hostnames; nothing more interesting than that).
-- File 03 — the TCP connection lifecycle on each wire, especially for chunked HTTP.
-- File 04 — the certificate chain on each provider hop.
-- File 05 — what HTTP methods, status codes, and headers each hop actually uses.
-- File 06 — the deep walk on NDJSON over chunked HTTP, with the case against SSE.
-- File 07 — the rate-limit playbook, retry ladder, and AbortSignal composition.
+What this map deliberately does NOT show: any internal services, any queues, any caches besides the in-process `Map` in `BloomreachDataSource` (`lib/data-source/bloomreach-data-source.ts:122`), any background workers, any databases. The architecture is intentionally three boxes. When you read the rest of the guide, the question is always "which of the three wires does this property belong to?"
 
 ## Interview defense
 
-**Q: How many network transports does this app use?**
-
-> Three, all HTTPS. Browser to my own `/api/*`, server to Bloomreach loomi-MCP, server to Anthropic. No IPC, no subprocess, no custom transport — every external hop goes through `fetch`. The MCP SDK ships other transports; we use only `StreamableHTTPClientTransport`.
+**Q: Walk me through what happens when a user opens the feed and clicks 'live.'**
 
 ```
-  on the whiteboard:
-
-  Browser ──HTTPS──► /api/*  ──HTTPS──► Bloomreach (MCP)
-                          └──HTTPS──► Anthropic (LLM)
+  user clicks 'live'
+      ↓
+  useBriefingStream.useEffect fires (mode = 'live-bloomreach')
+      ↓
+  fetch('/api/briefing?mode=live-bloomreach')  — wire 1 opens
+      ↓
+  route: getOrCreateSessionId() → sets bi_session cookie if absent
+      ↓
+  route: makeDataSource('live-bloomreach', sid)
+      → connectMcp(sid) → withAuthCookies → reads bi_auth cookie
+      → if no tokens: returns {ok:false, authUrl} → 401 JSON to browser
+      → browser redirects to authUrl (Bloomreach IdP), eventually
+        returns to /api/mcp/callback (cross-site, SameSite=None cookie
+        survives the redirect)
+      ↓
+  route: opens ReadableStream, enqueues NDJSON line per event
+      → many short wire-2 calls (Bloomreach) and wire-3 calls (Anthropic)
+      → each maps to a 'tool_call_start' / 'reasoning_step' / 'insight' line
+      ↓
+  route: enqueue 'done', close stream
+      ↓
+  browser: readNdjson resolves, status flips to 'loaded'
 ```
 
-Anchor: three wires, all HTTPS, no IPC.
+**Anchor:** three wires; wire 1 stays open the whole time, wires 2 and 3 are short bursts inside.
 
-**Q: Why is the OAuth callback hop interesting?**
+**Q: Why not WebSockets?**
 
-> It's the only inbound HTTPS request that's NOT initiated by my own client code. Bloomreach's IdP redirects the user's browser back to `https://<app-host>/api/mcp/callback?code=…`. That makes it a cross-site request from the browser's perspective. If the session cookie (`bi_session`) were `SameSite=Lax`, some browsers drop it on that return and we lose the binding between the OAuth code and our session. So `bi_session` is `SameSite=None; Secure` in production — `lib/mcp/session.ts:12`.
+The traffic is one-directional (agent → browser). WebSocket buys you bidirectional + framing on top of TCP; you'd pay for both without using either. Fetch streaming gives you the unidirectional half for free, riding the existing HTTP/2 connection the page already established. Plus: every middleware you have works (auth cookies, gzip, edge caching opt-outs); WebSockets force you to re-solve those.
 
-```
-  on the whiteboard:
+**Q: What's the load-bearing piece of this map?**
 
-  Browser ──redirect──► Bloomreach IdP ──redirect──► /api/mcp/callback?code=…
-                                                     ↑
-                                          cross-site return — Lax cookie
-                                          would drop here, so we use None
-```
-
-Anchor: SameSite=None + Secure exists for one specific moment in the OAuth dance.
-
-**Q: What if Bloomreach revokes a token mid-stream?**
-
-> They do, within minutes — the alpha server doesn't keep long-lived tokens. The 401 surfaces as an `invalid_token` body on whichever MCP call hits the wire next. `BloomreachDataSource.liveCall` wraps it as an `McpToolError`; the NDJSON `error` event reaches the browser; `useReconnectPolicy.handle` matches the message against `AUTH_ERROR_RE_AUTO` (`useReconnectPolicy.ts:33`), fires `POST /api/mcp/reset` to drop the encrypted cookie, then reloads. One-shot guard in sessionStorage prevents a loop if the second auth also fails.
-
-```
-  on the whiteboard:
-
-  call → 401 invalid_token → NDJSON {type:"error",message:"… invalid_token …"}
-        → useReconnectPolicy.handle(msg) matches LONG regex
-        → POST /api/mcp/reset (drops bi_auth cookie)
-        → window.location.href = '/' → re-auth on next request
-```
-
-Anchor: the alpha server is the reason the reconnect policy (`useReconnectPolicy`) exists.
+The NDJSON contract on wire 1 (`AgentEvent` in `lib/mcp/events.ts`). It's the only place the browser and the route agree on what they're saying to each other. Both `/api/briefing` and `/api/agent` write it; both `useBriefingStream` and `useInvestigation` read it. Drop or break it and the whole streaming surface goes dark.
 
 ## See also
 
-- `02-dns-routing-and-addressing.md` — name resolution on each hop
-- `05-http-semantics-caching-and-cors.md` — what each method/status means here
-- `06-websockets-sse-streaming-and-realtime.md` — wire #1 in depth
-- `07-timeouts-retries-pooling-and-backpressure.md` — wire #2 under pressure
-- `study-security/audit.md` — trust boundaries per wire
+  - `05-http-semantics-caching-and-cors.md` — for the HTTP details (status codes, cookies, cache directives) on each wire.
+  - `06-websockets-sse-streaming-and-realtime.md` — for the deep walk on wire 1's NDJSON streaming.
+  - `07-timeouts-retries-pooling-and-backpressure.md` — for the timeout + retry behavior on wire 2.
+  - `04-tls-and-trust-establishment.md` — for the OAuth handshake on wire 2.

@@ -1,174 +1,201 @@
 # Plan-and-execute
 
-*Industry name: plan-and-execute / plan-and-solve — Industry standard.*
+**Industry standard.** A reasoning pattern that separates planning from doing. **Not yet implemented** in this codebase.
 
-Separate the strategy (one expensive call) from the execution (many cheap calls). Not in this repo. The diagnostic agent comes closest but stays ReAct.
+## Zoom out, then zoom in
 
-## Zoom out — where this concept would live
-
-If adopted, it would sit at the agent layer alongside the existing ReAct loops — likely as a refactor of the DiagnosticAgent where the "hypothesize, then test each" structure becomes an explicit two-phase agent instead of a prompt instruction inside one loop.
+Sits at the same layer as ReAct — a prompting strategy the agent loop runs. The difference is the conversation shape: one expensive call up front, then many cheap calls executing the plan.
 
 ```
-  Where plan-and-execute WOULD live (not yet implemented)
+  Zoom out — where this concept WOULD live
 
-  ┌─ Service layer ──────────────────────────────────────────┐
-  │  /api/agent?step=diagnose                                 │
-  └─────────────────────┬────────────────────────────────────┘
-                        ▼
-  ┌─ Agent layer ────────────────────────────────────────────┐
-  │  Today:   DiagnosticAgent (ReAct, plans in-loop)         │
-  │  Future:  DiagnosticPlanner (sonnet, plans hypotheses)   │ ← would live here
-  │         + DiagnosticExecutor (haiku per hypothesis)      │
-  └──────────────────────────────────────────────────────────┘
+  ┌─ Reasoning layer ───────────────────────────────┐
+  │  (today: every agent runs ReAct)                 │
+  │  (would: an agent could run plan-and-execute)    │
+  └────────────────────────────┬────────────────────┘
+                               │
+  ┌─ Runtime layer ───────────▼────────────────────┐
+  │  runAgentLoop  (the skeleton)                   │
+  └────────────────────────────┬────────────────────┘
+                               │  prompted with...
+  ┌─ Prompting layer ─────────▼────────────────────┐
+  │  ReAct (today)   ◄── escalation point           │
+  │  ★ Plan-and-execute (when ReAct hits a ceiling)★│ ← we are here
+  └─────────────────────────────────────────────────┘
 ```
+
+This file places the pattern in the escalation family. The repo doesn't run it; if a future investigation got long enough that the path was knowable in advance, this is what you'd reach for.
 
 ## Structure pass
 
-The axis: **when does the strategy get decided — once up front, or every turn?**
+Layers: planner call (one expensive model) → execute calls (many cheap models) → optional re-plan trigger when execution diverges.
 
-```
-  ReAct (now)                          Plan-and-execute (alternative)
-  ───────────────────                  ──────────────────────────────
-  every turn: model re-decides         turn 1: model commits to plan
-  the next move based on the last      turns 2..N: cheaper model runs
-  tool result                          each step; rarely re-plans
+**Axis traced — "where does the strategy come from?":** all up front, in one call, from the expensive model. Execute calls don't re-decide the strategy; they only do the next step.
 
-  cost: full-power model every turn    cost: full-power once + cheap N times
-  risk: model wanders if data is noisy risk: plan breaks if reality diverges
-```
+**Seam:** the plan itself is the typed handoff between the two phases. Plans tend to be a list of `{step, dependencies, expectedOutput}` objects — structured enough that the execute phase can iterate over them mechanically.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know the "make a plan before you start coding" rule. Plan-and-execute is that rule applied to the model: one expensive "what's the plan" call up front, then a series of cheap "do step N" calls. The plan is the artifact; the executors don't deviate from it.
+You know the difference between a fresh debugger session and a written runbook. ReAct is the debugger — every move is "look at what I just learned, decide the next thing." Plan-and-execute is the runbook — someone (the expensive model, once) writes the steps in order; someone else (the cheap model, many times) follows them.
 
 ```
-  Plan-and-execute — two phases, hard split
+  The two-phase shape
 
-  ┌─ Plan phase (one expensive call) ──────────────────┐
-  │  model.complete("here's the goal; output the plan") │
-  │  → plan: [step1, step2, step3, ...]                 │
-  └──────────────────────────┬──────────────────────────┘
-                             ▼
-  ┌─ Execute phase (N cheap calls, optionally parallel) ┐
-  │  for step in plan:                                    │
-  │    result = cheap_model.execute(step)                 │
-  │    if step fails badly → re-plan trigger             │
-  └──────────────────────────────────────────────────────┘
+  ┌─ Plan phase (ONE expensive call) ─────────────────────────┐
+  │  input:  user goal + tools + context                       │
+  │  model:  Claude Sonnet (or a heavier reasoning model)      │
+  │  output: ordered list of steps with dependencies           │
+  │                                                             │
+  │   plan = [                                                  │
+  │     { step: 1, action: "query revenue", depends: [] },      │
+  │     { step: 2, action: "localize by country", depends: [1]},│
+  │     { step: 3, action: "test churn hypothesis", depends: [1│
+  │     { step: 4, action: "synthesize", depends: [2, 3] },     │
+  │   ]                                                         │
+  └─────────────────────────────┬──────────────────────────────┘
+                                │  plan
+                                ▼
+  ┌─ Execute phase (MANY cheap calls) ────────────────────────┐
+  │  for each step in topological order:                       │
+  │     model: Claude Haiku (or cheap/fast)                    │
+  │     input: the step's action + relevant prior results      │
+  │     output: the step's result                              │
+  │                                                             │
+  │  cheap models cannot re-plan — they only execute            │
+  └────────────────────────────────────────────────────────────┘
 ```
 
-### Move 2 — what it would look like in this repo
+The win is decoupling strategy from grunt work. One expensive call decides the plan; many cheap calls execute it. The cost-per-investigation can drop substantially when the plan has more than ~5-6 steps; below that, the planning overhead doesn't amortize.
 
-The diagnostic agent today (`lib/agents/diagnostic.ts` → `@aptkit/agent-diagnostic-investigation`) uses a soft plan-and-execute inside ReAct: the prompt says "generate 2-3 hypotheses before the first tool call." But the model can (and does) revise its hypotheses mid-loop as evidence comes in. That's ReAct's flexibility, not plan-and-execute's commitment.
+### Move 2 — step by step
 
-A real plan-and-execute refactor would look like:
+#### What this would look like in this repo
 
+The diagnostic agent (`lib/agents/diagnostic.ts`) is the natural candidate. Today it runs straight ReAct: `DiagnosticInvestigationAgent.investigate(anomaly)` calls `runAgentLoop` with maxTurns=8 and lets the model decide each turn.
+
+A plan-and-execute version would split into two AptKit-shaped passes:
+
+```ts
+// hypothetical lib/agents/diagnostic-planning.ts (not implemented)
+class PlanningDiagnosticAgent {
+  constructor(
+    private planner: ModelProvider,    // Sonnet
+    private executor: ModelProvider,   // Haiku
+    private tools: ToolRegistry,
+    // ... ports as today
+  ) {}
+
+  async investigate(anomaly: Anomaly, hooks: AgentHooks): Promise<Diagnosis> {
+    // Phase 1: plan
+    const plan = await runAgentLoop({
+      capabilityId: 'diagnostic-planner',
+      model: this.planner,
+      tools: this.tools,
+      system: PLAN_SYSTEM_PROMPT,
+      userPrompt: `Plan a diagnostic investigation for ${anomaly.metric}.`,
+      maxTurns: 2,  // tight cap — planning, not investigation
+      parseResult: parsePlan,
+    });
+
+    // Phase 2: execute
+    const results = [];
+    for (const step of plan.parsed.steps) {
+      const result = await runAgentLoop({
+        capabilityId: 'diagnostic-executor',
+        model: this.executor,
+        tools: this.tools,
+        system: EXECUTE_SYSTEM_PROMPT,
+        userPrompt: `Execute step: ${step.action}. Prior results: ${
+          JSON.stringify(results.filter(r => step.depends.includes(r.step)))
+        }`,
+        maxTurns: 3,
+      });
+      results.push({ step: step.step, result: result.finalText });
+    }
+
+    return synthesizeDiagnosis(anomaly, results);
+  }
+}
 ```
-  Hypothetical diagnostic refactor — two AptKit agents instead of one
 
-  ┌─ DiagnosticPlanner ──────────────────────────────────────┐
-  │  model: claude-sonnet-4-6 (the expensive one)            │
-  │  tools: none (pure reasoning over the anomaly)            │
-  │  output: { hypotheses: [{id, statement, query}, ...] }    │
-  │  budget: 1 turn, ~2K tokens                                │
-  └──────────────────────────┬───────────────────────────────┘
-                             ▼
-  ┌─ DiagnosticExecutor (parallel, one per hypothesis) ──────┐
-  │  model: claude-haiku-4-5 (cheap)                          │
-  │  tools: execute_analytics_eql only                        │
-  │  task: run this one query, score support 0..1, return     │
-  │  budget: 1-2 turns each, ~1K tokens                        │
-  └──────────────────────────┬───────────────────────────────┘
-                             ▼
-  ┌─ DiagnosticSynthesizer ──────────────────────────────────┐
-  │  model: claude-sonnet-4-6 (the expensive one again)       │
-  │  tools: none                                              │
-  │  input: planner output + executor scores                  │
-  │  output: Diagnosis (existing shape)                       │
-  └──────────────────────────────────────────────────────────┘
-```
+Two notes on this shape:
 
-The wins this would buy:
-- **Lower total cost** — haiku per hypothesis is much cheaper than sonnet per turn
-- **Parallel execution** — hypotheses are independent; testing them in parallel cuts latency
-- **Inspectable plan** — the plan is a JSON artifact you can store, eval, regression-test
+- Each call to `runAgentLoop` is still one of the same skeleton from `02-agent-loop-skeleton.md`. Plan-and-execute is *two skeletons stacked*, not a new primitive.
+- The planner and executor are *different model providers* (different cost tiers). Sonnet plans, Haiku executes. The model adapter (`AnthropicModelProviderAdapter`) takes the model name in its constructor (`lib/agents/aptkit-adapters.ts:31-37`) so this is trivial to wire — pass a different `AGENT_MODEL` to each ` ModelProvider` instance.
 
-The costs it would pay:
-- **Brittleness on bad data** — if a hypothesis turns out to be irrelevant mid-execution, the executor has no way to swap it for a better one; needs a re-plan trigger
-- **Two new AptKit agent classes** — currently one; would become three (planner, executor, synthesizer)
-- **Coordination tax** — now the route handler is orchestrating three agents instead of one; closer to true multi-agent territory (see `../03-multi-agent-orchestration/`)
+#### The re-plan trigger — where plan-and-execute breaks honestly
+
+The brittle part: a plan assumes the path through the data; when an execute step's result invalidates the plan ("step 2 said the cause is churn, but the data shows no churn"), the remaining steps are wrong. The mitigation is a *re-plan trigger* — after each execute step, a cheap check ("does this result confirm or contradict the plan's assumption?") and if it contradicts, restart from the planning phase with the new information.
+
+That trigger turns plan-and-execute into "ReAct with a plan-shaped scratchpad." If the trigger fires every step, you've collapsed back to ReAct's cost. If it never fires, you've got the canonical plan-and-execute win. The breakpoint for this repo's diagnostic agent: if 80%+ of investigations would execute the planned steps without contradiction, the pattern earns its overhead.
 
 ### Move 3 — the principle
 
-Plan-and-execute trades flexibility for cost and parallelism. The win is real when the task has a known shape and the steps are independent (a research question with N sub-questions, a coding task with N file edits). The loss is real when the data can surprise the plan — the model commits to "check checkout funnel" and then the evidence says "actually it's payment processor errors." ReAct adapts; plan-and-execute has to bail to a re-plan.
-
-## In this codebase
-
-**Not yet implemented.** The diagnostic agent uses a ReAct loop with a planning *prompt instruction*, not a two-phase architecture. The current DiagnosticAgent at `lib/agents/diagnostic.ts:35-44` is a single `runAgentLoop()` call where the model interleaves hypothesizing and testing within the same loop.
-
-Why not implemented: the diagnostic agent's quality ceiling under ReAct has not been measured against a workload that would expose ReAct's failure mode (the model wandering off the hypothesis list). With ~1 req/s MCP rate-limit, parallel execution would also require coordinating concurrency at the data-source layer, which is its own refactor (see `../05-production-serving/02-fan-out-backpressure.md`).
-
-The system-design template for adopting it lives in `../06-orchestration-system-design-templates/03-agentic-coding-system.md`'s "How to make it apply" bullet.
+**Plan-and-execute is the right escalation when the path is knowable but long.** "Knowable" is the load-bearing word: the planner has to be able to write a useful plan from the goal + context alone, without needing to see intermediate results. "Long" is the supporting word: the cost of the planning call needs many execute calls to amortize over. If the path is *not* knowable up front (the diagnostic agent's case today — which hypothesis to test next depends on what the previous query returned), ReAct is the correct choice and plan-and-execute will just add a useless first call.
 
 ## Primary diagram
 
-The contrast between today's ReAct diagnostic and a future plan-and-execute diagnostic:
-
 ```
-  Comparison — current vs hypothetical diagnostic
+  Plan-and-execute as two skeletons stacked
 
-  TODAY (ReAct, one agent):                  FUTURE (plan-and-execute, three):
-  ┌────────────────────────┐                 ┌─────────────┐
-  │  DiagnosticAgent       │                 │  Planner    │  sonnet ×1
-  │  prompt: "generate     │                 │  hypotheses │
-  │   2-3 hypotheses then  │                 └──────┬──────┘
-  │   test each"           │                        │ parallel
-  │                        │                  ┌─────┴─────┬─────┐
-  │  while not done {      │                  ▼           ▼     ▼
-  │    pick next move      │                ┌────┐   ┌────┐  ┌────┐
-  │    (test, re-plan,     │                │exec│   │exec│  │exec│  haiku ×N
-  │     conclude)          │                │ H1 │   │ H2 │  │ H3 │
-  │  }                     │                └─┬──┘   └─┬──┘  └─┬──┘
-  │  maxToolCalls=6        │                  └────────┼──────┘
-  └────────────────────────┘                           ▼
-                                              ┌──────────────┐
-                                              │ Synthesizer  │  sonnet ×1
-                                              │ → Diagnosis  │
-                                              └──────────────┘
+  ┌─ Plan skeleton ────────────────────────────────────────────────┐
+  │  user prompt: "investigate this anomaly"                        │
+  │   ▼                                                              │
+  │  Sonnet (expensive)                                              │
+  │   ▼                                                              │
+  │  one model.complete call, no tools (or tools to peek at schema) │
+  │   ▼                                                              │
+  │  plan = { steps: [...with dependencies...] }                    │
+  └─────────────────────────────┬──────────────────────────────────┘
+                                │  plan
+                                ▼
+  ┌─ Execute skeleton (run N times) ──────────────────────────────┐
+  │  per step in topological order:                                 │
+  │    user prompt: "execute step X; prior results: ..."            │
+  │     ▼                                                            │
+  │    Haiku (cheap)                                                 │
+  │     ▼                                                            │
+  │    runAgentLoop with maxTurns=2-3, tools allowed                │
+  │     ▼                                                            │
+  │    result = step output                                          │
+  │  collect results[]                                              │
+  └─────────────────────────────┬──────────────────────────────────┘
+                                │  results[]
+                                ▼
+  ┌─ Optional re-plan check ──────────────────────────────────────┐
+  │  if any step's result contradicts the plan's assumption:        │
+  │     loop back to Plan skeleton with new info                    │
+  │  else: synthesize final answer from results                     │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-Plan-and-execute crystallized in 2023 around papers like "Plan-and-Solve Prompting" (Wang et al.) and the LangChain pattern of the same name. The key insight: pure ReAct re-evaluates the whole strategy on every turn, which is expensive AND lets the model wander. Decoupling planning from execution gives you the same quality on structured tasks for less money.
+The most common implementation pattern uses LangGraph (or an equivalent state-machine library) to express the plan-and-execute shape as a graph — a planner node, a router that dispatches each step to a per-step executor node, and a re-plan node gated by a contradiction check. The graph framing is more robust than the for-loop framing above because it makes the dependencies between steps inspectable and makes the re-plan path a first-class edge instead of a control-flow hack.
 
-The "re-plan trigger" is the usual production tax. A pure plan-and-execute breaks the first time reality diverges from the plan. Production implementations add a re-plan condition: if an executor returns "this doesn't make sense" or a confidence score below threshold, the planner runs again with the new context. At that point you've nearly recreated ReAct, just at a coarser granularity.
-
-The right thing to take away: plan-and-execute is ReAct with a cost-shifting move — pay more up front for the plan so each step costs less. It earns its complexity when the per-step savings × N steps exceeds the planning overhead, which is roughly "N > 4 and the steps are similar in shape."
+The Anthropic blog's "extended thinking + tool use" post argues a related point: for *some* problem shapes, the right pattern isn't plan-and-execute at all but extended-thinking ReAct — let the model think for many tokens before each action, but keep the per-turn structure of ReAct. The two patterns are competing answers to "the model wanders mid-run." Plan-and-execute solves it by removing per-step decisions; extended thinking solves it by giving the model more room per decision. Both are escalations from baseline ReAct; the choice between them depends on whether the wandering is "the model doesn't know the strategy" (plan-and-execute wins) or "the model knows but reasons too shallowly per step" (extended thinking wins).
 
 ## Interview defense
 
-**Q: "Why didn't you use plan-and-execute for the diagnostic agent?"**
+> **Q: Why doesn't this codebase use plan-and-execute?**
+>
+> The path through the data isn't knowable up front. The diagnostic agent's investigations depend on what each query returns — "revenue dropped, now localize by country, now check whether the dropping country has a churn correlation, now test whether the churn correlation appears in any specific segment." The next hypothesis to test depends on the previous result. A plan written before turn 1 would be guessing; by turn 3 it would need re-planning, which collapses back to ReAct's cost. The breakpoint where this would change: if diagnostic investigations grew to 15+ tool calls AND the hypothesis order became standardizable per anomaly category. Neither is true today.
 
-A: Because ReAct hasn't hit a ceiling that justifies the refactor. The diagnostic prompt asks for 2-3 hypotheses up front — a soft plan — and the model usually follows it. The cases where it doesn't (the data surprises the hypothesis list) are exactly the cases where ReAct's flexibility helps. If we measured the trajectory traces and found the model consistently wasting tool calls on already-rejected hypotheses, that would be the failure mode that justifies the escalation. Right now the failure mode is more "the model's first hypothesis is too broad" — a prompt fix, not an architectural one.
+> **Q: If you had to add plan-and-execute, where would it go and what would it cost?**
+>
+> The recommendation agent is the better candidate, not the diagnostic agent. Recommendations follow a more predictable path: read scenarios, read segments, read campaigns, then propose. A planner could list "step 1: read scenarios for this anomaly's category; step 2: read segments matching the affected customer profile; step 3: read recent campaigns; step 4: synthesize" before any execute call runs. The cost: one extra Sonnet call up front (~2-3K tokens, ~$0.02), then 3-4 Haiku execute calls instead of 3-4 Sonnet ReAct turns. Net win is roughly 60-70% on tokens for the recommendation phase. The risk: if step 1 returns no scenarios for this category, the rest of the plan is wrong and we re-plan — paying the planning cost twice.
+>
+> Anchor: hypothetical refactor of `lib/agents/recommendation.ts` to split into planner + executor wrappers over `runAgentLoop`.
 
-Diagram I'd sketch:
-
-```
-  ReAct here                Plan-execute would be:
-  ┌──────────┐              ┌─────────┐  → ┌──────┬──────┬──────┐  → ┌──────┐
-  │ hypoth.  │              │planner  │    │exec  │exec  │exec  │    │synth │
-  │ + test   │              │(sonnet) │    │(haiku)              │    │(sonnet)│
-  │ in loop  │              └─────────┘    └──────┴──────┴──────┘    └──────┘
-  └──────────┘
-  one agent                 three agents — closer to multi-agent
-```
-
-Anchor: "the prompt at `lib/agents/legacy-prompts/diagnostic.md` already does the soft plan-and-execute. The escalation is from 'prompt-instructed plan' to 'separate planner agent' — that's the breakpoint we haven't crossed."
+> **Q: Plan-and-execute vs extended-thinking ReAct — when each?**
+>
+> Plan-and-execute when the model's failure mode is "doesn't know the strategy" — the path is knowable, the model just needs to commit to it before getting distracted. Extended thinking when the failure mode is "knows but reasons too shallowly" — give the model more tokens per decision instead of removing decisions. Both are escalations from baseline ReAct, not replacements. The interview signal is naming the failure mode that picked one over the other, not picking one because it's the newer paper.
 
 ## See also
 
-- [`03-react.md`](./03-react.md) — what the diagnostic agent currently is
-- [`05-reflexion-self-critique.md`](./05-reflexion-self-critique.md) — the other escalation past ReAct
-- [`../03-multi-agent-orchestration/02-supervisor-worker.md`](../03-multi-agent-orchestration/02-supervisor-worker.md) — what this becomes if you take the next step
-- [`../06-orchestration-system-design-templates/03-agentic-coding-system.md`](../06-orchestration-system-design-templates/03-agentic-coding-system.md) — template where plan-execute is the standard architecture
+- → `03-react.md` — the baseline this escalates from
+- → `05-reflexion-self-critique.md` — the orthogonal "catch wrong outputs" escalation
+- → `03-multi-agent-orchestration/02-supervisor-worker.md` — what plan-and-execute becomes when each step is a different specialist
+- → `06-orchestration-system-design-templates/03-agentic-coding-system.md` — the system design template where plan-and-execute is canonical

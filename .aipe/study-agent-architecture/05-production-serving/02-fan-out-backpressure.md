@@ -1,63 +1,44 @@
 # Fan-out backpressure
 
-*Industry name: concurrency limiting / backpressure / semaphore — Industry standard.*
+**Industry standard.** Concurrency caps when a fan-out topology can spawn faster than the provider serves. **Not exercised** in the multi-agent fan-out sense — but the underlying primitive (`minIntervalMs` spacing in `BloomreachDataSource`) is the same one a fan-out cap would use.
 
-A single LLM call has one outbound request to rate-limit. A fan-out topology fires many concurrent calls from one task — and a supervisor spawning workers can fan out faster than the provider's rate limit allows. **Not in this repo today** (no fan-out), but Bloomreach's ~1 req/s spacing acts as a degenerate global cap. Adding fan-out would require building this layer first.
+## Zoom out, then zoom in
 
-## Zoom out — where this concept would live
-
-Backpressure lives at the DataSource layer (where the rate-limit constraint is) and at the supervisor layer (where the decision to spawn more workers is made). If/when fan-out is adopted, both need wiring.
+Sits at the boundary between the agent (or orchestrator) that emits concurrent work and the provider that has finite serving capacity. Without a cap, the agent can pile up requests faster than the provider can answer; the result is a queue of 429 rate-limit errors.
 
 ```
-  Where backpressure WOULD live (the prerequisite for fan-out)
+  Zoom out — where this concept lives
 
-  ┌─ Supervisor layer ───────────────────────────────────────┐
-  │  spawn worker? check global concurrency state             │ ← new (if fan-out)
-  │  if queue depth > threshold → stop spawning               │
-  └─────────────────────┬────────────────────────────────────┘
-                        ▼
-  ┌─ DataSource layer ───────────────────────────────────────┐
-  │  concurrency semaphore (e.g. cap at 4 concurrent calls)  │ ← new (if fan-out)
-  │  + existing 1 req/s proactive spacing                     │
-  │  + existing rate-limit retry                              │
-  └──────────────────────────────────────────────────────────┘
+  ┌─ Orchestration layer ───────────────────────────┐
+  │  (today: sequential; would fan-out N workers)    │
+  └────────────────────────┬────────────────────────┘
+                           │ many concurrent calls
+                           ▼
+  ┌─ Backpressure layer ──────────────────────────────┐
+  │  ★ concurrency cap (semaphore / token bucket) ★  │ ← we are here
+  └────────────────────────┬────────────────────────┘
+                           ▼
+  ┌─ Provider ──────────────────────────────────────┐
+  │  Anthropic + Bloomreach MCP (each rate-limited) │
+  └─────────────────────────────────────────────────┘
 ```
 
 ## Structure pass
 
-The axis: **what's between the model's intent to call N tools and the provider receiving them?**
+Layers: spawner (the supervisor / fan-out caller) → concurrency limiter (semaphore over outbound calls) → provider (the rate-limited service) → upward backpressure (when the queue grows, the spawner stops spawning).
 
-```
-  Today (no fan-out, all sequential):
-  ────────────────────────────────────
-  agent → callTool → 1 req/s spacing → MCP
-  no concurrency, no semaphore needed
+**Axis traced — "what's preventing the runaway?":** the concurrency cap at the limiter and the backpressure signal back to the spawner. Without both, "spawn N then process the queue" turns into "spawn N then watch 429s pile up."
 
-  Hypothetical (fan-out, with backpressure):
-  ───────────────────────────────────────────
-  supervisor → spawn N workers (concurrently)
-       │
-       ▼
-  workers all call dataSource.callTool
-       │
-       ▼
-  semaphore (cap=N_concurrent) ← BACKPRESSURE
-       │  pop up to N concurrent; queue the rest
-       ▼
-  1 req/s spacing + rate-limit retry
-       │
-       ▼
-  MCP server (sees at most N_concurrent at a time)
-```
+**Seam:** the limiter's queue. Pop up to N concurrent; queue the rest. When the queue overruns a threshold, signal upstream.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know the "200 fetches with `Promise.all` open 200 connections at once" anti-pattern — production code reaches for a `limit` helper to cap concurrency. Backpressure for agents is that same primitive at a different layer: the supervisor decomposes into N workers, the workers fire concurrent tool calls, the semaphore caps how many actually hit the provider at once.
+You know `Promise.all` with a concurrency cap — "run 200 requests, but no more than 10 at a time." That's the canonical pattern. The agent version adds two wrinkles: the unit of concurrent work is an agent call (not a single HTTP request), and the spawner is sometimes another agent (a supervisor that can keep dispatching workers as long as the queue accepts).
 
 ```
-  Fan-out backpressure — flow control between supervisor and provider
+  Fan-out backpressure — the shape
 
   Supervisor decomposes → 12 worker calls at once
                        │
@@ -73,123 +54,132 @@ You know the "200 fetches with `Promise.all` open 200 connections at once" anti-
   └───────────────────────────────────────────────┘
 ```
 
-### Move 2 — what backpressure would look like in this repo
+### Move 2 — step by step
 
-Bloomreach's MCP server rate-limits at ~1 req/s globally per user — the current `BloomreachDataSource` enforces this with proactive spacing (calls are queued internally and released at ~1 req/s). Sequential agent calls don't trip this; they fire one at a time naturally.
+#### What this repo has — the proactive spacing primitive
 
-If the monitoring agent (`MonitoringAgent`) were refactored to fan out across categories (see `../03-multi-agent-orchestration/04-parallel-fan-out.md`), say 5 CategoryWorkers running in parallel, all 5 would call `dataSource.callTool` simultaneously. The current spacing would queue them — fan-out becomes serial again at the data-source layer, defeating the parallelism.
+Open `lib/data-source/bloomreach-data-source.ts:190-205`:
 
-The fix would be a concurrency cap **higher than** the spacing's effective throughput, with the spacing still acting as the per-call rate limit. Sketch:
-
-```typescript
-// hypothetical addition to BloomreachDataSource
-private semaphore = new Semaphore(4); // cap 4 concurrent in-flight
-
-async callTool(name, args, opts) {
-  await this.semaphore.acquire();
-  try {
-    // existing: cache check, spacing, MCP call, retry
-    return await this.actualCall(name, args, opts);
-  } finally {
-    this.semaphore.release();
+```ts
+private async liveCall(name, args, signal?): Promise<unknown> {
+  const elapsed = Date.now() - this.lastCallAt;
+  if (elapsed < this.minIntervalMs) {           // 200ms default
+    await new Promise((r) => setTimeout(r, this.minIntervalMs - elapsed));
   }
+  // ... actual transport call ...
 }
 ```
 
-With a cap of 4 and ~1 req/s spacing, you'd get roughly 4 concurrent calls cycling through the spacing — effective throughput ~4 req/s instead of 1. Latency for a fan-out of 5 workers drops from ~5s (sequential) to ~1.5-2s (4 in parallel, 1 queued briefly).
+`minIntervalMs = 200` enforces at least 200ms between MCP wire calls *per data-source instance*. This is the rate-limit-anticipation primitive — it works even when the agent loop fires tool calls without spacing because the data source enforces the floor regardless.
 
-**Backpressure upward — the second half of the pattern.**
+Why this matters: Bloomreach's loomi connect server is per-user rate-limited at roughly 1 request per second. The 200ms floor is conservative against that ceiling — agents can issue calls aggressively without immediately triggering 429s. When they do (which still happens; see `01-cross-turn-caching.md` and `03-per-tool-circuit-breaking.md`), the retry ladder handles it.
 
-The supervisor side also needs flow control: when the worker queue grows past a threshold, the supervisor should stop spawning further rather than queue unbounded work. A runaway supervisor that keeps spawning workers is the multi-agent version of an unbounded queue.
+This is the same primitive a fan-out concurrency cap would use. If the repo grew a parallel-worker topology, the natural implementation would be: wrap each worker's call sequence in a `p-limit`-style semaphore (or use an in-process token bucket), with the semaphore's max-concurrency tuned to the provider's rate. The `minIntervalMs` is the per-call-spacing form of the same backpressure idea.
 
-Concretely: if MonitoringDispatcher is iterating over 50 customer segments and the semaphore queue is already at 20, the dispatcher should pause spawning until the queue drains below a threshold. This prevents a 10x backlog of pending workers from sitting in memory.
+#### What's missing — true fan-out backpressure
 
-### Move 2.5 — the tradeoff
+Since the repo doesn't run fan-out, the *upward* backpressure signal isn't implemented. The full pattern needs:
 
-A low concurrency cap protects the provider but serializes the fan-out (you lose the parallel-latency win that made fan-out worth it). The breakpoint is the provider's rate limit divided by per-call duration:
+1. **Concurrency cap on outbound calls.** Present in the form of `minIntervalMs` spacing.
+2. **Queue depth visibility.** A spawning supervisor needs to know how deep the limiter's queue is so it can decide whether to keep spawning. Not present.
+3. **Upstream cancellation.** When the queue exceeds a threshold, the supervisor should pause decomposing further work. Not present.
 
-- Bloomreach: ~1 req/s, ~200-500ms per call → effective throughput ~2-5 req/s without rate-limiting
-- Concurrency cap = 4 → fits comfortably under this
-- Concurrency cap = 20 → would 429 the server constantly
+The supervisor isn't part of this repo (the orchestration is deterministic), so the upward backpressure isn't needed. If the repo escalated to supervisor-worker with fan-out, all three pieces would land together.
 
-The cap should be just under "the highest concurrency the provider can sustain without 429ing." For Bloomreach that's probably 3-5. If the task needs more throughput than that, the answer is request a higher limit OR batch within each call, not a higher local cap that just trades queueing for 429s.
+#### The tradeoff that's sharper for agents than for one-off calls
+
+The spec calls out: "a low concurrency cap protects the provider but serializes the fan-out (you lose the parallel-latency win that made fan-out worth it)." This is exactly the breakpoint analysis.
+
+For this repo: even if fan-out were added, the effective concurrency is bounded by the MCP per-user rate limit. Two agents fanning out 4 calls each at the same instant would still pace at 1 req/s per user — the parallelism gain on the wire is zero. The win would only manifest at the *model-call* layer, where Anthropic's per-account rate limit is higher (tens of requests per second) and concurrent model calls can serve concurrent reasoning steps.
+
+So the fan-out's actual win in this repo's domain wouldn't be wire concurrency (still bounded by MCP); it would be *reasoning concurrency* — two agents thinking about different sub-anomalies at the same time, each issuing sequential MCP calls. The supervisor's job becomes "split the work so each worker's MCP queue is independent" rather than "fire 12 MCP calls in parallel and pray."
+
+#### When the spawner needs to stop spawning
+
+The supervisor's reasoning is the runaway risk. A supervisor that keeps decomposing work as it sees previous work complete can spawn unbounded work. The mitigation: a global per-run worker cap. Whatever the supervisor's loop says, the orchestrator should refuse to spawn worker N+1 once N is at the cap. This is the multi-agent version of the single-agent budget exit from `01-reasoning-patterns/02-agent-loop-skeleton.md`.
 
 ### Move 3 — the principle
 
-A runaway supervisor that keeps spawning workers without backpressure is the multi-agent version of an unbounded queue. Three controls compose: a concurrency semaphore at the DataSource layer (bounds in-flight calls), proactive spacing at the same layer (smooths the rate), and upward backpressure at the supervisor layer (stops spawning when the queue grows). All three are needed for production-grade fan-out.
+**The cap protects the provider; the backpressure protects the system.** Without the cap, you flood the provider and accumulate 429s. Without the backpressure, the cap fills up and the spawning agent keeps queuing more work — eventually OOMing the orchestrator or burning the route's wall-clock budget on queued work that will never reach the provider in time. Both halves are needed for fan-out to be safe at scale.
 
-The cheaper alternative: don't fan out. Sequential agents with shared rate-limiting are simpler, and if the latency is acceptable, the complexity isn't earned.
-
-## In this codebase
-
-**Not implemented as a concurrency semaphore** — there's no fan-out today. The ~1 req/s proactive spacing in `BloomreachDataSource` acts as a degenerate "cap at 1 concurrent" — it works because all calls are sequential anyway.
-
-The case for adopting it: when MonitoringAgent's 6-call sequential budget becomes the latency bottleneck (today it's ~6-10s, fine; with a 10x expansion of the budget it becomes painful). At that point, fan-out + backpressure is the right answer; the load-bearing addition isn't the fan-out, it's the semaphore.
+If you need more throughput than the provider's rate limit allows, the answer is *request a higher limit or batch* — not a higher local concurrency cap that just trades queueing for 429s. The cap can't manufacture provider capacity.
 
 ## Primary diagram
 
-The contrast — today's degenerate cap vs hypothetical full backpressure:
-
 ```
-  Comparison — today's degenerate cap vs full backpressure
+  Backpressure in this repo today (sequential) and in a hypothetical fan-out
 
-  TODAY (sequential agents, ~1 req/s spacing as degenerate cap):
-  ┌──────────────┐  one call at a time   ┌──────────────┐
-  │ agent        │ ─────────────────────► │ ~1 req/s     │  MCP
-  │ (sequential) │                        │ spacing      │
-  └──────────────┘                        └──────────────┘
-  effective: 1 req/s, no actual concurrency
+  CURRENT (sequential, no fan-out):
 
-  HYPOTHETICAL (fan-out, with semaphore):
-  ┌──────────────┐  spawn N workers       ┌──────────────┐
-  │ supervisor   │ ─────────────────────► │ Semaphore    │
-  │  spawn cap   │                        │  cap = 4     │  ← BACKPRESSURE
-  │  (upward bp) │                        └──────┬───────┘
-  └──────────────┘                               │ pop 4 at a time
-                                                 ▼
-                                          ┌──────────────┐
-                                          │ ~1 req/s     │
-                                          │ spacing      │
-                                          └──────┬───────┘
-                                                 ▼
-                                                MCP
-  effective: ~4 concurrent, ~3-5 req/s; latency cut from 5s to 1.5s
+  agent loop → tool_use → tools.callTool → BloomreachDataSource
+                                                   │
+                                          ┌────────▼────────┐
+                                          │ liveCall:       │
+                                          │  spacing check  │
+                                          │  (minIntervalMs)│
+                                          │   ─► wait if    │
+                                          │      needed     │
+                                          │  ─► transport   │
+                                          │     call        │
+                                          └─────────────────┘
+                                                   │
+                                                   ▼
+                                          MCP wire (1 call at a time
+                                          per data-source instance)
+
+
+  HYPOTHETICAL fan-out with backpressure (not implemented):
+
+  Supervisor decomposes task → 12 worker calls
+              │
+              ▼
+  ┌─ Concurrency limiter (semaphore, N=4) ──────────┐
+  │  pop 4 → run concurrently                       │
+  │  queue 8                                         │
+  │  when queue.length > threshold:                  │
+  │     emit backpressure → supervisor pauses        │
+  │     decomposing further work                     │
+  └────────────────────────┬─────────────────────────┘
+                           ▼
+              4 worker agents in parallel
+              each: own runAgentLoop + own
+                    BloomreachDataSource
+                    (each enforces 200ms
+                     spacing for its own calls)
+                           │
+                           ▼
+                   MCP wire (rate-limited
+                   per user globally, so
+                   effective parallelism
+                   is roughly 1 req/s
+                   across all workers)
 ```
+
+## Elaborate
+
+The "request a higher limit or batch" rule from the spec is the production realization that local concurrency caps can't manufacture provider capacity. A team that hits 429s and responds by raising their local concurrency cap is solving the wrong problem — the cap controls *their* outbound rate, not the provider's serving rate. The right responses are (a) negotiate a higher rate limit with the provider (Anthropic has tier programs; Bloomreach has enterprise tiers), (b) batch operations where the protocol supports it, or (c) reduce the work-rate at the spawner.
+
+For this repo, the MCP rate-limit ceiling is the structural constraint. Even with perfect fan-out infrastructure, the per-user MCP limit caps effective throughput. The win from fan-out would be on the *reasoning* side (concurrent model calls thinking about different sub-problems), not on the *wire* side (concurrent MCP calls would still serialize). This is a useful reframe: fan-out's win isn't always wire parallelism; sometimes it's reasoning parallelism with serialized data access.
+
+The Anthropic SDK's per-account rate limit is hierarchical — input tokens per minute, output tokens per minute, requests per minute. Hitting any of these triggers a 429 with a `retry-after` header. A fan-out backpressure system needs to listen to all three signals; reacting only to RPS misses TPM-driven throttling. This repo's BloomreachDataSource handles the analogous MCP rate-limit retry by parsing the server's retry-after window (`bloomreach-data-source.ts:64-71`); a model-layer equivalent would parse Anthropic's headers and back off accordingly.
 
 ## Interview defense
 
-**Q: "What's the backpressure story for your agents?"**
+> **Q: Does this codebase have fan-out backpressure?**
+>
+> Not in the multi-agent fan-out sense — there's no parallel topology. But the underlying primitive — `BloomreachDataSource.minIntervalMs=200ms` proactive spacing between MCP calls — is the same one a fan-out cap would use. The data source enforces at least 200ms between wire calls per instance, which is conservative against Bloomreach's per-user rate limit (~1 req/s). If the repo escalated to fan-out, the natural implementation would wrap workers in a `p-limit`-style semaphore with a max-concurrency tuned to the provider's rate, and add an upward backpressure signal so the spawning supervisor pauses when the queue exceeds a threshold.
 
-A: Today, sequential — Bloomreach's ~1 req/s rate limit is enforced by proactive spacing in `BloomreachDataSource`, and all agents call sequentially within one ReAct loop. There's no concurrency to limit because there's no fan-out. The degenerate "cap at 1 concurrent" is built into the spacing.
+> **Q: Why does the local concurrency cap matter even when the provider rate-limits?**
+>
+> Local caps protect against your own queue from blowing up. The provider's rate limit kicks in via 429 retries — without a local cap, your code might queue 200 calls, send all 200 at once, get 196 of them rejected, and burn the route's wall-clock budget on retries that mostly fail. With a local cap, only N concurrent calls are in flight at a time; the queue drains at the provider's actual serving rate; you don't waste budget on retries the provider was always going to reject. Both layers (local cap + provider retry) are needed. Local cap as the first defense, retry as the recovery when the cap miscalculates.
 
-If we adopted fan-out (e.g., MonitoringAgent dispatching N CategoryWorkers in parallel), the load-bearing addition isn't the fan-out itself — it's a concurrency semaphore at the DataSource layer. With a cap of 4 and the existing ~1 req/s spacing, effective throughput goes to ~3-5 req/s, latency for 5 workers drops from ~5s to ~1.5s. The cap should be just under what Bloomreach can sustain without 429ing. The second half of the pattern — upward backpressure at the supervisor (stop spawning when the queue grows past a threshold) — prevents the runaway-supervisor case where the dispatcher keeps adding workers faster than the semaphore can drain them.
-
-Diagram I'd sketch:
-
-```
-  today:                              with fan-out:
-  agent → 1 req/s spacing → MCP       supervisor → spawn N
-                                            │
-                                            ▼
-                                      semaphore (cap=4) ← bp
-                                            │
-                                            ▼
-                                      1 req/s spacing → MCP
-                                            ▲
-                                            │
-                                      supervisor pauses spawning
-                                      if queue > threshold (upward bp)
-```
-
-Anchor: "a runaway supervisor that keeps spawning workers without backpressure is the multi-agent version of an unbounded queue. The semaphore is the load-bearing primitive — without it, fan-out is just a faster way to 429 the provider."
-
-**Q: "Why not just turn off the spacing and let the agents go full speed?"**
-
-A: Because the spacing exists to prevent the rate-limit from being tripped. Without it, the first few calls succeed and then the 4th gets a 429. The current spacing trades minor latency (~1s between calls) for never-tripping the rate limit. Removing it just trades the proactive cost for the reactive cost (retry on 429), and the reactive cost is higher because the rate-limit penalty window can be 5-10 seconds. Production wisdom: proactive spacing under the rate limit beats reactive retry around it. The same principle scales to fan-out — cap concurrency just under "what the provider sustains," let the spacing smooth the rate.
+> **Q: If you needed more throughput than the MCP rate limit allows, what would you do?**
+>
+> Three answers, in priority order. First: negotiate a higher rate limit with Bloomreach. Enterprise tiers have higher per-user limits; the alpha server's ~1 req/s ceiling isn't representative of production tiers. Second: batch where the protocol supports it. Some MCP servers expose batched operations (e.g. `execute_analytics_eql_batch`); a single batched call counts as one against the rate limit but covers N queries. The current Bloomreach loomi connect doesn't expose batched EQL, but it's a path. Third: reduce the work-rate at the spawner. If the supervisor's decomposition can produce 50 sub-tasks for a question that the user is fine getting an answer to in 30s, but the provider can only serve 20 in 30s, the supervisor should prefer 20 high-value sub-tasks over decomposing into 50 medium-value ones. Raising the local concurrency cap doesn't help — it just trades queueing for 429s.
 
 ## See also
 
-- [`../03-multi-agent-orchestration/04-parallel-fan-out.md`](../03-multi-agent-orchestration/04-parallel-fan-out.md) — the topology that needs this as a prerequisite
-- [`03-per-tool-circuit-breaking.md`](./03-per-tool-circuit-breaking.md) — the per-tool version of the same flow-control instinct
-- [`../03-multi-agent-orchestration/09-coordination-failure-modes.md`](../03-multi-agent-orchestration/09-coordination-failure-modes.md) — tool-call cascade is what backpressure prevents
-- ai-engineering's rate-limit + backpressure files (cross-ref) — the single-call version
+- → `03-multi-agent-orchestration/04-parallel-fan-out.md` — the topology this backpressure would protect
+- → `03-per-tool-circuit-breaking.md` — the retry side of the rate-limit story
+- → `01-cross-turn-caching.md` — caching reduces the call volume that fan-out would amplify
+- → cross-reference (when generated): `study-ai-engineering`'s rate-limit / backpressure file — the single-call mechanics this builds on

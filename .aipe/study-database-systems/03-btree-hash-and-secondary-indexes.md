@@ -1,257 +1,252 @@
-# B-tree, hash, and secondary indexes
+# B-tree, hash, and secondary indexes — the 60s cache as a hash index
 
-Industry standard · Storage engine internals
+*Industry standard / Project-specific* — there are no persisted indexes; the only index-shaped thing is the 60-second TTL response cache, which is a hash index in disguise.
 
-## Zoom out — where indexes would live, and what this repo has instead
+## Zoom out, then zoom in
 
-Indexes are how a database avoids reading every row. A B-tree gives you sorted range scans; a hash index gives you `O(1)` equality lookup; a secondary index lets you look up by something other than the primary key. This codebase has **exactly one index of any kind: the primary-key hash index that comes for free with `Map<string, T>`.**
-
-```
-  Zoom out — where indexes would matter (and what's there)
-
-  ┌─ Service layer ──────────────────────────────────────────────┐
-  │  getInsight(sessionId, id)       ← primary-key lookup (Map.get) │
-  │  listInsights(sessionId)         ← full scan (Map.values)       │
-  │  filter by severity              ← scan + JS filter             │
-  │  filter by metric                ← scan + JS filter             │
-  │  filter by scope                 ← scan + JS filter             │
-  └───────────────────────────────┬──────────────────────────────┘
-                                  │ Map.get / Map.values
-  ┌─ "Index" layer ────────────────▼──────────────────────────────┐
-  │  ★ THIS CONCEPT ★                                              │
-  │  • ONE hash index: the primary-key Map itself                  │
-  │  • NO secondary indexes                                        │
-  │  • NO range-queryable structure (no B-tree)                    │
-  │  • every non-PK lookup is a full scan in JS                    │
-  └────────────────────────────────────────────────────────────────┘
-```
-
-## Zoom in — the question this concept answers
-
-A real engine asks: "given a query, can the planner reach the rows without reading the table?" Here the answer is binary — yes if you have the primary key, no for anything else. Every other lookup is a JavaScript filter over the materialized array.
-
-## Structure pass — the skeleton
-
-### Two index families to know
-
-  - **Hash index.** `O(1)` average lookup. Equality only. No range, no ordering, no prefix match. A `Map<K, V>` is one. This is what every primary-key lookup uses.
-  - **B-tree (or B+tree).** `O(log n)` lookup. Sorted, so it answers `=`, `<`, `>`, `BETWEEN`, prefix matches, and `ORDER BY`. The default index type in nearly every RDBMS (Postgres, MySQL, Oracle). This codebase has zero of these.
-
-### Axis: what access patterns does the existing index serve?
+A real index does one job: turn an O(N) scan into an O(log N) or O(1) lookup. The only place in this repo that needs that is the path from an agent's tool call back to a tool result during a single briefing — and that path uses a `Map<string, Entry>` keyed by `${name}:${JSON.stringify(args)}`. That's a hash index. It just isn't called one.
 
 ```
-  The "supported access pattern" axis
+  Zoom out — where this concept lives
 
-  pattern                             this repo's index supports it?
-  ─────────────────────────────       ──────────────────────────────
-  getInsight(id)                      yes — Map.get O(1)
-  listInsights()                      yes — Map.values (full iter)
-  insights where severity='critical'  no  — scan + filter
-  insights where metric='revenue'     no  — scan + filter
-  insights ordered by timestamp       no  — scan + sort
-  insights from last 24h              no  — scan + filter
+  ┌─ UI layer ───────────────────────────────────────────────┐
+  │  StatusLog shows "from cache · 0ms" badges                │
+  └────────────────────────────┬─────────────────────────────┘
+                               │  HTTP / NDJSON
+  ┌─ Service layer ────────────▼─────────────────────────────┐
+  │  agent loop calls dataSource.callTool(name, args)         │
+  │                          │                                │
+  │                          ▼                                │
+  │  BloomreachDataSource.callTool                            │
+  │    cache.get(key) → ★ THE HASH INDEX LOOKUP ★              │ ← we are here
+  │    cache.set(key, { result, expiresAt })                  │
+  └────────────────────────────┬─────────────────────────────┘
+                               │
+  ┌─ Storage layer ────────────▼─────────────────────────────┐
+  │  Map<string, { result, expiresAt }>                       │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-Notice the asymmetry: one pattern is supported by structure, all others by *iteration*. In a real engine each of those "no" rows would be a candidate for a secondary index. Here, every "no" pays the cost of a full scan — which is fine at ~12 entries and would NOT be fine at 12,000.
+Zoom in: the index here is a `Map<string, Entry>`. The key is the call signature; the value is the result plus an expiry. There's no B-tree, no LSM, no covering index, no composite key. Just one hash table with TTL eviction.
 
-### Seams
+## Structure pass
 
-The interesting seam is between **the index (the `Map`, the only one)** and **the application filters (everything else).** In a real engine the planner sits at that seam and decides whether to use an index or scan. Here there's no planner; the call site picks: `getInsight` uses the index, everything else iterates.
+**Layers:**
+
+```
+  L1  cache: Map<string, Entry>     the hash table
+  L2  Entry: { result, expiresAt }  the value
+  L3  cache key: string             the hash input
+```
+
+**Axis traced: what does a lookup actually cost?**
+
+```
+  Trace one axis: cost of a lookup
+
+  ┌─ L1: Map.get(key) ──────────────────┐
+  │  O(1) average                       │   → JS Map's hash table
+  └─────────────────────────────────────┘
+                  (it flips)
+  ┌─ L1 + L2: TTL check on hit ─────────┐
+  │  cached.expiresAt > Date.now()      │   → still O(1), but conditional
+  └─────────────────────────────────────┘
+                  (it flips)
+  ┌─ miss: liveCall (network) ──────────┐
+  │  upstream RTT + ≥200ms spacing      │   → seconds, not nanoseconds
+  └─────────────────────────────────────┘
+
+  the hit/miss seam is where the lookup cost flips by ~6 orders of magnitude
+```
+
+**Seams** — one matters:
+
+- The cache-hit / cache-miss boundary. On hit, `fromCache: true, durationMs: 0` rides back in the result envelope (`lib/data-source/bloomreach-data-source.ts:151`) and the UI's `StatusLog` shows a "cache" badge. On miss, the agent waits for a real network round-trip plus ~1s of rate-limit spacing. Same code path, two orders of magnitude difference in cost.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You already know the shape. A hash index (the JavaScript `Map`) is what you reach for when you want `Map.get(id)` to be `O(1)` instead of `array.find(x => x.id === id)` at `O(n)`. That's the entire index story in this repo.
+You've used a hash table to dedupe network calls before — memoize a fetch by its URL, return the same response within a session. This is that, with two extras: a TTL so stale results expire, and a write-through behavior on forced refresh.
 
 ```
-  The shape — two index families, and which one we have
+  Hash index pattern — keyed lookup with TTL
 
-  HASH INDEX                    B+TREE INDEX
-  ─────────────                 ─────────────
-  unordered                     sorted
-  O(1) equality                 O(log n) eq + range
-  no range scan                 range, prefix, ORDER BY
-                                
-  ┌──────────────────┐         ┌─────────────────────┐
-  │ hash(key) → slot │         │     [root]          │
-  │ slot → row ref   │         │    /  |  \          │
-  └──────────────────┘         │  [leaf][leaf][leaf] │
-   ← Map<K,V> is this          │  rows linked across │
-                                │  for range scan     │
-                                └─────────────────────┘
-                                  ← this repo has ZERO of these
+           call(name, args)
+                │
+                ▼
+       key = `${name}:${JSON.stringify(args)}`
+                │
+                ▼
+        cache.get(key)
+           │       │
+       HIT │       │ MISS
+           │       │
+           ▼       ▼
+    fromCache    liveCall(name, args)
+    durationMs=0       │
+                       ▼
+                  cache.set(key, { result, expiresAt: now+60s })
 ```
 
-### Move 2 — the walkthrough
+That's the kernel. The rest is two correctness rules layered on top.
 
-#### The one primary-key hash index (`Map<string, T>`) that exists
+### Move 2 — the index, one part at a time
 
-```ts
-// lib/state/insights.ts:73-79
-export function getInsight(sessionId: string, id: string): Insight | null {
-  return state.get(sessionId)?.insights.get(id) ?? null;
-}
+#### The key — the only "hash function"
 
-export function getAnomaly(sessionId: string, id: string): Anomaly | null {
-  return state.get(sessionId)?.anomalies.get(id) ?? null;
-}
-```
-
-Annotation:
-  - `state.get(sessionId)` — first hash lookup, `O(1)`. Picks the right "namespace."
-  - `.insights.get(id)` — second hash lookup, `O(1)`. The primary-key index on the "insights table."
-  - `?? null` — explicit "not found" return; equivalent to a SQL `SELECT ... WHERE id = ?` returning zero rows.
-
-This pattern is the ONLY lookup in the codebase that uses an index. Every other access (filter by severity, by metric, by timestamp) does the scan-and-filter below.
-
-#### Every other lookup is a full scan
-
-```ts
-// lib/state/insights.ts:81-84
-export function listInsights(sessionId: string): Insight[] {
-  const s = state.get(sessionId);
-  return s ? [...s.insights.values()] : [];
-}
-```
-
-Annotation:
-  - `state.get(sessionId)` — `O(1)` to find the namespace.
-  - `s.insights.values()` — iterator over **all rows**. This is the full table scan.
-  - `[...]` — materializes into an array. Now any downstream `.filter()` or `.sort()` walks every row.
-
-When the UI wants "critical insights only," it gets the whole list and filters in React. That's an in-application `WHERE severity = 'critical'` evaluated by JS. With ~12 rows, the planner question is moot.
-
-#### What a secondary index would look like, if we added one
-
-In a real DB:
-
-```sql
--- hypothetical
-CREATE INDEX idx_insights_severity ON insights (severity);
-
--- query
-SELECT * FROM insights WHERE severity = 'critical';
--- planner: uses idx_insights_severity, fetches matching row IDs, then heap lookup
-```
-
-In this repo, the equivalent would be a *second Map keyed by severity*, maintained in lockstep with the primary Map:
-
-```ts
-// hypothetical — not in the codebase
-type SessionFeed = {
-  insights: Map<string, Insight>;                       // primary index
-  insightsBySeverity: Map<Severity, Set<string>>;       // secondary index (set of ids)
-};
-
-function putInsight(s: SessionFeed, i: Insight) {
-  s.insights.set(i.id, i);
-  if (!s.insightsBySeverity.has(i.severity)) {
-    s.insightsBySeverity.set(i.severity, new Set());
-  }
-  s.insightsBySeverity.get(i.severity)!.add(i.id);
-}
-```
-
-Annotation:
-  - The secondary index stores IDs, not row copies. Lookup returns IDs; you then re-hit the primary Map per ID. That's the same shape as a non-covering index in Postgres.
-  - The write path now updates two structures atomically. In Postgres, the engine handles index maintenance for you; here, the application would have to.
-  - Deletions and updates must mirror across both structures, or the secondary "lies." That's the bug a real engine prevents by making index maintenance part of the storage layer.
-
-We don't do this. The scale doesn't justify it; the maintenance burden would.
-
-#### What a range/sorted access pattern would need
-
-The closest the UI gets to a range scan is "show insights sorted by timestamp" or "show recent insights first." Today that's: `listInsights(...).sort((a, b) => b.timestamp.localeCompare(a.timestamp))`. That's a full materialize + JS sort — `O(n log n)`.
-
-A B+tree index on `timestamp` would let you:
-  - read the most recent K without sorting (forward iteration from the right edge)
-  - answer `timestamp BETWEEN x AND y` without scanning the whole table
-  - serve `ORDER BY timestamp LIMIT 20` from index order, no in-memory sort
-
-There is no equivalent of a B+tree in this repo. `Map` preserves *insertion order*, which is monotonic-ish for timestamps (we insert in arrival order), but it's a fragile contract. The day you re-insert anything out of order, that "implicit index" lies.
-
-#### The TTL cache is also a hash index — and it's the second one in the repo
-
-The `BloomreachDataSource` cache (`lib/data-source/bloomreach-data-source.ts:122`) is the codebase's *other* hash index, this time keyed by `${name}:${JSON.stringify(args)}`:
-
-```ts
-// lib/data-source/bloomreach-data-source.ts:122,144-148
-private cache = new Map<string, { result: unknown; expiresAt: number }>();
-// ...
+```typescript
+// lib/data-source/bloomreach-data-source.ts:144
 const cacheKey = `${name}:${JSON.stringify(args)}`;
-// ...
-const cached = this.cache.get(cacheKey);
-if (cached && cached.expiresAt > Date.now()) { ... }
 ```
 
-This is structurally identical to the primary-key index on `insights`. It's worth naming: every `Map` in the codebase is a hash index of one shape or another. There are exactly **four**: insights, investigations, anomalies, and the response cache. None of them are range-queryable.
+The "hash" is the JS `Map` engine's; the key construction is just string concatenation. `JSON.stringify` is the load-bearing call — it serializes the args object deterministically (for a fixed key order) so two structurally-equal arg objects produce the same key.
+
+**What breaks if you remove the `JSON.stringify`:** the key becomes `${name}:[object Object]`, every distinct args collapses to one entry, and the second `execute_analytics_eql` call returns the first call's result. Same shape of bug as a hash function that collides everything.
+
+**The non-deterministic edge case:** `JSON.stringify` preserves key insertion order. Two calls with the same logical args but different key order (`{a:1, b:2}` vs `{b:2, a:1}`) produce different cache keys and miss. In practice the agent constructs args from a JSON tool schema, so order is stable per call site — but it's a latent foot-gun for a future caller that hand-builds args.
+
+#### The TTL — bounded staleness
+
+```typescript
+// lib/data-source/bloomreach-data-source.ts:145
+const ttl = options.cacheTtlMs ?? 60_000;
+
+if (!options.skipCache) {
+  const cached = this.cache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return { result: cached.result as T, durationMs: 0, fromCache: true };
+  }
+}
+```
+
+The 60-second window is sized to the duration of one briefing — a monitoring scan plus a few investigations finish well inside a minute, so within one run the cache is effectively infinite. Across runs (different sessions or a later refresh) the cache is cold.
+
+**What breaks if you remove the TTL:** the cache grows unboundedly within one process lifetime, and a stale result outlives the briefing it was captured for. That's not a memory crisis (the process recycles before the cache gets large) but it is a correctness leak — a long-running dev server would serve hour-old EQL results.
+
+#### The two correctness rules
+
+**Rule 1 — don't cache errors.**
+
+```typescript
+// lib/data-source/bloomreach-data-source.ts:179-181
+// Don't cache error results — they should not poison the cache.
+if ((result as any)?.isError === true) {
+  return { result: result as T, durationMs, fromCache: false };
+}
+```
+
+An `isError: true` result envelope (the MCP shape for "the tool ran but returned an error") never enters the cache. The next call gets a fresh attempt. Without this, a one-off 401 would mask every subsequent call for 60 seconds.
+
+**Rule 2 — `skipCache` still write-throughs.**
+
+```typescript
+// lib/data-source/bloomreach-data-source.ts:184-186
+// Note: a skipCache call still refreshes the cache (write-through), which is
+// the desired behavior for the /debug "force fresh" path.
+const now = Date.now();
+this.cache.set(cacheKey, { result, expiresAt: now + ttl });
+```
+
+`/api/mcp/call` (the dev debug route) passes `skipCache: true` to force a live call. The result still updates the cache, so subsequent normal callers see the fresh value. This is the "force refresh" pattern from any HTTP cache — bypass on read, repopulate on write.
+
+```
+  Two-rule decision flow on a callTool
+
+       result = liveCall(...)
+            │
+            ▼
+       isError === true?
+        ┌──┴──┐
+        │     │
+       YES    NO
+        │     │
+        ▼     ▼
+   skip set    cache.set(key, { result, expiresAt: now+ttl })
+   return      return { result, fromCache: false, durationMs }
+```
+
+#### What's *not* an index here
+
+- `Insight.id`, `Investigation.insightId` — these are primary keys for the in-memory `Map`, not indexes (the Map IS the table; the key IS the only access path).
+- `Insight.category` — looks like it could back a secondary index, but nothing actually indexes by it. The UI filters on read with `insights.filter(i => i.category === c)` — an O(N) scan. With ≤10 insights per session, that's fine. If the feed ever grew, this is where a `Map<CategoryId, Insight[]>` secondary structure would land.
+- `sessionState` outer Map — primary key (sessionId → SessionFeed), not an index.
 
 ### Move 3 — the principle
 
-An index is a contract: "give me this kind of question, I'll answer in this time." Hash indexes promise equality in constant time and refuse to answer anything else. B-trees promise sorted order, which is the basis of every query that says BETWEEN, ORDER BY, or LIMIT-after-sort. Choosing which indexes to maintain IS the database design problem, because every index speeds up reads and slows down writes. This repo has chosen one index per table and pays the scan cost for everything else — which is correct at this dataset size and would be incorrect at any meaningful scale.
+When you're tempted to build a real index, first measure the N you're indexing. A 10-item array scanned per render doesn't need one. The 60s response cache earns its place because it converts a 1-second upstream call into a 0-millisecond hit — that's a real index-shaped win. The `category` "index" doesn't exist because the scan it would replace is over 10 items. Indexes are not free; build them only when the scan they replace shows up in a profile.
 
 ## Primary diagram
 
 ```
-  The complete index inventory of this repo
+  The 60s response cache — full index walkthrough
 
-  ┌─ Map<sessionId, SessionFeed> ────────────────────────────────┐
-  │   (hash on sessionId — primary index for the "namespace")     │
-  │                                                                 │
-  │   ┌─ SessionFeed ─────────────────────────────────────────┐    │
-  │   │  Map<insightId, Insight>      HASH INDEX (PK)         │    │
-  │   │  Map<insightId, Investigation> HASH INDEX (PK)         │    │
-  │   │  Map<insightId, Anomaly>      HASH INDEX (PK)         │    │
-  │   └────────────────────────────────────────────────────────┘    │
-  └────────────────────────────────────────────────────────────────┘
-
-  ┌─ BloomreachDataSource ────────────────────────────────────────┐
-  │   Map<"name:args", {result, expiresAt}>  HASH INDEX (key)      │
-  └────────────────────────────────────────────────────────────────┘
-
-  total hash indexes:  4
-  total B-tree indexes: 0
-  total secondary indexes: 0
-
-  every other access pattern → full scan + JS filter
+  ┌─ caller (agent loop) ─────────────────────────────────────┐
+  │  dataSource.callTool('execute_analytics_eql', { eql })     │
+  └────────────────────────────┬─────────────────────────────┘
+                               │
+  ┌─ BloomreachDataSource ─────▼─────────────────────────────┐
+  │                                                            │
+  │  key = `execute_analytics_eql:{"eql":"..."}`               │
+  │                                                            │
+  │  ┌─ cache (Map<string, Entry>) ─────────────────┐          │
+  │  │  "execute_analytics_eql:{...A}" → { ... }    │          │
+  │  │  "list_segmentations:{}"        → { ... }    │          │
+  │  │  "get_event_schema:{pid}"       → { ... }    │          │
+  │  └──────────────────────────────────────────────┘          │
+  │              │                                              │
+  │              ▼                                              │
+  │   ┌── HIT (within 60s) ────────────┐                       │
+  │   │  return {                       │                       │
+  │   │    result, durationMs: 0,       │                       │
+  │   │    fromCache: true              │                       │
+  │   │  }                              │                       │
+  │   └─────────────────────────────────┘                       │
+  │              │                                              │
+  │   ┌── MISS ──▼─────────────────────────────────┐           │
+  │   │  liveCall(name, args)  ──► Bloomreach MCP   │           │
+  │   │       │                    (network)        │           │
+  │   │       ▼                                     │           │
+  │   │  if isError: skip cache, return             │           │
+  │   │  else:       cache.set(key, { ... })        │           │
+  │   │              return { fromCache: false }    │           │
+  │   └─────────────────────────────────────────────┘           │
+  └────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The B+tree's dominance in databases comes from one fact: disks are good at sequential reads. Sorted index leaves let the engine read a range in one I/O. When your data is in RAM, the I/O argument evaporates — a hash index is just faster for equality. That's why in-memory engines (Redis for KV, DragonflyDB) lean hard on hash tables and only add sorted structures where range queries demand it (Redis sorted sets are a skip list + hash hybrid).
+The cache's design constraint came from the Bloomreach alpha server's rate limit (~1 req/s globally per user). Without a cache, a monitoring scan that re-issues the same EQL during investigation would burn the rate budget twice. With the cache, the second call is free. The comment at `lib/data-source/bloomreach-data-source.ts:135-137` explains why the retry delay defaults to 10 seconds — that's the observed penalty window when the cache miss *plus* the spacing fails to prevent a 429.
 
-This codebase sits in the in-memory regime. The fact that it has only hash indexes is the *right* default for in-memory. The fact that it has *no* sorted structure is fine because no query in the UI needs one — the UI sorts in JS over a 12-item array.
+Compare to Postgres: a query plan cache, a shared buffer pool, and a result cache (via materialized views or `pg_buffercache`) all do similar work — turn repeat work into O(1) reads. The shapes are wildly different but the principle is the same: pay once at fill time, free reads until invalidation.
 
-The day the dataset grows — even to a few thousand persisted briefings — the read-time math flips. `Array.sort` over 5000 entries on every page load is fine; over 50000 it's not; over 500000 it's a page-render bug. The transition point is where you'd add the first real B+tree.
+The thing this cache *doesn't* do that a real index would: range queries, ordering, joins. The `Map` only supports point lookups by exact key. If the agents ever needed "all EQL calls in the last 5 minutes" or "EQL calls grouped by metric," this structure couldn't answer that — they'd need a different shape.
 
 ## Interview defense
 
-> Q: "What indexes does this app maintain?"
+**Q: Is there an index anywhere in this codebase?**
 
-Verdict: four hash indexes total — three primary-key Maps on the per-session state (insights, investigations, anomalies) and one on the data-source response cache. Zero secondary indexes, zero B-trees. Every non-primary-key lookup is a full scan plus a JavaScript filter.
+The 60s response cache is the only thing that does an index's job — turn an expensive lookup into O(1). It's a `Map<string, { result, expiresAt }>` keyed by `${toolName}:${JSON.stringify(args)}`. Cache hit returns in 0ms with `fromCache: true`; miss does a network round-trip plus the ~1s rate-limit spacing.
 
 ```
-  the index inventory you draw
-
-   Maps in the repo:   insights · investigations · anomalies · response cache
-                       ──────────────────────────────────────────────────
-                       all four are hash indexes (Map<K, V>)
-                       all four answer equality only
+  cache.get("execute_analytics_eql:{...A}") → { result, expiresAt }
+       │
+       ▼
+  expiresAt > now?  →  HIT  →  fromCache: true,  durationMs: 0
+                   →  MISS →  liveCall(...) ─► cache.set(...)
 ```
 
-The load-bearing point: with ~12 insights per briefing, the scan cost is invisible. The shape would have to change in two places at once — adding a real datastore AND seeing access patterns that demand range or non-PK lookup — before secondary indexes earn their weight.
+**Q: What's the most subtle correctness rule in the cache?**
 
-> Q: "Why no B-tree?"
+Errors are never cached (`bloomreach-data-source.ts:179-181`). Without that, a transient 401 from token expiry would mask every subsequent call for 60 seconds — the user would see "everything's broken" until the cache expired, when actually only one call ever failed and the next would have succeeded.
 
-Two reasons compose. First, no on-disk storage means no I/O cost to amortize over sorted leaves. Second, no query in the product wants a range — the UI sorts a small array in JS. The day either of those flips (persisted state + time-range queries on it), a B+tree index on `timestamp` would be the obvious first move.
+**Q: When would you add a secondary index here?**
 
-> Q: "What's the cost of the scan-and-filter pattern?"
-
-`O(n)` per query, where `n` is the number of insights in the session (single-digit to low-double-digit). The cost is in the constant factor of iterating a JS Map and walking a JS filter callback — call it microseconds at this scale. It would matter at 10⁵+ entries; it doesn't here.
+When a scan starts showing up in a profile. Right now `Insight.category` looks like a secondary-index candidate, but the feed has ≤10 insights, so the O(N) filter on the UI side is faster than the cost of maintaining a `Map<CategoryId, Insight[]>`. If the feed ever grew to thousands of insights per session (it won't — the monitoring agent is bounded), or if a server-side filter needed to run before send, that's where a secondary index would land.
 
 ## See also
 
-  - [`02-records-pages-and-storage-layout.md`](./02-records-pages-and-storage-layout.md) — the "table" the index sits on
-  - [`04-query-planning-and-execution.md`](./04-query-planning-and-execution.md) — what a planner would do with these indexes
-  - [`audit.md`](./audit.md) — F1, F6 (why no real index story exists yet)
+- `01-database-systems-map.md` — where this cache sits among the four storage analogs (L2)
+- `04-query-planning-and-execution.md` — what the cached calls actually do
+- `06-locks-mvcc-and-concurrency-control.md` — why a single-writer cache needs no locking
+- `09-database-systems-red-flags-audit.md` — the `JSON.stringify` key-order foot-gun

@@ -1,52 +1,37 @@
 # Parallel / fan-out-fan-in
 
-*Industry name: parallel / fan-out / map-reduce agents — Industry standard.*
+**Industry standard.** Independent subtasks run simultaneously, a merger combines. **Not exercised** in this codebase — no parallel agents, no merger.
 
-Independent subtasks run simultaneously, a merger combines. **Not in this repo.** Bloomreach's ~1 req/s rate limit makes parallel calls infeasible without a concurrency cap, and no agent in the repo currently fans out work to concurrent workers.
+## Zoom out, then zoom in
 
-## Zoom out — where this concept would live
-
-If adopted, it would replace one of the sequential stages — likely a monitoring agent (`MonitoringAgent`) refactor that fans out one worker per category instead of running them sequentially in one ReAct loop.
+Sits at the orchestration layer as an alternative to sequential pipelining when the subtasks are genuinely independent.
 
 ```
-  Where fan-out WOULD live (hypothetical refactor)
+  Zoom out — where this WOULD live
 
-  ┌─ Agent layer ──────────────────────────────────────────┐
-  │  Today:  MonitoringAgent (one ReAct loop, 6 calls       │
-  │           serial across all runnable categories)        │
-  │  Future: MonitoringDispatcher → N CategoryWorkers       │ ← would live here
-  │           (one worker per category, run in parallel,    │
-  │           merged into one anomaly list)                 │
-  └─────────────────────────────────────────────────────────┘
+  ┌─ Orchestration layer ───────────────────────────┐
+  │  Today: sequential pipeline                      │
+  │  Would: ★ fan-out N concurrent agents ★         │ ← we are here
+  │         ★ fan-in: merge their outputs ★         │
+  └──────────────────────────────────────────────────┘
 ```
 
 ## Structure pass
 
-The axis: **do the subtasks depend on each other?**
+Layers: split (decide the subtasks) → N concurrent agent runs → merge (a fan-in agent or pure code combines results).
 
-```
-  Sequential pipeline (today):              Fan-out (hypothetical):
-  ──────────────────────────                ───────────────────────
-  one ReAct loop scans                      one worker per category,
-  N categories serially                     all running in parallel
-                                            then merge into one list
+**Axis traced — "what makes this possible?":** subtask independence. If any subtask depends on another's output, it's a pipeline, not a fan-out. The fan-out shape is reserved for the case where the work splits with zero cross-task dependencies.
 
-  works because: categories don't            wins on: latency — N categories
-  depend on each other, but                  in parallel cost the time of
-  Bloomreach rate-limit (~1 req/s)           the slowest, not the sum
-  forces serialization at the                forced cost: per-worker context
-  data-source layer                          setup; concurrency cap to honor
-                                             the rate limit
-```
+**Seam:** the merge function. Whether it's pure code (concat arrays, take the union) or an LLM call (synthesize across results) is the load-bearing call. Code merging is cheap and predictable; LLM merging is expensive and brings the synthesis-failure problem from `09-coordination-failure-modes.md`.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know `Promise.all([a(), b(), c()])` — N independent requests, fire all at once, wait for all to settle, merge results. Fan-out is that pattern over agents instead of fetch calls. The constraint that makes it work: the subtasks must be *genuinely independent* — no subtask needs another's output. If they're dependent, it's a pipeline (see `03-sequential-pipeline.md`), not a fan-out.
+You know `Promise.all([a, b, c])` over independent requests, then a reduce that combines them. Three fetches fire concurrently, you wait for the slowest, you merge the results. The fan-out agent topology is exactly that — three agents in parallel, you wait for the slowest, a merge step combines.
 
 ```
-  Parallel fan-out — split + merge
+  Fan-out / fan-in
 
            ┌──────── split ────────┐
            ▼          ▼            ▼
@@ -57,128 +42,118 @@ You know `Promise.all([a(), b(), c()])` — N independent requests, fire all at 
                       ▼
               ┌──────────────┐
               │ merge agent  │  synthesizes
+              │ (or code)    │
               └──────────────┘
 ```
 
-### Move 2 — what it would look like for the monitoring agent
+The win is latency. Three agents at 10 seconds each in parallel = 10 seconds + merge cost. Three agents sequentially = 30 seconds + merge cost. The constraint that makes parallelism possible: no agent's input depends on another's output.
 
-The MonitoringAgent today runs ONE ReAct loop with `maxToolCalls=6` and an enforced category list in the prompt's `{categories}` slot. The model picks one category, queries it, moves to the next category. Categories are independent — the conversion-drop check doesn't depend on the revenue-drop check — but they run in series because one agent is doing all of them.
+### Move 2 — step by step
 
-A fan-out refactor would:
+#### Where this could land in this repo
 
+The monitoring agent today scans up to 6 EQL queries sequentially against the runnable categories (`maxToolCalls=6` in `monitoring-agent.js:56`). The bottleneck is wall-clock — at the rate-limited tier (~1 req/s), 6 queries take ~6-10s on the wire alone, plus per-call model-decision overhead.
+
+A fan-out version would split the categories — say, 3 sets of 2 categories each — and run 3 monitoring agents in parallel. The merge would be a `concat` of the resulting anomaly arrays plus a re-sort by severity (the same `severityRank` sort the AptKit class already does). The latency drops by roughly 3x; the cost stays the same (same total queries, same total tokens).
+
+```ts
+// hypothetical fan-out version of monitoring scan (not implemented)
+async function fanOutMonitoring(
+  schema: WorkspaceSchema,
+  categories: AnomalyCategory[],
+  // ... ports
+): Promise<Anomaly[]> {
+  const groups = chunk(categories, 3);  // 3 groups, ~3 cats each
+  const concurrentResults = await Promise.all(
+    groups.map(group =>
+      new MonitoringAgent(anthropic, ds, schema, allTools, sid)
+        .scan(hooks, group)
+    )
+  );
+  // merge: flatten + re-sort by severity
+  return concurrentResults
+    .flat()
+    .sort((a, b) => severityRank[b.severity] - severityRank[a.severity])
+    .slice(0, 10);
+}
 ```
-  Hypothetical fan-out monitoring
 
-  ┌─ MonitoringDispatcher ────────────────────────────────────┐
-  │  schemaCapabilities → runnableCategories(...)             │
-  │  for each runnable category:                              │
-  │    spawn CategoryWorker(category, anthropic, dataSource)  │
-  │  await Promise.all(workers) WITH concurrency cap          │
-  └────────────────────────┬──────────────────────────────────┘
-                           ▼ parallel (capped at, say, 3 concurrent)
-  ┌─ CategoryWorker (one per runnable category) ─────────────┐
-  │  ReAct loop, tighter budget (maxToolCalls=2)              │
-  │  prompt: "check ONLY this category: <recipe>"             │
-  │  output: Anomaly | null                                   │
-  └────────────────────────┬──────────────────────────────────┘
-                           ▼
-  ┌─ MonitoringMerger ────────────────────────────────────────┐
-  │  collect workers' outputs                                 │
-  │  filter nulls; sort by severity                           │
-  │  emit Anomaly[]                                           │
-  └────────────────────────────────────────────────────────────┘
-```
+The fan-in here is pure code (concat + sort), not an LLM merger. That keeps the synthesis-failure mode off the table — no model has to reconcile contradictory anomalies because each agent scans different categories.
 
-The wins:
-- **Latency**: 5 categories in parallel cost the time of the slowest, not the sum
-- **Tighter prompts per worker**: each worker sees only its category, not all 10
-- **Failure isolation**: one worker hitting an error doesn't taint the others
+#### Why this isn't in the repo today
 
-The costs:
-- **Concurrency cap mandatory**: Bloomreach rate-limits at ~1 req/s globally; firing 10 workers concurrently triggers 429s. Need a semaphore at the data-source layer to bound concurrency (see `../05-production-serving/02-fan-out-backpressure.md`).
-- **Per-worker context setup**: each worker needs the workspace schema injected separately (~5K tokens × N workers vs 1× for the current sequential design)
-- **Merger logic**: deduplication, severity reconciliation, "did multiple categories detect the same underlying anomaly" — non-trivial
+Two reasons:
+
+1. **The wall-clock isn't the bottleneck.** The monitoring scan typically completes in 30-60s end to end, well under the 300s Vercel budget. The user experience isn't degraded by the latency at this scale.
+2. **The MCP rate limit serializes anyway.** `BloomreachDataSource.minIntervalMs=200ms` enforces global per-user spacing across all calls. Three parallel agents would still wait their turn at the wire. The parallelism would only help if the per-call wall-clock was dominated by the LLM's reasoning time rather than the MCP tool wait — which isn't the dominant case in this repo.
+
+Both reasons would change if the workspace grew much larger (more categories to scan) or the MCP rate limit relaxed. Either change would tip the fan-out from "not worth the complexity" to "worth the complexity."
+
+#### The backpressure problem fan-out introduces
+
+When a supervisor spawns workers, it can spawn faster than the provider's rate limit allows. The classic mistake: "split 12 subtasks, fire 12 agents in parallel," then hit 429s on tokens 4-12. The mitigation — concurrency caps with backpressure — is covered in `05-production-serving/02-fan-out-backpressure.md`. Even though this repo doesn't run fan-out, the `minIntervalMs` primitive in `BloomreachDataSource` is the same primitive a fan-out cap would use.
 
 ### Move 3 — the principle
 
-Fan-out wins on latency when subtasks are genuinely independent AND the per-call cost is dominated by latency (not tokens). The Bloomreach rate limit changes the math here: even if the workers fire in parallel, the data source serializes them to ~1 req/s, so the wall-clock win is bounded by `min(N_concurrent_cap, rate_limit_window)`. With a 6-call budget across 5 categories, the upside is ~3-4x latency improvement *if* you can get the concurrency cap to 3-4 concurrent.
-
-## In this codebase
-
-**Not implemented.** No agent in the repo fans out work to concurrent workers. Specific reasons:
-
-- **Bloomreach's ~1 req/s rate limit** (`lib/data-source/bloomreach-data-source.ts` enforces this with proactive spacing + retry). Concurrent calls to the same `dataSource` would either queue at the data-source layer (defeating the parallelism) or 429 the server (waste).
-- **No semaphore primitive yet** for capping concurrency below the proactive-spacing limit. Adding fan-out requires building this first.
-- **MonitoringAgent's 6-call budget is small enough** that the sequential cost is acceptable — typically 6-10 seconds for a full briefing. The user's review time on the feed dwarfs this; the latency win wouldn't be felt.
-- **The 300s Vercel maxDuration** is comfortably above the sequential cost anyway. Fan-out's win is mostly architectural (failure isolation, tighter prompts), not latency.
-
-The natural opportunity: if we ever added a feature like "analyze all 50 customer segments in parallel," sequential would become the bottleneck and fan-out would be the right answer — with backpressure as the load-bearing addition (see `../05-production-serving/02-fan-out-backpressure.md`).
+**Fan-out earns its overhead only when the subtasks are genuinely independent AND the wall-clock matters.** The first condition is structural (no cross-task dependencies). The second is operational (parallelism wins on time, not on cost). Most production agent pipelines that "feel like they should be parallel" are actually pipeline-shaped (each subtask wants the previous one's output) or wall-clock-acceptable (sequential is fine, latency budget isn't tight). When both conditions are met, fan-out is a meaningful 2-5x latency win for ~no cost change.
 
 ## Primary diagram
 
-The contrast — today's sequential monitoring vs hypothetical fan-out:
-
 ```
-  Comparison — sequential vs fan-out monitoring
+  Fan-out monitoring scan (hypothetical)
 
-  TODAY (sequential, one MonitoringAgent ReAct loop):
-  ┌────────────────────────────────────────────────┐
-  │  while not done (maxToolCalls=6):              │
-  │    pick category from {categories} slot         │
-  │    query it                                     │
-  │    accumulate                                   │
-  │  total time = sum of all queries (~6-10s)       │
-  └────────────────────────────────────────────────┘
-
-  HYPOTHETICAL (fan-out, parallel workers + merger):
-  ┌────────────────────────────────────────────────┐
-  │  Dispatcher: spawn 1 worker per category       │
-  │   ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐│
-  │   │worker│ │worker│ │worker│ │worker│ │worker││ ← parallel
-  │   │ rev  │ │ conv │ │ cart │ │churn │ │ ...  ││   (capped at
-  │   └──┬───┘ └──┬───┘ └──┬───┘ └──┬───┘ └──┬───┘│   N concurrent
-  │      └────────┴───────┬┴───────┴────────┘     │    by semaphore)
-  │                       ▼                        │
-  │              ┌──────────────────┐              │
-  │              │ Merger: dedupe,  │              │
-  │              │ sort by severity │              │
-  │              └──────────────────┘              │
-  │  total time ≈ slowest worker + merger          │
-  │  forced cost: concurrency cap, per-worker      │
-  │  context, merger logic                         │
-  └────────────────────────────────────────────────┘
+  ┌─ orchestrator (route handler) ───────────────────────────────┐
+  │   runnable = runnableCategories(capabilities)  // ~10 cats   │
+  │   groups = chunk(runnable, ~3 per group)                     │
+  │                                                                │
+  │   ┌─ Promise.all (concurrency capped by minIntervalMs at      │
+  │   │   the data-source layer; effectively serialized at MCP) ──┐
+  │   ▼                                                            │
+  │  ┌────────────┐  ┌────────────┐  ┌────────────┐               │
+  │  │MonitorAgent│  │MonitorAgent│  │MonitorAgent│  (3 ReAct      │
+  │  │  group A   │  │  group B   │  │  group C   │   loops in     │
+  │  │  scan()    │  │  scan()    │  │  scan()    │   parallel)    │
+  │  └─────┬──────┘  └─────┬──────┘  └─────┬──────┘               │
+  │        │               │                │                       │
+  │        └────────────┐  │  ┌─────────────┘                       │
+  │                     ▼  ▼  ▼                                     │
+  │                  ┌─────────────────┐                            │
+  │                  │ pure-code merge  │                            │
+  │                  │ flat → sort by   │  no LLM merger             │
+  │                  │ severity →      │  (avoids synthesis         │
+  │                  │ slice(0,10)     │   failure modes)            │
+  │                  └─────────────────┘                            │
+  │                          │                                       │
+  │                          ▼                                       │
+  │                     final Anomaly[]                              │
+  └────────────────────────────────────────────────────────────────┘
 ```
+
+## Elaborate
+
+The fan-out pattern composes naturally with supervisor-worker — the supervisor splits the task, fans out workers, fans in their results. The supervisor + fan-out shape is the canonical "multi-agent research assistant" topology (`06-orchestration-system-design-templates/01-multi-agent-research-assistant.md`).
+
+The fan-in choice is more important than the fan-out choice. Pure-code merging (concat, sort, dedupe) is cheap and predictable; LLM merging is expensive and brings synthesis failure modes (the LLM might average contradictory results instead of surfacing the conflict, or hallucinate a synthesis that doesn't follow from the inputs). The production heuristic: use code merging when the merge is structural (union of arrays, sum of counts, sort by score) and only use an LLM merger when the merge is genuinely *interpretive* (summarize across N research findings into a coherent narrative). Most production fan-outs find a way to make the merge structural.
+
+The Anthropic multi-agent research blog post (2025) gives a concrete number: their fan-out research assistant runs 3-5 parallel sub-research agents per question and gets a 3-5x latency improvement over sequential. The cost stays roughly equal — same total tokens, just done concurrently. The fan-in is an LLM synthesis (interpretive merge), which they accept the cost of because the use case demands narrative output.
 
 ## Interview defense
 
-**Q: "Why doesn't your monitoring agent fan out across categories?"**
+> **Q: Could you fan-out the monitoring scan to reduce latency?**
+>
+> Structurally, yes — the 10 anomaly categories don't depend on each other, so they could split across 3-4 parallel monitoring agents. Operationally, it doesn't help today because the wall-clock bottleneck is the MCP rate limit (~1 req/s). The Bloomreach server is per-user rate-limited, so parallel agents would still serialize at the wire — `BloomreachDataSource.minIntervalMs=200ms` enforces global spacing. The parallelism would only win if the per-call wait was dominated by LLM reasoning time, which it isn't. If the rate limit relaxed or the workspace grew much larger, fan-out becomes worth it; today the 30-60s end-to-end is well under the 300s Vercel budget.
 
-A: Three reasons. First, Bloomreach's ~1 req/s rate limit serializes all calls at the data-source layer anyway — fan-out without a concurrency cap that respects the rate limit would just 429 the server. Second, no semaphore primitive in the codebase yet — adding fan-out requires building backpressure as a prerequisite (`../05-production-serving/02-fan-out-backpressure.md`). Third, the sequential cost is acceptable — a full monitoring scan is 6-10 seconds, well under the user's review time on the feed. The latency win from fan-out wouldn't be felt.
+> **Q: If you did add fan-out, what's the merge strategy?**
+>
+> Pure-code merge: flatten the per-agent anomaly arrays, sort by severity using the existing `severityRank` map from `monitoring-agent.js:18`, slice the top 10. No LLM in the merge path. Each agent scans different categories so there are no cross-agent duplicates to dedupe and no contradictions to reconcile — the merge is genuinely structural. Adding an LLM merger would invite the synthesis-failure mode (`09-coordination-failure-modes.md`) for no gain — there's nothing interpretive to do.
 
-If we added a feature where the per-task budget grew (analyzing 50 customer segments instead of 10 categories), fan-out would become the right answer. The refactor would be: split the MonitoringAgent into a Dispatcher (spawns workers) + N CategoryWorkers (one per category, tighter prompt, smaller budget) + a Merger (dedupes, sorts by severity). The load-bearing addition isn't the fan-out itself — it's the concurrency cap on the data source.
-
-Diagram I'd sketch:
-
-```
-  ┌─ Dispatcher ──┐
-  └──────┬────────┘
-   ┌─────┼─────┬─────┐  ← parallel, capped at N concurrent
-   ▼     ▼     ▼     ▼
-  [w]   [w]   [w]   [w]
-   │     │     │     │
-   └─────┴─┬───┴─────┘
-           ▼
-        merger → Anomaly[]
-```
-
-Anchor: "fan-out without backpressure on a rate-limited dependency is the multi-agent version of an unbounded queue — it works in dev, dies in prod."
-
-**Q: "When would fan-out earn its complexity here?"**
-
-A: When the per-task budget exceeds the sequential time budget. Today, MonitoringAgent's 6-call budget against ~1 req/s is ~6-10 seconds total — fine. If we added "scan 50 customer segments per category" (a 10x expansion of the budget), sequential becomes ~60-100 seconds — at the edge of Vercel's 300s but starting to hurt UX. Fan-out at 4-concurrent gets that back to ~15-25 seconds. The breakpoint is "the user can feel the wait." Today they can't; with a 10x budget they would.
+> **Q: What about the backpressure problem fan-out introduces?**
+>
+> A real concern at scale. A supervisor that spawns workers faster than the provider can serve them just queues up rate-limit errors. The mitigation is concurrency capping with backpressure — `BloomreachDataSource.minIntervalMs` is the primitive at the data-source layer; a fan-out cap would also limit how many concurrent worker agents can fire `tool_use` simultaneously. Even without fan-out, the rate-limit retry ladder in `BloomreachDataSource` handles the 429-class failures by sleeping and retrying. The full fan-out + backpressure story lives in `05-production-serving/02-fan-out-backpressure.md`.
 
 ## See also
 
-- [`03-sequential-pipeline.md`](./03-sequential-pipeline.md) — the pattern this repo currently uses
-- [`../05-production-serving/02-fan-out-backpressure.md`](../05-production-serving/02-fan-out-backpressure.md) — the prerequisite for safely fanning out against a rate-limited provider
-- [`09-coordination-failure-modes.md`](./09-coordination-failure-modes.md) — what fan-out exposes you to (tool-call cascade, cost blowup)
+- → `02-supervisor-worker.md` — the natural pair to fan-out (supervisor splits, fans out workers)
+- → `05-production-serving/02-fan-out-backpressure.md` — the production controls fan-out requires
+- → `09-coordination-failure-modes.md` — what goes wrong when the merge is an LLM instead of code
+- → `06-orchestration-system-design-templates/01-multi-agent-research-assistant.md` — the canonical fan-out template

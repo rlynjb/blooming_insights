@@ -1,154 +1,76 @@
-# DSA foundations — overview
+# Overview — DSA Foundations in `blooming_insights`
 
-The reusable data-structures-and-algorithms vocabulary
-behind this repo, ranked by what actually carries
-weight in the running code.
+The one-page map. If you read only one file in this folder, read this one.
 
-## Zoom out — what shape of DSA repo is this?
+## What this repo actually exercises
 
-```
-  Blooming-insights, viewed through a DSA lens
-  ─────────────────────────────────────────────
-
-  ┌─ UI layer ─────────────────────────────────────┐
-  │ React: lists (.map), funnel argmin reduce      │
-  │   InsightCard.tsx · CoverageGrid.tsx           │
-  └────────────────────────┬───────────────────────┘
-                           │ NDJSON over fetch
-  ┌─ Streaming kernel ─────▼───────────────────────┐
-  │ split('\n') + pop() line-buffer                │
-  │   lib/streaming/ndjson.ts                      │
-  └────────────────────────┬───────────────────────┘
-                           │
-  ┌─ Service layer ────────▼───────────────────────┐
-  │ Map<sessionId, SessionFeed> · Set capability   │
-  │ gate · SEV_RANK sort+slice · Map<id, cache>    │
-  │   lib/state/insights.ts · agents/categories.ts │
-  │   agents/monitoring-legacy.ts (top-10)         │
-  │   data-source/bloomreach-data-source.ts        │
-  └────────────────────────┬───────────────────────┘
-                           │
-  ┌─ Provider boundary ────▼───────────────────────┐
-  │ Anthropic (Claude) · Bloomreach MCP server      │
-  └────────────────────────────────────────────────┘
-```
-
-Verdict, first: this is a **flat-array, hash-map,
-linear-scan** codebase. Everything load-bearing is a
-`Map`, a `Set`, an `Array.prototype.sort` with a
-comparator, or a `for`/`reduce` over a single-digit-
-length array. There are no trees, no graphs, no
-priority queues, no dynamic programming, no binary
-search. That's not a gap to apologise for — it's the
-honest shape of an LLM-orchestration app where the
-heavy lifting lives in network round-trips and prompt
-tokens, not in CPU-bound algorithms.
-
-That framing matters because it sets which concepts
-are *exercised* (and therefore taught against your
-code) and which are *missing* (and therefore taught
-as foundations to deliberately practice).
-
-## Ranked findings — the DSA primitives in this repo
+This is a flat Map+Set codebase. The data-structure work is shallow on purpose — Bloomreach is the storage, the agents are the compute, and everything in memory is a session-scoped index or a stream buffer. The reusable structures that show up:
 
 ```
-  what's exercised        ★ rating   load-bearing example
-  ─────────────────       ────────   ─────────────────────────────────
-  hash maps (Map, Set)    ★★★★★      session-keyed insights, capability
-                                      gate, response cache (60s TTL)
-  arrays + linear scans   ★★★★★      filter/map over tool name lists,
-                                      coverage cross-check, funnel
-  strings + buffers       ★★★★       NDJSON split('\n') + TextDecoder;
-                                      AES-256-GCM Buffer concat
-  comparator-based sort   ★★★        SEV_RANK sort + slice top-10;
-                                      events sorted by eventCount
-  argmin reduce           ★★★        funnel.reduce(min by .v) for leak
-                                      stage in InsightCard
-  recursion (one level)   ★          encode/decode helpers; no deep
-                                      recursion anywhere
+  the DSA surface of blooming_insights
+
+  ┌─ data structures ──────────────────────────────────────────────┐
+  │                                                                 │
+  │   hash map      lib/state/insights.ts:14                        │
+  │   (Map)         lib/state/investigations.ts:11                  │
+  │                 lib/agents/aptkit-adapters.ts:101                │
+  │                 lib/data-source/bloomreach-data-source.ts:122    │
+  │                 lib/mcp/auth.ts:36                               │
+  │                                                                 │
+  │   set           lib/agents/categories-legacy.ts:120              │
+  │   (Set)         lib/agents/tool-schemas.ts:13                    │
+  │                 lib/mcp/tool-coverage.ts:40                      │
+  │                                                                 │
+  │   array +       schema.events, anomaly[], evidence[], steps[]   │
+  │   linear scan   all over lib/agents/ and lib/insights/          │
+  │                                                                 │
+  │   string +      lib/streaming/ndjson.ts:30 (split('\n') buffer) │
+  │   buffer        lib/mcp/auth.ts:65    (Buffer.concat for AES)   │
+  │                                                                 │
+  └─────────────────────────────────────────────────────────────────┘
+
+  ┌─ algorithms ───────────────────────────────────────────────────┐
+  │                                                                 │
+  │   comparator sort  lib/agents/monitoring-legacy.ts:136          │
+  │                    (rank by severity, top 10)                   │
+  │                                                                 │
+  │   argmin reduce    components/feed/InsightCard.tsx:160          │
+  │                    (funnel-stage leak: smallest v)              │
+  │                                                                 │
+  │   linear filter    everywhere — categories, tool-schemas,       │
+  │                    evidence pulls, hypothesis tested counts     │
+  │                                                                 │
+  │   recursion        lib/agents/base-legacy.ts:114 — ONE level    │
+  │                    (the tool-use loop; flat `for`, not a tree)  │
+  │                                                                 │
+  └─────────────────────────────────────────────────────────────────┘
 ```
 
-```
-  what's not exercised    why it doesn't show up here
-  ─────────────────       ─────────────────────────────────
-  trees / tries           no hierarchical data; agent output is flat
-  graphs / BFS / DFS      no dependency graph in the running code
-  priority queues         no scheduler; severity is one sort + slice
-  binary search           every lookup is hash-keyed or short scan
-  dynamic programming     no overlapping subproblems anywhere
-  backtracking            agent search is delegated to the LLM
-  union-find / segment    no clustering or range-query workload
-```
+That's the whole DSA surface. No trees walked, no graphs traversed, no priority queue, no binary search, no DP, no backtracking. The list of *not yet exercised* primitives is long — see the per-file `not yet exercised` notes and the practice map at the end.
 
-The shape that pops: every "rank the top N" moment in
-this repo is solved by `[...arr].sort(cmp).slice(0,
-N)`. Every "what fired already" check is solved by a
-`Set.has(...)`. Every "look this up by id" is solved
-by a `Map.get(...)`. The DSA budget is consciously
-small.
+## The verdict
 
-## Reading order
+The structures are the right shape for what the code does. Hash-map indirection is the load-bearing primitive — the session map (`state`) keeps two warm Vercel users from clobbering each other's feed (`lib/state/insights.ts:14`); the response cache (`this.cache`) absorbs repeat tool calls under the 1 req/s rate limit (`lib/data-source/bloomreach-data-source.ts:122`); the active-tool-calls queue (`activeToolCalls`) lines `tool_call_start` up with its `tool_call_end` partner when both fire from the AptKit trace sink (`lib/agents/aptkit-adapters.ts:101`).
+
+Where the code reaches for *less* than it could: the monitoring agent re-ranks the anomaly list every time with a comparator sort then takes the top 10 (`lib/agents/monitoring-legacy.ts:136`). With ten anomalies and four severity buckets, a bucket sort or a fixed top-K heap is overkill — the comparator is the right cost. **The honest take is: this repo is comfortable in O(n) over small n, and that's correct.** The DSA gap isn't in the repo's code, it's in the foundations the repo never had to reach for. That's what this guide ranks at the end.
+
+## How to read this folder
+
+Reading order — each file uses the full `format.md` template (Zoom out → Structure pass → How it works → Primary diagram → Elaborate → Interview defense → See also):
 
 ```
-  start here ─►  01-complexity-and-cost-models
-                 (the language you'll use to reason
-                  about everything below)
-                              │
-                              ▼
-                 02-arrays-strings-and-hash-maps
-                 (★★★★★ — the workhorse of this repo)
-                              │
-                              ▼
-                 03-stacks-queues-deques-and-heaps
-                 (sort+slice is your current heap;
-                  real heap is Case B — taught from
-                  fundamentals, anchored to reincodes)
-                              │
-                              ▼
-                 04-trees-tries-and-balanced-indexes
-                 (Case B — none here; anchor to your
-                  BST/Tree implementations in reincodes)
-                              │
-                              ▼
-                 05-graphs-and-traversals
-                 (Case B — anchor to your Graph.ts,
-                  Graph2.ts, BFS over state space)
-                              │
-                              ▼
-                 06-sorting-searching-and-selection
-                 (sort exercised, binary search Case B)
-                              │
-                              ▼
-                 07-recursion-backtracking-and-dynamic-
-                    programming
-                 (Case B — repo doesn't go deep here)
-                              │
-                              ▼
-                 08-dsa-foundations-practice-map
-                 (the deliberate-practice plan that
-                  closes the gap between this repo's
-                  scope and the interview surface)
+  01-complexity-and-cost-models.md            ← cost vocabulary first
+  02-arrays-strings-and-hash-maps.md          ← the everyday primitives
+  03-stacks-queues-deques-and-heaps.md        ← ordering disciplines
+  04-trees-tries-and-balanced-indexes.md      ← mostly NOT yet exercised
+  05-graphs-and-traversals.md                 ← NOT yet exercised
+  06-sorting-searching-and-selection.md       ← one comparator sort + the gap
+  07-recursion-backtracking-and-dynamic-programming.md  ← one-level loop only
+  08-dsa-foundations-practice-map.md          ← ranked learning plan
 ```
 
-## On "not yet exercised"
-
-When a concept file is marked Case B (not exercised
-in this repo), the file teaches the primitive from
-fundamentals and — where you've already built it in
-the `reincodes` repo (your DSA portfolio) — anchors
-to that code. That's the honest split. The
-blooming_insights code teaches what it teaches; the
-reincodes implementations teach what blooming doesn't
-need to reach for. Combined, they cover the
-interview surface.
+Files 04, 05, and most of 07 teach foundations the repo does not currently exercise — they exist because the next AI-engineering interview will ask you to draw BFS on a whiteboard whether or not your shipped code uses it. The practice map (08) ranks where to spend hours.
 
 ## See also
 
-- `01-complexity-and-cost-models.md`
-- `02-arrays-strings-and-hash-maps.md`
-- `03-stacks-queues-deques-and-heaps.md`
-- `04-trees-tries-and-balanced-indexes.md`
-- `05-graphs-and-traversals.md`
-- `06-sorting-searching-and-selection.md`
-- `07-recursion-backtracking-and-dynamic-programming.md`
-- `08-dsa-foundations-practice-map.md`
+- `.aipe/study-system-design/00-overview.md` — the architectural shape these structures sit inside (sessions, routes, agent loop). Cross-link when a file needs the bigger box.

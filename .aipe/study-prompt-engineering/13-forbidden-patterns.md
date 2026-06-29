@@ -1,320 +1,264 @@
-# 13 — Forbidden patterns and rotating formulas
+# Forbidden patterns and rotating formulas
 
-*Output-style anti-drift · Industry standard*
+**Industry standard** · the concept blooming hasn't needed yet
 
-## Zoom out, then zoom in
+## Zoom out — where rotation would matter, and where it wouldn't
 
-LLMs converge on phrasings. Run the same generative prompt 50 times and you'll see the same 5–10 sentence openings drift to the top. Pull up where this matters in this codebase.
+This concept covers what generative chains do to *avoid LLM repetition* — listing forbidden openings, enumerating rotating formulas, tracking what's been said before. blooming doesn't exercise this pattern today because no agent in this codebase is a generative chain run *repeatedly for the same user*. Each agent runs once per briefing or once per user click; the outputs are read once and persisted. The diagram below sketches what *would* trigger rotation and what doesn't.
 
 ```
-  Where output convergence shows up — the recommendation rationale
+  Zoom out — when rotation matters vs when it doesn't
 
-  ┌─ /api/agent — recommendation chain ──────────────────────────┐
-  │  prompt: legacy-prompts/recommendation.md                      │
-  │  output: Recommendation[] with rationale field                 │
-  └───────────────────────────────┬──────────────────────────────┘
-                                  │
-  ┌─ over 50 recommendations across investigations ▼ ──────────────┐
-  │  rationale openings start to converge:                          │
-  │   "By targeting customers who have abandoned..."                │
-  │   "By targeting customers who haven't..."                        │
-  │   "By targeting customers in the affected segment..."           │
-  │   ★ DRIFT: every output starts the same way ★                   │ ← we are here
-  │  the recommendation cards begin to feel templated                │
-  └────────────────────────────────────────────────────────────────┘
+  ┌─ what triggers rotation needs ──────────────────────────┐
+  │   generative chains run repeatedly for the same user    │
+  │   examples (outside this codebase):                      │
+  │     - caption generator (per post, dozens per day)        │
+  │     - daily summary email (one per user per day)          │
+  │     - workout description (per workout, per user)         │
+  │   without rotation: every output sounds the same         │
+  └─────────────────────────────────────────────────────────┘
+
+  ┌─ blooming's chains: rotation NOT needed ────────────────┐
+  │   monitoring: structured anomaly array, once per briefing│
+  │   diagnostic: structured diagnosis, once per anomaly     │
+  │   recommendation: structured action set, once per diag   │
+  │   query: prose answer, free-form per question            │
+  │   intent: one-word label                                  │
+  └─────────────────────────────────────────────────────────┘
 ```
 
-This is the failure mode in any generative LLM chain run repeatedly for the same user. The model picks up on what's worked in past outputs (from training) and converges on it. The output stops feeling individuated; the user notices it as "AI-generated." The fix is in the prompt itself — enumerate the forbidden openings, list the rotating formulas. Concept 11's spec discipline applied to the running prompts.
+## Zoom in
+
+LLMs converge on phrasings. Run the same chain ten times against ten different inputs and the outputs start to share opening sentences, hedging patterns, and stylistic tics — "It looks like...", "I noticed that...", "Based on the data...". For one-off outputs, this is invisible (the user sees one). For generative chains run repeatedly for the same user, it's the difference between a tool that feels fresh and a tool that feels like spam. The pattern: explicitly list forbidden openings, enumerate rotating formulas, track rotation history. This concept is curriculum target for blooming; it doesn't fire yet, and the file is honest about where it would land if a future feature triggered it.
 
 ## Structure pass
 
-**Layers.** Outer: the generative chain (any chain that emits prose). Middle: the specific phrasings the model converges on. Innermost: the prompt rule that prevents convergence.
+**Layers.** Two altitudes worth holding: the *single-output layer* (rotation doesn't matter — the user sees one thing) and the *repeated-output layer* (rotation matters — the user sees a stream).
 
-**Axis — where does the convergence live.** Walk it:
+**Axis traced — sameness perception.** Hold one question constant: *does the user see enough output from this chain to notice repetition?*
 
 ```
-  one axis — "where does this convergence live?" — three layers
+  Axis = does the user notice repetition?
 
-  ┌─ training data ──────────────────┐
-  │  model has seen 10K "recovery     │  ROOT CAUSE: you can't fix this
-  │  email" rationales — they all     │  at the model layer
-  │  start "By targeting..."           │
-  └───────────────────────────────────┘
-       ┌─ prompt's example ───────────┐
-       │  if your one few-shot example │  CONTRIBUTES: example starts
-       │  starts "By targeting..."     │  with the convergent phrasing
-       │  the model copies              │
-       └───────────────────────────────┘
-            ┌─ prompt's anti-rule ─────┐
-            │  "Don't start with 'By    │  THE FIX: enumerate forbidden
-            │   targeting...' Rotate    │  openings, give the model
-            │   among: 'Recover...',    │  permitted alternatives
-            │   'Win back...', ..."      │
-            └───────────────────────────┘
+  ┌─ one-off outputs (no rotation needed) ──────────────────┐
+  │   anomaly impact strings    1 per anomaly per briefing  │
+  │   diagnosis conclusions     1 per investigation         │
+  │   recommendation titles     2-3 per recommendation run  │
+  │   query answers              1 per question              │
+  └─────────────────────────────────────────────────────────┘
+
+  ┌─ repeated outputs (rotation needed) ────────────────────┐
+  │   - not present in blooming today                        │
+  │   - would be triggered by: a feature that auto-generates │
+  │                            many outputs of the same shape│
+  │                            for the same user over time    │
+  └─────────────────────────────────────────────────────────┘
 ```
 
-**Seams.** The biggest seam is between the *generative* and *structured-classifier* chains. Generative chains drift; classifiers don't (the output range is too small for convergence to be visible). The defense is only needed where the model is writing prose.
+**Seams.** The "is this the same chain producing many outputs?" question is the seam. If the answer is no, the convergence-on-phrasing problem doesn't fire — the user sees one output and can't notice repetition. If the answer is yes, you need a mechanism (forbidden-openings list, rotation history, explicit "vary your opening" instruction) to break the convergence. blooming sits firmly on the "no" side today; this file exists to explain when and how it would move.
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — the pattern, as one picture
 
-You know how every Hollywood action trailer cuts the same way — "in a world..." → quick cuts → orchestral hit → text on screen — and you can tell within five seconds it's a trailer even with the sound off? LLM-generated prose has the same convergence problem. Every output starts to *sound* the same. The defense is what every good editor does: ban the cliché openings, name the rotation.
-
-```
-  Pattern — forbidden patterns, the kernel
-
-  ┌─ generative chain ──┐
-  │  recommendation     │
-  │  rationale: prose    │
-  └──────────┬──────────┘
-             │ run 50 times
-             ▼
-       ┌──────────────────────────────┐
-       │ outputs start with:           │
-       │   "By targeting..."  (12x)    │
-       │   "Send a..."  (8x)           │
-       │   "To recover..."  (7x)       │
-       │   "Trigger an..."  (5x)       │
-       │   "Set up a..."  (4x)         │
-       │   ... convergence!            │
-       └────────────┬─────────────────┘
-                    │
-                    ▼  add to prompt:
-       ┌──────────────────────────────┐
-       │  ## Forbidden openings        │
-       │  Do NOT begin the rationale   │
-       │  with any of:                  │
-       │   - "By targeting..."         │
-       │   - "Send a..."                │
-       │   - "To recover..."            │
-       │  Instead, rotate among these   │
-       │  patterns:                     │
-       │   - lead with the EVIDENCE     │
-       │     ("Mobile cart revenue       │
-       │      fell 23%; ...")            │
-       │   - lead with the IMPACT       │
-       │     ("~340 buyers were         │
-       │      affected; ...")            │
-       │   - lead with the ACTION        │
-       │     ("Recovery email to the     │
-       │      gap-window segment...")    │
-       └──────────────────────────────┘
-```
-
-The mechanism: forbidding the convergent openings AND listing rotating alternatives gives the model both a *don't* and a *do*. The *do* is what makes the rule work — banning without providing alternatives leaves the model to pick a *different* convergent opening from a smaller set.
-
-### Move 2 — the walkthrough
-
-**Step 1 — when this concept matters.** Two situations:
-
-  → **Any generative chain run repeatedly for the same user.** The recommendation agent in this codebase fits — a single user sees N recommendations across multiple investigations. Convergence makes the cards feel templated.
-  → **Any output that's *meant* to feel individuated.** Marketing copy, email drafts, product descriptions, code comments. If two outputs from the same chain look like reskins of each other, the user notices and trust drops.
-
-**Step 2 — when this concept doesn't matter.** Two situations:
-
-  → **One-shot classifiers.** The intent classifier returns one word. Convergence is *the goal* (always "monitoring" for "what's changed?" queries). No rotation needed.
-  → **Structured outputs.** The monitoring agent returns `Anomaly[]` with `category`, `severity`, etc. The fields are typed; there's no prose to converge on. The closest thing is the `impact` field, which IS prose — and where this concept applies even inside a structured output.
-
-**Step 3 — what this codebase does today (mostly nothing).** Look at the recommendation prompt at `legacy-prompts/recommendation.md`. There's a worked example showing one recommendation with a `title: "Send recovery email..."` and a `rationale`. There are no forbidden-pattern rules. After 50 recommendations, the rationale field probably has the convergence problem named above.
-
-The same applies (weaker) to:
-
-  → **Monitoring's `impact` field.** Every anomaly's `impact` is prose. After 50 anomalies, openings drift. Look at the worked example at `legacy-prompts/monitoring.md:81`: *"Revenue down 30% versus the prior 90 days on a baseline of ~12k purchases — a sustained drop at this magnitude..."*. The next 50 impact sentences will look a lot like this one.
-  → **Diagnostic's `conclusion` field.** Prose explanation of why the anomaly happened. Same drift risk.
-
-These are real opportunities for the concept. None are exercised today. Honest framing: this codebase doesn't have the *measurement* to know how bad the drift is, because there's no eval set (concept 05) tracking output diversity over runs. Adding the rotation rules is cheap; measuring whether they help requires the substrate.
-
-**Step 4 — what the rule looks like in practice.** A concrete addition I'd make to `recommendation.md`:
+You know how a `Math.random()` always picks the same biased range if you don't track history? Same thing happens with LLM output: ten "creative" captions from the same prompt cluster around the same three opening words, because the model has a most-likely next token and gravitates toward it. The fix is to feed back what's been said before and ask the model to avoid it.
 
 ```
-  Pattern — the rotation rule, added to recommendation.md
+  Pattern — rotation with explicit history
 
-  ## Style rules for rationale and steps
-
-  The `rationale` field MUST NOT start with any of these convergent
-  openings:
-    - "By targeting customers..."
-    - "Send a..."
-    - "To recover..."
-    - "Trigger an automated..."
-
-  Instead, vary the opening across these patterns (pick the one that
-  fits the diagnosis):
-
-    EVIDENCE-FIRST: lead with the specific number from the diagnosis.
-      Example: "Mobile cart abandonment jumped 23% in the last 30 days;
-      a recovery email targeting that segment ..."
-
-    IMPACT-FIRST: lead with the affected customer count or dollar value.
-      Example: "~340 gap-window buyers represent ~$380K in foregone
-      revenue at the current AOV; a recovery campaign ..."
-
-    ACTION-FIRST: lead with the Bloomreach feature being proposed.
-      Example: "A 'cart abandonment' scenario triggered after 24 hours
-      of inactivity recovers ..."
-
-  Aim for roughly equal distribution across the three patterns over
-  any 10 consecutive recommendations.
+  ┌─ static prompt ─────────────────────────────────────────┐
+  │   "Generate a caption for this post."                    │
+  │   → 10 captions, 8 start with "Just a"                   │
+  │   → user notices on the 3rd one, dismisses the tool      │
+  └─────────────────────────────────────────────────────────┘
+                              │  add rotation
+  ┌─ rotation-aware prompt ──▼──────────────────────────────┐
+  │   "Generate a caption. Avoid these opening phrases       │
+  │    (used in the last 10 captions): 'Just a', 'A quick',  │
+  │    'Here's a'."                                          │
+  │   → 10 captions, 10 different openings                   │
+  │   → user perceives variety                               │
+  └─────────────────────────────────────────────────────────┘
 ```
 
-The shape: *forbidden list* + *alternative list* + *distribution hint*. All three are needed. Just forbidding doesn't work (model picks another convergent opening); just listing alternatives doesn't help if the convergent ones are still allowed; without the distribution hint the model picks one alternative and over-uses it.
+### Move 2 — what the mechanism looks like in practice
 
-**Step 5 — the structured-output workaround.** This concept has an *architectural* alternative for some cases: move the prose to a typed field with constrained sub-fields. Instead of `rationale: string` (free prose), use:
-
-```
-  Pattern — structured rationale, anti-convergence by design
-
-  rationale: {
-    leadType: "evidence" | "impact" | "action"   // rotates explicitly
-    leadNumber: number                            // forces the model to pick
-                                                   // a specific number to cite
-    bodyText: string                              // shorter, less room to drift
-  }
-```
-
-The model now has to *choose* the lead type per recommendation, and the lead type is visible in the schema. You can audit the distribution after the fact. The body text still has drift risk but it's a shorter window.
-
-This codebase doesn't do this — the rationale is a free-string field — because the engineering cost of restructuring the type isn't paid back without measured drift. The concept I'd reach for first is the prompt-level forbidden-pattern rules; the structured-output workaround is for when prompt rules don't suffice.
-
-**Layers-and-hops view of how a forbidden-pattern rule reaches the output:**
+For a chain that needs rotation, the prompt has a rotation slot:
 
 ```
-  Layers-and-hops — forbidden-pattern rule, prompt to output
+  Hypothetical caption chain with rotation (not in blooming)
 
-  ┌─ Prompt source (recommendation.md) ────────────────────────┐
-  │  ## Style rules for rationale                                │
-  │   - forbidden list                                           │
-  │   - alternative list                                          │
-  │   - distribution hint                                         │
-  └──────────────┬─────────────────────────────────────────────┘
-                 │ hop 1: included in system prompt every call
-  ┌─ Each chain run ▼ ─────────────────────────────────────────┐
-  │  model generates rationale; checks against forbidden list  │
-  │  → picks an opening from the alternative list              │
-  └──────────────┬─────────────────────────────────────────────┘
-                 │ hop 2: structured output
-  ┌─ Recommendation[] ▼ ───────────────────────────────────────┐
-  │  rationale text varies across the alternative patterns     │
-  └──────────────┬─────────────────────────────────────────────┘
-                 │ hop 3: post-hoc audit (gap — needs evals)
-  ┌─ Audit ▼ ──────────────────────────────────────────────────┐
-  │  count rationale openings across N runs                    │
-  │  if any pattern > 40% of runs, add it to forbidden list    │
-  └────────────────────────────────────────────────────────────┘
+  ## Avoid these openings
+  The following opening phrases have been used recently.
+  Choose a different opening for this caption:
+  {recent_openings}
+
+  ## Format
+  - Use a different opening style than any in the avoid list
+  - Vary tone: declarative, question, observation, action
+  - 8-12 words
+
+  ## The post
+  {post_content}
 ```
 
-The audit step is what closes the loop. Without it, you guess at which patterns to forbid. With it, you measure and add to the list as new convergence patterns emerge. The audit is downstream of concept 05's eval substrate — another reason that gap matters.
+The `{recent_openings}` slot is filled at request time from a rotation history (last N captions, extract first 2-3 words, deduplicate). The `## Format` section enumerates the rotation formulas — explicit categories the chain rotates through. The model sees both the avoid-list and the variety target.
+
+The state cost of this pattern: somewhere has to remember the last N outputs. Typically that's a small JSON blob per user, updated after each call. blooming doesn't have user-scoped state of this kind today (the demo snapshots are workspace-scoped; the investigation cache is per-briefing); a rotation-needing feature would add it.
+
+### Move 2 — why blooming's chains don't trigger this
+
+Walk each agent and ask "does the user see enough output to notice repetition?":
+
+**Monitoring.** Each briefing produces 0-10 anomalies. The `impact` field is one sentence per anomaly. A user runs at most a few briefings per day; within one briefing, the anomalies are different metrics (revenue drop, conversion drop, traffic spike), so the prose naturally varies. Across briefings, same workspace, same handful of metrics — there *is* some risk of repetition over weeks. Not today's problem.
+
+**Diagnostic.** One diagnosis per investigation. A user clicks at most a few times per day. The `conclusion` field is one paragraph; the user reads it once. No rotation needed.
+
+**Recommendation.** 2-3 recommendations per investigation. The `title` and `rationale` fields could converge across runs (every recommendation for an email-flow problem might start with "Send a follow-up to..."). Mild risk over time; not visible at current usage.
+
+**Query.** Free-form prose per question. Each question is different; the answer shape depends on the question. No repetition pressure.
+
+**Intent.** One-word output. No prose; rotation doesn't apply.
+
+The honest summary: today's usage doesn't trigger the convergence problem. The risk is real if usage grows (a power user running many briefings per week against a stable workspace) or if a new feature adds a generative chain that runs many times per user (a daily-digest email, a per-customer recommendation explainer). Either would be the moment to revisit this concept.
+
+### Move 2 — what's structurally already there
+
+Two pieces of the rotation pattern blooming has, even though full rotation isn't implemented:
+
+**Structured output reduces convergence pressure.** Anomalies and diagnoses are mostly *fields*, not paragraphs. The repetition risk is concentrated in the few free-text fields (`impact`, `conclusion`, `rationale`, `title`). Most of each output is metric names, severity values, evidence arrays — domain-specific data that varies naturally with the input. The structured-output discipline (concept #2) does some of rotation's work for free.
+
+**Per-agent prompts mean per-chain phrasing styles.** Because monitoring, diagnostic, and recommendation each have their own prompt, the *phrasing styles* across the three are different. The monitoring agent says "Revenue down 30% versus..."; the recommendation agent says "Send a recovery email to..."; the diagnostic agent says "Mobile checkout regression confirmed by...". The cross-agent variety happens for free. Within-agent convergence is the residual risk.
+
+### Move 2 — when this would earn its place
+
+Three triggers would make rotation worth building:
+
+1. **A new generative feature.** Anything that auto-generates many outputs per user over time — a daily summary, a per-customer write-up, a per-event narrative. Add the rotation mechanism in the prompt at the same time you add the feature; don't ship without it.
+
+2. **User reports.** If a user says "all the recommendations sound the same" or "the impact text feels repetitive," that's the production signal. The fix at that point: add a rotation history to the user's session, pipe the last N `impact` strings into the monitoring prompt, ask the model to vary.
+
+3. **Eval signal.** Once concept #5 (eval-driven iteration) is in place, a "diversity" check across a set of runs would catch convergence before users do. ("Across these 20 monitoring runs, how many distinct opening phrases did the impact field use?") This is the production version of self-eval; it would catch rotation drift the same way an eval suite catches behavior drift.
+
+### Move 2 — the cousin pattern: "vary your tone" instructions
+
+A weaker version of rotation that earns its place sometimes: an explicit "vary your opening / vary your tone / vary your phrasing" instruction in the prompt, with no history slot. The instruction is a soft constraint; the model still has a preferred next token, but explicit variety instructions nudge it toward less common openings.
+
+Cost: a sentence in the prompt. Benefit: about half of full-rotation's effect, without the state. For features where you want some variety but don't want to track history, the soft instruction is the right starting point.
+
+blooming's monitoring prompt has one line that gestures in this direction:
+
+```
+  // monitoring.md:93 (from the field rules)
+  - `impact` — ... Do NOT just restate the percentage.
+```
+
+The "do not just restate the percentage" is a *forbidden-pattern* instruction — telling the model what NOT to do, which constrains output away from the convergent boring case. Not full rotation, but the same family.
 
 ### Move 3 — the principle
 
-LLMs converge on phrasings because next-token prediction rewards the most likely next token. Generative output run repeatedly for the same user collides with this — every output starts to sound like the previous one. The fix is to forbid the convergent patterns AND provide rotating alternatives AND audit the distribution. The principle generalises to any system whose output is meant to feel individuated: rules alone aren't enough; the *measurement* of whether outputs are still diverse is what makes the rules adaptive.
+Rotating formulas and forbidden-patterns lists are the response to a specific problem: LLM convergence on phrasing in generative chains run repeatedly. The pattern earns its place when usage produces enough output of the same shape for the user to notice repetition. blooming's chains don't hit that threshold today; the concept stays on the curriculum target list for when a future feature triggers it. The lighter-weight versions (structured output, per-agent prompts, soft "vary" instructions, forbidden-pattern callouts in field rules) catch most of the risk in this codebase.
 
-## Primary diagram — the forbidden-pattern rule, end to end
+## Primary diagram
 
 ```
-  ┌─ Prompt source (recommendation.md, with the rule added) ─────────┐
-  │  ## Style rules for rationale                                       │
-  │                                                                      │
-  │  ★ Forbidden openings ★                                              │
-  │    - "By targeting customers..."                                     │
-  │    - "Send a..."                                                     │
-  │    - "To recover..."                                                 │
-  │    - "Trigger an automated..."                                       │
-  │                                                                      │
-  │  ★ Rotating alternatives ★                                           │
-  │    - EVIDENCE-FIRST: lead with the diagnosis number                  │
-  │    - IMPACT-FIRST: lead with the affected count / dollars            │
-  │    - ACTION-FIRST: lead with the Bloomreach feature                  │
-  │                                                                      │
-  │  ★ Distribution hint ★                                               │
-  │    - aim for ~1/3 each across any 10 consecutive recommendations    │
-  └──────────────────────────────┬───────────────────────────────────┘
-                                 │
-  ┌─ Each chain run ▼ ────────────────────────────────────────────────┐
-  │  model picks lead pattern, generates rationale                     │
-  │  output rotates across the three alternatives                       │
-  └──────────────────────────────┬───────────────────────────────────┘
-                                 │
-  ┌─ Post-hoc audit (the missing piece) ▼ ───────────────────────────┐
-  │  count rationale openings across N runs                            │
-  │  IF any new pattern emerges at >40% → add to forbidden list        │
-  │  IF distribution drifts away from 1/3 each → tighten the rule      │
-  │  (this is a concept-05 eval-set responsibility)                    │
-  └──────────────────────────────────────────────────────────────────┘
+  Forbidden patterns / rotation — where the pattern lives, why blooming
+  doesn't yet exercise the full version
+
+  ┌─ THE FULL ROTATION PATTERN (not in blooming today) ───────────┐
+  │                                                                 │
+  │  ┌─ rotation history (state, per user) ──────────────────┐    │
+  │  │   recent_outputs[] = last N outputs from this chain   │    │
+  │  └────────────────────────┬────────────────────────────┘    │
+  │                           │                                   │
+  │  ┌─ prompt with avoid-list ▼───────────────────────────┐     │
+  │  │   "Avoid these openings: {recent_openings}"         │     │
+  │  │   "Vary tone: declarative / question / observation" │     │
+  │  └────────────────────────┬────────────────────────────┘     │
+  │                           │                                   │
+  │  ┌─ output ────────────────▼───────────────────────────┐     │
+  │  │   model produces output that avoids the avoid-list  │     │
+  │  └────────────────────────┬────────────────────────────┘     │
+  │                           │                                   │
+  │  ┌─ history update ────────▼───────────────────────────┐     │
+  │  │   recent_outputs.push(new_output) (cap at N)        │     │
+  │  └─────────────────────────────────────────────────────┘     │
+  └────────────────────────────────────────────────────────────────┘
+
+  ┌─ WHAT BLOOMING HAS TODAY (lighter-weight) ─────────────────────┐
+  │  - structured outputs ↓ convergence pressure (most fields vary  │
+  │    naturally with input data)                                   │
+  │  - per-agent prompts → distinct phrasing styles across agents    │
+  │  - one explicit forbidden-pattern callout:                       │
+  │      monitoring.md:93 "Do NOT just restate the percentage."      │
+  │  - no rotation history · no avoid-list slot · no diversity eval │
+  └────────────────────────────────────────────────────────────────┘
+
+  ┌─ WHEN BLOOMING WOULD ADD THE FULL PATTERN ─────────────────────┐
+  │  trigger 1: a new generative chain run many times per user      │
+  │             (e.g. daily digest, per-customer narrative)         │
+  │  trigger 2: user reports "everything sounds the same"            │
+  │  trigger 3: eval (concept #5) measures and flags low diversity   │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The convergence problem is the same problem as *mode collapse* in image-generation models — train a model on photographs of dogs and it'll happily generate the same kind of dog over and over. In LLMs the analog is style collapse: prose starts to look generic. The defense (enumerate forbidden patterns, list alternatives, audit distribution) is the same shape as mode-collapse mitigation in image models.
+The reason this concept is in the curriculum even though blooming doesn't exercise it: every working AI engineer ships a generative chain that converges eventually. The Twitter-thread-generator with "Here are 5 things you should know about..." 50 times in a row. The product-description writer that opens every description with "Discover the...". The workout planner where every Monday's intro paragraph reads like every other Monday's. The pattern is *predictable*; the fix is well-known; the time to learn it is before you ship something that needs it.
 
-This is one of the older concepts in the prompt-engineering folklore — it predates structured outputs and tool use; people writing GPT-3 marketing copy in 2021 hit it immediately. The framing here is the production version: not "make the output sound less AI-y" (vague), but "audit the distribution of openings and prevent any one from exceeding a threshold" (measurable).
+The loopd project the reader has shipped is the kind of system where rotation matters in practice — captions, summaries, narratives generated repeatedly for the same user. blooming sits in the "analytics + decisions" half of LLM application work, where the output volume per user is naturally low; loopd sits in the "content generation" half, where output volume is high and rotation is load-bearing. The same engineer will work in both halves of the field over time; knowing the rotation pattern is part of the toolkit even when the current project doesn't need it.
 
-Three places to deepen:
+The "soft constraint" version (explicit "vary your tone" instruction with no history) is underrated. It costs a sentence in the prompt and gets you about half the benefit of full rotation. For features where state management is awkward and the convergence problem is mild, soft constraints are the right first move. Full rotation is the second move, reserved for features where the convergence is undeniable in production.
 
-- **OpenAI's prompt-engineering best practices.** The "vary the format" guidance is the official version of this concept. Lighter than what this guide covers.
-- **Anthropic's docs on creative-writing prompting.** They acknowledge convergence and recommend few-shot diversity (concept 08) as the defense; this guide reaches for explicit forbidden-pattern rules instead because they're more controllable.
-- **The literature on n-gram repetition penalties (decoding-time).** A different defense — at decoding time, penalize tokens that have already appeared. Works inside one generation; doesn't help with cross-generation convergence. Complementary, not redundant.
+The forbidden-pattern callout in monitoring.md (`Do NOT just restate the percentage`) is interesting as a single data point — it's the working AI engineer's instinct showing up in a small place. The author of that prompt knew the model would default to "Revenue is down 30%" for a 30% revenue drop, and explicitly told it not to. That's the same instinct that, scaled up, becomes a full forbidden-openings list in a content-generation system. The instinct is right; the scale of the constraint depends on the scale of the convergence problem.
 
-In this codebase, concept 08 (few-shot) is the *first* defense — if your one worked example doesn't start with the convergent opening, the model is less likely to copy it. Concept 05 (eval-driven iteration) is the *measurement* prerequisite — without an eval that tracks output diversity, you can't tell whether the forbidden-pattern rules are working.
-
-## Project exercises
-
-### Exercise — Add forbidden-pattern rules to the recommendation prompt
-
-  → **Exercise ID:** FORBID-RECCO
-  → **What to build:** Modify `lib/agents/legacy-prompts/recommendation.md` to add a `## Style rules for rationale` section with the three-part structure: forbidden openings (list 4–6 patterns observed in current outputs), rotating alternatives (EVIDENCE-FIRST / IMPACT-FIRST / ACTION-FIRST patterns with examples), distribution hint (roughly equal across 10 consecutive recommendations).
-  → **Why it earns its place:** The recommendation rationale is the most user-exposed prose field in the codebase. Adding the rule is cheap (no code changes); the audit step is harder (requires concept 05's eval substrate). The rule alone is a measurable improvement.
-  → **Files to touch:** `lib/agents/legacy-prompts/recommendation.md`.
-  → **Done when:** the prompt has the three-part rule; a manual run of 5 different anomalies produces 5 recommendations with 3 different opening patterns.
-  → **Estimated effort:** ~1 hour to author the rule (the harder part is identifying the 4–6 convergent openings to forbid, which requires running ~30 recommendations and tallying).
-
-### Exercise — Add forbidden-pattern rules to the monitoring `impact` field
-
-  → **Exercise ID:** FORBID-IMPACT
-  → **What to build:** Similar to above, but for `legacy-prompts/monitoring.md`'s `impact` field. The convergence here is weaker (impact sentences are constrained by the metric and direction) but real. Add forbidden openings ("Revenue down...", "This represents a..."), rotating alternatives (lead with downstream effect, lead with customer count, lead with timing), and the distribution hint.
-  → **Why it earns its place:** The impact field is what makes anomaly cards feel like analyst notes vs. templated alerts. The convergence problem here matters for the same reason it matters for recommendations.
-  → **Files to touch:** `lib/agents/legacy-prompts/monitoring.md`.
-  → **Done when:** the prompt has the three-part rule; 5 different anomalies produce 5 impact sentences across 3 different opening patterns.
-  → **Estimated effort:** ~1 hour.
+Anthropic's prompt engineering guide and Simon Willison's writing both touch on this — the "model converges on the most likely sequence" problem and the "explicit variation instruction" fix. The eugeneyan.com blog has a longer treatment connected to evals (you can measure diversity, you can iterate against it). The literature is well-developed; the production-frequency of this pattern is just lower than for the other concepts in this guide.
 
 ## Interview defense
 
-**Q: "Why do all my LLM-generated outputs start to sound the same?"**
+**Q: Why isn't this pattern in blooming, and when would you add it?**
 
-LLMs are next-token predictors. Run the same generative prompt repeatedly and the model converges on the highest-probability openings — "By targeting...", "Send a...", "To recover...". The output stops feeling individuated; users start clocking it as AI-generated. The defense is in the prompt: enumerate forbidden openings AND list rotating alternatives AND give a distribution hint. All three are needed.
+A: It isn't in blooming because no chain in this codebase is run *many times for the same user with the same shape*. Monitoring produces one anomaly array per briefing; diagnostic produces one diagnosis per click; the user sees a handful of outputs per session, not a stream of dozens. The convergence-on-phrasing problem only becomes visible when the user is reading the 5th, 10th, 20th output and notices "everything sounds the same." blooming's current usage doesn't hit that volume; the structured-output discipline does the rest of rotation's work for free (most of an anomaly is metric name + severity + numbers, which vary with input; only the `impact` and `conclusion` free-text fields would converge). When *would* I add it? Three triggers: a new feature that auto-generates many same-shape outputs (a daily digest, a per-customer narrative), a user complaint that "the outputs feel repetitive," or an eval signal (once evals are in place) measuring low diversity across runs. The fix at any of those moments is the same — add a rotation history to user-scoped state, pipe the last N outputs into the prompt as an avoid-list, optionally add explicit "vary your tone" instructions. It's a one-day change when triggered; it's wrong to build pre-emptively because rotation state is just another thing to maintain.
 
 ```
-  the rule shape:
-    ★ FORBIDDEN list  (the convergent openings)
-  + ★ ALTERNATIVES list (the patterns to rotate)
-  + ★ DISTRIBUTION hint (roughly equal use)
-  = output that stays diverse over N runs
+  what I'd sketch:
+
+  current blooming:                     when to add rotation:
+  ─────────────────                     ─────────────────────
+  small output volume per user          new feature: many same-
+  diverse inputs                         shape outputs per user
+  structured fields dominate             repetitive prose noticed
+                                         in production
+                                         eval shows low diversity
+
+  → don't build it pre-emptively · do recognize the signals
+    when they show up · 1-day implementation when needed.
 ```
 
-Anchor: *"forbid the convergent openings, list the alternatives, hint at the distribution. Just forbidding picks another convergent opening from a smaller set."*
+**Q: What's the lighter-weight version of this pattern that's worth using even before full rotation?**
 
-**Q: "When does this NOT matter?"**
+A: Two moves earn their place even without full rotation infrastructure. **First**, forbidden-pattern callouts in the prompt's field rules — like the line in `monitoring.md:93` that says "Do NOT just restate the percentage" for the `impact` field. That's a one-sentence constraint that pushes the model away from the most convergent boring case. Costs nothing; pays off every call. **Second**, explicit "vary your tone / vary your opening" instructions as a soft constraint — no history needed, just a line in the prompt asking for variety. Gets you about half of full rotation's benefit at zero state-management cost. Together those two moves cover most of the convergence risk for chains that aren't yet at the scale where full rotation earns its place. blooming has the first (one explicit forbidden pattern) and doesn't have the second (no "vary" instructions); adding the second to the recommendation agent's `title` and `rationale` fields would be the right move whenever someone notices repetition there.
 
-One-shot classifiers and structured outputs. The intent classifier returns one word — convergence is the *goal*. The monitoring agent returns typed Anomaly fields — `category`, `severity`, `change.direction` are enumerated, no prose to drift on. The concept only matters where the model is writing prose, and only when the chain runs repeatedly for the same user. A one-time email draft doesn't need this; a recommendation feed the same user sees 50 times does.
+```
+  three tiers of rotation discipline:
 
-Anchor: *"only for generative chains run repeatedly for the same user. One-shot or structured outputs don't need it."*
+  tier 0 (free):    forbidden-pattern callouts in field rules
+                    "Do NOT just restate the percentage"
+                    ← blooming has one of these
 
-**Q: "How would you audit whether your rules are working?"**
+  tier 1 (cheap):   "vary your tone / opening / phrasing"
+                    ← stateless, ~30 tokens per call
+                    ← worth adding to recommendation agent
 
-Count opening phrases across N runs. If any single pattern exceeds ~40% of runs, the rule isn't holding — add it to the forbidden list. If the distribution drifts away from the intended ~1/3-1/3-1/3, tighten the rule. Honest gap in this codebase: there's no eval set today (concept 05), so the audit is by-hand. The first thing I'd build in the eval set is exactly this — a diversity metric over the recommendation rationale field across a fixture batch.
-
-Anchor: *"audit by counting openings. >40% in any one pattern means the rule failed."*
-
-**Q: "What about decoding-time repetition penalties?"**
-
-Different problem. Decoding-time penalties prevent tokens from repeating *within one generation* — useful for avoiding "the cat the cat the cat" loops. They don't help with *cross-generation* convergence — the model still picks the same opening on each independent call. The two are complementary, not interchangeable. The prompt-level forbidden-pattern rule is what works for cross-generation drift.
-
-Anchor: *"decoding-time penalties are within-one-generation; prompt-level forbidden patterns are cross-generation. Different defenses for different drifts."*
+  tier 2 (full):    rotation history + avoid-list slot
+                    ← needs per-user state
+                    ← add when a generative chain runs
+                       repeatedly for the same user
+```
 
 ## See also
 
-- `01-anatomy.md` — forbidden patterns live in section 1 (system role) as style rules.
-- `08-few-shot.md` — your worked example's opening should NOT be one of the convergent patterns, or the model copies it.
-- `05-eval-driven-iteration.md` — the audit step (counting openings across N runs) is an eval responsibility; without the eval substrate, the rule's effectiveness is by-eyeball.
-- `11-meta-prompting.md` — the spec discipline (`format.md` banning hedging and marketing phrases) is the meta-prompting application of this concept.
+- [02-structured-outputs.md](./02-structured-outputs.md) — structured outputs reduce convergence pressure for free
+- [06-single-purpose-chains.md](./06-single-purpose-chains.md) — per-agent prompts mean cross-agent phrasing varies naturally
+- [05-eval-driven-iteration.md](./05-eval-driven-iteration.md) — eval would catch convergence drift the way it would catch behavior drift
+- [11-meta-prompting.md](./11-meta-prompting.md) — the rotation history would be another code-generated slot, same family as `{categories}`

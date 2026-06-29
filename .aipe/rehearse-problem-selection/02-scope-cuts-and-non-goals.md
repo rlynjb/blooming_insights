@@ -1,190 +1,124 @@
-# 02 — Scope cuts and non-goals
+# 02 — Scope Cuts and Non-Goals
 
-**Industry name:** Non-goals / explicit scope cuts — Coach posture
+> What we are deliberately NOT building, and why each cut is load-bearing.
 
-The chapter that carries the most interview leverage. Anyone can list what they built. A staff-level candidate names what they **didn't build** and defends the cut without flinching.
+```
+  THE FULL PRODUCT SPACE vs WHAT WE'RE BUILDING
 
-Three cuts. Cut 2 is the L5 story.
+  ┌─ what a "complete" analytics product might do ──────────────────┐
+  │                                                                 │
+  │  detect anomalies  · investigate causes  · recommend actions    │  ← we do this
+  │  ────────────────────────────────────────────────────────────   │
+  │  schedule scans · persist runs · save/share insights · alerts   │  ← cut
+  │  multi-workspace · team workspaces · RBAC · SSO · audit log     │  ← cut
+  │  write-back to Bloomreach (one-click apply) · A/B execution     │  ← cut
+  │  custom EQL editor · dashboard builder · funnel builder         │  ← cut
+  │  drift detection · forecasting · attribution modeling           │  ← cut
+  │  Slack/email integrations · workflow automation                 │  ← cut
+  │  on-prem / VPC deploy · data residency controls                 │  ← cut
+  │                                                                 │
+  └─────────────────────────────────────────────────────────────────┘
+
+  in scope: the analyst's reasoning loop, made visible.
+  out of scope: everything that doesn't make the reasoning sharper.
+```
+
+## The cut discipline
+
+A cut is load-bearing when removing it from the cut list would **change which problem we're solving** — not just "make us slower." Each cut below names what's removed, the reason it's removed, and the smallest event that would put it back in scope.
+
+The temptation in a scope-cuts list is to be polite about each cut — "we'll get to it." Don't. **Cuts are deliberate "not this version" calls, and naming them sharply is the move.**
 
 ---
 
-## Zoom out — the cuts on a timeline
+## CUT 1 — No persistence (no database, no save/share, no scheduled scans)
 
-```
-  Three cuts, three different shapes
+**What's removed:** A database. Save-an-insight. Share-via-link. Alerts. Scheduled monitoring. Anything that requires durable cross-session state.
 
-  ┌─ Cut 1: no live BigQuery / no production data warehouse ─┐
-  │  Phase 1 decision, still in force                        │
-  │  → fakes for the seam, MCP for the real workspace        │
-  │  shape: principled boundary — kept                       │
-  └──────────────────────────────────────────────────────────┘
+**Why it's cut:** Persistence is a feature wishlist trap. The moment you add a database, you add: schema design, migration discipline, multi-tenant isolation, backup, retention, GDPR, the entire ops surface of a stateful product. **The repo deliberately runs on in-memory maps + gitignored JSON for dev + committed snapshots for demo** — that's a stack decision that says "we are not validating the persistence question yet, we are validating the reasoning-loop question."
 
-  ┌─ Cut 2: eval pipeline ───────────────────────────────────┐
-  │  Phase 1: cut (hackathon scope)                          │
-  │  Phase 3: BUILT IT ANYWAY — 4 pillars, calibrated        │
-  │  Phase 4: RETIRED with the Olist substrate (PR #8)       │
-  │  shape: cut → revisited → shipped → retired (L5)         │
-  │  ★ STRONGEST DEFENSIBLE STORY IN THIS BRIEF ★            │
-  └──────────────────────────────────────────────────────────┘
+**What's in the repo that proves this is deliberate:** `lib/state/insights.ts` and `lib/state/investigations.ts` are explicit in-memory state. The dev fallbacks (`.auth-cache.json`, `.investigation-cache.json` — gitignored) and the committed demo snapshots (`lib/state/demo-insights.json`, `lib/state/demo-investigations.json`) are the substitute. **The product works without a database; adding one would be a deferred decision, not a missing one.**
 
-  ┌─ Cut 3: no persistent storage / no database ─────────────┐
-  │  Phase 1 decision, still in force                        │
-  │  → in-memory maps + gitignored JSON in dev               │
-  │  shape: scope discipline — appropriate                   │
-  └──────────────────────────────────────────────────────────┘
-```
+**The smallest event that puts it back in scope:** an analyst says "I want to come back to last week's investigation and continue it." Two of those in a row and persistence is the next priority. Until then, **`do nothing` on persistence is the right call.**
 
 ---
 
-## Cut 1 — No live BigQuery / no production data warehouse
+## CUT 2 — No production agent eval beyond manual review
 
-**The cut:** the agent does not read from a customer data warehouse. It reads from a Bloomreach workspace via MCP, and in tests it reads from injected fakes.
+**What's removed:** Production-grade evaluation discipline. A live test bed with N seeded anomalies, K runs per anomaly, calibrated LLM-as-judge metrics, pass/fail thresholds gating deploys.
 
-**Why:** the product is "an analyst on top of Bloomreach Engagement," not "an analyst on top of arbitrary data." Adding a BigQuery adapter would:
-1. Double the surface area of the data layer (two adapters, two schemas, two failure modes).
-2. Force a decision about *which workspace's BigQuery* — and there's no clear answer for a portfolio project.
-3. Distract from the differentiator. The product's pitch is "shows its work" — the work is showing reasoning over Bloomreach tools, not showing data warehouse SQL.
+**Why it's cut:** The phase-1 call was "ship the loop first, evaluate after the substrate is stable." That was deliberate — hackathon scope, against a rate-limited alpha server, with `maxToolCalls` budgets and forced synthesis turns to make the loop terminate. **Building eval against an unstable substrate burns the budget and produces stale numbers.**
 
-**Would I cut it again?** Yes. The Bloomreach MCP server is the substrate that makes this product *concrete*. Generalizing too early would have produced a worse product faster.
+**What was learned from doing it once anyway:** A 4-pillar eval suite was built and run — detection precision/recall (K=10 per anomaly), diagnosis 5-criterion rubric, recommendation 3-criterion rubric, regression capture-and-score (structural diff + LLM similarity judge). The LLM-as-judge was calibrated against manual review (8/8 + 3/3 agreement on a spot-check). The suite **surfaced 3 real bugs that no unit test would catch:**
 
-**Coach line:** *"I scoped to one data source on purpose. The product is about the analyst loop, not the data adapter; making it MCP-only made the rest of the design sharper."*
+1. **BRL units (cents vs Reais).** The judge flagged an implausible average order value of R$131,965 at run 8 — surfacing that the agent was treating BRL cents as whole Reais.
+2. **Binary calibration drift.** A criterion that should have been graded on a 0/1 axis was drifting to 29/30 (too lenient) — invisible without the calibration discipline.
+3. **Conclusion instability.** A 30% regression baseline across K=10 runs — a stability problem invisible from any single run.
 
----
+The suite was **retired with the data substrate it ran against** (the public ecommerce dataset that proved the seam). The rebuild target is named: **the next version runs against the in-process Synthetic adapter**, where the substrate is deterministic and the eval doesn't decay with the data.
 
-## Cut 2 — The eval pipeline (the L5 story)
+**The L5 framing:** the receipt of having built it, calibrated it, found three named bugs with it, and made the deliberate call to retire it with the substrate **is stronger than promising to build it.** A senior reviewer learns more from "I built this, used it to find bugs, retired it for these reasons, here's the rebuild target" than from "we have an eval suite running on every commit."
 
-This is the chapter you rehearse hardest. It's three acts.
-
-### Act 1 — Phase 1: cut it
-
-**The original cut:** no eval pipeline. Hackathon scope. Ship the agent loop first.
-
-The rationale at the time was correct: with three engineer-weeks, building the agent loop + the MCP integration + the streaming UI was already the maximum scope. Adding an eval harness would have meant shipping nothing.
-
-This is L2 territory if you stop here — "I know evals matter, I didn't have time." Most candidates say exactly that. It's defensible but not impressive.
-
-### Act 2 — Phase 3: shipped it anyway
-
-**The revisit:** in Phase 3, I built the eval pipeline. Four pillars:
-
-```
-  The eval suite (Phase 3) — what got shipped
-
-  ┌─ Pillar 1: Detection ─────────────────────────────────┐
-  │  K=10 runs per anomaly; precision/recall over a       │
-  │  ground-truth set of seeded anomalies in Olist        │
-  └───────────────────────────────────────────────────────┘
-
-  ┌─ Pillar 2: Diagnosis ─────────────────────────────────┐
-  │  5-criterion rubric, LLM-as-judge scores each         │
-  │  diagnosis run; pass rate over K=10                   │
-  └───────────────────────────────────────────────────────┘
-
-  ┌─ Pillar 3: Recommendation ────────────────────────────┐
-  │  3-criterion rubric (action fits problem,             │
-  │  steps actionable, impact named); pass rate over K=10 │
-  └───────────────────────────────────────────────────────┘
-
-  ┌─ Pillar 4: Regression ────────────────────────────────┐
-  │  capture-and-score: structural diff of agent outputs  │
-  │  across versions + LLM similarity judge               │
-  └───────────────────────────────────────────────────────┘
-
-  Calibration discipline:
-  → manual spot-check vs LLM-judge agreement
-  → 8/8 on detection, 3/3 on diagnosis
-  → proves the judge isn't rubber-stamping
-```
-
-K=10 per anomaly. LLM-as-judge calibrated against manual spot-check: **8/8 agreement on detection, 3/3 on diagnosis.** That calibration is the load-bearing part — without it, the judge could be lying and you wouldn't know.
-
-### Act 3 — Phase 4: retired it
-
-When the Olist MCP server (the substrate the eval suite scored against) was retired (PR #8 / 2026-06-18), the eval suite went with it. The in-process Synthetic adapter is a cleaner shape for the same job, and rebuilding the eval pillars against Synthetic is the named next step — not a vague "we should add evals."
-
-### Why this is the L5 story
-
-```
-  The L-ladder for "evals in your project"
-
-  L1: "Evals? What do you mean?"          ← didn't think about it
-  L2: "I didn't have time for evals."     ← knows they matter, didn't ship
-  L3: "I planned for evals but cut them." ← named the cut, no receipts
-  L4: "I built evals on a small sample."  ← shipped a partial version
-  L5: "I cut, then built the full suite,  ← shipped, learned, made a call
-      calibrated it, used it to find
-      real bugs, then retired with the
-      substrate and named the rebuild."   ← THIS PROJECT
-```
-
-The L5 framing is not "we built evals." It's:
-
-1. **Cut deliberately** (Phase 1) — with a stated reason.
-2. **Revisited the cut** (Phase 3) — when the agent loop was stable.
-3. **Built the full suite** — 4 pillars, K=10 per anomaly.
-4. **Calibrated the judge** — 8/8 + 3/3 manual spot-check.
-5. **Used it to find real bugs** — three named:
-   - **BRL units bug** — the judge caught a R$131,965 AOV at run 8 as implausible; turned out the prompt was reading Brazilian cents as Reais (100x error). No unit test would have caught this; it took an LLM judge with business plausibility context.
-   - **Binary calibration breakdown** — 29 of 30 diagnosis runs were getting a binary pass/fail when the actual quality varied; the rubric was too coarse. Forced a redesign of the diagnosis criteria.
-   - **Conclusion instability** — across K=10 runs, the diagnosis conclusion varied by ~30%. That became the regression baseline ("if a change moves us above 30%, we've regressed"), not a bug to suppress.
-6. **Retired the suite with the substrate** — when Olist went, the suite went. Honest call: don't keep dead infrastructure around to look thorough.
-7. **Named the rebuild target** — Synthetic adapter, same four pillars, same calibration discipline.
-
-**Coach line:** *"Today I don't have a live eval harness. But I've built one end-to-end, calibrated it against manual spot-check, used it to surface three named bugs no unit test would catch, and made an honest call to retire it with the substrate it scored against. The next version is named — same four pillars against Synthetic. That receipt is stronger than promising to build it."*
-
-That's the L5 move: **shipped → learned → made a call.** Not "we plan to" (L1 weakness). Not "I didn't have time" (L2). Not even "I built it" (L3-L4). The full arc.
+**The smallest event that puts it back in scope:** the Synthetic substrate stabilizes enough to support deterministic anomaly seeding. That's the rebuild gate — and it's named, not vague.
 
 ---
 
-## Cut 3 — No persistent storage / no database
+## CUT 3 — No write-back to Bloomreach (no one-click apply)
 
-**The cut:** no Postgres, no Supabase, no Redis. State lives in in-memory `Map`s in the agent routes; in dev, auth and investigations persist to gitignored JSON (`.auth-cache.json`, `.investigation-cache.json`); committed demo snapshots in `lib/state/demo-*.json`.
+**What's removed:** The recommendation card has a "launch this campaign" button that writes the scenario / segment / campaign / voucher / experiment back to Bloomreach. The product is read-only.
 
-**Why:**
-- The product is *session-scoped*: an analyst opens it, runs a briefing, investigates one anomaly, gets a recommendation, closes the tab. No multi-user shared state.
-- Adding a database means choosing one (Postgres? SQLite? Supabase?), migrating schema as `Insight` / `Anomaly` / `Diagnosis` evolve, and managing auth-to-row mappings. None of that earns its keep at portfolio scope.
-- The demo snapshot in `lib/state/demo-*.json` is the reliable presentation path; persistent storage would not improve it.
+**Why it's cut:** Write-back changes the trust model. Read-only means "the agent is wrong, you ignore it, no harm done." Write-back means "the agent is wrong, your storefront sends 10K customers a coupon they shouldn't have." **The trust surface we've built — show your work, expandable tool calls, citations on every claim — is calibrated for the read-only case.** Write-back needs a different trust surface: human-in-the-loop confirmation, blast-radius preview, rollback. We haven't built that, and the cut is honest about it.
 
-**What this would change at scale** (named honestly):
-- Multi-user collaboration (two analysts on the same anomaly) — requires shared storage.
-- Historical comparisons (this week's anomalies vs last quarter's) — requires durable history.
-- Audit logging for compliance — requires immutable storage.
+**What's in the repo that proves this is deliberate:** the MCP tool inventory in `lib/agents/tool-schemas.ts` is read-only. The recommendation agent (`lib/agents/recommendation.ts`) outputs a `Recommendation` with `steps[]` — instructions for the analyst to execute by hand in Bloomreach — not an action it executes itself. The export-to-markdown (`lib/export/investigationMarkdown.ts`) is the handoff artifact; the analyst pastes it into Slack or hands it to ops.
 
-None of those are in scope. Naming them tells the reviewer I know what would trigger the migration.
-
-**Coach line:** *"No database on purpose. The product is session-scoped — open, briefing, investigate, recommend, done. Adding Postgres would have meant schema migrations every time `Diagnosis` got a new field. In-memory + gitignored JSON in dev + a committed demo snapshot is the right shape for what this is."*
+**The smallest event that puts it back in scope:** a marketer says "I trust this enough that the friction of going to Bloomreach and configuring it by hand is now the bottleneck." Until that's a stated complaint, write-back is a solution looking for a problem.
 
 ---
 
-## What this chapter teaches the reviewer
+## CUT 4 — No multi-tenant, no team workspaces, no RBAC
 
-```
-  The signal each cut sends
+**What's removed:** Multiple workspaces per user. Multiple users per workspace. Roles. Permissions. Audit log. SSO beyond what the MCP OAuth gives us.
 
-  ┌─ Cut 1 (BigQuery)  ────────────────────────────────┐
-  │  signal: "I can resist the urge to generalize"     │
-  └────────────────────────────────────────────────────┘
+**Why it's cut:** This is one-workspace-per-session. That's enforced in `lib/mcp/auth.ts` — the OAuth client provider is per-user, and the in-memory state in `lib/state/*` is per-process. **Multi-tenant means picking a storage substrate, picking an auth provider, picking a permission model, and rewriting half the agent surface to be tenant-aware.** It's a different product.
 
-  ┌─ Cut 2 (eval pipeline) ★ ──────────────────────────┐
-  │  signal: "I can cut, revisit, ship, learn, and     │
-  │  retire — without inflating the receipts"          │
-  │  ★ THE L5 SIGNAL ★                                 │
-  └────────────────────────────────────────────────────┘
-
-  ┌─ Cut 3 (no database) ──────────────────────────────┐
-  │  signal: "I know what triggers a storage decision  │
-  │  and this product isn't at that trigger"           │
-  └────────────────────────────────────────────────────┘
-```
-
-The takeaway: **scope cuts are a senior signal when they come with a story.** A flat list of non-goals ("no eval, no DB, no BigQuery") teaches the reviewer nothing. Three cuts with three different shapes — principled boundary, full lifecycle, scope discipline — teaches that the engineer thought about each one separately and made a different kind of call each time.
+**The smallest event that puts it back in scope:** a Bloomreach customer says "I want my team of 4 analysts to collaborate on the same workspace's insights." That's a product-shape change, not a feature add — gated on Cut 1 (persistence) and a real customer asking.
 
 ---
 
-## See also
+## CUT 5 — No custom EQL editor, no dashboard builder
 
-- `01-problem-brief.md` — the scope this is cutting against
-- `03-options-and-opportunity-cost.md` — what got built *instead* of these
-- `04-success-metrics-and-feedback-loop.md` — the eval numbers from Phase 3 (Cut 2's receipts)
-- `05-skeptical-reviewer-questions.md` — "how do you know any of this is good?" answer
-- `.aipe/audit-refactor-eval-substrate/` — the historical refactor that retired the eval substrate
+**What's removed:** A surface where the analyst writes their own EQL queries. A way to pin metrics. A way to build saved funnels.
+
+**Why it's cut:** Those tools already exist in Bloomreach. **Rebuilding them inside this product is competing with Bloomreach on the feature surface Bloomreach is best at** — query authoring and dashboard composition. Our product is the **layer above** those tools: the loop that decides what to query, runs it, and explains the answer.
+
+The agent decides which EQL queries to run via the monitoring agent's prompt + the tool schemas. The analyst doesn't write EQL; **they read the agent's reasoning, see which queries it ran, and challenge the queries.** That's a different interaction model than "give me an EQL editor."
+
+**The smallest event that puts it back in scope:** never, in this product. If the analyst needs to write custom EQL, they should be in Bloomreach, not in this app. The seam holds.
+
+---
+
+## CUT 6 — No advanced analytics features (forecasting, attribution, drift)
+
+**What's removed:** Forecasting (will this metric hit the quarter target?). Attribution modeling (which channel drove this?). Drift detection (is my segment definition stale?). Cohort retention curves.
+
+**Why it's cut:** Each of these is its own product. **Forecasting needs a forecasting model — that's not what an LLM agent is.** Attribution needs an attribution methodology choice (first-touch / last-touch / data-driven / Markov). Drift needs baselining infrastructure. **Adding any of them blurs the product's identity from "the analyst's reasoning loop, visible" to "the analytics swiss army knife, also with an LLM."**
+
+**The smallest event that puts it back in scope:** none of these, in this product. They are distinct products. If we want to build one, it's a new app — and that's an L5 call ("I want to make this decision deliberately as a separate product") rather than a feature creep call.
+
+---
+
+## CUT 7 — No Slack/email integrations, no workflow automation
+
+**What's removed:** "Post the anomaly to #marketing in Slack." "Email me a digest every Monday." "Trigger a workflow when X happens."
+
+**Why it's cut:** Notification / integration is a layer that should sit *above* this product — Zapier, n8n, the customer's existing alerting stack. **The product produces structured insights with stable schemas (`Insight`, `Diagnosis`, `Recommendation`, all locked as "what must not change");** anything downstream can consume them. Building the integrations ourselves means maintaining N webhooks instead of one stable API.
+
+**The smallest event that puts it back in scope:** an API surface is asked for. Not a Slack bot. An API. Then customers wire it up their way.
+
+---
+
+## The non-goals as a single sentence
+
+**We are not building an analytics platform. We are building the loop a human analyst runs, made visible, against an existing analytics platform.** Every cut above is a defense of that line.
+
+The reviewer who tries to push any of these back into scope is asking us to **build a different product.** That's a fair conversation to have — but it's a product-strategy conversation, not a feature-scope conversation. Naming it that way is the move.

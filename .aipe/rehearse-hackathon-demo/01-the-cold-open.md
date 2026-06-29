@@ -1,176 +1,163 @@
-# Chapter 1 — The cold open   (0:00 – 1:00, 60 seconds)
+# Chapter 01 — The cold open (0:00–1:00, 1 minute)
 
-## Opening hook
+You have sixty seconds. The room is half-warm from the last demo, half-checking their phones. Inside this minute they decide whether to pay attention or to start drafting their next email. The job of the cold open is to make that decision easy: they look up because something on screen is *already happening,* and they hear the one-liner that tells them what they're looking at. Not what you built. What it does.
 
-The first sixty seconds is the only minute of the demo where the room is making a binary decision: **is this real, or is this a pitch deck?** They will not say it out loud and they will not give you a second chance to set that frame. You set it by opening on the thing already moving. No title slide, no "hi, I'm Rein," no five-sentence problem setup. The browser is on the screen when you start talking, the start button is under your cursor, and the one-liner comes out of your mouth as you click it.
+The failure mode you are training against is the slow on-ramp — the title slide, the self-introduction, the problem-statement framing, the "so I wanted to build something that…" The room does not need any of it yet. Open with the thing working.
 
-Hackathon judges have sat through forty demos by the time you walk up. The cohort of presenters who burn ninety seconds on a self-introduction and a problem slide is so large that you win the room just by **not being one of them**. Open in motion, anchor the value in one sentence, and let the trace fill the screen while you finish the sentence.
-
-## The time-budget bar
-
-This is your slice. Sixty seconds. One hook, one sentence, the start button gets clicked at 0:45.
+  ## The time-budget bar
 
 ```
-  0:00 ┌─────────────────────────────────────────────────────────────┐
-       │ ▓▓▓▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │
-       │                                                              │
-       │ 01  COLD OPEN  ← you are here                  0:00 – 1:00   │
-       │ 02  THE DEMO                                                  │
-       │ 03  UNDER THE HOOD                                            │
-       │ 04  THE BUILD STORY                                           │
-       │ 05  THE CLOSE                                                 │
-  1:00 └─────────────────────────────────────────────────────────────┘
+  ┌────────────────────────────────────────────────────────────────┐
+  │ ▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │
+  │ 0:00 ── 1:00 ──────────────────────────────────────────── 10:00 │
+  │       THE COLD OPEN — you own 0:00 to 1:00 (60 seconds)         │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
-By 1:00 the browser shows the running app, the reasoning trace is rolling in the right column, and you are mid-sentence into the value claim.
+Sixty seconds to get the room's attention and tell them what they're watching. That's it. Move on.
 
-## The attention curve
+  ## The chapter-opening diagram — the room's attention curve
 
-This is what you are bending. Most demos lose the room at second 12. You climb past it by starting in motion.
-
-```
-THE ROOM'S ATTENTION — the first sixty seconds
-
-  attention
-  high  │
-        │     ★ ─────────── (you keep climbing because the trace is moving)
-        │    ╱
-        │   ╱    typical demo loses it here, around 0:12
-        │  ╱     ▼
-        │ ╱   ╭──────────────╮
-        │╱    │ "Hi I'm Rein,│ ← talking head, no motion on screen
-        │     │ today I'll   │
-        │     │ talk about…" │
-        │     ╰──────────────╯
-  low   │                                                     time →
-        └──────────────────────────────────────────────────────────
-        0:00      0:15           0:30           0:45        1:00
-                                                              ▲
-                                                       start clicked
-```
-
-The shape you are drawing is *up and to the right from second one*. Anything else and you spend the next four minutes climbing out of a hole.
-
-## The two beats
-
-There are exactly two beats in the cold open. The hook and the one-liner. You will rehearse them until they are reflex.
-
-### Beat 1 — the hook (0:00 – 0:30)
-
-The browser is already on screen, on `localhost:3000`, mode toggle on `live-synthetic`, the empty feed waiting. You do not introduce yourself. You name the problem in one short sentence with one number in it, and you do it while looking at the screen, not at the judges.
+The room's attention is not a flat line. It is highest in the first ten seconds — they are choosing whether to listen — then drops, then climbs back if you give them a reason. The cold open's only job is to keep that opening peak from collapsing.
 
 ```
-  SHOW (on screen)                  SAY (out of your mouth)
-  ────────────────────────────────  ──────────────────────────────────────
-  empty feed, mode toggle visible    "A marketer on Bloomreach has to notice
-  on `live-synthetic`                 a metric moved, hunt for the cause, then
-                                      pick which feature to reach for —
-                                      three jobs, one person."
+  ATTENTION CURVE IN THE FIRST 60 SECONDS
+
+  high │    ●●●                                                    .●
+       │   ●   ●                                                  ●
+       │  ●     ●●                                              ●●
+       │ ●        ●●●                                       ●●●
+       │●            ●●●●                              ●●●●●
+       │                 ●●●●●●●●●●●●●●●●●●●●●●●●●●●●●
+  low  │
+       └──────────────────────────────────────────────────────────────
+       0s    5s   10s     20s     30s     40s     50s     60s
+            ↑                                              ↑
+       opening peak                                hand-off to demo
+       (the thing                                  (the room is now
+       on screen)                                   leaning in or gone)
+
+       The slow-on-ramp opening collapses the peak by 0:15.
+       The cold open here PROTECTS the peak through 0:60.
 ```
 
-The script line:
+The strong opening keeps the peak alive long enough to get to the one-liner. The weak opening (title slide → name → "today I'm going to show you…") collapses it before you ever say what the project does.
+
+  ## Beat 1 — The hook (0:00–0:30)
+
+The hook is the screen the room walks into. You do not have an animation. You have an actual product that does the thing. Open on **the feed with one anomaly card already painted** — `usa purchase_revenue · -38.4%` — and the streaming trace beside it frozen mid-scroll. The room sees a real result before you have said a single word.
+
+| SHOW (on screen)                                                | SAY (out loud)                                            |
+|-----------------------------------------------------------------|-----------------------------------------------------------|
+| browser already on `localhost:3000`; the feed loaded; one card visible: `● usa purchase_revenue · -38.4%`; status log frozen mid-trace on the right | *(silent for ~3 seconds — let them see it)* "this is a marketing analyst's screen 30 seconds into their morning." |
+| zoom mouse to the trace column on the right                     | "everything on the right is the agent's actual thinking — the queries it ran, the hypotheses it tested, the numbers it pulled." |
+| zoom mouse to the card on the left                              | "everything on the left is what it concluded — and why it matters for the business."  |
+
+The room is now looking at something that exists. They have not heard your name, the problem statement, or the agenda. Good. Hand them the one-liner.
+
+  ## Beat 2 — The one-liner (0:30–0:60)
+
+The one-liner is the sentence that, if the wifi died right now, would still tell the room what your project is. One sentence. Pattern: *X is a Y that does Z for W.*
 
 ```
-┃ "A marketer on Bloomreach has to notice a metric moved, hunt for the
-┃ cause, then pick which feature to reach for — three jobs, one person."
+  ┃ "Blooming insights is a multi-agent AI analyst for a Bloomreach
+  ┃  workspace — it runs the loop a human analyst runs (what changed,
+  ┃  why, what to do), and it streams its reasoning so you see how
+  ┃  it got there, not just the answer."
 ```
 
-Notice what is **not** in there. No "in today's data-driven world." No "businesses struggle to." No "we built." Just the work the person actually does, in one breath. The hook earns the next sentence by being concrete.
-
-### Beat 2 — the one-liner + the click (0:30 – 1:00)
-
-Now you look up. The one-liner is the X-is-a-Y-that-does-Z sentence, and it lands while your cursor is moving to the start button. You hit start **mid-sentence**, not after. The trace begins streaming into the right column as you finish.
+That's the keeper. Say it close to verbatim. The second pull quote is the tag — the line that compresses the differentiator into something the room can repeat:
 
 ```
-  SHOW (on screen)                  SAY (out of your mouth)
-  ────────────────────────────────  ──────────────────────────────────────
-  cursor moving to "start briefing"  "Blooming insights is a multi-agent
-                                      analyst that does all three —"
-  click — trace starts streaming     "— and it shows you its work
-                                      while it does them."
-  trace lines appearing in right     [pause; let the trace fill three lines
-  column                              before you speak again]
+  ┃ "An analyst that shows its work."
 ```
 
-The script line you nail verbatim:
+Five words. Repeat it once at the end of the demo (chapter 02, money shot moment) and once in the close (chapter 05). Three plants total.
+
+  ## Strong vs. weak — the cold open move
+
+The contrast between the wrong and right opening is the whole teaching here. Both are sixty seconds. One collapses the attention curve. One protects it.
 
 ```
-┃ "Blooming insights is a multi-agent analyst that does all three —
-┃  and it shows you its work while it does them."
+  WEAK OPEN                              STRONG OPEN
+  ────────────────────────────────       ───────────────────────────────
+  title slide: "blooming insights"       browser already on the feed
+                                         with a real card painted
+  "hi, I'm [you], thanks for             *(silent 3 seconds — let them
+   having me, I'm excited to              see it)*
+   share what I've been working on"
+                                         "this is a marketing analyst's
+  "so a lot of marketers have this        screen 30 seconds into their
+   problem where they look at             morning"
+   dashboards and..."
+                                         (mouse highlights trace column)
+  → first 30 seconds are about YOU         "the right side is the agent's
+  → next 30 are about THE PROBLEM           actual thinking"
+  → the product hasn't shown up yet
+                                         → first 30 seconds are about
+  attention curve is already                THE PRODUCT
+   collapsed by 0:25                       → second 30 are the one-liner
+                                            and the tag
+
+                                         attention curve held through 0:60
 ```
 
-That pause at the end is load-bearing. The room is reading the trace. You are not narrating what they can already see. You are letting the screen do the work for two beats and then handing into chapter 02.
+The strong open buys you the rest of the demo. The weak open spends it on framing.
 
-## Weak open versus strong open
+  ## The IF-IT-BREAKS box
 
-This is the single most-repeated demo failure in hackathon history. Put it side by side so you never do it.
+╔══════════════════════════════════════════════════════════════════╗
+║ IF IT BREAKS                                                       ║
+║ The feed didn't paint, or the page is white, or the dev server     ║
+║ won't start.                                                       ║
+║                                                                    ║
+║ → Open the second tab pre-loaded with `?demo=cached` (mode =       ║
+║   `demo`, committed snapshot, instant). Same screen, same card,    ║
+║   no agent call.                                                   ║
+║ → Say: "let me pull this up from earlier — same workspace, same    ║
+║   numbers" and run the same SAY track over it. The room does not   ║
+║   know you switched tabs.                                          ║
+║ → Do NOT apologize twice. One brief acknowledgment, then keep      ║
+║   the energy up. Speed of recovery is itself a credibility signal. ║
+╚══════════════════════════════════════════════════════════════════╝
 
-```
-WEAK OPEN                             STRONG OPEN (yours)
-──────────────────────────────────    ──────────────────────────────────
-"Hi, I'm Rein, and I'd like to        [browser already on screen]
- walk you through a project I built   "A marketer on Bloomreach has to
- over the past few months called      notice a metric moved, hunt for
- blooming insights. So the problem    the cause, then pick which feature
- we're trying to solve is…"           to reach for — three jobs, one
-                                       person."
-0:00 – 0:30 spent on intro             0:00 spent on the work
-0:30 – 0:60 spent on problem framing   0:30 spent on the one-liner
-1:00: app not visible yet              1:00: trace streaming live
-room: "is this a pitch?"               room: "wait, is that running?"
-```
+The reason the snapshot path exists at all is that the alpha Bloomreach server revokes tokens after minutes and the conference wifi will be hostile. You built `demo` mode for exactly this moment. Use it without flinching.
 
-The weak open leaves the screen static for the entire first minute. The strong open has the trace moving by 0:50. That is the whole difference.
+  ## The "tighten it" cut
 
-## If it breaks
+If you're running ten seconds long out of the cold open (you will, the first three times you rehearse), drop the second mouse highlight ("everything on the left is what it concluded"). The room will figure that out from context once you start the demo. Floor: **you must say the one-liner.** Never cut the one-liner. The room can lose anything else and still know what your project is; without it they are watching a screen they don't have a frame for.
 
-The cold open's only on-screen risk is the start-button click failing — auth error, Anthropic timeout, dev server not responding. You have one backup.
-
-```
-╔══════════════════════════════════════════════════════════════════════════╗
-║ IF IT BREAKS                                                              ║
-║ Start button click returns an error or hangs past 5 seconds →             ║
-║   1. Flip the mode toggle from `live-synthetic` to `demo` (top-right).    ║
-║   2. Reload. The cached snapshot serves instantly — same UI, same trace.  ║
-║   3. Say: "I'm switching to the cached run from this morning so we don't  ║
-║      eat the clock — same screens, same agents, just yesterday's data."   ║
-║ Do not apologize twice. Do not explain the error. Keep the energy up.     ║
-╚══════════════════════════════════════════════════════════════════════════╝
-```
-
-The cached `demo` mode is *exactly* the same UI rendering *exactly* the same agent outputs as the live run — it just replays a committed snapshot from `lib/state/demo-*.json` instead of running the agents. The room cannot tell the difference. **Use this if anything looks slow before the start click.**
-
-## Tighten it
-
-You are unlikely to run long on a sixty-second beat, but if the slot is shorter than ten minutes (some hackathons give five), you compress the cold open this way:
-
-- **Cut the hook to one clause.** "Marketers on Bloomreach do three jobs to find what changed." Skip the period-and-rest, push straight into the one-liner.
-- **Floor:** the one-liner stays. You never cut the X-is-a-Y-that-does-Z sentence. Drop the hook before you drop the one-liner.
-
-## The one-page run sheet
-
-Glance at this on stage. Nothing else.
+  ## The one-page run sheet — cold open
 
 ```
-╭─────────────────────── COLD OPEN — RUN SHEET ────────────────────────╮
-│ Budget: 0:00 – 1:00 (60s)         Start click: 0:45                   │
-│                                                                        │
-│ SAY in order:                                                          │
-│   1. (0:00) "A marketer on Bloomreach has to notice a metric moved,    │
-│      hunt for the cause, then pick which feature to reach for —        │
-│      three jobs, one person."                                          │
-│   2. (0:30) "Blooming insights is a multi-agent analyst that does all  │
-│      three — and it shows you its work while it does them."            │
-│   3. (0:45) [click start — pause — let trace fill three lines]         │
-│                                                                        │
-│ SHOW: localhost:3000, mode = `live-synthetic`, empty feed → cursor →   │
-│       start → trace streaming in right column                          │
-│                                                                        │
-│ Money shot anchor: trace must be visibly moving by 1:00                │
-│                                                                        │
-│ IF IT BREAKS: flip toggle to `demo`, reload, say "I'm switching to     │
-│   the cached run from this morning so we don't eat the clock."          │
-│                                                                        │
-│ TIGHTEN IT: cut the hook to one clause; the one-liner is the floor.    │
-╰────────────────────────────────────────────────────────────────────────╯
+  ╭──────────────────────────────────────────────────────────────────╮
+  │ RUN SHEET — 01 THE COLD OPEN              0:00–1:00 (60 seconds) │
+  │                                                                  │
+  │ STATE BEFORE: browser on localhost:3000, mode = live-synthetic   │
+  │               OR mode = demo, feed loaded with 1+ cards visible  │
+  │                                                                  │
+  │ 0:00–0:05   silent — let them see the painted feed               │
+  │                                                                  │
+  │ 0:05–0:15   "this is a marketing analyst's screen 30 seconds     │
+  │              into their morning"                                 │
+  │                                                                  │
+  │ 0:15–0:30   mouse highlights trace column → "the right side is   │
+  │              the agent's actual thinking"                        │
+  │              mouse highlights card → "the left is what it        │
+  │              concluded and why it matters"                       │
+  │                                                                  │
+  │ 0:30–0:55   THE ONE-LINER (say close to verbatim):               │
+  │              "Blooming insights is a multi-agent AI analyst for  │
+  │              a Bloomreach workspace — it runs the loop a human   │
+  │              analyst runs (what changed, why, what to do), and   │
+  │              it streams its reasoning so you see how it got      │
+  │              there, not just the answer."                        │
+  │                                                                  │
+  │ 0:55–1:00   THE TAG: "an analyst that shows its work"            │
+  │              → hand off to demo                                  │
+  │                                                                  │
+  │ NAIL THIS:  the one-liner. Never cut it.                         │
+  │ IF BREAKS:  switch to demo-mode tab. Same SAY track. No apology. │
+  │ TIGHTEN:    drop the second mouse highlight.                     │
+  ╰──────────────────────────────────────────────────────────────────╯
 ```

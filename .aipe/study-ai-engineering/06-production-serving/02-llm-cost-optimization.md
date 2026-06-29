@@ -1,261 +1,239 @@
-# 02 — LLM cost optimization
+# LLM cost optimization
 
-**Subtitle:** Model routing + caching + batching · Industry standard (partial)
+*Industry standard — model routing · caching · truncation · batching*
 
-## Zoom out, then zoom in
+## Zoom out — where this concept lives
 
-**Partially exercised.** One model-routing move is in place: intent
-classification uses `claude-haiku-4-5` (~10x cheaper than sonnet). The
-*next* model-routing opportunity — running early diagnostic turns on
-haiku and only synthesis on sonnet — isn't built yet.
+Cost optimization has four levers. This codebase exercises **two** (model routing via the intent classifier, aggressive tool-result truncation) and has clear paths to **two more** (prompt caching, smart truncation). The honest framing: cost is low-volume today, so optimization is the next-step queue, not the current-pain queue.
 
 ```
-  Zoom out — cost optimization is a stack of levers
+  Zoom out — four cost levers
 
-  ┌─ Patterns ──────────────────────────────────────┐
-  │  prompt caching (06-01)                         │  ← Case B
-  │  model routing (THIS FILE)                      │  ← partial
-  │  truncation + shorter prompts                   │  ← present
-  │  batch processing                               │  ← Case B (low value here)
-  │  cheaper embeddings (if RAG)                    │  ← Case B (no RAG)
-  └─────────────────────────────────────────────────┘
+  ┌─ Model routing (heuristic-before-LLM) ──────────────────┐
+  │  Cheap classifier in front of expensive agents          │
+  │  STATUS: shipped — intent classifier uses Haiku         │
+  └─────────────────────────────────────────────────────────┘
+  ┌─ Prompt caching ────────────────────────────────────────┐
+  │  Cache static prompt prefix at the Anthropic API        │
+  │  STATUS: not wired (biggest dollar lever)               │
+  └─────────────────────────────────────────────────────────┘
+  ┌─ ★ Tool-result truncation ★ ────────────────────────────┐ ← we are here
+  │  Cap each tool result at 4KB before feeding back        │
+  │  STATUS: shipped (blind truncation; smart truncation    │
+  │           is the next iteration)                        │
+  └─────────────────────────────────────────────────────────┘
+  ┌─ Batching ──────────────────────────────────────────────┐
+  │  Anthropic message batch API (~50% discount, async)     │
+  │  STATUS: n/a — agents are user-facing real-time         │
+  └─────────────────────────────────────────────────────────┘
 ```
 
-## Structure pass
+**Zoom in.** Most cost optimization is operational, not algorithmic. Pick the model that fits the task; truncate aggressively; cache what's static. Batching matters for offline workloads (not this codebase). The four levers compose, and the biggest payoff per engineering hour is prompt caching today.
 
-  → **One axis to trace — quality vs cost.** Cheaper models save money
-    but produce lower-quality outputs. Model routing is the discipline
-    of "use the cheap model when it's good enough, fall back to the
-    expensive one when it isn't."
+## Structure pass — layers · axes · seams
+
+**Layers:** request → routing → cache → call → response → truncation → next request.
+
+**Axis: where in the call lifecycle does each lever apply?**
+  → Routing: at the user-input boundary (pick which agent/model handles this).
+  → Cache: at the request boundary (skip the call if cached).
+  → Truncation: at the response boundary (trim before feeding back into the loop).
+  → Batching: at the request boundary (defer + bundle for async paths).
+
+**Seam:** the four levers are independent — apply each at its own seam without coordinating.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-```
-  Routing pattern: cheap-first, expensive-second
+You know how AWS cost optimization works — right-size instances, cache hot paths, compress data on the wire, batch low-priority writes? Same shape. LLM cost optimization is right-size models, cache static prompts, compress tool results, batch async work.
 
-   request
-     │
-     ▼
-  ┌─ cheap model attempt ─┐  ← haiku or gpt-4o-mini
-  │  (90% of cases work)   │
-  └─────────┬──────────────┘
-            │
-       ┌────┴────┐
-       │ good    │
-       │ enough? │
-       └────┬────┘
-            │
-       ┌────┴─────┐
-       │          │
-       ▼ yes      ▼ no
-   return     ┌─ expensive model fallback ─┐
-              │  (sonnet, gpt-4)            │
-              └─────────────────────────────┘
+```
+  Four levers, four altitudes
+
+  routing       choose model    save: cost per call (cheap vs expensive)
+                                applies: user-input boundary
+
+  caching       skip call       save: cost per call (full)
+                                applies: request boundary
+
+  truncation    trim payload    save: input tokens
+                                applies: tool-result boundary
+
+  batching      defer + bundle  save: 50% of call cost
+                                applies: when latency doesn't matter
 ```
 
 ### Move 2 — the step-by-step walkthrough
 
-**Already in place: intent classifier on haiku.** `lib/agents/intent.ts:16`
-defines:
+**Part 1 — model routing (shipped via intent classifier).**
+
+The intent classifier at `lib/agents/intent.ts:16` uses Haiku, not Sonnet:
 
 ```typescript
 const CLASSIFIER_MODEL = 'claude-haiku-4-5-20251001';
 ```
 
-The classifier is constructed with this model passed to the adapter
-(`lib/agents/intent.ts:27-34`):
+Why this matters cost-wise: Haiku is ~10-15× cheaper than Sonnet per token. For the chat surface, every user query first hits the Haiku classifier (~$0.0003) before routing to the right Sonnet agent (~$0.05). The Haiku cost is negligible; the routing decision is structural.
+
+This is the only model-routing in the codebase. Three opportunities not taken:
+
+  → **Recommendation rationale generation in Haiku.** The recommendation agent's tool use is Sonnet-shaped (multi-step, schema-constrained), but the final rationale prose could be generated by Haiku from a structured outline. Would cut ~40% of recommendation cost.
+  → **Schema summary generation in Haiku.** `schemaSummary()` is pure transformation today; if a future version uses an LLM to produce a more nuanced summary, Haiku is right.
+  → **First-pass diagnosis in Haiku.** A two-pass diagnostic — Haiku narrows to "this is likely a campaign issue or a checkout issue," Sonnet drills in. Cuts cost when Haiku narrows correctly, slightly increases when it doesn't.
+
+None of these are wired; all are tradeoff exercises.
+
+**Part 2 — tool-result truncation (shipped, blind).**
+
+`app/api/agent/route.ts:98-101`:
 
 ```typescript
-return classifyAptKitIntent(
-  new AnthropicModelProviderAdapter(
-    anthropic,
-    'coordinator',
-    sessionId,
-    CLASSIFIER_MODEL,                    // ← haiku, not sonnet
-    'agents/intent:classifyIntent',
-  ),
-  query,
-  { signal },
-);
+const TRUNC = 4000;
+const trunc = (v: unknown): unknown => {
+  const s = JSON.stringify(v);
+  return s && s.length > TRUNC ? s.slice(0, TRUNC) + '…' : v;
+};
 ```
 
-  → **Why this works.** Intent classification is a one-shot, no-tools,
-    ~500 tokens-in / ~50 tokens-out task. Haiku 4.5 handles it well;
-    sonnet would be overkill at 10x the cost.
+Every tool result that goes into a `tool_call_end` event AND back to the model is capped at 4000 chars (~1000 tokens). For a 6-call monitoring scan, that's ~6000 tokens of tool results vs. potentially 50,000+ untruncated. Real input-cost reduction.
 
-  → **The cost difference per classify.** Haiku ~$0.0003 vs sonnet
-    ~$0.003. At 1000 classifies/day, that's ~$2.70 vs ~$27 — meaningful
-    if free-form queries become common.
+The truncation is *blind* — first 4000 chars, then `…`. For a Bloomreach EQL result like:
 
-**Not yet built: per-turn model routing within agent loops.** AptKit's
-agent classes accept a single `model` provider. To run *some* turns on
-haiku and *others* on sonnet, you'd need:
+```json
+{
+  "data": [
+    { "USA": 1024, "CAN": 220, ... 500 more entries ... }
+  ],
+  "total": 50000,
+  "metadata": { ... }
+}
+```
 
-  1. AptKit upstream to accept a `model` per call (not per agent), OR
-  2. Blooming to subclass / wrap AptKit's agent and swap providers
-     mid-loop.
+Blind truncation might land mid-JSON, giving the model garbled context. Smart truncation would preserve the JSON structure: keep `total` and `metadata`; cap `data` to top-N entries; serialize as `{ ... 487 more truncated ... }`. Same byte budget, more useful payload.
 
-The natural place for this in blooming insights:
+**Part 3 — prompt caching (not wired, biggest lever).**
 
-  → **Diagnostic loop turns 1-3** (exploration — running tool calls,
-    not synthesizing) → haiku is enough.
-  → **Diagnostic loop turn 4+ or synthesis turn** (final JSON
-    diagnosis) → sonnet for quality.
+See `01-llm-caching.md` for the full walk. Headline number: ~60-67% reduction in input bill on calls 2+ per session per agent. Single biggest dollar lever in the codebase.
 
-If the model-routing exercise from `01-llm-foundations/08-provider-abstraction.md`
-landed, you could also route across providers (e.g. gpt-4o-mini for
-intent, claude-sonnet for diagnostic).
+The reason it's not wired is operational (real engineering task to mark which parts are cacheable + manage cache invalidation on prompt changes). The exercise `B6.1` lays out the implementation.
 
-**Other levers, ranked by current applicability:**
+**Part 4 — batching (n/a here).**
 
-  → **Truncation (present).** `schemaSummary()` trims the schema from
-    ~30k tokens to ~1.5k. See `01-llm-foundations/02-tokenization.md`.
-    The biggest savings already in place.
+Anthropic's message batch API offers ~50% cost discount for async/offline workloads with up to 24-hour completion windows. This codebase's agents are user-facing real-time — the briefing scan blocks the UI, the investigation blocks the user clicking through. Batching doesn't fit the shape.
 
-  → **Prompt caching (Case B).** `06-production-serving/01-llm-caching.md`
-    — biggest remaining lever.
+The one exception: if a future "scheduled briefing" feature lands (e.g. email the user a daily anomaly digest at 8am), THAT path would batch — many users' briefings could be queued and run with the batch discount.
 
-  → **Batch processing (Case B).** Anthropic's Message Batches API lets
-    you submit N requests and get results within 24 hours at 50%
-    discount. Useful for offline workloads (running evals on a golden
-    set overnight). Not useful for live agent loops where users are
-    waiting.
+**Part 5 — the headroom math.**
 
-  → **Smaller embeddings.** N/A — there's no RAG.
+```
+  Full session cost today vs with prompt caching
 
-  → **Lower `max_tokens`.** Currently `4096`. The diagnostic agent's
-    synthesis turn typically emits ~1000-2000 tokens. Lowering
-    `max_tokens` to ~3000 wouldn't change behavior; the truncation
-    bound on output isn't currently binding.
+  Per investigation (briefing scan + diagnose + recommend):
+   - scan:          ~$0.06   (6 calls; first-call full + 5 cached if wired)
+   - diagnose:      ~$0.08   (7 calls; same shape)
+   - recommend:     ~$0.07   (5 calls; same shape)
+   total:           ~$0.21
+                       │
+                       │  with prompt caching wired:
+                       ▼
+   - scan:          ~$0.03   (60% input reduction on calls 2-6)
+   - diagnose:      ~$0.04
+   - recommend:     ~$0.04
+   total:           ~$0.11   (~48% session-cost reduction)
+
+  At 1,000 sessions/day:
+    today:   ~$210/day → ~$6,300/month
+    cached:  ~$110/day → ~$3,300/month
+    savings: ~$3,000/month, one-time engineering cost
+```
 
 ### Move 3 — the principle
 
-**Match model to task. The intent classifier proves the pattern works —
-haiku for triage, sonnet for synthesis. The natural extension is to
-push it INSIDE the agent loop: cheap models for exploration turns,
-expensive ones for final synthesis. The blocker is AptKit's per-agent
-(not per-turn) model selection.**
+**Optimize cost where the bill is, not where the algorithm is.** This codebase's bill is dominated by static-prompt-prefix input tokens replayed across the ReAct loop. Prompt caching is the biggest lever because it's where the dollars actually live. Model routing (Haiku for the classifier) is shipped because that was the lowest-hanging fruit at the time. Truncation is the third largest contributor — already exercised, with smart-truncation room to grow.
 
-## Primary diagram
+## Primary diagram — the full recap
 
 ```
-  Cost optimization stack — what's done, what's next
+  Cost optimization in this codebase — four levers, two shipped
 
-  ┌─ Already in place ──────────────────────────────┐
-  │  ✓ haiku for intent classify (~10x cheaper)    │
-  │  ✓ schemaSummary truncation (~20x cheaper)     │
-  │  ✓ per-agent tool allowlists (smaller tool defs)│
-  │  ✓ hard tool-call caps in prompts (6 / 4)       │
-  └─────────────────────────────────────────────────┘
+  ┌─ Shipped ────────────────────────────────────────────────────┐
+  │                                                              │
+  │  1. Model routing — Haiku for intent classification          │
+  │      site: lib/agents/intent.ts:16                            │
+  │      saves: ~$0.05 per generic-routed query                  │
+  │                                                              │
+  │  3. Tool-result truncation — 4KB blind cap                   │
+  │      site: app/api/agent/route.ts:98-101                     │
+  │      saves: 80%+ of would-be input tokens on tool results    │
+  │                                                              │
+  └──────────────────────────────────────────────────────────────┘
 
-  ┌─ Next levers ───────────────────────────────────┐
-  │  □ Anthropic prompt caching (06-01) — ~20% loop │
-  │  □ per-turn model routing (haiku→sonnet)       │
-  │  □ batch API for eval / offline                 │
-  └─────────────────────────────────────────────────┘
+  ┌─ Not shipped ────────────────────────────────────────────────┐
+  │                                                              │
+  │  2. Prompt caching — Anthropic cache_control markers         │
+  │      where: would extend lib/agents/aptkit-adapters.ts:42    │
+  │      saves: ~60-67% input bill on calls 2+ per agent run     │
+  │      next:  B6.1 (also B1.6 in 01-llm-foundations/)          │
+  │                                                              │
+  │  4. Batching — Anthropic message batch API                   │
+  │      n/a: agents are user-facing real-time                    │
+  │      future:would apply to scheduled-briefing feature        │
+  │                                                              │
+  └──────────────────────────────────────────────────────────────┘
+
+  Headroom:
+   today        ~$0.21/session
+   with cache   ~$0.11/session   (48% session-cost reduction)
+   at 1k/day    ~$3,000/month savings
 ```
 
 ## Elaborate
 
-The "cheap model for triage, expensive model for synthesis" pattern is
-widely used (it's how Cursor and Copilot route between fast small
-models for autocomplete and slower large models for chat). For agent
-loops specifically, the literature shows haiku-class models can handle
-~70-80% of tool-routing decisions just as well as sonnet-class — the
-quality drop shows up in synthesis (the final answer prose).
+**Why prompt caching first, then smart truncation.** Two reasons:
 
-The decision to keep model routing per-AGENT today (haiku for intent,
-sonnet for everything else) rather than per-TURN reflects implementation
-cost — AptKit doesn't expose per-turn model selection. The exercise
-below names the upstream change.
+  1. **Bigger dollar payoff.** Prompt caching saves ~$0.10/session (the static prefix). Smart truncation saves more *information per token*, not necessarily more dollars (the truncation is already aggressive).
+  2. **Lower engineering risk.** Prompt caching is a 1-2 file change with clear telemetry (`cache_read_input_tokens`). Smart truncation is harder because "smart" is per-tool — what's the right way to truncate an EQL result vs a `get_funnel` result vs a `list_customers` result? Each tool has its own answer.
+
+Sequence is prompt caching (`B6.1`), then smart truncation per high-volume tool (separate exercise per tool).
+
+**Why no token budget alerts.** No alert fires when token usage spikes. The honest framing is "low volume today, no alarm needed yet." When volume grows, the first alert is per-day budget: log a warning if the per-day Sonnet cost crosses a threshold (e.g. $50/day). Cheap to implement (cron over Vercel logs); valuable as the early warning before bills get scary.
+
+**Where this codebase explicitly chose cost-over-quality.** None. Every choice is either cost-neutral (model routing is structural, not a quality compromise) or doesn't trade off (truncation chooses 4KB blindly; the cost-quality tradeoff is "smart vs blind," not "truncate at all").
+
+The cleanest cost-over-quality framing: choosing Haiku over Sonnet for the recommendation rationale would trade rationale quality for cost. Not done; would be a real tradeoff to measure.
 
 ## Project exercises
 
-### Exercise — per-turn model routing in the diagnostic loop
+### Exercise — Smart tool-result truncation per tool type
 
-  → **Exercise ID:** `study-ai-eng-06-02.1`
-  → **What to build:** Upstream PR to `@rlynjb/aptkit-core` to expose a
-    `modelSelector(turn, context) -> ModelProvider` option on
-    `DiagnosticInvestigationAgent`. Downstream: `DiagnosticAgent.investigate`
-    passes a selector that returns the haiku adapter for turns 1-3 and
-    the sonnet adapter for turn 4+. Measure cost reduction over a
-    golden-set eval run.
-  → **Why it earns its place:** Demonstrates "I know when model
-    routing is worth the implementation cost." Real cost reduction
-    (~30-40% per investigation if 5/6 turns can use haiku).
-  → **Files to touch:** AptKit core (upstream),
-    `lib/agents/diagnostic.ts:35-44` (construct two adapters, pass
-    selector), `package.json` (bump aptkit version),
-    `test/agents/diagnostic.test.ts`.
-  → **Done when:** A live investigation runs first 3 turns on haiku,
-    last 3 on sonnet (verified via the `model` field in
-    `response.usage` logs); golden-set eval quality stays within 5%
-    of all-sonnet baseline.
-  → **Estimated effort:** `≥1 week`
-
-### Exercise — use Anthropic Message Batches for the eval suite
-
-  → **Exercise ID:** `study-ai-eng-06-02.2`
-  → **What to build:** Once the eval suite from
-    `05-evals-and-observability/01-eval-set-types.md` exercise 1
-    exists, modify it to submit the 10-20 golden-set evals as a
-    batch instead of sequentially. Anthropic processes within 24h at
-    50% discount; suitable for offline nightly evals.
-  → **Why it earns its place:** Shows fluency with batch APIs — a
-    pattern most candidates know exists but few have used.
-  → **Files to touch:** `test/evals/diagnosis.eval.ts`,
-    `package.json` (`@anthropic-ai/sdk` is already on
-    `^0.99.0` which supports batch API).
-  → **Done when:** Eval suite runs via batch API at 50% reduced cost;
-    completes within 24h.
-  → **Estimated effort:** `1–2 days`
+  → **Exercise ID:** B6.2
+  → **What to build:** Replace the blind 4KB truncation at `app/api/agent/route.ts:98-101` with per-tool smart truncation. For `execute_analytics_eql` results, preserve the result envelope (`data`, `total`, `metadata`) but cap the `data` array to top-20 entries by value. For `list_customers` results, cap the customer array to top-10. For other tools, fall back to the blind 4KB cap. Make the strategy a per-tool function in a new `lib/agents/result-truncation.ts`.
+  → **Why it earns its place:** the blind truncation can land mid-JSON, feeding garbled context to the model on the next iteration. Smart truncation per tool preserves structure, lets the model see *what kind* of data it got back without the full payload. Adjacent benefit: enables logging more useful tool-call summaries to the per-call telemetry.
+  → **Files to touch:** new `lib/agents/result-truncation.ts` (per-tool strategies), `app/api/agent/route.ts` (use the new function), `app/api/briefing/route.ts` (same), `test/agents/result-truncation.test.ts` (cover all three strategies + fallback).
+  → **Done when:** the model's tool_result inputs preserve the result envelope structure for the top-3 most-used tools (`execute_analytics_eql`, `list_funnels`, `get_funnel`), the byte budget stays at ~4KB equivalent, and a regression test confirms the agent's behavior is unchanged or improved on a fixture investigation.
+  → **Estimated effort:** 1–2 days.
 
 ## Interview defense
 
-**Q: What cost optimizations are in place in this codebase?**
+**Q: "Where's the biggest cost lever in your LLM stack?"**
 
-Four are active, two are next:
+Anthropic prompt caching, not wired today. The static parts of every agent prompt — system prompt, tool definitions, schema summary — are ~1700 tokens, identical across the ReAct loop's iterations. Caching them cuts input cost on calls 2-6 by ~60%, which translates to ~48% session-cost reduction across briefing + diagnose + recommend. At 1,000 sessions/day, that's ~$3,000/month saved against a one-time engineering cost of maybe a day's work. Exercise `B6.1` is the implementation path.
 
-```
-  Active:
-   1. haiku for intent classify (10x cheaper than sonnet)
-   2. schemaSummary truncation (~30k → ~1.5k tokens, 20x)
-   3. per-agent tool allowlists (8-17 tools vs union of 22+)
-   4. hard tool-call caps in prompts (6 / 4)
+Model routing (Haiku for intent) is already shipped; truncation is already aggressive but blind. Prompt caching is what's left.
 
-  Next:
-   5. Anthropic prompt caching (one config flag, ~20% on 6-turn loops)
-   6. per-turn model routing inside diagnostic loop (haiku for
-      exploration turns, sonnet for synthesis)
-```
+*Anchor: "Prompt caching = $3k/month savings at 1k sessions/day; one day of engineering. `B6.1`."*
 
-The pattern at every layer: pick the cheapest tool that meets the
-quality bar. Haiku for triage; sonnet for synthesis. Truncated
-summary instead of full schema. Narrow allowlist instead of union.
+**Q: "What's the cost of the cheap-classifier pattern?"**
 
-**Anchor line:** "Match model to task. Truncate inputs. Cap loop
-iterations. Each move is a different gear on the same machine."
+About $0.0003 per query — negligible. The Haiku call is ~500 input tokens + ~10 output, which is essentially free vs. Sonnet rates. The classifier doesn't actually *skip* an expensive LLM (the query agent still runs); it picks *which* expensive LLM. So the cost saved isn't the classifier itself; it's the safety of routing correctly so the right agent runs with the right tool surface.
 
-**Q: Why is haiku safe for intent classify but you wouldn't use it
-for diagnostic synthesis?**
+The honest framing: model routing here is a structural decision, not a cost-driven one. The cost story would be more interesting if Haiku could *replace* the recommendation rationale generation (cheaper output) — that's a tradeoff exercise not yet wired.
 
-Two different shape requirements. Intent classify is a one-shot
-4-class enum output — pattern matching, no reasoning chain. Haiku
-handles it well. Diagnostic synthesis is a multi-paragraph structured
-JSON output that has to weave evidence and hypotheses into a coherent
-conclusion — the reasoning quality difference between haiku and sonnet
-shows up here. The cheap model is enough for the easy task and not
-enough for the hard one.
-
-For the *exploration* turns of a diagnostic loop (running tool calls,
-not synthesizing), haiku is probably good enough — that's the per-turn
-routing the next exercise lands.
+*Anchor: "Haiku classifier is structurally cheap; not a cost story by itself; the cost story is prompt caching."*
 
 ## See also
 
-  → `01-llm-foundations/06-token-economics.md` — where the dollar amounts come from
-  → `01-llm-caching.md` — the parallel cost-reduction lever
-  → `01-llm-foundations/08-provider-abstraction.md` — the seam that makes
-    multi-provider model routing possible
+  → `01-llm-caching.md` — the cache layer this leans on
+  → `01-llm-foundations/06-token-economics.md` — the dollar math behind the headroom
+  → `01-llm-foundations/07-heuristic-before-llm.md` — the cheap-classifier pattern's deep walk

@@ -1,227 +1,212 @@
-# 05 — Skeptical reviewer questions
+# 05 — Skeptical Reviewer Questions
 
-**Industry name:** Devil's advocate / pre-mortem review — Coach posture
-
-The chapter you read the night before the conversation. Four probes a senior reviewer will reach for, and the answers that hold under follow-up.
-
-Coach voice throughout: lead with the answer, then rank what carries the weight. No hedging.
-
----
-
-## Zoom out — the four probes
+> The review-room questions the brief survives. For each: the question as the reviewer would actually ask it, the strongest answer in coach voice (don't say X, say Y), and the receipt the answer points to.
 
 ```
-  The four probes ranked by interview damage
+  THE PRESSURE-TEST GRID — six categories, the hard question in each
 
-  ┌─ Probe 1 ─ "How do you know any of the agent ─────────┐
-  │             output is actually good?"                  │
-  │  damage if mishandled: high — collapses your eval story│
-  │  the move: lead with the 3 named bugs the suite caught │
-  └────────────────────────────────────────────────────────┘
-
-  ┌─ Probe 2 ─ "Why retire the Olist MCP server you ──────┐
-  │             built?"                                    │
-  │  damage if mishandled: medium — looks like sunk-cost   │
-  │                        fallacy or feature regret       │
-  │  the move: frame it as "served its purpose, picked     │
-  │            better" — not failure                       │
-  └────────────────────────────────────────────────────────┘
-
-  ┌─ Probe 3 ─ "Why migrate from your own agent loop to ──┐
-  │             AptKit?"                                    │
-  │  damage if mishandled: high — frames it as L3 capitul. │
-  │  the move: name the defer-then-migrate L5 shape;       │
-  │            point at the 3 adapter classes and          │
-  │            base-legacy.ts as evidence of discipline    │
-  └────────────────────────────────────────────────────────┘
-
-  ┌─ Probe 4 ─ "What's the eval gap NOW?" ─────────────────┐
-  │  damage if mishandled: medium — pushes you to L1/L2    │
-  │                        ("we plan to add evals")        │
-  │  the move: name the gap honestly + the 3 receipts +    │
-  │            the named rebuild target                    │
-  └────────────────────────────────────────────────────────┘
+  ┌─────────────────────┬────────────────────────────────────────┐
+  │ category            │ the question that exposes weak briefs  │
+  ├─────────────────────┼────────────────────────────────────────┤
+  │ existence           │ does the user pain actually exist?     │
+  │ differentiation     │ why isn't this commodity?              │
+  │ scope               │ why this small? / why this big?        │
+  │ quality             │ how do you know any of it's good?      │
+  │ economics           │ does the unit math work?               │
+  │ identity            │ what is this product, in one sentence? │
+  └─────────────────────┴────────────────────────────────────────┘
 ```
 
----
-
-## Probe 1 — "How do you know any of the agent output is actually good?"
-
-### The reviewer's intent
-
-They're testing whether you have measurement, or whether you have a feature that *looks* impressive but you've never verified. This is the L1/L2/L5 sorting probe. Most candidates fold here.
-
-### Do NOT say
-
-> "We tested it with some example queries and it worked well."
-
-This is L1 territory. It tells the reviewer you eyeballed it once and called it shipped.
-
-> "We're planning to add an eval pipeline."
-
-This is L2. It signals you know evals matter but never built any.
-
-### The L5 answer
-
-> "Today, by eyeballing the trace — same as before Phase 3. But I built the harness once, used it on K=10 runs per anomaly across four pillars, calibrated the LLM judge against manual spot-check at 8/8 on detection and 3/3 on diagnosis, and surfaced three real bugs no unit test would catch:
->
-> 1. **BRL units** — the judge flagged a R$131,965 AOV as implausible at run 8; turned out the prompt was reading Brazilian cents as Reais, a 100x error.
-> 2. **Binary calibration breakdown** — 29 of 30 diagnosis runs were getting binary pass/fail when actual quality varied substantially; forced a rubric redesign into 5 criteria.
-> 3. **Conclusion instability** — across K=10 runs, conclusions varied ~30%; became the regression baseline rather than a bug to suppress.
->
-> Then I retired the suite when the Olist MCP server it scored against was retired — the in-process Synthetic adapter is a cleaner shape for the same job. The receipt of having built it, calibrated it, and used it to find three named bugs is stronger than promising to build it. The next version is named: same four pillars against Synthetic."
-
-### Follow-up: "Why don't you have evals running now?"
-
-> "Because the substrate they scored against was retired. Keeping a dead eval suite around to look thorough is worse than having none — it's a lie. The honest call was retire-with-substrate and name the rebuild target. The substrate to rebuild against (Synthetic) is already in the repo; what's missing is the pillar implementations against it."
-
-### Follow-up: "Eight out of eight on detection? That's a small sample."
-
-> "Yes — small but enough to refute the rubber-stamp objection. The whole point of a manual spot-check on LLM-judge is asking 'is the judge tracking what a human would flag?' Eight cases were enough to answer that with confidence; thirty wouldn't have added much. I named the sample size on purpose — small but honest beats inflated."
+Each question below: how it lands in the room, the wrong answer (the trap), the right answer (with the receipt), and the follow-up the reviewer asks next.
 
 ---
 
-## Probe 2 — "Why retire the Olist MCP server you built?"
+## EXISTENCE QUESTIONS
 
-### The reviewer's intent
+### Q1 — "How do you know any analyst actually wants this? Isn't this a solution looking for a problem?"
 
-They're testing whether you can let go of work that served its purpose, or whether you'd hold onto it for sunk-cost or feature-regret reasons. Senior engineers retire things; juniors maintain them past usefulness.
+**The trap answer:** "We talked to some marketers and they said it would be useful." — Vague, unverifiable, performative.
 
-### Do NOT say
+**The right answer:**
+> "Honest answer — the repo proves the workflow exists, not that the pain is widespread enough to scale investment around. The three-context loop (notice → hunt → decide) is encoded in the stepper UI and the dual-agent split because that's the loop a Bloomreach analyst actually runs. What the repo doesn't prove is **how many** analysts experience that loop as painful enough to want a tool. That's the discovery question. The move I'd make before scaling agent count is 5 conversations with marketers on Bloomreach Engagement, timing the manual loop and asking what they currently do when a metric moves. If the loop is 15+ minutes and they currently *don't* investigate half the alerts because it's too expensive — the product has its problem. If the loop is 3 minutes and they breeze through it — the product doesn't."
 
-> "Olist had limitations so we moved on."
+**The receipt:** the brief in `01-problem-brief.md` names this exact discovery question. **A brief that names what it doesn't know lands harder than a brief that pretends to.**
 
-This frames it as a deficiency in Olist rather than a deliberate architectural call.
-
-> "We didn't have time to maintain both."
-
-This is resource-constrained framing — true, but it sounds like you couldn't follow through.
-
-### The L5 answer
-
-> "It served its purpose — proved the `DataSource` seam by *using* it. The whole point of the seam was that the agent could swap data substrates without code changes. Olist was the first concrete substrate; Synthetic was the second. The in-process Synthetic adapter turned out to be a cleaner shape for the same job: no network, no rate limit, deterministic seeding, no auth dance.
->
-> Retiring Olist was an honest 'we tried this, learned, picked better' call — not a failure. The seam is what mattered, and the seam survived the swap. If I'd kept Olist around alongside Synthetic, the codebase would have two substrates doing the same job — drift risk, double maintenance, no upside."
-
-### Follow-up: "Wasn't that wasted work?"
-
-> "No — the work proved the seam was real. If I'd never built Olist, the `DataSource` abstraction would just be a TypeScript interface with one implementation. With Olist as the first concrete substrate and Synthetic as the second, the seam is *demonstrated* — and the eval suite history proves it ran against both. The work earned its keep before retirement."
-
-### Follow-up: "What would have changed your mind about retiring it?"
-
-> "If Olist had production-grade reliability and Synthetic was the toy, the call flips. But the alpha MCP server had rate limits and token revocation that made it actively painful for evals. The deciding factor was: which substrate is more useful for what the eval suite needs to do? Synthetic wins on every axis except realism, and for eval purposes determinism beats realism."
+**Follow-up the reviewer asks next:** "What would you change about the product if those 5 conversations told you the pain is small?" — and the answer is "I'd swap the bet from 'reasoning-trace as differentiator' to something else, because the trust surface is only worth building if the analyst is currently in a low-trust situation." That's the chain of logic working.
 
 ---
 
-## Probe 3 — "Why migrate from your own agent loop to AptKit?"
+### Q2 — "Why hasn't Bloomreach built this themselves?"
 
-### The reviewer's intent
+**The trap answer:** "They will eventually, but we'll be there first." — Naive about competitive dynamics.
 
-This is the L3/L5 sorting probe on architecture decisions. They want to know if you'll defend the hand-rolled loop (L3 risk: stubborn) or admit you should have used a library from the start (L2 risk: indecisive). The L5 answer is neither.
+**The right answer:**
+> "They might. The MCP server they shipped — loomi connect — is the substrate that makes this kind of integration possible, and they shipped it because they want this layer to exist. **Whether they build it themselves or partner with someone who builds it well is an open question.** What this product proves is the *shape* of the solution: the stepper, the dual-agent split, the reasoning-trace as a first-class surface. If Bloomreach absorbs that pattern, the work was still valuable as a portfolio piece and as a demo for the partnership conversation."
 
-### Do NOT say
+**The receipt:** `03-options-and-opportunity-cost.md` Option E names "ship as a native Bloomreach feature" as a real option that's currently gated on partnership timing — not on technical feasibility.
 
-> "The hand-rolled loop was getting unwieldy."
-
-This is L3 — reactive change driven by maintenance pain. It sounds like you didn't plan well.
-
-> "AptKit just had better features."
-
-This is L4 — feature-driven change. It sounds like you migrated because something shinier appeared.
-
-### The L5 answer
-
-> "I started by owning the loop on purpose. Two specific constraints made that the right call at the time: the rate-limited Bloomreach MCP server demanded a hard `maxToolCalls` budget, and the forced final synthesis turn was a project-specific contract — when the agent runs out of tool calls it needs one more turn with no tools to produce a final answer. Neither fit a library shape cleanly in Phase 1.
->
-> By Phase 4, AptKit 0.3.0 had shipped a clean generic-primitive surface — the constraints I'd been carrying manually fit its abstractions. I revisited the decision and migrated via three Blooming adapter classes. The library owns the loop now; I own the boundary. The legacy implementation is preserved at `base-legacy.ts` as a rollback receipt.
->
-> This is the most consequential decision I revisited on the project. The shape of the answer is *evaluated and accepted* — I defended the hand-rolled loop, then revisited it when the conditions changed, then migrated with discipline. Not 'I gave up,' not 'I should have used AptKit from the start' — both of those would be wrong."
-
-### Follow-up: "Why keep `base-legacy.ts`? Isn't that dead code?"
-
-> "It's a rollback receipt, not dead code. Two reasons it stays: first, if the AptKit adapter ever breaks under a model upgrade or library change, I have a working fallback I've already tested. Second, it documents the migration — anyone reading the codebase can see exactly what the loop looked like before and after, and what the adapters had to bridge. Deleting it would erase the evidence that the migration was disciplined."
-
-### Follow-up: "Why three adapter classes? Isn't that overkill?"
-
-> "Three because there are three boundaries to cross: the tool surface (Blooming's `ToolCall` shape vs AptKit's), the streaming event surface (the `AgentEvent` NDJSON contract vs AptKit's events), and the budget/synthesis contract (the `maxToolCalls` + forced-synthesis turn that AptKit doesn't enforce). Each class owns one boundary. Fewer classes would have meant one bloated adapter; more would have been theater."
+**Follow-up:** "If Bloomreach calls tomorrow and wants to acquire/partner, what's your answer?" — that's a separate conversation, but the brief is structured so the answer is yes (it was always one of the options).
 
 ---
 
-## Probe 4 — "What's the eval gap NOW?"
+## DIFFERENTIATION QUESTIONS
 
-### The reviewer's intent
+### Q3 — "Every AI product says it has an agent. What's actually different here?"
 
-They've heard the Phase 3 story. They're testing whether you'll deflect ("we have plans") or own the current state honestly. The L5 move is owning it AND naming the rebuild without flinching.
+**The trap answer:** "We use Claude Sonnet, multi-agent, MCP." — Stack-listing, no substance.
 
-### Do NOT say
+**The right answer:**
+> "The differentiator isn't the agent — the agent is commodity now. The differentiator is **the reasoning trace as a first-class product surface.** Every conclusion carries the exact tool call, the current-vs-prior numbers, and a streamed log of the reasoning, visible in a sticky sidebar (`StatusLog`) on every page. Most AI products treat reasoning as a debug log behind a toggle. This product treats it as 1/3 of the main UI. The NDJSON event protocol (`AgentEvent` in `lib/mcp/events.ts`) is locked as 'what must not change' precisely because the trace is part of the product contract, not a side-channel."
 
-> "We're going to rebuild the eval suite soon."
+**The receipt:** `components/shared/StatusLog.tsx` is on every page (feed, both investigate steps). `components/investigation/ReasoningTrace.tsx` renders per-line agent badge + step kind + content + timestamp with `ToolCallBlock`s. The codebase commits to the trace at the architectural level, not the marketing level.
 
-L2. Sounds like a promise without a plan.
-
-> "The eval suite still exists in a branch."
-
-If it's not running, it doesn't count. Don't claim infrastructure that isn't live.
-
-### The L5 answer
-
-> "Same as before Phase 3 in terms of live measurement — eyeballing the trace. But I have three receipts the pre-Phase-3 state didn't:
->
-> 1. I've built the suite end-to-end, so I know the shape. Four pillars, K=10 per anomaly, LLM-as-judge with manual-spot-check calibration. Not a hypothesis.
-> 2. I've used it to find three named bugs no unit test would catch — BRL units, binary calibration breakdown, conclusion instability. Proof the harness was useful, not just present.
-> 3. I know what the next version looks like — same four pillars against the in-process Synthetic adapter, same calibration discipline. The substrate is already in the repo.
->
-> The honest framing: today is eyeballing. Last quarter was a measured pipeline. Next quarter is a rebuild against Synthetic. The gap is real; it's not 'we plan to add evals,' it's 'we measured, learned, retired with substrate, rebuilding next.'"
-
-### Follow-up: "Why hasn't the rebuild happened yet?"
-
-> "Two reasons, named honestly: first, the Synthetic adapter is newer than the Olist substrate was — it needs to stabilize before I can build seeded ground-truth anomalies against it that won't change shape every week. Second, this is a portfolio project, not a funded product, and the next priority slice has been UI polish and the migration story. The rebuild is a real next step, not infinitely deferred — the substrate exists, the pillar designs are documented, the calibration discipline is known."
-
-### Follow-up: "If I gave you a week, what's the first pillar you'd rebuild?"
-
-> "Detection. Two reasons: it's the easiest to seed ground truth for (Synthetic adapter lets me inject anomalies deterministically), and it's the pillar that produced the cleanest signal in Phase 3 (8/8 manual-judge agreement). Starting there means I can prove the rebuild approach works on a known-good case before tackling the harder pillars."
+**Follow-up:** "How do you know analysts care about that vs just wanting an answer?" — that's Q4. The brief is honest about it being an untested bet on rung 3 of the metrics ladder.
 
 ---
 
-## The general principle — pre-mortem is a senior skill
+### Q4 — "Does anyone actually want to read the reasoning, or do they just want the answer?"
+
+**The trap answer:** "Of course they do, it builds trust." — Asserting the product's central bet, not defending it.
+
+**The right answer:**
+> "**Honest answer: I don't know yet, and that's the load-bearing bet of the product.** The brief is explicit about this — it's rung 3 of the metrics ladder, not yet measured. The A/B I'd run: same recommendation, with and without the trace visible, measure forward-rate via the markdown export. The hypothesis is that analysts who have to defend the recommendation to their stakeholder will *prefer* the trace because it's the thing they paste into the Slack message. The opposite hypothesis is that the trace is wallpaper and they only look at the conclusion card. If the opposite hypothesis wins, the trace becomes a collapsed default and the product simplifies. The bet is testable; that's the discipline."
+
+**The receipt:** `04-success-metrics-and-feedback-loop.md` rung 3 names this as the central, unmeasured bet. **Honesty about which bet is unverified is the move.**
+
+**Follow-up:** "What's plan B if the trace doesn't win?" — collapse it to a "see how I got this" link, simplify the recommendation card, ship faster on the recommendation quality.
+
+---
+
+## SCOPE QUESTIONS
+
+### Q5 — "Why isn't this saving to a database? Every real product persists state."
+
+**The trap answer:** "We'll add it later." — Treating it as a missing feature, not a deliberate cut.
+
+**The right answer:**
+> "**Cut 1 in the scope-cuts file** — it's deliberate, not deferred-by-accident. Persistence is a feature wishlist trap. The moment you add a database, you add schema design, migration discipline, multi-tenant isolation, backup, retention, GDPR, the entire ops surface of a stateful product. The product is currently validating the question 'is the reasoning loop worth running'; it's not yet validating the question 'is the persistence model worth designing.' In-memory state plus the committed demo snapshot is the substitute, and it works. **The smallest event that puts persistence back in scope is an analyst saying 'I want to come back to last week's investigation' twice in a row.** Until that's a stated complaint, the right call is `do nothing`."
+
+**The receipt:** `02-scope-cuts-and-non-goals.md` Cut 1 — with the exact code paths (`lib/state/insights.ts`, `lib/state/investigations.ts`, `lib/state/demo-*.json`) that prove the in-memory choice is structural, not accidental.
+
+**Follow-up:** "Doesn't the demo path being the reliable presentation path scare you?" — see Q11.
+
+---
+
+### Q6 — "Why aren't you also building Shopify? Bloomreach is a small market."
+
+**The trap answer:** "We'll generalize once we've nailed Bloomreach." — Vague roadmap, no defensible reason for now.
+
+**The right answer:**
+> "**Option F in the options file** — generalizing is on the table, but not for v0. The recommendation vocabulary is the load-bearing detail of the product. Bloomreach has scenarios, segments, vouchers, experiments — a specific feature surface the recommendation agent names by hand. Generalizing means the agent can only suggest the lowest-common-denominator action, losing the precision that's currently a strength. **The seam is built** — there's a `DataSource` port with an in-process Synthetic adapter behind it (the test substrate proving the seam works) — so adding Shopify later means writing an adapter, not rewriting the agents. The deliberate decision is **don't pay the abstraction cost until a second customer asks for it.**"
+
+**The receipt:** `03-options-and-opportunity-cost.md` Option F — names the cost of generalization (recommendation precision loss) and the asset that keeps the option open (the `DataSource` seam).
+
+**Follow-up:** "What if Bloomreach is too small a market to justify the engineering investment?" — that's the existence question (Q1) wearing a different hat; the answer is the same discovery move.
+
+---
+
+## QUALITY QUESTIONS
+
+### Q7 — "How do you know any of the agent output is actually good?"
+
+**The trap answer:** "We have an eval suite running on every commit." — A claim that doesn't survive contact.
+
+**The right answer:**
+> "Today, by eyeballing the trace — same way it was before the eval suite shipped. **But I built the eval harness once**, calibrated it 8/8 + 3/3 against manual review, and used it to surface 3 real bugs no unit test would catch: BRL units (cents vs Reais, surfaced at run 8 by an implausible R$131,965 average order value), binary calibration drift (a criterion grading 29/30 when it should have been binary), and conclusion instability (30% regression baseline across K=10 runs on the same anomaly). When I swapped to the in-process Synthetic adapter as a cleaner data shape, I retired the eval with the substrate it ran against. **That was a deliberate call.** The rebuild target is named — the next version runs against Synthetic, where the substrate is deterministic and the eval doesn't decay with the data. **The receipt of having done the work once, surfaced bugs with it, and made the deliberate call to retire it is stronger than promising to.**"
+
+**The receipt:** `04-success-metrics-and-feedback-loop.md` rung 2 — the 4 pillars, the 3 named bugs, the calibration discipline, the named rebuild gate.
+
+**Follow-up:** "When will the rebuild happen?" — when the Synthetic substrate stabilizes enough to support deterministic anomaly seeding. That's the rebuild gate, named, not vague.
+
+---
+
+### Q8 — "Why did you migrate from your own agent loop to AptKit? Wasn't your own loop fine?"
+
+**The trap answer:** "AptKit is better." — Vague, no decision frame.
+
+**The right answer:**
+> "Phase 1, the hand-rolled `runAgentLoop` was deliberate — I needed a `maxToolCalls` budget and a forced synthesis turn against a rate-limited alpha server, and writing it myself was the fastest way to get those guarantees. **Once `@aptkit/core@0.3.0` had a clean generic-primitive surface**, the migration was 3 adapter classes in `lib/agents/aptkit-adapters.ts`. Library owns the loop; I own the boundary. **The legacy is preserved at `lib/agents/base-legacy.ts` as a rollback receipt.** That's an `evaluated-and-accepted` move — I revisited a decision I'd originally defended deliberately, because the better surface existed. The original constraints (budget, synthesis turn) still hold; AptKit gave me a way to express them through a generic primitive instead of a custom loop."
+
+**The receipt:** the migration is a real architectural change visible in the file structure (`base.ts` vs `base-legacy.ts`, plus the adapter classes). **The discipline of preserving the legacy as a rollback receipt is itself the signal.**
+
+**Follow-up:** "If AptKit had a bug tomorrow that broke the loop, what would you do?" — flip to legacy via the boundary, ship a hotfix, file the AptKit issue. The boundary is precisely so that swap is cheap.
+
+---
+
+### Q9 — "Why did you retire the data substrate you originally built the eval against?"
+
+**The trap answer:** "It didn't work out." — No decision framing.
+
+**The right answer:**
+> "I proved the `DataSource` seam by using it against a real public ecommerce dataset — that was the right substrate for proving the seam was real, not theoretical. Once the seam was proven, the in-process Synthetic adapter became a cleaner data shape: deterministic, no external server, no rate limits, no token revocation. **Retiring the original substrate was an honest 'we tried this, learned, picked better' call** — and the seam survived, because it was always meant to be a seam, not a coupling to any one source. The Synthetic adapter slotted in behind the same port. The receipt is: the architecture passed the swap test."
+
+**The receipt:** the `DataSource` port architecture means there is a seam to swap behind, not a rewrite. That's the entire point of having built the port in the first place.
+
+**Follow-up:** "What's the eval gap now?" — same as Q7. The answer is consistent across the brief.
+
+---
+
+## ECONOMICS QUESTIONS
+
+### Q10 — "What does running this cost per investigation? Does the unit math work?"
+
+**The trap answer:** "It's pretty cheap." — Not a number.
+
+**The right answer:**
+> "I don't have a per-investigation cost benchmark yet — it depends on the anomaly count, the diagnostic agent's tool-call depth (bounded by `maxToolCalls`), and the recommendation agent's prompt complexity. What I can name today: the model choices are deliberate cost-vs-quality decisions. `claude-haiku-4-5-20251001` for the intent classifier (cheap, fast, structured output). `claude-sonnet-4-6` for the agents (the cost the product accepts to keep the reasoning quality high enough to defend in the trace). The `maxToolCalls` budget caps each agent's worst-case spend. **The economic question I can't answer today is what a Bloomreach analyst would pay per investigation** — and that's gated on the existence question (Q1)."
+
+**The receipt:** the model choices are visible in the project context — Haiku for the cheap classifier, Sonnet for the agents — and the `maxToolCalls` cap is in the legacy `runAgentLoop` and preserved through the AptKit adapter.
+
+**Follow-up:** "What's the most expensive investigation you've seen?" — capture it from a live run, name the number, use it as the worst-case anchor in the next conversation. The instrumentation is straightforward; the gate is having a live customer.
+
+---
+
+## IDENTITY QUESTIONS
+
+### Q11 — "If the demo is the reliable presentation path, isn't the live path basically broken?"
+
+**The trap answer:** "Live works most of the time." — Defensive.
+
+**The right answer:**
+> "**The live path is recovery-oriented, not magic-oriented.** The alpha MCP server is rate-limited (~1 req/s, enforced in `lib/mcp/client.ts`) and revokes tokens after minutes. The feed has auto-reconnect on `invalid_token` (`app/page.tsx`). Those are real constraints from a real alpha server — not bugs we're hiding. The product's response is honest: **capture a fresh snapshot locally, commit it as the demo, present from the demo.** The demo isn't a substitute for the live path — it's the **reliable presentation surface** that the live path feeds. When Bloomreach stabilizes the server, the live path becomes the presentation surface. Today, the demo is. **That's an honest call about the substrate we're building against, not a defect.**"
+
+**The receipt:** the demo capture flow (`app/page.tsx` dev-only one-click capture; `lib/state/demo-*.json` committed) is a built feature, not a workaround. The product has a deliberate two-mode design.
+
+**Follow-up:** "What if Bloomreach never stabilizes the alpha?" — then the demo-first posture stays. The product still works; the presentation surface is just permanently the snapshot.
+
+---
+
+### Q12 — "In one sentence, what is this product?"
+
+**The trap answer:** "An AI-powered analytics platform for ecommerce." — Marketing fluff, no signal.
+
+**The right answer:**
+> "**An analyst that shows its work** — a multi-agent reasoning loop on a Bloomreach Engagement workspace that goes from 'what changed' to 'why' to 'what to do,' with the reasoning streamed as a first-class UI surface so the analyst can defend the recommendation to their stakeholder."
+
+**The receipt:** the entire brief — the stepper, the dual-agent split, the streamed trace, the show-your-work surface — radiates from this sentence. **If a sentence doesn't carry the whole brief, the sentence is wrong.**
+
+**Follow-up:** "How is that different from ChatGPT with a Bloomreach plugin?" — ChatGPT with a plugin gives you a chat thread; this product gives you the **structured artifact** (Insight → Diagnosis → Recommendation, with NDJSON-streamed trace, with markdown export) that survives the conversation and travels to the analyst's stakeholder. The shape of the output is the differentiator, not the model behind it.
+
+---
+
+## The defense posture, summarized
 
 ```
-  The shape of a skeptical-question rehearsal
+  THE DEFENSE POSTURE — three moves that carry the room
 
-  step 1: identify the 3-4 questions a reviewer is most
-          likely to ask
-  step 2: rank them by interview damage (which one breaks
-          the conversation if mishandled?)
-  step 3: write the do-NOT-say version first (what most
-          candidates would say)
-  step 4: write the L5 version (lead with answer, rank
-          what carries weight, name the receipts)
-  step 5: write 1-2 follow-ups per probe (the second-
-          layer question that catches a weak answer)
+  1. NAME the receipts you have                  ← rung 1 + rung 2 (suite ran,
+                                                   3 bugs surfaced, retired
+                                                   deliberately)
 
-  this whole chapter IS the pre-mortem.
+  2. NAME the bets you haven't validated         ← rung 3 (show-your-work
+                                                   beats magic) — explicitly
+                                                   the load-bearing untested bet
+
+  3. NAME the discovery questions before they    ← Q1, Q4, the metrics gaps —
+     ask                                            said before the reviewer
+                                                   asks earns the room
 ```
 
-A pre-mortem is what separates a candidate who can talk about their project from one who's *defended* their project. The defense moves are: lead with the answer, never hedge, name receipts (not aspirations), and welcome the second-layer follow-up because you've already thought through it.
+A brief that does all three lands. A brief that does only the first sounds like marketing. A brief that does only the third sounds like a product manager with no engineering substance.
 
----
-
-## The single highest-leverage line in this brief
-
-If you only get to land one sentence, land this one:
-
-> *"I shipped the eval suite, calibrated it against manual spot-check at 8/8 and 3/3, used it to find three named bugs, and retired it with the substrate it scored against — the receipt of having done that is stronger than promising to do it."*
-
-That sentence is the whole problem-selection brief in one breath. It proves you can scope, you can ship, you can measure, you can retire, and you can name what comes next. Five senior signals in one line.
-
----
-
-## See also
-
-- `00-overview.md` — the bundle map
-- `01-problem-brief.md` — the problem these probes are defending against
-- `02-scope-cuts-and-non-goals.md` — Cut 2 (eval) is the source of Probe 1 + Probe 4 receipts
-- `03-options-and-opportunity-cost.md` — Decision 2 (AptKit migration) is the source of Probe 3 answer
-- `04-success-metrics-and-feedback-loop.md` — the numbers behind Probe 1's answer
-- `.aipe/rehearse-interview-defense/` — the technical-decision sister rehearsal
-- `.aipe/rehearse-design-doc/` — the written-artifact sister rehearsal
+**The L5 framing across all twelve answers:** "I built it, I evaluated it where I could, I named the bets that aren't verified, and I retired what wasn't worth keeping. Here's the receipt for each."

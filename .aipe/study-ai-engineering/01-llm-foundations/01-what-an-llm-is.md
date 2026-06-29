@@ -1,362 +1,246 @@
-# 01 — what an LLM actually is
+# What an LLM actually is
 
-**Subtitle:** The LLM-as-function I/O model · Industry standard
+*Industry standard — autoregressive next-token predictor*
 
-## Zoom out, then zoom in
+## Zoom out — where this concept lives
 
-The model is one box in blooming insights. It sits between the route handler and
-the data source — nothing more exotic than that. Here's where it lives:
+Before the agent loop, before tool calling, before any of the agent-shaped scaffolding — the thing at the bottom of the stack is just a function. Text in, text out. Five agents in this codebase, one shared shape underneath all of them.
 
 ```
-  Zoom out — where the LLM sits in the stack
+  Zoom out — the LLM box in the stack
 
-  ┌─ UI ─────────────────────────────────────────────┐
-  │  app/page.tsx · investigate pages · QueryBox      │
-  └────────────────────┬──────────────────────────────┘
-                       │ NDJSON over fetch
-  ┌─ Route ────────────▼──────────────────────────────┐
-  │  /api/briefing  ·  /api/agent  (maxDuration=300s) │
-  └────────────────────┬──────────────────────────────┘
+  ┌─ UI / Route / Agent layers ──────────────────┐
+  │  (everything that decides WHAT to send the   │
+  │   model and WHAT to do with what comes back) │
+  └────────────────────┬─────────────────────────┘
                        │
-  ┌─ Agent loop (AptKit) ─────────────────────────────┐
-  │  while(not done) {                                │
-  │     ★ LLM CALL ★  ──►  pick tool                  │  ← we are here
-  │     run tool        ──►  observation              │
-  │  }                                                │
-  └────────────────────┬──────────────────────────────┘
-                       │
-  ┌─ DataSource ───────▼──────────────────────────────┐
-  │  Bloomreach MCP / synthetic                       │
-  └───────────────────────────────────────────────────┘
+                       ▼
+  ┌─ ★ THE LLM ★  ────────────────────────────────┐ ← we are here
+  │  one function: tokens in → tokens out         │
+  │  every Anthropic call from this repo lands    │
+  │  here through one adapter method              │
+  │  (lib/agents/aptkit-adapters.ts:42)           │
+  └────────────────────┬─────────────────────────┘
+                       │  HTTPS
+                       ▼
+  ┌─ Anthropic API ──────────────────────────────┐
+  │  claude-sonnet-4-6  (agents)                 │
+  │  claude-haiku-4-5-20251001  (intent)         │
+  └──────────────────────────────────────────────┘
 ```
 
-The LLM is a function. Tokens in, tokens out. It is not a database. It is not a
-reasoner. It is not a planner. Everything that *looks* like reasoning or planning
-in blooming insights — the hypothesis lists, the multi-step diagnosis, the
-"check existing scenarios first" — is built *on top of* the I/O contract by the
-agent loop (next section). The LLM itself just emits the next token, repeatedly,
-until it stops.
+**Zoom in.** Everything you'll learn about prompts, agents, RAG, evals is built on top of this one box. The whole field is "how to put the right tokens *in* so the model writes the right tokens *out*." Five agents in this repo, one IO shape underneath all of them — and most LLM bugs come from treating the model as more than it is.
 
-## Structure pass
+## Structure pass — layers · axes · seams
 
-  → **Layers above the LLM:** route handler · agent loop · model adapter ·
-    Anthropic SDK · HTTPS to `api.anthropic.com`.
+**Layers** (one axis traced through them):
 
-  → **One axis to trace — state:** the LLM is **stateless across calls**. It
-    holds nothing. Every turn ships the whole conversation history. Read this
-    one fact and you understand most of the rest of the section (tokens cost
-    money because you re-pay for the history every turn; the context window
-    is finite because the history grows; prompt caching exists because
-    re-shipping the same prefix is wasteful).
+  → **Caller layer** — agent code with structured intent (`MonitoringAgent.scan()`, `DiagnosticAgent.investigate()`).
+  → **Adapter layer** — `AnthropicModelProviderAdapter` converts to/from the SDK's shape.
+  → **LLM layer** — Anthropic API; pure function on tokens.
 
-  → **The load-bearing seam:** between AptKit's `ModelProvider` interface
-    and Blooming's `AnthropicModelProviderAdapter`. Above the seam: AptKit
-    sees messages, tools, signal — provider-neutral. Below the seam:
-    Anthropic SDK, retry handling, the `claude-sonnet-4-6` model id, the
-    usage logging. Swap the adapter, swap the provider.
+**Axis: who decides what happens next?**
+
+  → Caller: CODE decides — fixed sequence (bootstrap → scan → emit).
+  → Adapter: CODE decides — translation only, no policy.
+  → LLM: MODEL decides — picks the next token from the learned distribution.
+
+**Seam:** the moment your control flow crosses from "your code decides" to "the model decides" is the adapter's `complete()` call. That's where the contract changes. Inside `complete()` you hand the model a prompt and tools; the model hands back text or a tool-use request. You don't control which.
+
+That seam — the line where determinism flips to probability — is the load-bearing one. Most "the model did something weird" debugging starts by drawing this line and asking "which side of it caused the surprise?"
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You already use this shape every day: a `fetch()` returns a Promise that resolves
-to text. An LLM call is the same — a Promise of text — except the text is
-generated by a probability model rather than a database query.
+You know how `fetch()` is just `request → response`? The LLM is just `tokens → tokens`. Same shape. The Anthropic SDK call is more elaborate than `fetch()`, but the kernel is a pure function: hand it a token sequence, get a token sequence back.
 
 ```
-  The LLM as a function
+  The LLM as a pure function
 
-  ┌─────────────────────────────────────────────────────────────┐
-  │                                                             │
-  │   messages: [{role, content}, …]                            │
-  │   system:   "you are the monitoring agent…"                 │
-  │   tools:    [{name, inputSchema}, …]                        │
-  │                  │                                          │
-  │                  ▼                                          │
-  │            ┌──────────────────┐                             │
-  │            │  Anthropic API   │   stateless                 │
-  │            │  (claude-sonnet) │   per call                  │
-  │            └────────┬─────────┘                             │
-  │                     │                                       │
-  │                     ▼                                       │
-  │   content: [ {type: 'text', text}                           │
-  │            | {type: 'tool_use', name, input} ]              │
-  │   usage:   {input_tokens, output_tokens}                    │
-  │   stop_reason: 'end_turn' | 'tool_use' | 'max_tokens'       │
-  │                                                             │
-  └─────────────────────────────────────────────────────────────┘
+  input tokens  →  ┌──────────────────────────┐  →  output tokens
+                   │   LLM (next-token        │
+                   │   predictor, applied     │
+                   │   one token at a time    │
+                   │   until a stop token)    │
+                   └──────────────────────────┘
+
+  it is NOT a database
+  it is NOT a reasoner
+  it is NOT a planner
+  it IS a function from tokens to tokens
 ```
 
-The shape that matters: input is a *whole conversation* every time. Output is
-a list of content blocks — either text the model wants to say, or `tool_use`
-blocks asking the agent loop to run a tool and feed the result back. The model
-itself has no memory between calls.
+The reasoning you see in agent traces? That's just the model writing tokens that *look like* reasoning. The tool calls? Just structured tokens the model was trained to emit when given a tool schema. The "I need to think about this" thoughts? Tokens. All of it.
 
 ### Move 2 — the step-by-step walkthrough
 
-**One call: messages in, content blocks out.**
+**Part 1 — the input is one prompt, not a conversation.**
 
-In this codebase, the *only* place that actually calls the Anthropic SDK is
-`AnthropicModelProviderAdapter.complete()` (`lib/agents/aptkit-adapters.ts:42-71`).
-Every agent — monitoring, diagnostic, recommendation, query, intent — gets to
-the model through this one method.
+When `MonitoringAgent.scan()` runs, AptKit eventually calls into `AnthropicModelProviderAdapter.complete()` with a `ModelRequest`. That request carries:
+
+  → a system prompt (the agent's role and rules)
+  → a `messages[]` array (user turns, assistant turns, tool results — all concatenated)
+  → a `tools[]` array (the MCP tools the agent is allowed to call)
+
+```
+  Input shape — what hits the API
+
+  ┌─ system ──────────────────────────────────────┐
+  │  "You are the monitoring agent in blooming…"  │
+  └───────────────────────────────────────────────┘
+  ┌─ messages[] ──────────────────────────────────┐
+  │  { role: 'user',      content: 'scan...' }    │
+  │  { role: 'assistant', content: [tool_use] }   │ ← prior turn
+  │  { role: 'user',      content: [tool_result] }│ ← tool result
+  │  { role: 'assistant', content: [tool_use] }   │ ← prior turn
+  │  ...                                           │
+  └───────────────────────────────────────────────┘
+  ┌─ tools[] ─────────────────────────────────────┐
+  │  [{ name: 'execute_analytics_eql', ... }, …] │
+  └───────────────────────────────────────────────┘
+                          │
+                          ▼  the model treats the WHOLE thing
+                             as one prompt and predicts what
+                             token comes next
+```
+
+There's no real "conversation." The model has no memory between calls. Every call rebuilds the whole context.
+
+**Part 2 — the call itself.**
+
+The adapter's `complete()` method is the entire LLM call surface for this codebase. From `lib/agents/aptkit-adapters.ts:42-70`:
 
 ```typescript
-// lib/agents/aptkit-adapters.ts:42-71  (adapter.complete)
 async complete(request: ModelRequest): Promise<ModelResponse> {
   const params: Anthropic.Messages.MessageCreateParamsNonStreaming = {
-    model: this.defaultModel,                           // claude-sonnet-4-6
-    max_tokens: request.maxTokens ?? 4096,              // cap on OUTPUT tokens
-    messages: request.messages.map(toAnthropicMessage), // whole history
+    model: this.defaultModel,                                   // claude-sonnet-4-6 (or haiku for intent)
+    max_tokens: request.maxTokens ?? 4096,                      // hard cap on output
+    messages: request.messages.map(toAnthropicMessage),         // map AptKit → SDK shape
   };
-  if (request.system) params.system = request.system;
+
+  if (request.system) params.system = request.system;           // system prompt
   if (request.tools?.length) params.tools = request.tools.map(toAnthropicTool);
 
-  const response = await this.anthropic.messages.create(
+  const response = await this.anthropic.messages.create(        // ← THE CALL
     params,
-    request.signal ? { signal: request.signal } : undefined,  // ← cancel support
+    request.signal ? { signal: request.signal } : undefined,    // route cancellation
   );
 
-  console.log(JSON.stringify({                          // ← usage telemetry
+  console.log(JSON.stringify({                                  // per-call usage log
     site: this.logSite,
     sessionId: this.sessionId,
-    usage: response.usage,
+    usage: response.usage,                                       // input + output tokens
   }));
 
-  return {
-    content: response.content.flatMap(toModelContentBlock),
-    usage: {
-      inputTokens: response.usage.input_tokens,
-      outputTokens: response.usage.output_tokens,
-    },
-    model: response.model,
-  };
+  return { content: response.content.flatMap(toModelContentBlock), ... };
 }
 ```
 
-The breakdown:
+Three things to notice:
 
-  → **Line 44:** `model: this.defaultModel` — set once at adapter construction,
-    `claude-sonnet-4-6` for the four real agents, `claude-haiku-4-5-20251001`
-    for intent (`lib/agents/intent.ts:16`). The model is a config value, not
-    a runtime decision; nothing in the code switches models per-call.
+  1. **`messages.create()`, not `messages.stream()`.** This codebase doesn't stream LLM tokens. See `05-streaming.md` for why.
+  2. **`max_tokens: 4096`** is the hard output cap. The model stops generating at 4096 tokens regardless of whether it was done.
+  3. **`response.usage`** is logged on every call. That's the only telemetry the AI stack has today (`05-evals-and-observability/04-llm-observability.md`).
 
-  → **Line 45:** `max_tokens` caps *output*, not the whole context. Input is
-    bounded by the model's context window (200k for Sonnet 4.6). Default 4096
-    — generous for "answer in JSON with 10 anomalies max" but small enough
-    that a runaway generation can't burn the whole 300s route budget.
+**Part 3 — the output is content blocks, not a string.**
 
-  → **Line 46:** `messages.map(toAnthropicMessage)` — Blooming's
-    provider-neutral `ModelMessage` shape gets translated to Anthropic's
-    `MessageParam` shape. The translator (`toAnthropicMessage` at line 144)
-    handles three block types: text, tool_use, tool_result. That's the
-    entire agent-loop vocabulary in three shapes.
-
-  → **Line 54:** `signal: request.signal` — the route's `req.signal` is
-    threaded all the way down to here. When the user closes the tab,
-    `AbortController` cancels the in-flight HTTP call. Without this thread,
-    a navigation-away would still burn the full 300s.
-
-  → **Lines 57-61:** the `console.log` is the *only* per-call observability
-    today. Vercel ingests it, you can filter by `site` to count calls per
-    agent. There's no per-call DB row, no tracing platform, no cost
-    aggregator. (Patterns for `traces / spans / replay` live in
-    `05-evals-and-observability/04-llm-observability.md`.)
-
-  → **Lines 63-70:** the response is translated *back* — Anthropic's
-    `ContentBlock[]` to AptKit's `ModelContentBlock[]`. The translator
-    (`toModelContentBlock`, line 187) drops `thinking` blocks if Anthropic
-    ever sends them, and returns text + tool_use unchanged.
-
-**One layers-and-hops view of one call:**
+The response carries an array of `ContentBlock`s, each either `{ type: 'text', text }` or `{ type: 'tool_use', id, name, input }`. The adapter flattens them to AptKit's `ModelContentBlock[]` shape via `toModelContentBlock()` at `lib/agents/aptkit-adapters.ts:154-167`. The agent loop then iterates: if there's a `tool_use`, execute it and feed the result back; if there's `text`, keep accumulating.
 
 ```
-  ┌─ AptKit agent loop ────┐ hop 1: request ┌─ Anthropic SDK ─┐
-  │  needs: complete(req)  │ ─────────────► │  axios over     │
-  └────────────────────────┘  hop 4: resp   │  fetch/keep-alive│
-                                ◄────────── └────────┬─────────┘
-                                                     │ hop 2: HTTPS POST
-                                                     ▼ /v1/messages
-                                            ┌─ api.anthropic.com ─┐
-                                            │  claude-sonnet-4-6   │
-                                            └────────┬─────────────┘
-                                                     │ hop 3: token stream
-                                                     ▼ (we don't stream;
-                                                       we await full body)
-                                            response.content[]
-```
+  Output shape — what comes back
 
-**What the agent loop does with the response.** When `content` carries a
-`tool_use` block, AptKit emits a trace event (`tool_call_start`), calls the
-tool through the registry, appends the result as a `tool_result` message, and
-loops back. When `content` is text-only, AptKit returns the text and the agent
-calls it a final answer. Both behaviors live inside `@aptkit/core`; Blooming
-doesn't implement either — see `04-agents-and-tool-use/01-agents-vs-chains.md`.
+  ┌─ content[] ───────────────────────────────────┐
+  │  { type: 'text', text: 'I need to check…' }   │ ← thoughts
+  │  { type: 'tool_use', id, name, input }        │ ← tool call
+  │  { type: 'text', text: 'Now let me…' }        │ ← more thoughts
+  │  { type: 'tool_use', id, name, input }        │ ← another tool call
+  └───────────────────────────────────────────────┘
+  ┌─ usage ───────────────────────────────────────┐
+  │  { input_tokens: 1247, output_tokens: 318 }   │ ← the bill
+  └───────────────────────────────────────────────┘
+```
 
 ### Move 3 — the principle
 
-**The model is a stateless function. Everything else is an abstraction you built
-on top of it.** Conversation memory? You append to the messages array. Tool
-calls? You define a schema, parse the tool_use block, run the tool, append the
-result. Reasoning? You prompt the model to write its thinking down first.
-"Multi-step planning" is a loop you wrote that keeps calling the same stateless
-function with a growing message history.
+**The LLM is one function call surface. Everything else is scaffolding.** Treat it as a function and most of the bugs become obvious — they're either (a) wrong tokens going in, or (b) tokens coming out being misinterpreted by your scaffolding. The model itself is rarely the bug.
 
-This principle is why the `AnthropicModelProviderAdapter` is 30 lines and AptKit
-is dozens of files: the model is trivial, the loop is everything.
-
-## Primary diagram
+## Primary diagram — the full recap
 
 ```
-  The full picture — one LLM call as it flows through blooming insights
+  The LLM call in this codebase, end to end
 
-  ┌─ Agent layer ────────────────────────────────────────────────────────┐
-  │                                                                      │
-  │  AptKit agent.investigate(anomaly, {signal})                         │
-  │       │                                                              │
-  │       ▼                                                              │
-  │  while (not done) {                                                  │
-  │       │                                                              │
-  │       ▼                                                              │
-  │     ┌─ adapter.complete(request) — lib/agents/aptkit-adapters.ts:42 ┐│
-  │     │                                                               ││
-  │     │  params = {                                                   ││
-  │     │    model: 'claude-sonnet-4-6',                                ││
-  │     │    max_tokens: 4096,                                          ││
-  │     │    system: '<the prompt>',                                    ││
-  │     │    messages: [history…],                                      ││
-  │     │    tools: [diagnosticTools schemas…],                         ││
-  │     │  }                                                            ││
-  │     │                                                               ││
-  │     │  anthropic.messages.create(params, {signal}) ──► HTTPS        ││
-  │     │                                                               ││
-  │     │  ◄── { content: [text|tool_use], usage, stop_reason }         ││
-  │     │                                                               ││
-  │     │  console.log({site, sessionId, usage})                        ││
-  │     │                                                               ││
-  │     │  return { content, usage, model }                             ││
-  │     └───────────────────────────────────────────────────────────────┘│
-  │       │                                                              │
-  │       ▼                                                              │
-  │     if (tool_use) { runTool → append result → loop }                 │
-  │     else          { return final answer }                            │
-  │  }                                                                   │
-  │                                                                      │
-  └──────────────────────────────────────────────────────────────────────┘
+  ┌─ Agent (lib/agents/monitoring.ts:78) ──────────────────────┐
+  │  agent.scan() — runs the AptKit loop                       │
+  └────────────────────┬───────────────────────────────────────┘
+                       │  loop iteration: build ModelRequest
+                       ▼
+  ┌─ Adapter (lib/agents/aptkit-adapters.ts:42) ───────────────┐
+  │  AnthropicModelProviderAdapter.complete(request):           │
+  │    map AptKit shape → SDK shape                             │
+  │    call anthropic.messages.create(params)                   │
+  │    log response.usage                                       │
+  │    map SDK shape → AptKit ModelResponse                     │
+  └────────────────────┬───────────────────────────────────────┘
+                       │  HTTPS (Anthropic SDK)
+                       ▼
+  ┌─ LLM (Anthropic API) ──────────────────────────────────────┐
+  │  predict next token, next token, next token,                │
+  │  ... until stop token or max_tokens                         │
+  └────────────────────┬───────────────────────────────────────┘
+                       │  ContentBlock[] + usage
+                       ▼
+  ┌─ Adapter → agent loop → next iteration or done             │
+  └────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The "LLM as a function" framing was made canonical by the OpenAI Chat Completions
-API in March 2023 and reinforced by every provider since: the boundary is always
-`messages in, content out` with no server-side conversation state. Anthropic's
-Messages API (introduced May 2023) added the explicit `tool_use` / `tool_result`
-content-block types that AptKit consumes; this is the substrate the agent loop
-sits on. The shape of the API forces the architecture: because the model has no
-memory, *someone* has to hold it, and "someone" is the agent loop running on
-your server.
+The "an LLM is a next-token predictor" framing isn't poetic — it's mechanical. The model has a vocabulary (Anthropic's tokenizer has ~100k entries; see `02-tokenization.md`), and at each step it produces a probability distribution over that vocabulary. The sampler picks one token (`03-sampling-parameters.md`). That token gets appended to the input, and the model runs again. Repeat until a stop token.
 
-The choice to log usage but not aggregate it (line 57) is a deliberate
-not-yet-built decision. Aggregation would mean a per-call row in a database, a
-dashboard, and per-team / per-feature cost budgets. None of that exists today —
-the snapshot demo path doesn't burn tokens, and live mode is rate-limited at
-the Bloomreach side, not at the Anthropic side. When live becomes more than a
-demo-presentation tool, the aggregation layer needs to land.
+The "intelligence" is statistical: the model has seen so many `prompt → continuation` pairs in training that its conditional probability `P(next_token | prompt_so_far)` carries useful structure. Tool use is the same trick — the model was trained on lots of `(prompt with tool schema) → (tool_use block)` pairs, so when you hand it a tool schema, the tokens it predicts include the tool-use structure.
 
-What to read next: `02-tokenization.md` (why the `usage.input_tokens` number is
-what it is) and `08-provider-abstraction.md` (the seam that makes this whole
-section live in 30 lines).
+**Where this codebase leans on the framing:** the agents never treat the model as a "thinker." They give it a tool schema, log its token usage, and parse the output blocks. The reasoning trace in the UI is the model's tokens, presented as if it were thought — useful for the user, but not what's happening underneath.
 
 ## Project exercises
 
-### Exercise — wire per-call cost into the trace
+### Exercise — Stream LLM tokens to the UI
 
-  → **Exercise ID:** `study-ai-eng-01.1`
-  → **What to build:** Extend `AnthropicModelProviderAdapter.complete()` to
-    emit a `{ type: 'usage', usage }` event into the existing trace sink,
-    so the UI's `StatusLog` can show per-turn token cost. Add a new
-    `AgentEvent` variant in `lib/mcp/events.ts` (`type: 'usage'`) and
-    handle it in `useBriefingStream.ts` / `useInvestigation.ts`.
-  → **Why it earns its place:** Today the only telemetry is `console.log`
-    to Vercel. The interview question "how do you know what each
-    investigation cost?" has no demo-able answer — wiring it onto the
-    wire fixes that.
-  → **Files to touch:** `lib/agents/aptkit-adapters.ts:57-71`,
-    `lib/mcp/events.ts`, `lib/hooks/useBriefingStream.ts`,
-    `lib/hooks/useInvestigation.ts`, `components/investigation/ReasoningTrace.tsx`.
-  → **Done when:** The status panel shows "× input tokens / × output tokens"
-    per agent turn during a live briefing, and the same field rides through
-    the demo replay (captured into `lib/state/demo-*.json`).
-  → **Estimated effort:** `1–4hr`
-
-### Exercise — pin model id to a release tag
-
-  → **Exercise ID:** `study-ai-eng-01.2`
-  → **What to build:** Promote `AGENT_MODEL` from a string constant
-    (`lib/agents/base.ts:7`) to an environment variable (`AGENT_MODEL_ID`)
-    with a default. Do the same for the intent classifier model
-    (`lib/agents/intent.ts:16`).
-  → **Why it earns its place:** "How do you handle model deprecation?" is
-    a standard interview question for an Anthropic-shaped product. Right
-    now the answer is "I edit two files and redeploy." Env-driven IDs
-    make rollback safe and shop-around easy.
-  → **Files to touch:** `lib/agents/base.ts:7`, `lib/agents/intent.ts:16`,
-    `README.md` (env var doc), and any test that asserts the model string.
-  → **Done when:** `process.env.AGENT_MODEL_ID` overrides both, defaults
-    match today's IDs, and `npm test` passes.
-  → **Estimated effort:** `<1hr`
+  → **Exercise ID:** B1.1 (curriculum: token streaming foundation)
+  → **What to build:** Add an optional streaming path to `AnthropicModelProviderAdapter` (a new `streamComplete(request): AsyncIterable<ModelContentBlock>` method) and an opt-in flag at the route layer that switches the recommendation agent to stream its rationale as it's generated. Keep the non-streaming `complete()` for everything else.
+  → **Why it earns its place:** the recommendation rationale is the most user-visible piece of generated text in the app — streaming it would cut perceived latency from ~12s to first-token in <1s. Forces you to design around stream cancellation + structured-output parsing on partial tokens.
+  → **Files to touch:** `lib/agents/aptkit-adapters.ts` (add streaming method), `lib/agents/recommendation.ts` (opt-in flag), `app/api/agent/route.ts` (route streaming tokens onto the existing NDJSON `AgentEvent` channel as a new `text_delta` event), `components/investigation/RecommendationCard.tsx` (render partial tokens).
+  → **Done when:** opening the recommend step shows the rationale text appearing token-by-token, the tests around `parseRecommendations` still pass on the full final text, and `req.signal` cancellation cleanly aborts an in-flight stream.
+  → **Estimated effort:** 1–2 days.
 
 ## Interview defense
 
-**Q: How does blooming insights talk to Claude?**
+**Q: "What's actually happening when your monitoring agent runs?"**
+
+Six tool calls, each one is a round-trip: build a prompt with the conversation-so-far and the tool schema, call `anthropic.messages.create()`, get back content blocks. If the model emitted a `tool_use` block, execute the EQL through the `DataSource`, feed the result back as a `tool_result` content block, loop. The model itself is stateless — every call rebuilds the whole context.
 
 ```
-  Adapter pattern: AptKit doesn't know about Anthropic.
+  one agent run = N LLM calls, stateless each time
 
-  ┌─ AptKit agent loop ───┐    ┌─ adapter ───────────┐   ┌─ Anthropic SDK ┐
-  │  needs ModelProvider  │ ──►│ AnthropicModel-     │──►│ messages.create│
-  │  interface            │    │  ProviderAdapter    │   │                │
-  └───────────────────────┘    │ (~30 LOC, 1 method) │   └────────────────┘
-                               └─────────────────────┘
+  call 1: [system + user]                          → text + tool_use
+  call 2: [system + user + assistant + tool_result] → text + tool_use
+  call 3: [system + ... + tool_result + tool_result] → text + tool_use
+  ...
+  call N: [system + everything] → text (final answer)
 ```
 
-One adapter class, one method. AptKit's `ModelProvider` interface is what we
-implement; AptKit calls `complete(request)` and gets a `ModelResponse` back.
-Swap the adapter, swap the provider — the agents don't know.
+*Anchor: "The LLM is a stateless function — the loop is on my side, the SDK is in `aptkit-adapters.ts:42`."*
 
-**Anchor line:** "The model is `claude-sonnet-4-6` for the four real agents and
-`claude-haiku-4-5-20251001` for the intent classifier; the adapter is 30 lines
-and that's the only place we touch the Anthropic SDK."
+**Q: "Why are you logging `response.usage` from inside the adapter?"**
 
-**Q: Why a separate model for the intent classifier?**
+The adapter is the only place every LLM call funnels through, so it's the only place I can guarantee per-call telemetry without instrumenting every agent. Both monitoring and intent classifiers emit a JSON line with `{ site, sessionId, usage }`. Vercel log filter on `site` gives me per-agent token volume. It's not a real observability story — see `05-evals-and-observability/04-llm-observability.md` — but it's the cheap version that works today.
 
-Cost and latency. Intent classification is a one-shot, no-tools, ~500-token-in /
-~50-token-out call. Sonnet would cost ~10x more per call for a task where a
-cheaper model is good enough. Haiku 4.5 is ~$1/M input vs Sonnet's ~$3/M, and
-faster end-to-end. Same adapter, different model id at construction time
-(`lib/agents/intent.ts:28-34`).
-
-**Anchor line:** "Sonnet for reasoning, Haiku for triage."
-
-**Q: What's the load-bearing thing people forget about the model layer?**
-
-The model is **stateless**. Every call ships the whole conversation. That one
-fact explains:
-
-  → why context-window management matters (the history grows every turn),
-  → why prompt caching helps (you re-ship the same prefix every turn),
-  → why "memory" is a layer you build, not something the model has,
-  → why a 300s route budget gets eaten by a 6-turn loop (each turn re-sends
-    everything the previous turns added).
-
-If a candidate talks about LLMs without naming the stateless function shape,
-they're working from one layer up — they've used LangChain but haven't read
-what `messages.create` actually takes.
+*Anchor: "One log line per LLM call, emitted from the adapter, filterable by `site`."*
 
 ## See also
 
-  → `02-tokenization.md` — what `input_tokens` actually counts
-  → `06-token-economics.md` — what each briefing costs in dollars
-  → `08-provider-abstraction.md` — the `ModelProvider` seam
-  → `04-agents-and-tool-use/01-agents-vs-chains.md` — what the loop AROUND
-    this single call looks like
+  → `02-tokenization.md` — what those `usage.input_tokens` numbers actually measure
+  → `04-structured-outputs.md` — how tool calling enforces a typed output contract
+  → `05-streaming.md` — why this app streams reasoning, not LLM tokens
+  → `08-provider-abstraction.md` — the `ModelProvider` port that lets the adapter be swapped
+  → `04-agents-and-tool-use/01-agents-vs-chains.md` — the loop wrapping this function

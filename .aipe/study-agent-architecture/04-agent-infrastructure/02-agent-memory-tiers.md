@@ -1,62 +1,41 @@
 # Agent memory tiers
 
-*Industry name: agent memory / working / episodic / long-term memory — Industry standard.*
+**Industry standard.** Memory as a dedicated component, separate from the context window. This repo runs **working memory only** — no episodic, no long-term.
 
-Memory as a dedicated component, separate from the context window. This repo has **only working memory** (in-context, per-run) plus a thin episodic cache for replay purposes (`lib/state/investigations.ts`). No long-term memory, no embeddings, no cross-session retrieval.
+## Zoom out, then zoom in
 
-## Zoom out — where this concept lives
-
-Memory tiers sit between the agent and the data layer — they're the storage for "what does this agent know across turns / runs / sessions." In this repo, the only durable storage is the demo-snapshot file and the in-memory state maps; everything else is the per-run context.
+Sits outside the agent loop as a persistent store the agent can read from across turns and (in richer tiers) across runs. Distinct from the context window — the window is the working buffer, memory is the durable substrate.
 
 ```
-  Where memory lives in blooming insights
+  Zoom out — where this concept lives
 
-  ┌─ Per-run (working memory) ────────────────────────────┐
-  │  Anthropic message array (the agent loop's history)    │ ← we are here
-  │  AptKit accumulates per turn; lives in process memory   │
-  │  GONE when the run ends                                 │
-  └────────────────────────────────────────────────────────┘
-  ┌─ Per-session (thin episodic) ─────────────────────────┐
-  │  lib/state/insights.ts (in-memory map, sid-scoped)     │ ← also we are here
-  │  lib/state/investigations.ts (in-memory map + dev file)│
-  │  CLEARED on Vercel instance recycle                     │
-  └────────────────────────────────────────────────────────┘
-  ┌─ Per-deploy (committed snapshot) ─────────────────────┐
-  │  lib/state/demo-insights.json + demo-investigations    │ ← also we are here
-  │  Git-tracked; used for demo mode replay                 │
-  └────────────────────────────────────────────────────────┘
-  ┌─ Long-term (NOT IMPLEMENTED) ─────────────────────────┐
-  │  No vector store. No embeddings. No semantic recall.   │ ← gap
-  └────────────────────────────────────────────────────────┘
+  ┌─ Agent context ─────────────────────────────────┐
+  │  ★ working memory (in-context, this run) ★      │ ← this repo
+  └─────────────────────────────────────────────────┘
+  ┌─ Episodic memory (recent sessions) ─────────────┐
+  │  (not in this repo)                              │
+  └─────────────────────────────────────────────────┘
+  ┌─ Long-term memory (persistent knowledge) ────────┐
+  │  (not in this repo)                              │
+  └─────────────────────────────────────────────────┘
 ```
 
 ## Structure pass
 
-The axis: **how long does this memory live?**
+Layers: working memory (the current run's accumulated messages) → episodic memory (summaries of past runs/conversations, retrieved by relevance) → long-term memory (durable facts, decisions, preferences, stored in a vector or graph DB).
 
-```
-  Tier        Lifetime           In this repo                   Use
-  ──────      ──────────         ────────────                   ───
-  Working     one run            Anthropic message array         loop history
-  Episodic    one session        lib/state/* maps + dev file     UI hydration,
-                                                                  replay
-  Long-term   forever (durable)  NONE                            past investigations,
-                                                                  semantic recall
-  Snapshot    forever (git)      lib/state/demo-*.json           demo mode
-```
+**Axis traced — "what survives the current run?":** in this repo, nothing. The conversation ends, the messages array is garbage-collected, the next investigation starts fresh.
+
+**Seam:** the retrieval boundary at each tier transition. Episodic memory only works if the right past summary is retrieved at the right time, which is RAG inside the agent.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know the cache hierarchy — L1 (per-request, tiny, fast) → L2 (per-session, medium) → L3 (per-deploy, durable). Agent memory tiers are the same shape:
-
-- **Working memory** = L1. The current run's context. Lives in the model's window. Gone when the run ends.
-- **Episodic memory** = L2. Summaries of past runs/conversations, retrieved by relevance to the current task. In this repo, just per-session caches for the UI.
-- **Long-term memory** = L3. Durable facts, decisions, preferences. Stored in a vector DB or graph. Unbounded. **Not in this repo.**
+You know the difference between RAM, an SSD, and cold storage. RAM holds what you're working on right now; the SSD holds your recent files; cold storage holds the archive. Working memory is the RAM equivalent — the message buffer that lives in this run's context. Episodic memory is the SSD — summaries of recent runs, retrieved when relevant. Long-term memory is cold storage — durable facts that survive everything.
 
 ```
-  Memory tiers — by lifetime
+  The three tiers
 
   ┌─ Working (in-context) ─────────────────────────┐
   │  The current task's context. Lives in the      │
@@ -72,171 +51,122 @@ You know the cache hierarchy — L1 (per-request, tiny, fast) → L2 (per-sessio
   └────────────────────────────────────────────────┘
 ```
 
-### Move 2 — walk this repo's actual memory layers
+### Move 2 — step by step
 
-**Tier 1: Working memory (the loop's message array).**
+#### Working memory — what this repo has
 
-Every agent's `runAgentLoop` keeps a `messages: Anthropic.Messages.MessageParam[]` array — that's the working memory. It accumulates the user prompt, each assistant turn, each tool result. From `base-legacy.ts:107-138` (and identically in AptKit's runtime):
+The working memory IS the message accumulator from `02-agent-loop-skeleton.md` — the `messages = [{ role: 'user', content: userPrompt }]` array in `run-agent-loop.js:22`. Every turn appends; the next `model.complete` reads the full array.
 
-```typescript
-const messages: Anthropic.Messages.MessageParam[] = [
-  { role: 'user', content: userPrompt },
-];
-// each turn:
-messages.push({ role: 'assistant', content: res.content });
-// after tool execution:
-messages.push({ role: 'user', content: toolResults });
+The lifecycle: created when `runAgentLoop` is called, lives in JavaScript memory for the duration of that one call (~50-120s for a typical investigation), garbage-collected when the function returns. The route handler's final `controller.close()` ends the stream, the closure capturing the messages array dereferences, the memory is freed.
+
+That's it. There's no flush-to-disk, no save-to-store, no "your last 5 investigations are available." The next time the diagnostic agent runs (whether it's a new investigation or the same anomaly investigated again), it starts with an empty messages array and re-derives everything from scratch.
+
+#### What the 60s tool-call cache IS and ISN'T
+
+`BloomreachDataSource` (`lib/data-source/bloomreach-data-source.ts:122-188`) keeps a 60-second TTL cache keyed by `name:JSON.stringify(args)`. This looks like memory but isn't memory in the agent-memory sense — it's a *tool-result cache* scoped to the data source, not an *agent context* store.
+
+The difference matters. The cache helps when the same agent run (or two concurrent runs) issues the same EQL query — the second issuance returns the cached result instead of re-calling MCP. That's a performance/cost optimization. It doesn't help the agent *remember* what it found — the agent's messages array is still empty at the start of each new run; only the underlying tool results happen to be cached for a minute.
+
+Concretely: two diagnostic investigations of the same anomaly run a minute apart would each construct fresh agent contexts (new messages arrays, new ReAct loops). The model would re-derive the diagnosis from scratch. But the tool calls those investigations make would hit the data-source cache, saving the MCP round-trip cost. The cache lives at the wrong layer to be "memory."
+
+#### Episodic memory — what this repo doesn't have
+
+The episodic version would store a structured summary of each completed investigation:
+
+```ts
+// hypothetical lib/memory/episodic.ts (not implemented)
+interface EpisodicMemory {
+  insightId: string;
+  anomaly: Anomaly;
+  diagnosis: Diagnosis;
+  recommendations: Recommendation[];
+  summary: string;  // model-generated tldr
+  embedding: number[];  // for similarity search
+  createdAt: string;
+}
 ```
 
-Lifetime: one run (one HTTP request, one `agent.scan()` call). Bounded by `maxTurns` and `maxToolCalls`. Gone when the function returns.
+When a new diagnostic investigation starts, the agent (or a wrapper around it) would embed the anomaly's metric + scope + change shape, retrieve the top-3 most similar past episodic entries, and prepend their summaries to the agent's system prompt as "you've investigated similar anomalies before — here's what they found."
 
-This is the only memory most agents have, and for ReAct it's enough — the model can recall every prior tool call within the same loop.
+The win: the model says "this looks like the post-Black-Friday revenue dip we saw 4 weeks ago — the cause was X" instead of re-deriving from scratch. The cost: the vector store dependency the architecture has avoided, plus the embedding pipeline + retention/cleanup policy.
 
-**Tier 2: Episodic cache (per-session in-memory maps + dev file).**
+#### Long-term memory — what this repo really doesn't have
 
-For UI hydration and demo capture, the route handler stores finished investigations in `lib/state/investigations.ts`. Two purposes:
+The long-term version is the agent's accumulated knowledge that survives across all runs, all users, all time. Customer preferences ("this user wants detailed evidence"), system facts ("the team's revenue threshold for an anomaly is 10%"), learned playbooks ("when this category fires, always check the funnel breakdown first").
 
-1. **Cache combined runs.** When `step === null` (capture path), the route saves the full collected event array to a per-session map keyed by `insightId`. Replaying that map serves the investigation back instantly without re-running the agents.
-2. **Persist for the user's session.** When the user navigates between feed and investigation pages, the in-memory map serves the cached investigation (until the Vercel instance recycles).
+For this product, long-term memory would be useful for cross-user personalization (each marketer/analyst gets diagnoses tuned to their attention) or cross-time learning (the system gets better at finding causes after seeing many similar anomalies). Neither is on the roadmap. The closest current substitute is the AptKit category definitions — they're hard-coded preferences about which anomaly types to scan and how (`@aptkit/agent-anomaly-monitoring/.../categories.js`), shipped as code rather than learned per-user.
 
-The "thin" qualifier is critical: this isn't a true episodic memory in the agent sense. The cached investigation isn't *retrieved by relevance to a new task* — it's keyed by exact `insightId`. It's a UI cache that happens to hold past agent outputs, not a tier the agents themselves consult.
+#### The retrieval problem is the load-bearing one
 
-In dev, the map also persists to a gitignored file (`.investigation-cache.json`) so investigations survive restart. In production on Vercel, it's purely in-memory and lost on instance recycle.
+For episodic and long-term memory, the *storage* is straightforward (vector DB or graph DB; pick one). The hard part is retrieval — the right past summary has to come back at the right time, with the right context. That's RAG inside the agent: embed the current task, search the memory store, pick the top-k, place them in the agent's context.
 
-**Tier 3: Snapshot (committed demo files).**
-
-`lib/state/demo-insights.json` and `demo-investigations.json` are git-tracked snapshots of one captured live run. The demo mode replays these files as if they were live agent output — the only purpose is presentation reliability (`bi:mode === 'demo'`). The agents themselves never read these files.
-
-**Tier 4: Long-term memory — NOT IMPLEMENTED.**
-
-There is no vector store, no embedding pipeline, no semantic-recall layer. The agents on each new investigation start from scratch — they don't know what past anomalies looked like, what past diagnoses concluded, or what past recommendations the user followed.
-
-The natural case for adding it: a feature like "have we seen this kind of anomaly before?" or "what did we recommend last time conversion dropped 18% on mobile?" Both would benefit from a semantic search over past investigations. The implementation would be:
-
-- Embed each finished investigation (anomaly + diagnosis + recommendations) at the time of save
-- Store in pgvector (adds Postgres — currently no DB at all)
-- Add a `vector_search` tool to the diagnostic agent's (`DiagnosticAgent`) tool grant
-- Update the prompt to encourage "check past investigations first"
-
-The cost: one new dependency (pgvector + Postgres), one new pipeline (embed-on-save), the maintenance of the corpus (re-embed when the embedding model changes). The win: each investigation can ground in prior ones; the system gets smarter over time.
-
-### Move 2.5 — current state vs the three-tier model
-
-The product as it is now is at the *minimum viable* point on the memory axis — only working memory + thin episodic for UI. The next step toward "three-tier model" is adding long-term memory.
-
-```
-  Current state vs full three-tier
-
-  TODAY:
-  ┌─ working (per-run) ──────────┐  ← all agent reasoning lives here
-  │  Anthropic message array      │
-  └───────────────────────────────┘
-  ┌─ episodic (UI cache only) ────┐  ← not agent-readable; just UI hydration
-  │  per-session in-memory map     │
-  └────────────────────────────────┘
-  ┌─ long-term ───────────────────┐
-  │  NOT IMPLEMENTED               │
-  └────────────────────────────────┘
-
-  HYPOTHETICAL (full three-tier):
-  ┌─ working (per-run) ──────────┐
-  │  Anthropic message array      │  same as today
-  └───────────────────────────────┘
-  ┌─ episodic (cross-session) ────┐
-  │  pgvector index over past      │  upgrade: agent-readable, not just UI
-  │  investigations                 │
-  │  retrieved by similarity to     │
-  │  current anomaly                │
-  └────────────────────────────────┘
-  ┌─ long-term (durable facts) ───┐
-  │  pgvector index over Bloomreach│
-  │  product docs + marketer guides│
-  └────────────────────────────────┘
-```
+The retrieval problem inherits all of `02-agentic-retrieval/`'s patterns — agentic RAG (the agent decides to query memory mid-loop), self-corrective RAG (grade the memory chunks for relevance before trusting them), retrieval routing (pick which memory tier to query). Adding memory means adding a retrieval substrate, which means adding agentic-RAG complexity. The "tier" framing makes it look like a storage decision; the implementation is mostly a retrieval decision.
 
 ### Move 3 — the principle
 
-The retrieval problem is the load-bearing one. Long-term memory only works if the right thing is retrieved at the right time — which is RAG inside the agent (see `../02-agentic-retrieval/01-agentic-rag.md`). Adding a memory tier without the retrieval discipline gives you a write-heavy store nobody reads.
-
-The right way to think about memory tiers: each tier is a tradeoff between freshness (working is hottest, long-term is coldest) and coverage (working sees one run, long-term sees everything). The product question is which freshness/coverage point your task lives at.
-
-## In this codebase
-
-**Partial.** Working memory is in the kernel; episodic exists as a UI cache (not agent-readable); long-term doesn't exist.
-
-The case for adding cross-session episodic memory (semantic recall over past investigations): when the product needs to ground new investigations in prior ones — "we've seen this kind of revenue drop before and the cause was X." Today every investigation starts from zero. Adding the tier would change "an analyst who restarts every conversation" into "an analyst who remembers patterns" — that's the qualitative shift it would unlock.
-
-What would change in the codebase:
-1. Add Postgres + pgvector (currently no DB)
-2. Embed-on-save hook in `lib/state/investigations.ts`
-3. New tool: `search_past_investigations(query, top_k)` in the DiagnosticAgent's tool grant
-4. Prompt update: "check past investigations first" instruction
+**Memory is a tiered storage decision dressed as an architecture decision.** Working memory is mandatory (you can't have a multi-turn loop without an accumulator). Episodic and long-term memory are escalations that earn their cost when cross-run reuse is real. For this product (one-off investigations, no cross-user personalization, no learned playbooks), working-memory-only is the right call. The escalation point: when users start noticing the agent re-derives the same conclusions across similar anomalies, episodic memory pays for itself. When users want personalization, long-term memory does.
 
 ## Primary diagram
 
-The four tiers in this repo with what each holds:
-
 ```
-  Memory in blooming insights — by tier
+  Memory tiers in this repo (only the first is live)
 
-  ┌─ Tier 1: working memory ─────────────────────────────────┐
-  │  Anthropic message array inside runAgentLoop              │
-  │  contents: user prompt, assistant turns, tool results     │
-  │  lifetime: one run                                        │
-  │  bounded by: maxTurns + maxToolCalls                      │
-  │  agent-readable: YES (this IS the agent's context)        │
-  └──────────────────────────────────────────────────────────┘
+  ┌─ Working memory (LIVE) ───────────────────────────────────────┐
+  │  messages: Anthropic.MessageParam[]                           │
+  │   - lives in runAgentLoop closure                             │
+  │   - grows turn by turn (assistant + user/tool_result blocks)  │
+  │   - garbage-collected when the loop returns                   │
+  │   - capped indirectly via maxTurns (8) and per-turn maxTokens │
+  │  Anchor: run-agent-loop.js:22, run-agent-loop.js:48,104       │
+  └───────────────────────────────────────────────────────────────┘
 
-  ┌─ Tier 2: episodic cache (UI hydration only) ──────────────┐
-  │  lib/state/insights.ts + investigations.ts (in-memory map) │
-  │  contents: collected AgentEvent arrays per insightId       │
-  │  lifetime: one Vercel instance / one dev session           │
-  │  bounded by: nothing (LRU not implemented)                 │
-  │  agent-readable: NO (UI cache, not agent input)            │
-  └──────────────────────────────────────────────────────────┘
+  ┌─ Episodic memory (NOT IN REPO — what it would look like) ─────┐
+  │  vector store of past completed investigations                 │
+  │   - per-investigation summary + diagnosis + recommendations    │
+  │   - embedded for similarity search                             │
+  │   - retrieved at start of new investigation: top-3 similar     │
+  │     past entries prepended to system prompt                    │
+  │  Anchor: hypothetical lib/memory/episodic.ts                   │
+  └───────────────────────────────────────────────────────────────┘
 
-  ┌─ Tier 3: snapshot (committed) ────────────────────────────┐
-  │  lib/state/demo-*.json                                     │
-  │  contents: one captured live run, replayed as demo         │
-  │  lifetime: git                                             │
-  │  agent-readable: NO (presentation reliability, not memory) │
-  └──────────────────────────────────────────────────────────┘
+  ┌─ Long-term memory (NOT IN REPO — what it would look like) ────┐
+  │  durable knowledge store (vector or graph)                     │
+  │   - per-user preferences (verbosity, focus areas)              │
+  │   - learned playbooks (which queries answered past anomalies)  │
+  │   - system facts (custom thresholds, business definitions)     │
+  │  Anchor: hypothetical lib/memory/longterm.ts                   │
+  └───────────────────────────────────────────────────────────────┘
 
-  ┌─ Tier 4: long-term memory ─ NOT IMPLEMENTED ──────────────┐
-  │  Would need: vector store, embedding pipeline, vector_search│
-  │              tool, prompt update                            │
-  │  Use case: ground new investigations in past similar ones   │
-  └──────────────────────────────────────────────────────────┘
+  Note: BloomreachDataSource's 60s tool-call cache is NOT memory —
+  it's a data-source-layer cache that helps with repeat tool calls
+  within ~1 minute. The agent's context starts empty on every run.
 ```
+
+## Elaborate
+
+The three-tier model is the standard agent-memory taxonomy in production systems (LangChain's `ConversationBufferMemory` / `ConversationSummaryMemory` / vector-store retrieval roughly maps to the three tiers; LangGraph's checkpointing is closer to working + episodic; CrewAI's `EntityMemory` is the long-term equivalent). The cross-framework convergence on this taxonomy is meaningful — the same problem keeps producing the same answer.
+
+The two-layer split (working + long-term) you sometimes see in older agent literature is a simplification that elides episodic. The episodic tier matters specifically when "remembering recent sessions" is a different problem from "remembering durable facts" — for chat agents (each conversation is one session you want to recall in context across messages) and for personal assistants (last week's preferences matter more than last year's). For task agents like this repo (each investigation is one-off, no within-conversation memory across turns at the user-facing level), episodic is the tier that would matter first.
+
+The retention/cleanup policy is the unsexy but critical part of any memory implementation. Working memory cleans itself up automatically (garbage collection). Episodic memory needs a TTL or a size cap to prevent unbounded growth. Long-term memory needs a relevance-based eviction policy (drop facts the model has never retrieved). Forgetting to design retention is how memory implementations turn into unbounded vector stores nobody cleans up.
 
 ## Interview defense
 
-**Q: "What memory does your agent system have?"**
+> **Q: How does this codebase handle memory?**
+>
+> Working memory only. Every agent run's context is the messages array inside `runAgentLoop` — created at the start of the call, grown turn by turn with assistant responses and tool results, garbage-collected when the loop returns. There's no episodic store (no "recent investigations summary"), no long-term store (no user preferences, no learned playbooks). The 60s tool-call cache in `BloomreachDataSource` looks like memory but isn't agent memory — it's a data-source-layer cache that helps with repeat tool calls within ~1 minute. The agent's context starts empty on every new run regardless of the cache.
 
-A: Working memory only, plus a thin per-session UI cache. The agent loop's message array is the working memory — every assistant turn and tool result accumulates within one run, bounded by `maxTurns + maxToolCalls`, gone when the run returns. The per-session cache in `lib/state/investigations.ts` is *not* agent-readable — it's a UI hydration cache for instant page loads, not a memory tier the agents themselves consult. No long-term memory, no embeddings, no cross-session recall. Every investigation starts from scratch.
+> **Q: Why no episodic memory?**
+>
+> Two reasons. The architecture intentionally avoids a vector store dependency — adding episodic memory means adding the vector pipeline. And the use case hasn't surfaced as a measured problem yet. If users started reporting "the agent re-derives the same conclusions across similar anomalies every time," that's the signal to add episodic memory — embed past `Diagnosis` outputs, retrieve top-3 similar past investigations at the start of a new one, prepend their summaries to the agent's system prompt. The implementation cost is moderate (one vector store + one retrieval call); the win compounds over time as the corpus of past investigations grows.
 
-The case for adding long-term memory: when "have we seen this kind of anomaly before" becomes a feature. Today every investigation is independent — adding semantic recall over past investigations would let the diagnostic agent ground its hypotheses in prior cases. The implementation would be pgvector + an embed-on-save hook + a `search_past_investigations` tool in the DiagnosticAgent's grant. The cost is real (one new dependency, one new pipeline, corpus maintenance); the win is qualitative (an analyst that remembers vs an analyst that restarts).
-
-Diagram I'd sketch:
-
-```
-  what we have:        what we'd add:
-  ┌─ working ─┐        ┌─ episodic (cross-session, agent-readable) ─┐
-  │ per-run   │        │ pgvector over past investigations          │
-  │ in-context│        │ retrieved by similarity to current anomaly │
-  └───────────┘        └────────────────────────────────────────────┘
-
-  ┌─ UI cache ─┐       ┌─ long-term (corpus) ─────────────────────┐
-  │ per-session│       │ pgvector over Bloomreach docs + guides   │
-  │ NOT agent- │       │ retrieved as reference knowledge          │
-  │ readable   │       └───────────────────────────────────────────┘
-  └────────────┘
-```
-
-Anchor: "the load-bearing decision isn't 'add memory' — it's 'add RAG over memory.' A write-heavy memory store with no retrieval discipline is just a log nobody reads. The agent has to be able to ask for it."
+> **Q: What's the retrieval problem that makes memory hard?**
+>
+> Storage is easy — vector DB or graph DB, pick one. The hard part is the right past summary coming back at the right time. That's RAG inside the agent — embed the current task, search the memory store, pick the top-k, place them in the context. Adding memory inherits every problem from agentic retrieval — the chunks might be irrelevant (need self-corrective RAG), the right memory tier might not be obvious (need retrieval routing), the agent might re-derive instead of trusting the memory (need prompt-level instruction about how to use memory). The framing "memory is storage" hides that the implementation is mostly a retrieval problem.
 
 ## See also
 
-- [`01-context-engineering.md`](./01-context-engineering.md) — memory tiers determine what's available to inject into context
-- [`../02-agentic-retrieval/01-agentic-rag.md`](../02-agentic-retrieval/01-agentic-rag.md) — the retrieval discipline that makes memory useful
-- ai-engineering's `agent-memory` file (cross-ref) — the two-layer short/long split; this file extends it to three tiers
+- → `01-context-engineering.md` — working memory IS the context engineering boundary for one run
+- → `02-agentic-retrieval/01-agentic-rag.md` — what retrieving from episodic / long-term memory looks like
+- → `02-agentic-retrieval/03-retrieval-routing.md` — how an agent picks which memory tier to query
+- → cross-reference (when generated): `study-ai-engineering`'s agent-memory file — the two-layer short/long split this file extends

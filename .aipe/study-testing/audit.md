@@ -1,355 +1,347 @@
-# audit.md — the 7-lens testing audit
-*Pass 1 of the two-pass output. Each lens is walked against this repo with `file:line` grounding or honest `not yet exercised`. Significant patterns cross-link into Pass 2 files.*
+# audit.md — testing & correctness, 7-lens walk
 
-The suite: `npm test` → vitest → 24 files, 221 tests, all passing. Node
-environment, `test/**/*.test.ts` include glob. See `vitest.config.ts:6-14`
-and `package.json:25`.
+A blunt scan of what the 24 vitest files (221 tests, all passing) cover
+and what they don't. Verdict-first per lens; cross-links to Pass 2
+patterns where a finding is load-bearing enough to earn its own file.
 
----
+## 1. what-is-tested-and-what-isnt
 
-## 1. what-is-tested-and-what-isnt — the risk map
+**Verdict: backend logic is well-covered; the UI is naked.** The 221
+tests sit on top of `lib/` — the agent loop, the MCP boundary,
+validators, derived insight fields, the streaming kernel, the state
+maps, and three API routes. The whole React layer — 19 components,
+4 hooks, 3 page routes — has zero automated tests.
 
-Not a coverage percentage. The **risk** map.
-
-```
-  layer                     tests?              the honest read
-  ─────────────────────     ───────────────     ──────────────────────────
-  React components          ZERO                no .test.tsx anywhere;
-  (components/**)                               UI verified by eye
-  Next.js routes            integration only    briefing + agent routes
-  (app/api/**)              (mocked SDK + DS)   covered; mcp/* routes
-                                                largely unaudited
-  Agent loops               TDD'd with fakes    base-legacy.runAgentLoop
-  (lib/agents)              (8 it() in          control flow fully tested
-                            base.test.ts)
-  MCP client + transport    deep unit           cache, ttl, rate-limit,
-  (lib/mcp/client.ts,                           retry, timeout, error
-   lib/mcp/transport.ts)                        enrichment all asserted
-  Auth (OAuth + cookies)    deep unit           token round-trip, PKCE,
-  (lib/mcp/auth.ts)                             state CSRF, AES-256-GCM
-                                                cookie crypto
-  Schema parsing            fixture-driven      see lens 2 deep walk +
-  (lib/mcp/schema.ts)                           Pass 2 file 02
-  Validators                acceptance + per-   see lens 5 + Pass 2
-  (lib/agents/                gate rejection    file 04
-   legacy-validate.ts)
-  Streaming framing         deep unit           NDJSON parse,
-  (lib/streaming/                               reassembly, cancellation
-   ndjson.ts)
-  Insight derivation        unit                derive.test.ts (11 it())
-  (lib/insights/derive.ts)
-  Data source adapters      unit                SyntheticDataSource +
-  (lib/data-source)                             makeDataSource factory
-```
-
-**The red flag check:** is the most-important / most-complex code the
-least tested?
-
-Mostly no. The agent loop (the trickiest control flow in the repo) has
-the deepest unit coverage. The Bloomreach data envelope (the most
-brittle integration point) is pinned by eight captured fixtures. The
-auth round-trip (the load-bearing security primitive) has its own
-isolated env-stubbing dance.
-
-The honest miss: **components are 100% untested.** That's a deliberate
-choice for a one-engineer app in active visual flux — every component
-test today would be rewritten next week — but it's a real risk. A wiring
-regression in `StatusLog` or `EvidencePanel` ships without a red.
-
----
-
-## 2. test-design-and-levels — the pyramid as built
+The risk map, worst-first:
 
 ```
-  pyramid as-built — measured by it() count
-
-         ┌──────────────────┐
-         │   integration    │   17 it() across briefing + agent routes
-         │   (mocked SDK)   │   (test/api/*.integration.test.ts)
-       ┌─┴──────────────────┴─┐
-       │                      │
-       │       unit           │   204 it() across agents, mcp, state,
-       │   (faked seams)      │   insights, streaming, data-source
-       └──────────────────────┘   (test/{agents,mcp,state,insights,
-                                   streaming,data-source}/*)
-
-         no e2e tier (intentional — no browser driver in the project)
+  what                                       tests   risk if it breaks
+  ─────────────────────────────────────────  ─────   ──────────────────
+  React components (InsightCard, Evidence-      0    silent UI regressions;
+    Panel, RecommendationCard, ReasoningTrace,        the surface users see
+    ToolCallBlock, StatusLog, ...)                    has no safety net
+  React hooks (useInvestigation,                 0    StrictMode double-mount
+    useBriefingStream, useReconnectPolicy,             bugs, race conditions,
+    useDemoCapture)                                    sessionStorage drift
+  app/api/mcp/{callback,reset,tools,            0    auth callback bugs land
+    capture,capture-demo}/route.ts                     in production silently
+  app/page.tsx + app/investigate/[id]/         0    page wiring untested
+    {page.tsx, recommend/page.tsx}
+  ───────────────────────────────────────────────────────────────────────
+  ✓ runAgentLoop (lib/agents/base-legacy)        8    well-covered
+  ✓ Monitoring/Diagnostic/Recommendation/        23   well-covered
+    Query agents (4 files, scan+propose+
+    investigate+answer)
+  ✓ McpClient cache + rate-limit + retry         14   well-covered
+  ✓ SdkTransport + redaction + timeout           15   well-covered
+  ✓ Validators (parseAgentJson, isAnomalyArray,  25   well-covered
+    isDiagnosis, isRecommendationArray)
+  ✓ Schema bootstrap on real fixtures            24   well-covered
+  ✓ /api/briefing + /api/agent integration       17   well-covered
+  ✓ Insight + investigation state isolation      16   well-covered
+  ✓ AgentEvent NDJSON codec round-trip            7   well-covered
+  ✓ readNdjson streaming kernel                   5   well-covered
 ```
 
-The shape is right-side-up: unit-heavy, integration-thin, no e2e.
+The most important and most complex code (the agent loop, the MCP
+client, the streaming codec) is the *most* tested. That's the right
+shape. The gap is at the *top* of the stack — the UI, where most of
+the user-visible behaviour lives.
 
-**Where mocking earns its keep — and where it could rot.** The shared
-helpers in `test/api/_helpers.ts:68-84` build a class-shaped Anthropic
-mock that satisfies `new Anthropic(...)` (the route does it inside the
-handler, so a `vi.fn()` factory fails — needs a real class). The mock
-queue (`anthropicQueue`) is module-shared state, hand-cycled by
-`resetAnthropicQueue()` in every `beforeEach`. Brittle? A little — a
-test that forgets the reset poisons the next one — but it's the
-cheapest way to drive multi-turn flows through a route that constructs
-its own client.
+→ Pattern files relevant: `01-injected-fake-anthropic-client.md` shows
+  how the well-covered half stays deterministic;
+  `04-real-fixture-snapshot-test.md` shows the schema-bootstrap
+  pinning.
 
-**The smell to watch:** integration tests that mock the MCP transport
-ALSO mock the data source factory (`vi.mock('../../lib/data-source')`)
-to remap onto the same `currentMcp` state — see
-`test/api/briefing.integration.test.ts:66-87`. Two mocks pointing at one
-state machine works, but if a third seam gets added (a `makeBriefing`
-factory, say) the indirection will start to bend. Flag it; don't fix it
-yet.
+## 2. test-design-and-levels
 
-→ see `01-scripted-anthropic-harness.md` for the injected-fakes pattern deep walk.
+**Verdict: the pyramid is sound where it exists — unit-heavy with
+focused integration on the two streaming routes.** No e2e at all.
 
----
+```
+  the as-built pyramid
 
-## 3. tests-as-design-pressure — what the testability tells you about the design
-
-The agent classes (`MonitoringAgent`, `DiagnosticAgent`,
-`RecommendationAgent`) take their dependencies via constructor:
-
-```ts
-// lib/agents/monitoring.ts:73-80
-export class MonitoringAgent {
-  constructor(
-    private anthropic: Anthropic,
-    private dataSource: McpCaller,
-    private schema: WorkspaceSchema,
-    private allTools: McpToolDef[],
-    private sessionId?: string,
-  ) {}
+  ┌─ E2E ────────────────────────────────────────┐
+  │  (none)                                        │
+  └────────────────────────────────────────────────┘
+  ┌─ Integration (~17 tests) ────────────────────┐
+  │  /api/briefing + /api/agent — real route,    │
+  │  mocked Anthropic SDK, mocked connectMcp,    │
+  │  scripted DataSource. Asserts on NDJSON      │
+  │  event sequence, status codes, phase logs.   │
+  └────────────────────────────────────────────────┘
+  ┌─ Unit (~204 tests) ──────────────────────────┐
+  │  agents, MCP client, validators, schema,     │
+  │  state, streaming, derive, data-source       │
+  └────────────────────────────────────────────────┘
 ```
 
-This is constructor injection, and the tests prove it works: tests pass
-plain-object fakes for `anthropic` and `dataSource` (see
-`test/agents/base.test.ts:51-83`) — no global state, no module-level
-singletons to reset, no `jest.mock` gymnastics inside the agent itself.
-The agent-facing port (`McpCaller`, at `lib/agents/base.ts:14`) is
-deliberately narrowed to `Pick<DataSource, 'callTool'>` — the agent only
-needs the one method, so the fake only has to implement one method.
+The mock surface in the integration tests is precise: only the
+*boundary* dependencies (the Anthropic SDK, the connect / session
+modules) are mocked. The real route handler, real `runAgentLoop`, real
+`bootstrapSchema`, real `parseAgentJson`, real `McpClient` rate-limit
+all run. That's the inversion of "mock-everything" anti-pattern — the
+mocks are at the edges, the code under test is the middle.
 
-**This is the design lesson the testability surfaces.** Where the
-boundary is sharp, the test is cheap. Where it's blurry, the test pays
-in setup.
+Watch out: the agent tests (`test/agents/*.test.ts`) and the
+integration tests carry near-duplicate `buildFakeAnthropic` /
+`buildFakeMcp` helpers. The integration tests centralized into
+`test/api/_helpers.ts` (good); the per-agent tests re-declare them
+in-file (drift risk if one tweaks the Message shape and the other
+doesn't). One central helper would close that gap.
 
-Counter-example: the route handlers construct their own
-`new Anthropic({ apiKey })` inside the handler body. That's why the
-integration tests have to use a module-level `vi.mock('@anthropic-ai/sdk',
-...)` with a class shim. The mock works, but it's a sign the route
-itself is mildly testability-hostile — passing an `Anthropic` instance
-in via a function parameter would make the integration test as simple
-as the unit test. Today's tradeoff (route owns the client construction)
-is fine; the test cost is real and worth naming.
+→ See `01-injected-fake-anthropic-client.md` for the kernel.
 
-Deep deep modules vs shallow tests is the `study-software-design` lens
-— don't restate it here.
+## 3. tests-as-design-pressure
 
----
+**Verdict: the design is testable because seams were extracted
+deliberately.** Two examples that pay rent:
+
+  → `McpCaller` (`lib/agents/base.ts:14`) — the agent-facing port. The
+    full `DataSource` can `listTools()`, but the agent loop only needs
+    `callTool`. Narrowing the type makes `buildFakeMcp` a one-liner;
+    the test never has to stand up a fake `listTools` it'll never
+    call. The seam was extracted *because* tests needed it.
+
+  → `McpClient` constructor takes an `McpTransport`
+    (`lib/mcp/client.ts`), and `SdkTransport` wraps the real
+    `@modelcontextprotocol/sdk` `Client`. The test substitutes a fake
+    transport in seven lines (`test/mcp/client.test.ts:5-12`). No
+    network, no SDK, no nock — the seam IS the substitution.
+
+```
+  Why these seams pay off — the substitution shape
+
+  ┌─ Real path ──────────────────────────────────┐
+  │  agent  →  McpClient  →  SdkTransport  →     │
+  │                          @mcp/sdk Client  →  │
+  │                          loomi MCP server    │
+  └─────────────────────────────────────────────┘
+                                ▲
+                                │  substituted here in tests
+                                │
+  ┌─ Test path ──────────────────────────────────┐
+  │  agent  →  buildFakeMcp({ callTool })        │
+  │            ↑                                  │
+  │            McpCaller — the narrowest port    │
+  └─────────────────────────────────────────────┘
+```
+
+→ See `02-mcp-as-callable-port.md`.
+
+One spot where the design *isn't* testable enough to bother yet: the
+React hook layer. `useInvestigation` (`lib/hooks/useInvestigation.ts`)
+needs a `@testing-library/react` setup that doesn't exist yet, plus a
+fake `EventSource`-style stream — it's not impossible, it's
+unfounded. That's a coverage gap (lens 1), not a design smell.
 
 ## 4. determinism-isolation-and-flakiness
 
+**Verdict: deterministic by construction. Three patterns earn the
+calm:**
+
+  → **Injected fakes for every external system.** Anthropic SDK never
+    contacted (every test in `test/agents/`). MCP server never
+    contacted (every test in `test/mcp/`). `fetch` stubbed via
+    `vi.stubGlobal` (`test/mcp/transport.test.ts:18`). No network in
+    the entire 6.2-second run.
+
+  → **Fake timers for the rate-limit / retry tests.** `vi.useFakeTimers()`
+    drives the 200ms `minIntervalMs`, the 10s `(1 per 10 second)`
+    retry-after parser, and the 7s `Retry after ~N seconds` hint
+    (`test/mcp/client.test.ts:60-77, 111-167`). The 30-second
+    `TOOL_TIMEOUT_MS` is asserted via synchronous rejection rather
+    than real elapsed time (`test/mcp/transport.test.ts:107-125`).
+
+  → **Tracked env stubbing.** `vi.stubEnv('AUTH_SECRET', ...)` +
+    `vi.unstubAllEnvs()` in `afterEach` (`test/mcp/auth.test.ts:117-122`).
+    The comment is explicit about why: direct mutation leaked across
+    parallel workers and made the block flaky.
+
 ```
-  isolation discipline                where it lives
-  ───────────────────────────         ──────────────────────────────────
-  vi.useFakeTimers / advance          test/mcp/client.test.ts:49-58
-    (cache ttl, rate limit)           test/mcp/client.test.ts:60-92
-  vi.stubEnv + unstubAllEnvs          test/mcp/auth.test.ts:117-122
-    (per-test env vars)               (the AUTH_SECRET cookie crypto block)
-  vi.stubGlobal('fetch', ...)         test/mcp/transport.test.ts:19-25
-    + vi.unstubAllGlobals in          test/mcp/transport.test.ts:11-13
-    afterEach                         (capturing-fetch tests)
-  module-scope mocks reset            test/api/_helpers.ts:52-55
-    per-test (anthropicQueue,         test/api/*.integration.test.ts
-    currentMcp, currentConn,          beforeEach blocks
-    currentSessionId)
-  schema cache reset                  test/api/briefing.integration.test.ts:97
-    (_resetSchemaCache)               (bootstrapSchema memoizes — without
-                                       this, test 2 skips its own bootstrap)
-  insights map clear                  test/api/*.integration.test.ts
-    (_clear)                          beforeEach
+  Isolation surfaces — pinned with named tools
+
+  process.env          →  vi.stubEnv / vi.unstubAllEnvs
+  global fetch         →  vi.stubGlobal / vi.unstubAllGlobals (afterEach)
+  Date.now / setTimeout→  vi.useFakeTimers / vi.useRealTimers
+  module-level state   →  beforeEach hooks reset queues + caches
+    (anthropicQueue,        (resetAnthropicQueue, _resetSchemaCache,
+     _schemaCache,           _clearInvestigationCache, _clearAuthStore,
+     investigationCache,     _clear)
+     authStore,
+     insights map)
 ```
 
-**No flaky tests observed.** Three rounds of `npm test` all green in
-~6.3s. Suite is fast enough to run on every save.
+Cross-session isolation is *itself* tested
+(`test/state/insights.test.ts:53-80`) — two sessions writing
+concurrently must not overwrite each other. That's the bug the refactor
+was meant to fix, pinned with a test that will fail loudly if anyone
+ever re-introduces it.
 
-The thing the discipline DOESN'T catch: a test that leaks
-`process.env.ANTHROPIC_API_KEY` (set directly in both integration test
-beforeEach blocks at `briefing.integration.test.ts:112` and
-`agent.integration.test.ts:146`). If a future test inspects that env var
-without expecting it to be set, it'll surprise. Fix is the same pattern
-as auth.test.ts — use `vi.stubEnv` + `vi.unstubAllEnvs`.
+→ See `05-tracked-env-stubbing.md`.
 
-→ see `03-vi-stubenv-isolation.md` for the env-isolation pattern deep walk.
-
----
+The one ordering trap to know about: every test that calls
+`bootstrapSchema` MUST call `_resetSchemaCache()` first
+(`test/api/briefing.integration.test.ts:96`). The comment names the
+bug ("the second test would skip the bootstrap callTool path
+entirely"). It's the right fix; it's also the kind of trap that bites
+the next person who adds a new bootstrap test and forgets.
 
 ## 5. edge-cases-and-error-paths
 
-The validators (`lib/agents/legacy-validate.ts`) are the clearest case
-of edge-case discipline in the suite. Every type guard pairs one
-"well-formed accepts" assertion with **one rejection per field**:
+**Verdict: the error paths are the well-tested paths.** The validators
+get 25 tests, most of which are reject-cases (bad severity, bad
+direction, missing fields, non-array, non-object). The agent loop
+has explicit tests for `MCP transport failed` (continues to final
+text), `maxTurns` hit (returns `''`), `maxToolCalls` reached (forces
+final answer without tools). The integration tests cover 401 unauthed,
+404 not found, 200-with-error-event-in-stream, and pre-aborted
+cancellation.
 
-```
-  isAnomalyArray (6 it() in test/mcp/validate.test.ts)
-    ✓ accepts a well-formed anomaly array
-    ✓ accepts an empty array
-    ✗ rejects a non-array
-    ✗ rejects a missing-field object
-    ✗ rejects a bad severity ("huge")
-    ✗ rejects a bad direction ("sideways")
+The standout move is the integration-test cancellation pin:
 
-  isRecommendationArray (8 it()) — same shape: per-field rejection
-    of every enum (bloomreachFeature, confidence) and every required
-    field (title, rationale, steps, estimatedImpact, …)
-```
-
-This is the right discipline for a JSON-from-LLM seam. The LLM will
-produce malformed output eventually; the guard's job is to refuse it
-loudly, and the test's job is to prove that refusal is per-field, not
-overall.
-
-**Error-path coverage on the agent loop:** `base.test.ts:182-214` proves
-the loop **records** a tool error as an `is_error: true` block and
-**continues** to the next turn, where the LLM can recover. That's the
-load-bearing failure-mode contract for the whole agent system — and
-it's tested directly.
-
-**Error-path coverage on the routes:** four error scenarios in
-`briefing.integration.test.ts` — 401 unauthed
-(`briefing.integration.test.ts:203-222`), listTools throws
-(`230-265`), Anthropic SDK throws mid-scan (`275-300`), client cancel
-(`312-345`). Each one asserts the exact error event shape the UI's
-NDJSON consumer parses.
-
-The honest miss: the 6 mcp callback / reset / call routes in
-`app/api/mcp/**` are not exercised by integration tests. The auth
-provider is unit-tested; the routes that wire it together are not.
-
-→ see `04-acceptance-with-per-gate-rejection.md` for the validator pattern deep walk.
-
----
-
-## 6. testing-ai-features — the deterministic harness around a probabilistic core
-
-This is where the seam lives — the most important lens in the audit for
-this repo specifically.
-
-**What IS tested at the AI boundary (deterministic):**
-
-```
-  layer                              tested?     how
-  ───────────────────────            ────        ─────────────────────
-  prompt assembly                    NO          no test reads a prompt
-  (lib/agents/legacy-prompts/*.md)               file and asserts shape
-  tool schema filtering              YES         test/agents/tool-schemas.test.ts
-  (lib/agents/tool-schemas.ts)                   (3 it())
-  tool dispatch (model says          YES         test/agents/base.test.ts
-   "call this tool" → loop                       (it #1: tool then text)
-   actually calls it)
-  budget enforcement                 YES         test/agents/base.test.ts
-   (maxTurns + maxToolCalls)                     (it #4 + #5)
-  forced-synthesis turn              YES         test/agents/base.test.ts
-   (omit tools + append                          (it #8: synthesisInstruction)
-    synthesis instruction)
-  output parsing                     YES         test/mcp/validate.test.ts
-   (parseAgentJson, isAnomalyArray,              (25 it() — every guard
-    isDiagnosis, isRecommendationArray)           with per-field rejection)
-  schema-from-MCP                    YES         test/mcp/schema.test.ts
-   (parseWorkspaceSchema)                        (24 it() — fixtures from
-                                                  the real server)
-  category coverage gate             YES         test/mcp/tool-coverage.test.ts
-   (which monitoring categories                  (8 it())
-    have the tools they need?)
+```typescript
+// test/api/briefing.integration.test.ts:312-345
+const ac = new AbortController();
+ac.abort();                      // pre-abort: deterministic
+const req = new NextRequest(url, { signal: ac.signal });
+const response = await GET(req);
+// asserts: no `done`, no `error`, summary log has aborted: true
 ```
 
-**What is NOT tested at the AI boundary (probabilistic):**
+Pre-aborting sidesteps the race against "did the first chunk land
+before the abort fired?" — it's a tiny detail that turns a flaky test
+into a deterministic one.
+
+What's NOT tested at the error-path level:
+
+  → The five untested MCP routes (`callback`, `reset`, `tools`,
+    `capture`, `capture-demo`) — auth callback bugs and capture-flow
+    failures both fall here.
+  → React error boundaries — none defined in the codebase, no tests
+    for what happens when an `InsightCard` throws mid-render.
+  → The browser-side `fetch + stream reader` consumer paths in
+    `useInvestigation` / `useBriefingStream`. The server emits an
+    `error` event; whether the client handles it correctly is
+    unverified.
+
+## 6. testing-ai-features
+
+**Verdict: this is the lens the repo nails.** Every agent test runs
+the real `runAgentLoop` against a scripted fake of the SDK type
+(`Anthropic.Messages.Message`). The deterministic harness wraps a
+probabilistic core — exactly the seam the spec describes.
 
 ```
-  the model's actual output quality        NO eval harness today
-    → does the diagnosis correctly         no eval set
-       identify the cause?                 no LLM-as-judge
-    → does the recommendation actually     no regression gate on
-       fit the anomaly?                     output drift
-    → does the monitoring agent surface
-       the RIGHT anomalies (not just
-       parseable ones)?
+  Deterministic harness around a probabilistic core
+
+  ┌─ Test (deterministic) ───────────────────────────────────┐
+  │                                                          │
+  │  scripted [msg, msg, msg]  ─►  buildFakeAnthropic        │
+  │                                       │                  │
+  │                                       ▼                  │
+  │                              messages.create()           │
+  │                                       │                  │
+  │  ┌────────────────────────────────────▼───────────────┐  │
+  │  │  real code: runAgentLoop                           │  │
+  │  │    parses content blocks                           │  │
+  │  │    routes tool_use → buildFakeMcp                  │  │
+  │  │    enforces maxTurns / maxToolCalls                │  │
+  │  │    fires onText / onToolCall / onToolResult        │  │
+  │  └────────────────────────────────────────────────────┘  │
+  │                                       │                  │
+  │                                       ▼                  │
+  │                              { finalText, toolCalls }    │
+  │                                       │                  │
+  │  expect(result.finalText).toContain('done')              │
+  │                                                          │
+  └──────────────────────────────────────────────────────────┘
+
+  In production this same loop runs against the real SDK (probabilistic).
+  Every part you can test deterministically is tested here.
 ```
 
-The agent's NDJSON trace (`AgentEvent` stream in `lib/mcp/events.ts`) is
-the inspectable trajectory — every reasoning step, tool call, and tool
-result is captured. Humans read it. No harness scores it. The trace is
-**testable** (the stream contract is unit-tested at
-`test/streaming/ndjson.test.ts`); the **content** of the trace is not
-evaluated.
+The four agents (Monitoring, Diagnostic, Recommendation, Query) each
+have their own test file that exercises:
 
-**The Phase 3 narrative — Case B framing.** An automated eval pipeline
-**did exist**: four-pillar harness (gold dataset + LLM-as-judge calibrated
-by K=10 manual spot-checks + category coverage gate + a BRL-currency
-sentinel that caught a rounding bug before merge), built against the
-Olist e-commerce substrate that lived in the `mcp-server-olist`
-sibling repo. PR #8 on 2026-06-18 removed that substrate; the eval
-pipeline was retired with it. The pattern is real; the substrate is
-gone. Honest claim today: "I shipped and ran a four-pillar eval. I
-retired it deliberately when the substrate changed." Dishonest claim:
-"the repo has evals." It doesn't.
+  → the happy path (scripted JSON parses, returns the parsed shape)
+  → the recovery path (first turn returns prose, second turn returns
+    JSON — `runRecoveryTurn` fires)
+  → the fallback path (both turns fail to parse — fallback shape
+    lands, doesn't throw)
+  → hook firing (`onText`, `onToolCall`, `onToolResult` called the
+    right number of times)
+  → the synthesis instruction (only appended on the forced-final
+    turn — `test/agents/base.test.ts:361-383`)
 
-→ see `05-llm-as-judge-as-testing.md` for why LLM-as-judge is testing
-and `06-eval-flywheel.md` for the retired four-pillar walk.
+The integration tests go a step further: they pin the exact NDJSON
+event sequence the route emits, including the phase-timing log shape
+in the `finally` block. That's the contract the UI hooks depend on,
+and it's mechanically defended.
 
----
+The eval half — the probabilistic side — is the built-and-retired
+arc. The 4-pillar suite + LLM-as-judge ran on the Olist substrate
+during Phase 3, calibrated 8/8 against manual spot-check, surfaced
+three real bugs (the BRL cents-vs-Reais miscount, a binary-calibration
+drift at 29/30, a 30% conclusion-instability rate), and was retired
+with PR #8. The next-version target rides the synthetic data source
+and is owned by `study-ai-engineering`.
 
-## 7. testing-red-flags-audit — consolidated checklist
+→ See `01-injected-fake-anthropic-client.md` and
+  `06-scripted-ndjson-integration-harness.md`.
+
+## 7. testing-red-flags-audit
+
+The consolidated checklist, marked against this repo:
 
 ```
-  red flag                                       this repo
-  ───────────────────────────────────            ─────────────────────
-  most important / most complex code is the     NO (agent loop is the
-   least tested                                  most-tested code)
-  heavy mocking that tests the mock              MOSTLY NO; the
-   not the code                                  Anthropic shim is
-                                                  a real class with
-                                                  scripted output —
-                                                  the loop's control
-                                                  flow is what's
-                                                  asserted, not the
-                                                  mock's internals
-  an inverted pyramid (all e2e, slow, flaky)    NO (no e2e tier)
-  tests that pass/fail on rerun                  NOT OBSERVED (3 runs,
-                                                  all green, ~6s)
-  tests that must run in a specific order        NO (every test
-                                                  initializes its own
-                                                  fixtures in
-                                                  beforeEach)
-  zero tests on error / exception branches       PARTIAL — agent loop
-                                                  error path tested;
-                                                  route error paths
-                                                  tested; mcp/* routes
-                                                  not
-  a test that needs elaborate setup to reach     ONE candidate — the
-   the code                                       integration tests'
-                                                  triple-mock (Anthropic
-                                                  + connect + data-source)
-                                                  for the route handler.
-                                                  Real, justified, but
-                                                  noisy. See lens 3.
-  an LLM feature with no test at the boundary    NO at the wrapper
-   (prompt assembly, tool dispatch, parsing)     (tool dispatch + parse
-                                                  + schema are all
-                                                  tested);
-                                                  YES at the prompt
-                                                  itself (prompt files
-                                                  are not asserted on)
-  no automated check that the model OUTPUT       YES, currently —
-   doesn't regress                                acknowledged gap;
-                                                  shipped-and-retired
-                                                  narrative documented
-                                                  in lens 6 + Pass 2
-                                                  files 05 + 06
-  zero component tests                           YES — deliberate, but
-                                                  the cost lands the
-                                                  day a wiring
-                                                  regression ships
+  red flag                                          status   evidence
+  ────────────────────────────────────────────────  ──────   ──────────
+  Heavy mocking that tests the mock                 ✗ clear  mocks are AT
+                                                              the seams,
+                                                              real code in
+                                                              the middle
+  Tests that pass/fail on rerun                     ✗ clear  221/221, no
+                                                              known flaky
+  Tests that need a specific order                  ⚠ one    schema-cache
+                                                              reset trap
+                                                              (lens 4)
+  Inverted pyramid (all e2e, slow, flaky)           ✗ clear  no e2e at all;
+                                                              6.2s wall clock
+  Zero tests on error/exception branches            ✗ clear  lens 5 is the
+                                                              strong half
+  Most-important code is the least-tested           ✗ clear  inverse —
+                                                              agent loop +
+                                                              MCP client are
+                                                              the MOST tested
+  Untestable code = a design smell                  ✗ clear  McpCaller +
+                                                              McpTransport
+                                                              seams paid for
+                                                              themselves
+  LLM feature with no test at the boundary          ✗ clear  every agent
+                                                              has scripted-
+                                                              SDK tests
+  ────────────────────────────────────────────────  ──────   ──────────
+  The big one: NO React / hook / page tests         ✓ open   the UI layer
+                                                              is the gap
+  Five MCP API routes uncovered                     ✓ open   callback /
+                                                              reset / tools /
+                                                              capture x2
+  Per-agent test helpers duplicated (drift risk)    ⚠ mild   integration
+                                                              tests centralized;
+                                                              agents didn't
+  Eval half not in this folder (Case B)             ✗ clear  built / retired;
+                                                              next-version
+                                                              target lives in
+                                                              study-ai-eng
 ```
 
-**Verdict:** the suite is well-designed for what it covers and honest
-about what it doesn't. The single biggest leverage move is adding back
-an LLM eval (the pattern is on the résumé; the implementation is gone)
-— and naming it as "the next thing" rather than pretending it exists is
-the move that holds up under interview pressure.
+**The top finding (worst-first):** the UI layer has no automated
+testing. 19 components, 4 hooks, 3 page routes, zero tests. The lib
+layer is in great shape; the layer the user actually touches has the
+biggest gap. The constructive move: stand up `@testing-library/react`
++ jsdom, start with the two hooks that own the streaming-consumer
+state (`useInvestigation`, `useBriefingStream`) — those are where the
+race conditions and StrictMode bugs live, and the AgentEvent NDJSON
+contract is already test-pinned on the server side, so a hook test can
+script the same event sequence and assert what the hook does with it.

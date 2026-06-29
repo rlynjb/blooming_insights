@@ -1,158 +1,123 @@
-# Shared state, races, and synchronization
+# Shared State, Races, and Synchronization
 
-**Industry name:** session-keyed in-memory storage · per-request context isolation · **Type:** Project-specific (built on Node primitives)
+**Industry name:** request-scoped state, AsyncLocalStorage, session-keyed state · **Type:** Industry standard
 
-## Zoom out, then zoom in
+## Zoom out — where this concept lives
 
-Two stories here, both at the same seam (module-scope vs per-request):
-
-  1. **The session-keyed `Map<sessionId, SessionFeed>`** at `lib/state/insights.ts:14` — module-scope, shared across all concurrent requests on a warm instance, kept race-safe by *never clearing the outer map* and keying every mutation by `sessionId`.
-  2. **The `AsyncLocalStorage` per-request context** at `lib/mcp/auth.ts:47` — module-scope `AsyncLocalStorage` instance, but every request gets its own isolated `RequestStore` frame inside it.
+A single-threaded JS event loop means no shared-memory races in the OS-thread sense — but the runtime has its own race surface: module-level mutables shared across requests on a warm Vercel instance. This file walks how the repo isolates four classes of state, why it works in three of them, and where it leaks in the fourth.
 
 ```
-  Zoom out — where shared state lives
+  Zoom out — the four state stores in the Node band
 
-  ┌─ band 1: client (no shared state across users) ───────────┐
-  └────────────────────────┬──────────────────────────────────┘
-                           │
-  ┌─ band 2: Node process ★ THIS FILE ★ ─────────────────────┐
-  │                                                           │
-  │  module-scope (shared across requests):                   │
-  │    const state = new Map<string, SessionFeed>()           │
-  │    const mem = new Map<string, AgentEvent[]>()            │
-  │    const requestStore = new AsyncLocalStorage<...>()      │
-  │    const memStore = new Map<string, SessionAuthState>()   │
-  │                                                           │
-  │  per-request (NOT shared):                                │
-  │    ALS ctx = {store, dirty}                               │
-  │    req.signal                                             │
-  │    DataSource instance                                    │
-  │                                                           │
-  └───────────────────────────────────────────────────────────┘
-  ┌─ band 3: providers (don't see our state) ────────────────┐
-  └───────────────────────────────────────────────────────────┘
+  ┌─ Node process (warm instance, may serve many users) ────────────────┐
+  │                                                                     │
+  │  ┌─ class 1: module-level session-keyed Maps ───────────────────┐   │
+  │  │  state (lib/state/insights.ts:14)                            │   │
+  │  │  mem   (lib/state/investigations.ts:11)                      │   │
+  │  │  memStore (lib/mcp/auth.ts:36) — test-only path              │   │
+  │  └──────────────────────────────────────────────────────────────┘   │
+  │  ┌─ class 2: ALS per-request store ─────────────────────────────┐   │
+  │  │  requestStore (lib/mcp/auth.ts:47)                           │   │
+  │  └──────────────────────────────────────────────────────────────┘   │
+  │  ┌─ class 3: per-request instance fields ───────────────────────┐   │
+  │  │  BloomreachDataSource.cache (per-request instance; safe)     │   │
+  │  │  BloomreachDataSource.lastCallAt (per-instance; safe)        │   │
+  │  └──────────────────────────────────────────────────────────────┘   │
+  │  ┌─ class 4: module-level UNKEYED ★ THE LEAK ★ ─────────────────┐   │
+  │  │  cached (lib/mcp/schema.ts:138) — bleeds projectId/Name      │   │
+  │  └──────────────────────────────────────────────────────────────┘   │
+  │                                                                     │
+  └─────────────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in. The hard question is: when two requests run on the same thread interleaved at every `await`, how do we keep them from clobbering each other's state? The answer in this codebase: **partition by `sessionId` in the outer map**, and **isolate per-request context via `ALS.run`**. No locks. The Node event loop's single-threaded model + Map's atomic get/set per microtask = enough.
+Three of those classes are correct; one is the highest-ranked finding in this guide's audit.
 
 ## Structure pass
 
-**Axis: state ownership — who can mutate what, and when?**
+### Axis: who can see this state?
+
+Trace one question — "who else has read access to this Map / variable / field?" — across the four classes.
 
 ```
-  Three altitudes, one question (who owns?)
+  Same one question, four answers — that contrast IS the lesson
 
-  ┌─ outer Map<sessionId, SessionFeed> ────────────────────┐
-  │  owner: the process                                     │  → never .clear()ed,
-  │  only ever .get/.set on individual keys                 │     never iterated mutably
-  └────────────────────┬───────────────────────────────────┘
-                       │  seam: keyed by sessionId
-  ┌─ inner SessionFeed sub-Maps ──────────────────────────┐
-  │  owner: this session's requests only                    │  → putInsights().clear()
-  │  one session's requests may interleave on this         │     wipes ONLY this session
-  └────────────────────┬───────────────────────────────────┘
-                       │  seam: ALS frame
-  ┌─ AsyncLocalStorage ctx ─────────────────────────────────┐
-  │  owner: this REQUEST only                               │  → impossible for another
-  │  no other request can read or write this ctx           │     request to even see it
-  └────────────────────────────────────────────────────────┘
+  class 1 (session-keyed Map) →  anyone with the same sessionId (one user)
+  class 2 (ALS requestStore)  →  anyone inside the same async tree (one request)
+  class 3 (per-request inst.) →  anyone holding this DataSource ref (one request)
+  class 4 (unkeyed cached)    →  EVERY request on this warm instance (any user)
 ```
 
-**Two seams. Two different isolation mechanisms.**
+Class 4's answer is the bug. Every other class scopes visibility to one user OR one request; class 4 scopes to the warm process — which has no relation to user identity. Two different users hitting the same warm instance get each other's `projectId` and `projectName` for as long as the cache lives.
 
-  → Outer Map → inner sub-maps: isolation by **key partitioning**. Two requests with different `sessionId`s touch different sub-maps, no collision possible.
-  → Inner sub-maps → ALS ctx: isolation by **scope**. ALS frames are invisible to anyone outside `ALS.run`'s callback.
+### Seams
 
-The bugs you can plausibly create here are bugs that violate one of those two invariants — touch the outer Map without partitioning, or read `getStore()` outside an ALS frame.
+The relevant seam is **the request boundary**. Above the seam (Vercel-side), each request is independent and the platform may route to any process. Below the seam (Node-side), within one warm process, module-level state survives between requests.
+
+```
+  The request seam — what flips when you cross it
+
+  ┌─ Vercel platform (request as unit) ──────────────────┐
+  │  isolation: 100% — platform routes each independently │
+  └────────────────────────┬─────────────────────────────┘
+                           │
+                           │ (the seam)
+                           │
+  ┌─ Node process (warm instance) ──────▼────────────────┐
+  │  isolation: depends on the developer                  │
+  │  - session-keyed Map → user-isolated ✓                │
+  │  - ALS store          → request-isolated ✓            │
+  │  - per-instance field → request-isolated ✓            │
+  │  - bare `let` global  → NOT isolated ✗ (finding #1)   │
+  └───────────────────────────────────────────────────────┘
+```
+
+The seam doesn't enforce isolation by itself. The code below it has to.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know how `localStorage` in the browser is one big key-value store but you scope per-user by prefixing keys with the user ID? Same idea, scaled to one warm Node process serving many sessions: one big `Map`, every key prefixed by `sessionId`, the *outer* map is treated as effectively immutable (we never `.clear()` it, never iterate it mutably). Mutations only touch the inner sub-maps belonging to one session.
+You know how a singleton DB connection at module level is fine for a single-user CLI but a session bleed waiting to happen in a web server? Same idea here, scaled to every kind of mutable state. The rule that keeps a web server's module-level state safe is: ONE OF (a) make it immutable, (b) key it by session, OR (c) put it inside an ALS context. Pick none of these and you have a leak.
 
 ```
-  Pattern — partition by sessionId, isolate per-request via ALS
+  The three safe shapes — pick at least one
 
-  module scope (process-wide):
-
-   state ───────► Map {
-                     sid_A: { insights: Map{...}, investig: Map{...}, anom: Map{...} }
-                     sid_B: { insights: Map{...}, investig: Map{...}, anom: Map{...} }
-                     sid_C: { insights: Map{...}, investig: Map{...}, anom: Map{...} }
-                   }
-   ▲                ▲
-   │ never          │ each cell owned by one session
-   │ .clear()       │ mutations confined here
-   │ never
-   │ iterated mutably
-
-  request A (sid_A)         request B (sid_B)
-  ─────────────────         ─────────────────
-  state.get(sid_A)          state.get(sid_B)
-  ↓                         ↓
-  s.insights.clear()        s.insights.clear()
-  s.insights.set(...)       s.insights.set(...)
-  ↓                         ↓
-  (no interleaving with B)  (no interleaving with A)
+  ┌─ shape (a): immutable ─────────┐
+  │  const TIMEOUT_MS = 30_000     │ ← fine; everyone reads the same thing
+  └────────────────────────────────┘
+  ┌─ shape (b): session-keyed ─────┐
+  │  Map<sessionId, SessionFeed>   │ ← fine; each user has their own slot
+  └────────────────────────────────┘
+  ┌─ shape (c): ALS-scoped ────────┐
+  │  requestStore.run(ctx, fn)     │ ← fine; each request gets its own ctx
+  └────────────────────────────────┘
+  ┌─ shape (✗): bare mutable ──────┐
+  │  let cached: T | null = null   │ ← leak; whoever wrote it last wins
+  └────────────────────────────────┘
 ```
 
-### Move 2 — the parts and what breaks if you remove each
+The repo gets this right in three places and wrong in one. Both classes are at module level — the difference is the key.
 
-#### Move 2 variant — the load-bearing kernel
+### Move 2 — the moving parts
 
-The kernel is **3 invariants**. Strip any one and the system races.
+#### Shape (b) in action: the session-keyed Map
 
-**Invariant 1: the outer Map is never `.clear()`d, never iterated mutably.**
+The canonical correct pattern in this codebase.
 
 ```ts
-// lib/state/insights.ts:14
+// lib/state/insights.ts:4-23
+// Session-scoped feed state. A single warm Vercel instance serves many users
+// concurrently, so module-level Maps would bleed between sessions — and
+// putInsights' clear() would wipe another user's feed mid-briefing. Each
+// session gets its own sub-feed; the outer map is never cleared by a request.
+type SessionFeed = {
+  insights: Map<string, Insight>;
+  investigations: Map<string, Investigation>;
+  anomalies: Map<string, Anomaly>;
+};
+
 const state = new Map<string, SessionFeed>();
-```
 
-What breaks if you violate it: `putInsights(sidA, ...)` doing `state.clear()` would wipe sidB's feed mid-briefing. The comment at `lib/state/insights.ts:6-11` calls this out explicitly: *"a single warm Vercel instance serves many users concurrently, so module-level Maps would bleed between sessions — and putInsights' clear() would wipe another user's feed mid-briefing."*
-
-**Invariant 2: every mutation is keyed by `sessionId` first, then operates on the inner sub-map.**
-
-```ts
-// lib/state/insights.ts:57-71  (annotated)
-export function putInsights(sessionId: string, items: Insight[], rawAnomalies?: Anomaly[]): void {
-  const s = sessionState(sessionId);   // ← find OR create this session's sub-map
-  s.insights.clear();                  // ← clears ONLY this session's insights
-  s.anomalies.clear();
-  items.forEach((i, idx) => {
-    s.insights.set(i.id, i);
-    if (rawAnomalies?.[idx]) s.anomalies.set(i.id, rawAnomalies[idx]);
-  });
-}
-```
-
-The whole body is synchronous — no `await` between the `.clear()` and the `.set()`s. That makes the entire mutation atomic with respect to other event-loop tasks: no other request can interleave inside this function. The "lock" is just "no awaits inside the critical section."
-
-What breaks if you add an `await`: another request could observe a half-cleared sub-map and crash on iteration.
-
-**Invariant 3: every read or write of the per-request `AsyncLocalStorage` instance (`requestStore`) happens inside `ALS.run`.**
-
-```ts
-// lib/mcp/auth.ts:47
-const requestStore = new AsyncLocalStorage<RequestStore>();
-
-// lib/mcp/auth.ts:114-115
-function readAll(): Store {
-  const ctx = requestStore.getStore();
-  if (ctx) return ctx.store;                  // ← inside ALS frame → return per-request store
-  if (!PERSIST) return Object.fromEntries(memStore);  // ← outside → fall back to module-scope memory
-  ...
-}
-```
-
-What breaks if you call `readAll()` outside an ALS frame in production: `getStore()` returns `undefined`, you fall through to the dev/test branches, and in production that means *no auth state at all* — every OAuth read returns `{}`. The handler thinks the user has no tokens; the OAuth flow restarts every request.
-
-#### Move 2.1 — `sessionState` is the only allocator
-
-`lib/state/insights.ts:16-23` is the only place where a new `SessionFeed` enters the outer Map:
-
-```ts
 function sessionState(sessionId: string): SessionFeed {
   let s = state.get(sessionId);
   if (!s) {
@@ -163,164 +128,276 @@ function sessionState(sessionId: string): SessionFeed {
 }
 ```
 
-Two requests for the same `sessionId` on the same instance, both seeing `undefined`, could each allocate a `SessionFeed` and one of them `.set`s after the other — the winner stays, the loser's allocation is GC'd. **That's fine** in this codebase because no request *depends* on observing a previously-set sub-map (the `.clear()` at the top of `putInsights` resets it anyway). If a future call site read state *first*, then awaited, then wrote, you'd have a check-then-act race.
+The outer `state` Map is module-level and survives between requests. The protection is `sessionId` as the key. Two users hit the same warm instance, both call `sessionState`, both get their OWN sub-feed; neither sees the other.
 
-```
-  Execution trace — the "fine" race in sessionState
+The mutation pattern at `lib/state/insights.ts:57-71`:
 
-  state:   Map { }        (empty)
-  ──────   ──────────
-  t=0      A: sessionState(sidX) — state.get returns undefined
-  t=1      A: creates allocA = {insights: Map, ...}
-  t=2      A: state.set(sidX, allocA)
-  t=3      A: returns allocA
-  t=4      (no race: B never ran in parallel because it's one thread)
-
-  Same scenario WITH an await:
-
-  t=0      A: sessionState(sidX) — undefined
-  t=1      A: creates allocA
-  t=2      A: await ... (yields!)
-  t=3      B: sessionState(sidX) — STILL undefined (A never set)
-  t=4      B: creates allocB
-  t=5      B: state.set(sidX, allocB)
-  t=6      B: returns allocB, mutates allocB
-  t=7      A: resumes, state.set(sidX, allocA)  ← clobbers B's
-  t=8      A: returns allocA — B's mutations are lost!
+```ts
+export function putInsights(sessionId: string, items: Insight[], rawAnomalies?: Anomaly[]): void {
+  // Replace the previous briefing for THIS session — each run IS the current
+  // feed, not an addition. Without clearing, a warm serverless instance (or a
+  // long-running dev server) accumulates stale insights from earlier runs, so
+  // the feed shows yesterday's anomalies alongside today's. Investigations are
+  // keyed separately and untouched here. Only this session's sub-maps are
+  // cleared — never the outer map, never another session's feed.
+  const s = sessionState(sessionId);
+  s.insights.clear();
+  s.anomalies.clear();
+  items.forEach((i, idx) => {
+    s.insights.set(i.id, i);
+    if (rawAnomalies?.[idx]) s.anomalies.set(i.id, rawAnomalies[idx]);
+  });
+}
 ```
 
-The current code is in the first shape (no await), so it's safe. **Don't add an await inside `sessionState` without thinking through this.**
+The comment makes the danger explicit: clearing the OUTER map would wipe everyone's feed mid-briefing. The code clears only `s.insights` and `s.anomalies` — only this session's slots.
 
-#### Move 2.2 — the ALS frame is the per-request bubble
+Same pattern in `lib/state/investigations.ts:11`:
 
-Tracing one request through the ALS lifecycle:
-
-```
-  Layers-and-hops — ALS frame from cookie to deep tool call
-
-  ┌─ Next.js platform ─────────────────────────────────┐
-  │  cookie comes in on req                            │
-  └────────────────┬───────────────────────────────────┘
-                   │  hop 1: handler reads
-  ┌─ withAuthCookies wrapper ──────────────────────────┐
-  │  raw = cookies().get(AUTH_COOKIE)                  │
-  │  ctx = {store: decrypt(raw), dirty: false}         │
-  │  requestStore.run(ctx, fn)                          │
-  └────────────────┬───────────────────────────────────┘
-                   │  hop 2: deep async calls
-  ┌─ MCP SDK provider methods ─────────────────────────┐
-  │  provider.tokens()  → readState(sid)               │
-  │   → readAll() → requestStore.getStore() → ctx ✓     │
-  │  provider.saveTokens(t) → patchState(sid, t)       │
-  │   → writeAll(...) → ctx.dirty = true               │
-  └────────────────┬───────────────────────────────────┘
-                   │  hop 3: handler returns
-  ┌─ withAuthCookies flush ────────────────────────────┐
-  │  if (ctx.dirty) cookies().set(AUTH_COOKIE,         │
-  │                                encrypt(ctx.store)) │
-  └────────────────────────────────────────────────────┘
+```ts
+const mem = new Map<string, AgentEvent[]>();
+// keyed by insightId, which is per-investigation; another user's investigation
+// has a different insightId (a UUID), so the keys never collide.
 ```
 
-The `getStore()` inside a deep callee sees the same `ctx` the wrapper set up. Concurrent requests each have their own ALS frame, so two `getStore()` calls from two requests return two different `ctx` objects — **automatically, no key lookup, no synchronization primitive.**
+The key choice (insightId — a UUID generated per anomaly) makes collision astronomically unlikely. Combined with `mem` being module-level for warm-instance reuse, this works.
 
-#### Move 2.3 — what counts as "synchronization" here
+#### Shape (c) in action: the ALS per-request store
 
-The codebase has zero `Mutex`, zero `Semaphore`, zero `Lock`. It does have:
+`AsyncLocalStorage` is the JavaScript answer to thread-local storage. It binds a value to an async call tree, so every `await` inside the tree sees the same value without passing it explicitly.
 
-  → **Synchronous critical sections.** `putInsights`, `sessionState`, `saveInvestigation` — all sync top-to-bottom. The event-loop guarantees no other task interleaves.
-  → **Key partitioning.** Every shared `Map` is keyed by something request-scoped (`sessionId`, `insightId`).
-  → **ALS scoping.** Per-request context isolated by ALS frame.
-  → **A "single-flight" guard** in `useInvestigation`: `startedRef.current = true` (`lib/hooks/useInvestigation.ts:48-49`) — but that's a *client-side* React StrictMode pattern, not server-side synchronization.
+```ts
+// lib/mcp/auth.ts:46-47, 86-104 — the request-scoped store
+interface RequestStore { store: Store; dirty: boolean }
+const requestStore = new AsyncLocalStorage<RequestStore>();
 
-There is no synchronization primitive in this codebase because none is needed at the current shape. The day someone adds a multi-step async mutation to a shared key, that calculus changes.
+export async function withAuthCookies<T>(fn: () => Promise<T>): Promise<T> {
+  if (process.env.NODE_ENV !== 'production') return fn();
+  const { cookies } = await import('next/headers');
+  const raw = (await cookies()).get(AUTH_COOKIE)?.value;
+  const ctx: RequestStore = { store: raw ? decryptStore(raw) : {}, dirty: false };
+  const result = await requestStore.run(ctx, fn);
+  // ...
+}
+
+function readAll(): Store {
+  const ctx = requestStore.getStore();          // ← reads the per-request ctx
+  if (ctx) return ctx.store;
+  // ...
+}
+
+function writeAll(store: Store): void {
+  const ctx = requestStore.getStore();
+  if (ctx) {
+    ctx.store = store;
+    ctx.dirty = true;
+    return;
+  }
+  // ...
+}
+```
+
+`requestStore.run(ctx, fn)` enters an async context. Every `requestStore.getStore()` call from inside `fn` — including from deep async descendants — returns the same `ctx`. Two concurrent requests on the same warm instance each call `withAuthCookies`, each call `run(...)` with a different `ctx`, and each of their `getStore()` calls returns THEIR `ctx`. The two never see each other's `store`.
+
+The mechanism underneath: Node's async_hooks tracks parent-child relationships between async resources (Promises, timers, I/O callbacks). When a context is entered with `run`, every async resource created inside inherits it. The "store" is a hidden field on the async context, propagated through every `await`.
+
+Why this exists for THIS code: Next.js's request-vs-response cookie split. Inside a request, reading `cookies()` returns the REQUEST cookies; writing returns a response builder. Reading-then-writing-then-reading-again sees the OLD value, not the just-written one. The OAuth flow needs to read PKCE state, do crypto, write it back, read it again — many times per request. The ALS pattern lets the provider's many sync read/write calls hit an in-memory `ctx.store` instead of touching cookies each time; the cookie is read ONCE at the start of the request and written ONCE at the end.
+
+#### Shape (a) in action: per-request instance fields
+
+```ts
+// lib/data-source/bloomreach-data-source.ts:121-137
+export class BloomreachDataSource implements DataSource {
+  private cache = new Map<string, { result: unknown; expiresAt: number }>();
+  private lastCallAt = 0;
+  // ...
+  constructor(private transport: McpTransport, opts: ClientOpts = {}) { /* ... */ }
+}
+```
+
+`cache` and `lastCallAt` are instance fields. They survive only as long as the `BloomreachDataSource` instance. Crucially, that instance is constructed PER REQUEST inside `connectMcp` (`lib/mcp/connect.ts:94-101`):
+
+```ts
+return {
+  ok: true,
+  mcp: new BloomreachDataSource(new SdkTransport(client, httpErrors), {
+    minIntervalMs: 1100,
+    retryDelayMs: 10_000,
+    retryCeilingMs: 20_000,
+    maxRetries: 3,
+  }),
+};
+```
+
+Per-request construction means per-request lifetime. Two concurrent users get two different `BloomreachDataSource` objects with two different `cache` Maps. The 60s response cache only helps repeats within ONE request — which is exactly what the agent loop hits (the same EQL fired in `diagnose` then `recommend`).
+
+This is shape (a) — immutable from the OUTSIDE — because no other request can reach this instance. The mutability is contained to the request's async tree.
+
+##### A latent micro-race in this class
+
+```ts
+// lib/data-source/bloomreach-data-source.ts:190-205
+private async liveCall(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
+  const elapsed = Date.now() - this.lastCallAt;
+  if (elapsed < this.minIntervalMs) {
+    await new Promise((r) => setTimeout(r, this.minIntervalMs - elapsed));
+  }
+  try {
+    const result = await this.transport.callTool(name, args, { signal });
+    this.lastCallAt = Date.now();
+    return result;
+  } catch (err) {
+    this.lastCallAt = Date.now();
+    throw new McpToolError(name, errorDetail(err), { cause: err });
+  }
+}
+```
+
+If TWO `callTool` invocations fire concurrently on the same `BloomreachDataSource`, both can read `lastCallAt`, both compute `elapsed >= minIntervalMs`, and both fire without spacing. This is a race in the JS-event-loop sense: it requires two awaits to overlap on the same instance. Today the agent loop runs tools SEQUENTIALLY per turn (`lib/agents/base-legacy.ts:162` iterates `toolUses` with awaits), so this never fires. If the loop ever did parallel tool calls (a `Promise.all` over `toolUses`), the race would surface. The mitigation is in the structure of the caller, not the class.
+
+#### Shape (✗) in action: the unkeyed `cached` — finding #1
+
+```ts
+// lib/mcp/schema.ts:138, 186-209
+let cached: WorkspaceSchema | null = null;
+
+export async function bootstrapSchema(
+  dataSource: DataSource,
+  opts: BootstrapOpts = {},
+): Promise<WorkspaceSchema> {
+  if (cached) return cached;                    // ← returns ANY user's cached schema
+  const { projectId, projectName } = await resolveProject(dataSource, opts);
+  const args = { project_id: projectId };
+
+  // Sequential — the server allows ~1 req/s; BloomreachDataSource already spaces calls.
+  const eventSchema = await callOrThrow(dataSource, 'get_event_schema', args, opts);
+  const customerProps = await callOrThrow(dataSource, 'get_customer_property_schema', args, opts);
+  const catalogs = await callOrThrow(dataSource, 'list_catalogs', args, opts);
+  const overview = await callOrThrow(dataSource, 'get_project_overview', args, opts);
+
+  cached = parseWorkspaceSchema({               // ← writes ANY user's schema globally
+    projectId,
+    projectName,
+    eventSchema,
+    customerProps,
+    catalogs,
+    overview,
+  });
+  return cached;
+}
+```
+
+`cached` is module-level, unkeyed, and persists for the lifetime of the warm process. The flow:
+
+```
+  Two users on one warm instance — what `cached` does
+
+  T=0   user A → bootstrapSchema → resolveProject returns A's project
+        → 4 MCP calls populate A's schema
+        → cached = A's schema
+        → user A's request continues with A's schema (correct)
+
+  T=10  user B → bootstrapSchema → if (cached) return cached
+        → user B sees A's projectId / projectName / events / customers
+        → user B's request continues with A's schema (WRONG)
+```
+
+The blast radius:
+- `WorkspaceSchema.projectId` flows into every tool call as `project_id`. User B's queries hit A's project (if B has tokens for A's project, fine; if not, the calls error out and the user sees Bloomreach permission errors).
+- `WorkspaceSchema.events` and `customerProperties` flow into the agent's prompt (`schemaSummary` in `lib/agents/monitoring.ts:19-60`). User B sees A's data layout in the agent's thinking — a small information leak.
+- `WorkspaceSchema.totalCustomers` and `totalEvents` appear in the UI header. User B sees A's customer count.
+
+Every OTHER module-level mutable in this codebase is session-keyed. This one isn't. The fix is small: change `let cached: WorkspaceSchema | null` to `const cached = new Map<string, WorkspaceSchema>()` keyed on `sessionId` (or on `projectId`, depending on which is the right scope). Or remove the cache entirely — the 4 MCP calls are slow (4 × ~1.1s = ~4.4s) but only run once per request, and the rest of the route's budget can absorb it.
+
+There's a `_resetSchemaCache()` test helper at `schema.ts:211-213` that does `cached = null` — used in tests but never called from production code.
+
+### Move 2 variant — the load-bearing skeleton
+
+The state-isolation skeleton has three required parts. Drop any one and you have a leak.
+
+```
+  The skeleton — the kernel that keeps multi-user state safe
+
+  1. A SCOPE choice for every mutable
+     (immutable / session-keyed / request-scoped (ALS) / per-instance)
+
+  2. A KEY that uniquely identifies the scope's owner
+     (sessionId for cross-request, async context for in-request,
+      object identity for per-instance)
+
+  3. A PUBLIC MUTATION PATTERN that respects both
+     (clear only YOUR sub-map; never the outer; use ALS run() to enter ctx)
+```
+
+What breaks when each is missing:
+- Drop the SCOPE choice and you get a global mutable that every request shares (the schema cache leak).
+- Drop the KEY and you have a per-user Map without a way to look up the right user's slot (the would-be bug if `state` were just `Map<insightId, ...>` instead of `Map<sessionId, ...>`).
+- Drop the MUTATION discipline and a method like `clear()` wipes another user's data (the bug that `putInsights`'s comment explicitly prevents).
+
+The repo gets all three right for the four shape-(b)/shape-(c) Maps. It misses #1 for the schema cache.
 
 ### Move 3 — the principle
 
-In a single-threaded async runtime, the cheapest synchronization is **never sharing mutable state across awaits**. Partition by a key, scope by an ALS frame, keep critical sections synchronous, and the runtime does the rest for free. The expensive synchronization (`Mutex`, `Semaphore`) only earns its place when those three tools fail — and at the current shape of this codebase, they haven't.
+On a single-threaded runtime, "race" doesn't mean two threads stepping on each other — it means two requests' async trees sharing a mutable that they shouldn't. The synchronization primitive isn't a lock; it's a key. The key partitions the state into per-owner slots, and the runtime's single-threaded execution model ensures each slot is touched serially. Lose the key (the schema cache) and there's nothing else to protect you — JavaScript has no `mutex` to fall back on.
 
 ## Primary diagram
 
 ```
-  Shared state, races, and synchronization — the whole picture
+  The full state-isolation map — four classes, three correct
 
-  ┌─ module scope ────────────────────────────────────────────────────────┐
-  │                                                                        │
-  │  state ──► Map<sessionId, SessionFeed>                                 │
-  │             { insights: Map, investigations: Map, anomalies: Map }    │
-  │             ↑ partitioned by sessionId, outer never .clear()'d         │
-  │                                                                        │
-  │  mem ────► Map<insightId, AgentEvent[]>                                │
-  │             ↑ partitioned by insightId                                 │
-  │                                                                        │
-  │  requestStore ──► AsyncLocalStorage<RequestStore>                      │
-  │                    ↑ frames isolated per request                       │
-  │                                                                        │
-  │  memStore ──► Map<sessionId, SessionAuthState>  (test backend)         │
-  │                                                                        │
-  └────────────────────────────────────────────────────────────────────────┘
-
-         ▲                                              ▲
-         │ reads/writes via                             │ reads/writes via
-         │ sessionState(sid)                            │ ALS.run / getStore
-         │                                              │
-  ┌─ request A ──────────────────┐         ┌─ request B ────────────────┐
-  │ sid = sidA (cookie)          │         │ sid = sidB (cookie)        │
-  │ withAuthCookies(() => {      │         │ withAuthCookies(() => {    │
-  │   ALS.run(ctxA, async () => {│         │   ALS.run(ctxB, async () =>│
-  │     ... putInsights(sidA)    │         │     ... putInsights(sidB)  │
-  │   })                         │         │   })                       │
-  │ })                           │         │ })                         │
-  └──────────────────────────────┘         └────────────────────────────┘
-
-  Synchronization "primitives" used: ZERO.
-  Tools used: key partitioning, ALS scoping, sync critical sections.
+  ┌─ Node process (warm instance) ──────────────────────────────────────┐
+  │                                                                     │
+  │   ┌─ state ────────────────────────────────────────────────────┐    │
+  │   │   Map<sessionId, SessionFeed>     ✓ session-keyed          │    │
+  │   │   - sub-maps cleared by THIS session only                  │    │
+  │   │   - outer map never cleared                                │    │
+  │   └────────────────────────────────────────────────────────────┘    │
+  │   ┌─ mem (investigations.ts:11) ──────────────────────────────┐    │
+  │   │   Map<insightId, AgentEvent[]>    ✓ insightId-keyed       │    │
+  │   │   - UUIDs make collision astronomical                      │    │
+  │   └────────────────────────────────────────────────────────────┘    │
+  │   ┌─ memStore (auth.ts:36, test-only) ────────────────────────┐    │
+  │   │   Map<sessionId, SessionAuthState>  ✓ session-keyed       │    │
+  │   └────────────────────────────────────────────────────────────┘    │
+  │   ┌─ requestStore (auth.ts:47) ───────────────────────────────┐    │
+  │   │   AsyncLocalStorage<RequestStore>   ✓ async-context-bound │    │
+  │   │   - one ctx per requestStore.run(ctx, fn) call            │    │
+  │   └────────────────────────────────────────────────────────────┘    │
+  │   ┌─ BloomreachDataSource.cache / .lastCallAt ────────────────┐    │
+  │   │   per-instance field, instance constructed per request    │    │
+  │   │   ✓ scoped by object identity                             │    │
+  │   │   ⚠ latent micro-race if caller ever fires parallel calls │    │
+  │   └────────────────────────────────────────────────────────────┘    │
+  │   ┌─ cached (schema.ts:138) ──────────────────────────────────┐    │
+  │   │   let cached: WorkspaceSchema | null     ✗ UNKEYED LEAK   │    │
+  │   │   - finding #1 in the audit                               │    │
+  │   └────────────────────────────────────────────────────────────┘    │
+  │                                                                     │
+  └─────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The pattern of "one big map, partitioned by request-scoped key, never iterate mutably" is the same shape PHP-FPM workers used to take in 2005 — except those workers each owned their own process, so partitioning was free. In a long-lived Node process serving many sessions, you have to do the partitioning yourself by being disciplined about the outer-Map invariant.
+`AsyncLocalStorage` is one of Node's most important runtime features for serverless. Before it (Node ≥13 stabilized in 16), the canonical way to propagate request-scoped state through async code was to pass a `context` argument everywhere — which works but pollutes every signature. ALS makes the context implicit and propagated by the runtime; the price is the magic.
 
-`AsyncLocalStorage` is the modern Node equivalent of OpenTelemetry's `context` propagation, of Go's `context.Context`, of Java's `ThreadLocal` for thread-per-request servers. It costs roughly nothing (`async_hooks` overhead is low; modern Node has fast paths) and it makes the per-request scope explicit at the API boundary instead of leaking into every function signature.
-
-Worth reading: *Concurrency in Go* ch. 4 (the patterns there map cleanly to async/await once you read "goroutine" as "Promise"); the Node.js `async_hooks` API docs to see what ALS is built on; the Tokio docs on `tracing::Span` (Rust async) for the same pattern in a different language.
+The schema-cache leak is the kind of bug that only shows up under load: a single-user dev session never sees it (the same user populates and reads `cached`), and a test never catches it (each test starts with `_resetSchemaCache()` or a fresh process). It surfaces only when two real users hit the same warm Vercel instance in quick succession. The fix is a single line — wrap `cached` in a `Map<sessionId, ...>` — but the slot in this guide is meant to make the *category* of bug visible, not just this one instance.
 
 ## Interview defense
 
-**Q: There's a `Map` at module scope being mutated by every request. Why isn't that a race?**
+> Q: "How does this codebase handle state shared across concurrent requests on the same Node process?"
 
-Three things keep it safe.
+Four classes of state, three patterns. Session-keyed Maps at module level (insights, investigations, the test auth store) — every method takes a `sessionId` and looks up a sub-slot. `AsyncLocalStorage` for per-request OAuth state, so the SDK's many sync read/write calls hit an in-memory context instead of cookies. Per-request instance fields on `BloomreachDataSource`, constructed fresh each request. The fourth — a bare `let cached: WorkspaceSchema | null` in `lib/mcp/schema.ts:138` — is the one place the pattern was missed; it leaks `projectId` and `projectName` across users.
 
-  1. The outer Map is *never* `.clear()`d and never iterated mutably. Only `.get(sid)` and `.set(sid, …)`. Different sessions touch different keys.
-  2. Inner mutations (`putInsights`, `saveInvestigation`) are entirely synchronous — no `await` between read and write. The single-threaded event loop guarantees no other task interleaves inside a sync function.
-  3. The `sessionId` key comes from a per-request cookie (`lib/mcp/session.ts:16-24`), so two requests for two users will partition to two different sub-maps automatically.
+> Q: "Why ALS instead of just passing a context argument?"
 
-The day someone adds an `await` inside `putInsights` or `sessionState`, this calculus changes — and that's the comment in `lib/state/insights.ts:6-11` warning the next maintainer.
+Next.js's request-vs-response cookie split. Reading `cookies()` returns request cookies; writing returns a response builder. The OAuth flow needs many sync read/writes per request. Passing the context everywhere would require modifying the MCP SDK's `OAuthClientProvider` interface, which we don't control. ALS lets us keep the SDK's sync API while making the underlying storage request-scoped.
 
-```
-  the rule:  shared state + sync critical section  =  safe
-             shared state + async (with await)     =  race
-```
+> Q: "Single-threaded runtime — there are no real races, right?"
 
-**Q: What's `AsyncLocalStorage` doing in this codebase, and why isn't a plain global enough?**
-
-It scopes a per-request object so any deep callee can find it via `getStore()` without threading it through every function argument — but a *plain* global wouldn't work because two concurrent requests on the same warm instance would clobber each other's value.
-
-`ALS.run(ctx, fn)` creates a frame that's *invisible to other requests*. Inside `fn`, `getStore()` returns `ctx`. Inside *another request's* `fn`, `getStore()` returns *their* `ctx`. Node's `async_hooks` machinery propagates the frame through every `await`, so even after the original stack frame is gone, the ctx is still findable.
-
-If we used a plain global: two OAuth callbacks racing on one instance would see each other's PKCE verifiers, and at best fail one user's flow, at worst leak tokens.
-
-Anchor: "ALS = per-request global, with no shared keyspace."
-
-```
-  plain global             ALS frame
-  ────────────             ─────────
-  let ctx = {}             ALS.run(ctx, fn)
-  // any request sees      // only fn's call tree
-  // any other's value     // sees this ctx
-```
+Wrong vocabulary, right intuition. There are no shared-memory races between OS threads. There ARE concurrency bugs: cross-request state bleed (the schema cache), and the latent micro-race in `BloomreachDataSource.lastCallAt` if two callTool invocations on the same instance ever ran in parallel. The single thread means each operation is atomic at the JS level, but two awaits can still interleave on the SAME mutable if the design didn't think about it.
 
 ## See also
 
-  → `03-event-loop-and-async-io.md` for the event-loop guarantees that make sync critical sections atomic.
-  → `05-memory-stack-heap-gc-and-lifetimes.md` for how long these Maps live.
-  → `07-backpressure-bounded-work-and-cancellation.md` for `AbortSignal` as another piece of per-request context.
+- `02-processes-threads-and-tasks.md` — why "single-threaded" doesn't mean "no concurrency bugs."
+- `05-memory-stack-heap-gc-and-lifetimes.md` — what gets garbage-collected when these maps grow.
+- `08-runtime-systems-red-flags-audit.md` — the schema-cache leak ranked as finding #1.

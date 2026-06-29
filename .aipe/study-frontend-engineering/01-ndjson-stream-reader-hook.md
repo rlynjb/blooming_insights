@@ -1,104 +1,214 @@
-# NDJSON Stream-Reader Hook
+# NDJSON stream reader hook
 
-**Industry names:** newline-delimited-JSON streaming (NDJSON), `fetch`-`ReadableStream` reader pattern, async iterator over chunked HTTP. **Type:** Industry-standard pattern, project-specific kernel.
+**Subtitle:** browser-side NDJSON consumer over `fetch` + `ReadableStream` (industry-standard streaming pattern), wrapped in a React custom hook that owns a state dispatcher. Local term: the kernel (`readNdjson`); the consumers (`useBriefingStream`, `useInvestigation`, `useDemoCapture`, `StreamingResponse`).
 
 ## Zoom out, then zoom in
 
-You already know `fetch().then(r => r.json())` — open a request, wait for it to finish, parse the body, render. That works when the answer arrives in one shot. This product can't work that way. A monitoring agent run takes 30-90 seconds. Render-when-done means a 30-90s blank screen, and the whole pitch — "an analyst that shows its work" — collapses into "an analyst that doesn't load."
-
-So the network seam is different. The response body is a `ReadableStream`. The hook reads chunks as they arrive, parses each `\n`-terminated JSON line into a typed `AgentEvent`, and calls `setState` per event. The UI animates from the first reasoning step that lands (~200ms) all the way through the final `done` event.
+**Zoom out — where this concept lives.** This is the seam where server-side streaming becomes browser-side state. Every "the agent is working" thing the user sees on screen — the trace lines arriving one by one, the coverage tiles checking in one at a time, the insights popping into the feed as monitoring finishes them — crosses this boundary.
 
 ```
-  Zoom out — where the NDJSON kernel lives in the system
+  Zoom out — the streaming seam, in one picture
 
-  ┌─ UI layer (browser, client SPA) ──────────────────────────────┐
-  │  app/page.tsx           app/investigate/[id]/page.tsx          │
-  │       │ uses                  │ uses                            │
-  │       ▼                       ▼                                 │
-  │  useBriefingStream       useInvestigation                       │
-  │  StreamingResponse       useDemoCapture                         │
-  │       │       │              │       │                          │
-  │       └───────┴──────┬───────┴───────┘                          │
-  │                      ▼                                          │
-  │       ★ lib/streaming/ndjson.ts — readNdjson<E>() ★             │ ← we are here
-  │                      │                                          │
-  └──────────────────────┼──────────────────────────────────────────┘
-                         │  HTTP/1.1 chunked, content-type ndjson
-  ┌─ Service layer (Next.js Route Handlers) ──────────────────────┐
-  │  GET /api/briefing        GET /api/agent                       │
-  │  → ReadableStream writes JSON.stringify(evt) + '\n' per event  │
-  └────────────────────────────────────────────────────────────────┘
+  ┌─ UI layer (client components) ───────────────────────────────┐
+  │  app/page.tsx                                                │
+  │  app/investigate/[id]/page.tsx                               │
+  │  app/investigate/[id]/recommend/page.tsx                     │
+  │  components/chat/StreamingResponse.tsx                       │
+  └──────────────────────────┬───────────────────────────────────┘
+                             │  consumes return value of
+  ┌─ The hook (custom hook in lib/hooks) ────────────────────────┐
+  │  useBriefingStream       ← /api/briefing                     │
+  │  useInvestigation        ← /api/agent?step=…                 │ ← we are here
+  │  useDemoCapture          ← /api/agent (drain)                │
+  │  StreamingResponse       ← /api/agent?q=…                    │
+  └──────────────────────────┬───────────────────────────────────┘
+                             │  delegates the parse loop to
+  ┌─ The kernel (lib/streaming/ndjson.ts) ───────────────────────┐
+  │  ★ readNdjson(body, onEvent, opts) ★                         │
+  │  fetch → reader → TextDecoder → split('\n') → JSON.parse     │
+  └──────────────────────────┬───────────────────────────────────┘
+                             │  HTTP over the wire (Content-Type: ndjson)
+  ┌─ The producer (app/api/*/route.ts) ──────────────────────────┐
+  │  ReadableStream + encodeEvent + controller.enqueue           │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-The kernel is **64 LOC** at `lib/streaming/ndjson.ts`. Every consumer is one of: a hook that owns useState slots and a `switch (evt.type)` dispatcher, or a component that does the same thing inline.
+**Zoom in — narrow to the concept.** Streaming the agent's work to the browser without WebSocket and without Server-Sent Events. You ask "is there a primitive in plain `fetch` that lets the server push lines and the browser handle them as they arrive?" — yes: a `ReadableStream` body, read chunk by chunk, with JSON-per-line as the format. Two design choices the repo made deliberately: (1) NDJSON, not SSE — because `EventSource` doesn't support custom headers (no auth) and doesn't support `POST`; (2) the parse loop is centralized so four consumers don't each ship a different `split('\n')` bug.
 
-Zoom in: the pattern is "fetch → reader → TextDecoder → split('\n') → JSON.parse → onEvent, with a cancel poll between reads." It's not exotic — it's the pattern any team that picks NDJSON over SSE will write. What's interesting is the *kernel-plus-five-consumers* shape: the kernel was extracted *after* four duplicates already existed, so you can read the original duplication and the consolidation side by side.
+The question this concept answers: **how do you get streamed agent events from a serverless route to a React component's state, in a way that survives StrictMode, mid-stream cancellation, and a 30-60s budget?**
 
 ## Structure pass
 
-Three layers, one axis — **who owns the lifetime of a stream chunk?** — traced down the stack.
+Layers, axis, seams — before we touch the kernel.
 
-**Layer 1: the consumer hook.** Owns: which fetch URL, which event types matter, which `useState` slots to update, which closure mirror to write so the `done` event can stash a complete object. Lifetime question: who decides when to stop? Answer: the **consumer** does — it owns the `cancelOn` predicate (a ref it can flip true) and decides whether to cancel on cleanup at all.
+### Layers
 
-**Layer 2: the kernel** (`lib/streaming/ndjson.ts`). Owns: the read loop, the buffer, the line split, the `JSON.parse`, the malformed-line policy, the trailing-tail flush. Lifetime question: who decides when to stop? Answer: it **defers** to the consumer's `cancelOn` and to the stream's natural `done` signal. The kernel reads exactly what's there and stops when told.
-
-**Layer 3: the route handler** (`app/api/{briefing,agent}/route.ts`). Owns: when to emit each event, when to close the stream. Lifetime question: who decides when to stop? Answer: the **producer** — when the agent loop's `done` event lands or an error throws.
-
-**The seam.** Layers 1 and 2 meet at `readNdjson<E>(body, onEvent, opts)`. The contract is small and load-bearing:
+Three nested layers, named once:
 
 ```
-  Seam between kernel and consumer — what flips across it
+  outer — the consumer hook (or component)
+          owns useState, useEffect, lifecycle, callbacks
 
-  ┌─ Kernel side ────────────────┐  ┌─ Consumer side ───────────────┐
-  │ doesn't know the event shape │  │ knows E = AgentEvent          │
-  │ doesn't hold any state       │  │ holds all the useState slots  │
-  │ doesn't decide what to render│  │ owns the dispatcher + render  │
-  │ doesn't know about React     │  │ owns React lifecycle          │
-  │     │                        │  │     │                         │
-  │     └────── readNdjson<E>(body, onEvent, { cancelOn }) ──────┘
-  │                              │  │                               │
-  │ control flow: a while loop   │  │ control flow: React effect    │
-  │ state: a ~100-byte string buf│  │ state: 5 useState + closure   │
-  │ failure: silent skip + log   │  │ failure: setError → render    │
-  └──────────────────────────────┘  └───────────────────────────────┘
+      inner — the kernel (readNdjson)
+              owns the read/decode/split/parse loop
 
-  The kernel knows nothing about your app; your app knows nothing
-  about TextDecoder. That's the line.
+          innermost — the browser primitive
+                      (ReadableStreamDefaultReader, TextDecoder)
 ```
 
-If you collapsed the kernel into the hook (or vice versa), you'd lose two things: (1) the third / fourth / fifth consumer would re-implement the trailing-buffer flush and the malformed-line policy and probably get them wrong, and (2) testing the parse loop would require mounting React.
+### Axis — control flow
+
+We trace ONE question down the layers: **who decides what happens next?**
+
+```
+  Tracing "who decides control flow" down the layers
+
+  ┌──────────────────────────────────────────────┐
+  │ outer: consumer hook                         │   → REACT decides
+  │  (useEffect runs on mount; cleanup on        │     (mount, unmount,
+  │   unmount; setState re-renders the tree)     │      dep-change re-fire)
+  └──────────────────────────────────────────────┘
+      ┌────────────────────────────────────────────┐
+      │ inner: readNdjson                          │   → KERNEL decides
+      │  (while(true) loop; cancelOn poll;         │     (next read,
+      │   onEvent dispatch; finally releaseLock)   │      next dispatch)
+      └────────────────────────────────────────────┘
+          ┌──────────────────────────────────────────┐
+          │ innermost: reader.read()                 │   → BROWSER decides
+          │  (waits for the next byte chunk; resolves│     (network arrival)
+          │   when the chunk lands or done=true)     │
+          └──────────────────────────────────────────┘
+
+  the answer flips at every altitude — that contrast IS the lesson
+```
+
+### Seams
+
+Two boundaries where the axis-answer flips.
+
+```
+  Two seams worth studying
+
+  REACT decides  ═══════════════ KERNEL decides
+        │             ▲             │
+        │             │             ▼
+        │       seam 1: cancelOn / cleanup latch
+        │       (the consumer hands the kernel
+        │        a closure to poll; cleanup
+        │        flips its source-of-truth)
+        │
+        ▼
+  KERNEL decides  ═══════════════ BROWSER decides
+                        ▲             │
+                        │             ▼
+                  seam 2: reader.read() awaits
+                  (the kernel surrenders control
+                   until the network resumes it)
+```
+
+Seam 1 (`cancelOn`) is the one this pattern earns its keep on — it's how `useBriefingStream` cancels cleanly when the user toggles `demo → live-bloomreach` mid-stream. Seam 2 is the browser primitive doing what it always does.
+
+With the skeleton named, hand off to How it works.
 
 ## How it works
 
-The mental model first, then the walkthrough.
+The load-bearing block. We'll build the pattern (Move 1), walk the kernel and the consumer hook part by part (Move 2), and end with the principle (Move 3).
 
 ### Move 1 — the mental model
 
-You know how `fetch().then(r => r.json())` blocks until the whole body arrives and then hands you a parsed object? `fetch().then(r => r.body.getReader())` hands you a `ReadableStreamDefaultReader` *immediately* — and from then on, `await reader.read()` resolves every time a chunk arrives. The pattern: keep a string buffer, append each decoded chunk, split on `\n`, parse each complete line, save the last (possibly partial) piece for next time.
+You know how a `fetch()` returns a `Response` with a `.json()` method that buffers the whole body and parses it once? This is the same `fetch`, but the body is treated as an async iterable of bytes. You ask for one chunk at a time, decode it to text, accumulate a buffer, split on `\n`, parse each complete line as JSON, and dispatch each parsed event to a handler. The body never gets buffered in full — by the time the last line arrives, the first one has been on screen for thirty seconds.
 
 ```
-  The kernel shape — one loop, one buffer, one split
+  The pattern — one frame
 
-   chunks arrive
-       ↓
-   ┌──────────┐  decode +  ┌──────────┐  split('\n')   ┌──────────┐
-   │  reader  │ ─────────► │  buffer  │ ──────────────►│ parsed   │ → onEvent
-   │  .read() │   append   │  string  │  buf = lines.  │ events   │
-   └──────────┘            └──────────┘  pop() ?? ''   └──────────┘
-       ▲                                       │
-       └──── while not done & not cancelOn ────┘
-
-  the buffer holds the trailing partial line between reads —
-  that's the part most hand-rolled versions forget
+  ┌─────────────────────────────────────────────────────────────┐
+  │                                                             │
+  │   ┌──────┐    chunk    ┌─────────┐   text   ┌────────────┐ │
+  │   │ body │ ──────────► │ decoder │ ───────► │ buffer     │ │
+  │   └──────┘   (bytes)   └─────────┘          │ "...\n.."  │ │
+  │      ▲                                       └─────┬──────┘ │
+  │      │                                             │        │
+  │      │ read() resumes              split('\n')     ▼        │
+  │      │ when next chunk lands       ┌─────┐  ┌────────────┐ │
+  │      └──────────────────────────── │lines│  │ buf = tail │ │
+  │                                    └──┬──┘  └────────────┘ │
+  │                                       │                     │
+  │                                       │ for each line:      │
+  │                                       │   JSON.parse(line)  │
+  │                                       │   onEvent(parsed)   │
+  │                                       │                     │
+  │                                       ▼                     │
+  │                              ┌──────────────────┐           │
+  │                              │ React: setState  │           │
+  │                              │ → re-render row  │           │
+  │                              └──────────────────┘           │
+  │                                                             │
+  │   loop until reader says done=true, or cancelOn() === true │
+  │                                                             │
+  └─────────────────────────────────────────────────────────────┘
 ```
 
-The most failure-prone part of the pattern is the "trailing partial line" — a chunk boundary may land mid-event, and you can't `JSON.parse` half a line. The fix is one line: `buf = lines.pop() ?? ''` (`ndjson.ts:41`) — pop the last element back into the buffer; the next chunk's append will complete it.
+That's the kernel. The hook around it does the rest.
 
-### Move 2 — the step-by-step walkthrough
+### Move 2 — step by step
 
-#### The kernel — 64 LOC at `lib/streaming/ndjson.ts`
+The pattern has an irreducible kernel (Move 2 variant — load-bearing skeleton): a `while(true)` loop, a buffer, a split-and-parse, a cancellation poll, and a `finally` release. Strip any one and the pattern loses something specific. Then we walk the consumer hook around it.
 
-Here's the full thing, side by side with what each part does.
+#### The kernel — `readNdjson` (lib/streaming/ndjson.ts:17-64)
+
+Five irreducible parts. Pseudocode first, then the real code side-by-side.
+
+```
+  Pseudocode — the irreducible kernel
+
+  function readNdjson(body, onEvent, opts):
+    reader  = body.getReader()                 // ⓐ acquire the lock
+    decoder = new TextDecoder()
+    buf     = ""
+
+    try:
+      loop:
+        if opts.cancelOn?.():                   // ⓑ cancellation check
+          reader.cancel()
+          return
+
+        {value, done} = await reader.read()    // ⓒ wait for next chunk
+        if done: break
+
+        buf = buf + decoder.decode(value, {stream: true})
+        lines = buf.split("\n")
+        buf   = lines.pop() ?? ""              // ⓓ tail = last (incomplete) line
+
+        for raw in lines:
+          line = raw.trim()
+          if line is empty: continue
+          try:
+            onEvent(JSON.parse(line))          // ⓔ dispatch
+          catch err:
+            opts.onMalformed?.(line, err)
+
+      // flush trailing buffer (no-op when producer always ends with \n)
+      tail = buf.trim()
+      if tail:
+        try: onEvent(JSON.parse(tail))
+        catch err: opts.onMalformed?.(tail, err)
+
+    finally:
+      reader.releaseLock()                     // ⓕ always release
+```
+
+Now what breaks when each part is missing:
+
+- **ⓐ `getReader()`.** Without acquiring the reader's lock, two consumers of the same body would race. With it, the kernel owns the body until `releaseLock`.
+- **ⓑ `cancelOn` poll.** Drop this and a mode toggle mid-stream leaks the running fetch. The consumer hook's `useEffect` cleanup runs, but the reader keeps consuming bytes and calling `onEvent` on stale state setters. `useBriefingStream` flips a ref on cleanup; the kernel polls that ref between reads.
+- **ⓒ `await reader.read()`.** This is the suspension point — the JS event loop is free to do anything else while the kernel waits. The whole "the user sees the trace fill in" effect depends on this being awaited, not buffered.
+- **ⓓ tail buffer.** Chunks arrive on arbitrary byte boundaries; a single `\n`-terminated event can split across two `read()` calls. The tail buffer holds the incomplete fragment until the next chunk completes it. Drop this and you'd get `JSON.parse` errors on the fragment.
+- **ⓔ `JSON.parse + onEvent`.** The hand-off. Each parsed event goes straight to the consumer's dispatcher. The consumer never sees a partial event.
+- **ⓕ `releaseLock`.** In `finally` so a `throw` inside the loop still releases. Without it, the response body is permanently locked and a second `getReader()` on the same response would throw.
+
+**Skeleton vs hardening.** The kernel is the five parts above. The `onMalformed` callback (default silent) and the trailing-buffer flush are optional hardening — the header comment names this explicitly: "Producers always terminate each event with '\n', so in practice the trailing-buffer flush is a no-op — but keeping it preserves the correct shape for any future producer that omits the terminal newline."
+
+Real code, annotated:
 
 ```ts
 // lib/streaming/ndjson.ts:17-64
@@ -106,344 +216,417 @@ export async function readNdjson<E>(
   body: ReadableStream<Uint8Array>,
   onEvent: (event: E) => void,
   opts?: {
-    cancelOn?: () => boolean;
+    cancelOn?: () => boolean;          // ⓑ polled between reads
     onMalformed?: (line: string, err: unknown) => void;
   },
 ): Promise<void> {
-  const reader = body.getReader();         // (1) take ownership of the stream
-  const decoder = new TextDecoder();       // (2) bytes → utf-8 string, stateful
+  const reader = body.getReader();      // ⓐ acquire the lock
+  const decoder = new TextDecoder();
   let buf = '';
   try {
     while (true) {
-      if (opts?.cancelOn?.()) {            // (3) consumer wants out — cancel
-        await reader.cancel();             //     and exit before the next read
+      if (opts?.cancelOn?.()) {         // ⓑ cancellation check
+        await reader.cancel();
         return;
       }
-      const { value, done } = await reader.read();
-      if (done) break;                     // (4) producer closed the stream
-      buf += decoder.decode(value, { stream: true }); // (5) stream:true holds
-                                                       //     mid-codepoint bytes
+      const { value, done } = await reader.read();   // ⓒ suspend
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
       const lines = buf.split('\n');
-      buf = lines.pop() ?? '';             // (6) the magic line — partial tail
-                                           //     goes back into the buffer
+      buf = lines.pop() ?? '';          // ⓓ tail = last (incomplete) line
       for (const raw of lines) {
         const line = raw.trim();
         if (!line) continue;
         try {
-          onEvent(JSON.parse(line) as E);  // (7) hand the event to the consumer
+          onEvent(JSON.parse(line) as E);   // ⓔ dispatch
         } catch (err) {
-          opts?.onMalformed?.(line, err);  // (8) skip malformed — default silent
+          opts?.onMalformed?.(line, err);
         }
       }
     }
-    // (9) flush trailing buffer — a no-op when the producer always terminates
-    //     with '\n', kept for the case where it doesn't
+    // flush trailing buffer — a no-op when producer always terminates with '\n'
     const tail = buf.trim();
     if (tail) {
       try { onEvent(JSON.parse(tail) as E); }
       catch (err) { opts?.onMalformed?.(tail, err); }
     }
   } finally {
-    reader.releaseLock();                  // (10) always release the reader lock
+    reader.releaseLock();               // ⓕ always release
   }
 }
 ```
 
-Reading it line by line:
+That's 64 lines, four consumers. Every other file in this pattern is a hook or component that calls `readNdjson(res.body, handle, opts?)` and supplies the dispatcher.
 
-**(1) `body.getReader()` — claim the stream.** A `ReadableStream` can only be read by one reader at a time; calling `getReader` locks it. The `finally` block at (10) releases that lock so nothing else gets stuck.
+#### The consumer hook — `useBriefingStream` (lib/hooks/useBriefingStream.ts:103-313)
 
-**(2) `new TextDecoder()` — stateful UTF-8 decoder.** This is critical and easy to get wrong. A UTF-8 character can be 1-4 bytes; a chunk boundary may split it. Constructing `TextDecoder` once and calling `.decode(value, { stream: true })` lets it hold partial bytes between calls — the alternative (`new TextDecoder().decode(value)` per chunk) corrupts non-ASCII content silently.
+The consumer brings the React lifecycle, the state slots, the fetch, the 9-case dispatcher, the cancellation latch, and the callbacks for the composition with `useReconnectPolicy`. The pattern is the same in `useInvestigation` and `StreamingResponse`; we'll walk the briefing one for grounding.
 
-**(3) `cancelOn` — the cooperative cancel hook.** Polled at the top of each loop iteration. If the consumer flips a ref true (e.g. a `useBriefingStream` cleanup function flips `cancelledRef.current = true`), the kernel `reader.cancel()`s and exits. This is *cooperative* cancellation: the consumer asks, the kernel obeys at the next safe point. Compared to AbortSignal, this is intentionally simpler — no controller, no event listener, just a function the consumer owns.
-
-**(4) `done` — the producer closed the stream.** Normal termination. The `break` falls through to (9).
-
-**(5) `decoder.decode(value, { stream: true })` — append bytes as text.** The `{ stream: true }` flag is the load-bearing detail. Without it, multi-byte characters at chunk boundaries become `�` replacement characters.
-
-**(6) `buf = lines.pop() ?? ''` — the partial-line handler.** This is the load-bearing line in the whole kernel. `split('\n')` on `"foo\nbar\nbaz"` returns `["foo", "bar", "baz"]`; on `"foo\nbar\nba"` it returns `["foo", "bar", "ba"]`. In the second case, `"ba"` is a partial line — it must NOT be `JSON.parse`d. `pop()` returns `"ba"` and removes it from the array; the loop processes `["foo", "bar"]` and the next chunk's `decoder.decode` appends to `"ba"`, completing it.
-
-**(7) `JSON.parse(line) as E` — typed by the caller.** The kernel is generic in `E`. The consumer specifies `readNdjson<AgentEvent>(...)` (in `useInvestigation.ts:194`) or `readNdjson<BriefingEvent>(...)` (in `useBriefingStream.ts:288`); the kernel doesn't know or care what's inside.
-
-**(8) `onMalformed` — the policy hook.** A `JSON.parse` throw means a bad line. The kernel's default is *silent skip* — log nothing, drop the line, keep reading. Loud failure would terminate the stream mid-run. The consumer can pass `onMalformed` to log; in practice none of the four consumers do, because the route handlers always emit valid JSON.
-
-**(9) Trailing-buffer flush.** When the producer terminates events with `\n` (which all four route handlers do), the buffer is empty when `done` arrives — this block is a no-op. Kept for the case where a future producer omits the terminal newline; one extra branch costs nothing.
-
-**(10) `releaseLock()` in `finally`.** Whether the loop exits via `cancel`, `done`, or an exception thrown by `onEvent`, the lock is released. Without this, a thrown event handler would leave the stream permanently locked.
-
-What breaks if you remove each part:
-
-| remove this | what breaks |
-|-------------|-------------|
-| `cancelOn` poll | StrictMode re-mount can leave two concurrent readers alive; mode-toggle stays stuck on the old run |
-| `TextDecoder` `{ stream: true }` | non-ASCII characters at chunk boundaries become `�` |
-| `buf = lines.pop()` | partial lines hit `JSON.parse`, throw, fall through to `onMalformed`, get dropped — random events go missing |
-| `try { onEvent } catch onMalformed` | one bad event from the producer crashes the whole consumer |
-| `finally releaseLock` | a throwing event handler leaves the body locked; subsequent `getReader()` calls reject |
-
-Kernel done. Skeleton complete. Everything else is **hardening on the consumer side.**
-
-#### The consumer (`useInvestigation`), side by side with what each part does
-
-The largest consumer (`lib/hooks/useInvestigation.ts`, 202 LOC) is the canonical shape. Let's walk the load-bearing parts.
-
-**The 5 useState slots plus the closure mirror.** Why both?
+**The state slots — what gets re-rendered when an event arrives.**
 
 ```ts
-// lib/hooks/useInvestigation.ts:39-43, 66-68
-export function useInvestigation(id, step): InvestigationState {
-  const [items, setItems] = useState<TraceItem[]>([]);
-  const [diagnosis, setDiagnosis] = useState<Diagnosis | null>(null);
-  const [recommendations, setRecommendations] = useState<Recommendation[]>([]);
-  const [complete, setComplete] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const startedRef = useRef(false);
-
-  useEffect(() => {
-    // ...
-    const cItems: TraceItem[] = [];         // ← closure mirror of `items`
-    let cDiag: Diagnosis | null = null;     // ← closure mirror of `diagnosis`
-    const cRecs: Recommendation[] = [];     // ← closure mirror of `recommendations`
+// lib/hooks/useBriefingStream.ts:108-120
+const [status, setStatus]               = useState<FeedStatus>('loading');
+const [insights, setInsights]           = useState<Insight[]>([]);
+const [workspace, setWorkspace]         = useState<...>(undefined);
+const [errorMessage, setErrorMessage]   = useState('');
+const [demoSuffix, setDemoSuffix]       = useState('');
+const [stepStatus, setStepStatus]       = useState('');
+const [queryCount, setQueryCount]       = useState(0);
+const [traceItems, setTraceItems]       = useState<TraceItem[]>([]);
+const [coverage, setCoverage]           = useState<CoverageReport>([]);
 ```
 
-The React state is what the UI renders. The closure mirrors are what the **stash gets serialized from** when `done` arrives:
+Nine slots. Each NDJSON event case updates exactly one or two of them. The page reads all nine off the hook's return value.
+
+**The cancellation latch — `cancelledRef` (lib/hooks/useBriefingStream.ts:130-152).**
 
 ```ts
-// lib/hooks/useInvestigation.ts:131-143
-case 'done':
-  setComplete(true);
-  try {
-    sessionStorage.setItem(
-      stashKey(step, id),
-      JSON.stringify({ items: cItems, diagnosis: cDiag, recommendations: cRecs }),
-    );
-    if (step === 'diagnose' && cDiag) {
-      sessionStorage.setItem(diagHandoffKey(id), JSON.stringify({ diagnosis: cDiag }));
-    }
-  } catch { /* stash is best-effort */ }
-  break;
-```
+const cancelledRef = useRef(false);
 
-If the stash read from `items` / `diagnosis` / `recommendations` (the React state) inside the event handler, it could read **stale values** — setState is async, batched, and not guaranteed to have flushed before `done` arrives. The closure mirrors are updated **synchronously** at each event arm (e.g. `cDiag = e.diagnosis` at L124, `cRecs.push(...)` at L128), so by the time `done` lands, the mirrors are a complete record of everything seen. That's what gets stashed; the React state is for rendering.
-
-**The StrictMode survival pattern.** React 19 with `reactStrictMode: true` (Next default) mounts effects, runs cleanup, then re-mounts in dev. Without a guard, each route load would open two concurrent agent runs.
-
-```ts
-// lib/hooks/useInvestigation.ts:44, 46-49
-const startedRef = useRef(false);
 useEffect(() => {
-  if (!id) return;
-  if (startedRef.current) return;   // ← run once per mount; the re-mount bails
-  startedRef.current = true;
+  if (!ready) return;
+  // reset on every effect run so a mode flip starts fresh
+  cancelledRef.current = false;
+  // ... fetch + readNdjson ...
+  return () => {
+    cancelledRef.current = true;       // cleanup flips it
+  };
+}, [mode, ready]);
 ```
 
-The latch prevents the second mount from opening a fetch. Then — and this is the surprising part — the cleanup function is **empty**. The comment block at L33-37 explains why:
+The kernel polls this via `cancelOn: () => cancelledRef.current` at line 288. When the user toggles `demo → live-bloomreach`, the effect cleanup runs, flips the ref, the kernel sees `true` between its next two reads, calls `reader.cancel()`, returns. The new effect run resets the ref and starts a fresh fetch.
 
-> we deliberately do NOT cancel the fetch on effect cleanup. React StrictMode (dev) mounts → cleans up → re-mounts; cancelling on the first cleanup, with the started-guard blocking the re-mount, aborted the stream and left the logs empty. The started-guard prevents a double fetch; the in-flight run simply completes (setState after unmount is a safe no-op).
-
-This is a real tradeoff (see lens 8.3 of `audit.md`) — a user who navigates away mid-run leaves the agent running in the background until completion. The team accepted it because the alternative (a more elaborate "is this a real unmount?" detector) doesn't exist in React's public API.
-
-**The dispatcher.** A 6-case `switch` (`useInvestigation.ts:98-152`), with two tricky arms:
+**The dispatcher — the 9-case switch (lib/hooks/useBriefingStream.ts:204-286).** The shape is:
 
 ```ts
-case 'tool_call_start': {
-  const it: TraceItem = { kind: 'tool', id: crypto.randomUUID(), toolName: e.toolName,
-                           status: 'running', ts: Date.now() };
-  cItems.push(it);                 // mirror update — synchronous
-  setItems((p) => [...p, it]);     // React update — async
-  break;
-}
-case 'tool_call_end':
-  replaceRunningTool(cItems, e);            // mirror update — synchronous
-  setItems((p) => replaceRunningTool([...p], e));  // React update — async
-  break;
+const handle = (evt: BriefingEvent) => {
+  switch (evt.type) {
+    case 'workspace':       setWorkspace(evt.workspace); break;
+    case 'coverage_item':   setCoverage((prev) => ...);   break;   // append/dedupe
+    case 'coverage':        setCoverage(evt.coverage);    break;
+    case 'tool_call_start': setQueryCount((n) => n + 1);
+                            setTraceItems((prev) => [...prev, { kind: 'tool', ... }]);
+                            break;
+    case 'reasoning_step':  setStepStatus(content);
+                            setTraceItems((prev) => [...prev, { kind: 'step', ... }]);
+                            break;
+    case 'tool_call_end':   setTraceItems((prev) => /* mutate the last running tool */);
+                            break;
+    case 'insight':         collected.push(evt.insight); break;
+    case 'done':            setInsights(collected); stashInsights(collected);
+                            callbacksRef.current?.onStreamComplete?.();
+                            setStatus(collected.length === 0 ? 'empty' : 'loaded');
+                            break;
+    case 'error': {
+      const msg = evt.message ?? 'something went wrong';
+      if (callbacksRef.current?.onAuthError?.(msg)) return;   // delegate auth
+      setErrorMessage(msg); setStatus('error'); break;
+    }
+  }
+};
 ```
 
-`replaceRunningTool` walks backward from the tail looking for the most recent `running` tool item with a matching `toolName` and flips it to `done` with the duration / result / error. The mirror update is in-place; the React update clones first. The pair-update pattern is repeated for every event arm.
+The interesting move is `case 'error'`: the dispatcher *delegates* the auth-shaped error case to a callback the page provides (`reconnectPolicy.handle`). If the callback returns `true`, it took the error — bail. Otherwise, surface it normally. That's the composition seam between this hook and `useReconnectPolicy`.
 
-**The mode-aware URL builder** (`useInvestigation.ts:154-178`). On a live run, the hook reads `localStorage.getItem('bi:mode')`, maps legacy values, and appends `&live=1&mode=<mode>`. It also pulls the stashed insight from `sessionStorage` and appends it as `&insight=<encoded>` — because on Vercel the feed and the investigation request can hit different serverless instances, and the browser is the only reliable carrier for the cross-instance handoff. (See lens 2 of `audit.md` for the full handoff map.)
-
-**The 401 / OAuth dance** (`useInvestigation.ts:181-186`). Before the body is even read, the response status is checked. If it's 401 and the body carries `{ needsAuth, authUrl }`, the hook does `window.location.href = authUrl` — full-page navigation to the OAuth start. The browser's auth flow finishes by redirecting to a callback that lands the user back on the page, and the hook's `useEffect` re-runs naturally.
-
-#### The two other consumers — same shape, different events
-
-`useBriefingStream.ts` (313 LOC, `lib/hooks/useBriefingStream.ts`) is the larger sibling — 9 useState slots, 9 event-type dispatcher, plus a `cancelledRef` that IS polled in `readNdjson`'s `cancelOn` (the briefing supports mode-toggling mid-stream; investigation doesn't, so investigation skips this). The kernel call site:
+**The call site — where the kernel meets the consumer.**
 
 ```ts
 // lib/hooks/useBriefingStream.ts:288
-await readNdjson<BriefingEvent>(res.body, handle, { cancelOn: () => cancelledRef.current });
+await readNdjson<BriefingEvent>(
+  res.body,
+  handle,
+  { cancelOn: () => cancelledRef.current },
+);
 ```
 
-`useDemoCapture.ts` (146 LOC, `lib/hooks/useDemoCapture.ts:84-87`) uses the kernel for its watch-the-stream-until-done shape:
+One line. The kernel does the loop; the hook owns the React layer.
 
-```ts
-let result: { ok: boolean; error?: string } = { ok: false, error: 'stream ended without done' };
-await readNdjson<{ type?: string; message?: string }>(res.body, (evt) => {
-  if (evt.type === 'done') result = { ok: true };
-  else if (evt.type === 'error') result = { ok: false, error: String(evt.message ?? 'error') };
-});
-return result;
-```
+#### The flow — layers-and-hops
 
-The minimal consumer: no React state, no useEffect — just a closure variable mutated inside the event callback, returned after the kernel returns.
-
-`StreamingResponse.tsx` (253 LOC, `components/chat/StreamingResponse.tsx:108`) is the chat-style consumer: 4-case dispatcher, special-cases `agent === 'coordinator' && stepKind === 'conclusion'` as "the final answer" and pulls it out into a separate `useState<string>`.
-
-#### Layers-and-hops — one event from agent loop to pixel
+What happens over the wire and across the layers, hop by hop, when the user toggles `demo → live-bloomreach`.
 
 ```
-  Layers-and-hops — what travels and which direction
+  Layers-and-hops — one round trip, briefing stream
 
-  ┌─ Browser ──────────┐  hop 1: GET /api/agent?step=diagnose       ┌─ Edge ────┐
-  │  useInvestigation  │ ──────────────────────────────────────────► │  Vercel   │
-  │  setItems(...)     │                                              │  Function │
-  │     ▲              │                                              └─────┬─────┘
-  └─────┼──────────────┘                                            hop 2  │
-        │ hop 7: setState fires, React reconciles, paint                  │ runs
-        │                                                                  ▼
-  ┌─────┴──────────────┐  hop 6: onEvent(parsed)             ┌─ Service layer ──┐
-  │  readNdjson kernel │ ◄──────────────────────────────────│  diagnostic.ts   │
-  │  buf.split('\n')   │  hop 5: chunk arrives               │  runAgentLoop()  │
-  │  JSON.parse(line)  │ ◄──────────────────────────────────│       │           │
-  └────────────────────┘  hop 4: '\n'-terminated bytes       │       │ tool call │
-                                                              │       ▼           │
-                                                              │  MCP server      │
-                                                              │       │           │
-                                                              │       │ hop 3     │
-                                                              │       ▼           │
-                                                              │  Bloomreach EQL  │
-                                                              └──────────────────┘
+  ┌─ Client / React ───┐    hop 1: setMode('live-bloomreach')   ┌─ Client / React ───┐
+  │ app/page.tsx       │ ──────────────────────────────────────► │ useBriefingStream  │
+  │  switchMode()      │    (deps [mode, ready] change           │  cleanup → effect  │
+  └────────────────────┘     → cleanup → re-run effect)          └──────────┬─────────┘
+                                                                            │
+                                                                            │ hop 2: fetch(/api/briefing?mode=live-bloomreach)
+                                                                            ▼
+                                                                  ┌─ Network ─────────┐
+                                                                  │  HTTP GET         │
+                                                                  └──────────┬────────┘
+                                                                             │ hop 3: ReadableStream body
+                                                                             ▼
+                                                                  ┌─ Server / Next ───┐
+                                                                  │ app/api/briefing  │
+                                                                  │  /route.ts        │
+                                                                  │  controller       │
+                                                                  │  .enqueue(line\n) │
+                                                                  └──────────┬────────┘
+                                                                             │ hop 4: bytes (one chunk per agent event)
+                                                                             ▼
+  ┌─ Browser primitive ┐                                          ┌─ Client / kernel ──┐
+  │ TCP / fetch reader │ ◄────────────────────────────────────── │ readNdjson         │
+  │                    │    hop 5: reader.read() resolves         │  loop body         │
+  └──────────┬─────────┘                                          └──────────┬─────────┘
+             │                                                                │ hop 6: JSON.parse(line)
+             │                                                                ▼
+             │                                                      ┌─ Client / hook ────┐
+             │                                                      │ handle(evt) switch │
+             │                                                      │  setState(…)       │
+             │                                                      └──────────┬─────────┘
+             │                                                                 │ hop 7: re-render
+             │                                                                 ▼
+             │                                                       ┌─ Client / React ──┐
+             │                                                       │ ReasoningTrace    │
+             │                                                       │ appends one row   │
+             │                                                       └───────────────────┘
+             │                                                                 │
+             └─── hops 5-7 repeat for every event until done=true ─────────────┘
 ```
 
-Hop 5 is where the streaming changes everything: instead of one big response after hop 3 completes, each agent step (each `reasoning_step`, each `tool_call_start`, each `tool_call_end`) is encoded and flushed independently. The browser sees the first `reasoning_step` at ~200ms — long before the diagnostic is done.
+Every hop is labelled. The kernel sits at hop 5-6; the consumer hook owns hop 7.
+
+#### Move 2.5 — the two StrictMode adaptations
+
+The pattern has a Phase A reality you can't skip: React 19 + `reactStrictMode` mounts every component twice in dev. The same kernel is consumed by two hooks that face *different* lifecycle pressures, and each one adapts differently. This is comparison territory.
+
+```
+  Comparison — two consumers, two StrictMode strategies
+
+  ┌─ useBriefingStream ─────────────────────┐  ┌─ useInvestigation ────────────────────┐
+  │                                         │  │                                       │
+  │  cancelledRef = useRef(false)           │  │  startedRef = useRef(false)           │
+  │                                         │  │                                       │
+  │  useEffect(() => {                      │  │  useEffect(() => {                    │
+  │    cancelledRef.current = false         │  │    if (startedRef.current) return     │
+  │    // ... fetch + readNdjson({          │  │    startedRef.current = true          │
+  │    //   cancelOn: () =>                 │  │    // ... fetch + readNdjson(...)     │
+  │    //     cancelledRef.current })       │  │    // NO cleanup of the in-flight     │
+  │    return () => {                       │  │    //    fetch — deliberate          │
+  │      cancelledRef.current = true        │  │  }, [id, step])                       │
+  │    }                                    │  │                                       │
+  │  }, [mode, ready])                      │  │                                       │
+  │                                         │  │                                       │
+  │  Why: the briefing SHOULD re-fetch      │  │  Why: an investigation should run     │
+  │  when mode toggles. Cleanup must        │  │  exactly once per mount. The         │
+  │  cancel the previous run. The kernel    │  │  StrictMode double-mount would       │
+  │  polls between reads and cancels        │  │  cancel + restart + race. Started-    │
+  │  cleanly when it sees the ref flip.     │  │  guard makes the effect idempotent.   │
+  │                                         │  │                                       │
+  │  Cancel mid-stream: yes                 │  │  Cancel mid-stream: no                │
+  │  Re-fire on dep change: yes             │  │  Re-fire on dep change: no            │
+  └─────────────────────────────────────────┘  └───────────────────────────────────────┘
+```
+
+The header comment on `useInvestigation.ts:33-37` names the bug that produced this split: *"cancelling on the first cleanup, with the started-guard blocking the re-mount, aborted the stream and left the logs empty."* The pattern doesn't dictate either choice — it provides the `cancelOn` hook and lets the consumer pick its lifecycle strategy.
 
 ### Move 3 — the principle
 
-The pattern that generalizes: **when the result takes longer than the user's patience budget, treat the response body as a sequence, not a value.** The transport (NDJSON over HTTP), the kernel shape (read → decode → split → parse → onEvent), and the consumer shape (closure mirror + React state pair) compose together — but the deepest principle is the first one. Once you commit to streaming, every other decision in this guide follows: no React Query (no cache for a stream), no Suspense (no single fallback for a sequence), no SSR (you can't pre-render a stream-driven UI), progressive composition over single-state skeletons (see `02`).
+**Pull the parse loop down to a kernel; let consumers own the lifecycle.** The principle generalizes past NDJSON: any time you have N callers doing the same `read → decode → split → parse → dispatch` loop, the lifecycle policies (cancel? restart? idempotent?) differ but the loop body is the same. Centralize the loop, parametrize the cancellation hook, leave the dispatcher and the React state to the caller. The 64-line kernel is what makes the four consumers tractable; without it, each one would re-implement the buffer-split bug.
+
+The cross-cutting version: **don't bake lifecycle into a kernel; expose the cancellation signal and let lifecycle live one layer up.** Fetch with `AbortSignal`, generators with `try/return`, observables with `unsubscribe`, this pattern with `cancelOn` — same shape every time.
 
 ## Primary diagram
 
-Everything Move 2 walked, in one frame.
+The full pattern, end to end, one frame.
 
 ```
-  The full picture — NDJSON kernel + consumer pair
+  NDJSON stream reader hook — the whole pattern
 
-  ┌─ UI layer (browser) ─────────────────────────────────────────────────────┐
-  │                                                                          │
-  │  React render                                                            │
-  │       ▲                                                                  │
-  │       │ setState per event (5 slots for investigation)                   │
-  │       │                                                                  │
-  │  ┌────┴───────── consumer (useInvestigation) ────────────────────────┐   │
-  │  │  startedRef latch  →  StrictMode survival                          │   │
-  │  │  sessionStorage stash check  →  hydrate-from-cache fast path       │   │
-  │  │  closure mirrors (cItems / cDiag / cRecs) — sync record for stash  │   │
-  │  │  URL builder reads bi:mode + bi:insight:<id>                       │   │
-  │  │  fetch(url) → 401? OAuth redirect : await readNdjson(res.body,…)   │   │
-  │  │  6-case switch (reasoning_step | tool_call_start | tool_call_end | │   │
-  │  │                  diagnosis | recommendation | done | error)        │   │
-  │  └────┬───────────────────────────────────────────────────────────────┘   │
-  │       │                                                                  │
-  │       │ onEvent(parsedEvent)                                             │
-  │       │                                                                  │
-  │  ┌────┴────── kernel (readNdjson, 64 LOC) ────────────────────────────┐  │
-  │  │  reader = body.getReader()                                          │  │
-  │  │  while (true):                                                      │  │
-  │  │    if cancelOn() → reader.cancel(); return                          │  │
-  │  │    { value, done } = await reader.read()                            │  │
-  │  │    if done → break                                                  │  │
-  │  │    buf += decoder.decode(value, { stream: true })                   │  │
-  │  │    lines = buf.split('\n');  buf = lines.pop() ?? ''                │  │
-  │  │    for each line: try JSON.parse → onEvent ; catch → onMalformed    │  │
-  │  │  flush trailing tail                                                │  │
-  │  │  finally reader.releaseLock()                                       │  │
-  │  └────┬───────────────────────────────────────────────────────────────┘  │
-  │       │                                                                  │
-  └───────┼──────────────────────────────────────────────────────────────────┘
-          │  HTTP/1.1 chunked, Content-Type: application/x-ndjson (or similar)
-  ┌───────┼──────────────────────────────────────────────────────────────────┐
-  │       ▼   Service layer (Next.js Route Handler)                          │
-  │  GET /api/agent  →  new Response(new ReadableStream({ start(controller){ │
-  │     runAgentLoop({ onEvent: (e) => controller.enqueue(encodeEvent(e)) }) │
-  │  }}))                                                                    │
-  │  encodeEvent(e) = TextEncoder.encode(JSON.stringify(e) + '\n')           │
-  └──────────────────────────────────────────────────────────────────────────┘
-
-  The kernel knows nothing about agents or events.
-  The consumer knows nothing about TextDecoder or chunk boundaries.
-  The route knows nothing about React.
-  Each layer can change without touching the others.
+  ┌─ UI ────────────────────────────────────────────────────────────────────┐
+  │  page.tsx                       investigate/[id]/page.tsx               │
+  │   { insights, traceItems,        { items, diagnosis, complete, error }  │
+  │     coverage, status, ... }       = useInvestigation(id, 'diagnose')    │
+  │   = useBriefingStream(mode,                                             │
+  │       ready, { onAuthError,      ReasoningTrace items={items}           │
+  │                onStreamComplete })  └─ re-renders on every appended row │
+  └────────────────────────────────────────┬────────────────────────────────┘
+                                           │
+  ┌─ Hook (useState ×N, useEffect, useRef) ▼────────────────────────────────┐
+  │  useEffect(() => {                                                      │
+  │    cancelledRef.current = false                                         │
+  │    (async () => {                                                       │
+  │      res = await fetch(url)                                             │
+  │      if (auth | error) handle → return                                  │
+  │                                                                         │
+  │      const handle = (evt) => {                                          │
+  │        switch (evt.type) {                                              │
+  │          case 'reasoning_step': setTraceItems(p => [...p, step])        │
+  │          case 'tool_call_start': setQueryCount(n => n + 1); setTrace... │
+  │          case 'tool_call_end':   setTraceItems(p => replaceRunning(p))  │
+  │          case 'insight':         collected.push(insight)                │
+  │          case 'done':            setInsights(collected); onStreamComp() │
+  │          case 'error':           if (onAuthError(msg)) return;          │
+  │                                  setError(msg); setStatus('error')      │
+  │        }                                                                │
+  │      }                                                                  │
+  │                                                                         │
+  │      await readNdjson(res.body, handle,                                 │
+  │                       { cancelOn: () => cancelledRef.current })         │
+  │    })()                                                                 │
+  │    return () => { cancelledRef.current = true }                         │
+  │  }, [mode, ready])                                                      │
+  └────────────────────────────────────────┬────────────────────────────────┘
+                                           │
+  ┌─ Kernel (lib/streaming/ndjson.ts) ─────▼────────────────────────────────┐
+  │  reader  = body.getReader()                                             │
+  │  decoder = new TextDecoder()                                            │
+  │  buf     = ''                                                           │
+  │  try {                                                                  │
+  │    while (true) {                                                       │
+  │      if (cancelOn?.()) { await reader.cancel(); return }                │
+  │      { value, done } = await reader.read()                              │
+  │      if (done) break                                                    │
+  │      buf += decoder.decode(value, { stream: true })                     │
+  │      lines = buf.split('\n');  buf = lines.pop() ?? ''                  │
+  │      for (raw of lines) {                                               │
+  │        line = raw.trim(); if (!line) continue                           │
+  │        try { onEvent(JSON.parse(line)) } catch (e) { onMalformed?.(.) } │
+  │      }                                                                  │
+  │    }                                                                    │
+  │    // flush trailing tail (no-op when producer ends with \n)            │
+  │  } finally { reader.releaseLock() }                                     │
+  └────────────────────────────────────────┬────────────────────────────────┘
+                                           │ HTTP, Content-Type: application/x-ndjson
+  ┌─ Server (Next route handler) ──────────▼────────────────────────────────┐
+  │  return new Response(                                                   │
+  │    new ReadableStream<Uint8Array>({                                     │
+  │      async start(controller) {                                          │
+  │        for await (const evt of runAgentLoop(...)) {                     │
+  │          controller.enqueue(encoder.encode(encodeEvent(evt)))           │
+  │        }                                                                │
+  │        controller.close()                                               │
+  │      }                                                                  │
+  │    }),                                                                  │
+  │    { headers: { 'content-type': 'application/x-ndjson' } }              │
+  │  )                                                                      │
+  └─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-NDJSON is older than the modern streaming-AI world — it has been the de facto format for log shipping (Fluentd, Vector), bulk data export (Elasticsearch, MongoDB), and inter-process pipes for years. The pattern your hook implements is the same one a Fluentd output plugin implements when it tails a file. What's new is using it as the client-server contract for an interactive UI.
+**Where this pattern comes from.** NDJSON ("newline-delimited JSON") is the simplest streaming protocol over HTTP that doesn't require a new transport: one JSON object per line, `\n` as the delimiter, `Content-Type: application/x-ndjson` on the response. It predates SSE in industry use (log shipping, ETL feeds, Elasticsearch `_bulk`) and remains the lingua franca when you need a stream over plain `fetch`. The browser-side recipe — `body.getReader() + TextDecoder + split('\n') + JSON.parse` — is the canonical browser implementation of an NDJSON consumer.
 
-The alternative that didn't win here is **Server-Sent Events (SSE)**. SSE is purpose-built for this — `EventSource` in the browser, automatic reconnection, a standardized `data: ...\n\n` wire format. The team chose `fetch` + `ReadableStream` over `EventSource` for three reasons:
+**Why not Server-Sent Events.** SSE has a built-in browser API (`EventSource`) and would have eliminated the kernel. Two blockers in this repo: `EventSource` doesn't support custom headers (so OAuth bearer tokens can't be sent), and it doesn't support `POST` (the chat surface uses `GET` with `?q=`, but a future mutation would have to switch). NDJSON over `fetch` is the strictly more general choice.
 
-1. `EventSource` doesn't allow custom request headers (no `Authorization: Bearer ...`)
-2. `EventSource` is GET-only — POST bodies aren't supported
-3. `EventSource` auto-reconnects on its own schedule, which would fight `useReconnectPolicy`'s one-shot guard
+**Why not a query library.** React Query / SWR / TanStack Query are *request-shaped* — they assume a request returns a value. Streaming agent events don't fit: the value arrives over thirty seconds, in pieces, with a 9-case dispatcher. A query library would either buffer the stream (defeating the point) or be used as a thin wrapper around the same fetch+reader loop. The kernel hits the ceiling first.
 
-WebSockets were never on the table — they're full-duplex, and the agent → UI stream is one-way; the bidirectional plumbing would be pure cost.
+**What this pattern doesn't solve, and what it punts to a neighbor.**
+- Backpressure — the kernel doesn't push back if React is slow to re-render. `study-performance-engineering` would measure this.
+- Reconnection — if the connection drops mid-stream, the kernel resolves and the consumer surfaces "stream ended." `useReconnectPolicy` handles the auth-revoked case; a true mid-stream reconnect would be a new layer.
+- Wire-format evolution — adding a tenth `BriefingEvent` case means updating the producer, the consumer's switch, and the type union. There's no schema versioning. The contract is the TypeScript union (`useBriefingStream.ts:36-45`).
+- Ordering / dedup — the kernel assumes the producer's order is the truth. No `eventId`, no replay.
 
-The pattern most adjacent in your portfolio is **AdvntrCue's streaming chat** (per `me.md`'s system-design portfolio). That uses the same conceptual shape (Vercel serverless + streaming response + browser stream consumer) but with `streamText` from the Vercel AI SDK — which wraps a similar `fetch + reader` loop under a friendlier API. The trade is: the SDK gives you a hook (`useChat`) at the cost of locking into one wire format and one event shape. NDJSON here is the unwrapped version of that same pattern; you control every byte.
-
-What to read next: `02-progressive-skeleton-with-stepper.md` covers how the events the kernel delivers actually become visible UI — the skeleton-sized-like-the-result trick that holds layout steady while the dispatcher fires.
+**See also.** The producer side (`app/api/briefing/route.ts:80-208`, `app/api/agent/route.ts:105-344`) builds the `ReadableStream` with `encodeEvent`. The route comments name the budget — `maxDuration = 300` on Vercel — that bounds the stream's lifetime. The wire contract (`AgentEvent` union in `lib/mcp/events.ts`, `BriefingEvent` union in `useBriefingStream.ts:36-45`) is the agreement between producer and consumer; *that's* the seam that must not change (see the project context's "what must not change" list).
 
 ## Interview defense
 
-**Q: Walk me through how you stream agent reasoning to the browser.**
+**Q: Why NDJSON over Server-Sent Events?**
 
-Open with the picture, not the definition. "Three layers — a Next.js route opens a `ReadableStream` and writes one JSON event per line; a 64-LOC kernel in `lib/streaming/ndjson.ts` reads the body, splits on `\n`, and calls a typed `onEvent` per event; a React hook owns the `useState` slots and a `switch` that maps event types to state updates. The whole thing is `fetch + ReadableStream + TextDecoder`, no SDK, no library."
-
-```
-  whiteboard sketch
-
-  fetch ──► reader.read() ──► decode + buf ──► split('\n')
-                                                    │
-                                             pop() trailing
-                                             partial line
-                                                    │
-                                                    ▼
-                                            JSON.parse → onEvent
-                                                    │
-                                                    ▼
-                                              setState per event
-```
-
-Then name the load-bearing parts: "The partial-line handler — `buf = lines.pop() ?? ''` — is the one most hand-rolled versions get wrong. The `TextDecoder` constructed once with `{ stream: true }` keeps UTF-8 codepoints intact across chunks. Cooperative cancellation via a `cancelOn` predicate the consumer owns."
-
-**Q: Why NDJSON instead of SSE?**
-
-"Three reasons. SSE's `EventSource` doesn't allow `Authorization` headers, doesn't allow POST, and auto-reconnects on its own schedule — which would fight our one-shot reconnect guard for the Bloomreach OAuth flow. The unwrapped `fetch + ReadableStream` gives us all that control. The wire format is JSON-per-line; the routing is whatever HTTP gives us."
-
-**Q: How do you handle React StrictMode? Most stream hooks have bugs there.**
-
-"A `startedRef` latch on the first effect run prevents the re-mount from opening a second fetch. The cleanup function is deliberately empty — I tried cancelling the fetch on cleanup, but with the latch blocking the re-mount, it aborted the stream and left the logs empty. The tradeoff: a user navigating away mid-run leaves the agent running until it finishes. Setstate after unmount is a safe no-op. I documented this with the rationale at the top of the hook."
+A — *the diagram you sketch while you answer:*
 
 ```
-  the StrictMode dance
+  Why NDJSON, not SSE
 
-  mount 1     ─► effect runs   ─► startedRef = true, opens fetch
-  cleanup 1   ─► (no cancel)
-  mount 2     ─► effect runs   ─► startedRef === true, bail
-  fetch from mount 1 finishes  ─► setStates flush into mount-2 React tree
+  SSE (EventSource)                NDJSON (fetch + reader)
+  ─────────────────                ───────────────────────
+  built-in browser API             custom 64-line kernel
+  GET only                         GET or POST
+  no custom headers                custom headers (OAuth)
+  auto-reconnect                   manual reconnect
+  text only                        any JSON
+  one event format                 you own the format
 ```
 
-**Q: Why is the closure mirror separate from the React state?**
+The deciding factor here was custom headers — the OAuth bearer needs to ride on the request. SSE's auto-reconnect is genuinely nice; we trade it for the flexibility. The kernel is 64 lines, so we paid for the trade.
 
-"Because `setState` is async. When the `done` event arrives, I want to stash a complete object into sessionStorage so the next visit hydrates instantly. If I read `items` from the React state inside the event handler, I might get a stale snapshot. The closure mirror — `cItems`, `cDiag`, `cRecs` — is updated synchronously as each event arrives, so by the time `done` fires, it's a complete record. React state is for rendering; the mirror is for serialization."
+*Anchor:* the kernel is `lib/streaming/ndjson.ts`; the comment names this as "the canonical implementation."
 
-**Q: What if a malformed line comes through?**
+---
 
-"The kernel's default is silent skip — `JSON.parse` throws, the `onMalformed` callback fires, the loop continues to the next line. Loud failure would terminate the stream mid-run, which is worse than dropping one event. The consumer can pass `onMalformed` to log; in practice ours don't, because the route handlers always emit valid JSON."
+**Q: Walk me through the kernel from memory. What's the part people forget?**
+
+A — *the diagram:*
+
+```
+  The kernel — five irreducible parts
+
+      ⓐ getReader()      → acquire the lock
+      ⓑ cancelOn poll    → check the cancellation hook
+      ⓒ reader.read()    → await the next chunk
+      ⓓ split('\n') / buf.pop()  → tail buffer for partial lines
+      ⓔ JSON.parse + onEvent     → dispatch
+      ⓕ finally releaseLock      → always release
+```
+
+The load-bearing part people forget is **ⓓ — the tail buffer.** Bytes arrive on arbitrary boundaries; a single event can split across two `read()` calls. Without `buf = lines.pop() ?? ''` holding the incomplete fragment, you get `JSON.parse` errors on a half-line. Most "broken NDJSON parser" bugs are this exact mistake.
+
+*Anchor:* `lib/streaming/ndjson.ts:40-41` is where the tail is captured.
+
+---
+
+**Q: You said you don't cancel the fetch on cleanup in `useInvestigation`. Defend that.**
+
+A — *the diagram:*
+
+```
+  Two consumers, two StrictMode strategies
+
+  useBriefingStream    useInvestigation
+  ─────────────────    ────────────────
+  cancel on cleanup    DO NOT cancel on cleanup
+  cancelOn polled      startedRef guard
+  ↑                    ↑
+  briefing re-fires    investigation runs once
+  when mode toggles    per mount, no race
+
+  Why no cancel for investigation:
+    StrictMode dev double-mount + startedRef
+    + cancel on cleanup = aborted stream,
+    re-mount blocked by guard, empty logs.
+    The bug shipped once; this is the fix.
+```
+
+The lifecycle pressure on the two hooks is different. The briefing hook re-fetches when `mode` toggles, so cleanup MUST cancel. The investigation runs once per mount; cleanup cancelling the first mount aborts the stream while the started-guard blocks the re-mount from restarting it. So we don't cancel — `setState` after unmount is a safe no-op in React.
+
+*Anchor:* `lib/hooks/useInvestigation.ts:33-37` and `:48-49`; comment names the bug.
+
+---
+
+**Q: What's the cost of unmemoized re-renders on `ReasoningTrace`?**
+
+A — *the diagram:*
+
+```
+  Per-event render cost
+
+  one NDJSON event arrives
+       │
+       ▼
+  setItems(p => [...p, item])    O(1) state update
+       │
+       ▼
+  ReasoningTrace re-renders      O(n) — full items.map()
+       │
+       ▼
+  one new row mounts             O(1) DOM insertion
+  n-1 keyed rows short-circuit   O(n) reconciliation, no DOM
+```
+
+Today: tens of trace items per investigation, the re-render cost is invisible. At a hundred-plus items it'd start showing in a profiler — the keys short-circuit DOM reconciliation but the JSX re-render is still O(n). Fix shape: `React.memo` on the row component or virtualization. Not yet a problem; named as the next bottleneck.
+
+*Anchor:* `components/investigation/ReasoningTrace.tsx:52-107`.
 
 ## See also
 
-- `00-overview.md` — the network seam diagram + the three highest-leverage patterns
-- `02-progressive-skeleton-with-stepper.md` — how the events this kernel delivers become visible UI
-- `audit.md` lens 1 (rendering & reactivity), lens 4 (data-fetching & cache), lens 8.3 (the deliberate non-cancel tradeoff)
-- `study-networking` (sibling guide) — HTTP chunked transfer, `EventSource` vs `fetch+ReadableStream` tradeoffs in depth
-- `study-runtime-systems` (sibling guide) — what happens under `await reader.read()` in the event loop
-- `study-software-design` (sibling guide) — `useInvestigation` as an Ousterhout deep module (5-field result interface hides the dispatcher + closure mirror + StrictMode latch)
+- `02-progressive-skeleton-with-stepper.md` — what the dispatched events DO once they land in state. The pattern that turns the stream into a UI that feels alive.
+- `audit.md` → `data-fetching-and-cache` — the lens-level finding for "no client query library; four streaming surfaces share the kernel."
+- `audit.md` → `rendering-and-reactivity` — the StrictMode adaptations recorded at the lens level.
+- Neighbor: `study-networking` — the wire format and HTTP/1.1 chunked-encoding semantics on the actual transport. This file owns the browser-side consumer; the network owns the bytes.
+- Neighbor: `study-runtime-systems` — the event loop and the `await reader.read()` suspension point. This file owns the React layer; the runtime owns the scheduler.
+- Neighbor: `study-system-design` — the `AgentEvent` / `BriefingEvent` contract as a system seam; the cache-as-architecture question (why sessionStorage, not memory).

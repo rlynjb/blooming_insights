@@ -1,134 +1,105 @@
-# AptKit primitive boundary — three adapters between Blooming and a reusable agent library
+# aptkit-primitive-boundary
 
-**Industry name:** anti-corruption layer / adapter pattern · Industry standard
+## Adapter pattern at the library boundary (industry standard)
 
-## Zoom out, then zoom in
+The same port + adapter shape as the DataSource seam, applied one layer up — between this repo and `@aptkit/core@0.3.0`. The library owns the agent loop; this repo owns the boundary. Three adapter classes (206 LOC, all in `lib/agents/aptkit-adapters.ts`) bridge the library's three ports to this repo's primitives: the Anthropic SDK client, the `DataSource` port, and the route's NDJSON event hooks.
 
-The agents themselves — the monitoring scan, the diagnostic investigation,
-the recommendation pipeline — don't live in this repo anymore. They live in
-`@aptkit/core@0.3.0`. What lives here is a thin wrapper per agent
-(`lib/agents/{monitoring,diagnostic,recommendation,query,intent}.ts`) plus
-**three adapter classes** that translate between AptKit's
-provider-neutral interfaces and Blooming's concrete types: Anthropic SDK,
-DataSource, and the AgentEvent trace shape.
+## Zoom out — where this pattern lives
 
-You know how a React component doesn't care whether the data came from a
-REST endpoint, a GraphQL query, or a static file — the props are the
-contract. Same shape here: AptKit's `AnomalyMonitoringAgent` takes a
-`ModelProvider`, a `ToolRegistry`, and a `CapabilityTraceSink`. It
-doesn't know it's Anthropic, doesn't know the data source is Bloomreach,
-doesn't know the trace ends up as NDJSON. The three adapters in
-`aptkit-adapters.ts` are what make that work.
+This is the boundary that lets the agent loop be a library concern instead of a Blooming concern. Five active agent files (`monitoring.ts`, `diagnostic.ts`, `recommendation.ts`, `query.ts`, `intent.ts`) are now thin wrappers — each one builds the three adapters and calls a library agent's `scan(...)` or `run(...)`.
 
 ```
-  Zoom out — where the AptKit boundary lives
+  Zoom out — where the AptKit boundary sits
 
-  ┌─ Route handler ────────────────────────────────────────────────────────┐
-  │  new DiagnosticAgent(anthropic, dataSource, schema, allTools, sid)     │
-  │    .investigate(anomaly, { onText, onToolCall, ..., signal })          │
-  └──────────────────────────────┬─────────────────────────────────────────┘
-                                 │
-  ┌─ Blooming wrapper (lib/agents/diagnostic.ts) ────────────────────────┐
-  │  Constructs three adapter instances + passes to AptKit:               │
-  │    AnthropicModelProviderAdapter(anthropic, 'diagnostic', sid)        │
-  │    BloomingToolRegistryAdapter(dataSource, allTools)                  │
-  │    BloomingTraceSinkAdapter(hooks, 'diagnostic')                      │
-  └──────────────────────────────┬─────────────────────────────────────────┘
-                                 │
-  ┌─ AptKit core ────────────────▼───────────────────────────────────────┐
-  │  new AptKitDiagnosticInvestigationAgent({ model, tools, trace, ... }) │
-  │    .investigate(anomaly, { signal })                                  │
-  │  ★ THE AGENT LOOP LIVES HERE, in @aptkit/core@0.3.0 ★                │ ← we are here
-  └───────────────────────────────────────────────────────────────────────┘
+  ┌─ Service layer (this repo) ────────────────────────────────────────┐
+  │  routes        agents/*.ts (thin wrappers)         lib/data-source │
+  │                       │                                             │
+  │                       ▼                                             │
+  │  ★ APTKIT BOUNDARY ★  3 adapter classes (lib/agents/aptkit-…ts)     │ ← we are here
+  │   ┌────────────────────────────────────────────────────────────┐    │
+  │   │ AnthropicModelProviderAdapter  → implements ModelProvider  │    │
+  │   │ BloomingToolRegistryAdapter    → implements ToolRegistry   │    │
+  │   │ BloomingTraceSinkAdapter       → implements CapabilityTraceSink │
+  │   └────────────────────────────────────────────────────────────┘    │
+  └────────────────────────┬───────────────────────────────────────────┘
+                           │  the library consumes these ports
+  ┌─ Library layer (@aptkit/core@0.3.0) ──────────────────────────────┐
+  │  AnomalyMonitoringAgent · DiagnosticAgent · RecommendationAgent    │
+  │  + the agent loop (the runAgentLoop kernel, now library-owned)     │
+  └────────────────────────────────────────────────────────────────────┘
 ```
 
-This is the same architectural move as the DataSource seam, one layer up.
-There, the agents are blind to which adapter they got; here, AptKit is
-blind to which SDK / data source / trace consumer it got.
+The library does not know about Anthropic, MCP, or NDJSON. The library knows about `ModelProvider`, `ToolRegistry`, and `CapabilityTraceSink`. The three adapters translate.
 
-## Structure pass — layers, axis, seams
+## Structure pass
 
-**Layers:** Route handler → Blooming wrapper → 3 adapters → AptKit primitive
-→ (back through adapters for outputs).
-
-**Axis (held constant): "who owns which type?"** This is the right axis
-because the whole boundary exists to translate between two
-type-vocabularies that shouldn't know about each other.
+Three layers carry this boundary: the **client** layer (the thin agent wrappers in `lib/agents/`), the **adapter** layer (the three classes in `aptkit-adapters.ts`), the **library** layer (`@aptkit/core`'s agents). One axis worth tracing: **who owns the loop?**
 
 ```
-  Axis: who owns which type?
+  Axis: who owns the agent loop?
 
-  ┌─ Blooming type-vocabulary ─────────────────────────┐
-  │  Anomaly, Diagnosis, Recommendation, ToolCall,     │   → BLOOMING owns
-  │  AgentEvent, WorkspaceSchema (lib/mcp/types.ts)    │
-  └──────────────────────────────┬─────────────────────┘
-                                 │
-  ┌─ 3 adapter classes ──────────▼─────────────────────┐
-  │  bidirectional translation                          │   → ADAPTERS own
-  │  toAnthropicMessage / toModelContentBlock           │     the mapping
-  │  toBloomingToolCall                                 │
-  └──────────────────────────────┬─────────────────────┘
-                                 │
-  ┌─ AptKit type-vocabulary ─────▼─────────────────────┐
-  │  ModelMessage, ModelResponse, ModelTool,            │   → APTKIT owns
-  │  ToolDefinition, CapabilityEvent (from @aptkit/core)│
-  └────────────────────────────────────────────────────┘
+  ┌─ pre-AptKit (lib/agents/base-legacy.ts:86-176) ──┐
+  │  THIS REPO owns runAgentLoop                      │   270 LOC hand-rolled
+  │  hand-rolled turn loop + tool_use plumbing        │   preserved as a receipt
+  └───────────────────────────────────────────────────┘
+
+  seam ═══════════════════════════════════════════════════════
+       │  AptKit lifted the loop into a library
+       ▼
+  ┌─ post-AptKit (lib/agents/*.ts wrappers) ──────────┐
+  │  LIBRARY owns the loop                             │   library code, library tests
+  │  THIS REPO owns three adapters at the boundary     │   3 classes, 206 LOC
+  │  + thin wrappers over each library agent           │
+  └───────────────────────────────────────────────────┘
 ```
 
-**Seams (boundaries where type-ownership flips):**
-
-- **Blooming wrapper ↔ AptKit primitive** — the API boundary. The wrapper
-  exposes Blooming types in its constructor + method signatures
-  (`Anthropic`, `DataSource`, `Anomaly`, `Diagnosis`); the adapter
-  translates inbound at construct time and outbound at call time.
-- **AptKit ↔ Anthropic SDK** — the model-provider boundary. AptKit calls
-  `model.complete(request)`; the adapter calls `anthropic.messages.create(...)`.
-- **AptKit ↔ DataSource** — the tool-execution boundary. AptKit calls
-  `tools.callTool(name, args)`; the adapter forwards to
-  `dataSource.callTool(name, args)`.
-- **AptKit ↔ trace consumer** — the observability boundary. AptKit emits
-  `CapabilityEvent`s; the adapter translates them into Blooming's hook
-  shape (`onText` / `onToolCall` / `onToolResult`).
+The axis flips at the seam: before the migration this repo owned both the loop and the boundary; after, the library owns the loop and the boundary becomes a single file. That's why the legacy implementation is preserved at `lib/agents/base-legacy.ts` (and `*-legacy.ts` for each agent) — as a rollback receipt, and as a witness for what was lifted.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-An anti-corruption layer (Eric Evans, *Domain-Driven Design*) is the
-formal name. The idea: when you depend on a third-party with its own
-type vocabulary, don't let those types leak into your domain — translate
-at the boundary. If the third-party renames a field tomorrow, only the
-adapter changes; your domain stays still.
+You've used React's `useState` over multiple frameworks. The `useState` *contract* is the same — call it with an initial value, get a tuple of state and setter, the framework re-renders. The *implementation* differs (React's fiber reconciler vs. Preact's diff vs. Solid's signals). The component code is the same; the runtime underneath is the seam.
+
+The AptKit boundary is the same shape. The "agent loop" is the runtime. The "Blooming agent code" is the component code. The three adapters are how Blooming's specific runtime — Anthropic SDK, MCP via `DataSource`, NDJSON route hooks — plugs into the library's generic contracts.
 
 ```
-  Pattern — anti-corruption layer (one direction at a time)
+  The pattern: library expects ports; this repo provides adapters
 
-       Blooming side                        AptKit side
-       ─────────────                        ───────────
-       Anthropic SDK         in:            ModelProvider
-       (vendor)        ───►  adapt   ───►  (interface)
-                                              │
-       ToolCall, Anomaly,    out:            CapabilityEvent
-       AgentEvent      ◄───  adapt   ◄───  (interface)
-                       (3 adapter classes)
+  ┌─ @aptkit/core ─────────────────────────┐
+  │  AnomalyMonitoringAgent({               │
+  │    model: ModelProvider,        ◄────── │  port 1
+  │    tools: ToolRegistry,         ◄────── │  port 2
+  │    trace: CapabilityTraceSink,  ◄────── │  port 3
+  │    workspace, categories                │
+  │  })                                      │
+  │                                          │
+  │  agent.scan() runs the loop:             │
+  │    while (more turns):                   │
+  │      model.complete(...)                 │
+  │      for each tool_use block:            │
+  │        tools.callTool(...)              │
+  │        trace.emit(events)               │
+  └─────────────────────────────────────────┘
+
+  this repo provides:
+    ┌─────────────────────────────────────┐
+    │ AnthropicModelProviderAdapter        │  → wraps `@anthropic-ai/sdk`
+    │ BloomingToolRegistryAdapter          │  → wraps DataSource (the other port)
+    │ BloomingTraceSinkAdapter             │  → wraps NDJSON event hooks
+    └─────────────────────────────────────┘
 ```
 
-Three classes (because the AptKit interface has three orthogonal slots):
-
-  → `AnthropicModelProviderAdapter` — bridges `ModelProvider` to Anthropic SDK
-  → `BloomingToolRegistryAdapter` — bridges `ToolRegistry` to `DataSource`
-  → `BloomingTraceSinkAdapter` — bridges `CapabilityTraceSink` to Blooming hooks
+Three ports → three adapters. The library never imports `@anthropic-ai/sdk`; this repo never re-implements the agent loop.
 
 ### Move 2 — the step-by-step walkthrough
 
-#### Step 1 — the model-provider adapter
+#### adapter 1 — `AnthropicModelProviderAdapter`
 
-AptKit doesn't know about Anthropic. It only knows the port
-(`ModelProvider`): a single async `complete(request)` method returning a
-`ModelResponse`. The adapter translates message shapes in both directions.
+The library's `ModelProvider` port has one method: `complete(request) → response`, with library-defined `ModelRequest` and `ModelResponse` types. The adapter's job is to translate those types into Anthropic SDK calls and translate the SDK's response back.
 
-```typescript
-// lib/agents/aptkit-adapters.ts:26-72 (abridged)
+```ts
+// lib/agents/aptkit-adapters.ts:26-72
 export class AnthropicModelProviderAdapter implements ModelProvider {
   readonly id = 'anthropic';
   readonly defaultModel: string;
@@ -138,12 +109,9 @@ export class AnthropicModelProviderAdapter implements ModelProvider {
     private readonly anthropic: Anthropic,
     agent: AgentName,
     private readonly sessionId?: string,
-    model = AGENT_MODEL,
+    model = AGENT_MODEL,                              // claude-sonnet-4-6 by default
     logSite = `agents/${agent}:aptkit-model`,
-  ) {
-    this.defaultModel = model;
-    this.logSite = logSite;
-  }
+  ) { this.defaultModel = model; this.logSite = logSite; }
 
   async complete(request: ModelRequest): Promise<ModelResponse> {
     const params: Anthropic.Messages.MessageCreateParamsNonStreaming = {
@@ -155,10 +123,13 @@ export class AnthropicModelProviderAdapter implements ModelProvider {
     if (request.tools?.length) params.tools = request.tools.map(toAnthropicTool);
 
     const response = await this.anthropic.messages.create(
-      params, request.signal ? { signal: request.signal } : undefined,
+      params,
+      request.signal ? { signal: request.signal } : undefined,    // cancel-aware
     );
 
-    console.log(JSON.stringify({ site: this.logSite, sessionId: this.sessionId, usage: response.usage }));
+    console.log(JSON.stringify({                                  // res.usage logged
+      site: this.logSite, sessionId: this.sessionId, usage: response.usage,
+    }));
 
     return {
       content: response.content.flatMap(toModelContentBlock),
@@ -169,54 +140,42 @@ export class AnthropicModelProviderAdapter implements ModelProvider {
 }
 ```
 
-What this adapter hides from AptKit:
+Three load-bearing details inside this single method:
 
-  → the `messages` shape (Anthropic uses `tool_use`/`tool_result` blocks
-    nested inside an array of message-objects; AptKit's shape is
-    structurally similar but distinct types)
-  → the `system` parameter being separate from `messages`
-  → the `usage` shape (Anthropic returns `input_tokens`/`output_tokens`;
-    AptKit normalizes to `inputTokens`/`outputTokens`)
-  → the per-call usage log line — emitted here, not in agent code,
-    because the adapter is the only place that sees every call
-    (`aptkit-adapters.ts:57-61`)
+- **`request.signal` threaded into the SDK call** (`aptkit-adapters.ts:52-55`). The library's `ModelRequest` carries the cancel signal; the adapter forwards it to the SDK as `{ signal }`. Without this, the route's `req.signal` would die at the library boundary and the SDK call would keep burning the 300s budget.
+- **`res.usage` logged per call** (`aptkit-adapters.ts:57-61`, also `:65`). Token usage is the observability spine for cost tracking — one log line per LLM call, structured for filtering.
+- **Two translation helpers** (`toAnthropicMessage` at `:144`, `toAnthropicContentBlock` at `:155`, `toAnthropicTool` at `:179`, `toModelContentBlock` at `:187`). The library's content-block types are generic (`text`, `tool_use`, `tool_result`); the Anthropic SDK's types are concrete. The translators are pure functions and small — three of them total under 60 LOC.
 
 ```
-  Layers-and-hops — one ModelProvider.complete() round-trip
+  Pattern — the model adapter as a bidirectional translator
 
-  ┌─ AptKit loop ────────────┐  request: ModelRequest    ┌─ Adapter ─────┐
-  │  AnomalyMonitoringAgent  │ ───────────────────────►  │ map messages, │
-  │  .scan() body             │                          │ tools, system │
-  └──────────────────────────┘                           └──────┬────────┘
-                                                                 │ anthropic.messages.create
-                                                                 ▼
-                                                          ┌─ Anthropic SDK ┐
-                                                          │  POST /v1/...  │
-                                                          └──────┬─────────┘
-                                                                 │ Message
-  ┌─ AptKit loop ────────────┐  ModelResponse            ┌──────▼────────┐
-  │  AnomalyMonitoringAgent  │ ◄──────────────────────── │ map content,  │
-  │  .scan() body             │                          │ normalize     │
-  └──────────────────────────┘                           │ usage         │
-                                                          └──────────────┘
+  ┌─ library ─────────────────┐                 ┌─ Anthropic SDK ─────────┐
+  │  ModelRequest             │ ──translate──► │  MessageCreateParams    │
+  │  { messages, tools, … }   │                 │  { messages, tools, … } │
+  └──────────────┬────────────┘                 └────────────┬────────────┘
+                 │                                            │
+                 │  awaits a response                         │
+                 ▼                                            ▼
+  ┌─ library ─────────────────┐                 ┌─ Anthropic SDK ─────────┐
+  │  ModelResponse            │ ◄──translate── │  response                │
+  │  { content, usage, model }│                 │  { content, usage, ... }│
+  └───────────────────────────┘                 └─────────────────────────┘
 ```
 
-#### Step 2 — the tool-registry adapter
+#### adapter 2 — `BloomingToolRegistryAdapter`
 
-AptKit knows the port (`ToolRegistry`): `listTools()` returns metadata,
-`callTool(name, args, opts)` executes one. The adapter forwards to a
-`DataSource`.
+The library's `ToolRegistry` port has two methods: `listTools()` returns the available tool definitions; `callTool(name, args, options)` executes one. This is the layer that bridges to the *other* port in this repo — the `DataSource`. So this adapter is a tiny one: it forwards.
 
-```typescript
-// lib/agents/aptkit-adapters.ts:74-97
+```ts
+// lib/agents/aptkit-adapters.ts:75-97
 export class BloomingToolRegistryAdapter implements ToolRegistry {
   constructor(
-    private readonly dataSource: McpCaller,
+    private readonly dataSource: McpCaller,            // ← Pick<DataSource, 'callTool'>
     private readonly allTools: McpToolDef[],
   ) {}
 
   listTools(): ToolDefinition[] {
-    return this.allTools.map((tool) => ({
+    return this.allTools.map((tool) => ({              // shape-translate
       name: tool.name,
       description: tool.description,
       inputSchema: tool.inputSchema,
@@ -224,44 +183,68 @@ export class BloomingToolRegistryAdapter implements ToolRegistry {
   }
 
   async callTool(
-    name: string, args: Record<string, unknown>,
+    name: string,
+    args: Record<string, unknown>,
     options?: { signal?: AbortSignal },
   ): Promise<{ result: unknown; durationMs: number }> {
     const { result, durationMs } = await this.dataSource.callTool(name, args, options);
-    return { result, durationMs };
+    return { result, durationMs };                      // drop `fromCache` — library doesn't need it
   }
 }
 ```
 
-Notice: this adapter drops `fromCache`. AptKit doesn't care; only the
-trace UI does. The trace adapter (step 3 below) doesn't see
-`fromCache` either — it only sees the `CapabilityEvent`s AptKit emits,
-which don't carry it. **This is a real lossy boundary**: cache-hit
-information stops at the adapter. If you wanted that information in the
-UI, the agent-wrapper-level hooks would have to surface it separately.
-Today they don't, and the trace's "via X" panel just shows tool name
-+ duration.
+This is the load-bearing composition. Two ports meet here: the library's `ToolRegistry` (the *consumer side* of this adapter) and the repo's `DataSource` (the *dependency side*). The agents in this repo never call `dataSource.callTool` directly during a scan — the library does, via this adapter. The adapter is what makes the chain work: route → factory → `DataSource` → `BloomingToolRegistryAdapter` → library agent.
 
-#### Step 3 — the trace-sink adapter
+Note `McpCaller = Pick<DataSource, 'callTool'>` (`lib/agents/base.ts:14`). The adapter narrows the port further: it doesn't need `listTools` (the route already called it). Interface segregation in action — adapters whose `listTools` is expensive could still serve.
 
-This is the most complex of the three because it has to reconstruct
-state across two events: AptKit emits `tool_call_start` and
-`tool_call_end` separately, but Blooming's `ToolCall` object carries
-both args (from start) and result+duration (from end). The adapter
-maintains a per-toolName queue of in-flight calls.
+```
+  Layers-and-hops — tool call routing through both adapters
 
-```typescript
-// lib/agents/aptkit-adapters.ts:100-142 (abridged)
+  ┌─ @aptkit/core agent ──┐  hop 1: tools.callTool('execute_analytics_eql', {...}, {signal})
+  │  decides what to call │ ───────────────────────────────────────────────────────────►
+  └───────────────────────┘                                                              ┌─ BloomingToolRegistryAdapter ──┐
+                                                                                         │  this.dataSource.callTool(...)  │
+                                                                                         └────────────┬────────────────────┘
+                                                                                                      │
+                                                                                                      │ hop 2: callTool
+                                                                                                      ▼
+                                                                                         ┌─ DataSource (port) ─────────────┐
+                                                                                         │  resolved to BloomreachDataSource│
+                                                                                         │  OR SyntheticDataSource          │
+                                                                                         └────────────┬────────────────────┘
+                                                                                                      │
+                                                                                                      │ hop 3: HTTPS or fixture
+                                                                                                      ▼
+                                                                                                  external/in-process
+                                                                                                  result
+                                                                                         ┌────────────▼────────────────────┐
+                                                                                         │  { result, durationMs, fromCache}│
+                                                                                         └────────────┬────────────────────┘
+                                                                                                      │ hop 4: drop fromCache
+  ┌──────────────────────────◄────────────────────────────────────────────────────────────────────────┘
+  │  { result, durationMs }
+  ▼
+  library wraps in tool_result block, hands back to model
+```
+
+Two adapter classes, two ports, one chain. The library asks for "callTool"; the answer travels through both abstractions before it touches network.
+
+#### adapter 3 — `BloomingTraceSinkAdapter`
+
+The library's `CapabilityTraceSink` port has one method: `emit(event)`. Whenever the library does something noteworthy — model decided to call a tool, tool started, tool finished, model emitted text — it emits an event through this port. The adapter routes those events to this repo's existing hook surface, which the route layer turns into NDJSON.
+
+```ts
+// lib/agents/aptkit-adapters.ts:100-141
 export class BloomingTraceSinkAdapter implements CapabilityTraceSink {
   private readonly activeToolCalls = new Map<string, ToolCall[]>();
 
   constructor(
-    private readonly hooks: AptKitAgentHooks,
+    private readonly hooks: AptKitAgentHooks,         // onToolCall, onToolResult, onText
     private readonly agent: AgentName,
   ) {}
 
   emit(event: CapabilityEvent): void {
-    if (event.type === 'step') {
+    if (event.type === 'step') {                       // model emitted text
       this.hooks.onText?.(event.content);
       return;
     }
@@ -281,37 +264,42 @@ export class BloomingTraceSinkAdapter implements CapabilityTraceSink {
       this.hooks.onToolResult?.(toolCall);
     }
   }
+  …
 }
 ```
 
-The queue-per-toolName matters because the same tool can be in-flight
-multiple times (the agent can decide to call `execute_analytics_eql`
-twice with different `eql` args in parallel-ish). FIFO by name keeps
-the start/end pairs correctly matched.
+The `activeToolCalls` queue is the load-bearing piece. The library emits `tool_call_start` and `tool_call_end` separately, with no shared id between them — just the tool name. If the same tool is called twice in parallel (which AptKit's monitoring agent does within the rate-limit envelope), the adapter has to match starts with ends in order. The `Map<toolName, ToolCall[]>` plus shift-on-end handles that ordering.
 
 ```
-  Pattern — start/end pairing in the trace sink
+  Execution trace — two parallel calls of the same tool
 
-  Map<toolName, ToolCall[]>:
-    "execute_analytics_eql" : [ TC#1 (started), TC#2 (started) ]
+  state:     activeToolCalls = { }
+  emit:      tool_call_start { toolName: 'execute_analytics_eql' }
+  state:     activeToolCalls = { execute_analytics_eql: [TC#1] }
+  hooks:     onToolCall(TC#1)
 
-  on tool_call_end for "execute_analytics_eql":
-    shift() → TC#1, fill in result/duration, emit onToolResult(TC#1)
-    Map becomes:
-    "execute_analytics_eql" : [ TC#2 (still in-flight) ]
+  emit:      tool_call_start { toolName: 'execute_analytics_eql' }   (parallel)
+  state:     activeToolCalls = { execute_analytics_eql: [TC#1, TC#2] }
+  hooks:     onToolCall(TC#2)
 
-  on next tool_call_end:
-    shift() → TC#2, fill in, emit
+  emit:      tool_call_end { toolName: 'execute_analytics_eql', durationMs: 1200, result }
+  shift:     activeToolCalls = { execute_analytics_eql: [TC#2] }
+  hooks:     onToolResult(TC#1 with result + duration)
+
+  emit:      tool_call_end { toolName: 'execute_analytics_eql', durationMs: 1450, result }
+  shift:     activeToolCalls = { execute_analytics_eql: [] }
+  hooks:     onToolResult(TC#2 with result + duration)
 ```
 
-#### Step 4 — what the Blooming wrapper actually contains
+The downstream effect: the route's `onToolResult` callback fires twice in the right order, emitting two `tool_call_end` NDJSON events with the right durations. The UI's trace panel renders both correctly.
 
-With the three adapters in place, the wrappers reduce to construction +
-call-forwarding. Here's `DiagnosticAgent` in full:
+#### the thin wrappers — five active agents
 
-```typescript
-// lib/agents/diagnostic.ts:26-45 (abridged)
-export class DiagnosticAgent {
+Each agent in `lib/agents/` is now a constructor + a single method that builds the three adapters and calls the library agent. The receipt is `MonitoringAgent` (the largest of the five at ~50 LOC):
+
+```ts
+// lib/agents/monitoring.ts:73-94
+export class MonitoringAgent {
   constructor(
     private anthropic: Anthropic,
     private dataSource: McpCaller,
@@ -320,271 +308,202 @@ export class DiagnosticAgent {
     private sessionId?: string,
   ) {}
 
-  async investigate(anomaly: Anomaly, hooks: AgentHooks = {}): Promise<Diagnosis> {
-    const agent = new AptKitDiagnosticInvestigationAgent({
-      model: new AnthropicModelProviderAdapter(this.anthropic, 'diagnostic', this.sessionId),
-      tools: new BloomingToolRegistryAdapter(this.dataSource, this.allTools),
+  async scan(hooks?: MonitorHooks, categories: AnomalyCategory[] = []): Promise<Anomaly[]> {
+    const toolRegistry = new BloomingToolRegistryAdapter(this.dataSource, this.allTools);
+    const agent = new AptKitAnomalyMonitoringAgent({
+      model: new AnthropicModelProviderAdapter(this.anthropic, 'monitoring', this.sessionId),
+      tools: toolRegistry,
       workspace: this.schema,
-      trace: new BloomingTraceSinkAdapter(hooks, 'diagnostic'),
+      trace: new BloomingTraceSinkAdapter(hooks ?? {}, 'monitoring'),
+      categories: categories.length ? toAptKitCategories(categories, this.schema.projectId) : [],
     });
-    return toBloomingDiagnosis(await agent.investigate(anomaly, { signal: hooks.signal }));
+    return (await agent.scan({ signal: hooks?.signal })).map(toBloomingAnomaly);
   }
 }
 ```
 
-What's left in this file is the Blooming-facing API — the constructor's
-arguments, the method's name, the hook shape, the return type. AptKit
-owns the loop body.
+The whole wrapper is: build the three adapters, hand them to the library, await the result, translate the library's anomaly type to this repo's `Anomaly` type. The legacy version of this same agent at `lib/agents/monitoring-legacy.ts` does all of the loop logic itself; the post-AptKit version is what this seam unlocks.
 
-#### Step 5 — what the wrappers still own (not just forwarding)
+#### the legacy rollback receipt
 
-A wrapper is more than a pass-through. The MonitoringAgent wrapper
-additionally:
+The hand-rolled loop is preserved at `lib/agents/base-legacy.ts:86-176`:
 
-  → builds the compact schema summary (`schemaSummary`,
-    `lib/agents/monitoring.ts:19-60`) — 20 events × 10 props × 30 customer
-    properties, NOT the full 112KB schema
-  → translates Blooming's `AnomalyCategory` shape (which carries
-    `eql(projectId)` as a function) to AptKit's `MonitoringAnomalyCategory`
-    (which carries `queryRecipe` as a string) — `monitoring.ts:96-109`
-  → translates AptKit's `MonitoringAnomaly` back to Blooming's
-    `Anomaly` (just a type widen for the `category` field) —
-    `monitoring.ts:111-116`
-
-These are domain translations, not just API forwarding. They prove the
-adapter pattern isn't a thin shim — it's a translation layer with real
-content.
-
-### Move 2.5 — the `-legacy.ts` siblings
-
-Every wrapper has a `*-legacy.ts` sibling preserved for reference. The
-hand-rolled agent loop is in `lib/agents/base-legacy.ts` (270 LOC).
-These files aren't wired into routes; they exist so the migration is
-reversible if AptKit ever needs to be replaced. The numbers:
-
-```
-  Pre-migration vs post-migration line counts
-
-  File                       LOC   wired?
-  ───                        ───   ──────
-  base.ts                     14   yes (just McpCaller + AGENT_MODEL)
-  base-legacy.ts             270   no (runAgentLoop preserved)
-  monitoring.ts              116   yes
-  monitoring-legacy.ts       138   no
-  diagnostic.ts               49   yes
-  diagnostic-legacy.ts       112   no
-  recommendation.ts           40   yes
-  recommendation-legacy.ts   105   no
-  query.ts                    34   yes
-  query-legacy.ts             53   no
-  intent.ts                   38   yes
-  intent-legacy.ts            42   no
-  aptkit-adapters.ts         206   yes (the new boundary)
+```ts
+// lib/agents/base-legacy.ts:86-176 (excerpt)
+export async function runAgentLoop<T = null>(
+  opts: RunAgentLoopOpts<T>,
+): Promise<AgentRunResult<T>> {
+  …
+  for (let turn = 0; turn < maxTurns; turn++) {
+    signal?.throwIfAborted();
+    const budgetSpent = maxToolCalls !== undefined && toolCalls.length >= maxToolCalls;
+    const forceFinal = turn === maxTurns - 1 || budgetSpent;
+    const params = { model: AGENT_MODEL, max_tokens, system: …, messages };
+    if (!forceFinal) params.tools = toolSchemas;
+    const res = await anthropic.messages.create(params, signal ? { signal } : undefined);
+    …
+    // Append assistant turn; extract text + tool_use; execute tools via dataSource.callTool;
+    // append tool_result blocks; loop.
+  }
+}
 ```
 
-The wrappers collectively shrank by ~60% while the boundary code
-(aptkit-adapters.ts, 206 LOC) is new. Net: the codebase is smaller and
-the agent loop is no longer Blooming's problem.
+The library's loop does the same job. The legacy file's purpose is twofold: it's a rollback path if the library breaks unrecoverably at 0.x, and it's the witness for what *was* lifted (the file is the diff between "in-tree loop" and "library loop"). Every active agent has a `*-legacy.ts` sibling for the same reason.
+
+```
+  Comparison — pre and post AptKit, side by side
+
+  ┌─ pre-AptKit ────────────────────┐    ┌─ post-AptKit ────────────────────┐
+  │ this repo: runAgentLoop (270 LOC)│    │ library: AnomalyMonitoringAgent  │
+  │ this repo: MonitoringAgent       │    │ this repo: MonitoringAgent       │
+  │   (calls runAgentLoop directly)  │    │   (~50 LOC wrapper)              │
+  │ NO adapter classes               │    │ 3 adapter classes (206 LOC total)│
+  │ NO library dependency            │    │ @aptkit/core@0.3.0 on the loop   │
+  │                                  │    │                                   │
+  │ ╳ loop logic in this repo's tests│    │ ✓ loop tested by the library     │
+  │ ╳ no other consumers of the loop │    │ ✓ library could be reused        │
+  │ ✓ no library risk                │    │ ╳ library risk at pre-1.0        │
+  └──────────────────────────────────┘    │ ⤺ legacy kept as rollback receipt│
+                                          └──────────────────────────────────┘
+```
 
 ### Move 3 — the principle
 
-**An anti-corruption layer is what makes a vendor swap survivable.**
-If a future @aptkit/core@0.4 ships breaking changes to its
-`ModelProvider` interface, only `aptkit-adapters.ts:26-72` changes.
-The wrappers don't change. The agents in the routes don't change. The
-UI doesn't change. That's the test.
+Library boundaries are *also* ports + adapters. When code in your repo calls a library, the library is the dependency and your code is the consumer — same shape as DataSource. When a library calls *into* your code (via callbacks, interfaces, or strategy objects it accepts), the library is the consumer and your code is the adapter. AptKit is the second shape: it accepts `ModelProvider`, `ToolRegistry`, `CapabilityTraceSink` ports, and this repo provides the adapters.
 
-The general principle, beyond this codebase: when you're integrating
-with a library whose interfaces are stable but whose internals are
-not, put the interface in your code (the wrapper's signature) and put
-the translation in a single named place (the adapter). When the
-library moves, you change one file.
-
-It's the same shape as the DataSource seam in `03-datasource-seam.md`,
-applied one layer up. Both files teach the same lesson; the difference
-is where the seam sits — DataSource between agents and providers,
-AptKit primitive between Blooming wrappers and the agent loop itself.
+The transferable lesson: when a library exposes ports for the runtime-specific bits (the model client, the storage, the event sink), you can adopt the library without coupling to it deeply. The blast radius of a library upgrade is the adapter file — 206 LOC here. The blast radius of a library downgrade (the legacy rollback) is also that file, plus deleting `*-legacy.ts`. That's the test: a clean library boundary has a known, small blast radius in both directions.
 
 ## Primary diagram
 
 ```
-  AptKit primitive boundary — one DiagnosticAgent.investigate() call
+  aptkit-primitive-boundary — full picture
 
-  ┌─ Route handler ──────────────────────────────────────────────────────────┐
-  │  new DiagnosticAgent(anthropic, dataSource, schema, allTools, sid)        │
-  │    .investigate(anomaly, { onText, onToolCall, onToolResult, signal })    │
-  └──────────────────────────────┬───────────────────────────────────────────┘
-                                 │
-  ┌─ Blooming wrapper (lib/agents/diagnostic.ts) ───────────────────────────┐
-  │  Constructs the 3 adapters + AptKit agent:                                │
+  ┌─ Service layer (this repo) ───────────────────────────────────────────────┐
   │                                                                            │
-  │   ┌─ AnthropicModelProviderAdapter ──┐  implements ModelProvider           │
-  │   │  complete(request) →              │                                    │
-  │   │   anthropic.messages.create(...)  │                                    │
-  │   │   + log usage                     │                                    │
-  │   └───────────────────────────────────┘                                    │
+  │  routes (briefing, agent)                                                  │
+  │      │                                                                     │
+  │      │  constructs                                                         │
+  │      ▼                                                                     │
+  │  thin agent wrappers (lib/agents/*.ts)                                     │
+  │      │                                                                     │
+  │      │  builds                                                             │
+  │      ▼                                                                     │
+  │  ┌─────────────────────────────────────────────────────────────────────┐   │
+  │  │ AnthropicModelProviderAdapter implements ModelProvider              │   │
+  │  │   ├─ wraps Anthropic SDK client                                     │   │
+  │  │   ├─ translates ModelRequest ↔ MessageCreateParams                  │   │
+  │  │   ├─ threads request.signal into the SDK                            │   │
+  │  │   └─ logs { site, sessionId, usage } per call                       │   │
+  │  ├─────────────────────────────────────────────────────────────────────┤   │
+  │  │ BloomingToolRegistryAdapter implements ToolRegistry                  │   │
+  │  │   ├─ holds McpCaller = Pick<DataSource, 'callTool'>                  │   │
+  │  │   ├─ listTools() → shape-translates McpToolDef[]                     │   │
+  │  │   └─ callTool() → dataSource.callTool() → drop fromCache             │   │
+  │  ├─────────────────────────────────────────────────────────────────────┤   │
+  │  │ BloomingTraceSinkAdapter implements CapabilityTraceSink              │   │
+  │  │   ├─ holds AptKitAgentHooks { onToolCall, onToolResult, onText }     │   │
+  │  │   ├─ activeToolCalls Map<toolName, ToolCall[]> matches start/end     │   │
+  │  │   └─ routes step / tool_call_start / tool_call_end to hooks          │   │
+  │  └─────────────────────────────────────────────────────────────────────┘   │
+  │      │                                                                     │
+  │      │  hands all three into                                                │
+  │      ▼                                                                     │
+  └──────┼─────────────────────────────────────────────────────────────────────┘
+         │
+  ┌──────▼─────────── @aptkit/core@0.3.0 ─────────────────────────────────────┐
+  │  AnomalyMonitoringAgent / DiagnosticAgent / RecommendationAgent / QueryAgent│
   │                                                                            │
-  │   ┌─ BloomingToolRegistryAdapter ────┐  implements ToolRegistry            │
-  │   │  listTools() → allTools.map(...)  │                                    │
-  │   │  callTool(name, args, opts) →     │                                    │
-  │   │   dataSource.callTool(...)        │                                    │
-  │   └───────────────────────────────────┘                                    │
+  │  agent.scan({ signal }) runs the loop:                                     │
+  │    while (turn < maxTurns):                                                │
+  │      res = model.complete({ messages, tools, signal })                     │
+  │      trace.emit({ type: 'step', content: text })                           │
+  │      for each tool_use block:                                              │
+  │        trace.emit({ type: 'tool_call_start', toolName, args })             │
+  │        result = tools.callTool(name, args, { signal })                     │
+  │        trace.emit({ type: 'tool_call_end', toolName, durationMs, result }) │
+  │      if no more tool_use → break (synthesis turn)                          │
   │                                                                            │
-  │   ┌─ BloomingTraceSinkAdapter ───────┐  implements CapabilityTraceSink     │
-  │   │  emit(event) →                    │                                    │
-  │   │   queue-per-toolName for start/end│                                    │
-  │   │   → call hooks.onToolCall/Result/Text                                  │
-  │   └───────────────────────────────────┘                                    │
-  └──────────────────────────────┬───────────────────────────────────────────┘
-                                 │
-  ┌─ AptKit core ────────────────▼───────────────────────────────────────────┐
-  │  AptKitDiagnosticInvestigationAgent                                       │
-  │    while not done:                                                        │
-  │      response = await model.complete({ messages, tools, signal })         │
-  │      for block in response.content:                                       │
-  │        if block.type === 'tool_use':                                      │
-  │          trace.emit({ type: 'tool_call_start', toolName, args, ... })     │
-  │          result = await tools.callTool(toolName, args, { signal })         │
-  │          trace.emit({ type: 'tool_call_end',   toolName, ..., result })   │
-  │          append tool_result to messages                                   │
-  │        if block.type === 'text':                                          │
-  │          trace.emit({ type: 'step', content: block.text })                │
-  │      done = (no tool_use in response)                                     │
-  │    return parsed Diagnosis                                                 │
-  └───────────────────────────────────────────────────────────────────────────┘
+  │  returns: typed result (MonitoringAnomaly[], Diagnosis, …)                 │
+  └─────────────────────────────────────────────────────────────────────────────┘
+
+  legacy preserved at lib/agents/base-legacy.ts:86-176 + agents/*-legacy.ts
+    as rollback receipt + witness for what was lifted
 ```
 
 ## Elaborate
 
-**Where this pattern comes from.** Anti-corruption layer is Eric Evans'
-term (*Domain-Driven Design*, 2003). The motivation: when two domains
-(yours and a vendor's) have different vocabularies for the same
-concepts, allowing the vendor's vocabulary to spread through your code
-ties your domain model to their release cycle. The adapter localizes
-the contamination at the boundary.
+**Why three ports and not one.** AptKit could have exposed a single `AgentEnvironment` port with all three concerns merged. Splitting them into three is the right call: each one has a different rotation. The model swap (Anthropic → OpenAI → some local model) only touches `ModelProvider`. The data source swap (Bloomreach → Synthetic → SQL adapter) only touches `ToolRegistry`. The trace transport swap (NDJSON → SSE → just-console) only touches `CapabilityTraceSink`. Three small ports buy three independent rotation axes; one big port would couple them.
 
-**The deeper principle.** Separation of concerns by *who owns the
-shape*. Anthropic owns the `Message` shape; AptKit owns the
-`ModelMessage` shape; Blooming owns the `ToolCall` shape. The adapter
-is where ownership flips. The boundary works because each side can
-evolve its own shape independently — the adapter absorbs the change.
+**The cost of a pre-1.0 library on the critical path.** `@aptkit/core@0.3.0` is the receipt: a pre-1.0 library *on the critical path* is a calculated bet. The hedge is what's in this repo today: (a) all integration confined to one 206-LOC adapter file, (b) every agent has a `*-legacy.ts` sibling preserving the pre-AptKit hand-roll, (c) the integration tests run against this repo's behavior, not against the library's API. If 0.4 breaks the adapter contract, the diff is one file; if 0.4 breaks correctness without breaking the adapter, the rollback is `git revert + delete *-legacy.ts → restore`. The bet is the right one when the library's loop is high-quality work that this repo would otherwise have to maintain forever.
 
-**Where it breaks.**
+**The dual-pass `activeToolCalls` map.** The library doesn't share an id between `tool_call_start` and `tool_call_end` — only the tool name. The naive implementation would store one `ToolCall` per tool name, but then two parallel calls of the same tool would clobber. The adapter uses `Map<toolName, ToolCall[]>` — push on start, shift on end — which is FIFO per tool name. The result is correct ordering as long as the library emits ends in the same order as starts (which it does for the common parallel case). A future library version that wants strict id-based pairing would change the port, and this adapter would simplify to `Map<id, ToolCall>`.
 
-- **Lossy boundaries.** `BloomingToolRegistryAdapter` drops
-  `fromCache` because AptKit's `callTool` return doesn't have a slot
-  for it. Cache-hit information stops at the adapter; the trace UI
-  doesn't know which calls hit the 60s cache. The wrapper-level hooks
-  could carry it separately, but today don't.
-- **State across events.** `BloomingTraceSinkAdapter` reconstructs
-  start/end pairing via a `Map<toolName, ToolCall[]>`. If AptKit ever
-  emits events out of order (start B, start A, end A, end B) the
-  FIFO-by-name scheme corrupts pairing. Today AptKit's loop is
-  sequential per tool call so this doesn't happen, but it's a latent
-  coupling to AptKit's emission order.
-- **The wrappers' constructor signatures are wide.** Each wrapper takes
-  `(anthropic, dataSource, schema, allTools, sid)` — five things. A
-  builder or a context object would clean this up; today the route
-  handler passes the same five to every agent constructor it builds.
+**Comparison to the DataSource seam.** Same shape, opposite direction:
 
-**What to explore next.**
+- DataSource seam — *this repo defines the port*; the library doesn't see it.
+- AptKit boundary — *the library defines the ports*; this repo provides the adapters.
 
-- `03-datasource-seam.md` — the same anti-corruption pattern one layer
-  down (DataSource is to agents what ModelProvider is to AptKit)
-- `07-multi-agent-orchestration.md` — how the route uses these wrappers
-- `06-streaming-ndjson.md` — what the trace adapter's hook calls produce
+Both are dependency inversion. In both, the inner ring (the abstraction owner) doesn't depend on the outer ring (the implementation). DataSource: the agents are the inner ring; the Bloomreach SDK is the outer. AptKit: the library is the inner ring; this repo is the outer. The pattern is symmetric — when you have a port, both sides of it are decoupled.
 
 ## Interview defense
 
-#### Q: "Why three adapter classes instead of one big bridge?"
+**Q: Why three adapter classes? Why not just put the library calls inline in each agent?**
 
-Because AptKit's interface has three orthogonal slots and they have
-different lifetimes. `ModelProvider` is per-agent and tied to the
-Anthropic SDK; `ToolRegistry` is per-agent and tied to the DataSource;
-`CapabilityTraceSink` is per-call and tied to the hooks the route
-handler builds for THIS request. Bundling them into one class would
-couple their construction order — the model provider would suddenly
-need to know about hooks it doesn't use.
+> Because the library's three ports rotate independently and the adapters are the only place that touches the library. `AnthropicModelProviderAdapter` knows about the Anthropic SDK; the library doesn't. `BloomingToolRegistryAdapter` knows about the `DataSource` port; the library doesn't. `BloomingTraceSinkAdapter` knows about the NDJSON hooks; the library doesn't. If the library's `ModelProvider` interface changes in 0.4, the diff is the model adapter — not five agent files. Inline calls would couple every agent to all three library ports at once; the adapters concentrate that coupling in 206 LOC, which is the blast radius for a library upgrade.
 
 ```
-  Three adapters, three independent decisions
+  the rotation axes
 
-  ModelProvider         ToolRegistry        CapabilityTraceSink
-  ─────────────         ────────────        ───────────────────
-  Anthropic vs other    Bloomreach vs       NDJSON hooks vs
-  SDK                   Synthetic           future trace stores
-  swappable per agent   swappable per req   swappable per request
+  ┌─ model swap ──────────┐  touches: AnthropicModelProviderAdapter only
+  ┌─ data source swap ────┐  touches: BloomingToolRegistryAdapter only
+  ┌─ trace transport swap ┐  touches: BloomingTraceSinkAdapter only
+
+  inline-in-agent: every swap touches every agent
+  3-adapter:       every swap touches one adapter
 ```
 
-**Surface:** "three slots, three adapters, independent lifetimes."
-**Probe:** if pressed, point to the trace-sink adapter as the only one
-that holds state across events (the start/end queue) and explain why
-it can't be merged with the others.
+**Anchor:** `lib/agents/aptkit-adapters.ts:26, 75, 100`.
 
-#### Q: "What's the load-bearing part — what breaks if you remove any of these adapters?"
+**Q: What part of `BloomingTraceSinkAdapter` would someone forget to write — the "if it broke, what would you notice last" piece?**
 
-The `BloomingTraceSinkAdapter`'s start/end pairing
-(`aptkit-adapters.ts:114-129`). It's the kernel: a `Map<toolName,
-ToolCall[]>` that buffers tool_call_start events until the matching
-tool_call_end arrives, so the merged `ToolCall` carries both args (from
-start) and result+duration (from end).
+> The `activeToolCalls` Map and the shift-on-end. The library emits `tool_call_start` and `tool_call_end` separately with no shared id — just the tool name. If two scans of the same EQL fire in parallel within the rate-limit envelope, the adapter needs to pair start #1 with end #1 and start #2 with end #2 in order. A naive `Map<toolName, ToolCall>` would clobber the first call when the second starts; you'd see one duration on the wire instead of two, and the UI's trace panel would render the first call as "still running." The `Map<toolName, ToolCall[]>` with push-on-start, shift-on-end gives FIFO per tool name. If the library ever adds a shared id, the adapter simplifies to `Map<id, ToolCall>` and this kernel goes away.
 
 ```
-  load-bearing skeleton — start/end pairing
+  the load-bearing kernel
 
-  on tool_call_start(toolName, args):
-    queue = activeToolCalls.get(toolName) ?? []
-    queue.push(new ToolCall(args))
-    emit onToolCall  (UI sees: tool started)
+  Map<toolName, ToolCall[]>
+    push on tool_call_start
+    shift on tool_call_end  ← without this, parallel calls clobber
 
-  on tool_call_end(toolName, durationMs, result, error):
-    toolCall = activeToolCalls.get(toolName).shift()     ← LOAD-BEARING
-    toolCall.durationMs = ...
-    toolCall.result = ...
-    emit onToolResult (UI sees: tool finished with this result)
+  what's hardening (not the kernel):
+    toBloomingToolCall translator
+    the type guards (isRecord)
 ```
 
-Drop the queue and concurrent calls to the same tool would either
-overwrite each other's args or attach the wrong result to the wrong
-call. The UI's "via X" trace would lie.
+**Anchor:** `lib/agents/aptkit-adapters.ts:101, 116-128`.
 
-Other load-bearing parts:
+**Q: There are `*-legacy.ts` files for every agent. Why are they still in the tree?**
 
-  → `toAnthropicMessage` / `toModelContentBlock` — the bidirectional
-    SDK translation; without them, AptKit's `ModelMessage` and
-    Anthropic's `Message` are different objects and the agent loop
-    can't run
-  → the `complete()` signature on the adapter — without it, AptKit
-    can't call the model at all
-  → `request.signal ? { signal: request.signal } : undefined` — passes
-    cancellation through; without it, `req.signal` from the route
-    doesn't reach the Anthropic SDK
+> Two reasons. First, rollback. `@aptkit/core` is at `0.3.0` — a pre-1.0 library on the critical path. If a future version breaks the loop and we can't get a fix landed quickly, the rollback is `git revert the migration PR + restore *-legacy.ts → import paths`. The legacy file at `lib/agents/base-legacy.ts:86-176` is the hand-rolled `runAgentLoop` that ran the production loop before AptKit; it's still tested. Second, the legacy files are the *witness* — they document what was lifted into the library. When someone asks "what does AptKit actually do," the answer is "the diff between `base-legacy.ts` and the library agent." Both reasons go away when the library hits 1.0 and the migration is six months old without a regression; until then the rollback receipt has real option value.
 
-Optional hardening:
+```
+  the rollback receipt
 
-  → the per-call usage log line — useful for cost telemetry, but the
-    adapter runs without it
-  → the per-agent `logSite` — distinguishes which agent made the call
-    in logs
+  ┌─ lib/agents/base-legacy.ts ─┐  the hand-rolled loop (preserved)
+  ┌─ lib/agents/monitoring-legacy.ts ─┐  pre-AptKit MonitoringAgent
+  ┌─ … (every agent has a sibling) ─┐
 
-#### Q: "AptKit shipped 0.3.0. What's your migration story when 0.4 lands?"
+  rollback path:
+    git revert <migration PR>
+    + import-path restore from legacy/
+    + delete lib/agents/aptkit-adapters.ts
+    + uninstall @aptkit/core
+```
 
-Three files change, at most. **One**: `aptkit-adapters.ts` — if AptKit
-renames `complete()` to `chat()` or adds a required field to
-`ModelResponse`, the adapters absorb it. **Two**: any wrapper whose
-AptKit constructor changed (e.g. if `AptKitDiagnosticInvestigationAgent`
-gains a new required option). **Three**: maybe `lib/agents/base.ts` if
-AGENT_MODEL needs to change.
-
-The route handlers don't change. The DataSource seam doesn't change.
-The hooks don't change. The NDJSON contract doesn't change. The UI
-doesn't change. That's the value of the anti-corruption layer — the
-blast radius of a vendor change is bounded to a known set of files.
+**Anchor:** `lib/agents/base-legacy.ts:86-176`.
 
 ## See also
 
-- `00-overview.md` — where this sits in the whole system
-- `03-datasource-seam.md` — the same pattern one layer down
-- `07-multi-agent-orchestration.md` — how the wrappers compose into pipelines
-- `06-streaming-ndjson.md` — what the trace adapter's hooks produce
-- `01-request-flow.md` — where the wrappers get constructed
+- `01-request-flow.md` — where the adapters get constructed (phase 3 of the briefing flow)
+- `03-datasource-seam.md` — the port the tool registry adapter forwards to
+- `06-streaming-ndjson.md` — where the trace sink's events land on the wire

@@ -1,290 +1,252 @@
-# Memory, stack, heap, GC, and lifetimes
+# Memory, Stack, Heap, GC, and Lifetimes
 
-**Industry name:** V8 heap · generational GC · closure retention · response cache · **Type:** Language-specific (Node/V8)
+**Industry name:** memory model, lifetimes, garbage collection · **Type:** Industry standard
 
-## Zoom out, then zoom in
+## Zoom out — where this concept lives
 
-Memory in this app is **boring on purpose** — no big objects pinned forever, no streaming caches that grow unbounded, no allocations in the hot loop. The only retained-across-requests things are a handful of `Map`s and the closures inside them. V8's default GC does the rest.
+V8's heap and stack run inside the Node process. The repo doesn't tune either — no `--max-old-space-size`, no `process.memoryUsage()` logging, no heap snapshots. What matters for THIS codebase is which references stay live across requests on a warm Vercel instance, because anything still reachable from a module-level Map is anything the GC will not reclaim.
 
 ```
-  Zoom out — where memory lives
+  Zoom out — what lives where
 
-  ┌─ band 1: client ─────────────────────────────────────┐
-  │  React state, NDJSON buffer (one TextDecoder, one    │
-  │  string buf rotated per chunk)                       │
-  └────────────────────────┬─────────────────────────────┘
-                           │
-  ┌─ band 2: Node V8 heap ★ THIS FILE ★ ────────────────┐
-  │                                                       │
-  │  young gen → old gen → large object space            │
-  │                                                       │
-  │  long-lived:                                          │
-  │   ─ module-scope Maps (Session feeds, investigations) │
-  │   ─ BloomreachDataSource.cache (60s TTL entries)      │
-  │   ─ ALS instance (one per process)                    │
-  │                                                       │
-  │  short-lived:                                         │
-  │   ─ per-request ctx, signals, Promises                │
-  │   ─ JSON.parse'd payloads (drop after handler exits)  │
-  │   ─ TextEncoder, ReadableStream chunks                │
-  └──────────────────────────────────────────────────────┘
+  ┌─ Node 20+ process ───────────────────────────────────────────────────┐
+  │                                                                      │
+  │  ┌─ V8 stack (per-call, ephemeral) ──────────────────────────────┐   │
+  │  │  one call frame per active sync function                      │   │
+  │  │  unwinds at every return / throw                              │   │
+  │  └───────────────────────────────────────────────────────────────┘   │
+  │  ┌─ V8 heap (the only place anything lives across awaits) ──────┐   │
+  │  │  ★ THIS CONCEPT LIVES HERE ★                                 │   │
+  │  │  - module-level Maps (lib/state/*, lib/mcp/auth.ts memStore) │   │
+  │  │  - the schema cache (lib/mcp/schema.ts:138) ← leak           │   │
+  │  │  - in-flight Promise objects (one per parked await)          │   │
+  │  │  - tool result blobs (truncated to 16K before stringify)     │   │
+  │  └───────────────────────────────────────────────────────────────┘   │
+  └──────────────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in. The interesting question is **what gets retained accidentally** — closures captured by long-lived things that pin objects that should have been short-lived. The repo has one such retention path worth understanding (the 60s response cache) and one that's intentionally bounded (`putInsights` `.clear()` semantics).
+Everything that survives an `await` lives on the heap. That's all of the interesting state. The stack matters only for synchronous functions and recursion depth — neither is a concern in this codebase.
 
 ## Structure pass
 
-**Axis: lifetime — how long does the bytes live in the heap?**
+### Axis: when does this die?
+
+Trace lifetime across the resource classes from `01-runtime-map.md`.
 
 ```
-  Heap residents by lifetime
+  When does this die? — the four answers
 
-  ┌─ old generation (survived ≥2 minor GCs) ─────────────────┐
-  │  module-scope Maps                                        │  → process lifetime
-  │  ALS root, OAuth provider singletons                      │     (warm instance)
-  └─────────────────────┬────────────────────────────────────┘
-                        │  seam: bytes only get here by
-                        │        surviving young gen
-  ┌─ young generation ─▼─────────────────────────────────────┐
-  │  per-request request frames                               │  → typically seconds
-  │  fetch responses, JSON.parse'd objects                    │     (cleared by GC)
-  │  ReadableStream chunks during streaming                   │
-  └─────────────────────┬────────────────────────────────────┘
-                        │  seam: short-lived burst, dies fast
-  ┌─ stack (call frame) ▼────────────────────────────────────┐
-  │  current sync execution frame                             │  → microseconds
-  │  local primitives (numbers, booleans)                     │
-  └──────────────────────────────────────────────────────────┘
+  module-level Maps       →  when the warm instance is recycled
+  ALS contexts            →  when the await tree completes (request end)
+  per-request instances   →  when the route handler returns and refs drop
+  in-flight Promises      →  when they settle (resolve/reject) AND callers stop holding refs
 ```
 
-**Seam: what makes a young-gen object end up in old gen?** Being referenced by an old-gen object. So when a long-lived `Map` retains a closure that captures a request-scoped payload, that payload's lifetime promotes from "seconds" to "process lifetime." This is the most common heap-retention bug in async Node code, and the 60s response cache is exactly where to look for it.
+Each answer corresponds to a different garbage-collection trigger. V8 reclaims an object when nothing references it; the question for each class is "what references it?" and "when does that go away?"
+
+### Seams
+
+The interesting seam is **request return → reference drop**. Inside a request, everything is reachable from the route handler's call stack. The moment `start(controller)` returns, those local references go away — and anything that was ONLY reachable from them becomes eligible for GC on the next pass.
+
+```
+  The request-return seam — what becomes garbage when
+
+  during request               request ends                  next request
+  ──────────────────           ─────────────────             ──────────────
+  controller alive             controller.close()            (new request:
+  BloomreachDataSource alive   start() returns                fresh handler,
+  schema (cached!)             local refs drop                fresh DS,
+                               GC eligible to free            cached survives)
+                               EXCEPT cached at module
+                               level — survives forever
+                               (until instance recycle)
+```
+
+The seam clears most of the per-request memory naturally. The schema cache is the one piece that doesn't get cleared — which is exactly what makes it a leak in two senses: a correctness leak (cross-user data) AND a memory retention pattern (it can't be reclaimed without a process restart).
 
 ## How it works
 
 ### Move 1 — the mental model
 
-Think of V8's heap like a fast lane (young generation) and a slow lane (old generation). New objects are allocated in the fast lane; if they survive two minor GCs, they get promoted to the slow lane. The fast lane is collected often (cheap); the slow lane is collected rarely (expensive).
-
-The retention question is: **does anything in the slow lane hold a reference to something that should have died in the fast lane?** If yes, you have a leak — slow growth across requests until the instance OOMs (or, in serverless, until Vercel reaps it).
+You know how a local variable in a JS function dies when the function returns? Same for everything you allocate inside a request handler — it dies when the handler returns and nothing else references it. The exception is anything reachable from module-level (the top of the file). Those stay alive as long as the process does. So the whole game of "managing memory" in this codebase reduces to: what's reachable from module-level, and is that the right scope?
 
 ```
-  Pattern — the retention graph that matters
+  The reachability rule — the only thing V8 cares about
 
-  ┌─ module scope (old gen) ──────────────────────────────────┐
-  │  state ──► Map { sid_A → SessionFeed, sid_B → ... }       │
-  │             ▲                                              │
-  │             │ Insight objects reachable from here          │
-  │             │ are RETAINED for as long as the sub-map      │
-  │             │ retains them.                                │
-  │                                                            │
-  │  cache ──► Map { 'tool:args' → { result, expiresAt } }    │
-  │             ▲                                              │
-  │             │ JSON-parsed results pinned for 60s           │
-  │             │ (or until next .set() overwrites)            │
-  └────────────────────────────────────────────────────────────┘
-                       ▲
-                       │ does anything in here
-                       │ accidentally keep a per-request
-                       │ payload alive past 60s?
+  module-level ─────► stays alive forever (process lifetime)
+       │
+       └─► references session-keyed Map ─► all sessions stay alive
+                                            forever (process lifetime)
+                                            ← this is correct: we want
+                                              per-user state to persist
+
+  request handler ──► everything inside dies on return, UNLESS
+                      something module-level grabs a reference
+                      ← the leak shape: handler populates `cached`,
+                        handler returns, `cached` survives, never freed
 ```
 
 ### Move 2 — the moving parts
 
-#### Move 2.1 — the module-scope Maps
+#### The stack: shallow and unmonitored
 
-`lib/state/insights.ts:14`: `const state = new Map<string, SessionFeed>()`. Module-scope = old generation. Every value reachable from this Map is pinned.
+Every active sync function has a stack frame. Every `await` releases the current frame (the function is parked; the continuation is captured on the heap) and re-pushes a fresh frame when it resumes. Recursion depth in this codebase is bounded — there's no recursive descent that would risk a stack overflow. The deepest stack you'd see is probably:
 
-A `SessionFeed` contains three sub-Maps:
+```
+  route handler
+    → ReadableStream.start
+      → agent.scan / .investigate / .propose
+        → runAgentLoop iteration
+          → dataSource.callTool
+            → transport.callTool
+              → client.callTool (MCP SDK)
+                → fetch (Node global)
+```
+
+That's seven or eight frames. V8's default stack size on 64-bit is around 1MB; you'd need thousands of recursive frames to hit it.
+
+No code in the repo reaches for `process.setUncaughtExceptionCaptureCallback`, `--stack-trace-limit`, or any stack-tuning flag. The default behavior is fine.
+
+#### The heap: where every interesting thing lives
+
+V8's heap holds objects, closures, Promises, Maps, Buffers, strings. Anything that survives an `await` is on the heap because the stack frame around it was already torn down. In serverless, the heap fills up over the warm-instance lifetime and is wiped on cold start.
+
+The repo's heap-residents, in rough order of how much memory they occupy:
+
+```
+  Heap occupants on a warm instance — what's actually big
+
+  ┌─ tool result blobs (transient) ───────────────────────────────┐
+  │  Each MCP callTool returns a result; ranges from KB to MB.    │
+  │  Truncated to 16K chars BEFORE stringify in agent loop        │
+  │  (lib/agents/base-legacy.ts:32). After the loop turn, the     │
+  │  reference is held by tc.result inside ToolCall, which the    │
+  │  route emits via send({type: 'tool_call_end', result: trunc}) │
+  │  and discards. So peak is ~16KB × few-tools-per-turn.         │
+  └───────────────────────────────────────────────────────────────┘
+  ┌─ session feeds (long-lived) ──────────────────────────────────┐
+  │  state: Map<sessionId, {insights, investigations, anomalies}> │
+  │  Per session: 5-20 Insights × ~2KB each = ~30-40KB; some      │
+  │  investigations stored as AgentEvent[] (a few KB each).       │
+  │  Total per session: <100KB.                                   │
+  │  Sessions are never explicitly evicted — the Map grows as     │
+  │  long as the instance is warm.                                │
+  └───────────────────────────────────────────────────────────────┘
+  ┌─ the schema cache (long-lived, unkeyed) ──────────────────────┐
+  │  One WorkspaceSchema ≈ 100-200KB (events × properties).       │
+  │  cached: WorkspaceSchema | null holds ONE at a time, so       │
+  │  bounded — but unfreed for the instance lifetime.             │
+  └───────────────────────────────────────────────────────────────┘
+  ┌─ in-flight Promise objects (transient) ───────────────────────┐
+  │  Every parked await holds its continuation as a Promise +     │
+  │  closure on the heap. With ~10 concurrent requests each       │
+  │  parked on 1-2 awaits, that's ~20 Promise+closure pairs —     │
+  │  negligible.                                                  │
+  └───────────────────────────────────────────────────────────────┘
+```
+
+#### Where session memory grows unbounded
 
 ```ts
-// lib/state/insights.ts:8-12
-type SessionFeed = {
-  insights: Map<string, Insight>;
-  investigations: Map<string, Investigation>;
-  anomalies: Map<string, Anomaly>;
-};
+// lib/state/insights.ts:14
+const state = new Map<string, SessionFeed>();
 ```
 
-The `Insight` objects are JSON-serializable data (no closures, no DOM refs), so they retain only their own bytes — modest. An average `Insight` is maybe 1–4 KB.
+This Map gains an entry every time a new session hits the server, and never sheds one. On a warm instance that survives for a day, that could be hundreds of sessionIds — each holding their last briefing + investigations. The growth is bounded by the instance lifetime (cold start clears it) but unbounded WITHIN that lifetime.
 
-**Bounded by `.clear()`.** Every fresh `putInsights(sid, items)` call (`lib/state/insights.ts:64-71`) does `s.insights.clear(); s.anomalies.clear();` before re-setting, so the per-session sub-maps cannot grow past one briefing's worth. The comment at lines 58-63 spells this out: *"each run IS the current feed, not an addition. Without clearing, a warm serverless instance accumulates stale insights from earlier runs."*
+For the current alpha, traffic is small enough that this never hits any limit. At higher scale, the move would be a TTL eviction: store a timestamp per session, sweep expired entries periodically. The pattern would mirror what `BloomreachDataSource.cache` already does (each entry has `expiresAt`) but at the session level.
 
-**The outer Map keeps growing across sessions.** A session that visited once and never came back leaves a `SessionFeed` pinned forever (or until the warm instance dies). With infinite users you'd OOM. With Vercel's instance lifetime measured in hours, the GC pressure is bounded by "active sessions per hour." No eviction policy.
+#### Where references are CORRECTLY dropped
 
-```
-  Lifetime trace — session feed retention
-
-  t=0           Vercel cold start
-  t=0           state = new Map()
-  t=12s         sid_A briefing → state.set(sid_A, SessionFeed)
-  t=25s         sid_B briefing → state.set(sid_B, SessionFeed)
-  t=120s        sid_A second briefing → s.insights.clear() then .set()
-                (sid_A's inner Maps stable size; outer Map untouched)
-  t=10min       sid_C briefing → outer Map = 3 entries
-  ...
-  t=2hr         no new traffic → Vercel scales to zero
-                process dies, ALL Maps go
-```
-
-#### Move 2.2 — the 60s response cache
-
-`lib/data-source/bloomreach-data-source.ts:122`: `private cache = new Map<string, { result: unknown; expiresAt: number }>()`. **Per-instance**, because `BloomreachDataSource` is constructed inside the request (`lib/mcp/connect.ts:96`). Wait — is it per-request or per-process? Let me trace it.
-
-Looking at `connectMcp` (`lib/mcp/connect.ts`): it returns a fresh `BloomreachDataSource` per call. Each request that goes live-mode constructs its own. So the response cache is **per-request**, not per-process. It dies when the handler's closures die (after the response is fully written).
-
-That means the cache primarily absorbs repeats *within one request*: the bootstrap chain does `list_cloud_organizations → list_projects → get_event_schema` and any tool that's called twice in one investigation hits the cache. It does NOT absorb repeats across two different `/api/agent` requests for the same insight — those each get their own DataSource and their own cache.
-
-```
-  Cache scope — per-request, not per-process
-
-  request A (live) ──► new BloomreachDataSource()
-                         └─ private cache: Map()
-                         └─ private lastCallAt: 0
-  request A: callTool('list_cloud_organizations', {})
-   ─ MISS, fetch from server, cache for 60s
-  request A: callTool('list_cloud_organizations', {})  ← bootstrap retry
-   ─ HIT (in-request)
-
-  request B (live) ──► new BloomreachDataSource()  (different instance)
-                         └─ private cache: Map()  (fresh, empty!)
-                         └─ private lastCallAt: 0
-  request B: callTool('list_cloud_organizations', {})
-   ─ MISS, fetch from server  (no benefit from A's cache)
-```
-
-**This is a deliberate-but-arguably-suboptimal call.** A process-scoped cache would absorb cross-request repeats on the same warm instance. The current shape doesn't — the comment at `bloomreach-data-source.ts:8` describes the cache as "60s response cache that absorbs repeats" without specifying scope, but the per-instance construction in `connectMcp` is what makes it per-request.
-
-If you wanted process-scoped: lift the `cache` Map to module scope, key it by `sessionId:tool:args` instead of just `tool:args`. Same partition discipline as the session feeds.
-
-#### Move 2.3 — closures and what they pin
-
-Every `setTimeout`, `Promise`, `AbortSignal.timeout` is a closure that captures variables from its lexical scope. If a long-lived structure holds a reference to one of those closures, the closure pins everything it captured.
-
-Concrete example — the spacing-gate Promise:
+The per-request `BloomreachDataSource` instance:
 
 ```ts
-// lib/data-source/bloomreach-data-source.ts:193
-await new Promise((r) => setTimeout(r, this.minIntervalMs - elapsed));
+// app/api/agent/route.ts:179, 322-323 — DataSource constructed and disposed per request
+const dataSource = dsResult.dataSource;
+// ...
+} finally {
+  try {
+    await disposeDataSource();
+  } catch (disposeErr) {
+    console.error('[agent] dispose error:', redactSecrets(formatError(disposeErr)));
+  }
 ```
 
-This Promise captures `r` (the resolve function); the `setTimeout` captures `r` too. Once `setTimeout` fires, both are released, the Promise resolves, the await continues, and everything captured goes out of scope. Lifetime: ≤1.1s. No leak.
+When `start(controller)` returns, the local `dataSource` reference drops. `disposeDataSource()` is currently a no-op for the Bloomreach adapter (`lib/data-source/index.ts:98`) — the comment explains why: the OAuth state lives in the cookie store, not on the instance. But the SHAPE is correct: a future adapter that holds real resources (a connection pool, a TCP socket, an open file) would hook into the same `dispose` slot and free them here.
 
-Counterexample — what would leak:
+The `cache` Map inside `BloomreachDataSource` dies with the instance. So does `lastCallAt`. So does the `HttpErrorHolder` from `transport.ts`. All of those are bounded to one request.
 
-```ts
-// HYPOTHETICAL — not in the repo
-const pendingByTool: Record<string, Promise<unknown>> = {};
-pendingByTool[name] = transport.callTool(name, args);  // never cleared
-```
+#### Where the GC actually does work
 
-That `pendingByTool` (module scope) would retain every Promise ever started, each pinning its closures, each pinning the args it captured. Slow leak, hard to spot, eventual OOM. The codebase avoids this — every Promise it creates is awaited and discarded in the same scope.
+V8's generational GC keeps short-lived objects in a "young" space and promotes survivors to "old" space. For this codebase:
 
-#### Move 2.4 — the NDJSON buffer
+- Most allocations (tool results, Promise continuations, parsed JSON) are short-lived — they live for one turn of the agent loop, then become eligible. V8's nursery cleans them up cheaply.
+- Long-lived heap residents (the session Maps, the schema cache) get promoted to old space and are touched only on full GC cycles, which are rarer.
 
-Client side: `lib/streaming/ndjson.ts:30` declares `let buf = ''` outside the read loop. Each chunk appends, then the buffer is split on `\n` and the trailing fragment kept:
-
-```ts
-buf += decoder.decode(value, { stream: true });
-const lines = buf.split('\n');
-buf = lines.pop() ?? '';
-```
-
-The buffer holds at most one partial line at a time. NDJSON producers terminate each event with `\n`, so the trailing partial is typically empty or a few bytes. Lifetime: as long as the read loop runs (one investigation, ≤300s server-side, then `releaseLock()` and out). No accumulation across requests.
-
-#### Move 2.5 — what does NOT exist (the easy wins for ruling out leaks)
-
-  → No long-lived `setInterval` keeping a closure alive forever.
-  → No global event emitters with `.on()` listeners that accumulate per-request handlers.
-  → No `WeakMap`/`WeakSet` usage (the codebase doesn't need them because there are no DOM-ref-style "remove when X is collected" patterns).
-  → No `Buffer` slicing that could pin parent buffers (`Buffer.slice` shares memory; only relevant if you slice and retain — the codebase doesn't).
-  → No streaming JSON parser holding a partial parse forever — everything goes through the chunk-at-a-time NDJSON loop above.
+The repo doesn't expose memory metrics. No `process.memoryUsage()` log lines. The Vercel dashboard shows memory per invocation but the app doesn't surface it. For an alpha, this is acceptable; for production, the move would be a periodic snapshot in the `finally` block of each route, joined with the per-request `console.log` already there.
 
 ### Move 3 — the principle
 
-In a long-lived server process, **the heap is what your module-scope variables transitively reference, plus whatever's live in the current request stack.** The bug is always "something module-scope accidentally retained a request-scope object." The defense is always "name your module-scope variables, audit their retention chains, partition or evict when growth is unbounded." This codebase does the first two well; the third (eviction on the outer `state` Map) is "not yet exercised" — bounded by Vercel's instance lifetime today.
+Garbage collection on a long-lived process turns "memory management" into "reachability management." Anything reachable from module-level is functionally a singleton — it's alive for the process. Anything reachable only from request-scoped code dies when the request ends. The skill is keeping these straight: putting per-user state at module level (correct, with a session key) vs. putting global state at module level (correct if truly immutable) vs. putting per-request state at module level (the leak).
 
 ## Primary diagram
 
 ```
-  Heap residents by lifetime — every retained thing, every retention edge
+  The reachability map — what's alive when, in this codebase
 
-  ┌─ V8 old generation (per Node process) ───────────────────────────┐
-  │                                                                   │
-  │  state ──► Map<sid, SessionFeed>                                  │
-  │             │                                                     │
-  │             ├─ sid_A → { insights, investigations, anomalies }    │
-  │             │            (each .clear()ed per fresh briefing)     │
-  │             ├─ sid_B → ...                                        │
-  │             └─ sid_C → ...                                        │
-  │                                                                   │
-  │  mem ────► Map<insightId, AgentEvent[]>                           │
-  │             (per-instance investigation cache)                    │
-  │                                                                   │
-  │  memStore ─► Map<sid, SessionAuthState>  (test backend only)      │
-  │                                                                   │
-  │  requestStore ─► AsyncLocalStorage instance (root)                │
-  │                                                                   │
-  │  module imports: Next.js, @anthropic-ai/sdk, @modelcontextprotocol│
-  │  /sdk, encoding tables, code, ...                                 │
-  │                                                                   │
-  └───────────────────────────────────────────────────────────────────┘
-
-  ┌─ V8 young generation (per request, mostly) ──────────────────────┐
-  │                                                                   │
-  │  per-request BloomreachDataSource                                 │
-  │   └─ cache: Map (≤60s entries) — dies with the DataSource         │
-  │   └─ lastCallAt: number                                           │
-  │                                                                   │
-  │  ALS frame ctx = {store, dirty}                                   │
-  │  req.signal AbortSignal                                           │
-  │  ReadableStream controller, encoder, collected[] array            │
-  │  fetch response Promises, JSON.parse'd payloads                   │
-  │                                                                   │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌─ module-level (alive for instance lifetime) ──────────────────────────┐
+  │  const TOOL_TIMEOUT_MS = 30_000        ← immutable; fine              │
+  │  const state: Map<sessionId, ...>      ← session-keyed; grows w/users │
+  │  const mem: Map<insightId, ...>        ← UUID-keyed; grows w/insights │
+  │  let cached: WorkspaceSchema | null    ← UNKEYED; finding #1          │
+  └───────────────────────────┬───────────────────────────────────────────┘
+                              │ references
+                              ▼
+  ┌─ request-scoped (alive while route handler runs) ─────────────────────┐
+  │  BloomreachDataSource instance      ← dies when start() returns       │
+  │    └─ cache: Map (60s TTL entries)  ← dies with instance              │
+  │    └─ lastCallAt: number            ← dies with instance              │
+  │  ALS ctx (auth.ts RequestStore)     ← dies when run() unwinds         │
+  │  ReadableStream controller          ← dies when controller.close()    │
+  └───────────────────────────┬───────────────────────────────────────────┘
+                              │ references
+                              ▼
+  ┌─ in-flight (alive while await is parked) ─────────────────────────────┐
+  │  Promise + continuation closures    ← settle, then GC'd               │
+  │  tool result blobs (truncated)      ← discarded after send()          │
+  │  AbortSignal listeners              ← removed on settle / abort       │
+  └───────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-V8's generational GC has been the default in Node since the beginning. Most allocations are short-lived — the "infant mortality" hypothesis — so collecting young gen frequently is cheap. The cost you pay: long-lived objects that *should have died* and got promoted to old gen are expensive to find later. That's why "leak" in Node usually means "module-scope reference you forgot about," not "missing free()."
+V8's heap model is well-suited to serverless: short-lived spikes get absorbed by the nursery, long-lived state lives in old space until a cold start wipes it. The app fits the model naturally — there's no need to tune `--max-old-space-size` or trigger manual `gc()` calls.
 
-The default V8 heap is around 1.7 GB on 64-bit. Vercel's Pro plan gives Node functions configurable memory (the default is enough here). A `--max-old-space-size` override is not in the repo and would only be needed if heap growth crossed that line — at this codebase's shape, nowhere close.
+The schema cache leak is interesting as a memory pattern AS WELL as a correctness bug. Because `cached` holds ONE schema at a time (the latest write overwrites), it's not unbounded memory growth — but the schema it holds is the WRONG ONE for whoever reads it next. Fixing the correctness bug by switching to a `Map<sessionId, WorkspaceSchema>` would change the memory shape: bounded → unbounded-in-instance-lifetime, same as the other session Maps. That's the right tradeoff.
 
-Worth reading: the V8 "fast properties" / "hidden classes" docs for why `new Map()` outperforms `{}` for dynamic keys; *High Performance Browser Networking* on browser GC (the client-side NDJSON loop's `buf` rotation is the same shape); Node's `--inspect` heap-snapshot workflow for chasing retention paths in production.
+The "not yet exercised" parts of the memory topic:
+
+- **Manual GC.** `global.gc()` would require launching Node with `--expose-gc`. The repo doesn't.
+- **Heap snapshots.** No tooling wired in. Production-style monitoring would use the Node `--inspect` flag or a service like Datadog APM.
+- **Off-heap buffers.** No `Buffer.allocUnsafe`, no `SharedArrayBuffer`. The only buffer use is in `auth.ts` for AES-256-GCM encryption (`createHash`, `createCipheriv`); those are short-lived and small.
+- **WeakMap / WeakRef.** Not used. A reasonable evolution for the session Map would be a `WeakMap<SessionToken, SessionFeed>` if sessions had a token object you could let go of, but session IDs are strings (not eligible as WeakMap keys).
 
 ## Interview defense
 
-**Q: What in this codebase could leak memory?**
+> Q: "What's the memory shape of this app on a warm Vercel instance?"
 
-The honest answer: very little, by construction. Two candidates worth inspecting:
+Most allocations are transient — tool results, Promise continuations, parsed JSON — all freed within a request. The long-lived heap is three things: session-keyed Maps that grow per user (insights, investigations), an unkeyed schema cache that holds one `WorkspaceSchema` at a time (~100-200KB), and the encrypted auth store in dev. None of these are tuned; V8's default GC handles the volume.
 
-  1. The outer `state` Map at `lib/state/insights.ts:14`. It grows monotonically as new sessions appear, no eviction. With infinite distinct sessions across one warm instance's lifetime, you'd OOM. With Vercel reaping idle instances every few hours, in practice it's bounded by "active sessions per few-hour window." Not a leak in the strict sense; an unbounded retention with a platform-level reaper.
+> Q: "Where would memory grow unboundedly?"
 
-  2. Closures captured by long-lived structures. The codebase doesn't have any module-scope structures retaining Promises or callbacks — the only long-lived Maps store JSON-shaped data, not closures. So nothing pins per-request scope past the response.
+The session Maps in `lib/state/insights.ts` and `lib/state/investigations.ts` never evict — they grow as new sessions hit the server until cold start. At alpha traffic this is fine; at scale you'd add TTL eviction (the same `{result, expiresAt}` pattern `BloomreachDataSource.cache` already uses, but at the session level). Cold start is the implicit eviction today.
 
-If I were tightening this: add an LRU on the outer `state` Map keyed by last-touch timestamp. Today it's not earning its keep — instance lifetime handles it.
+> Q: "Why doesn't this codebase tune GC or heap size?"
 
-```
-  the audit:  for every module-scope variable, ask
-              "does this retain anything per-request?"
-              → no, for every variable in this repo today
-```
-
-**Q: What's the lifetime of the BloomreachDataSource's 60s response cache?**
-
-Per-request. The DataSource is constructed inside `connectMcp` per call (`lib/mcp/connect.ts:96`), so each request gets its own instance with its own fresh cache. The 60s TTL governs entries *within* that request — it absorbs the bootstrap chain (`list_cloud_organizations → list_projects → get_event_schema → ...`) calling repeated tools.
-
-It does NOT cache across requests. A second `/api/agent` call for the same insight on the same instance re-fetches everything. A process-scoped cache would absorb that — the comment in `lib/data-source/index.ts:14-18` describes why the Bloomreach adapter is session-scoped today and what would change if we lifted the cache to module scope.
-
-Anchor: "60s TTL, per-DataSource-instance, per-request — the bootstrap retry is the typical hit."
-
-```
-  request 1: new DataSource → fresh cache → 6 tool calls → cache holds 6 entries
-  request 1 ends: DataSource closures GC'd → cache GC'd
-  request 2: new DataSource → fresh cache → re-fetches the same tools
-```
+Because the hot path is I/O-bound and the per-request memory budget is tiny — most allocations die within the request. V8's defaults are tuned for this shape. Tuning would matter if we held large in-memory caches across requests (we don't, beyond the schema cache, which is small) or did batch processing (we don't).
 
 ## See also
 
-  → `01-runtime-map.md` for where these heap regions sit relative to process lifetime.
-  → `04-shared-state-races-and-synchronization.md` for the partition discipline that makes the outer Map safe.
-  → `06-filesystem-streams-and-resource-lifecycle.md` for non-heap resources (file handles, stream controllers).
+- `04-shared-state-races-and-synchronization.md` — the schema cache leak in its full context.
+- `06-filesystem-streams-and-resource-lifecycle.md` — file-descriptor and stream lifetimes (the other resource class besides memory).
+- `08-runtime-systems-red-flags-audit.md` — the schema cache ranked as finding #1.

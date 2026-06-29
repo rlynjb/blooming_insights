@@ -1,138 +1,114 @@
-# DataSource seam — one interface, two adapters, swappable per request
+# datasource-seam
 
-**Industry name:** provider abstraction / hexagonal-architecture port / dependency-inversion seam · Industry standard
+## Port and adapter (industry standard)
 
-## Zoom out, then zoom in
+The load-bearing seam of the whole repo. A port (the `DataSource` interface in `lib/data-source/types.ts`) plus two adapters (`BloomreachDataSource`, `SyntheticDataSource`) chosen by a factory (`makeDataSource`). Every agent, every route, every helper consumes the port — never an adapter. Two adapter swaps in this seam's history without changing a single caller.
 
-The agents (monitoring, diagnostic, recommendation, query) don't know
-whether they're talking to a live Bloomreach MCP server over HTTPS or to a
-deterministic in-memory ecommerce fixture. They hold a `DataSource`. The
-factory picks the adapter per request based on `bi:mode`.
+## Zoom out — where this pattern lives
 
-You know how `useState` doesn't care whether the state lives in your
-component, a context, or a Redux store — the interface (`[value, setter]`)
-hides the implementation. Same shape here: `callTool(name, args)` hides
-"HTTPS + OAuth + rate-limit + cache" behind the same surface as "look up
-this fixture in a switch statement."
+This is the boundary between the deterministic shell of the app (routes, agents, state) and the noisy outside world (an alpha OAuth-protected upstream that rate-limits and revokes tokens). Pull the shell off the upstream and you can swap the upstream for fixtures, for a SQL database, for anything — without rewriting the shell.
 
 ```
-  Zoom out — where the DataSource seam lives
+  Zoom out — the seam as a wall
 
-  ┌─ UI ────────────────────────────────────────────────┐
-  │  page.tsx — toggle: demo | live-bloomreach | live-synthetic │
-  └────────────────────────┬────────────────────────────┘
-                           │
-  ┌─ Route handler ────────▼────────────────────────────┐
-  │  makeDataSource(mode, sessionId) ★ THE SEAM ★       │ ← we are here
-  │                                                      │
-  │   abstract surface (lib/data-source/types.ts:63-71): │
-  │      callTool(name, args, opts?) → {result, ...}     │
-  │      listTools(opts?) → unknown                      │
-  └────────────────────────┬────────────────────────────┘
-                           │
-              ┌────────────┴────────────┐
-              ▼                         ▼
-  ┌─ Adapter A ───────┐    ┌─ Adapter B ───────────────┐
-  │ Bloomreach        │    │ Synthetic                  │
-  │ HTTPS + OAuth     │    │ in-process fixtures        │
-  │ ~1 req/s + cache  │    │ no network, no rate limit  │
-  │ + retry + timeout │    │                            │
-  └───────────────────┘    └────────────────────────────┘
+  ┌─ Service layer (deterministic, in-process) ────────────────────────┐
+  │  routes (briefing, agent, mcp/*)                                    │
+  │  agents (monitoring, diagnostic, recommendation, query, intent)     │
+  │  helpers (bootstrapSchema, anomalyToInsight, putInsights, …)        │
+  │                       │                                             │
+  │                       │  every consumer holds a `DataSource`        │
+  │                       ▼                                             │
+  │  ★ THE SEAM ★  `interface DataSource` (`lib/data-source/types.ts`)  │ ← we are here
+  │  callTool(name, args, opts) → { result, durationMs, fromCache }     │
+  │  listTools(opts)                                                    │
+  └────────────────────────┬────────────────────────────────────────────┘
+                           │  one of two adapters today
+            ┌──────────────┴──────────────┐
+            ▼                              ▼
+  ┌─ Adapter (Bloomreach) ─┐    ┌─ Adapter (Synthetic) ────┐
+  │ HTTPS + OAuth/PKCE/DCR │    │ in-process fixtures      │
+  │ rate-limit + cache     │    │ deterministic, no network│
+  │ (214 LOC)              │    │ (516 LOC)                │
+  └───────────┬────────────┘    └──────────────────────────┘
+              │
+              ▼
+        external server
 ```
 
-This file is about the load-bearing architectural move: **put the seam
-where the provider could be swapped, then ship two implementations** so
-the seam isn't theoretical.
+## Structure pass
 
-## Structure pass — layers, axis, seams
-
-**Layers:** Route handler → Factory → DataSource interface → concrete
-adapter → underlying transport (HTTPS for one, function call for the
-other).
-
-**Axis (held constant): "what do callers see, and what does the adapter
-hide?"** The interface promises a `{result, durationMs, fromCache}`
-envelope — the question is what each layer adds or hides as you cross it.
+Three layers exist around this seam: the **client** layer (routes + agents that consume `DataSource`), the **port** layer (the interface itself), the **adapter** layer (concrete implementations). One axis worth tracing across the three: **who depends on whom?**
 
 ```
-  Axis: what's hidden behind this seam?
+  Axis: dependency direction
 
-  ┌─ Agent (caller) ───────────────────────────────────┐
-  │  dataSource.callTool('purchase', {project_id})     │   → SEES: name+args
-  │                                                     │     HIDDEN: everything below
-  └───────────────────────────┬─────────────────────────┘
-                              │
-  ┌─ DataSource interface ────▼─────────────────────────┐
-  │  {result, durationMs, fromCache}                    │   → contract
-  └───────────────────────────┬─────────────────────────┘
-                              │
-              ┌───────────────┴───────────────┐
-              ▼                               ▼
-  ┌─ BloomreachDataSource ──┐    ┌─ SyntheticDataSource ──────────┐
-  │ HIDES: 60s cache,        │   │ HIDES: switch(name) → fixture, │
-  │  ~1 req/s spacing,       │   │  deterministic seeded RNG,      │
-  │  retry ladder,           │   │  per-tool synthesis             │
-  │  30s timeout,            │   │                                 │
-  │  OAuth bearer header,    │   │                                 │
-  │  HTTP transport          │   │                                 │
-  └──────────────────────────┘   └─────────────────────────────────┘
+  ┌─ client (routes + agents) ──┐    depends on the PORT, not the adapter
+  │  hold `DataSource`          │   ═════╪═════►
+  └─────────────────────────────┘
+       ┌─ port (interface) ────────┐
+       │  `interface DataSource`   │
+       └───────────────────────────┘
+            ▲                  ▲
+            │                  │  adapters DEPEND on the port
+            │                  │  (they implement it)
+  ┌─ adapter (Bloomreach) ─┐  ┌─ adapter (Synthetic) ─┐
+  │  implements DataSource │  │  implements DataSource │
+  └────────────────────────┘  └────────────────────────┘
 ```
 
-**Seams (boundaries where the answer flips):**
+The dependency direction is the whole point. Without the port, agents would depend on `BloomreachDataSource`; swapping the adapter would mean touching every agent. With the port, the arrows are *inverted* — both the agents and the adapters depend on the same abstraction in the middle, and the agents don't know which adapter they got. This is dependency inversion in textbook form.
 
-- **Agent ↔ DataSource interface** — control-of-implementation flips
-  here. Agents previously called `McpClient` directly; the interface
-  extraction (Phase 2 PR A) lifted control out without changing
-  `McpClient`'s behavior.
-- **DataSource interface ↔ concrete adapter** — the substitution seam.
-  The factory chooses; nothing else does. `makeDataSource` is the only
-  place that names both concrete classes.
-- **Concrete adapter ↔ transport** — what's-on-the-wire flips here.
-  Bloomreach holds an `SdkTransport` (`lib/mcp/transport.ts:123-165`)
-  wrapping the MCP SDK Client; Synthetic holds nothing — it IS the
-  transport.
+Where the axis flips: at the port. Above it, callers *consume* `DataSource`. Below it, adapters *implement* `DataSource`. The interface is the contract that lets both sides change without coordination.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-The shape is a port and two adapters (hexagonal architecture, Cockburn).
-The port — the interface — names what callers need. The adapters
-implement it for different backends.
+You've used a wall socket. Two prongs, a defined voltage, a defined frequency. A lamp doesn't know what powers the grid (coal, solar, nuclear); the grid doesn't know what's plugged in. The socket is the contract; both sides can change independently as long as they keep the contract.
+
+A port is the software wall socket. `DataSource` defines two methods (`callTool`, `listTools`) with a defined argument shape and a defined return envelope (`{ result, durationMs, fromCache }`). Agents are the lamp — they call `callTool` and don't know which adapter is on the other side. Adapters are the grid — they implement `callTool` and don't know which agent is calling them. The factory `makeDataSource(mode, sessionId)` is the choice of which grid to plug into.
 
 ```
-  Pattern — port and adapters
+  The pattern: port + adapters + factory
 
-           ┌─ port (the interface) ─┐
-           │  callTool(name, args)  │
-           │  listTools()           │
-           └──────────┬─────────────┘
-                      │
-           ┌──────────┴──────────┐
-           ▼                     ▼
-       adapter A             adapter B
-       (Bloomreach)          (Synthetic)
-           │                     │
-           ▼                     ▼
-       HTTPS + MCP           switch(name) →
-       SDK + OAuth +         fixture
-       cache + retry
+  ┌──── client (agent) ────┐
+  │  needs a DataSource    │
+  └───────────┬────────────┘
+              │  injected by the route
+              ▼
+       ┌─ port ─────┐
+       │ DataSource │  ◄── interface (the contract)
+       └──┬──────┬──┘
+          │      │
+          │ implemented by         implemented by
+          ▼                                       ▼
+  ┌─ adapter A ──────────┐         ┌─ adapter B ────────┐
+  │ BloomreachDataSource │         │ SyntheticDataSource│
+  │ (real, networked)    │         │ (fake, in-process) │
+  └──────────┬───────────┘         └────────────────────┘
+             │
+             ▼
+    external Bloomreach server
+
+  factory picks one based on mode:
+     'live-bloomreach' → A
+     'live-synthetic'  → B
 ```
-
-What makes a port load-bearing: every consumer of the port stays the
-same when the adapter changes. The interface is the API; the adapter is
-the implementation; the factory is the choice.
 
 ### Move 2 — the step-by-step walkthrough
 
-#### Step 1 — the port (the interface)
+#### the port — the interface
 
-The interface is small on purpose. Two methods, both return shapes
-mirror the MCP SDK's result envelope so the rename didn't change
-behavior.
+The interface is small on purpose. Two methods, three types:
 
-```typescript
-// lib/data-source/types.ts:63-71
+```ts
+// lib/data-source/types.ts:53-71
+export interface DataSourceCallResult {
+  result: unknown;       // adapters cast at the call site (e.g. unwrap<T>(result))
+  durationMs: number;    // observability — surfaced in the UI "how it was gathered" panel
+  fromCache: boolean;    // observability — surfaced in trace events
+}
+
 export interface DataSource {
   callTool(
     name: string,
@@ -142,36 +118,68 @@ export interface DataSource {
 
   listTools(opts?: DataSourceListOptions): Promise<unknown>;
 }
+```
 
-// lib/data-source/types.ts:53-57
-export interface DataSourceCallResult {
-  result: unknown;
-  durationMs: number;
-  fromCache: boolean;
+Two design choices worth flagging:
+
+- **`result: unknown` instead of generic `T`.** The interface drops the generic that the concrete adapter carries — the abstract surface is type-erased so callers can't accidentally couple to a specific adapter's return shape. Call sites narrow with `unwrap<T>(result)` in `lib/mcp/schema.ts`, which is part of the port's vocabulary (it lives next to the interface and handles both `structuredContent` and `content[0].text` envelopes).
+- **The envelope shape `{ result, durationMs, fromCache }` matches the legacy `McpClient` exactly.** That's the receipt: the rename + lift to a seam (PR A of Phase 2) was a *behavior-preserving* refactor — no caller had to change. Adapters that don't track duration or cache hits return `fromCache: false` and a real-or-zero `durationMs`.
+
+```
+  Pattern — the port's surface
+
+  ┌──── DataSource (port) ────┐
+  │                            │
+  │  callTool(name, args, ?)   │  ──►  { result, durationMs, fromCache }
+  │  listTools(?)              │  ──►  unknown   (caller narrows)
+  │                            │
+  └────────────────────────────┘
+       narrow surface →
+       broad implementation space
+```
+
+#### the adapters — one real, one fake
+
+**`BloomreachDataSource`** (214 LOC, `lib/data-source/bloomreach-data-source.ts`) wraps a connected `StreamableHTTPClientTransport` and adds the upstream's reliability machinery: 60s response cache, 1.1s proactive spacing, rate-limit retry ladder, `AbortSignal` composition. The class declaration is the receipt:
+
+```ts
+// lib/data-source/bloomreach-data-source.ts:121-127
+export class BloomreachDataSource implements DataSource {
+  private cache = new Map<string, { result: unknown; expiresAt: number }>();
+  private lastCallAt = 0;
+  private minIntervalMs: number;
+  private maxRetries: number;
+  …
 }
 ```
 
-What's deliberate here:
+The history matters. This class used to be called `McpClient`, lived at `lib/mcp/client.ts`, and was already shaped to be the Bloomreach adapter — the file's header comment explains the seam wasn't retrofitted: "the seam wasn't retrofitted, the class was already shaped to be the Bloomreach adapter. Lifting `DataSource` over it only changed the TYPE that callers consume." → see `10-rate-limit-aware-mcp-client.md` for the reliability internals.
 
-- `result: unknown` — every consumer casts. The interface doesn't
-  pretend to know the shape of every tool's response. `unwrap<T>()`
-  (`lib/mcp/schema.ts:36-43`) lives at the call site, not the
-  interface.
-- `fromCache: boolean` — the agent doesn't care, but the trace surface
-  does. The UI's "how this was gathered" panel renders cache hits
-  differently. The interface carries the field so the trace doesn't
-  have to special-case the adapter.
-- `opts?: DataSourceCallOptions` — today only `signal`. The Bloomreach
-  adapter accepts MORE options (`cacheTtlMs`, `skipCache`) but those
-  live on the concrete class, not the interface — agents would never
-  need them.
+**`SyntheticDataSource`** (516 LOC, `lib/data-source/synthetic-data-source.ts`) is the second adapter. It implements the same port over deterministic in-process fixtures — a fake Bloomreach workspace, complete with events, customer properties, EQL results. The agent loop runs against it identically; the route layer asks no questions.
 
-#### Step 2 — the factory (the choice)
+```
+  Pattern — both adapters, same shape
 
-The factory is the one place that knows both adapters exist by name.
+  ┌─ BloomreachDataSource ──────┐    ┌─ SyntheticDataSource ───┐
+  │ implements DataSource       │    │ implements DataSource   │
+  │                              │    │                          │
+  │ callTool(...) {              │    │ callTool(...) {          │
+  │   await rate-limit            │    │   await fixture-lookup    │
+  │   await transport.callTool   │    │   return { result, 0, false}│
+  │   return { result, ms, cache}│    │ }                        │
+  │ }                            │    │                          │
+  │ listTools(...) → transport   │    │ listTools(...) → fixtures│
+  └──────────────────────────────┘    └──────────────────────────┘
+```
 
-```typescript
-// lib/data-source/index.ts:67-100 (abridged)
+The reason the synthetic adapter is *bigger* than the real one: it has to *generate* convincing data. The Bloomreach adapter just *transports* what the server returns. That asymmetry is normal for fakes — they own the data the real adapter borrows.
+
+#### the factory — chooses an adapter for a request
+
+`makeDataSource(mode, sessionId)` is the only place adapters are constructed. The routes never `new BloomreachDataSource(...)` — they call the factory and narrow the result to `DataSource`:
+
+```ts
+// lib/data-source/index.ts:67-100
 export async function makeDataSource(
   mode: LiveMode,
   sessionId: string,
@@ -185,334 +193,283 @@ export async function makeDataSource(
     };
   }
 
-  // live-bloomreach — defer to the existing connect path. It owns the OAuth
-  // dance, including the case where the session has no valid tokens.
+  // live-bloomreach — defer to the existing connect path.
   const conn: ConnectResult = await connectMcp(sessionId);
   if (!conn.ok) {
     return { ok: false, mode, authUrl: conn.authUrl };
   }
+  const bloomreachDs = conn.mcp;
   return {
-    ok: true, mode,
-    dataSource: conn.mcp,
-    bootstrap: (signal) => bootstrapSchema(conn.mcp, { signal }),
+    ok: true, mode, dataSource: bloomreachDs,
+    bootstrap: (signal?: AbortSignal) => bootstrapSchema(bloomreachDs, { signal }),
     dispose: async () => {},
   };
 }
 ```
 
-The factory also returns a `bootstrap` function and a `dispose` callback
-— a small lifecycle envelope. Synthetic's bootstrap is `async () =>
-syntheticWorkspaceSchema` (no I/O); Bloomreach's runs the real
-4-call orchestrator (`list_cloud_organizations`, `list_projects`,
-`get_event_schema`, `get_project_overview`).
+Three things the factory does beyond construction:
+
+- **Returns a discriminated union.** `{ ok: true, dataSource, bootstrap, dispose }` on success; `{ ok: false, authUrl }` on the Bloomreach auth-gate failure. Routes branch once, never twice.
+- **Closes over the bootstrap step.** Each adapter's "load the workspace schema" call is different — Bloomreach runs the loomi connect orchestrator; Synthetic returns a fixture. The factory bakes that difference into a `bootstrap(signal)` closure so the route just calls `await result.bootstrap(req.signal)` without branching.
+- **Provides a dispose closure.** Both adapters return a no-op dispose today (Bloomreach lives across requests via the cookie store; Synthetic has nothing to dispose). The shape exists for future adapters that own a process or a socket — the route's `finally` calls `disposeDataSource()` either way.
 
 ```
-  Factory result shape — the small lifecycle envelope
+  Layers-and-hops — the factory's job
 
-         ok:  true                  ok: false (Bloomreach only)
-         ────                        ───────
-         dataSource: DataSource     authUrl: string
-         bootstrap()                (browser redirects)
-         dispose()
+  ┌─ route ─────┐  hop 1: makeDataSource('live-bloomreach', sid)
+  │  /api/      │ ──────────────────────────────────────────────►
+  │  briefing   │                                                  ┌─ factory ──────────┐
+  └─────────────┘                                                  │  switch on mode     │
+                                                                   └────────┬───────────┘
+                                                                            │
+                                              ┌─────────────────────────────┴───────────────────┐
+                                              │ 'live-synthetic'                'live-bloomreach'│
+                                              ▼                                                  ▼
+                                  ┌─ new SyntheticDataSource() ┐         ┌─ connectMcp(sid) ──────────┐
+                                  │  bootstrap: async () =>     │         │  OAuth dance via provider   │
+                                  │    syntheticWorkspaceSchema │         │   ok ? BloomreachDataSource │
+                                  │  dispose: no-op             │         │      : { authUrl }          │
+                                  └────────────┬────────────────┘         └────────────┬────────────────┘
+                                               │                                       │
+                                               ▼                                       ▼
+                                  hop 2: { ok, dataSource, bootstrap, dispose }
+                                  hop 3: route narrows dataSource to `DataSource`
 ```
 
-#### Step 3 — adapter A: BloomreachDataSource
+#### consumers — agents that hold the port, not the adapter
 
-The Bloomreach adapter wraps an `SdkTransport` and adds 60-second
-response caching, ~1 req/s proactive spacing, a retry ladder for
-rate-limit errors, and an `AbortSignal` composition with a per-call
-30-second timeout.
+The agents — `MonitoringAgent`, `DiagnosticAgent`, `RecommendationAgent`, `QueryAgent` — accept the port:
 
-```typescript
-// lib/data-source/bloomreach-data-source.ts:121-152 (abridged)
-export class BloomreachDataSource implements DataSource {
-  private cache = new Map<string, { result: unknown; expiresAt: number }>();
-  private lastCallAt = 0;
-  // ...
-  async callTool<T = unknown>(
-    name: string, args: Record<string, unknown>,
-    options: CallToolOptions = {},
-  ): Promise<CallToolResult<T>> {
-    const cacheKey = `${name}:${JSON.stringify(args)}`;
-    const ttl = options.cacheTtlMs ?? 60_000;
-
-    if (!options.skipCache) {
-      const cached = this.cache.get(cacheKey);
-      if (cached && cached.expiresAt > Date.now()) {
-        return { result: cached.result as T, durationMs: 0, fromCache: true };
-      }
-    }
-    const start = Date.now();
-    let result = await this.liveCall(name, args, options.signal);
-    // ...retry ladder (see 05-caching-and-rate-limiting.md)...
-    return { result: result as T, durationMs: Date.now() - start, fromCache: false };
-  }
+```ts
+// lib/agents/monitoring.ts:73-80
+export class MonitoringAgent {
+  constructor(
+    private anthropic: Anthropic,
+    private dataSource: McpCaller,         // ← Pick<DataSource, 'callTool'>
+    private schema: WorkspaceSchema,
+    private allTools: McpToolDef[],
+    private sessionId?: string,
+  ) {}
+  …
 }
 ```
 
-The cache, the spacing, the retries, the timeout — none of it leaks
-through the interface. Agents see `{result, durationMs, fromCache}`.
+`McpCaller` is even narrower than `DataSource` — it's `Pick<DataSource, 'callTool'>` (`lib/agents/base.ts:14`). The agents don't need `listTools` (the route already called it and handed the result in). Narrowing the dependency to the minimum surface the agent actually uses is the "Interface Segregation" half of SOLID — adapters whose `listTools` is expensive or unavailable could still serve the agent.
 
-#### Step 4 — adapter B: SyntheticDataSource
+The library boundary (the three adapter classes in `lib/agents/aptkit-adapters.ts`) takes the same `McpCaller`:
 
-Synthetic implements the same interface but the body is `switch(name)`
-over fixtures.
-
-```typescript
-// lib/data-source/synthetic-data-source.ts:1-516 (sketch — abridged for clarity)
-export class SyntheticDataSource implements DataSource {
-  async callTool(name, args, opts) {
-    switch (name) {
-      case 'list_cloud_organizations': return { result: {...}, durationMs: 0, fromCache: false };
-      case 'get_event_schema':         return { result: {...}, durationMs: 0, fromCache: false };
-      case 'execute_analytics_eql':    return synthesizeEql(args);  // deterministic seeded computation
-      // ... ~10 tool names matching what monitoring/diagnostic/recommendation expect
-    }
-  }
-  async listTools(): Promise<unknown> { return { tools: SYNTHETIC_TOOLS }; }
+```ts
+// lib/agents/aptkit-adapters.ts:75-79
+export class BloomingToolRegistryAdapter implements ToolRegistry {
+  constructor(
+    private readonly dataSource: McpCaller,
+    private readonly allTools: McpToolDef[],
+  ) {}
+  …
 }
-
-// Plus an exported `syntheticWorkspaceSchema` for the factory's bootstrap.
 ```
 
-Synthetic's job: behave well enough that the AGENT LOOP runs end-to-end
-against it — same Anthropic SDK calls, same tool_use/tool_result
-ping-pong, same NDJSON events out — just with deterministic data. It's
-not for unit tests; it's a runnable demo backend.
+So the chain reads: route → factory → port → wrapping adapter (`BloomingToolRegistryAdapter`) → library agent (`@aptkit/core`). The library agent calls `tools.callTool(...)`; the wrapping adapter forwards to `dataSource.callTool(...)`; the port resolves to whatever concrete adapter the factory chose.
 
-#### Step 5 — the legacy alias
+#### the migration receipt — two swaps without a caller change
 
-The old `lib/mcp/client.ts` is a 17-line shim that re-exports
-`BloomreachDataSource` as `McpClient` for the four short MCP routes that
-need the Bloomreach-specific `skipCache` option:
-
-```typescript
-// lib/mcp/client.ts (17 lines, abridged):
-export {
-  BloomreachDataSource as McpClient,
-  McpToolError,
-  type CallToolOptions,
-  type ListToolsOptions,
-  type CallToolResult,
-} from '../data-source/bloomreach-data-source';
-```
-
-The four callers — `/api/mcp/{call,reset,tools,tools/check,capture}` —
-still need the concrete adapter so they can pass `skipCache: true` for
-the dev `/debug` force-fresh path. Agents NEVER need this; they narrow
-to `DataSource` at construction.
+The seam has survived two real swaps. The history is recorded in the file headers.
 
 ```
-  The two consumer styles
+  Comparison — the seam's history, side by side
 
-  Agent layer (4 wrappers):           4 short MCP routes:
-  ────────────────────────            ──────────────────
-  constructor(private dataSource:     const conn = await connectMcp(sid);
-    McpCaller)                        conn.mcp.callTool(..., { skipCache: true })
-  → narrows to {callTool}             → uses concrete BloomreachDataSource
-  → swappable                         → not swappable
-                                      → fine: these routes are Bloomreach-only by purpose
+  ┌─ Phase 1 (pre-seam) ─────────────┐  ┌─ Phase 2a ─────────────────────┐
+  │ agents hold McpClient (concrete) │  │ DataSource port introduced     │
+  │ no factory                       │  │ McpClient renamed →            │
+  │ ╳ swap requires touching agents  │  │   BloomreachDataSource          │
+  │                                  │  │ agents narrowed to McpCaller    │
+  └──────────────────────────────────┘  │ ✓ behavior-preserving rename    │
+                                        └────────────┬───────────────────┘
+                                                     │
+  ┌─ Phase 2b ──────────────────────────────────────▼─────────────────────┐
+  │ Olist (SQL) adapter ADDED behind the seam                              │
+  │ ✓ agents unchanged — they just got a third adapter to swap to          │
+  │ factory grew 'live-sql' branch                                         │
+  └──────────────────────────────────┬─────────────────────────────────────┘
+                                     │
+  ┌─ PR #8 (commit 62c24d7, 2026-06-18) ─▼─────────────────────────────────┐
+  │ Olist adapter REMOVED (the eval/ harness retired the same week)         │
+  │ ✓ agents unchanged                                                       │
+  │ factory's 'live-sql' branch dropped                                      │
+  └──────────────────────────────────┬─────────────────────────────────────┘
+                                     │
+  ┌─ Today ────────────────────────▼──────────────────────────────────────┐
+  │ SyntheticDataSource ADDED                                              │
+  │ ✓ agents unchanged                                                     │
+  │ factory grew 'live-synthetic' branch (lib/data-source/index.ts:71-79)  │
+  └────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### Step 6 — how the route uses it
+The receipt: in three changes spanning two adapter additions and one removal, *no agent's signature changed*. That's what a load-bearing seam looks like — the change ledger reads "adapter swap" not "shotgun surgery."
 
-The route handler is the one place that sees both shapes. It uses the
-factory to get an opaque `DataSource`, hands that to the agents, and
-keeps the bootstrap/dispose callbacks for its own use.
+#### the deliberate breach — `connectMcp.ConnectResult.mcp`
 
-```typescript
-// app/api/agent/route.ts:165-181 (abridged)
-let dsResult: Awaited<ReturnType<typeof makeDataSource>>;
-try {
-  dsResult = await makeDataSource(mode, sid);
-} catch (e) { /* 500 with redacted message */ }
-if (!dsResult.ok) return NextResponse.json({ needsAuth: true, authUrl: dsResult.authUrl }, { status: 401 });
+There's one place that intentionally holds the concrete adapter, not the port. `ConnectResult.mcp` is typed `BloomreachDataSource`, not `DataSource`:
 
-const dataSource = dsResult.dataSource;          // opaque DataSource
-const bootstrap  = dsResult.bootstrap;           // closure that runs the schema fetch
-const disposeDataSource = dsResult.dispose;      // teardown hook
-
-// ... later, inside the stream ...
-const schema = await bootstrap(req.signal);
-const rawTools = await dataSource.listTools({ signal: req.signal });
-const diagAgent = new DiagnosticAgent(anthropic, dataSource, schema, allTools, sid);
+```ts
+// lib/mcp/connect.ts:21-28
+/** ConnectResult.mcp is the concrete BloomreachDataSource (not just
+ *  `DataSource`) so the 4 short MCP routes — /api/mcp/{call,tools,tools/check,capture}
+ *  — keep access to Bloomreach-specific cache controls (skipCache). Agent + route
+ *  layers that only need the abstract surface narrow to `DataSource` at their
+ *  receive site (bootstrapSchema, agent ctors, etc.). */
+export type ConnectResult =
+  | { ok: true; mcp: BloomreachDataSource }
+  | { ok: false; authUrl: string };
 ```
+
+Why: `skipCache` is a Bloomreach-specific control (a cache-bypass option for the dev `/api/mcp/call` path). Putting it on the abstract port would force every adapter to model "cache" even when there isn't one (`SyntheticDataSource` has no cache to skip). The breach is deliberate and *scoped* — the four short MCP routes hold the concrete type; everyone else narrows to `DataSource` at the receive site. That's "depend on the port wherever you can, hold the concrete adapter only where you must" in practice.
 
 ### Move 3 — the principle
 
-**The seam earns its keep when an adapter exists on both sides.** An
-abstract interface with only one implementation is a guess about a
-future need; an abstract interface with two implementations is a fact
-about a present one. This codebase has two: live Bloomreach and
-synthetic. The synthetic adapter isn't a test double — it's a runnable
-backend that lets the rest of the system stay honest about running the
-real agent loop without depending on a flaky upstream.
+A port earns its keep when it survives an adapter swap *without* the callers changing. This repo has the receipt: three changes (two adds, one remove) and no consumer touched the seam's surface. The transferable lesson: when designing an abstraction, the right test is not "is the interface beautiful" — it's "what would change in the callers if I replaced the implementation tomorrow." If the answer is "nothing," the seam is load-bearing. If the answer is "everything," there's no seam; there's just a class that happens to have an interface.
 
-The general lesson: when an external provider is unreliable, slow, or
-rate-limited (as Bloomreach's alpha is), the seam in front of it isn't
-optimization — it's how you ship at all. Without the synthetic adapter,
-every demo would depend on the alpha server being available; with it,
-the alpha server is just one of two ways to run.
+The dual lesson: a port is *narrow*. `DataSource` has two methods, not twelve. `McpCaller` has one. Every additional method on a port is one more thing every future adapter must implement; every adapter-specific feature on a port is one more leak. Keep the port at the *intersection* of what callers actually need — the rest stays on the concrete adapter where it belongs.
 
 ## Primary diagram
 
 ```
-  DataSource seam — request to response, both adapters
+  datasource-seam — full picture
 
-  ┌─ Route handler ─────────────────────────────────────────────────────────┐
+  ┌─ Clients (depend on the port) ─────────────────────────────────────────┐
+  │                                                                         │
+  │  app/api/briefing/route.ts        ──► holds DataSource                  │
+  │  app/api/agent/route.ts           ──► holds DataSource                  │
+  │  app/api/mcp/{call,tools,…}/      ──► hold BloomreachDataSource (escape │
+  │                                       hatch for skipCache)              │
+  │                                                                         │
+  │  MonitoringAgent / DiagnosticAgent / RecommendationAgent / QueryAgent   │
+  │     ──► hold McpCaller = Pick<DataSource, 'callTool'>                   │
+  │                                                                         │
+  │  bootstrapSchema(dataSource: DataSource, opts)                          │
+  │  BloomingToolRegistryAdapter(dataSource: McpCaller, allTools)           │
+  │                                                                         │
+  └────────────────────────────┬────────────────────────────────────────────┘
+                               │
+  ┌─ Port (the contract) ─────▼────────────────────────────────────────────┐
+  │  lib/data-source/types.ts                                                │
   │                                                                          │
-  │  mode = parseLiveMode(...)                                               │
-  │  dsResult = await makeDataSource(mode, sid)                              │
+  │  interface DataSource {                                                  │
+  │    callTool(name, args, opts?) → { result, durationMs, fromCache }       │
+  │    listTools(opts?)            → unknown                                 │
+  │  }                                                                       │
   │                                                                          │
-  │       ┌─ mode === 'live-synthetic' ─────┐    ┌─ mode === 'live-bloomreach' ─┐
-  │       │ new SyntheticDataSource()       │    │ await connectMcp(sid)         │
-  │       │ bootstrap = async () =>         │    │   → { ok, mcp } | { authUrl } │
-  │       │   syntheticWorkspaceSchema      │    │ bootstrap = (s) =>            │
-  │       └─────────────────┬───────────────┘    │   bootstrapSchema(mcp, {s})   │
-  │                         │                    └────────────┬──────────────────┘
-  │                         ▼                                 ▼
-  │                  dsResult.dataSource : DataSource                          │
-  │                         │                                                  │
-  │                         ▼                                                  │
-  │  new DiagnosticAgent(anthropic, dataSource, schema, allTools, sid)         │
-  │  await agent.investigate(anomaly, { ..., signal: req.signal })             │
-  │           │                                                                │
-  │           ▼                                                                │
-  │     hooks emit tool_call_* events to the NDJSON stream                     │
-  │                                                                            │
-  └────────────────────────────────────────────────────────────────────────────┘
-
-  Inside the agent:                                Inside each adapter:
-  ─────────────────                                ────────────────────
-  toolRegistry.callTool('purchase', {...})         Bloomreach:
-      └─ BloomingToolRegistryAdapter.callTool ──►   60s cache → ~1 req/s spacing
-         └─ dataSource.callTool('purchase', {...})  → MCP HTTPS POST → retry on 429
-                                                    → {result, durationMs, fromCache}
-
-                                                  Synthetic:
-                                                    switch ('purchase') → fixture
-                                                    → {result, durationMs:0, fromCache:false}
+  │  + DataSourceCallOptions { signal? }                                     │
+  │  + DataSourceCallResult  { result, durationMs, fromCache }               │
+  │  + ToolDef               (the MCP Tool shape, protocol-agnostic)         │
+  │  + ToolResult            (the MCP CallToolResult envelope)               │
+  └────────────────────────────┬────────────────────────────────────────────┘
+                               │  implemented by:
+            ┌──────────────────┴──────────────────┐
+            ▼                                      ▼
+  ┌─ Adapter ───────────────────────────┐  ┌─ Adapter ──────────────────────┐
+  │  BloomreachDataSource                │  │  SyntheticDataSource           │
+  │  (lib/data-source/bloomreach-…ts,    │  │  (lib/data-source/synthetic-…ts│
+  │   214 LOC)                           │  │   516 LOC)                     │
+  │                                       │  │                                │
+  │  Wraps StreamableHTTPClientTransport  │  │  In-process fixtures           │
+  │  + AES-256-GCM cookie auth           │  │  + deterministic EQL results   │
+  │  + 1.1s proactive spacing            │  │  + no network                  │
+  │  + rate-limit retry ladder           │  │                                │
+  │  + 60s response cache                │  │  syntheticWorkspaceSchema      │
+  │  + AbortSignal composition           │  │  (exported alongside)          │
+  │                                       │  │                                │
+  │  Bloomreach-specific extras:          │  │                                │
+  │    CallToolOptions.cacheTtlMs         │  │                                │
+  │    CallToolOptions.skipCache          │  │                                │
+  │    (NOT on the port — escape via      │  │                                │
+  │     ConnectResult.mcp)                │  │                                │
+  └──────────────────────────────────────┘  └────────────────────────────────┘
+                               ▲
+                               │
+  ┌─ Factory ─────────────────┴────────────────────────────────────────────┐
+  │  makeDataSource(mode: LiveMode, sessionId: string)                       │
+  │    'live-synthetic'  → new SyntheticDataSource()                         │
+  │    'live-bloomreach' → connectMcp(sid) → BloomreachDataSource OR authUrl │
+  │                                                                          │
+  │  Returns: { ok: true, dataSource, bootstrap, dispose }                   │
+  │       OR  { ok: false, authUrl }                                         │
+  └─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-**Where this pattern comes from.** Ports-and-adapters / hexagonal
-architecture (Alistair Cockburn, ~2005) is the canonical name. The
-older "dependency injection" framing (Fowler, ~2004) is the same shape
-seen through a different lens — DI is HOW you wire adapters to ports;
-ports-and-adapters is WHY the port exists in the first place.
+**Hexagonal / ports-and-adapters.** This pattern's textbook name is Hexagonal Architecture (Alistair Cockburn, 2005). The shape is older — the GoF Adapter pattern dates to 1994, and `java.sql.Driver` is a port from 1997. The naming has rotated (ports + adapters, hexagonal, "clean architecture," dependency inversion) but the shape is constant: define the contract you want the inside of your app to consume, write adapters for each external system, depend only on the contract.
 
-**The deeper principle.** Substitutability. If you can swap adapter A
-for adapter B without changing callers, the seam is real. If you can't,
-the interface is decoration. The test that proves the seam: ship two
-implementations and run the same code against both. This codebase
-passes that test — `bi:mode = live-synthetic` runs the real agents
-against fake data; `bi:mode = live-bloomreach` runs them against real
-data. Same agent code, same NDJSON contract, same UI.
+**Why a factory and not DI.** This repo's "dependency injection" is the factory return value passed by argument. There's no DI container, no decorator-driven registration. The factory returns the adapter, the route receives it, the route hands it to the agent. That's "dependency injection" in the sense Mark Seemann means: passing the dependency at the boundary where the lifetime is known (the request). A DI container would buy nothing here — there's exactly one consumer per request, the lifetime is the request, and the construction is conditional on a runtime mode.
 
-**Where it breaks.**
+**Why a `DataSource` instead of a `Repository`.** `Repository` is the related pattern from Domain-Driven Design — a collection-like abstraction over a persistent store of *entities*. `DataSource` here is more general: it abstracts a *callable surface* (tools with names and JSON-schema arguments), not a typed collection. The two patterns share dependency inversion; they differ in vocabulary. The MCP tool model maps cleanly to `DataSource`; trying to force it into `Repository` would invent entities that don't exist.
 
-- **The interface is too thin to express adapter capabilities.**
-  `BloomreachDataSource` accepts `skipCache: true`; `SyntheticDataSource`
-  doesn't have a cache. We model this by exposing `skipCache` on the
-  concrete class (not the interface) and only the four short MCP routes
-  use it. If a future adapter needed cache controls too, we'd have to
-  promote `skipCache` to the interface — at which point Synthetic would
-  no-op it.
-- **The bootstrap closure leaks bootstrap-specific knowledge into the
-  factory result.** `makeDataSource` returns `{ bootstrap, dispose }`
-  alongside `dataSource` because Bloomreach needs a 4-call orchestrator
-  and Synthetic needs a constant. This is a real coupling — a third
-  adapter would need to define its own bootstrap, and the factory
-  result would still have one slot. Worth living with for now.
-- **The `cached` schema is module-level, not per-adapter.** `lib/mcp/
-  schema.ts:138` caches across adapter swaps. If you start a request
-  with `live-bloomreach` and then flip to `live-synthetic`, the cached
-  Bloomreach schema may still be returned to a `live-synthetic`
-  bootstrap call. Today this isn't an issue because the synthetic
-  bootstrap doesn't call `bootstrapSchema()` — it returns a different
-  constant. But it's a sharp edge for a future adapter.
+**The `unknown` return — vs. generics.** A generic `DataSource<TResults>` was on the table. It was rejected because (a) tool results have no single shape — each MCP tool returns a different payload, and (b) `unwrap<T>(result)` at the call site is exactly as type-safe as a generic on the port would be, but without forcing the port to model results it can't predict. The current shape preserves the call-site freedom without baking adapter-specific types into the abstraction.
 
-**What to explore next.**
-
-- `04-aptkit-primitive-boundary.md` — the SAME pattern, one layer up
-  (agents wrap AptKit primitives via three adapter classes; the
-  AnthropicModelProviderAdapter is to AptKit what BloomreachDataSource
-  is to agents)
-- `05-caching-and-rate-limiting.md` — what's hidden inside the
-  Bloomreach adapter
-- `01-request-flow.md` — where the factory gets called
+**Where this pattern is most overused.** People reach for ports + adapters when there's only ever going to be one adapter. The receipt this repo has — two swaps already — is the legitimate case. The illegitimate case is "wrapping an SDK in an interface because it might be replaced someday." If the swap never comes, you've paid for the seam (extra file, extra indirection, extra type) and gotten nothing back. The right time to extract a seam is when the second adapter is imminent or the upstream is unreliable enough that swapping is reliability insurance.
 
 ## Interview defense
 
-#### Q: "Walk me through your provider abstraction. Why not just use the MCP client directly?"
+**Q: Why is the `DataSource` interface in this repo a port and not just a class?**
 
-Two reasons. **One**: the live MCP server is rate-limited and revokes
-tokens after minutes — running the full agent loop against it on every
-dev save, every test run, every demo run is unworkable. **Two**: I want
-the agents to be testable and runnable without a network. The
-DataSource seam gives me one interface (`callTool` + `listTools`) and
-two adapters: `BloomreachDataSource` (live HTTPS + OAuth + cache +
-rate-limit) and `SyntheticDataSource` (in-process fixtures). The
-factory picks per request based on `bi:mode`.
+> Because two adapters live behind it today and three changes have crossed the seam without touching consumers. `BloomreachDataSource` is the real one — HTTPS over the MCP transport with OAuth, rate limit, cache. `SyntheticDataSource` is fixtures — in-process, deterministic, no network. The agents and routes hold the port (`DataSource` or its narrower `McpCaller` subset). The factory `makeDataSource(mode, sessionId)` picks the adapter. The receipt that proves the seam earns its keep: when the Olist SQL adapter was added in Phase 2 and removed in PR #8, no agent signature changed; when Synthetic was added, no agent signature changed. That's the test for "is this abstraction load-bearing" — does the change ledger read "swap an adapter" or does it read "touch the world."
 
 ```
-       agent loop
-           │
-           ▼
-       the port (`DataSource`)
-        ┌──┴──┐
-        ▼     ▼
-    Bloomreach  Synthetic
-    (live)      (in-process)
+  the dependency arrows — what makes it a port
+
+  agents ──►  DataSource  ◄── BloomreachDataSource
+                  ▲
+                  └──────── SyntheticDataSource
+
+  both sides depend on the abstraction in the middle
+  → dependency inversion (the inner ring doesn't know the outer ring)
 ```
 
-The agents never know which one they got. The route handler is the
-only place that names both.
+**Anchor:** `lib/data-source/types.ts:63-71`, `lib/data-source/index.ts:67-100`.
 
-**Surface:** "port + two adapters, factory chooses."
-**Probe:** if pressed — name the load-bearing test (`bi:mode =
-live-synthetic` runs the real agent loop, not a test double).
+**Q: Why is there a `skipCache` option on `BloomreachDataSource` but not on the port?**
 
-#### Q: "What's the load-bearing part of this seam — what breaks if you remove it?"
+> Because `skipCache` is Bloomreach-specific — it bypasses the 60s response cache that `BloomreachDataSource` carries. `SyntheticDataSource` has no cache; modeling `skipCache` on the port would force every adapter to either implement a cache or document a no-op. The trade is that the four short MCP routes (`/api/mcp/{call,tools,tools/check,capture}`) need cache bypass for the dev "force fresh" path, so `ConnectResult.mcp` is typed as the concrete `BloomreachDataSource`. Those routes are the deliberate scope of the breach. Everyone else — agents, `bootstrapSchema`, the briefing route — narrows the result to `DataSource`. The principle: depend on the port wherever you can, hold the concrete adapter only where you must.
 
-Two pieces are load-bearing. **The interface** itself — without
-`DataSource`, agents would import `BloomreachDataSource` directly, and
-swapping in Synthetic would require touching every agent constructor.
-**The factory** — without `makeDataSource`, every route handler would
-have to know about both concrete classes, which is exactly the coupling
-the interface was supposed to break.
+```
+  the scoped breach
 
-Optional hardening (not load-bearing):
+  ┌─ most callers ──┐  see DataSource (the port)
+  │ agents, routes  │
+  └─────────────────┘
 
-  → the `{ bootstrap, dispose }` callbacks on the factory result — these
-    work around the bootstrap-shape difference, but they're a leak;
-    cleaner would be a per-adapter `bootstrap()` method on the interface
-  → the `fromCache: boolean` field — only the trace UI uses it; the
-    agent doesn't care
-  → the legacy `McpClient` re-export — exists so the four short MCP
-    routes don't have to migrate; pure compatibility
+  ┌─ 4 short routes ────┐  see BloomreachDataSource (the concrete)
+  │ /api/mcp/{call,…}   │  because they need skipCache
+  └─────────────────────┘
+```
 
-#### Q: "What changes if you add a third adapter?"
+**Anchor:** `lib/mcp/connect.ts:21-28`, `lib/data-source/bloomreach-data-source.ts:22-26`.
 
-Three things. **One**: a new branch in `makeDataSource` (one switch
-arm). **Two**: a new `bootstrap` closure — because the schema-fetch
-shape isn't currently in the interface, every adapter needs its own.
-**Three**: maybe a new `bi:mode` value and a UI toggle option, if the
-mode is user-facing.
+**Q: What part of this is the "load-bearing skeleton" — what breaks first if you remove it?**
 
-The agents don't change. The hooks don't change. The NDJSON contract
-doesn't change. That's the proof the seam is real.
+> Remove the **interface in `types.ts`**, and the seam evaporates. The factory could still pick an adapter, but every consumer would now hold a concrete type — the agents would compile against `BloomreachDataSource`, the route would store `BloomreachDataSource`, and `SyntheticDataSource` would only work if it extended the same class (not a separate adapter — a subclass). The next swap would touch every consumer. The interface is the *whole* of the seam; everything else (the factory, the dispose closure, the two adapters) is hardening layered on top. The kernel is "an `interface` with two methods that two classes implement"; remove it, and the system regresses to "agents depend on Bloomreach forever."
 
-Latent concern: if the third adapter needs cache controls (like
-Bloomreach's `skipCache`), I'd promote `skipCache` to the interface
-and have Synthetic no-op it. Today the four short MCP routes are
-explicitly Bloomreach-only, so the leak is contained.
+```
+  the kernel
+
+  ┌──────────────────────────────────┐
+  │  interface DataSource {           │
+  │    callTool(name, args, opts?)    │  ← THIS is the seam
+  │    listTools(opts?)                │
+  │  }                                │
+  └──────────────────────────────────┘
+
+  what's hardening (not the kernel):
+    factory, dispose closure, bootstrap closure,
+    DataSourceCallOptions, fromCache field
+```
+
+**Anchor:** `lib/data-source/types.ts:63-71` is the irreducible piece.
 
 ## See also
 
-- `00-overview.md` — where this sits in the whole system
-- `04-aptkit-primitive-boundary.md` — the same pattern one layer up
-- `05-caching-and-rate-limiting.md` — what's behind the Bloomreach adapter
-- `01-request-flow.md` — where the factory is called
-- `study-data-modeling` — the `WorkspaceSchema` the bootstrap produces
+- `01-request-flow.md` — where the factory is called and the port is narrowed
+- `02-auth-boundary.md` — what `connectMcp` does before returning the Bloomreach adapter
+- `04-aptkit-primitive-boundary.md` — the same dependency-inversion shape, one layer up at the library boundary
+- `10-rate-limit-aware-mcp-client.md` — what's *inside* the Bloomreach adapter

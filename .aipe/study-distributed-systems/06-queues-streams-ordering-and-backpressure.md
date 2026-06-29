@@ -1,388 +1,493 @@
 # Queues, streams, ordering, and backpressure
 
-**Industry name:** newline-delimited JSON (NDJSON) over `ReadableStream`, cooperative cancellation, backpressure via standard streams API · **Type:** Industry standard pattern, applied to live agent traces
+*Industry standard — queues, streams, consumer behavior, ordering, poison messages, overload.*
 
-## Zoom out, then zoom in
+## Zoom out — where streaming lives
 
-Verdict first: no message queue, no broker, no consumer group, no poison-message handling. There is **one streaming pattern** — NDJSON over a `ReadableStream` from the Vercel route to the browser. That stream carries the agents' live reasoning, tool calls, and final results, and it's where ordering, backpressure, and cancellation get their workout.
-
-```
-  Zoom out — where the stream lives
-
-  ┌─ UI layer ───────────────────────────────────────────────┐
-  │  app/page.tsx · app/investigate/[id]/page.tsx             │
-  │  useBriefingStream · useInvestigation                     │
-  │  fetch().body → readNdjson() reader                       │
-  └────────────────────────┬─────────────────────────────────┘
-                           │ ★ HTTP NDJSON stream ★            ← we are here
-                           │ application/x-ndjson
-  ┌─ Service layer ────────▼─────────────────────────────────┐
-  │  /api/briefing · /api/agent                               │
-  │  new ReadableStream({async start(controller){…}})         │
-  │  controller.enqueue(encoder.encode(JSON + '\n'))          │
-  │  req.signal.aborted threaded down to upstream calls       │
-  └──────────────────────────────────────────────────────────┘
-```
-
-The whole "queue/stream" chapter in this codebase is **one wire format** (NDJSON) and the contract around it (`AgentEvent` union — `lib/mcp/events.ts:4`). That's it. No Kafka, no Redis Streams, no SQS, no Pub/Sub, no SSE (we deliberately use `fetch` + a stream reader rather than `EventSource` — see the Stack note in the project context). Everything that smells like "ordering" or "backpressure" here is the Streams API doing its job.
-
-## Structure pass
-
-### Axis: who controls flow rate, and where?
+The whole repo has *one* stream surface and *no* queues. The stream is the NDJSON channel from the route handler to the browser. There's no broker, no consumer group, no replay log, no DLQ — and that's the right shape for the product.
 
 ```
-  Trace "who controls flow rate" down the stack
+  Zoom out — the one stream, and a sea of nothing else
 
-  Agent loop          — produces events as fast as agents+tools resolve
-                        (Anthropic latency-bound + ~1.1s MCP spacing)
-
-  ReadableStream      — controller.enqueue is a sync write; backpressure
-  controller          — is HANDLED BY the platform if the consumer is slow
-                        (the stream's internal buffer applies)
-
-  HTTP transport      — chunked transfer (Vercel's edge)
-                        ✱ Cache-Control: no-cache, no-transform ✱
-
-  Browser fetch       — reader.read() pulls one chunk at a time
-                        if the UI doesn't await, chunks queue in the reader
-                        if the tab closes, the abort propagates back
-
-  React state         — setItems(arr => […arr, newItem]) — UI thread paces
-                        the consumption
+  ┌─ L1: Browser ───────────────────────────────────────────────┐
+  │  fetch() → reader.read() loop  (ONE consumer per stream)      │
+  │  lib/streaming/ndjson.ts → readNdjson(body, onEvent, opts)    │
+  └─────────────────────────┬───────────────────────────────────┘
+                            │
+                            │  hop A: HTTPS · NDJSON · `\n`-delimited
+                            │  ★ THE ONLY STREAM ★
+                            │
+  ┌─ L2: Route ─────────────▼───────────────────────────────────┐
+  │  ReadableStream.start(controller) → controller.enqueue(line)  │
+  │  ONE producer per stream (the route's start callback)         │
+  └─────────────────────────┬───────────────────────────────────┘
+                            │
+  ┌─ L3 + L4 ───────────────▼───────────────────────────────────┐
+  │  no queue, no broker, no fan-out, no replay, no consumer     │
+  │  group, no DLQ, no offset, no Kafka, no SQS, no Redis Streams│
+  │  ★ not yet exercised — entirely absent ★                      │
+  └─────────────────────────────────────────────────────────────┘
 ```
 
-The interesting flips:
+One writer. One reader. Same origin. No message system between them. This file walks what *is* there, then names everything that isn't.
 
-- **Producer-side throttle.** The agents naturally pace themselves through the MCP rate limit. So the stream is *never* hot enough to need a real backpressure mechanism.
-- **Consumer-side cancellation.** The browser closing the tab is the only "slow consumer" failure we care about — handled by `req.signal.aborted`.
+## Zoom in — the question this file answers
 
-### Seams (load-bearing boundaries)
+> What does the stream surface guarantee, and what doesn't it?
 
-- `controller.enqueue` (server) ↔ `reader.read()` (client) — the Streams API contract. Drop the `\n` per event and the line-splitter on the client breaks; emit malformed JSON and the consumer falls into the error event arm.
-- `req.signal.aborted` ↔ every async layer below — drop the `throwIfAborted()` calls at phase boundaries and a tab-close leaves the agent loop running until the 300s deadline.
-- `Cache-Control: no-cache, no-transform` (response header) ↔ Vercel's edge — drop `no-transform` and edge gzip *could* buffer the stream into a single response, breaking the live feel. (We don't trip this in practice, but the header is there.)
+Three answers: (1) ordering is preserved trivially because one writer + one reader + TCP; (2) backpressure is provided by `ReadableStream`'s internal queue + the browser's reader pace; (3) everything else (replay, fan-out, multi-consumer, persistence) is absent and would need a queue/broker that doesn't exist.
 
-### Layered decomposition: how is ordering preserved?
+## Structure pass — the skeleton
+
+### Axes — trace ordering
 
 ```
-  "How is ordering preserved?" — held constant
+  One axis: "what determines the order events arrive in?"
 
-  ┌─ Agent loop ─────────────────────────────────────────────┐
-  │  one event per send(), in calling order                   │   → SEQUENTIAL by construction
-  └────────────────────────┬─────────────────────────────────┘
-                           │
-  ┌─ ReadableStream controller ──────────────────────────────┐
-  │  enqueue is synchronous → emits in call order             │   → FIFO
-  └────────────────────────┬─────────────────────────────────┘
-                           │
-  ┌─ HTTP chunked encoding ──────────────────────────────────┐
-  │  TCP preserves byte order; one NDJSON line per "event"    │   → byte-ordered
-  └────────────────────────┬─────────────────────────────────┘
-                           │
-  ┌─ Client reader ──────────────────────────────────────────┐
-  │  read() returns chunks in send order; split on \n         │   → line-ordered
-  └────────────────────────┬─────────────────────────────────┘
-                           │
-  ┌─ React state ────────────────────────────────────────────┐
-  │  setItems(arr => […arr, newItem]) appends in receive ord  │   → reducer-ordered
-  └──────────────────────────────────────────────────────────┘
+  L2 producer (route)         the route calls controller.enqueue(line)
+                              ONCE per event, in the order the agent
+                              loop produces them; the controller queues
+                              bytes synchronously into the stream
+
+  TCP wire                    bytes are delivered in-order by TCP;
+                              HTTP/1.1 over a single connection
+                              preserves it
+
+  L1 consumer (reader)        reader.read() returns chunks in arrival
+                              order; the buffer split on '\n' preserves
+                              line order within each chunk
+
+  consumer dispatch           onEvent(JSON.parse(line)) runs synchronously
+                              per line, in order, in the consumer's
+                              event loop
 ```
 
-Same answer at every layer — *sequential, in arrival order, no reordering*. That makes the whole pattern feel boring, which is the point. We get ordering for free because there's only one producer and one consumer per stream.
+Same answer at every layer: **in-order**. The reason is the topology (one writer, one reader) and the transport (TCP). There's no axis flip — which is itself the lesson: **ordering is a property the stream gets for free, and only stops being free when you add a second writer or a broker that fans out.**
+
+### Seams — where ordering or backpressure *could* break
+
+```
+  Where the contract could fail — and why it doesn't today
+
+  failure mode                     prevented by
+  ─────────────                     ─────────────
+  malformed line in the middle      onMalformed: silent skip (default)
+                                    (lib/streaming/ndjson.ts:24-26)
+                                    → ordering preserved, one event lost
+
+  consumer slower than producer     ReadableStream backpressure: writes
+                                    block when the controller's internal
+                                    queue fills; the producer's await
+                                    inside the start callback gates
+                                    further enqueues
+
+  consumer closes early             reader cancellation propagates to
+                                    the route via req.signal.aborted;
+                                    the producer breaks out of its loop
+                                    (agent/route.ts:308-310)
+
+  network partition mid-stream      partial events buffered; the reader
+                                    sees an incomplete tail, flushes
+                                    only if it parses (silent drop
+                                    otherwise)
+```
+
+The seams are *real but bounded*. The system is one-writer/one-reader by topology, so the failure modes don't include "consumer A and consumer B got events in different orders" or "a replay re-issued event 47 with stale data."
+
+### Layered decomposition — the same axis at two altitudes
+
+```
+  Backpressure — held constant across producer and consumer
+
+  outer: route producer       awaits inside the start callback
+                               (e.g. await schema, await classifyIntent,
+                                await agent.scan); each await is a
+                               natural gate on event production
+
+  middle: ReadableStream       internal queue (default highWaterMark);
+                               controller.enqueue does not block
+                               in practice for the NDJSON sizes here
+
+  inner: TCP                   socket buffer + flow control on the wire
+
+  inner: consumer reader       reader.read() pulls one chunk at a time;
+                               the loop is sequential, so JSON.parse
+                               and onEvent block the next read until
+                               they return
+```
+
+Backpressure is **implicit at every layer** — not explicit signals, but natural single-threaded sequencing. The producer can't out-run the consumer by much, because the producer is *itself* gated by `await dataSource.callTool(…)` calls that take seconds. The consumer can't fall too far behind because TCP pushes back via window updates. **The whole pipeline is paced by the slowest link, and the slowest link is Bloomreach.**
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know how a generator function yields values one at a time and the consumer pulls them with `for await`? Same shape, but the producer is a Vercel route handler and the consumer is a `fetch` in the browser. The wire format is dead simple: one JSON object per line, separated by `\n`, served with `Content-Type: application/x-ndjson`. The client reads chunks, splits on `\n`, parses each line as one `AgentEvent`, and handles it.
+You've written this loop before, in the browser: `fetch(url)` → `response.body.getReader()` → `while (true) { read; decode; split('\n'); parse; handle }`. That's the entire pattern. The route handler is the mirror image.
+
+> **NDJSON over a ReadableStream is the simplest possible streaming protocol — one writer, one reader, `\n` as the record separator. Everything fancier you've heard of (Kafka, SQS, Kinesis, Pub/Sub) exists to solve problems this codebase doesn't have: multiple consumers, replay, persistence, durability, ordering across partitions.**
 
 ```
-  NDJSON streaming kernel — the picture
+  The kernel — one route → one browser stream
 
-  server                                client
-  ──────                                ──────
-                                        const res = await fetch('/api/agent');
-                                        const reader = res.body.getReader();
-  ReadableStream({
-    async start(controller) {
-      send(e1) ───enqueue('{e1}\n')──►    read() → '{e1}\n'
-                                          → split('\n') → [{e1}]
-      send(e2) ───enqueue('{e2}\n')──►    read() → '{e2}\n'
-                                          → setItems(…)
-      …
-      send(done) ──enqueue('{done}')─►    read() → done event
-      controller.close()           ───►   read() → {done:true}
-    }
-  })
+  ┌─ route start callback ───────────────────────────────────┐
+  │   const send = (e) =>                                     │
+  │     controller.enqueue(encoder.encode(encodeEvent(e)));   │
+  │                                                          │
+  │   send({ type: 'reasoning_step', ... })                   │
+  │   await dataSource.callTool(...)                          │ ← natural backpressure
+  │   send({ type: 'tool_call_end', ... })                    │
+  │   send({ type: 'done' })                                  │
+  │   controller.close()                                      │
+  └──────────────────────────────────────────────────────────┘
+                            │
+                            │  HTTPS chunks · TCP in-order delivery
+                            ▼
+  ┌─ browser reader loop ────────────────────────────────────┐
+  │   while (true) {                                          │
+  │     const { value, done } = await reader.read();          │
+  │     if (done) break;                                      │
+  │     buf += decoder.decode(value, { stream: true });       │
+  │     const lines = buf.split('\n');                        │
+  │     buf = lines.pop() ?? '';                              │
+  │     for (const line of lines) onEvent(JSON.parse(line));  │
+  │   }                                                       │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-Two rules make it work: **one JSON object per line** (the consumer's split point) and **one `await` between events** (so the producer doesn't fill the buffer faster than the consumer drains). In practice the agents take 100ms+ between sends (anthropic + MCP latency), so this is automatic.
+Three primitives: a writer (`controller.enqueue`), a record separator (`\n`), a reader loop. No third party between them.
 
-### Move 2 — walk the parts
+### Move 2 — walk the moving parts
 
-#### Part: the wire format (a tagged-union over NDJSON)
+#### Part 1 — the producer (one writer, in the route)
 
-The contract is `AgentEvent` from `lib/mcp/events.ts:4`:
-
-```ts
-export type AgentEvent =
-  | { type: 'reasoning_step'; step: ReasoningStep }
-  | { type: 'tool_call_start'; toolName: string; agent: AgentName }
-  | { type: 'tool_call_end'; toolName: string; agent: AgentName;
-      durationMs: number; result?: unknown; error?: string }
-  | { type: 'insight'; insight: Insight }
-  | { type: 'diagnosis'; diagnosis: Diagnosis }
-  | { type: 'recommendation'; recommendation: Recommendation }
-  | { type: 'done' }
-  | { type: 'error'; message: string };
-
-export function encodeEvent(e: AgentEvent): string {
-  return JSON.stringify(e) + '\n';
-}
-```
-
-Two production rules baked in:
-
-- **`type` is the discriminator.** Clients switch on it; new event types are backward-compatible (older clients ignore unknown `type`s).
-- **`done` and `error` are terminal.** The server promises one of them is the LAST event on the stream.
-
-The project-context file calls this contract out as "must not change" — both producers (routes) and consumers (UI hooks + demo snapshots) depend on the exact field names. That's the load-bearing constraint.
-
-#### Part: the producer (route handler)
-
-The pattern, in real code from `/api/briefing` (`app/api/briefing/route.ts:191`):
+The route handler builds the stream inside the `start` callback. The pattern, abstracted from `app/api/briefing/route.ts:191-194`:
 
 ```ts
 const stream = new ReadableStream<Uint8Array>({
   async start(controller) {
     const send = (e: BriefingEvent) =>
       controller.enqueue(encoder.encode(JSON.stringify(e) + '\n'));
-    // …
-    try {
-      req.signal.throwIfAborted();                       // phase boundary 1
-      step('reading the workspace schema…');             // → reasoning_step event
-      const schema = await bootstrap(req.signal);
-      req.signal.throwIfAborted();                       // phase boundary 2
-      // … runs agents, each fires send(...) inside hooks
-      send({ type: 'done' });
-    } catch (e) {
-      if (e instanceof DOMException && e.name === 'AbortError') return;   // client cancelled
-      send({ type: 'error', message: `/api/briefing · ${e.message}` });
-    } finally {
-      // dispose + summary log
-      controller.close();                                // end the stream
-    }
+    // … long-running async work, calling send() at each milestone …
   },
 });
-
-return new Response(stream, {
-  headers: {
-    'content-type': 'application/x-ndjson; charset=utf-8',
-    'cache-control': 'no-store, no-transform',
-  },
-});
+return new Response(stream, { headers: NDJSON_HEADERS });
 ```
 
-Three details worth marking:
+Three load-bearing details:
 
-- **`throwIfAborted` at every phase boundary.** Lines 215, 248, 259, 283. The signal also flows into `bootstrap`, `dataSource.listTools`, `agent.scan`, all the way down to `BloomreachDataSource.callTool` and the SDK's transport timeout.
-- **`AbortError` is swallowed silently.** No `error` event sent when the client cancelled — there's no consumer. The `finally` still runs so the phase summary still logs.
-- **`controller.close()` lives in `finally`.** The stream always closes. A leaked stream would hold the route open until the 300s ceiling kicked in.
+1. **The terminator is `\n`.** Producer always appends, reader always splits on it. The consumer (`lib/streaming/ndjson.ts:39`) handles a non-terminated trailing chunk by holding it in `buf` until the next read or end-of-stream — but in practice every producer in this codebase terminates with `\n`, so the trailing flush is a no-op safety net.
 
-#### Part: the consumer (`readNdjson`)
+2. **`encoder.encode` happens before enqueue.** The controller takes `Uint8Array`, not strings. Encoding inside the call site rather than in a stream-wide transform keeps the writer self-contained.
 
-The client uses `fetch` + a stream reader, not `EventSource`. The reason is in the project context — `EventSource` doesn't carry custom headers, can't POST, and reconnects automatically on error (which we don't want; we want our own `useReconnectPolicy` to handle that).
+3. **The `start` callback is `async`.** Every `await` inside it (the schema bootstrap, the agent loop, the tool calls) is a natural gating point. If the consumer falls behind, the controller's internal queue backs up; new enqueues *would* eventually block (`ReadableStream` standard backpressure), but in practice the await-chain inside the producer is the dominant gate — it produces events at ~1/s peak, far slower than any consumer needs to drain.
 
-```
-  Layers-and-hops — one event end-to-end
-
-  ┌─ /api/agent ───────┐  hop 1: chunk = '{type:"tool_call_start",…}\n'
-  │ controller.enqueue │ ─────────────────────────────────────►  ┌─ fetch reader ──────────┐
-  │ (sync write)       │                                          │ readNdjson generator    │
-  └────────────────────┘                                          │ split on '\n'           │
-                                                                   │ JSON.parse each line    │
-                                                                   └──────────┬──────────────┘
-                                                                              │ for await (e of …)
-                                                                              ▼
-                                                                   ┌─ hook switch(e.type) ──┐
-                                                                   │ 'tool_call_start' →    │
-                                                                   │  setItems(arr => […])  │
-                                                                   └────────────────────────┘
-```
-
-#### Part: backpressure (the part you get for free)
-
-The Streams API's contract: `controller.enqueue` is synchronous, but the *underlying source* has an internal queue. When that queue fills, the implementation **applies pressure** — in practice for HTTP streams, this means the TCP write buffer fills, the OS write blocks, and your `enqueue` calls eventually pause behind a microtask.
-
-In our system, this never actually fires because:
-
-1. The agents produce events at ~100ms intervals minimum (anthropic latency).
-2. The UI consumes them on every animation frame.
-3. The chunks are tiny (a JSON object, hundreds of bytes).
-
-So "backpressure" is theoretical here — but the pattern is correct: a slow consumer would cause the producer to slow down via the standard mechanism, not via a custom signal. That's the right design point.
-
-#### Part: ordering (also free)
-
-Single producer, single consumer, one TCP connection. There's no "out of order" failure mode unless the producer races itself (sends from two async tasks without awaiting). The producer is a single `async start` function — even though it `await`s internally, every `send(e)` lands in calling order.
-
-There's one place this could break in principle — the **demo replay** path interleaves coverage_item events with reasoning_step events from a forEach loop (`app/api/briefing/route.ts:114`):
+The cancellation contract is critical (`app/api/agent/route.ts:130-138`):
 
 ```ts
-const lines = coverageChecklistSteps(coverage);
-for (let i = 0; i < coverage.length; i++) {
-  controller.enqueue(encoder.encode(JSON.stringify(stepEvt(lines[i])) + '\n'));
-  controller.enqueue(encoder.encode(JSON.stringify({ type: 'coverage_item', item: coverage[i] }) + '\n'));
-  await new Promise((r) => setTimeout(r, REPLAY_DELAY_MS));
+async start(controller) {
+  for (const e of events) {
+    // Client cancelled mid-replay — break out so we don't keep enqueuing
+    // bytes into an already-closed reader.
+    if (req.signal.aborted) break;
+    controller.enqueue(encoder.encode(encodeEvent(e)));
+    await new Promise((r) => setTimeout(r, REPLAY_DELAY_MS));
+  }
+  controller.close();
 }
 ```
 
-Two `enqueue` calls in lockstep, then a `setTimeout(140)` to pace the reveal. Both writes are synchronous, so the order is guaranteed; the `await` is purely for UX pacing.
+Checking `req.signal.aborted` between enqueues is the producer's "consumer left" check. The same pattern appears in the live path (`agent/route.ts:226-298` calls `req.signal.throwIfAborted()` at coarse phase boundaries and threads `req.signal` into every async layer below).
 
-#### Part: cancellation (the load-bearing one)
+#### Part 2 — the consumer (one reader, in the browser)
 
-The `req.signal` flows down through every layer. The chain:
+The shared kernel (`lib/streaming/ndjson.ts:18-58`):
+
+```ts
+export async function readNdjson<E>(
+  body: ReadableStream<Uint8Array>,
+  onEvent: (event: E) => void,
+  opts?: { cancelOn?: () => boolean; onMalformed?: (line, err) => void },
+): Promise<void> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  try {
+    while (true) {
+      if (opts?.cancelOn?.()) {
+        await reader.cancel();
+        return;
+      }
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split('\n');
+      buf = lines.pop() ?? '';
+      for (const raw of lines) {
+        const line = raw.trim();
+        if (!line) continue;
+        try {
+          onEvent(JSON.parse(line) as E);
+        } catch (err) {
+          opts?.onMalformed?.(line, err);
+        }
+      }
+    }
+    // flush trailing buffer — a no-op when the producer always terminates with '\n'
+    const tail = buf.trim();
+    if (tail) {
+      try { onEvent(JSON.parse(tail) as E); }
+      catch (err) { opts?.onMalformed?.(tail, err); }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+```
+
+Walk the parts by what breaks if removed:
 
 ```
-  Layers-and-hops — abort propagation
+  Reader kernel — what each part guards against
 
-  ┌─ Browser ──────────┐  tab close / unmount cleanup → fetch().signal.abort()
-  │ fetch + cleanup    │ ────────────────────────────────────────►  ┌─ Vercel runtime ─┐
-  │                    │                                            │ req.signal       │
-  │                    │                                            │ .aborted = true  │
-  └────────────────────┘                                            └────────┬─────────┘
-                                                                             │
-                                                                  ┌──────────┴───────────┐
-                                                                  │ checked at each      │
-                                                                  │ phase boundary in    │
-                                                                  │ route.ts             │
-                                                                  └──────────┬───────────┘
-                                                                             │ threaded down
-                                                                             ▼
-                                                                  ┌──────────────────────┐
-                                                                  │ bootstrap(signal)    │
-                                                                  │  → callTool(…,{sig}) │
-                                                                  │     → SdkTransport   │
-                                                                  │       composeSignals │
-                                                                  │       (routeSig,     │
-                                                                  │        timeout(30s)) │
-                                                                  │       first-wins     │
-                                                                  └──────────────────────┘
+  while-loop with done check       drop it → reader leaks; promise
+                                    never resolves; consumer hangs
+
+  decoder.decode({ stream: true })  drop the stream:true flag → a
+                                    multi-byte UTF-8 char split across
+                                    chunks corrupts as latin-1 garbage
+
+  buf.split('\n')                   drop it → events run together;
+                                    JSON.parse fails on the whole
+                                    concatenation; everything turns
+                                    into "malformed line"
+
+  buf = lines.pop() ?? ''           drop it → a partial trailing line
+                                    is treated as complete; JSON.parse
+                                    fails; the event is silently lost
+                                    on the malformed handler
+
+  try/catch around JSON.parse       drop it → one malformed line kills
+                                    the whole stream
+
+  cancelOn poll                     drop it → consumer cleanup (React
+                                    unmount, etc.) can't abort an
+                                    inflight read; the producer keeps
+                                    burning route budget on nothing
 ```
 
-`useInvestigation` has a deliberate exception (`lib/hooks/useInvestigation.ts:34` and following — the comment block calls it out):
+The buffer-and-pop dance is the only non-obvious part. **Newline-delimited streaming is naturally chunked, and chunks don't align with lines.** A read might return `"...prev\nfoo\nbar\nbaz_par"` — six lines and a partial. The pop-and-keep-tail pattern preserves the partial as the start of the next decode.
 
-> we deliberately do NOT cancel the fetch on effect cleanup. React StrictMode (dev) mounts → cleans up → re-mounts; cancelling on the first cleanup, with the started-guard blocking the re-mount, aborted the stream and left the logs empty.
+#### Part 3 — backpressure (implicit at every layer)
 
-So in production, cancellation is the contract; in dev StrictMode, the guard pattern is what prevents the double-fetch instead of cancel-on-cleanup. This is the kind of detail that breaks a naive "always cancel on unmount" rule.
+There's no `await producer.flushed()`, no acknowledgements, no consumer-feedback loop. Backpressure happens for free because of the topology:
+
+```
+  Pacing — what gates what
+
+  ┌─ route producer ─────────────────────────────────────┐
+  │  await dataSource.callTool(…) ← 1.1s spacing per call │  ★ slowest link ★
+  │  controller.enqueue(line)                              │
+  │     → goes into ReadableStream internal queue          │
+  └──────────────────────────┬───────────────────────────┘
+                             │
+  ┌─ ReadableStream queue ───▼───────────────────────────┐
+  │  default highWaterMark; fills only if consumer is    │
+  │  slower than producer (rare in practice — producer    │
+  │  is gated by network calls, consumer is local JS)     │
+  └──────────────────────────┬───────────────────────────┘
+                             │
+  ┌─ TCP wire ───────────────▼───────────────────────────┐
+  │  flow control via window updates                      │
+  └──────────────────────────┬───────────────────────────┘
+                             │
+  ┌─ browser reader loop ────▼───────────────────────────┐
+  │  await reader.read() ← drains as fast as JS runs      │  ★ fast ★
+  │  JSON.parse + onEvent: synchronous                     │
+  └──────────────────────────────────────────────────────┘
+
+  net effect: the consumer is faster than the producer by
+  orders of magnitude, so no backpressure is observed in
+  practice. The mechanism exists but is dormant.
+```
+
+If a future producer ever decoupled from the slow upstream — say, replaying a 10,000-event captured trace at 100x speed — backpressure would start to matter and the implicit mechanism would activate. Today the natural pacing is 1.1s+ per tool call, and a typical investigation is 6-15 calls, so the stream produces a few dozen events over ~30-60s.
+
+#### Part 4 — error handling on the stream (what the consumer sees)
+
+Errors are events, not exceptions on the stream. From `lib/mcp/events.ts:4-12`:
+
+```ts
+export type AgentEvent =
+  | { type: 'reasoning_step'; step: ReasoningStep }
+  | { type: 'tool_call_start'; toolName: string; agent: AgentName }
+  | { type: 'tool_call_end'; toolName: string; agent: AgentName; durationMs: number; result?: unknown; error?: string }
+  | { type: 'insight'; insight: Insight }
+  | { type: 'diagnosis'; diagnosis: Diagnosis }
+  | { type: 'recommendation'; recommendation: Recommendation }
+  | { type: 'done' }
+  | { type: 'error'; message: string };
+```
+
+The producer's try/catch around the whole `start` callback (`app/api/agent/route.ts:303-316`) translates a thrown exception into one final `{ type: 'error', message }` event before closing. The consumer's `onEvent` dispatcher sees an error like any other event. **There's no stream-level error channel** — the protocol uses application-level event types for everything, which keeps the kernel uniform.
+
+```
+  Three event categories — one shape
+
+  data events     reasoning_step, tool_call_start, tool_call_end,
+                  insight, diagnosis, recommendation
+
+  status events   done — explicit "no more events"
+
+  failure events  error — last event before close, carries a message
+
+  every event is JSON, terminated by '\n', delivered in order
+```
+
+#### Part 5 — replay (the synthetic-stream pattern)
+
+The demo path replays a recorded stream from disk (`app/api/briefing/route.ts:99-152` for briefing, `agent/route.ts:128-141` for investigation). The replayer reads the JSON snapshot, enqueues each recorded event with a `REPLAY_DELAY_MS` pause between them, and emits the same `\n`-delimited NDJSON:
+
+```ts
+// agent/route.ts:128-141
+const stream = new ReadableStream<Uint8Array>({
+  async start(controller) {
+    for (const e of events) {
+      if (req.signal.aborted) break;
+      controller.enqueue(encoder.encode(encodeEvent(e)));
+      await new Promise((r) => setTimeout(r, REPLAY_DELAY_MS));
+    }
+    controller.close();
+  },
+});
+```
+
+The consumer can't tell the difference. Same protocol, same parser, same dispatcher. **This is the property that lets the demo path be reliable: the protocol is decoupled from the producer, so a tape replay and a live agent feed look identical to the browser.**
+
+### Move 2.5 — current state vs absent shape
+
+```
+  Today (one stream, no queue)            What would force a queue
+  ──────────────────────────              ─────────────────────────
+  one writer, one reader,                  multiple consumers want
+   same-origin, no replay                   the same events
+                                            (e.g. analytics tap,
+                                             admin dashboard, …)
+
+  no persistence — stream ends             need to replay events to
+   when route ends                          a consumer that arrived
+                                            late (e.g. resume after
+                                             disconnect)
+
+  no fan-out                                fan-out to many users from
+                                             one producer (e.g. shared
+                                             briefing pushed to all
+                                             subscribed sessions)
+
+  no ordering hazard                        producers from multiple
+   (single writer)                          instances need a total
+                                             order
+```
+
+None of the four right-column scenarios are on the roadmap. A queue (Kafka, NATS, SQS, Redis Streams) is the right answer when any of them lights up — but adding one before then is over-engineering.
 
 ### Move 3 — the principle
 
-**A stream is a queue with one consumer.** Get the contract right (terminal event, ordered, line-delimited) and the rest of the chapter (ordering, backpressure, cancellation) is handled by the platform. The trap is reaching for queue infrastructure (Kafka, SQS, Redis Streams) when a `ReadableStream` over HTTP with a single consumer is the actual shape. If you ever do need to fan a single producer out to N consumers, *then* a real queue earns its place — until then, you're paying coordination overhead for nothing.
+> **The cheapest streaming protocol is NDJSON over HTTP — one writer, one reader, in-order delivery for free. Reach for a queue/broker only when the topology forces it (multi-consumer, replay, durability, cross-instance ordering). "We might need it later" is not topology.**
 
-## Primary diagram
+This file's content is a counterargument to the default modern reflex of "throw Kafka at every async problem." The codebase shows what you can do without one when the problem really is one-writer/one-reader.
+
+## Primary diagram — the full stream
 
 ```
-  Full picture — the only streaming pattern in this codebase
+  blooming_insights — the one stream, end-to-end
 
-  ┌─ Browser ─────────────────────────────────────────────────────────┐
-  │  useBriefingStream / useInvestigation                              │
-  │  const res = await fetch('/api/briefing?demo=cached');             │
-  │  const reader = res.body.getReader();                              │
-  │  for await (const event of readNdjson(reader)) {                   │
-  │    switch (event.type) {                                           │
-  │      case 'workspace': setWorkspace(...);                          │
-  │      case 'coverage_item': setCoverage(arr => [...]);              │
-  │      case 'reasoning_step': setItems(arr => [...]);                │
-  │      case 'tool_call_start': setItems(arr => [...]);               │
-  │      case 'tool_call_end': replaceRunningTool(arr, e);             │
-  │      case 'insight': setInsights(arr => [...]);                    │
-  │      case 'done': setComplete(true);                               │
-  │      case 'error': useReconnectPolicy.handle(e.message);           │
-  │    }                                                               │
-  │  }                                                                 │
-  │  on unmount: started-guard prevents double-fetch                   │
-  │              (NOT abort-on-cleanup — would break StrictMode)       │
-  └────────────────────────────┬──────────────────────────────────────┘
-                               │ HTTPS application/x-ndjson
-                               │ Cache-Control: no-cache, no-transform
-                               │ TCP backpressure if consumer slow
-                               │ fetch.signal.abort() if tab closed
-  ┌─ /api/briefing or /api/agent ─────────────────────────────────────┐
-  │  new ReadableStream({                                              │
-  │    async start(controller) {                                       │
-  │      try {                                                         │
-  │        req.signal.throwIfAborted();   // phase 1                   │
-  │        send(reasoning_step "reading schema…");                     │
-  │        const schema = await bootstrap(req.signal);                 │
-  │        req.signal.throwIfAborted();   // phase 2                   │
-  │        // for each agent.scan / agent.investigate, hooks fire:    │
-  │        //   onText  → send(reasoning_step)                         │
-  │        //   onToolCall → send(tool_call_start)                     │
-  │        //   onToolResult → send(tool_call_end)                     │
-  │        for (insight of insights) send({type:'insight', insight});  │
-  │        send({type:'done'});                                        │
-  │      } catch (e) {                                                 │
-  │        if (e.name === 'AbortError') return;   // silent            │
-  │        send({type:'error', message: e.message});                   │
-  │      } finally {                                                   │
-  │        dispose();                                                  │
-  │        controller.close();                                         │
-  │        log({route, totalMs, phases, aborted: req.signal.aborted}); │
-  │      }                                                             │
-  │    }                                                               │
-  │  });                                                               │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌─ Route start callback (producer) ─────────────────────────────┐
+  │  agent emits trace/tool events                                 │
+  │     │                                                          │
+  │     ▼                                                          │
+  │  send({ type, ... }) ──► controller.enqueue(                   │
+  │                              encoder.encode(JSON + '\n')        │
+  │                            )                                    │
+  │     │                                                          │
+  │  await dataSource.callTool(...)  ← implicit backpressure       │
+  │     │                                                          │
+  │     ▼                                                          │
+  │  send({ type: 'done' });  controller.close();                  │
+  └─────────────────────────────────┬─────────────────────────────┘
+                                    │
+                                    │  HTTPS / NDJSON / `\n` lines
+                                    │  TCP in-order delivery
+                                    ▼
+  ┌─ Browser reader loop (consumer) ─────────────────────────────┐
+  │  reader.read() → decode (UTF-8, streaming)                    │
+  │     │                                                         │
+  │     ▼                                                         │
+  │  buf = lines.pop() ?? ''  (keep the partial)                  │
+  │     │                                                         │
+  │     ▼                                                         │
+  │  for each complete line:                                      │
+  │     try   { onEvent(JSON.parse(line)) }                       │
+  │     catch { onMalformed(line, err)    }                       │
+  │     │                                                         │
+  │     ▼                                                         │
+  │  cancelOn() polled between reads — if true, reader.cancel()   │
+  └───────────────────────────────────────────────────────────────┘
+
+  guarantees:
+    ✓ in-order (one writer + TCP)
+    ✓ at-most-once (no replay, no acks)
+    ✓ implicit backpressure (consumer faster than producer)
+    ✗ no replay, no persistence, no fan-out, no ack
 ```
 
 ## Elaborate
 
-NDJSON is one of three sane choices for "live events over HTTP":
+The references that matter for this material:
 
-- **NDJSON over fetch** (this codebase): one JSON object per line, parse on `\n`. Works with `fetch`, supports POST, supports custom headers, no auto-reconnect. We chose this for the reasons listed.
-- **Server-Sent Events (`EventSource`)**: `text/event-stream`, `data: …\n\n` framing, auto-reconnect. Limited to GET, no custom headers in the browser API. The auto-reconnect is *seductive* but here it'd fight `useReconnectPolicy`.
-- **WebSockets**: bidirectional, full-duplex, framed protocol. Overkill when the server is the only producer.
+- **WHATWG Streams (ReadableStream).** The browser/Node primitive used on both sides. The internal queue + highWaterMark is the spec mechanism for backpressure; we lean on the defaults.
+- **NDJSON (newline-delimited JSON).** Not a formal standard but a widely-adopted convention. The contract is one JSON document per line, `\n` as the terminator. Worth knowing: Server-Sent Events (SSE) is the alternative that adds reconnection + last-event-id; we chose NDJSON because we don't need the SSE features and NDJSON parses with `JSON.parse` per line rather than SSE's `event:` / `data:` framing.
+- **Kafka log-as-the-database** (Jay Kreps, "The Log: What every software engineer should know about real-time data's unifying abstraction"). The mental model for why queues exist: replay, multiple consumers, decoupled producer/consumer lifecycles. The article is the best long-read on the *why* if you want to know what's *not* in this codebase.
+- **Backpressure in React Streams / TC39 async iterators.** Adjacent reading — the same pull-based backpressure mechanism shows up in Node's async iterators (`for await of stream`).
 
-The closest industry analog to our pattern is **gRPC server streaming** — one request, many response messages, ordered, with deadline propagation. We don't use gRPC (web compatibility, runtime overhead) but the contract is the same shape.
-
-What to read next: the WHATWG Streams Standard for the ReadableStream contract; the SSE spec (HTML5 living standard) for the alternative we passed on; Kafka's "exactly-once semantics" blog for the world where real queues earn their keep.
+The interesting comparison is **NDJSON vs SSE.** Both are one-writer/one-reader over HTTP. NDJSON wins when the consumer needs `fetch` for headers/auth/POST bodies (`EventSource` is GET-only and can't set arbitrary headers — there's a workaround with `withCredentials`, but it's clumsy). SSE wins when the consumer needs automatic reconnection + last-event-id replay. We picked NDJSON because we use POST-style request shapes via `fetch` (for the `req.signal` and the URL params), and because reconnection here means "re-run the briefing," not "replay from offset 47."
 
 ## Interview defense
 
-**Q: "Why NDJSON over WebSockets or SSE?"**
+### "Walk me through your streaming protocol."
 
-> "Three reasons. NDJSON over `fetch` supports POST and custom headers — `EventSource` is GET-only and can't carry auth headers in the browser. WebSockets are bidirectional and our server is the only producer, so the duplex is overkill. And `EventSource`'s automatic reconnect would fight `useReconnectPolicy` — we want our own one-shot reconnect with the session-storage flag, not the browser's open-ended retry loop. NDJSON with our own contract: `{type, …}` per line, `\n`-delimited, terminal `done` or `error`. The wire format is one line of code on each side."
-
-Diagram:
+The route handler builds a `ReadableStream` whose `start` callback runs the agent loop and calls `controller.enqueue(encoder.encode(JSON.stringify(event) + '\n'))` once per event. The browser opens it with `fetch(...).body.getReader()`, reads chunks, splits on `\n`, parses each line as JSON, and dispatches. The protocol is NDJSON — one event per line. Ordering is preserved because there's one producer per stream and TCP delivers in-order. There's no replay, no acks, no broker — at-most-once delivery, which is fine because the result of every briefing/investigation is cacheable in-memory (`saveInvestigation`, `putInsights`) and re-runnable. If the consumer disconnects mid-stream, the producer notices via `req.signal.aborted` and breaks out of its loop.
 
 ```
-  server                              client
-  ──────                              ──────
-  enqueue('{e1}\n')  ──HTTP chunk──►  read() → split('\n') → JSON.parse → handler
-  enqueue('{e2}\n')  ──────────────►  …
-  enqueue('{done}')  ──close()────►  loop ends
+  Anchor:
+    producer:  app/api/agent/route.ts:185-189 (send/controller.enqueue)
+    consumer:  lib/streaming/ndjson.ts:18-58 (readNdjson kernel)
+    abort:     app/api/agent/route.ts:308-310 (DOMException AbortError suppression)
 ```
 
-**Q: "How is ordering guaranteed?"**
+### "What's your backpressure strategy?"
 
-> "One producer, one consumer, one TCP connection. `controller.enqueue` is synchronous, so the producer never races itself; TCP preserves byte order; the client splits chunks on `\n`. There's no failure mode where events arrive out of order unless someone calls `send` from two async tasks without `await`ing between them. That's a code-review thing, not a protocol thing."
+Implicit. The producer is gated by `await dataSource.callTool(…)` which has a 1.1s spacing floor and ~1-5s typical latency, so it emits events at ~1/s peak. The browser consumer is local JavaScript reading from a TCP stream, drains chunks at memory bandwidth, and dispatches `onEvent(JSON.parse(line))` synchronously. The consumer is always faster than the producer by orders of magnitude, so the `ReadableStream` internal queue (default `highWaterMark`) never fills. The mechanism for explicit backpressure exists in the spec — `controller.desiredSize`, the queue would back up and pause writes — but it's dormant here because the pacing is naturally producer-limited.
 
-**Q: "What about backpressure?"**
+The case where I'd add explicit backpressure is if we ever replayed a captured stream at high speed (e.g. dumping 10,000 historical events for analytics ingestion). Today the demo replay is 140-180ms per event by design, so even that path is pacing-limited.
 
-> "I get it for free from the Streams API. If the consumer reads slowly, the underlying source's queue fills, the TCP write buffer fills, the OS write blocks, and my `enqueue` calls eventually pause behind a microtask. In practice it never fires here because the agents produce events at 100ms+ intervals (Anthropic latency + the ~1.1s MCP spacing) and the UI consumes them on every animation frame. But the pattern is correct — a slow consumer would slow the producer down via the platform mechanism, not via a custom signal."
+### "Why NDJSON instead of Server-Sent Events?"
 
-**Q: "What's the load-bearing detail?"**
+Three reasons. (1) NDJSON parses with `JSON.parse(line)` per line — clean and trivial. SSE has `event:` / `data:` framing that needs its own parser even though the payload is also JSON. (2) `fetch` lets us set arbitrary headers, follow cookies the way the rest of the app does, and read `req.signal` for cancel — `EventSource` is more constrained. (3) SSE's headline feature is automatic reconnect with `Last-Event-Id`, which isn't useful here: reconnection in our system means "re-run the briefing" (server-side fresh state), not "replay from offset 47." The reconnect-on-401 path in `app/page.tsx` is bespoke for the OAuth-token-rotation case, not a generic replay. NDJSON has a smaller spec surface for our use case.
 
-> "Cancellation propagation. `req.signal.throwIfAborted()` is called at every phase boundary in the route — schema bootstrap, listTools, agent loop, each MCP call. The signal threads all the way down to `SdkTransport.callTool` where it's composed with a per-call 30s timeout via `AbortSignal.any`, first-signal-to-fire wins. The client closing the tab cancels the upstream Bloomreach call in flight; without that, a tab-close leaves the agent loop running until the 300s ceiling. The one place we don't cancel — `useInvestigation`'s cleanup — is deliberate and the comment block explains why: React StrictMode in dev would otherwise abort the only good fetch."
+```
+  Anchor:
+    contract:  lib/mcp/events.ts:4-22 (AgentEvent + encodeEvent/decodeEvent)
+    headers:   app/api/agent/route.ts:105-108 (NDJSON_HEADERS constant)
+```
 
-**Q: "What's NOT here that I should know about?"**
+### "What happens to one malformed event in the stream?"
 
-> "No message queue, no consumer group, no poison-message handling, no dead-letter queue. One stream, one consumer. If we ever need to fan out — say, monitoring runs in the background and pushes anomalies to multiple subscribers — that's the day a real queue earns its place. Today it'd be ceremony."
+The reader's per-line `try { JSON.parse } catch { onMalformed }` (`lib/streaming/ndjson.ts:45-49`) isolates the failure to that one line. The default `onMalformed` is silent — the malformed line is dropped, the read loop continues. **Ordering is preserved for surviving events.** This is a deliberate at-most-once choice: better to lose one event than to abort the whole stream. The trade-off: if the producer is buggy and starts emitting malformed lines systematically, the consumer silently drops them all — there's no telemetry for malformed-rate today. That's a real observability gap; it's flagged in file 09.
 
 ## See also
 
-- `02-partial-failure-timeouts-and-retries.md` — the abort signal propagation that lives at the bottom of this stream.
-- `04-consistency-models-and-staleness.md` — `insight.timestamp` is the snapshot disclosure on every streamed event.
-- `09-distributed-systems-red-flags-audit.md` — the "no cancel on cleanup" exception is documented there.
-- `../study-runtime-systems/` — the event loop and Streams API plumbing this pattern sits on top of.
-- `../study-networking/` — HTTP chunked transfer + the no-transform header story.
+- `02-partial-failure-timeouts-and-retries.md` — what produces the events the stream carries.
+- `03-idempotency-deduplication-and-delivery-semantics.md` — at-most-once delivery and why it's safe here.
+- `07-clocks-coordination-and-leadership.md` — why event ordering inside the stream is trivial (one writer).
+- `09-distributed-systems-red-flags-audit.md` — malformed-rate telemetry gap, SSE-vs-NDJSON re-evaluation.
+- `.aipe/study-debugging-observability/` — the per-phase console.log that records what the stream did.

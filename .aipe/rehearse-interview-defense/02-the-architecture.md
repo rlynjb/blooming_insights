@@ -1,329 +1,259 @@
 # Chapter 2 — The architecture
 
-Sometime in the first fifteen minutes of every system-design-flavored interview, someone walks to the whiteboard and says "draw me your architecture." This chapter teaches you to draw it in under ninety seconds, with confidence, in a way that gives the interviewer something to interrupt. Because they will interrupt — and you want them interrupting at a layer you can defend, not at a layer you skipped past.
+  ## Opening hook
 
-The trap most candidates fall into is drawing the architecture they wish they had, not the one they shipped. You skip past the messy parts (the rate-limit retry, the encrypted-cookie auth store, the StrictMode-safe hook) because they feel embarrassing. They are not embarrassing. They are *evidence you shipped a real thing*. Draw them.
+You delivered the pitch. The interviewer leans in and says "okay, walk me through how it actually works." You have about ninety seconds and one whiteboard. This chapter is about being able to draw the architecture from memory, in order, without backtracking — and surviving the inevitable interruption at minute one without losing the thread.
 
-## The architecture diagram — the one you redraw on the whiteboard
+The architecture is layered enough that you can lose yourself in any layer if you start there. The discipline you're practicing is *top-down with no dive*. You draw the four bands, name the role of each, and only then walk a single request through them end-to-end. You do not stop to explain the agent loop's internals before the user has even fetched anything. The interviewer will *ask* you to dive — that's the next question, not the first one.
 
-This is the whole picture. Memorize it as four bands top-to-bottom: UI, Service, Data, Provider. Every box, every arrow, every layer crossing.
+  ## The picture you draw — the layered architecture
 
-```
-  blooming insights — full architecture (the whiteboard target)
-
-  ┌─ UI layer ──────────────────────────────────────────────────────────┐
-  │                                                                      │
-  │  app/page.tsx (feed, 461 LOC)                                        │
-  │    ├─ useBriefingStream  (313 LOC) — opens /api/briefing             │
-  │    ├─ useDemoCapture     (146 LOC) — dev-only capture                │
-  │    └─ useReconnectPolicy (123 LOC) — token-revoke recovery           │
-  │                                                                      │
-  │  app/investigate/[id]/page.tsx              ← step 2 (diagnose)      │
-  │  app/investigate/[id]/recommend/page.tsx    ← step 3 (recommend)     │
-  │    └─ lib/hooks/useInvestigation.ts ─ runs one step, stashes result  │
-  │                                                                      │
-  │  components/shared/StatusLog → ReasoningTrace → ToolCallBlock        │
-  │  (the streamed agent trace; same component on every page)            │
-  │                                                                      │
-  └────────────┬────────────────────────────────────────────┬────────────┘
-               │ NDJSON over fetch                          │
-               │ (consumed by readNdjson @                  │
-               │  lib/streaming/ndjson.ts, 64 LOC,          │
-               │  shared by 4 streaming surfaces)           │
-  ┌─ Service ──▼────────────────────────────────────────────▼────────────┐
-  │                                                                      │
-  │  /api/briefing  (monitoring scan → insights[])                       │
-  │  /api/agent     (step=diagnose|recommend|null)                       │
-  │  /api/mcp/*     (callback, reset, call, tools, capture)              │
-  │      maxDuration = 300s (Vercel Pro)                                 │
-  │      writes NDJSON via ReadableStream                                │
-  │                                                                      │
-  │       ┌──────────────────────────────────────────────────┐           │
-  │       │  agents (thin wrappers over @aptkit/core@0.3.0)  │           │
-  │       │   monitoring · diagnostic · recommendation       │           │
-  │       │   query · intent                                 │           │
-  │       └──────────────────────┬───────────────────────────┘           │
-  │                              │ runs the loop via                     │
-  │                              ▼                                       │
-  │       ┌──────────────────────────────────────────────────┐           │
-  │       │  lib/agents/aptkit-adapters.ts (206 LOC)         │           │
-  │       │   3 Blooming-owned adapter classes:              │           │
-  │       │    · AnthropicModelProviderAdapter               │           │
-  │       │    · BloomingToolRegistryAdapter                 │           │
-  │       │    · BloomingTraceSinkAdapter                    │           │
-  │       │   ↑ THIS IS THE SEAM I OWN                       │           │
-  │       └──────────┬───────────────────────────────────────┘           │
-  │                  │                                                   │
-  └──────────────────┼───────────────────────────────────────────────────┘
-                     │
-  ┌─ Data layer ─────▼───────────────────────────────────────────────────┐
-  │                                                                      │
-  │  lib/data-source/types.ts  — DataSource interface                    │
-  │    makeDataSource(mode, sessionId) returns one of:                   │
-  │      ├─ BloomreachDataSource (HTTPS + OAuth + ~1.1s spacing + retry) │
-  │      └─ SyntheticDataSource  (516 LOC in-process, deterministic)     │
-  │                                                                      │
-  │  lib/state/insights.ts — Map<sessionId, SessionFeed>                 │
-  │    (session-keyed; concurrent-user wipe bug RESOLVED)                │
-  │                                                                      │
-  │  lib/mcp/client.ts — 17-line backwards-compat shim                   │
-  │  lib/mcp/auth.ts — AES-256-GCM encrypted cookie (prod) / file (dev)  │
-  │                                                                      │
-  └─────────────────────┬───────────────────────────────────────┬────────┘
-                        │                                       │
-  ┌─ Provider layer ────▼───────────────────────────────────────▼────────┐
-  │  Anthropic API                       Bloomreach loomi connect MCP    │
-  │   · claude-sonnet-4-6 (agents)        (alpha — rate-limited,         │
-  │   · claude-haiku-4-5 (intent)          revokes tokens after minutes) │
-  └──────────────────────────────────────────────────────────────────────┘
-
-  bi:mode = 'demo' | 'live-bloomreach' | 'live-synthetic'  (default demo)
-```
-
-Three things to point at while you draw it — these are the moves that turn the picture from a feature list into an architecture: **the agent boundary** in the Service layer (AptKit owns the loop, you own three adapters), **the data-source seam** between Service and Data (one interface, two adapters), and **the streaming kernel** crossing UI and Service (one `readNdjson`, four surfaces). Walk each one as you draw.
-
-## How you draw it under time pressure
-
-You can't draw the whole picture above on a real whiteboard. You draw a compressed version, then expand exactly the band the interviewer asks about. Practice this order:
+This is the whiteboard, drawn in the order you'd draw it. Top to bottom: the user, the service, the agent loop, the data source. Every arrow is labeled with what travels and in which direction. Memorize the *order you draw the boxes* — that's the muscle memory you want under pressure.
 
 ```
-  Whiteboard draw order — under 90 seconds
+  blooming insights — the architecture, four bands
 
-  1.  Four boxes top to bottom, labeled bands:
-        UI / Service / Data / Provider                    (10s)
-  2.  Inside Service: the agent box                       (10s)
-  3.  Inside UI: page.tsx + StatusLog                     (10s)
-  4.  The arrow from UI to Service, labeled "NDJSON"      (5s)
-  5.  Inside Data: the DataSource interface + 2 adapters  (15s)
-  6.  Provider: Anthropic + Bloomreach MCP                (10s)
-  7.  Mark the seam: aptkit-adapters.ts                   (10s)
-  8.  Stop. Ask: "where would you like me to go deeper?"  (5s)
+  ┌─ UI band ─────────────────────────────────────────────────────┐
+  │  app/page.tsx (feed) · /investigate/[id] · /recommend         │
+  │  3 hooks: useBriefingStream · useInvestigation · useDemoCapture│
+  │  one shared NDJSON kernel: lib/streaming/ndjson.ts readNdjson  │
+  └────────┬──────────────────────────────────────────────────────┘
+           │ fetch(POST) → ReadableStream of NDJSON
+           │ event types: insight · diagnosis · recommendation ·
+           │   tool_call_start · tool_call_end · reasoning_step ·
+           │   coverage_item · done · error
+           ▼
+  ┌─ Service band (Next 16, App Router on Vercel) ────────────────┐
+  │  /api/briefing  →  monitoring + categories agents              │
+  │  /api/agent     →  diagnostic | recommendation | query agents  │
+  │  /api/mcp/{callback,reset,call,tools,…}                        │
+  │  bootstraps the DataSource INSIDE the stream                   │
+  │  Vercel Pro · maxDuration = 300                                │
+  └────────┬──────────────────────────────────────────────────────┘
+           │ runs an agent (constructs the loop, hands it a
+           │   DataSource, streams events back to the response)
+           ▼
+  ┌─ Agent loop band (library: @aptkit/core@0.3.0) ───────────────┐
+  │  iterate: model → tool_use blocks → tool_results → repeat      │
+  │  3 adapters bridge Blooming to the library (206 LOC total):    │
+  │    AnthropicModelProviderAdapter (Sonnet 4.6, Haiku for intent)│
+  │    BloomingToolRegistryAdapter (wraps the DataSource seam)     │
+  │    BloomingTraceSinkAdapter (translates aptkit events to       │
+  │      Blooming's AgentEvent shape for the stream)               │
+  │  legacy hand-rolled loop preserved at base-legacy.ts:86-176    │
+  └────────┬──────────────────────────────────────────────────────┘
+           │ callTool(name, args) — DataSource.callTool returns
+           │   { result, durationMs, fromCache }
+           ▼
+  ┌─ DataSource band (lib/data-source/types.ts) ──────────────────┐
+  │  BloomreachDataSource — HTTPS to loomi connect MCP, OAuth      │
+  │    (PKCE + DCR), encrypted cookie, ~1 req/s rate limit + retry │
+  │  SyntheticDataSource — 516 LOC, in-process EQL substrate,      │
+  │    no network, used by `live-synthetic` mode                   │
+  └───────────────────────────────────────────────────────────────┘
 ```
 
-Total: ~75 seconds. The "stop and ask" at the end is doing real work — it cedes the floor to the interviewer in a way that makes you look senior, not nervous. Don't keep drawing.
+Four bands. UI consumes a single streaming contract. Service handles one HTTP request and runs the agent loop inside it. Loop lives in a library; this app owns the boundary. Data source is a swap seam — two adapters today, same caller surface.
 
-## The end-to-end request flow — `/api/briefing`
+  ## The body — the walk-through and where they interrupt
 
-The single most likely follow-up is "okay, now walk me through what happens when a user hits the feed page." This is a hops-and-bands walk. Memorize the eight hops.
+  ### The 90-second walkthrough
 
-```
-  Request flow — feed page load with bi:mode = 'live-bloomreach'
-
-  ┌─ Browser ────┐  hop 1: GET /                ┌─ Vercel edge ──┐
-  │  app/page.tsx│ ───────────────────────────► │  Next.js SSR   │
-  │  mounts      │                              │  (RSC)         │
-  └──────────────┘                              └────────┬───────┘
-                                                          │
-                                                  hop 2   │ HTML shell
-                                                          ▼
-  ┌─ Browser ────────────────────────────────────────────────────┐
-  │  useBriefingStream effect fires after hydration              │
-  │  fetch('/api/briefing', { headers: { 'x-bi-mode': ... } })   │
-  └────────────────────────┬─────────────────────────────────────┘
-                hop 3 POST │ + cookie (encrypted OAuth state)
-                           ▼
-  ┌─ Service: /api/briefing route handler ───────────────────────┐
-  │   1. setup: read cookie → aesKey() → OAuth provider          │
-  │      (wrapped in try/catch returning real error JSON —       │
-  │       see Chapter 6, hard bug 2 for the bare-500 fix)        │
-  │   2. makeDataSource('live-bloomreach', sessionId)            │
-  │   3. monitoringAgent.run(dataSource, traceSink)              │
-  │   4. return new ReadableStream piping NDJSON events          │
-  └────────────────────────┬─────────────────────────────────────┘
-                hop 4 loop │  (one iteration per agent step)
-                           ▼
-  ┌─ aptkit-adapters.ts (the boundary) ──────────────────────────┐
-  │  AptKit's loop drives:                                        │
-  │    · AnthropicModelProviderAdapter.complete()                 │
-  │      → POST api.anthropic.com (Sonnet 4.6)                    │
-  │    · BloomingToolRegistryAdapter.execute(toolCall)            │
-  │      → dataSource.executeEql(...)                             │
-  │    · BloomingTraceSinkAdapter.write(event)                    │
-  │      → writes NDJSON line back to UI                          │
-  └──────┬─────────────────────────────────────────┬─────────────┘
-   hop 5 │ token + tools                     hop 6 │ EQL
-         ▼                                         ▼
-  ┌─ Anthropic ────────┐                 ┌─ Bloomreach MCP ──┐
-  │  Sonnet 4.6        │                 │  rate-limited     │
-  │  returns:          │                 │  ~1.1s spacing    │
-  │   reasoning step   │                 │  retries on 429   │
-  │   tool_use blocks  │                 │  may revoke token │
-  └────────────────────┘                 └────────┬──────────┘
-                                                  │ hop 7
-                                          tool result
-                                                  ▼
-  ┌─ aptkit-adapters.ts ─────────────────────────────────────────┐
-  │  Loop continues until max-iterations or final synthesis      │
-  │  Each step emits an AgentEvent (NDJSON) back to the browser  │
-  └────────────────────────┬─────────────────────────────────────┘
-                           │
-                hop 8 NDJSON│ (one line per event)
-                           ▼
-  ┌─ Browser ────────────────────────────────────────────────────┐
-  │  readNdjson(reader) yields events; useBriefingStream          │
-  │  routes them: reasoning_step → StatusLog,                     │
-  │  insight → InsightCard, error → ReconnectPolicy               │
-  └──────────────────────────────────────────────────────────────┘
-```
-
-That's the whole flow. Walk it in that order if asked: hop labels, layer crossings, what each band promises the next. The two bits an interviewer is most likely to probe are **hop 5** (why a forced final synthesis turn? — Chapter 3) and **hop 6** (how do you handle the rate limit? — Chapter 5).
+This is the script you walk a request through. Read it aloud once. Time it. You're aiming for ninety seconds.
 
 ```
-  ┃ "Every hop crosses a band, and every band crossing is
-  ┃  a contract I can defend on its own."
+  ┌─────────────────────────────────────────────────────────────┐
+  │ THEY ASK                                                    │
+  │   "Walk me through how the system works, end-to-end."       │
+  │                                                             │
+  │ WHAT THEY'RE TESTING                                        │
+  │   Do you have a mental model of your own system? Can you    │
+  │   tell the story top-down without rabbit-holing into one    │
+  │   layer? Do you know where the seams are? Can you stay      │
+  │   inside ninety seconds?                                    │
+  └─────────────────────────────────────────────────────────────┘
 ```
 
-## The big question — "walk me through your architecture"
+**Strong answer (the walk-through):**
 
-```
-  ┌─────────────────────────────────────────────────┐
-  │ THEY ASK                                        │
-  │   "Walk me through your architecture."          │
-  │                                                 │
-  │ WHAT THEY'RE TESTING                            │
-  │   Can you talk about a system at the level of   │
-  │   bands and seams, not files and features? Do   │
-  │   you know where the load is actually carried?  │
-  │   Will you draw the messy parts honestly or     │
-  │   try to make it look cleaner than it is?       │
-  └─────────────────────────────────────────────────┘
-```
-
-The strong answer, in your voice, designed to fit the whiteboard draw above:
-
-> "Four bands top-to-bottom — **UI, Service, Data, Provider**. The UI is Next.js 16 App Router; the main page is `app/page.tsx` and it uses three custom hooks that I pulled out of it deliberately — `useBriefingStream` for the live agent feed, `useDemoCapture` for the dev-only snapshot capture, `useReconnectPolicy` for the token-revoke recovery. The page talks to the Service layer over **NDJSON over fetch** — not SSE, not a websocket — because it's append-only and a single reader and that's the simplest contract I could ship.
+> "Let me draw the four bands. UI, service, agent loop, data source. *(draw boxes top to bottom)*
 >
-> "In the Service layer, the route handlers are thin. The agents themselves are also thin — they're wrappers over `@aptkit/core@0.3.0`. The interesting part is right here" — *point at* `lib/agents/aptkit-adapters.ts` — "this is the boundary I own. Three small adapter classes — model provider, tool registry, trace sink. AptKit owns the agent loop; I own the boundary. It's about two hundred lines and the legacy hand-rolled loop is still preserved at `base-legacy.ts` as my rollback receipt.
+> User loads the feed at `app/page.tsx`. The default mode is `'demo'` — it serves a committed snapshot as plain JSON, instantly, no auth, no agents. That's my reliable presentation path. The user can toggle into `'live-bloomreach'` to run the agents for real, or `'live-synthetic'` to run them against my in-process substrate.
 >
-> "Below that is the **DataSource seam** — `lib/data-source/types.ts`. One interface, two adapters: `BloomreachDataSource` talks HTTPS over OAuth PKCE with about 1.1-second call spacing because the alpha server is rate-limited; `SyntheticDataSource` is in-process and deterministic, about 500 lines, so I can run the system end-to-end without touching Bloomreach at all. The seam has survived two adapter swaps without changing the caller surface — that's the receipt for it being a real seam, not future-proofing.
+> When they click run live, the UI hook — `useBriefingStream` — does a `fetch(POST)` to `/api/briefing`. That route handler bootstraps the DataSource *inside the stream*, so any setup error becomes a real error event the UI can render, not a bare 500.
 >
-> "Providers are Anthropic — Sonnet 4.6 for agents, Haiku for the intent classifier — and the Bloomreach loomi connect MCP server over OAuth. Where would you like me to go deeper?"
+> The handler then runs the monitoring agent. The agent loop itself is the library `@aptkit/core` — I own three adapter classes that bridge Blooming to its primitives. The library iterates: model produces tool_use blocks, the registry executes them, the trace sink emits events. Those events get translated to my NDJSON event contract and streamed back through the same response.
+>
+> The actual data calls go through the DataSource seam. In live-Bloomreach mode that's an OAuth'd HTTPS client to the loomi connect MCP server, rate-limited to roughly one request per second. In live-synthetic mode it's a 516-LOC in-process substrate that satisfies the same caller surface.
+>
+> The user sees, in real time: tool calls firing, intermediate reasoning steps, and finally the insight cards rendering as each anomaly is found. Then they click into one — that's `/investigate/[id]`. Same shape: hook fetches, route runs the diagnostic agent, NDJSON streams back through the same kernel.
+>
+> Same architecture every time. UI fetches NDJSON. Route runs an agent. Agent calls tools through the seam."
 
-Notice the structure: bands, then the load-bearing detail in each band, then the hand-off. The hand-off is the whole point. You've named three things they could pull on (the AptKit boundary, the DataSource seam, the agent loop), and they'll pick one.
+That's the walkthrough. Four bands. One request. Same shape every time.
 
-```
-  ┌─────────────────────────┬─────────────────────────┐
-  │ WEAK ARCHITECTURE WALK  │ STRONG ARCHITECTURE WALK│
-  ├─────────────────────────┼─────────────────────────┤
-  │ "So the frontend is     │ "Four bands top-to-     │
-  │ Next.js. It calls an    │ bottom: UI, Service,    │
-  │ API route. The API      │ Data, Provider. The     │
-  │ route calls Claude.     │ UI talks to the Service │
-  │ Claude calls tools.     │ over NDJSON over fetch  │
-  │ The tools call          │ — append-only, single   │
-  │ Bloomreach over MCP.    │ reader, simplest        │
-  │ Then it streams the     │ contract I could ship.  │
-  │ result back."           │ The interesting piece   │
-  │                         │ is the adapter boundary │
-  │                         │ between my code and the │
-  │                         │ AptKit agent runtime..."│
-  ├─────────────────────────┼─────────────────────────┤
-  │ Why it's weak:          │ Why it works:           │
-  │ A chain of calls is not │ Bands and seams, then   │
-  │ an architecture. There's│ a load-bearing detail   │
-  │ no band, no seam, no    │ in each band. The       │
-  │ contract. The reader    │ "interesting piece" is  │
-  │ can't tell what's a     │ named explicitly. The   │
-  │ load-bearing decision   │ choice of contract      │
-  │ from what's a default.  │ (NDJSON) is justified.  │
-  └─────────────────────────┴─────────────────────────┘
-```
+  ### The interruptions you should expect
 
-## Where they'll interrupt and what to say
-
-Walk the decision tree before the interview so you're not caught flat-footed.
+The interviewer rarely lets you finish the full ninety. They interrupt at the layer they want to dig into. Know the branches.
 
 ```
-  You finish the band walk and ask "where would you like me to go deeper?"
+  Where the interviewer interrupts the walkthrough
         │
         ▼
+  You're mid-walkthrough.
         │
-        ├─► "Tell me about the agent layer"
-        │     → Chapter 3, Choice 2 (AptKit migration).
-        │       Lead with "I started by owning the loop;
-        │       migrated to AptKit once its primitives
-        │       were clean enough." Show base-legacy.ts.
+        ├─► AT THE UI BAND ("how does the streaming actually work?")
+        │     One kernel: lib/streaming/ndjson.ts readNdjson.
+        │     fetch returns a ReadableStream, we read the body,
+        │     split on newlines, JSON.parse each line, dispatch
+        │     by event.type. Same kernel for 4 surfaces.
         │
-        ├─► "How does the streaming work?"
-        │     → Walk readNdjson at lib/streaming/ndjson.ts.
-        │       64 lines. Used by 4 surfaces. Then walk
-        │       the StatusLog → ReasoningTrace render path.
+        ├─► AT THE SERVICE BAND ("why bootstrap inside the stream?")
+        │     The setup phase — token decryption, MCP client init,
+        │     listTools — used to throw before any response had
+        │     started, which surfaced as a bare 500 in the UI. By
+        │     pushing setup inside the stream, errors become a real
+        │     error event with a real message. Production-only 500
+        │     was how I found this bug — see chapter 6.
         │
-        ├─► "Walk me through one request end-to-end"
-        │     → The 8-hop flow above. Slow down at hops 5
-        │       and 6 (agent loop + rate-limited tool).
+        ├─► AT THE AGENT LOOP ("why a library and not your own loop?")
+        │     I had my own loop first — base-legacy.ts:86-176, still
+        │     in the repo. I migrated to @aptkit/core@0.3.0 once it
+        │     exposed primitives I could adapt to. Library owns the
+        │     loop; I own the boundary. Three adapter classes,
+        │     ~200 LOC. Legacy preserved as a rollback receipt.
         │
-        ├─► "Why no database?"
-        │     → Chapter 3, Choice 1 (no DB) and Chapter 7,
-        │       Reconsideration 1. Honest answer: deliberate
-        │       for the context, with a real bug (concurrent-
-        │       user wipe) that's now resolved.
-        │
-        └─► "How do you handle auth?"
-              → Chapter 8 (the AI question — OAuth PKCE +
-                DCR is the canonical defaulted-to). Honest:
-                the MCP SDK provides the mechanics; I own
-                the encrypted-cookie store wrapper.
+        └─► AT THE DATA SOURCE ("two adapters? why?")
+              The seam survives. I built against Bloomreach, then
+              built a synthetic adapter for development without
+              network, then a third (SQL-backed) adapter lived
+              behind it briefly. Two adapter swaps, zero caller-
+              surface change. That's the receipt for the seam.
 ```
 
-## When you don't know
+  ### Why bootstrap inside the stream — the seam they'll probe
 
-The territory you're most likely to get pushed past your depth in this chapter is *scale*. Architecture diagrams invite "how would this handle X RPS?" questions. The honest answer is that you've designed for the constraint that exists (a rate-limited upstream), not the constraint that doesn't (production load).
+This is the architecture choice senior interviewers reliably stop on, because it sounds backwards. Bootstrapping the data source *inside* the route response stream means more code inside the streaming path. Why?
 
 ```
-  ╔═══════════════════════════════════════════════╗
-  ║ WHEN YOU DON'T KNOW                           ║
-  ║                                               ║
-  ║   They ask: "How does this architecture       ║
-  ║   handle 1000 requests per second?"           ║
-  ║                                               ║
-  ║   You haven't load-tested it and you          ║
-  ║   shouldn't pretend you have. The real        ║
-  ║   constraint is upstream, not your code.      ║
-  ║                                               ║
-  ║   Say:                                        ║
-  ║   "I haven't load-tested at that throughput.  ║
-  ║    The binding constraint in this system      ║
-  ║    isn't my service — it's the upstream       ║
-  ║    Bloomreach API, which is rate-limited to   ║
-  ║    roughly one request per second and revokes ║
-  ║    tokens after minutes. So at 1000 RPS what  ║
-  ║    breaks first is the upstream, not me. The  ║
-  ║    interesting design question becomes how to ║
-  ║    fan out without hammering — caching, queue,║
-  ║    one upstream connection per workspace. I'd ║
-  ║    love to walk through the design if you'd   ║
-  ║    like."                                     ║
-  ║                                               ║
-  ║   What this signals: you know the binding     ║
-  ║   constraint, you don't fake a load number,   ║
-  ║   and you re-frame the question to a design   ║
-  ║   conversation you can actually have.         ║
-  ║                                               ║
-  ║   Do NOT say:                                 ║
-  ║   "Vercel auto-scales so it should handle     ║
-  ║    it." Cargo-culted infra confidence. The    ║
-  ║    interviewer will probe and you'll fold.    ║
-  ╚═══════════════════════════════════════════════╝
+  ┌─────────────────────────────────────────────────────────────┐
+  │ THEY ASK                                                    │
+  │   "Why bootstrap the MCP connection inside the streaming    │
+  │    response instead of in route middleware?"                │
+  │                                                             │
+  │ WHAT THEY'RE TESTING                                        │
+  │   Do you understand the cost of setup-phase failures in     │
+  │   a streaming app? Do you treat the user-visible error as   │
+  │   a first-class output? Or do you let exceptions become     │
+  │   500s that the UI can't render?                            │
+  └─────────────────────────────────────────────────────────────┘
 ```
 
-## What you'd change in the architecture
+**Strong answer:**
 
-The one thing you'd reconsider in the architecture today is **cross-instance state**. `lib/state/insights.ts` is now session-keyed (`Map<sessionId, SessionFeed>`), which fixed the concurrent-user wipe bug that AI had defaulted me into. But it's still in-process. If a single warm Vercel instance handles both reads, you're fine; if traffic lands on two different instances, the second instance has no insights for the same session. The trigger for changing this is multi-instance deployment, which a portfolio app doesn't have. The fix is straightforward — Vercel KV or a small Postgres — and the seam is already there. I'd add it the day I had two instances.
+> "Setup-phase failures used to throw before the response had started. The client would see a bare 500 with no body. There's a specific case where this bit me: in production, `aesKey()` in `lib/mcp/auth.ts` would throw if `AUTH_SECRET` was unset — pre-stream, unguarded. The UI saw a 500 and could only say 'something went wrong.' Demo mode worked fine, which made the bug invisible until I tried live in prod.
+>
+> The fix was to wrap setup in try/catch *inside* the stream, so any setup error becomes a real NDJSON error event with a real message — the UI renders the actual problem and offers a reconnect button on auth errors. Now the streaming contract is the *only* output surface; every failure rides through it."
 
-## One-page summary
+```
+  ┃ "The streaming contract is the only output surface.
+  ┃  Every failure rides through it."
+```
 
-**Core claim:** Talk about architecture in bands and seams, not files and features. Draw the messy parts honestly. Hand the interviewer a thread at the end.
+  ### Why a library agent loop and not the one you built
+
+This is the second seam they'll probe. You hand-rolled the loop first; you migrated to a library. Both decisions need defending.
+
+```
+  ┌─────────────────────────────────────────────────────────────┐
+  │ THEY ASK                                                    │
+  │   "Why migrate to a library agent loop after building       │
+  │    your own?"                                               │
+  │                                                             │
+  │ WHAT THEY'RE TESTING                                        │
+  │   Do you know when to own infrastructure and when to        │
+  │   adopt it? Can you defend revisiting a decision you        │
+  │   previously made the other way? Do you keep a rollback     │
+  │   path?                                                     │
+  └─────────────────────────────────────────────────────────────┘
+```
+
+**Strong answer:**
+
+> "I hand-rolled the loop in Phase 1. That was deliberate — I needed two things the library didn't yet expose: a hard `maxToolCalls` budget so I could bound rate-limit exposure on the alpha Bloomreach server, and a forced final-synthesis turn so the model would always produce a structured answer instead of looping forever. The hand-rolled loop is still in the repo at `lib/agents/base-legacy.ts:86-176`.
+>
+> In Phase 4, `@aptkit/core` reached version 0.3.0 with the generic-primitive surface I needed. I migrated. The Blooming side is three adapter classes in `lib/agents/aptkit-adapters.ts`, around two hundred lines total: an `AnthropicModelProviderAdapter` for the model, a `BloomingToolRegistryAdapter` that wraps my DataSource seam, and a `BloomingTraceSinkAdapter` that translates aptkit events into my UI's event contract.
+>
+> I own the boundary; AptKit owns the loop. Three small adapter classes, around two hundred lines, and the legacy loop is preserved for the day I need to peel back to it."
+
+```
+  ┃ "I own the boundary; AptKit owns the loop. Three small
+  ┃  adapter classes, ~200 LOC, and the legacy loop is preserved
+  ┃  for the day I need to peel back to it."
+```
+
+  ## When you don't know
+
+The interviewer can push you into Next.js runtime internals or Vercel's streaming behavior — territory you didn't deeply design for; you used the defaults.
+
+```
+  ╔═══════════════════════════════════════════════════════════════╗
+  ║ WHEN YOU DON'T KNOW                                           ║
+  ║                                                               ║
+  ║   They ask: "What's the connection model for your Vercel      ║
+  ║   functions handling streaming responses? Are they keeping    ║
+  ║   sockets open? How does that interact with cold starts?"     ║
+  ║                                                               ║
+  ║   You picked the Node runtime, set maxDuration to 300, and    ║
+  ║   the streaming worked. You did not deeply design the         ║
+  ║   socket / cold-start behavior.                               ║
+  ║                                                               ║
+  ║   Say:                                                        ║
+  ║   "I configured maxDuration at 300 for the long-running       ║
+  ║    streaming routes and used Vercel's default Node runtime.   ║
+  ║    The socket lifecycle and cold-start tradeoffs underneath   ║
+  ║    — I didn't deeply design for those. What I designed for    ║
+  ║    was the user-visible side: every failure becoming an       ║
+  ║    NDJSON error event so the UI has something to render.      ║
+  ║    The platform side I trusted Vercel on. If we needed to     ║
+  ║    scale connections, that's where I'd want to dig in."       ║
+  ║                                                               ║
+  ║   What this signals: honesty about the boundary between       ║
+  ║   what you owned and what you defaulted to, plus a sharp      ║
+  ║   handoff to what you DID design for. Senior interviewers     ║
+  ║   read this as confidence about scope.                        ║
+  ║                                                               ║
+  ║   Do NOT say:                                                 ║
+  ║   "Yeah, Vercel handles all that with their edge / lambda     ║
+  ║    hybrid…" — vague handwaving about a platform you didn't    ║
+  ║   read deeply is the surest way to get pushed further into    ║
+  ║   the territory you don't know.                               ║
+  ╚═══════════════════════════════════════════════════════════════╝
+```
+
+  ## What you'd change
+
+If you were redoing the architecture today, the one structural change you'd reach for first is **giving the agent loop a real cancellation primitive across the whole request path** — not just the in-loop `AbortSignal` you have today. Cancellation works on the model SDK call; it doesn't cleanly propagate through the streaming response to the in-flight tool call, which can mean a wasted Bloomreach hit after the user has already navigated away. The fix is one extra layer of `AbortController` plumbing from the route through the adapter into the DataSource. You know what to do; you haven't done it.
+
+  ## One-page summary
+
+**Core claim:** four bands, drawn top-down, walked once. UI consumes NDJSON; service runs an agent; loop is a library; data is a seam. The walkthrough is ninety seconds. Every interruption corresponds to a layer.
 
 **Questions covered:**
-- "Walk me through your architecture." → Four bands top-to-bottom; load-bearing detail per band; end with "where would you like me to go deeper?"
-- "Walk me through one request end-to-end." → The eight-hop flow; slow down at the agent-loop hop and the rate-limited tool hop.
-- "How would this handle 1000 RPS?" → Honest "I haven't load-tested at that throughput"; the binding constraint is upstream rate-limit, not my service; re-frame to design.
+- *"Walk me through the system"* → four bands, one request, end-to-end in ninety seconds.
+- *"Why bootstrap inside the stream?"* → setup failures become NDJSON error events instead of bare 500s; specific bug: prod-only `aesKey()` throw.
+- *"Why a library agent loop?"* → I hand-rolled it first (deliberate), migrated when `@aptkit/core@0.3.0` exposed the primitives. Three adapters at `aptkit-adapters.ts`. Legacy preserved at `base-legacy.ts:86-176`.
+- *"Vercel runtime details?"* → I designed the user-visible side; platform internals I trusted defaults on.
 
 **Pull quotes:**
 ```
-  ┃ "Every hop crosses a band, and every band crossing
-  ┃  is a contract I can defend on its own."
+┃ "The streaming contract is the only output surface.
+┃  Every failure rides through it."
+```
+```
+┃ "I own the boundary; AptKit owns the loop. Three small
+┃  adapter classes, ~200 LOC, and the legacy loop is preserved
+┃  for the day I need to peel back to it."
 ```
 
-**What you'd change:** the in-process insights store will need cross-instance state the day there's a second Vercel instance. The seam is ready; the trigger isn't here yet.
+**What you'd change:** plumb a proper `AbortController` chain from route → adapter → DataSource, so a cancelled request kills the in-flight Bloomreach call instead of wasting rate-limit budget on a navigation the user already moved past.

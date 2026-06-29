@@ -1,285 +1,277 @@
-# Database systems map
+# The datastore map — every storage analog in the repo
 
-Industry standard · Orientation diagram
+*Industry standard / Project-specific* — there's no datastore; instead the repo composes four local analogs that collectively do the work a database would.
 
-## Zoom out — what a "DB systems map" usually shows, and what it shows for this repo
+## Zoom out, then zoom in
 
-In a normal architecture review, the database systems map is the layered picture of *which datastore answers which query, what its durability boundary is, and where the read path goes.* For most apps that's three to seven boxes (primary OLTP, OLAP warehouse, cache, search index, queue store, vector index, ...). For this repo the map has **one real datastore — and it's not yours.**
-
-```
-  Zoom out — the datastore map for this codebase
-
-  ┌─ UI layer ──────────────────────────────────────────────────┐
-  │  React 19 (App Router)                                        │
-  │  sessionStorage: bi:insight:<id>, bi:diag:<id> (client-side)  │
-  │  localStorage:   bi:mode (demo|live)                          │
-  └───────────────────────────────┬──────────────────────────────┘
-                                  │ fetch + NDJSON
-  ┌─ Service layer ───────────────▼──────────────────────────────┐
-  │  /api/briefing       /api/agent       /api/mcp/*              │
-  │  reads: listInsights · getInsight · getInvestigation          │
-  │  writes: putInsights · putInvestigation · saveInvestigation   │
-  └───────────────────────────────┬──────────────────────────────┘
-                                  │ Map.get / Map.set
-  ┌─ "State" layer (heap + dev FS) ▼─────────────────────────────┐
-  │  ★ THE LOCAL "DATASTORE" ★                                    │
-  │  Map<sessionId, SessionFeed>     insights.ts:14               │
-  │  Map<insightId, AgentEvent[]>    investigations.ts:11         │
-  │  Map<key, {result, expiresAt}>   bloomreach-data-source.ts:122│
-  │  .investigation-cache.json       (dev only)                   │
-  │  .auth-cache.json                (dev only)                   │
-  │  demo-*.json                     (committed snapshot)         │
-  └───────────────────────────────┬──────────────────────────────┘
-                                  │  callTool(name, args)
-  ┌─ Adapter layer ───────────────▼──────────────────────────────┐
-  │  DataSource interface  →  BloomreachDataSource                │
-  └───────────────────────────────┬──────────────────────────────┘
-                                  │  MCP / HTTP / OAuth+PKCE
-  ┌─ Provider ────────────────────▼──────────────────────────────┐
-  │  Bloomreach Engagement (loomi connect MCP server)             │
-  │  THE REAL DATASTORE — events, customers, catalogs, revenue   │
-  │  queried via EQL; durability + indexes + ACID owned upstream  │
-  └───────────────────────────────────────────────────────────────┘
-```
-
-## Zoom in — the question this concept answers
-
-When someone asks "what's the database story for this app?" — the answer is the map above. The honest map. Three things matter on it:
-
-  1. The **canonical datastore is Bloomreach**, not anything in this repo.
-  2. The **local "state" layer is in-memory heap plus opt-in dev files** — it owns nothing of record.
-  3. The **demo snapshot is committed JSON**, not a replica of anything live.
-
-## Structure pass — the skeleton
-
-Three layers, one axis traced across them.
-
-### Layers
-  - **Provider** — Bloomreach. The canonical store. Has its own engine, indexes, durability, replication. Opaque to us.
-  - **Adapter + cache** — `BloomreachDataSource`. A keyed expiring cache in front of the provider. No durability of its own.
-  - **App state** — `Map`s in the Next process heap + dev JSON files. Volatile by design.
-
-### Axis: who owns the data of record?
+Open this repo expecting a `db/` folder or a `prisma/schema.prisma` and you'll bounce around for an hour looking for the storage layer. There isn't one. The whole "datastore" is four places: two `Map` instances in process memory, a JSON file on disk, and a cookie in the user's browser. That's it.
 
 ```
-  The "ownership" axis, traced down the stack
+  Zoom out — where this concept lives
 
-  ┌─ Provider ─────────────────────┐
-  │  OWNS canonical data of record │   ← record-of-truth lives here
-  └────────────────────────────────┘
-       ┌─ Adapter + cache ──────────┐
-       │  HOLDS a 60s recent copy   │   ← derivative; cache only
-       └────────────────────────────┘
-            ┌─ App state ───────────┐
-            │  HOLDS computed views │   ← derivative; throw away anytime
-            │  (Insight, Diagnosis) │
-            └───────────────────────┘
+  ┌─ UI layer ───────────────────────────────────────────────┐
+  │  app/page.tsx   →   fetch('/api/briefing')                │
+  └────────────────────────────┬─────────────────────────────┘
+                               │  HTTP
+  ┌─ Service layer ────────────▼─────────────────────────────┐
+  │  app/api/briefing/route.ts   →   ★ THE DATASTORE MAP ★    │ ← we are here
+  │  - in-memory Map (session feed)                           │
+  │  - 60s response cache                                     │
+  │  - file read for demo snapshot                            │
+  │  - encrypted cookie for OAuth tokens                      │
+  └────────────────────────────┬─────────────────────────────┘
+                               │
+  ┌─ Storage layer ────────────▼─────────────────────────────┐
+  │  process memory   ·   filesystem (RO)   ·   client cookie │
+  │  (NO database)                                            │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-Every layer below the provider is *derivative*. None of them are allowed to be the only place a fact lives. That single invariant is what makes "no DB by design" safe.
+Zoom in: every concept that follows hangs off one of those four boxes. When this guide talks about "tables," "indexes," "transactions," "durability" — pick a box and ask "which of these is doing that job here?" Most of the time only one of them is, and often the answer is "nothing is, and here's why that's fine."
 
-### Seams (where the axis flips)
+## Structure pass
 
-  - **Provider ↔ adapter seam.** Ownership flips here from "record" to "cached copy." Crossing it without going through the adapter (and its cache + rate limit) means hitting Bloomreach at full rate — which is forbidden.
-  - **Adapter ↔ app-state seam.** Ownership flips here from "cached copy of real data" to "computed result of running the agent over that data." Insights and investigations are *derivations*, not data of record. They are throwaway on purpose.
+The skeleton has four layers and one axis worth tracing.
+
+**Layers:**
+
+```
+  L1  in-memory Map        process-scoped, dies on restart
+  L2  60s response cache   process-scoped, time-bounded
+  L3  filesystem JSON      read-only at runtime, committed to git
+  L4  encrypted cookie     client-scoped, survives everything
+```
+
+**Axis traced: durability** — how long does a write survive?
+
+```
+  Trace one axis: how long does a write survive?
+
+  ┌─ L1: in-memory Map ──────────────────┐
+  │  putInsights → Map.set               │   → until process restart
+  └──────────────────────────────────────┘
+                  (it flips)
+  ┌─ L2: response cache ─────────────────┐
+  │  cache.set(key, { expiresAt })       │   → 60s OR process restart
+  └──────────────────────────────────────┘
+                  (it flips)
+  ┌─ L3: filesystem (build) ─────────────┐
+  │  git commit lib/state/*.json         │   → next deploy
+  └──────────────────────────────────────┘
+                  (it flips)
+  ┌─ L4: bi_auth cookie ─────────────────┐
+  │  withAuthCookies → set Secure cookie │   → 10 days (AUTH_COOKIE_MAX_AGE)
+  └──────────────────────────────────────┘
+
+  every boundary flips the answer — this is why the layers are real layers
+```
+
+**Seams** — three of them matter:
+
+- The seam between L1 and L4 is the only one a user can cross: log in, get an L4 cookie; log out (or have the alpha server revoke), lose the cookie. Everything else (L1, L2, L3) is invisible to the user.
+- The seam between L1 and L3 is the `?demo=cached` branch in `app/api/briefing/route.ts:78`. The same UI reads from either side depending on the query string.
+- The seam between L1 and L2 is `cacheTtlMs` on `BloomreachDataSource.callTool`. Same `Map` shape, different lifetime semantics.
+
+The mechanics in `02`-`08` each sit inside one of these layers.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-If you've ever shipped a Next.js app that calls a third-party API, you already know the shape: API → fetch cache → React state. This is that shape, with names attached.
+A real database does four jobs: store rows, index them, run queries, survive crashes. Pull those four jobs apart and look for who in this repo does each one — that's the picture you want to hold.
 
 ```
-  The shape — three-tier derivative pipeline
+  The four jobs of a database — who does each here?
 
-  ┌─ provider ─┐  freshness
-  │ canonical  │  ▲
-  └─────┬──────┘  │
-        │ EQL    │
-  ┌─ adapter ──┐  │  data ages as you go DOWN the stack
-  │ 60s cache  │  │  liveness ages as you go DOWN the stack
-  └─────┬──────┘  │  ownership stays UP at the provider
-        │        │
-  ┌─ app state ┐  ▼
-  │ computed   │  oldest
-  └────────────┘
+       store rows      →  Map (in lib/state/insights.ts)
+       index rows      →  cache key string (in BloomreachDataSource)
+       run queries     →  the Bloomreach server (via EQL strings)
+       survive crashes →  the bi_auth cookie (for tokens only)
+
+  three of the four jobs are absorbed by something else;
+  the fourth (durability) is partial — only auth survives
 ```
 
-That's the whole map. Every concept file in this guide picks one layer of that picture and asks "what would a database engine do here?" — and answers "we don't, because the engine lives upstream."
+That's the whole pattern. The rest of this file walks each layer.
 
-### Move 2 — the layer-by-layer walkthrough
+### Move 2 — the four layers, one by one
 
-#### Provider (Bloomreach Engagement)
+#### L1 — In-memory Map (the table-analog)
 
-The canonical datastore. We don't see its engine. We send EQL ("execute analytics EQL") and it returns rows. From the outside, we treat it as having strong consistency for our purposes — the agent doesn't run two queries and rely on them being a consistent snapshot of the same instant; it runs sequential queries and reasons over what comes back.
+The closest thing to a "table" in this repo is `sessionState` in `lib/state/insights.ts`. It's keyed by `sessionId` so each user gets their own sub-feed.
 
-```
-  Provider boundary — opaque from this side
-
-  ┌─ this repo ─────┐         ┌─ Bloomreach ────────────┐
-  │  agent          │  EQL   │  ? engine ? indexes ?    │
-  │  callTool(...)  │ ─────► │  ? durability ?          │
-  │                 │ ◄───── │  ? replicas ?            │
-  └─────────────────┘ rows   └──────────────────────────┘
-                              the answers live here; we don't see them
-```
-
-This is the entire reason every concept file below it is Case B for *us*. The mechanism exists, it just doesn't live in our codebase.
-
-#### Adapter layer — `BloomreachDataSource` with TTL cache
-
-This is the closest thing in the repo to a "database engine concern" — a keyed store with expiry. Read-through on hit; rate-limited fetch + cache-fill on miss.
-
-```ts
-// lib/data-source/bloomreach-data-source.ts:122
-private cache = new Map<string, { result: unknown; expiresAt: number }>();
-// ...
-// lib/data-source/bloomreach-data-source.ts:144-152
-const cacheKey = `${name}:${JSON.stringify(args)}`;
-const ttl = options.cacheTtlMs ?? 60_000;
-
-if (!options.skipCache) {
-  const cached = this.cache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) {
-    return { result: cached.result as T, durationMs: 0, fromCache: true };
-  }
-}
-```
-
-Annotation:
-  - **Line 122** — the cache is a `Map`; key is `name + JSON-stringified args`; value carries an `expiresAt` epoch ms. No LRU, no size cap, no eviction other than expiry-on-read.
-  - **Line 145** — TTL default is 60s. The agent never overrides; only `/api/mcp/capture` and debug tooling do.
-  - **Lines 148-151** — read-through: if a non-expired entry exists, return it tagged `fromCache: true`. The `durationMs: 0` flows out to the UI's tool-call trace.
-
-This pattern recurs in real databases at the buffer-pool layer (DB pages cached in memory) and at the materialized-view layer (precomputed query results cached with invalidation). Here it's the only cache; there's no engine below it, just HTTP to the provider.
-
-#### App-state layer — namespaced tables (session-keyed `Map`s)
-
-The two state files are deliberately shaped like *namespaced tables.* The namespace (the outer `Map`) partitions by sessionId; the tables (the inner `Map`s) hold the rows.
-
-```ts
+```typescript
 // lib/state/insights.ts:8-23
 type SessionFeed = {
-  insights: Map<string, Insight>;
-  investigations: Map<string, Investigation>;
-  anomalies: Map<string, Anomaly>;
+  insights: Map<string, Insight>;            // ← the "insights" table
+  investigations: Map<string, Investigation>; // ← the "investigations" table
+  anomalies: Map<string, Anomaly>;           // ← the "anomalies" table
 };
 
-const state = new Map<string, SessionFeed>();
-
-function sessionState(sessionId: string): SessionFeed {
-  let s = state.get(sessionId);
-  if (!s) {
-    s = { insights: new Map(), investigations: new Map(), anomalies: new Map() };
-    state.set(sessionId, s);
-  }
-  return s;
-}
+const state = new Map<string, SessionFeed>(); // ← partitioned by sessionId
 ```
 
-Annotation:
-  - **Lines 8-12** — `SessionFeed` is the per-session set of "tables." Three of them. Each is a hash-indexed lookup by primary key (`id` for insights and anomalies, `insightId` for investigations).
-  - **Line 14** — `state` is the global outer Map. One entry per active session. It is *never* cleared by a request handler.
-  - **Lines 16-23** — the DDL bootstrap (`USE database <sessionId>; CREATE TABLE IF NOT EXISTS ...`) is what `sessionState` is doing. Lazy initialization, no schema migration, no real DDL.
+Three "tables" inside a per-session container. The container is partitioned by `sessionId` — see `02-records-pages-and-storage-layout.md` for why that partition is load-bearing.
 
-Compare to a real RDBMS: replace `Map<sessionId, SessionFeed>` with `schema_<sessionId>` namespacing, the inner Maps become heap tables, and `Map.get`/`Map.set` become `SELECT WHERE id = ?` / `INSERT ... ON CONFLICT DO UPDATE`. Same shape, very different durability story.
+```
+  L1 — the in-memory Map as a table
 
-#### Dev FS layer — read-through to JSON
+  state (outer Map)
+    ├─ "sess-abc": { insights: Map, investigations: Map, anomalies: Map }
+    ├─ "sess-def": { insights: Map, investigations: Map, anomalies: Map }
+    └─ "sess-xyz": { insights: Map, investigations: Map, anomalies: Map }
 
-Investigations have one extra trick: a *three-tier* read with the dev file in the middle.
-
-```ts
-// lib/state/investigations.ts:22-28
-export function getCachedInvestigation(insightId: string): AgentEvent[] | null {
-  if (mem.has(insightId)) return mem.get(insightId)!;
-  const fromFile = PERSIST ? readJson(CACHE_FILE)[insightId] : undefined;
-  if (fromFile) return fromFile;
-  const fromDemo = readJson(DEMO_FILE)[insightId];
-  return fromDemo ?? null;
-}
+  primary key: sessionId       (outer)
+  primary key: insight.id      (inner)
+  durability: until process restart
 ```
 
-Annotation:
-  - **Line 23** — first hit the in-memory cache. This is the L1.
-  - **Line 24** — in dev only, fall through to `.investigation-cache.json` on disk. This is the L2 — and the equivalent of a database's "cold storage" tier for the dev workflow specifically.
-  - **Line 26** — fall through to the committed `demo-investigations.json`. This is the read replica — frozen at capture time, served identically across all sessions and instances.
+**What breaks if you remove the outer `Map`:** every session shares one feed → one user's `clear()` wipes another user's data mid-briefing. The comment at `lib/state/insights.ts:5-7` calls this out explicitly.
 
-That three-tier read IS the closest thing in this codebase to a tiered storage hierarchy.
+#### L2 — 60s response cache (the cache)
+
+The cache (`BloomreachDataSource.cache`) is another `Map`, but its job is different: deduplicate calls to the upstream Bloomreach MCP server during a single briefing.
+
+```typescript
+// lib/data-source/bloomreach-data-source.ts:122
+private cache = new Map<string, { result: unknown; expiresAt: number }>();
+```
+
+```
+  L2 — response cache (the cache)
+
+  cache (Map<string, Entry>)
+    key:   "execute_analytics_eql:{eql:'...',time:'...'}"
+    value: { result, expiresAt: now + 60000 }
+
+  invalidation: TTL (60s default) OR process restart
+  semantics:    write-through on skipCache; never cache errors
+```
+
+Two interesting rules here, both in the code:
+
+- **Errors are never cached** (`lib/data-source/bloomreach-data-source.ts:179-181`) — a failed call must not poison the next attempt.
+- **`skipCache` still write-throughs** (`:184-186`) — a forced refresh from `/debug` updates the cache so subsequent normal calls see the fresh value.
+
+#### L3 — Filesystem JSON (the read replica / build artifact)
+
+`lib/state/demo-insights.json` (665 lines) and `lib/state/demo-investigations.json` (3,487 lines) are committed snapshots. The capture route (`app/api/mcp/capture-demo/route.ts` — dev-only) runs a real briefing against Bloomreach and writes the result to those files. They then ship in the repo and serve as the `?demo=cached` data source.
+
+```
+  L3 — filesystem JSON (frozen read replica)
+
+  capture (dev-only, manual) ──► writes lib/state/demo-*.json
+                                          │
+                                          │  git commit
+                                          ▼
+                                  ships in the build
+                                          │
+                                          │  app/api/briefing/route.ts:86
+                                          ▼
+                                  read-only on Vercel
+                                          │
+                                          ▼
+                                  NDJSON streamed to UI
+```
+
+This is a read replica in the same sense that `git pull` is replication — point-in-time, manual, no lag because there's no streaming relationship. Detailed walk in `08-replication-and-read-consistency.md`.
+
+#### L4 — Encrypted cookie (the durability story)
+
+The `bi_auth` cookie is the only state that survives a Vercel cold start. It holds OAuth client information, tokens, PKCE verifier, and CSRF state — all under AES-256-GCM with `AUTH_SECRET` as the key.
+
+```typescript
+// lib/mcp/auth.ts:48-49
+const AUTH_COOKIE = 'bi_auth';
+const AUTH_COOKIE_MAX_AGE = 60 * 60 * 24 * 10; // 10 days
+```
+
+```
+  L4 — bi_auth cookie (the only true durability)
+
+  request in ──► withAuthCookies seeds ALS from cookie
+                       │
+                       │  (provider does many reads/writes)
+                       ▼
+                 ALS-scoped Store mutated in memory
+                       │
+                       │  (if dirty)
+                       ▼
+                 encrypt + Set-Cookie on response out
+```
+
+The full walkthrough lives in `07-wal-durability-and-recovery.md` — this is the closest thing the repo has to a write-ahead log, with an explicit dirty bit and a single flush per request.
 
 ### Move 3 — the principle
 
-A database's job is to be *the place* a piece of data lives. The moment a system needs more than one place for the same datum — primary + replica, table + index, hot + cold, in-memory + on-disk — you've built a database engine, whether or not you call it one. This repo deliberately keeps the answer at one place (the provider) and treats every local copy as expendable. That's the cleanest possible architecture for a *client* of someone else's datastore.
+When you read a codebase expecting a database and find none, the move is not "find the database" — it's "find who's doing each of the four jobs a database does, and ask why that's enough." In this repo three of the four jobs are absorbed by something else (query planning lives in Bloomreach, indexing is replaced by a cache, row storage is per-process), and the fourth (durability) is honestly partial — only the auth cookie survives a crash. Recognizing that pattern is faster than hunting for a missing `prisma/`.
 
 ## Primary diagram
 
-```
-  The full database systems map for this repo
+The full map, with the layers, the durability spectrum, and the only seam a user touches.
 
-  ┌─ UI / browser ────────────────────────────────────────────┐
-  │  sessionStorage: bi:insight:<id> · bi:diag:<id>             │
-  │  localStorage:   bi:mode                                    │
-  └─────────────────────────────┬───────────────────────────────┘
-                                │ fetch / NDJSON
-  ┌─ App / service ─────────────▼───────────────────────────────┐
-  │  routes: /api/briefing · /api/agent · /api/mcp/*             │
-  │  agents: monitoring · diagnostic · recommendation · query    │
-  └─────────────────────────────┬───────────────────────────────┘
-                                │ Map.get / Map.set
-  ┌─ Local state (heap + dev FS) ▼──────────────────────────────┐
-  │  L0 in-mem  Map<sessionId, SessionFeed>     insights.ts:14   │
-  │  L0 in-mem  Map<insightId, AgentEvent[]>    invest.ts:11     │
-  │  L0 in-mem  Map<key, {result, expiresAt}>   ds:122 (60s TTL) │
-  │  L1 dev-fs  .investigation-cache.json       (dev only)       │
-  │  L1 dev-fs  .auth-cache.json                (dev only)       │
-  │  L2 repo    demo-insights.json   demo-investigations.json    │
-  └─────────────────────────────┬───────────────────────────────┘
-                                │ callTool(name, args)
-  ┌─ Adapter ───────────────────▼───────────────────────────────┐
-  │  BloomreachDataSource: rate-limit · retry · cache · errors   │
-  └─────────────────────────────┬───────────────────────────────┘
-                                │ MCP over HTTP (OAuth+PKCE)
-  ┌─ Provider ──────────────────▼───────────────────────────────┐
-  │  Bloomreach Engagement (loomi connect MCP server)            │
-  │  CANONICAL DATA OF RECORD                                    │
-  └──────────────────────────────────────────────────────────────┘
+```
+  The datastore map — four layers, one axis (durability)
+
+  ┌─ Browser ──────────────────────────────────────────────────┐
+  │  cookie: bi_auth (encrypted)              ◄── 10 days       │
+  └──────────────────────────────┬─────────────────────────────┘
+                                 │  every request
+  ┌─ Vercel function ────────────▼─────────────────────────────┐
+  │                                                             │
+  │  ┌─ Process memory ───────────────────────────────────┐    │
+  │  │  L1: sessionState Map  (insights/inv/anom per sid) │    │
+  │  │  L2: cache Map         (60s TTL response cache)    │    │
+  │  └────────────────────────────────────────────────────┘    │
+  │         ▲                                                   │
+  │         │ if ?demo=cached                                   │
+  │         │                                                   │
+  │  ┌─ Filesystem (RO) ──────────────────────────────────┐    │
+  │  │  L3: lib/state/demo-*.json  (committed snapshot)   │    │
+  │  └────────────────────────────────────────────────────┘    │
+  │                                                             │
+  └─────────────────────────────────────────────────────────────┘
+
+  durability spectrum:
+    L2 < L1 < L3 < L4
+    60s   restart  deploy   10 days
 ```
 
 ## Elaborate
 
-The "no DB by design" call is unusual but defensible. Three places it shows up in industry:
+The interesting historical note: the repo *did* once have a real database. PR #8 removed the Olist SQLite adapter — there was a `live-sql` mode in the factory, an `OlistDataSource` that read from a local SQLite file, and the comment in `lib/data-source/types.ts:8` still names it ("an Olist (SQL-backed) adapter previously lived behind this seam and was removed"). So the DataSource seam was designed to support real databases; the codebase just doesn't have one today.
 
-  - **Pure analytics frontends** over a warehouse you don't own — Looker, Mode, Hex. The visualization layer is stateless; the warehouse is the database.
-  - **Agent frameworks** that wrap a third-party API — the agent's state is the conversation, the data is whoever's behind the tool calls.
-  - **Edge-rendered marketing sites** with CMS-as-database — Sanity, Contentful. The CMS is the store; the frontend has no schema of its own.
+The reason matters: the product's whole value is "talk to *your* Bloomreach workspace." Bloomreach owns the database. The MCP server owns the EQL planner. The model owns the reasoning. This app owns the orchestration and the UI — and orchestration state (the current briefing, the current investigation) is fine to lose on a restart because the user can always re-run it.
 
-What unites them: the product owns *behavior over someone else's data*, not data of its own. The minute that flips — first user-owned record — a real datastore lands. That's the inflection point F1 in `audit.md` is tracking.
+That's why the durability story is so thin: there's nothing valuable enough to persist except the OAuth tokens, and those got the one real piece of crypto work in the codebase.
 
 ## Interview defense
 
-> Q: "Walk me through the data layer of this app."
+**Q: Where does the data live in this app?**
 
-Verdict first: this app has no datastore of its own. The canonical data lives in Bloomreach Engagement, accessed via EQL through an MCP server. Local "state" is three in-memory Maps — one for the per-session feed of insights, one for cached investigations, and a 60-second TTL response cache on the data-source adapter — plus committed demo snapshots that serve as a frozen replica for offline demos.
+The answer is a map (mental, not data-structure) of four layers:
 
 ```
-  the three-tier picture you draw while answering
-
-  Bloomreach  ◄── EQL ──  Adapter (60s cache) ◄── Map.get ──  App state
-   (record)                 (cached copy)               (computed views)
+  L1  in-memory Map        per-process, per-session sub-maps
+  L2  60s response cache   per-process, key-by-call-args
+  L3  demo-*.json          read-only, committed
+  L4  bi_auth cookie       encrypted, survives instance churn
 ```
 
-The single load-bearing invariant: every layer below the provider is *derivative*. Nothing in this repo is the only place a fact lives. That's what makes the absence of WAL, transactions, and replication a deliberate choice rather than a missing feature.
+The lead is: "there's no database. The four pieces of state are…" — then walk the picture above. The load-bearing detail is that the outer `Map` is keyed by sessionId so one user's `clear()` can't wipe another user's data.
 
-> Q: "Why no Postgres? Wouldn't that make a lot of this easier?"
+**Q: How do you decide which layer something belongs in?**
 
-It would make a *different* thing easier — a product where you save investigations across sessions, share them with teammates, audit them later. None of that is in the product today. Adding Postgres now means either duplicating Bloomreach (a sync problem) or building a product surface that doesn't exist yet. The right move is to keep the datastore-shaped hole vacant until product clarifies what canonical data we'd own.
+Trace durability. If the thing must survive a Vercel cold start, it goes in the cookie (and gets crypto). If it must survive within one user's session but not across sessions, it goes in the L1 Map. If it's a repeat-call optimization with no correctness implications, it goes in the L2 cache. If it's frozen demo data, it goes in L3. The axis IS the decision rule.
 
-> Q: "What's the worst thing that can happen with this no-DB shape?"
+**Q: What's the biggest risk in this design?**
 
-User loses their feed when the serverless instance recycles, and clicks "refresh" to recompute. That's a UX cost — not a correctness cost — because no information lived only in the local Map.
+The L1 Map has no recovery. If a Vercel instance recycles mid-briefing, the user sees their feed evaporate and has to re-run. That's by design (the briefing is cheap to redo and the alpha server's rate limits make persistence-then-recovery more complex than just re-running), but it's the load-bearing limitation of "no database."
 
 ## See also
 
-  - [`02-records-pages-and-storage-layout.md`](./02-records-pages-and-storage-layout.md) — what a "row" looks like when your table is a `Map`
-  - [`07-wal-durability-and-recovery.md`](./07-wal-durability-and-recovery.md) — what "restart loses state" means in detail
-  - [`audit.md`](./audit.md) — F1 "no DB by design" framing
-  - `.aipe/study-system-design/` — the provider boundary, caching pattern, rate-limit retry
+- `02-records-pages-and-storage-layout.md` — how the session is laid out, why the partition is load-bearing
+- `03-btree-hash-and-secondary-indexes.md` — the cache key as a hash index
+- `07-wal-durability-and-recovery.md` — the bi_auth cookie as the one real durability story
+- `08-replication-and-read-consistency.md` — the demo snapshot as a frozen read replica
+- `09-database-systems-red-flags-audit.md` — ranked risks

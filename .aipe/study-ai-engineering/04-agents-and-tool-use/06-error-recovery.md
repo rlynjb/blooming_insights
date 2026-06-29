@@ -1,108 +1,97 @@
-# 06 — error recovery in agents
+# Error recovery in agents
 
-**Subtitle:** Tool errors, timeouts, runaway loops, parse failures · Industry standard
+*Industry standard — tool error feedback, infinite-loop detection, budget caps*
 
-## Zoom out, then zoom in
+## Zoom out — where this concept lives
 
-Agents fail in more ways than chains. Five common failure modes,
-mitigated by layers spread across AptKit and Blooming.
+Agents fail in more ways than chains: tool calls can error, the LLM can loop on the same tool, the call budget can blow, the network can drop, the user can cancel. Most of the recovery here is delegated to `@aptkit/core` (which owns the loop); this codebase contributes the *boundary* defenses — typed tool errors that the model sees, the rate-limit retry inside `BloomreachDataSource`, and `AbortSignal` threading for clean cancellation.
 
 ```
-  Zoom out — error sources by layer
+  Zoom out — where each defense sits
 
-  ┌─ Provider (Anthropic) ─────────────────────┐
-  │   5xx, rate limit, model error             │  ← Anthropic SDK auto-retries
-  └────────────────────────────────────────────┘
-  ┌─ Adapter (Blooming) ───────────────────────┐
-  │   typed validation failure                 │  ← parseAgentJson + isX guard
-  └────────────────────────────────────────────┘
-  ┌─ Tool registry (Blooming) ─────────────────┐
-  │   tool returns error result                │  ← BloomreachDataSource catches  ← we are here
-  │   tool times out                           │     and surfaces as McpToolError
-  │   rate-limit retry                          │
-  └────────────────────────────────────────────┘
-  ┌─ Loop (AptKit) ────────────────────────────┐
-  │   max iterations hit                       │  ← AptKit hard cap
-  │   model loops on same tool                  │  ← prompt cap (6 calls)
-  └────────────────────────────────────────────┘
-  ┌─ Route (Blooming) ─────────────────────────┐
-  │   AbortError (user navigated away)         │  ← skip error emit, close stream
-  │   any other throw                          │  ← emit { type: 'error', message }
-  └────────────────────────────────────────────┘
+  ┌─ Cancellation ───────────────────────────────────────────┐
+  │  req.signal threaded everywhere                          │
+  │  → route → agent → AptKit loop → adapter → DataSource    │
+  │  → anthropic.messages.create                             │
+  └──────────────────────────────────────────────────────────┘
+  ┌─ Tool failure (transport / rate-limit) ──────────────────┐
+  │  BloomreachDataSource.callTool:                          │
+  │   - parses 429 retry window, waits, retries (max 3)      │
+  │   - throws McpToolError tagged with tool name + detail   │
+  └──────────────────────────────────────────────────────────┘
+  ┌─ Tool failure (logic error in result) ───────────────────┐
+  │  result.isError === true                                 │
+  │  → fed back to model as tool_result with is_error: true  │
+  │  → model can retry or pick different tool                │
+  └──────────────────────────────────────────────────────────┘
+  ┌─ ★ Infinite-loop + budget defenses (AptKit) ★ ───────────┐ ← we are here
+  │  - 6-call cap enforced in prompt + library               │
+  │  - if LLM emits no tool_use → loop exits cleanly         │
+  └──────────────────────────────────────────────────────────┘
+  ┌─ LLM call failure (HTTP error, 5xx, etc.) ───────────────┐
+  │  bubbles up to route's try/catch                         │
+  │  → 'error' event on stream → UI surfaces reconnect       │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-## Structure pass
+**Zoom in.** Five failure modes, five recovery paths. The pattern is "fail at the right altitude" — transport errors at the adapter, tool-logic errors at the model, budget enforcement at the loop, cancellation everywhere.
 
-  → **One axis to trace — recovery strategy.** Each layer handles its
-    own failure mode. Lower layers (provider, tool) try to recover
-    silently (retry, timeout); middle layers (validator) reject early
-    so failure surfaces as throws not silent corruption; upper layers
-    (route) translate throws to user-facing errors.
+## Structure pass — layers · axes · seams
+
+**Layers:** UI → route → agent → adapter → MCP transport → Bloomreach.
+
+**Axis: where does each failure originate / propagate / get contained?**
+
+  → Transport errors (rate limit, 401, 5xx): originate at MCP transport, contained in `BloomreachDataSource` (retry), propagate up as `McpToolError` if retries exhausted.
+  → Tool-logic errors (`isError: true` in result): originate at Bloomreach server, propagate verbatim to the model as `is_error: true` tool_result, contained by the model picking a different tool.
+  → LLM call errors: originate at Anthropic, propagate to the route's try/catch, contained by emitting `'error'` to the stream and letting the UI handle reconnect.
+  → Cancellation: originates at the client (closed tab), propagates through `req.signal`, contained by `AbortError` swallow in route's try/catch.
+
+**Seam:** every layer's `try/catch` boundary. The route is the outermost; the agent loop's iteration is the innermost.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-Same shape as defense in depth: each layer catches what it can, throws
-what it can't, and the route handler is the last line that turns a
-throw into a user-visible message.
+You know how a try/catch can be at multiple layers — a tight try inside a function, a broader one in the caller, an outermost one at the request boundary? Same pattern here. Errors get caught at the altitude that knows how to handle them.
 
 ```
-  Failure modes + mitigations
+  Failure modes and recovery altitudes
 
   ┌──────────────────────┬──────────────────────────────────┐
-  │ Failure              │ Recovery                         │
+  │ Failure              │ Where it's caught                │
   ├──────────────────────┼──────────────────────────────────┤
-  │ Tool returns error   │ AptKit passes error as observation│
-  │ (e.g. EQL syntax)    │ → model retries with corrected   │
-  │                      │   query                           │
+  │ MCP rate limit       │ BloomreachDataSource.callTool    │
+  │                      │  (parses retry window, retries)  │
   ├──────────────────────┼──────────────────────────────────┤
-  │ Tool times out       │ 30s transport timeout in MCP     │
-  │                      │ → AbortError → loop or fail      │
+  │ MCP 401 / OAuth lost │ McpToolError → route's auth      │
+  │                      │  reconnect flow                  │
   ├──────────────────────┼──────────────────────────────────┤
-  │ Rate limit (Bloomreach)│ BloomreachDataSource parses    │
-  │                      │ retry-after, sleeps, retries up  │
-  │                      │ to 3x                            │
+  │ Tool returns isError │ Fed back to model as tool_result │
+  │                      │  with is_error: true             │
   ├──────────────────────┼──────────────────────────────────┤
-  │ Model loops on same  │ Prompt cap ("at most 6 tool      │
-  │ tool                  │ calls") + AptKit iteration limit │
+  │ LLM hallucinated     │ SDK rejects: schema mismatch     │
+  │ tool name            │  → model gets error, picks again │
   ├──────────────────────┼──────────────────────────────────┤
-  │ Model emits invalid  │ parseAgentJson throws            │
-  │ JSON                 │ → AptKit catches or rethrows;    │
-  │                      │ → route emits 'error' event       │
+  │ LLM loops on same    │ Budget cap (6 in monitoring,     │
+  │ tool                 │  library caps elsewhere)         │
   ├──────────────────────┼──────────────────────────────────┤
-  │ User navigates away  │ AbortController fires             │
-  │                      │ → throwIfAborted in loop          │
-  │                      │ → AbortError caught at route,    │
-  │                      │   error event SKIPPED             │
+  │ Budget exhausted     │ Forced final answer with         │
+  │                      │  whatever has been accumulated   │
+  ├──────────────────────┼──────────────────────────────────┤
+  │ Anthropic HTTP 5xx   │ Route's try/catch → 'error'      │
+  │                      │  event → UI handles              │
+  ├──────────────────────┼──────────────────────────────────┤
+  │ Client cancelled     │ AbortError swallowed at route;   │
+  │                      │  phase log still emits           │
   └──────────────────────┴──────────────────────────────────┘
 ```
 
 ### Move 2 — the step-by-step walkthrough
 
-**Layer 1 — tool error returns.** When `BloomreachDataSource.callTool`
-gets back a result with `isError: true`, it doesn't throw — it returns
-the error result so AptKit can pass it back to the model as an
-observation:
+**Part 1 — rate-limit retry inside the adapter.**
 
-```typescript
-// lib/data-source/bloomreach-data-source.ts:179-181
-if ((result as any)?.isError === true) {
-  return { result: result as T, durationMs, fromCache: false };
-}
-```
-
-The model sees something like `{ isError: true, content: [{type:
-'text', text: 'EQL syntax error: unexpected token'}] }` as the next
-turn's observation. Its next thought says "that query failed; let me
-fix the syntax" and it tries again. This is recovery-by-feedback —
-the model fixes its own errors when it can see them.
-
-**Layer 2 — rate-limit retry.** Bloomreach's alpha server enforces "1
-per 10 second" globally per user. `BloomreachDataSource.callTool`
-detects rate-limit errors, parses the server-stated penalty window,
-sleeps, and retries up to 3 times
-(`lib/data-source/bloomreach-data-source.ts:163-174`):
+`BloomreachDataSource.callTool` at `lib/data-source/bloomreach-data-source.ts:153-170`:
 
 ```typescript
 let retries = 0;
@@ -119,220 +108,178 @@ while (isRateLimited(result) && retries < this.maxRetries) {
 }
 ```
 
-The AptKit loop above doesn't see rate-limit retries — they're
-absorbed silently inside `callTool`. The agent's turn just takes
-longer. See `06-production-serving/05-retry-circuit-breaker.md` for
-the full pattern.
+Parses the server's stated penalty window (`"per 10 second"` or `"Retry after ~12 second(s)"`) from the error envelope, waits + a 500ms buffer, retries up to 3 times, every wait capped at `retryCeilingMs` (20s). The agent never sees rate limits — only the result, possibly delayed.
 
-**Layer 3 — tool timeout.** The MCP transport (`lib/mcp/transport.ts`)
-applies a 30s per-call timeout via `AbortSignal.timeout(30000)`
-composed with the route's `req.signal`. A tool that hangs gets
-`AbortError`'d, propagates up as `McpToolError` (with a meaningful
-`toolName` and `detail`), and the route catches it.
+**Part 2 — tool-logic errors fed back to the model.**
 
-**Layer 4 — validation failure.** When the model's final synthesis
-emits invalid JSON, `parseAgentJson` throws "no parseable json in
-agent output" (`lib/mcp/validate.ts:12`). AptKit may retry the
-model turn; if it can't, the throw propagates to the route, which
-emits `{ type: 'error', message: '...' }`.
-
-**Layer 5 — runaway loops.** Two caps:
-
-  → **Prompt cap.** Every agent prompt says "make at most N tool
-    calls then conclude" (6 for monitoring/diagnostic, 4 for
-    recommendation). This is a soft cap — the model usually
-    respects it.
-
-  → **AptKit hard cap.** AptKit's loop has a max-iteration limit
-    (configured in AptKit). If the model ignores the prompt cap and
-    keeps emitting `tool_use`, AptKit forces termination by emitting
-    a "max iterations reached, return best answer" signal.
-
-**Layer 6 — user navigates away.** When the browser cancels the
-fetch:
-  - Route handler's `req.signal.aborted` becomes true.
-  - Next `req.signal.throwIfAborted()` in the route throws
-    `DOMException: AbortError`.
-  - The route's catch (`app/api/agent/route.ts:308-310`) recognizes
-    AbortError and *skips* the error event emit (no one's listening),
-    just lets the finally close the stream.
+When a tool result comes back with `isError: true`, the adapter passes it through to the model as a `tool_result` content block with `is_error: true`. From `lib/agents/aptkit-adapters.ts:66-76`:
 
 ```typescript
-if (e instanceof DOMException && e.name === 'AbortError') {
-  return;  // skip error emit, finally still runs
+return {
+  type: 'tool_result',
+  tool_use_id: block.toolUseId,
+  content: block.content,
+  ...(block.isError ? { is_error: true } : {}),
+};
+```
+
+The model sees `is_error: true` and can either retry with different args, pick a different tool, or synthesize a final answer noting the failure. The loop continues — one tool error doesn't kill the whole investigation.
+
+**Part 3 — McpToolError for transport-level failures.**
+
+`BloomreachDataSource.callTool` throws `McpToolError` when the transport layer fails (e.g. HTTP 401). From `lib/data-source/bloomreach-data-source.ts:98-105`:
+
+```typescript
+export class McpToolError extends Error {
+  constructor(
+    public readonly toolName: string,
+    public readonly detail: string,
+    options?: { cause?: unknown },
+  ) {
+    super(`${toolName} → ${detail}`, options);
+    this.name = 'McpToolError';
+  }
 }
 ```
 
-This is the difference between *failure* (something went wrong, tell
-the user) and *cancellation* (nothing went wrong, the user just left).
-Different recovery: failure surfaces, cancellation is silent.
+This propagates up through the agent loop, through the route's try/catch, and surfaces as an `'error'` event on the stream. The UI handles `invalid_token` specifically by triggering a reconnect — see `app/api/briefing/route.ts:81-152` and the feed's auto-reconnect at `app/page.tsx`.
+
+**Part 4 — budget caps.**
+
+The monitoring agent prompt at `lib/agents/legacy-prompts/monitoring.md:18`:
+
+```
+3. Make at most 6 tool calls total, then stop and return your JSON answer.
+   Be decisive — do NOT re-run variations of the same query.
+   After 6 calls you will be forced to answer with whatever you have.
+```
+
+Prompt-level cap is the first line of defense. AptKit's library has its own internal iteration cap as the second line. Belt-and-suspenders: prompt cap can be relaxed/tightened per agent; library cap is a hard ceiling.
+
+**Part 5 — cancellation, threaded everywhere.**
+
+`req.signal` from the route enters the agent constructor and threads through every async call. From `app/api/agent/route.ts:285`:
+
+```typescript
+diagnosis = await diagAgent.investigate(inv, { ...hooksFor('diagnostic'), signal: req.signal });
+```
+
+The signal reaches every downstream call: AptKit loop, `model.complete()`, `dataSource.callTool()`. Cancellation at any depth cleanly aborts. The route's try/catch swallows `AbortError`:
+
+```typescript
+} catch (e) {
+  if (e instanceof DOMException && e.name === 'AbortError') {
+    return;
+  }
+  // ... log and emit error event for non-cancel errors
+}
+```
+
+The `finally` still fires, so the per-phase log records how much budget was burned before the cancel.
+
+**Part 6 — what's NOT explicitly defended.**
+
+  → **Infinite-loop detection beyond budget cap.** AptKit's library has internal loop detection, but this codebase doesn't add a defense layer ("if same tool + same args called twice in a row, halt"). The budget cap is the catch-all.
+  → **Circuit breaker.** No "stop calling Anthropic if N consecutive 5xx in M seconds" defense. After 3 rate-limit retries, the call returns the rate-limit envelope; the next call retries from scratch. This is honest about not being implemented.
 
 ### Move 3 — the principle
 
-**Push recovery as low in the stack as possible. Tool errors retry at
-the tool layer; rate limits retry at the transport layer; runaway loops
-are bounded at the loop layer; the route is only the last
-catch-and-translate. Each layer's recovery makes the layers above it
-simpler.** The opposite anti-pattern is "everything throws to the
-route handler" — which works in tutorials and falls over in production
-because the route has no idea how to recover from a rate limit when
-the agent loop is mid-investigation.
+**Fail at the right altitude.** Transport errors at the transport layer; tool-logic errors at the model layer; budget caps at the loop layer; cancellation at every layer. Pushing every error to one top-level catch would lose the recovery context. The structural commitment is "every layer knows what to do with the errors that originate at its own boundary."
 
-## Primary diagram
+## Primary diagram — the full recap
 
 ```
-  Failure flow — error sources, mitigations, escape points
+  Error recovery — five failure modes, five paths
 
-  ┌─ Route handler (app/api/agent/route.ts) ──────────────────┐
-  │                                                            │
-  │  ┌─ AptKit agent loop ──────────────────────────────────┐ │
-  │  │                                                       │ │
-  │  │  ┌─ adapter.complete() ─┐                             │ │
-  │  │  │  Anthropic SDK retries│  ← provider errors handled│ │
-  │  │  └──────────┬────────────┘                             │ │
-  │  │             │                                          │ │
-  │  │             ▼ tool_use detected                        │ │
-  │  │  ┌─ BloomingToolRegistryAdapter ─┐                    │ │
-  │  │  │  ┌─ BloomreachDataSource ────┐ │                   │ │
-  │  │  │  │  rate-limit retry  ◄──────┘ │  ← absorbed       │ │
-  │  │  │  │  cache hit                  │                    │ │
-  │  │  │  │  transport timeout 30s      │  ← AbortError up   │ │
-  │  │  │  │  isError → return result    │  ← model recovers  │ │
-  │  │  │  └────────────────────────────┘                    │ │
-  │  │  └──────────┬────────────────────┘                     │ │
-  │  │             │                                          │ │
-  │  │             ▼ tool result back to model                │ │
-  │  │             │                                          │ │
-  │  │  iteration cap hit? ─── yes ─► force terminate         │ │
-  │  │       │ no                                             │ │
-  │  │       ▼                                                │ │
-  │  │   model emits final text                               │ │
-  │  │       │                                                │ │
-  │  │       ▼                                                │ │
-  │  │   parseAgentJson → throws if invalid                   │ │
-  │  │   isDiagnosis → throws if wrong shape                  │ │
-  │  └──────────────────────────────────────────────────────┘ │
-  │                                                            │
-  │  catch (e):                                                │
-  │    if AbortError → return (silent — user left)             │
-  │    else → send { type: 'error', message }                  │
-  │                                                            │
-  │  finally:                                                  │
-  │    dispose data source                                     │
-  │    log phase summary                                       │
-  │    controller.close()                                      │
-  └────────────────────────────────────────────────────────────┘
+  ┌─ Client cancellation ──────────────────────────────────────────┐
+  │  Browser tab closes / navigates                                │
+  │  → req.signal aborts                                           │
+  │  → AbortError propagates up                                    │
+  │  → route's catch swallows AbortError                           │
+  │  → finally still runs (phase log + dispose)                    │
+  └────────────────────────────────────────────────────────────────┘
+
+  ┌─ MCP rate limit ───────────────────────────────────────────────┐
+  │  Bloomreach returns 429-ish envelope                           │
+  │  → BloomreachDataSource parses retry window                    │
+  │  → sleep(window + 500ms), retry up to 3×                       │
+  │  → agent never sees rate limits                                │
+  └────────────────────────────────────────────────────────────────┘
+
+  ┌─ MCP 401 / OAuth lost ─────────────────────────────────────────┐
+  │  Bloomreach returns invalid_token                              │
+  │  → McpToolError propagates                                     │
+  │  → route's catch emits 'error' event                           │
+  │  → UI's auto-reconnect resets auth + reloads (guarded)         │
+  └────────────────────────────────────────────────────────────────┘
+
+  ┌─ Tool returns logic error (isError: true) ─────────────────────┐
+  │  Wrapped as tool_result with is_error: true                    │
+  │  → model sees the error                                        │
+  │  → loop continues; model retries with different args / tool    │
+  └────────────────────────────────────────────────────────────────┘
+
+  ┌─ LLM loops on same tool / budget exhausted ────────────────────┐
+  │  Iteration cap fires (6 in monitoring, varies per agent)       │
+  │  → AptKit forces final synthesis with whatever's accumulated   │
+  │  → return typed partial result                                 │
+  └────────────────────────────────────────────────────────────────┘
+
+  ┌─ Anthropic HTTP 5xx ───────────────────────────────────────────┐
+  │  SDK throws                                                    │
+  │  → propagates through adapter, agent, AptKit, route            │
+  │  → route's catch emits 'error' event                           │
+  │  → UI shows error panel                                        │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The "tool error as observation" pattern (Layer 1) is the cleanest LLM-
-specific recovery move. The model emitted a bad EQL query; the server
-said "syntax error"; the model sees the error in its next observation
-and naturally retries with a corrected query. No code change needed —
-the loop's natural feedback handles it. The prompt helps by listing
-common EQL syntax errors (`lib/agents/legacy-prompts/monitoring.md`
-has a "Common errors to avoid" section that pre-empts most of these).
+**Why tool errors go to the model, not the catch.** A tool failing is information the model can act on. If `get_funnel` returns "funnel not found," the model can pick a different tool (`list_funnels`) or try different args (a different funnel name). Bubbling tool errors up to the catch would lose the recovery context — the model would never get a chance to recover.
 
-The "AbortError is silent" distinction (Layer 6) is subtle but matters
-for production observability. Without it, every user-navigation-away
-would log an "error" line and the dashboard would show a 30% error
-rate that's actually a 30% normal-cancellation rate. The categorical
-distinction between *failure* and *cancellation* is what keeps the
-error budget meaningful.
+The distinction: *transport* errors (the server is broken, OAuth is bad, the network is down) bubble up; *logic* errors (the request was malformed, the resource doesn't exist) go to the model.
+
+**Why the rate-limit retry is inside the DataSource, not in the agent loop.** Rate limiting is a property of the Bloomreach server, not of the agent's reasoning. Putting it in the DataSource means it's transparent to every consumer (agent, route handler, test). If the rate limit logic lived in the agent layer, every agent (and every future agent) would have to know about it. The DataSource is the right altitude.
+
+**Where the recovery story is weakest.** Two known gaps:
+
+  → **No circuit breaker.** If Bloomreach is down for 30 minutes, every new request will spend 30+ seconds (3 retries × 10s each) before failing. A circuit breaker would fail-fast after N consecutive failures.
+  → **No explicit infinite-loop detection beyond budget cap.** Same tool + same args called twice in a row isn't explicitly detected; it just burns calls toward the cap. The defense is the cap; the detection isn't surgical.
+
+Both worth implementing eventually; not pressing today because volume is low and the cap catches the worst case.
 
 ## Project exercises
 
-### Exercise — surface "retry exhausted" distinctly from generic errors
+### Exercise — Add a circuit breaker around Anthropic calls
 
-  → **Exercise ID:** `study-ai-eng-04-06.1`
-  → **What to build:** Add a `RetryExhaustedError extends Error` class
-    in `lib/data-source/bloomreach-data-source.ts`, thrown when the
-    rate-limit retry loop exits without success. Catch it specifically
-    in the route and emit `{ type: 'error', message, retryable: true }`
-    so the UI can show a "wait 30s and try again" affordance.
-  → **Why it earns its place:** Today rate-limit-exhaustion looks like a
-    generic error to the UI. Distinguishing it lets the UI offer the
-    right recovery (wait, not "refresh page").
-  → **Files to touch:** `lib/data-source/bloomreach-data-source.ts`,
-    `app/api/agent/route.ts`, `lib/mcp/events.ts`,
-    `lib/hooks/useReconnectPolicy.ts`,
-    `components/feed/InsightCard.tsx` (or wherever error renders).
-  → **Done when:** Exhausting the retry budget shows a distinct
-    "rate-limited, wait 30s" message instead of generic "something
-    went wrong."
-  → **Estimated effort:** `1–4hr`
-
-### Exercise — detect "model looped on same tool" and surface
-
-  → **Exercise ID:** `study-ai-eng-04-06.2`
-  → **What to build:** In `BloomingTraceSinkAdapter`, count consecutive
-    `tool_call_start` events for the same tool name. If >3 in a row,
-    emit a `{ type: 'warning', message: 'model looping on toolX' }`
-    event. The UI can show a soft warning in the trace.
-  → **Why it earns its place:** Today repeated tool calls are invisible
-    — you have to scroll the trace to notice. Making it surface
-    automatically lets you spot prompt-tuning opportunities.
-  → **Files to touch:** `lib/agents/aptkit-adapters.ts:100-141`,
-    `lib/mcp/events.ts`, `components/investigation/ReasoningTrace.tsx`.
-  → **Done when:** An investigation where the model calls
-    `execute_analytics_eql` 4 times in a row shows a warning chip in
-    the StatusLog.
-  → **Estimated effort:** `1–4hr`
+  → **Exercise ID:** B4.6
+  → **What to build:** Wrap `AnthropicModelProviderAdapter.complete()` with a circuit breaker. After 5 consecutive failures in a 60s window, open the circuit — all `complete()` calls fail fast with `CircuitOpenError` for 60s. After 60s, half-open: try one call. If it succeeds, close. If not, re-open. Bonus: instrument with a `circuit_state` Vercel log line so you can see when it opens / closes.
+  → **Why it earns its place:** today, if Anthropic is having an outage, every request burns the full timeout before failing — the user sees minutes of "loading" before an error. A circuit breaker means the user sees the error within ~1s after the first few requests confirm the outage. Pattern transfers to any external dependency.
+  → **Files to touch:** new `lib/agents/circuit-breaker.ts` (the breaker), `lib/agents/aptkit-adapters.ts` (wrap `complete()`), `test/agents/circuit-breaker.test.ts` (cover all three states + transitions).
+  → **Done when:** simulated Anthropic outage triggers the circuit to open after 5 failures, the breaker stays open for 60s, half-open succeeds and re-closes when service returns, and the per-call log emits `circuit_state` transitions.
+  → **Estimated effort:** 1–2 days.
 
 ## Interview defense
 
-**Q: What can go wrong during an agent investigation, and how do you
-handle each?**
+**Q: "How does your agent handle a failing tool call?"**
 
-Six failure modes, six layers:
+Two paths, depending on the failure type. *Transport* failures (rate limit, 401, network) get retry-ladder logic inside the `BloomreachDataSource` adapter — parses the server's stated retry window, waits + 500ms buffer, retries up to 3 times. The agent never sees rate limits, just the delayed result. *Logic* errors (tool returned `isError: true`) get fed back to the model verbatim as a `tool_result` with `is_error: true` — the model sees the error and can retry with different args or pick a different tool. The loop continues.
 
-```
-  source              mitigation                       layer
-  ──────              ──────────                       ─────
-  tool returns error  pass as observation, model       AptKit
-                      retries with correction
-  rate limit          parse retry-after, sleep, retry  BloomreachDataSource
-  tool timeout (30s)  AbortError → propagate           transport
-  invalid JSON        parseAgentJson throws → maybe    validator
-                      retry, then error event
-  runaway loop        prompt cap (6 calls) + AptKit    prompt + loop
-                      hard cap
-  user navigated      AbortError → SILENT (skip emit) route catch
-```
+The structural commitment: errors get caught at the altitude that knows how to recover, not at one global try/catch.
 
-Push recovery as low as possible. The route's catch is the
-catch-and-translate — it doesn't recover, it just turns whatever
-escaped into either a user-visible error event or a silent close
-(for AbortError, which means "user left, nothing went wrong").
+*Anchor: "Transport: retry in `BloomreachDataSource`. Logic: feed back to the model. Budget cap as backstop."*
 
-**Anchor line:** "Layered recovery. Each layer handles its own failure
-mode. The route is the last line — it translates throws into wire
-events but doesn't recover."
+**Q: "What happens when the agent gets stuck?"**
 
-**Q: What's the load-bearing distinction in the route's catch?**
+Budget cap fires. Monitoring's prompt enforces 6 calls max; AptKit's library has its own internal iteration cap as a backstop. When the cap hits, the loop exits with whatever's been accumulated — AptKit forces a final synthesis from the partial context. Better a partial typed output than infinite tokens.
 
-AbortError vs everything else. AbortError means the user navigated
-away — no consumer for the error event, so emitting it would just log
-noise. Everything else means actual failure — emit the error event so
-the UI can show something. Without this distinction, every navigation-
-away would log as an error and your error rate would be ~30% of
-sessions instead of the real 1-2%.
+I don't have explicit "same tool + same args called twice → halt" detection. The budget cap catches that case structurally rather than surgically. The `B4.6` exercise adds a circuit breaker for the next altitude up (Anthropic-level failures).
 
-```typescript
-if (e instanceof DOMException && e.name === 'AbortError') {
-  return;  // silent — user left
-}
-// else: send error event
-```
-
-**Anchor line:** "Failure vs cancellation. AbortError is cancellation;
-it's silent. Everything else is failure; emit and surface."
+*Anchor: "Budget cap is the backstop; no surgical loop detection today; circuit breaker is the next move (`B4.6`)."*
 
 ## See also
 
-  → `01-agents-vs-chains.md` — the loop these failures happen inside
-  → `06-production-serving/05-retry-circuit-breaker.md` — the retry layer
-    that wraps the data source
-  → `06-production-serving/04-rate-limiting-backpressure.md` — the
-    rate-limit detection that triggers the retry
+  → `03-react-pattern.md` — the loop the budget cap protects
+  → `06-production-serving/04-rate-limiting-backpressure.md` — the rate-limit story from the production-serving lens
+  → `06-production-serving/05-retry-circuit-breaker.md` — the deep walk on retry + circuit breaker patterns
+  → `study-system-design/10-rate-limit-aware-mcp-client.md` — the same retry logic from the system-design lens

@@ -1,259 +1,275 @@
 # Chapter 5 — The failure story
 
-The failure question is the operational maturity probe. Anyone can ship a happy path. The senior signal is whether you've actually walked the codebase asking *"what happens when this returns nothing,"* *"what happens when this throws,"* *"what happens when the user navigates away mid-request."*
+  ## Opening hook
 
-This chapter walks the failure surfaces in **blooming insights** — there are five — and for each one, what the system actually does when that surface fails. Some are handled well. Some are handled honestly (you know about the gap and you've named the cost). One is genuinely a soft spot you'd fix next. The senior move is to name all three honestly, not to perform comprehensiveness on the ones that are weak.
+The scale chapter was about *what* breaks first under load. This chapter is about *what your system does* when something breaks at all. Different question. Scale is the curve; failure is the cliff. The interviewer who asks "what happens when X goes wrong" is testing whether you treat failure as a first-class output or as an afterthought you patched over.
 
-## The failure-mode map — five failure surfaces
+Most candidates treat failure handling as a stack of try/catch blocks. That's the weak shape. The strong shape is naming a *failure surface* — the boundary where something can go wrong — and saying what *travels back to the user* across that surface, on that exact failure. In this app the boundaries are clear: the OAuth dance to the alpha MCP server, the rate-limited tool call, the streaming response, malformed tool results, partial writes to in-memory state. Each gets a specific answer.
 
-The visual anchor. Trace one row at a time — failure surface on the left, system behavior on the right, your defense underneath.
+The picture below is the failure-surface map. Walk it once, then walk each surface in the body.
 
-```
-  blooming insights — failure surfaces and current behavior
-
-  ─────────────────────────────────────────────────────────────────────────
-  FAILURE SURFACE                  WHAT THE SYSTEM DOES TODAY
-  ─────────────────────────────────────────────────────────────────────────
-
-  1.  Bloomreach token             useReconnectPolicy detects invalid_token
-      revoked mid-session          in the NDJSON error event, resets auth
-      (the alpha behavior)         state, reloads the feed once (guarded
-                                   against re-loops). Demo mode is the
-                                   reliable presentation fallback —
-                                   ?demo=cached serves the committed
-                                   snapshot, no auth.
-
-  2.  Bloomreach 429               BloomreachDataSource retries with the
-      (rate limit hit)             configured spacing (~1.1s baseline).
-                                   On repeated failure the agent receives
-                                   an error tool-result and decides what
-                                   to do (usually: surface as best-effort
-                                   evidence in the trace, continue).
-
-  3.  Anthropic API outage         The agent loop surfaces the API error
-      or partial response          as a real error JSON in the NDJSON
-                                   stream. UI shows an error panel with
-                                   a reconnect button. Bare 500s used to
-                                   leak from /api/briefing setup
-                                   (Chapter 6, hard bug 2 — fixed).
-
-  4.  Malformed EQL result         validate.ts rejects shapes that don't
-      from Bloomreach              match the WorkspaceSchema; the result
-                                   never reaches the agent. Tool call
-                                   ends with a structured error the
-                                   agent can reason about.
-
-  5.  User navigates away          useInvestigation's StrictMode-safe
-      mid-fetch                    pattern (Chapter 6, hard bug 1) means
-                                   the fetch is not cancelled on unmount
-                                   — setState after unmount is a safe
-                                   no-op. Pending writes complete; the
-                                   user's next session hydrates from
-                                   sessionStorage if they back-nav.
-```
-
-Five surfaces, five behaviors. Now defend each. The trap is to claim a behavior the system doesn't actually have. Don't — every defense below is anchored to real code.
-
-## Failure 1 — Bloomreach token revoke (the alpha killer)
+  ## The picture you draw — the failure-mode map
 
 ```
-  ┌─────────────────────────────────────────────────┐
-  │ THEY ASK                                        │
-  │   "What happens if the upstream auth fails      │
-  │    mid-session?"                                │
-  │                                                 │
-  │ WHAT THEY'RE TESTING                            │
-  │   Have you thought about non-happy-path auth?   │
-  │   Specifically: do you handle the case where a  │
-  │   token is valid when you start and invalid     │
-  │   30 seconds later?                             │
-  └─────────────────────────────────────────────────┘
+  Failure surfaces — what happens at each boundary when it gives way
+
+  ┌─ UI ─────────────────────────────────────────────────────────┐
+  │  StrictMode double-fetch (dev) → guard at useInvestigation   │
+  │  network drop mid-stream     → reader breaks, "reconnect"    │
+  │  malformed NDJSON line       → readNdjson swallows, continues │
+  └──────────────────────────────────────────────────────────────┘
+                            │ NDJSON over fetch
+                            ▼
+  ┌─ Service ────────────────────────────────────────────────────┐
+  │  setup throw before stream → bare 500 (PROD-ONLY 500 BUG)    │
+  │     → fix: wrap setup INSIDE the stream; emit error event    │
+  │  agent loop maxTurns hit  → forced final synthesis turn      │
+  │  AbortError mid-stream    → real cancellation event          │
+  └──────────────────────────────────────────────────────────────┘
+                            │ DataSource.callTool
+                            ▼
+  ┌─ DataSource (Bloomreach) ────────────────────────────────────┐
+  │  token revoked (minutes) → invalid_token error event,        │
+  │     UI auto-reconnect (guarded, one-shot)                     │
+  │  rate-limit 429           → McpClient retry with backoff      │
+  │  malformed MCP envelope  → unwrap() prefers structuredContent │
+  │     else content[0].text; result rides through                │
+  │  tool throws server-side → toolResult.isError=true,           │
+  │     loop carries is_error:true back to model                  │
+  └──────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+                  Bloomreach loomi connect (alpha)
+                  rate-limited · revokes tokens · sometimes 500s
 ```
 
-The strong answer:
+Five surfaces. Each row is a real failure mode with a real handler. The boxes are the layer that catches it; the arrows are what travels back up. The reader who memorizes this picture has the whole chapter.
 
-> "This was the single most consequential reliability constraint in the project. The Bloomreach loomi connect alpha server **revokes tokens after minutes**. Not an hour, not a day — minutes. That means a token I issued at the start of a briefing can be invalid by the time the agent is partway through its tool calls.
+  ## The body — the failure surfaces walked
+
+  ### Failure 1 — the bare 500 (the prod-only setup failure)
+
+This is the gold-thread failure story for this chapter, because it isn't a single failure — it's a class of failure (setup-phase exception in a streaming app) that you only saw once it bit you in production.
+
+```
+  ┌─────────────────────────────────────────────────────────────┐
+  │ THEY ASK                                                    │
+  │   "What happens if the agent loop fails before the stream   │
+  │    even starts?"                                            │
+  │                                                             │
+  │ WHAT THEY'RE TESTING                                        │
+  │   Do you understand the failure mode of a streaming app?    │
+  │   Where does an exception thrown during setup go? Have you  │
+  │   actually shipped a streaming endpoint and watched what    │
+  │   the user sees when it breaks?                             │
+  └─────────────────────────────────────────────────────────────┘
+```
+
+**Strong answer:**
+
+> "There's a specific bug here that taught me to think about this differently. In prod, `aesKey()` in `lib/mcp/auth.ts` throws when `AUTH_SECRET` is unset — and that throw used to happen during pre-stream setup, unguarded. Demo mode worked fine because it doesn't touch auth. Live mode worked locally because my dev env had the secret. In prod live, the route returned a bare 500 with no body, and the UI's only honest message was 'something went wrong.'
 >
-> "The defense is two-layered. First, the **detection layer** — `useReconnectPolicy` (123 LOC, one of the three custom hooks I extracted from `app/page.tsx`). When the NDJSON stream emits an error event whose code is `invalid_token`, the policy resets the OAuth state through `/api/mcp/reset` and triggers exactly one reload of the feed. There's a guard against re-loops — if the reload itself errors with the same code, we surface the error to the UI instead of looping forever.
+> The isolation by contrast is what made this teach a real lesson. Demo returned 200. Live returned 500. The only difference was the setup path. So the bug wasn't in the agent loop; it was in *where setup ran*.
 >
-> "Second, the **fallback layer** — demo mode. The default `bi:mode` is `'demo'`, which serves a committed snapshot from `lib/state/demo-insights.json`. There's no auth in the demo path. So if you're presenting this on a flight, or if the alpha server is having a bad day, demo is the reliable surface and you can demonstrate the system without depending on the upstream at all. The honest framing is that demo mode exists *because* the alpha is unreliable, not as a fake metric.
+> The fix was to wrap setup in try/catch *inside* the stream, so any setup error becomes a real NDJSON error event with a real message — the UI renders the actual problem and shows a reconnect button on auth errors. Now the streaming contract is the *only* output surface; every failure rides through it. There is no way to fail this app where the user sees a bare 500."
+
+```
+  ┃ "There is no way to fail this app where the user
+  ┃  sees a bare 500. Every failure rides through the
+  ┃  streaming contract."
+```
+
+  ### Failure 2 — token revocation mid-session
+
+The alpha Bloomreach server revokes tokens after minutes. This isn't a bug; it's a constraint of the substrate.
+
+```
+  ┌─────────────────────────────────────────────────────────────┐
+  │ THEY ASK                                                    │
+  │   "Your session token is revoked mid-briefing — what happens │
+  │    on the user's screen?"                                    │
+  │                                                              │
+  │ WHAT THEY'RE TESTING                                         │
+  │   Do you handle auth as a first-class failure mode, or only │
+  │   as a happy-path concept? Do you know what your              │
+  │   reconnect-loop looks like and what protects you from it    │
+  │   looping forever?                                            │
+  └─────────────────────────────────────────────────────────────┘
+```
+
+**Strong answer:**
+
+> "The MCP server returns an `invalid_token` error inside the tool-call result. The agent loop's adapter sees that, the trace sink emits a `tool_call_end` with the error, and the route handler turns it into an `error` NDJSON event on its way back up. The UI hook recognizes the `invalid_token` shape, hits `/api/mcp/reset` to clear the OAuth cookie, and reloads the page once.
 >
-> "Cost I'm paying: live mode is recovery-oriented. I'm not going to claim it's production-stable — it's stable enough to capture fresh snapshots locally, which I then commit for the demo path. The trigger that would change the design is a stable upstream that doesn't revoke; at that point the demo-replay machinery becomes optional rather than load-bearing."
-
-```
-  ┃ "Demo mode exists because the alpha is unreliable,
-  ┃  not as a fake metric. Calling it that out loud is
-  ┃  the senior move."
-```
-
-## Failure 2 — Bloomreach 429 (rate limit)
-
-The 429 case lives in `BloomreachDataSource` (and the old `lib/mcp/client.ts` shim before the seam was extracted).
-
-> "The data source is configured to space calls at roughly 1.1 seconds — the conservative number for the documented rate limit. When a 429 still comes back (the limit is ambiguous and the server occasionally throttles harder than documented), the data source retries with a back-off. After a configured number of retries, the call surfaces as a structured error tool-result to the agent.
+> The 'once' is the protection. There's a guard in the reconnect path so a permanently-broken auth state can't loop the page forever. After one auto-reconnect attempt, the user sees the auth error rendered as a real card with a reconnect button. They drive the next attempt manually.
 >
-> "Here's the senior signal: I don't pretend the agent recovers gracefully from every 429. What the agent does is treat the failed tool call as *evidence in its trace*. The diagnostic agent's prompt is structured to keep going on best-effort evidence — it cites what it has, names what's missing, and lowers its confidence accordingly. So a partial-data diagnosis is honest about being partial, not invented.
+> Cost I'm paying: the briefing the user was on is lost. I don't resume mid-stream; I restart. For an alpha server that revokes tokens roughly every few minutes, this is the right tradeoff — implementing mid-stream resume is significant code for a constraint that goes away once the server's auth lifetime extends."
+
+```
+  ┌─────────────────────────┬─────────────────────────────────┐
+  │ WEAK ANSWER             │ STRONG ANSWER                   │
+  ├─────────────────────────┼─────────────────────────────────┤
+  │ "The session times out  │ "MCP returns invalid_token in   │
+  │  and the user re-       │  the tool result. Loop surfaces │
+  │  authenticates. Pretty  │  it as an error event. UI       │
+  │  standard."             │  resets auth via /api/mcp/reset │
+  │                         │  and reloads ONCE — guard       │
+  │                         │  prevents infinite reload. User │
+  │                         │  loses the briefing in flight;  │
+  │                         │  trade I made for an alpha       │
+  │                         │  server."                       │
+  ├─────────────────────────┼─────────────────────────────────┤
+  │ Why it's weak: "pretty  │ Why it works: names the path     │
+  │ standard" hides that    │ the error travels (tool result  │
+  │ you didn't actually     │ → loop → NDJSON → UI), the      │
+  │ ship the reconnect      │ guard against infinite reload,  │
+  │ behavior. Generic       │ the cost owned. Specific.       │
+  │ language signals you    │                                 │
+  │ haven't done it.        │                                 │
+  └─────────────────────────┴─────────────────────────────────┘
+```
+
+  ### Failure 3 — rate-limit overrun on Bloomreach
+
+```
+  ┌─────────────────────────────────────────────────────────────┐
+  │ THEY ASK                                                    │
+  │   "An agent runs so many tool calls it hits the Bloomreach   │
+  │    rate limit. What happens?"                                │
+  │                                                              │
+  │ WHAT THEY'RE TESTING                                         │
+  │   Do you have a real strategy at the rate-limit boundary,   │
+  │   or do you let the upstream propagate? Do you know the     │
+  │   difference between retry and fail?                         │
+  └─────────────────────────────────────────────────────────────┘
+```
+
+**Strong answer:**
+
+> "Two layers of handling. First, `BloomreachDataSource` paces calls at roughly 1.1 seconds between requests — that's a floor I picked to stay under the alpha server's ~1 req/s soft limit with a safety margin. Most agent runs never see a 429 because of this pacing alone.
 >
-> "What I'd add if I were operating this in production: a circuit breaker on the data source. After N consecutive 429s in a window, fail fast and surface a 'upstream degraded' state to the UI rather than hammering. Today I don't have that — the conservative spacing has been enough."
-
-## Failure 3 — Anthropic API outage or partial response
-
-> "Two cases here. **API outage** — Anthropic returns a 5xx or the request times out. The adapter at `lib/agents/aptkit-adapters.ts` lets the error propagate; AptKit's loop surfaces it; the route handler emits a real error JSON in the NDJSON stream; the UI's error panel shows it with a reconnect button.
+> Second, when a 429 does come back — usually because the bucket is shared across whatever else is hitting Bloomreach in the same window — `McpClient` retries with backoff. The retry is bounded; after a few attempts it surfaces a real error rather than spinning. The agent loop sees `toolResult.isError = true` and the model gets a tool result with `is_error: true` in its history. Anthropic's models handle that — they typically pivot to a different tool or give up the line of inquiry rather than retrying the same call.
 >
-> "**Partial response** — the trickier case. Sonnet's streaming response gets cut off mid-tool-use block, or the final synthesis turn ends without a structured answer. The adapter logs the partial `res.usage` (lines 60 and 65) so I can see what tokens were spent before the cut. The agent loop's discipline — the **forced final synthesis turn** I built in the legacy and preserved in the AptKit migration — is the defense here: when the model budget runs out, the loop forces one more turn that has to produce a structured answer rather than another tool call. That turn can itself fail, but it bounds the unboundedness.
+> What I don't do: I don't queue across users. The rate-limit bucket is a shared external resource. If two users both trigger briefings and burn through the budget concurrently, both runs degrade — neither gets prioritized."
+
+  ### Failure 4 — malformed tool result from MCP
+
+```
+  ┌─────────────────────────────────────────────────────────────┐
+  │ THEY ASK                                                    │
+  │   "An MCP tool returns something that doesn't match the      │
+  │    schema your agent expects. What happens?"                 │
+  │                                                              │
+  │ WHAT THEY'RE TESTING                                         │
+  │   Do you trust the boundary? Or do you treat it as adversarial│
+  │   the way a senior engineer should?                          │
+  └─────────────────────────────────────────────────────────────┘
+```
+
+**Strong answer:**
+
+> "Two defenses. First, the MCP envelope is opinionated — `lib/mcp/schema.ts` has an `unwrap()` helper that prefers `structuredContent` (the typed payload) over `content[0].text` (the freeform fallback). If neither is present, it returns null and the agent gets a null result it can handle.
 >
-> "What used to leak: a bare 500 from `/api/briefing` when the **setup** before the stream threw — specifically when `aesKey()` in `lib/mcp/auth.ts` threw because `AUTH_SECRET` was unset in production. I caught that one (Chapter 6, hard bug 2) and wrapped the setup in a try/catch that returns a real error JSON with the actual cause. So 'AUTH_SECRET is required in production' now shows up in the error panel instead of a bare 500."
-
-## Failure 4 — Malformed EQL result from Bloomreach
-
-> "The validation layer is `lib/mcp/validate.ts`. Every EQL result is parsed against the expected shape before it reaches the agent — a result with missing keys, wrong types, or unexpected envelope structure is rejected. The tool call ends with a structured error the agent can reason about ('the EQL returned a malformed result with X missing') rather than the agent receiving a confused payload and producing a confused conclusion.
+> Second, the agents don't blindly trust what comes back. Each agent has prompts that ask the model to verify the shape it's reasoning over — and at the route handler boundary, every output the agent emits gets validated against the `AgentEvent` schema before going on the NDJSON wire. A bad event from the model gets dropped with a logged warning rather than poisoning the UI stream.
 >
-> "The Bloomreach MCP result envelope is also a known footgun — sometimes the data is in `structuredContent`, sometimes in `content[0].text` as a JSON string. The transport layer at `lib/mcp/transport.ts` handles that branching so the agent code never has to see it. That's the **MCP result envelope handling** that's in the *what-must-not-change* list — the agents above the transport assume a normalized shape."
+> What this misses: schema *evolution*. If Bloomreach adds a new field to a tool result, my unwrap doesn't break — it just ignores the field. If they *remove* a field the agent expected, the agent's prompt may keep referencing a field that's no longer there, and the response degrades quietly. I don't have a cross-version contract test against the live MCP today. That's a gap."
 
-## Failure 5 — User navigates away mid-fetch
+```
+  ┃ "The MCP envelope is opinionated. The boundary
+  ┃  validates. The agent doesn't blindly trust the wire."
+```
 
-This one's worth a careful walk because it ties to the trickiest bug in the project (Chapter 6, hard bug 1).
+  ### Failure 5 — AbortError from a cancelled fetch under StrictMode
 
-> "The pattern most React tutorials would tell you to write is: cancel the in-flight fetch on unmount via an AbortController. I tried that. It collided with React StrictMode in development in a specific way that caused **empty logs in development** — and only in development. The mechanism is in Chapter 6; the short version is that the cleanup-cancel and the started-guard were solving for different lifetimes, and under StrictMode they cancelled the only request and then blocked the remount from starting fresh.
+This is the user-visible failure that taught you something specific about React 19's development semantics — it deserves its own section because it's a senior-signal answer.
+
+```
+  ┌─────────────────────────────────────────────────────────────┐
+  │ THEY ASK                                                    │
+  │   "What happens when a user navigates away mid-investigation?"│
+  │                                                              │
+  │ WHAT THEY'RE TESTING                                         │
+  │   Have you thought about lifecycle? Do you understand the    │
+  │   difference between StrictMode's intentional double-render  │
+  │   and a real lifecycle event?                                │
+  └─────────────────────────────────────────────────────────────┘
+```
+
+**Strong answer:**
+
+> "There's a real bug story here. The hook is `useInvestigation`. Originally it had both an effect guard (so duplicate fetches couldn't fire under StrictMode's intentional double-mount) and a cleanup that aborted the in-flight fetch when the effect tore down. Under StrictMode in development, those two were solving for *different lifetimes*. The cleanup aborted the only fetch I had. The guard then blocked the second mount from re-firing it. The UI showed nothing — silent failure.
 >
-> "The fix at `lib/hooks/useInvestigation.ts` is to **keep the started-guard, drop the cleanup-cancel**. `setState` after unmount is a safe no-op — React just ignores it. The pending fetch completes; if the component is gone, the result is discarded; if the user back-navs (which the hook supports through `sessionStorage` hydration), the result is there for them.
+> The fix was to keep the guard, drop the cancel-on-cleanup. The guard protects against a double fetch; the cancel protects against a leaked one. Under StrictMode they were solving for different lifetimes — the guard was the right one to keep.
 >
-> "Cost I'm paying: a fetch that the user has navigated away from runs to completion and consumes upstream budget. For a portfolio app that's negligible. At production scale I'd want a debounced or coalesced cancellation that survives StrictMode — the right pattern is a single source of truth for whether the request is 'still wanted,' not a cleanup-side cancellation."
+> Now if the user really navigates away (a true unmount, not StrictMode's dev-only double mount), the fetch completes silently in the background. The browser tears down the render tree; the response data is GC'd. The Bloomreach tool calls that were in-flight do still run on the server — that's the rate-limit waste I called out in the architecture chapter as the cancellation-chain gap.
+>
+> The comment in `lib/hooks/useInvestigation.ts` explicitly says: *survives StrictMode by NOT cancelling the in-flight fetch on cleanup*. That comment is the receipt for the bug fix."
+
+  ## When you don't know
+
+The interviewer can push you into operating-system level fault tolerance — what happens if the Vercel function gets OOM-killed, how do you handle a partial write to a stream that's already been seen, what's your durability story for in-flight work. You did not design for any of that.
 
 ```
-  ┌─────────────────────────┬─────────────────────────┐
-  │ WEAK FAILURE ANSWER     │ STRONG FAILURE ANSWER   │
-  ├─────────────────────────┼─────────────────────────┤
-  │ "The system has retries │ "Five failure surfaces. │
-  │ and error handling      │ Token revoke is handled │
-  │ throughout. Errors are  │ by useReconnectPolicy   │
-  │ caught and surfaced to  │ resetting auth and      │
-  │ the user. We have a     │ reloading once with a   │
-  │ demo mode as a backup." │ guard. Rate-limit 429s  │
-  │                         │ retry, then surface as  │
-  │                         │ evidence to the agent.  │
-  │                         │ The bare-500 setup leak │
-  │                         │ used to happen and I    │
-  │                         │ fixed it..."            │
-  ├─────────────────────────┼─────────────────────────┤
-  │ Why it's weak:          │ Why it works:           │
-  │ Sweeping. Doesn't name  │ Names each surface,     │
-  │ a specific surface, a   │ each behavior, each     │
-  │ specific behavior, or   │ file. Names a real bug  │
-  │ a specific weakness.    │ that's been fixed.      │
-  │ Reads as the candidate  │ Honest about the costs  │
-  │ has rehearsed the word  │ still being paid.       │
-  │ "retries."              │                          │
-  └─────────────────────────┴─────────────────────────┘
+  ╔═══════════════════════════════════════════════════════════════╗
+  ║ WHEN YOU DON'T KNOW                                           ║
+  ║                                                               ║
+  ║   They ask: "What happens if the Vercel function gets OOM-    ║
+  ║   killed mid-briefing? How do you handle a partial write?"    ║
+  ║                                                               ║
+  ║   You don't have a durability story for in-flight work. The   ║
+  ║   briefing is ephemeral. If the function dies, the run is     ║
+  ║   gone.                                                        ║
+  ║                                                               ║
+  ║   Say:                                                        ║
+  ║   "I don't have a durability story for in-flight work. The    ║
+  ║    briefing is ephemeral by design — no persistence layer,    ║
+  ║    so if the function gets OOM-killed or hits maxDuration     ║
+  ║    mid-stream, the user sees the stream cut off and has to    ║
+  ║    re-run. The cost I'm paying for the no-DB design includes  ║
+  ║    no resume. The fix would be the same lever as 'persisted   ║
+  ║    insights' — once that becomes a real requirement, I'd add  ║
+  ║    a persistence layer and durable run records that survive   ║
+  ║    function death. Right now neither is on. If you wanted to  ║
+  ║    walk what that would look like, I'd start by checkpointing │
+  ║    the agent loop's tool-call history."                       ║
+  ║                                                               ║
+  ║   What this signals: honest about the design boundary,        ║
+  ║   names where the trigger is, offers a concrete sketch of     ║
+  ║   what you'd build. No fake confidence; no panic.             ║
+  ║                                                               ║
+  ║   Do NOT say:                                                 ║
+  ║   "Yeah, the function would restart and we'd resume from      ║
+  ║    where we left off..." — confabulating a recovery story     ║
+  ║   you didn't build is the worst move. Senior interviewers     ║
+  ║   read the code; they'll check.                               ║
+  ╚═══════════════════════════════════════════════════════════════╝
 ```
 
-## The follow-up tree
+  ## What you'd change
 
+If you were redoing the failure story today, the one change you'd reach for first is **a cross-version contract test against the live Bloomreach MCP** — something that runs nightly against the alpha server and asserts that each tool you depend on still returns the schema your agents reason over. Today, schema drift on the Bloomreach side degrades the agent output quietly. The user sees vaguer answers, not an error. A contract test surfaces the drift as a real failure before a user does. The cost is one more CI dependency on the alpha server, which is real.
+
+  ## One-page summary
+
+**Core claim:** failures travel through the streaming contract. There is no way to fail this app where the user sees a bare 500 — every failure surface emits a real, parseable event the UI can render.
+
+**Questions covered:**
+- *Setup throws before the stream starts?* → bug story: the prod-only 500 from `aesKey()`. Fix: wrap setup inside the stream.
+- *Token revoked mid-session?* → `invalid_token` → error event → UI resets auth via `/api/mcp/reset` and reloads ONCE (guarded). Briefing in flight is lost — owned cost.
+- *Rate-limit overrun?* → ~1.1s pacing first; `McpClient` retries with backoff; surfaces `isError = true` to the model; no cross-user queueing.
+- *Malformed tool result?* → `unwrap()` prefers `structuredContent` over `content[0].text`; agent events validated at route boundary. Gap: no schema-drift contract test.
+- *Navigate away mid-investigation?* → bug story: StrictMode double-fetch. Guard kept, cleanup cancel dropped. Real unmount = silent completion; in-flight Bloomreach call still runs (rate-limit waste).
+- *OOM kill / partial write?* → no durability story for in-flight work; cost of no-DB design. Trigger to add: persisted briefings.
+
+**Pull quotes:**
 ```
-  You walk the five failure surfaces.
-        │
-        ▼
-        ├─► "What's the worst failure mode?"
-        │     Token revoke mid-investigation. Honest answer:
-        │     it interrupts the user's flow even with the
-        │     reconnect, because the in-flight investigation
-        │     state isn't durable. Fix would be a more
-        │     persistent investigation store; today you re-
-        │     navigate and the investigation re-runs.
-        │
-        ├─► "How do you know about these in production?"
-        │     Honest: today I don't have production. The
-        │     real signal is the dev-time NDJSON error
-        │     event surfaced to the UI. In production I'd
-        │     add structured logs at the route boundaries
-        │     and at aptkit-adapters.ts (where res.usage is
-        │     already logged) wired into a sink. Today the
-        │     server logs go to Vercel; no aggregation.
-        │
-        ├─► "What's the worst silent failure?"
-        │     The agent producing a confident-sounding
-        │     diagnosis from partial evidence. That's not
-        │     a code bug — it's a reasoning failure. The
-        │     defense is the prompt discipline (cite
-        │     evidence, lower confidence on partials)
-        │     plus the retired eval suite's regression
-        │     check. Naming that the eval is retired is
-        │     part of the honest story (Chapter 6).
-        │
-        └─► "Have you tested the failure paths?"
-              The hard bug fixes have tests. The reconnect
-              policy has tests. The validate.ts schemas
-              have tests. 24 test files, 221 passing.
-              Honest gap: the full token-revoke-mid-stream
-              path is hard to test deterministically and
-              I haven't built the harness for it.
+┃ "There is no way to fail this app where the user
+┃  sees a bare 500. Every failure rides through the
+┃  streaming contract."
+```
+```
+┃ "The MCP envelope is opinionated. The boundary
+┃  validates. The agent doesn't blindly trust the wire."
 ```
 
-## When you don't know
-
-The territory most likely to push you past your depth is **distributed failure modes** — what happens to a request that's partially committed across two services, partial network partitions, eventual consistency under partition.
-
-```
-  ╔═══════════════════════════════════════════════╗
-  ║ WHEN YOU DON'T KNOW                           ║
-  ║                                               ║
-  ║   They ask: "What happens if the Bloomreach   ║
-  ║   call partially succeeds and your service    ║
-  ║   crashes before the result reaches the       ║
-  ║   client?"                                    ║
-  ║                                               ║
-  ║   You haven't designed for distributed        ║
-  ║   commit semantics. The system is fire-and-   ║
-  ║   stream, not transactional.                  ║
-  ║                                               ║
-  ║   Say:                                        ║
-  ║   "Honest answer: today the system isn't      ║
-  ║    transactional across that boundary. The    ║
-  ║    Bloomreach call either succeeds or fails;  ║
-  ║    if my service dies after the tool result   ║
-  ║    is in memory but before the NDJSON line    ║
-  ║    is flushed, the user reloads and the       ║
-  ║    whole briefing re-runs — the upstream      ║
-  ║    call is paid for twice. There's no idem-   ║
-  ║    potency key on the briefing scan today.    ║
-  ║    For production I'd add one: a per-session  ║
-  ║    request ID that lets a retry coalesce      ║
-  ║    against the in-flight original. I haven't  ║
-  ║    built that and I won't pretend I have."    ║
-  ║                                               ║
-  ║   What this signals: you understand what      ║
-  ║   distributed commit even means, you know     ║
-  ║   what you'd build, and you're not pretending ║
-  ║   you've shipped it.                          ║
-  ║                                               ║
-  ║   Do NOT say:                                 ║
-  ║   "The retries should handle that." They      ║
-  ║   don't. The interviewer is testing whether   ║
-  ║   you know what retries cover and what they   ║
-  ║   don't.                                      ║
-  ╚═══════════════════════════════════════════════╝
-```
-
-## What you'd change in the failure story
-
-The one weakest spot in the failure story today is **observability**. The system has good error *behavior* — it doesn't crash silently, it doesn't lose user state, it routes errors to the UI. What it lacks is a real production-grade signal that errors are happening at all. `res.usage` is logged at `lib/agents/aptkit-adapters.ts:60,65`, route handlers throw to Vercel's default logger, and that's it. The fix is structured logs at the route boundaries plus a sink — datadog, axiom, anything. The trigger is production traffic; for a portfolio project it's not worth the wiring yet.
-
-## One-page summary
-
-**Core claim:** The senior move on failures is to name the five surfaces, name what the system actually does for each, and be honest about which behaviors are robust and which are still soft.
-
-**The five failure surfaces, one line each:**
-- **Token revoke** → `useReconnectPolicy` resets auth, reloads once, with a re-loop guard. Demo is the reliable fallback.
-- **Rate-limit 429** → spacing + retry, then surface as evidence to the agent.
-- **Anthropic outage / partial** → real error JSON in the NDJSON stream; forced final synthesis bounds unboundedness.
-- **Malformed EQL** → validated at `lib/mcp/validate.ts`; rejected before reaching the agent.
-- **User navigates away** → fetch runs to completion; `setState` after unmount is a no-op; back-nav hydrates from `sessionStorage`.
-
-**Pull quote:**
-```
-  ┃ "Demo mode exists because the alpha is unreliable,
-  ┃  not as a fake metric. Calling it that out loud is
-  ┃  the senior move."
-```
-
-**What you'd change:** add structured logs at the route boundaries plus a real sink. The error *behaviors* are good; the observability is missing. Production traffic is the trigger.
+**What you'd change:** a nightly cross-version contract test against the live Bloomreach MCP, so schema drift surfaces as a real failure before the user sees vaguer agent answers.

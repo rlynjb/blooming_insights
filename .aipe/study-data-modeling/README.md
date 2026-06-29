@@ -1,98 +1,120 @@
-# Study — Data Modeling
+# Study — Data modeling
 
-The shape of persistent data in **blooming_insights**: schema, duplication,
-indexes vs queries, integrity, evolution, storage choice. The whole guide is
-about one question — *does the data's shape match how it's actually read and
-written, and can it stay correct?*
+The through-line: **does the data's shape match how it's actually read and written, and can it stay correct?** Code is cheap to change; a schema with live data in it is not. Most "data modeling" advice assumes a database with rows and indexes. This repo doesn't have one — and that itself is the most load-bearing modeling decision in the codebase.
 
-The twist for this repo: **there is no database.** State lives in in-memory
-maps, gitignored JSON dev caches, and two committed JSON snapshots. The
-"schemas" worth auditing are **TypeScript types** (`Insight`, `Anomaly`,
-`Diagnosis`, `Recommendation`, `WorkspaceSchema`), the **session-keyed Map**
-in `lib/state/insights.ts`, and the **inverted-pyramid event model** in the
-two `DataSource` adapters (`BloomreachDataSource` live; `SyntheticDataSource`
-deterministic).
+## What this guide audits
 
-```
-  The through-line, in one picture
+Persistent and quasi-persistent data here lives in three places:
 
-  ┌─ how the app READS data ───────────────────────────────┐
-  │  ad-hoc EQL  →  evidence[]  →  Insight  →  card        │
-  │  (90d vs prior 90d, every metric computed at run time) │
-  └────────────────────────────────────────────────────────┘
-                            │
-                            ▼  does the shape match the read pattern?
-  ┌─ how the app STORES data ──────────────────────────────┐
-  │  no DB · session-keyed Map<sessionId, SessionFeed>     │
-  │  dev: .auth-cache.json + .investigation-cache.json     │
-  │  demo: lib/state/demo-{insights,investigations}.json   │
-  └────────────────────────────────────────────────────────┘
-```
+1. **Type-only contracts** — the discriminated union (`AgentEvent`), the entity types (`Insight`, `Anomaly`, `Diagnosis`, `Recommendation`), and `WorkspaceSchema`. These are the schema; they live in `lib/mcp/types.ts` and `lib/mcp/events.ts`.
+2. **In-memory state, session-keyed** — a `Map<sessionId, SessionFeed>` at `lib/state/insights.ts`. Volatile by design; the durability story is "the next briefing replaces it."
+3. **JSON files on disk** — `lib/state/demo-insights.json` and `lib/state/demo-investigations.json` (committed, the demo replay snapshot); `.investigation-cache.json` and `.auth-cache.json` (dev-only, gitignored). No SQL, no migrations, no indexes.
 
-The verdict up front: **the read shape and the store shape match — for now.**
-Every metric is a fresh tool call, and "storage" is a cache of an
-already-finished briefing. No JOINs, no migrations, no indexes. The risk
-isn't that the schema is wrong; it's that **a few load-bearing invariants
-are enforced in TypeScript types and demo JSON files with no DB to guard
-them**. That's what the audit hunts.
+Everything else — agent prompts, fixtures, env vars — is configuration, not data.
 
----
-
-## Where data modeling sits — and where it doesn't
-
-Two seams keep this guide focused:
+## The two partition seams (stated up front)
 
 ```
-  data modeling     ← the SHAPE of persistent data: schema, normalization,    you are here
-                      indexes, queries, integrity, evolution
-  system design     WHICH datastore + scaling/sharding/replication
-                    (architecture, not schema shape)
-                    → .aipe/study-system-design/
-  dsa foundations   IN-MEMORY data structures (heaps, trees, graphs)
-                    → not this guide; lives elsewhere in the study family
-  software design   information-hiding / duplication in CODE
-                    (normalization is the DATA analog of that)
+  Where data-modeling stops and other studies pick up
+
+  ┌─ data modeling (HERE) ────────────────────────────┐
+  │  SHAPE of persistent data:                         │
+  │  schema · normalization · indexes · integrity      │
+  └────────────────────────┬───────────────────────────┘
+                           │ seam 1: "which datastore"
+                           ▼
+  ┌─ system design ────────────────────────────────────┐
+  │  Postgres vs Redis vs files; replication;          │
+  │  sharding; backups; durability tier                │
+  └────────────────────────┬───────────────────────────┘
+                           │ seam 2: "in-memory data structures"
+                           ▼
+  ┌─ DSA foundations ──────────────────────────────────┐
+  │  the Map as a hash table; lookup is O(1)           │
+  │  the algorithms, not the schema                    │
+  └────────────────────────────────────────────────────┘
 ```
 
-Two boundary calls to keep this guide tight:
+- **Against system-design.** "Use Postgres, shard by tenant" is architecture — over there. "This field is denormalized, here's why" is data modeling — here. The decision to *not* use a database lives in `06-access-patterns-and-storage-choice.md`.
+- **Against DSA foundations.** A `Map<string, SessionFeed>` is a hash table; the *concept* of a hash table is DSA. The *contract* of what lives in that map and how it's keyed is data modeling.
 
-- "Should we move from in-memory Maps to Postgres?" is a **system-design**
-  question (which datastore). What that Postgres schema would look like is
-  this guide.
-- "Why does `lib/state/insights.ts` use a `Map<sessionId, SessionFeed>`
-  instead of a flat `Map<insightId, Insight>`?" is this guide — it's about
-  *data shape and access pattern*. The fact that the Map happens to live in
-  memory doesn't make it a system-design question.
+## The schema diagram
 
----
+This is the model as-built. Everything else in the guide hangs off it.
+
+```
+  blooming insights — the data model as-built
+
+  ┌─ Type-only contracts (lib/mcp/types.ts, events.ts) ─────────────────┐
+  │                                                                      │
+  │  WorkspaceSchema  ── one per project, bootstrap-cached, ~immutable   │
+  │     ├── events[]:           { name, properties[], eventCount }       │
+  │     ├── customerProperties[]                                         │
+  │     ├── catalogs[]                                                   │
+  │     └── totalCustomers · totalEvents · oldestTimestamp               │
+  │                                                                      │
+  │  Anomaly ── monitoring agent output (the JSON the LLM emits)         │
+  │     │      { metric, scope[], change{value,direction,baseline},      │
+  │     │        severity, evidence[], impact?, history?, category? }    │
+  │     ▼                                                                │
+  │  Insight ── derived from Anomaly, plus id + timestamp + summary      │
+  │     │      + denormalized affectedCustomers (from Diagnosis)         │
+  │     │      + downstreamReady{diagnosis, recommendations}             │
+  │     │                                                                │
+  │     ├── 1 ─────► Diagnosis    (one per Insight, diagnostic agent)    │
+  │     │             { conclusion, evidence[], hypothesesConsidered[],  │
+  │     │               affectedCustomers?{count, segmentDescription} }  │
+  │     │                                                                │
+  │     └── 1 ─────► Recommendation[]  (many per Insight, recom. agent)  │
+  │                   { id, title, rationale, bloomreachFeature,         │
+  │                     steps[], estimatedImpact, confidence }           │
+  │                                                                      │
+  │  AgentEvent ── discriminated union, 8 variants, the wire format      │
+  │     reasoning_step | tool_call_start | tool_call_end | insight |     │
+  │     diagnosis | recommendation | done | error                        │
+  │                                                                      │
+  └──────────────────────────────────────────────────────────────────────┘
+                              │
+                              │  hydrate
+                              ▼
+  ┌─ In-memory state (lib/state/insights.ts) ───────────────────────────┐
+  │                                                                      │
+  │  Map<sessionId, SessionFeed>  ── outer map, never cleared            │
+  │     │                                                                │
+  │     └── SessionFeed                                                  │
+  │           ├── insights:        Map<insightId, Insight>               │
+  │           ├── investigations:  Map<insightId, Investigation>         │
+  │           └── anomalies:       Map<insightId, Anomaly>  (parallel)   │
+  │                                                                      │
+  └──────────────────────────────────────────────────────────────────────┘
+                              │
+                              │  serialize for replay / persistence
+                              ▼
+  ┌─ JSON files on disk ────────────────────────────────────────────────┐
+  │                                                                      │
+  │  lib/state/demo-insights.json       { insights, workspace,           │
+  │                                       coverage, trace } — committed  │
+  │  lib/state/demo-investigations.json { [insightId]: AgentEvent[] }    │
+  │                                       — committed                    │
+  │  .investigation-cache.json          dev-only, gitignored             │
+  │  .auth-cache.json                   dev-only, gitignored             │
+  │                                                                      │
+  └──────────────────────────────────────────────────────────────────────┘
+```
 
 ## Reading order
 
-Start with the overview to see the whole picture, then walk the concept
-files in number order. The audit is the capstone — read it last with the
-mechanics from the concept files already loaded.
+1. **`01-the-data-model-and-its-shape.md`** — the entities and their relationships, drawn from `lib/mcp/types.ts`. The zoom-out.
+2. **`02-normalization-and-duplication.md`** — `Anomaly` and `Insight` share four fields; `affectedCustomers` is duplicated from `Diagnosis` onto `Insight`. Which duplications are deliberate.
+3. **`03-indexing-vs-query-patterns.md`** — the access patterns and what they index on. `Map`-by-id is the only "index" the repo has.
+4. **`04-transactions-and-integrity.md`** — `parseAgentJson` + the type guards are the only integrity layer. No FKs, no checks.
+5. **`05-migrations-and-evolution.md`** — there are no migrations. The optional-field discipline that lets the demo snapshot stay valid across releases.
+6. **`06-access-patterns-and-storage-choice.md`** — the decision to not use a database, and why it's the right call for this repo today.
+7. **`07-data-modeling-red-flags-audit.md`** — the consolidated checklist scored against this codebase.
 
-| # | File | What it covers |
-|---|---|---|
-| 0 | [`00-overview.md`](./00-overview.md) | One-page map of every data shape in the repo + the no-DB framing |
-| | [`audit.md`](./audit.md) | The 7-lens checklist applied to this repo — capstone, read last |
-| 1 | [`01-the-data-model-and-its-shape.md`](./01-the-data-model-and-its-shape.md) | The entities and how they relate — `WorkspaceSchema`, `Insight`, `Anomaly`, `Diagnosis`, `Recommendation`, `AgentEvent` |
-| 2 | [`02-normalization-and-duplication.md`](./02-normalization-and-duplication.md) | What's stored twice on purpose (`Anomaly` → `Insight` enrichment), what's stored twice by accident |
-| 3 | [`03-indexing-vs-query-patterns.md`](./03-indexing-vs-query-patterns.md) | How the in-memory Maps mirror access patterns; the `Map<id, Insight>` *is* the index |
-| 4 | [`04-transactions-and-integrity.md`](./04-transactions-and-integrity.md) | Atomicity in serverless without a DB; per-session write isolation; the runtime validators |
-| 5 | [`05-migrations-and-evolution.md`](./05-migrations-and-evolution.md) | How `Insight` evolves field-by-field — optional fields + the demo JSON as a frozen migration target |
-| 6 | [`06-access-patterns-and-storage-choice.md`](./06-access-patterns-and-storage-choice.md) | Why a "no DB" choice is the right one here — the seam to system-design |
+## What you carry away
 
----
-
-## What to expect
-
-The voice is direct. The diagrams come first; prose fills in what diagrams
-can't show. Every claim points at a real file path and line range — when a
-field is enforced by a TypeScript type, the file is named; when an invariant
-is *not* enforced anywhere, the audit calls it out by name.
-
-Where the repo doesn't yet exercise a classical data-modeling concern (it
-has no migrations because it has no schema to migrate), the file says so
-honestly and shows the **buildable target** — what the concern would look
-like the day the repo grows a real datastore.
+- The data model lives in **TypeScript types**, not a schema file. The types are the contract; the `Map`s are the storage.
+- **Session isolation** is the only invariant the in-memory store has to enforce, and it does it by *never* clearing the outer map — that's the entire concurrency story.
+- **There are no migrations because there's no schema.** The optional-field discipline is the substitute, and it's load-bearing for the committed demo snapshot.
+- **The biggest red flag isn't in the data model** — it's the absence of a real one. Every page reload past the same warm Vercel instance shows yesterday's session's empty state; the demo snapshot is the persistence. Whether that's a bug or a feature is the central design call. See `06`.

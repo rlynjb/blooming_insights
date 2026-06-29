@@ -1,91 +1,129 @@
-# Design docs — overview
+# blooming insights — design docs (RFCs)
 
-Six RFCs covering every load-bearing decision in `blooming_insights`. Each one
-is a real choice the code made, written the way it should have been written
-*before* the code went in — so a reviewer, a future-you, or a promo committee
-can read the decision in five minutes and understand the cost.
+The six load-bearing decisions in this repo, written as ADR-shape RFCs. One file per decision. Each follows Context → Decision → Alternatives → Consequences → Open Questions, grounded in the real files that ship the decision.
 
-This is the **coach voice** version of the book: lead with the decision; do not
-bury it in alternatives; own the tradeoff in one sentence; surface what is
-still unresolved.
+These are not aspirational designs. Every one is already in `main`. The docs exist so a reviewer can read the *why* without having to reverse-engineer the *what* — and so when someone asks "why didn't you use Server Components?" or "why isn't there a database?" the answer doesn't depend on the right person being in the room.
 
-```
-  How these six fit together — the architectural spine
-
-  ┌─ Runtime + state ────────────────────────────────┐
-  │  RFC 1  no database                              │ session-keyed in-memory
-  │  RFC 4  framework as runtime, not data layer     │ Next.js 16 carries
-  └──────────────────────────────────────────────────┘ nothing but the request
-                       │
-                       │ produces a 30–90s stream
-                       ▼
-  ┌─ Transport ──────────────────────────────────────┐
-  │  RFC 2  NDJSON over fetch, not SSE               │ one kernel, four
-  └──────────────────────────────────────────────────┘ consumers
-                       │
-                       │ feeds a multi-agent pipeline
-                       ▼
-  ┌─ Agent topology ─────────────────────────────────┐
-  │  RFC 3  deterministic supervisor, not LLM router │ ROUTE is code,
-  │  RFC 6  AptKit primitives + adapter boundary     │ AGENT is loop
-  └──────────────────────────────────────────────────┘
-                       │
-                       │ talks to one of several backends
-                       ▼
-  ┌─ Backend seam ───────────────────────────────────┐
-  │  RFC 5  DataSource interface + adapter pattern   │ proven across
-  └──────────────────────────────────────────────────┘ 2 swaps
-```
-
-## Which decisions earned a doc
-
-The rule: a decision earns an RFC if it was **hard to reverse, had a real
-alternative on the table, and a reviewer will ask "why this way?"** Defaults
-get one-liners, not docs.
-
-| # | Decision | Reversal cost | Real alternative? |
-|---|---|---|---|
-| 1 | No database; session-keyed in-memory state | Medium (schema + migrations) | Yes — Vercel KV, Postgres |
-| 2 | NDJSON over fetch (not SSE / WebSocket) | High (4 consumers + 2 producers) | Yes — SSE was the obvious choice |
-| 3 | Deterministic supervisor, not LLM router | High (changes the failure model) | Yes — coordinator agent calling sub-agents |
-| 4 | Next.js 16 as runtime, no data primitives | Low per surface, high in aggregate | Yes — React Server Components + Suspense |
-| 5 | DataSource interface + adapter pattern | High (two adapters depend on it) | Yes — direct `McpClient` everywhere |
-| 6 | AptKit primitives + Blooming adapter boundary | Medium (rollback receipt preserved) | Yes — keep the hand-rolled loop |
-
-Six docs is the ceiling for a project this size. Anything else (Tailwind v4,
-the `bi:mode` enum, the dark-mode-only call) is a default — write it down
-inline in the code, not in a doc.
+---
 
 ## How to read these
 
-Each doc is one chapter, one decision, the canonical RFC shape:
+Each RFC names the standard industry term first and the local file/symbol in parens — "the port (`DataSource`)", "the kernel (`readNdjson`)", "the adapter (`BloomreachDataSource`)". On first mention the parens bind the term to the repo; after that the local name stands alone.
 
-1. **Title + one-line summary** — the verdict in a sentence
-2. **Context / problem** — what forced the call
-3. **Goals & non-goals** — what's in scope, what's explicitly out
-4. **The decision** — the chosen design with a diagram
-5. **Alternatives considered** — 2–3 options that were on the table, each
-   with why it lost
-6. **Tradeoffs accepted** — what this costs, named without flinching
-7. **Risks & mitigations** — what could go wrong, what guards it
-8. **Rollout / migration** — how it shipped, what changed for callers
-9. **Open questions** — what's still undecided
+The shape is the same in every doc:
 
-Read them in numeric order on first pass. After that they stand alone.
+```
+  RFC chapter shape
 
-## Coach notes — the framings that hold under scrutiny
+  ┌─ Context ───────────────────────────────┐
+  │  what forced the decision —             │
+  │  real constraints from the repo         │
+  └────────────────────┬────────────────────┘
+                       │
+  ┌─ Decision ─────────▼────────────────────┐
+  │  the chosen design, named at the top    │
+  │  one diagram of the shape               │
+  └────────────────────┬────────────────────┘
+                       │
+  ┌─ Alternatives ─────▼────────────────────┐
+  │  2–3 options that were on the table     │
+  │  each with why it lost                  │
+  └────────────────────┬────────────────────┘
+                       │
+  ┌─ Consequences ─────▼────────────────────┐
+  │  what this costs, owned without         │
+  │  flinching — and what it bought         │
+  └────────────────────┬────────────────────┘
+                       │
+  ┌─ Open Questions ───▼────────────────────┐
+  │  what's still undecided                 │
+  └─────────────────────────────────────────┘
+```
 
-These show up in every doc. They are the verbal moves that earn a senior
-reviewer's "okay, you've thought about this."
+Skip directly to whichever decision you're being pressed on. They don't depend on each other in reading order, but the dependencies between the decisions themselves are real — and named below.
 
-  → **"I chose X, accepting Y."** Never "unfortunately we had to use X."
-    The decision was deliberate. Own it.
-  → **Verdict before the matrix.** A reviewer who reads the first sentence
-    should already know which option you picked. Then walk the alternatives.
-  → **Name the load-bearing part.** The session-keying of `lib/state/insights.ts`;
-    the trailing-buffer flush in `readNdjson`; the `maxToolCalls` budget; the
-    `bootstrap` branch inside `makeDataSource`. The part a casual reader
-    misses is the part you spotlight.
-  → **Surface the open question.** A doc with no open questions reads as
-    polished marketing, not as engineering. Every one of these docs ends with
-    real unresolved decisions.
+---
+
+## Ranked — which decisions warrant a doc, and why
+
+Six made the bar. Ranked by *blast radius* (how much of the system the decision pins) — not by how clever the decision is.
+
+| # | Decision | Why it warranted a doc |
+|---|----------|------------------------|
+| 1 | No database | Pins the entire reliability story. Demo snapshot is the path that always works; live is the recovery-oriented path. Reversing this would touch session, capture, deploy, and the "instant demo" pitch. |
+| 2 | NDJSON over `fetch` stream, not SSE | Four streaming surfaces share one 64-LOC kernel. Picking SSE or WebSockets here would have meant a different transport in the browser, a different infrastructure boundary on Vercel, and a different debugging story. |
+| 3 | Deterministic supervisor (not LLM router) | The route file IS the supervisor. An LLM "coordinator agent" was the obvious move and was deliberately not taken. |
+| 4 | Framework runtime without data primitives | Next.js 16 is the runtime; React Server Components, Suspense, `use(promise)`, React Query, and SWR are not used. The 30–90s NDJSON stream IS the product. Most reviewers will assume the opposite default. |
+| 5 | DataSource seam + adapter pattern | The port (`DataSource`) survived two adapter swaps without changing caller surface. That's the receipt; the doc explains the shape so future swaps don't relitigate it. |
+| 6 | AptKit primitives + Blooming adapter boundary | Hand-rolled agent loop replaced with `@aptkit/core@0.3.0`; three Blooming adapter classes carry the boundary. Legacy lives at `*-legacy.ts` as the rollback receipt. Reversing this means owning the loop again. |
+
+The order is *roughly* outside-in: reliability story first, then the transport that delivers it, then the orchestration shape, then the framework posture, then the data-source seam, then the model-loop seam.
+
+---
+
+## Dependencies between the decisions
+
+These docs are independent reads, but the decisions themselves stack. The shape:
+
+```
+  How the six decisions depend on each other
+
+  ┌─ 01: No database ─────────────────────────┐
+  │  encrypted-cookie session + in-memory     │
+  │  session-keyed state + demo snapshot      │
+  └────────────────────┬──────────────────────┘
+                       │  the session boundary
+                       │  it pins → drives:
+  ┌─ 04: Framework runtime ▼──────────────────┐
+  │  Next.js as a stream host, not as a       │
+  │  data primitive — no RSC, no Suspense,    │
+  │  no React Query / SWR                     │
+  └────────────────────┬──────────────────────┘
+                       │  the stream is the product →
+                       │  shared transport kernel:
+  ┌─ 02: NDJSON kernel ▼──────────────────────┐
+  │  one `readNdjson` (64 LOC) consumed by    │
+  │  4 streaming surfaces                     │
+  └────────────────────┬──────────────────────┘
+                       │  what the stream carries →
+                       │  agent reasoning + tool calls:
+  ┌─ 03: Deterministic supervisor ▼───────────┐
+  │  sequential pipeline (route code) +       │
+  │  intent router (haiku) as ROUTE code      │
+  └────────────────────┬──────────────────────┘
+                       │  agents need a data backend
+                       │  AND a model loop:
+            ┌──────────┴─────────────────┐
+            ▼                            ▼
+  ┌─ 05: DataSource seam ──┐   ┌─ 06: AptKit boundary ──┐
+  │  port + adapters       │   │  AptKit owns the loop  │
+  │  factory by `bi:mode`  │   │  Blooming owns 3       │
+  │  2 adapters today      │   │  adapter classes       │
+  └────────────────────────┘   └────────────────────────┘
+```
+
+01 sets the session boundary. 04 keeps the framework out of the data path so the stream survives Vercel cold starts. 02 is the actual transport that gets the agents' work to the UI. 03 decides who decides what runs next. 05 and 06 are the two seams that let the rest of the system stay stable while the *insides* change — one swapped twice, one migrated once, neither broke its callers.
+
+---
+
+## What's NOT in this set
+
+A decision earns a doc when it's hard to reverse, had a real alternative, and a reviewer will ask "why this way?". A few choices were considered and dropped *below* the bar:
+
+- **Tailwind v4 + dark-mode-only.** Cosmetic. No data-layer or contract impact. Easy to swap.
+- **AES-256-GCM cookie store specifically.** This is an implementation detail under decision 01 (no database) — the doc covers the encrypted-cookie session as the *kind* of session store, not the cipher choice.
+- **`maxDuration = 300` on Vercel Pro.** A platform constant, not a decision. The choice it implies (long-running stream over short-lived request + queue) is covered under decisions 01 and 04.
+- **Markdown export.** Useful, not load-bearing. No alternative was on the table.
+
+If any of these become contentious later, they get a doc *then*. Premature documentation is its own debt.
+
+---
+
+## A note on the "weak" decisions
+
+Two of the six (decisions 03 and 04) push *against* the default move a reviewer would make. They're the ones to read first if you're preparing for scrutiny:
+
+- **Decision 03 (deterministic supervisor).** The popular pattern is "supervisor LLM agent." This repo intentionally did not do that. The doc owns why — and where the limit lives.
+- **Decision 04 (no Server Components / no Suspense / no React Query).** Next.js 16's selling point includes patterns this repo doesn't reach for. The doc explains why the stream itself replaces them, and where that breaks down.
+
+The other four are easier to defend. Read in any order.

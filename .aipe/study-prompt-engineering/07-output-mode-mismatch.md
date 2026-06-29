@@ -1,312 +1,308 @@
-# 07 — Output mode mismatch
+# Output mode mismatch
 
-*Chain-boundary contract violations · Industry standard*
+**Industry standard** · the failure mode at the chain-handoff seam
 
-## Zoom out, then zoom in
+## Zoom out — where output modes live
 
-Output mode mismatch lives at the seams between chains. Pull up where one chain's output meets the next chain's input.
+Five agents, two output modes. The four structured agents (monitoring, diagnostic, recommendation, intent) emit JSON; the query agent emits prose. The route assembles the message stream and the validator decides what to do with each shape. When the mode at the producer doesn't match the mode at the consumer, the parser breaks — and the failure mode is silent in production (the type guard returns false; the route returns `[]`; the user sees an empty state with no error).
 
 ```
-  Where output-mode mismatches happen — at every chain handoff
+  Zoom out — output mode is per-agent, set in two places
 
-  ┌─ diagnostic agent ──────────────────────────────────────┐
-  │  output mode: JSON object (Diagnosis)                    │
-  │  enforced: isDiagnosis() type guard                       │
-  └────────────────────┬────────────────────────────────────┘
-                       │
-                       ▼  ★ THE SEAM — output mode contract ★    ← we are here
-                       │
-  ┌─ recommendation agent ─▼─────────────────────────────────┐
-  │  input mode: JSON object (Diagnosis)                     │
-  │  expectation: diagnosis.conclusion, diagnosis.evidence    │
-  │  failure if: shape drifts, fields missing, wrong types    │
-  └──────────────────────────────────────────────────────────┘
+  ┌─ producer (the agent) ──────────────────────────────────┐
+  │   prompt: '## Output\nReturn ONLY a JSON array...'      │
+  │           '...wrapped in a ```json fenced block:'        │
+  │   →  declared mode: JSON-in-fence                        │
+  └─────────────────────────────────────────────────────────┘
+                              │  finalText
+  ┌─ consumer (the route) ───▼──────────────────────────────┐
+  │   parseAgentJson(finalText) ──► unknown                  │
+  │   isAnomalyArray(parsed)    ──► Anomaly[] | false        │
+  │   →  expected mode: JSON-in-fence                        │
+  └─────────────────────────────────────────────────────────┘
 
-  Every chain declares one output mode in its prompt. Every consumer
-  asserts that mode. A mismatch is a silent parser break — the kind of
-  bug that ships in dev and explodes in production a week later.
+  match: anomaly cards render
+  mismatch: empty state, no error
 ```
 
-This is the bug class that single-purpose chains (concept 06) and structured outputs (concept 02) collectively defend against. The chain boundary is *where the contract lives*, and getting it wrong is the most common cross-chain failure mode.
+## Zoom in
+
+Output mode mismatch is when the prompt declares one shape and the consumer expects another. The classic version: chain A returns JSON, chain B's prompt expects markdown, the parser silently fails. Subtler versions exist in this codebase: the query agent returns prose, the route knows that and streams it as text; if someone "improved" the query prompt to also return JSON, the route's prose-passthrough would render the raw JSON to the user. This concept is about how to spot mismatches in code review before they ship.
 
 ## Structure pass
 
-**Layers.** Outer: the pipeline (multiple chains in sequence). Middle: each chain's declared output mode. Innermost: the consumer's parsing expectation.
+**Layers.** Two: the *declared mode* in the prompt's `## Output` section, and the *handled mode* in the route's response-processing code.
 
-**Axis — what enforces the contract.** Walk it down:
-
-```
-  one axis — "what makes the contract enforceable?" — three layers
-
-  ┌─ pipeline layer ───────────────────┐
-  │  ENFORCED by: code review            │  human checks chain A's prompt
-  │                                       │  says what chain B expects
-  └────────────────────────────────────┘
-       ┌─ prompt layer ─────────────────┐
-       │  ENFORCED by: prompt instruction │  "Return ONLY a JSON object in
-       │  + example                        │   a ```json fence: {...}"
-       └────────────────────────────────┘
-            ┌─ runtime layer ────────────┐
-            │  ENFORCED by: type guard    │  isDiagnosis() returns boolean
-            │  (concept 02)               │  at the consumer boundary
-            └────────────────────────────┘
-```
-
-**Seams.** The chain-A-to-chain-B handoff is the load-bearing seam. If either side's understanding of "the output mode" drifts, the handoff breaks. The type guard is the runtime defense; the prompt declaration is the design-time defense; code review is the change-time defense.
-
-## How it works
-
-### Move 1 — the mental model
-
-You know how a function signature in TypeScript is a contract — caller and callee agree on input/output types and the compiler enforces it? Output mode at a chain boundary is the *same shape* of contract, except the compiler can't enforce it because the producer is an LLM emitting probabilistic text.
+**Axis traced — contract.** Hold one question constant: *what shape does the consumer expect to receive?*
 
 ```
-  Pattern — chain boundary as a contract, with three enforcement points
+  Axis = output contract — what shape, what wrapper, what guard?
 
-  ┌─ chain A ────────────────┐                    ┌─ chain B ──────────────┐
-  │  prompt declares:         │                    │  prompt expects:        │
-  │  "Return ONLY JSON object  │   ───contract───►  │  the Diagnosis shape    │
-  │   in a ```json fence:      │                    │  (conclusion, evidence, │
-  │   {conclusion, evidence,..}│                    │   hypothesesConsidered) │
-  └────────────┬─────────────┘                    └────────────┬───────────┘
-               │                                                │
-               ▼                                                ▼
-        emits text                                        validates shape
-               │                                                ▲
-               │                                                │
-               └────────► type guard at boundary ───────────────┘
-                          (isDiagnosis returns boolean)
+  ┌─ four structured agents ────────────────────────────────┐
+  │   declared:  JSON (array or object) inside ```json fence│
+  │   handled:   parseAgentJson + type guard                 │
+  │   on miss:   degrade to [] or null                       │
+  └─────────────────────────────────────────────────────────┘
 
-  Three enforcement points: prompt declaration · type guard · code review.
-  Lose any one and the contract becomes folklore.
-```
-
-The kernel: every chain has *one* declared output mode and the consumer asserts it. Lose any of the three enforcement points and the contract becomes folklore — "well, it usually returns JSON…"
-
-### Move 2 — the walkthrough
-
-**Step 1 — every chain declares its output mode in the prompt.** This is where it lives in this codebase:
-
-```
-  Where each chain declares its output mode
-
-  monitoring.md:70-71   →  "Return ONLY a JSON array of anomaly objects ...
-                            wrapped in a ```json fenced block:"
-  diagnostic.md:58-59   →  "Return ONLY a JSON object (in a ```json fenced
-                            block) of exactly this shape:"
-  recommendation.md:49-50 → "Return ONLY a JSON array (in a ```json fenced
-                            block) of at most 3 objects, each of exactly
-                            this shape:"
-  query.md:46-48        →  "Give a clear, concise answer in plain prose —
-                            a few sentences; you may use short markdown
-                            bullets. ... No JSON shape is required."
-```
-
-Two output modes in this codebase:
-
-  → **Structured JSON in a fence** (monitoring, diagnostic, recommendation, intent).
-  → **Plain prose** (query).
-
-**Note query is the odd one out.** Query returns text and the UI renders it as markdown (`StreamingResponse` component). The diagnostic chain's output flows into the recommendation chain; query's output flows to the UI directly. That's why query's output mode is different — it has a different consumer.
-
-**Step 2 — the example output IS the contract.** Look at `legacy-prompts/diagnostic.md:58-82`:
-
-```
-Return ONLY a JSON object (in a ```json fenced block) of exactly this shape:
-
-```json
-{
-  "conclusion": "string — the best-supported explanation, or an honest...",
-  "evidence": [
-    "string — one piece of evidence per item, citing tool results..."
-  ],
-  "hypothesesConsidered": [
-    {
-      "hypothesis": "string — what you tested",
-      "supported": true,
-      "reasoning": "string — why the data supports or rules this out"
-    }
-  ],
-  "affectedCustomers": {
-    "count": 0,
-    "segmentDescription": "string — optional; include only if..."
-  },
-  "timeSeries": [
-    { "day": "d-13", "value": 0 },
-    { "day": "today", "value": 51 }
-  ]
-}
-```
-```
-
-The example is *the* contract. The prose around it ("of exactly this shape") is reinforcement. The model has both the shape and a worked example to copy. The receiving end (`isDiagnosis` in `lib/mcp/validate.ts:29-35`) checks only the *required* fields — `conclusion` (string), `evidence` (array), `hypothesesConsidered` (array). Optional fields like `affectedCustomers` and `timeSeries` are checked at the UI render layer with safe defaults.
-
-**Step 3 — the type guard at the boundary.** `lib/mcp/validate.ts:29-35`:
-
-```typescript
-export function isDiagnosis(v: unknown): v is Diagnosis {
-  if (!v || typeof v !== 'object') return false;
-  const d = v as any;
-  return typeof d.conclusion === 'string'
-    && Array.isArray(d.evidence)
-    && Array.isArray(d.hypothesesConsidered);
-}
-```
-
-The runtime check. If the diagnostic agent returns a JSON object that doesn't have these three required fields, the boundary returns `false`. The caller (the recommendation chain's input handler, or the route handler) decides the fallback — in this codebase, a FALLBACK Diagnosis at `lib/agents/diagnostic-legacy.ts:16-20`:
-
-```typescript
-const FALLBACK: Diagnosis = {
-  conclusion: 'Insufficient data to determine a cause for this change.',
-  evidence: [],
-  hypothesesConsidered: [],
-};
-```
-
-The fallback satisfies the contract (it IS a valid Diagnosis). The downstream chain can run against it. Failure stays inside the diagnostic boundary; the pipeline continues.
-
-**Step 4 — the bug: chain A and chain B disagree.** This is the classic. Most common version in real codebases:
-
-```
-  Anti-pattern — output mode mismatch, the bug
-
-  chain A's prompt says:                  chain B parses with:
-  ─────────────────────                   ───────────────────
-  "Return a list of suggestions,           JSON.parse(text)
-  one per line, in markdown."              → throws on markdown
-
-  OR
-
-  chain A's prompt says:                  chain B parses with:
-  ─────────────────────                   ───────────────────
-  "Return a JSON array of strings."        const obj = JSON.parse(text)
-                                            if (obj.items) ...
-                                            → undefined, silent breakage
-
-  OR  (the dangerous one — both are JSON, both are valid)
-
-  chain A returns:                         chain B expects:
-  ────────────────                         ────────────────
-  { "suggestions": ["a", "b"] }            ["a", "b"]
-  (object with array field)                (array directly)
-                                            → silent parsing succeeds,
-                                              consumer reads .map() on
-                                              an object → empty UI
-```
-
-The third one is the *dangerous* one. Both sides are emitting and parsing JSON. The mismatch is in the *shape*, and `JSON.parse` doesn't catch it. The type guard does — that's exactly why it's at the boundary.
-
-**Step 5 — how to spot mismatches in code review.** When reviewing a PR that touches a prompt:
-
-  1. **What output mode does this prompt declare?** Read the "Output" section of the `.md` file. Find the literal example.
-  2. **What type guard validates this chain's output?** Open `lib/mcp/validate.ts`, find the `is*` function for this shape.
-  3. **What consumer reads this output?** `grep` for the type. `Diagnosis` is consumed in `lib/agents/recommendation.ts` and in the UI's `EvidencePanel`.
-  4. **Do all three agree?** If the prompt says `evidence: string[]` but the type guard checks `Array.isArray(d.evidence)` (which allows `evidence: number[]`), the type guard is too loose. If the consumer reads `evidence[0].cite` but the prompt's example has `evidence: ["string", "string"]`, the consumer is wrong.
-
-**Layers-and-hops view of the contract at runtime:**
-
-```
-  Layers-and-hops — one chain handoff, three enforcement layers
-
-  ┌─ Diagnostic agent ─────────────────────────────────────┐
-  │  prompt: "Return ONLY a JSON object {...}"              │
-  │  model emits: text                                       │
-  └──────────────┬─────────────────────────────────────────┘
-                 │ hop 1: parseAgentJson(text) → unknown
-  ┌─ Parser ▼ ─────────────────────────────────────────────┐
-  │  extract from ```json fence                              │
-  │  fall back to substring scan                             │
-  │  → unknown (could be anything)                           │
-  └──────────────┬─────────────────────────────────────────┘
-                 │ hop 2: isDiagnosis(parsed) → boolean
-  ┌─ Type guard ▼ ─────────────────────────────────────────┐
-  │  checks: conclusion string, evidence array,             │
-  │  hypothesesConsidered array                              │
-  │  → typed Diagnosis OR fallback                           │
-  └──────────────┬─────────────────────────────────────────┘
-                 │ hop 3: typed Diagnosis passed forward
-  ┌─ Recommendation agent ▼ ───────────────────────────────┐
-  │  reads diagnosis.conclusion, diagnosis.evidence         │
-  │  works because the contract held                         │
+  ┌─ query agent (prose) ───────────────────────────────────┐
+  │   declared:  plain prose, no JSON, no fence              │
+  │   handled:   streamed as text to the UI                  │
+  │   on miss:   user sees raw JSON in the chat panel        │
   └─────────────────────────────────────────────────────────┘
 ```
 
-### Move 3 — the principle
+**Seams.** The producer-consumer seam is where mismatches live. The producer's contract is in the `.md` file (the `## Output` section). The consumer's contract is in the route's parse-and-validate code. Both sides have to agree on (a) format wrapper — fence or no fence, (b) shape — array or object or string, (c) field schema — what's required, what's optional. Mismatches on any of the three produce a silent failure.
 
-A chain boundary is a contract. A contract without runtime enforcement is folklore. The prompt declares the mode, the type guard enforces it, the consumer relies on it. All three layers are necessary because the producer is probabilistic and the consumer is deterministic — the runtime check is what bridges the gap. This is the same principle as input validation at any service boundary; the LLM substrate doesn't change it, only sharpens its importance.
+## How it works
 
-## Primary diagram — output mode contract, full enforcement
+### Move 1 — the contract per agent, side by side
 
 ```
-  ┌─ design time (PR review) ────────────────────────────────────────┐
-  │  reviewer compares:                                                │
-  │    legacy-prompts/diagnostic.md "Output" section                    │
-  │    vs lib/mcp/validate.ts:isDiagnosis()                            │
-  │    vs lib/agents/recommendation.ts (and EvidencePanel.tsx) consumer│
-  └──────────────────────────┬───────────────────────────────────────┘
-                             │
-  ┌─ build time ▼ ───────────────────────────────────────────────────┐
-  │  TypeScript: `Diagnosis` type referenced by isDiagnosis +          │
-  │  consumers + agent return type — drift fails the build             │
-  └──────────────────────────┬───────────────────────────────────────┘
-                             │
-  ┌─ runtime ▼ ──────────────────────────────────────────────────────┐
-  │                                                                    │
-  │  ┌─ chain A ─────────┐    ┌─ parser ─┐    ┌─ type guard ─┐        │
-  │  │  prompt declares   │ →  │ extract  │ →  │ isDiagnosis   │       │
-  │  │  output mode +     │    │ from     │    │ returns bool   │       │
-  │  │  worked example    │    │ fence    │    │                │       │
-  │  └────────────────────┘    └──────────┘    └───────┬───────┘       │
-  │                                                     │               │
-  │                                              ┌──────▼──────┐        │
-  │                                              │ FALLBACK if  │        │
-  │                                              │ guard false  │        │
-  │                                              └──────┬───────┘        │
-  │                                                     │                │
-  │  ┌─ chain B (consumer) ──────────────────────────────▼───────────┐  │
-  │  │  reads typed Diagnosis (real or fallback) — contract held       │  │
-  │  └────────────────────────────────────────────────────────────────┘  │
-  └────────────────────────────────────────────────────────────────────┘
+  Five agents, five output contracts — read each one's ## Output section
+
+  ┌─ monitoring.md:71-72 ───────────────────────────────────┐
+  │  Return ONLY a JSON array of anomaly objects, at most    │
+  │  10 items, sorted by severity..., wrapped in a ```json   │
+  │  fenced block                                            │
+  │   → shape: array · wrapper: ```json fence · validator: isAnomalyArray
+  └─────────────────────────────────────────────────────────┘
+
+  ┌─ diagnostic.md:58-60 ──────────────────────────────────┐
+  │  Return ONLY a JSON object (in a ```json fenced block)   │
+  │  of exactly this shape: { "conclusion": ..., ... }       │
+  │   → shape: object · wrapper: ```json fence · validator: isDiagnosis
+  └─────────────────────────────────────────────────────────┘
+
+  ┌─ recommendation.md:49-50 ──────────────────────────────┐
+  │  Return ONLY a JSON array (in a ```json fenced block) of│
+  │  at most 3 objects, each of exactly this shape: ...      │
+  │   → shape: array · wrapper: ```json fence · validator: isRecommendationArray
+  └─────────────────────────────────────────────────────────┘
+
+  ┌─ intent (inline in intent.ts:29-31) ────────────────────┐
+  │  'Reply with ONLY the one word.'                         │
+  │   → shape: string (one word) · wrapper: none ·            │
+  │     validator: parseIntent (substring match)              │
+  └─────────────────────────────────────────────────────────┘
+
+  ┌─ query.md:46-50 ───────────────────────────────────────┐
+  │  Give a clear, concise answer in plain prose — a few    │
+  │  sentences; you may use short markdown bullets.          │
+  │  No JSON shape is required — just the answer text.       │
+  │   → shape: prose · wrapper: none · validator: none       │
+  └─────────────────────────────────────────────────────────┘
+```
+
+Three of the five use the same ```json fence convention; one (intent) uses bare text expected to match a substring; one (query) uses prose. The consistency where it exists is deliberate — three agents using the same wrapper means `parseAgentJson` works for all of them. Inconsistency where it exists is also deliberate (intent needs to fit in 16 tokens; prose can't be parsed).
+
+### Move 2 — the mismatch in code review
+
+Here's the bug you're looking for in a PR. Someone "improves" the query agent's prompt to also return structured data:
+
+```
+  PR diff that introduces an output-mode mismatch
+
+  --- a/lib/agents/legacy-prompts/query.md
+  +++ b/lib/agents/legacy-prompts/query.md
+  @@ -46,4 +46,8 @@ ## Output
+
+  -Give a clear, concise answer in plain prose...
+  -No JSON shape is required — just the answer text.
+  +Return a JSON object with shape:
+  +```json
+  +{ "answer": "...", "citations": [...] }
+  +```
+  +Wrap the answer in plain prose; the JSON is for the UI.
+```
+
+The diff looks reasonable. The reviewer needs to know to ask: *who consumes this output? does the consumer parse JSON?* Looking at the route:
+
+```
+  // app/api/agent/route.ts:255-257 (current)
+  const answer = await queryAgent.answer(q, intent, { ... });
+  stepFor('coordinator', 'conclusion', answer);
+  send({ type: 'done' });
+```
+
+The route does `stepFor('coordinator', 'conclusion', answer)` — passing the answer straight to the trace, which the UI renders as text. If the answer is now JSON, the user sees raw JSON in the chat panel. The fix has to land in two places: the prompt change *and* the route change *and* probably a new type guard. If only the prompt changes, the failure is silent.
+
+```
+  Code-review checklist for output-mode changes
+
+  ┌─ when reviewing a prompt change ────────────────────────┐
+  │   1. did the ## Output section change?                  │
+  │   2. who consumes this output (grep the agent's call)?  │
+  │   3. does the consumer's parsing match the new shape?   │
+  │   4. is there a type guard? does it need updating?      │
+  │   5. is the degradation path still safe?                │
+  └─────────────────────────────────────────────────────────┘
+```
+
+### Move 2 — mismatch from chain composition
+
+The other place mismatches show up: when chain A's output is chain B's input. The recommendation agent takes a `Diagnosis` (from the diagnostic agent) and an `Anomaly` (from monitoring). The contract for "what fields a Diagnosis has" is defined in `lib/mcp/types.ts`:
+
+```
+  // lib/mcp/types.ts:95-104 — the Diagnosis contract
+  export interface Diagnosis {
+    conclusion: string;
+    evidence: string[];
+    hypothesesConsidered: { hypothesis: string; supported: boolean;
+                             reasoning: string }[];
+    affectedCustomers?: { count: number; segmentDescription: string };
+    confidence?: 'high' | 'medium' | 'low';
+    timeSeries?: { day: string; value: number }[];
+  }
+```
+
+The recommendation agent's prompt interpolates the Diagnosis as JSON via the `{diagnosis}` slot:
+
+```
+  // recommendation-legacy.ts:46
+  .replace('{diagnosis}', JSON.stringify(diagnosis));
+```
+
+If a future PR adds a new required field to `Diagnosis` (let's say `severity: Severity`), three things have to update together:
+- The TypeScript type
+- The `isDiagnosis` type guard (so the new field is checked)
+- The recommendation agent's prompt (so it knows the field exists and what it means)
+
+Miss one and you have a mismatch. The TypeScript type protects the compile-time path; the type guard protects the runtime path; the prompt protects the model's understanding. All three are part of the same contract; all three move together.
+
+### Move 2 — the contract pinned in the prompt example
+
+The thing that prevents most output-mode mismatches in this codebase is the worked example in each prompt. Look at the monitoring prompt's `## Output` section: the example JSON object is *not* just illustrative; it's the canonical shape the model is expected to emit. If a developer changes the type guard to require a new field, they should also update the example. If they update the example but not the guard, the guard fails on the new field. If they update the guard but not the example, the model emits the old shape and the guard rejects.
+
+```
+  The three places the contract has to agree
+
+  ┌─ TypeScript type (lib/mcp/types.ts) ────────────────────┐
+  │   Anomaly { ... category?: CategoryId; ... }            │
+  └────────────────────────┬────────────────────────────────┘
+                           │
+  ┌─ Type guard (lib/mcp/validate.ts) ─▼────────────────────┐
+  │   isAnomalyArray checks: metric, scope, change,         │
+  │                          severity                       │
+  │   does NOT check: category, impact (optional)           │
+  └────────────────────────┬────────────────────────────────┘
+                           │
+  ┌─ Prompt example (legacy-prompts/monitoring.md:73-85) ─▼─┐
+  │   { "metric": "...", "category": "...", "scope": [...], │
+  │     "change": {...}, "severity": "...", "impact": "...",│
+  │     "evidence": [...] }                                  │
+  └─────────────────────────────────────────────────────────┘
+
+  these three must agree on:
+    - required vs optional fields
+    - enum values (severity, direction, bloomreachFeature)
+    - shape of nested objects (change, evidence)
+```
+
+When you add a new required field, you edit all three. When you add a new optional field, you edit the type + the prompt example (the guard doesn't need to check it). The discipline is: *if you change the contract, change every place it's expressed*. If you can't, you don't have one contract; you have three.
+
+### Move 2 — the silent-failure case
+
+The reason mismatch matters: the failure is silent. Look at the degrade behavior at `lib/agents/monitoring-legacy.ts:128-136`:
+
+```
+  // monitoring-legacy.ts:128-136
+  let parsed: unknown;
+  try {
+    parsed = parseAgentJson(finalText);
+  } catch {
+    return [];                              // ← parse failed → empty array
+  }
+  if (!isAnomalyArray(parsed)) return [];   // ← shape failed → empty array
+```
+
+Both failure modes return `[]`. The route still streams `done`. The UI shows "no anomalies found." The user has no idea anything went wrong. The on-call engineer sees nothing in the logs because the route didn't error. The only way to notice is to look at the captured raw output (which isn't logged) or to spot that briefings have been suspiciously empty for the last 48 hours.
+
+This is the strongest argument for evals (concept #5): the type guards prevent crashes, but they don't prevent silent regressions. An eval would catch "the monitoring agent suddenly returns 0 anomalies for inputs that used to produce 3" before it shipped. The type guards alone cannot.
+
+### Move 3 — the principle
+
+Output mode is a contract between producer and consumer, and the contract lives in three places: the producer's prompt, the consumer's parser, and the typed boundary between them. Change one without the others and you ship a silent mismatch. Read every prompt change in PR review with the question "what consumes this output?" — if the answer isn't immediately clear, the change isn't ready to merge.
+
+## Primary diagram
+
+```
+  Output mode mismatch — where it hides, how to spot it
+
+  ┌─ producer side ────────────────────────────────────────────┐
+  │  ## Output section in the .md template                      │
+  │    declares: shape, wrapper, field schema                   │
+  │  ## Output example (a worked JSON object)                   │
+  │    pins: the canonical instance                             │
+  └────────────────────────────┬───────────────────────────────┘
+                               │  finalText
+  ┌─ boundary (lib/mcp/validate.ts) ▼──────────────────────────┐
+  │  parseAgentJson  ← extracts JSON from text + fence          │
+  │  isAnomalyArray  ← narrows unknown → Anomaly[]              │
+  │  isDiagnosis     ← narrows unknown → Diagnosis              │
+  │  isRecommendationArray ← narrows unknown → Recommendation[] │
+  └────────────────────────────┬───────────────────────────────┘
+                               │  typed value | false
+  ┌─ consumer side ────────────▼───────────────────────────────┐
+  │  monitoring-legacy.ts:128-136                                │
+  │    on parse fail   → return []                              │
+  │    on guard fail   → return []                              │
+  │  route handles the empty value                              │
+  │  UI shows empty state                                       │
+  └────────────────────────────────────────────────────────────┘
+
+  silent-failure path:
+    declared mode changes  →  guard returns false  →  []  →  UI silent
+    (no log line · no error · no user-visible feedback)
 ```
 
 ## Elaborate
 
-This concept is *the most common bug class in multi-agent systems*, and the canonical version of it shows up in every framework you've seen. LangGraph has the same problem — nodes return `state` mutations, and a node that mutates `state.foo` while the next node reads `state.bar` is exactly this bug. CrewAI: agent A's output is "the answer," agent B reads "the result" — silent break. The substrate doesn't matter; the seam matters.
+The silent-failure property is what makes output mismatch sneakier than most prompt bugs. A typo in the prompt that breaks the model's reasoning shows up in the output (the user sees a weird answer). A mismatch shows up as *nothing* — the type guard returns false, the route returns the empty value, the UI handles the empty case gracefully (as it should), and there's no log line that says "the output was rejected by the guard." The guard is doing its job (degrade safely). The route is doing its job (handle empty values). The UI is doing its job (render the empty state). And yet the user has had a broken briefing for two weeks.
 
-Two places to deepen:
+The fix is observability at the guard boundary. The guards are the place where "the model gave us something we didn't accept" is decided; logging that decision (with a sampled fraction of the rejected output) is the single highest-leverage observability change this codebase could make for prompt debugging. Right now, guard failures are silent. Logging them would surface mismatches the day they ship.
 
-- **Anthropic's "Building effective agents."** Names the workflow-vs-agent distinction. Workflows (deterministic chain composition, like this codebase) make contract enforcement easier than autonomous agents because the consumer is *known* at design time.
-- **OpenAPI as a parallel.** REST APIs solved this with OpenAPI schemas + client code generation. The LLM-chain equivalent is what this codebase does informally — the type guard + the TypeScript type. The richer version would be: generate the prompt's example output from the TypeScript type so they can't drift.
+The chain-handoff version of mismatch — diagnostic output feeding recommendation input — is partially protected by TypeScript. The `Diagnosis` type's shape is enforced at compile time on the `recommendation.propose(anomaly, diagnosis)` call signature. What TypeScript doesn't protect is the *prompt's understanding* of the diagnosis shape: if the diagnostic agent's prompt is updated to put information in a new field, the recommendation agent's prompt doesn't automatically know. The handoff is typed at the data layer and prose-bound at the model layer.
 
-In this codebase, concept 02 (structured outputs) is the per-chain output mode discipline; this concept is the cross-chain version of the same enforcement. Concept 06 (single-purpose chains) is the architectural reason the contracts are *small enough* to enforce — a monolithic agent has one giant output mode that's much harder to validate.
+The reader's loopd portfolio (per `me.md`) exercises chain composition; this concept's failure mode is the one that bites all chain-composed LLM systems eventually. The discipline that prevents it: every prompt change asks "what reads this output?" and every output-shape change asks "do all three places agree?" (TypeScript type, type guard, prompt example). Make this part of code review; you won't catch every mismatch, but you'll catch the ones that would have shipped.
 
 ## Interview defense
 
-**Q: "What's output-mode mismatch?"**
+**Q: How would you catch an output-mode mismatch in code review?**
 
-Bug class at the chain boundary. *(Draw the contract diagram.)* Chain A emits an output mode (JSON array, JSON object, prose). Chain B expects an input mode. When the two disagree, the parser breaks — sometimes loudly with a `JSON.parse` throw, sometimes silently with a shape that *parses* but is the wrong type. The silent kind is the dangerous one. The defense is three layers: the prompt declares the mode + a worked example, a type guard enforces at runtime, and code review checks the prompt vs the consumer when either changes.
+A: Two-part check. **First**, on any change to a prompt's `## Output` section, grep for who calls that agent and read the parsing code: does the parser expect a fence? does the type guard expect those fields? does the route handle the new shape? If any answer is "no" or "not yet," the change isn't ready. **Second**, on any change to a type guard or a TypeScript interface like `Diagnosis`, check that the prompt's worked example reflects the new shape. The three places the contract is expressed — TypeScript type, type guard, prompt example — have to agree, and a PR that updates one without the others is a silent-failure waiting to ship. Treat the contract as a triangle: if you move one corner, you move all three.
 
 ```
-  prompt declaration  +  runtime type guard  +  code review = enforced contract
+  what I'd sketch:
+
+         TypeScript type
+         /            \
+        /              \
+  Type guard ─────── Prompt example
+
+  move one corner → must move the others
+  (compiler only enforces type ↔ guard;
+   prompt is freelance — review for it.)
 ```
 
-Anchor: *"the dangerous one is when both sides emit and parse JSON but disagree on the shape. JSON.parse doesn't catch it. The type guard does."*
+**Q: What's the worst failure mode here?**
 
-**Q: "How do you spot a mismatch in code review?"**
+A: Silent regression. The type guard returns false, the route returns the empty value, the UI renders an empty state gracefully — and nobody knows the model has been producing rejected output for the last two weeks. There's no error in the log. There's no error in the UI. The only signal is "the product seems to be returning fewer anomalies than usual." The fix that has the highest leverage is logging at the guard boundary: every time `isAnomalyArray` returns false, log the rejected output (sampled, with PII stripped) and the agent name. That single log line turns mismatches from a two-week mystery into a same-day alert. The whole "silent failures are degraded gracefully" path is good design; what's missing is the observability hook that says "degraded gracefully" without saying "and nothing is going wrong." The guard rejection is exactly that signal.
 
-Four-step check. *(Walk it.)* Open the prompt — find the "Output" section, read the literal example. Open `lib/mcp/validate.ts` — find the `is*` guard for that shape. Grep for the type — find the consumers. Compare all three. If the prompt's example has `evidence: string[]` but the guard checks `Array.isArray(evidence)` (which allows `number[]`), the guard's too loose. If the consumer reads `evidence[0].cite` but the prompt says `evidence: ["string"]`, the consumer is wrong.
+```
+  observability gap → log change to close it:
 
-Anchor: *"prompt → type guard → consumer. All three must agree. If any two diverge, the third will eventually break."*
+  today:   guard returns false → return []      (silent)
+  fix:     guard returns false → console.error( (loud)
+             { site: 'validate', agent: 'monitoring',
+               sample: sampledOutput })
+           return []
 
-**Q: "Why isn't TypeScript enough?"**
-
-Because the producer is an LLM, not a function. TypeScript catches the bug if the *consumer* references the wrong field, but TypeScript can't constrain the *output* of `anthropic.messages.create()` — that's typed as `Anthropic.Messages.ContentBlock[]`. The model can emit any JSON shape it wants inside that. The runtime type guard is the bridge — it's the moment where `unknown` becomes typed `Diagnosis`. Without it, you have TypeScript narrowing on a `(parsed as Diagnosis)` cast that's a lie.
-
-Anchor: *"TypeScript catches consumer bugs. The runtime guard catches producer bugs. Both are necessary because the producer is probabilistic."*
+  cost: one log line · benefit: same-day alerts on mismatch
+```
 
 ## See also
 
-- `02-structured-outputs.md` — the per-chain output discipline; this file is the cross-chain extension.
-- `06-single-purpose-chains.md` — small per-chain output modes are what makes the contracts enforceable; monolithic outputs are not.
-- `05-eval-driven-iteration.md` — type guards catch shape mismatches; evals catch *content* mismatches (the diagnosis was the wrong shape OR the diagnosis was the wrong *answer*).
-- `13-forbidden-patterns.md` — sometimes "output mode drift" is the model converging on a phrasing the consumer didn't expect; concept 13 walks the prevention.
+- [02-structured-outputs.md](./02-structured-outputs.md) — the parser and guards that decide what counts as a mismatch
+- [03-prompts-as-code.md](./03-prompts-as-code.md) — the prompt-change PR review is where mismatches get caught
+- [05-eval-driven-iteration.md](./05-eval-driven-iteration.md) — eval would catch behavior regressions the guards miss
+- [06-single-purpose-chains.md](./06-single-purpose-chains.md) — typed handoffs make the chain-handoff version of mismatch a compile-time error

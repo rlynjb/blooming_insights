@@ -1,246 +1,159 @@
-# Agent patterns in this codebase
+# Agent patterns in `blooming_insights`
 
-The critical file. Every agent loop in the repo, named by the pattern it instantiates, with its control envelope. Read this before any sub-section file — the sub-sections explain the patterns; this file says which one each agent is.
+What this repo actually exercises, as a table you can scan in 30 seconds. Each row is a real loop or piece of orchestration in the code, named by the pattern, anchored to the file.
 
-## The agent inventory
-
-Five active agent loops, all `runAgentLoop()` inside `@aptkit/core@0.3.0`. Plus one classifier that's a single LLM call (no loop). The Blooming-owned classes are thin wrappers — the bodies are 20-50 lines each, mostly adapter wiring.
-
-| Feature | File | Pattern / shape | Control envelope | Why this pattern |
-|---|---|---|---|---|
-| Anomaly detection | `lib/agents/monitoring.ts` → AptKit `AnomalyMonitoringAgent` | ReAct (single-agent loop) | `maxTurns=8`, `maxToolCalls=6`, forced-final synthesis | The model decides which categories to probe and in what order; the path isn't predetermined. |
-| Cause investigation | `lib/agents/diagnostic.ts` → AptKit `DiagnosticInvestigationAgent` | ReAct (single-agent loop) | `maxTurns=8`, `maxToolCalls=6`, forced-final synthesis | Hypothesis-driven — the model generates 2-3 hypotheses, falsifies each, then concludes. |
-| Action proposal | `lib/agents/recommendation.ts` → AptKit `RecommendationAgent` | ReAct (single-agent loop, tighter budget) | `maxTurns=6`, `maxToolCalls=4`, forced-final synthesis | Mostly reasoning from the diagnosis; tool calls only to check what scenarios/segments already exist. |
-| Free-form Q&A | `lib/agents/query.ts` → AptKit `QueryAgent` | ReAct (single-agent loop, broadest tool grant) | `maxTurns=8`, `maxToolCalls=6`, forced-final synthesis | Unknown path — the user could ask anything, so the model has to drive. |
-| Intent classification | `lib/agents/intent.ts` → AptKit `classifyIntent` | Single LLM call (no loop, no tools) | One call, cheap `claude-haiku-4-5-20251001` | Pure classification: `monitoring` / `diagnostic` / `recommendation`. No tool use, so no loop. |
-| Pipeline orchestration | `app/api/agent/route.ts` | Sequential pipeline — DETERMINISTIC route code | `?step=diagnose|recommend` decides | The product workflow is fixed (what changed → why → what to do); the orchestrator is the URL, not an LLM. |
-| Briefing orchestration | `app/api/briefing/route.ts` | Schema-gated single-agent invocation | `runnableCategories(capabilities)` feeds the prompt | The route gates the category checklist against the workspace before the agent starts, so the model never wastes budget on unsupported categories. |
-
-## The kernel they all share
-
-Every one of the four loop-shaped agents above is the same `runAgentLoop()` skeleton with a different prompt and tool grant. The loop lives in `@aptkit/core` and is described in `01-reasoning-patterns/02-agent-loop-skeleton.md`. The four invariants — `step → execute → accumulate → terminate` — are identical; only the prompt, tool policy, and budgets differ.
+## The table
 
 ```
-  Same skeleton, four prompts, four tool grants
-
-                      ┌────────────────────────────────────┐
-   prompt:            │  AptKit runAgentLoop (one impl)    │
-   monitoring  ──┐    │                                    │
-   diagnostic   ─┼──► │  while not done {                  │
-   recommend   ──┤    │    step  ← model.complete(...)     │
-   query       ──┘    │    if final → return                │
-                      │    result ← tools.callTool(...)     │
-   tool policy:       │    state  ← accumulate(result)      │
-   ANOMALY_MONITORING │    if budget_spent → force final    │
-   DIAGNOSTIC         │  }                                  │
-   RECOMMENDATION     └────────────────────────────────────┘
-   QUERY                       ▲
-                               │
-                tool registry (BloomingToolRegistryAdapter)
-                       │
-                       ▼
-                DataSource (Bloomreach | Synthetic)
+  Feature                       Pattern / shape              Why this pattern
+  ─────────────────────────────  ─────────────────────────    ──────────────────────────────
+  monitoring agent              single-agent ReAct loop      dynamic path — model picks
+  (lib/agents/monitoring.ts     (8 turns, 6 tool calls)      which EQL queries to run
+   → AptKit AnomalyMonitoring                                against the runnable categories
+   Agent)
+  ─────────────────────────────  ─────────────────────────    ──────────────────────────────
+  diagnostic agent              single-agent ReAct loop      dynamic path — hypothesis-
+  (lib/agents/diagnostic.ts                                  testing against the workspace
+   → AptKit DiagnosticInvest-                                until evidence is sufficient
+   igationAgent)
+  ─────────────────────────────  ─────────────────────────    ──────────────────────────────
+  recommendation agent          single-agent ReAct loop      dynamic path — reads scenarios
+  (lib/agents/recommendation                                 / segments / campaigns from
+   .ts → AptKit Recommend-                                   Bloomreach before proposing
+   ationAgent)
+  ─────────────────────────────  ─────────────────────────    ──────────────────────────────
+  query agent                   single-agent ReAct loop      free-form Q&A — wide tool
+  (lib/agents/query.ts                                       allowlist (33 tools), the
+   → AptKit QueryAgent)                                      model picks every query
+  ─────────────────────────────  ─────────────────────────    ──────────────────────────────
+  intent classifier             single-shot LLM call         deterministic routing — pick
+  (lib/agents/intent.ts                                      query vs investigation before
+   → @aptkit/core classify-                                  committing to a loop
+   Intent, Haiku-backed)
+  ─────────────────────────────  ─────────────────────────    ──────────────────────────────
+  briefing pipeline             sequential workflow,         schema-gate then scan — the
+  (app/api/briefing/route.ts)   deterministic                anomaly checklist is gated by
+                                                             schema coverage; only runnable
+                                                             categories make it to the LLM
+  ─────────────────────────────  ─────────────────────────    ──────────────────────────────
+  investigate pipeline          sequential workflow,         diagnose → recommend, the
+  (app/api/agent/route.ts)      deterministic with a         user clicks "see recommend-
+                                client-side handoff          ations" between the two steps;
+                                                             the diagnosis is handed to
+                                                             step 3 via sessionStorage
+  ─────────────────────────────  ─────────────────────────    ──────────────────────────────
+  coverage gate                 capability gating            don't ask the LLM to scan
+  (lib/agents/categories.ts +   (schema-driven allowlist)    categories the workspace can't
+   @aptkit/agent-anomaly-                                    answer — skip the EQL budget
+   monitoring categories.js)                                 entirely
+  ─────────────────────────────  ─────────────────────────    ──────────────────────────────
+  per-agent tool policy         capability gating            each AptKit agent class
+  (anomalyMonitoringToolPolicy, (least-privilege tool        ships a fixed `allowedTools`
+   diagnosticInvestigation-     allowlist per agent)         list — the model never sees
+   ToolPolicy, recommendation-                               the full 33-tool surface
+   ToolPolicy, queryToolPolicy)
+  ─────────────────────────────  ─────────────────────────    ──────────────────────────────
+  data-source seam              port / adapter               three adapters total (Bloom-
+  (lib/data-source/types.ts +   (dependency inversion)       reach over MCP, synthetic
+   factory in index.ts)                                      in-memory, plus an in-memory
+                                                             ToolRegistry for tests)
+  ─────────────────────────────  ─────────────────────────    ──────────────────────────────
+  cross-turn caching            production serving           prompt prefix (provider-side
+  (BloomreachDataSource         (three layers)               at Anthropic) + intra-run
+   60s cache + Anthropic                                     memoization (the 60s cache,
+   prompt prefix)                                            keyed by name + args)
+  ─────────────────────────────  ─────────────────────────    ──────────────────────────────
+  per-tool rate-limit retry     production serving           BloomreachDataSource parses
+  (BloomreachDataSource         (per-tool circuit break-     "retry after N seconds" from
+   retry ladder)                ish — retry, not break)      the error envelope, sleeps,
+                                                             retries up to 3×; failure
+                                                             surfaces to the agent as an
+                                                             error tool_result the model
+                                                             can route around
+  ─────────────────────────────  ─────────────────────────    ──────────────────────────────
+  budget exit                   load-bearing skeleton        every agent: maxTurns=8,
+  (run-agent-loop.js in         part                         maxToolCalls=6 (monitoring),
+   @aptkit/runtime)                                          maxTokens=4096 — the model
+                                                             can't burn budget in a silent
+                                                             loop
+  ─────────────────────────────  ─────────────────────────    ──────────────────────────────
+  synthesis instruction         load-bearing skeleton        on the final turn, tools are
+  ("forced final turn")         part                         removed from the request and
+                                                             a "you have no more tool
+                                                             calls" instruction is added —
+                                                             the model has to synthesize,
+                                                             not call another tool
+  ─────────────────────────────  ─────────────────────────    ──────────────────────────────
+  recovery prompt               agent infrastructure         monitoring agent only — if
+  (parseResult returns null →   (structured-output           tryParseAnomalies can't find
+   recoveryPrompt fires)        recovery)                    a JSON array, a recovery
+                                                             prompt restates the evidence
+                                                             and asks for ONLY the JSON
+  ─────────────────────────────  ─────────────────────────    ──────────────────────────────
+  capability trace sink         agent infrastructure         CapabilityEvent stream (step,
+  (BloomingTraceSinkAdapter →   (observable trajectory)      tool_call_start / _end, etc.)
+   AgentEvent NDJSON →                                       crosses three boundaries:
+   StatusLog UI)                                             AptKit → Blooming hooks →
+                                                             NDJSON wire → UI
+  ─────────────────────────────  ─────────────────────────    ──────────────────────────────
+  Vitest with injected fakes    agent evaluation             test ReAct loops without
+  (144 tests, no network)       (deterministic eval)         network — fake ModelProvider
+                                                             responds with scripted tool-
+                                                             use blocks; fake ToolRegistry
+                                                             returns canned results
 ```
 
-## The orchestration layer — by feature
+## What this repo does NOT use
 
-### Feature: briefing (the feed)
+Listing the absences honestly — these are the patterns covered in the rest of the guide that this repo deliberately or incidentally does not run:
 
-```
-  GET /api/briefing — monitoring agent invocation, schema-gated
+- **No LLM supervisor.** The intent classifier picks query vs investigation, but it does not orchestrate sub-agents. The briefing → diagnose → recommend pipeline is deterministic code.
+- **No debate / verifier-critic.** A second model never grades the first's output.
+- **No swarm / handoff.** Agents don't transfer control to each other; the deterministic orchestrator hands the next agent the previous agent's typed output.
+- **No graph orchestration.** No LangGraph, no state machine, no checkpointing. The handoff between diagnose (step 2) and recommend (step 3) is a `sessionStorage` write in the browser — not server-side resumable state.
+- **No plan-and-execute.** Every agent is straight ReAct; no agent builds a plan up front and then executes it.
+- **No reflexion / self-critique loop.** No model second-passes its own output.
+- **No tree-of-thoughts.** No branching exploration.
+- **No agent memory across runs.** Each agent run is fresh; the only cross-run state is the BloomreachDataSource's 60s tool-call cache (not memory in the agent-memory sense).
+- **No vector store / RAG.** The repo does not embed anything. The "retrieval" is the agent calling MCP tools to pull EQL results from Bloomreach in real time.
+- **No MCP outside Bloomreach.** One MCP server, one workspace. The MCP protocol matters here because it's the substrate every tool sits on; the *multi-server MCP* pattern doesn't apply.
+- **No human-in-the-loop pause.** Every loop runs to completion or budget; the only "human" is the user clicking "see recommendations" between step 2 and step 3, which is a deterministic pipeline boundary, not a model-gated approval.
 
-  ┌───────────────────────────────────────────────────────────────┐
-  │  Route handler — app/api/briefing/route.ts                    │
-  │                                                                │
-  │  1. bootstrap()          → fetch WorkspaceSchema (live MCP)   │
-  │  2. schemaCapabilities() → derive what events exist           │
-  │  3. coverageReport()     → 10 categories × {full|limited|none}│
-  │  4. runnableCategories() → drop unrunnable categories          │
-  │  5. dataSource.listTools() → fetch MCP tool catalog            │
-  │  6. new MonitoringAgent(...).scan({ ..., }, runnable)         │
-  │       └─► AptKit AnomalyMonitoringAgent.scan()                │
-  │             └─► runAgentLoop(maxTurns=8, maxToolCalls=6)      │
-  │                  → up to 6 EQL queries via Bloomreach          │
-  │                  → forced JSON synthesis on turn 8 or budget   │
-  │  7. anomalies.map(anomalyToInsight) → stream as `insight`     │
-  └───────────────────────────────────────────────────────────────┘
+## The control envelope, at a glance
 
-  Pattern: single-agent ReAct. Control envelope: schema-gated
-  category list narrows the search space BEFORE the model starts.
-```
-
-### Feature: investigation step 2 (diagnose)
+Every agent runs inside the same envelope. Specifics live in `04-agent-infrastructure/05-guardrails-and-control.md`; here's the summary so you can see the shape:
 
 ```
-  GET /api/agent?insightId=X&step=diagnose — diagnostic agent only
+  ┌─ Input guardrail ─────────────────────────────────┐
+  │  schema-coverage gate (monitoring only)            │
+  │  intent classifier (query agent only)              │
+  │  no input sanitization on the user's free-form q   │
+  └─────────────────────────────────────────────────┘
 
-  ┌───────────────────────────────────────────────────────────────┐
-  │  Route handler — app/api/agent/route.ts                       │
-  │                                                                │
-  │  1. resolveAnomaly(insightId, insightParam)                   │
-  │       → prefers client-passed insight (survives Vercel cold)  │
-  │       → falls back to in-memory state, then demo snapshot     │
-  │  2. bootstrap() + listTools() (inside the stream)             │
-  │  3. new DiagnosticAgent(...).investigate(anomaly)             │
-  │       └─► AptKit DiagnosticInvestigationAgent.investigate()   │
-  │             └─► runAgentLoop(maxTurns=8, maxToolCalls=6)      │
-  │                  prompt: generate 2-3 hypotheses, falsify each │
-  │  4. send `diagnosis` event                                    │
-  │  5. STOP. Recommendation is NOT run here.                     │
-  └───────────────────────────────────────────────────────────────┘
+  ┌─ Agent loop (every agent) ─────────────────────────┐
+  │  maxTurns = 8                                      │
+  │  maxToolCalls = 6 (monitoring only) — others       │
+  │    are bounded by maxTurns only                    │
+  │  maxTokens = 4096 per turn                         │
+  │  per-agent allowedTools (4 / 11 / 14 / 33 tools)   │
+  │  per-call AbortSignal threaded from the route     │
+  │  per-call 30s MCP transport timeout                │
+  │  per-route Vercel maxDuration = 300s               │
+  └─────────────────────────────────────────────────┘
 
-  Pattern: single-agent ReAct. Step 3 is a SEPARATE request — the
-  pipeline is split across two HTTP calls so the user reviews the
-  diagnosis before recommendations run.
+  ┌─ Output guardrail ─────────────────────────────────┐
+  │  tryParseAnomalies / tryParseDiagnosis /           │
+  │  recommendation validate — structured-output        │
+  │  validators run on the final text; failure         │
+  │  triggers the recovery prompt or returns []        │
+  │  the agent's output never triggers side effects    │
+  │  directly — recommendations are proposals the user │
+  │  reads, not actions the system takes               │
+  └─────────────────────────────────────────────────┘
 ```
 
-### Feature: investigation step 3 (recommend)
+## The eval, at a glance
 
-```
-  GET /api/agent?insightId=X&step=recommend&diagnosis={...}
+`vitest` with injected fakes. The agent loops are TDD'd: each `test/agents/*.test.ts` file constructs a fake `ModelProvider` that returns scripted Anthropic content blocks (a `tool_use` block, then a `text` block with the final JSON), a fake `ToolRegistry` (or the real `BloomingToolRegistryAdapter` against a fake `DataSource`), and asserts on the trajectory. No network, no API key. 144 tests pass.
 
-  ┌───────────────────────────────────────────────────────────────┐
-  │  Route handler — app/api/agent/route.ts                       │
-  │                                                                │
-  │  1. parseDiagnosis(diagnosisParam) — handed over from step 2   │
-  │     (lives in sessionStorage in the browser between requests) │
-  │  2. bootstrap() + listTools()                                 │
-  │  3. new RecommendationAgent(...).propose(anomaly, diagnosis)  │
-  │       └─► AptKit RecommendationAgent.propose()                │
-  │             └─► runAgentLoop(maxTurns=6, maxToolCalls=4)      │
-  │                  TIGHTER budget — mostly reasoning, few tools │
-  │  4. stream `recommendation` events (up to 3)                  │
-  └───────────────────────────────────────────────────────────────┘
-
-  Pattern: single-agent ReAct with a tighter budget. The diagnosis
-  is the upstream agent's output, passed via URL — message passing
-  WITHOUT a shared blackboard. Each agent sees only what it needs.
-```
-
-### Feature: free-form Q&A
-
-```
-  GET /api/agent?q=... — intent classifier then QueryAgent
-
-  ┌───────────────────────────────────────────────────────────────┐
-  │  Route handler — app/api/agent/route.ts                       │
-  │                                                                │
-  │  1. bootstrap() + listTools()                                 │
-  │  2. classifyIntent(anthropic, q, sid)                         │
-  │       └─► AptKit classifyIntent — ONE haiku-4-5 call, no tools│
-  │       returns 'monitoring' | 'diagnostic' | 'recommendation'  │
-  │  3. new QueryAgent(...).answer(q, intent)                     │
-  │       └─► AptKit QueryAgent.answer()                          │
-  │             └─► runAgentLoop(maxTurns=8, maxToolCalls=6)      │
-  │                  tool grant is the UNION of all four agents'   │
-  │                  policies — broadest tool surface in the repo │
-  │  4. stream `reasoning_step` events; final `conclusion` text   │
-  └───────────────────────────────────────────────────────────────┘
-
-  Pattern: heuristic-first router (the intent classifier is the
-  cheap-and-fast handler that frames the answer) feeding a single
-  ReAct loop with the broadest tool grant. The intent classifier
-  doesn't pick a different AGENT — it just labels the question
-  so the QueryAgent's prompt frames the answer correctly.
-```
-
-## The shared control envelope
-
-Every loop carries the same four-part envelope. The numbers differ per agent; the parts don't.
-
-```
-  Control envelope — same shape, four agents
-
-  ┌─ INPUT ────────────────────────────────────────────────────┐
-  │  schema-gated prompt (monitoring only — categories filtered)│
-  │  tool policy (allowedTools per capability)                  │
-  └─────────────────────────────┬──────────────────────────────┘
-                                ▼
-  ┌─ LOOP ─────────────────────────────────────────────────────┐
-  │  maxTurns = 6 (recommendation) or 8 (others)                │
-  │  maxToolCalls = 4 (recommendation) or 6 (others)            │
-  │  on each turn: signal.throwIfAborted() between turns       │
-  │  signal threaded into anthropic.messages.create + callTool │
-  └─────────────────────────────┬──────────────────────────────┘
-                                ▼
-  ┌─ TERMINATION ──────────────────────────────────────────────┐
-  │  success exit: model emits text with no tool_use blocks     │
-  │  budget exit:  maxToolCalls reached → forced-final synthesis│
-  │  turn exit:    maxTurns reached → forced-final synthesis    │
-  │  recovery:     parseResult fails → one tool-less turn       │
-  └─────────────────────────────┬──────────────────────────────┘
-                                ▼
-  ┌─ OUTPUT ───────────────────────────────────────────────────┐
-  │  validated parsed JSON (per-agent shape) OR fallback []     │
-  │  trace events emitted into BloomingTraceSinkAdapter         │
-  │  trace events become AgentEvent NDJSON on the wire          │
-  └────────────────────────────────────────────────────────────┘
-```
-
-## How shared state flows between agents
-
-No shared blackboard. Each agent's output is the next agent's input, passed as plain data. Two channels:
-
-```
-  Message passing between agents — no shared blackboard
-
-  Channel 1: in-process (capture-only, combined runs)
-  ──────────────────────────────────────────────────
-  MonitoringAgent.scan() → Anomaly[]
-       │
-       ▼ in-memory map (lib/state/insights.ts)
-       │  per-session, single-instance only
-       ▼
-  DiagnosticAgent.investigate(anomaly) → Diagnosis
-       │
-       ▼ in-memory map (lib/state/investigations.ts)
-       ▼
-  RecommendationAgent.propose(anomaly, diagnosis) → Recommendation[]
-
-
-  Channel 2: cross-request (production split-step flow)
-  ─────────────────────────────────────────────────────
-  step 2 response  ── diagnosis ──► browser sessionStorage
-                                              │
-                                              ▼
-  step 3 request   ◄── diagnosis (URL param) ─┘
-                            │
-                            ▼
-                     RecommendationAgent
-```
-
-The cross-request channel exists because Vercel's serverless instances are ephemeral — between step 2 and step 3 the user might land on a different instance with no shared memory. Passing the diagnosis through the browser is the only way to guarantee the next step sees it. This is **message passing, not shared state**, by force of architecture.
-
-## The data-source port (`DataSource`)
-
-Every agent's tools route through the same port — the only thing that changes between `live-bloomreach` and `live-synthetic` is *which adapter is injected*. The agent code is identical; the URL `?mode=` parameter picks the adapter.
-
-```
-  ┌──────────────────────────────────────────────────────────────┐
-  │  makeDataSource(mode, sessionId)                             │
-  │    'live-bloomreach' → new BloomreachDataSource(...)         │
-  │    'live-synthetic'  → new SyntheticDataSource()             │
-  │  returns: { dataSource, bootstrap, dispose }                 │
-  └──────────────────────────┬───────────────────────────────────┘
-                             ▼
-  ┌──────────────────────────────────────────────────────────────┐
-  │  new MonitoringAgent(anthropic, dataSource, schema, allTools)│
-  │  new DiagnosticAgent(anthropic, dataSource, schema, allTools)│
-  │  new RecommendationAgent(anthropic, dataSource, schema, ...) │
-  │  new QueryAgent(anthropic, dataSource, schema, allTools)     │
-  └──────────────────────────────────────────────────────────────┘
-```
-
-The agents never know they're talking to a Bloomreach MCP server or to an in-process synthetic store. The seam IS the swap.
-
-## What's NOT a pattern in this repo
-
-To save you reading the sub-section files looking for it:
-
-- **No RAG of any kind.** No embeddings, no vector store, no chunking, no similarity search. Retrieval is via Bloomreach EQL tool calls — the model writes the query, the tool runs it, the result comes back as a tool_result block.
-- **No supervisor agent.** The orchestrator is `app/api/agent/route.ts` — TypeScript. No LLM decides which agent runs next.
-- **No fan-out / parallel agents.** Every loop runs sequentially. The monitoring agent doesn't fan out across categories; the recommendation agent doesn't spawn workers per recommendation.
-- **No debate / verifier-critic.** A diagnosis is final. No second agent re-grades it.
-- **No swarm / handoff.** Agents don't transfer control to each other — the route does.
-- **No graph orchestration.** No LangGraph-style explicit state machine. The "graph" is the URL routing table.
-- **No automated trajectory-eval harness.** Eval is reading the streamed AgentEvent trace by eye. (See `04-agent-infrastructure/04-agent-evaluation.md` for what this implies.)
+This is the "trajectory eval" surface from `04-agent-infrastructure/04-agent-evaluation.md` — the unit of test is the trajectory (which tools, in what order, with what final output), not just the final output.

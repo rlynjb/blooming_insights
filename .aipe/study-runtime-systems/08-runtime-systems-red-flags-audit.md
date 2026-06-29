@@ -1,238 +1,306 @@
-# Runtime systems — red flags audit
+# Runtime Systems — Red Flags Audit
 
-**Industry name:** runtime-risk audit · **Type:** Project-specific findings
+**Industry name:** runtime risk audit · **Type:** Project-specific
 
-## Zoom out, then zoom in
+## Zoom out — where this concept lives
 
-This is the ranked list of things that would bite first under load, traffic spikes, or partial failure. Each finding is grounded in a real `file:line` and labelled by severity. The earlier concept files explain the *mechanism*; this file ranks the *risk*.
-
-```
-  Zoom out — where the risks cluster
-
-  ┌─ band 1: client ──────────────────────────────────────┐
-  │  R1: investigation hook never cancels on unmount     │  ← high
-  └────────────────────────┬─────────────────────────────┘
-                           │
-  ┌─ band 2: server ★ THIS FILE ★ ───────────────────────┐
-  │  R2: outer state Map grows monotonically             │  ← medium
-  │  R3: ALS frame missing = silent prod auth failure    │  ← high
-  │  R4: retry sleep is not signal-aware                 │  ← low
-  │  R5: per-instance response cache, not per-process    │  ← low
-  │  R6: no upper bound on tools-per-request             │  ← low
-  └──────────────────────────────────────────────────────┘
-```
-
-Zoom in. The two highest-severity findings (R1 and R3) are both **deliberate-with-tradeoffs**, not bugs. The mid-severity one (R2) is unbounded retention with a platform-level reaper. The rest are minor — worth knowing, not worth fixing today.
-
-## Structure pass
-
-**Axis: blast radius — what fails when each risk fires?**
+This file is the audit. Every other file in this folder was a teaching pass; this one ranks the five things actually visible in the current code that a senior engineer would flag in review. Each entry is grounded in a real `file:line`, named, and paired with a fix sized to the risk.
 
 ```
-  Findings ranked by blast radius
+  Zoom out — the five findings, ranked
 
-  one user / one tab        one warm instance         one cold-start cycle
-  ───────────────────       ──────────────────         ────────────────────
-  R1: budget burn           R2: heap growth            R3: prod auth break
-  R4: cancellation lag      R5: cache miss             R6: long-running req
+  HIGH        ✗ Finding #1: schema cache leaks across users
+              ✗ Finding #2: per-instance cache co-located with bug-shaped neighbor
+
+  MEDIUM      ⚠ Finding #3: useInvestigation deliberately doesn't cancel
+              ⚠ Finding #4: disposeDataSource is a no-op for the only live adapter
+
+  LOW         ◦ Finding #5: latent lastCallAt micro-race (dormant)
 ```
 
-The vertical axis is "how much does it impact." R3 (the ALS one) sits highest because it would break authentication for *every* user on the affected instance, silently. R1 burns budget for one user at a time. R2 builds up over minutes-to-hours until Vercel reaps the instance.
+The ranking weights: blast radius (how many users affected), correctness vs ergonomics (data leak vs UX cost), and how easy it is to fix.
 
-## The findings
+## Finding #1 — Schema cache leaks across sessions
 
-### R1 — investigation hook deliberately doesn't cancel on unmount
-
-**Severity:** high (budget) · **Evidence:** `lib/hooks/useInvestigation.ts:32-37, 46-50`
-
-**What:** The React hook (`useInvestigation`) fires a `fetch('/api/agent?…')` and consumes the NDJSON stream. The effect cleanup does NOT call `controller.abort()` or set a cancellation latch. The `startedRef` guard prevents a double-fetch on React StrictMode's mount-cleanup-remount; the in-flight stream simply runs to completion regardless of whether the component is still mounted.
+**Severity:** HIGH (correctness · multi-user data exposure)
+**Evidence:** `lib/mcp/schema.ts:138`, `186-209`
 
 ```ts
-// lib/hooks/useInvestigation.ts:46-50 (annotated)
-useEffect(() => {
-  if (!id) return;
-  if (startedRef.current) return;          // ← run once per mount
-  startedRef.current = true;
-  // ... fetch + readNdjson ... no cleanup function returned
-}, [id, step]);
-```
+// lib/mcp/schema.ts:138
+let cached: WorkspaceSchema | null = null;
 
-**Why it's a risk:** A user navigates into an investigation, then SPA-navigates away (without closing the tab). The `/api/agent` request keeps running on the server, consuming Vercel function time and burning toward the 300s `maxDuration` ceiling. The browser doesn't sever the connection, so `req.signal` never aborts. The server runs to natural completion (or hits 300s).
-
-**Mitigation in place:** Server-side cancellation IS plumbed for the *real* tab-close case — the browser severs TCP, `req.signal` aborts, the whole cancellation chain fires (`app/api/agent/route.ts:226-310`). Only the React-unmount-without-tab-close case is uncancelled.
-
-**Verdict:** Honest tradeoff, not a bug. The comment at `lib/hooks/useInvestigation.ts:32-37` owns it. Fix would be a `useRef`-based cancellation latch that survives StrictMode's double-mount (the pattern `useBriefingStream` uses at `lib/hooks/useBriefingStream.ts:130-152`). Today, the cost is acceptable for an explicit-click-to-investigate UX.
-
-**Reach:** one user's tab at a time, ≤300s of function budget per stranded request.
-
-### R2 — outer `state` Map grows monotonically, no eviction
-
-**Severity:** medium (heap pressure) · **Evidence:** `lib/state/insights.ts:14, 16-23`
-
-**What:** The module-scope `Map<sessionId, SessionFeed>` adds a new entry every time a fresh `sessionId` calls `sessionState(sid)`. Entries are never evicted. The inner sub-maps are `.clear()`d per fresh briefing, so per-session memory stays bounded — but the outer map's entry count grows with distinct active sessions over the warm instance's lifetime.
-
-```ts
-// lib/state/insights.ts:14
-const state = new Map<string, SessionFeed>();   // ← never .clear()'d, never evicted
-```
-
-**Why it's a risk:** With high traffic across many distinct sessions, the warm instance accumulates `SessionFeed` shells (each ~empty after a `.clear()`, but each pinned forever). At Vercel's typical instance lifetime (hours under steady traffic), this is bounded; at sustained high traffic with many distinct users, it could become measurable.
-
-**Mitigation in place:** Vercel reaps idle instances; the process dying nukes the Map. No explicit eviction logic.
-
-**Verdict:** Worth knowing, not worth fixing today. An LRU on the outer Map keyed by last-touch timestamp would be the clean fix — maybe 30 lines. Not earning its keep at current traffic.
-
-**Reach:** one warm instance's heap.
-
-### R3 — ALS frame missing = silent production auth failure
-
-**Severity:** high (auth break) · **Evidence:** `lib/mcp/auth.ts:34, 86-104, 113-123`
-
-**What:** The production auth backend is cookie-based, scoped to an `AsyncLocalStorage` frame established by `withAuthCookies`. The `readAll()` fallback hierarchy is:
-
-```ts
-// lib/mcp/auth.ts:113-123 (annotated)
-function readAll(): Store {
-  const ctx = requestStore.getStore();                 // ← inside ALS frame → use ctx
-  if (ctx) return ctx.store;
-  if (!PERSIST) return Object.fromEntries(memStore);   // ← dev/test → memory Map
-  try { if (existsSync(CACHE_FILE)) return JSON.parse(...); }  // ← dev → file
-  catch { /* ignore */ }
-  return {};                                            // ← LAST RESORT: empty store
+// lib/mcp/schema.ts:186-209 (the read+write site)
+export async function bootstrapSchema(
+  dataSource: DataSource,
+  opts: BootstrapOpts = {},
+): Promise<WorkspaceSchema> {
+  if (cached) return cached;
+  const { projectId, projectName } = await resolveProject(dataSource, opts);
+  // ... 4 MCP calls populate ...
+  cached = parseWorkspaceSchema({ /* ... */ });
+  return cached;
 }
 ```
 
-In production (`NODE_ENV === 'production'`, `PERSIST === false`), if any auth-touching call happens *outside* a `withAuthCookies` wrapper, `getStore()` returns `undefined`, the function falls through to the dev branch (which is skipped because `PERSIST` is false), and finally returns an **empty store**. The OAuth provider then sees "no tokens, no client info" and starts a fresh OAuth flow.
+### What's wrong
 
-**Why it's a risk:** A single forgotten `withAuthCookies(() => …)` wrapper anywhere in a production handler punches a hole. The symptom would be intermittent unexpected re-auth redirects with no obvious error.
+`cached` is module-level and unkeyed. Every other module-level mutable in this codebase is session-keyed (`state` in `lib/state/insights.ts:14`, `mem` in `lib/state/investigations.ts:11`, `memStore` in `lib/mcp/auth.ts:36`); this one isn't. On a warm Vercel instance, the FIRST request populates `cached` for its user; the SECOND request from a different user sees `cached` is non-null and returns the FIRST user's schema.
 
-**Mitigation in place:** Today, every auth-touching route IS wrapped. The codebase pattern is `withAuthCookies(() => makeDataSource(...))`. The risk is a *future* handler that forgets the wrapper.
+The blast radius:
+- `WorkspaceSchema.projectId` flows into every tool call as `project_id`. If user B doesn't have tokens for user A's project, every MCP call errors out and B sees Bloomreach permission errors.
+- `WorkspaceSchema.events`, `customerProperties`, `catalogs` flow into the agent's prompt via `schemaSummary` (`lib/agents/monitoring.ts:19-60`). User B's agent sees user A's data layout — a small information leak.
+- `WorkspaceSchema.projectName`, `totalCustomers`, `totalEvents` appear in the UI header. User B sees user A's project name and customer count.
 
-**Verdict:** Architecturally tight today; one missed wrapper away from silent failure. Would benefit from a lint rule or a type-level guard. The dev/test fallbacks (memory + file) mask the symptom locally — you wouldn't catch the missing wrapper until prod.
+### Why it's not caught by tests
 
-**Reach:** every user on the affected instance (broken auth, silent re-auth loops).
+A single-user dev session never sees the leak (the same user populates and reads `cached`). Tests reset the cache via `_resetSchemaCache()` (`schema.ts:211-213`) between runs. The bug only surfaces with two real users hitting the same warm instance in quick succession.
 
-### R4 — retry sleep is not signal-aware
+### The fix
 
-**Severity:** low (cancellation lag) · **Evidence:** `lib/data-source/bloomreach-data-source.ts:73-75, 163-174`
-
-**What:** The rate-limit retry ladder uses `sleep(waitMs)` (a plain `setTimeout` Promise) which doesn't observe the `signal`:
+Smallest change: session-key the cache.
 
 ```ts
-// lib/data-source/bloomreach-data-source.ts:73-75
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));   // ← no signal check
+const cached = new Map<string, WorkspaceSchema>();
+
+export async function bootstrapSchema(
+  dataSource: DataSource,
+  opts: BootstrapOpts & { sessionId: string } = { sessionId: '' },
+): Promise<WorkspaceSchema> {
+  const existing = cached.get(opts.sessionId);
+  if (existing) return existing;
+  // ... bootstrap ...
+  cached.set(opts.sessionId, schema);
+  return schema;
 }
-
-// :172
-await sleep(waitMs);                              // ← can be up to 20_000ms
-result = await this.liveCall(name, args, options.signal);   // ← signal observed AFTER sleep
 ```
 
-**Why it's a risk:** A client cancels mid-retry-wait. We sleep the full `waitMs` (up to 20s capped by `retryCeilingMs`) before the next `liveCall` sees the aborted signal and throws. Net effect: cancellation latency = remaining retry wait, up to 20s extra.
+Costs: change the bootstrap signature (one extra param) and pass `sessionId` from the route handler / factory.
 
-**Verdict:** Minor. Fix would be a signal-aware sleep helper that races `setTimeout` against `signal.addEventListener('abort', ...)`. Not in the codebase today.
+Alternative: remove the cache entirely. The 4 MCP calls are sequential at ~1.1s spacing = ~4.4s per bootstrap, but they only run ONCE per request. The route budget can absorb it. The downside is every request pays ~4.4s; the upside is removing a leak vector permanently.
 
-**Reach:** ≤20s cancellation lag, per stranded request.
+Recommended: session-key. Keeps the cache benefit, fixes the leak with one line.
 
-### R5 — response cache is per-DataSource-instance, not per-process
+---
 
-**Severity:** low (cache miss rate) · **Evidence:** `lib/data-source/bloomreach-data-source.ts:122` + `lib/mcp/connect.ts:96` (fresh instance per `connectMcp`)
+## Finding #2 — Cache is per-request (currently safe), but co-located with the leak
 
-**What:** The 60s response cache lives on the data-source adapter instance (`BloomreachDataSource`). The instance is constructed fresh in `connectMcp` per request, so the cache is effectively per-request. Two `/api/agent` requests for the same insight on the same warm instance each get their own empty cache and re-fetch the same tools.
+**Severity:** HIGH (latent · review hazard)
+**Evidence:** `lib/data-source/bloomreach-data-source.ts:122`, `144-188`
 
-**Why it's a risk:** Higher Bloomreach tool-call volume than necessary. The bootstrap chain (`list_cloud_organizations`, `list_projects`, `get_event_schema`) fires twice for two consecutive requests instead of being absorbed by a shared cache on the second one.
-
-**Verdict:** Worth noting, not worth fixing today. Lifting the cache to module scope would absorb cross-request repeats; it'd need key-partitioning by `sessionId` (the same discipline as `state` in `lib/state/insights.ts`). Today the bootstrap takes ~3-5s; cross-request cache hits would save that on every subsequent request from the same warm instance. Real win if traffic to a single instance is high; minor otherwise.
-
-**Reach:** one user's traffic to one warm instance — measured in seconds-per-request, not correctness.
-
-### R6 — no upper bound on tools-per-request
-
-**Severity:** low (budget burn) · **Evidence:** absence; `app/api/agent/route.ts` has no per-iteration cap on `runAgentLoop`
-
-**What:** The agent loop runs until Claude stops calling tools or `req.signal` aborts. There's no hard cap like "max 50 tool calls per investigation." The spacing gate (~1.1s) + the 30s per-call timeout + the 300s route ceiling form an implicit cap (~270 tools max), but no explicit one.
-
-**Why it's a risk:** A pathological agent run (loop, mis-prompted) could burn the full 300s budget on tool calls. Less a runtime risk than a prompt-design one — but the runtime is what bills the budget.
-
-**Verdict:** Implicit bound is acceptable today. An explicit `maxToolCalls` ceiling in the agent loop would be defense-in-depth.
-
-**Reach:** one request at a time.
-
-## Not yet exercised
-
-Things a runtime-systems audit would normally flag, that don't apply because the underlying mechanism isn't in the codebase:
-
-  → **Worker thread starvation.** No `worker_threads`. No risk.
-  → **Child-process lifecycle leaks.** No `child_process` / no subprocesses. No risk.
-  → **Cluster master-worker race conditions.** No cluster mode. No risk.
-  → **File-descriptor leak from streamed file I/O.** No `fs.createReadStream` / no streamed file I/O. The sync `readFileSync` / `writeFileSync` calls close fds automatically. No risk.
-  → **GC pause during high allocation.** No deliberate GC tuning; no allocation hot path. The agent loop is I/O-bound, not allocation-bound. Not a current concern.
-  → **`process.SIGTERM` graceful shutdown.** Not subscribed. Vercel terminates instances; we don't drain in-flight work. Acceptable because the in-flight work is regenerable (insights / investigations) and durable state (auth tokens) lives in the cookie.
-  → **Backpressure on `controller.enqueue` when the consumer is slow.** Not handled — the ReadableStream interface allows `enqueue` to return a Promise the producer should await, and the codebase doesn't. For NDJSON of small events at sub-1KB each, this hasn't surfaced. If we ever streamed large payloads, this would matter.
-
-## Primary diagram
-
-```
-  Runtime red flags — ranked by blast radius and severity
-
-                            severity high
-                                 │
-                  ───────────────┼────────────────
-                                 │
-                R3 (auth break)  │  R1 (budget burn)
-                process-wide     │  per-user
-                                 │
-                  ───────────────┼────────────────  blast radius:
-                                 │                  one user → one instance
-                                 │  → process
-                R2 (heap growth) │  R5 (cache miss)
-                instance-wide    │  per-instance
-                                 │
-                R4 (cancel lag)  │  R6 (no tool cap)
-                per request      │  per request
-                                 │
-                            severity low
+```ts
+// lib/data-source/bloomreach-data-source.ts:121-122
+export class BloomreachDataSource implements DataSource {
+  private cache = new Map<string, { result: unknown; expiresAt: number }>();
 ```
 
-## Interview defense
+### What's wrong
 
-**Q: What's the worst-case runtime failure mode of this app?**
+This cache is currently safe — `BloomreachDataSource` is constructed per request inside `connectMcp` (`lib/mcp/connect.ts:94-101`), so each user gets their own instance with their own cache Map. The 60s TTL is enforced per entry.
 
-R3 — a forgotten `withAuthCookies` wrapper in a future production handler. The dev/test backends (memory + file) would mask the missing wrapper locally; in production, every auth read would return an empty store, the OAuth provider would think the user has no tokens, and the user would get caught in a re-auth loop with no error message.
+BUT: the comment doesn't say this. A future "let's reuse one BloomreachDataSource singleton to save the OAuth handshake cost" refactor would silently break isolation — the cache would become shared and start leaking results across users.
 
-The reason it's "worst-case" rather than "currently broken": today every production handler IS wrapped. The risk is architectural — one bad PR away. Defense would be a lint rule that flags any `BloomreachAuthProvider` construction outside `withAuthCookies` scope, or a type-level marker on functions that touch the auth store.
+### The fix
 
-Anchor: "ALS frame missing in prod = silent auth break for everyone on the instance."
+Add an inline comment naming the per-request lifetime as a correctness invariant.
 
-```
-  dev / test backends: file / memory (mask the bug)
-  prod backend: cookie via ALS → if no ALS, empty store
-       ↓
-  auth state always missing
-       ↓
-  every request looks like first-time-user → re-auth loop
-       ↓
-  user has no idea why
+```ts
+export class BloomreachDataSource implements DataSource {
+  // ★ INVARIANT: this cache is per-instance, and instances are constructed
+  //   PER REQUEST in lib/mcp/connect.ts. DO NOT promote to a module-level
+  //   singleton without re-keying entries by sessionId — the 60s TTL alone
+  //   does not protect against cross-user leaks.
+  private cache = new Map<string, { result: unknown; expiresAt: number }>();
 ```
 
-**Q: What's the highest-impact runtime risk that's actually a deliberate tradeoff?**
+Five-minute fix, prevents a future foot-gun.
 
-R1 — `useInvestigation` deliberately not cancelling on React unmount. The comment at `lib/hooks/useInvestigation.ts:32-37` owns the call: React StrictMode's mount-cleanup-remount dance would otherwise abort the stream on the first cleanup, the started-guard would block the re-mount from re-fetching, and the user would see an empty trace.
+---
 
-The cost paid: a user who SPA-navigates away from an investigation page keeps the server function running for up to 300s. For our UX (explicit click to investigate, users typically stay on the page), the tradeoff is fine.
+## Finding #3 — `useInvestigation` deliberately does NOT cancel on cleanup
 
-The fix if we ever needed it: a `useRef`-based cancellation latch that survives StrictMode (the pattern `useBriefingStream` uses at `lib/hooks/useBriefingStream.ts:128-152`). It would replace the unconditional opt-out with a "cancel ONLY when truly unmounting, not on StrictMode re-mount" discipline.
+**Severity:** MEDIUM (resource waste · documented trade)
+**Evidence:** `lib/hooks/useInvestigation.ts:36-37`, `44-49`
+
+```ts
+// lib/hooks/useInvestigation.ts:36-37 (the comment)
+//  NOTE: we deliberately do NOT cancel the fetch on effect cleanup. React
+//  StrictMode (dev) mounts → cleans up → re-mounts; cancelling on the first
+//  cleanup, with the started-guard blocking the re-mount, aborted the stream
+//  and left the logs empty. The started-guard prevents a double fetch; the
+//  in-flight run simply completes (setState after unmount is a safe no-op).
+```
+
+### What's wrong
+
+When a user opens an investigation page and then closes the tab (or navigates away) mid-stream, the server-side investigation keeps running until `maxDuration = 300` kicks in. That's up to 300s of MCP and Anthropic costs for a result no one will read.
+
+For an alpha with low traffic, this is acceptable — the dev ergonomics (StrictMode-safe re-mount) outweighs the wasted compute. At higher volume it would matter.
+
+### Why it's the way it is
+
+The `useEffect` cleanup pattern of "cancel on cleanup" interacts badly with React StrictMode (dev only): mount → cleanup → re-mount, with the cleanup aborting the in-flight fetch and the started-guard blocking the re-mount's restart. The result was empty logs in dev. The doc'd workaround: don't cancel; let the in-flight run finish (setState after unmount is a documented React no-op).
+
+### The fix
+
+Multi-step option that preserves both invariants:
+
+1. Detect "real unmount" (page navigated away) vs "StrictMode cleanup" (about to re-mount). Production builds don't run StrictMode cleanup, so a `process.env.NODE_ENV === 'production'` guard would let prod cancel on cleanup and dev keep the current behavior.
+2. Or: use AbortController with a tiny delay — schedule the abort on cleanup, but cancel the schedule on re-mount. This is the "debounced cancel" pattern.
+3. Or: accept the trade as-is and add server-side cancellation via the cookie-stored session ID — a separate route that marks the session as "cancel any in-flight work."
+
+Option 1 is the cheapest fix; option 3 is the most correct. Pick based on traffic.
+
+---
+
+## Finding #4 — `disposeDataSource()` is a no-op for the only live adapter
+
+**Severity:** MEDIUM (latent · cleanup hook unfilled)
+**Evidence:** `lib/data-source/index.ts:91-99`, `app/api/{agent,briefing}/route.ts` finally blocks
+
+```ts
+// lib/data-source/index.ts:91-99 (the no-op)
+return {
+  ok: true,
+  mode,
+  dataSource: bloomreachDs,
+  bootstrap: (signal?: AbortSignal) => bootstrapSchema(bloomreachDs, { signal }),
+  // Bloomreach is session-scoped, not subprocess-scoped — the client lives
+  // across requests via the cookie store, so the route's `finally` doesn't
+  // tear it down.
+  dispose: async () => {},
+};
+```
+
+### What's wrong
+
+Both live routes (`/api/agent`, `/api/briefing`) call `await disposeDataSource()` in their `finally` block — but the only production adapter (Bloomreach) returns a no-op. The seam is wired but doesn't fire.
+
+This is correct TODAY (Bloomreach has nothing to tear down — its OAuth state lives in the cookie). It becomes wrong the moment someone adds an adapter with real per-request resources: a SQL connection pool, an open WebSocket, an in-process lock, a file handle. Without a working dispose, those resources leak.
+
+### Why it's the way it is
+
+The previous Olist SQL adapter (now retired) WAS the case the dispose was built for — it spawned a subprocess that needed to be torn down per request. When the adapter went away, the dispose became a no-op for the remaining adapter.
+
+### The fix
+
+No code change needed today. The seam is correct; the implementation is correct. The maintenance discipline: any new adapter MUST implement a real `dispose` if it holds anything beyond per-call locals.
+
+Worth adding to a docs comment:
+
+```ts
+// dispose() runs in the route's finally block on EVERY exit path (success,
+// error, client abort). Adapters that hold per-request resources (DB pools,
+// open files, locks, sockets) MUST release them here.
+```
+
+---
+
+## Finding #5 — Latent `lastCallAt` micro-race (dormant)
+
+**Severity:** LOW (dormant · doesn't fire today)
+**Evidence:** `lib/data-source/bloomreach-data-source.ts:190-205`
+
+```ts
+// lib/data-source/bloomreach-data-source.ts:190-205
+private async liveCall(name: string, args: ..., signal?: AbortSignal): Promise<unknown> {
+  const elapsed = Date.now() - this.lastCallAt;
+  if (elapsed < this.minIntervalMs) {
+    await new Promise((r) => setTimeout(r, this.minIntervalMs - elapsed));
+  }
+  try {
+    const result = await this.transport.callTool(name, args, { signal });
+    this.lastCallAt = Date.now();
+    return result;
+  } catch (err) {
+    this.lastCallAt = Date.now();
+    throw new McpToolError(name, errorDetail(err), { cause: err });
+  }
+}
+```
+
+### What's wrong
+
+If TWO `callTool` invocations fire concurrently on the same `BloomreachDataSource`, both can read `lastCallAt`, both compute `elapsed >= minIntervalMs` as false (no wait), both fire immediately. The rate limit gets bypassed.
+
+This is a JS-event-loop race: it requires two awaits to overlap on the same instance. Today the agent loop runs tools SEQUENTIALLY per turn (`lib/agents/base-legacy.ts:162` iterates `toolUses` with awaits inside a `for` loop). The race never fires.
+
+### When it would fire
+
+If the loop ever switched to parallel tool execution:
+
+```ts
+// hypothetical: parallel tool calls per turn
+await Promise.all(toolUses.map((tu) => dataSource.callTool(tu.name, tu.input, { signal })));
+```
+
+THEN the race would surface. Two `callTool` calls would parallel through `liveCall`, both read `lastCallAt`, both skip the wait, both hit Bloomreach inside the same 1.1s window. Bloomreach would 429, the retry ladder would kick in, the calls would eventually succeed — but the spacing protection would be useless.
+
+### The fix
+
+Promise-based serialization, only if parallel calls become a thing:
+
+```ts
+private callQueue: Promise<unknown> = Promise.resolve();
+
+private async liveCall(...) {
+  const myTurn = this.callQueue.then(async () => {
+    // ... existing body ...
+  });
+  this.callQueue = myTurn.catch(() => {});  // don't fail the queue on one call's failure
+  return myTurn;
+}
+```
+
+Today: no action needed. Worth a comment noting the structural constraint:
+
+```ts
+// ★ INVARIANT: callers must NOT fire parallel callTool invocations on the
+//   same BloomreachDataSource instance. lastCallAt is a per-instance gate;
+//   parallel calls would race past the ~1 req/s spacing. The agent loop
+//   in lib/agents/base-legacy.ts iterates tools sequentially per turn —
+//   keep it that way unless you also fix the race.
+```
+
+---
+
+## Summary — what to fix and in what order
 
 ```
-  tradeoff:
-   safety:    StrictMode-safe (trace populates correctly)
-   cost:      stranded server runs on SPA nav-away (≤300s each)
-   measured:  acceptable for explicit-click investigations
+  Priority order — biggest blast radius first
+
+  1. Session-key the schema cache (Finding #1) — 1 line + plumbing,
+     fixes a real multi-user data leak                              HIGH
+
+  2. Add the per-request invariant comment on
+     BloomreachDataSource.cache (Finding #2)                        HIGH (5 min)
+
+  3. Add the dispose-hook docs comment (Finding #4)                 MEDIUM (5 min)
+
+  4. Either NODE_ENV-guard useInvestigation cleanup
+     OR accept the trade and revisit at scale (Finding #3)          MEDIUM (judgment)
+
+  5. Add the parallel-call invariant comment on liveCall
+     (Finding #5)                                                   LOW (5 min)
 ```
+
+Three of these are 5-minute comment fixes that close foot-guns. One is a real code change with real test coverage (the schema cache leak). One is a judgment call (the useInvestigation cleanup).
+
+## What's solid in the runtime
+
+The audit is the negative half; the positive half is worth naming so the review doesn't read as a hit piece. The repo gets the harder parts right:
+
+- **ALS-scoped per-request store** (`lib/mcp/auth.ts:47`, `91`, `114`, `126`) — production-grade async context propagation, correctly placed at the cookie boundary to dodge Next's request-vs-response cookie split.
+- **AbortSignal composition** (`lib/mcp/transport.ts:131`, `173`) — modern `AbortSignal.any` with a runtime feature check and a hand-rolled fallback. Composes client cancel with per-call timeout cleanly.
+- **Signal threading through five async layers** — route → bootstrap/agent → loop → dataSource → transport → SDK. Every layer accepts `{ signal }`; cancel reaches the deepest await.
+- **Session-keyed module-level state** (`lib/state/insights.ts:14-23`) — explicit comment about cross-session bleed; `putInsights` clears only THIS session's slot.
+- **Per-route `finally` discipline** — `disposeDataSource` + `controller.close` + phase-summary log fire on every exit path, including client abort. No leaked controllers.
+- **Truncation guard against blocking the event loop** (`lib/agents/base-legacy.ts:32`, `184`) — 16K cap on tool-result strings before `JSON.stringify`, preventing a multi-megabyte blob from stalling the thread.
+
+The schema cache stands out as the one piece that didn't get the same care — which is the lesson. Even in a codebase with strong patterns, a single missed key is enough to leak across users.
 
 ## See also
 
-  → `01-runtime-map.md` for the resource lifetimes that frame these risks.
-  → `04-shared-state-races-and-synchronization.md` for the partition discipline that keeps R2's growth from causing actual races.
-  → `07-backpressure-bounded-work-and-cancellation.md` for the cancellation chain R1/R4 sit on.
+- `00-overview.md` — the runtime map these findings sit on.
+- `04-shared-state-races-and-synchronization.md` — the deeper walk on findings #1, #2, #5.
+- `06-filesystem-streams-and-resource-lifecycle.md` — the deeper walk on finding #4.
+- `07-backpressure-bounded-work-and-cancellation.md` — the deeper walk on finding #3.

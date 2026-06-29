@@ -1,86 +1,45 @@
-# study-security · reading order
+# Security study — blooming insights
 
-The single question this guide answers: **what can an attacker reach in
-blooming insights, and what happens when they do?**
+A trust-axis audit of this repo. The single question: **what can an attacker reach, and what happens when they do?** Every finding traces back to a boundary, a trust assumption, and what breaks if it's wrong.
 
-The repo runs a Next.js 16 app that brokers a browser into a third-party
-OAuth-protected MCP server, runs Claude as the policy engine, and streams
-the agent's thinking back to the UI. Three trust boundaries carry the
-weight. Trace them in this order and the rest of the file list reads in
-context.
+## Through-line — trace the trust axis
 
 ```
-  the trust axis — three boundaries, in order
+  Trust axis — what can each side see, reach, or tamper with?
 
-  ┌─ untrusted ──────────────┐
-  │ browser  (query params,  │
-  │ POST bodies, cookies)    │
-  └──────────┬───────────────┘
-             │  HTTP  ← boundary 1: route validates input + session
-  ┌─ Service ▼───────────────┐
-  │ Next.js API route        │
-  └──────────┬───────────────┘
-             │  MCP   ← boundary 2: OAuth2.1 + PKCE + DCR + AES-256-GCM cookie
-  ┌─ Provider ▼──────────────┐
-  │ Bloomreach MCP server    │
-  └──────────┬───────────────┘
-             │ Claude reads result; route validates model output
-             │        ← boundary 3: parseAgentJson + type guards + FALLBACK
-             ▼
-  ┌─ UI ─────────────────────┐
-  │ React (auto-escape)      │
-  └──────────────────────────┘
+  ┌─ untrusted ─────────────────┐    seam     ┌─ trusted ─────────────────┐
+  │ browser, IdP redirect,      │ ═════╪═════► │ Next.js route handlers,    │
+  │ MCP tool results, LLM text  │             │ Anthropic / Bloomreach     │
+  └─────────────────────────────┘             └────────────────────────────┘
+            ▲                                            ▲
+            └────── 3 trust boundaries (see 00-overview.md) ──────┘
+                    every boundary either enforces a trust
+                    decision or leaks one
 ```
 
-## Read in this order
+## Map
 
-  1. `00-overview.md` — the whole-system map, the three boundaries, the
-     single load-bearing control at each, and the one finding worth
-     keeping awake at night.
-  2. `audit.md` — the 8-lens pass: what the codebase does (with
-     `file:line`) or "not yet exercised" honestly. The capstone red-flag
-     checklist sits at the bottom.
-  3. Pattern files (Pass 2) — discovered controls and gaps that earned a
-     deep walk:
+```
+  .aipe/study-security/
+    README.md                       ← you are here
+    00-overview.md                  ← trust map + 3 highest-risk findings
+    audit.md                        ← Pass 1: the 8-lens audit
+    01-encrypted-auth-cookie.md     ← Pass 2: AES-256-GCM bi_auth + ALS store
+    02-oauth-pkce-dcr-boundary.md   ← Pass 2: OAuth 2.1 + PKCE + DCR
+    03-per-agent-tool-allowlist.md  ← Pass 2: capability gating (+ regression)
+    04-model-output-type-guard.md   ← Pass 2: type guard at model-output boundary
+    05-secret-redaction.md          ← Pass 2: token-shape redaction before logs
+    06-session-isolation.md         ← Pass 2: per-session state on shared instances
+```
 
-     - `01-encrypted-cookie-oauth-state.md` — how OAuth/PKCE/token state
-       survives Vercel's stateless functions without a shared store: an
-       AES-256-GCM-encrypted session cookie (`bi_auth`) keyed by
-       `AUTH_SECRET`.
-     - `02-als-scoped-request-store.md` — how the SDK's many `state()` /
-       `saveTokens()` calls in a single request all see one decrypted
-       view of the store, with a single flush. Read-after-write inside
-       one request without the Next.js request-vs-response cookie split.
-     - `03-type-guard-trust-boundary.md` — how model output crosses from
-       hostile string to typed value: defensive parsing
-       (`parseAgentJson`) + per-shape type guards + typed defaults
-       (`FALLBACK`). The seam between "what Claude said" and "what the
-       UI renders."
-     - `04-read-only-tool-whitelist.md` — how the agents are kept
-       read-only by construction. Per-agent allowlists in
-       `lib/mcp/tools.ts` mean `monitoring` literally cannot reach a
-       write tool, even if Claude asks.
-     - `05-open-tool-surface-gap.md` — the proxy-shaped route
-       (`POST /api/mcp/call`). Now gated by a union allowlist
-       (`ALL_KNOWN`), but still doesn't scope by *agent* or by *args*,
-       so a session-auth'd user (or stolen cookie) can call any
-       bootstrap/diagnostic tool the union covers.
+## Reading order
 
-## What this guide does not cover
+1. **`00-overview.md`** — verdict per primitive + the three highest-risk findings.
+2. **`audit.md`** — the 8 lenses, each with `file:line` grounding or `not yet exercised`.
+3. **Pass 2 files** — open in the order they're cross-linked from `audit.md`.
 
-  → Bloomreach's own server security (out of scope; trust-boundary 2
-    treats it as a black-box provider).
-  → Distributed-systems threat modeling (Vercel's edge platform is
-    trusted as a single-tenant runtime).
-  → The dev-only routes (`/api/mcp/capture`, `/api/mcp/capture-demo`)
-    beyond noting they're gated by `NODE_ENV === 'production'` and
-    return 403 in prod. They're called out in `audit.md` for
-    completeness, no pattern file.
+## Cross-links
 
-## Cross-links to other study guides
-
-  → `study-system-design/` — the architecture-and-scale story. Same
-    boundaries, different axis (control + state instead of trust).
-  → `study-software-design/` — the interfaces-and-complexity story. The
-    `DataSource` seam is design; *who's allowed to call which tool* is
-    security.
+- Trust boundaries map → `study-system-design/audit.md`'s system map.
+- The `parseAgentJson` validator → `study-software-design`'s interface chapter.
+- The DataSource adapter (the Bloomreach client) is treated as a port + adapter in `study-software-design`; this guide treats it as a trust seam.

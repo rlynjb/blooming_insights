@@ -1,505 +1,437 @@
-# Request flow — the briefing and investigation pipelines
+# request-flow
 
-**Industry name:** request flow / orchestrated request handler · Language-agnostic
+## End-to-end request flow (industry standard)
 
-## Zoom out, then zoom in
+How a single click in the browser becomes a streamed sequence of insights on the screen. The whole path from `fetch` to the last `done` event, in the order it actually happens.
 
-The two streaming routes (`/api/briefing` and `/api/agent`) carry the entire
-product. Same shape: a route handler builds a DataSource, bootstraps the
-workspace schema, runs one or more agents, streams NDJSON. Different bodies:
-one runs the monitoring agent and emits insights; the other runs a sequential
-diagnostic-then-recommendation pipeline.
+## Zoom out — where this pattern lives
 
-You know how a typical Next.js handler looks — parse the URL, do some work,
-`return NextResponse.json(...)`. This is the same shape on the outside; the
-inside swaps the synchronous JSON for a `ReadableStream<Uint8Array>` that
-emits one NDJSON line per event as the agent does its work.
+The request flow is the *spine* of the system. Every other pattern in this folder either rides on it, hangs off it, or hardens it.
 
 ```
-  Zoom out — where the request flow lives
+  Zoom out — the request flow's place in the system
 
-  ┌─ UI layer ─────────────────────────────────────────┐
-  │  app/page.tsx → fetch('/api/briefing?mode=...')     │
-  │  useBriefingStream, useInvestigation hooks          │
-  └──────────────────────┬──────────────────────────────┘
-                         │  HTTP, NDJSON response body
-  ┌─ Service layer ──────▼──────────────────────────────┐
-  │  app/api/briefing/route.ts ★ REQUEST FLOW ★         │ ← we are here
-  │  app/api/agent/route.ts                             │
-  │    parse → makeDataSource → bootstrap → run agents  │
-  │    → stream NDJSON                                  │
-  └──────────────────────┬──────────────────────────────┘
-                         │
-  ┌─ DataSource layer ───▼──────────────────────────────┐
-  │  BloomreachDataSource  |  SyntheticDataSource       │
-  └──────────────────────┬──────────────────────────────┘
-                         │
-  ┌─ Provider layer ─────▼──────────────────────────────┐
-  │  Bloomreach MCP   |   in-process synthetic data     │
+  ┌─ UI ────────────────────────────────────────────────┐
+  │  page.tsx → useBriefingStream → fetch + readNdjson  │
+  └────────────────────────────┬────────────────────────┘
+                               │  HTTP, content-type: application/x-ndjson
+  ┌─ Route layer ──────────────▼────────────────────────┐
+  │  /api/briefing → session → factory → ★ FLOW ★ → ... │ ← we are here
+  └────────────────────────────┬────────────────────────┘
+                               │
+  ┌─ Adapter layer ────────────▼────────────────────────┐
+  │  DataSource adapter → external server (or fixtures) │
   └─────────────────────────────────────────────────────┘
 ```
 
-The thing to remember: a route handler in this codebase isn't a function that
-returns a response — it's an orchestrator that builds a streaming response
-*while* it does work, and threads cancellation into every layer below.
+This file walks the spine. The other pattern files zoom into each joint: `02-auth-boundary.md` for the session/auth hop, `03-datasource-seam.md` for the port boundary, `04-aptkit-primitive-boundary.md` for what happens inside `MonitoringAgent.scan`, `06-streaming-ndjson.md` for the wire format the spine streams in.
 
-## Structure pass — layers, axis, seams
+## Structure pass
 
-**Layers:** UI hook → Route handler → DataSource adapter → Provider.
-
-**Axis (held constant): "who decides what happens next?"** Trace it down the
-stack and watch the answer flip at each seam.
+Three layers carry the request: the **client** layer (the page + hooks), the **service** layer (the Next.js route handler), the **adapter** layer (`BloomreachDataSource` or `SyntheticDataSource`). One axis worth tracing across all three: **who decides control flow?**
 
 ```
   Axis: who decides control flow?
 
-  ┌─ Browser hook (useBriefingStream) ─────────────────┐
-  │  fetch() → reader loop → switch(event.type)        │   → CLIENT decides
-  └────────────────────────────┬───────────────────────┘
-                               │
-  ┌─ Route handler ────────────▼───────────────────────┐
-  │  fixed phase order: bootstrap → list → scan → done │   → CODE decides
-  └────────────────────────────┬───────────────────────┘
-                               │
-  ┌─ Agent loop (AptKit) ──────▼───────────────────────┐
-  │  message → tool_use → tool_result → message → ...  │   → LLM decides
-  └────────────────────────────┬───────────────────────┘
-                               │
-  ┌─ DataSource / MCP transport ───────────────────────┐
-  │  callTool(name, args) → fetch → JSON               │   → PROVIDER runs
-  └────────────────────────────────────────────────────┘
+  ┌─ client ──────────────────┐    seam: HTTP
+  │  CODE decides             │   ═════╪═════►
+  │  (fixed fetch + dispatch) │
+  └───────────────────────────┘
+       ┌─ service ────────────┐    seam: port (`DataSource`)
+       │  CODE decides phases │   ═════╪═════►
+       │  (bootstrap → gate   │
+       │   → scan → emit)     │
+       └──────────────────────┘
+            ┌─ agent inside service ──┐    seam: tool call
+            │  LLM decides            │   ═════╪═════►
+            │  (which EQL to run next)│
+            └─────────────────────────┘
+                 ┌─ adapter ─────┐
+                 │  CODE again   │
+                 │  (cache,      │
+                 │   spacing,    │
+                 │   retry)      │
+                 └───────────────┘
 ```
 
-The axis flips at every seam. That's why the route handler is a *pipeline*
-(fixed order: schema → tools → agent → done) wrapping an *agent loop* (model
-decides per turn). The pipeline guarantees consistent stage ordering; the
-loop inside it gives the model freedom to choose tools. Pattern: outer
-pipeline, inner loop.
+The control-flow answer flips three times. The first flip (client → service) is just HTTP. The second (service → agent) is the surprising one: inside one route handler, control hands off to the LLM for the duration of the scan, then takes it back to emit the wire events. The third (adapter → external) is where the rate-limit envelope sits.
 
-**Seams (boundaries where control flips):**
-
-- **Browser → Route handler** (HTTP) — the HTTP request hand-off. Auth is
-  checked BEFORE committing to a stream so 401s can return JSON instead of
-  an empty stream (`app/api/briefing/route.ts:180-182`).
-- **Route handler → Agent layer** (function call) — the route owns phase
-  ordering and timing; the agent owns model+tool decisions.
-- **Agent layer → DataSource** (interface call) — the agent doesn't know
-  which adapter is plugged in; it only knows `callTool`.
-- **DataSource → Provider** (HTTP or in-process) — the adapter knows the
-  wire format; the agent doesn't.
+The load-bearing seam is the second flip — between the route's deterministic phases and the agent's autonomous loop. Everything downstream (streaming, reliability, demo replay) is shaped by the fact that the route must keep streaming events while the agent is in charge of *what to do next*.
 
 ## How it works
 
-The mechanism walks through three moves: the mental model (what shape this
-is), the step-by-step body of one request, and the principle.
-
 ### Move 1 — the mental model
 
-A route handler in this codebase looks like a streaming `fetch`-handler with
-a fixed phase sequence inside it. The shape:
+Think of a one-shot subscription: the browser opens a `fetch` and reads the response as it arrives, one newline-delimited JSON event at a time. The server writes events to the same `ReadableStream` as they happen — the schema bootstrap, the coverage decisions, each tool call start, each tool call end, each insight as it's computed, then `done`. There's no polling, no WebSocket, no second connection. One HTTP request, one progressive response, terminated by a `done` event.
 
 ```
-  Pattern — orchestrated streaming pipeline
+  The pattern: progressive HTTP response, NDJSON-framed
 
-       ┌─────────────────────────────────────────────┐
-       │ Stage 1 — parse + auth-gate (returns JSON   │
-       │           on failure, no stream committed)  │
-       └──────────────────┬──────────────────────────┘
-                          │
-       ┌──────────────────▼──────────────────────────┐
-       │  Open ReadableStream → controller           │
-       └──────────────────┬──────────────────────────┘
-                          │
-       ┌──────────────────▼──────────────────────────┐
-       │ Stage 2 — bootstrap (schema)                │   ──► emit reasoning_step
-       └──────────────────┬──────────────────────────┘
-                          │
-       ┌──────────────────▼──────────────────────────┐
-       │ Stage 3 — list_tools                        │
-       └──────────────────┬──────────────────────────┘
-                          │
-       ┌──────────────────▼──────────────────────────┐
-       │ Stage 4 — RUN AGENT (the variable stage)    │   ──► emits tool_call_*,
-       │           — monitor / diagnose / recommend  │       reasoning_step, …
-       └──────────────────┬──────────────────────────┘
-                          │
-       ┌──────────────────▼──────────────────────────┐
-       │ Stage 5 — emit 'done', close controller     │
-       └─────────────────────────────────────────────┘
-
-       Wrapping every stage:
-         try / catch — error events → close
-         finally     — dispose, console-log summary, close
+  ┌─ browser ──┐                                    ┌─ server ────┐
+  │   fetch    │ ──────── GET /api/briefing ──────► │  route.ts   │
+  │            │                                    │             │
+  │  reader.read() ◄── chunk: {workspace:…}\n ───── │  send(...)  │
+  │  reader.read() ◄── chunk: {reasoning_step}\n ── │  send(...)  │
+  │  reader.read() ◄── chunk: {tool_call_start}\n ─ │  send(...)  │
+  │  reader.read() ◄── chunk: {tool_call_end}\n ─── │  send(...)  │
+  │       …                                         │       …     │
+  │  reader.read() ◄── chunk: {insight}\n ───────── │  send(...)  │
+  │  reader.read() ◄── chunk: {done}\n ──────────── │  send(...)  │
+  │  reader.read() ◄── (stream closes) ──────────── │  close()    │
+  └────────────┘                                    └─────────────┘
 ```
 
-The shape never changes between routes; only Stage 4 differs.
+That picture is the whole pattern. The rest of this file walks each phase the server runs between accepting the request and closing the stream.
 
 ### Move 2 — the step-by-step walkthrough
 
-Walking one live briefing request from `GET /api/briefing?mode=live-bloomreach`
-end-to-end.
+#### the request arrives
 
-#### Step 1 — parse + auth-gate (before any stream)
+The page opens the request:
 
-The route never commits to a stream when it can return a flat JSON error
-instead. The order matters: a `401 needsAuth` response triggers the browser
-to redirect to the OAuth provider (`useBriefingStream.ts:162-171`); a
-started-then-failed stream can't do that cleanly because the response status
-is already 200.
-
-```typescript
-// app/api/briefing/route.ts:155-188 (abridged)
-if (!process.env.ANTHROPIC_API_KEY) {
-  return NextResponse.json({ error: 'ANTHROPIC_API_KEY is not set' }, { status: 500 });
-}
-const mode: LiveMode = parseLiveMode(req.nextUrl.searchParams.get('mode'));
-
-let sid: string;
-let dsResult: Awaited<ReturnType<typeof makeDataSource>>;
-try {
-  sid = await getOrCreateSessionId();      // sets bi_session cookie if absent
-  dsResult = await makeDataSource(mode, sid);
-} catch (e) {
-  // wrapped because a setup throw (missing AUTH_SECRET) shouldn't bare-500
-  return NextResponse.json({ error: `... ${e.message}` }, { status: 500 });
-}
-if (!dsResult.ok) {
-  // Bloomreach has no valid tokens → 401 + authUrl for the browser to redirect
-  return NextResponse.json({ needsAuth: true, authUrl: dsResult.authUrl }, { status: 401 });
-}
+```ts
+// lib/hooks/useBriefingStream.ts:154-158
+const url = `/api/briefing${search}`;       // search = ?demo=cached OR ?mode=live-…
+…
+const res = await fetch(url);
 ```
 
-The annotation worth keeping: **auth runs before the stream opens.** This is
-the only place we can speak JSON to the client. After this point, every
-problem becomes an NDJSON `error` event.
+The route handler answers (`app/api/briefing/route.ts:77`). Before it commits to streaming, it inspects two things: `?demo=cached` (which short-circuits to the snapshot replay), and the `Authorization` / session cookie state (which can return a 401 with the auth URL the browser must redirect to).
 
-#### Step 2 — open the stream, set up the emit helpers
+```
+  Layers-and-hops — request lands on the route
 
-```typescript
-// app/api/briefing/route.ts:190-207 (abridged)
+  ┌─ browser ────┐  hop 1: GET /api/briefing?mode=… ┌─ Next.js route ─┐
+  │  fetch       │ ──────────────────────────────► │  app/api/briefing/│
+  │              │  hop 4: 200 + NDJSON stream ◄── │  route.ts        │
+  └──────────────┘                                  └────────┬─────────┘
+                                                            │ hop 2: read cookie
+                                                            │       (bi_session)
+                                                            ▼
+                                                   ┌─ session helper ─┐
+                                                   │  getOrCreateSessionId │
+                                                   └────────┬─────────┘
+                                                            │ hop 3: 401 + authUrl
+                                                            │       when unauthorized
+                                                            ▼
+                                                   (or proceed to streaming)
+```
+
+#### resolve the session, build the adapter
+
+The route resolves the session id from the cookie (or sets a fresh one), then asks the factory for an adapter:
+
+```ts
+// app/api/briefing/route.ts:170-186
+sid = await getOrCreateSessionId();
+dsResult = await makeDataSource(mode, sid);
+…
+if (!dsResult.ok) {
+  return NextResponse.json({ needsAuth: true, authUrl: dsResult.authUrl }, { status: 401 });
+}
+const dataSource = dsResult.dataSource;     // the port — narrowed to DataSource
+const bootstrap = dsResult.bootstrap;       // closure over the adapter's bootstrap step
+const disposeDataSource = dsResult.dispose; // best-effort teardown
+```
+
+`makeDataSource` is the factory (`lib/data-source/index.ts:67-100`). For `'live-bloomreach'` it defers to `connectMcp(sessionId)` which runs the OAuth dance and returns a `BloomreachDataSource`; for `'live-synthetic'` it constructs a `SyntheticDataSource` directly. The route holds only the abstract surface — it does not know which adapter it got. → see `03-datasource-seam.md`.
+
+If the auth dance fails (no valid token, never authorized), the factory returns `{ ok: false, authUrl }` and the route sends a 401 JSON body containing the URL the browser should redirect to. The hook reads that on `res.status === 401` and navigates (`useBriefingStream.ts:162-171`). → see `02-auth-boundary.md`.
+
+#### commit to streaming
+
+Once the auth gate passes, the route opens a `ReadableStream` and returns it. Every `controller.enqueue(...)` from inside `start()` becomes a chunk on the wire:
+
+```ts
+// app/api/briefing/route.ts:190-200
 const encoder = new TextEncoder();
 const stream = new ReadableStream<Uint8Array>({
   async start(controller) {
     const send = (e: BriefingEvent) =>
       controller.enqueue(encoder.encode(JSON.stringify(e) + '\n'));
     const step = (content: string) =>
-      send({ type: 'reasoning_step',
-             step: { id: crypto.randomUUID(), agent: 'monitoring',
-                     kind: 'thought', content } });
-    const t0 = performance.now();
-    const phases: Array<{ phase: string; durationMs: number }> = [];
-    // ...try/catch/finally body below...
-  }
-});
-return new Response(stream, {
-  headers: { 'content-type': 'application/x-ndjson; charset=utf-8',
-             'cache-control': 'no-store, no-transform' }
-});
+      send({ type: 'reasoning_step', step: { id: crypto.randomUUID(), agent: 'monitoring', kind: 'thought', content } });
+    …
 ```
 
-`send` is the one-liner the rest of the handler uses. Every event becomes a
-single JSON object + `\n`. The encoder is hoisted because allocating one per
-event would be wasteful — same shape as `encodeEvent` in
-`lib/mcp/events.ts:14-17` (the agent route uses the named helper; briefing
-inlines because it adds `workspace` and `coverage_item` event types not in
-the shared `AgentEvent` union).
+The `'\n'` at the end of every event is the wire framing. The reader on the other side splits on `'\n'` and `JSON.parse` each chunk. → see `06-streaming-ndjson.md`.
 
-```
-  Layers-and-hops — opening the stream
+#### phase 1 — bootstrap the schema
 
-  ┌─ Client ──────────────┐   GET /api/briefing?mode=...     ┌─ Route ─────┐
-  │  fetch()              │ ────────────────────────────────► │  parse + auth│
-  └───────────────────────┘                                   └──────┬───────┘
-                                                                     │ ok → 200
-                                                  return Response(   │
-                                  ReadableStream + ndjson headers)   │
-                                                                     ▼
-  ┌─ Client ──────────────┐  body.getReader() (ndjson hook)  ┌─ Route ─────┐
-  │  readNdjson loop      │ ◄──────────────────────────────── │  controller.│
-  └───────────────────────┘  one JSON object per '\n'         │  enqueue()  │
-                                                              └──────────────┘
-```
+The first useful work: ask the adapter to describe the workspace.
 
-#### Step 3 — bootstrap the schema (inside the stream)
-
-The schema-fetch is the first phase that costs real time (~1-4 calls @ ~1
-req/s on cold cache). Doing it INSIDE the stream means the client sees the
-"reading the workspace schema…" reasoning_step immediately, instead of a
-silent multi-second wait followed by a burst.
-
-```typescript
-// app/api/briefing/route.ts:215-221
+```ts
+// app/api/briefing/route.ts:215-229
 req.signal.throwIfAborted();
 step('reading the workspace schema…');
 const t_schema = performance.now();
-const schema = await bootstrap(req.signal);    // factory's bootstrap → bootstrapSchema
+const schema = await bootstrap(req.signal);
 recordPhase('schema_bootstrap', t_schema);
-send({ type: 'workspace', workspace: { ... }});
+send({ type: 'workspace', workspace: { … } });
 ```
 
-Cancellation lands at the top of every phase via `throwIfAborted()` — the
-in-flight `await` already honours the signal because it's threaded down to
-`dataSource.callTool({ signal })`; the explicit throw catches the case where
-the client cancelled BETWEEN phases.
+`bootstrap(signal)` is a closure the factory baked over the adapter. For Bloomreach, it runs the loomi connect orchestrator (`list_cloud_organizations` → `list_projects` → `get_event_schema` → …) and returns a `WorkspaceSchema`. For Synthetic, it returns a fixture.
 
-#### Step 4 — schema gate (the cheapest move in the system)
+This is also the first place a `workspace` event hits the wire — the UI shows the project name and customer count in the header as soon as the schema is back.
 
-Before the monitoring agent gets called, the route computes which of the 10
-anomaly categories the workspace can actually answer. Only those reach the
-agent. See `09-schema-gated-coverage.md` for the deep walk.
+#### phase 2 — schema-gated coverage
 
-```typescript
-// app/api/briefing/route.ts:234-246 (abridged)
+The 10-category checklist gates which categories actually run:
+
+```ts
+// app/api/briefing/route.ts:234-246
 const capabilities = schemaCapabilities(schema);
 const coverage = coverageReport(capabilities);
 const runnable = runnableCategories(capabilities);
-coverage.forEach((item) => { step(coverageLines[i]); send({ type: 'coverage_item', item }); });
+step('matching the workspace schema to the 10-category anomaly checklist…');
+const coverageLines = coverageChecklistSteps(coverage);
+coverage.forEach((item, i) => {
+  step(coverageLines[i]);
+  send({ type: 'coverage_item', item });
+});
 ```
 
-#### Step 5 — run the agent (Stage 4, the variable one)
+Each `coverage_item` event fills one tile in the UI's coverage grid. The `runnable` array is what the agent actually scans — categories with missing dependencies are surfaced honestly, not silently skipped. → see `09-schema-gated-coverage.md`.
 
-This is where the routes diverge. The monitoring route calls
-`agent.scan(runnable, hooks)`; the agent route calls one of three
-(`DiagnosticAgent`, `RecommendationAgent`, `QueryAgent`). The hooks are
-the bridge from the agent's tool/text events to the NDJSON stream:
+#### phase 3 — list tools, build the agent
 
-```typescript
-// app/api/briefing/route.ts:262-281 (abridged)
+```ts
+// app/api/briefing/route.ts:248-257
+req.signal.throwIfAborted();
+const raw = await dataSource.listTools({ signal: req.signal });
+const allTools: McpToolDef[] = …
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const agent = new MonitoringAgent(anthropic, dataSource, schema, allTools, sid);
+```
+
+`MonitoringAgent` is a thin wrapper around the library agent (`@aptkit/core`'s `AnomalyMonitoringAgent`); the wrapper's job is to construct the three adapter classes — model provider, tool registry, trace sink — and hand them in. → see `04-aptkit-primitive-boundary.md`.
+
+#### phase 4 — the scan (control flow flips to the LLM)
+
+This is the second seam from the structure pass. The route calls `agent.scan(...)` with three event hooks; from this point until the scan returns, *the LLM decides what to do next*.
+
+```ts
+// app/api/briefing/route.ts:259-281
+req.signal.throwIfAborted();
+step(`checking ${runnable.length} of 10 anomaly categories against this workspace…`);
+const t_scan = performance.now();
 const anomalies = await agent.scan({
-  onToolCall:   (tc) => { send({ type: 'tool_call_start', toolName: tc.toolName, agent: 'monitoring' });
-                          step(describeToolCall(tc)); },
-  onToolResult: (tc) => send({ type: 'tool_call_end', toolName: tc.toolName, agent: 'monitoring',
-                               durationMs: tc.durationMs ?? 0, result: trunc(tc.result),
-                               error: tc.error }),
-  onText:       (t)  => { if (t.trim()) step(t.trim()); },
-  signal:       req.signal,
+  onToolCall: (tc) => {
+    send({ type: 'tool_call_start', toolName: tc.toolName, agent: 'monitoring' });
+    step(describeToolCall(tc));   // surfaces the real EQL query as the live status line
+  },
+  onToolResult: (tc) =>
+    send({
+      type: 'tool_call_end',
+      toolName: tc.toolName,
+      agent: 'monitoring',
+      durationMs: tc.durationMs ?? 0,
+      result: trunc(tc.result),
+      error: tc.error,
+    }),
+  onText: (t) => { if (t.trim()) step(t.trim()); },
+  signal: req.signal,
 }, runnable);
 ```
 
-Every tool call the agent makes becomes two NDJSON lines (`tool_call_start`
-+ `tool_call_end`); every model-emitted text becomes a `reasoning_step`.
+Each hook turns an internal AptKit event into one or more NDJSON events on the wire. The user sees the agent's queries appear in the status panel in near real time — the "shows its work" pitch from the product context.
 
-#### Step 6 — terminate the stream
+The `signal: req.signal` is the load-bearing detail: if the browser closes the tab, the abort signal propagates into the AptKit loop → into `dataSource.callTool({signal})` → into the Anthropic SDK call's `{signal}` option. The whole subtree cancels.
 
-```typescript
+```
+  Layers-and-hops — the scan, with control flipping to the LLM and back
+
+  ┌─ route handler ────────┐   hop A: agent.scan(hooks, runnable)
+  │  app/api/briefing      │ ───────────────────────────────────────►
+  └────────────────────────┘                                          ┌─ AptKit loop ───┐
+                                                                      │  decides which  │
+                                                                      │  tool to call   │
+                                                                      └────────┬────────┘
+                                                                               │ hop B
+                                                                               │ tool_use
+                                                                               ▼
+                                                                      ┌─ tool registry ─┐
+                                                                      │  callTool       │
+                                                                      └────────┬────────┘
+                                                                               │ hop C
+                                                                               ▼
+                                                                      ┌─ DataSource ────┐
+                                                                      │  Bloomreach OR  │
+                                                                      │  Synthetic      │
+                                                                      └────────┬────────┘
+                                                                               │ hop D
+                                                                               │ result
+                                                                               ▼
+                                                                      ┌─ trace sink ────┐
+                                                                      │  emit event     │
+                                                                      └────────┬────────┘
+                                                                               │ hop E
+  ┌──────────────────────────◄────────────────────────────────────────────────┘
+  │  send({ type: 'tool_call_end', … })  ← back on the wire
+  ▼
+  (loop until the model emits its final synthesis — no more tool_use blocks)
+```
+
+The loop terminates when the model emits a turn with no tool-use blocks (the synthesis turn). The route block waits for the whole `agent.scan(...)` promise to resolve; the wire has been receiving events the whole time.
+
+#### phase 5 — convert anomalies, persist, emit insights
+
+```ts
 // app/api/briefing/route.ts:283-288
+req.signal.throwIfAborted();
 const insights = anomalies.map(anomalyToInsight);
 putInsights(sid, insights, anomalies);
 for (const insight of listInsights(sid)) send({ type: 'insight', insight });
+
 send({ type: 'done' });
 ```
 
-The agent route additionally writes the combined-run cache for replay
-(`app/api/agent/route.ts:301-302`), but only when `step == null` (the
-legacy combined run used by the capture). Split steps hand off via the
-client's `sessionStorage` — see `08-client-stream-handoff.md`.
+`putInsights(sid, …)` writes to the session-keyed feed map (`lib/state/insights.ts`). Each insight becomes one wire event. Then `done` closes the logical stream.
 
-#### Step 7 — finally: dispose, log, close
+#### cleanup — the finally block runs on every exit path
 
-```typescript
-// app/api/briefing/route.ts:303-326 (abridged)
+```ts
+// app/api/briefing/route.ts:289-326 (condensed)
 } catch (e) {
-  if (e instanceof DOMException && e.name === 'AbortError') return;   // client cancelled
+  if (e instanceof DOMException && e.name === 'AbortError') return;  // client cancelled
   console.error('[briefing] error:', redactSecrets(formatError(e)));
-  send({ type: 'error', message: `/api/briefing · ${e.message}` });
+  send({ type: 'error', message: `/api/briefing · ${...}` });
 } finally {
-  try { await disposeDataSource(); } catch (e) { /* must not swallow */ }
+  try { await disposeDataSource(); } catch (e) { … }
   console.log(JSON.stringify({
-    route: '/api/briefing', sessionId: sid, mode,
+    route: '/api/briefing',
+    sessionId: sid,
+    mode,
     totalMs: Math.round(performance.now() - t0),
-    phases, aborted: req.signal.aborted,
+    phases,                              // [{ phase, durationMs }, …]
+    aborted: req.signal.aborted,
   }));
   controller.close();
 }
 ```
 
-Three things to notice. **One**: the AbortError check suppresses error
-events for a cancelled client (no consumer to read them) but still lets
-`finally` run. **Two**: the dispose error is caught locally — a dispose
-failure must not swallow the route-level error above. **Three**: the
-console-log is the only observability signal — see audit lens 8 (R6).
+Three things matter here:
 
-### Move 2.5 — what's different in `/api/agent`
-
-The pipeline shape is identical; the body differs. Three branches inside
-Stage 4:
-
-```
-  /api/agent — three branches inside Stage 4
-
-  Branch A — query (q != null, no insightId):
-    classifyIntent(query) → QueryAgent.answer(query, intent) → text + done
-
-  Branch B — diagnose (step='diagnose' or null):
-    DiagnosticAgent.investigate(anomaly) → diagnosis → recommendation (if null step)
-
-  Branch C — recommend (step='recommend'):
-    parseDiagnosis(?diagnosis=...) → RecommendationAgent.propose(anomaly, diagnosis)
-```
-
-And one extra branch BEFORE Stage 1: cache-first replay
-(`app/api/agent/route.ts:124-142`). When `insightId && !live`, the route
-serves a precomputed investigation from `getCachedInvestigation(insightId)`
-filtered by `step`, replayed with `REPLAY_DELAY_MS = 180` between events
-for a readable pace. The demo path lives here.
+- The cancel path (the `AbortError` branch) returns *without* emitting an error event — there's nobody listening — but it still falls through to `finally`, so the phase log fires with `aborted: true` and the partial budget consumed.
+- The dispose call is best-effort. A dispose error must not swallow the route error.
+- The per-request log line is the observability spine. Same shape on `/api/agent`, so one Vercel filter reads across both routes.
 
 ### Move 3 — the principle
 
-The principle is **build the pipeline, then put a loop inside it.** A pure
-loop (let the model drive end-to-end) is unbounded and unpredictable —
-hitting the 300s ceiling without a checkpoint is a real failure mode. A
-pure pipeline (no loop at all, classic ETL) is too rigid for an agent
-product where the next tool call depends on the previous result.
+The request flow is a *single progressive HTTP response* with a deterministic shell wrapping an autonomous core. The shell — bootstrap, gate, list tools, persist, emit — runs in fixed order, written in TypeScript. The core — the scan — runs under the LLM's control, but every event it generates is forwarded through the same `send` function as the shell's own events. The wire never knows the difference.
 
-The fix is the hybrid you're looking at: a fixed-order pipeline at the
-outer level (so phase timing is predictable and observable), with an agent
-loop at the inner level (so the model can choose tools freely). The route
-log line at the end of `finally` records *which phase* ate the budget when
-a request blew the ceiling — an interview-grade observability story for
-half a screen of structured-log JSON.
+The transferable lesson: when an agent loop sits inside a server route, treat the route as a *streaming shell* and the loop as one of its phases. Don't try to make the route imperative-from-end-to-end (it can't predict what the agent will do); don't try to make the loop emit directly to the wire (you'll lose the route's framing and cleanup). Hooks in, NDJSON out — the route owns the boundary; the library owns the loop.
 
 ## Primary diagram
 
-The recap visual. Everything Move 2 walked, in one frame.
+The full flow, recap visual.
 
 ```
-  /api/briefing — one full request, layered
+  /api/briefing — full request flow
 
-  ┌─ Browser ────────────────────────────────────────────────────────────┐
-  │  fetch('/api/briefing?mode=live-bloomreach')                          │
-  │  readNdjson(body, switch(event.type) → setState(...))                 │
-  └──────────────────────┬───────────────────────────────────────────────┘
-                         │  HTTP GET
-  ┌─ Route handler ──────▼───────────────────────────────────────────────┐
-  │                                                                       │
-  │  STAGE 1 (sync return paths, no stream yet)                           │
-  │    ANTHROPIC_API_KEY check → 500 JSON                                 │
-  │    parseLiveMode + getOrCreateSessionId                               │
-  │    makeDataSource(mode, sid)                                          │
-  │      └─ Bloomreach not authed → 401 { needsAuth, authUrl }            │
-  │                                                                       │
-  │  ─── commit to stream: new ReadableStream({ start(controller) ──────  │
-  │                                                                       │
-  │  STAGE 2 schema_bootstrap        ──► send 'reasoning_step', 'workspace'│
-  │  STAGE 3 coverage_gate           ──► send 'coverage_item' × N         │
-  │  STAGE 4 list_tools                                                    │
-  │  STAGE 5 monitoring_scan         ──► send 'tool_call_start/end',       │
-  │                                       'reasoning_step', 'insight'     │
-  │  STAGE 6 send 'done'                                                   │
-  │                                                                       │
-  │  catch (AbortError) → return     // client cancelled                  │
-  │  catch (other)      → send 'error' { message }                        │
-  │  finally:                                                              │
-  │    await disposeDataSource()      // best-effort                       │
-  │    console.log({ route, sid, mode, totalMs, phases, aborted })        │
-  │    controller.close()                                                  │
-  │                                                                       │
-  └──────────────────────┬───────────────────────────────────────────────┘
-                         │  one '\n'-terminated JSON object per event
-                         ▼
-                  back to the browser hook
+  ┌─ browser ─────────────────────────────────────────────────────────────┐
+  │  page.tsx                                                              │
+  │    useBriefingStream → fetch('/api/briefing?mode=live-bloomreach')     │
+  │                                                                        │
+  │   ◄── 401 + { needsAuth, authUrl }     → window.location = authUrl     │
+  │   ◄── 200 + NDJSON stream              → readNdjson(body, handle, …)   │
+  └──────────────────┬─────────────────────────────────────────────────────┘
+                     │  HTTP
+  ┌─ Next.js route ─▼─────────────────────────────────────────────────────┐
+  │  app/api/briefing/route.ts (maxDuration = 300)                         │
+  │                                                                        │
+  │  1. session     getOrCreateSessionId()                                  │
+  │  2. factory     makeDataSource(mode, sid)                               │
+  │                   ├─ live-bloomreach → connectMcp → BloomreachDataSource│
+  │                   └─ live-synthetic  → new SyntheticDataSource()        │
+  │  3. commit      new ReadableStream({ start(controller) { … } })         │
+  │  4. bootstrap   bootstrap(signal) → schema   ─ emit workspace           │
+  │  5. gate        coverageReport(capabilities) ─ emit coverage_item ×10   │
+  │  6. tools       dataSource.listTools(signal) → allTools                 │
+  │  7. scan        new MonitoringAgent(...).scan(hooks, runnable)          │
+  │                   ╱ onToolCall    → emit tool_call_start + step         │
+  │                   ╲ onToolResult  → emit tool_call_end                  │
+  │                     onText        → emit reasoning_step                 │
+  │  8. persist     putInsights(sid, insights)                              │
+  │  9. emit        emit insight × N → emit done                            │
+  │ 10. finally     dispose() + log { route, sid, mode, totalMs, phases }   │
+  └──────────────────┬─────────────────────────────────────────────────────┘
+                     │  port: DataSource.callTool
+  ┌─ adapter ───────▼─────────────────────────────────────────────────────┐
+  │  BloomreachDataSource (HTTPS) OR SyntheticDataSource (in-process)      │
+  └────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-**Where this pattern comes from.** "Build a pipeline, run an agent inside"
-is the working AI-engineer shape that emerged once people built enough
-agent products to learn that pure-loop architectures explode and pure-ETL
-architectures can't make decisions. The pipeline gives you the slots a
-real engineering org needs (per-phase timing, per-phase metrics, clean
-cancellation boundaries); the agent gives you the flexibility the product
-needs (let the model pick the next tool).
+**Where this pattern comes from.** Progressive HTTP responses predate modern frameworks — chunked transfer encoding is a 1999 HTTP/1.1 feature. NDJSON over `fetch` is the modern equivalent of Server-Sent Events without the protocol overhead: no `Last-Event-ID` semantics, no automatic reconnect, no event-type discrimination at the transport layer. The wire format is just "JSON, one per line." The trade is that you write the framing yourself and the reconnect policy yourself (which is exactly what `useReconnectPolicy` does for the token-revocation case).
 
-**The deeper principle.** A streaming response is just a special case of
-the request-handler pattern with one extra rule: **once the body starts,
-the status code is fixed.** Everything error-shaped after that point has
-to ride the body. That's why the auth-gate runs before
-`new ReadableStream`, and why `AbortError` is swallowed in the catch:
-the cancelled client can't read the 'error' event either way.
+**Why not `EventSource`.** Two reasons. First, `EventSource` only supports GET — it can't carry a JSON body (the investigation route uses POST with the diagnosis payload). Second, `EventSource` reconnects automatically with `Last-Event-ID`, which is the wrong semantics here: a reconnect during a live agent scan would either duplicate work or skip events. The hand-rolled `fetch + readNdjson` model gives explicit control over reconnect, which `useReconnectPolicy` uses to do one-shot reload-after-auth-error.
 
-**Where it breaks.**
+**Why not WebSocket.** Same reasons plus the deployment overhead. Vercel functions are request-response; a long-lived socket needs a different runtime. The progressive HTTP response fits the serverless model exactly: one request, one streamed response, then teardown.
 
-- **Sequential bootstrap blows the budget on cold start.** Schema
-  bootstrap does 4 sequential MCP calls (`lib/mcp/schema.ts:195-198`); a
-  cold cache + a rate-limit retry can eat 30s+. The module-level cache
-  hides this on warm instances.
-- **The error-as-NDJSON-line contract can confuse pre-AbortSignal
-  clients.** A client that doesn't read the body after a cancel won't
-  see the `'error'` event — which is fine because there's nothing to
-  show, but it does mean errors that happen DURING a stream are
-  invisible in any log aggregator that only reads response status codes.
-- **The phase timings are a one-line JSON dump.** No traces, no spans,
-  no parent-child correlation across routes. Fine for now; the line at
-  the end of `finally` is a deliberate starting point (see audit R6).
-
-**What to explore next.**
-
-- `06-streaming-ndjson.md` — the wire contract this pipeline produces
-- `07-multi-agent-orchestration.md` — Stage 4's three-branch body
-- `03-datasource-seam.md` — the swappable provider behind `makeDataSource`
-- `02-oauth-boundary.md` — why Stage 1 is non-negotiable
+**What changes if this evolves.** The two natural growth paths are (a) a second producer route emitting on the same wire (chat, free-form query) — already exercised by `/api/agent` — and (b) backpressure. Today the producer enqueues as fast as it can; if a slow reader ever became a real concern, `ReadableStream` has a built-in backpressure signal (`controller.desiredSize`) the producer could honor. Neither is needed today.
 
 ## Interview defense
 
-#### Q: "Why is your route handler a pipeline AROUND an agent loop instead of just letting the agent drive end-to-end?"
+**Q: Walk me through what happens between the user clicking "live" and the first insight appearing on screen.**
 
-A pure loop is unbounded — the agent can decide to keep calling tools
-until it hits the model's max_tokens or our 300s `maxDuration`. We need
-predictable phase timing for two reasons: cancellation boundaries (so
-`throwIfAborted()` lands somewhere meaningful) and observability (so the
-log line at end-of-`finally` tells me which phase ate the budget when a
-request blows up).
+> The page's `useBriefingStream` hook opens `GET /api/briefing?mode=live-bloomreach`. The route resolves the session cookie, calls the factory `makeDataSource`, which runs the OAuth dance and returns a `BloomreachDataSource`. If the dance fails, the route sends 401 + the auth URL and the hook navigates. Otherwise the route opens a `ReadableStream`, bootstraps the workspace schema, gates the 10-category checklist, lists the MCP tools, builds the `MonitoringAgent`, and calls `agent.scan(hooks, runnable)`. The agent runs the loop under the LLM's control; each tool call fires `onToolCall` / `onToolResult` hooks, which the route turns into NDJSON events on the wire. As soon as the first anomaly is produced and converted to an `Insight`, an `insight` event hits the wire and the UI renders the card.
 
 ```
-  outer pipeline (CODE decides phases)
-      └── inner loop (LLM decides tools within one phase)
+  the spine, one sentence per phase
+
+  fetch → 401-gate → ReadableStream
+        → bootstrap → coverage → listTools
+        → MonitoringAgent.scan { onToolCall, onToolResult, onText }
+        → putInsights → emit insight × N → emit done
+        → finally: dispose + log
 ```
 
-**Surface:** the answer is "control flow flips at the agent boundary."
-**Probe:** if asked to defend further — name the phase-log
-(`app/api/briefing/route.ts:317-322`) and the `throwIfAborted()` calls at
-every phase boundary as the concrete payoff.
+**Anchor:** `app/api/briefing/route.ts:170-288`.
 
-#### Q: "What's the load-bearing part of this pipeline — what breaks if you remove it?"
+**Q: The LLM is in control during `agent.scan`. How does the route handle that?**
 
-The `try / catch / finally` is the kernel. Specifically: the `finally`
-running even on `AbortError`. Remove that and the per-phase timings
-disappear on every cancelled request — and on Vercel, a 300s-budget blow
-is exactly the cancel case (client gave up, route still running). The
-phase log is how we know where it died.
+> The route gives up imperative control of "what query to run next" but keeps imperative control of "what hits the wire." It passes three hooks into the agent: `onToolCall`, `onToolResult`, `onText`. The agent fires those hooks as it runs; the route translates each one into an NDJSON event. So the LLM owns the loop's *decisions* but the route owns the *framing*. The seam is the hook surface — the agent doesn't know there's an HTTP response on the other side; the route doesn't know which EQL the model will pick next.
 
-Other load-bearing parts (in order):
+```
+  the load-bearing seam
 
-  → `req.signal.throwIfAborted()` between phases — cancellation must land
-    at a clean boundary, not mid-stream
-  → the auth-gate BEFORE `new ReadableStream` — the only place we can
-    return JSON status codes
-  → the per-phase `recordPhase(name, started)` — what makes the log
-    actionable
+  ┌─ route owns ─┐  hooks  ┌─ AptKit owns ─┐
+  │ NDJSON wire  │ ◄────── │ the loop      │
+  │ + framing    │         │ + decisions   │
+  └──────────────┘         └───────────────┘
+```
 
-Optional hardening (not load-bearing):
+**Anchor:** the three hooks at `app/api/briefing/route.ts:262-280`, called from inside `agent.scan` via `BloomingTraceSinkAdapter.emit` at `lib/agents/aptkit-adapters.ts:108-130`.
 
-  → `redactSecrets` on the error log — important for security, but the
-    pipeline runs without it
-  → `trunc(tc.result)` to cap event size — quality-of-life
+**Q: What's the most load-bearing piece you'd point at if I asked "what breaks if it goes wrong?"**
 
-#### Q: "What changes at 10x users?"
+> The `req.signal` thread. Cancellation has to propagate from the browser's `AbortController` (`useBriefingStream` cleanup) into `req.signal` (the route's input), into every async call the route makes — `bootstrap(req.signal)`, `dataSource.listTools({signal})`, `dataSource.callTool({signal})`, and the Anthropic SDK call's `{signal}` option. If any layer drops the signal, the route keeps burning the 300-second budget on a request the browser already abandoned. The `req.signal.throwIfAborted()` checks between phases are coarse safety nets; the per-call `{signal}` is the fine-grained one.
 
-The Bloomreach alpha rate-limits per user globally, so 10x concurrent
-users doesn't change the per-user budget — but it does multiply the
-warm-instance memory footprint (each session is a Map entry in
-`lib/state/insights.ts`). Vercel auto-scales serverless instances, so
-the binding constraint stays per-user. At 100x I'd worry about the
-schema cache being per-instance — 100 warm instances each pay the
-4-call bootstrap on first request. A shared cache (Vercel KV) is the
-move.
+```
+  the cancel chain
+
+  browser AbortController
+        │
+        ▼
+  req.signal  ── route checks .throwIfAborted() between phases
+        │
+        ├──► bootstrap(req.signal)
+        ├──► dataSource.listTools({ signal: req.signal })
+        ├──► dataSource.callTool({ signal })  ◄── per tool call
+        └──► anthropic.messages.create(params, { signal })
+```
+
+**Anchor:** `app/api/briefing/route.ts:215, 248, 259, 283` plus the SDK signal at `lib/agents/aptkit-adapters.ts:52-55`.
 
 ## See also
 
-- `00-overview.md` — the whole-system map
-- `06-streaming-ndjson.md` — the NDJSON contract this pipeline produces
-- `07-multi-agent-orchestration.md` — the variable Stage 4 body
-- `05-caching-and-rate-limiting.md` — what makes Stage 2's bootstrap survivable
-- `02-oauth-boundary.md` — why Stage 1's auth-gate exists
-- `study-runtime-systems` — the async / AbortSignal / event-loop mechanics
-- `study-networking` — HTTP, NDJSON-on-the-wire, connection lifecycle
+- `02-auth-boundary.md` — the auth dance the factory defers to
+- `03-datasource-seam.md` — the port the route narrows to
+- `04-aptkit-primitive-boundary.md` — what happens inside `agent.scan`
+- `06-streaming-ndjson.md` — the wire format this flow emits
+- `07-in-memory-state-ownership.md` — where `putInsights` writes
+- `08-demo-replay-as-reliability.md` — the alternate path when `?demo=cached`
+- `09-schema-gated-coverage.md` — how `runnable` is decided
+- `10-rate-limit-aware-mcp-client.md` — what the adapter does behind `callTool`

@@ -1,272 +1,332 @@
-# Chapter 6 — The Q&A   (prep only, post-clock)
+# Chapter 06 — The Q&A (post-clock — prep, no budget)
 
-## Opening hook
+This chapter does not eat your ten minutes. It runs after the timed slot. But it is the chapter that decides whether the judges walk away thinking "real engineering" or "AI-built mockup." The room saw the demo for five minutes. They will spend three to ten minutes asking you about it. Those questions are the second half of your scorecard.
 
-Q&A runs **after** the buzzer. It does not eat the ten minutes. The reason this chapter exists is that the questions you get in the three minutes after a hackathon demo are wildly predictable, and the difference between a winning demo and a *winning-and-getting-funded* demo is whether you have crisp, honest, speakable answers to the standard probes already loaded.
+The pattern judges use in 2026 is well-known: they assume heavy AI assistance in the build (correctly), and they probe to find out whether you understand what you shipped. Defensive answers — "I really did write most of it myself" — score worse than matter-of-fact answers — "I used Claude heavily for the agent loop refactor; here's the boundary I drew and here's what I decided." The job of this chapter is to train you for that posture: own the tools, own the decisions, own the rough edges, and have a crisp speakable answer ready for every probe you can predict.
 
-The discipline here is different from the demo chapters. You are no longer choreographing screens. You are preparing for questions where the wrong move is **performative** — overclaiming, defensiveness, or pretending the build is more finished than it is. **Hackathon judges in 2026 assume heavy AI use. They assume rough edges. What they are checking is whether you understand what you built well enough to be honest about it.**
+The five probes the room will almost certainly ask, plus the harder ones the experienced judges will. Each answer is in your voice, first person, present tense, speakable on the spot.
 
-This chapter is not a script you read top-to-bottom. It is a question bank. For each question, you have a verdict-first answer (one short paragraph) and a follow-up branch. Practice the verdict-first answers out loud — they should come out in roughly the same words every time.
-
-## The time-budget bar
+  ## The Q&A map — the questions in priority order
 
 ```
-  10:00  ┌─────────────────────────────────────────────────────────────┐
-         │ buzzer rings — timed slot ends                                │
-         │                                                               │
-         │ 06  Q&A  ← starts here, you have ~3 minutes typically        │
-         │           target: 3 questions answered well > 6 answered fast │
-         └─────────────────────────────────────────────────────────────┘
+  ┌────────────────────────────────────────────────────────────────┐
+  │                  Q&A — LIKELY → LESS LIKELY                     │
+  │                                                                 │
+  │  TIER 1 — almost certain (prep these cold)                      │
+  │    Q1  "Is this actually working, or is it a mockup?"           │
+  │    Q2  "What was the hard part?"                                │
+  │    Q3  "What's the stack?"                                      │
+  │    Q4  "Did you build this during the hackathon?" (AI-usage)    │
+  │    Q5  "Is there a business here / what's next?"                │
+  │                                                                 │
+  │  TIER 2 — experienced judges (prep these warm)                  │
+  │    Q6  "Why a library for the loop instead of writing your own?"│
+  │    Q7  "Isn't synthetic just fake data?"                        │
+  │    Q8  "You built an eval pipeline and then deleted it?"        │
+  │    Q9  "What's the production deployment story?"                │
+  │                                                                 │
+  │  TIER 3 — adversarial / weird (prep one liner each)             │
+  │    Q10 "Why Bloomreach?"                                        │
+  │    Q11 "Couldn't a marketer just ask ChatGPT?"                  │
+  │    Q12 "What stops the agent from hallucinating numbers?"       │
+  │    Q13 "How much does this cost per briefing?"                  │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
-Three minutes, three questions. Quality over quantity. If a question is unclear, ask for the clarification — you have time. If you don't know the answer, **say so directly** and name what you would check. Judges remember the candidate who said "I don't know" cleanly more than the one who bullshitted around it.
+Below: each question, the crisp answer, and the most likely follow-up so you don't get walked into a corner.
 
-## The standard probes — verdict first, then branch
+  ## Tier 1 — almost certain
 
-The seven questions below cover ~90% of what you will be asked. Each has the verdict-first answer to lead with, the anecdote or detail you reach for if asked to elaborate, and the trap to avoid.
+  ### Q1 — "Is this actually working, or is it a mockup?"
 
-### Probe 1 — "Is this actually working?"
-
-**Verdict:** Yes. Three modes — `demo`, `live-bloomreach`, and `live-synthetic`. What you saw was `live-synthetic`: real four-agent loop on real Claude, against in-process synthetic ecommerce data. Creds-free, deterministic, no upstream dependency.
+This is the no-vaporware probe. The answer is short and specific:
 
 ```
-  THE BRANCH
-
-  ┌─ if they ask "is the data real?" ────────────────────────────────┐
-  │  "The agent behavior is real — same Claude model, same loop,      │
-  │  same tool-use, same trace. The data is Blooming-owned synthetic │
-  │  ecommerce — purchase, view_item, session_start events with       │
-  │  realistic properties. The fake is the data, not the agent."     │
-  └───────────────────────────────────────────────────────────────────┘
-
-  ┌─ if they ask "can it hit a real workspace?" ─────────────────────┐
-  │  "Yes — `live-bloomreach` mode. The DataSource seam means the    │
-  │  agents don't care which adapter is behind them. I don't demo    │
-  │  it live because the alpha MCP server revokes OAuth tokens       │
-  │  after minutes and that's not a stage-safe risk."                │
-  └───────────────────────────────────────────────────────────────────┘
+  ┃ "Real. There are three modes — the toggle you saw in the
+  ┃  corner — `demo`, `live-synthetic`, and `live-bloomreach`.
+  ┃  All three run real agent code. Demo replays a committed
+  ┃  snapshot of a real run. Synthetic runs the agents in
+  ┃  process against deterministic ecommerce data. Bloomreach
+  ┃  runs against a real Bloomreach workspace over OAuth and
+  ┃  MCP. The thing on stage was synthetic — real Claude,
+  ┃  real agent loop, fake data."
 ```
 
-**Trap to avoid:** overclaiming "production-grade." Say what's true — three modes, two of them live, alpha upstream too unreliable for a stage.
+**Likely follow-up:** "Can I see the live-bloomreach one?"
+**Answer:** "Yes — but the Bloomreach alpha server revokes tokens after a few minutes, so I demo on synthetic for reliability. I can run it on Bloomreach after this if you want to see the OAuth flow and the rate-limiter."
 
-### Probe 2 — "Why a library for the loop? Why not write your own?"
+  ### Q2 — "What was the hard part?"
 
-**Verdict:** I did write my own first. That was Phase 1 — `runAgentLoop`, hand-rolled — and it proved the four-agent shape worked. Once `@aptkit/core` had a clean generic-primitive surface, the migration was three adapter classes. Library owns the loop; I own the boundary. Legacy preserved at `base-legacy.ts` as the rollback receipt.
-
-```
-  THE BRANCH
-
-  ┌─ if they ask "why migrate at all?" ──────────────────────────────┐
-  │  "The hand-rolled loop worked but mixed two concerns — what an  │
-  │  agent does and how the loop steps. Pulling the loop out into    │
-  │  a library let me reuse it for the intent router and any future  │
-  │  agent, and the boundary became the documented thing."           │
-  └───────────────────────────────────────────────────────────────────┘
-
-  ┌─ if they ask "isn't @aptkit/core yours too?" ────────────────────┐
-  │  "Yes. I authored both. The split isn't NIH versus library —     │
-  │  it's whether the loop should be reusable across projects        │
-  │  (yes) and whether this app should own the agent contracts (yes)."│
-  └───────────────────────────────────────────────────────────────────┘
-```
-
-**Trap:** sounding like you used a framework you don't understand. The opposite — you wrote the framework and you can name what it owns.
-
-### Probe 3 — "Isn't synthetic just fake data?"
-
-**Verdict:** It's deterministic, Blooming-owned synthetic ecommerce — purchase, view_item, session_start, cart_update events with realistic properties. The point is to let the agent loop run live (real Claude, real reasoning, real trace) without depending on Bloomreach being up or having OAuth tokens. **The fake is the data, not the agent behavior** — which is what a demo needs.
+There is one good answer here and it is not "everything." Pick one and tell it tight.
 
 ```
-  THE BRANCH
-
-  ┌─ if they ask "why not just hit Bloomreach?" ─────────────────────┐
-  │  "I do — that's `live-bloomreach`. Two problems for a stage:     │
-  │  the alpha server is rate-limited at ~1 req/s and revokes        │
-  │  tokens after minutes. Synthetic gives me the live agent         │
-  │  behavior without the upstream risk."                            │
-  └───────────────────────────────────────────────────────────────────┘
-
-  ┌─ if they ask "won't the agent overfit to synthetic patterns?" ───┐
-  │  "Possible. That's why the seam matters — the same agent code    │
-  │  runs against Bloomreach in live mode. If the agent only worked  │
-  │  on synthetic, the seam wouldn't have survived two adapter       │
-  │  swaps already."                                                 │
-  └───────────────────────────────────────────────────────────────────┘
+  ┃ "Building the eval pipeline. I had four agents and no
+  ┃  ground truth for what 'good' looked like — so I built a
+  ┃  4-pillar eval suite (detection, diagnosis, recommendation,
+  ┃  regression) with LLM-as-judge plus manual spot-check
+  ┃  calibration. It surfaced three real bugs the agents had:
+  ┃  one was a units bug where revenue came out as
+  ┃  R$131,965 because I was treating BRL cents as Reais; one
+  ┃  was a binary-calibration bug — the LLM judge was giving
+  ┃  29 out of 30 perfect scores; one was conclusion
+  ┃  instability — 30% of identical inputs produced
+  ┃  diverging conclusions. The eval finding the bugs was the
+  ┃  hard part. The bugs themselves were easy once I had a
+  ┃  scoreboard."
 ```
 
-**Trap:** getting defensive. Synthetic-as-fake is a fair probe. Own it — the fake is the data, not the agent.
+**Likely follow-up:** "And you removed the eval pipeline?"
+**Bridge to Q8.**
 
-### Probe 4 — "You built an eval pipeline and then deleted it?"
+  ### Q3 — "What's the stack?"
 
-**Verdict:** Built it, used it to surface three real bugs — including one where the agent reported a $26K average order value because it forgot Brazilian reais are quoted in cents — and retired it with the dataset it scored against. The rebuild target is against the synthetic adapter, decoupled from any one adapter's seed data. **The receipt of having shipped it once plus the bugs it caught are stronger than promising to build it.**
-
-```
-  THE BRANCH
-
-  ┌─ if they ask "what were the three bugs?" ────────────────────────┐
-  │  "BRL cents-vs-reais — recommendation judge caught it at run 8   │
-  │  when the agent claimed R$131,965 average order value, which is  │
-  │  about $26,000 per order, obviously wrong. Binary calibration —  │
-  │  the diagnostic agent's confidence was zero in 29 of 30 runs.    │
-  │  Conclusion instability — 30% regression baseline."              │
-  └───────────────────────────────────────────────────────────────────┘
-
-  ┌─ if they ask "isn't retiring an eval risky?" ────────────────────┐
-  │  "Retiring it without a plan would be. The plan is to rebuild    │
-  │  against synthetic so the eval doesn't depend on any one         │
-  │  adapter's seed data. That's a stronger eval than the one I      │
-  │  retired."                                                       │
-  └───────────────────────────────────────────────────────────────────┘
-
-  ┌─ if they push: "why not keep it?" ───────────────────────────────┐
-  │  "The substrate was wrong. The eval scored against Olist-shaped │
-  │  data. The product runs against ecommerce shapes more broadly.  │
-  │  Keeping a wrong-shape eval is worse than rebuilding right."     │
-  └───────────────────────────────────────────────────────────────────┘
-```
-
-**Trap:** sounding like you deleted work because it was hard. The opposite — you retired it because you learned what it needed to be.
-
-### Probe 5 — "What's the stack?"
-
-**Verdict:** Next.js 16 with the App Router on Vercel, React 19, TypeScript. Anthropic SDK for Claude — Sonnet-4.6 for the task agents, Haiku-4.5 for the intent router. MCP via `@modelcontextprotocol/sdk` with PKCE and Dynamic Client Registration when hitting Bloomreach. Streaming as newline-delimited JSON over `ReadableStream`. Agent runtime on `@aptkit/core@0.3.0`. Tailwind v4. No database — in-memory state plus committed demo snapshots.
+Short. Names. Move on.
 
 ```
-  THE BRANCH
-
-  ┌─ if they ask "why NDJSON not SSE?" ──────────────────────────────┐
-  │  "EventSource doesn't let you POST a body — the briefing request │
-  │  needs one. NDJSON over fetch + ReadableStream gives me the     │
-  │  POST body, the streaming, and a single kernel I reuse on three │
-  │  hooks (briefing, investigation, query)."                       │
-  └───────────────────────────────────────────────────────────────────┘
-
-  ┌─ if they ask "why no database?" ─────────────────────────────────┐
-  │  "Demo snapshots are committed JSON for reliability. Live state │
-  │  is in-memory because every briefing is a fresh scan — there's  │
-  │  nothing to persist across requests. A DB would be premature."  │
-  └───────────────────────────────────────────────────────────────────┘
+  ┃ "Next.js 16 App Router on Vercel, React 19. TypeScript.
+  ┃  Anthropic SDK — claude-sonnet-4-6 for the agents,
+  ┃  claude-haiku-4-5 for intent classification. AptKit core
+  ┃  at 0.3.0 for the agent loop runtime. Model Context
+  ┃  Protocol over Streamable HTTP with OAuth PKCE for the
+  ┃  Bloomreach side. NDJSON over ReadableStream for the
+  ┃  trace streaming. Tailwind v4. Vitest — 24 test files,
+  ┃  221 passing. No database; state in memory, demo
+  ┃  snapshots committed as JSON."
 ```
 
-**Trap:** listing tech with no reason. Every choice has a reason. Lead with the choice that has the strongest reason (NDJSON or no-DB).
+**Likely follow-up:** "Why Sonnet and not Opus?"
+**Answer:** "Latency. The streaming trace is the differentiator, and Sonnet keeps the time-to-first-event short enough that the trace feels alive. Opus would feel like waiting."
 
-### Probe 6 — "Did you build this during the hackathon?"
+  ### Q4 — "Did you build this during the hackathon?" (the AI-usage probe)
 
-**Verdict:** Most of it. The four-phase arc — hand-rolled loop, DataSource seam, eval pipeline, migration to `@aptkit/core` — spans about eight weeks. The streaming UI, the synthetic data source, and the demo polish are the last two weeks. Some of the older bones (the auth provider, the MCP client wrapper) were built before the window. **I'd rather be honest about the timeline than win on a technicality.**
-
-```
-  THE BRANCH
-
-  ┌─ if they ask "what did you actually ship this week?" ────────────┐
-  │  "The synthetic data source, the streaming trace polish on the  │
-  │  shared StatusLog, and the four-pillar eval rebuild plan. The   │
-  │  rest is the substrate."                                        │
-  └───────────────────────────────────────────────────────────────────┘
-```
-
-**Trap:** overclaiming. Honest timelines win in this room.
-
-### Probe 7 — "Where's the business?"
-
-**Verdict:** Two paths. Direct — sell into the existing Bloomreach customer base as a workspace add-on: their marketers already do this work manually. Indirect — the streaming-reasoning UX itself is a product pattern that generalizes to any analyst tool, not just Bloomreach. The codebase is the proof of the pattern; the substrate is interchangeable.
+This is the test for posture. Matter-of-fact. Own it.
 
 ```
-  THE BRANCH
-
-  ┌─ if they ask "what's the moat?" ─────────────────────────────────┐
-  │  "Speed of iteration on the agent loop and the trace UX. The    │
-  │  DataSource seam means I can drop into a new analytics backend   │
-  │  in a week. The trace UX is the differentiator — most analyst   │
-  │  AI shows results; this shows reasoning."                       │
-  └───────────────────────────────────────────────────────────────────┘
-
-  ┌─ if they ask "who pays?" ────────────────────────────────────────┐
-  │  "Marketing teams on Bloomreach in the short term. Analyst-AI   │
-  │  product teams in the medium term — the trace pattern is the    │
-  │  reusable piece."                                                │
-  └───────────────────────────────────────────────────────────────────┘
+  ┃ "I used Claude heavily — the agent prompts, the data
+  ┃  source adapter, big chunks of the route handlers, most
+  ┃  of the test scaffolding. What I decided: the 4-agent
+  ┃  decomposition, the DataSource seam, that the trace had
+  ┃  to be the differentiator, that the eval would be 4
+  ┃  pillars not 2, and that the loop should migrate from
+  ┃  hand-rolled to library after I proved the shape worked.
+  ┃  The model wrote a lot of code. I wrote the architecture
+  ┃  and the judgments."
 ```
 
-**Trap:** the moat question. Don't claim a technical moat that isn't there. Speed-of-iteration and UX differentiation are honest moats; "proprietary algorithms" would be a lie.
+**Likely follow-up:** "How long did it take?"
+**Answer:** Pick a real number you can defend; do not round up.
 
-## The "I don't know" recovery
-
-This is the most important section in the chapter. You will get a question you don't have a clean answer to. The recovery move:
-
-```
-  THE RECOVERY MOVE — three lines, in this order
-
-  1. "I don't know."                       ← say it directly
-  2. "Here's what I'd check —"             ← name the file or method
-  3. "— and I can follow up after if       ← offer the follow-up
-      that's the right answer for you."
-
-  Example:
-    Judge: "How does the diagnostic agent decide when to stop?"
-    You:   "I don't know the exact stopping condition off the top of
-            my head. I'd check the prompt at
-            lib/agents/prompts/diagnostic.md and the loop in
-            @aptkit/core's tool-use kernel. I can follow up after if
-            that's the right answer for you."
-```
-
-The three-line recovery is more credible than a guess. A guess that lands wrong destroys the rest of your credibility for the room. The honest "I don't know" lets the next question reset.
-
-## Anti-patterns to recognize in yourself, on the spot
+  ### Q5 — "Is there a business here? / What's next?"
 
 ```
-WEAK Q&A MOVES                        STRONG Q&A MOVES
-──────────────────────────────────    ──────────────────────────────────
-hedging ("kind of, sort of")          verdict first, then qualify
-"that's a great question"             skip the pleasantry, answer
-guessing when unsure                  three-line "I don't know" recovery
-defensiveness on tradeoffs            naming the tradeoff directly
-talking over the question             waiting until the question ends
-"like I said earlier…"                fresh sentence — they don't remember
-listing six possible answers          one verdict, one branch if pressed
+  ┃ "The business model is the same as every analytics-on-top
+  ┃  of-platform-X product — Bloomreach has marketers who
+  ┃  spend hours staring at dashboards, and the agent loop
+  ┃  collapses that into a five-minute morning read. Next is
+  ┃  rebuilding the eval against synthetic, adding a
+  ┃  notification path on the monitoring agent so the feed
+  ┃  pushes you, and broadening past Bloomreach — the
+  ┃  DataSource seam is exactly what would let me adapt to a
+  ┃  second platform."
 ```
 
-The "that's a great question" reflex is hard to break. Try this: when you hear yourself about to say it, replace it with a one-second pause. The pause is more credible than the compliment.
+**Likely follow-up:** "Who pays for it?"
+**Answer:** "Marketers / growth teams on Bloomreach. The pitch is 'replace the dashboard-staring hour with a five-minute briefing.' Per-seat SaaS is the natural shape; I haven't priced it."
 
-## The one-page Q&A run sheet
+  ## Tier 2 — experienced judges
+
+  ### Q6 — "Why a library for the loop instead of writing your own?"
 
 ```
-╭───────────────────────── Q&A — RUN SHEET ────────────────────────────╮
-│ Post-clock. ~3 minutes. Target: 3 answered well > 6 answered fast.    │
-│                                                                        │
-│ VERDICT-FIRST ANSWERS (lead with these, then branch):                 │
-│                                                                        │
-│  "Is this actually working?"     → Yes, 3 modes; you saw `live-       │
-│                                    synthetic` — real agents, fake     │
-│                                    data.                              │
-│                                                                        │
-│  "Why a library?"                → I built it first. Library owns     │
-│                                    loop; I own boundary. Legacy       │
-│                                    preserved as rollback receipt.     │
-│                                                                        │
-│  "Isn't synthetic fake data?"    → The fake is data, not behavior.   │
-│                                                                        │
-│  "You deleted the eval?"         → Built, used (caught 3 bugs),       │
-│                                    retired with substrate. Receipt    │
-│                                    of having shipped it > promise.    │
-│                                                                        │
-│  "What's the stack?"             → Next.js 16, Anthropic SDK,         │
-│                                    @aptkit/core, NDJSON over fetch,   │
-│                                    MCP for Bloomreach.                │
-│                                                                        │
-│  "Built during hackathon?"       → Most. 4-phase arc = ~8 weeks.      │
-│                                    Honest timeline > technicality.    │
-│                                                                        │
-│  "Where's the business?"         → Bloomreach add-on direct;          │
-│                                    streaming-reasoning UX pattern     │
-│                                    is the reusable piece.             │
-│                                                                        │
-│ "I DON'T KNOW" RECOVERY:                                              │
-│   1. "I don't know."                                                  │
-│   2. "Here's what I'd check — [file or method]"                       │
-│   3. "I can follow up if that's the right answer for you."            │
-│                                                                        │
-│ NEVER SAY: "that's a great question" / "kind of" / "sort of" /        │
-│   "like I said earlier"                                               │
-╰────────────────────────────────────────────────────────────────────────╯
+  ┃ "I built it first. The hand-rolled loop is still in the
+  ┃  repo at base-legacy.ts as a rollback receipt. Once
+  ┃  @aptkit/core had a clean generic-primitive surface, the
+  ┃  migration was 3 adapter classes — about 200 lines. The
+  ┃  library owns the loop; I own the boundary. That's the
+  ┃  trade I want: deep code I author lives at the boundary,
+  ┃  not in the loop itself."
+```
+
+**Likely follow-up:** "What if AptKit goes away?"
+**Answer:** "Roll back to base-legacy.ts. It's not deleted, it's preserved. That's why."
+
+  ### Q7 — "Isn't synthetic just fake data?"
+
+This is the question that tests whether you understand what synthetic mode is *for*. Don't get defensive.
+
+```
+  ┃ "The data is fake — purchase, view_item, session_start,
+  ┃  cart_update events with realistic properties, owned by
+  ┃  the app. The behavior is real: real Claude, real
+  ┃  4-agent loop, real streaming trace, real EQL-shaped
+  ┃  queries executed against in-process tables. What
+  ┃  synthetic lets me do is run the agent loop live for a
+  ┃  judge without depending on Bloomreach being up or
+  ┃  having an OAuth token. The fake is the data, not the
+  ┃  agent behavior. That's exactly what a demo needs."
+```
+
+**Likely follow-up:** "But you don't know it works on real data."
+**Answer:** "It runs on real data in `live-bloomreach` mode against a real Bloomreach workspace. Synthetic is the demo-day path; Bloomreach is the production path. I can flip the toggle and show you."
+
+  ### Q8 — "You built an eval pipeline and then deleted it?"
+
+This is the question that decides whether the chapter-04 arc reads as senior or as messy. The answer is the strongest single anecdote in your interview kit.
+
+```
+  ┃ "Built it, used it to surface three real bugs — the BRL
+  ┃  units bug, the binary-calibration bug, the conclusion
+  ┃  instability — and retired it together with the data
+  ┃  substrate it scored against. The substrate was Olist
+  ┃  ecommerce data over a SQLite MCP server I owned; I
+  ┃  retired that substrate in favor of the Blooming-owned
+  ┃  synthetic shape, which is cleaner. The eval went with
+  ┃  it. The rebuild target is against synthetic, decoupled
+  ┃  from any one adapter's seed data. The receipt of
+  ┃  having shipped the eval once, and the three bugs it
+  ┃  caught, are stronger than promising to build it. That's
+  ┃  what's in the close as next."
+```
+
+**Likely follow-up:** "Wouldn't it have been safer to keep the eval?"
+**Answer:** "It would have been safer. It would also have meant carrying a substrate I no longer wanted, just so the scoring still worked. The right shape is eval-against-synthetic. The cost is the gap until I rebuild it. I'm naming the gap, not hiding it."
+
+  ### Q9 — "What's the production deployment story?"
+
+```
+  ┃ "Demo as default for reliability — the committed snapshot
+  ┃  serves instantly with no auth. live-bloomreach when
+  ┃  there's a real workspace and OAuth tokens. live-
+  ┃  synthetic is the dev/test/judge-friendly path. Vercel
+  ┃  Pro for the agent routes — maxDuration 300 because
+  ┃  Bloomreach is rate-limited to ~1 req/s and a briefing
+  ┃  can take a couple of minutes end to end. Auth is
+  ┃  AES-256-GCM-encrypted cookies in production, file-based
+  ┃  store in dev. The alpha Bloomreach server revokes
+  ┃  tokens after minutes — the feed has auto-reconnect on
+  ┃  invalid_token to handle it."
+```
+
+**Likely follow-up:** "How do you scale past one user?"
+**Answer:** "Session ID per user, OAuth tokens per session, in-memory caches per session. The agent loop is stateless across requests — each briefing fetches fresh from Bloomreach. The scaling question is really 'how many Bloomreach tool calls per minute can you sustain' and that's an alpha-server problem, not an architecture problem."
+
+  ## Tier 3 — adversarial / weird
+
+  ### Q10 — "Why Bloomreach?"
+
+```
+  ┃ "It's where the marketer already is. There's a real MCP
+  ┃  surface — execute_analytics_eql, the EQL query language,
+  ┃  the segment and campaign APIs — which means I can act
+  ┃  on the diagnosis, not just describe it. The
+  ┃  recommendation agent proposes scenarios, vouchers,
+  ┃  campaigns — those are Bloomreach primitives. The
+  ┃  product is Bloomreach-specific on purpose."
+```
+
+  ### Q11 — "Couldn't a marketer just ask ChatGPT?"
+
+```
+  ┃ "ChatGPT doesn't have tool access to the workspace. The
+  ┃  whole loop here is grounded — every conclusion cites
+  ┃  the exact EQL query that produced it and the current-vs-
+  ┃  prior numbers behind it. You can't get that from a
+  ┃  general chatbot. The streaming trace is the proof."
+```
+
+  ### Q12 — "What stops the agent from hallucinating numbers?"
+
+```
+  ┃ "Every number in the UI is sourced from a tool call. The
+  ┃  Insight type carries an evidence array of {tool, result}
+  ┃  pairs, and the UI renders the prior→now comparison from
+  ┃  that evidence. If the agent makes a number up, there's
+  ┃  no evidence entry — and the UI shows a `--` placeholder
+  ┃  instead of a fabricated value. Hallucinated narrative is
+  ┃  still possible. Hallucinated numbers are caught at the
+  ┃  render layer."
+```
+
+  ### Q13 — "How much does this cost per briefing?"
+
+```
+  ┃ "Haven't measured precisely. The monitoring agent does
+  ┃  maybe 6 to 10 tool calls and a similar number of model
+  ┃  turns on Sonnet, so ballpark a few cents. The
+  ┃  recommendation agent is shorter. Bloomreach side is
+  ┃  free — rate-limited but not metered. Order of magnitude:
+  ┃  a daily briefing per user costs less than the API
+  ┃  charges for the marketer's expense-report tool."
+```
+
+  ## Postures to hold across all answers
+
+```
+  ┌────────────────────────────────────────────────────────────────┐
+  │ POSTURE                          INSTEAD OF                     │
+  │ ────────────────────────────     ─────────────────────────────  │
+  │ "I used Claude heavily for X"    "I really did write it myself" │
+  │ "Real, on path Y. Here's the     "It's a working demo, I        │
+  │  toggle."                          promise."                    │
+  │ "Built it, retired it, here's    "It worked at some point but   │
+  │  why."                             I had to remove it."         │
+  │ "Naming the gap, not hiding it." "I'm planning to add that."    │
+  │ "Same loop, swappable substrate."  "Well it works on synthetic  │
+  │                                    so it should work on real."  │
+  └────────────────────────────────────────────────────────────────┘
+```
+
+The right column is the junior default. The left column is the move you practice until it's reflex.
+
+  ## The "I don't know" recovery
+
+You will get a question you don't have an answer for. The pattern that works:
+
+```
+  ┃ "Honest answer: I don't know. The thing I do know is [a
+  ┃  related fact you DO know that connects to their
+  ┃  question]. Happy to dig into that part if it's useful."
+```
+
+Three moves: admit the gap, anchor on what you do know, offer the related dig. Do not bluff. Judges remember the bluff longer than they remember the gap.
+
+  ## The one-page run sheet — Q&A
+
+```
+  ╭──────────────────────────────────────────────────────────────────╮
+  │ RUN SHEET — 06 THE Q&A                       post-clock, no cap  │
+  │                                                                  │
+  │ POSTURE: matter-of-fact about AI assistance, specific about      │
+  │          decisions, willing to name gaps.                        │
+  │                                                                  │
+  │ TIER 1 (cold):                                                   │
+  │   Q1 mockup?    → "real. three modes. all run real agent code."  │
+  │   Q2 hard part? → "the eval pipeline — surfaced 3 real bugs."    │
+  │   Q3 stack?     → Next 16 / React 19 / Sonnet / AptKit / MCP /   │
+  │                   NDJSON / Vitest, 24 files / 221 passing.       │
+  │   Q4 AI usage?  → "Claude heavily for code. I wrote the          │
+  │                   architecture and the judgments."               │
+  │   Q5 business?  → "marketers on Bloomreach. DataSource seam      │
+  │                   broadens past Bloomreach."                     │
+  │                                                                  │
+  │ TIER 2 (warm):                                                   │
+  │   Q6 why library? → "built it first. library owns loop, I own   │
+  │                     boundary. legacy preserved as receipt."      │
+  │   Q7 fake data?   → "fake DATA, real behavior."                  │
+  │   Q8 deleted eval?→ "shipped + caught 3 bugs + retired with     │
+  │                     substrate. naming the gap, not hiding it."   │
+  │   Q9 production?  → "demo default. live-bloomreach with OAuth.   │
+  │                     auto-reconnect for token revokes."           │
+  │                                                                  │
+  │ TIER 3 (one-liners ready):                                       │
+  │   Q10 why bloomreach?      → "marketer already there + EQL"     │
+  │   Q11 vs ChatGPT?           → "grounded in tool calls"           │
+  │   Q12 hallucinations?       → "numbers caught at render layer"   │
+  │   Q13 cost?                 → "few cents / briefing, ballpark"   │
+  │                                                                  │
+  │ I DON'T KNOW: admit the gap → anchor on related → offer the dig. │
+  │                                                                  │
+  │ NEVER: bluff. defend AI usage defensively. apologize for         │
+  │        retiring code.                                            │
+  ╰──────────────────────────────────────────────────────────────────╯
 ```

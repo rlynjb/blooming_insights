@@ -1,117 +1,124 @@
-# 03 — Indexing vs query patterns
+# Indexing vs query patterns
 
-**Access-pattern-shaped storage · Industry standard**
+*Hash-keyed lookup (industry standard) · Project-specific*
 
 ## Zoom out, then zoom in
 
-The classical question — *do the indexes match the queries the app
-actually runs?* — usually means "is there a B-tree on the column we
-filter by." In **blooming_insights** the question is the same but the
-answer is `Map.get(id)`. There's no DB, so there's also no `EXPLAIN`. The
-question worth asking is whether the **Map shape** matches the **access
-shape**.
+In a SQL database, the indexing question is: which queries run often, and what indexes do they need? An unindexed query that scans 10M rows is the classic data-modeling failure — the schema didn't account for the actual access pattern, and you find out under load.
+
+This repo has no SQL and no query planner. But it has the same question, restated: **which lookups happen in the hot path, and what data structure makes them O(1)?** The answer is `Map`, and the keys are the indexes.
 
 ```
-  Zoom out — every read path in the app
+  Zoom out — where the "queries" live
 
-  ┌─ UI ──────────────────────────────────────────────────────────────┐
-  │  feed page         → list all insights for this session           │
-  │  investigate/[id]  → get one insight + its diagnosis              │
-  │  recommend/[id]    → get one insight + its recommendations        │
-  │  StatusLog         → stream new AgentEvents as they arrive        │
-  └──────────────────────┬────────────────────────────────────────────┘
-                         │  fetch → session cookie → server route
-  ┌─ State layer ─────── ▼──── ★ THIS CONCEPT ★ ──────────────────────┐
-  │                                                                   │
-  │   Map<sessionId, SessionFeed>                                     │ ← we are here
-  │       ├─ insights:        Map<insightId, Insight>                 │
-  │       ├─ investigations:  Map<insightId, Investigation>           │
-  │       └─ anomalies:       Map<insightId, Anomaly>                 │
-  │                                                                   │
-  │   Map<insightId, AgentEvent[]>  (event log cache)                 │
-  │                                                                   │
-  └──────────────────────┬────────────────────────────────────────────┘
-                         │  cache miss
-  ┌─ Substrate ──────────▼────────────────────────────────────────────┐
-  │  EQL queries — substrate handles its own indexing                 │
-  │  ~1 req/s rate limit; 60s response cache                          │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌─ UI layer ────────────────────────────────────────────┐
+  │  /investigate/[id]  →  needs insight by id            │
+  │  /investigate/[id]/recommend  →  needs Diagnosis      │
+  └────────────────────────────┬──────────────────────────┘
+                               │ HTTP w/ ?insightId=...
+  ┌─ Service layer ────────────▼──────────────────────────┐
+  │  /api/agent  resolveAnomaly(sid, insightId, ...)      │
+  │     → getAnomaly(sid, id) → getInsight(sid, id)       │
+  │  /api/briefing  listInsights(sid) at end of stream    │
+  └────────────────────────────┬──────────────────────────┘
+                               │ in-process Map lookup
+  ┌─ Storage layer ────────────▼──────────────────────────┐
+  │  ★ THE INDEXES ★                                       │
+  │  Map<sessionId, SessionFeed>                          │ ← we are here
+  │    SessionFeed.insights:        Map<id, Insight>      │
+  │    SessionFeed.anomalies:       Map<id, Anomaly>      │
+  │    SessionFeed.investigations:  Map<id, Investigation>│
+  └───────────────────────────────────────────────────────┘
 ```
 
-Zoom in. Two layers run "queries" — the in-process Maps (which serve
-every UI read in O(1)) and the substrate (which the agents query via EQL,
-where Bloomreach handles indexing). The state layer's Maps **are** the
-indexes; the substrate's indexes are not the app's problem. The hot
-question for the audit: are the keys right, and is the access pattern
-truly key-based?
+**Zoom in.** Every "query" in this codebase is a 1- or 2-level `Map.get()`. There are no list scans on the read path, no full-table sweeps, no joins. That sounds like a strength — and it is — but it's also the *reason* the data model can be this minimal. The access pattern was designed first; the storage shape followed.
 
----
+## Structure pass
 
-## Structure pass — the axis is "how is this fetched?"
+**Layers.** Three lookup altitudes in the system:
+
+- **Session lookup** (outermost) — `state.get(sessionId)`. Keyed by the session cookie.
+- **Entity lookup** (per session) — `feed.insights.get(insightId)` or `.anomalies.get(insightId)` or `.investigations.get(insightId)`.
+- **Wire-replay lookup** (process-wide) — `mem.get(insightId)` in `lib/state/investigations.ts` — the cached `AgentEvent[]` for a finished investigation. Not session-scoped (more on why below).
+
+**Axis traced — "how many comparisons to find this fact?"** The classic indexing axis. Hold it across the altitudes:
 
 ```
-  Trace ONE axis — "what's the key for this read?" — across layers
+  Trace the comparison-count axis
 
-  ┌─ access path ──────────────────────┐
-  │  list all insights for a session   │   → key = sessionId
-  │  get one insight by id             │   → key = (sessionId, insightId)
-  │  get diagnosis for an insight      │   → key = (sessionId, insightId)
-  │  stream events as they arrive      │   → key = (sessionId, insightId)
-  │  capture demo snapshot             │   → key = insightId (single-tenant)
-  └────────────────────────────────────┘
+  Session lookup          → 1 Map.get        → O(1)
+  Entity lookup           → 1 Map.get        → O(1)
+  Investigation cache     → 1 Map.get        → O(1) in-memory
+                                              → O(N) JSON file scan
+                                                (dev only — N tiny)
 
-  every read is a primary-key lookup OR a full scan of one session's data.
-  no read uses a secondary attribute as the key.
-  → a Map is sufficient.
+  listInsights(sid) for the feed
+                          → 1 Map.get + .values() spread
+                          → O(K) where K = insights this session
+                            (always 5-10 in practice)
 ```
 
-The seam to watch: **session boundary.** Reads inside one session are
-trivial; cross-session aggregation (e.g. "show me all critical insights
-across all users today") would not be a Map lookup — it'd be a full scan
-of every session's sub-map. The audit notes this; today the app has no
-cross-session read.
+Everything is O(1) on the hot path. The one O(N) — the JSON file scan in `getCachedInvestigation` — is dev-only and N is 5 (the number of insights in the committed demo snapshot).
 
----
+**Seams.** The seam that matters is **the dual-keyed insight↔anomaly store**:
+
+```
+  The seam: two maps, one key, two consumers
+
+  ┌─ session feed ──────────────────────────────────────┐
+  │                                                      │
+  │  Map<insightId, Insight>   ←─── UI reads this        │
+  │  Map<insightId, Anomaly>   ←─── agent loop reads     │
+  │                                  this                │
+  │  same key → two shapes for two consumers             │
+  └──────────────────────────────────────────────────────┘
+```
+
+This is denormalization-as-an-index. The agent doesn't have to derive Anomaly from Insight on every investigation — the parallel `anomalies` map *is* the lookup index for "give me the original Anomaly for this Insight." See `02-normalization-and-duplication.md` for why both shapes exist; this file is about *why both shapes are indexed.*
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know how a JS `Map<string, T>` is basically a hash table — `get(key)`
-is O(1), `[...map.values()]` is O(n), `delete(key)` is O(1)? That's the
-whole index story here. Every access pattern the app needs reduces to one
-of those three operations.
+You know how a SQL primary key buys you O(1) lookup via a B-tree index? A `Map<id, Entity>` buys the same thing via a hash table — same Big-O, different mechanism. The "schema" here is "every entity has an id, every lookup is by id." Two consequences:
+
+1. **There are no secondary queries.** No `WHERE severity = 'critical'`, no `ORDER BY timestamp DESC`. The agents produce a small ordered list; the UI takes that list in order. If you wanted "show me all critical insights across all sessions," there's no index for it — you'd have to scan every session.
+2. **There are no joins.** The `Insight ←→ Diagnosis` and `Insight ←→ Recommendation[]` relationships are walked through the `Investigation` container (`{ insightId, reasoning, diagnosis, recommendations }`), which is itself stored by `insightId`. One lookup, all related entities.
 
 ```
-  The "Map IS the index" pattern
+  The pattern — Map as the only index
 
-       ┌─ access pattern ─────┐    ┌─ Map operation ──┐
-       │  by id               │ ──►│  .get(id)        │  O(1)
-       │  list this session   │ ──►│  [...values()]   │  O(n) per session
-       │  write a new value   │ ──►│  .set(id, v)     │  O(1)
-       │  clear last briefing │ ──►│  .clear()        │  O(n) sub-map
-       │  delete one session  │ ──►│  .delete(id)     │  O(1)
-       └──────────────────────┘    └──────────────────┘
+  query: "give me insight X and its diagnosis"
 
-  No access pattern in the codebase asks for:
-    - "all insights with severity = critical" (no SCAN BY ATTRIBUTE)
-    - "all sessions modified in the last hour" (no RANGE OVER TIMESTAMPS)
-    - "insights sorted by change.value descending" (no SORTED INDEX)
+   sessionId ──► state.get(sid)        ── 1 hash lookup ──► SessionFeed
+                       │
+                       ▼
+   insightId ──► feed.investigations.get(id)  ── 1 lookup ──► Investigation
+                                                                  │
+                                                                  ▼
+                                                          { reasoning,
+                                                            diagnosis,    ◄── here
+                                                            recommendations }
+
+  Two map lookups. Diagnosis comes free (lives inside Investigation).
 ```
 
-The Map is **enough** precisely because every read is keyed. The day the
-product asks "show me a leaderboard of which metrics moved the most this
-week," the Map stops being enough — you'd need a secondary structure or
-a real DB. See `06-access-patterns-and-storage-choice.md`.
+The contrast with SQL: a relational version would be `insights JOIN diagnoses ON diagnoses.insight_id = insights.id` — one join, indexed on both sides. Same O(1) per row, but you'd pay query-plan overhead and a network round-trip. The `Map`-of-`Map`s skips both.
 
-### Move 2 — the access patterns, one at a time
+### Move 2 — the queries and their indexes
 
-#### **Read: feed page (`listInsights(sessionId)`)**
+#### Query 1 — "show me the feed for this user"
 
-The feed renders every insight for the current session. The read is
-**one Map.get + one spread of its values**:
+The /api/briefing route at the end of a successful run emits every insight for the session. The "query":
 
-```typescript
+```ts
+// app/api/briefing/route.ts:286
+for (const insight of listInsights(sid)) send({ type: 'insight', insight });
+```
+
+Backed by:
+
+```ts
 // lib/state/insights.ts:81-84
 export function listInsights(sessionId: string): Insight[] {
   const s = state.get(sessionId);
@@ -119,349 +126,267 @@ export function listInsights(sessionId: string): Insight[] {
 }
 ```
 
-Annotation:
+Two operations: one `Map.get(sessionId)` to find the session, then `.values()` to materialize the list. The list is 5-10 insights in practice — small enough that even a list scan would be fine, but the `Map`-as-the-feed gives you `.set`-by-id elsewhere for free.
 
-- **L82 `state.get(sessionId)`** — O(1) hash lookup. The `state` Map is
-  the *outer* map; its key is the session UUID from the `bi_session`
-  cookie.
-- **L83 `[...s.insights.values()]`** — O(n) where n is the number of
-  insights *in this session* (typically 5-15 for a briefing). The order
-  is insertion order (Map iteration is ordered in JS).
+**What the "index" is.** The insertion order of `Map.set()` *is* the feed order. JavaScript `Map` preserves insertion order — so the order the monitoring agent emits insights is the order the cards render. That's a load-bearing implicit contract.
 
 ```
-  Feed read flow
+  listInsights — the only list-shaped read
 
-  Browser           Route                State layer
-    │                │                       │
-    │  GET /         │                       │
-    │ ──────────────►│  bi_session cookie    │
-    │                │ ──────────────────────►  state.get(sessionId)   O(1)
-    │                │                       │      │
-    │                │                       │      ▼ SessionFeed
-    │                │                       │  [...insights.values()] O(n)
-    │                │ ◄─────────────────────│
-    │ ◄──────────────│  Insight[]            │
+  Map<sessionId, SessionFeed>
+       │
+       │ 1 lookup
+       ▼
+  SessionFeed.insights: Map<id, Insight>
+       │
+       │ .values() — preserves insertion order
+       ▼
+  [Insight, Insight, Insight, Insight, Insight]   ← the feed
+       │
+       │ emit one at a time over NDJSON
+       ▼
+  React renders cards in this exact order
 ```
 
-What this gets right: the **outer Map is per-session** specifically so two
-warm requests in the same Vercel instance don't iterate each other's
-data. Without that scoping, `[...insights.values()]` would return *every
-user's* insights from every concurrent session — the exact bleed comment
-above `state` warns against (`lib/state/insights.ts:7-13`).
+#### Query 2 — "give me the anomaly behind this insight" (the agent loop's read)
 
-#### **Read: investigate page (`getInsight(sessionId, id)`)**
+The investigate flow at `/api/agent` needs the *original* Anomaly to feed the diagnostic agent — not the enriched Insight. The lookup:
 
-Two-level lookup, both O(1):
-
-```typescript
-// lib/state/insights.ts:73-75
-export function getInsight(sessionId: string, id: string): Insight | null {
-  return state.get(sessionId)?.insights.get(id) ?? null;
-}
-```
-
-The compound key `(sessionId, insightId)` is split across **two nested
-Maps** rather than concatenated into a single key. This is more code than
-`state.get(\`${sessionId}:${id}\`)` would be, but it matches how the data
-naturally clusters — a session owns a set of insights; clearing the
-session clears them all.
-
-```
-  Two-level Map = a tree-shaped index
-
-  state: Map<sessionId, SessionFeed>
-   │
-   ├─ session-A ─── insights ─── { id1: Insight, id2: Insight, ... }
-   │                anomalies ── { id1: Anomaly, id2: Anomaly, ... }
-   │                investigations ── { ... }
-   │
-   └─ session-B ─── insights ─── { id3: Insight, ... }
-
-  benefit: O(1) "drop this session's data" via .delete(sessionId)
-  cost:    O(1) lookup is now TWO chained .get() calls
-```
-
-#### **Write: end-of-briefing (`putInsights(sessionId, items)`)**
-
-This is the only multi-write operation in the state layer. It clears and
-re-fills the session's sub-maps:
-
-```typescript
-// lib/state/insights.ts:57-71
-export function putInsights(sessionId: string, items: Insight[], rawAnomalies?: Anomaly[]): void {
-  // Replace the previous briefing for THIS session — each run IS the current
-  // feed, not an addition. Without clearing, a warm serverless instance (or a
-  // long-running dev server) accumulates stale insights from earlier runs, so
-  // the feed shows yesterday's anomalies alongside today's. Investigations are
-  // keyed separately and untouched here. Only this session's sub-maps are
-  // cleared — never the outer map, never another session's feed.
-  const s = sessionState(sessionId);
-  s.insights.clear();
-  s.anomalies.clear();
-  items.forEach((i, idx) => {
-    s.insights.set(i.id, i);
-    if (rawAnomalies?.[idx]) s.anomalies.set(i.id, rawAnomalies[idx]);
-  });
-}
-```
-
-The clear-then-fill is the **closest thing this codebase has to a
-transaction**. It's not atomic (no rollback if `set` throws midway), but
-it *is* isolated per session — the comment makes the boundary explicit.
-See `04-transactions-and-integrity.md` for the integrity story.
-
-#### **Read: substrate (the actual "query" layer)**
-
-The agents issue EQL queries against the substrate. The "indexing" at this
-layer isn't the app's problem — Bloomreach owns the event store and its
-indexes. What the app **does** own is the **60s response cache** in
-`BloomreachDataSource`:
-
-```typescript
-// lib/data-source/bloomreach-data-source.ts:122-152
-export class BloomreachDataSource implements DataSource {
-  private cache = new Map<string, { result: unknown; expiresAt: number }>();
-  ...
-
-  async callTool<T = unknown>(
-    name: string,
-    args: Record<string, unknown>,
-    options: CallToolOptions = {},
-  ): Promise<CallToolResult<T>> {
-    const cacheKey = `${name}:${JSON.stringify(args)}`;
-    const ttl = options.cacheTtlMs ?? 60_000;
-
-    if (!options.skipCache) {
-      const cached = this.cache.get(cacheKey);
-      if (cached && cached.expiresAt > Date.now()) {
-        return { result: cached.result as T, durationMs: 0, fromCache: true };
+```ts
+// app/api/agent/route.ts:35-60 (resolveAnomaly)
+function resolveAnomaly(sessionId: string, insightId: string, insightParam?: string | null): Anomaly | null {
+  if (insightParam) {
+    try {
+      const i = JSON.parse(insightParam) as Insight;
+      if (i && typeof i.metric === 'string' && i.change && Array.isArray(i.scope) && i.severity) {
+        return insightToAnomaly(i);                  // (a) client-provided, derived
       }
+    } catch { /* fall through */ }
+  }
+  const a = getAnomaly(sessionId, insightId);        // (b) parallel map — preferred
+  if (a) return a;
+  const i = getInsight(sessionId, insightId);
+  if (i) return insightToAnomaly(i);                 // (c) derive from Insight
+  try {
+    if (existsSync(DEMO_FILE)) {                     // (d) demo snapshot fallback
+      const snap = JSON.parse(readFileSync(DEMO_FILE, 'utf8')) as { insights?: Insight[] };
+      const di = (snap.insights ?? []).find((x) => x.id === insightId);
+      if (di) return insightToAnomaly(di);
     }
-    ...
+  } catch { /* ignore */ }
+  return null;
+}
 ```
 
-The cache key is `name + JSON.stringify(args)`. This is the **deduplication
-index** for repeated tool calls during a single briefing — the monitoring
-agent and diagnostic agent both call `get_event_schema` early, and the
-second call is a Map hit instead of a round trip.
+This is a **four-tier lookup ladder**, in priority order:
+
+1. **Client-provided Insight** in `?insight=` param — survives Vercel's per-instance memory split (the route may hit a *different* warm instance than the briefing that produced the Insight).
+2. **`getAnomaly(sid, id)`** — the parallel `Map<id, Anomaly>` on `SessionFeed`. The reason this map exists: the agent loop wants the raw shape, not the enriched one.
+3. **`getInsight(sid, id)` + `insightToAnomaly`** — derive on the fly if (2) missed.
+4. **Demo snapshot file scan** — `JSON.parse` the committed file, then `.find()` over its `insights[]`. O(N) over 5 items.
+
+Notice the index choice. Tier 2 — the dedicated `Anomaly` map — is what makes (a) the agent loop fast and (b) the "give me the original anomaly" query not require deriving. That parallel map IS the index for "lookup Anomaly by insight id."
 
 ```
-  Substrate cache as a dedup index
+  resolveAnomaly — four tiers, preferred index first
 
-       ┌─ monitoring agent ─┐                    ┌─ diagnostic agent ─┐
-       │  get_event_schema  │                    │  get_event_schema  │
-       └─────────┬──────────┘                    └─────────┬──────────┘
-                 │                                         │
-                 │  cacheKey = "get_event_schema:{...}"    │
-                 ▼                                         ▼
-       ┌──────────────────────────────────────────────────────────┐
-       │  cache.get(cacheKey)                                     │
-       │    miss → liveCall → cache.set(key, result, ttl=60s)     │
-       │    hit  → return immediately, fromCache:true             │
-       └──────────────────────────────────────────────────────────┘
+  ┌─ 1. client-provided (?insight=JSON) ──┐  survives instance hop
+  │     parse + validate                   │
+  └────────────────┬───────────────────────┘
+                   │ miss
+  ┌─ 2. getAnomaly(sid, id) ──────────────▼┐  ← THE INDEX
+  │     SessionFeed.anomalies.get(id)      │     direct Map lookup
+  └────────────────┬───────────────────────┘
+                   │ miss
+  ┌─ 3. getInsight(sid, id) + derive ─────▼┐  fallback path
+  │     same lookup, derive Anomaly        │
+  └────────────────┬───────────────────────┘
+                   │ miss
+  ┌─ 4. demo snapshot scan ───────────────▼┐  cold path
+  │     .find() over insights[]            │
+  └────────────────────────────────────────┘
 ```
 
-The 60s TTL is the load-bearing parameter. Bloomreach rate-limits at ~1
-req/s globally per user; without a cache, a single briefing would
-re-query the same schema 4-5 times and burn the rate budget.
+#### Query 3 — "give me the cached investigation for this insight"
 
-#### **Read: investigation cache (file-backed in dev)**
+The /api/agent route checks for a previously-saved investigation before running the agents:
 
-The `getCachedInvestigation` function is the only read with a *three-tier
-fall-through* in the repo:
+```ts
+// app/api/agent/route.ts:125-127
+const cached = insightId && !live ? getCachedInvestigation(insightId) : null;
+if (cached) {
+  const events = step ? filterByStep(cached, step) : cached;
+  // ... replay events with REPLAY_DELAY_MS pause between them
+}
+```
 
-```typescript
+Backed by a three-tier lookup:
+
+```ts
 // lib/state/investigations.ts:22-28
 export function getCachedInvestigation(insightId: string): AgentEvent[] | null {
-  if (mem.has(insightId)) return mem.get(insightId)!;
-  const fromFile = PERSIST ? readJson(CACHE_FILE)[insightId] : undefined;
+  if (mem.has(insightId)) return mem.get(insightId)!;                          // (a) in-memory
+  const fromFile = PERSIST ? readJson(CACHE_FILE)[insightId] : undefined;      // (b) dev file
   if (fromFile) return fromFile;
-  const fromDemo = readJson(DEMO_FILE)[insightId];
+  const fromDemo = readJson(DEMO_FILE)[insightId];                             // (c) committed
   return fromDemo ?? null;
 }
 ```
 
-Read order — try memory, fall through to the dev file, fall through to the
-committed demo. The "index" here is the same `insightId` key across three
-storage tiers; the function abstracts the tier choice from the caller.
+Two interesting choices. First, **the in-memory `mem` map is process-wide, not session-scoped**. That's deliberate — investigations are deterministic enough that one user running an investigation can answer another user's request for the same insight id. It's also why the dev file (`.investigation-cache.json`) is keyed by `insightId` alone, not `sessionId/insightId`. Second, **the demo file is the cold-fallback for production** — in prod, `PERSIST` is false, so the lookup is mem → demo, no file in between.
+
+**What's not indexed.** There's no "list all cached investigations." The cache is purely point-lookup. If you ever needed an admin view "show me everything that's been investigated," you'd have to enumerate the `Map` and pay an O(N) walk.
 
 ```
-  Three-tier fall-through
+  getCachedInvestigation — three tiers, in-memory first
 
-  ┌─ tier 1 ────────────┐
-  │  in-process Map     │   O(1) — typical case during a session
-  │  (mem)              │
-  └──────┬──────────────┘
-         │  miss
-  ┌──────▼──────────────┐
-  │  .investigation-    │   reads the WHOLE file then indexes by key
-  │   cache.json (dev)  │   O(file) — not great, but dev-only
-  └──────┬──────────────┘
-         │  miss
-  ┌──────▼──────────────┐
-  │  demo-investigations│   reads the WHOLE file (3,487 lines)
-  │   .json (committed) │   O(file) — fine for demo (10 fixed insights)
-  └─────────────────────┘
+  ┌─ a. mem (process-wide Map) ─────┐  hottest — warm instance
+  └────────────────┬────────────────┘
+                   │ miss
+  ┌─ b. .investigation-cache.json ──▼┐  dev only (PERSIST=true)
+  │    JSON.parse the whole file     │  O(file size) per call
+  └────────────────┬────────────────┘
+                   │ miss
+  ┌─ c. demo-investigations.json ───▼┐  committed seed
+  │    JSON.parse the whole file     │  same cost
+  └─────────────────────────────────┘
 ```
 
-The audit flags one inefficiency: `readJson(CACHE_FILE)` and
-`readJson(DEMO_FILE)` re-parse the entire JSON file on **every read**.
-For dev with a handful of cached investigations that's fine; if the cache
-grew to thousands, parsing 100KB+ JSON per request would show up in
-flamegraphs. The mitigation is to lift the parse into module init —
-trivial when needed.
+#### Query 4 — `WorkspaceSchema` (the module-level singleton)
+
+This isn't really a "query" — it's a cache lookup. The schema is bootstrapped once and held in module memory:
+
+```ts
+// lib/mcp/schema.ts:138,190-209
+let cached: WorkspaceSchema | null = null;
+
+export async function bootstrapSchema(
+  dataSource: DataSource,
+  opts: BootstrapOpts = {},
+): Promise<WorkspaceSchema> {
+  if (cached) return cached;
+  // ... orchestrate 4 sequential MCP calls (~4-5s)
+  cached = parseWorkspaceSchema({...});
+  return cached;
+}
+```
+
+**The lookup is O(1)** — it's a single variable check. But the cache **is process-wide**, not session-scoped — and not keyed by anything. That works because in practice there's one Bloomreach project per deployment (`BLOOMREACH_PROJECT_ID` env pin at line 180), so "the workspace schema" is a singleton. If you ever served two projects from one process, this cache would leak the first project's schema into the second's session.
+
+The "index" is the variable name itself. The "key" is the implicit "the one project this process serves."
+
+### Move 2 variant — the load-bearing skeleton
+
+The lookup kernel has three parts. Strip any one and a real capability breaks:
+
+1. **The `Map<sessionId, SessionFeed>` outer key.** Drop this and concurrent users on the same warm Vercel instance read each other's feeds. The test that pins this is `test/state/insights.test.ts:53-80` — two sessions writing concurrently must not overwrite or read each other's state. The outer Map *is* the multi-tenancy story. See `04-transactions-and-integrity.md` for the invariant in full.
+
+2. **The id-keyed entity `Map`s.** Drop these (replace with arrays, `.find()`) and you go from O(1) to O(N) on every investigate-page navigation. With N small (5-10) it would still work — but the *type* of operation matters: `Map.get(id)` says "lookup by primary key" loud and clear, where `.find(x => x.id === id)` reads like a scan.
+
+3. **The parallel `anomalies` map alongside `insights`.** Drop this and `resolveAnomaly` falls back to derive-from-Insight every time. That works (tier 3 of the ladder), but throws away the round-trip property: the diagnostic agent would get the *derived* anomaly (with `evidence: []`, no `impact`, no `history`) instead of the *original*. The agent would investigate without seeing the evidence that triggered the anomaly in the first place — which would change the quality of the diagnosis.
+
+Hardening on top: the four-tier `resolveAnomaly` ladder is hardening; tiers 1 and 4 are recovery paths that exist because the warm-instance assumption (tier 2) can fail. The skeleton is just tier 2.
 
 ### Move 3 — the principle
 
-**The right "index" is whatever lets every read be O(1) in the access
-shape the product actually has.** Here that's a per-session Map, because
-every access is keyed by `(sessionId, insightId)`. The day the product
-grows a "show me critical insights across all users this hour" view, the
-Map stops being enough — that's a `WHERE severity = 'critical' AND
-timestamp > NOW() - 1 hour` query, which needs either a sorted index or
-a real query engine.
-
-The generalisation: start with the access pattern, then choose the
-storage shape. Most codebases get this backwards — they pick PostgreSQL
-because that's the default, then discover their access pattern is 100%
-key-based and they're paying the cost of relational semantics for
-nothing. **blooming_insights** does it right: the access pattern is
-trivially keyed, so a `Map` is the entire data layer.
-
----
+When your data model is small enough that every "query" is a primary-key lookup, you don't need a database — you need a `Map` with the right keys. The trap is that the moment a real secondary query shows up ("all critical insights from last week"), the `Map`-only model collapses, because there's no index to scan. The signal to migrate isn't "we have a lot of data" — it's "we have a query whose answer isn't a single key lookup."
 
 ## Primary diagram
 
-Every "query" in the app and how it gets answered.
+The full lookup map, with every "query" and the index it hits.
 
 ```
-  Indexes vs queries — the full map
+  Every lookup in the app, and the data structure that backs it
 
-  ┌─ UI access pattern ──────────────┬─ data path ────────────────────────────────┐
-  │                                  │                                            │
-  │  feed: list all insights         │  state.get(sessionId).insights.values()    │
-  │                                  │  O(1) + O(n)                               │
-  │                                  │                                            │
-  │  /investigate/[id]: one insight  │  state.get(sessionId).insights.get(id)     │
-  │                                  │  O(1) + O(1)                               │
-  │                                  │                                            │
-  │  /recommend/[id]: investigation  │  state.get(sessionId).investigations       │
-  │                                  │  O(1) + O(1)                               │
-  │                                  │                                            │
-  │  StatusLog: stream events        │  getCachedInvestigation(id) → 3-tier       │
-  │                                  │  mem O(1) → file O(file) → demo O(file)    │
-  │                                  │                                            │
-  │  agent loop: query substrate     │  BloomreachDataSource.callTool             │
-  │                                  │  cache.get(name+args) O(1) → liveCall      │
-  │                                  │                                            │
-  │  (not exercised) cross-session   │  WOULD need: iterate every sub-map         │
-  │  aggregation                     │  O(sessions × insights/session)            │
-  │                                  │  → buildable target: a real DB             │
-  │                                  │                                            │
-  └──────────────────────────────────┴────────────────────────────────────────────┘
+  ┌─ READS ──────────────────────────────────────────────────────────────┐
+  │                                                                       │
+  │  listInsights(sid)                                                    │
+  │     state.get(sid)                                  → SessionFeed     │
+  │     .insights.values()                              → Insight[]       │
+  │     [O(1) lookup + O(K) materialize, K = 5-10]                        │
+  │                                                                       │
+  │  resolveAnomaly(sid, id)                                              │
+  │     tier 1: parse(?insight= param)                  → Insight (raw)   │
+  │     tier 2: getAnomaly(sid, id)                                       │
+  │             state.get(sid).anomalies.get(id)        → Anomaly         │
+  │     tier 3: getInsight(sid, id) + insightToAnomaly  → Anomaly         │
+  │     tier 4: demo file scan + .find()                → Anomaly         │
+  │     [O(1) tiers 1-3, O(N) tier 4, N = 5]                              │
+  │                                                                       │
+  │  getCachedInvestigation(id)                                           │
+  │     tier a: mem.get(id)                             → AgentEvent[]    │
+  │     tier b: read .investigation-cache.json[id]      → AgentEvent[]    │
+  │     tier c: read demo-investigations.json[id]       → AgentEvent[]    │
+  │     [O(1) tier a, O(file size) tiers b-c]                             │
+  │                                                                       │
+  │  bootstrapSchema(dataSource)                                          │
+  │     cached || (4 MCP calls + parse)                 → WorkspaceSchema │
+  │     [O(1) on cache hit; O(4 network) on cold start]                   │
+  │                                                                       │
+  └───────────────────────────────────────────────────────────────────────┘
 
-  Every supported access pattern is O(1) or O(n-in-this-session).
-  No N+1 issue today because no read joins across sessions.
+  ┌─ WRITES ─────────────────────────────────────────────────────────────┐
+  │                                                                       │
+  │  putInsights(sid, items, anomalies)                                   │
+  │     sessionState(sid).insights.clear()              ← THIS SESSION    │
+  │     sessionState(sid).anomalies.clear()             ← only            │
+  │     items.forEach(insights.set(id, i), anomalies.set(id, a))          │
+  │                                                                       │
+  │  putInvestigation(sid, inv)                                           │
+  │     sessionState(sid).investigations.set(inv.insightId, inv)          │
+  │                                                                       │
+  │  saveInvestigation(insightId, events)                                 │
+  │     mem.set(insightId, events)                                        │
+  │     PERSIST ? writeFileSync(.investigation-cache.json, ...) : noop    │
+  │                                                                       │
+  └───────────────────────────────────────────────────────────────────────┘
 ```
-
----
 
 ## Elaborate
 
-Where this comes from: the "right structure matches access pattern" rule
-is older than DBs. It's why `std::vector` exists alongside `std::list`,
-why DynamoDB asks you to design a *partition key* before you write any
-data, why Redis offers half a dozen structures (`SET`, `ZSET`, `HASH`,
-`LIST`, `STREAM`) — each one is optimal for one access shape.
+In a SQL world, the equivalent of every `Map<id, Entity>` here would be a `CREATE INDEX UNIQUE (id)` — the same O(1) point lookup. The mapping from "key in a Map" to "primary key in a table" is exact, and the cost shape is the same: O(1) on the hot path, no help on secondary queries. The repo is in the rare position where its query mix is *only* point lookups, so the simplest possible index does everything.
 
-The seam to **system design**: the choice to keep state in process memory
-is a system-design call (no DB, no Redis, no Dynamo). The choice of `Map`
-vs `object` vs `Set` for that in-memory state is data modeling. See
-`06-access-patterns-and-storage-choice.md` for the system-design
-boundary.
+What the repo deliberately doesn't have: any kind of **N+1 query pattern**. The classic N+1 bug is "loop over a list, issue one query per item" — and the place it would show up here is the feed render. Today's feed reads `listInsights(sid)` once, gets the full list materialized, and emits cards. No per-card lookup, no per-card MCP call, no per-card storage hit. The investigation is loaded lazily — only when the user clicks into one. That's the right shape: bulk-load the index page, lazy-load the detail page.
 
-What this codebase consciously doesn't do — and is right not to:
-
-- **No secondary indexes.** No "give me all insights with
-  severity=critical." If that read appeared, the right move would be a
-  second Map keyed by severity, kept in sync by the same writer
-  (`putInsights`). Until then, paying for it is waste.
-- **No range queries.** No "insights from the last hour." If that read
-  appeared, you'd want either a sorted structure or a real DB.
-- **No JOINs.** The two-level Map *is* the join — every consumer holds
-  the join key (`insightId`) and follows it across maps.
-
-What to read next: `04-transactions-and-integrity.md` walks how multi-Map
-writes stay coherent without a transaction primitive.
-
----
+A useful contrast: AdvntrCue (in your portfolio) uses Drizzle ORM + Postgres, so its "indexing question" is real — there are actual `CREATE INDEX` statements in migrations, and `EXPLAIN ANALYZE` is the diagnostic tool. Here, the diagnostic tool is "check that the lookup is `.get(id)` and not `.find(x => ...)`." Same question, very different surface.
 
 ## Interview defense
 
-**Q: "How do you make sure your queries hit indexes?"**
+**Q: What are the indexes in this codebase?**
 
-Verdict first: every read in the codebase is a primary-key Map lookup, so
-the question doesn't arise — there's no query planner to outsmart. The
-state layer is structured around the access pattern: a per-session outer
-Map, three keyed inner Maps (insights, investigations, anomalies). Every
-UI page reads by `(sessionId, insightId)`; both lookups are O(1).
+> Every `Map` keyed by id is an index. The outer one is `Map<sessionId, SessionFeed>` — multi-tenancy index. Inside each session, three parallel `Map`s keyed by `insightId`: `insights`, `anomalies`, `investigations`. Plus a process-wide `Map<insightId, AgentEvent[]>` for the investigation replay cache. All O(1) on the hot path. The only O(N) is a `.find()` over the demo snapshot's `insights[]`, used as the last-resort fallback when the warm instance has no memory for the requested id.
 
 ```
-  the answer, sketched
+   the indexes
 
-  state: Map<sessionId, SessionFeed>          ← outer Map
-   │                                            ★ scoped per user
-   ├─ session-A ── { insights:        Map<insightId, Insight> }
-   │              { investigations:   Map<insightId, Investigation> }
-   │              { anomalies:        Map<insightId, Anomaly> }
-   │
-   └─ session-B ── { ... }
+   Map<sessionId, SessionFeed>           ← multi-tenancy
+     SessionFeed
+       .insights:        Map<id, _>       ← entity index
+       .anomalies:       Map<id, _>       ← parallel index (round-trip)
+       .investigations:  Map<id, _>       ← entity index
 
-  feed read:          state.get(sid).insights → [...values()]
-  investigate read:   state.get(sid).insights.get(id)
-  both O(1) chained.
+   Map<insightId, AgentEvent[]>          ← investigation cache
+   let cached: WorkspaceSchema | null    ← singleton cache
 ```
 
-Anchor: "the load-bearing piece is the *outer* Map being per-session —
-without that scoping, listing one user's insights would iterate every
-user's data in a warm serverless instance."
+**Q: Why is there a parallel `anomalies` map alongside `insights` if you could derive Anomaly from Insight?**
 
-**Q: "Where would this design break?"**
+> The round trip drops fields by design — `insightToAnomaly` resets `evidence: []` and drops `impact`, `history`, `category`. Tested explicitly in `test/state/insights.test.ts:112-130`. If the agent loop derived Anomaly from Insight every time, the diagnostic agent would investigate without ever seeing the original evidence that triggered the anomaly. The parallel map is the index that preserves the un-dropped original.
 
-Verdict first: the day the product wants cross-session aggregation —
-"show me all critical insights across all customers today." That's a
-`WHERE severity = 'critical'` over every session's sub-map, which is a
-full scan with no index to help. The Map shape stops being right; you'd
-move to Postgres (or DynamoDB with a GSI).
+**Q: What query would break this model?**
+
+> Anything that isn't a point lookup. The clearest example: "show me all critical insights for this user from the last 7 days, sorted by severity." That's a `WHERE severity = ? AND timestamp > ?` + `ORDER BY severity`, with no supporting index. Today the feed only ever shows the *current* briefing — so the only "filter" is "this session, right now" — and the only "sort" is "the order the agent emitted them." The day product asks for history is the day the `Map` model has to grow up. The smallest move would be adding a secondary `Map<severity, Set<insightId>>` per session; the right move would be moving to a real store.
 
 ```
-  the access pattern that breaks the Map
+   what breaks the Map-only model
 
-  current pattern               cross-session pattern
-  ─────────────────             ─────────────────────
-  by (sessionId, insightId)     by attribute (severity)
-            │                            │
-            ▼                            ▼
-        Map.get(id)              ITERATE every session,
-        O(1)                     iterate every insight
-                                 O(sessions × insights/session)
-                                      ▲
-                                      │
-                                 → secondary index or real DB
+   today's query:    "feed for this session"   → listInsights(sid)   ✓
+   imaginary query:  "critical insights since   → no index           ✗
+                      Monday, sorted by severity"
 ```
-
-Anchor: "the access pattern is the design input — the moment that input
-changes, the storage shape has to change with it. I'd reach for a real
-DB the day cross-session reads appeared, not before."
-
----
 
 ## See also
 
-- [`01-the-data-model-and-its-shape.md`](./01-the-data-model-and-its-shape.md)
-  — the entities the Maps store
-- [`04-transactions-and-integrity.md`](./04-transactions-and-integrity.md)
-  — how multi-Map writes stay consistent without a transaction
-- [`06-access-patterns-and-storage-choice.md`](./06-access-patterns-and-storage-choice.md)
-  — when the access pattern would force you off Maps
-- [`audit.md`](./audit.md) — checklist with this file's findings
+- `01-the-data-model-and-its-shape.md` — the entity shapes the `Map`s store.
+- `04-transactions-and-integrity.md` — why session isolation is the only invariant the `Map` model has to defend.
+- `06-access-patterns-and-storage-choice.md` — when point-lookup-only stops being enough.

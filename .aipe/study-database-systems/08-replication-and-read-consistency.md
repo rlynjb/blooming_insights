@@ -1,277 +1,287 @@
-# Replication and read consistency
+# Replication and read consistency — the demo snapshot as a frozen read replica
 
-Industry standard · Distributed storage internals
+*Industry standard / Project-specific* — there's no streaming replication. The committed JSON snapshots in `lib/state/demo-*.json` are point-in-time read replicas of one previous live briefing, frozen at capture time and served as the `?demo=cached` path.
 
-## Zoom out — where replication would live, and what's there instead
+## Zoom out, then zoom in
 
-Replication is the mechanism that gives a database high availability and read scale: the same data lives on multiple nodes (primary + replicas, or multi-primary with consensus), and reads can be served from any of them. Read consistency defines what the replica is allowed to show you — the latest write (strong), eventually-the-latest (eventual), or a snapshot from when you started (snapshot isolation). This codebase has **no database, no replication mechanism, and no consistency contract — but it does have one structure that resembles a frozen read replica: the committed `demo-*.json` snapshot.**
-
-```
-  Zoom out — where replication would live (and what's there)
-
-  ┌─ Service layer ──────────────────────────────────────────────┐
-  │  /api/briefing  /api/agent                                    │
-  └───────────────────────────────┬──────────────────────────────┘
-                                  │
-  ┌─ Two "read paths" ────────────▼───────────────────────────────┐
-  │  ★ THIS CONCEPT ★                                              │
-  │                                                                │
-  │  LIVE PATH                          DEMO PATH                  │
-  │  ─────────                          ─────────                  │
-  │  agent runs against Bloomreach      reads demo-*.json files    │
-  │  60s response cache on top          frozen at last capture     │
-  │                                                                │
-  │  ↑ "primary" (fresh, expensive)     ↑ "frozen read replica"    │
-  │    rate-limited at provider           deterministic, instant   │
-  └────────────────────────────────────────────────────────────────┘
-                                  │
-  ┌─ Multi-instance heap ──────────▼──────────────────────────────┐
-  │  each Vercel instance holds its OWN in-memory Map             │
-  │  → instances diverge; no replication between them              │
-  │  → not a "replica set" — independent caches that don't sync   │
-  └────────────────────────────────────────────────────────────────┘
-```
-
-## Zoom in — the question this concept answers
-
-In a real DB: "how do replicas stay in sync, and what staleness do my reads tolerate?" Here, three honest answers depending on which "replica" you mean:
-  1. **The demo snapshot** is a frozen, immutable, deterministic "read replica" that ages until manually re-captured.
-  2. **The 60s response cache** is a per-instance lazy "cache replica" with a fixed TTL — read-your-own-writes if you write through it, eventually-consistent otherwise.
-  3. **Multi-instance Maps** are independent stores that *look* like replicas but never sync; "consistency" between them is whatever the next briefing run produces.
-
-## Structure pass — the skeleton
-
-### The three "replica" shapes in this codebase
+A read replica exists to take read load off the primary and to provide a consistent fallback when the primary is unavailable. The repo's `?demo=cached` mode does exactly that — it takes load off Bloomreach (no upstream calls during a demo) and provides a fallback when the primary is unavailable (the alpha server is rate-limited and revokes tokens after minutes, so demos *must* not depend on it). The lag is infinite — the snapshot updates only when someone runs the dev-only capture and commits the JSON files.
 
 ```
-  shape                  what it is                          consistency model
-  ─────                  ──────────────────                  ─────────────────
-  demo-*.json            committed snapshot of one run       FROZEN (never updates)
-  60s response cache     per-instance TTL cache over EQL     stale ≤60s per key
-  multi-instance Map     independent heaps per Vercel proc   divergent, no sync
+  Zoom out — where this concept lives
+
+  ┌─ UI layer ───────────────────────────────────────────────┐
+  │  feed + investigations render IDENTICALLY in both modes  │
+  └────────────────────────────┬─────────────────────────────┘
+                               │  HTTP, ?demo=cached
+  ┌─ Service layer ────────────▼─────────────────────────────┐
+  │  /api/briefing GET ?demo=cached                          │
+  │      ┌────────────────────────────────────┐              │
+  │      │  read JSON file                     │              │
+  │      │  stream NDJSON with replay pacing   │ ★ THE REPLICA │ ← we are here
+  │      │  filter events per step (agent)     │              │
+  │      └────────────────────────────────────┘              │
+  └────────────────────────────┬─────────────────────────────┘
+                               │
+  ┌─ Storage layer ────────────▼─────────────────────────────┐
+  │  lib/state/demo-insights.json       (665 lines)          │
+  │  lib/state/demo-investigations.json (3487 lines)          │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-None of them are a "replica" in the strict sense (no replication protocol, no log shipping, no consensus). All three are *cache-shaped* artifacts that play replica-like roles.
+Zoom in: the "replica" is a pair of committed JSON files. The capture path that updates them is dev-only. The replay path is read-only at runtime on Vercel. The contract between primary (live Bloomreach) and replica (the snapshot) is one promise: **the snapshot's event shapes are a superset of what the live path produces, so the UI can render either without branching.**
 
-### Axis: where does freshness come from?
+## Structure pass
+
+**Layers:**
 
 ```
-  The "freshness" axis, across the three replica analogs
-
-  demo-*.json:          frozen at capture time (manual refresh only)
-  60s response cache:   refreshed on miss after expiry
-  multi-instance Map:   refreshed on each briefing re-run
-  Bloomreach (primary): always fresh by definition
+  L1  primary (Bloomreach MCP)        the live source of truth
+  L2  capture path (dev-only)         runs primary, writes JSON
+  L3  committed JSON (git)            the "replica"
+  L4  replay path (?demo=cached)      reads JSON, streams NDJSON
+  L5  UI                              renders either, same code
 ```
 
-Each "replica" has a different staleness contract, and the contracts are NOT explicit anywhere in code — they're emergent properties of the cache mechanics. That's the risk: a reader who doesn't know the contract may treat a stale read as fresh.
+**Axis traced: where does the data come from on a read?**
 
-### Seams
+```
+  Trace one axis: where does the read get its data?
 
-The seam that matters: **the demo/live toggle.** When the UI switches between demo mode (read from snapshot) and live mode (read from Bloomreach with cache), it switches between two *different consistency models* without saying so. Demo guarantees deterministic replay; live guarantees ≤60s staleness per query. The same UI renders both identically — the user has to know which one they're looking at.
+  ┌─ live mode ─────────────────────────────┐
+  │  agents call BloomreachDataSource        │   → primary (network)
+  └──────────────────────────────────────────┘
+                  (it flips)
+  ┌─ demo mode ─────────────────────────────┐
+  │  readFileSync(DEMO_FILE)                 │   → replica (disk)
+  └──────────────────────────────────────────┘
+
+  the seam is the ?demo=cached query param at /api/briefing
+  same UI, two read paths, identical event shapes
+```
+
+**Seams** — two matter:
+
+- The query-param boundary (`req.nextUrl.searchParams.get('demo') === 'cached'` at `app/api/briefing/route.ts:78`) — same route, two implementations, branched at the first line.
+- The capture / replay boundary — the capture path (dev) and the replay path (any) share the snapshot file but never run in the same flow. Capture writes; replay reads; they never interleave.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-If you've ever used a CDN that caches your API responses, served a stale page from the cache while the origin was being re-fetched, and shown the user "data as of 30 seconds ago" — that's exactly the consistency model of the 60s response cache. The demo snapshot is a different shape: imagine taking a screenshot of your API responses at one moment, committing them to git, and serving the screenshot when you don't want to hit the origin. That's `demo-*.json`.
+You've used `git pull` before — point-in-time copy of a remote source, with explicit "update me" steps. The shape here is the same: capture is the `git push`, deploy is the `git pull`, replay is "now read from your local copy." The replication lag is whatever time elapsed between the last capture and now. There's no streaming, no log shipping, no consistency lag in the traditional sense — there's just "when was the snapshot last refreshed."
 
 ```
-  The shape — three "replicas," three freshness contracts
+  Manual replication — pull, push, read
 
-   Bloomreach              ← primary; always fresh
-        │
-        │ tool calls (rate-limited ~1 req/s)
-        ▼
-   60s response cache       ← per-instance; ≤60s staleness
-        │
-        │ tool result
-        ▼
-   in-memory Map            ← per-instance; written on briefing
-        │
-        │ HTTP read
-        ▼
-   UI (live mode)
-
-   ────────────────────────────────────────────────────────
-
-   demo-*.json (committed)  ← frozen snapshot; staleness = (now - capture-time)
-        │
-        │ direct read
-        ▼
-   UI (demo mode)
+  ┌─ primary (live) ──┐
+  │  Bloomreach EQL    │
+  └────────┬───────────┘
+           │ dev runs capture
+           ▼
+  ┌─ capture route ───┐
+  │  /api/mcp/capture- │
+  │  demo (dev-only)   │
+  └────────┬───────────┘
+           │ writes
+           ▼
+  ┌─ committed JSON ──┐
+  │  lib/state/demo-*  │
+  │  .json             │
+  └────────┬───────────┘
+           │ git commit + deploy
+           ▼
+  ┌─ replay route ────┐    ┌─ UI ───────────┐
+  │  /api/briefing?    │ ──►│ feed + invest. │
+  │  demo=cached       │    │ same code      │
+  └────────────────────┘    └────────────────┘
 ```
 
-### Move 2 — the walkthrough
+That's the kernel: an offline snapshot pipeline that delivers a frozen, consistent view to the read path.
 
-#### The frozen read replica (the demo snapshot)
+### Move 2 — the replication pipeline, one part at a time
 
-The two JSON files are committed in `lib/state/demo-insights.json` and `lib/state/demo-investigations.json`. They capture one live briefing run end-to-end, including the agent's reasoning trace, every tool call, and every result.
+#### The snapshot shape — what's actually in the JSON
 
-```ts
-// lib/state/investigations.ts:9
-const DEMO_FILE = join(process.cwd(), 'lib/state/demo-investigations.json');
+`lib/state/demo-insights.json` is a `DemoSnapshot` (typed at `app/api/briefing/route.ts:28-36`):
+
+```typescript
+type DemoSnapshot = {
+  workspace?: BriefingWorkspace;        // projectName, totalCustomers, totalEvents
+  coverage?: CoverageReport;            // 10-category checklist results
+  trace?: DemoTraceItem[];              // recorded EQL calls + reasoning steps
+  insights?: Insight[];                 // the final insight cards
+};
 ```
 
-```ts
-// lib/state/investigations.ts:22-28
-export function getCachedInvestigation(insightId: string): AgentEvent[] | null {
-  if (mem.has(insightId)) return mem.get(insightId)!;
-  const fromFile = PERSIST ? readJson(CACHE_FILE)[insightId] : undefined;
-  if (fromFile) return fromFile;
-  const fromDemo = readJson(DEMO_FILE)[insightId];
-  return fromDemo ?? null;
+`lib/state/demo-investigations.json` is keyed by `insightId` and holds the recorded `AgentEvent[]` stream for each investigation. The replay route (`/api/agent`) filters those events by `agent` to serve step 2 (diagnostic) vs step 3 (recommendation) separately.
+
+#### The capture path (dev-only)
+
+`/api/mcp/capture-demo` runs a real briefing against Bloomreach, runs each investigation, and writes both files. From `.aipe/project/context.md`:
+
+> Dev-only one-click capture ("capture this as the demo snapshot"): runs the live briefing + each investigation and writes `lib/state/demo-*.json`.
+
+This is the "manual replication" step. It's gated to dev because (a) writing to the filesystem in prod isn't supported on Vercel, and (b) the snapshot is meant to be reviewed in git before going live.
+
+#### The replay path (any mode)
+
+```typescript
+// app/api/briefing/route.ts:86-152 (the demo branch, condensed)
+if (demo && existsSync(DEMO_FILE)) {
+  const snapshot = JSON.parse(readFileSync(DEMO_FILE, 'utf8')) as DemoSnapshot;
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const emit = async (e: BriefingEvent) => {
+        controller.enqueue(encoder.encode(JSON.stringify(e) + '\n'));
+        await new Promise((r) => setTimeout(r, REPLAY_DELAY_MS));  // ◄── pacing
+      };
+      try {
+        if (snap.workspace) await emit({ type: 'workspace', workspace: snap.workspace });
+        for (const item of coverage) {
+          await emit(stepEvt(coverageLines[i]));
+          await emit({ type: 'coverage_item', item });
+        }
+        for (const t of trace) {
+          if (t.kind === 'tool') {
+            await emit({ type: 'tool_call_start', ... });
+            await emit({ type: 'tool_call_end', ... });
+          } else if (t.content) {
+            await emit(stepEvt(t.content));
+          }
+        }
+        for (const insight of insights) await emit({ type: 'insight', insight });
+        await emit({ type: 'done' });
+      } finally {
+        controller.close();
+      }
+    },
+  });
+  return new Response(stream, { headers: { 'content-type': 'application/x-ndjson; ...' } });
 }
 ```
 
-Annotation:
-  - **Line 26** — the demo file is the *last* fallback in the read chain. In-memory first, dev cache second, committed snapshot third. The snapshot is the always-available default.
-  - This is the moral equivalent of a read replica that was perfect at one moment and hasn't received any replication since. In real-DB terms, it's "infinite lag" — and that's the deliberate trade for "zero failure mode."
-  - The refresh mechanism is a dev-only one-click capture script in `app/page.tsx` (the "capture this as the demo snapshot" button). There's no automatic replication, no lag monitor, no failover. Manual refresh is the only way to update.
+Four things this does:
 
-In replica vocabulary: this is a **manually-promoted snapshot replica.** It serves stale reads forever (or until someone re-captures). The consistency model is "deterministic but old."
+1. Reads the snapshot as JSON.
+2. Replays the events in the same order the live path emits them: workspace → coverage → trace → insights → done.
+3. Uses `REPLAY_DELAY_MS` (140ms) between emits so the UI's `StatusLog` reveals progressively rather than all at once — matches the live "watching the agent work" experience.
+4. Filters and shapes the events so the UI consumer doesn't know which mode it's in.
 
-#### The per-instance TTL cache (the 60s response cache)
+#### The contract — same event shapes, both modes
 
-`BloomreachDataSource` caches every successful tool call result for 60 seconds:
+The `AgentEvent` union (`lib/mcp/events.ts` per the project context) is the wire contract. Both the live agent loop and the demo replay produce events that match this union. The UI's stream reader doesn't branch on mode — it consumes the same NDJSON regardless.
 
-```ts
-// lib/data-source/bloomreach-data-source.ts:122,144-148
-private cache = new Map<string, { result: unknown; expiresAt: number }>();
-// ...
-const cacheKey = `${name}:${JSON.stringify(args)}`;
-const ttl = options.cacheTtlMs ?? 60_000;
+This is what makes the replica useful: it's not a "downgraded fallback," it's the same UI with the same data shapes, just sourced differently. The cost of maintaining this contract is the "What must not change" rule from `.aipe/project/context.md`:
 
-if (!options.skipCache) {
-  const cached = this.cache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) {
-    return { result: cached.result as T, durationMs: 0, fromCache: true };
-  }
-}
-```
+> The demo snapshot keys (`insights`, `workspace`, `trace`) and the per-step replay filter (events tagged by `agent`).
 
-Annotation:
-  - **Line 122** — one cache per `BloomreachDataSource` instance, which is one per session (constructed in `lib/mcp/connect.ts`). Different sessions don't share cache hits.
-  - **Line 145** — TTL is 60s by default. The agent loop never overrides; only debug tooling does.
-  - **Lines 147-152** — if the key exists AND hasn't expired, return the cached result tagged `fromCache: true`. The flag flows out to the UI's tool-call trace.
+Break that contract and the replica stops being a drop-in for the primary.
 
-In consistency terms: this is a **read-after-write consistent** cache for queries you've made within the last 60s (you'll see your own cached writes), and **eventually consistent up to 60s** for queries someone else made. There's no invalidation — entries simply expire. A real-DB analog: the buffer pool with TTL-based eviction (which isn't quite how real buffer pools work, but the staleness shape is the same).
+#### Consistency model — eventually fresh, never live
 
-The cost of this shape: **a briefing kicked off 30s after a previous one returns mostly-cached numbers.** For 90-day window queries, that's invisible — the underlying metric doesn't move meaningfully in 30 seconds. For tighter-window queries, it would be a real correctness issue.
-
-#### Accidental "replication" — the multi-instance Map divergence
-
-Two Vercel instances serving the same session each hold their own Map. They look like replicas from the outside (same session ID, same data shape) but they don't sync with each other.
+The snapshot is whatever was captured the last time someone ran capture and committed. There's no expiry, no automatic refresh, no consistency guarantee beyond "what's in git is what serves." The lag is measured in commits, not milliseconds.
 
 ```
-  The divergence picture
+  Consistency model — manual, commit-bounded
 
-  instance A's Map                      instance B's Map
-  ┌────────────────────────┐            ┌────────────────────────┐
-  │ session-X:             │            │ session-X:             │
-  │   insights: { A1, A2 } │            │   insights: { } empty  │
-  └────────────────────────┘            └────────────────────────┘
-       (ran briefing here)                   (cold start, no briefing yet)
-            │                                        │
-            └──── never replicate ───────────────────┘
-            user can hit either, sees different data
+  primary (Bloomreach):    ◄── live, changes constantly
+       │
+       │  (lag = time since last capture commit)
+       │
+       ▼
+  replica (committed JSON): ◄── frozen until next commit
 ```
 
-In replica vocabulary: this is the *anti-pattern* — replicas that don't replicate. The consistency model is "whatever instance you happen to land on," which is no consistency at all. The mitigation lives outside the replica layer: the client stashes data in `sessionStorage` (`lib/hooks/useBriefingStream.ts:56`) so the data follows the *user*, not the *instance*. Effectively, the client becomes a poor-man's distributed cache that bridges the divergence.
+For a demo at a meeting, this is exactly the property you want — the snapshot doesn't change between rehearsal and the live demo. For a production analytics product, this would be unusable.
 
-This is fine because the data isn't of record. If the user lands on instance B with an empty Map, they re-run the briefing or the client re-supplies what it has. No data is lost; just some computation is redone.
+#### Stale-read protection — the UI doesn't try
 
-#### What read consistency the live path actually offers
-
-If you ask "what does the UI in live mode actually guarantee about freshness?" — the honest answer:
-  - **Within one briefing run:** every query the agent issues is at most 60s stale (because the cache filled within the same run for repeated queries, or it was a fresh upstream call for new queries).
-  - **Across briefing runs within 60s:** repeated queries return identical cached results. The two briefings will land on the same underlying data.
-  - **Across briefing runs >60s apart:** every query goes upstream fresh. Two runs may produce different anomalies as Bloomreach data shifts.
-  - **Across two instances simultaneously:** they don't see each other. Whichever instance runs the next briefing first wins; the other instance's view is irrelevant.
-
-None of these guarantees are surfaced to the UI. The UI shows "live" or "demo" and the user reasons about freshness from the label.
-
-#### What the demo path guarantees
-
-  - **Deterministic.** Every run returns identical content. Useful for testing UI changes against a stable backdrop.
-  - **Instant.** No network, no rate limit, no LLM call. The snapshot reads from `lib/state/demo-*.json` synchronously.
-  - **Stale.** The data is exactly as fresh as the last commit to those files. The "capture this as the demo snapshot" dev tool refreshes it; CI does not.
-
-The deliberate trade: **reliable demo > fresh demo.** The alpha MCP server is unreliable enough during demo windows that a frozen replica is the better presentation path. That's an explicit architectural choice, surfaced in the project context.
+Both modes use the same UI. The UI has no concept of "this data might be stale" because in live mode the data is fresh by construction (just emitted by the agent), and in demo mode the user explicitly opted in with a `?demo=cached` or the localStorage `bi:mode` toggle. There's no logic that says "warn the user the demo snapshot is old" — the assumption is the user knows.
 
 ### Move 3 — the principle
 
-Replication is the answer to two different questions: *availability* (can I read when one node is down?) and *scale* (can I serve more reads than one node can?). Cache is the answer to a third question: *latency/cost* (can I avoid the expensive read?). The shapes overlap — both are "data lives in multiple places" — but the consistency contracts diverge. Real replication asks "how stale can the replica be relative to the primary?" (lag bound). Cache asks "how stale can the cached value be relative to truth?" (TTL or invalidation policy). Treating one like the other is how stale-data bugs ship. This codebase has caches (the 60s response cache and the demo snapshot) and pretends they aren't replicas — which is correct, because they don't promise the contract a replica would.
+A "read replica" doesn't need streaming replication to be useful — it needs a stable contract with the primary and a clear refresh story. The committed snapshot here gets both: the AgentEvent shape is the contract, and `git commit` is the refresh. The whole machinery — capture script, JSON files, replay path, identical UI — collapses to "checkpoint your primary into git, serve from git on the read path." Most "fallback mode" requirements in apps can be satisfied this way; persistent replicas are heavier than they need to be when staleness is acceptable.
 
 ## Primary diagram
 
 ```
-  Replication and read consistency — the complete picture
+  Replication + read consistency — full pipeline
 
-  ┌─ provider ────────────────────────────────────────────────────┐
-  │  Bloomreach Engagement (primary, source of truth)              │
-  │  consistency: whatever they offer (opaque to us)               │
-  └────────────────────────────────┬──────────────────────────────┘
-                                   │ live queries (~1 req/s)
-  ┌─ data-source cache ────────────▼──────────────────────────────┐
-  │  Map<"name:args", {result, expiresAt}>                         │
-  │  contract: read-after-write within 60s window                  │
-  │           eventually-consistent up to 60s for others           │
-  │  scope:   per-instance (not shared across processes)           │
-  │  invalidation: TTL only, no explicit invalidation              │
-  └────────────────────────────────┬──────────────────────────────┘
-                                   │ tool results
-  ┌─ per-instance state ───────────▼──────────────────────────────┐
-  │  Map<sessionId, SessionFeed>                                   │
-  │  contract: instance-local, last-write-wins on collision        │
-  │  divergence: instances do NOT sync; client mitigates           │
-  └────────────────────────────────────────────────────────────────┘
+  ┌─ Bloomreach MCP (primary) ──────────────────────────────┐
+  │  live EQL execution                                      │
+  └────────────────────────┬────────────────────────────────┘
+                           │
+                           │ dev runs /api/mcp/capture-demo
+                           │ (manual, gated to NODE_ENV=development)
+                           ▼
+  ┌─ capture path (dev) ────────────────────────────────────┐
+  │  • run live briefing (real agents, real MCP calls)       │
+  │  • run each investigation (step 2 + step 3)              │
+  │  • write lib/state/demo-insights.json                    │
+  │  • write lib/state/demo-investigations.json              │
+  └────────────────────────┬────────────────────────────────┘
+                           │
+                           │ git commit + deploy
+                           ▼
+  ┌─ committed JSON (the "replica") ────────────────────────┐
+  │  lib/state/demo-insights.json       (DemoSnapshot)       │
+  │  lib/state/demo-investigations.json (keyed by insightId) │
+  └────────────────────────┬────────────────────────────────┘
+                           │
+                           │ ?demo=cached query param
+                           ▼
+  ┌─ replay path (any env) ─────────────────────────────────┐
+  │  • readFileSync(DEMO_FILE)                               │
+  │  • emit events: workspace → coverage → trace → insights  │
+  │  • 140ms between emits (REPLAY_DELAY_MS)                 │
+  │  • NDJSON, same shape as live path                       │
+  └────────────────────────┬────────────────────────────────┘
+                           │
+                           ▼
+  ┌─ UI ────────────────────────────────────────────────────┐
+  │  same components, same stream reader, no mode branch     │
+  └──────────────────────────────────────────────────────────┘
 
-  ────────────────────────────────────────────────────────────────
-
-  ┌─ demo path (parallel read path) ───────────────────────────────┐
-  │  lib/state/demo-insights.json                                  │
-  │  lib/state/demo-investigations.json                            │
-  │  contract: frozen at last capture (manual refresh)             │
-  │  scope:   global (committed to repo, identical for all users)  │
-  │  invalidation: dev "capture" command rewrites the files        │
-  └────────────────────────────────────────────────────────────────┘
+  consistency: eventually fresh, refreshed by commit
+  lag: time since last capture (typically days)
+  cost: zero infra; one git history line per capture
 ```
 
 ## Elaborate
 
-The classical references for replication consistency are the consistency-model papers (Lamport's "Time, Clocks, and the Ordering of Events," Brewer's CAP, Vogels' "Eventually Consistent"). The hierarchy from strongest to weakest: linearizable → sequential → causal → eventual → no-consistency. Real DBs sit at different points: Postgres primary-replica is read-your-own-writes if you read your own primary, eventually consistent on replicas, with a measurable lag. DynamoDB offers eventual or strong reads as a per-request flag. Spanner offers external consistency via TrueTime. Cassandra tunes per-query via R+W>N quorum.
+The interesting design constraint is the **presentation reliability** requirement from `.aipe/project/context.md`:
 
-The "cache as quasi-replica" pattern this codebase uses has its own lineage: CDN edge caches, Cloudflare Workers KV, Vercel's own Edge Cache. The shape is always: a TTL-bounded cache layer that absorbs read load, with no invalidation other than expiry. It works well when staleness within the TTL is acceptable, and badly when downstream-of-the-cache writes need to be visible immediately.
+> Demo (default): `?demo=cached` serves the committed snapshot as plain JSON; investigations replay the committed events (filtered per step). Instant, no auth — the reliable presentation path.
+>
+> Live: runs the agents against Bloomreach. The alpha server is rate-limited (~1 req/s) and revokes tokens after minutes, so live is recovery-oriented (auto-reconnect) — capture a fresh snapshot locally and commit it for the demo.
 
-The demo snapshot is something more specific: a **golden snapshot.** Used for deterministic UI development, demo reliability, and regression testing. In other ecosystems this is the role of fixture files, recorded HTTP responses (VCR-style), or test-mode mocks. Here it's promoted to a runtime path — the same UI renders against it as against live.
+That paragraph explains why the snapshot exists at all: the upstream's alpha-grade availability makes live demos unsafe. The replica isn't a performance optimization; it's a *correctness for the demo flow* mechanism. The lag is acceptable because the demo doesn't need fresh data — it needs *reliably renderable* data.
+
+Compare to Postgres streaming replication: a real read replica receives WAL records from the primary and applies them, so reads are slightly behind but eventually catch up. This repo's "replica" never catches up unless someone runs capture — but for the use case, that's the feature. A streaming replica would be wrong here because it would couple the demo to the upstream's flakiness.
+
+The cleanest extension of this pattern: if the team ever wanted multiple snapshots (e.g. "demo for the conversion-drop story" vs "demo for the fraud spike story"), the move is to commit multiple `demo-*.json` variants and select between them with a query param. The replay path already handles the "file exists / file doesn't exist" branch; multi-snapshot just changes which file gets read.
 
 ## Interview defense
 
-> Q: "How does this app handle read consistency?"
+**Q: Does this app have read replicas?**
 
-Verdict: there are three "replica-like" surfaces, each with a different consistency contract, and none of them are formally a replica. The 60s response cache on the data-source adapter offers read-after-write within the window and eventual consistency up to 60s for others. The committed demo snapshot is a frozen golden snapshot, deterministic but as old as the last manual capture. Multi-instance heaps are accidental "replicas" that don't sync at all — divergence is mitigated by stashing data on the client in sessionStorage.
+Yes, conceptually — `lib/state/demo-insights.json` and `lib/state/demo-investigations.json` are a frozen point-in-time replica of one previous live briefing. The capture path (dev-only `/api/mcp/capture-demo`) runs a real briefing against Bloomreach and writes the JSON files. They get committed to git, ship in the deploy, and serve as the `?demo=cached` path at `/api/briefing` and `/api/agent`. The replay streams the same NDJSON event shapes as the live path, so the UI doesn't branch on mode.
 
-```
-  the picture you draw — three replica-like surfaces
+**Q: What's the consistency model?**
 
-   60s cache         ≤60s stale, per-instance
-   demo-*.json       frozen at capture, deterministic
-   multi-instance    divergent, no sync, client bridges
-```
+Eventually fresh, refreshed by `git commit`. There's no streaming replication, no automatic refresh — the snapshot is whatever the last capture committed. That's by design: the demo is the *reliable* presentation path, and "reliable" here means "doesn't depend on the alpha upstream that revokes tokens after minutes."
 
-The load-bearing point: none of these promise the strong-consistency contract of a real replica, and the architecture is built around that. Live mode says "things might be up to 60s old" (silently). Demo mode says "this is the captured replay" (via the demo/live toggle).
+**Q: What's the load-bearing contract between primary and replica?**
 
-> Q: "What's the worst inconsistency you could see?"
+The `AgentEvent` NDJSON shape. The live agent loop emits these events; the demo replay emits identical-shaped events from the JSON file. The UI's stream reader can't tell the difference. That contract is in the "What must not change" list — break it and the replica stops being a drop-in.
 
-Two instances diverging on a session is the loudest case — the user sees different data depending on which Vercel instance answered their request. The user-visible symptom is "the briefing I just saw is now empty," which is annoying but recoverable (refresh re-runs). The 60s cache rarely manifests because the queried metrics use 90-day windows that don't move meaningfully in a minute.
+**Q: How would you make the replica auto-refresh?**
 
-> Q: "When would real replication enter the picture?"
-
-When a single instance can't handle the read load AND there's data of record to replicate. Today neither is true — the local state is derivative (no need to replicate it) and the upstream (Bloomreach) handles replication on its side. The day local data of record exists (saved investigations, audit log), the replication question lands at the same time as the datastore question.
+You wouldn't — and that's the whole point. The lag is the feature: a fixed snapshot doesn't change between rehearsal and the actual demo. If you needed fresh-ish data, the right move is a second snapshot file (or a remote-fetched JSON that's still rendered through the same replay path), not streaming replication. Streaming would couple the demo to the upstream's availability, which is exactly what the snapshot exists to decouple.
 
 ## See also
 
-  - [`07-wal-durability-and-recovery.md`](./07-wal-durability-and-recovery.md) — durability is the precondition for replication
-  - [`04-query-planning-and-execution.md`](./04-query-planning-and-execution.md) — how the 60s cache acts as a materialized view
-  - [`audit.md`](./audit.md) — F4 (60s cache staleness), F5 (demo snapshot as frozen replica)
+- `01-database-systems-map.md` — where the snapshot sits among the four storage analogs (L3)
+- `04-query-planning-and-execution.md` — the live path the snapshot mirrors
+- `07-wal-durability-and-recovery.md` — the other "survives a deploy" thing (the cookie)
+- `09-database-systems-red-flags-audit.md` — the staleness risk if capture isn't refreshed

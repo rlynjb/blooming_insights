@@ -1,253 +1,292 @@
 # Replication, partitioning, and quorums
 
-**Industry name:** primary/replica, leader-follower, consistent hashing, quorum reads/writes · **Type:** Industry standard — Case B (not exercised in this repo)
+*Industry standard — replicas, shards, partition keys, quorum reads/writes, failover.*
 
-## Zoom out, then zoom in
+## Verdict — `not yet exercised`
 
-Verdict, first sentence: **this repo does not replicate or partition any state.** No replica set, no shards, no consistent hashing, no quorum reads. This file is here so you can defend the absence and recognize when the gap would start mattering.
-
-```
-  Zoom out — where replication WOULD live (and doesn't)
-
-  ┌─ UI layer ───────────────────────────────────────────────┐
-  │  React 19 client                                          │
-  └──────────────────────────────────────────────────────────┘
-
-  ┌─ Service layer — Vercel serverless cohort ───────────────┐
-  │  N ephemeral instances. They share NOTHING except:        │
-  │    • bi_session cookie  (per-user routing)                │
-  │    • bi_auth cookie     (auth state)                      │
-  │                                                           │
-  │  ✗ no replicated state                                    │
-  │  ✗ no shared cache layer (Redis, Memcached)               │
-  │  ✗ no consistent hashing                                  │
-  └──────────────────────────────────────────────────────────┘
-
-  ┌─ Provider layer ─────────────────────────────────────────┐
-  │  Bloomreach loomi-MCP — ONE upstream                      │
-  │  (its internal replication is opaque to us)               │
-  │                                                           │
-  │  Anthropic API — ONE upstream                             │
-  │  (same — opaque)                                          │
-  └──────────────────────────────────────────────────────────┘
-
-  ┌─ "Database" ──────────────────────────────────────────────┐
-  │  ✗ no database. Period.                                   │
-  │  in-memory Maps (per-instance) + gitignored JSON files    │
-  │  for dev auth + committed JSON snapshots for demo replay  │
-  └──────────────────────────────────────────────────────────┘
-```
-
-If you're studying for a distributed-systems interview, the chapter on replication/partitioning is real — but the truthful answer for this codebase is "not exercised." Read this file to know what you'd be adding when it becomes time.
-
-## Structure pass (compressed — there's no mechanism to walk)
-
-### Axis: where could a replica or shard logically live?
+The repo has zero replication, zero partitioning, zero quorum machinery, and no datastore it owns. This file exists to draw the absent picture honestly, explain why it's the right shape today, and name the one place where the topic *would* show up if it shipped.
 
 ```
-  Trace "could-this-replicate?" across the stack
+  Zoom out — the entire datastore picture
 
-  Browser            — N tabs already exist; client-side replication = none
-  Vercel instance    — N instances exist; share nothing → "replication-less"
-  Caches             — per-instance, not shared → each replica is its own cache
-  State              — per-instance + per-session Maps; never shared
-  Datastore          — DOES NOT EXIST. Nothing to replicate.
+  ┌─ L1: Browser ────────────────────────────────────────────┐
+  │  sessionStorage (per-tab, per-origin)                     │
+  │  → no replication, no partitioning, no quorum             │
+  └─────────────────────────────────────────────────────────┘
+                            │
+  ┌─ L2: Vercel route ──────▼────────────────────────────────┐
+  │  in-memory Maps (per warm instance, session-keyed)        │
+  │  ★ no replication ★  → cold restart wipes everything      │
+  │  ★ no partitioning ★ → no sharding key, no fan-out        │
+  │  ★ no quorum ★      → no replica to agree with             │
+  │                                                          │
+  │  encrypted cookie (carries OAuth state across instances)  │
+  │  → state-on-the-client, not state-on-replicas             │
+  └─────────────────────────────────────────────────────────┘
+                            │
+  ┌─ L3: BloomreachDataSource ──────────────────────────────┐
+  │  per-request 60s response cache                           │
+  │  → ephemeral, not replicated                              │
+  └─────────────────────────────────────────────────────────┘
+                            │
+  ┌─ L4: Bloomreach MCP ────▼───────────────────────────────┐
+  │  workspace store: we don't own it; their replication      │
+  │   is opaque to us                                         │
+  └─────────────────────────────────────────────────────────┘
 ```
 
-The axis answer is "no" at every layer. There's nowhere replication would land because there's no stateful component that owns durable state.
+There is no row in this stack where we choose `(replication factor, partition strategy, quorum)`. That's by design for the product shape today.
 
-### Seams (load-bearing absences)
+## Zoom in — the question this file answers
 
-- **No primary/replica seam.** Each Vercel instance is independent and authoritative for its own per-instance memory only. There's no "promote to primary" event because there's no primary.
-- **No partition key boundary.** The `bi_session` cookie acts a bit like a routing key (per-user isolation), but Vercel doesn't pin a session to an instance — any instance can serve any request. This means the *opposite* of sharding: any data that needs to span requests has to ride the request itself (cookie, URL param) or live in the upstream.
-- **No quorum seam.** No N/W/R decisions to make.
+> What would replication, partitioning, or quorums *be doing* in this codebase if they existed, and why is it correct that they don't?
 
-## Move 1 — what the picture would look like if it existed
+Three answers: (1) we don't own a datastore, so there's nothing to replicate; (2) we don't have a workload that needs partitioning, because state is per-session and bounded; (3) we don't have multiple writers to agree, so quorums don't apply. The whole topic is `not yet exercised` because we're upstream of every datastore in the design.
 
-For contrast, here's the shape this repo would take if a replicated datastore landed.
+## Structure pass — the skeleton (of an absent thing)
 
-```
-  Hypothetical: what replication WOULD add (not in this repo)
-
-  ┌─ Browser ──────────┐
-  └─────────┬──────────┘
-            │
-  ┌─ Vercel cohort ────┴────────────────────────────┐
-  │  load balancer (already exists)                  │
-  └──────────┬──────────────────────────────────────┘
-             │
-   ┌─────────┴─────────────┐
-   │                       │
-   ▼                       ▼
-  ┌─ Replica 1 ──┐    ┌─ Replica 2 ──┐    ┌─ Replica 3 ──┐
-  │  primary     │    │  follower     │    │  follower     │
-  │  (writes)    │    │  (reads)      │    │  (reads)      │
-  └──────┬───────┘    └──────▲────────┘    └──────▲────────┘
-         │ async replication │                    │
-         └───────────────────┴────────────────────┘
-
-  Adding this would introduce:
-    • replica lag (eventual consistency)
-    • failover (leader election, split-brain risk)
-    • partition key for sharding (consistent hashing)
-    • quorum reads/writes (N/W/R tradeoff)
-    • client-side read repair OR strong-read on follower miss
-```
-
-None of those concerns apply today. The closest analog to "multi-replica" is "the Vercel cohort serves all reads," but every instance hits the same Bloomreach upstream — fan-out, not replication.
-
-## Move 2 — what's actually here, by way of counter-example
-
-### The single-source-of-truth pattern
-
-```ts
-// lib/mcp/schema.ts:166
-export async function resolveProject(
-  dataSource: DataSource,
-  opts: BootstrapOpts = {},
-): Promise<{ projectId: string; projectName: string }> {
-  const orgs = unwrap<{ data: { id: string; name: string }[] }>(
-    await callOrThrow(dataSource, 'list_cloud_organizations', {}, opts),
-  ).data;
-  if (!orgs?.length) throw new Error('no cloud organizations for this user');
-
-  const projects = unwrap<{ data: { id: string; name: string }[] }>(
-    await callOrThrow(dataSource, 'list_projects', { cloud_organization_id: orgs[0].id }, opts),
-  ).data;
-  if (!projects?.length) throw new Error('no projects in organization');
-
-  const pinned = process.env.BLOOMREACH_PROJECT_ID;
-  const project = (pinned && projects.find((p) => p.id === pinned)) || projects[0];
-  return { projectId: project.id, projectName: project.name };
-}
-```
-
-The "partition key" here is the user (via the OAuth Bearer token) — Bloomreach handles the multi-tenancy. We pick *one* project (`pinned ?? projects[0]`) and use that for the lifetime of the schema cache. There's no sharding decision to make at our layer.
-
-### The "demo snapshot" as a degenerate datastore
-
-`lib/state/demo-insights.json` (committed) is the only thing in this repo that survives a process restart with no upstream. It's not a database — it's a JSON file the briefing route serves verbatim:
-
-```ts
-// app/api/briefing/route.ts:86
-if (demo && existsSync(DEMO_FILE)) {
-  let snapshot: DemoSnapshot | null = null;
-  try {
-    snapshot = JSON.parse(readFileSync(DEMO_FILE, 'utf8')) as DemoSnapshot;
-  } catch {
-    snapshot = null;
-  }
-  if (snapshot) { /* replay */ }
-}
-```
-
-If this ever became a real datastore (the user can edit notes on an investigation, say), replication would land here. Today it's read-only and ships with the repo, so its "consistency model" is just `git pull`.
-
-### Per-instance in-memory caches — read-replica-shaped, but not replicas
+### Axes — trace "who owns the data?"
 
 ```
-  Three Vercel instances, each with its own everything
+  One axis: "who owns the data on this layer?"
 
-  ┌─ Instance A ─────────┐ ┌─ Instance B ─────────┐ ┌─ Instance C ─────────┐
-  │ insights Map: {…}     │ │ insights Map: {…}     │ │ insights Map: {…}     │
-  │ schema cache: {…}     │ │ schema cache: {…}     │ │ schema cache: (cold)  │
-  │ data-source cache: {…}│ │ data-source cache: {…}│ │ data-source cache: {…}│
-  └──────────┬───────────┘ └──────────┬───────────┘ └──────────┬───────────┘
-             └─────────────────────────┴────────────────────────┘
-                                       │
-                                       ▼
-                         ┌─ Bloomreach loomi-MCP ─┐
-                         │  the only source of    │
-                         │  truth                 │
-                         └────────────────────────┘
+  L1 sessionStorage      browser (single owner — the user's tab)
+  L2 in-memory Maps      one Vercel instance (single owner per process)
+  L2 encrypted cookie    browser (single owner — the user)
+  L3 response cache      one request (single owner — the adapter)
+  L4 Bloomreach store    Bloomreach (single owner from our perspective)
 ```
 
-Each instance is its own cache — that *resembles* the "fan-out to N read replicas" pattern, but with two crucial differences: (a) the caches are populated lazily per request, not seeded from a primary; (b) instances never talk to each other. Two requests for the same data hit two different caches, with no coordination between them. That's not replication — it's "every instance is alone."
+Every layer has *one* owner from the system's perspective. No row reads "two replicas agree on …" or "the shard for tenant X lives on …" — because we never reach that shape. **When the owner is always one, replication / partitioning / quorums never light up.**
 
-## What would change if replication landed
-
-A practical, ranked list of what'd need to be added:
-
-1. **Add Redis (or Vercel KV) as a shared cache layer.** The 60s response cache currently in `BloomreachDataSource` becomes a shared layer — instance A's cache hit serves instance B's request. This is the *cheapest* "replication" win and the one we'd reach for first.
-2. **Move `insights` and `investigations` Maps out of process.** Same store. Removes the `?insight=` URL param hack from the consistency model.
-3. **Add a TTL to the schema cache and move it to Redis too.** Solves the process-lifetime staleness in `lib/mcp/schema.ts:190`.
-4. **THEN** start thinking about partitioning (multi-region Vercel + multi-region Redis), at which point quorum reads/writes (W=1, R=2 for example) would become a real choice.
-5. **Only THEN** start thinking about Postgres + read replicas, at which point replication lag, failover, and split-brain become concerns.
-
-This list is the migration path. We're at step 0. The honest framing is that this is right-sized for a portfolio project; the same listing as a production roadmap would be sensible at scale.
-
-## Why this doesn't matter (yet)
-
-The volume profile keeps this corner empty:
-
-- One user per session. No fan-out.
-- Read-only upstream tools (no writes to dedup, replicate, or order).
-- Bounded duration (max 300s per request → instance never needs warm long-running state).
-- Demo snapshot is the "shared store" and it's a JSON file in git.
-
-The architectural pressure that *would* push us into real replication: multi-tenant teams sharing a workspace (now you have to share `insights` across users), or letting the user save/edit briefings (now you need a real write path with conflict resolution).
-
-## Primary diagram
+### Seams — where replication *would* attach
 
 ```
-  Full picture — what's NOT here
+  Where the topic WOULD show up if the product grew it
 
-  ┌─ Browser ─────────────────────────────────────────────────────────┐
-  │  one tab, one user (today)                                         │
-  └────────────────────────────┬──────────────────────────────────────┘
-                               │ HTTPS
-  ┌─ Vercel cohort ────────────▼──────────────────────────────────────┐
-  │  N independent instances. SHARE NOTHING except cookies.            │
-  │                                                                    │
-  │  ✗ no Redis        ✗ no leader election    ✗ no shard key          │
-  │  ✗ no Postgres     ✗ no consensus group    ✗ no quorum             │
-  │  ✗ no failover     ✗ no read repair        ✗ no replication lag    │
-  └────────────────────────────┬──────────────────────────────────────┘
-                               │ HTTPS Bearer
-  ┌─ Bloomreach loomi-MCP ─────▼──────────────────────────────────────┐
-  │  ONE upstream. Its internal replication is opaque.                 │
-  │  (we don't pay coordination cost; we pay rate-limit cost instead)  │
-  └───────────────────────────────────────────────────────────────────┘
+  if/when…                                this file would teach…
+  ──────────                              ─────────────────────
+  multi-region Vercel deployment           sticky routing vs. read-from-edge
+   (today: single region, irrelevant)      replicas vs. a global store
+
+  shared cache across instances            consistent hashing for partitioning,
+   (today: per-instance Maps)               primary-replica or leaderless writes
+
+  user data stored server-side             RPO/RTO, sync vs. async replication,
+   (today: cookie + sessionStorage)         quorum reads (R+W>N)
+
+  scaling Bloomreach                       not ours to design — opaque
+   (their infra problem)
+
+  scaling Anthropic                        not ours to design — opaque
+   (their infra problem)
+```
+
+The four "if/when" rows are the realistic adjacent futures. Three of them are deferrals on the product side, not engineering omissions. The fourth (Bloomreach) is permanently somebody else's problem.
+
+## How it works — what the absent picture looks like
+
+### Move 1 — the mental model
+
+> **Replication, partitioning, and quorums are the answer to: "I have data, multiple machines, and I want either survival or scale." This codebase doesn't own data on multiple machines, so the question never arises.**
+
+```
+  The triple, drawn against absence
+
+  REPLICATION    answers: "what survives if one machine dies?"
+                 here:    nothing survives a cold restart — the
+                          design accepts this and re-resolves from
+                          the client / the demo snapshot
+
+  PARTITIONING   answers: "how do I split work across machines?"
+                 here:    no work to split — each user's request
+                          is independent, scoped by sessionId,
+                          handled on one instance start-to-finish
+
+  QUORUMS        answers: "how do I get agreement across replicas?"
+                 here:    no replicas, no disagreement possible —
+                          single owner per layer
+```
+
+This is *not* a hand-wave. It's a deliberate posture: pushing state to the client and the opaque upstream means we don't run the replicated/sharded/quorum-managed parts of the system, so we don't owe the corresponding correctness work.
+
+### Move 2 — walk what's not there, one by one
+
+#### Part 1 — no datastore we own (so no replication question)
+
+```
+  The five things that could be "data we own" — and what each is today
+
+  candidate                       reality                          ours?
+  ────────────                     ────────                          ─────
+  user accounts                   none; identity is the bi_session     NO
+                                  cookie + Bloomreach OAuth
+
+  briefings + insights            transient in-memory Maps;            NO
+                                  rebuild from Bloomreach or demo
+
+  investigations                  cached in-memory + dev file;         NO
+                                  rebuild from Bloomreach or demo
+
+  audit logs / events             not persisted; per-phase             NO
+                                  console.log only (Vercel logs
+                                  are the retention story)
+
+  user content (e.g. saved        not in the product today              N/A
+   queries, dashboards)
+```
+
+Every row is `NO`. **Without owned data, replication has nothing to replicate.** The state we *do* keep transiently lives on one machine for the duration of one warm-instance lifetime — and the design accepts that loss.
+
+The two pieces of state that *do* need to survive across machines are handled differently:
+- **OAuth state** survives via an encrypted cookie carried by the browser (`lib/mcp/auth.ts:38-104`). The cookie is the "shared store" — *the client is the replication target*. See file 07.
+- **Investigation handoff state** survives via the browser's `sessionStorage` and the URL params (`?insight=`, `?diagnosis=`). Same trick — *the client is the carrier*. See file 03 and file 01.
+
+This is a real design pattern with a name: **state on the client, not on replicas.** It works when (a) the state is per-user, (b) the client can be trusted with it (or it's encrypted), and (c) the state isn't large enough to bloat every request. All three hold here.
+
+#### Part 2 — no partitioning (because there's no shared workload)
+
+```
+  Partitioning kicks in when…                  …here, instead:
+
+  …one user's data is too large for             every user's request fits in
+  one machine                                   the 300s route budget on
+                                                one instance
+
+  …throughput exceeds one machine's CPU         Vercel auto-scales instances;
+                                                each instance handles one
+                                                request at a time (functionally)
+
+  …a query needs to fan-out across              every query touches one
+  multiple shards                               Bloomreach project (the EQL
+                                                runs server-side, not by us)
+```
+
+There's nothing to partition because each request is **independent, bounded, and one-owner**. The session is the natural partition key — and Vercel's request routing partitions for us implicitly by hashing the request to *some* instance.
+
+What we don't get for free is **stickiness**: a follow-up request on the same session can land on a different instance, which is the cold-cache hazard from file 04. The fix the codebase chose: *don't rely on stickiness* — design every state read with a "where else could this come from?" fallback. The three-source `resolveAnomaly` (`app/api/agent/route.ts:30-62`) is the canonical example.
+
+#### Part 3 — no quorums (because there are no replicas to agree)
+
+A quorum is a mechanism for *multiple replicas of the same logical value to agree on the current value*. Examples: Raft (leader-elected log replication), Paxos (proposers/acceptors/learners), Dynamo-style (R + W > N).
+
+The whole list is `not yet exercised`:
+
+```
+  Quorum mechanisms — none present, none planned
+
+  ─────────────────────────────────────────────────────────
+  Raft / Paxos consensus           not present
+  Leader election                  not present
+  Distributed locks                not present
+  R+W > N quorum reads/writes      not present
+  Hinted handoff                   not present
+  Read repair / anti-entropy       not present
+  Vector clocks / version vectors  not present
+  ─────────────────────────────────────────────────────────
+```
+
+The single-owner property at every layer is what closes the door on this whole family. **If you find yourself wanting a vector clock, you have multiple writers; if you have multiple writers in this system, the design has slipped.**
+
+#### Part 4 — Bloomreach's replication is opaque (and that's correct)
+
+We *are* a client of a replicated, partitioned, quorum-managed system: Bloomreach Engagement is a multi-tenant data platform, almost certainly running with replication and partitioning for its workspace data. **We just don't get to see or design any of it.**
+
+What we do see:
+- Reads are *eventually consistent* (events written elsewhere appear in our EQL after some ingest delay)
+- Rate-limits are *global per user* — implying their backend coordinates a counter across whatever shard fan-out exists
+- Errors surface as `isError: true` envelopes — we don't see partial-quorum semantics
+
+The discipline: **treat the upstream as a black box with documented behavior; don't bake assumptions about its internals into our code.** The retry ladder and the 60s cache don't care whether Bloomreach is one machine or ten thousand.
+
+### Move 2.5 — current state vs future state
+
+```
+  Today                                Tomorrow (the realistic next step)
+  ──────────────────────────           ─────────────────────────────────────
+  no datastore we own                  if we add user accounts / saved
+                                        queries / persisted insights:
+                                        the question becomes "Postgres
+                                        single instance or replicated?"
+                                        — answer probably "single instance
+                                        first, replicate when RPO matters"
+
+  no replication                       same: defer replication until
+                                        there's data worth surviving
+
+  no partitioning                      same: a single Postgres handles
+                                        many orders of magnitude more
+                                        sessions than this product needs
+
+  no quorums                           same: single-writer, single-reader
+                                        is fine for the product's scale
+```
+
+The next step on this axis isn't "add Raft." It's "add Postgres (single instance) when we have data worth keeping." Quorums would come — if ever — *much* later, behind a real RPO/RTO requirement we don't have today.
+
+### Move 3 — the principle
+
+> **The cheapest distributed-systems property is the one you don't have to provide. Push state to the upstream you don't own (Bloomreach) and the client you do (encrypted cookie + sessionStorage), and the replication/partitioning/quorum chapter of distributed systems just doesn't apply.**
+
+This isn't a punt — it's a posture. Every system eventually needs durable owned state; when that day arrives, the work is *adding* a datastore, and the file you'll need is the database-systems guide, not this one. Until then, the honest answer to "what's your replication strategy?" is "we don't have data to replicate, and that's intentional."
+
+## Primary diagram — the absence map
+
+```
+  Replication / partitioning / quorums — the whole picture is absences
+
+  layer                    replication        partitioning         quorum
+  ─────                    ───────────        ────────────         ──────
+  L1 Browser               n/a — single tab   n/a                  n/a
+  L1 sessionStorage        n/a                n/a                  n/a
+  L2 cookie store          carried by client  n/a                  n/a
+                            (the client IS the
+                            replica)
+  L2 in-memory Maps        none — cold        none — per-instance, n/a
+                            restart wipes      naturally per-user
+  L3 response cache        none               none                 n/a
+  L4 Bloomreach            opaque             opaque                opaque
+                            (their problem)    (their problem)      (their problem)
+
+  no row says "we run R=2 with W=2 against N=3"
+  no row says "tenant X lives on shard 4"
+  no row says "wait for majority to ack the write"
+  ★ this is the entire shape of the topic in this repo today ★
 ```
 
 ## Elaborate
 
-The standard distributed-systems vocabulary for replication and partitioning lives in Kleppmann *Designing Data-Intensive Applications* chapters 5–6 and Lindsey Kuper's distributed-systems lectures. Worth knowing at the vocabulary level for interviews even when not exercised:
+The classic references for the absent material:
 
-- **Synchronous vs asynchronous replication.** Sync = primary waits for follower ack (strong consistency, slow); async = fire-and-forget (fast, replica lag). Most real systems are async or "semi-sync" (wait for at least one follower).
-- **Leader-based vs leaderless.** Leader-based (Postgres, MySQL, MongoDB): one writer, many readers. Leaderless (DynamoDB, Cassandra, Riak): writes go to N replicas with W acknowledging, reads go to R replicas — the N/W/R quorum tradeoff.
-- **Single-leader vs multi-leader.** Multi-leader (CRDTs, last-write-wins, version vectors) lets multiple regions accept writes; required for active-active multi-region. Conflict resolution is the whole story.
-- **Partitioning strategies.** Hash partitioning (uniform distribution, no range scans), range partitioning (range scans cheap, hot-spot risk), consistent hashing (minimal rebalance on node add/remove). Re-sharding is its own hard problem.
-- **Quorum math.** N replicas, write to W, read from R; strong consistency requires W + R > N. Common: N=3, W=2, R=2 — tolerate one replica down on either side.
+- **Brewer's CAP theorem.** Pick two of consistency, availability, partition-tolerance. *Doesn't apply to this codebase because we don't own a partitioned store. Applies to Bloomreach internally; their choice is opaque to us.*
+- **Vogels' eventual consistency** (Werner Vogels, ACM Queue 2008). The model of "all replicas eventually converge to the same value if no new updates are made." *Bloomreach's read consistency model from our side is consistent with this — events written elsewhere appear in our reads with some delay.*
+- **Dynamo paper** (DeCandia et al., 2007). The original R+W>N quorum design. *Worth knowing the shape; no part of the codebase uses it.*
+- **Raft** (Ongaro & Ousterhout, 2014). The leader-elected log-replication consensus algorithm that powers etcd, Consul, CockroachDB, TiKV. *No use today; the cleanest reference if we ever needed a tiny embedded coordination service.*
 
-What to read next: Kleppmann ch. 5–6; the DynamoDB paper; the Cassandra docs on tunable consistency; Aphyr's Jepsen reports for what goes wrong in practice.
+The reading recommendation: if you're going to read one paper to fill in the gap this file deliberately leaves, read Werner Vogels' "Eventually Consistent" (the short blog version, not the longer paper). It frames the topic at the altitude this codebase actually cares about — *we're a consumer of an eventually-consistent upstream, not a designer of one.*
 
 ## Interview defense
 
-**Q: "How do you handle replication in this system?"**
+### "What's your replication strategy?"
 
-> "I don't. This repo has no replicated state — no Redis, no Postgres, no shared cache, no replica set. The Vercel cohort serves all reads but every instance is independent; they share nothing except cookies. The day this needs to change, the first move is Vercel KV or Redis to hold the response cache and the `insights` maps; the per-instance staleness I work around with a `?insight=<JSON>` URL hack would go away. Only after THAT would partitioning, quorum reads, or a Postgres primary/replica setup become real choices."
+There is none, and that's the right answer for today. We don't own a datastore — every piece of state lives in one of three places: the browser (sessionStorage, encrypted cookie), in-memory Maps on whichever Vercel instance serves the request (session-keyed, ephemeral), or Bloomreach (opaque to us). The two pieces of state that need to survive across instances — OAuth tokens and investigation handoff context — survive by being carried *on the client*: the encrypted cookie for tokens (AES-256-GCM, 10-day max-age) and sessionStorage + URL params for handoff. The client is the replication target. When the product grows owned data — saved queries, user accounts, persisted briefings — we'd start with a single-instance Postgres and only replicate when an RPO/RTO requirement forced the question.
 
-Diagram you sketch:
+*Anchor:* `lib/mcp/auth.ts:38-104` — the cookie-as-distributed-state mechanism; `app/api/agent/route.ts:30-62` — the three-source fallback that makes us instance-agnostic.
 
-```
-  today:   N Vercel instances → 1 Bloomreach (fan-out, no shared cache)
+### "How do you partition user data?"
 
-  step 1:  N Vercel instances → 1 Redis (shared 60s cache) → 1 Bloomreach
-  step 2:  + Postgres for write state → multi-region → quorum reads
-```
+Implicitly by Vercel's request routing — every user is one session (`bi_session` cookie), every request handles one user, and the session-keyed Maps (`lib/state/insights.ts:14-23`) keep one user's state from bleeding into another's *inside* a warm instance. There's no explicit partition key because each session's data fits in one process, runs in one request budget (300s), and doesn't need to be queried from a second instance. If the product grew shared queries across users, we'd start needing a real partition key (tenant_id) and a real store; we don't yet.
 
-**Q: "What would push you into real replication?"**
+*Anchor:* `lib/state/insights.ts:14` — `state = new Map<string, SessionFeed>()`; the outer Map's key IS the partition.
 
-> "Three triggers: (1) multi-user teams sharing a workspace — `insights` becomes a shared collection. (2) Persistent investigations — the user saves notes, that's a write path with concurrency. (3) Multi-region latency — at which point the shared cache and shared state need to replicate, and the conflict-resolution choices (leader vs leaderless, last-write-wins vs CRDTs) become real. None of those exist today."
+### "Do you ever need quorum reads or writes?"
 
-**Q: "What's the single closest thing to replication you have?"**
-
-> "The per-instance caches. Three Vercel instances, three independent caches, all pointing at the same Bloomreach upstream — it *resembles* fan-out to read replicas. But there's no coordination, no read repair, no consistency story between them. Each instance is its own little world. That's the honest framing — not replicated, just multiplied."
+No, because there are no replicas to disagree. Every piece of state in this codebase has exactly one owner at a time: one tab for sessionStorage, one instance for in-memory Maps, one adapter (one request) for the response cache, one upstream for Bloomreach data. No multi-writer scenario, no replication, no quorum question. The whole consensus / leader-election / R+W>N family is `not yet exercised`. If the product ever needs cross-region durability with strong consistency, the conversation starts with picking a database that handles quorum internally (Spanner, CockroachDB, DynamoDB) rather than implementing it ourselves — at our scale and team size, rolling our own consensus is the wrong choice.
 
 ## See also
 
-- `01-distributed-system-map.md` — the picture this file is the counter-example to.
-- `04-consistency-models-and-staleness.md` — the per-instance staleness this file would solve if replication landed.
-- `07-clocks-coordination-and-leadership.md` — the encrypted-cookie pattern that hops the per-instance gap for auth specifically.
-- `09-distributed-systems-red-flags-audit.md` — listed alongside the per-instance throttling caveat.
+- `04-consistency-models-and-staleness.md` — the consistency story for the state we *do* have.
+- `07-clocks-coordination-and-leadership.md` — the OAuth state survival mechanism (the client as replica).
+- `09-distributed-systems-red-flags-audit.md` — what would change if the product added owned data.
+- `.aipe/study-database-systems/` — datastore-local consistency (mostly `not yet exercised` here too).
+- `.aipe/study-system-design/` — the architectural shape that keeps the topic small.

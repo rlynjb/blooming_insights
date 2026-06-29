@@ -1,277 +1,316 @@
-# 11 — Meta-prompting
+# Meta-prompting
 
-*LLM-authored prompts · Industry standard · Anchor: aipe (your meta-tooling project)*
+**Industry standard** · prompts that generate prompt content at runtime
 
-## Zoom out, then zoom in
+## Zoom out — where meta-prompting fires in this codebase
 
-Meta-prompting is using an LLM to write or improve prompts for other LLM calls. It doesn't live in `blooming_insights` itself — it lives in *aipe*, your meta-tooling project. The two systems exemplify the two sides of meta-prompting: the *consumer* (blooming) and the *generator* (aipe).
+The clearest case of meta-prompting in blooming is the *runnable-category checklist* that gets injected into the monitoring agent's `{categories}` slot. The categories themselves are defined as TypeScript objects with metadata (id, label, requires, eql recipe, thresholds); at request time, a coverage check decides which ones the current workspace can run; the runnable subset is formatted into a markdown list that becomes part of the system prompt. The monitoring agent's prompt is *partly* generated, per call, by code that knows what the workspace supports.
 
 ```
-  Meta-prompting — where the prompt generator and consumer sit
+  Zoom out — where the categories meta-prompt lives
 
-  ┌─ aipe (the meta-tooling) ─────────────────────────────────────┐
-  │  slash commands map to prompt templates                         │
-  │  /aipe:study-prompt-engineering → reads spec/format/me .md      │
-  │  → spawns Claude Code agent with assembled prompt                │
-  │  ★ THE GENERATOR ★ — LLM authoring prompts                      │ ← we are here
-  └──────────────────────┬────────────────────────────────────────┘
-                         │ produces .md files in
-                         │ .aipe/study-prompt-engineering/
-                         ▼
-  ┌─ output: 14 study .md files ──────────────────────────────────┐
-  │  this very file, plus 13 sibling concept files                  │
-  │  human-reviewed, committed to git                                │
-  └────────────────────────────────────────────────────────────────┘
-
-  ┌─ blooming_insights (the consumer) ────────────────────────────┐
-  │  lib/agents/legacy-prompts/{monitoring,diagnostic,...}.md        │
-  │  prompts authored by HUMANS, version-controlled (concept 03)    │
-  │  → loaded by readFileSync, sent to claude-sonnet-4-6             │
-  │  ★ THE CONSUMER ★ — running prompts in production                │
-  └────────────────────────────────────────────────────────────────┘
+  ┌─ TS source (anomaly-category metadata) ─────────────────┐
+  │  lib/agents/categories.ts                                │
+  │  CATEGORIES: AnomalyCategory[] = [                       │
+  │    { id: 'revenue_drop', label: '...', whyItMatters, eql,│
+  │      thresholds: { critical, warning }, requires: [...]},│
+  │    ...                                                   │
+  │  ]                                                       │
+  └─────────────────────────┬───────────────────────────────┘
+                            │  runtime capability check
+  ┌─ runnableCategories(available) ──▼──────────────────────┐
+  │  filters CATEGORIES by what the workspace can do         │
+  │  → returns subset that has all required signals          │
+  └─────────────────────────┬───────────────────────────────┘
+                            │
+  ┌─ monitoring agent assembly ──▼──────────────────────────┐
+  │  checklist = runnable.map(c =>                           │
+  │    `- \`${c.id}\` (${c.label}) — ${c.whyItMatters}        │
+  │      recipe: \`${c.eql(projectId)}\`. flag when           │
+  │      |Δ| ≥ ${c.thresholds.warning}% (critical ≥ ...).`   │
+  │  ).join('\n')                                            │
+  │  → markdown list, baked into {categories} slot           │
+  └─────────────────────────┬───────────────────────────────┘
+                            │
+  ┌─ PROMPT ──▼─────────────────────────────────────────────┐
+  │  monitoring.md template, {categories} replaced           │
+  └─────────────────────────────────────────────────────────┘
 ```
 
-aipe is your shipped example of a meta-prompting system. blooming_insights is a consumer of human-authored prompts. The relationship is real: this very file exists because aipe used an LLM to generate it from a spec, and a human (you) reviewed it before commit. That's the meta-prompting workflow in its actually-useful form.
+## Zoom in
+
+Meta-prompting is the pattern where one piece of code generates prompt content for another LLM call. The strongest version uses an LLM to write or refine prompts (LLM-as-prompt-engineer). The version blooming exercises is gentler: TypeScript code generates the *runtime-variable section* of a prompt from structured metadata. Both count. The pattern earns its place when the prompt's content genuinely needs to change per call (workspace capabilities differ; user inputs vary) — not as a generic "let's get fancy" move.
 
 ## Structure pass
 
-**Layers.** Outer: the meta-system that produces prompts. Middle: the workflow (spec → LLM-draft → human-review → committed prompt). Innermost: the produced prompt running in some other system.
+**Layers.** Two altitudes: the *static template* (the `.md` file with slots) and the *generated content* (the strings that fill the slots, computed at request time).
 
-**Axis — what's the role of the human at each layer?** Walk it down:
+**Axis traced — who writes this text.** Hold one question constant: *who or what produces the words the model reads?*
 
 ```
-  one axis — "what's the human's role at this layer?" — three layers, three roles
+  Axis = authorship — who writes each part of the prompt?
 
-  ┌─ meta-system (aipe) ───────────────────┐
-  │  human: WRITES THE SPEC                  │  high-leverage: spec drives N prompts
-  │  (study-prompt-engineering.md)           │
-  └─────────────────────────────────────────┘
-       ┌─ workflow ─────────────────────────┐
-       │  human: REVIEWS THE DRAFT          │  the load-bearing pass —
-       │  rejects what reads like LLM output │  without it, prompts drift
-       └─────────────────────────────────────┘
-            ┌─ produced prompt ──────────────┐
-            │  human: COMMITS THE RESULT     │  the prompt enters the
-            │  to git (concept 03)            │  codebase as ordinary source
-            └─────────────────────────────────┘
+  ┌─ committed .md text ───────────────────────────────────┐
+  │   human-authored, reviewed in PRs                       │
+  │   ## Role, ## Hard rules, ## Output, the example        │
+  └─────────────────────────────────────────────────────────┘
+                              │
+  ┌─ {schema} slot (schemaSummary output) ──▼───────────────┐
+  │   code-authored, deterministic                          │
+  │   reads WorkspaceSchema, applies caps, formats           │
+  └─────────────────────────────────────────────────────────┘
+                              │
+  ┌─ {categories} slot (the meta-prompt) ──▼────────────────┐
+  │   code-authored, capability-gated                       │
+  │   reads runnable subset, formats as markdown list        │
+  └─────────────────────────────────────────────────────────┘
+                              │
+  ┌─ {anomaly} / {diagnosis} slots ──▼──────────────────────┐
+  │   upstream-agent-authored                               │
+  │   the previous chain's structured output, JSON.stringified│
+  └─────────────────────────────────────────────────────────┘
 ```
 
-**Seams.** The biggest seam is the *human review pass*. Without it, meta-prompting produces prompts that read like LLM output — verbose, polite, full of hedging. With it, you get prompts that read like engineering specs. The review is what turns "LLM drafted this" from a liability into a productivity multiplier.
+**Seams.** The metadata → markdown seam is where the meta-prompting happens. The code reads structured TypeScript objects (`AnomalyCategory[]`) and produces markdown text (`- \`revenue_drop\` (Revenue drop) — ...`). The contract for that seam is "the markdown form will appear inside the system prompt verbatim, so it has to be correct markdown, correct backtick escaping, and tone-consistent with the surrounding template." Change the metadata; the prompt changes automatically. That's the win — and the risk if the markdown formatter has a bug.
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — the meta-prompting pattern
 
-You know how a code generator (Rails scaffold, OpenAPI codegen, Prisma migrate) writes the boilerplate so you can focus on the parts that matter — and then you *read what it wrote* and reject any garbage? Meta-prompting is the same shape, with one twist: the generator and the reviewer are both you, but the generator is the model.
-
-```
-  Pattern — meta-prompting workflow, the kernel
-
-  ┌─ human writes spec ───┐
-  │  "I want a guide on    │  high-level intent, constraints,
-  │   prompt engineering,  │  examples of what good output looks like
-  │   13 concepts, this    │
-  │   format..."           │
-  └──────────┬────────────┘
-             │
-             ▼
-  ┌─ LLM drafts the prompt(s) ─┐
-  │  reads spec + format rules  │  produces N candidate prompts
-  │  → emits 13 .md files       │  in the specified shape
-  └──────────┬─────────────────┘
-             │
-             ▼
-  ┌─ human reviews ────────────┐
-  │  ★ THE LOAD-BEARING STEP ★  │  rejects hedging, marketing
-  │  edit, reject, accept       │  language, drift from the intent
-  └──────────┬─────────────────┘
-             │
-             ▼
-  ┌─ commit to git ────────────┐
-  │  the prompt enters the     │  now treated as ordinary source
-  │  codebase as ordinary       │  (concept 03 applies)
-  │  source                     │
-  └────────────────────────────┘
-```
-
-The kernel: a spec drives the meta-system, the meta-system drafts the prompts, the human reviews, the reviewed prompts ship. Skip the human review and you've automated the production of mediocre prompts.
-
-### Move 2 — the walkthrough
-
-**Step 1 — when meta-prompting saves time.** Two situations where it earns its place:
-
-  → **Initial drafting of complex prompts.** A first draft of `legacy-prompts/diagnostic.md` would take a human ~2 hours from scratch — naming the 4-step approach, listing tool reminders, naming common errors, structuring the JSON output spec. An LLM can draft a good first pass in 60 seconds. The human then spends 30 minutes editing — total 30 minutes vs 2 hours.
-  → **Producing N parallel prompts in a consistent shape.** This is exactly what aipe does. The /aipe:study orchestrator spawns 15 sister agents in parallel, each producing one study guide in the same format. A human writing those 15 guides by hand would take weeks. The LLM produces drafts in minutes; the human reviews each one. The *consistency* of the output is the meta-prompting payoff — every guide follows `format.md` because the model was given `format.md`.
-
-**Step 2 — when meta-prompting doesn't save time.** Two situations:
-
-  → **Small tweaks.** "Change rule 3 to allow 8 tool calls instead of 6" is a one-line edit. Round-tripping through an LLM adds latency without benefit.
-  → **Prompts under high iteration pressure.** When you're tuning a prompt against an eval set and changing it 20 times per day, each LLM-drafted iteration adds 30 seconds of generation + 5 minutes of review for what could be a 10-second human edit. Meta-prompting is for *first drafts*, not for iteration loops.
-
-**Step 3 — aipe as the running example.** Look at this very session. The aipe spec for this generator (`study-prompt-engineering.md`) is ~770 lines. It defines:
-
-  → A persona (the working AI engineer voice this file is written in).
-  → 13 concepts to cover.
-  → The output folder name.
-  → The reader profile (via `me.md`).
-  → The format rules (via `format.md`).
-
-The aipe orchestrator (`/aipe:study`) spawns 15 sister agents in parallel — one per study generator. Each agent reads the relevant spec + format + me, then drafts the output files. The output files (this one and its 13 siblings) are LLM-drafted, human-reviewed, then committed to `.aipe/study-prompt-engineering/`.
-
-The shape:
+You know how a templating engine generates HTML from data — Mustache, Handlebars, JSX? Meta-prompting is the same shape, scaled to LLM prompts. There's a template with slots, there's structured data (metadata, user input, prior outputs), and there's code that combines them. The output is text that goes into the next LLM call. The "meta" part is that the generated text is *itself* instructional content the LLM reads.
 
 ```
-  Pattern — aipe's meta-prompting shape, applied to this session
+  Pattern — meta-prompt as template + structured data
 
-  ┌─ spec: study-prompt-engineering.md (~770 lines, human-authored) ──┐
-  │  persona · concept list · output folder · reader profile           │
-  └────────────────────────┬───────────────────────────────────────────┘
-                           │
-                           ▼
-  ┌─ orchestrator: /aipe:study ──────────────────────────────────────┐
-  │  spawns 16 sister agents (15 study + 1 audit)                     │
-  │  each gets:                                                        │
-  │    - the topic spec                                                │
-  │    - format.md (shared structure)                                  │
-  │    - me.md (shared reader profile)                                 │
-  │    - the codebase to anchor to                                     │
-  └────────────────────────┬───────────────────────────────────────────┘
-                           │
-                           ▼
-  ┌─ sister agent (this session) ─────────────────────────────────────┐
-  │  reads spec + format + me + codebase                               │
-  │  drafts 14 .md files                                                │
-  │  → .aipe/study-prompt-engineering/{00-overview, 01-anatomy, ...}.md │
-  └────────────────────────┬───────────────────────────────────────────┘
-                           │
-                           ▼
-  ┌─ human review (next step) ────────────────────────────────────────┐
-  │  THE LOAD-BEARING STEP — without it, output reads like LLM output  │
-  │  reviewer edits voice, rejects hedging, verifies factual claims    │
-  └────────────────────────────────────────────────────────────────────┘
+  ┌─ template (committed) ──────────────────────────────────┐
+  │  monitoring.md                                           │
+  │  ...                                                     │
+  │  ## Your category checklist                              │
+  │  Check each of these — and only these. ...               │
+  │  {categories}              ← slot                        │
+  │  ## Hard rules                                           │
+  │  ...                                                     │
+  └─────────────────────────┬───────────────────────────────┘
+                            │  + structured data
+  ┌─ data ──────────────────▼───────────────────────────────┐
+  │  CATEGORIES = [                                          │
+  │    { id, label, whyItMatters, eql, thresholds }, ...     │
+  │  ]                                                       │
+  └─────────────────────────┬───────────────────────────────┘
+                            │  + formatter
+  ┌─ generator (TypeScript) ▼──────────────────────────────┐
+  │  runnable                                                │
+  │    .map(c => `- \`${c.id}\` (${c.label}) — ...`)         │
+  │    .join('\n')                                           │
+  └─────────────────────────┬───────────────────────────────┘
+                            │  →  filled-in template
+  ┌─ assembled prompt ──────▼───────────────────────────────┐
+  │  ## Your category checklist                              │
+  │  Check each of these — and only these. ...               │
+  │  - `revenue_drop` (Revenue drop) — Sustained revenue ... │
+  │  - `conversion_drop` (Conversion drop) — Funnel quality...│
+  │  ...                                                     │
+  │  ## Hard rules                                           │
+  │  ...                                                     │
+  └─────────────────────────────────────────────────────────┘
 ```
 
-**Step 4 — the risk: prompts that read like LLM output.** This is the failure mode every meta-prompting system hits. LLMs tend to:
+### Move 2 — the categories meta-prompt in code
 
-  → **Pad with throat-clearing.** "Let's explore the fascinating world of structured outputs..."
-  → **Add unnecessary preambles.** "Before we dive in, let me set the stage..."
-  → **Hedge.** "This *might* be useful in *some* situations *potentially*..."
-  → **Reach for marketing language.** "robust solution," "scalable architecture," "best practices."
-
-A prompt with any of these reads like marketing copy, not like engineering spec. The model that *runs* against that prompt then *copies the style* — the rationale field gets verbose, the JSON output gets prefaced with "Sure, here's your analysis:", the trace gets longer.
-
-The defense is in the *spec*. Look at `format.md`'s hard rules:
+The formatting code lives in `lib/agents/monitoring-legacy.ts:84-93`:
 
 ```
-  Hard rules from format.md that defend against drift
+  // monitoring-legacy.ts:84-93 — the meta-prompt formatter
+  const checklist = categories.length
+    ? categories
+        .map(
+          (c) =>
+            `- \`${c.id}\` (${c.label}) — ${c.whyItMatters} ` +
+            `recipe: \`${c.eql(this.schema.projectId)}\`. ` +
+            `flag when |Δ| ≥ ${c.thresholds.warning}% ` +
+            `(critical ≥ ${c.thresholds.critical}%).`,
+        )
+        .join('\n')
+    : '(no checklist provided — scan for any significant recent change)';
 
-  → No definition-first openings. Start with shape/scenario, end with term.
-  → Direct, opinionated. No hedging language.
-  → Marketing language banned.
-  → Bridge from what the reader knows in every Move 2 sub-section.
-  → No on-ramps. Skip the slow setup.
+  const system = PROMPT
+    .replace('{schema}', schemaSummary(this.schema))
+    .replace(/\{project_id\}/g, this.schema.projectId)
+    .replace('{categories}', checklist);
 ```
 
-The spec tells the meta-system to NOT produce the failure mode. The human review catches what slips through. The two together produce prompts that read like engineering, not like LLM output.
+A few details earn their place. **The empty-list fallback** — if no categories are runnable (the workspace has so few signals that nothing applies), the slot becomes `(no checklist provided — scan for any significant recent change)`. That's a deliberate degradation: instead of leaving the slot empty (which would produce an awkward heading with no content), the formatter inserts a one-line fallback that's still useful to the model. **The threshold interpolation** — each category's `thresholds.warning` and `thresholds.critical` are baked into the rule text, so the model knows the threshold per category without having to remember a global rule. The thresholds are themselves metadata, version-controlled in `lib/agents/categories.ts` (the aptkit version in `@aptkit/core` for the active path). **The EQL recipe** — `c.eql(projectId)` materializes the per-category query template with the right project id substituted, so the model has a concrete starting query for each category.
 
-**Step 5 — aipe's specific encoding.** aipe uses markdown templates with frontmatter — slash commands map to template files, the template body becomes the prompt, the spec frontmatter declares dependencies (which other specs this one reads). The shape is intentional: prompts as ordinary `.md` source (concept 03), composed via the slash-command surface.
+The whole formatter is ~10 lines. The benefit it gives the monitoring agent: every per-call prompt has exactly the categories this workspace can run, with the right thresholds, with the right recipes. Without the meta-prompt, the monitoring prompt would have to enumerate every category statically and the agent would waste tool calls on categories the workspace can't support.
 
-The link to blooming: aipe is the *meta-tool* that drafts study guides; blooming's `legacy-prompts/*.md` are *application prompts* that drive the agents. Both are markdown-first, both are version-controlled, both follow the same prompts-as-code discipline. The difference: aipe's prompts are *about prompts*; blooming's prompts are *about ecommerce analytics*.
+### Move 2 — the capability check, where the meta-prompt is gated
+
+The meta-prompt depends on a prior capability check. Read `lib/agents/categories.ts:44-46`:
+
+```
+  // lib/agents/categories.ts:44-46
+  export function runnableCategories(available: Set<string>): AnomalyCategory[] {
+    return aptKitRunnableCategories(CATEGORIES.map(toAptKitCategory), available)
+      .map(toBloomingCategory);
+  }
+```
+
+`available` is a `Set<string>` of event names the workspace actually emits (computed from the bootstrap schema fetch). The function filters `CATEGORIES` to those whose `requires` list is satisfied by `available`. The result is the *runnable subset* — the categories that can plausibly produce a result against this specific workspace.
+
+The route calls `runnableCategories` before invoking the monitoring agent, passes the subset to `monitoring.scan(hooks, runnable)`, and the formatter turns it into the markdown checklist. Workspaces that emit `purchase` events get `revenue_drop` in the checklist; workspaces that don't, get a checklist without it. The monitoring prompt is *per workspace*, not just per call.
+
+This is meta-prompting in the productive sense: the prompt content reflects what the system can do. It's not "let's ask an LLM to write our prompt"; it's "let's have code decide what the prompt should say based on runtime capabilities." Both count as meta-prompting; this version is more predictable.
+
+### Move 2 — the LLM-as-prompt-engineer version (what blooming does NOT do)
+
+The strongest version of meta-prompting uses an LLM to author or refine prompts:
+
+```
+  Hypothetical LLM-as-prompt-engineer flow (not in blooming)
+
+  ┌─ human writes the goal ────────────────────────────────┐
+  │   "Write a prompt that classifies user queries into     │
+  │    monitoring, diagnostic, or recommendation. Output    │
+  │    should be one word."                                 │
+  └─────────────────────────┬──────────────────────────────┘
+                            │
+  ┌─ LLM drafts the prompt ─▼──────────────────────────────┐
+  │   model produces:                                       │
+  │   "You are a classifier. Classify..."                   │
+  └─────────────────────────┬──────────────────────────────┘
+                            │
+  ┌─ human reviews + edits ─▼──────────────────────────────┐
+  │   refine the draft, add edge-case handling              │
+  └─────────────────────────┬──────────────────────────────┘
+                            │
+  ┌─ prompt enters the codebase ▼──────────────────────────┐
+  │   committed as .md, runs as the actual classifier       │
+  └────────────────────────────────────────────────────────┘
+```
+
+blooming doesn't do this at runtime (no part of the system uses an LLM to write a prompt for another LLM call), and the workflow above is mostly an authoring aid — useful for getting a first draft of a complex prompt fast, less useful for iterative refinement (where the LLM-drafted prose tends to read like LLM output rather than like engineering specs).
+
+The reader's aipe project *does* exercise the LLM-as-prompt-engineer pattern via its slash commands — the meta-prompting where a human writes the goal, the model drafts the prompt, the human reviews. blooming's version is more conservative: deterministic code generation of a per-call slot, not LLM authorship of the whole prompt.
+
+### Move 2 — when meta-prompting saves time vs when it doesn't
+
+The categories case is a clear win: 10 categories × 5+ fields each (id, label, requires, eql, thresholds, whyItMatters) × per-workspace variability = too much to hand-maintain in the prompt. Code that generates the markdown is shorter, more correct, and easier to update.
+
+Cases where meta-prompting wouldn't help:
+
+- **The system prompt header.** "You are the monitoring agent... your role is..." — this is stable, low-volume, well-suited to direct editing. Generating it from a TypeScript object would add abstraction without saving labor.
+- **The output schema example.** The worked Anomaly object in the prompt is reviewed alongside the type guard and the TypeScript interface. Generating it from the type would lose the ability to add explanatory comments and example-specific values (the `30%` and `critical` pairing that pins the threshold).
+- **Small prompts that don't change.** The intent classifier's prompt is 4 lines. Meta-prompting it would be longer than the prompt.
+
+The rule: meta-prompt the parts that *legitimately vary per call or per environment*; hand-write the parts that don't.
+
+### Move 2 — the risk: prompts that read like LLM output
+
+The spec calls this out explicitly. When an LLM is used to author prompts, the resulting prompts often read like LLM output — verbose, hedging, full of "please" and "kindly," missing the assertive voice of a working engineer. The aipe / slash-command pattern works because there's a human review step: the LLM drafts; the human edits down. Without the review step, prompts accumulate fluff over time.
+
+blooming's category meta-prompt avoids this because the formatter is deterministic code — the markdown comes out the same shape every time, no fluff, no LLM hedging. The prompt as a whole still gets human-written, human-reviewed components (the .md template). The mix is right: code-generated for runtime variability, human-written for instructional content.
 
 ### Move 3 — the principle
 
-Meta-prompting is code generation with a probabilistic generator. The same review discipline that catches generated code regressions catches generated prompt regressions. The *spec* is the leverage — a high-quality spec produces N prompts of consistent quality; the human review is what keeps the bar at engineering level instead of LLM-output level. Without the review, you've automated the production of mediocre prompts; with it, you've multiplied your authoring throughput by an order of magnitude.
+Meta-prompting is the move that lets prompts adapt to runtime context without bloating the template. Use it for the parts that legitimately vary (workspace capabilities, available signals, upstream agent outputs); hand-write the parts that don't (rules, output schema, examples). When you reach for LLM-as-prompt-engineer, keep a human in the loop — drafted prompts read like LLM output without review, and the agents that consume them inherit the fluff.
 
-## Primary diagram — aipe's meta-prompting flow (this session, end to end)
+## Primary diagram
 
 ```
-  ┌─ THE SPEC (human-authored, version-controlled) ───────────────────┐
-  │  ~/.claude/plugins/cache/.../specs/study-prompt-engineering.md     │
-  │   - persona: working AI engineer                                    │
-  │   - 13 concepts                                                     │
-  │   - output folder                                                   │
-  │   - reader profile reference                                        │
-  │  ~/.claude/plugins/cache/.../specs/format.md (shared structure)    │
-  │  ~/.claude/plugins/cache/.../specs/me.md (shared reader profile)    │
-  └────────────────────────┬───────────────────────────────────────────┘
-                           │
-  ┌─ ORCHESTRATOR ▼ ────────────────────────────────────────────────────┐
-  │  /aipe:study (or /aipe:study-prompt-engineering standalone)         │
-  │  spawns sister agents in parallel                                    │
-  └────────────────────────┬────────────────────────────────────────────┘
-                           │
-  ┌─ THIS SESSION ▼ ────────────────────────────────────────────────────┐
-  │  Claude reads spec + format + me + codebase                          │
-  │  drafts 14 .md files                                                  │
-  │  → /Users/rein/Public/blooming_insights/.aipe/                       │
-  │    study-prompt-engineering/{00-overview, 01-anatomy, ..., README}.md │
-  └────────────────────────┬────────────────────────────────────────────┘
-                           │
-  ┌─ HUMAN REVIEW (you, after this session) ────────────────────────────┐
-  │  read each file                                                       │
-  │  reject hedging, marketing, slow on-ramps                             │
-  │  verify against codebase (no false claims)                            │
-  │  commit (concept 03 applies — now these are version-controlled)       │
-  └─────────────────────────────────────────────────────────────────────┘
-  ┌─ THE PRODUCED PROMPTS (no longer LLM-output; engineering source) ────┐
-  │  committed to git                                                      │
-  │  blameable, diffable, reviewable                                       │
-  │  drive YOUR future study + interview prep                              │
-  └─────────────────────────────────────────────────────────────────────┘
+  Meta-prompting in blooming — the categories slot, end to end
+
+  ┌─ STATIC METADATA (TypeScript, committed) ──────────────────────┐
+  │  lib/agents/categories.ts (mirror of @aptkit/core categories)   │
+  │  CATEGORIES: AnomalyCategory[] = [                              │
+  │    { id: 'revenue_drop',                                         │
+  │      label: 'Revenue drop',                                      │
+  │      requires: ['purchase', 'purchase.total_price'],             │
+  │      whyItMatters: '...',                                        │
+  │      eql: (projectId) => 'select sum event purchase...',         │
+  │      thresholds: { warning: 10, critical: 20 } },                │
+  │    ...                                                           │
+  │  ]                                                                │
+  └────────────────────────────────────────┬───────────────────────┘
+                                            │  per request
+  ┌─ CAPABILITY GATE ──────────────────────▼───────────────────────┐
+  │  runnableCategories(available_event_set):                        │
+  │    filter CATEGORIES by requires ⊆ available                    │
+  │  → runnable subset (workspace-specific)                          │
+  └────────────────────────────────────────┬───────────────────────┘
+                                            │
+  ┌─ FORMATTER (monitoring-legacy.ts:84-93) ▼──────────────────────┐
+  │  runnable.map(c =>                                               │
+  │    `- \`${c.id}\` (${c.label}) — ${c.whyItMatters} ` +           │
+  │    `recipe: \`${c.eql(projectId)}\`. ` +                         │
+  │    `flag when |Δ| ≥ ${c.thresholds.warning}% (critical ≥ ${c.thresholds.critical}%).`)│
+  │    .join('\n')                                                   │
+  │  → markdown checklist                                            │
+  └────────────────────────────────────────┬───────────────────────┘
+                                            │
+  ┌─ SLOT INTERPOLATION (monitoring-legacy.ts:95-98) ▼─────────────┐
+  │  PROMPT.replace('{categories}', checklist)                       │
+  └────────────────────────────────────────┬───────────────────────┘
+                                            │
+  ┌─ ASSEMBLED PROMPT (the model sees this) ▼──────────────────────┐
+  │  ## Your category checklist                                      │
+  │  - `revenue_drop` (Revenue drop) — ... recipe: `select sum...`   │
+  │    flag when |Δ| ≥ 10% (critical ≥ 20%).                         │
+  │  - `conversion_drop` (Conversion drop) — ...                     │
+  │  ...                                                              │
+  └─────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The pattern has a few names in the literature — "prompt programming" (when the spec is treated as a program), "LLM-aided prompt engineering" (when the focus is on the workflow), "meta-prompting" (when the focus is on the LLM-writing-prompts-for-LLMs angle). They're the same thing.
+The reader's aipe project is the canonical example of meta-prompting at the *authoring* layer: slash commands that take a human-written goal and produce a draft prompt or skill file. That pattern is well-suited to one-off authoring tasks — getting the first draft of a new prompt fast — and less well-suited to iterative refinement, where every iteration round-trips through the LLM and the prose drifts in ways the human reviewer has to actively prune. The pragmatic version: draft with an LLM, edit with a human, commit the edited version. Don't have the LLM in the iteration loop.
 
-The interesting variants:
+blooming's categories meta-prompt is the *runtime* version: code generates the variable slot per call, no LLM involved in the prompt authorship. This works well because the metadata is structured (TypeScript objects) and the format is simple (markdown list). The category code generates ~10 lines of markdown per call; the rest of the prompt is human-authored. The split is the right one.
 
-- **Prompt rewriting against an eval set.** A more advanced shape — the LLM generates N variations of a prompt, all run against the eval set, the highest-scoring variation gets committed. Requires concept 05's eval substrate (which this codebase doesn't have). Heavy-handed for most cases but powerful when iterating against a stable benchmark.
-- **APE (Automatic Prompt Engineer).** A research thread (Zhou et al., 2022) on fully-automated prompt generation. Interesting; rarely productionised because the human review is what makes the result usable, and APE assumes you can skip it.
-- **Constitutional AI's self-improvement loop.** A different angle — using LLM-drafted critique to refine *the model's own behavior* via fine-tuning. Adjacent to meta-prompting; same shape (LLM critiquing/drafting prompts), different goal.
+A subtle benefit of meta-prompting: it lets you *separate the rules from the instances*. The rule "flag when |Δ| ≥ warning% (critical ≥ critical%)" is universal across categories; the actual thresholds (10%, 20% for revenue_drop) are per-category. Without meta-prompting, you'd either hard-code each category's thresholds into the prompt prose (drift-prone, hard to update) or hand-wave the thresholds and let the model decide (loose, inconsistent). The meta-prompt formats the rule with the category-specific thresholds plugged in, so the model sees a concrete rule per category and a consistent format across them.
 
-Where to read next: Anthropic's prompt-engineering docs reference using Claude to help write prompts for Claude — the most pragmatic take. Eugene Yan's writing on prompt-engineering workflows touches on this. Simon Willison has a running thread on his own usage of LLMs to draft `llm` CLI templates, which is meta-prompting in the wild.
+The risk to watch: meta-prompt content drift. The formatter at `monitoring-legacy.ts:84-93` controls a load-bearing part of every monitoring call. A bug in the formatter — say, swapping `${c.thresholds.warning}` with `${c.thresholds.critical}` — would silently change the agent's behavior across every category, on every call, without any prompt file change. The TypeScript types catch most categories of mistake (a typo would fail to compile); the semantic mistakes (swapping fields, wrong join character) wouldn't. The fix is the same as for any code-generated text: write a test that asserts the generated markdown matches a snapshot for known inputs, and re-run the test on every change to the formatter. blooming doesn't have this test today; the demo snapshots are the closest thing.
 
-In this codebase, concept 03 (prompts as code) is the *prerequisite* — the produced prompts only become trustworthy when they enter version control like any other source. Concept 05 (eval-driven iteration) is the *complement* — the eval set catches regressions in produced prompts the same way it catches regressions in human-authored ones.
+Eugene Yan and Hamel Husain both write about meta-prompting as a *production* pattern (capability-gated, deterministic, code-generated) rather than as a research pattern (LLM-as-prompt-engineer). The production version is harder to find in tutorials but more common in shipped systems — anywhere a prompt needs to adapt to per-tenant configuration, per-user preferences, or per-workspace capabilities, you'll find code that generates a slot at runtime. blooming's categories slot is one of many possible cases; whenever a future agent needs to know what's available in *this* workspace, the same pattern is the move.
 
 ## Interview defense
 
-**Q: "Do you use LLMs to help write prompts?"**
+**Q: Why generate the categories list at runtime instead of hard-coding it in the prompt?**
 
-Yes — that's exactly what aipe (my meta-tooling project) does. The slash commands map to prompt templates; the orchestrator spawns sister agents that each draft a study guide following the spec. *This* study guide on prompt engineering is itself an example — Claude drafted these 14 markdown files in one session from a spec I authored; I review each file, edit voice, reject hedging or marketing language, then commit. The pattern saves an order of magnitude of authoring time on first drafts.
-
-```
-  spec → LLM draft → HUMAN REVIEW → commit
-                       ↑ load-bearing step
-```
-
-Anchor: *"first drafts, not iteration loops. The review pass is what turns LLM output into engineering source."*
-
-**Q: "What's the failure mode?"**
-
-Prompts that read like LLM output. *(Name the symptoms.)* Padding, throat-clearing, hedging, marketing language. If the meta-system produces a prompt full of "let's explore" and "this might be useful," the model running against that prompt copies the style — the rationale field gets verbose, the JSON output gets prefaced with chat-tone preamble, the trace gets longer. The defense is in the spec (banned-words lists in `format.md`) AND in the human review.
+A: Two reasons that compound. **Workspace variability** — not every workspace emits every event. A workspace that doesn't track checkouts can't run a `cart_abandonment` category; if the prompt had it hard-coded, the model would waste tool calls trying to query a metric that doesn't exist. The runnable-categories check (`lib/agents/categories.ts:44`) filters the list to what this workspace actually supports, and the meta-prompt formatter injects only those into the prompt. **Maintenance** — when a new category gets added or a threshold gets tuned, the change is one TypeScript object: id, label, requires, eql recipe, thresholds. The prompt regenerates automatically with the new shape. The alternative would be enumerating all 10 categories statically in the prompt and remembering to update the prose every time a threshold moves — drift-prone and error-prone. Meta-prompt the parts that vary; hand-write the parts that don't.
 
 ```
-  symptoms in produced prompts:           defense:
-  ────────────────────────────           ───────
-  "Let's explore..."                      banned in format.md
-  "It's important to note..."             banned in format.md
-  "potentially might be useful"           hedging banned
-  "scalable solution"                     marketing banned
-                                          + human review pass
+  what I'd sketch:
+
+  hard-coded prompt:                  meta-prompted slot:
+  ─────────────────                   ───────────────────
+  all 10 categories listed            only runnable subset listed
+  thresholds in prose                  thresholds from metadata
+  agent wastes calls on               agent only sees what
+   unsupported categories              applies to this workspace
+  every threshold change               threshold change is a
+   = prompt-file edit                  one-line TypeScript edit
 ```
 
-Anchor: *"the review is what turns it from automated mediocrity into a productivity multiplier."*
+**Q: When would you NOT use meta-prompting?**
 
-**Q: "When NOT to use it?"**
+A: When the prompt content doesn't legitimately vary, meta-prompting adds abstraction without saving work. The intent classifier's system message is 4 lines of stable rules; meta-prompting it would be longer than the prompt itself. The diagnostic agent's `## Investigation approach` section is the same procedure every time; generating it from a JSON spec would be more code, not less. The output schema example in each prompt is co-designed with the type guard and the TypeScript interface; generating it from the type would lose the ability to add per-example values (the `30%` paired with `critical` that pins the threshold). The rule: meta-prompt the parts that vary per call or per environment; hand-write the parts that are universal. The categories slot varies per workspace, so meta-prompting earns its place; the rules section is universal, so it doesn't.
 
-Two cases. Small tweaks — round-tripping through an LLM adds latency without benefit; faster to edit by hand. And tight iteration loops — when I'm tuning a prompt against an eval set and changing it 20 times per day, each LLM-drafted iteration costs 5 minutes of review for what could be a 10-second human edit. Meta-prompting is for *first drafts* and for *parallel production* (15 study guides at once), not for iterating on a single prompt.
+```
+  meta-prompting decision rule:
 
-Anchor: *"meta-prompting wins on first drafts and parallel production. Loses on small tweaks and tight iteration."*
+  does this part change per call/env?
+                  │
+       yes ───────┴─────── no
+       │                   │
+   meta-prompt it    hand-write it
+   (categories,      (rules, schema,
+    user query,       output example,
+    upstream output)  procedure)
+```
 
 ## See also
 
-- `03-prompts-as-code.md` — the prerequisite; produced prompts only become source when they enter version control with the same discipline as human-authored ones.
-- `05-eval-driven-iteration.md` — the complement; the eval set catches regressions whether the prompt was hand-written or LLM-drafted.
-- `08-few-shot.md` — meta-prompting often uses few-shot inside the spec (show the LLM what good output looks like, then ask it to produce more).
-- `13-forbidden-patterns.md` — banning specific phrases in the spec is the meta-prompting application of concept 13.
+- [01-anatomy.md](./01-anatomy.md) — `{categories}` is one of the interpolation slots in the four-section anatomy
+- [03-prompts-as-code.md](./03-prompts-as-code.md) — meta-prompting is what makes "prompts as code" cover the variable parts too
+- [04-token-budgeting.md](./04-token-budgeting.md) — `schemaSummary` is another code-generated slot; both compress for the budget
+- [06-single-purpose-chains.md](./06-single-purpose-chains.md) — capability gating (per-agent tool registry) is the structural cousin of meta-prompt gating

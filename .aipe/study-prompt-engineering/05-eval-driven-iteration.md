@@ -1,328 +1,302 @@
-# 05 — Eval-driven prompt iteration
+# Eval-driven prompt iteration
 
-*Eval-driven development for prompts · Industry standard · Case B (substrate absent)*
+**Industry standard** · the discipline blooming hasn't shipped yet
 
-## Zoom out, then zoom in
+## Zoom out — where the eval layer would sit
 
-This concept is the senior-vs-junior dividing line in prompt work. Pull up where the eval substrate *would* live in this codebase.
+blooming has type guards on the model output (`lib/mcp/validate.ts`), 221 passing Vitest tests, and committed demo snapshots in `lib/state/demo-*.json`. What it does *not* have is an eval set — a curated collection of (input, expected output) cases that runs against the agents and produces a regression-trackable score. The eval/ folder was retired (PR #8). This concept is the honest case for what would go in its place, and why the discipline matters more than any single technique downstream.
 
 ```
-  Where eval-driven iteration would sit in the system
+  Zoom out — where evals would slot in
 
-  ┌─ Source (lib/agents/legacy-prompts/*.md) ─────────────────────────┐
-  │  monitoring.md · diagnostic.md · recommendation.md · query.md      │
-  └────────────────────────────┬──────────────────────────────────────┘
+  ┌─ Prompt template ────────────────────────────────────────┐
+  │  lib/agents/legacy-prompts/monitoring.md                  │
+  └────────────────────────────┬─────────────────────────────┘
+                               │  changes
+  ┌─ ★ NOT YET EXERCISED ★ ───▼─────────────────────────────┐ ← we are here
+  │  eval set:                                                │
+  │    (input, expected output, scoring fn) × N cases         │
+  │    run before merging the prompt change                   │
+  │    diff scores · keep if up, regress check before merge   │
+  └────────────────────────────┬─────────────────────────────┘
+                               │  pass
+  ┌─ Type guards ──────────────▼─────────────────────────────┐
+  │  lib/mcp/validate.ts                                      │
+  │  → checks shape only · NOT behavior                       │
+  └────────────────────────────┬─────────────────────────────┘
                                │
-  ┌─ The missing layer ▼ ─────────────────────────────────────────────┐
-  │  ★ EVAL HARNESS — DOES NOT EXIST IN THIS REPO TODAY ★             │ ← we are here
-  │   - golden set (20–50 hand-curated cases with expected outputs)    │
-  │   - regression suite (production failures, added forever)          │
-  │   - score: deterministic checks + LLM-as-judge for fuzzier shapes  │
-  │   - runner: in CI, on every prompt PR                              │
-  │  NOT PRESENT IN THIS REPO: no eval/ directory, no harness today.   │
-  │  TODAY: by-hand comparison against lib/state/demo-*.json snapshot │
-  └────────────────────────────┬──────────────────────────────────────┘
-                               │
-  ┌─ Process ▼ ────────────────────────────────────────────────────────┐
-  │  prompt change → run evals → diff outputs → keep if improved        │
-  │  TODAY: prompt change → run live → eyeball UI → ship                │
-  └────────────────────────────────────────────────────────────────────┘
+  ┌─ Vitest suite (221 tests) ─▼─────────────────────────────┐
+  │  test/agents/* · test/mcp/*                               │
+  │  → tests pure logic + agent loops with fakes              │
+  │  → does NOT call real model · is NOT an eval              │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-This file is **Case B**: the pattern is real and load-bearing across the industry; the substrate is *absent* from this repo today. There is no `eval/` directory, no 4-pillar eval suite, no LLM-as-judge harness. The honest framing matters — without evals, prompt iteration in this codebase is by-hand against the captured demo snapshot, and that's a real gap I'd close next.
+## Zoom in
+
+The senior-vs-junior dividing line on prompt work is the eval set. A junior iterates by vibes ("the response feels better now"). A senior iterates against a regression-trackable suite of cases with expected outputs. blooming's prompts have been iterated by vibes — the demo snapshots are a partial substitute but not a full eval, and changing a prompt today means hand-checking a few briefings and shipping if they look OK. That works at this scale. It will not survive a model upgrade.
 
 ## Structure pass
 
-**Layers.** Outer: the iteration loop (change prompt → measure → decide). Middle: the eval set (golden set + regression suite). Innermost: the per-case scoring function.
+**Layers.** Three altitudes of "what's verified about model behavior" exist in this codebase today: the *type guards* (shape, at the model-output boundary), the *Vitest suite* (logic + agent loops with fakes, no real model), and the *demo snapshots* (committed captures, manual visual review). Each verifies something useful; none of them is an eval set.
 
-**Axis — what flips between "amateur" and "professional" prompt work.** Walk it down:
+**Axis traced — what's actually verified.** Hold one question constant: *if I change the system prompt, what test will catch a regression?*
 
 ```
-  one axis — "how do I know this prompt change is better?" — three layers
+  Axis = "what catches a prompt-change regression?"
 
-  ┌─ amateur ─────────────────────────┐
-  │  "the response feels better now"  │   vibes
-  └───────────────────────────────────┘
-       ┌─ middle ground (this repo today) ─┐
-       │  "the demo snapshot still renders" │  single-snapshot regression
-       └────────────────────────────────────┘
-            ┌─ professional ────────────────┐
-            │  "score went 0.78 → 0.84      │  golden-set + regression suite
-            │   without regressing any case" │  + LLM-as-judge for fuzzier shapes
-            └────────────────────────────────┘
+  ┌─ type guards (lib/mcp/validate.ts) ────────────────────┐
+  │   catches: returned shape is wrong (e.g. missing field)│
+  │   misses:  shape right, but content semantically wrong  │
+  │            (e.g. wrong severity, hallucinated metric)   │
+  └─────────────────────────────────────────────────────────┘
+                              │
+  ┌─ Vitest (test/agents/*) ──▼────────────────────────────┐
+  │   catches: the agent loop wires fakes correctly         │
+  │            the parser/guard handle edge cases           │
+  │   misses:  anything about the real model's behavior     │
+  │            (tests use injected fakes — no Anthropic call)│
+  └─────────────────────────────────────────────────────────┘
+                              │
+  ┌─ demo snapshots (lib/state/demo-*.json) ──▼────────────┐
+  │   catches: the UI renders captured data correctly       │
+  │   misses:  whether the captured data was good           │
+  │            (snapshots are "what the agent did," not     │
+  │             "what it should have done")                 │
+  └─────────────────────────────────────────────────────────┘
 ```
 
-**Seams.** The biggest seam is between *deterministic* checks (the type guards already in `lib/mcp/validate.ts`) and *semantic* checks (does the diagnosis actually explain the anomaly?). Type guards catch shape drift; semantic checks need an eval set.
+**Seams.** The eval-set seam is the missing one: a layer that catches *behavior* regressions — the model returned the right shape and the right number of items, but the wrong items, with the wrong severity, or invented an evidence number. Without that layer, a prompt change can ship that satisfies every test in the suite and breaks the product semantically. The reader has felt this exact bug shape before in any project with content generation; this is where the formal discipline goes.
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — the eval loop, as one picture
 
-You know how you don't ship a database migration without running it against a test database first? Eval-driven prompt iteration is the same shape: you don't ship a prompt change without running it against a curated set of cases first.
-
-```
-  The eval-driven loop — change-measure-decide
-
-       ┌──────────────────────────────────────────────────────────┐
-       │                                                            │
-       ▼                                                            │
-  ┌─────────┐    ┌────────────┐    ┌─────────────┐    ┌──────────┐│
-  │ change  │ →  │ run evals  │ →  │ diff scores │ →  │ keep or  ││
-  │ prompt  │    │ (N cases)  │    │ + per-case  │    │ revert   ││
-  └─────────┘    └────────────┘    └─────────────┘    └────┬─────┘│
-                                                            │      │
-                                                            └──────┘
-
-  the loop is fast (seconds per iteration) only when the eval set is real
-```
-
-The kernel: a set of cases with expected outputs, a scoring function, and the discipline to *write the eval before iterating the prompt*. Without those three, you're iterating against a moving target — "better" is whatever the most recent run looked like.
-
-### Move 2 — the walkthrough
-
-**Step 1 — the golden set.** A hand-curated set of 20–50 cases that represent the *real* range of inputs the prompt will see. Each case has an input (what gets fed to the prompt) and an expected output (what a correct response looks like).
-
-For the monitoring agent in this codebase, a golden set would look like:
+You know how unit tests work: a function, an input, an expected output, a comparison. Evals are the same shape, scaled to whole-agent behavior. The function is the agent. The input is (anomaly | diagnosis | query). The expected output is what a domain expert says is right — typically captured as "this is acceptable, this is not." The comparison is either deterministic (exact match on key fields) or LLM-as-judge (a separate model call that scores the answer against a rubric).
 
 ```
-  Pattern — a golden set entry for the monitoring agent
+  Eval loop — the pattern that doesn't yet exist in this repo
 
-  {
-    "name": "revenue-drop-Q4-2025",
-    "input": {
-      "workspace": "wobbly-ukulele",
-      "schemaSnapshot": "fixtures/wobbly-q4.json",   // a real workspace state
-      "categories": ["revenue_drop", "conversion_drop", "traffic_drop"]
-    },
-    "expected": {
-      "containsCategory": "revenue_drop",
-      "severity": "critical",
-      "scopeContains": "global",
-      "changeDirection": "down",
-      "changeValueMin": 20.0,    // critical = >20%
-      "evidenceCount": ">=1"
-    }
-  }
+  ┌─ golden set (20-50 hand-curated cases) ─────────────────┐
+  │   case 001: { input: anomaly_X,                         │
+  │              expected: { hypotheses: ≥3 tested,         │
+  │                          conclusion mentions device },  │
+  │              tolerated: { time_series may vary } }      │
+  │   case 002: ...                                          │
+  └──────────────────────────────┬──────────────────────────┘
+                                 │  on prompt change
+  ┌─ run the agent ──────────────▼──────────────────────────┐
+  │   for each case:                                         │
+  │     output = await agent.investigate(case.input)         │
+  │     score  = check(output, case.expected, case.tolerated)│
+  │   collect scores                                         │
+  └──────────────────────────────┬──────────────────────────┘
+                                 │
+  ┌─ compare to baseline ────────▼──────────────────────────┐
+  │   diff: new_scores - baseline_scores                     │
+  │   pass: avg improved AND no critical case regressed      │
+  │   fail: avg flat/worse OR critical regression            │
+  └──────────────────────────────┬──────────────────────────┘
+                                 │
+  ┌─ decide ─────────────────────▼──────────────────────────┐
+  │   pass → merge the prompt change + bump baseline         │
+  │   fail → don't merge · investigate the regressed cases   │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-Note: expected is *constraint-based*, not byte-equal. You can't byte-compare LLM output — it's probabilistic. You can check "contains the category id `revenue_drop`," "severity is `critical` or `warning`," "scope includes `global`." These are deterministic predicates over the parsed structured output.
+### Move 2 — what the type guards do NOT catch
 
-**Step 2 — the regression suite.** Every production failure that's worth not regressing on, added as a case. Forever. The regression suite *only grows*. This is the part that compounds — six months in, the regression suite is the project's memory of every bug it ever shipped.
-
-For this codebase, the regression suite would include:
-
-  → A workspace with 0 events in the last 90 days (the "data may be historical" failure mode named in `legacy-prompts/diagnostic.md:48-54`).
-  → A workspace with a syntax-validation EQL error (the "bare leading dot in a breakdown" case from `legacy-prompts/monitoring.md:63-67`).
-  → A workspace where the prompt model would *want* to invent anomalies for empty data — assert the output is `[]`.
-  → A workspace where the model exhausts its tool-call budget (assert the forced-final synthesis turn produces parseable JSON).
-
-Each one of these is a real failure I'd seen and fixed by adjusting the prompt; without the regression suite, the next prompt change is one step from re-introducing it.
-
-**Step 3 — the iteration loop.** Pseudocode:
+Read the `isAnomalyArray` guard at `lib/mcp/validate.ts:17-27`:
 
 ```
-  # iterate-prompt.py — the eval-driven loop
-
-  baseline_scores = run_evals(prompt_version='HEAD~1')   # what's currently in main
-  candidate_scores = run_evals(prompt_version='HEAD')    # what's in the PR
-
-  for case in eval_set:
-    if candidate_scores[case] < baseline_scores[case]:
-      print(f"REGRESSION on {case.name}: {baseline} → {candidate}")
-      print(f"  input:    {case.input}")
-      print(f"  baseline: {case.baselineOutput}")
-      print(f"  candidate:{case.candidateOutput}")
-
-  if any_regression and not approved_with_justification:
-    exit(1)   # block the PR
-
-  print(f"avg score: {baseline_avg} → {candidate_avg}")
-  if candidate_avg < baseline_avg - tolerance:
-    exit(1)   # average regressed, block
+  // lib/mcp/validate.ts:17-27 — shape check only
+  return Array.isArray(v) && v.every((a) =>
+    !!a && typeof a === 'object' &&
+    typeof (a as any).metric === 'string' &&    // ← any string passes
+    Array.isArray((a as any).scope) &&           // ← any array passes
+    !!(a as any).change && typeof (a as any).change.value === 'number' &&  // ← any number
+    ((a as any).change.direction === 'up' || (a as any).change.direction === 'down') &&
+    typeof (a as any).change.baseline === 'string' &&
+    SEVERITIES.includes((a as any).severity)
+  );
 ```
 
-The discipline: **average improvement is not enough.** A prompt change that improves the average by 3 points but regresses one critical case is *not* a win — that one case is in the regression suite for a reason. You either fix the regression or document why it's an acceptable trade.
+The guard passes if `metric: "xyzzy"` (made-up word), if `scope: ["potato"]`, if `change.value: 999999`, if `change.baseline: "totally fabricated period"`. It checks *shape*, not *content*. A prompt change that causes the model to hallucinate metric names and invent baselines passes the guard. The Vitest suite (which uses injected fakes) doesn't catch it either — the fakes return whatever the test author wrote, not what the real model would return.
 
-**Step 4 — LLM-as-judge for fuzzier shapes.** Some outputs can't be checked with deterministic predicates. The recommendation agent's `rationale` field is one — "is this rationale a good explanation?" isn't a regex. The pattern: a *second* LLM call that scores the output against a rubric.
+This isn't a knock on the guard; the guard is doing exactly the job it should do (degrade safely on shape mismatch). It's a statement about *what additional layer is needed* to catch behavior regressions.
 
-```
-  Pattern — LLM-as-judge, for fuzzier outputs
+### Move 2 — what an eval would look like, concretely
 
-  ┌─ candidate output ─────────────────────┐
-  │  {                                      │
-  │    "title": "Send recovery email...",   │
-  │    "rationale": "Mobile cart abandonment │
-  │       jumped 23% — a recovery email      │
-  │       targeting that segment recovers..."│
-  │  }                                      │
-  └────────────────────┬───────────────────┘
-                       │
-  ┌─ rubric (you author) ─────────────────┐
-  │  Score the rationale 1–5:               │
-  │   - cites a specific number from        │
-  │     the diagnosis                       │
-  │   - names the customer segment          │
-  │   - explains the causal link            │
-  │   - actionable for a marketer           │
-  └────────────────────┬───────────────────┘
-                       │
-  ┌─ judge LLM call ▼ ────────────────────┐
-  │  Score: 4/5                             │
-  │  Missing: doesn't quantify recovery     │
-  │  Confidence: high                       │
-  └─────────────────────────────────────────┘
-```
-
-LLM-as-judge has its own failure modes — it has the same blind spots as the model being judged (this matters more for self-critique; see concept 10). The discipline: use it for outputs where deterministic scoring would be impossible *and* you can spot-check 10% of the judge's scores against human review.
-
-**The specific bug — better average, worse edge case.** This is the classic. You ship a prompt change. Average score on the eval set goes up. You ship it. A week later a customer reports a critical bug — turns out the prompt change "improved" the average by being better on common cases but completely regressed one tail case that wasn't in the eval set yet.
-
-The fix isn't "more cases" — you can't enumerate them in advance. The fix is the *discipline*: when a production failure happens, add it to the regression suite before fixing it. The regression suite is the project's memory of "things we've broken before."
-
-**Why this file is Case B.** There is no eval substrate in this codebase today — no `eval/` directory, no 4-pillar suite, no LLM-as-judge harness. The current state of "how do I know a prompt change is better":
+The agents this codebase ships are amenable to evals because they produce structured output. A monitoring agent eval case would look something like this:
 
 ```
-  Honest state — eval substrate today
+  Case shape — a single monitoring-agent eval case
 
-  TARGET STATE                           ACTUAL STATE (today)
-  ────────────                           ────────────────────
-  eval/ harness                          (none — no eval/ directory)
-  LLM-as-judge runner                    (none)
-  golden + regression cases              (none)
-  CI on every prompt PR                  (none)
-                                          ↓
-                                          by-hand verification:
-                                            change prompt
-                                            run /api/briefing live
-                                            eyeball UI output
-                                            compare against lib/state/
-                                              demo-insights.json
-                                              demo-investigations.json
-                                            ship if it looks right
+  ┌─ inputs ────────────────────────────────────────────────┐
+  │   schema:     known synthetic workspace (committed)      │
+  │   categories: ['revenue_drop', 'conversion_drop']        │
+  │   dataSource: deterministic fake returning planted        │
+  │               EQL results (e.g. revenue down 30%)         │
+  └─────────────────────────────────────────────────────────┘
+
+  ┌─ expected ──────────────────────────────────────────────┐
+  │   array.length:           ≥ 1                           │
+  │   first.metric:           'purchase_revenue'            │
+  │   first.category:         'revenue_drop'                │
+  │   first.severity:         'critical'  (because >20%)    │
+  │   first.change.direction: 'down'                        │
+  │   first.change.value:     close to 30 (±5)              │
+  │   first.impact:           contains 'revenue' (semantic)  │
+  └─────────────────────────────────────────────────────────┘
+
+  ┌─ tolerated ─────────────────────────────────────────────┐
+  │   evidence[].result detail (model picks the wording)     │
+  │   impact wording (model writes prose; just check it      │
+  │   mentions the right metric)                             │
+  └─────────────────────────────────────────────────────────┘
 ```
 
-What I have today is the *single committed demo snapshot* at `lib/state/demo-*.json` — a useful one-data-point regression check but not an eval set. The substrate has to be built from scratch; the project exercises below sketch the smallest version that closes the gap.
+The discipline in the case shape: **expected** holds what *must* be right (metric, severity, direction), **tolerated** holds what's allowed to vary (wording, evidence detail). Without the tolerated bucket, every minor model drift fails the case and you stop trusting the suite. With only the tolerated bucket, the suite catches nothing.
 
-**What I'd build next.** The discipline doesn't need the old infrastructure rebuilt — it needs a new one that fits the current shape:
+### Move 2 — the golden set vs the regression suite
 
-  1. ~10 hand-curated cases, each a workspace-schema fixture + expected anomaly shape.
-  2. A runner that calls the actual `MonitoringAgent.scan()` (and `DiagnosticAgent.investigate()`) against each fixture using a recorded/replayed Anthropic response.
-  3. Deterministic predicates over the structured output (the type guards in `lib/mcp/validate.ts` are half of this — they catch shape; the eval predicates would catch *content*).
-  4. CI on every PR that touches `lib/agents/legacy-prompts/` or `AGENT_MODEL`.
+Two flavors of eval, both useful, neither in this repo today:
 
-The prerequisite is concept 03 (prompts-as-code) — already in place. The actual harness is the missing piece.
+**Golden set** — 20-50 hand-curated cases chosen for *coverage*. One case per anomaly type the monitoring agent should detect. One case per common diagnosis pattern (device-specific, country-specific, campaign-driven). One case per recommendation feature (scenario, campaign, voucher, experiment). The goal is to verify the agent handles the full spectrum of expected inputs. You write it once; you maintain it as the product evolves.
+
+**Regression suite** — every production failure, added as a case, forever. When a user reports "the monitoring agent missed the revenue drop in December," capture the inputs (schema, categories, data) and the expected output (a critical revenue_drop anomaly with these properties), add it to the suite. Even if you fix the issue today, the case stays — to make sure no future prompt change accidentally re-introduces the same bug.
+
+```
+  Two suites, two jobs
+
+  ┌─ golden set ────────────────────────────────────────────┐
+  │   coverage-driven · maintained for representativeness    │
+  │   "do we handle every expected input shape?"             │
+  └─────────────────────────────────────────────────────────┘
+
+  ┌─ regression suite ──────────────────────────────────────┐
+  │   incident-driven · grows monotonically over time        │
+  │   "do we still NOT have the bugs we already fixed?"      │
+  └─────────────────────────────────────────────────────────┘
+```
+
+### Move 2 — when LLM-as-judge is the right tool
+
+For monitoring + diagnostic + recommendation, the structured output makes most checks deterministic: severity is one of four values, direction is up or down, category is a known id, dollar ranges are within bounds. You can write the check in TypeScript. No LLM-as-judge needed.
+
+For the *query* agent — which returns prose — deterministic checks are harder. "Did the answer mention the right number?" is a regex; "Did the answer interpret the question correctly?" is not. That's where LLM-as-judge earns its place: a separate model call (typically cheaper, like Haiku) that scores the answer against a rubric ("Does this answer the user's question about country breakdown? Does it cite a real number? Does it acknowledge if it couldn't get the data?"). LLM-as-judge has known failure modes (the judge has the same blind spots as the judged), so for safety-critical evaluation you triangulate: deterministic where you can, judge where you must, manual review on a sample.
+
+blooming's query agent is the natural eval target if and when the team writes an eval. The other four agents could be evaluated deterministically.
+
+### Move 2 — iteration loop, what changes
+
+When you have an eval set, the iteration loop for a prompt change looks different:
+
+```
+  Without eval set (today):                With eval set:
+  ──────────────────────                   ─────────────
+  1. edit monitoring.md                    1. edit monitoring.md
+  2. spin up dev                           2. npm run eval:monitoring
+  3. trigger a briefing manually           3. read the score diff
+  4. eyeball the cards                     4. inspect regressed cases (if any)
+  5. "looks good" → ship                   5. iterate or ship based on numbers
+```
+
+The today-path takes 5 minutes per iteration. The with-eval path takes 5 minutes for the first run and seconds for each subsequent iteration. More importantly, the with-eval path lets you A/B prompt variants ("does adding this sentence about edge cases improve the score?") without leaving the IDE.
+
+The model-upgrade scenario is where the eval set earns its keep. Anthropic ships Sonnet 4-7; you bump the constant in `base.ts`. Without an eval, you ship and wait for users to complain. With an eval, you run the suite, see the diff (probably some regressions, some improvements), and decide whether to ship the upgrade, adjust the prompts, or pin to the old model until you can.
+
+### Move 2 — why "I'll write evals later" is wrong
+
+The default failure mode on evals: "we'll add them once the product stabilizes." The reasoning sounds right (why test against a moving target?) and is exactly backwards. *The reason* the product can't stabilize is that there's no way to verify a change without breaking something else. Evals are how you make iteration converge. Without them, every prompt change is a gamble; every model upgrade is a crisis; every "small tweak" risks a regression nobody catches until a user reports it weeks later.
+
+Hamel Husain's writing on this lands hard: *the gap between teams that ship LLM features and teams that ship reliable LLM features is the eval set*. Not the model choice, not the prompt cleverness, not the framework. The eval set. blooming is in the "shipped" column; it isn't yet in the "shipped reliably" column.
 
 ### Move 3 — the principle
 
-Eval-driven iteration is the same discipline as test-driven development, with one twist: the assertions can't be exact equalities, they have to be predicates over fuzzy output. The principle survives: *write the test before changing the implementation*. Without it, prompt iteration is iterating against a moving target — "better" is whatever the most recent run looked like, and you'll iterate in circles forever.
+Eval-driven iteration is the discipline that turns prompt engineering from a craft into engineering. Type guards verify shape; tests with fakes verify logic; only an eval set verifies *behavior*. Skip it and you'll iterate in circles — confident the prompt is good because no test caught a problem, blindsided when the model behaves differently against real inputs the test fakes never covered.
 
-## Primary diagram — the eval-driven loop (Case B: the target state)
+## Primary diagram
 
 ```
-  ┌─ prompt source (lib/agents/legacy-prompts/*.md) ───────────────────┐
-  │  reviewed in PRs, version-controlled (concept 03 — done)             │
-  └────────────────────────────┬────────────────────────────────────────┘
-                               │
-  ┌─ THE EVAL HARNESS (missing today; the target) ────────────────────┐
-  │                                                                     │
-  │  ┌─ golden set ──────────┐   ┌─ regression suite ─────────────┐   │
-  │  │  20–50 hand-curated    │   │  every production failure ever  │   │
-  │  │  cases, real workspace │   │  seen, added as a case          │   │
-  │  │  shapes                 │   │  (grows forever)                 │   │
-  │  └───────────┬─────────────┘   └────────┬─────────────────────────┘   │
-  │              │                            │                           │
-  │              ▼                            ▼                           │
-  │  ┌─ runner ────────────────────────────────────────────────────┐    │
-  │  │  for each case: call agent → parse output → score against    │    │
-  │  │  predicates (deterministic) + LLM-as-judge (fuzzy)           │    │
-  │  └─────────────────────────┬──────────────────────────────────┘    │
-  │                            │                                          │
-  │                            ▼                                          │
-  │  ┌─ diff vs baseline ────────────────────────────────────────────┐  │
-  │  │  any per-case regression? → block PR                            │  │
-  │  │  average improved without regressions? → green                  │  │
-  │  └─────────────────────────────────────────────────────────────────┘  │
-  └────────────────────────────┬────────────────────────────────────────┘
-                               │
-  ┌─ CI (on every prompt PR) ──▼────────────────────────────────────────┐
-  │  block merge on any regression                                        │
-  └─────────────────────────────────────────────────────────────────────┘
-  ┌─ TODAY (the gap) ─────────────────────────────────────────────────┐
-  │  by-hand comparison against lib/state/demo-{insights,investigations}.json│
-  │  single snapshot = single data point; useful but not an eval set        │
-  └─────────────────────────────────────────────────────────────────────┘
+  Eval-driven iteration — the missing layer in blooming, sized to context
+
+  ┌─ Prompt change PR ─────────────────────────────────────────┐
+  │   diff lib/agents/legacy-prompts/monitoring.md              │
+  │   diff lib/agents/base.ts (AGENT_MODEL change)              │
+  └───────────────────────────┬────────────────────────────────┘
+                              │
+                              ▼   ★ THIS BLOCK DOESN'T EXIST YET ★
+  ┌─ Eval run ─────────────────────────────────────────────────┐
+  │   Golden set:    20-50 cases × 3 agents = ~100 model calls │
+  │   Regression:    every prod failure ever, grows over time   │
+  │                                                              │
+  │   Per case:                                                  │
+  │     run agent against synthetic input + deterministic fake   │
+  │     score against expected (deterministic where possible,    │
+  │       LLM-as-judge for prose-mode agents like query)         │
+  │   Output:                                                    │
+  │     score diff vs baseline · list of regressed cases         │
+  └───────────────────────────┬────────────────────────────────┘
+                              │
+                              ▼   what exists today
+  ┌─ Verification today ───────────────────────────────────────┐
+  │   type guards    (shape)       lib/mcp/validate.ts          │
+  │   vitest         (logic+fakes) test/agents/*                │
+  │   demo snapshots (visual)      lib/state/demo-*.json        │
+  │   manual eyeballing                                          │
+  └───────────────────────────┬────────────────────────────────┘
+                              │
+  ┌─ Decision ─────────────────▼───────────────────────────────┐
+  │   today: "looks good in dev" → ship                         │
+  │   with eval: scores up + no critical regression → ship      │
+  └────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The canonical reference here is Hamel Husain's *"Your AI Product Needs Evals"* (hamel.dev/blog/posts/evals/). Read it once, then again after you've built your first eval set — it lands differently the second time. The discipline Hamel advocates is exactly what's missing in this codebase: the loop, the golden set, the regression suite, the LLM-as-judge for fuzzy outputs.
+The retired eval/ folder (PR #8) had a different shape — it was experimentation infrastructure that never produced a stable suite. Removing it was right; what replaces it is not "no evals" but "evals that earn their place." The right next step here isn't to reinstate the old folder; it's to start small with one suite for one agent (the monitoring agent is the natural pick — most structured, most testable, most user-visible), build the case format, build the runner, build the score-diff reporter. Once one agent is covered, the second is a copy-and-adjust.
 
-Other places to look:
+The demo snapshots (`lib/state/demo-*.json`) are the closest thing this codebase has to captured behavior. They're not an eval set (no expected outputs, no scoring), but they're real captures of real agent runs against the real workspace. They're a *fixture library* waiting for a test runner. The smallest possible move toward eval-driven iteration is: take one snapshot, write down what the agent *should* have output, write a check that compares. That's one case. Repeat until the suite is interesting. The discipline grows from there.
 
-- **OpenAI's evals framework.** The `openai/evals` repo is open-source and runnable. Heavy machinery; useful as a reference for the *shape* of a real eval harness even if you build something lighter.
-- **Anthropic's evaluation docs.** Anthropic publishes patterns for LLM-as-judge specifically (`anthropic.com/news/evaluating-ai-systems`). The bias-mitigation discussion is the part most "build your own judge" posts miss.
-- **promptfoo (npm package).** A lighter-weight eval runner aimed at the use case in this codebase. CLI tool, YAML-defined cases, deterministic + LLM-as-judge scoring. Closer to what I'd build for `blooming_insights` than the OpenAI framework.
+The LLM-as-judge tradeoff is worth naming explicitly: the judge has the same blind spots as the judged. A judge that's an LLM evaluating an LLM's output for "factual accuracy" can't tell you anything about facts the judge model doesn't already know. The best uses of judge are for things where the judge has *more* context than the judged — e.g. the judge sees the original question + the answer + a known-good reference answer, and the question is just "does the candidate answer match the reference on these dimensions?" That's a comparison task, which judges are good at. "Is this answer factually correct in isolation?" is not a comparison task, and judges are bad at it. Use accordingly.
 
-In this codebase, concept 03 (prompts as code) is the *prerequisite* (you can't run a regression suite against a prompt-version you don't have). Concept 10 (self-critique) is the *adjacent* concept that shares the LLM-as-judge mechanism but uses it at runtime instead of in CI. The two get conflated; they shouldn't be — self-critique is for output quality at the boundary, evals are for output quality across versions.
-
-## Project exercises
-
-### Exercise — Stand up a 10-case eval harness for `MonitoringAgent`
-
-  → **Exercise ID:** EVAL-MONITORING-MIN
-  → **What to build:** A `lib/evals/monitoring/` directory with: 10 fixture workspaces (saved JSON), expected anomaly predicates per fixture, a runner that instantiates `MonitoringAgent` against each, scores with deterministic predicates (shape via `isAnomalyArray`; content via per-fixture assertions), and exits non-zero on any regression vs the previous git revision's scores.
-  → **Why it earns its place:** Eval-driven iteration is Case B in this guide — the discipline is industry-standard, the substrate is gone from this repo, and this is the smallest unit that closes the gap. Once it exists, every prompt change is gated by it.
-  → **Files to touch:** `lib/evals/monitoring/runner.ts` (new), `lib/evals/monitoring/cases/*.json` (new fixtures), `lib/evals/monitoring/predicates.ts` (new), `package.json` (add `eval:monitoring` script), `.github/workflows/evals.yml` (new, gates PRs that touch `lib/agents/legacy-prompts/monitoring.md` or `AGENT_MODEL`).
-  → **Done when:** `npm run eval:monitoring` runs all 10 cases, prints per-case scores, exits non-zero on any regression. The first 10 cases include at least: empty-window workspace, healthy-baseline workspace, syntax-error injection, sparse-tail workspace.
-  → **Estimated effort:** ~6–10 hours for the runner + 10 hand-curated cases. Each subsequent case is ~20 min.
-
-### Exercise — Add `promptSha` to the runtime log line
-
-  → **Exercise ID:** EVAL-PROMPT-LOG
-  → **What to build:** Modify `lib/agents/aptkit-adapters.ts:57-61` (the existing `console.log({ site, sessionId, usage })`) to include `promptSha` (the git SHA of the active prompt `.md` file, captured at build time as a `process.env.PROMPT_SHA` injected by `next.config`).
-  → **Why it earns its place:** Concept 03 names this as the prerequisite gap for closing the loop from production-trace back to prompt-version. Adding one field unlocks tracing "which output came from which prompt revision."
-  → **Files to touch:** `lib/agents/aptkit-adapters.ts`, `next.config.ts` (inject the SHA), the log-aggregation parser if one exists.
-  → **Done when:** every agent call's log line carries a `promptSha`; querying logs by `promptSha` returns only outputs produced by that revision.
-  → **Estimated effort:** ~2 hours.
+Eugene Yan's blog has good material on building evals; the Latent Space podcast episode with Hamel Husain on the eval discipline is worth the hour. The pattern across all of them: start narrow, score on what you can check deterministically first, add LLM-as-judge only where it earns its place, treat the suite as an asset that grows over time. The cost of starting is small; the cost of *not* starting compounds with every prompt change you ship blind.
 
 ## Interview defense
 
-**Q: "How do you iterate a prompt?"**
+**Q: blooming has 221 tests and type guards. Why is that not enough?**
 
-The senior version is eval-driven: write the eval first, then iterate the prompt against it. Honest answer for this codebase: I *don't* have an eval harness today — no `eval/` directory, no harness, no CI gate. What I have today is the committed demo snapshot at `lib/state/demo-*.json` — one data point's worth of regression check. Useful for "the prompt still produces *a* response," not for "the prompt is *better* than the previous version." The next thing I'd build is the 10-case harness I sketched in the project exercise.
-
-```
-  the gap, named honestly:                  the target:
-  ────────────────────                     ───────────
-  change prompt                            change prompt
-  run live, eyeball UI                     run 10-case eval
-  compare to demo snapshot                 diff per-case scores
-  ship if it looks right                   block merge on any regression
-```
-
-Anchor: *"the discipline is industry-standard; the substrate is the gap I haven't filled yet. The pattern is real, the implementation is on the to-do list."*
-
-**Q: "What's the failure mode of average-scoring?"**
-
-A prompt change that improves the average score but regresses one critical case is *not* a win. The regression suite is what catches it — every production failure goes into the suite, forever, and the runner blocks merges on any per-case regression even when the average went up. The discipline is *per-case*, not average. Average-only scoring is how you ship a prompt that "improved" by 3 points and broke the one case that mattered.
+A: The 221 tests check that the agent loops wire fakes correctly and that the parser handles edge cases — they don't make a single real model call. The type guards check that the model's output is the right shape — `severity` is one of four strings, `change.value` is a number — they don't check that the severity is *correct* or the number is *right*. So today, a prompt change that causes the model to confidently emit `{ metric: 'fabricated_metric', severity: 'critical', change: { value: 99, direction: 'down' } }` passes every test in this repo. The shape is right; the content is fabricated. An eval set is the layer that catches that — a curated set of (input, expected output) cases that runs against the real model and scores the result against what a domain expert says is correct. Without it, prompt iteration is gambling.
 
 ```
-  the trap:                              the fix:
-  ────────                              ───────
-  avg score: 0.78 → 0.84  ✓ ship       per-case diff blocks on ANY regression
-  case-X score: 0.92 → 0.61  (hidden)   even if average went up
+  what I'd sketch:
+
+  shape correct  ──►  type guards say YES
+  shape correct  ──►  vitest says YES (fakes return planted data)
+  shape correct  ──►  eval says NO ("metric should be purchase_revenue,
+                                     not fabricated_metric")
+
+  three layers, three different jobs.
+  blooming has two of three; the third is the missing piece.
 ```
 
-Anchor: *"average improvement is not enough; per-case regression blocks the merge."*
+**Q: How would you start adding evals here — what's the first move?**
 
-**Q: "When do you reach for LLM-as-judge?"**
+A: Take the demo snapshots in `lib/state/demo-*.json` and treat them as a fixture library. For one snapshot, write down what the monitoring agent *should* have produced — the metric, the category, the severity band, the direction. That's case 001. Write a small runner that re-runs the monitoring agent against the same input (the schema + categories + a deterministic fake `DataSource`), parses the output, and scores it against the expectation. One case, one runner, ~50 lines of TypeScript. Run it before merging any change to `monitoring.md` or `base.ts`. Add a second case the next time you find a production failure; add a third the next week. Don't try to write 50 cases up front — write the smallest possible suite that catches one regression, then grow it as failures teach you what's worth checking. The first case earns its place when it catches its first regression.
 
-When the output can't be checked with deterministic predicates and you can spot-check 10% of judge scores against human review. The recommendation agent's `rationale` field is a good example — "is this rationale a good explanation?" isn't a regex. The risk: the judge has the same blind spots as the model being judged. Mitigation: rotate judge models (use Sonnet to judge Opus output, and vice versa) and human-spot-check a sample. Concept 10 (self-critique) is the runtime sibling of this pattern and has the same blind-spot problem.
+```
+  start small, grow under pressure:
 
-Anchor: *"reach for LLM-as-judge only when deterministic predicates can't reach. Verify the judge with humans on 10%."*
+  week 1:  1 case · 50 lines of runner · pass/fail boolean
+  week 4:  5 cases · score-diff reporter · CI integration
+  month 3: 20 cases · 3 agents covered · ratchet on each merge
+
+  not:  build 50-case suite in a quarter and never use it.
+```
 
 ## See also
 
-- `02-structured-outputs.md` — type guards catch shape drift; evals catch content drift. Same boundary, two layers.
-- `03-prompts-as-code.md` — versioned prompts are the prerequisite for evals; without prompts-as-code, you can't bisect a regression.
-- `10-self-critique.md` — runtime version of the same LLM-as-judge mechanism; same blind-spot problem.
+- [02-structured-outputs.md](./02-structured-outputs.md) — the type guards this concept is layered on top of
+- [03-prompts-as-code.md](./03-prompts-as-code.md) — evals are how prompt-code changes get reviewed in code-review terms
+- [10-self-critique.md](./10-self-critique.md) — the one-turn recovery is a runtime substitute for some failure modes evals would catch

@@ -1,408 +1,457 @@
 # Clocks, coordination, and leadership
 
-**Industry name:** ephemeral compute coordination via signed cookies, AsyncLocalStorage request-scoped state, server timestamps · **Type:** Industry standard for "stateless-by-default" platforms — leader election / distributed clocks are Case B
+*Industry standard — time, ordering, leases, distributed locks, leader election, split-brain.*
 
-## Zoom out, then zoom in
+## Verdict — almost entirely `not yet exercised`, with one trick that earns its own walkthrough
 
-Verdict first: this codebase has **one real coordination problem** — Vercel's serverless instances are ephemeral and share nothing, so the OAuth `connect` request and the OAuth `callback` request may land on different instances. The fix is an AES-256-GCM encrypted cookie + AsyncLocalStorage. That's the entire "coordination" chapter that's actually exercised. Everything else (leader election, distributed locks, vector clocks, hybrid logical clocks) is **Case B — not exercised**.
+There is no leader election, no distributed lock, no lease, no logical clock, no Lamport timestamps, no consensus. The repo's coordination story is small — but it has *one* real distributed-state mechanism: the AsyncLocalStorage-scoped, encrypted-cookie OAuth store that survives the Vercel cross-instance gap. That mechanism is what this file is actually about.
 
-```
-  Zoom out — where coordination lives (and doesn't)
-
-  ┌─ Browser ────────────────────────────────────────────────┐
-  │  one tab → one session cookie → one (or more) request    │
-  └────────────────────────┬─────────────────────────────────┘
-                           │ cookies ride every request
-  ┌─ Vercel cohort ────────▼─────────────────────────────────┐
-  │  N independent instances. The ONLY thing they coordinate │
-  │  on is what the user's cookie says:                      │
-  │                                                           │
-  │  ★ bi_auth     — encrypted DCR client info + PKCE        │ ← we are here
-  │                  verifier + OAuth tokens                  │
-  │  ★ bi_session  — sessionId for in-memory map lookups     │
-  │                                                           │
-  │  ✗ no leader election                                    │
-  │  ✗ no distributed locks                                  │
-  │  ✗ no consensus group                                    │
-  │  ✗ no clock-skew problem (no ordering across instances)  │
-  └──────────────────────────────────────────────────────────┘
-```
-
-This file is two halves: a deep walk of the cookie-as-shared-state pattern (the real one), then short Case-B notes on leadership/clocks (the absent ones).
-
-## Structure pass
-
-### Axis: where does state live, and who can see it?
+## Zoom out — coordination state in this codebase
 
 ```
-  Trace "who can see this state" across the stack
+  Zoom out — coordination state, drawn against absence
 
-  Browser            — sees: localStorage 'bi:mode', sessionStorage stashes,
-                              cookies (bi_session, bi_auth, the value),
-                              the JSON in ?insight= URL params
-
-  bi_auth cookie     — sees: ONLY the request handler that decrypts it
-                       (per-request, ALS-scoped) — instance A and B both can,
-                       given the same cookie
-
-  bi_session cookie  — sees: every request handler (plaintext UUID)
-
-  Per-instance Maps  — sees: this instance's handlers only
-                       (insights, investigations, schema cache)
-
-  Bloomreach upstream — sees: the Bearer token (revealed every request)
+  ┌─ L1: Browser ────────────────────────────────────────────────┐
+  │  cookies: bi_session (the session id), bi_auth (encrypted    │
+  │  AES-256-GCM blob with OAuth state)                          │
+  │  ★ THE BROWSER CARRIES THE DISTRIBUTED COORDINATION STATE ★   │
+  └─────────────────────────┬────────────────────────────────────┘
+                            │
+  ┌─ L2: Vercel route ──────▼────────────────────────────────────┐
+  │  AsyncLocalStorage-scoped requestStore                        │
+  │  • seeded from bi_auth ONCE at request entry                  │
+  │  • flushed back to bi_auth ONCE at request exit               │
+  │  • the OAuthClientProvider's MANY synchronous calls hit       │
+  │    this in-memory store, never the cookie API directly        │
+  │  ★ THIS IS THE CLEVER PART ★                                   │
+  └─────────────────────────┬────────────────────────────────────┘
+                            │
+  ┌─ L3: BloomreachDataSource ──────────────────────────────────┐
+  │  no coordination state of its own                            │
+  │  (the OAuth tokens it uses live above, in the cookie/store)   │
+  └─────────────────────────┬────────────────────────────────────┘
+                            │
+  ┌─ L4: Bloomreach ────────▼────────────────────────────────────┐
+  │  rate-limit window (server-side, per-user)                    │
+  │  OAuth token state (issued, revoked) — server-side authority   │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
-The axis-answer flips dramatically across layers. The cookie is the **only** state that survives across instances. Per-instance Maps die at the boundary. That's not a bug — that's the platform.
+The browser is the coordination substrate. The route is a per-request hydration of that state. Bloomreach is the authority on rate-limit and token validity. There's no in-process coordination needed beyond AsyncLocalStorage, because nothing in this codebase needs to claim leadership or hold a lock.
 
-### Seams (load-bearing boundaries)
+## Zoom in — the question this file answers
 
-- `withAuthCookies` (`lib/mcp/auth.ts:86`) ↔ everything inside the request. Reads the cookie ONCE at request start, flushes ONCE at end via `AsyncLocalStorage`. Drop this wrapping and the SDK's many synchronous `provider.tokens()` / `provider.saveCodeVerifier(v)` calls would each re-read the cookie and hit Next's "request-vs-response cookie split" (a read after a set in the same request returns the OLD value).
-- The PKCE verifier ↔ the OAuth round-trip. Saved during `connect` on instance A, read during `callback` on instance B. The cookie is the only thing that bridges them.
-- The clock readings on `lastCallAt` (`lib/data-source/bloomreach-data-source.ts:191`) ↔ rate-limit logic. These are per-instance — two instances have independent `lastCallAt`. That's why proactive spacing doesn't fully prevent rate-limit hits at scale.
+> What state must survive across Vercel function instances, and how does it survive without a shared store?
 
-### Layered decomposition: what is "consistent enough" at this layer?
+One answer: an encrypted cookie + AsyncLocalStorage. That single mechanism is the entire "coordination" story; everything else is honestly absent.
+
+## Structure pass — the skeleton
+
+### Axes — trace "who has the authoritative clock?"
 
 ```
-  "Is state consistent across instances?" — held constant
+  One axis: "where is the source of truth for time / ordering / state?"
 
-  ┌─ bi_auth cookie ─────────────────────────────────────────┐
-  │  YES — encrypted, signed, authoritative                   │   → coordinated
-  │  any instance can decrypt and trust it                    │
-  └────────────────────────┬─────────────────────────────────┘
-       ┌──────────────────────────────────────────────────────┐
-       │ bi_session cookie                                    │   → coordinated
-       │ UUID, plaintext; the routing key for in-memory state │
-       └────────────────────────┬─────────────────────────────┘
-            ┌─────────────────────────────────────────────────┐
-            │ per-instance Maps (insights, investigations)    │   → NOT coordinated
-            │ instance A populates, instance B doesn't see it │      (the gap is real)
-            └────────────────────────┬────────────────────────┘
-                 ┌────────────────────────────────────────────┐
-                 │ per-instance schema cache                  │   → NOT coordinated
-                 │ instance B may bootstrap independently     │
-                 └────────────────────────┬───────────────────┘
-                      ┌───────────────────────────────────────┐
-                      │ per-instance lastCallAt (rate-limit)  │   → NOT coordinated
-                      │ two instances can race the rate limit │     (red flag)
-                      └───────────────────────────────────────┘
+  L1 Browser              cookie value = authoritative for OAuth state
+                          (the cookie is the only thing that crosses
+                          the cross-instance gap)
+
+  L2 Route                req.signal.aborted — local read of "did the
+                          consumer cancel?"; not a clock, a status
+
+  L2 AsyncLocalStorage    a per-request snapshot of the cookie; the
+                          source of truth for the lifetime of one
+                          request, then flushed back
+
+  L3 DataSource           Date.now() for spacing — local wall clock,
+                          per-adapter, no coordination
+
+  L4 Bloomreach           server-side rate-limit window — the
+                          authoritative clock for "may I call?"
 ```
 
-The contrast: only the cookie is coordinated. Everything else is per-instance, which is fine when the operation is idempotent (cache, schema bootstrap) and problematic when it isn't (the rate limit — two instances could each be at ~1.1s since their last call, doubling the actual upstream rate).
+The axis flips at L1: **the browser cookie is the source of truth for cross-instance coordination state.** Nothing on the server side has a longer-lived authoritative view than the cookie does. The AsyncLocalStorage is a clever per-request mirror of that authority.
+
+### Seams — where coordination *would* be needed if it existed
+
+```
+  Three potential coordination needs — and what closes each
+
+  potential need                              closed by
+  ───────────────                              ─────────
+  shared mutable state across instances        ★ encrypted cookie ★
+  (e.g. OAuth tokens that must survive a       (the client carries it)
+   cross-instance gap)
+
+  exclusive access to a resource              n/a — no resource needs
+   (e.g. only one worker may process job X)    locking; every request
+                                               is independent
+
+  ordering of writes across producers          n/a — single writer per
+                                               session per stream
+
+  leader for scheduled work                    n/a — no scheduled work
+                                               (Vercel Cron not used)
+```
+
+Only the first row lights up, and it's solved by the cookie, not by a server-side coordination service.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know how a JWT carries claims so the server doesn't need to look anything up — every request is self-contained? Same idea: the `bi_auth` cookie carries the OAuth state (DCR client info + PKCE verifier + tokens) so every Vercel instance can serve any request without needing a shared database. The browser is the "shared store" because it's the only thing that's actually constant across the request span.
+The clever trick: **make the BROWSER the cross-instance store**, not Redis or a DB. The browser has a cookie. The cookie carries the state. Vercel instance A reads the cookie at request start, modifies the state in-process, writes the cookie at request end. Vercel instance B does the same on the next request. Across instances, the only thing that needs to be coordinated is the cookie — and HTTPS + browser-side cookie jar do that for free.
 
-The twist is the **inside-a-single-request reads/writes**: the MCP SDK calls `provider.tokens()` and `provider.saveCodeVerifier(v)` synchronously, many times, during a single OAuth flow. Next.js's `cookies()` API gives you the *request* cookie on read; if you `set` during the request, the read still returns the OLD value (a `set` only affects the response). So we can't naively re-read the cookie on every method call. Solution: read once at the start, hold in an `AsyncLocalStorage`-scoped object, flush at the end.
+> **State on the client is the cheapest distributed state. Trust + size + privacy decide whether the cookie can be the carrier; here all three say yes (AES-256-GCM + httpOnly + ~2KB), so the cookie IS the shared store.**
 
 ```
-  Cookie-as-shared-state kernel — the picture
+  The kernel — cookie-as-distributed-store
 
-       request enters
-            │
-            ▼
-   withAuthCookies(fn) {
-     raw = cookies().get('bi_auth').value
-     ctx = { store: decrypt(raw) || {}, dirty: false }
-            │
-            ▼  ─ AsyncLocalStorage scope ─
-     await requestStore.run(ctx, fn)
-        │
-        ▼
-     provider.codeVerifier() → readState(sid).codeVerifier
-                              → readAll() reads ctx.store
-     provider.saveTokens(t) → patchState(sid, {tokens:t})
-                            → writes ctx.store, ctx.dirty = true
-        │
-        ▼  ─ scope ends ─
-     if (ctx.dirty) cookies().set('bi_auth', encrypt(ctx.store), {…})
-   }
+  ┌─ Request lands on instance X ───────────────────────────────┐
+  │                                                             │
+  │  withAuthCookies(fn):                                        │
+  │     1. read bi_auth cookie value                             │
+  │     2. decryptStore(value) → Store object                    │
+  │     3. AsyncLocalStorage.run(ctx={store, dirty:false}, fn)   │
+  │                                                             │
+  │     ┌─ fn runs ────────────────────────────────────────┐    │
+  │     │  OAuthClientProvider.tokens()  → readState(sid)   │    │
+  │     │  OAuthClientProvider.saveTokens(t) → patch+dirty=true │
+  │     │  …MANY synchronous reads/writes…                  │    │
+  │     │  each one hits ctx.store, NEVER the cookie API     │    │
+  │     └────────────────────────────────────────────────────┘    │
+  │                                                             │
+  │     4. if (ctx.dirty) write encryptStore(ctx.store) cookie   │
+  │                                                             │
+  └─────────────────────────────────────────────────────────────┘
+
+  next request on instance Y:
+     same dance, sees the cookie the previous request wrote
+     → tokens / PKCE verifier / DCR client info available
 ```
 
-That kernel is the pattern. Everything else (the AES-256-GCM crypto, the `SameSite=None` cookie flag, the dev/test fallbacks) is hardening on top.
+Two seams: `cookie ↔ ctx.store` (the per-request hydration/flush) and `ctx.store ↔ provider method calls` (the in-process synchronous access). The first is HTTPS-mediated; the second is AsyncLocalStorage.
 
-### Move 2 — walk the parts
+### Move 2 — walk it one part at a time
 
-#### Part: the three backends (dev / test / production)
+#### Part 1 — why this is hard (the OAuth state survival problem)
+
+OAuth + PKCE + DCR is a three-stage handshake. Three pieces of state are saved during stage 1 and *must* be readable during stage 2:
+
+```
+  Three pieces of OAuth state that must survive the cross-instance gap
+
+  saved during          read during           shape
+  ────────────          ────────────          ─────
+  connect (stage 1)     callback (stage 2)    DCR client_information
+                                              (client_id + secret from
+                                               Dynamic Client Registration)
+
+  connect (stage 1)     callback (stage 2)    PKCE code_verifier
+                                              (random string used to prove
+                                               we initiated the flow)
+
+  callback (stage 2)    every later call      OAuth tokens
+                                              (access_token, refresh_token,
+                                               id_token, lifetime)
+```
+
+The trap: in production, Vercel functions are *ephemeral and not sticky*. The `connect` request creates state in memory and returns a redirect URL. The browser bounces to Bloomreach, the user approves, the browser comes back to `/api/mcp/callback` — and that callback request can land on a *different* Vercel instance, with an empty memory. Without a shared store, the DCR client info and PKCE verifier are gone.
+
+**Three solutions exist:**
+1. Sticky routing (browser request → same instance). Doesn't exist on Vercel functions in general.
+2. Server-side shared store (Redis, KV, DB). Adds infra; adds a network hop.
+3. Client-side shared store (cookie). The browser carries the state across the gap.
+
+The codebase picks (3). The cookie is encrypted (so the user can't tamper with it), httpOnly (so JavaScript can't read it), SameSite=None+Secure (so it survives the cross-site OAuth redirect).
+
+#### Part 2 — the encryption (why a cookie is safe to hold tokens)
+
+```
+  Cookie crypto — AES-256-GCM under AUTH_SECRET
+
+  raw store (JSON):
+    { "<sid>": { tokens: {...}, clientInformation: {...}, codeVerifier: "..." } }
+
+  encryption:
+    key   = sha256(AUTH_SECRET)             // 32 bytes for AES-256
+    iv    = randomBytes(12)                 // 12 bytes for GCM
+    cipher = createCipheriv('aes-256-gcm', key, iv)
+    enc   = cipher.update(JSON.stringify(store))
+    tag   = cipher.getAuthTag()             // 16 bytes for GCM auth
+    cookie_value = base64url(iv || tag || enc)
+
+  decryption:
+    iv    = cookie_value[0..12]
+    tag   = cookie_value[12..28]
+    enc   = cookie_value[28..]
+    decipher.setAuthTag(tag)
+    plain = decipher.update(enc) + final()
+    return JSON.parse(plain)  // OR {} if tampered
+```
+
+Three load-bearing properties from `lib/mcp/auth.ts:51-79`:
+
+- **Confidentiality + integrity (GCM).** AES-256-GCM is an AEAD — encrypts AND authenticates. A tampered cookie fails at `setAuthTag` and the catch block returns `{}`, which means the user is silently logged out (which is the correct behavior; we don't want to *process* a tampered cookie).
+- **Random IV per encryption.** A fresh IV every flush is required for GCM security. `randomBytes(12)` guarantees it.
+- **Rotated-secret safety.** If `AUTH_SECRET` changes, all existing cookies fail decryption and users are silently logged out. This is a safe failure mode for the use case.
+
+The store is keyed by `sessionId` (the `bi_session` cookie), so one user's state is in one slot of the encrypted JSON. The cookie carries `Store = Record<sessionId, SessionAuthState>` because a single cookie could in principle hold multiple sessions for the same browser — though in practice it's one session per cookie.
+
+#### Part 3 — AsyncLocalStorage (the in-request mirror)
+
+The problem AsyncLocalStorage solves is at a different layer: **Next.js's cookies API has a request-vs-response split.** If you `cookies().set(...)` and then `cookies().get(...)` in the same request, you might get the old value back depending on the runtime. The OAuthClientProvider doesn't know about this — it's an SDK contract that calls `provider.tokens()` and `provider.saveTokens(t)` many times during one auth flow.
+
+So the design wraps every route handler that touches OAuth in `withAuthCookies(fn)`:
 
 ```ts
-// lib/mcp/auth.ts:34
-const PERSIST = process.env.NODE_ENV === 'development';
-const CACHE_FILE = join(process.cwd(), '.auth-cache.json');
-const memStore = new Map<string, SessionAuthState>();
-```
-
-Three backends because three environments have different needs:
-
-- **Dev**: gitignored file (`.auth-cache.json`). Next's dev server hot-reloads, which would wipe an in-memory Map mid-flow. Persistence to disk is what lets the DCR client info + PKCE verifier survive a hot-reload between `connect` and `callback`.
-- **Test**: in-memory Map, isolated per run, with `_clearAuthStore()` for setup.
-- **Production**: encrypted cookie, ALS-scoped per request.
-
-This is the pattern: **the storage backend follows the failure mode of the runtime**. Dev needs persistence across module reloads; test needs isolation; prod needs cross-instance shared state.
-
-#### Part: AES-256-GCM with key derived from `AUTH_SECRET`
-
-```ts
-// lib/mcp/auth.ts:51
-function aesKey(): Buffer {
-  const secret = process.env.AUTH_SECRET;
-  if (!secret) {
-    throw new Error('AUTH_SECRET is required in production to encrypt the auth cookie. ' +
-      'Set it in your Vercel project environment variables.');
+// lib/mcp/auth.ts:86-104
+export async function withAuthCookies<T>(fn: () => Promise<T>): Promise<T> {
+  if (process.env.NODE_ENV !== 'production') return fn();
+  const { cookies } = await import('next/headers');
+  const raw = (await cookies()).get(AUTH_COOKIE)?.value;
+  const ctx: RequestStore = { store: raw ? decryptStore(raw) : {}, dirty: false };
+  const result = await requestStore.run(ctx, fn);
+  if (ctx.dirty) {
+    (await cookies()).set(AUTH_COOKIE, encryptStore(ctx.store), {
+      httpOnly: true,
+      secure: true,
+      sameSite: 'none',
+      path: '/',
+      maxAge: AUTH_COOKIE_MAX_AGE,
+    });
   }
-  return createHash('sha256').update(secret).digest(); // 32 bytes → AES-256
-}
-
-function encryptStore(store: Store): string {
-  const iv = randomBytes(12);
-  const cipher = createCipheriv('aes-256-gcm', aesKey(), iv);
-  const enc = Buffer.concat([cipher.update(JSON.stringify(store), 'utf8'), cipher.final()]);
-  return Buffer.concat([iv, cipher.getAuthTag(), enc]).toString('base64url');
-}
-
-function decryptStore(token: string): Store {
-  try {
-    const buf = Buffer.from(token, 'base64url');
-    const decipher = createDecipheriv('aes-256-gcm', aesKey(), buf.subarray(0, 12));
-    decipher.setAuthTag(buf.subarray(12, 28));
-    const plain = Buffer.concat([decipher.update(buf.subarray(28)), decipher.final()]).toString('utf8');
-    return JSON.parse(plain) as Store;
-  } catch {
-    return {}; // tampered, rotated-secret, or corrupt cookie → treat as no auth
-  }
+  return result;
 }
 ```
 
-The cookie layout is `iv (12) | authTag (16) | ciphertext`. AES-GCM gives both confidentiality and authenticity — a tampered cookie fails `decipher.final()` and we return `{}`, which translates to "no auth, run OAuth again." Rotating `AUTH_SECRET` has the same effect: all existing cookies decrypt to `{}`, all users re-auth.
+Walk it as an execution trace:
 
-Three details on the cookie itself:
+```
+  Execution trace — withAuthCookies running connect → finishAuth
 
-- **`httpOnly: true`** — not readable from JS, so XSS can't exfiltrate.
-- **`secure: true`** — only over HTTPS.
-- **`sameSite: 'none'`** — required so the cookie survives the cross-site OAuth return from Bloomreach's IdP to `/api/mcp/callback`.
+  step                                         ctx.store              ctx.dirty
+  ─────────────────────────────────────────    ──────────────────     ──────
+  enter handler                                {}                     false
+  read cookie, decrypt                         { sid: { tokens: T0 } } false
+  run fn() under requestStore                  ↑ available to fn
+    OAuthClientProvider.tokens(sid)            (reads T0)              false
+    OAuthClientProvider.saveCodeVerifier(v)    { sid: { …, cv: v } }   true
+    OAuthClientProvider.saveTokens(T1)         { sid: { tokens: T1, cv: v }} true
+    …more reads…                                no change              true
+  fn returns
+  if (ctx.dirty) encrypt + set cookie          (persisted to browser) —
+```
 
-#### Part: AsyncLocalStorage — the request-scoped lens
+The two single-touch invariants (cookie read once at entry, cookie write once at exit) are why this works around Next.js's cookies-API quirk. Inside `fn`, the provider talks to a plain JS object — no cookie API involved, no Next.js semantics in the way.
+
+```
+  AsyncLocalStorage — the per-request execution context
+
+  request 1 (instance X)                         request 2 (instance Y)
+  ─────────────────────                         ─────────────────────
+  withAuthCookies(handler1)                      withAuthCookies(handler2)
+    ctx1 = { store: …, dirty: false }            ctx2 = { store: …, dirty: false }
+    requestStore.run(ctx1, …) ───►               requestStore.run(ctx2, …) ───►
+       handler1's many async calls                   handler2's many async calls
+       requestStore.getStore() = ctx1               requestStore.getStore() = ctx2
+                                                  (NEVER ctx1 — different ALS context)
+
+  the two requests' contexts are isolated even when handler code is the same
+  module's code, because ALS keys context to the async call tree, not the file
+```
+
+ALS is the right tool because the OAuthClientProvider's methods can be called from any depth in the async call tree of `client.connect(transport)` — not just at the top level. Threading a `store` arg through every method would require modifying the SDK; ALS gets the same effect without touching it.
+
+#### Part 4 — what happens when the cookie is missing or expired
+
+```
+  Failure modes — and how each is handled
+
+  case                              behavior
+  ──────                             ──────────
+  no bi_auth cookie                  decryptStore returns {} (empty store);
+                                     OAuthClientProvider.tokens() returns
+                                     undefined; SDK runs the auth flow
+                                     and asks for redirect → captured
+
+  tampered bi_auth cookie            decryptStore catch returns {};
+                                     same path as missing — user logs in again
+
+  AUTH_SECRET rotated                all cookies fail decryption; everyone
+                                     re-authenticates silently
+
+  cookie expired (10-day max-age)    browser stops sending it; treated as
+                                     missing; user re-authenticates
+
+  Bloomreach revoked tokens          tokens still in cookie, but every call
+                                     fails with 401 invalid_token; the
+                                     reconnect-on-401 path (app/page.tsx)
+                                     POSTs /api/mcp/reset which clears
+                                     the cookie and re-runs auth
+```
+
+The reset path (`app/api/mcp/reset/route.ts`):
 
 ```ts
-// lib/mcp/auth.ts:46
-interface RequestStore { store: Store; dirty: boolean }
-const requestStore = new AsyncLocalStorage<RequestStore>();
-```
-
-ALS lets you carry context through async chains without explicit threading. In our case, it carries `{store, dirty}` so any code running inside `withAuthCookies(fn)` can read/write the same in-memory object, and a single flush at the end persists changes. Per-request isolation: two concurrent requests on the same instance each get their own ALS context, no shared state between them.
-
-```ts
-// lib/mcp/auth.ts:114
-function readAll(): Store {
-  const ctx = requestStore.getStore();
-  if (ctx) return ctx.store; // production: ALS-scoped, cookie-backed
-  if (!PERSIST) return Object.fromEntries(memStore); // test
-  try {
-    if (existsSync(CACHE_FILE)) return JSON.parse(readFileSync(CACHE_FILE, 'utf8')) as Store;
-  } catch { /* … */ }
-  return {};
-}
-
-function writeAll(store: Store): void {
-  const ctx = requestStore.getStore();
-  if (ctx) {
-    ctx.store = store;
-    ctx.dirty = true;
-    return;
-  }
-  // … dev/test branches
+export async function POST() {
+  const sid = await getOrCreateSessionId();
+  clearAuth(sid);            // dev/test: removes the file/memory entry
+  await deleteAuthCookie();  // production: drops the encrypted cookie
+  return NextResponse.json({ ok: true, cleared: true });
 }
 ```
 
-`readAll` and `writeAll` are the only two functions that touch storage; they switch on backend by checking `requestStore.getStore()` first. The `dirty` flag is the optimization that avoids re-encrypting and writing a cookie when nothing changed (a pure-read request leaves `dirty: false`, so no `Set-Cookie` goes out).
+Two operations, one for each backend. In production only the cookie matters; the in-memory store is empty between requests anyway. In dev only the file matters; there's no cookie path.
+
+#### Part 5 — what's NOT here (the absent coordination machinery)
+
+Everything else in the coordination chapter is absent:
 
 ```
-  Execution trace — one OAuth flow across two instances
+  Coordination mechanisms — none present
 
-  request                                instance A          instance B
-  ──────                                 ──────────          ──────────
-  GET /api/briefing                      withAuthCookies:
-                                          raw = cookies().get → undefined
-                                          ctx = {store:{}, dirty:false}
-                                          connectMcpInner(sid):
-                                            provider.clientMetadata
-                                            client.connect (DCR + PKCE)
-                                            provider.saveClientInformation(info)
-                                              → ctx.store[sid].clientInformation
-                                              → ctx.dirty = true
-                                            provider.saveCodeVerifier(v)
-                                              → ctx.store[sid].codeVerifier
-                                              → ctx.dirty = true
-                                            provider.redirectToAuthorization(url)
-                                              → lastAuthorizeUrl captured
-                                            throws UnauthorizedError
-                                          catch returns {authUrl}
-                                          flush: cookies().set('bi_auth', encrypt(ctx.store))
-                                                                                  ← cookie returned
-   browser navigates to Bloomreach IdP                       (cookie now in jar)
+  leader election (Raft, Bully)         not present — no work that needs
+                                         a single leader
 
-  GET /api/mcp/callback?code=…           [different instance!]
-                                                              withAuthCookies:
-                                                               raw = cookies().get → present
-                                                               ctx = {store: decrypt(raw),
-                                                                       dirty: false}
-                                                               completeAuth(sid, code):
-                                                                 transport.finishAuth(code):
-                                                                   provider.clientInformation()
-                                                                     → ctx.store[sid].clientInfo
-                                                                       ← survived!
-                                                                   provider.codeVerifier()
-                                                                     → ctx.store[sid].codeVerifier
-                                                                       ← also survived!
-                                                                   exchange code for tokens
-                                                                   provider.saveTokens(t)
-                                                                     → ctx.dirty = true
-                                                               flush: cookies().set('bi_auth', encrypt)
-                                                                                    ← updated cookie
+  distributed locks (Zookeeper,         not present — no resource that
+   etcd, Redlock)                        needs exclusive access
+
+  leases (cache invalidation,           not present — no work scheduling
+   work allocation)
+
+  logical clocks (Lamport, vector)      not present — no need for happens-
+                                         before ordering across nodes
+
+  fencing tokens                        not present — no risk of stale
+                                         leader making writes after revocation
+
+  split-brain detection                 not present — no replicated state
+                                         to disagree
+
+  global ordering                        not present — single writer per
+                                         stream
 ```
 
-The trace shows the load-bearing move: **state created on instance A is recovered verbatim on instance B**, with no shared database, no Redis, no Vercel KV. The cookie is the only thing both instances can see.
+The "absent because there's only one writer / one owner / no shared mutable state" pattern is consistent with files 03, 05, 06. **The coordination work this codebase does is exactly what's needed to make the OAuth flow survive Vercel's ephemeral functions; everything else is not needed.**
 
-#### Part: server timestamps — the only "clocks" in this repo
-
-There's no distributed clock concern because there's no ordering decision that crosses an instance. The only timestamps that matter:
-
-- **`Insight.timestamp`** (`lib/state/insights.ts:32`) — `new Date().toISOString()` at the time the briefing ran. Server-local clock. The UI shows it as the snapshot disclosure.
-- **`lastCallAt`** (`lib/data-source/bloomreach-data-source.ts:191`) — `Date.now()` for proactive rate-limit spacing. Per-instance. Used for relative timing only (`elapsed = now - lastCallAt`).
-- **`expiresAt`** in the cache — `Date.now() + ttl`. Same — relative timing on the local clock.
-
-No clock-skew problem because every comparison is local to one process. No vector clocks because there's no causality to track across processes. No hybrid logical clocks because there's no need to order events across instances.
-
-If we ever shared the cache across instances (Redis), the TTL math would still be safe (each instance's clock is close enough for 60s windows). If we ever tried to *order* events across instances — say, "investigation 1 came before investigation 2" globally — *then* we'd need vector clocks or HLCs.
-
-### Move 2.5 — Case B: leadership, distributed locks, consensus
-
-These are real distributed-systems concepts. **They are not in this repo.** Documented here so you know what they'd add.
-
-#### Leader election
-
-Pattern: N replicas run the same code; one is elected leader (Raft, Bully algorithm, Zookeeper ephemeral nodes); only the leader writes; followers read. Adds complexity: split-brain detection, leader failover, fencing tokens.
-
-**When this repo would need it:** If a background job (refresh schema every hour, refresh demo snapshot nightly) had to run *exactly once* across the Vercel cohort. Today there's no such job — everything is request-driven.
+### Move 2.5 — current state vs future state
 
 ```
-  Phase A (today)           vs       Phase B (if a background job existed)
-  ───────────────────              ───────────────────────────────────────
-  every request runs                a single "leader" instance runs the job
-  the schema bootstrap              on schedule; others skip it
-  independently (idempotent,        coordination cost: Raft / locks /
-  duplicate work tolerated)         leader-election infra
+  Today                              Tomorrow (if it shows up)
+  ─────────────────────────          ─────────────────────────────────
+  cookie carries auth state          if the cookie grows past ~4KB
+   (~2KB, well under cookie limit)    (e.g. JWE for richer claims),
+                                      move to server-side KV with the
+                                      cookie holding a small reference
+
+  no scheduled work                   if cron-style "nightly briefing
+                                       summary" lands → Vercel Cron or
+                                       external scheduler; if multi-
+                                       region, lease-the-leader pattern
+
+  no work that needs locking          if "compute this expensive thing
+                                       once" comes up → distributed
+                                       lock (Redis SETNX with TTL or
+                                       fencing token) — but a content-
+                                       addressable cache is usually a
+                                       better answer first
 ```
 
-#### Distributed locks
-
-Pattern: a shared lock (Redis SETNX with TTL, etcd lease, Zookeeper) that only one process can hold. Used for serializing access to a critical section across processes.
-
-**When this repo would need it:** If the schema bootstrap had to run *only once across all instances* (today it can run on each cold instance independently, and the duplicate work is wasted bandwidth not corrupted state). Or if we ever did atomic increment-style writes against shared state.
-
-#### Consensus (Raft / Paxos)
-
-Pattern: a group of N nodes agree on an ordered log of operations, surviving up to f failures (where N = 2f+1). Used for replicated state machines (etcd, Consul, distributed databases).
-
-**When this repo would need it:** Never, at this shape. Consensus is for distributed *databases*; we don't have one.
-
-#### Vector clocks / HLCs / Lamport timestamps
-
-Pattern: each process tags its events with a logical clock that captures causal precedence. Used to determine "happened-before" across processes without a global clock.
-
-**When this repo would need it:** If two users edited the same investigation concurrently, vector clocks would let us detect the conflict ("user A's edit and user B's edit are concurrent — show a merge UI"). Today, investigations are write-once per session.
+The realistic forward path is "add KV when the cookie isn't enough" — not "add a coordination service." The complexity floor for distributed locks isn't worth crossing without a use case.
 
 ### Move 3 — the principle
 
-**Coordination is expensive. Don't add it unless the failure mode forces you.** The cookie-as-shared-state pattern is the cheapest possible "distributed" state — the browser is doing the carrying, and the encryption + AsyncLocalStorage wrapping is the entire price. No Redis, no Raft, no locks. The pattern works because we picked the corner of the design space where state changes infrequently (per OAuth flow, not per request) and the state is small (< 8KB cookie limit).
+> **State on the client is the cheapest distributed state. Encrypt it for confidentiality + integrity (AEAD), key it for tampering safety (rotation = silent logout), and use AsyncLocalStorage to make the per-request hydration transparent to the code that uses it. You get cross-instance coordination without running a coordination service.**
 
-The day we need real coordination — a background job, a shared lock, multi-region cohorts that need to agree on something — the cost goes up dramatically. Knowing where that line is, and staying on this side of it, is most of the design judgment in this pattern.
+The deeper move: **distinguish coordination state from coordination machinery.** This codebase has coordination state (the OAuth tokens, the PKCE verifier, the DCR client info), but no coordination *machinery* (no leader, no lock, no consensus). The state is small and per-user; the right carrier is the user's browser, not a shared server.
 
-## Primary diagram
+## Primary diagram — the coordination story
 
 ```
-  Full picture — the only coordination pattern in this codebase
+  Coordination — the full picture, every box labelled
 
-  ┌─ Browser ─────────────────────────────────────────────────────────┐
-  │  cookies: bi_session=<uuid>; bi_auth=<encrypted blob>              │
-  │  every request carries them                                        │
-  └────────────────────────────┬──────────────────────────────────────┘
-                               │ HTTPS, every request
-  ┌─ Vercel instance (any of N) ──────────────────────────────────────┐
-  │                                                                    │
-  │  withAuthCookies(fn) {                                             │
-  │    raw = cookies().get('bi_auth').value                            │
-  │    ctx = { store: decrypt(raw) || {}, dirty: false }                │
-  │    await requestStore.run(ctx, fn)   ─ AsyncLocalStorage scope ─    │
-  │       ↓                                                             │
-  │       BloomreachAuthProvider methods (readState/patchState)          │
-  │         → readAll() reads ctx.store                                 │
-  │         → writeAll() updates ctx.store, sets ctx.dirty             │
-  │       ↑                                                             │
-  │    if (ctx.dirty) cookies().set('bi_auth', encrypt(ctx.store), {…}) │
-  │  }                                                                  │
-  │                                                                    │
-  │  per-instance, NOT coordinated:                                    │
-  │    • insights/investigations Maps (per-session sub-maps)           │
-  │    • lib/mcp/schema.ts `cached` (process-lifetime)                 │
-  │    • BloomreachDataSource cache + lastCallAt                       │
-  │    • timestamps (Insight.timestamp, Date.now())                    │
-  │                                                                    │
-  └────────────────────────────────────────────────────────────────────┘
+  ┌─ Browser ────────────────────────────────────────────────────┐
+  │  bi_session cookie  → identity (sessionId)                    │
+  │  bi_auth   cookie   → encrypted Store (AES-256-GCM)           │
+  │                       SameSite=None · Secure · httpOnly       │
+  │                       10-day max-age                          │
+  └─────────────────────────┬────────────────────────────────────┘
+                            │  HTTPS · cookie ride-along
+                            ▼
+  ┌─ Route handler ──────────────────────────────────────────────┐
+  │  withAuthCookies(handler):                                    │
+  │   • cookies().get(bi_auth) → encrypted blob                   │
+  │   • decryptStore() → Store                                    │
+  │   • AsyncLocalStorage.run({store, dirty}, handler)            │
+  │      ↓                                                        │
+  │   ┌─ handler ────────────────────────────────────────────┐    │
+  │   │  OAuthClientProvider methods read/write ctx.store     │    │
+  │   │  (the SDK does NOT see cookies; it sees in-memory)    │    │
+  │   └─────────────────────────────────────────────────────┘    │
+  │   • if (ctx.dirty) cookies().set(bi_auth, encryptStore(…))    │
+  └─────────────────────────┬────────────────────────────────────┘
+                            │
+  ┌─ DataSource ────────────▼────────────────────────────────────┐
+  │  BloomreachDataSource.callTool(…)                             │
+  │  uses the tokens from ctx.store implicitly (via the SDK's      │
+  │   Bearer header) — no token state of its own                  │
+  └─────────────────────────┬────────────────────────────────────┘
+                            │
+  ┌─ Bloomreach ────────────▼────────────────────────────────────┐
+  │  validates Bearer · serves request OR returns 401 invalid_token│
+  │  (revokes tokens server-side; we discover via 401)            │
+  └────────────────────────────────────────────────────────────────┘
 
-  Case B (not exercised here):
-    • leader election (would need: background scheduled jobs)
-    • distributed locks (would need: shared mutable state)
-    • consensus (would need: replicated state machine)
-    • vector clocks (would need: concurrent updates to shared resources)
+  what's NOT here:
+    ✗ Redis / KV / shared cache
+    ✗ leader election
+    ✗ distributed locks
+    ✗ leases
+    ✗ logical clocks
 ```
 
 ## Elaborate
 
-The cookie-as-shared-state pattern has a name in industry: **stateless session management with signed cookies**, used by every JWT-based system. The novel-to-us part is using it for the OAuth flow's transient state (PKCE verifier, DCR client info) rather than just for the user identity. The risk that pushed us here is the same risk that pushed everyone there: ephemeral compute (Vercel, Lambda) doesn't have a shared memory layer by default, and adding one (Redis, Vercel KV) is an extra service to operate and pay for.
+The references that ground this material:
 
-AsyncLocalStorage is the Node analog of Java's `ThreadLocal` or Go's context.Context — a way to thread per-request state through async chains without polluting function signatures. The Next.js cookie API problem (request-vs-response split, can't read your own writes within a request) is well-known; ALS is the standard workaround.
+- **OAuth 2.0 + PKCE (RFC 7636).** The protocol that requires the cross-request verifier survival. The fundamental insight: PKCE adds a one-time verifier so an intercepted authorization code can't be exchanged without the verifier — but the *client* has to remember the verifier from `connect` to `callback`, which is exactly the cross-instance gap problem.
+- **Dynamic Client Registration (RFC 7591).** Why we need to remember `client_information` too — we register a client_id with Bloomreach on the fly, and we have to use the same client_id throughout the flow.
+- **AsyncLocalStorage (Node 13+).** The Node primitive for per-async-tree context. The async_hooks-based mechanism is the cleanest way to do per-request state without explicit thread-locals or arg threading.
+- **Web Crypto + AES-GCM.** The standard for authenticated encryption. GCM is the right AEAD mode for short-message use (cookies, JWE) because it's parallelizable and has small overhead. ChaCha20-Poly1305 is the alternative; here GCM is fine because Node has hardware AES support.
 
-What to read next: Marc Brooker's "Caches, modes, and unprincipled gradients" for the cookie-as-cache shape; the Vercel KV docs for the next step up; the Raft paper if you want to know what leader election actually costs.
+The interesting comparison: **stateless sessions (JWE) vs. stateful sessions (KV-keyed by cookie ID).** This codebase uses the JWE-style pattern (state on the client, encrypted with a server-held key) but doesn't call it JWE — it's just a JSON store encrypted with AES-GCM and base64url'd into a cookie. The trade-off vs a KV-backed session: no server-side state to invalidate (rotation = silent logout) but no immediate revocation path (the cookie is valid until rotation or expiry). For our use case (auth that re-establishes on 401 anyway), this is correct.
 
 ## Interview defense
 
-**Q: "How do you handle state across your serverless instances?"**
+### "How does OAuth state survive a Vercel function instance change?"
 
-> "The honest answer: I don't have shared state across instances except for what's in the user's cookies. The only real coordination problem is the OAuth flow — the `connect` request and the `callback` may land on different Vercel instances. So the DCR client info, PKCE verifier, and tokens all live in an AES-256-GCM encrypted cookie called `bi_auth`. The pattern: read the cookie once at request start, decrypt into an AsyncLocalStorage-scoped object, let the OAuth SDK do its many synchronous reads/writes against that object, flush back to the cookie at request end. Cross-instance state without Redis."
+The OAuth state (DCR client info, PKCE code verifier, tokens) is encrypted with AES-256-GCM under `AUTH_SECRET` and stored in an httpOnly `bi_auth` cookie on the browser. The browser carries the cookie on every request, including the cross-site bounce back from Bloomreach to `/api/mcp/callback`. On the server, `withAuthCookies(fn)` reads the cookie once at request entry, decrypts it into a plain Store object, and stashes it in an `AsyncLocalStorage`-scoped context. The `OAuthClientProvider`'s many synchronous read/write calls during the auth flow hit this in-memory context — never the Next.js cookies API directly. At request exit, if anything was written, the modified store is encrypted and set back on the cookie. The browser carries the new state to whatever instance handles the next request.
 
-Diagram:
+The pattern is *state on the client + per-request hydration*. The browser is the shared store; AsyncLocalStorage is the in-process mirror; the encryption is what makes the cookie safe to trust.
 
 ```
-  instance A: connect → save verifier to ctx → encrypt → Set-Cookie
-                                                        │
-  browser:    Cookie: bi_auth=...                       │
-                                                        ▼
-  instance B: callback → decrypt cookie → read verifier → exchange code → save tokens → re-encrypt → Set-Cookie
+  Anchor:
+    cookie I/O:  lib/mcp/auth.ts:86-104 (withAuthCookies)
+    crypto:      lib/mcp/auth.ts:51-79  (encryptStore/decryptStore)
+    provider:    lib/mcp/auth.ts:160-218 (BloomreachAuthProvider methods)
+    cookie set:  lib/mcp/session.ts:10-14 (sessionCookieOpts)
 ```
 
-**Q: "Why AsyncLocalStorage?"**
+### "Why AsyncLocalStorage instead of just reading the cookie on every method call?"
 
-> "Next.js's `cookies()` API is request-scoped — `cookies().set(...)` only affects the response. A read after a set in the same request returns the OLD value. The OAuth SDK calls `provider.saveCodeVerifier(v)` and `provider.codeVerifier()` many times during a single flow, often interleaved with `tokens()` and `saveTokens()`. Re-reading the cookie on every call would lose the most recent writes. ALS lets me read the cookie ONCE at request entry, hold the decrypted store in a per-request object, let the SDK hammer it synchronously, and flush ONCE at exit. The `dirty` flag is the optimization — pure-read requests don't trigger a re-encrypt or a Set-Cookie."
+Two reasons. (1) Next.js's cookies API has a request-vs-response split — a `cookies().set(...)` followed by `cookies().get(...)` in the same request can return the old value. The `OAuthClientProvider` SDK contract calls `saveTokens()` and `tokens()` interleaved within one flow, so this would produce incorrect behavior. (2) Even if the API didn't have that quirk, decrypting on every method call would be wasteful — the SDK calls these methods many times per `client.connect(transport)` invocation. AsyncLocalStorage gives a per-request execution context that the synchronous provider methods can read and write at zero crypto cost; one decrypt at entry, one encrypt at exit, dirty-flag-gated.
 
-**Q: "What if `AUTH_SECRET` rotates?"**
+The shape this generalizes to: **per-request expensive-to-construct state belongs in AsyncLocalStorage when the consumers are deep in the async call tree and modifying it across the request lifecycle.** It's the cleaner alternative to threading the state through every call as an argument.
 
-> "Every existing cookie decrypts to `{}` (the try/catch in `decryptStore` swallows the GCM authentication failure). All users re-auth. That's the deliberate behavior — rotating the secret is a force-logout. Same effect for tampered cookies."
+### "What's your distributed-lock strategy?"
 
-**Q: "What's NOT here that I should be aware of?"**
-
-> "No leader election, no distributed locks, no consensus, no vector clocks. The per-instance state (insights Map, schema cache, BloomreachDataSource cache) is uncoordinated — instance A's cache is invisible to instance B. That's fine for idempotent reads but the `lastCallAt` rate-limit spacing is per-instance too, so two warm instances can technically race the upstream's rate limit. Listed in the red-flags audit. The day a background job needs to run exactly once across the cohort, leader election earns its place."
-
-**Q: "What's the load-bearing detail?"**
-
-> "AsyncLocalStorage scoping. Without it, the OAuth SDK's mid-request `saveCodeVerifier` would write a cookie that the next `codeVerifier()` call inside the same request couldn't read. The whole flow would silently fail with 'no PKCE code_verifier stored for this session.' The scoping is what makes the in-request reads consistent."
+There isn't one, and there shouldn't be. No work in this codebase requires exclusive access — every request is independent and stateless from the perspective of work allocation. The only shared mutable state across instances is OAuth tokens, and those are carried by the client (the browser cookie) rather than coordinated server-side. The case where I'd reach for a distributed lock is something like "compute this expensive briefing once and serve it to everyone" — but that's a *cache* problem, not a *lock* problem; the right answer is content-addressable caching (hash the inputs, key the cache by the hash, single-flight via in-memory or KV). I'd reach for an actual distributed lock (Redis SETNX with TTL + fencing token) only if we had cross-instance writes to a shared resource — which we don't, because we don't own one.
 
 ## See also
 
-- `01-distributed-system-map.md` — the picture this file is the deep walk of.
-- `04-consistency-models-and-staleness.md` — the per-instance staleness the cookie pattern fixes for auth (and the `?insight=` URL hack fixes for everything else).
-- `09-distributed-systems-red-flags-audit.md` — the per-instance `lastCallAt` rate-limit gap is listed there.
-- `../study-security/` — the cookie crypto, the secret rotation, the redaction at `lib/mcp/transport.ts:66`.
+- `04-consistency-models-and-staleness.md` — the other in-process state (insights Maps) and its cross-instance behavior.
+- `05-replication-partitioning-and-quorums.md` — why we don't need a server-side shared store.
+- `09-distributed-systems-red-flags-audit.md` — the cookie-size ceiling, rotation behavior risks.
+- `.aipe/study-security/` — the cookie encryption / trust model in security terms.
+- `.aipe/study-system-design/` — the OAuth flow at architectural altitude.

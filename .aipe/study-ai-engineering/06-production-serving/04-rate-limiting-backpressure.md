@@ -1,121 +1,103 @@
-# 04 — rate limiting and backpressure
+# Rate limiting and backpressure
 
-**Subtitle:** Provider-side rate limit + retry · Industry standard (load-bearing)
+*Industry standard — proactive spacing · retry-on-429 · backpressure*
 
-## Zoom out, then zoom in
+## Zoom out — where this concept lives
 
-**Load-bearing for live mode.** The Bloomreach alpha MCP server enforces
-"1 per 10 seconds" globally per user. Without explicit rate-limit
-handling, the live mode hits 429 (or its MCP equivalent) on the second
-tool call. The adapter (`BloomreachDataSource`) parses the server's
-stated penalty window, sleeps, and retries up to 3 times — this is what
-makes multi-tool-call agent loops work at all.
+Bloomreach's loomi connect alpha MCP server rate-limits per user globally at ~1 req/s (sometimes stated as ~1 per 10 second in 429 messages). This codebase defends with two layers: **proactive spacing** (~1.1s between calls inside `BloomreachDataSource`) and **parsed-window retry** (when a 429 comes through anyway, parse the stated penalty window from the error text, wait, retry). Anthropic isn't rate-limited at scales this codebase hits today.
 
 ```
-  Zoom out — rate-limit handling sits at the data-source layer
+  Zoom out — rate-limit defense layers
 
-  ┌─ AptKit agent loop ────────────────────────────────┐
-  │  model picks tool_use → BloomingToolRegistryAdapter│
-  │                          .callTool()               │
-  └──────────────────────┬─────────────────────────────┘
+  ┌─ Agent loop ────────────────────────────────────────────┐
+  │  agent calls dataSource.callTool many times             │
+  └──────────────────────┬──────────────────────────────────┘
                          │
                          ▼
-  ┌─ BloomreachDataSource.callTool ────────────────────┐
-  │  ★ rate-limit retry ladder ★                        │  ← we are here
-  │  - detect rate limit (isError + text match)         │
-  │  - parse Retry-After hint                           │
-  │  - sleep parsed_hint OR exponential backoff         │
-  │  - retry up to maxRetries (3)                       │
-  │  - cap each wait at retryCeilingMs (20s)            │
-  └──────────────────────┬─────────────────────────────┘
+  ┌─ ★ BloomreachDataSource (the defense) ★ ────────────────┐ ← we are here
+  │  proactive: sleep until 1.1s since last call             │
+  │  retry: parse the server's "per N seconds" hint,         │
+  │          wait + 500ms buffer, retry (max 3)              │
+  │  cache: 60s response cache absorbs repeats               │
+  └──────────────────────┬──────────────────────────────────┘
                          │
                          ▼
-  ┌─ MCP transport → Bloomreach loomi connect ──────────┐
-  │  server returns rate-limit error envelope            │
-  └──────────────────────────────────────────────────────┘
+  ┌─ Bloomreach MCP server ─────────────────────────────────┐
+  │  ~1 req/s per user globally                              │
+  │  429 with stated window when violated                    │
+  └─────────────────────────────────────────────────────────┘
 ```
 
-## Structure pass
+**Zoom in.** This is the most defensively-engineered part of the codebase because the Bloomreach alpha server is the codebase's most-rate-limited dependency. Three defense layers compose — cache reduces calls, proactive spacing prevents 429s, retry recovers from any 429s that slip through.
 
-  → **One axis to trace — retry strategy.** Parse the server's stated
-    wait (preferred) → exponential backoff (fallback) → cap at
-    ceiling. Each decision optimizes for "land just AFTER the
-    penalty clears, not before, not way after."
+## Structure pass — layers · axes · seams
+
+**Layers:** agent → DataSource → MCP server.
+
+**Axis: where does each defense apply?**
+  → Cache: at the DataSource entry (skip the call entirely if cached).
+  → Proactive spacing: between DataSource calls (delay the next call until 1.1s elapsed).
+  → Retry: after a failed call (wait + retry up to 3 times).
+
+**Seam:** every defense is inside `BloomreachDataSource` (`lib/data-source/bloomreach-data-source.ts`). The agent layer never sees rate limits.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-Same shape as a typed-rate-limit-aware HTTP client (axios with
-retry-after support, Cloudflare's auto-retry). The provider tells you
-when to come back; honor it.
+You know how a polite client waits between requests instead of bursting, and falls back gracefully when told "slow down"? Same shape. Proactive spacing = polite by default. Retry = graceful recovery when politeness wasn't enough.
 
 ```
-  Retry ladder
+  Three layered defenses, in order
 
-  call tool → ok? → return
-       │ no, rate limit
-       ▼
-  parse Retry-After from error envelope
-       │
-  ┌────┴────┐
-  │         │
-  ▼ found   ▼ not found
-   sleep    exponential backoff
-   (hint+   (retryDelayMs *
-    buffer) 2^retry_count)
-       │         │
-       ▼         ▼
-       cap at retryCeilingMs
-       │
-       ▼
-  retry call
-       │
-   retry count < maxRetries?
-   ┌──┴──┐
-   │     │
-   ▼ yes ▼ no
-   loop  return error result
+  Layer 1: cache (60s response cache)
+   ─────────────────────────────────
+   Most "calls" never reach the server — duplicates within
+    60s return the cached result.
+
+  Layer 2: proactive spacing (1.1s between live calls)
+   ──────────────────────────────────────────────────
+   When a live call IS needed, wait until enough time has
+    elapsed since the last live call.
+
+  Layer 3: parsed-window retry (when 429 happens anyway)
+   ─────────────────────────────────────────────────────
+   The agent's tool selection sometimes bursts; or another
+    session on the same instance bursts; or the server's
+    window is tighter than expected. Retry up to 3 times,
+    waiting the server's stated window + 500ms buffer.
 ```
 
 ### Move 2 — the step-by-step walkthrough
 
-**Detection — `isRateLimited`** (`lib/data-source/bloomreach-data-source.ts:51-55`):
+**Part 1 — proactive spacing.**
+
+`BloomreachDataSource.liveCall` at `lib/data-source/bloomreach-data-source.ts:180-189`:
 
 ```typescript
-function isRateLimited(result: unknown): boolean {
-  if (!result || typeof result !== 'object' || (result as any).isError !== true) return false;
-  const text = JSON.stringify((result as any).content ?? result);
-  return /rate limit|too many requests/i.test(text);
+private async liveCall(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
+  const elapsed = Date.now() - this.lastCallAt;
+  if (elapsed < this.minIntervalMs) {
+    await new Promise((r) => setTimeout(r, this.minIntervalMs - elapsed));
+  }
+  try {
+    const result = await this.transport.callTool(name, args, { signal });
+    this.lastCallAt = Date.now();
+    return result;
+  } catch (err) {
+    this.lastCallAt = Date.now();
+    throw new McpToolError(name, errorDetail(err), { cause: err });
+  }
 }
 ```
 
-The MCP server returns rate limits as error results (not HTTP 429 —
-the tool-call wrapper hides the transport). `isError: true` plus text
-matching "rate limit" or "too many requests" is the detection.
+`minIntervalMs = 1100` (set at `lib/mcp/connect.ts:105`). Before every live call, check `(Date.now() - lastCallAt)`. If under 1100ms, sleep the difference. `lastCallAt` updates both on success AND on error — a failed call still counts toward the rate.
 
-**Parsing the wait hint — `parseRetryAfterMs`**
-(`lib/data-source/bloomreach-data-source.ts:64-71`):
+The choice of 1100ms (not 1000ms exactly): 100ms of buffer above the server's stated `1 per 1 second` window to avoid landing on the boundary.
 
-```typescript
-function parseRetryAfterMs(result: unknown): number | null {
-  const text = JSON.stringify((result as any)?.content ?? result);
-  const after = text.match(/retry[\s-]*after[^0-9]*(\d+)\s*second/i);
-  if (after) return parseInt(after[1], 10) * 1000;
-  const perWindow = text.match(/per\s*(\d+)\s*second/i);
-  if (perWindow) return parseInt(perWindow[1], 10) * 1000;
-  return null;
-}
-```
+**Part 2 — parsed-window retry.**
 
-Two regex patterns matching the two observed shapes:
-  - `"Retry after ~12 second(s)"` → 12000
-  - `"rate limit reached (1 per 10 second)"` → 10000
-
-Returns null when neither matches; the caller falls back to backoff.
-
-**The retry loop — `callTool`**
-(`lib/data-source/bloomreach-data-source.ts:163-174`):
+When a call comes back as `isError: true` AND the result text matches `/rate limit|too many requests/i`, the retry loop kicks in at `lib/data-source/bloomreach-data-source.ts:153-170`:
 
 ```typescript
 let retries = 0;
@@ -132,229 +114,123 @@ while (isRateLimited(result) && retries < this.maxRetries) {
 }
 ```
 
-The breakdown:
+Three things to notice:
 
-  → **`retryDelayMs = 10_000`** (default, line 135). The comment says:
-    *"Bloomreach's observed penalty window is ~10s ('1 per 10 second'),
-    so a fixed sub-second retry just burns the attempt inside the same
-    window. Default the fallback base to that window."*
+  → **Hint parsing** (`parseRetryAfterMs` at line 62-69) reads two shapes from the error text: `"Retry after ~12 second(s)"` → 12_000ms, and `"rate limit reached (1 per 10 second)"` → 10_000ms.
+  → **Hint wins over backoff.** When a hint exists, wait the hint + a 500ms buffer (`RETRY_BUFFER_MS`). When no hint, fall back to exponential backoff (`retryDelayMs * 2^retries`). Default `retryDelayMs = 10_000` because Bloomreach's observed penalty window is ~10s.
+  → **Ceiling caps the wait.** `retryCeilingMs = 20_000` — even a server hint of 60s would cap at 20s. This bounds worst-case latency.
 
-  → **`RETRY_BUFFER_MS = 500`** (line 49). Added to the parsed hint so
-    the retry lands *just after* the penalty clears rather than on the
-    boundary. Small cushion against clock skew between client and
-    server.
+**Part 3 — why retry is in the DataSource, not the agent.**
 
-  → **`retryCeilingMs = 20_000`** (default, line 136). Cap on any single
-    retry wait. Without this, an exponential backoff at retry 3 would
-    be 40s, blowing the route's 60s budget.
+The agent layer sees `dataSource.callTool` as a black box: either it returns a result, or it throws. The agent doesn't know about rate limits, doesn't know about retries, doesn't know `lastCallAt`. Hiding this complexity in the DataSource means:
 
-  → **`maxRetries = 3`** (default, line 131). Bounded. The comment
-    notes: *"Latency note: against the 60s route budget (app/api/agent),
-    maxRetries=3 at ~10s each can cost ~30s on a single call, so the
-    cap stays low by default."*
+  1. **Agents are testable in isolation.** The agent tests use a mocked DataSource that returns immediately; no need to simulate rate limits.
+  2. **One place to evolve the retry logic.** Switch from parsed-window to true exponential backoff? One file change.
+  3. **Cancellation works cleanly.** The `AbortSignal` threads through every sleep + every retry. A client navigating away interrupts mid-retry.
 
-**Proactive spacing** (line 130, 190-194). Separately from retry, the
-data source enforces a `minIntervalMs` between calls (default 200ms,
-not the 10s server-side window — that's a different budget):
+**Part 4 — backpressure (not explicitly implemented).**
 
-```typescript
-private async liveCall(name, args, signal): Promise<unknown> {
-  const elapsed = Date.now() - this.lastCallAt;
-  if (elapsed < this.minIntervalMs) {
-    await new Promise((r) => setTimeout(r, this.minIntervalMs - elapsed));
-  }
-  // ... transport call
-}
-```
+Backpressure in the classical sense is "when the queue grows beyond a threshold, reject new requests." This codebase has no queue — agent loops are synchronous within a request, and each request gets its own session. The implicit backpressure is the request budget (300s `maxDuration` on `/api/briefing` and `/api/agent`):
 
-This is *proactive* — it ensures calls are spread, not bursty — but
-not enough on its own to stay under the server's 1-per-10s limit.
-The retry ladder absorbs the actual rate-limit events.
+  → If the rate-limit retry ladder eats too much wall-clock, the route hits 300s and Vercel terminates.
+  → The per-phase log fires in `finally` so the timeout is observable.
 
-**Cache** (lines 122, 144-152, 185-186). 60-second TTL on every
-successful tool-call result. Repeat calls within 60s return from
-cache without hitting the server. This is the single biggest reducer
-of rate-limit pressure — the agent often re-queries during a loop
-(checking volume, then re-checking after a breakdown query), and
-cache absorbs the repeats.
+This is "fail at the boundary, observable in logs" rather than queue-based backpressure. Acceptable for the current volume; would need a real queue if scaling to many concurrent users per session.
 
-**The whole ladder in motion** for a hypothetical scenario where the
-model burst-calls 3 tools in 1 second:
+**Part 5 — Anthropic rate limits (not currently a concern).**
 
-  1. Call 1 — fresh — runs → cached, lastCallAt = T.
-  2. Call 2 — fresh, 200ms after T → liveCall waits 0ms (200ms
-     elapsed), runs → rate-limit error.
-  3. Retry 1 for call 2 — parsed hint says "1 per 10 second" → wait
-     10s + 500ms → call succeeds, cached.
-  4. Call 3 — happens after call 2's 10s wait → 10.2s after T,
-     `minIntervalMs` elapsed → runs immediately → maybe rate-limited
-     again (depends on server state).
-
-In practice, the cache absorbs most repeats, so the rate-limit pressure
-is much lower than the worst case. A typical 6-call investigation has
-maybe 1-2 rate-limit retries; the route lands in 60-90s instead of
-the worst-case 180s+.
+Anthropic has its own rate limits (tokens per minute, requests per minute per model). At this codebase's volume, the limits aren't pressing. The adapter at `lib/agents/aptkit-adapters.ts:42` doesn't have proactive spacing for Anthropic calls — if a future high-volume scenario lands, the same pattern (`liveCall` with spacing) would apply.
 
 ### Move 3 — the principle
 
-**Honor the server's stated wait. Fall back to exponential backoff
-only when the server didn't say. Cap every wait at a ceiling that
-keeps you inside your overall budget. Add small buffers for clock
-skew.** The pattern is universal across rate-limited HTTP APIs (Stripe,
-GitHub, Twitter); MCP servers happen to encode the wait inline in the
-error text instead of in a `Retry-After` header.
+**Be polite by default; recover gracefully when politeness fails.** Proactive spacing is the cheap defense (always pay 100ms-1100ms latency); retry is the expensive defense (only pays cost when the cheap defense failed). Layered together, the agent layer never sees a rate limit — the DataSource absorbs it.
 
-## Primary diagram
+## Primary diagram — the full recap
 
 ```
-  The full retry ladder for one tool call
+  Rate-limit defense in BloomreachDataSource
 
-  callTool(name, args, options)
+  agent.callTool(name, args)
        │
        ▼
-  cache hit?
-       │
-  ┌────┴────┐
-  │ yes     │ no
-  ▼         ▼
-  return    enforce minIntervalMs spacing
-  cached    │
-            ▼
-         liveCall → transport → MCP server
-            │
-            ▼
-         result. isRateLimited?
-            │
-       ┌────┴────┐
-       │ no      │ yes, retries < maxRetries
-       ▼         ▼
-       cache    parse Retry-After hint
-       result    │
-       return    ▼
-                hint? hint + 500ms : retryDelayMs * 2^retry
-                    │
-                    ▼
-                cap at retryCeilingMs (20s)
-                    │
-                    ▼
-                sleep
-                    │
-                    ▼
-                liveCall again → loop
-                    │
-                    ▼
-                if retries == maxRetries:
-                    return last result (still error)
-
-       finally: errors NOT cached
-       (line 179-181 — don't poison the cache)
+  ┌─ Check cache (60s TTL) ─────────────────────────────────┐
+  │  hit?  → return { result, durationMs:0, fromCache:true }│
+  │  miss? → continue                                       │
+  └──────────────────────┬──────────────────────────────────┘
+                         │
+                         ▼
+  ┌─ Proactive spacing ─────────────────────────────────────┐
+  │  elapsed = Date.now() - lastCallAt                       │
+  │  if elapsed < 1100ms: sleep(1100 - elapsed)              │
+  └──────────────────────┬──────────────────────────────────┘
+                         │
+                         ▼
+  ┌─ Live call ─────────────────────────────────────────────┐
+  │  transport.callTool(name, args, { signal })              │
+  │  on error: throw McpToolError                            │
+  │  on success: return result                               │
+  └──────────────────────┬──────────────────────────────────┘
+                         │
+                         ▼
+  ┌─ Retry ladder (when result is rate-limited) ────────────┐
+  │  parse window from error text                            │
+  │  wait = min(hint + 500ms, exponential backoff, 20s cap) │
+  │  retry up to 3 times                                     │
+  │  each retry waits, then loops to "Live call"             │
+  └──────────────────────┬──────────────────────────────────┘
+                         │
+                         ▼
+  ┌─ Cache write (success only) ────────────────────────────┐
+  │  if !isError: cache.set(key, { result, expiresAt + 60s })│
+  └──────────────────────┬──────────────────────────────────┘
+                         │
+                         ▼
+  return { result, durationMs, fromCache: false }
 ```
 
 ## Elaborate
 
-The "parse Retry-After from error text" pattern is specific to MCP-
-shaped servers that wrap errors in tool-call envelopes. For standard
-HTTP APIs, `Retry-After` is a header and parsing is trivial. The
-choice here is forced by the protocol shape.
+**Why the codebase doesn't use a global request queue.** Two reasons:
 
-The decision to NOT cache errors (line 179-181) is important. Without
-it, a single rate-limit response would be cached for 60s, locking out
-the tool for that period. By skipping the cache on `isError: true`,
-the retry-after sleep is the only blocker, and the next call (after
-the wait) hits the server fresh.
+  1. **Per-session state.** The `lastCallAt` lives on the `BloomreachDataSource` instance, which is per-request. Two concurrent users have two separate spacing timers, both correctly enforcing 1.1s per-session. A global queue would centralize this but require shared state across instances.
+  2. **Bloomreach rate-limits per USER, not per app.** Two users in different Bloomreach workspaces have independent rate limits server-side. Per-user spacing (which is what per-session gives us) is structurally right.
 
-`maxRetries = 3` is conservative. Could be raised to 5 if the route
-budget allowed — currently `300s` Vercel Pro budget, the diagnostic
-loop typically uses ~60-90s, so there's headroom. The cap is
-specifically conservative because *each* retry could burn 10s, and
-six retries across a multi-tool-call agent loop could add 60s to a
-single investigation.
+The cost: two users in the SAME workspace can each issue calls inside their own 1.1s window, totaling ~2 calls/sec across them. Bloomreach may 429 the second one. Retry handles it; the cost is wall-clock latency on the second user's calls.
+
+**Why hint-from-error wins over exponential backoff.** When the server tells you exactly when to come back ("retry after 12 seconds"), waiting the stated window is more accurate than exponential backoff. The backoff is the fallback for when the server's error message doesn't carry a parseable hint. Two shapes are parsed; if neither matches, the codebase falls back to `retryDelayMs = 10_000` (the observed Bloomreach penalty window).
+
+**The 20s ceiling math.** With `maxRetries = 3` and `retryCeilingMs = 20_000`, the worst-case single-call wall-clock is ~60s (3 retries × 20s each). For a 6-call monitoring scan, the worst case is bounded but real: 6 × 60s = 360s of retry wall-clock IF every call max-retries. Against a 300s route budget, this could fail. The actual observation is rare (the 60s cache absorbs repeats; the 1.1s spacing keeps most calls below the threshold). But it's a known edge case — surfaced via the per-phase log when it happens.
 
 ## Project exercises
 
-### Exercise — surface retry events on the trace wire
+### Exercise — Cross-session rate limiter using Vercel KV
 
-  → **Exercise ID:** `study-ai-eng-06-04.1`
-  → **What to build:** Add a `{ type: 'retry', toolName, attemptN,
-    waitMs, hintMs }` event emitted from `BloomreachDataSource.callTool`
-    via the trace sink. UI shows a "rate limited, waiting Ns" indicator
-    inline in the tool call row.
-  → **Why it earns its place:** Today rate-limit retries are invisible
-    — the tool just takes longer. Surfacing them tells the user "this
-    isn't broken, the alpha server is slow."
-  → **Files to touch:** `lib/data-source/bloomreach-data-source.ts`
-    (accept a trace callback option), `lib/agents/aptkit-adapters.ts`
-    (pass it through), `lib/mcp/events.ts`, route's `hooksFor`,
-    `components/investigation/ToolCallBlock.tsx`.
-  → **Done when:** A live investigation that hits rate-limit retries
-    shows "retrying in 10s..." inline in the tool call row.
-  → **Estimated effort:** `1–4hr`
-
-### Exercise — add backpressure on the route's parallel request handling
-
-  → **Exercise ID:** `study-ai-eng-06-04.2`
-  → **What to build:** Vercel scales horizontally — concurrent requests
-    from the same user could each hit the adapter's
-    (`BloomreachDataSource`) per-instance rate-limit handling, but they
-    don't coordinate across instances. Add a per-user concurrency
-    semaphore (e.g. via
-    Vercel KV or Upstash Redis) that limits one user to N concurrent
-    `/api/agent` calls at a time. Excess requests get 429'd at the
-    route with a hint to retry.
-  → **Why it earns its place:** Cross-instance coordination is what
-    real backpressure looks like in serverless. Demonstrates "I know
-    how to bound concurrency at the platform layer, not just the
-    process layer."
-  → **Files to touch:** new `lib/middleware/backpressure.ts`,
-    `app/api/agent/route.ts` (apply middleware), env vars for KV
-    connection.
-  → **Done when:** Three concurrent `/api/agent` requests from the
-    same session — two run, one gets 429 with a retry-after.
-  → **Estimated effort:** `1–2 days`
+  → **Exercise ID:** B6.4
+  → **What to build:** Add a cross-session rate limiter that coordinates per-Bloomreach-workspace spacing across Vercel instances. Use Vercel KV to store `lastCallAt` per `workspace_id`. Before each live call, check KV; if another instance called <1.1s ago, sleep. Falls back to in-process spacing if KV is unreachable.
+  → **Why it earns its place:** today, two concurrent users in the same Bloomreach workspace can each independently respect 1.1s spacing but together exceed it. The defense is retry, which costs wall-clock. Coordinating across instances eliminates the burst at the source.
+  → **Files to touch:** `lib/data-source/bloomreach-data-source.ts` (extend `liveCall` to consult a shared store before the in-process timer), new `lib/state/rate-limiter.ts` (the Vercel KV wrapper), `test/data-source/rate-limiter.test.ts` (cover in-process fallback when KV is down).
+  → **Done when:** simulated concurrent calls from two instances respect a shared 1.1s window, the in-process fallback path works when KV is unreachable, and the per-call telemetry surfaces whether the rate-limit check came from KV or local.
+  → **Estimated effort:** 1–2 days.
 
 ## Interview defense
 
-**Q: How does this codebase handle rate limits?**
+**Q: "How do you handle rate limits?"**
 
-Bloomreach's alpha MCP server enforces "1 per 10s" globally per user.
-`BloomreachDataSource.callTool` has explicit handling: detect the
-rate-limit error (regex on the result text), parse the server's
-stated wait (`Retry-After ~X second(s)` or `per X second`), sleep,
-retry. Up to 3 retries, each capped at 20s.
+Three layered defenses inside `BloomreachDataSource`. First, a 60s response cache absorbs duplicates — most "calls" never reach the server. Second, proactive spacing — `~1.1s` between live calls, enforced via `lastCallAt` tracking. Third, parsed-window retry when a 429 slips through — read the server's stated penalty window from the error text (two shapes observed: `"Retry after ~12 second(s)"` and `"rate limit reached (1 per 10 second)"`), wait that long + a 500ms buffer, retry up to 3 times, every wait capped at 20s. Agents never see rate limits — they hit the DataSource, the DataSource handles it.
 
-```
-  detect → parse hint → wait (hint+500ms or backoff) → retry
-  cap retries at 3
-  cap each wait at 20s
-  parallel: 60s cache absorbs repeats
-  parallel: 200ms proactive spacing between calls
-```
+The latency cost: every retried call adds 10-20s, but the cache and proactive spacing keep retries rare.
 
-Cache is the load-bearing reducer of pressure: most agent loops
-re-query data within 60s of the previous query, so the cache absorbs
-the bulk of would-be repeat calls.
+*Anchor: "Cache + proactive spacing + parsed-window retry, all inside `BloomreachDataSource`. Three layers compose; agent never sees rate limits."*
 
-**Anchor line:** "Parse the server's stated wait first; exponential
-backoff is the fallback. Cap each wait at 20s to keep the route
-budget."
+**Q: "What's the edge case in your retry logic?"**
 
-**Q: Why not cache errors?**
+Worst case: 6 tool calls × 3 retries × 20s wait each = 360s of pure retry wall-clock. Against the 300s Vercel route budget, that route fails. In practice, the cache absorbs duplicates and the proactive spacing keeps most calls under threshold, so the worst case is rare — but it's known. The per-phase log fires in `finally` so when a route does hit 300s, the phase log shows which calls hit retries. Right move when this becomes a real problem is a circuit breaker (`B4.6`) — fast-fail when the server's clearly unhappy, instead of grinding through 3 retries × 20s.
 
-If an error result gets cached, every subsequent call sees the cached
-error for 60s — locks out the tool. By skipping cache on
-`isError: true`, the retry-after sleep is the only blocker, and the
-next call after the wait hits the server fresh and (probably)
-succeeds. The comment in code at line 179-181 calls this out
-explicitly.
-
-**Anchor line:** "Errors poison the cache. Skipping them is what
-makes the retry ladder actually recover."
+*Anchor: "Bounded but real worst case (~6 minutes); circuit breaker is the next layer when it becomes a real problem."*
 
 ## See also
 
-  → `04-agents-and-tool-use/02-tool-calling.md` — the layer ABOVE this
-    (how tool calls get dispatched)
-  → `04-agents-and-tool-use/06-error-recovery.md` — the layer that
-    catches what slips through the retry ladder
-  → `05-retry-circuit-breaker.md` — the next pattern (circuit breaker
-    on top of retry — Case B in this codebase)
+  → `01-llm-caching.md` — the 60s cache that absorbs most repeats
+  → `05-retry-circuit-breaker.md` — the retry deep walk + the missing circuit breaker
+  → `04-agents-and-tool-use/06-error-recovery.md` — adjacent: how the agent loop handles the post-retry result
+  → `study-system-design/10-rate-limit-aware-mcp-client.md` — the same logic from the system-design lens

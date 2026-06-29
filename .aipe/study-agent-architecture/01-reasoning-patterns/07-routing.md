@@ -1,119 +1,75 @@
 # Routing
 
-*Industry name: routing / intent classification / dispatcher — Industry standard.*
+**Industry standard.** Pick the right handler before committing to a loop. The bridge from single-agent reasoning to multi-agent orchestration.
 
-Pick the right handler before committing to a loop. This repo uses TWO routers — a *URL-based heuristic router* in `app/api/agent/route.ts` (the `?step=` param picks the agent class) and an *LLM-based intent router* in `lib/agents/intent.ts` (a cheap haiku call labels free-form questions).
+## Zoom out, then zoom in
 
-## Zoom out — where this concept lives
-
-Both routers live at the service layer, in front of the agent layer. The URL router decides which agent runs; the intent router labels a question so the downstream agent's prompt has the right framing.
+Routing sits *in front of* the agent loop. It's a single-shot decision (or a cascade of single-shot decisions) that picks which loop runs.
 
 ```
-  Where routing lives in blooming insights
+  Zoom out — where this concept lives
 
-  ┌─ UI layer ──────────────────────────────────────────────┐
-  │  POST /api/agent?step=diagnose       ←  URL is the route│
-  │  POST /api/agent?q=...               ←  no step; free-form
-  └─────────────────────┬───────────────────────────────────┘
-                        ▼
-  ┌─ Service / Routing layer ───────────────────────────────┐
-  │  app/api/agent/route.ts                                  │
-  │   ┌─ heuristic router (URL) ──────────────────────────┐ │
-  │   │  if (step === 'recommend')  → RecommendationAgent │ │ ← we are here
-  │   │  if (step === 'diagnose')   → DiagnosticAgent     │ │
-  │   │  if (q && !insightId)       → ★ intent router ★   │ │
-  │   └────────────────────────────────────────────────────┘ │
-  │                          ↓ q + intent                    │
-  │   ┌─ LLM router (intent.ts) ───────────────────────────┐│
-  │   │  classifyIntent(haiku) → 'monitoring' | 'diagnostic'│
-  │   │                        | 'recommendation'           │ │
-  │   └─────────────────────────────────────────────────────┘│
-  └──────────────────────────────────────────────────────────┘
-                             ▼ (single agent class)
-  ┌─ Agent layer ───────────────────────────────────────────┐
-  │  QueryAgent  ← receives `intent` to frame the answer    │
-  └──────────────────────────────────────────────────────────┘
+  ┌─ UI layer ──────────────────────────────────────┐
+  │  QueryBox  →  fetch /api/agent?q=...             │
+  └────────────────────────────┬────────────────────┘
+                               │
+  ┌─ Orchestration layer ─────▼────────────────────┐
+  │  ★ classifyIntent (the router) ★                │ ← we are here
+  │  (Haiku, single-shot, no loop)                   │
+  └────────────────────────────┬────────────────────┘
+              ┌──────────────────┴──────────────────┐
+              ▼ intent=query                        ▼ intent=diagnostic
+        QueryAgent.answer                  (today: routes to QueryAgent;
+        (one ReAct loop)                    diagnostic intent is for
+                                            future routing, not yet wired)
 ```
+
+This repo runs *one* level of routing — the intent classifier in `lib/agents/intent.ts`. There's no second level (no supervisor picking which sub-agent to run inside an agent), because the orchestration above the agents is deterministic code, not an LLM router.
 
 ## Structure pass
 
-The axis: **what does each router decide?**
+Layers: heuristic router (fast, deterministic — regex, rules) → LLM router (slower, model-decided, for ambiguous input) → the agent that handles the matched route.
 
-```
-  URL router (heuristic, deterministic):
-  ──────────────────────────────────────
-  → which AGENT CLASS to instantiate
-  → DiagnosticAgent vs RecommendationAgent vs QueryAgent
-  → no LLM call; just `if (step === 'X')`
-  → cost: zero tokens, zero latency
+**Axis traced — "what decides the route?":** in this repo it's the model (Haiku) for one decision; everything else is code. There's no heuristic-first cascade.
 
-  Intent router (LLM, classifier):
-  ──────────────────────────────────────
-  → which FRAMING to use for the QueryAgent's prompt
-  → does NOT pick a different agent — picks the prompt's `{intent}` slot
-  → one haiku call, no tools
-  → cost: ~1K tokens, ~300ms
-
-  Both are routing patterns. Different decisions, different costs.
-```
+**Seam:** the typed `Intent` value (`'query' | 'diagnostic'`) is the handoff between the router and the downstream agent dispatch. The router's job is to produce that value; the dispatcher's job is to wire the right agent based on it.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-Heuristic-first then LLM-fallback is the production answer. You know the React pattern of "render a fast loading skeleton, then hydrate with the real data" — same shape. Cheap deterministic dispatch for the predictable cases (the URL parameter), LLM call only when the input is ambiguous (free-form Q&A).
+You know the pattern from a frontend `Router` component — match the URL, dispatch to the right page component. The agent version is the same shape, with a model where the URL matcher would be: the model reads free-form input and emits a typed intent the dispatcher can switch on.
 
 ```
-  Routing — heuristic first, LLM fallback
+  Routing — the model as a typed dispatch
 
-  Input
-    │
-    ▼
-  ┌─────────────────────┐
-  │ Heuristic router    │ fast, deterministic
-  │ (URL ?step=…)       │ (this repo: a URL param)
-  └─────────┬───────────┘
-            │ no clear match
-            │ (e.g. free-form Q&A with no step)
-            ▼
-  ┌─────────────────────┐
-  │ LLM router          │ classify intent
-  │ (claude-haiku-4-5)  │ → 'monitoring' | 'diagnostic'
-  └─────────────────────┘   | 'recommendation'
+  user types: "what's our top product this week?"
+          │
+          ▼
+  ┌─ classifyIntent (Haiku) ────────────────────────┐
+  │  one model call, no tools, no loop              │
+  │  system prompt: "classify this question…"        │
+  │  output: 'query' | 'diagnostic'                 │
+  └──────────────────────┬──────────────────────────┘
+                         │  intent
+                         ▼
+  ┌─ deterministic dispatch (route handler) ─────────┐
+  │  switch (intent):                                │
+  │    case 'query': run QueryAgent                  │
+  │    case 'diagnostic': … (no path yet)            │
+  └──────────────────────────────────────────────────┘
 ```
 
-### Move 2 — walk both routers
+The model isn't in the loop after the routing decision. The dispatch is plain `if`/`switch` code in `app/api/agent/route.ts:247-260`.
 
-**The URL router lives in `app/api/agent/route.ts`.**
+### Move 2 — step by step
 
-The relevant lines (paraphrased from the file):
+#### The classifier — one model call, no tools, no loop
 
-```typescript
-// app/api/agent/route.ts:113-119 — read the route params
-const insightId = req.nextUrl.searchParams.get('insightId');
-const q = req.nextUrl.searchParams.get('q')?.trim() || null;
-const stepParam = req.nextUrl.searchParams.get('step');
-const step: Step | null = stepParam === 'diagnose' || stepParam === 'recommend' ? stepParam : null;
+Open `lib/agents/intent.ts`:
 
-// app/api/agent/route.ts:247 — first branch: free-form query
-if (q && !insightId) {
-  // intent router runs here, then QueryAgent
-}
-
-// app/api/agent/route.ts:267 — branch on step
-if (step === 'recommend') { /* RecommendationAgent only */ }
-else { /* DiagnosticAgent */ }
-if (step !== 'diagnose') { /* RecommendationAgent */ }
-```
-
-What this is: pure TypeScript `if`/`else` deciding which agent class to construct. No LLM involved. The URL is the dispatch key.
-
-**The LLM router lives in `lib/agents/intent.ts`.**
-
-The whole file is 39 lines. Here's the live entry point:
-
-```typescript
-// lib/agents/intent.ts:16-38
+```ts
+// lib/agents/intent.ts:21-38
 const CLASSIFIER_MODEL = 'claude-haiku-4-5-20251001';
 
 export async function classifyIntent(
@@ -127,7 +83,7 @@ export async function classifyIntent(
       anthropic,
       'coordinator',
       sessionId,
-      CLASSIFIER_MODEL,
+      CLASSIFIER_MODEL,           // ← Haiku, not Sonnet
       'agents/intent:classifyIntent',
     ),
     query,
@@ -136,101 +92,129 @@ export async function classifyIntent(
 }
 ```
 
-What this is: a single LLM call to a cheap-and-fast model (`claude-haiku-4-5-20251001`), classifying the query into one of three intents. NO tools, NO loop — just classification.
+Three properties matter here:
 
-The result flows into the QueryAgent's prompt as the `{intent}` slot — from `@aptkit/prompts/query.d.ts`:
+1. **Haiku, not Sonnet.** Routing decisions are cheap; the classifier model is the small/fast one. The agent that handles the route uses the bigger model. Cost ratio is roughly 10x — Haiku at ~$0.001/1K input tokens vs Sonnet at ~$0.003/1K + Haiku is faster end-to-end.
+2. **No loop.** `classifyAptKitIntent` (from `@aptkit/core`) is single-shot — one `model.complete` call, parse the output, return. No `runAgentLoop`. The skeleton from `02-agent-loop-skeleton.md` is the same shape with `maxTurns=1`.
+3. **Returns a typed value.** `Intent` is `QueryIntent` from AptKit — a small union. `parseIntent` (line 12 of `intent.ts`) handles the case where the model emits something off-format, defaulting to `'diagnostic'`. That default is the "fail-open" choice — when the classifier is uncertain, route to the more capable agent (the one with broader tools).
 
-> "The user's question has been classified as {intent}: monitoring = what changed / what's new; diagnostic = why did something happen; recommendation = what should I do. Use that classification to frame your answer, but answer the actual question the user asked."
+#### The dispatch — deterministic `if` code
 
-The intent doesn't pick a different agent — the QueryAgent handles all three intents — it frames the answer.
+```ts
+// app/api/agent/route.ts:247-260 (abridged)
+if (q && !insightId) {
+  req.signal.throwIfAborted();
+  const intent = await classifyIntent(anthropic, q, sid, req.signal);
+  stepFor('coordinator', 'thought', `interpreting your question as a ${intent} query…`);
+  const queryAgent = new QueryAgent(anthropic, dataSource, schema, allTools, sid);
+  const answer = await queryAgent.answer(q, intent, { ...hooksFor('coordinator'), signal: req.signal });
+  stepFor('coordinator', 'conclusion', answer);
+  send({ type: 'done' });
+  return;
+}
+```
 
-**Why split routing across two layers?**
+Today the dispatch is "always run QueryAgent, but pass the intent down so the agent's prompt can adapt to it." This is route-but-don't-fork: the same agent class handles both intents; the intent flavors the prompt inside `QueryAgent.answer` (line 25 of `lib/agents/query.ts`).
 
-The investigation flow has a predictable URL shape — the user clicks a card, goes to step 2, then step 3. The URL already knows which step. Burning an LLM call to re-classify "the user is on the diagnose page" would be waste. The URL router handles it for free.
+A fuller routing implementation would dispatch to different agent classes per intent (e.g. `case 'diagnostic': run DiagnosticAgent against a synthesized anomaly`). The repo doesn't yet — the QueryBox is the only free-form-input entry point and the QueryAgent covers both shapes with its 33-tool allowlist.
 
-The free-form Q&A flow has no predictable shape — the user types whatever they want. Here, the heuristic router has nothing to dispatch on, so it falls through to the LLM router. Production pattern in action: heuristic at the front for the high-volume predictable routes, LLM at the back for the ambiguous ones.
+#### The bridge to multi-agent
+
+In a single-agent system, routing picks a *tool* (or here, a flavor of prompt). In a multi-agent system, the same pattern picks which *agent* handles the request — that's the supervisor's core job. The skill transfers directly: `classifyIntent` today picks one agent's prompt flavor; a supervisor in a multi-agent system would pick which agent to dispatch to.
+
+```
+  Routing's role in two topologies
+
+  Single-agent (today):                Multi-agent (future):
+
+  input ──► classify ──► agent         input ──► supervisor (classifies)
+                          ▲                            │
+                          │                       ┌────┼────┐
+                  one agent always                ▼    ▼    ▼
+                  receives the                  agent agent agent
+                  matched intent                  A    B    C
+```
+
+The supervisor IS a router that also synthesizes — it picks who runs, the picked agent runs, the supervisor merges the result. The repo doesn't have this layer yet (orchestration is deterministic code, not a supervisor). See `03-multi-agent-orchestration/02-supervisor-worker.md`.
+
+#### The production pattern — heuristic at the front, LLM at the back
+
+This repo doesn't have a heuristic-first layer, but the production pattern is worth knowing: a regex or rule-based router handles the high-volume predictable routes (e.g. anything matching `/^show me top \w+$/` → `query` intent, no model call needed), and the LLM router handles the long tail of ambiguous phrasings. The win is cost — for an interface with 1000 queries/day, if 80% match a heuristic, you've saved 800 classifier calls. The cost — adding the heuristic — is one regex table.
+
+For this repo's QueryBox volume (low; one user at a time during a demo), the heuristic layer isn't worth adding. The Haiku classifier costs ~$0.0001 per call; the engineering cost of maintaining a regex table exceeds the model cost at this volume.
 
 ### Move 3 — the principle
 
-Routing is the bridge from single-agent to multi-agent: in a single-agent system it picks a tool; in a multi-agent system it picks an agent. The cost story is always "is this dispatch worth an LLM call?" When the answer is no (URL param, MIME type, file extension), use the heuristic. When the answer is yes (free-form text the user typed), use the LLM — and use the cheapest model that can do the classification, because routing is hot-path on every request.
+**Routing is the cheapest way to compose capabilities.** Instead of building one mega-agent that handles every input type with one giant prompt and one bloated tool allowlist, you build N small agents each specialized for one input type and put a router in front. The router's cost is one cheap model call; each downstream agent is simpler, smaller, and easier to test. The interview-grade move: lead with the routing decision when describing an agent system, not the agents. The routing is what makes the agents composable.
 
 ## Primary diagram
 
-Both routers in action across the two flows the repo supports:
-
 ```
-  Routing in blooming insights — two flows, two routers
+  Routing in the QueryBox path — one shot, then the agent
 
-  Flow 1: investigation (heuristic router only)
-  ─────────────────────────────────────────────
-  click card → /api/agent?insightId=X&step=diagnose
-                                    │
-                                    ▼
-                          ┌────────────────────┐
-                          │ URL router (route) │
-                          │  step==='diagnose'  │
-                          └─────────┬──────────┘
-                                    ▼
-                            DiagnosticAgent
-                            (no intent classification needed)
-
-  Flow 2: free-form Q&A (heuristic falls through to LLM router)
-  ─────────────────────────────────────────────────────────────
-  type question → /api/agent?q=...&step=null
-                            │
-                            ▼
-                  ┌────────────────────┐
-                  │ URL router         │
-                  │  step===null       │ → "fall through to intent"
-                  │  q && !insightId   │
-                  └─────────┬──────────┘
-                            ▼
-                  ┌────────────────────┐
-                  │ LLM intent router  │
-                  │  haiku, no tools   │
-                  │  ~300ms, ~1K tokens│
-                  └─────────┬──────────┘
-                            ▼ intent: 'monitoring'|'diagnostic'|'recommendation'
-                  ┌────────────────────┐
-                  │ QueryAgent.answer  │
-                  │ (intent in prompt) │
-                  └────────────────────┘
+  ┌─ UI ────────────────────────────────────────────────────────┐
+  │  QueryBox  →  GET /api/agent?q=<encoded query>              │
+  └─────────────────────────────┬───────────────────────────────┘
+                                │
+                                ▼
+  ┌─ /api/agent route handler ─────────────────────────────────┐
+  │  if (q && !insightId):                                      │
+  │    req.signal.throwIfAborted()                              │
+  │                                                              │
+  │    ┌─ classifyIntent (Haiku, single call) ──────────────┐   │
+  │    │  AnthropicModelProviderAdapter                       │   │
+  │    │   ─► claude-haiku-4-5-20251001                        │   │
+  │    │  one model.complete, no tools                        │   │
+  │    │  output: 'query' | 'diagnostic'                      │   │
+  │    │  (parseIntent defaults to 'diagnostic' on parse fail)│   │
+  │    └────────────────────┬──────────────────────────────────┘   │
+  │                         │  intent                                │
+  │                         ▼                                        │
+  │    ┌─ dispatch (today: always QueryAgent, pass intent) ─┐    │
+  │    │  new QueryAgent(...).answer(q, intent, hooks)        │    │
+  │    │   ─► runAgentLoop with 33-tool allowlist              │    │
+  │    │  intent flavors the system prompt inside QueryAgent  │    │
+  │    └────────────────────┬──────────────────────────────────┘    │
+  │                         │  answer                                 │
+  │                         ▼                                         │
+  │    stepFor('coordinator', 'conclusion', answer)                  │
+  │    send({ type: 'done' })                                        │
+  └──────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-Routing as a named pattern shows up everywhere LLMs touch product UX. The split between heuristic-front and LLM-back is the production wisdom from teams who tried "just put an LLM in front" and watched their bill explode — most user requests have predictable shape (a URL param, a referrer, a session state) that doesn't need a language model to disambiguate. Burning the haiku call only when the heuristic has nothing to say is the cheap path.
+The routing pattern shows up at three altitudes in a mature agent system:
 
-The model choice for the LLM router is its own little decision. The job is classification, not generation — a small, fast model (Haiku, GPT-4o-mini) does it for ~10x less than the production model. This repo uses `claude-haiku-4-5-20251001` for the intent classifier specifically because its job is "pick one of three labels," which is closer to a `String -> Enum` cast than a reasoning task.
+1. **Above the agents** (covered above) — pick which agent runs.
+2. **Inside an agent's loop** — the model picks which tool to call. That's already what ReAct's `tool_use` block is. The model is routing per-turn.
+3. **Inside a tool** — the called tool might itself route between sub-tools or data sources. The MCP layer in this repo is a single source so this altitude doesn't apply, but a multi-source retrieval router (vector DB + SQL + web search) would be exactly this.
 
-The next step past this pattern is *retrieval routing* (`../02-agentic-retrieval/03-retrieval-routing.md` — not in this repo) where the router decides which knowledge source to query. The same heuristic-first principle applies there.
+All three are the same pattern — typed input, typed routing decision, typed dispatch — at different altitudes.
+
+The classifier model choice matters more than people credit. A common mistake: use the same Sonnet model for routing that you use for the agent. That doubles the per-request cost for no quality gain — routing is a coarse decision (5-10 categories typical) that a small model handles fine. The repo's choice of Haiku for the classifier is the right one: the savings compound over volume.
+
+The "fail-open" default in `parseIntent` (defaulting to `'diagnostic'` when the model emits an unrecognized intent) is a small but load-bearing call. The alternative would be fail-closed: throw an error and surface a 500. Fail-open lets the request through to a capable agent; the worst case is the request goes to a slightly-wrong-but-still-tooled agent, not a hard failure. For user-facing agent systems this is almost always the right call.
 
 ## Interview defense
 
-**Q: "Why two routers and not one LLM that dispatches everything?"**
+> **Q: Walk through how the QueryBox handles a free-form question.**
+>
+> Three stages. UI fires `GET /api/agent?q=...`. The route handler in `app/api/agent/route.ts:247-260` runs `classifyIntent`, which is a single-shot Haiku call that maps the question to `'query' | 'diagnostic'`. Then it dispatches: today, always to `QueryAgent` (`lib/agents/query.ts`), with the intent passed down so the agent's prompt can adapt. `QueryAgent.answer` runs `runAgentLoop` with the broad 33-tool allowlist, the model picks which MCP tools to call, and the final text streams back as a `reasoning_step` event of kind `conclusion`. The whole path is two model invocations — one Haiku for the intent, one or more Sonnet calls inside the agent loop.
+>
+> Anchor: `lib/agents/intent.ts:21-38` (classifier) → `app/api/agent/route.ts:247-260` (dispatch) → `lib/agents/query.ts` (agent).
 
-A: Cost and latency. The investigation flow has a deterministic URL shape — the user clicked a card, the URL knows they're on the diagnose step. Routing that through an LLM would burn a haiku call (~300ms, ~1K tokens) for free information. The URL router handles it in TypeScript with an `if`. The LLM router only runs when the input is *genuinely ambiguous* — free-form text the user typed in the QueryBox. That's the production pattern: heuristic at the front for predictable routes, LLM at the back for ambiguous ones.
+> **Q: Why is the classifier a separate Haiku call instead of just letting Sonnet handle it?**
+>
+> Cost and latency. Haiku is ~10x cheaper per token than Sonnet and meaningfully faster for short outputs. Routing is a coarse decision — the model only needs to pick between two categories — so a small model handles it fine. If we routed through Sonnet, every query would pay Sonnet pricing for the routing step plus Sonnet pricing for the answer step, doubling the cost floor. The classifier model is configurable at the `AnthropicModelProviderAdapter` constructor (`lib/agents/aptkit-adapters.ts:31-37`) so swapping isn't a code-change-the-loop operation — it's one constructor argument.
 
-The diagram I'd sketch:
-
-```
-  input
-    │
-    ▼
-  heuristic (URL ?step=…)  → if it knows, ship it (zero cost)
-    │ falls through (no match)
-    ▼
-  LLM (haiku)             → only for "what did the user actually mean"
-```
-
-Anchor: "the URL is the route in the investigation flow; the intent classifier only fires on `q && !insightId` — that's the line in `route.ts:247` where the heuristic gives up and the LLM takes over."
-
-**Q: "Why does the intent classifier not pick a different agent?"**
-
-A: Because the agent surface is one — `QueryAgent` handles all three intents (monitoring / diagnostic / recommendation). The intent is a *framing label*, not a dispatch key. The QueryAgent's prompt has an `{intent}` slot that tells it how to frame the answer; the tool grant (the union of all four agent policies' tools) is the same regardless. If we ever found that the framing wasn't strong enough — that a diagnostic-intent query needed the actual DiagnosticAgent's narrower tool grant and stricter prompt — that's when the intent classifier would graduate from "frame the prompt" to "pick the agent class." Hasn't been needed.
+> **Q: Where would routing escalate in this system?**
+>
+> Two places. First, if the QueryBox grew more intent types — "explore the schema," "build a custom anomaly category," "compare two time windows" — and each needed a meaningfully different agent (different tool allowlist, different prompt), then today's "always run QueryAgent" dispatch becomes a real `switch` over intent → agent class. Second, if the briefing flow grew dynamic ("sometimes monitor anomalies, sometimes run a deep dive on one customer segment, sometimes summarize the catalog"), the deterministic pipeline in `app/api/briefing/route.ts` becomes a supervisor that classifies the user's session intent and dispatches to one of several pipelines. The first escalation is one-level routing; the second is a supervisor-worker topology.
 
 ## See also
 
-- [`01-chains-vs-agents.md`](./01-chains-vs-agents.md) — the URL router is the chain part of the system
-- [`../03-multi-agent-orchestration/02-supervisor-worker.md`](../03-multi-agent-orchestration/02-supervisor-worker.md) — supervisor's core job is the same routing primitive at a different layer
-- [`../02-agentic-retrieval/03-retrieval-routing.md`](../02-agentic-retrieval/03-retrieval-routing.md) — routing applied to picking knowledge sources
+- → `02-agent-loop-skeleton.md` — the loop the router dispatches to (with `maxTurns=1` for the router itself)
+- → `02-agentic-retrieval/03-retrieval-routing.md` — routing applied to picking a data source
+- → `03-multi-agent-orchestration/02-supervisor-worker.md` — routing applied to picking an agent
+- → cross-reference (when generated): `study-ai-engineering`'s tool-routing file — the per-call mechanics of structured outputs for routing

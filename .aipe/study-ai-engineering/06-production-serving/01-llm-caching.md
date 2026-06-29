@@ -1,292 +1,247 @@
-# 01 — LLM caching
+# LLM caching
 
-**Subtitle:** Prompt cache / semantic cache / exact match · Industry standard (Case B)
+*Industry standard — prompt cache · semantic cache · exact-match cache*
 
-## Zoom out, then zoom in
+## Zoom out — where this concept lives
 
-**Case B.** Three cache layers, none currently active in this codebase.
-The most impactful one — **Anthropic prompt caching** — is one config
-flag away and would cut input cost on multi-turn agent loops by ~50%.
+Three cache layers in the LLM serving stack. This codebase has **one shipped** (60s response cache for tool results inside `BloomreachDataSource`) and **two not yet exercised** (Anthropic prompt caching, semantic cache for LLM answers). The honest gap: Anthropic prompt caching is the single biggest dollar lever and isn't wired.
 
 ```
-  Zoom out — three caches, three places
+  Zoom out — three cache layers, one shipped
 
-  ┌─ Browser ───────────────────────────────────────┐
-  │  (no LLM cache here)                            │
-  └──────────────────────┬──────────────────────────┘
-                         │
-  ┌─ Blooming server ────▼──────────────────────────┐
-  │  ┌─ semantic cache: NOT EXERCISED ────────────┐ │  ← Case B
-  │  │  (would embed query, look up similar)      │ │
-  │  └─────────────────────────────────────────────┘ │
-  │  ┌─ exact-match cache: NOT EXERCISED ─────────┐ │  ← Case B
-  │  │  (would hash input, return cached output)  │ │
-  │  └─────────────────────────────────────────────┘ │
-  └──────────────────────┬──────────────────────────┘
-                         │ HTTPS messages.create
-                         ▼
-  ┌─ Anthropic ─────────────────────────────────────┐
-  │  ┌─ prompt cache: NOT EXERCISED ──────────────┐ │  ← Case B
-  │  │  cache_control: {type: 'ephemeral'} on     │ │   (biggest lever)
-  │  │  system block → ~90% cost reduction on     │ │
-  │  │  cached prefix tokens on turn 2+           │ │
-  │  └─────────────────────────────────────────────┘ │
-  └─────────────────────────────────────────────────┘
+  ┌─ Anthropic prompt caching ──────────────────────────────┐
+  │  Provider-side. Cache the static prompt prefix          │
+  │  (system + tool defs + schema summary)                  │
+  │  Cost: ~10% of normal input rate for cache hits         │
+  │  STATUS: not wired                                      │
+  └─────────────────────────────────────────────────────────┘
+  ┌─ Semantic cache (your side) ────────────────────────────┐
+  │  Embed query, check if similar query answered recently   │
+  │  STATUS: not implemented; no embedder anywhere          │
+  └─────────────────────────────────────────────────────────┘
+  ┌─ ★ Tool-result cache (60s response cache) ★ ────────────┐ ← we are here
+  │  Inside BloomreachDataSource.callTool                   │
+  │  Keyed on `${name}:${JSON.stringify(args)}`              │
+  │  60s TTL, no errors cached                              │
+  │  STATUS: shipped                                        │
+  └─────────────────────────────────────────────────────────┘
 ```
 
-## Structure pass
+**Zoom in.** Three altitudes of caching — provider-side, semantic, exact. The shipped layer is exact-match on tool results, which is the load-bearing defense against Bloomreach's rate limits. The two unshipped are real dollar levers (prompt caching especially); whether and when to wire them is an open question.
 
-  → **One axis to trace — staleness tolerance.** Prompt cache is safe
-    (cached prefix is identical text, same model behavior). Semantic
-    cache is risky (similar-but-not-identical queries get the same
-    answer, may return stale data). Exact-match is medium (safe if
-    nothing relevant changed since the cache write).
+## Structure pass — layers · axes · seams
+
+**Layers:** request → cache check → live call → response → cache write.
+
+**Axis: where does each cache live?** Prompt cache: at the Anthropic API. Semantic cache: in your code, in front of the LLM. Exact tool cache: in your code, in front of the MCP server.
+
+**Seam:** each cache's lookup point. The 60s cache check is at `lib/data-source/bloomreach-data-source.ts:140-145`. The other two have NO lookup point today.
 
 ## How it works
 
 ### Move 1 — the mental model
 
+You know how CDN caches the *response* and Redis caches *function results*? Same shape applied at different altitudes in the LLM stack. Each cache layer serves a different question.
+
 ```
-  Three layers, each with different tradeoffs
+  Three caches, three questions
 
-  ┌─ Prompt cache (provider-side) ────────────────┐
-  │  Anthropic / OpenAI cache common system        │
-  │  prompts and prefix messages between your      │
-  │  calls. You pay ~10% of normal input cost      │
-  │  for cached prefix tokens.                     │
-  │                                                │
-  │  RISK: none — same exact tokens, same          │
-  │  behavior                                       │
-  │  BIGGEST LEVER for agent loops                  │
-  └────────────────────────────────────────────────┘
+  Anthropic prompt cache:
+   ──────────────────────
+   Question: "I sent this same system prompt + tools + schema
+              5 minutes ago — can I avoid paying full input cost?"
+   Saves:    ~60% of input bill on calls 2+ per session
 
-  ┌─ Semantic cache (your side) ──────────────────┐
-  │  Embed the query; if a similar query was       │
-  │  answered recently, return the cached answer.  │
-  │                                                │
-  │  RISK: stale answers if data changed; tuning  │
-  │  the similarity threshold is the whole game    │
-  └────────────────────────────────────────────────┘
+  Semantic cache:
+   ────────────────
+   Question: "Someone asked a similar question 10 minutes ago —
+              can I return the same answer?"
+   Saves:    full LLM call when there's a hit
+   Risk:     stale answers when underlying data changed
 
-  ┌─ Exact-match cache (your side) ───────────────┐
-  │  Hash the input; return cached output if      │
-  │  identical input.                              │
-  │                                                │
-  │  RISK: low — only fires on exact repeat;      │
-  │  hit rate is low because most LLM calls aren't │
-  │  exact repeats                                  │
-  └────────────────────────────────────────────────┘
+  Exact-match tool cache (the 60s one shipped here):
+   ─────────────────────────────────────────────────
+   Question: "I called execute_analytics_eql with these exact
+              args 30 seconds ago — can I avoid the rate-limited
+              round-trip?"
+   Saves:    1 MCP call + rate-limit budget
 ```
 
 ### Move 2 — the step-by-step walkthrough
 
-**Layer 1 — Anthropic prompt caching is the biggest lever and it's
-one config flag away.** Today the adapter sends `system` as a plain
-string (`lib/agents/aptkit-adapters.ts:49`):
+**Part 1 — the 60s tool-result cache (shipped).**
+
+`BloomreachDataSource.callTool` at `lib/data-source/bloomreach-data-source.ts:131-180`:
 
 ```typescript
-if (request.system) params.system = request.system;
-```
+async callTool<T = unknown>(
+  name: string,
+  args: Record<string, unknown>,
+  options: CallToolOptions = {},
+): Promise<CallToolResult<T>> {
+  const cacheKey = `${name}:${JSON.stringify(args)}`;
+  const ttl = options.cacheTtlMs ?? 60_000;
 
-To enable caching, send it as a structured array with `cache_control`:
+  if (!options.skipCache) {
+    const cached = this.cache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      return { result: cached.result as T, durationMs: 0, fromCache: true };
+    }
+  }
 
-```typescript
-if (request.system) {
-  params.system = [
-    { type: 'text', text: request.system, cache_control: { type: 'ephemeral' } },
-  ];
+  // ... live call + retry ladder ...
+
+  // Don't cache error results — they should not poison the cache.
+  if ((result as any)?.isError === true) {
+    return { result: result as T, durationMs, fromCache: false };
+  }
+
+  this.cache.set(cacheKey, { result, expiresAt: now + ttl });
+  return { result: result as T, durationMs, fromCache: false };
 }
 ```
 
-That's the whole change. The first call seeds the cache
-(`cache_creation_input_tokens > 0`); every subsequent call within the
-TTL (5 minutes for ephemeral) reads from cache
-(`cache_read_input_tokens > 0`, ~90% cheaper).
+Five things to notice:
 
-**For blooming insights, the cacheable parts are:**
-  - The system prompt (~500 tokens, identical across all turns of one
-    agent's loop).
-  - The schema summary (~1500 tokens, identical within a session).
-  - The tool definitions (~1500 tokens, identical per agent).
+  → **Key** is `${name}:${JSON.stringify(args)}`. Order-sensitive on object keys (depends on Node's JSON serialization being stable, which it is for keys defined in the same order). Same query → same key.
+  → **TTL** defaults to 60s, overrideable per-call via `cacheTtlMs`.
+  → **Errors not cached** — explicit check at the bottom. A rate-limit failure or transport error doesn't poison the cache.
+  → **`skipCache` flag** for the `/debug` "force fresh" path. Note: still writes through to cache on success (line ~170).
+  → **`fromCache: true` in the envelope** is surfaced in the UI's tool-call trace (`StatusLog` shows "from cache" tag).
 
-Total cacheable prefix per turn: ~3.5k tokens. At Sonnet rates:
-  - Normal cost: 3500 × $3/M = $0.0105 per turn
-  - Cached cost: 3500 × $0.30/M = $0.00105 per turn (cache_read)
-  - Savings per turn: $0.0094
-  - Across a 6-turn diagnostic loop: ~$0.056 saved per investigation
+**Part 2 — why 60s.**
 
-At ~5 investigations per session, that's ~$0.28 saved per session.
-For a heavily-used product, that compounds quickly.
+Two pressures:
 
-**The `cache_creation_input_tokens` field is already being logged**
-(`lib/agents/aptkit-adapters.ts:60` includes `usage` in the log, which
-contains these fields per Anthropic's API). They're always zero today
-because nothing's been marked as cacheable.
+  → **Bloomreach is rate-limited to ~1 req/s per user globally**, with retry windows up to 10s when violated. A 60s cache absorbs the "user reloads the briefing tab" case without any extra MCP traffic.
+  → **Anomaly data is slow-moving.** 60s of cache age on a "revenue last 90d" query is acceptable — the underlying numbers don't change minute-to-minute.
 
-**Layer 2 — semantic cache (Case B).** For blooming insights, the
-useful semantic-cache surface would be the QueryBox. If two users (or
-the same user in two sessions) asked semantically-equivalent questions
-("what's our purchase trend?" vs "show me purchase numbers"), a
-semantic cache could return the same answer without re-running the
-agent.
+The agent loop within a single investigation is rarely cached (the agent typically picks different tools each iteration), but cross-investigation calls within the 60s window (e.g. two users investigating the same anomaly) ARE cached.
 
-Implementation: embed the query, check vector store for similar past
-queries with cached answers, return if similarity > threshold.
-Tradeoff: tuning the threshold is the whole game. Too high (0.95+) and
-hit rate is near zero. Too low (0.7-) and you return stale or
-inappropriate answers.
+**Part 3 — prompt caching (NOT shipped).**
 
-For analytics queries where data changes (today's purchase numbers
-differ from yesterday's), semantic cache is risky — even an exact-text
-repeat should NOT use a cached answer past some TTL. Better to skip
-semantic caching for time-sensitive answers and only apply it to
-truly evergreen questions ("how does cart_update work?").
+The adapter at `lib/agents/aptkit-adapters.ts:42-52` builds the request *without* `cache_control` markers:
 
-**Layer 3 — exact-match cache (Case B).** Hash the request (system +
-messages + tools), return cached response if identical. Low hit rate
-in practice — most agent calls have at least slightly different
-context turn-to-turn. Useful for idempotent classifier calls (intent
-classify on the same query repeats often) but the gain is small.
+```typescript
+const params: Anthropic.Messages.MessageCreateParamsNonStreaming = {
+  model: this.defaultModel,
+  max_tokens: request.maxTokens ?? 4096,
+  messages: request.messages.map(toAnthropicMessage),
+};
 
-**Why these aren't built yet.** Demo mode (which is the default) hits
-no LLM at all — it replays the snapshot. Live mode is rate-limited by
-the Bloomreach side, not the Anthropic side. So today's *bottleneck*
-is the MCP server, not the model. Caching would be a cost reduction,
-not a latency reduction. Worth doing when (a) live becomes a real
-user-facing path, or (b) cost grows past "casual single-user."
+if (request.system) params.system = request.system;
+if (request.tools?.length) params.tools = request.tools.map(toAnthropicTool);
+// NOTHING about cache_control.
+```
+
+To wire prompt caching, the adapter would mark the static parts (`system` + `tools[]`) with `cache_control: { type: 'ephemeral' }`. Anthropic then caches that prefix and bills cached input tokens at ~10% of normal.
+
+For the monitoring agent's typical 6-call ReAct loop:
+
+  → **Without caching:** ~1700 static input tokens × 6 calls = ~10,200 tokens at full rate.
+  → **With caching:** ~1700 tokens at premium rate on call 1, ~1700 tokens at cached rate (~10%) on calls 2-6 = ~3400 effective full-rate tokens.
+
+Savings: ~67% of input bill on monitoring agent runs. Same shape for diagnostic / recommendation / query agents.
+
+The reason it's not wired: it's a real engineering task (mark which prompt parts to cache, manage cache invalidation on prompt changes), and cost is low-volume today. Whenever the cost story tightens, this is the first move.
+
+**Part 4 — semantic cache (NOT shipped).**
+
+Semantic cache would embed each user query (intent classifier or free-form), check if a similar query was answered recently, return the cached answer if close enough. Two requirements:
+
+  1. An embedder (this codebase has none — see `03-retrieval-and-rag/03-rag-concepts-not-yet-exercised.md`).
+  2. A storage layer for the embeddings + answers (this codebase has no DB).
+
+The risk semantic cache carries is staleness: a user asks "what's our revenue?" at 9am, the answer is cached, at 9:30am a new anomaly drops, the next user gets the stale 9am answer. Mitigation is short TTL or invalidate-on-new-anomaly. Both are real work.
+
+Not pressing today; named honestly.
 
 ### Move 3 — the principle
 
-**Cache where it's safe and where the win is biggest. For agent loops,
-that's the provider-side prompt cache — same exact tokens, same
-behavior, ~90% discount. Semantic cache buys you cross-query reuse
-but at correctness risk. Exact-match cache is the safest but the
-hit-rate is too low to matter much.**
+**Cache at the altitude that matches the question.** The 60s tool cache solves "Bloomreach rate-limited me." The prompt cache would solve "static prompt parts cost full price every call." A semantic cache would solve "users ask the same question." Different altitudes, different payoffs. Don't reach for the wrong one.
 
-## Primary diagram
+## Primary diagram — the full recap
 
 ```
-  Caching opportunity per agent loop (today vs prompt-cached)
+  LLM caching in this codebase — shipped + not-shipped
 
-  Today (one diagnostic investigation, 6 turns):
-    turn 1: 4500 input + 200 output  = $0.0165
-    turn 2: 6000 input + 300 output  = $0.0225
-    turn 3: 8000 input + 300 output  = $0.0285
-    turn 4: 10500 input + 500 output = $0.0390
-    turn 5: 13500 input + 1000 output= $0.0555
-    turn 6: 17500 input + 2000 output= $0.0825
-                                       ──────
-                                      $0.2445
+  ┌─ Shipped: 60s tool-result cache ─────────────────────────────┐
+  │  Where:   BloomreachDataSource.callTool                       │
+  │  Key:     `${tool_name}:${JSON.stringify(args)}`              │
+  │  TTL:     60_000 ms                                           │
+  │  Skip:    optional via skipCache flag                         │
+  │  Errors:  not cached                                          │
+  │  Saves:   1 MCP call (~1.1s rate spacing + round-trip)        │
+  │  Visible: `fromCache: true` in the call envelope, surfaced    │
+  │           in UI tool-call trace                               │
+  └──────────────────────────────────────────────────────────────┘
 
-  With Anthropic prompt cache on system + schema + tools
-  (~3500 cacheable per turn):
-    turn 1: 4500 input + cache_creation 3500 + 200 output ≈ $0.018
-    turn 2: 6000 input - 3500 cached + 300 output  ≈ $0.014
-    turn 3: 8000 - 3500 + 300                       ≈ $0.018
-    turn 4: 10500 - 3500 + 500                      ≈ $0.029
-    turn 5: 13500 - 3500 + 1000                     ≈ $0.045
-    turn 6: 17500 - 3500 + 2000                     ≈ $0.072
-                                                    ──────
-                                                   $0.196
+  ┌─ Not shipped: Anthropic prompt caching ──────────────────────┐
+  │  Where:   would go in AnthropicModelProviderAdapter.complete()│
+  │  Mark:    cache_control: { type: 'ephemeral' } on system +    │
+  │           tools[] blocks                                       │
+  │  Saves:   ~60-67% of input bill on calls 2+ per agent run     │
+  │  Why not: real engineering task; cost is low-volume today      │
+  │  Exercise:01-llm-foundations/06-token-economics.md `B1.6`     │
+  └──────────────────────────────────────────────────────────────┘
 
-  Savings: ~$0.05 per investigation (~20%)
-  At scale: $5/100 investigations
+  ┌─ Not shipped: semantic cache ────────────────────────────────┐
+  │  Where:   would go in the query path before LLM call          │
+  │  Saves:   full LLM call on similar-query hit                  │
+  │  Risk:    stale answers when data changed                      │
+  │  Why not: requires embedder + storage; neither exist           │
+  │  Reference:03-retrieval-and-rag/03-rag-concepts-not-yet-exercised.md│
+  └──────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-Anthropic introduced prompt caching in August 2024. Adoption is one
-config flag (set `cache_control` on the message you want cached).
-The TTL is 5 minutes for `ephemeral` cache; persisting longer would
-require their as-yet-unreleased "persistent" cache. For agent loops
-(which complete in <60s typically), the 5-minute TTL is comfortably
-long.
+**Why the 60s cache is inside `BloomreachDataSource`, not in the agent layer.** The cache is a property of the Bloomreach surface — rate-limited per user, slow-moving data, expensive round-trips. Putting it in the DataSource means every consumer (agents, route handlers, tests) benefits without knowing the cache exists. If it lived in the agent layer, each agent would have to know about it, and route handlers (which sometimes hit `dataSource.callTool` directly via `/api/mcp/call`) would bypass it.
 
-OpenAI's equivalent is implicit prompt caching (no flag needed — they
-auto-cache prefixes >1024 tokens). Adoption is automatic on supported
-models. Both providers are converging on "cache the prefix, charge
-less for re-reads."
+The DataSource abstraction is the right altitude.
 
-The semantic cache idea was popularized by GPTCache (2023) — embed
-query, vector-search prior queries+answers, return cached if similarity
-> threshold. Works well for narrow Q&A domains where queries cluster;
-works badly for analytics domains where data shifts.
+**Why prompt caching isn't a free lunch.** Three real costs:
+
+  1. **Cache-set premium.** First call carries ~25% extra cost to set up the cache. Worth it only when calls 2+ amortize.
+  2. **Cache invalidation discipline.** If you edit the system prompt, the cache invalidates. Each agent prompt edit = first call pays the premium again.
+  3. **Engineering surface.** The adapter needs to mark cacheable parts explicitly. That's small code (a few lines per agent) but it's prompt-content-aware code, which means the adapter knows about the prompt structure.
+
+Not insurmountable; all are reasons the priority is "when cost tightens," not "immediately."
+
+**Why semantic cache is structurally complex here.** This codebase doesn't have a corpus to embed *against* — the user's free-form questions don't repeat enough to make embedding worth it for cache deduplication. Semantic cache is more valuable in chat-shaped apps with high query volume; this codebase is investigation-shaped with low repeat rate per query.
 
 ## Project exercises
 
-### Exercise — enable Anthropic prompt caching on the system block
+### Exercise — Wire Anthropic prompt caching for the monitoring agent
 
-  → **Exercise ID:** `study-ai-eng-06-01.1`
-  → **What to build:** In `AnthropicModelProviderAdapter.complete()`,
-    when `request.system` is present, send it as `[{type: 'text', text:
-    request.system, cache_control: {type: 'ephemeral'}}]` instead of as
-    a plain string. Verify the next turn's
-    `usage.cache_read_input_tokens` is > 0 in the logs.
-  → **Why it earns its place:** Biggest cost-reduction move on the
-    table. Config flag, immediate ~20% savings on 6-turn loops.
-  → **Files to touch:** `lib/agents/aptkit-adapters.ts:49`,
-    possibly AptKit `ModelRequest` if `system` needs to be structured
-    upstream.
-  → **Done when:** Logs show `cache_read_input_tokens > 0` on the
-    second turn of any agent loop. A back-of-envelope check shows
-    measurable input-cost reduction.
-  → **Estimated effort:** `1–4hr` (AptKit upstream may add half a day).
-
-### Exercise — add semantic cache to the QueryBox surface only
-
-  → **Exercise ID:** `study-ai-eng-06-01.2`
-  → **What to build:** Add a small semantic cache for the
-    `QueryAgent.answer()` flow. Embed the query; check
-    `lib/state/query-cache.ts` (a new sqlite-vec-backed store) for past
-    queries with similarity > 0.95 AND timestamp within last 5
-    minutes; return the cached answer if hit. Otherwise run the agent
-    and cache the result.
-  → **Why it earns its place:** The QueryBox is the only surface where
-    semantic cache buys real wins (repeat questions are common). The
-    5-min TTL bounds staleness on time-sensitive answers.
-  → **Files to touch:** new `lib/state/query-cache.ts`,
-    `app/api/agent/route.ts` (free-form branch), `lib/agents/query.ts`.
-  → **Done when:** Two consecutive identical queries to QueryBox return
-    in <100ms on the second one (cache hit).
-  → **Estimated effort:** `1–2 days`
+  → **Exercise ID:** B6.1 (also referenced as B1.6 in `01-llm-foundations/06-token-economics.md`)
+  → **What to build:** Add `cache_control: { type: 'ephemeral' }` markers to the static parts of the monitoring agent's request — the system prompt, the schema summary block, and the tool definitions. Extend `AnthropicModelProviderAdapter.complete()` to honor a per-request `cacheableParts` hint that names which parts to mark cacheable. Measure the cache hit rate via `response.usage.cache_read_input_tokens` and `response.usage.cache_creation_input_tokens`.
+  → **Why it earns its place:** monitoring is the highest-volume agent (briefing scan runs on every page load when live). Even a 50% cache hit rate cuts the monitoring bill in half. The single biggest dollar lever in the codebase today.
+  → **Files to touch:** `lib/agents/aptkit-adapters.ts` (extend `complete()` to support cache markers), `lib/agents/monitoring.ts` (declare which prompt parts are cacheable), `test/agents/aptkit-adapters.test.ts` (assert cache markers land on the SDK request).
+  → **Done when:** the per-call usage log shows non-zero `cache_read_input_tokens` after the second monitoring scan in a session, a wallclock measurement shows the second scan cheaper than the first by ~50% on input tokens, and the test suite covers both cache-create and cache-read scenarios.
+  → **Estimated effort:** 1–4hr.
 
 ## Interview defense
 
-**Q: Does this codebase cache LLM calls?**
+**Q: "What caching do you have on your LLM stack?"**
 
-Not yet. Three caching layers are possible:
+One layer shipped, two not. The shipped layer is a 60s tool-result cache inside `BloomreachDataSource` — keyed on `${name}:${JSON.stringify(args)}`, errors not cached, optional `skipCache` flag for the debug path. It absorbs "user reloads the briefing tab" without burning a Bloomreach rate-limit slot. The two unshipped: Anthropic prompt caching (the biggest dollar lever — would cut input bills ~60% on calls 2+) and semantic cache (not pressing for an investigation-shaped product).
 
-  1. **Anthropic prompt caching** (provider-side) — one config flag
-     away (`cache_control: {type: 'ephemeral'}` on the system block).
-     Cuts input cost on multi-turn loops by ~20% per investigation.
-     Biggest lever still on the table.
+Prompt caching is `B6.1`; it's the next move when cost tightens.
 
-  2. **Semantic cache** (your side) — embed query, return cached
-     answer if similar enough. Risky for time-sensitive data; best
-     for QueryBox-style repeated questions with a short TTL.
+*Anchor: "60s tool cache shipped; prompt cache is the big lever, not wired; semantic cache not pressing."*
 
-  3. **Exact-match cache** (your side) — hash input, return cached
-     output. Safe but low hit rate.
+**Q: "Why is the 60s cache inside the DataSource and not in the agent?"**
 
-`response.usage.cache_creation_input_tokens` and
-`cache_read_input_tokens` are already being logged
-(`lib/agents/aptkit-adapters.ts:60`) — they're just always zero today.
+Because the cache is a property of the *Bloomreach surface*, not the agent. Bloomreach is rate-limited per user globally, the data is slow-moving, and round-trips are expensive (~1.1s spacing + network). Putting the cache in the DataSource means agents, route handlers, even tests all benefit transparently — they call `dataSource.callTool()` and the cache is checked under the hood. If it lived in the agent layer, every consumer would have to know about it, and routes that hit `dataSource.callTool` directly (`/api/mcp/call`) would bypass it.
 
-**Anchor line:** "Caching is one config flag away on the provider side.
-The usage object already has the cache fields; they're just always
-zero."
+The seam-extraction PR (Phase 2 PR A) was deliberate about this — the cache moved WITH the data source when it was renamed from `McpClient` to `BloomreachDataSource`.
 
-**Q: Why hasn't caching been enabled?**
-
-Today the bottleneck is the Bloomreach MCP server's "1 per 10s" rate
-limit, not the Anthropic side. Demo mode hits no LLM at all. So caching
-is a cost reduction, not a latency reduction — worth doing when live
-becomes a real user-facing path. The 30-min PR is shovel-ready;
-priority is just below "make live actually scale."
+*Anchor: "Cache is a Bloomreach property → lives in `BloomreachDataSource`. Agent layer doesn't know."*
 
 ## See also
 
-  → `01-llm-foundations/06-token-economics.md` — what the cache saves in $
-  → `02-llm-cost-optimization.md` — model routing as the parallel lever
-  → `05-evals-and-observability/04-llm-observability.md` — what the
-    cache metrics look like once enabled
+  → `02-llm-cost-optimization.md` — the cost-optimization framing this contributes to
+  → `04-rate-limiting-backpressure.md` — the rate-limit story the 60s cache defends against
+  → `01-llm-foundations/06-token-economics.md` — the cost story the prompt-cache would shift
+  → `study-system-design/10-rate-limit-aware-mcp-client.md` — the same logic from the system-design lens

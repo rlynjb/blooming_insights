@@ -1,29 +1,28 @@
-# 03 · Multi-agent orchestration
+# 03 — Multi-agent orchestration
 
-Everything above one agent. **The load-bearing section for this repo** — this is where the "minimal multi-agent" shape lives.
+Anchor: multi-agent (primary)
 
-## Files
+Everything *above* one agent. This is the load-bearing new material in the spec — multi-agent orchestration is the area with the largest gap between "I read about it" and "I shipped it."
 
-1. [`01-when-not-to-go-multi-agent.md`](./01-when-not-to-go-multi-agent.md) — the most important multi-agent decision (READ FIRST)
-2. [`02-supervisor-worker.md`](./02-supervisor-worker.md) — the common topology; this repo's *route handler* fills the supervisor slot deterministically
-3. [`03-sequential-pipeline.md`](./03-sequential-pipeline.md) — **THE pattern this repo uses** (monitoring → diagnostic → recommendation)
-4. [`04-parallel-fan-out.md`](./04-parallel-fan-out.md) — not in this repo; would require concurrency-cap work
-5. [`05-debate-verifier-critic.md`](./05-debate-verifier-critic.md) — not in this repo; the human reading the StatusLog is the critic
-6. [`06-swarm-handoff.md`](./06-swarm-handoff.md) — not in this repo; orchestration is deterministic
-7. [`07-graph-orchestration.md`](./07-graph-orchestration.md) — not in this repo; the "graph" is the URL routing table
-8. [`08-shared-state-and-message-passing.md`](./08-shared-state-and-message-passing.md) — this repo uses message passing (per-request URL params + sessionStorage)
-9. [`09-coordination-failure-modes.md`](./09-coordination-failure-modes.md) — most don't show up because the orchestration is deterministic, but the cost-blowup ones do
+## How this maps to the repo
 
-## How this maps to the codebase
+The repo runs a **sequential pipeline of single-agent loops**, dispatched by deterministic TypeScript. There is **no LLM supervisor, no debate, no swarm, no graph orchestration**. The pipeline (`monitoring → diagnose → recommend`) splits along capability boundaries that map to UI screens, not along reasoning specialties that need an LLM to coordinate them.
 
-| File | In this codebase? |
-|---|---|
-| When not to go multi-agent | **Yes — read first.** This repo deliberately went *minimal* multi-agent: one ReAct loop per pipeline stage, no supervisor LLM, no fan-out, no debate. |
-| Supervisor-worker | **No (LLM-supervisor)** but **Yes (code-supervisor)**. The supervisor (`app/api/agent/route.ts`) is written in TypeScript, not as an LLM agent. |
-| Sequential pipeline | **Yes.** monitoring → diagnostic → recommendation, with a hard split at the HTTP boundary between step 2 and step 3. |
-| Parallel fan-out | **No.** No agent fans out work to concurrent workers. Bloomreach's ~1 req/s rate limit makes parallel calls infeasible without a concurrency cap. |
-| Debate / verifier-critic | **No.** The diagnosis is final; the human reading the StatusLog is the critic. |
-| Swarm / handoff | **No.** Agents don't transfer control to each other. The route does. |
-| Graph orchestration | **No** (in the LangGraph sense). The "graph" is the URL routing table — `if (step === 'recommend')` is the graph edge. |
-| Shared state & message passing | **Message passing**, by force of architecture (Vercel serverless = ephemeral instances). |
-| Coordination failure modes | **Some apply.** Tool-call cascade, cost blowup, synthesis failure — the rest (infinite handoff, context bloat from blackboard) don't show up because the topology forbids them. |
+So the headline file in this sub-section is `01-when-not-to-go-multi-agent.md` — the deliberate non-escalation is the lesson this repo carries. The topology files (supervisor-worker, debate, swarm, graph) are marked "Not yet implemented" honestly, with a system-design template (Section F) naming what the refactor would look like.
+
+Two parts of the sub-section *are* live:
+
+- `03-sequential-pipeline.md` — the briefing → diagnose → recommend pipeline IS a pipeline, just with deterministic code as the "pipe" between stages.
+- `08-shared-state-and-message-passing.md` — the repo does message-passing (typed handoffs `Anomaly → Diagnosis → Recommendation[]`), not shared blackboard. The chosen model is exactly what the spec recommends.
+
+## Reading order
+
+1. `01-when-not-to-go-multi-agent.md` — read this first. The most important decision.
+2. `02-supervisor-worker.md` — the most common topology if you escalate.
+3. `03-sequential-pipeline.md` — the topology this repo's orchestration shape resembles.
+4. `04-parallel-fan-out.md` — independent subtasks in parallel.
+5. `05-debate-verifier-critic.md` — quality-refinement topology.
+6. `06-swarm-handoff.md` — peer-to-peer control transfer.
+7. `07-graph-orchestration.md` — making the others inspectable.
+8. `08-shared-state-and-message-passing.md` — how agents communicate.
+9. `09-coordination-failure-modes.md` — what breaks above one agent.

@@ -1,74 +1,58 @@
 # Coordination failure modes
 
-*Industry name: multi-agent failure modes — Industry standard.*
+**Industry standard.** The failures that don't exist in single-agent systems. **Mostly prevented by topology choice** in this codebase — the deterministic pipeline sidesteps the failure modes that come with LLM coordination.
 
-The failures that don't exist in single-agent systems but show up the moment you have two or more. This repo's minimal-multi-agent shape *forbids* most of them by topology choice, but the cost-blowup and synthesis-failure cases still apply.
+## Zoom out, then zoom in
 
-## Zoom out — which failures show up where
-
-The applicability of each failure depends on the topology. This repo's deterministic sequential pipeline + code supervisor eliminates the orchestration-decision failures (infinite handoff, supervisor wandering) but not the cost/budget failures.
+Sits as a meta-pattern across every topology. When you escalate from single-agent to any multi-agent shape, you inherit a class of failures single-agent can't have. This file enumerates them and names the mitigations.
 
 ```
-  Which failures apply to this repo
+  Zoom out — where this concept lives
 
-  ┌─ DO NOT APPLY (topology forbids) ─────────────────────┐
-  │  Infinite handoff (A→B→A→B…)                          │
-  │    — agents never hand off; route dispatches          │
-  │  Supervisor wandering / wrong-worker dispatch          │
-  │    — supervisor is code; `if (step === X)` can't wander│
-  │  Context bloat from shared blackboard                  │
-  │    — no blackboard (message passing forced by Vercel) │
-  └────────────────────────────────────────────────────────┘
-
-  ┌─ DO APPLY ─────────────────────────────────────────────┐
-  │  Tool-call cascade (one agent triggers a storm)        │ ← see below
-  │  Cost blowup (2-5x overhead compounds silently)        │ ← see below
-  │  Synthesis failure (supervisor merges contradictions)  │ ← see below
-  │     (route handler synthesizes by passing through;     │
-  │      contradiction = inconsistent agent outputs)       │
-  └────────────────────────────────────────────────────────┘
+  ┌─ Multi-agent topology ──────────────────────────┐
+  │  Whichever you picked: supervisor, debate, swarm │
+  │  ★ Coordination failure modes you now inherit ★ │ ← we are here
+  │  (each topology brings a subset of these)        │
+  └──────────────────────────────────────────────────┘
 ```
+
+This repo, by staying deterministic-pipeline, sidesteps most of these. The ones that *could* still apply (cost blowup, tool-call cascade within a single agent's loop) are bounded by the control envelope from `04-agent-infrastructure/05-guardrails-and-control.md`.
 
 ## Structure pass
 
-The axis: **what mitigation lives at what layer?**
+Layers: failure mode (the named thing that goes wrong) → topology it lives in (which shapes can produce it) → mitigation (the specific control that bounds it).
 
-```
-  Failure                  Mitigation in this repo                Where it lives
-  ─────────                ──────────────────────                 ──────────────
-  Tool-call cascade        maxToolCalls per agent (4 or 6)        kernel (AptKit)
-  Cost blowup              maxTurns per agent (6 or 8)            kernel (AptKit)
-  Synthesis failure        validators on each agent's output      AptKit per-agent
-                           + structural prompt rules               prompts
-```
+**Axis traced — "what does this failure mode require?":** each one needs at least one multi-agent feature to exist. Infinite handoff needs handoffs. Synthesis failure needs a merger. Tool-call cascade is the only one that can fire in single-agent too.
+
+**Seam:** the specific control that catches each failure. Caps, budgets, validators, schemas.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-Multi-agent failure modes are *emergent* — they don't show up in unit tests where you test one agent in isolation. They show up when agents compose, and they manifest as cost blowups, infinite loops, or contradictory outputs. The mitigation pattern is always the same: bound the bad-case behavior at the lowest layer, so the failure surfaces fast and stops.
+You know the difference between a function and a microservice mesh. The function can crash. The mesh can crash, deadlock, cascade-fail, retry-storm, partition, or end up with two services convinced of different truths. Multi-agent has the same expansion: single-agent can produce wrong output or burn budget; multi-agent can do those AND fail in ways that require coordination to even exist.
 
 ```
-  Coordination failure modes — table of failures and mitigations
+  The failure-mode table
 
   ┌──────────────────────┬──────────────────────────┐
   │ Failure              │ Mitigation               │
   ├──────────────────────┼──────────────────────────┤
-  │ Infinite handoff     │ Handoff counter; force   │
-  │ (A→B→A→B…)            │ stop or escalate to human│
+  │ Infinite handoff     │ Handoff counter; force    │
+  │ (A→B→A→B…)            │ stop or escalate to human │
   ├──────────────────────┼──────────────────────────┤
   │ Tool-call cascade    │ Per-agent and global      │
   │ (one agent triggers  │ iteration caps; budget    │
   │ a storm of calls)    │ ceiling that halts the run│
   ├──────────────────────┼──────────────────────────┤
-  │ Context bloat as      │ Message passing / context │
-  │ agents accumulate     │ routing instead of a       │
+  │ Context bloat as     │ Message passing / context │
+  │ agents accumulate    │ routing instead of a       │
   │ shared state         │ shared blackboard          │
   ├──────────────────────┼──────────────────────────┤
   │ Synthesis failure    │ Validate worker outputs    │
   │ (supervisor merges    │ against a schema before    │
-  │ contradictory results│ synthesis; surface         │
-  │ )                    │ conflicts, don't average   │
+  │ contradictory)        │ synthesis; surface         │
+  │                      │ conflicts, don't average   │
   ├──────────────────────┼──────────────────────────┤
   │ Cost blowup          │ Per-run token budget;      │
   │ (2-5x overhead       │ cheap models for workers,  │
@@ -77,115 +61,124 @@ Multi-agent failure modes are *emergent* — they don't show up in unit tests wh
   └──────────────────────┴──────────────────────────┘
 ```
 
-### Move 2 — failure by failure, with this repo's specifics
+### Move 2 — step by step
 
-**Tool-call cascade.**
+#### Failure 1 — infinite handoff
 
-The classic failure: one agent retries a flaky tool every turn, burning the whole budget on a tool that isn't coming back. In a multi-agent system this compounds — if Worker A keeps retrying and that retry causes Worker B to retry its dependency, you get a cascade.
+**Where it lives:** swarm topology (`06-swarm-handoff.md`).
+**Doesn't apply here:** no handoffs, no peer transitions. The orchestrator is deterministic code.
 
-In this repo, the mitigation is at the kernel layer:
-- `MonitoringAgent`: `maxToolCalls=6` (capped at AptKit's `AnomalyMonitoringAgent`)
-- `DiagnosticAgent`: `maxToolCalls=6`
-- `RecommendationAgent`: `maxToolCalls=4` (tighter — it mostly reasons from diagnosis)
-- `QueryAgent`: `maxToolCalls=6`
+If this repo adopted swarm, the mitigation would be a runtime handoff counter capped at ~5-8 transitions per conversation, plus asymmetric handoff catalogs (A can hand to B; B cannot hand back to A in the same conversation). OpenAI's Swarm SDK enforces both at the kernel level — a hand-rolled swarm has to do the same.
 
-The cap is enforced inside `runAgentLoop` — once hit, the synthesis turn fires regardless of what the model wants. **No agent in this repo can issue more than 6 tool calls per run** by topology guarantee. See `../01-reasoning-patterns/02-agent-loop-skeleton.md`.
+#### Failure 2 — tool-call cascade
 
-What's *not* yet mitigated: per-tool circuit breaking (see `../05-production-serving/03-per-tool-circuit-breaking.md`). A flaky tool still wastes calls until the budget is spent; it doesn't get short-circuited.
+**Where it lives:** any agent loop. The single-agent version is "one runaway agent burning tool calls"; the multi-agent version is "supervisor spawns many workers, each runs its own loop, total tool calls × N." This is the only failure mode in the table that can fire in single-agent systems.
 
-**Cost blowup.**
+**Mitigation in this repo:** every agent has hard caps.
 
-Multi-agent overhead compounds silently. A 3-agent pipeline with 6 tool calls each = up to 18 LLM calls + 18 tool calls per investigation. Without per-agent budgets, that climbs to ~50 calls fast.
+- `maxTurns = 8` is the default in `runAgentLoop` (`run-agent-loop.js:21`). Monitoring overrides via the AptKit class.
+- `maxToolCalls = 6` for monitoring specifically (`monitoring-agent.js:56`). Other agents are bounded only by `maxTurns`.
+- `maxTokens = 4096` per turn (`run-agent-loop.js:21`).
+- `maxDuration = 300` at the route level (`app/api/briefing/route.ts:19`, `app/api/agent/route.ts:22`). The whole request can't blow past 5 minutes.
 
-In this repo, the mitigation is per-agent budgets plus the bounded sequential structure (no fan-out). Total per-investigation budget worst-case:
-- DiagnosticAgent: 8 turns × ~1 LLM call each + 6 tool calls = ~14 calls
-- RecommendationAgent: 6 turns + 4 tool calls = ~10 calls
-- Total: ~24 LLM calls + ~10 tool calls per investigation
+The cascade can't compound across agents in this repo because the orchestrator is sequential — only one agent loop runs at a time. If the repo grew fan-out, the per-agent caps would multiply by N and need a global cap added on top.
 
-Bounded and predictable. Cost blowup mitigated.
+#### Failure 3 — context bloat
 
-What's *not* yet mitigated: a per-run token-ceiling that halts the entire pipeline if the sum exceeds a threshold. Today the per-agent caps add up to a bounded total, but if a future change loosened any cap, there's no global guard.
+**Where it lives:** shared-state topologies (`08-shared-state-and-message-passing.md`). When every agent reads/writes a common context, the context grows with the topology size. Past ~30-50% of the model's nominal context length, the lost-in-the-middle problem fires.
 
-**Synthesis failure.**
+**Doesn't apply here:** the repo uses message passing with small typed handoffs. The `Diagnosis` interface is hundreds of bytes; the `Anomaly` is similar. Each agent's context is its system prompt + its bounded input + its own running conversation — nothing inherited from sibling agents.
 
-In a fan-out + merge topology, the synthesis step has to handle contradictory worker outputs — Worker A says "the drop is caused by mobile checkout"; Worker B says "the drop is caused by payment processor." Averaging is wrong; flagging the conflict is right.
+If the repo added a shared-state architecture for some reason (e.g. a long-running multi-step analysis with rich shared context), the mitigation would be: don't. Use multi-agent context routing instead — pass role-specific context to each agent. This is `04-agent-infrastructure/01-context-engineering.md` applied at the multi-agent boundary.
 
-In this repo, synthesis is degenerate — the route handler "synthesizes" by passing through. Each agent's output is the next agent's input directly; there's no merger to fail. **Synthesis failure is forbidden by topology.**
+#### Failure 4 — synthesis failure
 
-The case where it would re-appear: if MonitoringAgent ever fanned out (`04-parallel-fan-out.md`), the merger would need to handle "two categories detected the same anomaly with different severities" — the synthesis failure shows up at the merger boundary.
+**Where it lives:** any topology with a merger — supervisor-worker, fan-out-fan-in, debate. The merger reads contradictory inputs and either averages them (hiding the conflict) or hallucinates a synthesis that doesn't follow from the inputs.
 
-**Validators as the structural defense.**
+**Doesn't apply here:** no LLM merger. Each stage produces a typed output the next consumes; there's no aggregation step. If a hypothetical fan-out version added a merger, the mitigation would be: validate worker outputs against a schema before synthesis; surface conflicts as explicit "these workers disagreed" data rather than letting the synthesizer average them.
 
-Even without a synthesis step, each agent's output has to pass an AptKit-layer validator before it's surfaced — `tryParseAnomalies`, `tryParseDiagnosis`, `validateRecommendations`. These catch shape errors (missing fields, wrong types) before the next agent in the pipeline sees them. The validator is what turns "free-form text from a model" into "guaranteed-shape data the next agent can rely on."
+The closest cousin in this repo is the structured-output validators (`tryParseAnomalies`, `tryParseDiagnosis`, recommendation validators). They catch *structural* failures in one agent's output (the model emitted text that doesn't parse as JSON) but they're not synthesis-failure prevention because there's no synthesis to prevent.
+
+#### Failure 5 — cost blowup
+
+**Where it lives:** any multi-agent topology. The 2-5x coordination tax compounds silently across coordination messages, sub-agent runs, and per-turn context overheads. Without budget caps, the bill explodes before you notice.
+
+**Doesn't apply here in the multi-agent sense:** no coordination tax to compound. The cost ceiling is the deterministic pipeline's natural cost (one agent run per stage, no supervisor overhead). The per-request cost lands around $0.10-0.25 for a full investigation (monitoring + diagnose + recommend at Sonnet pricing).
+
+**Does apply in the single-agent sense:** a runaway agent loop with no budget cap can burn tokens indefinitely. Mitigations:
+
+- The skeleton's budget exit (`maxTurns`) is unbreakable — the `for` loop can't continue past it.
+- The per-tool-call cost is bounded by the per-call response size (capped at 16,000 chars in the tool result block — `run-agent-loop.js:2-4`).
+- Token-usage logging (`aptkit-adapters.ts:57-61`) emits per-call usage to console for observability; aggregating these would surface cost anomalies post-hoc.
+
+The piece this repo doesn't have: a hard per-run *dollar* budget that halts the run if the cumulative cost crosses a threshold. The `maxTurns` × `maxTokens` × per-call-cost give an effective ceiling (~$0.50 for the most expensive possible run) but no live cost gate. For a system with higher stakes (e.g. customer-facing agent that could fire 100s of times per day), adding a dollar gate would be cheap insurance.
+
+#### The fifth failure that's only in the spec table — multi-agent coordination latency
+
+The spec doesn't separate this from cost blowup, but it's worth a paragraph: in a multi-agent system, each coordination message adds wall-clock latency. The supervisor's "decide which worker runs" call is ~1-2s of latency added per dispatch; sequential coordination compounds. A four-stage pipeline with a supervisor at each handoff is roughly 8-15s of pure coordination overhead per request.
+
+This repo's deterministic pipeline doesn't pay this latency because the handoffs are zero-cost function calls. The whole investigation runs in ~50-120s wall-clock (the MCP tool calls are the dominant cost), not 50-120s + 8-15s of coordination.
 
 ### Move 3 — the principle
 
-Multi-agent failure modes are emergent; mitigations belong at the lowest layer where the failure can be bounded. Per-agent budgets in the kernel; per-tool breakers at the data-source layer; validators at the agent-output boundary. The senior-engineer move is naming WHICH failure each mitigation prevents and WHAT topology change would re-expose the failure.
+**Multi-agent escalation buys quality at the cost of new failure modes.** Each topology brings a specific subset of the table above; you inherit them the moment you adopt the topology. The mitigations are well-known but they're not free — caps cost time-to-implement, validators cost design effort, budget gates cost monitoring infrastructure. The honest framing for any multi-agent decision: name the failure mode you're escalating to address, and name the failure modes you're now inheriting. If the inherited modes outweigh the addressed mode, don't escalate.
 
-The minimal-multi-agent shape in this repo eliminates several failures by topology (handoff, supervisor wandering, context bloat). The remaining failures (cost, cascade) are bounded by the kernel's per-agent caps. The unaddressed failure (per-tool breaker) is the natural next investment when traffic justifies it.
+This repo's deterministic-pipeline shape is the structural choice that prevents the inherited modes from existing in the first place. That's not absence-of-discipline; it's the discipline of "don't escalate before you need to."
 
 ## Primary diagram
 
-The failure → mitigation → layer map for this repo:
-
 ```
-  Coordination failure modes — what's mitigated where
+  Which failure modes this repo can vs cannot produce
 
-  ┌─ AptKit kernel (per-agent budgets) ──────────────────────┐
-  │  maxTurns + maxToolCalls + forced-final synthesis        │
-  │  PREVENTS: tool-call cascade, infinite turn loop          │
-  └────────────────────────────┬─────────────────────────────┘
-                               │
-  ┌─ AptKit per-agent validator ──────────────────────────────┐
-  │  tryParseAnomalies / tryParseDiagnosis / validateRecs     │
-  │  PREVENTS: malformed handoff between agents               │
-  └────────────────────────────┬─────────────────────────────┘
-                               │
-  ┌─ Route handler (topology) ────────────────────────────────┐
-  │  sequential pipeline (no fan-out)                          │
-  │  code supervisor (no LLM-decided dispatch)                 │
-  │  message passing (no blackboard)                           │
-  │  PREVENTS: handoff loops, supervisor wander, context bloat │
-  └────────────────────────────┬─────────────────────────────┘
-                               │
-  ┌─ DataSource adapter (BloomreachDataSource) ──────────────┐
-  │  ~1 req/s spacing + retry on rate-limit + 60s cache       │
-  │  PREVENTS: provider 429-storm                             │
-  │  DOES NOT YET PREVENT: per-tool failure cascade           │ ← gap
-  └───────────────────────────────────────────────────────────┘
+  ┌──────────────────────────────────────────────────────────────┐
+  │  Failure              | Can fire? | Why / mitigation          │
+  ├──────────────────────────────────────────────────────────────┤
+  │  Infinite handoff     | NO        | No handoffs in topology   │
+  │                        |           |                            │
+  │  Tool-call cascade    | YES       | maxTurns=8,                │
+  │  (within one agent)   |  (bounded) | maxToolCalls=6 (mon),     │
+  │                        |           | maxDuration=300s (route)   │
+  │                        |           |                            │
+  │  Context bloat        | NO        | Message passing, small     │
+  │                        |           | typed handoffs             │
+  │                        |           |                            │
+  │  Synthesis failure    | NO        | No LLM merger              │
+  │                        |           |                            │
+  │  Cost blowup          | YES       | Hard caps bound max cost   │
+  │  (within one agent's  |  (bounded) | per request to ~$0.50;    │
+  │  loop, in theory)     |           | no live dollar gate         │
+  │                        |           |                            │
+  │  Coordination latency | NO        | Zero-cost function-call    │
+  │                        |           | handoffs, no model         │
+  │                        |           | coordination               │
+  └──────────────────────────────────────────────────────────────┘
 ```
+
+## Elaborate
+
+The cost-blowup failure mode is the one production teams get bitten by most often, because it's silent. A misbehaving multi-agent system that produces wrong outputs is visible (you notice the wrong outputs). A misbehaving multi-agent system that produces correct outputs at 5x expected cost is invisible until the monthly bill arrives. The mitigation (per-run dollar budget) is cheap to add and surprisingly often missing in agent systems built by teams new to the topology.
+
+The synthesis-failure mode is the one most likely to ship invisibly when you DO adopt multi-agent. Two workers disagree on something subtle; the supervisor averages their outputs into a synthesis that doesn't follow from either side; the user reads it as authoritative. The fix — surface conflicts, don't average — requires the supervisor's prompt to explicitly handle conflict detection, plus structured-output validation on worker outputs so conflicts are detectable. Both are doable; both are commonly skipped.
+
+The Anthropic multi-agent research blog post (2025) is candid about which of these failures their team has hit and how they handle them. Tool-call cascade is the one they call out as the most operationally annoying — a sub-research-agent that gets stuck in a tool-call loop burns budget that compounds across the supervisor's other sub-agents. Their mitigation is a per-agent tool-call cap plus a global per-run budget that halts the supervisor if any single sub-agent crosses its allotted share.
 
 ## Interview defense
 
-**Q: "What are the failure modes you'd worry about in a multi-agent system, and which apply to yours?"**
+> **Q: What multi-agent failure modes could this codebase produce?**
+>
+> Mostly none, because the orchestration is deterministic. No infinite handoff (no handoffs). No context bloat (message passing). No synthesis failure (no LLM merger). Tool-call cascade can fire inside a single agent's loop in theory, but `maxTurns=8`, `maxToolCalls=6` for monitoring, `maxTokens=4096`, and `maxDuration=300s` at the route level bound it hard. Cost blowup within a single agent's loop is similarly bounded — the worst-case single investigation costs maybe $0.50 — but the repo doesn't have a live per-run dollar gate that halts at a threshold. That's the gap worth filling if the system grew to higher-volume use.
 
-A: Five canonical failures. Three don't apply to this repo by topology choice: infinite handoff (no agent-to-agent handoff; route dispatches), supervisor wandering (supervisor is code; an `if` statement can't wander), context bloat from shared blackboard (no blackboard; message passing forced by Vercel's ephemeral instances). Two do apply: tool-call cascade and cost blowup — both bounded by per-agent budgets in the AptKit kernel (`maxToolCalls=4 or 6`, `maxTurns=6 or 8`, forced-final synthesis). One half-applies: synthesis failure — the route's "synthesis" is degenerate pass-through today, so contradictions can't arise; if we ever fanned out (`04-parallel-fan-out.md`), the synthesis step would need a real conflict-detection step.
+> **Q: What changes if you adopted a supervisor?**
+>
+> You inherit synthesis failure as a real risk, plus coordination latency, plus deeper cost-blowup exposure. Mitigations: schema-validate worker outputs before the supervisor synthesizes (surface conflicts, don't average); add a per-run dollar budget that halts the supervisor at threshold; use cheap models (Haiku) for the workers and reserve the supervisor's expensive model for synthesis. The Anthropic multi-agent research blog post is candid that even with these mitigations the operational complexity is real — they keep their supervisor topology to ≤5 sub-agents per run because beyond that the failure-mode surface dominates.
 
-The unaddressed gap: per-tool circuit breaking. A flaky tool today still wastes calls until the per-agent budget is spent. The fix is a per-tool breaker at the data-source layer (`../05-production-serving/03-per-tool-circuit-breaking.md`) that fails fast on a known-dead tool and feeds the open-circuit state back to the agent as an observation so the agent's reasoning routes around it.
-
-Diagram I'd sketch:
-
-```
-  Topology-prevented:               Budget-bounded:
-   - infinite handoff                - tool-call cascade
-   - supervisor wander               - cost blowup
-   - context bloat
-                              Topology-degenerate (no merger):
-                                - synthesis failure
-                              Not yet mitigated:
-                                - per-tool failure cascade
-                                  (fix: circuit breaker)
-```
-
-Anchor: "the kernel's `maxToolCalls` is the single most load-bearing failure-bound. Without it, one flaky tool + an agent loop = the entire iteration budget spent on retries — the worst kind of cost blowup because it produces nothing."
-
-**Q: "Where does the 2-5x multi-agent overhead show up in your numbers?"**
-
-A: Worst-case investigation: DiagnosticAgent (8 turns × ~1 LLM call + 6 tool calls = ~14 calls) + RecommendationAgent (6 + 4 = ~10 calls) = ~24 LLM calls per investigation. Compared to a hypothetical single-agent "investigate and recommend in one loop" with a 12-call budget, that's ~2x the calls. The buy: each agent has a narrower prompt + tighter tool grant, so each call is cheaper than a do-everything single-agent's call. Net: probably ~1.5x cost for the specialization. Acceptable when the structure also gives us the human-in-the-loop pause between stages (the user reviews the diagnosis before recommendations are generated).
+> **Q: What's the failure mode you'd worry about most if you escalated?**
+>
+> Synthesis failure — specifically the silent version where the supervisor averages contradictory worker outputs into a plausible-but-ungrounded synthesis. It ships invisibly because the output looks coherent; you only catch it by reading the worker outputs in the trace and noticing they disagree in ways the synthesis hides. The mitigation requires both schema-validation (so the supervisor can detect conflicts) and a prompt instruction to surface conflicts rather than reconcile them. Both are easy to skip and the failure mode is hard to detect post-hoc.
 
 ## See also
 
-- [`../01-reasoning-patterns/02-agent-loop-skeleton.md`](../01-reasoning-patterns/02-agent-loop-skeleton.md) — where the budget exits live
-- [`../05-production-serving/03-per-tool-circuit-breaking.md`](../05-production-serving/03-per-tool-circuit-breaking.md) — the unaddressed gap
-- [`../05-production-serving/02-fan-out-backpressure.md`](../05-production-serving/02-fan-out-backpressure.md) — what synthesis failure would look like if topology changed
-- [`../04-agent-infrastructure/05-guardrails-and-control.md`](../04-agent-infrastructure/05-guardrails-and-control.md) — the full control envelope around a loop
+- → `01-when-not-to-go-multi-agent.md` — the gate that prevents most of these by not escalating
+- → `04-agent-infrastructure/05-guardrails-and-control.md` — the control envelope that bounds the single-agent versions
+- → `05-production-serving/02-fan-out-backpressure.md` — the cost-blowup-during-fan-out story
+- → `05-production-serving/03-per-tool-circuit-breaking.md` — the tool-call-cascade story specifically

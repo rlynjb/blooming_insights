@@ -1,274 +1,202 @@
-# 06 — token economics
+# Token economics
 
-**Subtitle:** Per-call cost ledger · Industry standard
+*Industry standard — pay-per-token pricing model*
 
-## Zoom out, then zoom in
+## Zoom out — where this concept lives
 
-Cost is per token. Per call, you pay for both input and output, at different
-rates, and output costs ~5x more than input. Per agent loop, you pay for input
-*every turn* because the model is stateless.
+Every LLM call in this codebase emits a `usage` log line (`input_tokens`, `output_tokens`). Multiply by the model's per-token rate; you have the bill. The two cost-drivers here are (1) Sonnet's per-token rate × the agents' tool-loop token volume, and (2) the absence of prompt caching, which means long system prompts pay full price on every call.
 
 ```
-  Zoom out — where dollars get spent in one investigation
+  Zoom out — what costs money in this stack
 
-  ┌─ /api/agent (one investigation) ──────────────────┐
-  │  bootstrap     ≈ 0   tokens     ($0; no LLM)       │
-  │  listTools     ≈ 0   tokens     ($0; no LLM)       │
-  │  diagnostic    6 turns × ~5k in + ~1k out          │
-  │                ≈ 30k in + 6k out ≈ $0.18           │
-  │  recommendation 4 turns × ~5k in + ~1k out         │
-  │                ≈ 20k in + 4k out ≈ $0.12           │
-  │  TOTAL per investigation:        ≈ $0.30           │
-  └─────────────────────────────────────────────────────┘
-
-  ┌─ /api/briefing (one daily check) ─────────────────┐
-  │  monitoring    6 turns × ~6k in + ~2k out          │
-  │                ≈ 36k in + 12k out ≈ $0.29          │
-  └─────────────────────────────────────────────────────┘
+  ┌─ Per-user flow ──────────────────────────────────────────┐
+  │  briefing scan       → monitoring agent  (Sonnet, ~$0.06)│
+  │  click card          → diagnostic agent  (Sonnet, ~$0.08)│
+  │  click "see recs"    → recommendation    (Sonnet, ~$0.07)│
+  │  ask any question    → intent classify (Haiku, ~$0.0003) │
+  │                        + query agent     (Sonnet, ~$0.05)│
+  └──────────────────────┬───────────────────────────────────┘
+                         │
+                         ▼
+  ┌─ ★ The ledger ★ ─────────────────────────────────────────┐ ← we are here
+  │  one full flow (scan → diagnose → recommend) ≈ $0.21     │
+  │  per user, per session, before any caching savings.      │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-## Structure pass
+**Zoom in.** Costs are tractable because volume is low (this is an analyst tool, not a chatbot). But the rates are honest about the scaling math: 1,000 sessions/day = $210/day = ~$6,300/month, and that's *before* prompt caching cuts the input-token bill.
 
-  → **One axis to trace — cost per unit work.** Input vs output, turn count
-    vs single call, sonnet vs haiku. Holding "what's one unit of work?"
-    constant across the agents:
-    - monitoring: one briefing scan ≈ $0.30
-    - diagnostic: one investigation ≈ $0.18
-    - recommendation: one set of recs ≈ $0.12
-    - intent: one classify ≈ $0.0003 (haiku)
+## Structure pass — layers · axes · seams
 
-  → **The seam:** the input-side accumulation. Every agent turn re-pays for
-    the system prompt, the schema summary, and the conversation so far. The
-    multiplier is *turn count*, not "additional cost per turn." A 6-turn
-    loop with a 5k-token prompt costs 30k input tokens for the prompt alone.
+**Layers:** model → tokens → dollars.
+
+**Axis: where do the tokens go?** Mostly to *input* — the system prompt + schema summary + tool definitions + tool results are large; the model's output is small. Typical ratio: ~10× input to output tokens.
+
+**Seam:** the per-call `usage` log at `lib/agents/aptkit-adapters.ts:55-60`. That's where token volume becomes visible. Aggregating across calls is something this codebase doesn't do yet — Vercel log queries are the only path.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-Imagine a meter on the wire. Every byte you send is counted as input; every
-byte the model writes back is counted as output. The meter starts again on
-every API call.
+You know how AWS charges per request + per GB? Anthropic charges per input token + per output token, at different rates. Output tokens are ~5× more expensive than input tokens. Your bill is `Σ(input × input_rate + output × output_rate)` across every call.
 
 ```
-  One call: the cost ledger
+  The cost shape — input vs output tokens
 
-  ┌─ Input tokens (you pay $3/M for sonnet) ──────────┐
-  │   system prompt       ~500   tokens                │
-  │   schema summary      ~1500  tokens                │
-  │   category checklist  ~750   tokens                │
-  │   tool definitions    ~1000  tokens                │
-  │   prior turns (turn N) ~N × 1k tokens              │
-  │   TOTAL (turn 1):     ~4-5k                        │
-  │   TOTAL (turn 6):    ~10-15k                       │
-  ├────────────────────────────────────────────────────┤
-  │ Output tokens (you pay $15/M for sonnet)           │
-  │   tool_use args       ~50-200                      │
-  │   text reasoning      ~200-500                     │
-  │   final JSON          ~1-2k                        │
-  │   TOTAL per turn:     ~500-2000                    │
-  ├────────────────────────────────────────────────────┤
-  │ Cost per turn (turn 6):                            │
-  │   input:  12000 × $3/1M  = $0.036                  │
-  │   output:  1500 × $15/1M = $0.0225                 │
-  │   TOTAL per turn:        ≈ $0.06                   │
-  └────────────────────────────────────────────────────┘
+  ┌─ One monitoring scan ───────────────────────────────────┐
+  │  Input tokens (you pay full price):                     │
+  │   system prompt        ~400 tokens                      │
+  │   schema summary       ~500 tokens                      │
+  │   tool definitions     ~800 tokens                      │
+  │   tool results (×6)   ~12,000 tokens (truncated to 4KB) │
+  │   ────────────────────────────────                      │
+  │   Total input         ~13,700 tokens                    │
+  │                                                         │
+  │  Output tokens (5× more expensive per token):           │
+  │   tool_use blocks      ~600 tokens                      │
+  │   anomaly synthesis    ~800 tokens                      │
+  │   ────────────────                                      │
+  │   Total output        ~1,400 tokens                     │
+  │                                                         │
+  │  Cost (Sonnet 4.6 pricing, approx 2026):                │
+  │   input:  13,700 × $3/1M  = $0.041                      │
+  │   output:  1,400 × $15/1M = $0.021                      │
+  │   ──────────────────────                                │
+  │   Total per scan: ~$0.062                               │
+  └─────────────────────────────────────────────────────────┘
 ```
 
 ### Move 2 — the step-by-step walkthrough
 
-**The pricing table.** As of 2026, the models this codebase uses:
+**Part 1 — where the tokens are logged.**
 
-  → `claude-sonnet-4-6` — $3 / 1M input, $15 / 1M output.
-  → `claude-haiku-4-5-20251001` — $1 / 1M input, $5 / 1M output.
-
-**The actual measurement source.** Every `complete()` call logs `usage` to
-Vercel logs (`lib/agents/aptkit-adapters.ts:57-61`):
+Every Anthropic call emits a log line from `AnthropicModelProviderAdapter.complete()` at `lib/agents/aptkit-adapters.ts:55-60`:
 
 ```typescript
 console.log(JSON.stringify({
-  site: this.logSite,                // e.g. "agents/diagnostic:aptkit-model"
+  site: this.logSite,                // "agents/{name}:aptkit-model"
   sessionId: this.sessionId,
-  usage: response.usage,             // {input_tokens, output_tokens,
-                                     //  cache_creation_input_tokens,
-                                     //  cache_read_input_tokens}
+  usage: response.usage,             // { input_tokens, output_tokens }
 }));
 ```
 
-To get a real cost number, you'd filter Vercel logs by `site` for the
-investigation period, sum `input_tokens` and `output_tokens`, multiply by the
-pricing. There's no in-app aggregation; the logs are the source of truth.
+That's it. No aggregation, no per-day rollup, no per-route cost. To answer "how much did we spend yesterday on diagnostic agents?", you query Vercel logs for `site = "agents/diagnostic:aptkit-model"`, sum input + output across the time window, multiply by Sonnet rates.
 
-**Where the money goes in a typical diagnostic loop.** Walking the numbers:
+**Part 2 — where the tokens come from (input side).**
 
-  → **Turn 1.** Input ≈ 4k (system prompt + schema summary + anomaly context
-    + tool defs). Output ≈ 200 (model picks a tool, emits `tool_use`
-    block, very little prose). Cost: ~$0.015.
+The input side has four contributors, in rough descending order:
 
-  → **Turn 2.** Input ≈ 5k (turn 1's everything + the tool_use block from
-    turn 1 + the tool result). Output ≈ 300. Cost: ~$0.020.
+  → **Tool results** (~70% of input on a typical scan). Each `tool_call_end` feeds the truncated (4KB) result back to the model as a `tool_result` content block. With 6 tool calls × 4KB each = 24KB ≈ ~6000–8000 tokens depending on the result shape.
+  → **Tool definitions** (~10–15% of input). Each agent ships its tool subset to the model: monitoring's 13 tools, diagnostic's 17, etc. Tool schemas are verbose JSON — even with no calls made yet, the prompt carries ~800 tokens of tool definitions.
+  → **System prompt** (~5%). The agent's role + rules. Monitoring's prompt at `lib/agents/legacy-prompts/monitoring.md` is ~400 tokens.
+  → **Schema summary** (~5%). `schemaSummary()` at `lib/agents/monitoring.ts:18` caps at 20 events + 10 properties + 30 customer props ≈ ~400-500 tokens.
 
-  → **Turn 3-5.** Each ~6-9k input, ~300-500 output. Each ~$0.025-$0.035.
+**Part 3 — output side is the structured output, plus reasoning text.**
 
-  → **Turn 6 (final synthesis).** Input ≈ 10k. Output ≈ 1500 (the full
-    `Diagnosis` JSON). Cost: ~$0.055.
+Output is dominated by:
 
-  → **Total:** ~$0.18 for one diagnostic investigation.
+  → **`tool_use` blocks** — the agent's tool calls. Each is ~50-100 tokens (name + small input object). 6 calls ≈ 400-600 tokens.
+  → **Final synthesis** — the typed reduction (`Anomaly[]`, `Diagnosis`, etc.). Verbose for recommendations (rationale + steps + impact), small for anomalies.
 
-The output cost on turn 6 is the single biggest line. That's the
-synthesis-turn pattern — the model has held back on prose until it has all
-the data, then emits the whole structured answer. Output costs 5x input,
-so the final-turn shape dominates.
+**Part 4 — the cheap-classifier savings.**
 
-**Why output costs more.** The model's compute cost per token is the same
-on input and output; the pricing premium on output reflects two things:
-(1) it's pure generation, no parallelization (a single token at a time),
-and (2) it's the value-add (anyone can supply text — only the model can
-generate the answer). Provider pricing reflects this across the industry.
+Intent classification (`lib/agents/intent.ts:30`) uses Haiku, not Sonnet. Per call cost: ~$0.0003 vs ~$0.05 for a Sonnet query. The savings only materialize on the free-form `q` path where the user types a question — the briefing/investigation paths don't classify intent. But on the chat surface, the savings compound: a generic "hi" or off-topic question gets a cheap Haiku call and a default-route to the query agent, never spinning up a full Sonnet investigation.
 
-**Where the cost hits today.** Live mode is gated by the Bloomreach side, not
-Anthropic. The alpha MCP server's "1 per 10s" rate limit caps the throughput
-at ~360 tool calls per hour per user; agent loops do 3-10 tool calls each so
-the budget caps at ~30-50 investigations per hour. Demo mode is free. So the
-*current* Anthropic bill is small — maybe $10-30/month for the user's own
-testing. The number scales linearly with users + live-mode usage.
+```
+  Cheap-classifier routing cost shape
+
+  user types "hi"
+       │
+       ▼
+  intent classify (Haiku, ~$0.0003) → 'generic'
+       │
+       ▼
+  query agent (Sonnet, ~$0.005 for a short answer)
+       │
+       ▼
+  Total: ~$0.0053 instead of jumping straight to a
+         full ~$0.05 Sonnet investigation.
+
+  On bigger questions (legit metric queries), the
+   intent classify adds $0.0003 to a $0.05 investigation —
+   essentially free. The Haiku call also serves a routing
+   purpose, not just cost: pickng the right downstream agent.
+```
 
 ### Move 3 — the principle
 
-**Cost = (input_tokens × turn_count × input_rate) + (output_tokens × output_rate).
-Output dominates per turn; input dominates per loop.** The two cost-reduction
-levers are: (1) cap turn count (`max_tokens` on output, hard tool-call caps in
-prompts: 6 for monitoring/diagnostic, 4 for recommendation), and (2) cap
-per-turn input (`schemaSummary()` trimming). Both are in place. The next
-lever is prompt caching — re-sending the same system prompt prefix every
-turn could be a cache-hit, but that's a Case B (see
-`06-production-serving/01-llm-caching.md`).
+**Output tokens cost more; tool results dominate input.** The two biggest cost levers are (1) prompt caching for the static parts (system prompt + tool definitions + schema summary), and (2) truncating tool results aggressively. This codebase does the second (4KB cap at `route.ts:99`); it does NOT do the first.
 
-## Primary diagram
+## Primary diagram — the full recap
 
 ```
-  Cost flowchart — where to spend a token-reduction hour
+  Token economics ledger — one full session in this app
 
-   start
-     │
-     ▼
-  measure (read Vercel logs for `usage` field)
-     │
-     ▼
-  is input growing per turn?  ── yes ──►  truncate schema / history more
-     │ no                                  (schemaSummary tweak)
-     ▼
-  is output > 1k per turn?    ── yes ──►  lower max_tokens or prompt
-     │ no                                  for terser output
-     ▼
-  is turn count > 4?          ── yes ──►  cap tool calls harder
-     │ no                                  (prompt or AptKit config)
-     ▼
-  do system prompt + tool      ── yes ──►  enable Anthropic prompt caching
-  defs repeat verbatim                     (Case B in this codebase)
-  per turn?
-     │ no
-     ▼
-  consider switching to haiku
-  for non-synthesis turns
-  (Case B — model routing)
+  ┌──────────────────────┬───────┬──────┬──────────────────┐
+  │ Step                 │ Model │ Cost │ Notes            │
+  ├──────────────────────┼───────┼──────┼──────────────────┤
+  │ Briefing scan        │ Sonnet│ $0.06│ 6 tool calls,     │
+  │                      │       │      │ truncated results │
+  ├──────────────────────┼───────┼──────┼──────────────────┤
+  │ Diagnostic           │ Sonnet│ $0.08│ ~7 tool calls,    │
+  │ investigation        │       │      │ hypothesis-testing│
+  ├──────────────────────┼───────┼──────┼──────────────────┤
+  │ Recommendation       │ Sonnet│ $0.07│ ~5 tool calls +   │
+  │ proposal             │       │      │ verbose synthesis │
+  ├──────────────────────┼───────┼──────┼──────────────────┤
+  │ Free-form query      │ Haiku │ $.0003│ pre-routing       │
+  │ intent classify      │       │      │                  │
+  ├──────────────────────┼───────┼──────┼──────────────────┤
+  │ Free-form query      │ Sonnet│ $0.05│ 1 user question   │
+  │ answer               │       │      │                  │
+  └──────────────────────┴───────┴──────┴──────────────────┘
+
+  Total typical session (scan + 1 invest + 1 query) ≈ $0.26
+   Scaling math:
+     100 sessions/day  → ~$26/day  → ~$780/month
+   1,000 sessions/day  → ~$260/day → ~$7,800/month
+   The 60s response cache catches repeat-scans within the
+    window, so multi-tab or rapid-reload behavior doesn't multiply cost.
 ```
 
 ## Elaborate
 
-The "haiku for triage, sonnet for synthesis" model-routing pattern is the
-biggest cost-reduction move that hasn't been made in this codebase. The intent
-classifier is already on haiku; the *first few exploratory turns* of the
-diagnostic loop could plausibly run on haiku and only the final synthesis
-turn on sonnet. The blocker is that AptKit owns the loop and doesn't expose a
-per-turn model choice today. The exercise below names the refactor.
+**Why prompt caching matters here.** The static parts of every agent prompt (system + tool definitions + schema summary) are ~1700 tokens. They're identical for every call by the same agent against the same workspace. With Anthropic's prompt caching, cached prefix tokens cost ~10% of normal input rate. For an agent that runs 6 LLM calls per scan, that's a ~60% saving on input tokens for calls 2-6 (call 1 pays the cache-set premium, ~25% extra).
 
-Anthropic's prompt caching (introduced 2024) is the other big lever. Every
-agent turn re-sends the system prompt verbatim — perfect cache candidate. The
-`cache_creation_input_tokens` and `cache_read_input_tokens` fields in
-`response.usage` are already being logged, they're just always `0` because
-nothing is being cached. Adding `cache_control: { type: 'ephemeral' }` to the
-system block in `AnthropicModelProviderAdapter.complete()` (and to the schema
-summary block, which is also stable per session) would cut input cost on
-turns 2+ by ~90%. See `06-production-serving/01-llm-caching.md` for the
-walkthrough.
+The cache isn't wired today. The adapter would need to set `cache_control: { type: 'ephemeral' }` on the system prompt + tool definitions block when building the request. Wire one agent first (monitoring is the highest-volume per session), measure, then propagate.
+
+**Why output is the expensive side.** Sonnet's output rate is roughly 5× the input rate. For an agent that outputs verbose recommendations (300+ tokens of rationale × N recommendations), output can rival input in dollar terms even though it's 1/10th the token count.
+
+**Where the codebase is honest about not measuring.** There's no aggregate cost dashboard. There's no per-user cost cap. There's no alert when usage spikes. The honest framing: cost is tractable today because volume is low; the moment that changes, the first step is wiring prompt caching, the second is per-user rate limiting, the third is per-day caps with `console.warn` thresholds.
 
 ## Project exercises
 
-### Exercise — emit per-investigation cost summary at done
+### Exercise — Wire Anthropic prompt caching for the monitoring agent
 
-  → **Exercise ID:** `study-ai-eng-06.1`
-  → **What to build:** Accumulate `usage` numbers across all `complete()`
-    calls inside a single route invocation, and emit a final
-    `{ type: 'cost_summary', inputTokens, outputTokens, estUsd }` event
-    before `{ type: 'done' }`. The UI shows it in the investigation
-    footer.
-  → **Why it earns its place:** Makes the cost visible at the unit-of-work
-    boundary. Today the only way to know what an investigation cost is
-    grepping Vercel logs.
-  → **Files to touch:** `lib/agents/aptkit-adapters.ts` (accumulator on the
-    adapter), `app/api/agent/route.ts` (emit before done),
-    `lib/mcp/events.ts`, `components/investigation/EvidencePanel.tsx`.
-  → **Done when:** Live investigation shows "this investigation: 32k in / 4k
-    out · ~$0.16" in the UI.
-  → **Estimated effort:** `1–4hr`
-
-### Exercise — enable Anthropic prompt caching on the system block
-
-  → **Exercise ID:** `study-ai-eng-06.2`
-  → **What to build:** In `AnthropicModelProviderAdapter.complete()`, when
-    `request.system` is present, send it as a structured `system` array
-    with `cache_control: { type: 'ephemeral' }` instead of a plain string.
-    Verify the next turn's `usage.cache_read_input_tokens` is >0.
-  → **Why it earns its place:** Cuts input cost on turns 2+ by ~90% for the
-    cached prefix. The biggest cost lever still on the table.
-  → **Files to touch:** `lib/agents/aptkit-adapters.ts:49`, and possibly
-    AptKit `ModelRequest` (if `system` needs to be structured upstream).
-  → **Done when:** Logs show `cache_read_input_tokens > 0` on the second
-    turn of any agent loop. A back-of-envelope check shows ~50%+ input
-    cost reduction across a 6-turn loop.
-  → **Estimated effort:** `1–4hr` (AptKit upstream may add a half-day).
+  → **Exercise ID:** B1.6
+  → **What to build:** Add `cache_control: { type: 'ephemeral' }` markers to the static parts of the monitoring agent's request — the system prompt, the schema summary, and the tool definitions. Measure the cache hit rate via the `usage.cache_read_input_tokens` and `usage.cache_creation_input_tokens` fields. Log the cost savings per scan.
+  → **Why it earns its place:** monitoring is the highest-volume agent per session (briefing scan runs on every page load when live). Even a 50% cache hit rate cuts the monitoring bill in half. This is the most direct dollar lever in the codebase.
+  → **Files to touch:** `lib/agents/aptkit-adapters.ts` (extend `complete()` to thread cache markers through), `lib/agents/monitoring.ts` (mark static parts as cacheable), `test/agents/aptkit-adapters.test.ts` (assert the markers land on the SDK request).
+  → **Done when:** the per-call usage log shows non-zero `cache_read_input_tokens` after the second monitoring scan in a session, a wallclock measurement shows the second scan cheaper than the first by ~50% on input tokens, and the test suite has fixtures for both cache-create and cache-read cases.
+  → **Estimated effort:** 1–4hr.
 
 ## Interview defense
 
-**Q: What does one investigation cost in dollars?**
+**Q: "How much does it cost to run a monitoring scan?"**
 
-About $0.30 end-to-end (diagnostic ~$0.18 + recommendation ~$0.12). The
-monitoring scan is about the same — ~$0.30 for one daily briefing. The
-biggest line item is the final synthesis turn's output tokens: ~1-2k of JSON
-at sonnet's $15/M-output rate is ~$0.02 per call, and the synthesis turn is
-the most expensive in every agent loop.
+About 6 cents per scan, in Sonnet 4.6 pricing. The breakdown is roughly $0.04 input + $0.02 output, driven by 6 tool calls each returning a truncated (4KB) result. The full session — scan + one investigation + one recommendation — comes to about $0.21. The cheap classifier is Haiku at $0.0003 per call; it covers the free-form query intent only.
 
-```
-  Cost per agent (one unit of work):
-    monitoring (briefing scan)        ≈ $0.30
-    diagnostic (one investigation)    ≈ $0.18
-    recommendation (one rec set)      ≈ $0.12
-    intent classify (haiku)           ≈ $0.0003
+*Anchor: "$0.06 per scan, $0.21 per session, measured from `response.usage` logs."*
 
-  Per-turn dominance:
-    input cost dominates LOOP cost (multiplied by turn count)
-    output cost dominates PER-TURN cost (5× input rate)
-```
+**Q: "Where would you go to cut cost?"**
 
-**Anchor line:** "Output is 5× more expensive than input per token. The
-synthesis turn dominates each call; the prompt re-send dominates the loop."
+Two levers. First, Anthropic prompt caching — the system prompt + tool definitions + schema summary are static per agent per workspace, ~1700 tokens. Caching them cuts the input bill by ~60% on the second-and-later calls per scan. Not wired yet (`B1.6`). Second, the tool-result truncation is already aggressive (4KB cap) but blind — large numeric results get truncated alongside small ones. A smarter truncation (`{ count, first 100 rows, ... }` rather than first 4KB raw) would let the model see *more* of the result for fewer tokens.
 
-**Q: What's the biggest cost-reduction move you haven't shipped yet?**
-
-Anthropic prompt caching on the system block. Every agent turn re-sends the
-~500-token system prompt verbatim — perfect cache candidate. The
-`response.usage` already has `cache_creation_input_tokens` and
-`cache_read_input_tokens` fields; they're being logged, they're always zero
-today because we don't set `cache_control: { type: 'ephemeral' }`. Setting
-it on the `system` block in `AnthropicModelProviderAdapter.complete()` would
-cut input cost on turns 2+ by ~90% for the cached prefix.
-
-**Anchor line:** "Caching is one config flag away. The usage object already
-has the cache fields; they're just always zero."
+*Anchor: "Prompt caching first (60% input savings on monitoring), smart truncation second."*
 
 ## See also
 
-  → `02-tokenization.md` — what `input_tokens` is actually counting
-  → `06-production-serving/01-llm-caching.md` — the cache that would cut this in half
-  → `06-production-serving/02-llm-cost-optimization.md` — model routing as the next lever
+  → `02-tokenization.md` — the unit costs are denominated in
+  → `06-production-serving/01-llm-caching.md` — the prompt-caching exercise from a serving lens
+  → `06-production-serving/02-llm-cost-optimization.md` — the full cost-optimization story
+  → `05-evals-and-observability/04-llm-observability.md` — the per-call usage log story

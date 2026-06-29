@@ -1,88 +1,112 @@
-# Overview — prompt engineering in `blooming_insights`
+# Overview — the prompt-engineering surface of blooming insights
 
-The orientation page. Where prompts live, who calls them, what they produce, and where every later concept file plugs in.
+**Industry standard** · system overview, prompt-engineering lens
 
-## The system, one diagram
+## Zoom out — where prompts live in this system
 
-```
-  Where prompts live, top to bottom
-
-  ┌─ UI (React 19 · App Router) ─────────────────────────────────────────────┐
-  │  feed page · investigate pages · QueryBox                                │
-  └──────────────────────────────────┬───────────────────────────────────────┘
-                                     │  fetch + NDJSON ReadableStream
-  ┌─ Route handlers (/api/briefing · /api/agent) ───────────────────────────┐
-  │  bootstrap MCP schema  →  instantiate agent  →  stream events back      │
-  └──────────────────────────────────┬───────────────────────────────────────┘
-                                     │
-  ┌─ Agent adapters (lib/agents/*.ts) ──────────────────────────────────────┐
-  │  MonitoringAgent · DiagnosticAgent · RecommendationAgent · QueryAgent    │
-  │  intent.classifyIntent                                                   │
-  │  Each one a thin wrapper that:                                           │
-  │    • picks the right AptKit agent class                                  │
-  │    • passes 3 adapters (model · tools · trace) + workspace schema        │
-  └──────────────────────────────────┬───────────────────────────────────────┘
-                                     │
-  ┌─ AptKit runtime (@aptkit/core@0.3.0) ───────────────────────────────────┐
-  │  AnomalyMonitoringAgent · DiagnosticInvestigationAgent · ...             │
-  │  Owns: the tool-use loop · forced-final synthesis turn · validators      │
-  │  Carries the active system prompts (Bloomreach-only)                      │
-  └──────────────────────────────────┬───────────────────────────────────────┘
-                                     │
-  ┌─ Anthropic API · MCP server ────────────────────────────────────────────┐
-  │  claude-sonnet-4-6 (agents) · claude-haiku-4-5 (intent)                  │
-  │  Bloomreach loomi connect MCP → execute_analytics_eql + ancillary tools  │
-  └──────────────────────────────────────────────────────────────────────────┘
-
-  Legacy prose-source-of-truth (Bloomreach-only) at:
-    lib/agents/legacy-prompts/{monitoring,diagnostic,recommendation,query}.md
-  Loaded only by lib/agents/*-legacy.ts (not the active path).
-```
-
-The active path runs through AptKit; the legacy `.md` files are the version-controlled Bloomreach-only source-of-truth for the same shapes, kept readable as markdown for review and audit.
-
-## The five agents and what each one's prompt does
-
-| Agent          | What its prompt asks for                                            | Output shape                |
-|----------------|---------------------------------------------------------------------|-----------------------------|
-| `monitoring`   | Walk the category checklist, run 90d-vs-prior-90d, emit anomalies   | `Anomaly[]` (JSON in fence) |
-| `diagnostic`   | Generate 2–3 hypotheses, query to falsify, conclude                 | `Diagnosis` (single object) |
-| `recommendation`| Given a diagnosis, propose 2–3 Bloomreach actions with dollar impact| `Recommendation[]`         |
-| `query`        | Answer a free-form user question with grounded numbers              | Natural-language text       |
-| `intent`       | Classify a query as monitoring / diagnostic / recommendation        | One word                    |
-
-Four return structured JSON (a tool-calling agent loop with schema validation at the boundary). One — `query` — returns prose. One — `intent` — is a single-shot classifier with no tools and no JSON. The shape of the output drives almost every prompt-engineering decision downstream.
-
-## The two-axis structure
-
-Two axes carry across every concept file:
+blooming insights runs four LLM-backed agents (monitoring, diagnostic, recommendation, query) plus a one-token intent classifier. Every one of them has a system prompt template stored as markdown in the repo; every one of them validates the model's output at a typed boundary before the rest of the app touches it. The diagram below pins those two surfaces — prompts in, structured output out — across the stack.
 
 ```
-  axis 1 — output mode             axis 2 — call shape
+  Zoom out — the prompt-engineering surface
 
-  structured        ─►  schema     single-shot   ─►  intent
-  (JSON / fenced)       validation                   (no tools, 1 turn)
-                        boundary
-                                   tool-use loop ─►  monitoring · diagnostic
-  free prose        ─►  no parse                      · recommendation · query
-  (query)               just stream                  (multi-turn, budget-capped,
-                        to UI                         forced-final on overflow)
+  ┌─ UI layer ────────────────────────────────────────────────┐
+  │  app/page.tsx · components/chat/QueryBox.tsx              │
+  │  user-controlled text enters HERE                         │
+  └─────────────────────────────────┬─────────────────────────┘
+                                    │  POST /api/agent { q }
+  ┌─ API route layer ────────────────▼────────────────────────┐
+  │  app/api/agent/route.ts · app/api/briefing/route.ts        │
+  │  picks the agent · streams NDJSON                          │
+  └─────────────────────────────────┬─────────────────────────┘
+                                    │
+  ┌─ ★ PROMPT LAYER ★ ──────────────▼────────────────────────┐ ← we are here
+  │  system prompt templates:                                  │
+  │    lib/agents/legacy-prompts/{monitoring,diagnostic,       │
+  │                              recommendation,query}.md      │
+  │  slot interpolation: {schema}, {project_id}, {categories}, │
+  │                      {anomaly}, {diagnosis}, {intent}      │
+  │  active wrapping: @aptkit/core (consumes the same patterns)│
+  └─────────────────────────────────┬─────────────────────────┘
+                                    │  text in → text out
+  ┌─ Model + MCP layer ─────────────▼────────────────────────┐
+  │  Anthropic (claude-sonnet-4-6 / haiku-4-5 for intent)      │
+  │  tool registry: lib/mcp/tools.ts (per-agent allowlists)    │
+  │  per-result truncation: lib/agents/base-legacy.ts:34       │
+  └─────────────────────────────────┬─────────────────────────┘
+                                    │  JSON in a ```json fence
+  ┌─ Validator layer ───────────────▼────────────────────────┐
+  │  defensive parser:  parseAgentJson  (lib/mcp/validate.ts) │
+  │  type guards:       isAnomalyArray · isDiagnosis ·         │
+  │                     isRecommendationArray                  │
+  └─────────────────────────────────┬─────────────────────────┘
+                                    │  typed `Anomaly[]` / `Diagnosis` / ...
+  ┌─ State + UI ────────────────────▼────────────────────────┐
+  │  rendered as InsightCard, EvidencePanel, RecommendationCard│
+  └────────────────────────────────────────────────────────────┘
 ```
 
-Both axes flip the engineering. Structured output forces schemas + validators + retry. Tool-use loops force budget caps + forced-final synthesis. The intent classifier hits neither — it's the simplest possible prompt in the codebase, and the comparison sharpens what makes the others complex.
+## Zoom in — what this notebook covers
 
-## What you'll learn, in order
+Thirteen concepts, organized so the operational discipline (anatomy, structured outputs, prompts-as-code, token budgeting, eval-driven iteration) comes before the specific techniques (few-shot, chain-of-thought, self-critique, meta-prompting). Two concepts cover specific failure modes (output mode mismatch, prompt injection); one covers a pattern this repo doesn't yet exercise (forbidden patterns / rotating formulas).
 
-**01–07 — operational discipline.** Read these before the techniques. They are how a prompt becomes production code: four-section anatomy (01), structured outputs via tool-calling (02), prompts-as-code under version control (03), token budgeting (04), eval-driven iteration (05), single-purpose chains (06), output-mode discipline (07).
+Every concept anchors to real code:
 
-**08–11 — specific techniques.** Few-shot (08), chain-of-thought (09), self-critique (10), meta-prompting (11). Each one a tool with a sharp shape — knowing when to reach for it is the work.
+  → prompt templates at `lib/agents/legacy-prompts/*.md`
+  → the schema-compaction helper (`schemaSummary`) at `lib/agents/monitoring.ts:19`
+  → the tool registry at `lib/mcp/tools.ts`
+  → the defensive parser (`parseAgentJson`) at `lib/mcp/validate.ts:3`
+  → the type guards at `lib/mcp/validate.ts:17-57`
+  → the per-result truncation at `lib/agents/base-legacy.ts:32-37`
+  → token usage logging at `lib/agents/aptkit-adapters.ts:57-61`
 
-**12–13 — defense and hygiene.** Prompt-injection defense (12). Forbidden patterns (13).
+## The five agents at a glance
 
-## What this codebase is honest about NOT having
+```
+  Five agents, five system prompts — each with one job
 
-- **No eval harness in the repo today.** Concept 05 walks the eval-driven iteration pattern and names Case B: the pattern is real, the substrate is absent — no `eval/` directory, no 4-pillar suite, no LLM-as-judge harness in this repo. The honest framing matters — without evals, prompt iteration in this repo is by-hand against the captured demo snapshot.
-- **No production prompt-version logging.** The legacy `.md` files are version-controlled, but there's no log entry that says "this output was produced by prompt vX of monitoring.md." Concept 03 names this as the next step.
-- **No automated drift detection across model upgrades.** Sonnet 4 → Sonnet 4.6 was a manual swap. Concept 03 names what would need to exist to catch a regression.
+  ┌─ classifier ─────────────────────────────────────────────┐
+  │  intent (haiku-4-5)                                       │
+  │    one-token output: monitoring | diagnostic |            │
+  │                      recommendation                       │
+  │    16 max_tokens · no tools · 1 SDK call                  │
+  └───────────────────────────────────────────────────────────┘
 
-These gaps are real, and naming them is part of the discipline. A production AI engineer's portfolio doesn't have to be complete — it has to be honest about what's complete and what's next.
+  ┌─ monitoring ─────────────────────────────────────────────┐
+  │  monitoring (sonnet-4-6)                                  │
+  │    output: JSON array of Anomaly{} (in ```json fence)     │
+  │    6 tool calls max · execute_analytics_eql + catalog     │
+  │    isAnomalyArray() validates · UI renders as cards       │
+  └───────────────────────────────────────────────────────────┘
+
+  ┌─ diagnostic ─────────────────────────────────────────────┐
+  │  diagnostic (sonnet-4-6)                                  │
+  │    output: JSON object Diagnosis{} (in ```json fence)     │
+  │    6 tool calls max · segments + time-series              │
+  │    isDiagnosis() validates · UI renders as EvidencePanel  │
+  └───────────────────────────────────────────────────────────┘
+
+  ┌─ recommendation ─────────────────────────────────────────┐
+  │  recommendation (sonnet-4-6)                              │
+  │    output: JSON array Recommendation[] (in ```json fence) │
+  │    4 tool calls max · Bloomreach feature catalog          │
+  │    isRecommendationArray() validates · UI renders cards   │
+  └───────────────────────────────────────────────────────────┘
+
+  ┌─ query (free-form Q&A) ──────────────────────────────────┐
+  │  query (sonnet-4-6)                                       │
+  │    output: plain prose (NO json contract)                 │
+  │    ~6 tool calls · superset registry                      │
+  │    no validator · streamed straight to the UI             │
+  └───────────────────────────────────────────────────────────┘
+```
+
+Four of the five are JSON-structured outputs; one (the query agent) returns prose. That asymmetry shows up in every concept that follows — structured-output discipline applies to four agents, doesn't apply to one. Worth holding that contrast in your head as you read.
+
+## What the codebase is missing (the honest list)
+
+Two concepts get a "not yet exercised" treatment:
+
+  → **Eval-driven iteration with a real eval set.** The validator (`lib/mcp/validate.ts`) tests shape, not behavior. There's no golden set of (prompt, input, expected output) cases. The eval/ folder was retired (PR #8). Concept #5 covers what this means and what a buildable target looks like.
+  → **Rotating formulas / forbidden patterns.** No agent in this codebase is a generative chain run repeatedly for the same user, so the pattern doesn't fire here yet. Concept #13 covers when it would.
+
+The rest of the concepts have real anchors in real files. Read on.

@@ -1,504 +1,355 @@
-# Graphs and traversals
+# Graphs and Traversals
 
-*Graph models, BFS, DFS, shortest paths — Industry standard · Case B (not exercised; taught from fundamentals + reincodes anchors)*
+Graph · directed / undirected · adjacency list · BFS · DFS · shortest path · topological sort — Industry standard
 
-## Zoom out — graphs in this codebase (none at runtime)
+## Zoom out — where this concept lives
 
-```
-  Graph-shaped things in this codebase
-  ────────────────────────────────────
-
-  ┌─ UI layer ────────────────────────────────────┐
-  │  no graph state in components                  │
-  └────────────────────────┬──────────────────────┘
-                           │
-  ┌─ Service layer ────────▼──────────────────────┐
-  │  ★ NO GRAPHS AT RUNTIME ★                      │
-  │                                                │
-  │  Sort-of-graph-shaped at BUILD/DESIGN time:    │
-  │    - category dependencies (Set membership,    │
-  │      not traversed; agents/categories.ts)      │
-  │    - tool coverage (set difference, not        │
-  │      reachability; mcp/tool-coverage.ts)       │
-  │    - import graph (TypeScript handles it)      │
-  └────────────────────────┬──────────────────────┘
-                           │
-  ┌─ Provider boundary ────▼──────────────────────┐
-  │  agent loop = LLM picks next tool — that's an  │
-  │  implicit traversal, but the algorithm is the  │
-  │  model's, not yours                            │
-  └───────────────────────────────────────────────┘
-```
-
-Verdict-first: **this repo has no graph data
-structures and no traversal algorithms in the running
-code.** The closest thing is the category dependency
-check — "does this category require capability X?" —
-but it's a single `Set.has(...)` lookup per
-dependency, not a traversal. There's no BFS, no DFS,
-no shortest-path, no topological sort.
-
-So this file is Case B: teach graphs from fundamentals,
-anchored to your reincodes implementations (`Graph.ts`,
-`Graph2.ts`, BFS over state spaces in `PG.ts`). The
-interview surface for graphs is enormous, and you've
-*built* most of it — this file makes that bridge
-explicit.
-
-## Structure pass — graph variants and the questions they answer
-
-Three graph dimensions, one question held constant:
-*"how do you find what's reachable from here?"*
+**Not yet exercised** in the running code. There is no explicit graph data structure in `blooming_insights`, no BFS, no DFS, no topological sort, no shortest-path algorithm. The closest thing to a graph is the **categories → required-events dependency map** in `lib/agents/categories-legacy.ts` — that's a bipartite relation, not a graph the code traverses. The agent loop runs as a flat `for` (file 07), not a graph walk.
 
 ```
-  One question, dimensions of variation
-  ─────────────────────────────────────
+  Zoom out — where a graph would fit (none exercised today)
 
-  "from this node, what's reachable, and how cheaply?"
-
-  ┌─ Directed vs undirected ────────────┐
-  │ directed   → edges point one way     │  e.g. import graph
-  │ undirected → edges go both ways      │  e.g. friendship
-  └─────────────────────────────────────┘
-
-  ┌─ Weighted vs unweighted ────────────┐
-  │ unweighted → all edges cost 1        │  → BFS finds shortest
-  │ weighted   → edges carry a cost      │  → Dijkstra/Bellman-Ford
-  └─────────────────────────────────────┘
-
-  ┌─ Explicit vs implicit ──────────────┐
-  │ explicit → adjacency list/matrix     │  e.g. social graph
-  │ implicit → neighbors computed from   │  e.g. state-space
-  │   rules at traversal time            │    search (your PG.ts)
-  └─────────────────────────────────────┘
+  ┌─ UI (browser) ─────────────────────────────────────────────────┐
+  │  (no graph walked)                                              │
+  └────────────────────────────────────────────────────────────────┘
+  ┌─ Service ──────────────────────────────────────────────────────┐
+  │  ★ where a graph WOULD live ★                                   │
+  │  categories ↔ required-events: bipartite relation, but the     │
+  │  code answers "are all my requires present?" by Set.has,       │
+  │  not by graph traversal. it's a one-step lookup, not a walk.   │
+  │                                                                 │
+  │  hypothesisspace exploration: the agent loop COULD be modeled  │
+  │  as graph search (state = messages so far; edge = next tool    │
+  │  call). today it's a flat for-loop with no branching.          │
+  └────────────────────────────────────────────────────────────────┘
+  ┌─ Storage (Bloomreach) ─────────────────────────────────────────┐
+  │  (opaque)                                                       │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
-The seam that flips the algorithm choice: **weighted
-or not**. Unweighted shortest path is BFS, dead
-simple. Weighted shortest path is Dijkstra (non-
-negative weights) or Bellman-Ford (any weights, but
-slower). Get this wrong in an interview and the rest
-of the solution is wasted.
+Cross-link: you have BFS, DFS, Dijkstra, valid-tree check, connected-components, Eulerian cycle, and a river-crossing state-space search already implemented in `reincodes` (`Graph.ts`, `Graph2.ts`, `PG.ts`). The teaching here is to keep those sharp — they're your interview asset — and to name the seam where a graph *would* land in `blooming_insights` if the surface grew.
 
-Hand off to How it works.
+## Zoom in — the concept
+
+A graph is a set of **nodes** (vertices) connected by **edges**. The two questions you ask of a graph are:
+
+1. "From here, what can I reach?" — answered by traversal (BFS / DFS).
+2. "What's the cost to get there?" — answered by shortest-path (Dijkstra / Bellman-Ford / A*).
+
+That's the whole subject. Every other graph algorithm — topological sort, connected components, cycle detection, MST, max-flow — is built on top of those two primitives.
+
+`blooming_insights` doesn't run either question on any data structure today. But almost every interesting backend problem turns into a graph eventually: dependency resolution, build systems, social networks, routing, scheduling, package managers, knowledge graphs, agent state-space search.
+
+## Structure pass — layers · axes · seams
+
+One axis traced: **how is the graph stored, and what does that cost for each operation?**
+
+```
+  one axis — "stored as what, costing what?"
+
+  ┌─ adjacency list ─────────────────────────────────────────────┐
+  │   Map<nodeId, nodeId[]>                                       │
+  │   space:           O(V + E)                                   │
+  │   has-edge?:       O(deg(v))  (scan neighbors)                │
+  │   iterate edges:   O(deg(v))                                  │
+  │   good for:        sparse graphs (most graphs in the wild)    │
+  └──────────────────────────────────────────────────────────────┘
+  ┌─ adjacency matrix ───────────────────────────────────────────┐
+  │   boolean[V][V]                                                │
+  │   space:           O(V²)                                       │
+  │   has-edge?:       O(1)                                        │
+  │   iterate edges:   O(V) per node                               │
+  │   good for:        dense graphs, fast edge-existence queries   │
+  └──────────────────────────────────────────────────────────────┘
+  ┌─ edge list ──────────────────────────────────────────────────┐
+  │   [{from, to, weight}, ...]                                    │
+  │   space:           O(E)                                        │
+  │   has-edge?:       O(E)  (scan list)                           │
+  │   good for:        algorithms that walk all edges (Kruskal's,  │
+  │                    Bellman-Ford), or as initial input format   │
+  └──────────────────────────────────────────────────────────────┘
+```
+
+- **layers**: not exercised — no graph layer exists.
+- **axis**: storage shape. Each shape trades a different cost.
+- **seam**: the boundary between "do I want fast edge existence?" (matrix) and "do I want to walk neighbors?" (list). Most working code wants the list — graphs in the wild are almost always sparse.
 
 ## How it works
 
-#### Move 1 — the mental model
+### Move 1 — the mental model
 
-You already think in graphs every time you debug an
-import error: file A imports file B which imports
-file C which imports A — *cycle*. That's a graph
-problem. The reachable set from your entry point is
-"all files that get bundled." The unreachable set is
-"dead code." TypeScript's compiler does both with
-DFS.
+A graph is **a hash map from each node to its list of neighbors** (the adjacency-list representation, which is what 90% of working code uses). That's it. Everything else — traversal, shortest path, topological order — is "given this map, what can I compute?"
 
-The anchor that works best for you (from reincodes):
-your BFS visualizer lighting up cells in a grid. The
-grid IS a graph — each cell is a node, each
-horizontal/vertical neighbor is an edge — and BFS
-sweeps outward in concentric "wavefronts."
+You've built this exact structure in `reincodes/Graph.ts`. The teaching here uses pseudocode (file format prefers pseudocode where the concept is language-agnostic).
 
 ```
-  BFS — the wavefront expansion
-  ─────────────────────────────
+  graph — the kernel
 
-  step 0:  S . . .           start at S
-           . . . .
-           . . . .
-           . . . G
+  type Graph = Map<NodeId, NodeId[]>
 
-  step 1:  S 1 . .           neighbors of S
-           1 . . .             added to frontier
-           . . . .
-           . . . G
+  the entire abstract data structure:
+     addNode(id):             g.set(id, [])
+     addEdge(from, to):       g.get(from).push(to)
+                              g.get(to).push(from)    // undirected only
+     neighbors(id):           g.get(id)
 
-  step 2:  S 1 2 .           neighbors of frontier
-           1 2 . .             added (if unvisited)
-           2 . . .
-           . . . G
-
-  ...                        wavefront expands until
-                             goal G is found
+  every algorithm below operates over this one shape.
 ```
 
-That picture *is* BFS. The data structure that
-makes it work is a *queue* (the frontier), a *Set*
-of visited nodes, and a loop: dequeue → expand →
-enqueue unvisited neighbors → repeat until queue
-empty or goal found.
-
-#### Move 2 — the operations, anchored to reincodes
-
-**Graph as adjacency list — your `Graph.ts`**
-
-The two graph representations:
+BFS explores level by level using a **queue**: dequeue a node, enqueue its unvisited neighbors. DFS explores as far as possible down one branch using a **stack** (or recursion's implicit call-stack): pop a node, push its unvisited neighbors. Both are O(V + E) — every node visited once, every edge inspected once.
 
 ```
-  Adjacency list vs matrix
-  ────────────────────────
+  BFS — the pattern
 
-  graph:   A — B
-           |   |
-           C   D
+  start state:    frontier = queue([start])
+                  visited  = set({start})
 
-  adjacency list                 adjacency matrix
-  ──────────────                 ────────────────
-  A: [B, C]                          A B C D
-  B: [A, D]                       A [0 1 1 0]
-  C: [A]                          B [1 0 0 1]
-  D: [B]                          C [1 0 0 0]
-                                  D [0 1 0 0]
+  while frontier not empty:
+    node = frontier.dequeue()
+    for each neighbor of node:
+      if neighbor not in visited:
+        visited.add(neighbor)
+        frontier.enqueue(neighbor)
 
-  space: O(V + E)                 space: O(V²)
-  iterate edges: O(degree)        iterate edges: O(V)
-  → great for sparse graphs       → great for dense graphs
+  termination: when frontier is empty
 ```
 
-Anchor to reincodes:
+### Move 2 — the moving parts
 
-```ts
-// reincodes — Graph.ts
-class Graph {
-  private adjacencyList: Map<vertex, vertex[]>
-  addVertex(v)
-  addEdge(v1, v2)
-  bfs_traversal(start): vertex[]
-  dfs_traversal(start): vertex[]
-  isGraphValidTree(): boolean
-  numberOfConnectedComponents(): number
-}
-```
+#### the load-bearing skeleton of BFS
 
-The adjacency list is **the right default**: most
-real graphs are sparse (V vertices, ~V edges, not V²
-edges), so adjacency list wins on space *and* on the
-"iterate this vertex's neighbors" hot path that every
-traversal needs.
-
-**BFS — the load-bearing skeleton**
-
-This is the algorithm to know cold. The four parts:
-
-1. **Frontier (queue)** — the nodes to expand next,
-   processed FIFO. **What breaks without it:** you'd
-   need a different ordering (stack → DFS) or no
-   ordering → you can't reason about distance.
-
-2. **Visited set** — nodes you've already processed.
-   **What breaks without it:** on a cyclic graph,
-   you re-enqueue B from A, re-enqueue A from B, and
-   never terminate.
-
-3. **Dequeue → expand → enqueue unvisited
-   neighbors** — the loop body. **What breaks without
-   it:** you've described BFS without doing BFS.
-
-4. **Termination on empty frontier** — the loop ends
-   when there's nothing left to expand. **What breaks
-   without it:** infinite loop, or wrong answer (you
-   miss "is unreachable" as a return value).
+Three parts. Drop any one and the algorithm becomes wrong.
 
 ```
-  BFS pseudocode — the kernel
-  ───────────────────────────
+  BFS kernel — what BREAKS when each part is missing
 
-  function bfs(graph, start, goal):
-    frontier = Queue([start])           // FIFO
-    visited  = Set([start])             // mark BEFORE enqueue,
-                                        //   not after dequeue,
-                                        //   to avoid duplicate enqueues
-    distance = Map([start → 0])
+  1. frontier (queue)    — without it: no place to track "to visit next"
+                           you can't explore beyond the start
 
-    while frontier is not empty:        // ← termination check
-      current = frontier.dequeue()
-      if current == goal:
-        return distance[current]        // found, return cost
-      for neighbor in graph.neighbors(current):
-        if neighbor not in visited:
-          visited.add(neighbor)
-          distance[neighbor] = distance[current] + 1
-          frontier.enqueue(neighbor)
+  2. visited (set)       — without it: on a cyclic graph the algorithm
+                           revisits nodes infinitely and never terminates
+                           on a tree (acyclic) you "get away with it" but
+                           do exponential work re-exploring shared subtrees
 
-    return UNREACHABLE                  // frontier emptied, no goal
+  3. termination test    — without checking frontier empty: infinite loop
+                           on a cycle (combined with missing visited)
+                           or undefined exit on a finite graph
+
+  + the FIFO discipline of the queue is what makes it BFS rather than DFS.
+    swap to a stack (LIFO) and the SAME algorithm becomes DFS.
 ```
 
-**The most-forgotten part: mark visited BEFORE
-enqueue, not after dequeue.** If you mark on dequeue,
-multiple parents can enqueue the same node before any
-of them processes it — wasted work and wrong
-distances in some variants. The interview tell.
+The interview hook: name the **visited set** as the part people forget. New-grad implementations of BFS routinely ship without it, work fine on the test tree, and blow up the first time someone hands them a cyclic graph. **Saying "the visited set is what guarantees termination on a cyclic graph" signals you've built BFS, not just read about it.**
 
-**DFS — same shape, swap queue for stack (or use
-recursion)**
+Bridge from what you know: you've shipped this. `reincodes/Graph.ts:bfs_traversal` walks this kernel. The frontier-queue + visited-set pattern is the same shape as any breadth-explorer you've coded — a file-system walker, a comment-thread expander, a "find all reachable users" query.
+
+#### BFS vs DFS — same structure, two questions
 
 ```
-  DFS — depth-first via stack OR recursion
-  ────────────────────────────────────────
+  same skeleton, swap the data structure
 
-  iterative                          recursive
-  ─────────                          ─────────
-  stack = [start]                    function dfs(node):
-  visited = Set()                      visited.add(node)
-  while stack not empty:               for neighbor in neighbors:
-    n = stack.pop()                      if neighbor not in visited:
-    if n in visited: continue              dfs(neighbor)
-    visited.add(n)
-    for nb in neighbors(n):
-      if nb not in visited:
-        stack.push(nb)
+  BFS (queue, FIFO):              DFS (stack, LIFO):
+    frontier.enqueue(neighbor)     frontier.push(neighbor)
+    node = frontier.dequeue()      node = frontier.pop()
 
-  → both yield the same DFS tree
-  → recursion uses the call stack; iterative uses
-     an explicit one. Same algorithm.
+  what BFS gives you:             what DFS gives you:
+    - shortest path in unweighted    - cycle detection (back edge)
+      graphs (level = distance)      - topological sort (reverse post-order)
+    - level-by-level exploration     - strongly connected components
+    - "closest" reachable node       - "deepest" reachable node first
 ```
 
-DFS is the algorithm to reach for when the question
-is *"is there a path?"* or *"find any cycle"* or
-*"order these by dependencies"* (topological sort).
-BFS is for *"shortest path in an unweighted graph"*
-or *"all nodes within distance K."*
+The choice depends on the **question** you're answering. "Is there ANY path?" — either works, BFS is safer (won't infinite-loop down a long branch first). "What's the SHORTEST path in an unweighted graph?" — BFS. "Topological sort of a DAG?" — DFS with post-order. "Find a cycle?" — DFS with a stack of currently-on-this-path nodes.
 
-**Dijkstra — BFS with a priority queue**
+#### shortest path — Dijkstra's pattern
 
-When edges have weights, BFS no longer gives shortest
-path (the "fewest hops" answer is not the "lowest
-cost" answer). Dijkstra is the answer for non-
-negative weights.
+You have this in `reincodes/Graph2.ts` driving the Dijkstra animation that uses your priority queue. The pattern, in pseudocode:
 
 ```
-  Dijkstra — the change from BFS
-  ──────────────────────────────
+  Dijkstra — the pattern (single-source shortest path, non-negative weights)
 
-  BFS:        frontier = Queue (FIFO)
-              "next to expand = oldest in queue"
+  distances = Map<node, ∞>;   distances[source] = 0
+  pq        = PriorityQueue;  pq.insert(source, 0)
+  visited   = Set
 
-  Dijkstra:   frontier = MinHeap (priority = current cost)
-              "next to expand = cheapest known so far"
+  while pq not empty:
+    (node, dist) = pq.extractMin()
+    if node in visited: continue
+    visited.add(node)
+    for each (neighbor, weight) in neighbors(node):
+      newDist = dist + weight
+      if newDist < distances[neighbor]:
+        distances[neighbor] = newDist
+        pq.insert(neighbor, newDist)
 
-  everything else is the same — visited set, expand,
-  enqueue neighbors with updated cost. The data structure
-  swap (Queue → MinHeap) is the entire algorithmic delta.
+  termination: when pq is empty
 ```
 
-Anchor to reincodes:
+Dijkstra is BFS with a **priority queue** instead of a regular queue — the next node to visit is the one with the smallest tentative distance, not the next one enqueued. **The data structure swap (queue → priority queue / heap) is what turns "shortest in unweighted" (BFS) into "shortest in weighted" (Dijkstra).** Cost: O((V + E) log V) with a binary heap.
 
-```ts
-// reincodes — Graph2.ts + PriorityQueue.ts
-class Graph2 {
-  addNode(id)
-  addEdge(from, to, weight)         // weighted edges
-  markObstacle(node)                // for grid pathfinding
-  // Dijkstra uses PriorityQueue.ts internally
-}
+```
+  the family — BFS, Dijkstra, A*, all the same shape
 
-// PriorityQueue with updatePriority(value, newPriority)
-// → enables "relax the edge" without re-inserting duplicates
+  ┌──────────────┬──────────────────┬───────────────────────────────┐
+  │ algorithm    │ data structure   │ priority function              │
+  ├──────────────┼──────────────────┼───────────────────────────────┤
+  │ BFS          │ queue (FIFO)     │ insertion order (== distance   │
+  │              │                  │ in unweighted graphs)          │
+  │ Dijkstra     │ min-priority Q   │ distance from source           │
+  │ A*           │ min-priority Q   │ distance from source +         │
+  │              │                  │ heuristic to goal              │
+  │ Best-first   │ min-priority Q   │ heuristic only                 │
+  └──────────────┴──────────────────┴───────────────────────────────┘
+
+  same kernel: explore-from-frontier, mark visited, expand neighbors
+  the only knob: how the frontier picks the next node
 ```
 
-The PriorityQueue's `updatePriority` is what makes
-your Dijkstra implementation textbook-correct rather
-than the lazy-Dijkstra variant (which inserts
-duplicates and discards stale ones on extract).
+This is the **load-bearing self-similarity** of graph search: one kernel, parameterized by a comparator. When you can say "BFS is Dijkstra with all weights equal to 1," you've collapsed two algorithms into one — that's the strongest version of the layered-decomposition move.
 
-**Implicit graph — state-space search (your `PG.ts`)**
+#### where a graph would land in `blooming_insights`
 
-The most underrated graph-traversal lesson: **you
-don't need to materialise the graph.** If neighbors
-can be *computed* from the current node, BFS still
-works. Anchor:
+Two plausible places, neither built:
 
-```ts
-// reincodes — PG.ts (river-crossing puzzle)
-// state = (farmer_side, wolf_side, goat_side, cabbage_side)
-// neighbors(state) = all states reachable by one valid move
-// (no eating, no leaving wolf+goat together)
-// BFS finds the shortest sequence of crossings.
-```
+- **categories with dependencies** — today `categories.requires` is a flat list of event names checked against a Set. If categories ever had inter-category dependencies ("show 'revenue drop' analysis only after 'conversion drop' analysis completes"), that's a DAG and topological sort is the right tool to compute the run order.
+- **agent state-space search** — today the agent loop is a flat for: ask Claude, run tool calls, repeat. If you ever wanted "explore multiple hypothesis branches in parallel and pick the highest-confidence one," that's a graph (state = conversation so far; edge = next tool call) and either BFS by turns or best-first with a confidence heuristic is the right structure.
 
-The neighbors function *is* the graph. You never
-build an adjacency list. This is the pattern that
-unlocks pathfinding in puzzles, game AI, planning
-agents, and (less obviously) the LLM-agent loop —
-where each "state" is the conversation so far and
-each "neighbor" is a possible next tool call. The
-model picks the traversal; you provide the rules.
+Neither is built. The interview surface is the part to drill — see file 08.
 
-#### Move 3 — the principle
+### Move 3 — the principle
 
-Graphs are *the* unifying data structure for
-"reachability" problems. Pick the algorithm by the
-edge-weight model: BFS for unweighted shortest path,
-Dijkstra for non-negative weighted, Bellman-Ford for
-any weights, DFS for "any path / order / cycle"
-problems. The graph itself can be explicit (adjacency
-list) or implicit (compute neighbors from rules) —
-the traversal kernel is the same either way.
+A graph is a hash map from each node to its neighbors. Traversal is **explore-from-frontier + mark-visited**, with the data structure of the frontier deciding the order (queue → BFS; stack → DFS; priority queue → Dijkstra / A*). One pattern, three names. **Learn the kernel; the algorithms are parameter choices.**
 
 ## Primary diagram
 
+The recap — what's not exercised, the kernel you've shipped in `reincodes`, and the family map.
+
 ```
-  Algorithm-selection table — by edge model and question
-  ──────────────────────────────────────────────────────
+  graphs in blooming_insights — the empty shelf
+  (the work lives in your reincodes portfolio; interview surface stays
+   sharp by drilling there, not by retrofitting here)
 
-  ┌──────────────────────────────────────────────────────┐
-  │ question                          algorithm   cost   │
-  ├──────────────────────────────────────────────────────┤
-  │ "is there a path?"                DFS or BFS  O(V+E) │
-  │ "shortest path, unweighted"       BFS         O(V+E) │
-  │ "shortest path, ≥0 weights"       Dijkstra    O(E    │
-  │                                                log V)│
-  │ "shortest path, any weights"      Bellman-    O(V·E) │
-  │                                   Ford               │
-  │ "order by dependencies"           Topological O(V+E) │
-  │                                   sort (DFS)         │
-  │ "any cycle?"                      DFS         O(V+E) │
-  │ "connected components"            DFS or BFS  O(V+E) │
-  │                                   (repeated)         │
-  │ "minimum spanning tree"           Prim/       O(E    │
-  │                                   Kruskal     log V) │
-  └──────────────────────────────────────────────────────┘
+  NOT YET EXERCISED in any layer of the running code.
 
-  blooming-insights uses NONE of these at runtime.
-  Anchors for hands-on understanding live in reincodes:
-    Graph.ts (BFS/DFS/components)   Graph2.ts (weighted)
-    PG.ts (BFS over implicit state space)
+  ┌─ where a graph WOULD land if the surface grew ─────────────────┐
+  │  · category dependencies → topological sort over a DAG          │
+  │  · agent multi-hypothesis exploration → best-first search       │
+  │  · neither built today; the agent loop is a flat for            │
+  └────────────────────────────────────────────────────────────────┘
+
+  ┌─ the kernel you've already shipped (reincodes) ────────────────┐
+  │                                                                 │
+  │   frontier = queue([start])         ← data structure decides    │
+  │   visited  = set({start})              the family member        │
+  │                                                                 │
+  │   while frontier not empty:                                     │
+  │     node = frontier.dequeue()       ← FIFO  → BFS               │
+  │                                       LIFO  → DFS               │
+  │                                       min-PQ → Dijkstra         │
+  │     for neighbor of node:                                       │
+  │       if not in visited:                                         │
+  │         visited.add(neighbor)                                   │
+  │         frontier.enqueue(neighbor)                              │
+  │                                                                 │
+  │   termination: frontier empty                                   │
+  │                                                                 │
+  └────────────────────────────────────────────────────────────────┘
+
+  ┌─ the family — same kernel, different frontier ────────────────┐
+  │   BFS         queue                  shortest in unweighted    │
+  │   DFS         stack (or recursion)   topological sort, cycles  │
+  │   Dijkstra    min-priority queue     shortest in weighted      │
+  │   A*          min-PQ + heuristic     shortest, heuristic guide │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-BFS and DFS were both formalised in the 1950s-60s
-(Moore for maze-solving, Dijkstra for shortest path
-with weights). The remarkable thing is how few
-algorithms are needed to cover most graph workloads:
-BFS, DFS, Dijkstra, and topological sort handle
-maybe 80% of graph interview questions.
+The graph as a formal object goes back to Euler's 1736 paper on the Seven Bridges of Königsberg — the first published graph theory result, and the question was "can you walk every bridge exactly once?" (an Eulerian path problem, which you've coded in `reincodes/Graph.ts`).
 
-The graph algorithms that *aren't* on this file but
-are worth knowing as a step beyond: A* (Dijkstra with
-a heuristic, the dominant pathfinding algorithm in
-games and robotics), Bellman-Ford (handles negative
-weights, but slower; used in distance-vector routing
-protocols), Floyd-Warshall (all-pairs shortest path,
-O(V³), good for small dense graphs), Kosaraju /
-Tarjan (strongly connected components).
+**BFS** is Moore (1959), in the context of finding the shortest path through a maze. **DFS** is older as a search strategy but was formalized by Tarjan in the 1970s alongside his cycle and strongly-connected-components algorithms (Tarjan's SCC, 1972 — the canonical DFS application). **Dijkstra** is 1959, allegedly designed in 20 minutes while drinking coffee with his fiancée — the original paper used it to find the shortest train route from Rotterdam to Groningen.
 
-The implicit-graph pattern (compute neighbors on the
-fly) shows up in: game playing (Chess/Go state
-space), constraint satisfaction (Sudoku, n-queens),
-agent planning (the LLM-agent loop is literally a
-graph search over conversation states), and
-pathfinding in continuous spaces (sampled into a
-grid).
+**Where graphs come up in real engineering work** (not just interviews): dependency resolution (npm, cargo, apt), build systems (make, bazel — the build graph is a DAG, topological sort schedules the work), git's commit history (a DAG; rebase walks it), social network features ("friends of friends" = BFS at depth 2), routing (the internet is a graph; OSPF is Dijkstra), serverless cold-start dependency loading, garbage collection (the heap is a graph; mark-and-sweep is DFS).
 
-For deep grounding: CLRS Chapters 22-26 (elementary
-graph algorithms, MST, shortest paths). Sedgewick
-*Algorithms 4th Ed* §4.1-4.4. The river-crossing
-puzzle you implemented is a tiny version of the
-"15-puzzle" / "missionaries and cannibals" class —
-all solved by BFS over implicit graphs.
+The interview reflex: when a problem mentions **"dependency," "reachable," "shortest," "ordering with constraints," or "connected"** — that's a graph problem, and the first move is to name the nodes and edges explicitly before reaching for an algorithm.
+
+Read next: file 06 (binary search, which is BST-flavored on a sorted array), file 07 (recursion, which is implicit DFS over the call stack), file 08 (where BFS/DFS/Dijkstra rank in the practice plan — high, because every AI-engineering interview eventually asks for one).
 
 ## Interview defense
 
-**Q: Walk me through BFS. Name the part most people
-forget.**
+### Q: BFS vs DFS — when do you pick which?
+
+Same kernel (frontier + visited), different data structure for the frontier (queue → BFS, stack → DFS). Pick by the question:
+
+- **shortest path in an unweighted graph** — BFS. The first time BFS reaches a node, the level you reached it on IS the shortest path (in number of edges). DFS doesn't guarantee that.
+- **detect a cycle** — DFS. Walk with a "currently on this path" set; if you see a node already on the path, you've found a back edge.
+- **topological sort of a DAG** — DFS post-order, then reverse. The post-order finishes a node after all its descendants, so reversing gives you "dependencies before dependents."
+- **memory** — BFS holds the entire frontier (one level wide) in memory; in a wide graph that's huge. DFS holds the path depth. For very wide / shallow graphs, DFS is cheaper; for very deep / narrow graphs, BFS is cheaper.
 
 ```
-  BFS kernel — mark visited BEFORE enqueue
-  ────────────────────────────────────────
+  the load-bearing thing to NOT forget
 
-  frontier = Queue([start])
-  visited = Set([start])              ← mark HERE, not at dequeue
+  the visited set. without it, BFS or DFS on a cyclic graph
+  loops forever. on a DAG you "get away with it" but pay
+  exponential time re-exploring shared subtrees.
 
-  while frontier not empty:
-    n = frontier.dequeue()
-    for nb in neighbors(n):
-      if nb not in visited:
-        visited.add(nb)               ← mark IMMEDIATELY
-        frontier.enqueue(nb)
+  saying this — that the visited set is what makes the
+  algorithm terminate — signals you've built it, not just
+  read about it.
 ```
 
-Model answer: "Four parts — frontier queue, visited
-set, dequeue-expand-enqueue loop, termination on
-empty frontier. The part people forget is *when* to
-mark visited. If you mark on dequeue instead of on
-enqueue, the same node can be enqueued multiple times
-by different parents before any of them dequeue it.
-That's wasted work and can produce wrong distances
-in variants. Mark *before* enqueue. Anchor:
-`Graph.ts:bfs_traversal` in reincodes."
+Anchor: your `reincodes/Graph.ts:bfs_traversal` and `:dfs_traversal`.
 
-**Q: When do you use DFS and when BFS?**
+### Q: Why a priority queue for Dijkstra and not a regular queue?
 
-Model answer: "BFS for shortest-path-in-hops and 'all
-nodes within K hops.' DFS for 'any path', 'find a
-cycle', 'topological sort', and 'recursive
-exploration' problems. The split is *what ordering
-matters*: BFS gives you breadth-by-distance; DFS
-gives you depth-by-recursion. If the question is
-'shortest' and edges are unweighted, BFS. If the
-question is weighted-shortest, Dijkstra. If the
-question is 'is there a path' or 'order these by
-deps', DFS is usually simpler."
+Because edge weights aren't all equal. BFS works on unweighted graphs (or graphs where all weights are 1) because **insertion order equals distance from source** — the next node out of the queue is always the next-closest unvisited node. The moment weights vary, that breaks: a node enqueued early might be reachable via a shorter weighted path discovered later.
 
-**Q: Walk me through Dijkstra. How does it differ
-from BFS?**
+The priority queue fixes this: always extract the node with the **smallest tentative distance**, so when you finalize a node you can be sure you've found the shortest path to it (because every other path to it would have to go through a not-yet-extracted node, which has a larger distance).
 
-Model answer: "It's BFS with a priority queue instead
-of a FIFO queue, and the priority is the cumulative
-edge cost from the start. Initialize all distances
-to infinity, distance[start]=0, push start into the
-min-heap with priority 0. Pop the smallest, for each
-neighbor: if `dist[current] + edge_weight <
-dist[neighbor]`, update it and push/update in the
-heap (the 'relax' step). Repeat until the heap is
-empty or you pop the goal. The load-bearing piece
-people miss: relax-and-update needs
-`updatePriority(node, newDist)` on the priority
-queue — my reincodes PriorityQueue keeps a value→
-index Map specifically to make that O(log N) instead
-of O(N). Anchors: `Graph2.ts`, `PriorityQueue.ts`."
+```
+  the bug a regular queue would have on weighted edges
 
-**Q: You implemented a river-crossing puzzle as
-BFS — why?**
+  graph:   A --1--> B
+           A --10--> C --1--> B
 
-Model answer: "The puzzle is a graph search: each
-*state* is (farmer, wolf, goat, cabbage) sides, each
-*edge* is a valid move, and the question is 'shortest
-sequence of crossings.' Unweighted shortest path =
-BFS. I never built an adjacency list — the neighbors
-were computed from the move rules at traversal time.
-That's the implicit-graph pattern, and it's the same
-pattern that drives game AI, agent planning, and
-constraint satisfaction. Anchor: `PG.ts` in
-reincodes."
+  BFS from A:  enqueue A, dequeue → enqueue B, C
+                (B reached, dist=1)
+                dequeue B → done with B at dist=1   ← correct
 
-**Q: Why is the agent loop in blooming-insights *not*
-graph search?**
+  same graph, but now A --1--> B and A --10--> B (two edges):
+   regular queue still works because BFS-by-edges = right answer for hops.
 
-Model answer: "The traversal *is* happening — each
-state is the conversation, each neighbor is a possible
-next tool call — but the algorithm is the LLM's, not
-mine. I don't write BFS over conversation states; I
-hand the model a tool schema, an iteration budget,
-and a goal, and let it pick. The shape is the same
-as classical search, but the policy is learned, not
-algorithmic. That distinction matters: I can name the
-graph structure underneath, but the code doesn't
-implement a traversal — it implements a budget and a
-tool registry. Anchor: AptKit's agent loop wrapped
-in `lib/agents/aptkit-adapters.ts`."
+  graph:   A --10--> B
+           A --1-->  C --1--> B
+
+  BFS from A (treating as unweighted): B reached in 1 hop, dist labeled 10
+  but the real shortest weighted path is A→C→B, total 2.
+  BFS gives you the wrong answer.
+
+  Dijkstra: pq starts with (A, 0). extract A.
+            enqueue (B, 10), (C, 1).
+            extract C (smallest). enqueue (B, 2).
+            extract B (smallest, dist=2).  ← correct.
+```
+
+Cost: O((V+E) log V) with a binary heap. With a Fibonacci heap it's O(E + V log V), better asymptotically but the constants kill it in practice.
+
+Anchor: your `reincodes/Graph2.ts` with `PriorityQueue.ts` driving the Dijkstra animation.
+
+### Q: When would a graph land in `blooming_insights`?
+
+Two real candidates, neither built:
+
+- **category dependencies** — today `categories.requires` is a flat event-name list checked against a Set. If categories ever depended on each other ("don't run 'revenue drop' until 'conversion drop' produced an answer"), that's a DAG and **topological sort** computes the run order. Cycle detection would warn at config time on bad inputs.
+- **agent multi-hypothesis search** — today the agent loop is a flat `for` (one path through). If you wanted the agent to fork — explore "is this a tracking bug?" and "is this a real revenue drop?" in parallel, then pick the higher-confidence branch — that's a **search tree** (state = conversation so far; edge = next tool call) and you'd reach for best-first search with a confidence heuristic.
+
+Neither exists today. **The honest answer in an interview**: "the codebase doesn't exercise graphs yet, but I've shipped BFS, DFS, and Dijkstra in my reincodes portfolio, and the second place a graph would land here is the agent loop the moment we want branching exploration instead of linear conversation." That's both honest and a hook into your shipped work.
+
+Anchors: `lib/agents/categories-legacy.ts` (the flat dep list today), `lib/agents/base-legacy.ts:114` (the flat for-loop agent today), `reincodes/Graph.ts` and `reincodes/Graph2.ts` (your shipped graph work).
 
 ## See also
 
-- `02-arrays-strings-and-hash-maps.md` — adjacency
-  list = `Map<vertex, vertex[]>`
-- `03-stacks-queues-deques-and-heaps.md` — BFS needs
-  a queue; Dijkstra needs a heap
-- `04-trees-tries-and-balanced-indexes.md` — trees
-  are acyclic, single-parent graphs
-- `07-recursion-backtracking-and-dynamic-
-  programming.md` — DFS is recursion in disguise
-- `08-dsa-foundations-practice-map.md` — union-find,
-  topological sort on the practice plan
+- 03-stacks-queues-deques-and-heaps.md — the frontier data structures that decide BFS vs DFS vs Dijkstra.
+- 04-trees-tries-and-balanced-indexes.md — a tree is a graph with extra rules (acyclic, connected, one parent).
+- 07-recursion-backtracking-and-dynamic-programming.md — DFS via recursion uses the implicit call stack as the frontier.
+- 08-dsa-foundations-practice-map.md — where BFS/DFS/Dijkstra rank in the practice plan (top tier).

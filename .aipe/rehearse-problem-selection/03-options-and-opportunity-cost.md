@@ -1,204 +1,145 @@
-# 03 — Options and opportunity cost
+# 03 — Options and Opportunity Cost
 
-**Industry name:** Options analysis / opportunity-cost framing — Coach posture
+> The options that were on the table — including `do nothing` — and what each one would have cost in time, complexity, and product surface.
 
-The chapter that proves you didn't just pick the first plausible path. Coach voice: name the alternatives, name what each one would have cost you, and lead with the most consequential decision-revisit on the project.
+```
+  THE OPTION SPACE — six paths, one chosen
 
-The AptKit migration is the L5 story here — **defer-then-migrate**, evaluated-and-accepted mode.
+  ┌────────────────────────────────────────────────────────────────┐
+  │                                                                │
+  │   A. do nothing            │  ← always on the table            │
+  │   ─────────────────────    │                                   │
+  │   B. dashboard tool        │  build into Bloomreach UI         │
+  │   C. single-agent answerer │  one big agent, one big prompt    │
+  │   D. multi-agent loop      │  ← chose this                     │
+  │      + reasoning trace UI                                      │
+  │   E. native Bloomreach     │  ship as a Bloomreach feature     │
+  │   F. ecommerce-platform-   │  generalize to Shopify / etc      │
+  │      agnostic agent                                            │
+  │                                                                │
+  └────────────────────────────────────────────────────────────────┘
+
+  the chosen option is the one that defends its own scope cuts.
+```
+
+## The opportunity-cost discipline
+
+For each option below: **what we build, what we give up, and what the "1-week sniff-test" tells us** — the smallest experiment that would either kill the option or harden it before going further. **The chosen option has to beat `do nothing` on a real axis, not a hand-wave.**
 
 ---
 
-## Zoom out — the option space at decision time
+## Option A — Do nothing
 
-```
-  The options at Phase 1 — what could have been built
-  with the same three engineer-weeks
+**What it means:** the analyst keeps doing the three-context loop by hand. We don't ship anything.
 
-  ┌─ Option A: do nothing ───────────────────────────────┐
-  │  no project, no portfolio piece, no learning         │
-  │  cost: zero work, zero signal                        │
-  └──────────────────────────────────────────────────────┘
+**Why it's the baseline:** if `do nothing` wins, no other option matters. Every option below has to defend itself against the cost of building it vs the cost of the analyst's current workflow.
 
-  ┌─ Option B: classic RAG chatbot over Bloomreach docs ─┐
-  │  "ask questions about Bloomreach features"          │
-  │  cost: well-trodden, no differentiation              │
-  │        (AdvntrCue already proves you can do RAG)     │
-  └──────────────────────────────────────────────────────┘
+**What `do nothing` actually costs:**
+- The analyst keeps context-switching across three tools. That's the status quo — by definition not a regression.
+- Recommendations continue to lack visible reasoning. Stakeholders continue to either trust the analyst or not.
+- The MCP server matures without us using it. The agent capability we have available right now goes unused.
 
-  ┌─ Option C: dashboard generator ──────────────────────┐
-  │  "describe a chart, get an EQL query + viz"          │
-  │  cost: incremental, not a workflow shift             │
-  │        (an analyst still has to know what to ask)    │
-  └──────────────────────────────────────────────────────┘
+**Why we don't pick it:** two reasons, one product, one personal:
+1. **Product:** the reasoning-trace bet is testable. If "show your work" beats "magic answer," we want to know — and `do nothing` doesn't generate that signal.
+2. **Personal (named honestly — this matters in an L5 review):** the project is an AI-engineering portfolio piece for a frontend engineer pivoting into AI roles. **`do nothing` produces no artifact to defend in an interview loop.** That's a real opportunity cost — naming it is the move.
 
-  ┌─ Option D: agentic analyst with streamed reasoning ──┐ ★ picked
-  │  monitoring → diagnosis → recommendation loop        │
-  │  + provenance as the differentiator                  │
-  │  cost: harder to build, novel UI surface,            │
-  │        but no other portfolio project shaped this way│
-  └──────────────────────────────────────────────────────┘
-```
-
-The verdict was Option D. The rest of this chapter is why, and what the next layer of decision-options looked like *inside* D.
+**The honest framing:** `do nothing` is a defensible option for the marketer. It's not defensible for the engineer building the portfolio.
 
 ---
 
-## Why Option D over A/B/C
+## Option B — Build it as a Bloomreach dashboard tool
 
-**Why not A (do nothing):** the opportunity cost of doing nothing is the portfolio piece itself. The IK pivot needs work that demonstrates AI-engineering judgment, not just frontend craft. Zero work, zero signal.
+**What it means:** instead of a separate Next.js app with agents, build it as a dashboard inside Bloomreach Engagement. The analyst stays in one tool.
 
-**Why not B (RAG chatbot over docs):** I already shipped a RAG product (AdvntrCue — `pgvector` + GPT-4 + tool-calling + session memory). Building another RAG would teach me nothing new and would land in a reviewer's "okay, another RAG demo" bucket. The opportunity cost of B is *re-proving what I've already proved.*
+**Why it's tempting:** zero context-switching cost. The product is just "a smarter view inside Bloomreach."
 
-**Why not C (dashboard generator):** the workflow doesn't shift. An analyst with a dashboard generator still has to know what question to ask. The product would compress one step ("write EQL") without addressing the harder steps ("notice the metric moved" and "decide what to do"). The opportunity cost of C is solving the easy part of the problem.
+**What we'd give up:**
+- **The reasoning-trace surface.** A dashboard tile is not a 1/3-width streaming sidebar. Reasoning becomes a "click to expand" tooltip — defeating the bet.
+- **Iteration speed.** Building inside someone else's product means their release cycle, their UI primitives, their auth. We can't ship in a week.
+- **The portability story.** A Bloomreach-internal tool dies if we ever want to be ecommerce-platform-agnostic (see Option F).
+- **Control of the agent loop.** A Bloomreach tile probably can't run a Claude agent with arbitrary tool calls and a `maxToolCalls` budget. The architecture flattens to "send the query, render the answer."
 
-**Why D:** the analyst's loop has three stages (notice → hunt → decide), and no existing product runs all three. Building an agent that runs the whole loop, with the reasoning trace visible, addresses a workflow that doesn't have a clean product today. The opportunity cost of D is engineering effort and risk that the agent quality won't be good enough — and that's the right cost to take on at this career stage.
+**The 1-week sniff-test:** ask Bloomreach if a Bloomreach customer can run a Claude agent that streams reasoning inside their UI. If the answer is "we'd have to build that infra," the option is dead.
 
----
-
-## The harder option space — inside Option D
-
-Once D was picked, the consequential decisions weren't *what to build* — they were *how to build the agent loop.* That's where the L5 story lives.
-
-### Decision 1 — Hand-rolled `runAgentLoop` vs. use a library (Phase 1)
-
-The option space:
-
-```
-  Agent runtime — Phase 1 options
-
-  ┌─ Option a: use LangChain/LlamaIndex ─────────────────┐
-  │  cost: heavy abstraction, opinionated tool schemas,  │
-  │        steep learning curve, debugging through       │
-  │        someone else's loop                            │
-  └──────────────────────────────────────────────────────┘
-
-  ┌─ Option b: use a smaller library (Mastra, etc.) ─────┐
-  │  cost: newer, less battle-tested, library-specific   │
-  │        primitives still in flux                       │
-  └──────────────────────────────────────────────────────┘
-
-  ┌─ Option c: hand-roll the loop ──────────────────────┐ ★ picked
-  │  cost: more code to write and own                    │
-  │  payoff: own the budget (maxToolCalls), own the      │
-  │          forced-synthesis turn, own the streaming    │
-  │          contract end to end                          │
-  └──────────────────────────────────────────────────────┘
-```
-
-**The pick (c) was deliberate.** Two reasons it was the right call at the time:
-
-1. **The rate-limited Bloomreach MCP server demanded a tool-call budget.** Letting an off-the-shelf agent loop run free against a ~1 req/s server with token revocation would have produced 429s and a broken demo. Owning the loop meant owning `maxToolCalls` and the back-pressure logic.
-
-2. **The forced final synthesis turn was load-bearing.** When the agent ran out of tool calls, it needed *one more turn* with no tools to produce a final answer. That contract was project-specific; baking it into a generic library loop would have been ugly.
-
-The opportunity cost of (c) was real: more code to maintain, no library updates riding for free, the "is your loop correct?" question on me alone.
-
-**Coach line for Decision 1:** *"I started by owning the loop on purpose. The rate-limited server made a hard tool-call budget non-negotiable, and the forced-synthesis turn was a project-specific contract that didn't fit any library's shape at the time. The cost was carrying the loop code myself, and I took it deliberately."*
-
-### Decision 2 — Stick with hand-rolled or migrate to AptKit (Phase 4) ★ the L5 revisit
-
-This is the most consequential decision-revisit on the project. It's where the senior signal lives.
-
-```
-  Agent runtime — Phase 4 options
-  (after AptKit v0.3.0 shipped with a generic primitive surface)
-
-  ┌─ Option a: stick with hand-rolled runAgentLoop ──────┐
-  │  cost: keep carrying the loop, no library leverage,  │
-  │        every new model/feature is a manual port      │
-  │  benefit: known, working, tested                     │
-  └──────────────────────────────────────────────────────┘
-
-  ┌─ Option b: migrate to AptKit via adapter layer ──────┐ ★ picked
-  │  cost: 3 Blooming adapter classes, one migration PR  │
-  │  benefit: library owns the loop;                     │
-  │           Blooming owns the boundary;                 │
-  │           legacy preserved at base-legacy.ts as      │
-  │           rollback receipt                            │
-  └──────────────────────────────────────────────────────┘
-
-  ┌─ Option c: rip-and-replace (use AptKit directly,     │
-  │            delete the boundary)                       │
-  │  cost: leak AptKit primitives into agent code;       │
-  │        any future library swap becomes a full        │
-  │        rewrite                                        │
-  └──────────────────────────────────────────────────────┘
-```
-
-**The pick was (b) — migrate via adapter, keep the boundary, preserve the legacy as a rollback receipt.**
-
-This is the **defer-then-migrate** pattern, evaluated-and-accepted mode:
-
-```
-  Defer-then-migrate — the senior shape
-
-  Phase 1                Phase 4
-  ───────                ───────
-  HAND-ROLL              MIGRATE (with discipline)
-  the loop               ──────────────────────
-  ──────────             → adapter layer keeps
-  → owned the              the boundary mine
-    constraints           (Blooming-shaped, not
-    (rate limit,           AptKit-shaped)
-    forced               → legacy preserved at
-    synthesis)             base-legacy.ts as
-  → no library             rollback receipt
-    fit at the           → 3 adapter classes,
-    time                   one migration PR
-                         → library owns the loop,
-                           I own the boundary
-
-  ╲                            ╱
-   ╲     same engineer        ╱
-    ╲    revisits her own    ╱
-     ╲   decision when the  ╱
-      ╲  conditions change ╱
-       ╲──────────────────╱
-              L5 move
-```
-
-**Why this is L5 not L3:**
-
-- **L3** would be "I migrated to AptKit because the hand-rolled loop was getting unwieldy" — a reactive change.
-- **L4** would be "I migrated to AptKit because it has better features now" — a feature-driven change.
-- **L5** is: *"My original decision was deliberate and right at the time. The conditions changed — AptKit shipped a clean generic-primitive surface that fit the constraints I'd been carrying manually. I revisited the decision, picked the cleaner shape, kept the boundary discipline mine via 3 adapter classes, and preserved the legacy implementation as a rollback receipt at `base-legacy.ts`. The library owns the loop now; I own the boundary."*
-
-The three adapter classes are the boundary. The legacy file is the receipt. Both together prove the migration was discipline, not capitulation.
-
-**Coach line for Decision 2:** *"This is the most consequential decision I revisited on the project. I defended the hand-rolled loop in Phase 1 — and I still defend that call. AptKit 0.3.0 changed the conditions: generic primitives that fit the constraints I'd been carrying. The migration was 3 adapter classes; library owns the loop, I own the boundary, legacy preserved at base-legacy.ts. The shape of the answer is 'evaluated and accepted,' not 'I gave up.'"*
+**Why we don't pick it:** the reasoning trace is the differentiator, and a dashboard tile can't host it as a first-class surface. The bet collapses.
 
 ---
 
-## The general principle — opportunity cost is the question, not "is this good?"
+## Option C — Single-agent answerer (one big agent, one big prompt)
 
-```
-  The shape of an opportunity-cost answer
+**What it means:** one agent. One system prompt. Ask "what's wrong with my workspace?" and let the model do everything — anomaly detection, diagnosis, recommendation — in one long turn.
 
-  ┌─ Naive answer ─────────────────────────────────────┐
-  │  "I built X because it's the best approach."        │
-  │  → no comparison; reviewer learns nothing about     │
-  │     your judgment                                    │
-  └─────────────────────────────────────────────────────┘
+**Why it's tempting:** simpler code. No coordinator. No handoff between agents. The model "just figures it out."
 
-  ┌─ L5 answer ────────────────────────────────────────┐
-  │  "I built X. The alternatives were Y and Z.        │
-  │   Y would have cost me [specific cost]; Z would    │
-  │   have cost me [specific cost]. I picked X         │
-  │   because [specific tradeoff], and the cost of X   │
-  │   was [named honestly]."                            │
-  │  → comparison + cost-naming = senior signal        │
-  └─────────────────────────────────────────────────────┘
-```
+**What we'd give up:**
+- **Predictable structure.** A multi-agent split with `AgentName = coordinator|monitoring|diagnostic|recommendation` (in `lib/mcp/types.ts`) gives every step a known shape — known inputs, known outputs, known evaluation criteria. A single-agent answerer is unpredictable; you don't know which step it's on, so the UI can't render a stepper that means anything.
+- **The stepper UI itself.** The shared `ProcessStepper` (monitoring → investigating → decision) **only makes sense if there are discrete stages.** A single-agent answerer collapses the stepper into a single spinner.
+- **Independent evaluation.** With separate agents, each one can be evaluated against its own rubric (detection precision/recall, diagnosis criteria, recommendation criteria). With one agent doing everything, you only get end-to-end pass/fail — much weaker signal.
+- **Cost control.** Separate agents = separate token budgets. The monitoring agent doesn't need a 200K-token context window; the diagnostic one might. Mixing them wastes tokens.
 
-The general lesson: **every decision in a senior conversation deserves an opportunity-cost answer.** "I picked X" is not enough. "I picked X over Y, because Y would have cost me [N], and the cost of X I accepted was [M]" is the shape.
+**The 1-week sniff-test:** prompt-engineer a single agent that does monitoring + diagnosis + recommendation in one turn. Time how long it takes to produce one anomaly's worth of work. If the latency is acceptable and the structure is consistent, the option is alive. **It is neither, in practice — the loop diverges, the structure is mush, and the trace is unparseable.**
+
+**Why we don't pick it:** the single-agent shape can't support the stepper UI, can't support per-step evaluation, and can't sustain the reasoning-trace surface as a coherent narrative. The structure isn't a code-cleanliness preference; **it's what makes the product visible.**
 
 ---
 
-## See also
+## Option D — Multi-agent loop + reasoning trace UI (CHOSEN)
 
-- `01-problem-brief.md` — the problem the options were trying to solve
-- `02-scope-cuts-and-non-goals.md` — Cut 2 (eval) is another decision-revisit story
-- `04-success-metrics-and-feedback-loop.md` — how I knew the AptKit migration didn't regress quality
-- `05-skeptical-reviewer-questions.md` — "why migrate?" answer
-- `.aipe/audit-refactor-page-decomposition/` — sister refactor pattern (decompose then adapt)
-- `.aipe/study-agent-architecture/` — the technical deep-dive on the AptKit migration
+**What it means:** a coordinator + three specialist agents (monitoring, diagnostic, recommendation), each with its own prompt and tool set. The reasoning trace is streamed as NDJSON and rendered as a first-class UI surface on every page.
+
+**What we get:**
+- **The stepper UI maps 1:1 to the agent split.** Monitoring → investigating → decision matches the agent identities. The user's mental model and the code's structure are the same model.
+- **Per-step evaluation is possible.** Each agent can be evaluated against its own rubric (detection precision/recall, diagnosis criteria, recommendation criteria). The 4-pillar eval suite that surfaced the BRL bug, the calibration drift, and the conclusion instability **was only possible because the agents are separately addressable.**
+- **The reasoning trace is structured.** Each `AgentEvent` carries the agent identity, the step kind, the tool calls, and the timestamps — so the trace renders as "the monitoring agent called `execute_analytics_eql` with this EQL and got this result" rather than "the AI did some stuff."
+- **Independent iteration.** The recommendation agent's prompt can be rewritten without re-validating monitoring or diagnosis. That's a real velocity win when the product is being tuned weekly.
+
+**What we give up:**
+- **Code complexity.** Four agents, a coordinator, the NDJSON event protocol, the streaming UI plumbing — more code than Option C. This is the deliberate cost.
+- **Latency overhead.** Each agent handoff is a model call, plus serialization through the event stream. Acceptable for the analyst persona (their alternative is a 15-minute manual loop), unacceptable for an "instant answer" persona — and that persona is not the user.
+- **A migration we had to make.** Phase 1 used a hand-rolled `runAgentLoop` (deliberate at the time — needed `maxToolCalls` budget + forced synthesis turn against the rate-limited server, `lib/agents/base-legacy.ts` preserves it). Phase 4 migrated to `@aptkit/core@0.3.0` via 3 adapter classes in `lib/agents/aptkit-adapters.ts`. **Library owns the loop, I own the boundary, legacy preserved as a rollback receipt.** That's an `evaluated-and-accepted` move — revisiting a decision that was originally defended deliberately, once the better surface existed.
+
+**Why we picked it:** it's the only option that supports the reasoning-trace surface as a first-class product surface, the only one where the stepper UI maps to a real architecture, and the only one where per-agent evaluation is even possible. The cost is justified.
+
+---
+
+## Option E — Ship as a native Bloomreach feature (vs an independent app)
+
+**What it means:** partner with Bloomreach and ship this as part of Bloomreach Engagement — not as a separate webapp. Effectively a more ambitious version of Option B.
+
+**Why it's tempting:** every Bloomreach customer gets it. Distribution is solved. We don't have to acquire users.
+
+**What we'd give up:**
+- **Iteration speed and product control.** Bloomreach's release cycle, brand constraints, support obligations, security review for every change.
+- **The ability to ship a v0 in weeks.** A native feature has to land at v1.0 quality from day one — there's no "ship the loop first, evaluate against a stable substrate later" path.
+- **The portfolio story.** A feature inside someone else's product is harder to point at in an interview than an app you can demo end-to-end.
+
+**The 1-week sniff-test:** none, really — this is a business-development question, not a technical one. The answer is "we don't have a Bloomreach partnership and acquiring one takes months."
+
+**Why we don't pick it (now):** distribution-via-Bloomreach is a real win, but it's a separate decision from "is this product worth building." Build it independently first, then have the partnership conversation with a working demo in hand. **Sequencing matters — picking it now means waiting on someone else's calendar.**
+
+---
+
+## Option F — Ecommerce-platform-agnostic agent (Shopify / WooCommerce / Bloomreach)
+
+**What it means:** abstract the analytics platform behind a `DataSource` port; the agents work against any backing platform. Ship for Bloomreach, Shopify, WooCommerce, BigCommerce.
+
+**Why it's tempting:** larger market. The reasoning-trace value prop is platform-agnostic.
+
+**What we'd give up:**
+- **Time-to-validate.** Building three or four adapters means we don't have a working v0 against any one platform. The product becomes "an integration project" before it becomes "an analyst's reasoning loop."
+- **The depth of the Bloomreach integration.** Bloomreach has scenarios, segments, vouchers, experiments — a specific recommendation vocabulary. Shopify has Flow, customer segments, Shopify Email. Generalizing the recommendation agent means it can only suggest the lowest-common-denominator action — losing the "name the exact Bloomreach feature" precision that's currently a strength.
+- **A reasoning-trace surface that has to work the same across platforms.** That's a substantive product-design problem we haven't solved.
+
+**The 1-week sniff-test:** would a Shopify analyst pay for an AI loop that proposes "create a Shopify Flow trigger" with full reasoning? Probably yes. But the sniff-test for **the integration cost being acceptable** is much longer than one week.
+
+**Why we don't pick it (now):** Bloomreach-specific is the right scope for v0 because **the recommendation vocabulary is the load-bearing detail.** Generalizing too early means the recommendations get vaguer. **The `DataSource` seam (the port + the in-process Synthetic adapter that lives behind it) keeps the option open** — if we want to add a second platform later, the seam is built. But we're not adding it now.
+
+---
+
+## The chosen option, said sharply
+
+**Option D — multi-agent loop + reasoning-trace UI as a first-class surface, Bloomreach-specific, read-only, no persistence, demo-snapshot for reliable presentation.**
+
+The opportunity cost we accepted: code complexity (more agents, more plumbing) and platform specificity (we're not generalizing yet). Both costs are bounded and named. **Every other option either collapses the differentiator (B, C, E) or delays time-to-validate to the point where we can't generate signal (F) or generates no signal at all (A).**
+
+The defensible posture in a review is: "I considered each of these, named what I gave up, named the 1-week sniff-test, picked D. Here's the receipt — every cut in `02-scope-cuts-and-non-goals.md` is a deliberate consequence of picking D, not an accident."

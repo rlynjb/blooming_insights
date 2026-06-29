@@ -1,251 +1,241 @@
-# Processes, threads, and tasks
+# Processes, Threads, and Tasks
 
-**Industry name:** Node.js single-threaded execution model · **Type:** Language-agnostic primitive (Node implementation)
+**Industry name:** process / task model · **Type:** Industry standard
 
-## Zoom out, then zoom in
+## Zoom out — where this concept lives
 
-The honest answer first: **this server has one process, one main thread, and a fan of async tasks scheduled by the event loop.** No subprocesses. No worker threads. No cluster. That's the whole story.
+The whole repo runs inside one process. There are zero threads of the OS-level "second cook" kind. The "tasks" are JavaScript Promises and microtasks, scheduled by the V8 event loop.
 
 ```
-  Zoom out — what "concurrent" actually means here
+  Zoom out — what's actually running
 
-  ┌─ UI (browser) ───────────────────────────────────────┐
-  │  React 19 main thread + NDJSON reader microtasks     │
-  └────────────────────────┬─────────────────────────────┘
-                           │  HTTPS
-  ┌─ Server runtime ★ THIS FILE ★ ──────────────────────┐
-  │  ONE Node 20 process                                 │
-  │  ONE main thread (the V8 + libuv event loop)         │
-  │  N async tasks (Promises, timers, I/O callbacks)     │
-  │  ZERO child_process / worker_threads / cluster       │
-  └────────────────────────┬─────────────────────────────┘
-                           │  HTTPS
-  ┌─ Providers ─────────────▼────────────────────────────┐
-  │  Anthropic / Bloomreach — their own processes        │
-  │  (not ours; we wait on them via fetch)               │
-  └──────────────────────────────────────────────────────┘
+  ┌─ Browser tab ────────────────────────────────────────────────────────┐
+  │  one main thread (React 19, fetch, NDJSON reader)                    │
+  │  ★ also one process — but the browser owns its own model ★           │
+  └────────────────┬─────────────────────────────────────────────────────┘
+                   │
+  ┌─ Vercel platform ──▼─────────────────────────────────────────────────┐
+  │  function instances — opaque pool the app cannot observe             │
+  └────────────────┬─────────────────────────────────────────────────────┘
+                   │  one process per invocation
+  ┌─ Node 20+ process ──▼────────────────────────────────────────────────┐
+  │  ★ THIS CONCEPT LIVES HERE ★                                         │
+  │  one V8 main thread                                                  │
+  │  no child_process · no worker_threads · no cluster                   │
+  │  tasks = Promises/microtasks on the event loop                       │
+  └──────────────────────────────────────────────────────────────────────┘
 ```
 
-Now zoom in. "Concurrency" inside band 2 is the event loop interleaving I/O-bound tasks on one thread. There is no parallelism on this server. When two requests appear to run "at the same time," they're sharing the same thread by yielding at every `await`.
+If you grep the repo for `child_process`, `worker_threads`, `spawn(`, or `cluster`, you get zero hits in `lib/` and `app/`. The runtime is *deliberately* one process: the previous Olist SQL adapter used to run in a subprocess (for SQL-driver isolation, not for parallelism), and it was retired before this guide was written. The seam survives — `lib/data-source/index.ts` still has a `dispose: () => Promise<void>` hook on the factory result — but every live adapter today runs inside the caller's process.
 
 ## Structure pass
 
-**Axis: control — who decides what runs next?**
+### Axes (one question, traced across the bands)
+
+**Axis: who runs the JavaScript?**
 
 ```
-  Three altitudes, one question (who decides?)
-
-  ┌─ OS / Vercel ──────────────────────────────────────┐
-  │  the kernel + Vercel scheduler decide               │  → PLATFORM decides
-  │  when a new instance spins up                       │     (we have no say)
-  └────────────────────┬───────────────────────────────┘
-                       │
-  ┌─ Node event loop ─▼────────────────────────────────┐
-  │  libuv decides which I/O callback runs next         │  → RUNTIME decides
-  │  V8 decides which microtask drains next             │     (we await; it picks)
-  └────────────────────┬───────────────────────────────┘
-                       │
-  ┌─ Application ─────▼────────────────────────────────┐
-  │  our `await`s decide WHERE we yield                 │  → CODE decides where
-  │  (every await is a permission slip to swap tasks)   │     to yield, runtime
-  │                                                     │     decides who runs next
-  └────────────────────────────────────────────────────┘
+  Browser    →  the browser's main thread (one)
+  Vercel     →  doesn't run JS itself; spawns Node processes
+  Node       →  V8's main thread (one)
 ```
 
-**Seam where control flips:** every `await`. Before the await, application code owns the thread; at the await, control returns to the event loop, which can pick a different pending task — including another request's continuation.
+The answer is "one thread" in both bands that execute code. The platform band between them is a scheduler, not an executor.
 
-**That's the whole skeleton.** Two requests racing on a Map are two suspended continuations the event loop interleaves at `await` boundaries. Everything in `04-shared-state-races-and-synchronization.md` hangs off this seam.
+**Axis: how is concurrency expressed?**
+
+```
+  Browser    →  Promises + the DOM event loop
+  Node       →  Promises + the libuv event loop
+```
+
+Same primitive in both bands: a Promise. The schedulers underneath are different (DOM vs libuv), but the surface the app codes against is identical. That's why `lib/streaming/ndjson.ts` is shared between browser callers (`useBriefingStream`, `useInvestigation`, `StreamingResponse`) and Node callers without modification — there's nothing thread-aware in it.
+
+### Seams
+
+The interesting seam is **the request boundary** between Vercel and Node. Above the seam, the platform decides whether to spawn a new process or reuse a warm one. Below the seam, the app sees one process and writes module-level state into it. The axis "is this state visible to the next request?" flips across the seam: above the seam, NO (platform sees each request as independent); below the seam, YES (module Maps survive between requests on the same warm instance).
+
+That flip is what `04-shared-state-races-and-synchronization.md` is entirely about.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know how `fetch()` returns a Promise and your code continues only after `await`? Same shape, scaled up: every async operation in this server is a Promise the event loop holds; when its underlying I/O resolves, the event loop puts the continuation in a microtask queue to run next. There is no second thread to "also" run things. There's one thread that runs whichever continuation is at the front of the queue.
+You know how a `fetch()` returns a Promise that resolves later? That's a task. The event loop sees `await fetch(...)`, suspends the calling function, runs other work (microtasks, timers, more I/O), and when the network response comes in, it resumes your function. There's no second thread executing your code — there's one thread that PARKS your function and PICKS UP another.
 
 ```
-  Pattern — the single-threaded interleaving
+  The single-thread task model — one execution, many parked functions
 
-  thread (one)
-   ├─ tick 1: request A enters handler
-   │           runs sync code, hits `await fetch(...)`
-   │           yields
-   ├─ tick 2: request B enters handler         ← could run NOW
-   │           runs sync code, hits `await ds.callTool(...)`
-   │           yields
-   ├─ tick 3: A's fetch resolves
-   │           microtask: A's continuation drains
-   │           runs sync code, hits next await, yields
-   ├─ tick 4: B's callTool resolves
-   │           microtask: B's continuation drains
-   │           ...
-   ▼
+  time →
+  ─────────────────────────────────────────────────────────────────
+
+  request #1  ───►  await fetch ───parked───────────►  resume
+                                  │
+  request #2          ───►  await fetch ───parked──────►  resume
+                                          │
+  microtask                                ►•─ resolve cb
+                                                       ▲
+                                                  one thread,
+                                                  picking up
+                                                  whatever's ready
 ```
 
-Every horizontal line is the same thread. The interleaving is cooperative — A and B agreed to yield at their awaits, and the runtime picked the order they resume in.
+The mistake people make: assuming `await` means "wait" in a thread sense. It means "park this function, let the loop work on other things, resume when the awaited Promise settles." The function is paused; the thread isn't.
 
 ### Move 2 — the moving parts
 
-#### Move 2.1 — what's a "process" here
+#### One process per Vercel function invocation
 
-The server's process is the Node binary Vercel spawns on cold start. It has:
+When a request hits `/api/briefing`, Vercel either spawns a new Node process or hands the request to a warm one. The app doesn't choose. From inside the process, the only signal you have is: did your module-level state survive from a previous request? (Cold = no, warm = yes.)
 
-  → a heap (V8-managed) — for module state, the `Map`s, every Promise, every closure.
-  → a stack (per active synchronous call frame) — small; async work lives on the heap.
-  → file descriptors (for incoming HTTP, outgoing `fetch` sockets).
-  → an event loop (libuv).
-
-```
-  ┌─ Node process (Vercel instance) ────────────────────────┐
-  │                                                          │
-  │  heap                                                    │
-  │  ├─ const state = new Map()    [lib/state/insights.ts]   │
-  │  ├─ const mem = new Map()      [lib/state/investig.ts]   │
-  │  ├─ pending Promises                                     │
-  │  └─ closures captured by setTimeout, AbortSignal, etc.   │
-  │                                                          │
-  │  stack (whichever sync frame is running right now)       │
-  │  └─ at most one continuation at a time                   │
-  │                                                          │
-  │  libuv event loop                                        │
-  │  ├─ timer queue (setTimeout)                             │
-  │  ├─ I/O callback queue (fetch resolved, etc.)            │
-  │  └─ microtask queue (Promise.then continuations)         │
-  └──────────────────────────────────────────────────────────┘
+```ts
+// lib/state/insights.ts:14 — survives between requests on a warm instance
+const state = new Map<string, SessionFeed>();
 ```
 
-There is no `process.fork`, `child_process.spawn`, or `new Worker(…)` in `lib/` or `app/`. Verified by grep: zero hits. (An olist subprocess existed briefly in Phase 2 and was removed in PR #8.)
+That `new Map(...)` runs ONCE per process. The `import` that pulls it in is cached. Two requests to a warm instance see the SAME Map object. This is what makes module-level Maps load-bearing for session memory — and what makes them a leak vector when they're not session-keyed (finding #1, `lib/mcp/schema.ts:138`).
 
-#### Move 2.2 — what's a "thread" here
+The lifetime question becomes: how long is "warm"? Vercel doesn't publish a number. Empirically: minutes to tens of minutes of activity, then cold. Cold start means the process is killed and a new one starts; all module-level state is wiped. This is why the encrypted cookie store exists for production auth (`lib/mcp/auth.ts:86-104`) — `connect` and `callback` may hit different processes, so the only state both can see is the browser's cookie.
 
-There is one. V8's main thread runs all your JavaScript. libuv has a small internal thread pool for some I/O (DNS resolution, file I/O), but your application code never sees those threads — by the time a callback fires, you're back on the main thread.
+#### No threads, no workers, no children
 
-If you wanted parallelism (true multi-core), you'd reach for `worker_threads`. The codebase does not — the agent loop is I/O-bound waiting on Anthropic and Bloomreach, so a worker thread would just be another thing waiting. CPU on the server is not the bottleneck; round-trip latency is.
-
-#### Move 2.3 — what's a "task" here
-
-Every Promise continuation is a task. Concrete examples from the codebase:
-
-  → `await this.transport.callTool(name, args, { signal })` at `lib/data-source/bloomreach-data-source.ts:196` — yields the thread until the MCP server responds (or the 30s timeout fires).
-  → `await reader.read()` at `lib/streaming/ndjson.ts:37` — yields until the next chunk arrives on the response body.
-  → `await new Promise((r) => setTimeout(r, this.minIntervalMs - elapsed))` at `lib/data-source/bloomreach-data-source.ts:193` — the spacing gate yields for up to 1.1s.
-  → `await sleep(waitMs)` at `lib/data-source/bloomreach-data-source.ts:172` — the retry ladder yields up to 20s.
-
-Every one of these is a permission slip. While we're awaiting Bloomreach, the event loop runs other things — another request's handler, another timer callback, another NDJSON chunk arriving on a different request's response.
-
-#### Move 2.4 — what "concurrent" actually means on this server
-
-Vercel can route two requests to the same warm instance at the same time. Both handlers start, both hit their first `await`, both yield. Then the event loop interleaves their continuations as I/O lands. The illusion is "they ran in parallel"; the reality is "they took turns on one thread, each yielding at every await."
+Grepped, verified:
 
 ```
-  Two concurrent requests, one thread — execution trace
-
-  time   thread runs:                          state
-  ────   ────────────────────────────────      ──────────────────────────────
-  t=0    A handler starts                       state Map = { ... }
-  t=1    A: bootstrap() awaits                  (A yields)
-  t=2    B handler starts                       state Map = { ... }
-  t=3    B: bootstrap() awaits                  (B yields)
-  t=4    libuv fires A's bootstrap response
-         A: putInsights(sidA, ...) — sync       state.get(sidA).insights.clear()
-                                                state.get(sidA).insights.set(...)
-  t=5    A: send({type:'insight'}) — sync       (controller.enqueue)
-  t=6    A: await next ... yields
-  t=7    libuv fires B's bootstrap response
-         B: putInsights(sidB, ...) — sync       state.get(sidB).insights.clear()
-         ...
+  $ grep -rn "child_process\|worker_threads\|spawn(\|fork(\|cluster" lib/ app/
+  (zero hits in source code)
 ```
 
-A and B never collide on the *same* `sessionId` (different cookies → different sub-maps). They do share the outer `Map` reference; the outer map is never `.clear()`ed, only individual sub-maps are (`lib/state/insights.ts:67-71`). That's the load-bearing safety — see the next file for the race analysis.
+This isn't oversight. The hot path is I/O-bound: an agent loop spends 95%+ of its time awaiting Anthropic API responses and Bloomreach MCP responses. The event loop already handles that concurrency cleanly. Adding `worker_threads` would let the app run JavaScript in parallel on multiple cores — but there's almost no CPU work to parallelize. The only CPU costs are:
 
-#### Move 2.5 — what BREAKS if you treat this as multi-threaded
+- JSON parse/stringify (small; bounded by truncation to 16K chars in `lib/agents/base-legacy.ts:32`)
+- AES-256-GCM encrypt/decrypt of the auth cookie (microseconds; `lib/mcp/auth.ts:62-79`)
+- The NDJSON encode/decode (string concatenation; trivial)
 
-If you assume two threads, you reach for locks. There are no locks in this codebase — and there don't need to be, because between any two lines of synchronous code in one request, no other request can execute. The atomic unit on this server is "the code between two `await`s."
+None of that justifies the complexity of a worker pool. The previous Olist subprocess was about adapter isolation (keep SQL driver crashes out of the main process), not parallelism — and when the adapter went away, the subprocess went with it.
 
-What breaks if you forget this:
+#### Tasks: what's actually on the event loop
 
-  → You read a value, await, write a derived value back — and between read and write, another request mutated the same key. (The check-then-act race, classic.)
-  → You assume `Map.set` followed by `Map.get` is paired — and it is, sync — but if anything `await`s between them, another request can interleave.
+A task in JS-land is a Promise's resolution callback. A microtask is what `.then()` and `await` schedule. The event loop drains microtasks between every task. The app produces lots of both.
 
-The repo avoids this by keeping `putInsights` (`lib/state/insights.ts:57-71`) entirely synchronous: `clear()` then `set()` in a tight loop, no await. The whole function runs as one event-loop tick.
+```
+  One agent loop turn — what runs as what
+
+  ─────────────────────────────────────────────────────────────
+  TASK: stream controller's start(controller) function starts
+    │
+    ├─ MICROTASK: await anthropic.messages.create(...)
+    │             ↳ parks the function until network I/O resolves
+    │
+    │  (event loop free; other requests' microtasks may run)
+    │
+    ├─ TASK: HTTP response arrives → resolve callback queued
+    │
+    ├─ MICROTASK: continuation resumes; tool_use blocks extracted
+    │
+    ├─ MICROTASK: await dataSource.callTool(...)
+    │             ↳ parks again until MCP response resolves
+    │
+    │  (event loop free; sleep(minIntervalMs) may schedule a timer)
+    │
+    └─ TASK: timer fires → liveCall resumes → tool result returned
+  ─────────────────────────────────────────────────────────────
+```
+
+The `~1 req/s` proactive spacing in `lib/data-source/bloomreach-data-source.ts:191-194` is a `setTimeout`-backed sleep:
+
+```ts
+// lib/data-source/bloomreach-data-source.ts:73-75, 191-194
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+private async liveCall(name: string, args: ...): Promise<unknown> {
+  const elapsed = Date.now() - this.lastCallAt;
+  if (elapsed < this.minIntervalMs) {
+    await new Promise((r) => setTimeout(r, this.minIntervalMs - elapsed));
+  }
+  // ...
+}
+```
+
+That `await` parks the function for ~1.1s (the configured `minIntervalMs`). During those 1.1s, the event loop is FREE to run other requests' work. The function isn't blocking the thread; it's blocking ITSELF. This is the central trick of async I/O on a single thread — the difference between "the function is waiting" (fine) and "the thread is waiting" (catastrophic).
+
+#### One per-request DataSource, not a singleton
+
+```ts
+// app/api/agent/route.ts:165-167, 179-182
+let dsResult: Awaited<ReturnType<typeof makeDataSource>>;
+try {
+  dsResult = await makeDataSource(mode, sid);
+} catch (e) { /* ... */ }
+// ...
+const dataSource = dsResult.dataSource;
+```
+
+Every request constructs its own `BloomreachDataSource`. The 60s response cache inside it (`bloomreach-data-source.ts:122, 144`) is therefore per-request, not shared across users. The `~1 req/s` spacing (`lastCallAt`) is also per-instance — which means concurrent requests on one warm instance can each fire one MCP call without waiting on each other, and the rate limit is enforced by Bloomreach (with parsed retries) rather than by our spacing.
+
+The cost of per-request construction is small: `BloomreachDataSource` is just three numeric configs and an empty cache; the heavy OAuth/PKCE handshake happens once and the tokens persist via the cookie store.
+
+The would-be alternative — a module-level `BloomreachDataSource` singleton — would share the 60s cache (faster repeats) but also share the per-call rate gate and force every concurrent request through it sequentially. Worse, the cache would leak across users like `cached` in `schema.ts` does. The per-request choice is the safer one.
 
 ### Move 3 — the principle
 
-A single-threaded async runtime is **not** "slower than multi-threaded" — for I/O-bound work it's the same throughput with simpler reasoning. The tradeoff you accept is that long sync work blocks *everything*. The tradeoff you escape is locks. Pick the right side of that line: every `await` is your scheduling point, every sync block is your latency floor for the whole instance.
+Single-process, single-threaded JavaScript runtimes solve concurrency by parking functions, not by spawning threads. The skill is recognizing what's "parked" (fine) vs what's "blocking the thread" (poisonous). Anything `await`-able is parked. Anything CPU-bound (a tight loop, a synchronous regex on a huge string, a `JSON.parse` of a 50MB blob) is blocking — and blocking on the event loop blocks every other request on the same process.
+
+The repo stays safely parked because the hot path is I/O. The two places where it gets close to blocking are AES encryption of the auth cookie (microseconds, fine) and JSON.stringify of tool results before truncation (`lib/agents/base-legacy.ts:184` — bounded to 16K, fine). Neither is a real risk.
 
 ## Primary diagram
 
 ```
-  Processes / threads / tasks in blooming insights
+  The full picture — one process, many parked functions, one schedule
 
-  ┌─ ONE Node process (per warm Vercel instance) ─────────────────┐
-  │                                                                │
-  │  ┌─ ONE main thread ────────────────────────────────────────┐  │
-  │  │                                                          │  │
-  │  │  request A continuations ──┐                             │  │
-  │  │  request B continuations ──┼──► event loop picks one      │  │
-  │  │  request C continuations ──┘    at each tick              │  │
-  │  │  timer callbacks         ──┘                             │  │
-  │  │  I/O callbacks           ──┘                             │  │
-  │  │                                                          │  │
-  │  │  yield points (every await):                             │  │
-  │  │   ─ fetch() to Anthropic                                  │  │
-  │  │   ─ transport.callTool() to Bloomreach                    │  │
-  │  │   ─ reader.read() on incoming response                    │  │
-  │  │   ─ setTimeout for spacing gate / retry sleep             │  │
-  │  └──────────────────────────────────────────────────────────┘  │
-  │                                                                │
-  │  ZERO worker threads. ZERO child processes. ZERO cluster.      │
-  └────────────────────────────────────────────────────────────────┘
+  ┌─ Node process (Vercel function instance) ────────────────────────────┐
+  │                                                                      │
+  │   ┌─ V8 main thread (the ONLY thread running JS) ───────────────┐   │
+  │   │                                                              │   │
+  │   │   request #1 ───► await ────parked───────► resume ───► done │   │
+  │   │   request #2 ─────► await ───parked────► resume ───► done   │   │
+  │   │   request #3 ──────► await ────parked──► resume ───► done   │   │
+  │   │                                                              │   │
+  │   │   microtask queue: settled Promise callbacks                 │   │
+  │   │   macrotask queue: setTimeout fires, network I/O completions │   │
+  │   │   (both drained by libuv, scheduled around each other)       │   │
+  │   │                                                              │   │
+  │   └──────────────────────────────────────────────────────────────┘   │
+  │                                                                      │
+  │   module-level state survives between requests on this instance      │
+  │   instance dies when Vercel recycles it (timer or scale-down)        │
+  │                                                                      │
+  └──────────────────────────────────────────────────────────────────────┘
+
+  CPU work would block the thread → every request stalls.
+  I/O work parks one function → other requests' functions run.
+  this app does only I/O work on the hot path. that's why it's fine.
 ```
 
 ## Elaborate
 
-The Node single-threaded model came from the Node.js authors' bet that I/O is the bottleneck for server work — given that, the locking complexity of multi-threaded servers buys you nothing, and you can serve more concurrent connections per machine with cooperative multitasking. It's the same bet Nginx made vs Apache.
+The Node single-thread model came from Ryan Dahl's 2009 idea: most server work is I/O-bound, so let one thread juggle many connections via non-blocking I/O instead of paying a thread-per-connection cost. The model wins when the hot path is I/O and loses when it's CPU. Twenty years later it's the dominant shape for I/O-heavy services, and Vercel built their entire serverless runtime around it.
 
-The serverless deployment doubles down: Vercel doesn't even expose threads or process control. You write the handler; the platform handles the rest. The cost of that abstraction is exactly what's in this guide — every long-lived resource has to live in the cookie or sessionStorage or be content with dying on instance teardown.
-
-Worth reading: the original Ryan Dahl JSConf 2009 talk on Node's design (still the clearest articulation); Node's `worker_threads` docs to see what we're *not* using and why.
+The parts of "process / thread / task" that DON'T apply to this codebase are nontrivial. There's no work-stealing scheduler to tune. There's no thread pool to size. There's no lock to hold. The bugs you watch for in this kind of system are at a different layer: cross-request state bleed (module-level Maps), async-context loss (ALS not propagated through some library), unhandled promise rejections (which crash the process under Node's default handler). The Olist subprocess that used to live in this repo was the closest the codebase came to multi-process design; with it gone, the runtime is simpler and the failure modes are narrower.
 
 ## Interview defense
 
-**Q: Walk me through what happens when two users hit `/api/briefing` at the same time.**
+> Q: "How many threads does this app use?"
 
-Both requests land on the same Vercel instance, both invoke the route handler. The handler is async, so each goes through:
+One per process. Vercel spawns one Node process per function invocation; the JavaScript runs on V8's single main thread. There are no `worker_threads`, no `child_process`, no `cluster`. The previous build had an Olist SQL adapter in a subprocess for driver isolation; it was retired, so the runtime is one process today.
 
-```
-  request A                    request B
-  ─────────                    ─────────
-  await getOrCreateSessionId   await getOrCreateSessionId
-            ↓                            ↓
-  (yields)                     (yields)
-            ↓                            ↓
-  await makeDataSource         await makeDataSource
-            ↓                            ↓
-  await bootstrap(req.signal)  await bootstrap(req.signal)
-            ↓                            ↓
-   ... interleaving on one thread ...
-```
+> Q: "How do you handle concurrent requests then?"
 
-One thread. The interleaving happens at every `await`. They never collide because each `getOrCreateSessionId` returns a different cookie value, so all the per-session state in `lib/state/insights.ts` is keyed apart. The only thing they share is the outer `Map` reference — and we never `.clear()` the outer Map, only per-session sub-maps.
+The event loop. Each request's handler is an async function; when it `await`s a network I/O, the function parks and the loop runs other requests' work. `AsyncLocalStorage` (`lib/mcp/auth.ts:47`) gives each request its own scoped context so they don't see each other's auth state. Module-level Maps in `lib/state/insights.ts` are session-keyed so the same instance can serve multiple users.
 
-Anchor: "one thread, two suspended continuations, interleaved at every await."
+> Q: "What happens if something blocks the event loop?"
 
-**Q: Why no worker threads?**
-
-The hot path is waiting on Anthropic and Bloomreach. A worker would just be another thread waiting. CPU is not the bottleneck — round-trip latency is. Adding workers would buy us nothing except more memory pressure per instance.
-
-If we added CPU-bound work later — say, a heavy JSON transform or a local LLM inference — that's when worker_threads earns its place. For now, the codebase has zero `worker_threads`, zero `child_process`, zero `cluster` imports. Verified by grep.
-
-```
-  the question:  is CPU saturated or is I/O blocking us?
-       │
-       ▼
-  I/O blocking → workers don't help → single thread is correct
-  CPU saturated → workers help → not our situation today
-```
+Every request on that process stalls. The repo stays I/O-bound on the hot path on purpose — the only CPU work is JSON parse/stringify (bounded by 16K truncation in `lib/agents/base-legacy.ts:32`) and AES encrypt/decrypt (microseconds in `lib/mcp/auth.ts:62-79`). If we needed real CPU work we'd reach for `worker_threads`, not extra processes — the abstraction is lighter and the message-passing is built in.
 
 ## See also
 
-  → `03-event-loop-and-async-io.md` for what the runtime is doing while we await.
-  → `04-shared-state-races-and-synchronization.md` for the races this seam creates.
-  → `01-runtime-map.md` for where this single thread fits in the three-band picture.
+- `03-event-loop-and-async-io.md` — what the event loop actually does between awaits.
+- `04-shared-state-races-and-synchronization.md` — how state stays isolated without locks.
+- `07-backpressure-bounded-work-and-cancellation.md` — what bounds the parked functions from accumulating forever.

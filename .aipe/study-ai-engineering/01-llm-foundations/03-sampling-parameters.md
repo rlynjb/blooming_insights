@@ -1,68 +1,78 @@
-# 03 — sampling parameters
+# Sampling parameters
 
-**Subtitle:** Temperature / top-p / top-k · Industry standard
+*Industry standard — temperature, top-p, top-k*
 
-## Zoom out, then zoom in
+## Zoom out — where this concept lives
 
-Sampling parameters live inside the model call — they're knobs on how the next
-token is chosen. Blooming doesn't currently set any of them; everything runs at
-provider defaults.
+After the model produces a probability distribution over the next token, the *sampler* picks one. Sampling parameters (temperature, top-p, top-k) reshape that distribution before the pick. In this codebase, **no agent sets any sampling parameter** — every call uses Anthropic's defaults.
 
 ```
-  Zoom out — sampling sits inside one call
+  Zoom out — where sampling lives
 
-  ┌─ Agent loop ─────────────────────────────────┐
-  │  adapter.complete({ messages, system,        │
-  │                     tools, max_tokens })     │
+  ┌─ Caller (agent code) ────────────────────────┐
+  │  builds ModelRequest                         │
+  │  — does NOT set temperature/top-p/top-k      │
   └────────────────────┬─────────────────────────┘
-                       │  no temperature, no top_p, no top_k
-                       ▼  passed through
-  ┌─ Anthropic — sampler ────────────────────────┐
-  │  ★ sample next token using defaults ★         │  ← we are here
-  └───────────────────────────────────────────────┘
+                       │
+                       ▼
+  ┌─ Adapter (aptkit-adapters.ts:42-52) ─────────┐
+  │  complete(request) builds SDK params         │
+  │  — passes NO sampling field                  │
+  └────────────────────┬─────────────────────────┘
+                       │
+                       ▼
+  ┌─ ★ Anthropic API ★ ──────────────────────────┐ ← we are here
+  │  model → distribution over next token        │
+  │  sampler (DEFAULT params) → next token       │
+  └──────────────────────────────────────────────┘
 ```
 
-## Structure pass
+**Zoom in.** The codebase relies on Anthropic's defaults for everything. That's a deliberate choice but worth being honest about — every agent that should be deterministic (intent classifier, structured-output emitters) is running on the same defaults as the open-ended ones.
 
-  → **One axis to trace — determinism.** `temperature=0` → deterministic
-    output. Higher values → more variance. This codebase uses *no* sampling
-    overrides, which means provider defaults (Sonnet ~`temperature=1.0`)
-    apply. The agents produce structured JSON outputs that are validated by
-    runtime type guards — so variance in *prose* is tolerable, but variance
-    in *shape* breaks `parseAgentJson` and the call gets rejected.
+## Structure pass — layers · axes · seams
 
-  → **The seam (which doesn't exist yet):** the place to plumb a temperature
-    setting would be `AnthropicModelProviderAdapter.complete()` — but
-    AptKit's `ModelRequest` type doesn't currently expose a temperature
-    field, so plumbing it through means extending AptKit core. This is the
-    Case B refactor.
+**Layers:** model → distribution → sampler → token.
+
+**Axis: how much variance do I want?** The agents in this codebase have *different* answers — intent classification wants deterministic; recommendation rationale wants creative. But the code doesn't differentiate: same sampling for all.
+
+**Seam:** the `MessageCreateParamsNonStreaming` shape at `lib/agents/aptkit-adapters.ts:42-52`. The seam exists — Anthropic accepts `temperature`, `top_p`, `top_k` here — it's just not being used.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-The model assigns a probability to every possible next token. Sampling decides
-how to pick one.
+You know how `Math.random()` returns a number, but if you skewed the distribution (only return values near 0.5), the outputs would feel less random? Sampling parameters do that to the model's next-token distribution.
 
 ```
-  Same context, three sampling settings, three behaviors
+  Three parameters, three knobs on the same distribution
 
-  next-token distribution: ["the": 0.42, "a": 0.18, "an": 0.12, …]
-
-  temperature=0   →  always "the"  (deterministic / argmax)
-  temperature=0.7 →  usually "the", sometimes "a", rarely "an"
-  temperature=1.5 →  any reasonable token, including rare ones
-
-  top_p=0.9       →  keep tokens until cumulative probability ≥ 0.9, then
-                     sample uniformly among those. Adapts to confidence.
-
-  top_k=40        →  hard cap: only consider the top 40 tokens.
+  Model produces:
+    token_A: 0.45  ←──┐
+    token_B: 0.30     │
+    token_C: 0.15     │
+    token_D: 0.07     │
+    token_E: 0.03     │
+    ...               │
+    (long tail)       │
+                      │
+  temperature=0       │  pick the max → token_A every time
+                      │
+  temperature=0.7     │  scale + sample → mostly A or B, sometimes C
+   (default)          │
+                      │
+  temperature=1.5     │  flatten distribution → sometimes D, E, or further
+                      │
+  top-p=0.9           │  keep tokens until cumulative=0.9, sample from those
+   (nucleus)          │
+                      │
+  top-k=5             │  keep top 5 tokens, sample from those
 ```
 
 ### Move 2 — the step-by-step walkthrough
 
-**What Blooming actually sets.** Look at the adapter again
-(`lib/agents/aptkit-adapters.ts:42-71`):
+**Part 1 — what the adapter actually sets (and doesn't).**
+
+From `lib/agents/aptkit-adapters.ts:42-52`:
 
 ```typescript
 const params: Anthropic.Messages.MessageCreateParamsNonStreaming = {
@@ -70,140 +80,132 @@ const params: Anthropic.Messages.MessageCreateParamsNonStreaming = {
   max_tokens: request.maxTokens ?? 4096,
   messages: request.messages.map(toAnthropicMessage),
 };
+
 if (request.system) params.system = request.system;
 if (request.tools?.length) params.tools = request.tools.map(toAnthropicTool);
-// ← no temperature
-// ← no top_p
-// ← no top_k
+// NOTHING about temperature, top_p, top_k.
 ```
 
-That's the whole `params` object. No sampling overrides. Anthropic's default
-`temperature` is 1.0; the model is sampling freely turn-to-turn.
+No sampling parameters set. The SDK uses Anthropic's defaults. As of 2026, Anthropic's default temperature for chat models is around `1.0` for prose, but tool-call output is constrained by the schema regardless of temperature — so the determinism comes from the schema, not the sampler.
 
-**Why this is fine for THIS codebase, even though it sounds risky.** The
-agents produce JSON that gets:
+**Part 2 — what each parameter does (in case you wire it).**
 
-  1. Extracted by `parseAgentJson` (lenient — strips markdown fences, scans
-     for `[`/`{`, tries multiple parses). `lib/mcp/validate.ts:3-13`.
-  2. Validated by a type guard (`isAnomalyArray`, `isDiagnosis`,
-     `isRecommendationArray`). `lib/mcp/validate.ts:17-57`.
-  3. If validation fails, the agent loop emits an error or the model
-     gets another turn to try again (AptKit's loop handles this internally).
+  → **`temperature: 0`** — argmax sampling. Picks the token with the highest probability every time. Reproducible. Use for: classifiers, structured outputs you want to be byte-identical across runs, regression-set replay.
+  → **`temperature: 0.7`** — standard chat-like variance. Most production defaults.
+  → **`temperature: 1.2+`** — more creative, more risk of going off-topic.
+  → **`top_p: 0.9`** — nucleus sampling. Keep tokens until cumulative probability hits 0.9, sample within. Adaptive: a confident distribution narrows naturally; a flat one stays wide.
+  → **`top_k: 40`** — hard cap. Keep only top 40 tokens regardless of distribution shape.
 
-So the model can vary its *prose* across runs — different diagnostic
-explanations, different recommendation rationales — without breaking the
-contract, because the contract is the parsed JSON shape.
+Anthropic recommends using either `temperature` or `top_p`, not both.
 
-**Where this is fragile.** Two places:
+**Part 3 — where this codebase *should* care.**
 
-  → **The intent classifier.** `classifyIntent` is a one-shot, no-tools call
-    that returns a single label (`diagnostic` / `monitoring` /
-    `recommendation` / `query`). At default temperature, the same ambiguous
-    query could classify differently on repeat. `temperature=0` would make
-    repeats deterministic. AptKit's `classifyIntent` doesn't expose
-    sampling, so the fix needs to land in AptKit.
+```
+  Agents and the sampling defaults they're running on
 
-  → **The monitoring agent's category selection.** When two categories
-    fire on the same data (e.g. `revenue_drop` and `conversion_drop`
-    measuring overlapping things), the agent's tie-breaking is
-    non-deterministic. The prompt mitigates by enforcing severity sorting
-    (`critical → warning → info → positive`), so two runs end up with the
-    same ordered list even if the prose around each anomaly differs.
+  ┌──────────────────┬─────────────────────┬────────────────────────┐
+  │ Agent            │ Should be           │ Actually is            │
+  ├──────────────────┼─────────────────────┼────────────────────────┤
+  │ Intent           │ temperature=0       │ default (Anthropic's)  │
+  │ classifier       │ (deterministic      │ — structurally OK      │
+  │                  │  classification)    │ because parseIntent    │
+  │                  │                     │ accepts anything       │
+  │                  │                     │ (defaults to           │
+  │                  │                     │ 'diagnostic')          │
+  ├──────────────────┼─────────────────────┼────────────────────────┤
+  │ Monitoring       │ temperature=0.3     │ default                │
+  │ (tool selection) │ (some exploration   │ — the 6-call budget    │
+  │                  │  on which EQL to    │ caps exploration       │
+  │                  │  run, but mostly    │ anyway                 │
+  │                  │  deterministic)     │                        │
+  ├──────────────────┼─────────────────────┼────────────────────────┤
+  │ Recommendation   │ temperature=0.7+    │ default                │
+  │ (rationale       │ (creative prose     │ — probably already in  │
+  │  writing)        │  helps)             │ this range             │
+  ├──────────────────┼─────────────────────┼────────────────────────┤
+  │ Diagnostic       │ Mixed — varies      │ default                │
+  │                  │ between hypothesis  │ — was a source of      │
+  │                  │ exploration and     │ "conclusion            │
+  │                  │ conclusion          │ instability" (30% of   │
+  │                  │ commitment          │ runs reach different   │
+  │                  │                     │ conclusions; Phase 3   │
+  │                  │                     │ retired finding)       │
+  └──────────────────┴─────────────────────┴────────────────────────┘
+```
+
+The "conclusion instability" finding from the retired Phase 3 eval suite is the canonical case where this matters: same anomaly, same prompt, different conclusion on 3 of 10 runs. Lowering temperature for the conclusion-emission step would have reduced this — but it would also reduce hypothesis exploration. The right move is split sampling (low for conclusions, higher for hypotheses), which requires per-agent or even per-call control.
 
 ### Move 3 — the principle
 
-**Use temperature = 0 when the output is going to be parsed; let the model run
-hot when the output is going to be read by a human.** This codebase emits both
-shapes from the same model — JSON contracts AND human-readable `summary` /
-`rationale` / `conclusion` fields. The tradeoff is being made implicitly: the
-JSON shape survives variance because of the runtime validator, and the human
-prose benefits from variance because it makes the agent feel less
-robotic. If parse failures start showing up in logs, temperature=0 on the
-*final synthesis turn* is the move — not on every turn (which would make
-multi-turn loops less robust to ambiguity).
+**Sampling parameters are how you tell the model "be reproducible" vs "be creative."** Defaults are fine for chat. For structured-output agents and classifiers, `temperature=0` is the move. This codebase hasn't paid the cost yet because the structured-output paths are constrained by tool schemas, not by sampling.
 
-## Primary diagram
+## Primary diagram — the full recap
 
 ```
-  Sampling in this codebase — current state
+  Where sampling sits in the LLM call surface
 
-  ┌─ AptKit ModelRequest ─────────────────────────┐
-  │  { messages, system?, tools?, maxTokens? }    │  ← no sampling field
-  └────────────────────┬──────────────────────────┘
-                       │
-                       ▼ adapter passes through
-  ┌─ Anthropic MessageCreateParams ───────────────┐
-  │  { model, max_tokens, system, messages, tools}│  ← also no sampling
-  └────────────────────┬──────────────────────────┘
-                       │
-                       ▼ provider applies defaults
-  ┌─ Anthropic sampler ───────────────────────────┐
-  │  temperature ≈ 1.0   (Sonnet default)         │
-  │  top_p, top_k = provider defaults             │
-  └───────────────────────────────────────────────┘
+  Caller → Adapter → SDK → API
+                            ▼
+                  ┌─ Model: distribution ─┐
+                  │   over next token     │
+                  └──────────┬────────────┘
+                             │
+                             ▼
+                  ┌─ Sampler ─────────────┐
+                  │  temperature: default │ ← this codebase's
+                  │  top_p:       default │   only choice today:
+                  │  top_k:       default │   "use Anthropic's
+                  │                       │    defaults for every
+                  └──────────┬────────────┘    agent"
+                             │
+                             ▼
+                       next token
+                             │
+                             ▼  loop until stop
+                       output sequence
 
-  Refactor target: add `temperature?: number` to ModelRequest in AptKit,
-  thread through in adapter, set temperature=0 for intent classifier.
+  Reproducibility today: NOT guaranteed.
+  An agent run on the same input may produce
+  different outputs (different tool choices,
+  different conclusions, different rationales).
 ```
 
 ## Elaborate
 
-The decision to leave sampling at defaults is *implicit*, not deliberate.
-Nobody picked `temperature=1.0`; it just wasn't set. For a product where the
-JSON validation layer catches bad shapes, this has been fine. For a more
-serious eval harness (see `05-evals-and-observability/`) you'd want
-`temperature=0` for reproducibility — same inputs, same outputs, golden tests
-that don't flake.
+**Why defaults work surprisingly well here.** Two reasons:
 
-The intent classifier is the most likely place a temperature override actually
-ships. Repeat queries giving inconsistent intents is a classic frustration —
-the user types the same thing twice and gets routed differently. Pinning
-`temperature=0` for that one model is a 5-line change once AptKit exposes the
-parameter.
+  1. **Tool schemas constrain output.** When the model emits a `tool_use` block, the schema enforces the field shape regardless of sampling. So even at `temperature=1.0`, an EQL query call is structurally valid.
+  2. **The 6-call budget caps exploration.** The monitoring prompt at `lib/agents/legacy-prompts/monitoring.md:18` enforces a hard 6-tool-call cap. High temperature can't make the agent thrash forever — it gets cut off.
+
+**Why defaults bite anyway.** The conclusion-emission step in the diagnostic agent is unconstrained prose. High temperature there is what made the Phase 3 eval surface 30% conclusion instability. The right fix is per-call sampling — `temperature=0` for the conclusion step, default for the exploration steps — which requires plumbing sampling through the AptKit `ModelRequest` shape.
 
 ## Project exercises
 
-### Exercise — plumb temperature through AptKit + Blooming, set it to 0 for intent
+### Exercise — Per-call sampling for the diagnostic conclusion
 
-  → **Exercise ID:** `study-ai-eng-03.1`
-  → **What to build:** Open a PR against `@rlynjb/aptkit-core` to add
-    `temperature?: number` to `ModelRequest`. Update
-    `AnthropicModelProviderAdapter.complete()` to pass it through. Set
-    `temperature: 0` in `classifyIntent`'s adapter construction.
-  → **Why it earns its place:** "How do you make the classifier
-    deterministic?" is a real question for any LLM-routing product, and
-    the answer "we can't, the param isn't exposed" is unsatisfying. This
-    exercise is small but spans a package boundary — good signal.
-  → **Files to touch:** AptKit core (upstream) ·
-    `lib/agents/aptkit-adapters.ts:42-71` · `lib/agents/intent.ts:21-38`.
-  → **Done when:** Two identical queries to `classifyIntent` produce identical
-    outputs in a unit test (deterministic), and the existing intent tests
-    still pass.
-  → **Estimated effort:** `1–4hr` (the upstream PR is the most of it).
+  → **Exercise ID:** B1.3
+  → **What to build:** Wire `temperature` through `ModelRequest` from the AptKit boundary down through `AnthropicModelProviderAdapter.complete()`, and have the diagnostic agent set `temperature: 0` on the final conclusion-emission turn (the last call before returning).
+  → **Why it earns its place:** directly addresses the retired Phase 3 finding of 30% conclusion instability. Pattern transfers to any agent that mixes exploration with structured commitment.
+  → **Files to touch:** `lib/agents/aptkit-adapters.ts` (pass `request.temperature` to SDK params), `lib/agents/diagnostic.ts` or the AptKit hook surface (set `temperature=0` on the synthesis turn), `test/agents/diagnostic.test.ts` (assert the conclusion turn uses temperature 0).
+  → **Done when:** running the same anomaly diagnosis 10 times produces the same conclusion text (or close to it — exploration steps can still vary), and the test suite explicitly covers the per-call sampling distinction.
+  → **Estimated effort:** 1–4hr.
 
 ## Interview defense
 
-**Q: What temperature does this codebase run at?**
+**Q: "What temperature does your monitoring agent run at?"**
 
-Provider defaults — Anthropic's `temperature ≈ 1.0`. We don't set sampling
-parameters anywhere in `AnthropicModelProviderAdapter.complete()`. The
-agents produce structured JSON validated by a runtime type guard
-(`lib/mcp/validate.ts`), so variance in the prose around the JSON is
-tolerable; the contract is the shape, not the wording.
+Anthropic's default — I don't set it. It's a deliberate but honest gap: the codebase relies on tool schemas to constrain structured output and on the 6-call budget to cap exploration, so default sampling has been good enough for the loop's mechanics. Where it bit was the diagnostic conclusion-emission step — the retired Phase 3 eval surfaced 30% conclusion instability on the same input. The fix is per-call temperature: 0 on the synthesis turn, default on exploration. Not wired yet.
 
-**Q: Where would lower temperature actually help here?**
+*Anchor: "Defaults today; per-call sampling is the next move (`B1.3`)."*
 
-The intent classifier (`lib/agents/intent.ts`). It's a one-shot, no-tools call
-that returns a single label. At `temperature=0` repeat queries would always
-classify identically. The blocker is that AptKit's `classifyIntent` doesn't
-expose a temperature parameter today — it's a one-line addition to
-`ModelRequest` and an adapter passthrough.
+**Q: "Why not just set temperature=0 everywhere?"**
 
-**Anchor line:** "We tolerate variance because the validator catches bad
-shapes. The next move is `temperature=0` for intent classification — small
-PR against AptKit, immediate determinism win."
+Three agents want creativity: monitoring (which EQL angle to try), diagnostic (which hypothesis to explore), recommendation (rationale writing). Forcing temperature=0 globally would kill exploration and make the agents brittle to small prompt changes. The right framing is per-step, not per-agent.
+
+*Anchor: "Exploration steps want variance; commitment steps want determinism. Split, not flat."*
 
 ## See also
 
-  → `04-structured-outputs.md` — the validator that makes default sampling safe
-  → `08-provider-abstraction.md` — the adapter where temperature would land
+  → `01-what-an-llm-is.md` — the function whose output the sampler shapes
+  → `04-structured-outputs.md` — why tool schemas constrain output regardless of sampling
+  → `05-evals-and-observability/03-llm-as-judge-bias.md` — eval framing for the conclusion-instability finding

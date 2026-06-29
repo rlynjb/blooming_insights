@@ -1,51 +1,24 @@
 # 01 — LLM foundations
 
-The model is a function. Input tokens → output tokens. Everything in this section
-is about the I/O contract at that boundary — what travels in, what comes back, how
-much it costs, and where the seams sit that let you swap providers, count tokens,
-or constrain shapes.
+The foundations: what the LLM actually is, how text becomes tokens, what sampling parameters do, how structured outputs are enforced through tool calling, the token economics that drive cost, the heuristic-before-LLM router that keeps cost down, and the provider port that lets you swap Anthropic for anything else later.
 
-## Files in reading order
+Most of these land as straightforward concept walks against the codebase's existing patterns. The two with the most local weight are:
 
-```
-01-what-an-llm-is.md          ← the I/O model — start here
-02-tokenization.md             ← why tokens, not characters
-03-sampling-parameters.md      ← temperature / top-p / top-k
-04-structured-outputs.md       ← typed contracts at the LLM boundary (LOAD-BEARING)
-05-streaming.md                ← NOT exercised inside the agent loop; IS exercised on the wire
-06-token-economics.md          ← how much each briefing/investigation costs
-07-heuristic-before-llm.md     ← where deterministic logic guards the LLM
-08-provider-abstraction.md     ← the ModelProvider seam (this is the BIG one)
-09-user-override-locks.md      ← NOT exercised — explained as a pattern
-```
+- **`07-heuristic-before-llm.md`** — the intent classifier (`lib/agents/intent.ts`) is the local instance of this pattern, applied at the *intent* layer rather than the *tool* layer.
+- **`08-provider-abstraction.md`** — the `ModelProvider` port (from `@aptkit/core`) is the load-bearing seam that lets every agent depend on the abstraction, not the SDK.
 
-## What's load-bearing in this section for THIS codebase
+Streaming (`05-streaming.md`) is the inverse case: this codebase deliberately does NOT stream the LLM response itself — it streams the *agent's reasoning* via NDJSON. The file explains why.
 
-  → **`04-structured-outputs.md`** — every agent's final answer is JSON
-    extracted by `parseAgentJson` + checked by a hand-written type guard
-    (`isAnomalyArray`, `isDiagnosis`, `isRecommendationArray`). No JSON
-    schema mode, no tool-call schema as output, no Zod. Read this to
-    understand the "lenient parse + runtime validate" choice.
+## Reading order
 
-  → **`08-provider-abstraction.md`** — `ModelProvider` is AptKit's seam.
-    Blooming implements it with `AnthropicModelProviderAdapter` so AptKit
-    can run agent loops without knowing about Anthropic specifically. This
-    is the *entire* reason AptKit code is reusable across projects.
+The files are concept-shaped, not strictly sequential. Read in this order on first pass:
 
-  → **`07-heuristic-before-llm.md`** — the bootstrap chain
-    (`list_cloud_organizations` → `list_projects` → `get_event_schema`) is
-    deterministic; only AFTER it runs does the LLM see anything. The
-    schema summary is hand-truncated (`schemaSummary()` in
-    `lib/agents/monitoring.ts:19-60`) to bound input tokens.
-
-## What's pattern-only (Case B) in this codebase
-
-  → **`05-streaming.md`** — the agent loop itself uses non-streaming
-    `messages.create()` (`lib/agents/aptkit-adapters.ts:52-55`), but the
-    NDJSON wire format streams individual agent events to the UI. Two
-    different streams, both called "streaming."
-
-  → **`09-user-override-locks.md`** — the codebase has no user-editable
-    LLM-generated fields. Taught as a pattern with a concrete refactor
-    target (the recommendation card's title/rationale would be the natural
-    place to add it).
+1. `01-what-an-llm-is.md` — the IO model. The mental anchor for the rest.
+2. `02-tokenization.md` — why context windows are sized in tokens, not chars.
+3. `03-sampling-parameters.md` — temperature / top-p / top-k; what the adapter sets (or doesn't).
+4. `04-structured-outputs.md` — the tool-calling contract as the structured-output mechanism.
+5. `05-streaming.md` — why this app streams reasoning, not tokens.
+6. `06-token-economics.md` — what a scan / investigation / proposal costs.
+7. `07-heuristic-before-llm.md` — the intent classifier as the local instance of the pattern.
+8. `08-provider-abstraction.md` — the `ModelProvider` port: the load-bearing seam.
+9. `09-user-override-locks.md` — `not yet exercised` in this codebase; honest treatment.

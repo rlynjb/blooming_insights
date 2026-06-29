@@ -1,275 +1,268 @@
 # Chapter 7 — The counterfactuals
 
-The senior-engineer move is to **volunteer what you'd reconsider before being asked**. Junior candidates wait for the interviewer to find a weakness and then defend it. Senior candidates name the reconsideration themselves, with a named trigger that would change the decision, and the named tradeoff that's being paid in the meantime.
+  ## Opening hook
 
-The mirror-image trap is the *fake regret* — fabricating a counterfactual for a decision that was clearly right, because you think the interviewer wants to hear it. They don't. A fake counterfactual is louder than a missing one. This chapter teaches you both halves: **the four decisions you'd reconsider** (each with a real trigger), and **the four decisions you'd keep** (each with the receipt that proves it earned its place).
+The senior-engineer move on this question is to volunteer what you'd reconsider before being asked. It signals two things at once: you're not romantically attached to your own decisions, and you've actually thought about which ones have the highest revisit value. Junior engineers defend everything. Senior engineers defend the load-bearing things and volunteer the rest.
 
-## The counterfactuals matrix — the chapter on one page
+This is also the chapter most likely to backfire. The trap is fabricating regrets for decisions that were obviously right. "Oh I wish I hadn't used TypeScript" is the wrong answer — not because someone might believe you, but because the interviewer hears a candidate who can't tell the difference between a load-bearing decision and a settled one. The strong shape is a *would-not-change list* up front (so they know your baseline is grounded) followed by the *four real reconsiderations* with each one's trigger named.
 
-The visual anchor. Left column is what you'd reconsider; right column is what you'd keep. Each row's bottom is the receipt or the trigger.
-
-```
-  blooming insights — what you'd reconsider vs what you'd keep
-
-  ┌────────────────────────────────┬────────────────────────────────┐
-  │   WOULD RECONSIDER             │   WOULD KEEP                   │
-  │   (with named trigger)         │   (with the receipt)           │
-  ├────────────────────────────────┼────────────────────────────────┤
-  │                                │                                │
-  │ 1. No database                 │ A. NDJSON + readNdjson kernel  │
-  │    (in-process Map)            │    (lib/streaming/ndjson.ts,   │
-  │                                │     64 LOC, 4 surfaces)        │
-  │    Concurrent-user wipe is     │                                │
-  │    RESOLVED (session-keyed).   │    Receipt: one kernel, four   │
-  │    Open: cross-instance state. │    consumers, no duplication.  │
-  │    Trigger: multi-instance.    │                                │
-  │                                │                                │
-  ├────────────────────────────────┼────────────────────────────────┤
-  │                                │                                │
-  │ 2. Demo-replay as the          │ B. TypeScript                  │
-  │    reliability path            │                                │
-  │                                │    Receipt: every event-shape  │
-  │    Workaround for alpha        │    boundary in the system has  │
-  │    Bloomreach (revokes         │    a type and breaks loudly    │
-  │    tokens after minutes).      │    when violated. The bare-500 │
-  │    Trigger: stable upstream.   │    bug would have been worse   │
-  │                                │    without it.                 │
-  │                                │                                │
-  ├────────────────────────────────┼────────────────────────────────┤
-  │                                │                                │
-  │ 3. Fixed ~1.1s call spacing    │ C. DataSource seam + adapter   │
-  │    on BloomreachDataSource     │    pattern                     │
-  │                                │                                │
-  │    Conservative for ambiguous  │    Receipt: survived 2 adapter │
-  │    rate limit. Costs me real   │    swaps (Olist in then out,   │
-  │    latency on every live run.  │    Synthetic in) without       │
-  │    Trigger: stable headroom +  │    changing the caller surface.│
-  │    measurement.                │                                │
-  │                                │                                │
-  ├────────────────────────────────┼────────────────────────────────┤
-  │                                │                                │
-  │ 4. Coverage deps as exact      │ D. AptKit primitive boundary   │
-  │    event-name match (no        │    (3 small adapter classes)   │
-  │    alias layer)                │                                │
-  │                                │    Receipt: library owns the   │
-  │    Deliberate — alias indir-   │    loop, I own the boundary,   │
-  │    ection adds cost. Trigger:  │    legacy preserved at         │
-  │    workspaces with different   │    base-legacy.ts as the       │
-  │    event naming conventions.   │    rollback receipt.           │
-  │                                │                                │
-  └────────────────────────────────┴────────────────────────────────┘
-```
-
-Walk left-then-right. The left column shows judgment; the right column shows discipline. Both halves are the senior signal.
-
-## What's NOT on the would-keep list (and why)
-
-One thing that *used to be* on the would-keep list is **the shared `runAgentLoop`**. It's not anymore. The hand-rolled loop is now legacy — preserved at `lib/agents/base-legacy.ts:86-176` as the rollback receipt, but no longer the active path. The active path is `@aptkit/core@0.3.0` behind three small adapter classes. That migration is the proudest part (Chapter 6) and a load-bearing decision-revisit; calling it out as a "would-keep" today would be defending a decision the project has already moved past.
-
-This kind of honesty — *that's what I kept, this is what I changed* — is the senior-shape of the counterfactuals chapter.
-
-## Reconsideration 1 — No database (in-process state)
+  ## The picture you draw — the counterfactuals matrix
 
 ```
-  ┌─────────────────────────────────────────────────┐
-  │ THEY ASK                                        │
-  │   "What would you do differently?"              │
-  │                                                 │
-  │ WHAT THEY'RE TESTING                            │
-  │   Will you volunteer your weakest decision and  │
-  │   name the trigger that would change it? Or     │
-  │   will you wait to be asked, and then defend?   │
-  └─────────────────────────────────────────────────┘
+  Counterfactuals — what stays, what you'd revisit, what triggers the revisit
+
+  ┌─ WOULD NOT CHANGE (the receipts) ──────────────────────────────────────┐
+  │  NDJSON over fetch + shared readNdjson kernel                          │
+  │     → receipt: same kernel powers 4 streaming surfaces today           │
+  │  TypeScript                                                            │
+  │     → receipt: the type surface caught the schema drift on each       │
+  │       MCP unwrap change                                                │
+  │  DataSource seam + adapter pattern                                     │
+  │     → receipt: survived 2 adapter swaps without changing caller        │
+  │       surface — that's the receipt, not future-proofing                │
+  │  AptKit primitive boundary                                             │
+  │     → receipt: library owns the loop, I own the boundary,             │
+  │       legacy preserved at base-legacy.ts:86-176                        │
+  └────────────────────────────────────────────────────────────────────────┘
+
+  ┌─ WOULD RECONSIDER (with trigger) ──────────────────────────────────────┐
+  │                            │                                            │
+  │  decision                  │  trigger that flips it                     │
+  │  ──────────────────────────┼──────────────────────────────────────────  │
+  │  1. No DB (cross-instance  │  Vercel runs more than one warm instance  │
+  │     state remains open)    │  in rotation for the same user             │
+  │                            │                                            │
+  │  2. Demo-replay as the     │  the alpha Bloomreach server's token       │
+  │     reliability path        │  lifetime extends past the briefing       │
+  │                            │  duration AND rate limits stabilize        │
+  │                            │                                            │
+  │  3. Fixed ~1.1s call       │  measured rate-limit headroom AND a real   │
+  │     spacing (Bloomreach)   │  metric showing some users blocked         │
+  │                            │  by the floor                              │
+  │                            │                                            │
+  │  4. Tool-coverage deps as  │  a second workspace that uses different    │
+  │     exact event-name match │  event naming for the same concepts         │
+  └────────────────────────────────────────────────────────────────────────┘
 ```
 
-> "Top of my reconsiderations list: the in-process state in `lib/state/insights.ts`. Today it's a `Map<sessionId, SessionFeed>` — session-keyed, which fixed the concurrent-user wipe bug I caught earlier (Chapter 6's defaulted-to story). So the *concurrency* problem is resolved. What's still open is **cross-instance state** — if a user's first request lands on Vercel instance A and their second request lands on instance B, B has no memory of the session.
+Four reconsiderations. Each one has a trigger. The trigger is the senior signal — it shows the decision isn't "I'd reconsider this someday" but "I'd reconsider this *when* X."
+
+  ## The body — would-not-change first, then the four reconsiderations
+
+  ### The would-not-change list (volunteered up front)
+
+```
+  ┌─────────────────────────────────────────────────────────────┐
+  │ THEY ASK                                                    │
+  │   "What would you do differently if you were starting       │
+  │    today?"                                                   │
+  │                                                              │
+  │ WHAT THEY'RE TESTING                                         │
+  │   Will you fabricate regrets to sound humble, or will you   │
+  │   distinguish settled decisions from open ones? Can you     │
+  │   defend the things that stay AND name the things that      │
+  │   change?                                                    │
+  └─────────────────────────────────────────────────────────────┘
+```
+
+**Strong answer (the opener — volunteer the would-not-change list first):**
+
+> "Four things I'd keep exactly as they are, and then four I'd reconsider.
 >
-> "For a portfolio project with no production traffic that's not a real problem. The trigger that would change my design is **multi-instance deployment**, which a single-region Vercel hobby tier doesn't have. The day there's a real second instance, I'd reach for Vercel KV or a small Postgres — the `lib/state/insights.ts` module is already the seam, so it's a substitution behind one interface, not a refactor.
+> What I'd keep: the NDJSON streaming contract with a single shared `readNdjson` kernel — the receipt is that one kernel powers four streaming surfaces in the app today (briefing, investigation, demo capture, tests) and the contract has held across every refactor. TypeScript — every MCP unwrap change shifted the type surface and that surface caught the drift before runtime. The DataSource seam with its adapter pattern — the receipt isn't future-proofing, it's that the seam *already survived* two adapter swaps without changing what the agents call. And the AptKit primitive boundary — three small adapter classes, library owns the loop, I own the boundary, legacy hand-rolled loop preserved at `lib/agents/base-legacy.ts:86-176` as a rollback receipt.
 >
-> "The fake-regret version of this answer would be 'I'd add Postgres from day one because real systems need a database.' That's not true for this system. The right shape was deferring the database until I knew what state I needed. The concurrent-user bug was the lesson; session-keying fixed it; cross-instance is the next move *only when the trigger arrives*."
-
-## Reconsideration 2 — Demo-replay as the reliability path
-
-> "Demo mode exists because the alpha Bloomreach server revokes tokens after minutes. That's a real constraint and demo mode is a real fix — but it shapes the design in ways I'd reconsider if the upstream got stable.
->
-> "Specifically, the route handler for `/api/briefing` has a branch that switches between live and the committed snapshot in `lib/state/demo-insights.json`. There's machinery — the dev-only one-click capture in `useDemoCapture`, the per-step replay filter, the schema that lets older snapshots still validate. All of that is honest fallback machinery, but it's machinery I wouldn't need if the upstream were stable.
->
-> "The trigger is **a stable upstream that doesn't revoke tokens**. The day Bloomreach's MCP server reaches GA with documented session lifetimes, demo-replay becomes a development convenience rather than a presentation necessity. I'd keep the capture path (it's a fast local dev loop), but I'd retire the demo-as-default branch in production. The default mode would flip from `'demo'` to `'live-bloomreach'`."
-
-## Reconsideration 3 — Fixed ~1.1s call spacing on `BloomreachDataSource`
-
-> "This is the one I'd reconsider *the soonest* if I were operating the system. I'm spacing calls at roughly 1.1 seconds because the rate limit is documented ambiguously and I picked a conservative number to stay safe. That choice is costing me real latency on every live run — a multi-step diagnostic agent makes 10–15 tool calls, and at 1.1s spacing that's 10–15 seconds of artificial wait per investigation.
->
-> "The trigger to change it is a **stable upstream with documented headroom plus measurement**. With a real production telemetry signal — per-call latency and 429-rate histograms — I'd find the actual ceiling and tighten the spacing to it. The fix is one constant in `BloomreachDataSource`; the courage to change it requires the measurement.
->
-> "The reason this matters for the counterfactuals chapter is that it's a real cost being paid right now, not a hypothetical at scale. Volunteering it tells the interviewer I know where my own performance is being sacrificed for safety, and I know what would let me reclaim it."
-
-## Reconsideration 4 — Coverage deps as exact event-name match
-
-> "This one's narrower. The monitoring agent's coverage logic — whether a given category has been confirmed checked — keys off exact Bloomreach event names. If a workspace happens to use `customer_session_start` instead of `session_start`, my coverage logic doesn't recognize it and the category stays empty.
->
-> "I deliberately didn't build an alias layer. The alias layer would add a layer of indirection — a config or convention mapping workspace-specific names to my canonical names — and for the single workspace I've tested against (the standard Bloomreach ecommerce event taxonomy), it's overhead with no benefit.
->
-> "The trigger is **a workspace with different event naming conventions**. The day I encounter one, the alias layer earns its keep — without one, I'd be hand-editing tool-coverage.ts for every new workspace, which doesn't scale and produces a worse user experience than 'this category isn't checked' (which currently surfaces honestly in the UI).
->
-> "Naming this as a reconsideration rather than a current change is the right call — it's a real *future* fix triggered by a real *future* condition, not a regret I should fake today."
+> Now the four I'd reconsider — and each has a specific trigger."
 
 ```
-  ┌─────────────────────────┬─────────────────────────┐
-  │ WEAK COUNTERFACTUAL     │ STRONG COUNTERFACTUAL   │
-  ├─────────────────────────┼─────────────────────────┤
-  │ "If I were starting     │ "Top of my list: the    │
-  │ today I'd use Postgres  │ in-process insights map.│
-  │ from day one. And       │ Concurrent-user wipe is │
-  │ probably Redis. And     │ resolved with session-  │
-  │ proper monitoring. And  │ keying; cross-instance  │
-  │ maybe Kubernetes."      │ is still open. Trigger  │
-  │                         │ is multi-instance,      │
-  │                         │ which a portfolio       │
-  │                         │ project doesn't have."  │
-  ├─────────────────────────┼─────────────────────────┤
-  │ Why it's weak:          │ Why it works:           │
-  │ Fake regret menu. Lists │ Names the reconsider-   │
-  │ infrastructure the      │ ation, names the        │
-  │ project doesn't need.   │ trigger, names what's   │
-  │ Reads as "I think the   │ already done. No fake   │
-  │ interviewer wants to    │ regret. The interviewer │
-  │ hear about Postgres."   │ hears judgment, not     │
-  │                         │ performance.            │
-  └─────────────────────────┴─────────────────────────┘
+  ┃ "I'm not future-proofing for a swap I haven't done.
+  ┃  I've done two. The seam is paid for."
 ```
 
-## The would-keep list — what earned its place
+  ### Reconsideration 1 — no database (cross-instance state)
 
-The right way to talk about each kept decision is **with the receipt that proves it earned its place**, not as a defense of why it was the right call originally. The receipts are what turn the answers into something the interviewer can verify.
+```
+  ┌─────────────────────────────────────────────────────────────┐
+  │ THEY ASK                                                    │
+  │   "You really wouldn't add a database?"                     │
+  │                                                             │
+  │ WHAT THEY'RE TESTING                                        │
+  │   Do you understand that the right architecture today is    │
+  │   not always the right architecture tomorrow? Can you name  │
+  │   the trigger that flips the call?                          │
+  └─────────────────────────────────────────────────────────────┘
+```
 
-> **A. NDJSON + the `readNdjson` kernel.** The kernel is `lib/streaming/ndjson.ts`, 64 lines, and it's consumed by four streaming surfaces — `/api/briefing`, `/api/agent` for the diagnose step, `/api/agent` for the recommend step, and the free-form query. The receipt for keeping the design is that the same 64 lines serve four consumers without duplication and without a leak. If I had reached for SSE or a websocket I'd be paying for capabilities I don't use (SSE's framing convention, websocket's bidirectional surface) on every surface.
+**Strong answer:**
+
+> "Today, no. The data the user cares about historically lives in Bloomreach already — I'm not building a system of record, I'm reading one. Briefings are ephemeral. Cross-session state was a real concern and I addressed it the right way at the right time: when I had a concurrent-user bug in `lib/state/insights.ts` — module-level Map with `clear()` wiping other users mid-briefing — I session-keyed the map. That bug is resolved.
 >
-> **B. TypeScript.** Every event-shape boundary in the system has a type and breaks loudly when it's violated. The receipt: when I was debugging the bare-500 bug (Chapter 6), the type signature of the route handler told me where the error path was wrong before I even read the code. Without TS, that bug would have taken longer to find and fix.
+> What's still open is cross-instance state. If Vercel adds a second warm instance to the rotation for the same user, their session state doesn't follow them across instances. The trigger to add a database is exactly that: a second warm instance in the rotation. At one warm instance the in-memory model is correct and any database is overhead I'm paying for nothing. At two it stops being correct.
 >
-> **C. The DataSource seam + adapter pattern.** The receipt is two adapter swaps. Olist was added; Olist was removed (when I retired the eval suite with it); Synthetic was added. Each swap kept the caller surface — `dataSource.executeEql(...)`, `dataSource.listTools()` — unchanged. *That's the test for whether a seam is real.* Future-proofing is when you add an abstraction "in case." Receipt-driven is when the abstraction has already paid for itself by absorbing real change.
+> When the trigger fires, the change is bounded. The session-keyed maps already isolate per-user state — moving them behind a key-value store with the same `sessionId` keys is mostly an adapter swap, conceptually the same move as `BloomreachDataSource` to `SyntheticDataSource`."
+
+  ### Reconsideration 2 — demo-replay as the reliability path
+
+```
+  ┌─────────────────────────────────────────────────────────────┐
+  │ THEY ASK                                                    │
+  │   "Demo mode is the default — that's weird for a real app.  │
+  │    Why?"                                                    │
+  │                                                             │
+  │ WHAT THEY'RE TESTING                                        │
+  │   Do you have a real reason for the default, or is it       │
+  │   hiding from a problem? Can you name what would flip       │
+  │   the default?                                              │
+  └─────────────────────────────────────────────────────────────┘
+```
+
+**Strong answer:**
+
+> "Demo is the default because the alpha Bloomreach server isn't a presentation-grade dependency. Tokens revoke in minutes; the server occasionally 500s; the rate limit is shared. For a presentation, a demo, or anyone who wants to see what the app *does*, live mode is hostile.
 >
-> **D. The AptKit primitive boundary.** Three small adapter classes — `AnthropicModelProviderAdapter`, `BloomingToolRegistryAdapter`, `BloomingTraceSinkAdapter`. About 200 lines total. The receipt for keeping this design over the alternatives (own the whole loop / use a heavier framework) is that the legacy hand-rolled loop is preserved at `lib/agents/base-legacy.ts`, lines 86–176. If AptKit's API ever shifts in a way that breaks one of my disciplines, I peel back to the legacy and re-evaluate. The preservation is the receipt for the discipline being load-bearing in the first place.
+> The committed demo snapshot solves this honestly: `lib/state/demo-*.json` is a real captured run — real agent output, real tool calls, real numbers — that any instance can serve instantly as plain JSON. Cards, logs, comparison bars, recommendations all render from real data. Where a field wasn't captured at capture time, the UI shows `--`, not a fake.
+>
+> The trigger to flip the default to live is when the alpha server's token lifetime is longer than a typical briefing AND the rate limit doesn't degrade under realistic concurrent load. Both are upstream changes, not changes I can make. Until then, demo-first is the right default."
 
 ```
-  ┃ "Future-proofing is when you add an abstraction
-  ┃  in case. Receipt-driven is when the abstraction
-  ┃  has already paid for itself by absorbing real
-  ┃  change."
+  ┌─────────────────────────┬─────────────────────────────────┐
+  │ WEAK ANSWER             │ STRONG ANSWER                   │
+  ├─────────────────────────┼─────────────────────────────────┤
+  │ "Yeah I'd love to make  │ "Demo is the default because    │
+  │  live the default but   │  the alpha server isn't         │
+  │  it's flaky right now." │  presentation-grade — tokens    │
+  │                         │  revoke in minutes, rate limit  │
+  │                         │  is shared. Trigger to flip:    │
+  │                         │  upstream auth lifetime extends │
+  │                         │  past a briefing AND rate limit │
+  │                         │  stays stable under load."      │
+  ├─────────────────────────┼─────────────────────────────────┤
+  │ Why it's weak: "flaky"  │ Why it works: names what's     │
+  │ is a feeling. Doesn't   │ specifically wrong about the    │
+  │ name the specific       │ upstream, names the conditions  │
+  │ constraint or what       │ that would flip the decision,  │
+  │ would change it.        │ and owns the design today.     │
+  └─────────────────────────┴─────────────────────────────────┘
 ```
 
-## The follow-up tree
+  ### Reconsideration 3 — fixed ~1.1s call spacing
 
 ```
-  You volunteer the four reconsiderations.
-        │
-        ▼
-        ├─► "Why haven't you fixed those?"
-        │     Each reconsideration has a *trigger* —
-        │     multi-instance, stable upstream, measured
-        │     headroom, workspace with different naming.
-        │     The trigger isn't here yet for any of them.
-        │     Acting before the trigger is over-engineering;
-        │     acting after the trigger is on-time. Naming
-        │     the trigger explicitly is the senior signal.
-        │
-        ├─► "What about [thing I didn't list]?"
-        │     The honest answer for things you'd actually
-        │     keep is to defend the receipt. The honest
-        │     answer for things you've genuinely not
-        │     considered is "I haven't thought about that
-        │     one — walk me through what you'd reconsider
-        │     and why?" Re-route to a conversation.
-        │
-        ├─► "What's the would-not-change list?"
-        │     The four items in the right column. Each
-        │     defended with the receipt, not the original
-        │     justification.
-        │
-        └─► "What about the agent loop — would you write
-            it yourself again?"
-              The honest answer is *I already did, and
-              then I revisited the decision*. The hand-
-              roll is preserved as base-legacy.ts. The
-              active path is AptKit. That decision-revisit
-              is in Chapter 3 (Choice 2) and Chapter 6
-              (the proudest part).
+  ┌─────────────────────────────────────────────────────────────┐
+  │ THEY ASK                                                    │
+  │   "Why a fixed 1.1-second floor between Bloomreach calls?   │
+  │    Why not exponential backoff or token-bucket?"            │
+  │                                                             │
+  │ WHAT THEY'RE TESTING                                        │
+  │   Do you understand the rate-limit shape you're working     │
+  │   against? Did you measure or did you guess? When would     │
+  │   you tune it?                                              │
+  └─────────────────────────────────────────────────────────────┘
 ```
 
-## When you don't know
+**Strong answer:**
 
-The territory you're most likely to get pushed past your depth in this chapter is **decisions about technologies you didn't seriously evaluate**. If the interviewer says "would you reconsider using Anthropic vs OpenAI?" — and you only ever tried Anthropic — be honest.
+> "The ~1.1s spacing in `BloomreachDataSource` is a conservative floor I picked based on the alpha server's documented 'roughly one request per second' soft limit, with a safety margin to avoid skating the edge of the 429. The retry-on-429 in `McpClient` is the second layer if the floor proves wrong on a given call.
+>
+> I didn't measure the actual headroom. I guessed conservatively and it works — which is fine for an alpha substrate, but it's a guess. The trigger to revisit is two things together: an actual measurement of rate-limit headroom (how close to the boundary the server lets me skate before 429s start), AND a real metric showing some users are blocked by the 1.1s floor itself rather than by the server.
+>
+> Today neither is true. The 1.1s floor is well within the budget; the briefings that feel slow feel slow because of *number* of tool calls, not pacing of each. So I'd revisit on measurement, not on impulse."
+
+  ### Reconsideration 4 — exact-match tool-coverage dependencies
 
 ```
-  ╔═══════════════════════════════════════════════╗
-  ║ WHEN YOU DON'T KNOW                           ║
-  ║                                               ║
-  ║   They ask: "Would you reconsider using       ║
-  ║   Anthropic vs OpenAI for the agents?"        ║
-  ║                                               ║
-  ║   You didn't run a head-to-head. You picked   ║
-  ║   Anthropic and shipped against Sonnet 4.6.   ║
-  ║                                               ║
-  ║   Say:                                        ║
-  ║   "Honest answer: I didn't run a head-to-     ║
-  ║    head against OpenAI's models for this      ║
-  ║    project. I picked Anthropic because Sonnet ║
-  ║    4.6 worked well in earlier projects and    ║
-  ║    the SDK and tool-use story was clean       ║
-  ║    enough for me to focus on the system       ║
-  ║    rather than the provider. The reconsider-  ║
-  ║    ation I would do — and haven't — is a      ║
-  ║    real eval bake-off against a couple of     ║
-  ║    OpenAI's models on the diagnostic synth-   ║
-  ║    esis turn, because that's where reasoning  ║
-  ║    quality matters most. Without that eval    ║
-  ║    I can't tell you which one would be        ║
-  ║    better. What I can defend is the boundary  ║
-  ║    that lets me swap — the model provider     ║
-  ║    sits behind AnthropicModelProviderAdapter, ║
-  ║    so adding an OpenAI adapter is the same    ║
-  ║    shape as the existing one."                ║
-  ║                                               ║
-  ║   What this signals: honesty about the eval   ║
-  ║   you didn't run, awareness of the design     ║
-  ║   property (the swap-ability) that protects   ║
-  ║   the decision being reconsiderable.          ║
-  ║                                               ║
-  ║   Do NOT say:                                 ║
-  ║   "Anthropic is better for agentic tool use   ║
-  ║    than OpenAI, that's why I picked it."      ║
-  ║   This is a generalization you can't back up. ║
-  ║   The interviewer will ask "based on what     ║
-  ║   benchmark?" and you'll fold.                ║
-  ╚═══════════════════════════════════════════════╝
+  ┌─────────────────────────────────────────────────────────────┐
+  │ THEY ASK                                                    │
+  │   "Your tool-coverage map depends on exact event-name        │
+  │    matches. What happens on a second workspace?"             │
+  │                                                              │
+  │ WHAT THEY'RE TESTING                                         │
+  │   Have you thought about generalizing past the one workspace │
+  │   you built against? Or have you hard-coded yourself in?    │
+  └─────────────────────────────────────────────────────────────┘
 ```
 
-## What you'd change about the counterfactuals practice itself
+**Strong answer:**
 
-The one meta-counterfactual: I'd be more aggressive about **writing the trigger down at the time of the decision**, not after. Right now the triggers for each reconsideration live in my head and in this chapter. If I were starting today I'd add a short "decisions and triggers" log — one paragraph per load-bearing decision, with the named trigger that would change it. That artifact would be useful to me in three months and useful to anyone who reads the repo.
+> "Today, tool-coverage in `lib/mcp/tool-coverage.ts` checks for specific Bloomreach event names — `purchase`, `view_item`, `cart_update`, `checkout`, `session_start`. These are the events the current workspace exposes; the agents depend on them; the coverage grid in the UI tells the user which categories are diagnosable.
+>
+> The gap is: if I dropped this app onto a second Bloomreach workspace with the same conceptual events under different names — say `order_placed` instead of `purchase` — the coverage grid silently goes red for events the workspace actually has. The agent then refuses to investigate a category it could have handled.
+>
+> The fix is an alias layer: each agent-conceptual dependency maps to a set of acceptable workspace-actual names. The trigger to do this work is a second workspace. Today I have one workspace and shipping the alias layer would be speculative abstraction — the same mistake I'd be calling out elsewhere. The seam where the alias would land is already isolated, so when the second workspace appears the change is bounded to one file."
 
-## One-page summary
-
-**Core claim:** Volunteer the reconsiderations with named triggers. Defend the would-keeps with the receipts that prove they earned their place. Don't fake regret for decisions that were right.
-
-**The four reconsiderations in one line each:**
-- **No DB** → trigger is multi-instance deployment; concurrent-user wipe already fixed via session-keying.
-- **Demo-replay** → trigger is a stable upstream; today it's load-bearing because the alpha revokes tokens.
-- **1.1s call spacing** → trigger is stable headroom + measurement; today it costs real latency on every live run.
-- **Coverage exact-name match** → trigger is workspaces with different event naming; alias layer is overhead today.
-
-**The four would-keeps in one line each:**
-- **NDJSON + `readNdjson` kernel** → 64 LOC, 4 surfaces, no duplication.
-- **TypeScript** → every event-shape boundary types-and-breaks loudly.
-- **DataSource seam** → survived 2 adapter swaps without caller change.
-- **AptKit boundary** → library owns the loop, I own the boundary, legacy preserved as rollback.
-
-**Pull quote:**
 ```
-  ┃ "Future-proofing is when you add an abstraction
-  ┃  in case. Receipt-driven is when the abstraction
-  ┃  has already paid for itself by absorbing real
-  ┃  change."
+  ┃ "Speculative abstraction is the same mistake at both
+  ┃  ends — building the seam too early is as wrong as
+  ┃  never building it. The trigger names the right moment."
 ```
 
-**What you'd change:** keep a written "decisions and triggers" log alongside the code, not just in your head. The artifact is useful to your future self.
+  ## When you don't know
+
+The trap on this chapter is being asked about a counterfactual you *should* have considered but didn't think to volunteer — an entirely different shape of the system the interviewer thinks you should have weighed.
+
+```
+  ╔═══════════════════════════════════════════════════════════════╗
+  ║ WHEN YOU DON'T KNOW                                           ║
+  ║                                                               ║
+  ║   They ask: "Would you have considered building this as a     ║
+  ║   chat agent — one conversation, the agent decides which      ║
+  ║   step (monitor / diagnose / recommend) to run next?"         ║
+  ║                                                               ║
+  ║   You did not seriously evaluate a single-agent conversational║
+  ║   shape against the three-agent pipeline shape you built.     ║
+  ║   You'd be guessing if you claimed to have weighed it.        ║
+  ║                                                               ║
+  ║   Say:                                                        ║
+  ║   "I didn't seriously evaluate a single-conversation agent    ║
+  ║    shape against the three-agent pipeline. I picked the       ║
+  ║    pipeline because the user flow already had three           ║
+  ║    distinct stages — monitor, investigate, decide — and       ║
+  ║    each maps cleanly to one agent with its own prompt and     ║
+  ║    its own output schema. A single chat agent would have      ║
+  ║    needed routing logic the user couldn't see, which          ║
+  ║    contradicts the 'show your work' product premise. But      ║
+  ║    that's a post-hoc defense — I didn't put both shapes       ║
+  ║    side-by-side at decision time. If you want to walk what   ║
+  ║    that comparison would look like, I'd be doing it on the   ║
+  ║    whiteboard with you, not from memory."                     ║
+  ║                                                               ║
+  ║   What this signals: honesty that you didn't run the          ║
+  ║   counterfactual at decision time, a real post-hoc defense    ║
+  ║   anchored to the product premise, willingness to do the      ║
+  ║   analysis in the room rather than confabulating one.         ║
+  ║                                                               ║
+  ║   Do NOT say:                                                 ║
+  ║   "I considered both and the pipeline was clearly better      ║
+  ║    because..." — fabricating a decision process you didn't    ║
+  ║   actually run is the worst move. Senior interviewers know   ║
+  ║   what real evaluation looks like and will probe.            ║
+  ╚═══════════════════════════════════════════════════════════════╝
+```
+
+  ## What you'd change about the counterfactuals chapter itself
+
+If you were redoing how you *think about* counterfactuals on this project, the change you'd make is **logging the trigger conditions explicitly**, somewhere checked into the repo. Right now the triggers — "two warm instances," "stable upstream rate limit," "second workspace" — live in your head. The fix is a one-page `TRIGGERS.md` next to the counterfactuals, so the next maintainer (or you, six months later) doesn't have to rediscover them. The cost is one more doc to keep current. The payoff is a senior-team-shaped artifact: decisions with explicit revisit conditions.
+
+  ## One-page summary
+
+**Core claim:** the senior move is to volunteer the would-not-change list first (so the interviewer knows your baseline is grounded), then walk four real reconsiderations each with a specific trigger. Decisions don't have abstract regrets; they have conditions that would flip them.
+
+**Would not change:** NDJSON + shared `readNdjson` kernel (receipt: powers 4 surfaces); TypeScript (receipt: caught schema drift); DataSource seam (receipt: survived 2 adapter swaps); AptKit primitive boundary (receipt: legacy preserved as rollback).
+
+**Would reconsider (with trigger):**
+1. *No DB* → trigger: a second warm Vercel instance for the same user. Cross-instance state remains open; the concurrent-user wipe is resolved.
+2. *Demo-replay as reliability path* → trigger: alpha server's auth lifetime extends past briefing duration AND rate limit stabilizes.
+3. *Fixed ~1.1s call spacing* → trigger: measured rate-limit headroom AND a metric showing users blocked by the floor.
+4. *Exact-match tool-coverage deps* → trigger: a second workspace with different event naming for the same concepts.
+
+**Pull quotes:**
+```
+┃ "I'm not future-proofing for a swap I haven't done.
+┃  I've done two. The seam is paid for."
+```
+```
+┃ "Speculative abstraction is the same mistake at both
+┃  ends — building the seam too early is as wrong as
+┃  never building it. The trigger names the right moment."
+```
+
+**What you'd change:** check the trigger conditions into the repo as `TRIGGERS.md`, so the revisit conditions are explicit rather than living in your head.
