@@ -142,7 +142,7 @@ async callTool<T = unknown>(
 
 #### Part: per-instance state IS a consistency surface
 
-Vercel's serverless instances are independent. `lib/state/insights.ts:14` keeps a session-scoped Map:
+Vercel's serverless instances are independent. The session-scoped state map (`lib/state/insights.ts:14`) keeps:
 
 ```ts
 type SessionFeed = {
@@ -222,7 +222,7 @@ Two staleness anchors on every Insight: `timestamp` (when the briefing ran) and 
 
 #### Part: the schema cache as monotonic-read violation
 
-`lib/mcp/schema.ts:190` memoizes the schema for the lifetime of the Node process:
+Process-lifetime memoization (`lib/mcp/schema.ts:190`) holds the schema for as long as the Node process lives:
 
 ```ts
 if (cached) return cached;

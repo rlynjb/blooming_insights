@@ -123,9 +123,9 @@ Three classes (because the AptKit interface has three orthogonal slots):
 
 #### Step 1 — the model-provider adapter
 
-AptKit doesn't know about Anthropic. It only knows `ModelProvider`: a
-single async `complete(request)` method returning a `ModelResponse`. The
-adapter translates message shapes in both directions.
+AptKit doesn't know about Anthropic. It only knows the port
+(`ModelProvider`): a single async `complete(request)` method returning a
+`ModelResponse`. The adapter translates message shapes in both directions.
 
 ```typescript
 // lib/agents/aptkit-adapters.ts:26-72 (abridged)
@@ -203,7 +203,7 @@ What this adapter hides from AptKit:
 
 #### Step 2 — the tool-registry adapter
 
-AptKit knows `ToolRegistry`: `listTools()` returns metadata,
+AptKit knows the port (`ToolRegistry`): `listTools()` returns metadata,
 `callTool(name, args, opts)` executes one. The adapter forwards to a
 `DataSource`.
 

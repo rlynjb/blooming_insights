@@ -46,7 +46,7 @@ Three surfaces, not four. The fourth (an `eval/results/<date>/` paper trail) exi
 
 ### 1. NDJSON streaming trace (live)
 
-The `AgentEvent` discriminated union at **`lib/mcp/events.ts:4-12`** is the wire contract. Eight variants: `reasoning_step | tool_call_start | tool_call_end | insight | diagnosis | recommendation | done | error`. Encoded one-per-line, terminated with `'\n'`.
+The discriminated union (`AgentEvent`) at **`lib/mcp/events.ts:4-12`** is the wire contract. Eight variants: `reasoning_step | tool_call_start | tool_call_end | insight | diagnosis | recommendation | done | error`. Encoded one-per-line, terminated with `'\n'`.
 
 Two routes produce it: `app/api/briefing/route.ts` (monitoring scan) and `app/api/agent/route.ts` (diagnostic + recommendation + free-form query). Four client consumers read it via the shared kernel at **`lib/streaming/ndjson.ts:17-64`**: `useBriefingStream.ts`, `useInvestigation.ts`, `useDemoCapture.ts`, and `StreamingResponse.tsx`. One wire, two producers, four consumers, one kernel.
 

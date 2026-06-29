@@ -56,13 +56,13 @@ Notice the asymmetry: one pattern is supported by structure, all others by *iter
 
 ### Seams
 
-The interesting seam is between **the Map (the only index)** and **the application filters (everything else).** In a real engine the planner sits at that seam and decides whether to use an index or scan. Here there's no planner; the call site picks: `getInsight` uses the index, everything else iterates.
+The interesting seam is between **the index (the `Map`, the only one)** and **the application filters (everything else).** In a real engine the planner sits at that seam and decides whether to use an index or scan. Here there's no planner; the call site picks: `getInsight` uses the index, everything else iterates.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You already know the shape. A JavaScript `Map` IS a hash index. You learned this when you reached for `Map.get(id)` instead of `array.find(x => x.id === id)` and got an `O(1)` lookup instead of `O(n)`. That's the entire index story in this repo.
+You already know the shape. A hash index (the JavaScript `Map`) is what you reach for when you want `Map.get(id)` to be `O(1)` instead of `array.find(x => x.id === id)` at `O(n)`. That's the entire index story in this repo.
 
 ```
   The shape — two index families, and which one we have
@@ -85,7 +85,7 @@ You already know the shape. A JavaScript `Map` IS a hash index. You learned this
 
 ### Move 2 — the walkthrough
 
-#### The one index that exists: `Map<string, T>` as primary-key hash
+#### The one primary-key hash index (`Map<string, T>`) that exists
 
 ```ts
 // lib/state/insights.ts:73-79

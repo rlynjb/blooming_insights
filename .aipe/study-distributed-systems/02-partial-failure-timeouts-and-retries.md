@@ -223,7 +223,7 @@ Three load-bearing details:
 
 #### Part: the per-call timeout (the floor under everything)
 
-`SdkTransport.callTool` composes the caller's signal with a 30s per-call ceiling:
+The transport call site (`SdkTransport.callTool`) composes the caller's signal with a 30s per-call ceiling:
 
 ```ts
 // lib/mcp/transport.ts:131
@@ -244,7 +244,7 @@ The `composeSignals` helper uses `AbortSignal.any` when available (line 173 — 
 
 Alpha Bloomreach revokes tokens after a few minutes. When that happens, the next call returns 401 with body `invalid_token`. By the time the user sees it, the NDJSON stream has already emitted `{type: 'error', message: '...invalid_token...'}`.
 
-`useReconnectPolicy.handle` (lib/hooks/useReconnectPolicy.ts:84) is the response:
+The reconnect-policy handler (`useReconnectPolicy.handle`, `lib/hooks/useReconnectPolicy.ts:84`) is the response:
 
 ```ts
 const AUTH_ERROR_RE_AUTO = /invalid_token|unauthor|forbidden|401|session expired|reconnect/i;
@@ -278,7 +278,7 @@ The trace makes the guard's purpose obvious: if the *new* page load also fails o
 
 #### Part: error containment — McpToolError carries the real server body
 
-The SDK's `client.callTool` throws a generic-feeling `Error` whose `cause` chain hides the actual HTTP response body. `SdkTransport.makeCapturingFetch` (`lib/mcp/transport.ts:103`) clones every non-OK response, redacts secrets, and stores the body so the throw can include it:
+The SDK's `client.callTool` throws a generic-feeling `Error` whose `cause` chain hides the actual HTTP response body. A capturing fetch interceptor (`SdkTransport.makeCapturingFetch`, `lib/mcp/transport.ts:103`) clones every non-OK response, redacts secrets, and stores the body so the throw can include it:
 
 ```ts
 const captured = this.httpErrors?.last;
@@ -288,7 +288,7 @@ if (captured) {
 }
 ```
 
-The `redactSecrets` pass (`lib/mcp/transport.ts:66`) strips `Bearer …`, `access_token`, `refresh_token`, `id_token`, and `code_verifier` shapes before the body gets stored. Otherwise the captured body could carry a Bearer header (some failure modes attach the request envelope to `err.cause`) and reach Vercel logs.
+The secret-redaction pass (`redactSecrets`, `lib/mcp/transport.ts:66`) strips `Bearer …`, `access_token`, `refresh_token`, `id_token`, and `code_verifier` shapes before the body gets stored. Otherwise the captured body could carry a Bearer header (some failure modes attach the request envelope to `err.cause`) and reach Vercel logs.
 
 ### Move 3 — the principle
 

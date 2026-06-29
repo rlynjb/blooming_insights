@@ -72,7 +72,7 @@ Each flag below has the same shape:
                One-shot guard prevents looping if re-auth also fails.
 ```
 
-The mitigation is real and shipping. Listed CRITICAL/HIGH because if `useReconnectPolicy` ever stopped firing on an `invalid_token` (e.g. message text changes), every live briefing past minute 3 would 401 and stick. The auto-reconnect is what makes live mode usable.
+The mitigation is real and shipping. Listed CRITICAL/HIGH because if the reconnect policy (`useReconnectPolicy`) ever stopped firing on an `invalid_token` (e.g. message text changes), every live briefing past minute 3 would 401 and stick. The auto-reconnect is what makes live mode usable.
 
 ### Flag #2 — Two divergent auth-error regexes
 **Severity: MEDIUM** (the explicit reconnect button can miss `invalid_token`; the auto path catches the common case)

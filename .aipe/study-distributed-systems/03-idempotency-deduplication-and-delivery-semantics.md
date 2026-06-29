@@ -274,7 +274,7 @@ What to read next: Stripe's idempotency keys docs; Kafka's "exactly-once semanti
 
 **Q: "How do you handle duplicate requests in this system?"**
 
-> "Two layers of memoization, both process-scoped. Layer one is the schema bootstrap — a module-level `cached` variable in `lib/mcp/schema.ts:190` so the first request runs the 6-call orchestration and subsequent requests skip it entirely. Layer two is `BloomreachDataSource.cache` — a 60s TTL keyed by `${tool}:${JSON.stringify(args)}` so repeat reads inside that window return instantly. The two layers stack: identical investigations re-run in under a second."
+> "Two layers of memoization, both process-scoped. Layer one is the schema bootstrap — a module-level `cached` variable in `lib/mcp/schema.ts:190` so the first request runs the 6-call orchestration and subsequent requests skip it entirely. Layer two is a TTL response cache (`BloomreachDataSource.cache`) — 60s, keyed by `${tool}:${JSON.stringify(args)}` so repeat reads inside that window return instantly. The two layers stack: identical investigations re-run in under a second."
 
 Diagram:
 

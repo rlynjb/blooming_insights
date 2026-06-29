@@ -153,9 +153,9 @@ Annotation:
 
 This pattern recurs in real databases at the buffer-pool layer (DB pages cached in memory) and at the materialized-view layer (precomputed query results cached with invalidation). Here it's the only cache; there's no engine below it, just HTTP to the provider.
 
-#### App-state layer — session-keyed `Map`s
+#### App-state layer — namespaced tables (session-keyed `Map`s)
 
-The two state files are deliberately shaped like *namespaced tables.* The outer `Map` partitions by sessionId; the inner Maps hold the rows.
+The two state files are deliberately shaped like *namespaced tables.* The namespace (the outer `Map`) partitions by sessionId; the tables (the inner `Map`s) hold the rows.
 
 ```ts
 // lib/state/insights.ts:8-23
@@ -180,7 +180,7 @@ function sessionState(sessionId: string): SessionFeed {
 Annotation:
   - **Lines 8-12** — `SessionFeed` is the per-session set of "tables." Three of them. Each is a hash-indexed lookup by primary key (`id` for insights and anomalies, `insightId` for investigations).
   - **Line 14** — `state` is the global outer Map. One entry per active session. It is *never* cleared by a request handler.
-  - **Lines 16-23** — `sessionState` is the equivalent of "USE database <sessionId>; CREATE TABLE IF NOT EXISTS ...". Lazy initialization, no schema migration, no DDL.
+  - **Lines 16-23** — the DDL bootstrap (`USE database <sessionId>; CREATE TABLE IF NOT EXISTS ...`) is what `sessionState` is doing. Lazy initialization, no schema migration, no real DDL.
 
 Compare to a real RDBMS: replace `Map<sessionId, SessionFeed>` with `schema_<sessionId>` namespacing, the inner Maps become heap tables, and `Map.get`/`Map.set` become `SELECT WHERE id = ?` / `INSERT ... ON CONFLICT DO UPDATE`. Same shape, very different durability story.
 

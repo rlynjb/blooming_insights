@@ -200,7 +200,7 @@ try {
 }
 ```
 
-The `NextResponse.redirect` returns a `302 Found` with `Location: /`. The `Set-Cookie` for `bi_auth` (the encrypted tokens) is added by `completeAuth → withAuthCookies` inside the flow (`lib/mcp/auth.ts:92-102`).
+The `NextResponse.redirect` returns a `302 Found` with `Location: /`. The `Set-Cookie` for the encrypted token cookie (`bi_auth`) is added by the auth-completion helper (`completeAuth → withAuthCookies`) inside the flow (`lib/mcp/auth.ts:92-102`).
 
 #### Route — `POST /api/mcp/reset`
 

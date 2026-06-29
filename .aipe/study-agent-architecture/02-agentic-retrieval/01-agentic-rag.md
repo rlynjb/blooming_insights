@@ -8,7 +8,7 @@ ReAct whose primary tool is retrieval. Static RAG is one shot — retrieve top-k
 
 ## Zoom out — where this concept would live
 
-If adopted, it'd be a refactor inside an existing agent — most likely the QueryAgent or a new corpus-grounded agent that retrieved from blog posts / product docs / past investigations rather than from live Bloomreach data.
+If adopted, it'd be a refactor inside an existing agent — most likely the query agent (`QueryAgent`) or a new corpus-grounded agent that retrieved from blog posts / product docs / past investigations rather than from live Bloomreach data.
 
 ```
   Where agentic RAG WOULD live (not yet implemented)

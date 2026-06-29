@@ -6,7 +6,7 @@ The connective tissue under every pattern in this guide. **This repo uses MCP di
 
 ## Zoom out — where this concept lives
 
-Tool calling is the bridge between the agent layer and the data layer. In this repo it goes through three abstractions: AptKit's `ToolRegistry`, Blooming's `BloomingToolRegistryAdapter`, and the `DataSource` seam (Bloomreach or Synthetic).
+Tool calling is the bridge between the agent layer and the data layer. In this repo it goes through three abstractions: the AptKit tool-registry port (`ToolRegistry`), Blooming's adapter (`BloomingToolRegistryAdapter`), and the data-source port (`DataSource` — Bloomreach or Synthetic).
 
 ```
   Where tool calling lives in blooming insights

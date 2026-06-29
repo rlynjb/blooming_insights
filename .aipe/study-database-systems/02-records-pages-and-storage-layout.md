@@ -106,7 +106,7 @@ In a real engine the row format would specify byte offsets per column, NULL bitm
 
 The deliberate convention in this repo: **new fields stay optional so older snapshots still validate.** From the project context: "new fields stay optional so older snapshots still validate." That's the schema-evolution discipline that substitutes for a migration system.
 
-#### A "table" is `Map<string, T>` keyed by primary key
+#### The table (`Map<string, T>`) — keyed by primary key
 
 ```ts
 // lib/state/insights.ts:8-12
@@ -122,7 +122,7 @@ Annotation:
   - The value type is the row type directly. There's no row codec, no serialization, no buffer pool. The value is a heap reference.
   - There's *no* secondary structure — no separate index Map, no sorted view, no by-severity bucket. If you want insights-by-severity, you iterate the whole Map and filter. That's a full scan. → see `03-btree-hash-and-secondary-indexes.md`.
 
-#### A "scan" is `Map.values()`
+#### The full table scan (`Map.values()`)
 
 ```ts
 // lib/state/insights.ts:81-84
@@ -137,7 +137,7 @@ Annotation:
   - Spreading into an array materializes the full result set every call — no streaming, no cursor, no LIMIT/OFFSET pagination. The dataset is small enough (today's briefing is ~6–12 insights) that this is fine.
   - There is no equivalent of an index-only scan, a covering index, or a sequential scan with a WHERE pushdown. The filter, if any, happens in JS on the array.
 
-#### "Pages" don't exist — V8 heap is the only layout
+#### Pages don't exist — the V8 heap is the only layout
 
 In a real engine, the moment you store thousands of rows you start caring about which rows share a page, because reading one row brings the rest of its page into the buffer pool. Here, every `Insight` is a separate heap allocation. There is no spatial locality, no read-ahead, no page-level eviction.
 

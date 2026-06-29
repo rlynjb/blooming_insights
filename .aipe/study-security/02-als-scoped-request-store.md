@@ -119,7 +119,7 @@ handlers here run on the Node runtime, not edge) supports it natively.
 
 ### Move 2 — the step-by-step walkthrough
 
-#### a · `withAuthCookies` — the request envelope
+#### a · the request envelope (`withAuthCookies`)
 
 The route never decrypts/encrypts the cookie directly. It hands a
 callback to `withAuthCookies`, which sets up the ALS context, runs the
@@ -174,7 +174,7 @@ don't own). Drop the `ctx.dirty` check → write the cookie even when
 nothing changed, which costs one Set-Cookie per request and pushes
 the `bi_auth` cookie back to the browser unnecessarily.
 
-#### b · `readAll` / `writeAll` — the ALS-first store accessors
+#### b · the store accessors (`readAll` / `writeAll`) — ALS-first
 
 These two functions are the *only* place the provider talks to storage.
 They check the ALS context first; if present, that's the source of
@@ -236,7 +236,7 @@ the cookie never gets the new tokens, the next request decrypts an
 empty Store and the user appears logged out *immediately after* a
 successful auth.
 
-#### c · why ALS instead of just passing `ctx` as a parameter
+#### c · why AsyncLocalStorage (ALS) instead of passing `ctx` as a parameter
 
 We don't own the SDK's `OAuthClientProvider` interface. It defines
 methods like `tokens(): OAuthTokens | undefined` and

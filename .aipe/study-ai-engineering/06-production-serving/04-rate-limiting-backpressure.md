@@ -7,9 +7,9 @@
 **Load-bearing for live mode.** The Bloomreach alpha MCP server enforces
 "1 per 10 seconds" globally per user. Without explicit rate-limit
 handling, the live mode hits 429 (or its MCP equivalent) on the second
-tool call. `BloomreachDataSource` parses the server's stated penalty
-window, sleeps, and retries up to 3 times — this is what makes
-multi-tool-call agent loops work at all.
+tool call. The adapter (`BloomreachDataSource`) parses the server's
+stated penalty window, sleeps, and retries up to 3 times — this is what
+makes multi-tool-call agent loops work at all.
 
 ```
   Zoom out — rate-limit handling sits at the data-source layer
@@ -294,9 +294,10 @@ single investigation.
 
   → **Exercise ID:** `study-ai-eng-06-04.2`
   → **What to build:** Vercel scales horizontally — concurrent requests
-    from the same user could each hit the BloomreachDataSource's
-    per-instance rate-limit handling, but they don't coordinate
-    across instances. Add a per-user concurrency semaphore (e.g. via
+    from the same user could each hit the adapter's
+    (`BloomreachDataSource`) per-instance rate-limit handling, but they
+    don't coordinate across instances. Add a per-user concurrency
+    semaphore (e.g. via
     Vercel KV or Upstash Redis) that limits one user to N concurrent
     `/api/agent` calls at a time. Excess requests get 429'd at the
     route with a hint to retry.

@@ -417,12 +417,13 @@ slow. Anchors in reincodes: `BinaryHeap.ts`
 
 **Q: Where do you use a FIFO in blooming-insights?**
 
-Model answer: "One place: `activeToolCalls:
-Map<string, ToolCall[]>` in the AptKit trace
-adapter. The agent may have multiple in-flight calls
-to the same tool name, and the `tool_call_end` event
-has to match the *oldest unmatched start*. So I
-`push` on start, `shift` on end. `shift` is O(N) in
+Model answer: "One place: a queue per tool name
+(`activeToolCalls: Map<string, ToolCall[]>`) in the
+AptKit trace adapter. The agent may have multiple
+in-flight calls to the same tool name, and the
+`tool_call_end` event has to match the *oldest
+unmatched start*. So I `push` on start, `shift` on
+end. `shift` is O(N) in
 JavaScript because the array re-indexes — for N ≤ 5
 parallel calls per tool, that's invisible; for a
 real production queue I'd use a linked list or a

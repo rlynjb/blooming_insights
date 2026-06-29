@@ -211,9 +211,9 @@ No shared blackboard. Each agent's output is the next agent's input, passed as p
 
 The cross-request channel exists because Vercel's serverless instances are ephemeral — between step 2 and step 3 the user might land on a different instance with no shared memory. Passing the diagnosis through the browser is the only way to guarantee the next step sees it. This is **message passing, not shared state**, by force of architecture.
 
-## The DataSource seam
+## The data-source port (`DataSource`)
 
-Every agent's tools route through the same seam — the only thing that changes between `live-bloomreach` and `live-synthetic` is *which DataSource is injected*. The agent code is identical; the URL `?mode=` parameter picks the adapter.
+Every agent's tools route through the same port — the only thing that changes between `live-bloomreach` and `live-synthetic` is *which adapter is injected*. The agent code is identical; the URL `?mode=` parameter picks the adapter.
 
 ```
   ┌──────────────────────────────────────────────────────────────┐

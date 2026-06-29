@@ -173,7 +173,7 @@ We skip step 1 because we have no log file. We skip step 2 because we have no fs
 
 The reason this works: **nothing has been written that someone else committed to.** The user never gets a "your briefing is saved" message. The product surface doesn't promise durability, so the engine doesn't need to provide it.
 
-#### The dev-mode JSON files — convenience persistence, not durability
+#### Convenience persistence (not durability) — the dev-mode JSON files
 
 ```ts
 // lib/state/investigations.ts:9
@@ -197,7 +197,7 @@ Annotation:
   - This is the right shape for a *cache* (which is all the file is) and the wrong shape for a system of record. A real database would never silently swallow a corrupt data file.
   - In production this code path is unreachable because `PERSIST` is false. The file would not exist on Vercel anyway.
 
-#### The auth cookie — the one production durability story
+#### The one production durability story — the auth cookie
 
 The OAuth/PKCE state in production is encrypted into an httpOnly cookie:
 

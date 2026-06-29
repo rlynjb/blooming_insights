@@ -20,16 +20,19 @@ The product is a multi-agent Bloomreach Engagement client. The real datastore li
 ## The three local analogs you'll see referenced everywhere
 
 ```
-  the local analog                  the engine concern it gestures at
+  the engine concern                the local analog it lands as
 
-  Map<sessionId, SessionFeed>       a table — keyed lookup with namespace
-    (lib/state/insights.ts:14)      no schema, no index, no durability
+  table                             Map<sessionId, SessionFeed>
+    keyed lookup with namespace       (lib/state/insights.ts:14)
+    no schema, no index, no durability
 
-  TTL cache on BloomreachDataSource a single-shot per-key store with expiry
-    (lib/data-source/...:122,144)   the cache layer ABOVE a database
+  TTL cache                         response cache on BloomreachDataSource
+    single-shot per-key with expiry   (lib/data-source/...:122,144)
+    the cache layer ABOVE a database
 
-  demo-*.json (committed)           a frozen "read replica" of one captured run
-    (lib/state/demo-*.json)         deterministic, no lag, no failover
+  read replica (frozen)             demo-*.json (committed)
+    one captured run, deterministic   (lib/state/demo-*.json)
+    no lag, no failover
 ```
 
 Each concept file pulls the one that matches.

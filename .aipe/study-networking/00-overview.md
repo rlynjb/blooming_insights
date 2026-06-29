@@ -43,8 +43,8 @@ The story this file owns: what happens on each of those three wires, where the p
 
 Three things you might expect on a "networking" map that are absent on purpose:
 
-- **No IPC, no subprocess transport.** Every external hop is HTTPS. No `fetch`-replacement adapters, no local sockets, no child processes. The MCP SDK exposes other transports; we use only `StreamableHTTPClientTransport`.
-- **No database wire.** There is no Postgres / Redis / SQLite / S3 in production. State lives in in-memory maps and (in dev) gitignored JSON files. The closest thing to a "storage hop" is the `bi_auth` cookie, which is a client-side state envelope, not a network round-trip.
+- **No IPC, no subprocess transport.** Every external hop is HTTPS. No `fetch`-replacement adapters, no local sockets, no child processes. The MCP SDK exposes other transports; we use only its HTTP transport (`StreamableHTTPClientTransport`).
+- **No database wire.** There is no Postgres / Redis / SQLite / S3 in production. State lives in in-memory maps and (in dev) gitignored JSON files. The closest thing to a "storage hop" is the encrypted token cookie (`bi_auth`), which is a client-side state envelope, not a network round-trip.
 - **No SyntheticDataSource hop.** When the user picks `mode=live-synthetic`, the briefing route runs the same agents and the same Claude calls, but the MCP wire is replaced by an in-process fake. Wire #2 disappears; wire #3 still fires.
 
 ## The verdict-first finding

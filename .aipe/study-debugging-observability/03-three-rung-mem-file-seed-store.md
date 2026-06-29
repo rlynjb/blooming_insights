@@ -64,7 +64,7 @@ The state-survival axis is what makes the rungs meaningful: each rung answers "I
 
 1. **rung 1 ↔ rung 2: the dev/prod boundary.** `PERSIST = process.env.NODE_ENV === 'development'` at `lib/state/investigations.ts:7` decides whether rung 2 exists. In production the file system is read-only on Vercel, so the rung is *gated by env*, not just by presence.
 2. **rung 2 ↔ rung 3: the writability boundary.** Rung 2 is written by the request path (`saveInvestigation`); rung 3 is written by a *manual capture flow* (the dev-only "capture this as demo snapshot" button in `app/page.tsx`). Different write triggers, different intentions: rung 2 says "I saw this just now," rung 3 says "freeze this as the canonical example."
-3. **Read seam: the function itself.** `getCachedInvestigation` at `lib/state/investigations.ts:22-28` walks all three; callers see one return value. Drop the function and every consumer would have to implement the cascade itself → drift, missed rungs, inconsistent priority.
+3. **Read seam: the function itself.** The read-through lookup (`getCachedInvestigation`) at `lib/state/investigations.ts:22-28` walks all three; callers see one return value. Drop the function and every consumer would have to implement the cascade itself → drift, missed rungs, inconsistent priority.
 
 Skeleton mapped.
 

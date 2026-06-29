@@ -204,11 +204,12 @@ return [...parsed]
 //                              (critical > warning > info > positive)
 ```
 
-The `SEV_RANK` is a `Map<Severity, number>` (or a
-plain object indexed by string). The comparator reads
-both ranks and subtracts. **The pattern to internalise:**
-when sorting by a categorical field, build a rank
-table once, then compare *ranks* in the comparator.
+The rank table (`SEV_RANK`) is a `Map<Severity,
+number>` (or a plain object indexed by string). The
+comparator reads both ranks and subtracts. **The
+pattern to internalise:** when sorting by a
+categorical field, build a rank table once, then
+compare *ranks* in the comparator.
 Comparing strings directly with `localeCompare` would
 give alphabetical order ("critical, info, positive,
 warning"), not severity order.

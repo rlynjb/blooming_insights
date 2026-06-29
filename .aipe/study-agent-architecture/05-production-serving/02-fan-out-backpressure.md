@@ -77,7 +77,7 @@ You know the "200 fetches with `Promise.all` open 200 connections at once" anti-
 
 Bloomreach's MCP server rate-limits at ~1 req/s globally per user — the current `BloomreachDataSource` enforces this with proactive spacing (calls are queued internally and released at ~1 req/s). Sequential agent calls don't trip this; they fire one at a time naturally.
 
-If MonitoringAgent were refactored to fan out across categories (see `../03-multi-agent-orchestration/04-parallel-fan-out.md`), say 5 CategoryWorkers running in parallel, all 5 would call `dataSource.callTool` simultaneously. The current spacing would queue them — fan-out becomes serial again at the DataSource layer, defeating the parallelism.
+If the monitoring agent (`MonitoringAgent`) were refactored to fan out across categories (see `../03-multi-agent-orchestration/04-parallel-fan-out.md`), say 5 CategoryWorkers running in parallel, all 5 would call `dataSource.callTool` simultaneously. The current spacing would queue them — fan-out becomes serial again at the data-source layer, defeating the parallelism.
 
 The fix would be a concurrency cap **higher than** the spacing's effective throughput, with the spacing still acting as the per-call rate limit. Sketch:
 

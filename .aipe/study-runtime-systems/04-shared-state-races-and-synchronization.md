@@ -131,7 +131,7 @@ The whole body is synchronous — no `await` between the `.clear()` and the `.se
 
 What breaks if you add an `await`: another request could observe a half-cleared sub-map and crash on iteration.
 
-**Invariant 3: every read or write of the `requestStore` ALS happens inside `ALS.run`.**
+**Invariant 3: every read or write of the per-request `AsyncLocalStorage` instance (`requestStore`) happens inside `ALS.run`.**
 
 ```ts
 // lib/mcp/auth.ts:47

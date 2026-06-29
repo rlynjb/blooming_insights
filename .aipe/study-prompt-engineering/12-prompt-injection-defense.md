@@ -25,7 +25,7 @@ Prompt injection lives at the seam where untrusted user input meets a system pro
   └─────────────────────────────────────────────────────────────────────┘
 ```
 
-Two real injection surfaces in this codebase. The QueryBox sends free-form user text directly into a prompt. The diagnostic agent receives an `Anomaly` object that, in principle, could carry attacker-controlled content (the metric name, the headline, the impact text — any of which could be authored upstream). The defenses live across multiple layers and the framing matters: prompt injection is *not* a fully-solved problem. Defense-in-depth is the right framing.
+Two real injection surfaces in this codebase. The user input component (`QueryBox`) sends free-form user text directly into a prompt. The diagnostic agent receives an upstream payload (`Anomaly`) that, in principle, could carry attacker-controlled content (the metric name, the headline, the impact text — any of which could be authored upstream). The defenses live across multiple layers and the framing matters: prompt injection is *not* a fully-solved problem. Defense-in-depth is the right framing.
 
 ## Structure pass
 

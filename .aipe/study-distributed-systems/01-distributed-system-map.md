@@ -289,7 +289,7 @@ The shape comes from three deliberate choices:
 
 2. **One upstream of record (Bloomreach).** No microservices, no fan-out, no internal queues. This is honest — adding a second backend you also call would multiply the boundary count.
 
-3. **In-process synthetic source as a fallback.** `SyntheticDataSource` (`lib/data-source/synthetic-data-source.ts:314`) is *not* a wire — it's a class implementing the same `DataSource` interface. Calls have `fromCache: false` and a small `durationMs` because they're function calls, not network calls. This is the "what would change if we swapped upstreams" answer.
+3. **In-process synthetic source as a fallback.** The in-process implementation (`SyntheticDataSource`, `lib/data-source/synthetic-data-source.ts:314`) is *not* a wire — it's a class behind the same port (`DataSource`). Calls have `fromCache: false` and a small `durationMs` because they're function calls, not network calls. This is the "what would change if we swapped upstreams" answer.
 
 Useful adjacent reading: Werner Vogels on eventual consistency, AWS Lambda's cold-start lifecycle, the MCP spec for the JSON-RPC envelope shape.
 

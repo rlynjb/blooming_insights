@@ -4,7 +4,7 @@
 
 ## Zoom out — where this concept lives
 
-The route's `send` function does two things at once: enqueue bytes into the live HTTP stream *and* push the event into an in-memory array that will be persisted on `done`. One function call, two destinations. That's the seam that keeps the live wire and the saved snapshot in lockstep — without it, the replay would drift from the live experience.
+The route's dual-write closure (`send`) does two things at once: enqueue bytes into the live HTTP stream *and* push the event into an in-memory array that will be persisted on `done`. One function call, two destinations. That's the seam that keeps the live wire and the saved snapshot in lockstep — without it, the replay would drift from the live experience.
 
 ```
   Zoom out — dual-write at the service layer, fanning to wire + storage
@@ -163,7 +163,7 @@ if (step == null) saveInvestigation(insightId!, collected);   // ← `collected`
 
 **Reading the gate `if (step == null)`.** Only combined runs (no `?step=` param — the capture flow) get persisted. Per-step runs (the user investigating step 2 or step 3 separately) don't write to the cache, because the cache is keyed by `insightId` and storing per-step would mean partial snapshots that can't be replayed as a whole. The single-write-per-insight rule means rung 2 holds *complete combined runs only*, which is exactly what the replay branch expects.
 
-**`saveInvestigation` is the bridge to the three-rung store** (→ `03-three-rung-mem-file-seed-store.md`). It writes to rung 1 always, rung 2 in dev. So the live request's `collected` array becomes the next request's cached fixture, transparently.
+**The bridge to the three-rung store (`saveInvestigation`)** (→ `03-three-rung-mem-file-seed-store.md`) writes to rung 1 always, rung 2 in dev. So the live request's `collected` array becomes the next request's cached fixture, transparently.
 
 ### Move 2.4 — load-bearing skeleton
 

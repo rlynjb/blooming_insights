@@ -117,7 +117,7 @@ include it. Same effect — limit the verbs before you start the program.
 
 ### Move 2 — the step-by-step walkthrough
 
-#### a · the curated list — `lib/mcp/tools.ts`
+#### a · the per-agent allowlists — `lib/mcp/tools.ts`
 
 Three sibling consts, one per agent. Each is a hand-written `as const`
 array of tool names. Read top-to-bottom: the file *is* the
@@ -182,7 +182,7 @@ tools; the agents only get the ones they need for their job. That
 the names map verb-by-verb (`list_*`, `get_*`, `execute_*`) makes
 the read-only nature visible at a glance during review.
 
-#### b · the bootstrap list — different consumer, different scope
+#### b · the bootstrap allowlist (`bootstrapTools`) — different consumer, different scope
 
 The session-start path is a different beast. It runs once at the top
 of every briefing/investigation to discover schema. It needs a few
@@ -205,7 +205,7 @@ chain in `lib/mcp/schema.ts:166-184` can't find the project id, every
 subsequent call fails with "no cloud organizations." The bootstrap
 list is the *minimum* shape the schema-discovery orchestrator needs.
 
-#### c · the proxy route's union — `ALL_KNOWN`
+#### c · the union allowlist (`ALL_KNOWN`) — gating the proxy route
 
 `POST /api/mcp/call` is the only route that lets the *client* name a
 tool. It takes the union of all four lists (so the UI's debug page

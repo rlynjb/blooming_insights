@@ -113,7 +113,7 @@ how JS expresses that.
 
 ### Move 2 — the step-by-step walkthrough
 
-#### a · `parseAgentJson` — tolerant string-to-unknown
+#### a · the defensive parser (`parseAgentJson`) — tolerant string-to-unknown
 
 The model wraps JSON in fences. It writes "Here's your data:" before
 the JSON. It writes "Hope that helps!" after. It might split a string
@@ -234,7 +234,7 @@ not less. The Recommendation guard even handles a legacy + current
 shape for `estimatedImpact` (`:46-49`), accepting either a string or
 `{ range, ... }`, because the data evolved.
 
-#### c · FALLBACK — what runs when the shape doesn't match
+#### c · the typed default (`FALLBACK`) — what runs when the shape doesn't match
 
 A type guard returns `boolean`; the call site decides what to do on
 false. The pattern in this repo is "swap in a typed `FALLBACK`

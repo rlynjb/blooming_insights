@@ -133,9 +133,9 @@ them.
 
 **The synthetic data source uses the same lists.** Looking at
 `lib/data-source/synthetic-data-source.ts`, the per-agent tool lists
-are mirrored — the SyntheticDataSource exposes only the tools each
-agent should see, matching the Bloomreach allowlist structure. The
-heuristic gating works identically across data sources.
+are mirrored — the synthetic adapter (`SyntheticDataSource`) exposes
+only the tools each agent should see, matching the Bloomreach allowlist
+structure. The heuristic gating works identically across data sources.
 
 **Coverage gating as a second heuristic.** Inside the monitoring agent
 specifically, `runnableCategories(available)` from

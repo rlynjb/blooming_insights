@@ -6,7 +6,7 @@ Independent subtasks run simultaneously, a merger combines. **Not in this repo.*
 
 ## Zoom out — where this concept would live
 
-If adopted, it would replace one of the sequential stages — likely a MonitoringAgent refactor that fans out one worker per category instead of running them sequentially in one ReAct loop.
+If adopted, it would replace one of the sequential stages — likely a monitoring agent (`MonitoringAgent`) refactor that fans out one worker per category instead of running them sequentially in one ReAct loop.
 
 ```
   Where fan-out WOULD live (hypothetical refactor)

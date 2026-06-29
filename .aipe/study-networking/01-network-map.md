@@ -75,9 +75,9 @@ The codebase has no inbound provider webhook. No push. No long-poll FROM Bloomre
 ### Seams — where the axis flips
 
 - **Browser ↔ Service** (`fetch('/api/briefing')` → `app/api/briefing/route.ts`). The axis flips from "client originates" to "server originates the next two hops." Same-origin, so cookies ride free; no CORS preflight.
-- **Service ↔ Bloomreach** (`StreamableHTTPClientTransport` → `https://loomi-mcp-alpha.bloomreach.com/mcp`). Trust flips: from the browser's `bi_session`/`bi_auth` cookies to an OAuth Bearer token in an `Authorization` header. Cookies don't leave the Service band.
+- **Service ↔ Bloomreach** — the MCP HTTP transport (`StreamableHTTPClientTransport`) → `https://loomi-mcp-alpha.bloomreach.com/mcp`. Trust flips: from the browser's session cookies (`bi_session`/`bi_auth`) to an OAuth Bearer token in an `Authorization` header. Cookies don't leave the Service band.
 - **Service ↔ Anthropic** (`anthropic.messages.create`). Trust flips again: from session cookie to `ANTHROPIC_API_KEY` Bearer. Different secret per provider, never reused.
-- **Browser ↔ OAuth IdP ↔ /api/mcp/callback**. The one cross-origin hop the *browser* makes — Bloomreach redirects the user back to us with `?code=…`. This is why `bi_session` is `SameSite=None; Secure` in production (`lib/mcp/session.ts:12`): a Lax cookie would drop on the cross-site return.
+- **Browser ↔ OAuth IdP ↔ /api/mcp/callback**. The one cross-origin hop the *browser* makes — Bloomreach redirects the user back to us with `?code=…`. This is why the session cookie (`bi_session`) is `SameSite=None; Secure` in production (`lib/mcp/session.ts:12`): a Lax cookie would drop on the cross-site return.
 
 ## How it works
 
@@ -114,7 +114,7 @@ The hub matters because most of the protocol semantics in this codebase live the
 
 #### Hop 1 — Browser to /api/briefing
 
-The canonical example. The user lands on `app/page.tsx`, the `useBriefingStream` hook fires `fetch('/api/briefing?mode=live-bloomreach')`, and the response body is an NDJSON stream the hook reads with `readNdjson`.
+The canonical example. The user lands on `app/page.tsx`, the briefing-stream hook (`useBriefingStream`) fires `fetch('/api/briefing?mode=live-bloomreach')`, and the response body is an NDJSON stream the hook reads with the NDJSON parser (`readNdjson`).
 
 ```
   Layers-and-hops — Browser to /api/briefing (live mode)
@@ -187,7 +187,7 @@ const transport = new StreamableHTTPClientTransport(mcpUrl(), {
 });
 ```
 
-The SDK does the actual `fetch` for hop 2a internally; we inject `makeCapturingFetch` (`lib/mcp/transport.ts:103`) so we can keep the body of any non-2xx response and reattach it to the thrown error — without that, the SDK collapses every 401 into a generic "Unauthorized" and we lose the real `invalid_token` text.
+The SDK does the actual `fetch` for hop 2a internally; we inject a capturing fetch wrapper (`makeCapturingFetch`) (`lib/mcp/transport.ts:103`) so we can keep the body of any non-2xx response and reattach it to the thrown error — without that, the SDK collapses every 401 into a generic "Unauthorized" and we lose the real `invalid_token` text.
 
 #### Hop 3 — Service to Anthropic
 
@@ -282,7 +282,7 @@ Anchor: three wires, all HTTPS, no IPC.
 
 **Q: Why is the OAuth callback hop interesting?**
 
-> It's the only inbound HTTPS request that's NOT initiated by my own client code. Bloomreach's IdP redirects the user's browser back to `https://<app-host>/api/mcp/callback?code=…`. That makes it a cross-site request from the browser's perspective. If `bi_session` were `SameSite=Lax`, some browsers drop it on that return and we lose the binding between the OAuth code and our session. So `bi_session` is `SameSite=None; Secure` in production — `lib/mcp/session.ts:12`.
+> It's the only inbound HTTPS request that's NOT initiated by my own client code. Bloomreach's IdP redirects the user's browser back to `https://<app-host>/api/mcp/callback?code=…`. That makes it a cross-site request from the browser's perspective. If the session cookie (`bi_session`) were `SameSite=Lax`, some browsers drop it on that return and we lose the binding between the OAuth code and our session. So `bi_session` is `SameSite=None; Secure` in production — `lib/mcp/session.ts:12`.
 
 ```
   on the whiteboard:
@@ -308,7 +308,7 @@ Anchor: SameSite=None + Secure exists for one specific moment in the OAuth dance
         → window.location.href = '/' → re-auth on next request
 ```
 
-Anchor: the alpha server is the reason `useReconnectPolicy` exists.
+Anchor: the alpha server is the reason the reconnect policy (`useReconnectPolicy`) exists.
 
 ## See also
 

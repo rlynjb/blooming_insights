@@ -179,7 +179,7 @@ Ranked by user-visible consequence, each grounded in real evidence. The cleanups
 
 **Why it ranks here.** Real bug, but rare in practice (the in-stream auto-reconnect fires first on most token-revocation paths). Resolution needs live Bloomreach verification, which is why the refactor deferred it.
 
-### Rank 3 — `useInvestigation` deliberately does NOT cancel the fetch on unmount (`lib/hooks/useInvestigation.ts:33-37, 38`)
+### Rank 3 — The investigation hook (`useInvestigation`) deliberately does NOT cancel the fetch on unmount (`lib/hooks/useInvestigation.ts:33-37, 38`)
 
 **Evidence.** The `useEffect` returns no cleanup; the comment block at L33-37 explains: cancelling-on-cleanup + the `startedRef` guard against StrictMode re-mount left the logs empty in dev. The team chose "let the in-flight run complete; setState-after-unmount is a safe no-op."
 
@@ -187,7 +187,7 @@ Ranked by user-visible consequence, each grounded in real evidence. The cleanups
 
 **Why it ranks here.** A real cost, but bounded — the agent run is single-shot and finishes within `maxDuration = 300`s. Fix is non-trivial (it requires distinguishing StrictMode re-mount from real unmount, which React doesn't directly expose).
 
-### Rank 4 — `InsightCard` is 495 LOC of single-file derived state + JSX (`components/feed/InsightCard.tsx`)
+### Rank 4 — The insight card component (`InsightCard`) is 495 LOC of single-file derived state + JSX (`components/feed/InsightCard.tsx`)
 
 **Evidence.** `wc -l components/feed/InsightCard.tsx` → 495. The file has 7 derived-state helpers (`fmtNum`, `fmtUsd`, `daysSince`, `fmtPct`, `humanizeBaseline`, `whyItMatters`, `scopeExplain`, `readEvidence`) and a 320-line JSX body with 9 optional render sections.
 

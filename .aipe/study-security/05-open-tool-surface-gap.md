@@ -119,7 +119,7 @@ expected shape.
 
 ### Move 2 — the step-by-step walkthrough
 
-#### a · the gate today — `ALL_KNOWN` is the union
+#### a · the gate today — the union allowlist (`ALL_KNOWN`)
 
 Real code (`app/api/mcp/call/route.ts:14-33`):
 

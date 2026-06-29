@@ -142,10 +142,10 @@ Every `GET /api/briefing` or `GET /api/agent` creates a new request frame. The h
 
 What lives per-request:
 
-  → `req.signal` — the client-side cancel signal, threaded through every async call (`app/api/agent/route.ts:226, 237, 248, 274, 290`).
+  → the client-side cancel signal (`req.signal`), threaded through every async call (`app/api/agent/route.ts:226, 237, 248, 274, 290`).
   → A `ReadableStream` with one `controller` + one `encoder` (`app/api/agent/route.ts:183-185`).
   → An `AsyncLocalStorage` frame established at the top of `withAuthCookies` (`lib/mcp/auth.ts:86-104`) for any auth-touching handler.
-  → A `BloomreachDataSource` instance (in live mode) constructed by the factory at `lib/data-source/index.ts:67-99`. **The session-scoped one has a no-op `dispose`** — the OAuth tokens it holds live across requests via the cookie store, so we deliberately do not tear down its in-memory cache between requests. (See the comment at `index.ts:14-18`.)
+  → A data-source adapter instance (`BloomreachDataSource`, in live mode) constructed by the factory at `lib/data-source/index.ts:67-99`. **The session-scoped one has a no-op `dispose`** — the OAuth tokens it holds live across requests via the cookie store, so we deliberately do not tear down its in-memory cache between requests. (See the comment at `index.ts:14-18`.)
 
 ```
   ┌─ per-request frame (lives ≤ 300s) ─────────────────────┐

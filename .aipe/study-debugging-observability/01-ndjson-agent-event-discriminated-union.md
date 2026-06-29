@@ -1,6 +1,6 @@
 # NDJSON `AgentEvent` discriminated union
 
-**Industry name(s):** newline-delimited JSON (NDJSON) wire format + TypeScript discriminated union (a.k.a. tagged union, sum type). **Type:** Industry standard format, language-agnostic pattern.
+**Industry name(s):** newline-delimited JSON wire format (NDJSON) + discriminated union (a.k.a. tagged union, sum type — `AgentEvent` is the TypeScript instance here). **Type:** Industry standard format, language-agnostic pattern.
 
 ## Zoom out — where this concept lives
 
@@ -34,7 +34,7 @@ This one concept is the spine of the entire observability story. It's the contra
   └──────────────────────────────────────────────────────────────┘
 ```
 
-**Zoom in.** `AgentEvent` is a TypeScript discriminated union with 8 variants. Each variant has a `type` literal that picks one case (`'reasoning_step' | 'tool_call_start' | …`). The wire encoding is one JSON object per line, terminated with `'\n'`. Producers call `encodeEvent`; consumers call `readNdjson<AgentEvent>(body, handle)` and a `switch (e.type)` decides what to do with each event.
+**Zoom in.** The discriminated union (`AgentEvent`) has 8 variants. Each variant has a `type` literal that picks one case (`'reasoning_step' | 'tool_call_start' | …`). The wire encoding is one JSON object per line, terminated with `'\n'`. Producers call the event encoder (`encodeEvent`); consumers call the NDJSON reader (`readNdjson<AgentEvent>(body, handle)`) and a `switch (e.type)` decides what to do with each event.
 
 The question this contract answers: *"how do four different consumers stay in lockstep with two different producers — and with a JSON file on disk — without inventing a separate schema for each pair?"*
 

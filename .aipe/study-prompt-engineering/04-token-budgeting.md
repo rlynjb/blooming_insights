@@ -90,7 +90,7 @@ The 80% rule is the operational one: if you're using more than 80% of the contex
 
 ### Move 2 — the walkthrough
 
-**Slot 1 — the system prompt, budgeted at template time.** The `monitoring.md` template is ~1.2K tokens of stable content. It's fixed at build time. The budget here is "keep the rules dense and don't pad with examples you don't need." Concept 01 walks the four-section anatomy that makes this slot survivable.
+**Slot 1 — the system prompt, budgeted at template time.** The system prompt template (`monitoring.md`) is ~1.2K tokens of stable content. It's fixed at build time. The budget here is "keep the rules dense and don't pad with examples you don't need." Concept 01 walks the four-section anatomy that makes this slot survivable.
 
 **Slot 2 — the context injection. This is the one that drifts.** `lib/agents/monitoring.ts:19-60` does the budgeting for you in code:
 
@@ -181,7 +181,7 @@ The execution trace, one call:
 
 The truncation isn't just "save tokens." It's *bounded growth*. Without `truncate`, one runaway EQL result blows the budget for the entire conversation.
 
-**Slot 4 — the response. `max_tokens` enforces.** `lib/agents/base-legacy.ts:126`:
+**Slot 4 — the response. The output cap (`max_tokens`) enforces.** `lib/agents/base-legacy.ts:126`:
 
 ```typescript
 const params: Anthropic.Messages.MessageCreateParamsNonStreaming = {
@@ -241,8 +241,8 @@ In this codebase the variable interpolations happen *throughout* the prompt (pro
 
 **The specific failure — small inputs work, scale breaks.** This is the classic. A chain works fine in dev with a tiny test workspace, you push it, the first customer with a real-sized schema lands, and you see the agent timeout or — worse — silently truncate its response mid-JSON because `max_tokens` was too low for the new context. The fix:
 
-1. `schemaSummary` instead of raw schema (this codebase already does this).
-2. `truncate` on every tool result (this codebase already does this).
+1. Schema compaction (`schemaSummary`) instead of raw schema (this codebase already does this).
+2. Per-result truncation (`truncate`) on every tool result (this codebase already does this).
 3. A logged token count per call so you can see budget usage in production (this codebase logs `usage` but doesn't aggregate it — concept 03's gap).
 4. An eval set that includes a *large workspace* scenario (this codebase doesn't have evals — concept 05's gap).
 
@@ -299,7 +299,7 @@ In this codebase, concept 06 (single-purpose chains) is the architectural answer
 
 **Q: "How do you keep your prompts inside the context window?"**
 
-Four-slot budget: system prompt, injected context, tool results, response. *(Draw the diagram.)* The biggest lever in this codebase is `schemaSummary` at `lib/agents/monitoring.ts:19-60` — the full workspace schema is 112KB / ~30K tokens; the compacted summary is ~1K. Caps at 20 events × 10 properties + 30 customer properties. Tool results get a separate 16K-char-per-result cap at `lib/agents/base-legacy.ts:32-37`. Response is capped with `max_tokens: 4096`. Each slot has its own enforcement.
+Four-slot budget: system prompt, injected context, tool results, response. *(Draw the diagram.)* The biggest lever in this codebase is schema compaction (`schemaSummary` at `lib/agents/monitoring.ts:19-60`) — the full workspace schema is 112KB / ~30K tokens; the compacted summary is ~1K. Caps at 20 events × 10 properties + 30 customer properties. Tool results get a separate 16K-char-per-result cap at `lib/agents/base-legacy.ts:32-37`. Response is capped with `max_tokens: 4096`. Each slot has its own enforcement.
 
 ```
   worst case sum: ~38K tokens, well under the 200K window's 80% line

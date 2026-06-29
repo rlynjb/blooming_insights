@@ -25,7 +25,7 @@ for the entity graph + line-by-line type reading.
 
 - **[OK]** Type-as-schema is the right framing for a no-DB app; every
   layer reads against the same interfaces.
-- **[OK]** `WorkspaceSchema` as a duck-typed interface lets two adapters
+- **[OK]** The duck-typed interface (`WorkspaceSchema`) lets two adapters
   (live MCP, in-process synthetic) substitute freely. `lib/mcp/schema.ts:8-25`.
 - **[L]** `evidence: { tool: string; result: unknown }[]` uses `unknown` as
   the escape hatch. Flexible — but the UI defensively scans for

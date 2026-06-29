@@ -45,7 +45,7 @@ The vertical axis is "how much does it impact." R3 (the ALS one) sits highest be
 
 **Severity:** high (budget) · **Evidence:** `lib/hooks/useInvestigation.ts:32-37, 46-50`
 
-**What:** The `useInvestigation` hook fires a `fetch('/api/agent?…')` and consumes the NDJSON stream. The effect cleanup does NOT call `controller.abort()` or set a cancellation latch. The `startedRef` guard prevents a double-fetch on React StrictMode's mount-cleanup-remount; the in-flight stream simply runs to completion regardless of whether the component is still mounted.
+**What:** The React hook (`useInvestigation`) fires a `fetch('/api/agent?…')` and consumes the NDJSON stream. The effect cleanup does NOT call `controller.abort()` or set a cancellation latch. The `startedRef` guard prevents a double-fetch on React StrictMode's mount-cleanup-remount; the in-flight stream simply runs to completion regardless of whether the component is still mounted.
 
 ```ts
 // lib/hooks/useInvestigation.ts:46-50 (annotated)
@@ -139,7 +139,7 @@ result = await this.liveCall(name, args, options.signal);   // ← signal observ
 
 **Severity:** low (cache miss rate) · **Evidence:** `lib/data-source/bloomreach-data-source.ts:122` + `lib/mcp/connect.ts:96` (fresh instance per `connectMcp`)
 
-**What:** The 60s response cache lives on the `BloomreachDataSource` instance. The instance is constructed fresh in `connectMcp` per request, so the cache is effectively per-request. Two `/api/agent` requests for the same insight on the same warm instance each get their own empty cache and re-fetch the same tools.
+**What:** The 60s response cache lives on the data-source adapter instance (`BloomreachDataSource`). The instance is constructed fresh in `connectMcp` per request, so the cache is effectively per-request. Two `/api/agent` requests for the same insight on the same warm instance each get their own empty cache and re-fetch the same tools.
 
 **Why it's a risk:** Higher Bloomreach tool-call volume than necessary. The bootstrap chain (`list_cloud_organizations`, `list_projects`, `get_event_schema`) fires twice for two consecutive requests instead of being absorbed by a shared cache on the second one.
 

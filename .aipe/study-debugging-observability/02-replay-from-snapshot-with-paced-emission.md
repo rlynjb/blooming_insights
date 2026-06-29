@@ -65,7 +65,7 @@ The control axis flips at one seam — the service layer. Upstream of the servic
 
 1. **Source seam (live vs replay).** Decided per-request by `demo=cached` (briefing) or by *cache hit + not `live=1`* (agent). At `app/api/briefing/route.ts:78-86` and `app/api/agent/route.ts:125-127`. Break the decision logic (e.g. always-replay) → live is unreachable.
 2. **Pace seam (the sleep).** `REPLAY_DELAY_MS = 140` (briefing) and `180` (agent) at `app/api/briefing/route.ts:25` and `app/api/agent/route.ts:103`. Drop the sleep → the whole snapshot arrives in one tick; the UI shows the full trace but the *reasoning effect* is gone (no "I see the agent thinking"). Make it too long → the demo feels staged.
-3. **Filter seam (per-step replay).** `filterByStep(events, step)` at `app/api/agent/route.ts:64-82` strips out events not belonging to the requested step. Break the filter → step 2 shows recommendation-phase events.
+3. **Filter seam (per-step replay).** The per-step replay filter (`filterByStep(events, step)`) at `app/api/agent/route.ts:64-82` strips out events not belonging to the requested step. Break the filter → step 2 shows recommendation-phase events.
 
 The filter is the load-bearing piece that lets one captured run serve as two fixtures (step 2 diagnose, step 3 recommend). Skeleton mapped.
 

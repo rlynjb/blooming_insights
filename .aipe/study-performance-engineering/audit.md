@@ -74,7 +74,7 @@ Three distinct caching mechanisms, no batching, no real backpressure:
 
 **No batching** — MCP calls are issued one at a time (the 1.1s spacing forces serialization).
 
-**No true backpressure.** `minIntervalMs = 1100` is rate-limit compliance — a fixed proactive delay. Backpressure would mean "downstream is slow → upstream sees that signal and slows down accordingly." Here, upstream (the agent) just sleeps before every call regardless of downstream state. The distinction matters — see `02-mcp-spacing-and-retry.md` for the full teaching point.
+**No true backpressure.** The spacing gate (`minIntervalMs = 1100`) is rate-limit compliance — a fixed proactive delay. Backpressure would mean "downstream is slow → upstream sees that signal and slows down accordingly." Here, upstream (the agent) just sleeps before every call regardless of downstream state. The distinction matters — see `02-mcp-spacing-and-retry.md` for the full teaching point.
 
 The synthetic data source (`lib/data-source/synthetic-data-source.ts`) is the **bypass** for both the cache and the spacing — `live-synthetic` mode keeps the real agent loop but uses a deterministic in-process tool catalog. No network, no spacing, no cache pressure. The killer demo path.
 

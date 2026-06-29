@@ -112,7 +112,7 @@ Five files, five prompts. Not "one giant prompt with sections." Five *separate* 
   → A monitoring regression doesn't touch the recommendation chain.
   → `git log lib/agents/legacy-prompts/monitoring.md` shows only monitoring-prompt history.
 
-**Each chain has its own tool subset.** `lib/mcp/tools.ts` defines which MCP tools each agent gets — `monitoringTools`, `diagnosticTools`, `recommendationTools`. The diagnostic agent doesn't have access to `list_scenarios` (a recommendation tool). The monitoring agent doesn't have access to ancillary detail tools. **Constrained tool surfaces are what make budgets predictable.**
+**Each chain has its own tool subset.** The tool registry (`lib/mcp/tools.ts`) defines which MCP tools each agent gets — `monitoringTools`, `diagnosticTools`, `recommendationTools`. The diagnostic agent doesn't have access to the recommendation-only tool `list_scenarios`. The monitoring agent doesn't have access to ancillary detail tools. **Constrained tool surfaces are what make budgets predictable.**
 
 **Each chain has its own budget.** Compare two chains at `lib/agents/diagnostic-legacy.ts:66-68` and `recommendation-legacy.ts:59-61`:
 
@@ -193,7 +193,7 @@ async propose(
 ): Promise<Recommendation[]>
 ```
 
-The `Diagnosis` type (defined in `lib/mcp/types.ts`) is the contract between the two chains. Validators (`isDiagnosis` in `lib/mcp/validate.ts`) enforce that contract at the boundary. The two chains can be developed, tested, and reasoned about independently because the seam between them is typed.
+The handoff type (`Diagnosis`, defined in `lib/mcp/types.ts`) is the contract between the two chains. Validators (`isDiagnosis` in `lib/mcp/validate.ts`) enforce that contract at the boundary. The two chains can be developed, tested, and reasoned about independently because the seam between them is typed.
 
 **Layers-and-hops view of the whole pipeline:**
 

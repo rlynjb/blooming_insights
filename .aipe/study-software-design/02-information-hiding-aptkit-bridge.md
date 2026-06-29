@@ -1,4 +1,4 @@
-# Information hiding — the AptKit adapter bridge
+# Information hiding — the adapter bridge (AptKit)
 
 *industry name: Adapter pattern + information hiding · type: Language-agnostic (Gang of Four × APOSD)*
 
@@ -9,7 +9,7 @@
 **Zoom out — where this pattern lives.** Between the agent layer and the AptKit primitives library.
 
 ```
-  Zoom out — where the AptKit bridge sits in the system
+  Zoom out — where the bridge (AptKit) sits in the system
 
   ┌─ UI layer ────────────────────────────────────────────────┐
   │  app/page.tsx + hooks                                     │

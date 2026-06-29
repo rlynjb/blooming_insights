@@ -310,7 +310,7 @@ The total line count rose (817 → 1043 across 4 files) — that's expected. Lif
 
 **Where this primitive comes from.** "Classitis" is APOSD's term for the related anti-pattern (Ch. 4). React-world calls the component variant "god component"; Vue calls it "page component anti-pattern." Same shape, same fix: extract by concern, not by size.
 
-**What changed in this codebase.** The lift landed across PRs #1–#4 (June 2026), gated by two preconditions: lifting the `readNdjson` kernel (commit `0f06eff`) and adding integration tests for the route NDJSON contracts (PR #4). With the preconditions cleared, the three hook extractions executed in sequence (Frontend-Behaviour template — state/effects/events lifts, not module restructures). The shallow-module case has been verified-resolved since 2026-06-15.
+**What changed in this codebase.** The lift landed across PRs #1–#4 (June 2026), gated by two preconditions: lifting the kernel (`readNdjson`, commit `0f06eff`) and adding integration tests for the route NDJSON contracts (PR #4). With the preconditions cleared, the three hook extractions executed in sequence (Frontend-Behaviour template — state/effects/events lifts, not module restructures). The shallow-module case has been verified-resolved since 2026-06-15.
 
 **The decision NOT to extract `useModePersistence`** (the ~10 LOC localStorage read for the demo/live toggle) is a real APOSD judgment call. At 10 LOC, lifting it would emit a 4th hook for what's essentially a one-liner — the wrapper would be as complex as the body, which is shallow-module's exact failure mode applied to a hook. The audit called it: leave it inline as documented-without-stub. Future executor can fold it into one of the three existing hooks if they touch the page; otherwise it stays.
 

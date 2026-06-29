@@ -118,8 +118,8 @@ export class MonitoringAgent {
   ) {}
 ```
 
-And the `McpCaller` type is deliberately narrowed so the fake only has
-to implement one method:
+And the agent-facing port (`McpCaller`) is deliberately narrowed so the fake
+only has to implement one method:
 
 ```ts
 // lib/agents/base.ts:11-14
@@ -312,8 +312,8 @@ isn't the pattern anymore.
 ```
 
 Skeleton = these three. Optional hardening on top: `vi.fn()` for call
-counts, helper builders for `tool_use` / `text` blocks, the
-`buildFakeMcp` envelope wrapper. Useful, not load-bearing.
+counts, helper builders for `tool_use` / `text` blocks, the envelope
+wrapper (`buildFakeMcp`). Useful, not load-bearing.
 
 The interview-payoff move is naming the **loud exhaustion** rule. Most
 people remember the inject-and-script half; far fewer call out that the
@@ -324,7 +324,7 @@ mystery.
 ### Move 3 — the principle
 
 **Test against the interface, not the wire.** When you own the
-interface (your own `McpCaller` type), the fake is plain TypeScript.
+interface (your own port, `McpCaller`), the fake is plain TypeScript.
 When you don't own the interface (Anthropic's SDK), satisfy its
 *shape* in-process — never reach for HTTP-level mocking unless the wire
 itself is what you're testing.

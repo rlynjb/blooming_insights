@@ -159,7 +159,7 @@ DNS treatment is identical to case 2. The difference is that we don't have a kno
 
 #### Case 4 — The OAuth callback's `redirect_uri`
 
-The one place DNS-style routing logic lives in our application code is `redirectUri()` in `lib/mcp/connect.ts:36-57`. It picks the host for the OAuth callback dynamically:
+The one place DNS-style routing logic lives in our application code is the callback URL builder (`redirectUri()`) in `lib/mcp/connect.ts:36-57`. It picks the host for the OAuth callback dynamically:
 
 ```ts
 // lib/mcp/connect.ts:42-56

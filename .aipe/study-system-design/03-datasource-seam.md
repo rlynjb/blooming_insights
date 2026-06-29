@@ -460,7 +460,7 @@ factory picks per request based on `bi:mode`.
        agent loop
            │
            ▼
-       DataSource (the port)
+       the port (`DataSource`)
         ┌──┴──┐
         ▼     ▼
     Bloomreach  Synthetic

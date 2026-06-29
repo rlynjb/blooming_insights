@@ -172,7 +172,7 @@ The RecommendationAgent is explicitly read-only — from its prompt: "You are re
 
 **No global token-ceiling.** Per-agent budgets sum to a bounded total, but there's no overall cap that halts the pipeline if total tokens exceed a threshold. If a future change loosened any per-agent cap, the global guard wouldn't catch it.
 
-**No input sanitization for prompt injection on the QueryAgent's free-form input.** The user's typed query goes into the prompt as-is. Prompt injection vectors (e.g., the user typing "ignore previous instructions and ...") aren't filtered. Mitigations: the per-agent tool policy contains the blast radius (the QueryAgent can't trigger side effects regardless), and the AbortSignal lets the user cancel. But "the user CAN'T injection-attack the agent" isn't true; "the user can't get the agent to do anything harmful via injection" mostly is, because of the read-only tool grants.
+**No input sanitization for prompt injection on the query agent's (`QueryAgent`) free-form input.** The user's typed query goes into the prompt as-is. Prompt injection vectors (e.g., the user typing "ignore previous instructions and ...") aren't filtered. Mitigations: the per-agent tool policy contains the blast radius (the QueryAgent can't trigger side effects regardless), and the AbortSignal lets the user cancel. But "the user CAN'T injection-attack the agent" isn't true; "the user can't get the agent to do anything harmful via injection" mostly is, because of the read-only tool grants.
 
 ### Move 3 — the principle
 

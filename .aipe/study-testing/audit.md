@@ -121,9 +121,9 @@ This is constructor injection, and the tests prove it works: tests pass
 plain-object fakes for `anthropic` and `dataSource` (see
 `test/agents/base.test.ts:51-83`) — no global state, no module-level
 singletons to reset, no `jest.mock` gymnastics inside the agent itself.
-The `McpCaller` type (`lib/agents/base.ts:14`) is deliberately narrowed
-to `Pick<DataSource, 'callTool'>` — the agent only needs the one method,
-so the fake only has to implement one method.
+The agent-facing port (`McpCaller`, at `lib/agents/base.ts:14`) is
+deliberately narrowed to `Pick<DataSource, 'callTool'>` — the agent only
+needs the one method, so the fake only has to implement one method.
 
 **This is the design lesson the testability surfaces.** Where the
 boundary is sharp, the test is cheap. Where it's blurry, the test pays

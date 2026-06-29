@@ -76,7 +76,7 @@ A retrieval-routing agent would dispatch:
 - "What's the right way to configure a recovery scenario?" → product docs (knowledge)
 - "Is there a known industry-wide outage today?" → web search (freshness)
 
-None of this exists in the repo today. The QueryAgent today has tools that all hit one source (Bloomreach), so there's no source decision to make — only a tool-pick decision within that source.
+None of this exists in the repo today. The query agent (`QueryAgent`) today has tools that all hit one source (Bloomreach), so there's no source decision to make — only a tool-pick decision within that source.
 
 ### Move 3 — the principle
 

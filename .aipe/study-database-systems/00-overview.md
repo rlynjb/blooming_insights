@@ -57,9 +57,9 @@ Two reasons to walk these concepts even when the repo doesn't exercise them:
 
   2. **Honest analogs.** Three things in this repo *gesture at* DB engine concerns without being one. They're useful to study because they isolate one engine concern at a time:
 
-     - the per-session `Map<sessionId, ...>` is a **table**: a keyed lookup with namespacing
-     - the BloomreachDataSource cache is a **single-shot per-key store with expiry**: a TTL cache that absorbs repeated reads
-     - the committed `demo-*.json` is a **captured read replica**: a frozen snapshot of one live run, replayed deterministically
+     - the **table** (the per-session `Map<sessionId, ...>`): a keyed lookup with namespacing
+     - the **TTL cache** (the BloomreachDataSource response cache): a single-shot per-key store with expiry that absorbs repeated reads
+     - the **read replica** (the committed `demo-*.json`): a frozen snapshot of one live run, replayed deterministically
 
 ## The concept inventory — and where each one lands
 

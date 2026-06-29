@@ -183,9 +183,9 @@ What breaks if you remove each part:
 
 Kernel done. Skeleton complete. Everything else is **hardening on the consumer side.**
 
-#### The consumer — `useInvestigation`, side by side with what each part does
+#### The consumer (`useInvestigation`), side by side with what each part does
 
-`lib/hooks/useInvestigation.ts` (202 LOC) is the largest consumer and the canonical shape. Let's walk the load-bearing parts.
+The largest consumer (`lib/hooks/useInvestigation.ts`, 202 LOC) is the canonical shape. Let's walk the load-bearing parts.
 
 **The 5 useState slots plus the closure mirror.** Why both?
 

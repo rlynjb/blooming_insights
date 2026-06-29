@@ -84,27 +84,28 @@ holding.
 
 ## Zoom in — the one load-bearing control at each boundary
 
-  → **Boundary 1.** The `bi_session` cookie scopes per-session state
-    (`lib/state/insights.ts:14`, `lib/mcp/session.ts:11`). Two users on
-    the same warm Vercel instance can't see each other's insights or
-    investigations — but a logged-in user can still call any tool the
-    union allowlist covers (see boundary-2 caveat).
+  → **Boundary 1.** The session cookie (`bi_session`) scopes
+    per-session state (`lib/state/insights.ts:14`,
+    `lib/mcp/session.ts:11`). Two users on the same warm Vercel
+    instance can't see each other's insights or investigations — but a
+    logged-in user can still call any tool the union allowlist covers
+    (see boundary-2 caveat).
 
-  → **Boundary 2.** The `bi_auth` cookie holds the OAuth tokens
-    AES-256-GCM-encrypted under `AUTH_SECRET`
+  → **Boundary 2.** The encrypted-session cookie (`bi_auth`) holds the
+    OAuth tokens, AES-256-GCM-encrypted under `AUTH_SECRET`
     (`lib/mcp/auth.ts:51-67`). Tampering corrupts the GCM auth tag,
     `decryptStore` swallows the throw and returns `{}` —
     re-authentication, not impersonation
     (`lib/mcp/auth.ts:69-79`). The cookie is the only thing the SDK and
-    the route share across requests on Vercel; without it, PKCE
-    verifier and DCR client info would be lost between `/connect` and
-    `/callback`.
+    the route share across requests on Vercel; without it, the PKCE
+    verifier and DCR (Dynamic Client Registration) client info would be
+    lost between `/connect` and `/callback`.
 
-  → **Boundary 3.** `parseAgentJson` + per-shape type guards
-    (`lib/mcp/validate.ts:3-13`, `17-57`). The agent can return malformed
-    JSON, an extra prose tail, a fence, or the wrong shape — every path
-    falls back to a typed `FALLBACK` instead of crashing the route or
-    flowing junk into the UI.
+  → **Boundary 3.** Defensive parsing (`parseAgentJson`) + per-shape
+    type guards (`lib/mcp/validate.ts:3-13`, `17-57`). The agent can
+    return malformed JSON, an extra prose tail, a fence, or the wrong
+    shape — every path falls back to a typed `FALLBACK` instead of
+    crashing the route or flowing junk into the UI.
 
 ## The single finding that earns the headline
 
@@ -112,8 +113,9 @@ holding.
 route calls it on the (token-bound) MCP server, the response comes back
 as JSON. The original version of this route accepted any string for
 `name`. The current version (`app/api/mcp/call/route.ts:14-27`) gates
-against `ALL_KNOWN = monitoringTools ∪ diagnosticTools ∪
-recommendationTools ∪ bootstrapTools`, returning 403 for anything else.
+against a union allowlist (`ALL_KNOWN = monitoringTools ∪
+diagnosticTools ∪ recommendationTools ∪ bootstrapTools`), returning 403
+for anything else.
 
 **That closes the worst leak** — an attacker can no longer name an
 arbitrary write tool like `delete_customer`. What's still open: the

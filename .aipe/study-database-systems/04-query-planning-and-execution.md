@@ -84,7 +84,7 @@ If you've ever written a `users.filter(u => u.role === 'admin')` instead of an `
 
 ### Move 2 — the walkthrough
 
-#### Local "query 1" — `getInsight` is `SELECT WHERE id = ?`
+#### Local "query 1" — `SELECT WHERE id = ?` (here: `getInsight`)
 
 ```ts
 // lib/state/insights.ts:73-75
@@ -98,7 +98,7 @@ Annotation:
   - The plan a real engine would pick: index seek on a composite `(session_id, id)` primary key. Two `Map.get` calls is the in-memory equivalent — same `O(1)` cost, no plan to choose.
   - There is no result-set caching here beyond the Map being the source of truth. The cache exists one layer down (BloomreachDataSource), where it caches the *upstream* query result.
 
-#### Local "query 2" — `listInsights` is `SELECT * WHERE session_id = ?`
+#### Local "query 2" — `SELECT * WHERE session_id = ?` (here: `listInsights`)
 
 ```ts
 // lib/state/insights.ts:81-84
@@ -223,5 +223,5 @@ When local queries gain a real choice. The first trigger is usually a secondary 
 ## See also
 
   - [`03-btree-hash-and-secondary-indexes.md`](./03-btree-hash-and-secondary-indexes.md) — the indexes a planner would choose between
-  - [`08-replication-and-read-consistency.md`](./08-replication-and-read-consistency.md) — how the 60s cache stands in for a materialized view
+  - [`08-replication-and-read-consistency.md`](./08-replication-and-read-consistency.md) — how the materialized view role gets played by the 60s cache
   - `.aipe/study-ai-engineering/` — how the agent decides which EQL to run

@@ -1,4 +1,4 @@
-# Pull complexity down — the `readNdjson` kernel
+# Pull complexity down — the kernel (`readNdjson`)
 
 *industry name: Extract Function / lifted kernel · type: Language-agnostic (APOSD primitive)*
 
@@ -370,7 +370,7 @@ Naming these as optional clarifies that they're not the load-bearing parts. The 
 
 **Q1: Walk me through a refactor where you pulled complexity downward.**
 
-The `readNdjson` kernel at `lib/streaming/ndjson.ts`. Three React hooks plus a chat component were all doing the same `fetch → body.getReader() → TextDecoder → buffer → split('\n') → JSON.parse → dispatch` loop inline — about 25 lines repeated three times with subtle differences in how each handled malformed lines and cleanup. I lifted the loop into one 64-LOC kernel generic over `<E>`. Now each consumer hands it a body and a handler; the kernel owns the buffering, decoding, line splitting, malformed-line policy, cancellation polling, and `finally` lock release. The test integration helper uses the SAME kernel — there's no risk of test parser ≠ production parser drift.
+The kernel (`readNdjson`) at `lib/streaming/ndjson.ts`. Three React hooks plus a chat component were all doing the same `fetch → body.getReader() → TextDecoder → buffer → split('\n') → JSON.parse → dispatch` loop inline — about 25 lines repeated three times with subtle differences in how each handled malformed lines and cleanup. I lifted the loop into one 64-LOC kernel generic over `<E>`. Now each consumer hands it a body and a handler; the kernel owns the buffering, decoding, line splitting, malformed-line policy, cancellation polling, and `finally` lock release. The test integration helper uses the SAME kernel — there's no risk of test parser ≠ production parser drift.
 
 ```
    before                            after

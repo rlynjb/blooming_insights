@@ -187,7 +187,7 @@ async callTool(name: string, args: Record<string, unknown>, opts?: CallToolOpts)
 }
 ```
 
-The `composeSignals` helper (`transport.ts:173-189`) does `AbortSignal.any([routeSignal, timeoutSignal])` — first to fire wins. So either the user closes the tab (route signal) or 30s elapses (timeout signal) — either way, the in-flight `fetch` aborts.
+The signal-combinator helper (`composeSignals`, `transport.ts:173-189`) does `AbortSignal.any([routeSignal, timeoutSignal])` — first to fire wins. So either the user closes the tab (route signal) or 30s elapses (timeout signal) — either way, the in-flight `fetch` aborts.
 
 The timeout tag is deliberately `HTTP 0:` — a status code outside the real HTTP range — so callers can recognize it without parsing the message text.
 

@@ -1,4 +1,4 @@
-# Deep module — the DataSource seam
+# Deep module — the seam (`DataSource`)
 
 *industry name: deep module / narrow interface · type: Language-agnostic (APOSD primitive)*
 
@@ -9,7 +9,7 @@
 **Zoom out — where this pattern lives.** The data layer of the stack.
 
 ```
-  Zoom out — where the DataSource seam sits in the system
+  Zoom out — where the seam (DataSource) sits in the system
 
   ┌─ UI layer ────────────────────────────────────────────────┐
   │  app/page.tsx + hooks (useBriefingStream, ...)            │
@@ -36,7 +36,7 @@
   └───────────────────────────────────────────────────────────┘
 ```
 
-**Zoom in — narrow to the concept.** A *deep module* is a small interface over a big body. The fewer decisions the caller knows about, the less complexity propagates per change. The `DataSource` interface is the smallest seam in the codebase that still lets the agent layer do useful work: two methods, one envelope. Behind it sit ~730 LOC of concrete behavior the agents never see — OAuth, rate-limit retry ladders, request spacing, response caching, signal composition for one adapter; a 30+ tool synthetic dispatcher for the other. Same caller-facing shape; wildly different bodies. That ratio — small mouth, big stomach — IS the pattern.
+**Zoom in — narrow to the concept.** A *deep module* is a small interface over a big body. The fewer decisions the caller knows about, the less complexity propagates per change. The port (`DataSource`) is the smallest seam in the codebase that still lets the agent layer do useful work: two methods, one envelope. Behind it sit ~730 LOC of concrete behavior the agents never see — OAuth, rate-limit retry ladders, request spacing, response caching, signal composition for one adapter; a 30+ tool synthetic dispatcher for the other. Same caller-facing shape; wildly different bodies. That ratio — small mouth, big stomach — IS the pattern.
 
 ---
 
@@ -289,7 +289,7 @@ The whole pattern in one frame.
 **What's adjacent in this codebase.**
 
   - The AptKit adapter bridge (`02-information-hiding-aptkit-bridge.md`) is the same lesson at a different scale — three small adapter classes hiding AptKit's generic primitive interfaces from the four agent classes.
-  - The `readNdjson` kernel (`03-pulled-complexity-down-readndjson.md`) is the OUTPUT-side dual: one body, many callers, but at a single-function scale rather than a whole class.
+  - The kernel (`readNdjson`, see `03-pulled-complexity-down-readndjson.md`) is the OUTPUT-side dual: one body, many callers, but at a single-function scale rather than a whole class.
 
 **What to read next.** `.aipe/read-aposd/part-2/03-deep-modules.md` is the book chapter this pattern most directly anchors to.
 
@@ -299,7 +299,7 @@ The whole pattern in one frame.
 
 **Q1: What is a deep module and where in this codebase do you have one?**
 
-The clearest one is the `DataSource` interface at `lib/data-source/types.ts` — 73 lines, two methods. Behind it sit two adapters: `BloomreachDataSource` (214 LOC, owns OAuth, rate-limit retry, 60s caching, signal composition) and `SyntheticDataSource` (516 LOC, owns a 30+ tool deterministic dispatcher). About a 10:1 ratio of body to interface. The agent layer holds a `DataSource` reference and never knows which adapter it has — that's what makes the seam load-bearing.
+The clearest one is the port (`DataSource`) at `lib/data-source/types.ts` — 73 lines, two methods. Behind it sit two adapters: `BloomreachDataSource` (214 LOC, owns OAuth, rate-limit retry, 60s caching, signal composition) and `SyntheticDataSource` (516 LOC, owns a 30+ tool deterministic dispatcher). About a 10:1 ratio of body to interface. The agent layer holds a `DataSource` reference and never knows which adapter it has — that's what makes the seam load-bearing.
 
 ```
   ┌─ interface (73 LOC) ─┐

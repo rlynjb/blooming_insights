@@ -44,7 +44,7 @@ Zoom in: the pattern is **four independent visual tiers, each filling in on its 
 
 Three layers, one axis — **how much does this surface know about the underlying data?** — traced across the tiers.
 
-**Layer 1: the static shell.** Knows: nothing about the data. The header text, the layout grid, the page width — all encoded at render time from constants in the page component. `ProcessStepper` *almost* belongs here; it's static markup with three steps and accepts state props per step. Renders during the first React commit, before any effect runs.
+**Layer 1: the static shell.** Knows: nothing about the data. The header text, the layout grid, the page width — all encoded at render time from constants in the page component. The process stepper (`ProcessStepper`) *almost* belongs here; it's static markup with three steps and accepts state props per step. Renders during the first React commit, before any effect runs.
 
 **Layer 2: the shape-mirroring skeletons.** Knows: the *shape* of the data, not the data. `Skeleton` (18 LOC, one rectangle) is dumb; `RecommendationCardSkeleton` (71 LOC) is deliberately laid out as the shape of `RecommendationCard` — same feature-chip box, same title block, same expected-impact callout, same three-up tile row — so when the real data swaps in, no layout shifts. The "loading" branch in `EvidencePanel.tsx:62-99` does the same thing for the diagnosis card.
 
@@ -131,7 +131,7 @@ Paints on the first React commit. Zero data dependencies. The shell is just mark
   />
 ```
 
-`ProcessStepper` (`components/shared/ProcessStepper.tsx`, 138 LOC) is the load-bearing component of tier 1. It always renders all three steps regardless of state — the visual difference comes from the per-step `state` prop:
+The process stepper (`ProcessStepper`, `components/shared/ProcessStepper.tsx`, 138 LOC) is the load-bearing component of tier 1. It always renders all three steps regardless of state — the visual difference comes from the per-step `state` prop:
 
 ```ts
 // components/shared/ProcessStepper.tsx:47-64
@@ -252,7 +252,7 @@ The same shape-mirroring pattern repeats in `EvidencePanel`'s loading branch (`c
 
 Paint at every state change, not just at `done`. Two surfaces own this tier: `CoverageGrid` (the 10-category tile grid) and `StatusLog` (the streaming trace sidebar).
 
-**`CoverageGrid` — tiles stream in one at a time.** The grid receives a `coverage` array that starts empty and grows as the briefing emits `coverage_item` events:
+**The coverage grid (`CoverageGrid`) — tiles stream in one at a time.** The grid receives a `coverage` array that starts empty and grows as the briefing emits `coverage_item` events:
 
 ```ts
 // lib/hooks/useBriefingStream.ts:209-213
@@ -292,7 +292,7 @@ The grid renders **all 10 categories every render**, but a category that hasn't 
 
 The header counts (`monitored`, `firing`, `skipped`) tick up as tiles stream in (`CoverageGrid.tsx:71-74, 93-101`). The user watches a real progress signal — "checking 3/10…", "checking 7/10…" — not a single indeterminate spinner.
 
-**`StatusLog` — trace items animate per fade-up keyframe.** The sidebar receives a `traceItems` array that grows per `reasoning_step` / `tool_call_start` / `tool_call_end` event. The header shows query count + "running…" + an indeterminate progress bar:
+**The status log (`StatusLog`) — trace items animate per fade-up keyframe.** The sidebar receives a `traceItems` array that grows per `reasoning_step` / `tool_call_start` / `tool_call_end` event. The header shows query count + "running…" + an indeterminate progress bar:
 
 ```ts
 // components/shared/StatusLog.tsx:48-67

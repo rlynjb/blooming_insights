@@ -112,7 +112,7 @@ the auth tag is detected, the decrypt throws, the user re-auths.
 
 ### Move 2 — the step-by-step walkthrough
 
-#### a · the AES key derivation
+#### a · the key derivation (`aesKey`)
 
 `AUTH_SECRET` is whatever the operator sets in Vercel. It might be a
 long random string, it might be 12 ASCII chars. AES-256 needs exactly
@@ -156,7 +156,7 @@ because `AUTH_SECRET` *is* the master key. If you ever derived it from
 a low-entropy source — a password — swap to scrypt/PBKDF2. Not a
 concern for this app's deploy model.)
 
-#### b · encrypt — IV + ciphertext + tag, packed flat
+#### b · encryption (`encryptStore`) — IV + ciphertext + tag, packed flat
 
 GCM is an AEAD cipher: it produces ciphertext PLUS a 16-byte auth tag.
 The IV (96-bit random per call) is *not* secret but MUST be unique per
@@ -195,7 +195,7 @@ bytes and the route happily reads garbage tokens. Drop the
 `base64url` and the cookie value contains characters the browser
 truncates or refuses.
 
-#### c · decrypt — fail closed on tamper
+#### c · decryption (`decryptStore`) — fail closed on tamper
 
 ```
   decrypt — split, verify, parse, OR catch → empty
@@ -240,7 +240,7 @@ system handles every failure mode (rotated key, corrupt bytes, old
 cookie format, attacker bit-flips) uniformly: send the user back
 through OAuth.
 
-#### d · cookie attributes — why SameSite=None
+#### d · cookie attributes — `SameSite=None` and why
 
 ```
   cookie set — every flag matters

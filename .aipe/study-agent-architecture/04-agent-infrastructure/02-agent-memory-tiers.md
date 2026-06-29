@@ -115,7 +115,7 @@ The natural case for adding it: a feature like "have we seen this kind of anomal
 
 - Embed each finished investigation (anomaly + diagnosis + recommendations) at the time of save
 - Store in pgvector (adds Postgres — currently no DB at all)
-- Add a `vector_search` tool to the DiagnosticAgent's tool grant
+- Add a `vector_search` tool to the diagnostic agent's (`DiagnosticAgent`) tool grant
 - Update the prompt to encourage "check past investigations first"
 
 The cost: one new dependency (pgvector + Postgres), one new pipeline (embed-on-save), the maintenance of the corpus (re-embed when the embedding model changes). The win: each investigation can ground in prior ones; the system gets smarter over time.

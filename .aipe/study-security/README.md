@@ -45,23 +45,25 @@ context.
 
      - `01-encrypted-cookie-oauth-state.md` — how OAuth/PKCE/token state
        survives Vercel's stateless functions without a shared store: an
-       AES-256-GCM-encrypted `bi_auth` cookie keyed by `AUTH_SECRET`.
+       AES-256-GCM-encrypted session cookie (`bi_auth`) keyed by
+       `AUTH_SECRET`.
      - `02-als-scoped-request-store.md` — how the SDK's many `state()` /
        `saveTokens()` calls in a single request all see one decrypted
        view of the store, with a single flush. Read-after-write inside
        one request without the Next.js request-vs-response cookie split.
      - `03-type-guard-trust-boundary.md` — how model output crosses from
-       hostile string to typed value: `parseAgentJson` + per-shape type
-       guards + `FALLBACK` constants. The seam between "what Claude
-       said" and "what the UI renders."
+       hostile string to typed value: defensive parsing
+       (`parseAgentJson`) + per-shape type guards + typed defaults
+       (`FALLBACK`). The seam between "what Claude said" and "what the
+       UI renders."
      - `04-read-only-tool-whitelist.md` — how the agents are kept
        read-only by construction. Per-agent allowlists in
        `lib/mcp/tools.ts` mean `monitoring` literally cannot reach a
        write tool, even if Claude asks.
      - `05-open-tool-surface-gap.md` — the proxy-shaped route
-       (`POST /api/mcp/call`). Now allowlisted against `ALL_KNOWN`, but
-       still doesn't scope the allowlist by *agent* or by *args*, so a
-       session-auth'd user (or stolen cookie) can call any
+       (`POST /api/mcp/call`). Now gated by a union allowlist
+       (`ALL_KNOWN`), but still doesn't scope by *agent* or by *args*,
+       so a session-auth'd user (or stolen cookie) can call any
        bootstrap/diagnostic tool the union covers.
 
 ## What this guide does not cover

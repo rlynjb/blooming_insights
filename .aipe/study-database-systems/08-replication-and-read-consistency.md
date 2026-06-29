@@ -104,7 +104,7 @@ If you've ever used a CDN that caches your API responses, served a stale page fr
 
 ### Move 2 — the walkthrough
 
-#### The demo snapshot — a frozen read replica
+#### The frozen read replica (the demo snapshot)
 
 The two JSON files are committed in `lib/state/demo-insights.json` and `lib/state/demo-investigations.json`. They capture one live briefing run end-to-end, including the agent's reasoning trace, every tool call, and every result.
 
@@ -131,7 +131,7 @@ Annotation:
 
 In replica vocabulary: this is a **manually-promoted snapshot replica.** It serves stale reads forever (or until someone re-captures). The consistency model is "deterministic but old."
 
-#### The 60s response cache — a per-instance TTL cache
+#### The per-instance TTL cache (the 60s response cache)
 
 `BloomreachDataSource` caches every successful tool call result for 60 seconds:
 
@@ -159,7 +159,7 @@ In consistency terms: this is a **read-after-write consistent** cache for querie
 
 The cost of this shape: **a briefing kicked off 30s after a previous one returns mostly-cached numbers.** For 90-day window queries, that's invisible — the underlying metric doesn't move meaningfully in 30 seconds. For tighter-window queries, it would be a real correctness issue.
 
-#### The multi-instance Map divergence — accidental "replication"
+#### Accidental "replication" — the multi-instance Map divergence
 
 Two Vercel instances serving the same session each hold their own Map. They look like replicas from the outside (same session ID, same data shape) but they don't sync with each other.
 

@@ -224,7 +224,7 @@ async callTool(
 }
 ```
 
-Why ignore the signal: the dispatch is **synchronous in-process work** — there's nothing async to interrupt. The signal exists in the signature because the abstract `DataSource` interface mandates it; the implementation doesn't need to act on it.
+Why ignore the signal: the dispatch is **synchronous in-process work** — there's nothing async to interrupt. The signal exists in the signature because the abstract port (`DataSource`) mandates it; the implementation doesn't need to act on it.
 
 **This is the honest framing.** It's not a bug; it's not technical debt; it's the right shape. If a future adapter did long-running CPU work, it'd need to check `signal.aborted` periodically. The synthetic dispatch is <1ms, so the question doesn't arise.
 
@@ -314,7 +314,7 @@ The cancellation kernel is **3 parts**. Strip any one and cancellation breaks so
 
 ### Move 3 — the principle
 
-Cancellation in JavaScript is a **chain of opt-ins**, not a runtime feature. There's no equivalent of OS-level `kill` or POSIX signals; you have to pass `AbortSignal` to every layer and compose it with every fresh timeout at every layer. The discipline is the design. The codebase makes this discipline visible by accepting `signal` in the abstract `DataSource` interface, so an adapter that fails to thread it would fail typing review. The places it deliberately doesn't propagate (synthetic dispatch, retry sleeps, the investigation hook) are commented and owned.
+Cancellation in JavaScript is a **chain of opt-ins**, not a runtime feature. There's no equivalent of OS-level `kill` or POSIX signals; you have to pass `AbortSignal` to every layer and compose it with every fresh timeout at every layer. The discipline is the design. The codebase makes this discipline visible by accepting `signal` in the abstract port (`DataSource`), so an adapter that fails to thread it would fail typing review. The places it deliberately doesn't propagate (synthetic dispatch, retry sleeps, the investigation hook) are commented and owned.
 
 ## Primary diagram
 

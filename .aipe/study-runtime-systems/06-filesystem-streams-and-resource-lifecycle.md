@@ -194,7 +194,7 @@ Three places can fire a cancel; one place observes each:
   └─────────────────────────────────┘
 ```
 
-The `useInvestigation` hook deliberately does NOT fire the cancel from the consumer side (`lib/hooks/useInvestigation.ts:32-37` comment). React StrictMode mounts-unmounts-remounts, and cancelling on the first unmount with a `startedRef` guard blocking the re-mount would abort the stream and leave the trace empty. So the consumer here just stops reading; the server keeps running until it finishes (or hits the 300s ceiling).
+The React hook (`useInvestigation`) deliberately does NOT fire the cancel from the consumer side (`lib/hooks/useInvestigation.ts:32-37` comment). React StrictMode mounts-unmounts-remounts, and cancelling on the first unmount with a `startedRef` guard blocking the re-mount would abort the stream and leave the trace empty. So the consumer here just stops reading; the server keeps running until it finishes (or hits the 300s ceiling).
 
 This is the only place a stream isn't bilaterally closed on consumer disconnect. Server-side, the `req.signal` from the *underlying TCP close* would still abort eventually — but only when the browser severs the connection (closed tab, network failure). The hook intentionally keeps the connection open through React's churn.
 

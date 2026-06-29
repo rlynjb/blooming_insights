@@ -207,7 +207,7 @@ const raw = await dataSource.listTools({ signal: req.signal });
 const anomalies = await agent.scan({ /* … */ signal: req.signal }, runnable);
 ```
 
-Inside the transport, the route-cancel signal gets composed with a per-call timeout via `composeSignals`:
+Inside the transport, the route-cancel signal gets composed with a per-call timeout via the signal combinator (`composeSignals`):
 
 ```ts
 // lib/mcp/transport.ts:131

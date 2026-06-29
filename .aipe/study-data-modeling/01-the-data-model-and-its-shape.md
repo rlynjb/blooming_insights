@@ -126,10 +126,11 @@ and the "rows" are `Map` values keyed by string IDs.
    └─────────┘ └──────────────┘  └─────────────────────┘
 ```
 
-`Insight.id` is the join key everything else hangs off — investigations,
-event logs, the URL of the investigate page (`/investigate/[id]`). The
-agents never see each other's data; they communicate by *writing* shapes
-into this graph and *reading* shapes back out.
+The join key (`Insight.id`) is what everything else hangs off —
+investigations, event logs, the URL of the investigate page
+(`/investigate/[id]`). The agents never see each other's data; they
+communicate by *writing* shapes into this graph and *reading* shapes back
+out.
 
 ### Move 2 — the entities, one at a time
 
@@ -269,13 +270,13 @@ either copied verbatim or transformed into a display-shaped version. That
 intentional overlap is what `02-normalization-and-duplication.md` is
 about. Three things worth noticing in the field list:
 
-- `id: string` is the **primary key** (a `crypto.randomUUID()` minted in
-  `anomalyToInsight`). It's the join key for `Diagnosis`, `Recommendation`,
+- The **primary key** (`id: string`) is a `crypto.randomUUID()` minted in
+  `anomalyToInsight`. It's the join key for `Diagnosis`, `Recommendation`,
   and the cached event log.
 - Every enrichment field (`revenueImpact`, `aov`, `funnel`, …) is
   `optional`. This is migrations-by-optional — see
   `05-migrations-and-evolution.md`.
-- `source: 'monitoring' | 'query'` — a discriminator that says where the
+- The discriminator (`source: 'monitoring' | 'query'`) says where the
   insight came from. The "query" path (free-form Q&A in `QueryBox`)
   produces single insights without going through the monitoring scan.
 
@@ -326,8 +327,8 @@ export interface Recommendation {
 }
 ```
 
-`estimatedImpact: EstimatedImpact` is a **discriminated union** that
-carries both the new shape and the legacy shape:
+The **discriminated union** (`estimatedImpact: EstimatedImpact`) carries
+both the new shape and the legacy shape:
 
 ```typescript
 // lib/mcp/types.ts:108-110

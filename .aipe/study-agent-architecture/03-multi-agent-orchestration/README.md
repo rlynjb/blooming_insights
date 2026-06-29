@@ -19,7 +19,7 @@ Everything above one agent. **The load-bearing section for this repo** — this 
 | File | In this codebase? |
 |---|---|
 | When not to go multi-agent | **Yes — read first.** This repo deliberately went *minimal* multi-agent: one ReAct loop per pipeline stage, no supervisor LLM, no fan-out, no debate. |
-| Supervisor-worker | **No (LLM-supervisor)** but **Yes (code-supervisor)**. `app/api/agent/route.ts` is the supervisor — written in TypeScript, not as an LLM agent. |
+| Supervisor-worker | **No (LLM-supervisor)** but **Yes (code-supervisor)**. The supervisor (`app/api/agent/route.ts`) is written in TypeScript, not as an LLM agent. |
 | Sequential pipeline | **Yes.** monitoring → diagnostic → recommendation, with a hard split at the HTTP boundary between step 2 and step 3. |
 | Parallel fan-out | **No.** No agent fans out work to concurrent workers. Bloomreach's ~1 req/s rate limit makes parallel calls infeasible without a concurrency cap. |
 | Debate / verifier-critic | **No.** The diagnosis is final; the human reading the StatusLog is the critic. |

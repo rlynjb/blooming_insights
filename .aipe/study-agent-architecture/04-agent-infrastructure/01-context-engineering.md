@@ -159,7 +159,7 @@ What this is: principle of least privilege at the tool layer. Each agent only se
 
 **Decision 4: message-pass, don't blackboard.**
 
-Covered in `../03-multi-agent-orchestration/08-shared-state-and-message-passing.md`. Each agent's input is exactly what it needs — the DiagnosticAgent gets an Anomaly; the RecommendationAgent gets an Anomaly + Diagnosis. Neither sees the other's full trajectory. **This is context engineering at the topology layer.**
+Covered in `../03-multi-agent-orchestration/08-shared-state-and-message-passing.md`. Each agent's input is exactly what it needs — the diagnostic agent (`DiagnosticAgent`) gets an Anomaly; the recommendation agent (`RecommendationAgent`) gets an Anomaly + Diagnosis. Neither sees the other's full trajectory. **This is context engineering at the topology layer.**
 
 **What's NOT a context-engineering decision in this repo:**
 

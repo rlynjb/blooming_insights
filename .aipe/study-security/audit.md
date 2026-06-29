@@ -65,19 +65,19 @@ typed allowlist for explicitness, not load-bearing today.
 
 **authn (who are you)** — present and reasonably hardened:
 
-  → `bi_session` cookie: `httpOnly` + (prod) `SameSite=None` + `Secure`,
-    set on first request (`lib/mcp/session.ts:11-13`). `SameSite=None`
-    is required to survive the cross-site OAuth round-trip from
-    Bloomreach back to `/api/mcp/callback`; locally it falls back to
-    `Lax` (no Secure on http).
-  → `bi_auth` cookie: same flags + AES-256-GCM under `AUTH_SECRET`,
-    `maxAge` 10 days matching the token lifetime
+  → Session cookie (`bi_session`): `httpOnly` + (prod) `SameSite=None`
+    + `Secure`, set on first request (`lib/mcp/session.ts:11-13`).
+    `SameSite=None` is required to survive the cross-site OAuth
+    round-trip from Bloomreach back to `/api/mcp/callback`; locally it
+    falls back to `Lax` (no Secure on http).
+  → Encrypted-session cookie (`bi_auth`): same flags + AES-256-GCM
+    under `AUTH_SECRET`, `maxAge` 10 days matching the token lifetime
     (`lib/mcp/auth.ts:48-104`). The cookie *is* the auth store on
     Vercel — see `01-encrypted-cookie-oauth-state.md`.
-  → OAuth 2.1 + PKCE + Dynamic Client Registration via the MCP SDK
-    (`lib/mcp/connect.ts:64-112`). DCR registers a new client per host,
-    which means preview deploys and prod each have their own client
-    registration on Bloomreach.
+  → OAuth 2.1 + PKCE + DCR (Dynamic Client Registration) via the MCP
+    SDK (`lib/mcp/connect.ts:64-112`). DCR registers a new client per
+    host, which means preview deploys and prod each have their own
+    client registration on Bloomreach.
 
 **authz (what can you do)** — the classic gap, partially closed:
 

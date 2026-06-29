@@ -101,7 +101,7 @@ If you take one thing away from this guide:
 
 > **The codebase teaches "small interface, fat body" TWICE.**
 >
-> Once at the data layer: a 73-LOC `DataSource` interface over ~730 LOC of two implementations (`BloomreachDataSource` + `SyntheticDataSource`). The agents see five methods; they never see OAuth, rate-limit retry, or synthetic dispatch.
+> Once at the data layer: a 73-LOC port (`DataSource`) over ~730 LOC of two adapters (`BloomreachDataSource` + `SyntheticDataSource`). The agents see five methods; they never see OAuth, rate-limit retry, or synthetic dispatch.
 >
 > Once at the agent layer: three ~200-LOC adapter classes (`AnthropicModelProviderAdapter`, `BloomingToolRegistryAdapter`, `BloomingTraceSinkAdapter`) over the AptKit primitive interfaces. The route handlers see Blooming's `Anomaly` / `Diagnosis` / `Recommendation` types; they never see AptKit's `ModelRequest` / `CapabilityEvent` shapes.
 >

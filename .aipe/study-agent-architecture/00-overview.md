@@ -4,7 +4,7 @@ One page. The whole system in one diagram, then the load-bearing decision behind
 
 ## Zoom out — the whole system
 
-Three layers: a Next.js UI that streams NDJSON, a route layer that owns orchestration, and an AptKit-runtime layer that owns the agent loops. The DataSource seam swaps Bloomreach for synthetic without any agent code changing.
+Three layers: a Next.js UI that streams NDJSON, a route layer that owns orchestration, and an AptKit-runtime layer that owns the agent loops. The data-source port (`DataSource`) swaps Bloomreach for synthetic without any agent code changing.
 
 ```
   blooming insights — three layers, one shape

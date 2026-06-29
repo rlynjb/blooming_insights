@@ -91,7 +91,7 @@ The two routes deliberately share this shape. One Vercel filter — `phases.phas
 
 1. **The 300s route ceiling is real and load-bearing.** Both routes emit a phase log on every request (including the failure path) so you can see how much of the budget was burned before a timeout. The 30s per-MCP-call cap (`lib/mcp/transport.ts:38`) is the first defence against a single hung call eating the whole budget.
 
-2. **`minIntervalMs = 1100` is not backpressure — it is rate-limit compliance.** Backpressure means a downstream-pressure signal slowing an upstream producer. This is a fixed proactive sleep that schedules calls just inside the upstream's penalty window. The distinction matters for the interview defense — calling this "backpressure" is wrong and a senior engineer will catch it. See `02-mcp-spacing-and-retry.md`.
+2. **The spacing gate (`minIntervalMs = 1100`) is rate-limit compliance, not backpressure.** Backpressure means a downstream-pressure signal slowing an upstream producer. This is a fixed proactive sleep that schedules calls just inside the upstream's penalty window. The distinction matters for the interview defense — calling this "backpressure" is wrong and a senior engineer will catch it. See `02-mcp-spacing-and-retry.md`.
 
 3. **The 60s response cache holds errors safely.** `BloomreachDataSource.callTool` returns BEFORE writing the cache when `isError === true` (`lib/data-source/bloomreach-data-source.ts:179`). A transient 429 cannot poison the cache; the next call hits the live server and gets a real answer. The cache is shaped as a small bug-prevention move.
 

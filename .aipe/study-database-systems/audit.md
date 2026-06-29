@@ -39,8 +39,8 @@ The verdict for the headline finding is the one you should remember: **no DB is 
   lens                                       verdict
 
   datastore selection                        not yet exercised — no DB by design
-  records / pages / storage layout           not yet exercised — Map is the only "table"
-  indexes (B-tree / hash / secondary)        not yet exercised — Map = single hash index
+  records / pages / storage layout           not yet exercised — the only "table" is a Map
+  indexes (B-tree / hash / secondary)        not yet exercised — single hash index = a Map
   query planning + execution                 not yet exercised — no SQL planner
   transactions / atomicity                   not yet exercised — no multi-row write
   isolation levels / anomalies               not yet exercised — single-process state
@@ -92,7 +92,7 @@ Findings are ordered by the *consequence* of the architectural decision, not the
 
 **The cost.** A determined retry-spammer on one session could see a flickering feed. No data corruption, no cross-user leak.
 
-**What would change the call.** A second instance serving the same session (Vercel doesn't pin sessions to instances — concurrent requests CAN land on different processes, which means the in-memory Map IS the partition: instance A and instance B simply don't see each other's writes). The current shape leans on the briefing always being a *full re-compute*, so divergence resolves itself on the next run. The day a partial-update pattern lands, we need actual concurrency control. → see `06-locks-mvcc-and-concurrency-control.md`.
+**What would change the call.** A second instance serving the same session (Vercel doesn't pin sessions to instances — concurrent requests CAN land on different processes, which means the partition boundary IS the in-memory Map: instance A and instance B simply don't see each other's writes). The current shape leans on the briefing always being a *full re-compute*, so divergence resolves itself on the next run. The day a partial-update pattern lands, we need actual concurrency control. → see `06-locks-mvcc-and-concurrency-control.md`.
 
 ---
 

@@ -32,7 +32,7 @@ The asymmetry between the two clients is the lesson:
 - **Bloomreach** is the *interesting* upstream. Alpha-grade behavior — ~1 req/s global per-user rate limit, tokens revoked after minutes, error envelopes carrying parseable retry hints. This is where partial-failure, idempotency, backpressure, and reconnect actually bite. The repo's distributed-systems vocabulary lives in `lib/data-source/bloomreach-data-source.ts:121` and `lib/mcp/transport.ts:103`.
 - **Anthropic** is the *boring* upstream. No rate limit hit at this volume; just latency variance and the per-route Vercel deadline. The 300s `maxDuration` (`app/api/agent/route.ts:22`, `app/api/briefing/route.ts:19`) is the only real concern.
 
-The synthetic data source (`lib/data-source/synthetic-data-source.ts:314`) is **not** a distributed surface — it's an in-process function call behind the same `DataSource` interface. Listed here so you don't go hunting for a wire.
+The synthetic data source (`lib/data-source/synthetic-data-source.ts:314`) is **not** a distributed surface — it's an in-process function call behind the same port (`DataSource`). Listed here so you don't go hunting for a wire.
 
 ## What this repo actually exercises
 
@@ -40,7 +40,7 @@ Ranked by how load-bearing each pattern is in the running system.
 
 ### 1. Partial failure + retry against a per-user rate-limited upstream (load-bearing)
 
-The kernel: `BloomreachDataSource.callTool` proactively spaces calls at ~1.1s (`lib/data-source/bloomreach-data-source.ts:130`), parses the server's stated penalty window from rate-limit error envelopes (`parseRetryAfterMs`, line 64), and retries up to 3 times with `Math.min(hintMs + 500, retryCeilingMs)` — capped at 20s because the route only has 300s total.
+The kernel: the rate-limit-aware MCP client (`BloomreachDataSource.callTool`) proactively spaces calls at ~1.1s (`lib/data-source/bloomreach-data-source.ts:130`), parses the server's stated penalty window from rate-limit error envelopes (`parseRetryAfterMs`, line 64), and retries up to 3 times with `Math.min(hintMs + 500, retryCeilingMs)` — capped at 20s because the route only has 300s total.
 
 Every other distributed concern in the repo orbits this one mechanic.
 

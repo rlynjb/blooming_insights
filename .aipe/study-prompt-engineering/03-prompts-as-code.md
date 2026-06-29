@@ -251,7 +251,7 @@ Anchor: *"the prompt is source code. It lives in the repo, reviews in PRs, ships
 
 **Q: "What happens when Anthropic releases a new model?"**
 
-It's a one-line PR that ships *with* whatever prompt changes are needed: `AGENT_MODEL` constant bumps in `base-legacy.ts`, prompt rules adjust in the relevant `.md`. The two ship together because they're one regression. The honest gap in this repo: I don't have an automated regression suite, so the verification is by-hand against the captured demo snapshot. The *next* version of this discipline is what concept 05 walks — an eval set the PR runs against in CI.
+It's a one-line PR that ships *with* whatever prompt changes are needed: the model-pin constant (`AGENT_MODEL`) bumps in `base-legacy.ts`, prompt rules adjust in the relevant `.md`. The two ship together because they're one regression. The honest gap in this repo: I don't have an automated regression suite, so the verification is by-hand against the captured demo snapshot. The *next* version of this discipline is what concept 05 walks — an eval set the PR runs against in CI.
 
 ```
   PR diff:                                          regression check today:

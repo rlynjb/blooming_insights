@@ -123,7 +123,7 @@ Annotation:
 
 This is the strongest concurrency-control move in the codebase — and it's not a control mechanism, it's an architectural one. The contention doesn't exist because the resource was split.
 
-#### Within one instance, the event loop IS the lock
+#### Within one instance, the lock (the Node event loop) is implicit
 
 Every state-mutating function in `lib/state/insights.ts` is synchronous. Look at `putInsights` (`lib/state/insights.ts:57-71`), `putInvestigation` (`lib/state/insights.ts:86-88`), `getInsight` (`lib/state/insights.ts:73-75`) — no `await`, no `Promise`, no `setTimeout`. Each runs as one synchronous block.
 

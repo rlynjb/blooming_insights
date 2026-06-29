@@ -207,9 +207,9 @@ const TOKEN_PATTERNS: RegExp[] = [
 ];
 ```
 
-Every captured body is run through `redactSecrets` before being stored or logged (`transport.ts:110`). TLS gets the bytes there safely; this code keeps them from leaking after arrival.
+Every captured body is run through the secret redactor (`redactSecrets`) before being stored or logged (`transport.ts:110`). TLS gets the bytes there safely; this code keeps them from leaking after arrival.
 
-Second: the `bi_auth` cookie that holds tokens at rest in the browser is AES-256-GCM encrypted in production (`lib/mcp/auth.ts:62-67`). TLS encrypts the cookie *in flight*; the encryption-at-rest is so a cookie dumped from a logged-out tab, browser extension, or memory snapshot doesn't expose tokens. Defense in depth — TLS isn't enough on its own when the secret has to be stored.
+Second: the encrypted token cookie (`bi_auth`) that holds tokens at rest in the browser is AES-256-GCM encrypted in production (`lib/mcp/auth.ts:62-67`). TLS encrypts the cookie *in flight*; the encryption-at-rest is so a cookie dumped from a logged-out tab, browser extension, or memory snapshot doesn't expose tokens. Defense in depth — TLS isn't enough on its own when the secret has to be stored.
 
 ### Move 3 — the principle
 
@@ -299,7 +299,7 @@ Anchor: standard public PKI, no custom trust.
 
 **Q: TLS encrypts the wire. What about the tokens once they arrive?**
 
-> Two protections. First, `redactSecrets` in `lib/mcp/transport.ts:55-76` runs over every captured error body before it goes to `console.error` — Bearer tokens, access tokens, refresh tokens, PKCE verifiers all get replaced with `[redacted]`. That keeps Vercel logs clean. Second, the `bi_auth` cookie that holds tokens at rest in the browser is AES-256-GCM encrypted under `AUTH_SECRET` in production (`lib/mcp/auth.ts:62`). TLS protects transit; this protects what lands.
+> Two protections. First, the secret redactor (`redactSecrets`) in `lib/mcp/transport.ts:55-76` runs over every captured error body before it goes to `console.error` — Bearer tokens, access tokens, refresh tokens, PKCE verifiers all get replaced with `[redacted]`. That keeps Vercel logs clean. Second, the encrypted token cookie (`bi_auth`) that holds tokens at rest in the browser is AES-256-GCM encrypted under `AUTH_SECRET` in production (`lib/mcp/auth.ts:62`). TLS protects transit; this protects what lands.
 
 ```
   on the whiteboard:

@@ -63,7 +63,7 @@ Every place AI shows up in blooming insights, what pattern it uses, and why.
       naive `in last 7 days` query returns 0 and produces a bogus ±100%
       swing. The prompt enforces 90d windows + a volume-check first call.
     - Bloomreach rate-limit (1 per 10s globally per user) — handled by
-      `BloomreachDataSource`'s parse-hint retry ladder.
+      the adapter's (`BloomreachDataSource`) parse-hint retry ladder.
     - Token revocation: the alpha MCP server revokes after minutes; the UI
       catches `invalid_token` errors and reloads via `useReconnectPolicy`.
 
