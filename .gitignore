@@ -56,3 +56,4 @@ next-env.d.ts
 
 # eval receipts — one JSON per run; cost + non-determinism, never committed
 /eval/receipts
+/eval/load-receipts
