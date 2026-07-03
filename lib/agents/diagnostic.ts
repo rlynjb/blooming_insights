@@ -22,6 +22,12 @@ export interface AgentHooks {
    *  rows), so callers can feed the trace into `summarizeUsage` +
    *  `estimateCost`. Optional; unset callers see identical behavior. */
   onCapabilityEvent?: (event: import('@aptkit/core').CapabilityEvent) => void;
+  /** Phase-3 per-investigation budget tracker. When set, every model turn
+   *  in the underlying AptKit agent checks the tracker BEFORE dispatching
+   *  and throws `BudgetExceededError` if the ceiling has been hit. The
+   *  same tracker can be reused across multiple agent invocations in one
+   *  investigation to share the running total. Optional. */
+  budget?: import('./budget').BudgetTracker;
   /** Cancellation signal threaded from the route's `req.signal` down through
    *  AptKit's agent loop to Anthropic and MCP. Optional — existing callers compile
    *  + pass unchanged. */
@@ -39,7 +45,14 @@ export class DiagnosticAgent {
 
   async investigate(anomaly: Anomaly, hooks: AgentHooks = {}): Promise<Diagnosis> {
     const agent = new AptKitDiagnosticInvestigationAgent({
-      model: new AnthropicModelProviderAdapter(this.anthropic, 'diagnostic', this.sessionId),
+      model: new AnthropicModelProviderAdapter(
+        this.anthropic,
+        'diagnostic',
+        this.sessionId,
+        undefined,
+        undefined,
+        hooks.budget,
+      ),
       tools: new BloomingToolRegistryAdapter(this.dataSource, this.allTools),
       workspace: this.schema,
       trace: new BloomingTraceSinkAdapter(hooks, 'diagnostic'),

@@ -13,6 +13,7 @@ import {
   type ToolRegistry,
 } from '@aptkit/core';
 import { AGENT_MODEL, type McpCaller } from './base';
+import { BudgetExceededError, type BudgetTracker } from './budget';
 import type { McpToolDef } from './tool-schemas';
 import type { AgentName, ToolCall } from '../mcp/types';
 
@@ -42,12 +43,28 @@ export class AnthropicModelProviderAdapter implements ModelProvider {
     private readonly sessionId?: string,
     model = AGENT_MODEL,
     logSite = `agents/${agent}:aptkit-model`,
+    /**
+     * Phase-3 optional per-investigation budget tracker. When set, every
+     * `complete()` call checks the tracker BEFORE dispatching and throws
+     * `BudgetExceededError` if the ceiling has already been hit. Usage
+     * from each response is fed back into the tracker so subsequent
+     * agents in the same investigation see the accumulated total.
+     */
+    private readonly budget?: BudgetTracker,
   ) {
     this.defaultModel = model;
     this.logSite = logSite;
   }
 
   async complete(request: ModelRequest): Promise<ModelResponse> {
+    // Phase-3 budget-ceiling gate: check BEFORE dispatching the API call
+    // so a runaway loop can't burn additional cost after the ceiling has
+    // already been hit. Route handler catches this and emits a graceful
+    // NDJSON `error` event.
+    if (this.budget?.exceeded()) {
+      throw new BudgetExceededError(this.budget.snapshot(), this.budget.limit);
+    }
+
     const params: Anthropic.Messages.MessageCreateParamsNonStreaming = {
       model: this.defaultModel,
       max_tokens: request.maxTokens ?? 4096,
@@ -82,6 +99,15 @@ export class AnthropicModelProviderAdapter implements ModelProvider {
       sessionId: this.sessionId,
       usage: response.usage,
     }));
+
+    // Phase-3 budget accumulation. Uses inputTokens (not cache_read tokens
+    // — those aren't exposed by aptkit's model_usage event) so the tracker
+    // is slightly conservative when caching is on: it undercounts the
+    // cache-read fraction.
+    this.budget?.add({
+      inputTokens: response.usage.input_tokens,
+      outputTokens: response.usage.output_tokens,
+    });
 
     return {
       content: response.content.flatMap(toModelContentBlock),

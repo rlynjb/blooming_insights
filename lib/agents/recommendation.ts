@@ -29,7 +29,14 @@ export class RecommendationAgent {
     hooks: AgentHooks = {},
   ): Promise<Recommendation[]> {
     const agent = new AptKitRecommendationAgent({
-      model: new AnthropicModelProviderAdapter(this.anthropic, 'recommendation', this.sessionId),
+      model: new AnthropicModelProviderAdapter(
+        this.anthropic,
+        'recommendation',
+        this.sessionId,
+        undefined,
+        undefined,
+        hooks.budget,
+      ),
       tools: new BloomingToolRegistryAdapter(this.dataSource, this.allTools),
       workspace: this.schema,
       trace: new BloomingTraceSinkAdapter(hooks, 'recommendation'),

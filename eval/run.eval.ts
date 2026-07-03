@@ -35,6 +35,7 @@ import { DiagnosticAgent } from '../lib/agents/diagnostic';
 import { RecommendationAgent } from '../lib/agents/recommendation';
 import { AnthropicModelProviderAdapter } from '../lib/agents/aptkit-adapters';
 import { estimateAnthropicCost } from '../lib/agents/pricing';
+import { BudgetExceededError, BudgetTracker } from '../lib/agents/budget';
 import {
   SyntheticDataSource,
   syntheticWorkspaceSchema,
@@ -185,6 +186,15 @@ describe('eval · Week 2C — 10 goldens · diagnosis + recommendation quality',
         `\n[case ${goldenCase.caseId}] (${goldenCase.signalClass}) investigating…`,
       );
 
+      // Per-investigation budget tracker. Shared across DiagnosticAgent
+      // + RecommendationAgent so the ceiling counts total spend, not
+      // per-agent spend. Limit sourced from BUDGET_MAX_USD env var
+      // (default 2.00 USD — very generous vs the observed ~$0.09/case,
+      // this is here as an escape valve, not a normal-path constraint).
+      const budgetLimitUsd = Number(process.env.BUDGET_MAX_USD ?? '2.0');
+      const budget = new BudgetTracker({ maxCostUsd: budgetLimitUsd });
+      let budgetError: string | undefined;
+
       // ─── diagnose ─────────────────────────────────────────────────────
       const t0Investigate = performance.now();
       const diagnosticAgent = new DiagnosticAgent(
@@ -199,6 +209,7 @@ describe('eval · Week 2C — 10 goldens · diagnosis + recommendation quality',
       const diagnosis = await diagnosticAgent.investigate(goldenCase.anomaly, {
         onToolResult: (tc) => diagnosisToolCalls.push({ ...tc }),
         onCapabilityEvent: (ev) => diagnosisTrace.push(ev),
+        budget,
       });
       const investigateMs = Math.round(performance.now() - t0Investigate);
       const diagnosisUsage = summarizeUsage(diagnosisTrace);
@@ -253,6 +264,7 @@ describe('eval · Week 2C — 10 goldens · diagnosis + recommendation quality',
         {
           onToolResult: (tc) => recommendationToolCalls.push({ ...tc }),
           onCapabilityEvent: (ev) => recommendationTrace.push(ev),
+          budget,
         },
       );
       const recommendMs = Math.round(performance.now() - t0Recommend);
@@ -362,6 +374,17 @@ describe('eval · Week 2C — 10 goldens · diagnosis + recommendation quality',
         usage: {
           diagnose: usageWithCost(diagnosisUsage, diagnosisCost),
           recommend: usageWithCost(recommendUsage, recommendCost),
+        },
+        // Phase-3 per-investigation budget snapshot. Shared tracker across
+        // diagnose + recommend, so this is the ACROSS-agents running total.
+        // budgetError is set only if the ceiling was breached mid-run
+        // (currently unreachable at BUDGET_MAX_USD=2.0 default; here as
+        // proof-of-pipe).
+        budget: {
+          limit: budget.limit,
+          snapshot: budget.snapshot(),
+          exceeded: budget.exceeded(),
+          budgetError,
         },
         diagnosis,
         diagnosisJudgment,
