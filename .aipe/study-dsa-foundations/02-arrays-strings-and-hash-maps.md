@@ -1,156 +1,112 @@
-# Arrays, Strings, and Hash Maps
+# Arrays, strings, and hash maps
 
-Array · string · hash map · set — Industry standard
+Industry names: indexed sequences, strings, hash sets, hash maps, dictionaries. Type: Industry standard.
 
-## Zoom out — where this concept lives
+## Zoom out — the heavy chapter for this repo
 
-These are the structures that show up in literally every layer of this codebase. The session feed is a hash map; the schema is an array of events; the NDJSON parser is a string buffer; the tool-coverage check is a set. **They're the substrate.** The diagram marks where the load-bearing ones sit — the session map at the service layer is the one that holds the whole multi-tenant story together.
-
-```
-  Zoom out — where the everyday primitives live
-
-  ┌─ UI (browser) ─────────────────────────────────────────────────┐
-  │  array      schema.events[], evidence[], steps[]                │
-  │  string     headline construction, summary template            │
-  │  set        new Set(ev.map(e=>e.tool))  (dedupe in card)        │
-  └────────────────────────────────────────────────────────────────┘
-                          ▼  fetch + NDJSON
-  ┌─ Service (Next API) ───────────────────────────────────────────┐
-  │  hash map   ★ state: Map<sessionId, SessionFeed> ★             │   ← we are here
-  │             cache: Map<key, {result, expiresAt}>                │
-  │             activeToolCalls: Map<toolName, ToolCall[]>          │
-  │  set        schemaCapabilities, tool-coverage server set        │
-  │  string     buffer in readNdjson, JSON.parse/stringify          │
-  └────────────────────────────────────────────────────────────────┘
-                          ▼  MCP transport
-  ┌─ Storage (Bloomreach) ─────────────────────────────────────────┐
-  │  (opaque)                                                       │
-  └────────────────────────────────────────────────────────────────┘
-```
-
-## Zoom in — the concept
-
-Three primitives, one shared property: **O(1) access by the right key.** Array is access by *index*, string is access by *position*, hash map (and set) is access by *value identity*. The choice between them is the choice of what you want to look up things by.
-
-In this codebase the answer is mostly "by string id" — session id, insight id, cache key, tool name — which is why Map is the workhorse. Array shows up when order matters or when the structure came in as JSON; string shows up at the seams where bytes become objects (NDJSON parse, JSON.stringify cache keys).
-
-## Structure pass — layers · axes · seams
-
-One axis traced: **what is the lookup key, and what does the structure cost to find by it?**
+If Blooming Insights has a single DSA superpower, it's *"put it in a Map, then look it up."* Almost every service-layer file uses `Map` or `Set` — for cache, for session state, for tool coverage, for dedup, for schema filtering. This chapter walks the six load-bearing spots and teaches the vocabulary — hash function, collision, load factor, iteration order, prototype pollution — that separates "I used a Map" from "I picked Map for a reason."
 
 ```
-  one axis — "lookup by what, costing what?"
+  Where hash-keyed structures show up
 
-  ┌─ array  ──────────────────────────────────────────────┐
-  │  lookup by index:     O(1)                              │
-  │  lookup by value:     O(n)  ← linear scan, the seam     │
-  └────────────────────────────────────────────────────────┘
-  ┌─ string ──────────────────────────────────────────────┐
-  │  lookup by position:  O(1)                              │
-  │  lookup by substring: O(n+m)  ← KMP, regex              │
-  └────────────────────────────────────────────────────────┘
-  ┌─ hash map / set ──────────────────────────────────────┐
-  │  lookup by key:       O(1) average, O(n) worst         │
-  │  lookup by value:     O(n)  ← same scan as array        │
-  └────────────────────────────────────────────────────────┘
-
-  the seam: when you find yourself scanning an array to
-  find an element by some property, that's the moment to
-  build a Map keyed on that property (one O(n) pre-pass,
-  then O(1) lookups). this codebase does this 6+ times.
+  ┌─ UI layer ──────────────────────────────────────┐
+  │  (no hash structures here — pure display)       │
+  └────────────────────┬────────────────────────────┘
+                       │
+  ┌─ Service layer ────▼────────────────────────────┐
+  │  Map<sessionId, SessionFeed>  (state/insights)  │  ← nested Maps
+  │  Set<string>  (tool-coverage cross-check)       │  ← membership
+  │  Set<string>  (filterToolSchemas)               │  ← allow-list
+  └────────────────────┬────────────────────────────┘
+                       │
+  ┌─ Transport layer ──▼────────────────────────────┐
+  │  Map<cacheKey, {result, expiresAt}>             │  ← the 60s cache
+  │  RegExp  (parseRetryAfterMs)                    │  ← string parse
+  └────────────────────┬────────────────────────────┘
+                       │
+  ┌─ Eval layer ───────▼────────────────────────────┐
+  │  Set<string>  (runId dedup from filenames)      │  ← extract-unique
+  └─────────────────────────────────────────────────┘
 ```
 
-The recurring pattern: a list arrives, the code needs to dedupe / look up / index by some field, and it spends one O(n) to build a Set or Map keyed on that field. After that, every check is O(1). The seam between "scan the array" and "build a Set first" is where you watch for whether `n` is large enough or the lookups are repeated enough to make the prep worthwhile.
+The interesting seam is the **service ↔ transport** boundary. Both sides use `Map`, but for different reasons: service Maps hold per-user session state (correctness); transport Maps hold time-bounded response cache (performance). Same primitive, different job. That's the axis worth tracing.
 
-## How it works
+## Structure pass — trace *state ownership* across layers
+
+Axis: **who owns this Map, and when does it get cleared?**
+
+- **Service Maps** (`lib/state/insights.ts:14`): outer Map keyed by sessionId; never cleared globally; inner Maps cleared *per session* on new briefing. Ownership = *user session*.
+- **Transport Map** (`lib/data-source/bloomreach-data-source.ts:122`): keyed by `${name}:${JSON.stringify(args)}`; entries expire after 60s; not cleared explicitly. Ownership = *transport instance* (per connection).
+- **Set-based membership** (`filterToolSchemas`, `crossCheckToolCoverage`): built and discarded within one function call. Ownership = *stack frame*.
+
+Seam: **between the transport Map (time-bounded) and the service Map (session-bounded).** The failure mode differs — a stale transport entry means an outdated tool result (recoverable); a bleeding service Map would leak one user's insights into another's feed (catastrophic). That's why `putInsights` at `lib/state/insights.ts:57` clears the inner Map, never the outer. Structure protects correctness.
+
+## How it works — six primitives, six real anchors
 
 ### Move 1 — the mental model
 
-A hash map (`Map`) takes a key, hashes it into a bucket index, and stores the value there. Lookups hash the same key and read the same bucket. The hash makes a value-identity lookup as fast as an index lookup — **O(1) average**, instead of the O(n) scan you'd pay walking an array looking for a matching field.
-
-You already use this every time you key a React list with `<li key={item.id}>`. The key isn't decoration — React internally builds a Map from key to fiber so it can pair the next render's items to the previous render's nodes in O(1) per item, instead of comparing every old node to every new node in O(n²).
-
-A Set is a Map without values — same bucket trick, the only question is "is this key in here?" answered in O(1).
+Hash maps are the workhorse. You already reach for them without thinking. What the chapter adds is *why* JavaScript gives you two collection types and when to pick which.
 
 ```
-  hash map — the pattern
+  The kernel: a hash map lookup
 
-  insert("session_abc", feedObj)
-       │
-       │ hash("session_abc") → bucket 47
-       ▼
-  ┌─────────────────────────────────────────────┐
-  │ bucket 0   bucket 47   bucket 99   bucket … │
-  │  ⋮         (k,v) ──    ⋮           ⋮         │
-  └─────────────────────────────────────────────┘
+  key ──► [ hash fn ] ──► bucket index
+                              │
+                              ▼
+                         ┌──────────────┐
+                         │  bucket[k]   │  ← may hold multiple entries
+                         │  = value_1   │     if collision (chaining)
+                         │  = value_2   │
+                         └──────────────┘
+                              │
+                              ▼   equality check on stored keys
+                          value
 
-  get("session_abc")
-       │
-       │ hash("session_abc") → bucket 47 → read (k,v)
-       ▼
-  O(1) — same key, same bucket, direct read
+  what makes it O(1): hash spreads keys evenly across buckets,
+                       so bucket sizes stay tiny (load factor ~ 1)
+  what breaks it     : bad hash (all → same bucket) → linear scan
 ```
 
-### Move 2 — the moving parts
+Two things can go wrong: the hash function collides all keys (unlikely with V8's implementation), or you use *the wrong container* (plain `{}` for user-controlled keys — see the `__proto__` trap below).
 
-#### the session map — multi-tenancy in one Map
+### Move 2 — the six load-bearing spots
 
-This is the load-bearing hash map in the codebase. A single warm Vercel instance serves multiple users concurrently; without a per-session sub-map, the `clear()` inside `putInsights` would wipe another user's feed mid-briefing.
+**Map for session state (`Map<string, SessionFeed>`)** — `lib/state/insights.ts:14-19`.
+
+Every warm Vercel instance can serve multiple users concurrently. Session state lives in module-level Maps keyed by sessionId, and the *inner* maps get cleared on new briefings — the *outer* map never does.
 
 ```ts
-// lib/state/insights.ts:8-23
-type SessionFeed = {
-  insights: Map<string, Insight>;
-  investigations: Map<string, Investigation>;
-  anomalies: Map<string, Anomaly>;
-};
-
+// lib/state/insights.ts:14
 const state = new Map<string, SessionFeed>();
 
-function sessionState(sessionId: string): SessionFeed {
-  let s = state.get(sessionId);
-  if (!s) {
-    s = { insights: new Map(), investigations: new Map(), anomalies: new Map() };
-    state.set(sessionId, s);
-  }
-  return s;
+// lib/state/insights.ts:57-70
+export function putInsights(sessionId: string, items: Insight[], rawAnomalies?: Anomaly[]): void {
+  const s = sessionState(sessionId);
+  s.insights.clear();     // clear ONLY this session
+  s.anomalies.clear();
+  items.forEach((i, idx) => {
+    s.insights.set(i.id, i);
+    if (rawAnomalies?.[idx]) s.anomalies.set(i.id, rawAnomalies[idx]);
+  });
 }
 ```
 
-Read it line by line:
+Load-bearing part — **`s.insights.clear()` clears the inner map, never `state.clear()`**. Drop that discipline and one user's new briefing wipes every other user's feed on the same warm instance.
 
-- **`state = new Map<string, SessionFeed>()`** — the outer hash map (`state`), keyed on session id. Lookup by session id is O(1) regardless of how many concurrent users this instance is serving.
-- **`SessionFeed`** is itself three nested Maps. Each insight is keyed by its UUID; same for investigations and the raw anomalies.
-- **`sessionState(sessionId)`** — the get-or-create pattern. If the session is new, build the three sub-maps and store them. This is the only place the outer map is written.
+Why `Map` not `{}`? Three reasons that matter here:
+- **Prototype safety.** A user-controlled sessionId of `__proto__` on a plain object would let a caller write to `Object.prototype`. Not exploitable through this codebase, but the safe default is `Map`.
+- **Iteration order.** `Map` iterates in insertion order, guaranteed. Plain objects mix insertion order and numeric-key sort order.
+- **`.size` is O(1).** On a plain object you'd need `Object.keys(o).length` — O(n).
 
-What breaks without it: if `state` were a single flat `Map<string, Insight>` shared across sessions, the `putInsights` clear (line 65) would wipe **every user's** feed. The two-level Map is the multi-tenancy primitive.
+**Map for a time-bounded cache** — `lib/data-source/bloomreach-data-source.ts:122, 144-152`.
 
-```
-  the two-level map — what each level does
-
-  outer map (state)               inner maps (SessionFeed)
-  ┌─────────────────────┐         ┌────────────────────────┐
-  │ "session_abc"       │ ──────► │ insights:       Map<…> │
-  │ "session_xyz"       │ ──────► │ investigations: Map<…> │
-  │ "session_def"       │ ──────► │ anomalies:      Map<…> │
-  └─────────────────────┘         └────────────────────────┘
-  outer NEVER cleared             inner cleared per briefing
-   (would drop a user)             (the briefing IS the feed)
-
-  one user clearing their feed has zero effect on the others
-```
-
-Bridge from what you know: this is the same shape as a React reducer with `state[userId] = {...}` — namespace the data by an identity key so mutations stay scoped. The Map is just the right primitive for that, because `string` keys are exactly what `state.get(userId)` answers in O(1).
-
-#### the response cache — Map as a TTL store
-
-The Bloomreach adapter caches every successful tool call for 60 seconds keyed on `name + args`. The Map's job: turn a one-line cache lookup into O(1) so the rate-limit retry ladder doesn't fire on repeats.
+Every Bloomreach tool result gets cached for 60 seconds by `(name, args)`:
 
 ```ts
-// lib/data-source/bloomreach-data-source.ts:122 + 144-150
+// lib/data-source/bloomreach-data-source.ts:122
 private cache = new Map<string, { result: unknown; expiresAt: number }>();
 
-// ... inside callTool:
+// lib/data-source/bloomreach-data-source.ts:144-152
 const cacheKey = `${name}:${JSON.stringify(args)}`;
 const ttl = options.cacheTtlMs ?? 60_000;
 
@@ -162,241 +118,168 @@ if (!options.skipCache) {
 }
 ```
 
-- **`cacheKey = name:JSON.stringify(args)`** — the string composition is the cheap, deterministic key. Two calls with the same name and the same args produce the same string, hence the same hash, hence the same bucket.
-- **`{result, expiresAt}`** — the value carries its own TTL. Cleanup is lazy: an expired entry is ignored on read and overwritten on the next miss.
-- **`durationMs: 0, fromCache: true`** — the cache hit short-circuits the entire rate-limit ladder. Saves seconds.
+Load-bearing part — **`JSON.stringify(args)` in the cache key**. Object identity would give false negatives (`{a:1,b:2}` and `{a:1,b:2}` are different objects); JSON is the poor-man's structural equality. It's fragile — key order matters, so `{a:1,b:2}` and `{b:2,a:1}` cache separately, and functions/undefined don't serialize. Fine for this call site (args are simple JSON) but a landmine at scale.
 
-What breaks without it: every repeat call pays the rate-limit ceiling. Under the parsed retry hint of ~10s, two agent turns asking the same EQL would block for 10s on the second one. The cache turns that into a microsecond Map lookup.
+Not shown here but worth knowing: nothing evicts entries when they expire; the Map grows monotonically until the serverless instance dies. On a single warm instance running a full day, this is a **memory leak** — small (60s TTL means each unique key lives briefly) but real. See `.aipe/study-performance-engineering/` for the fix (LRU with size cap).
 
-#### `activeToolCalls` — Map of queues, keyed on tool name
-
-When the AptKit trace sink converts `tool_call_start` / `tool_call_end` events back into Blooming's `ToolCall` shape, it needs to pair an end with its matching start. The Map indexes one queue per tool name:
+**Set for allow-list filtering** — `lib/agents/tool-schemas.ts:13-15`.
 
 ```ts
-// lib/agents/aptkit-adapters.ts:101 + 114-128
-private readonly activeToolCalls = new Map<string, ToolCall[]>();
-
-// on tool_call_start:
-const existing = this.activeToolCalls.get(event.toolName) ?? [];
-existing.push(toolCall);
-this.activeToolCalls.set(event.toolName, existing);
-
-// on tool_call_end:
-const toolCall = this.activeToolCalls.get(event.toolName)?.shift() ?? this.toBloomingToolCall(event);
+// lib/agents/tool-schemas.ts:13-15
+const set = new Set(allowed);
+return all
+  .filter((t) => set.has(t.name))
+  .map((t) => ({ name: t.name, description: t.description ?? '',
+                  input_schema: t.inputSchema as Anthropic.Messages.Tool['input_schema'] }));
 ```
 
-- the Map keys by `toolName`, so two simultaneous `execute_analytics_eql` calls don't collide with a concurrent `list_projects` call.
-- the **value is a queue (an array used FIFO)** — push at the start, shift at the end. The first start is paired with the first end of the same name — see the next file (`03-stacks-queues-deques-and-heaps.md`) for the queue discipline.
+Kernel: `new Set(allowed)` promotes an array to O(1) membership test, then `.filter` scans the tools with O(1) probes. Drop the Set and it degrades to `allowed.includes(t.name)` inside the filter — O(n·m) instead of O(n+m). Same picture as `01-complexity-and-cost-models.md`'s Move 2, told from the Set side.
 
-What breaks without it: pair a start and an end by global order across all tools, and two interleaved tool calls of different names get crossed wires (start-A, start-B, end-A pairs with B's queue head). The keyed Map keeps each tool's pairing in its own lane.
-
-#### the dedupe set — one O(n) pass for O(1) lookups
-
-The `InsightCard` builds a deduplicated list of tools that produced the insight:
+**Set for tool-name coverage** — `lib/mcp/tool-coverage.ts:39-41, 50-55`.
 
 ```ts
-// components/feed/InsightCard.tsx:89
-const tools = [...new Set(ev.map((e) => e?.tool).filter((t): t is string => !!t))];
-```
+// lib/mcp/tool-coverage.ts:39-41
+export function crossCheckToolCoverage(serverToolNames: string[]): ToolCoverageReport {
+  const server = new Set(serverToolNames);
+  const absent = (list: readonly string[]) => list.filter((n) => !server.has(n));
 
-Read right-to-left: map to extract `tool` strings, filter out nulls, **stuff into a Set to dedupe (one O(n) hash pass)**, spread back to an array for the join. The whole expression is O(n) where n is the number of evidence entries (small — usually 1-3).
+  const missing = { monitoring: absent(monitoringTools), diagnostic: absent(diagnosticTools),
+                    recommendation: absent(recommendationTools), bootstrap: absent(bootstrapTools) };
 
-The instinct here is the seam from the structure pass: any time you'd write "if I haven't seen this value before, add it" in a manual loop, a Set is the one-liner.
-
-#### the capability set — gate categories against the schema
-
-```ts
-// lib/agents/categories-legacy.ts:116-127
-export function schemaCapabilities(schema: {
-  events: { name: string; properties: string[] }[];
-  catalogs?: { name: string }[];
-}): Set<string> {
-  const set = new Set<string>();
-  for (const e of schema.events ?? []) {
-    set.add(e.name);
-    for (const p of e.properties ?? []) set.add(`${e.name}.${p}`);
-  }
-  for (const c of schema.catalogs ?? []) set.add(`catalog:${c.name}`);
-  return set;
+  const configured = new Set<string>([...monitoringTools, ...diagnosticTools,
+                                       ...recommendationTools, ...bootstrapTools]);
+  // ...
 }
 ```
 
-Each capability is a string with a discriminator prefix (`event.property`, `catalog:name`). The Set is the lookup table: `coverageFor` then asks `available.has(dep)` for each of a category's `requires` and `enriches`. That `has` is O(1); if `available` were a plain array, every `has` would scan the list — and `coverageFor` runs across 10 categories × (3-5 deps each) = ~40 checks, so the difference is real.
+Two Sets doing complementary work: `server` for "does the MCP server have this tool?" and `configured` for "does *any* agent list reference this server tool?" The two Sets meet at `unusedOnServer: serverToolNames.filter(n => !configured.has(n))`. Symmetric-difference-shaped, without needing to compute an actual symmetric difference.
 
-```
-  the gate, drawn
-
-  schema.events[] ──┐
-                    │  schemaCapabilities (one O(n) build)
-  schema.catalogs[] ┤
-                    ▼
-                  Set<string> = { "view_item", "purchase",
-                                  "purchase.total_price",
-                                  "catalog:inventory_level", … }
-                    │
-                    │  10 categories × 3-5 deps each
-                    ▼
-              coverageFor(cat, set)  →  has(dep) is O(1)
-```
-
-#### string buffers — the NDJSON kernel
-
-Strings get reached for at the network seam. The NDJSON reader holds an in-progress buffer across chunks because a JSON line can split mid-arrival:
+**Set for dedup** — `eval/report.eval.ts:204-207`.
 
 ```ts
-// lib/streaming/ndjson.ts:29-50
-const decoder = new TextDecoder();
-let buf = '';
-try {
-  while (true) {
-    if (opts?.cancelOn?.()) { await reader.cancel(); return; }
-    const { value, done } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    const lines = buf.split('\n');
-    buf = lines.pop() ?? '';
-    for (const raw of lines) {
-      const line = raw.trim();
-      if (!line) continue;
-      try { onEvent(JSON.parse(line) as E); }
-      catch (err) { opts?.onMalformed?.(line, err); }
-    }
-  }
+// eval/report.eval.ts:203-210
+const files = readdirSync(RECEIPTS_DIR).filter((f) => f.endsWith('.json'));
+const runIds = new Set<string>();
+for (const f of files) {
+  const m = f.match(/-(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d+Z)\.json$/);
+  if (m) runIds.add(m[1]);
+}
+if (runIds.size === 0) throw new Error('No receipts found');
+return [...runIds].sort().pop() as string;
 ```
 
-- **`buf += decoder.decode(...)`** — string concatenation as accumulation. Each chunk lands at the end.
-- **`buf.split('\n')`** — turn the buffer into lines. The last element is the partial line (or `''` if the chunk ended on `\n`).
-- **`buf = lines.pop() ?? ''`** — keep the partial as the new buffer; emit the complete lines as events.
+The classic *extract-unique-from-corpus* pattern. Regex pulls a timestamp out of each filename, Set eats duplicates, `.sort().pop()` picks the newest. This is the exact shape you'd write for "find the unique users who did X" — swap filenames for events and it transfers unchanged.
 
-What breaks without the partial-line keep-back: a JSON event that spans two TCP chunks gets parsed as two malformed halves. The buffer is the load-bearing part — drop it and the parser becomes wrong, not just slow.
+**Regex over strings** — `lib/data-source/bloomreach-data-source.ts:64-71`.
 
+```ts
+// lib/data-source/bloomreach-data-source.ts:64-71
+function parseRetryAfterMs(result: unknown): number | null {
+  const text = JSON.stringify((result as any)?.content ?? result);
+  const after = text.match(/retry[\s-]*after[^0-9]*(\d+)\s*second/i);
+  if (after) return parseInt(after[1], 10) * 1000;
+  const perWindow = text.match(/per\s*(\d+)\s*second/i);
+  if (perWindow) return parseInt(perWindow[1], 10) * 1000;
+  return null;
+}
 ```
-  the buffer — execution trace
 
-  chunk 1 = '{"a":1}\n{"b":2'
-  buf = '{"a":1}\n{"b":2'
-  split('\n') → ['{"a":1}', '{"b":2']
-  pop() → buf = '{"b":2'
-  emit: {"a":1}
+Two regexes with capture groups. This is the repo's clearest string-algorithm anchor — matching a pattern (`retry-after ~N second`) and extracting a numeric parameter. The interview transfer is *"parse an unstructured error string to a structured value"* — a standard shape.
 
-  chunk 2 = '}\n{"c":3}\n'
-  buf = '{"b":2}\n{"c":3}\n'
-  split('\n') → ['{"b":2}', '{"c":3}', '']
-  pop() → buf = ''
-  emit: {"b":2}, {"c":3}
-```
+Load-bearing part — **the `i` flag and the loose character-class `[^0-9]*`**. The upstream text is human-written and inconsistent; strict matching would break on the second variant.
 
 ### Move 3 — the principle
 
-Arrays answer "what's at position k?" in O(1). Strings answer "what byte is at position k?" in O(1). Hash maps answer "what value sits at this key?" in O(1) — and the key can be anything stringifiable, which is why they're the universal indirection primitive in dynamic-language code. **The art is not the data structure; it's noticing the moment your code is scanning an array to find something it could be looking up directly.** Every Map and Set in this repo is the result of that noticing.
+*Membership tests and keyed lookups are the primitives you'll reach for hundreds of times a year.* Getting the container right (Map vs `{}`, Set vs array) is a code-shape decision that costs nothing at write time and saves you correctness bugs (prototype pollution, false-negative dedup) and O(n·m) surprises at read time. The muscle memory: **user-controlled keys → Map**, **membership test → Set**, **cache with expiry → Map + timestamp value**.
 
-## Primary diagram
-
-The recap — every Map and Set in the codebase, indexed by what they answer.
+## Primary diagram — the six anchors mapped
 
 ```
-  arrays / strings / hash maps in blooming_insights
+  Six hash-keyed structures across the layers
 
-  ┌─ hash maps (Map<string, …>) ─────────────────────────────────────┐
-  │  state                       Map<sessionId, SessionFeed>          │
-  │  ├─ insights                 Map<insightId, Insight>              │
-  │  ├─ investigations           Map<insightId, Investigation>        │
-  │  └─ anomalies                Map<insightId, Anomaly>              │
-  │  cache (Bloomreach)          Map<"name:args", {result, expiresAt}>│
-  │  activeToolCalls             Map<toolName, ToolCall[]>            │
-  │  memStore (auth)             Map<sessionId, SessionAuthState>     │
-  │  mem (investigations)        Map<insightId, AgentEvent[]>         │
-  └──────────────────────────────────────────────────────────────────┘
-
-  ┌─ sets (Set<string>) ─────────────────────────────────────────────┐
-  │  schemaCapabilities          Set<"event" | "event.prop" | "cat:…"> │
-  │  filterToolSchemas allowed   Set<toolName>                         │
-  │  tool-coverage server set    Set<serverToolName>                   │
-  │  InsightCard tool dedupe     Set<toolName>                         │
-  └──────────────────────────────────────────────────────────────────┘
-
-  ┌─ arrays + strings (everywhere) ──────────────────────────────────┐
-  │  schema.events[], evidence[], steps[], hypothesesConsidered[]    │
-  │  buf in readNdjson  (string accumulator across chunks)            │
-  │  cacheKey = `${name}:${JSON.stringify(args)}` (string composition)│
-  │  Buffer.concat in auth (AES bytes, not text)                      │
-  └──────────────────────────────────────────────────────────────────┘
+  ┌─ Service layer ─────────────────────────────────────────┐
+  │                                                          │
+  │  state ── Map<sessionId, {                              │
+  │              insights:      Map<id, Insight>            │
+  │              investigations Map<id, Investigation>      │
+  │              anomalies:     Map<id, Anomaly>            │
+  │            }>                                            │
+  │                          ↑ session-owned, per-user clear │
+  │                                                          │
+  │  filterToolSchemas ── new Set(allowed) ── O(1) probe    │
+  │  crossCheckCoverage ── new Set(serverTools)             │
+  │                                                          │
+  └──────────────────────────┬──────────────────────────────┘
+                             │
+  ┌─ Transport layer ────────▼──────────────────────────────┐
+  │                                                          │
+  │  cache ── Map<`${name}:${json}`, {result, expiresAt}>   │
+  │                          ↑ time-owned, 60s TTL          │
+  │                                                          │
+  │  parseRetryAfterMs ── regex over error envelope         │
+  │                                                          │
+  └──────────────────────────┬──────────────────────────────┘
+                             │
+  ┌─ Eval layer ─────────────▼──────────────────────────────┐
+  │                                                          │
+  │  pickRunId ── new Set<string>() ── dedup filenames      │
+  │                                                          │
+  └──────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-Hash maps trace back to Luhn (1953) at IBM — the first chaining-based hash table. Modern JS `Map` is spec'd in ES2015; under the hood V8 uses a small-integer-friendly HashTable for plain objects and a tuned open-addressing variant for `Map` instances. **The practical performance difference between `Map` and a plain object** is real for hot-loop integer keys but invisible for string keys at this codebase's scale — use `Map` for the explicit key/value semantics and the size-tracking, not for speed.
+Hash tables were invented independently in ~1953 by Hans Peter Luhn at IBM. The load-factor / collision / chaining terminology comes from the compiler-writing tradition (symbol tables). Modern JavaScript's `Map` uses V8's internal hidden-class + SipHash implementation — it's *not* a linear-probing open-addressed table like Python's dict; the details matter if you ever hit degenerate cases.
 
-The string-buffer pattern in `readNdjson` is the same shape as a TCP framing parser — every line-delimited or length-prefixed protocol has this loop. Once you see it once, you see it in: SSE parsers, log tailers, IRC clients, MIME-multipart upload handlers. The trick is always "keep the partial; emit the complete; the seam is the delimiter."
+**Prototype pollution** — the reason `Map` exists — is real: CVE-2018-3721 (lodash.merge), CVE-2019-10744 (lodash.defaultsDeep). The lesson isn't "always use Map"; it's *"know which container's contract you need"*.
 
-Read next: file 03 (queues + the `activeToolCalls` pattern in depth), file 06 (where the sort comparator lives).
+For strings, learn one thing beyond regex: **Rabin-Karp fingerprinting** (rolling hashes) and **suffix arrays**. Neither appears in this repo, but they show up in interview questions constantly and both build on the hash-map intuition — a hash reduces a variable-length key to a fixed-length probe.
 
 ## Interview defense
 
-### Q: Why is `state` a Map of Maps instead of one flat Map?
+**Q: Why `Map` instead of a plain object in `lib/state/insights.ts`?**
 
-Multi-tenancy. A single warm Vercel instance serves multiple users at once. `putInsights` clears the feed on every briefing — if everyone shared one flat `Map<insightId, Insight>`, that clear would wipe another user's feed mid-stream. The two-level shape namespaces by `sessionId`: the outer Map is never cleared, the inner Maps are cleared per-session per-briefing.
-
-```
-  the bug a flat map would have
-
-  flat:  Map<insightId, Insight>
-         user A briefs → clear() → user A writes → user B's items gone
-
-  nested: Map<sessionId, {insights: Map<insightId, Insight>, …}>
-          user A briefs → sessionState("A").insights.clear() → A writes
-          user B's sessionState("B") untouched
-```
-
-The lookup is two `.get()` calls (outer then inner), both O(1), so the namespacing costs nothing.
-
-Anchor: `lib/state/insights.ts:14, 57-71`.
-
-### Q: When would you reach for a Set instead of an array?
-
-When the operation you keep doing on the data is `includes` — i.e., "is this value already in here?" — and the data is more than tiny. Set.has is O(1); array.includes is O(n). Two real examples here:
-
-- `schemaCapabilities` builds a Set once (O(events × props)) so that the coverage gate can ask `available.has(dep)` for 40+ deps cheaply. If it were an array, each `has` would scan the list.
-- `filterToolSchemas` builds a Set from the allowed-tools list to filter the full tool catalog. With ~20 tools it doesn't matter on paper, but the code makes the intent explicit: "I want a membership test, not a list."
+Answer: Three reasons. First, prototype safety — the sessionId is user-derived, and a plain object with key `__proto__` would let a caller mutate the prototype chain. Second, iteration order is guaranteed insertion-order for `Map`, whereas plain objects mix insertion and numeric-key sort order. Third, `.size` is O(1) instead of `Object.keys(o).length`'s O(n). None of them are performance sensitive here, but the safe default in TypeScript is `Map` for anything user-keyed.
 
 ```
-  the seam — when does Set beat array?
+  Why Map over {} for user-keyed state
 
-  one-shot includes:         array is fine
-  repeated includes (loop):  Set is right — pay O(n) once,
-                             save O(n) on every lookup after
+  Map:        set(k, v) O(1)  ·  clear() O(1)  ·  size O(1)  ·  no __proto__ trap
+  {}:         o[k] = v  O(1)  ·  keys().length O(n)  ·  __proto__ hazard
 ```
 
-The other reason: Set spread-then-pop is the canonical dedupe one-liner: `[...new Set(arr)]`. That's how `InsightCard` dedupes tool names.
+Anchor: `lib/state/insights.ts:14`.
 
-Anchors: `lib/agents/categories-legacy.ts:120`, `lib/agents/tool-schemas.ts:13`, `components/feed/InsightCard.tsx:89`.
+**Q: The cache Map at `lib/data-source/bloomreach-data-source.ts:122` — what breaks first at scale?**
 
-### Q: What's the load-bearing part of the NDJSON reader?
-
-The partial-line carry-over: `buf = lines.pop() ?? ''`. A TCP chunk has no relationship to a JSON line boundary — a 5KB chunk might contain 3 full JSON lines and the first 200 bytes of a fourth. The reader splits on newlines, takes the last element off (the partial), and saves it as the new `buf`. The next chunk's bytes get appended to that buffer before the next split.
+Answer: Memory. Nothing evicts entries when they expire, so the Map grows monotonically until the serverless instance dies. It's a slow leak — 60s TTLs mean each unique key contributes briefly — but at high uniqueness (random query params in cache key), memory grows unbounded. The fix is an LRU cap: cap size at N entries and evict on insert. That trades a bit of complexity for a hard memory ceiling.
 
 ```
-  the kernel, two-chunk trace
+  cache growth: current vs bounded
 
-  chunk 1: '{"a":1}\n{"b":2'
-    split('\n') → ['{"a":1}', '{"b":2']
-    pop()       → buf = '{"b":2'
-    emit:       {"a":1}
-
-  chunk 2: '}\n{"c":3}\n'
-    buf += chunk2 → '{"b":2}\n{"c":3}\n'
-    split('\n')   → ['{"b":2}', '{"c":3}', '']
-    pop()         → buf = ''
-    emit:         {"b":2}, {"c":3}
+  current:   entries = ∫ writes(t) dt  →  grows forever, TTL is display-only
+  bounded:   entries ≤ N, evict LRU on insert  →  hard ceiling
 ```
 
-Drop the pop-and-save and `{"b":2` parses as malformed in chunk 1 and `}` parses as malformed in chunk 2 — you lose the event entirely. The string buffer is the kernel; the rest is decoration.
+Anchor: `lib/data-source/bloomreach-data-source.ts:122,144-152`.
 
-Anchor: `lib/streaming/ndjson.ts:30, 39-41`.
+**Q: Talk through `filterToolSchemas` — what does the Set save you?**
+
+Answer: The pattern is "given a list of items and a whitelist of allowed names, return the whitelisted items with their schemas mapped." Without the Set, you'd do `allowed.includes(t.name)` inside the filter — O(m) per tool, so O(n·m) total. Pre-computing the Set makes membership O(1), so total cost drops to O(n + m). At this repo's scale (40 tools, 8 allowed) the difference is invisible; the shape is what protects you at any future scale.
+
+```
+  Set-then-scan cost
+
+  allowed.includes  :  O(m) × n tools  =  O(n·m)
+  new Set(allowed)  :  O(m) once
+  set.has  × n      :  O(1) × n        =  O(n)   ← total O(n + m)
+```
+
+Anchor: `lib/agents/tool-schemas.ts:13-15`.
 
 ## See also
 
-- 01-complexity-and-cost-models.md — for the O(1) / O(n) cost calculus these primitives sit inside.
-- 03-stacks-queues-deques-and-heaps.md — for `activeToolCalls`' FIFO discipline.
-- 06-sorting-searching-and-selection.md — for what to reach for when array scan stops being enough.
-- `.aipe/study-system-design/00-overview.md` — for the multi-tenant warm-instance shape the session map serves.
+- `01-complexity-and-cost-models.md` — the O(1)/O(n)/O(n·m) vocabulary this chapter cites.
+- `03-stacks-queues-deques-and-heaps.md` — the load harness's index-queue is another use of arrays as ordered containers.
+- `06-sorting-searching-and-selection.md` — `.sort().pop()` in `pickRunId`.
+- `.aipe/study-security/` — for the prototype-pollution class of bug in more depth.

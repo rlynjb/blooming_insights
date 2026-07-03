@@ -1,16 +1,34 @@
 # 03 — Retrieval and RAG
 
-This codebase has **no vector store, no embeddings, no semantic similarity, no chunking, no reranking**. The base spec's retrieval-and-RAG section walks 12 concepts; here, most come back honestly as `not yet exercised`. Two patterns are actually in the code and earn deeper walks:
+**Mostly not exercised in this codebase.** No embeddings, no vector store, no chunking. The agents query structured event/customer data via MCP tools (`execute_analytics_eql`, `list_customers`), not text over vectors.
 
-  → **`01-schema-as-retrieval.md`** — the workspace schema IS the corpus the monitoring agent retrieves from. `bootstrapSchema()` walks the Bloomreach orchestrator once and caches the shape.
-  → **`02-schema-gated-coverage.md`** — the 10-category checklist is filtered by what the workspace can actually support. The agent never gets a category it can't run.
+This sub-section is generated per spec — the concepts are in scope for the LLM-app-engineering shape, and Case B project exercises describe how RAG would be added if the product grew a corpus (past investigations, comment threads, runbook markdown).
 
-The other ten concepts (embeddings, embedding model choice, chunking, vector DBs, dense vs sparse, hybrid RRF, reranking, query rewriting/HyDE, stale embeddings, incremental indexing, RAG, GraphRAG) are honestly treated in one consolidated file:
+## Files
 
-  → **`03-rag-concepts-not-yet-exercised.md`** — names each concept, explains what it would look like here, names the gap.
+Each file is on-spec but concise. Case B exercises name the concrete add-RAG-to-this-repo move.
 
-## Reading order
+- `01-embeddings.md` — Case B
+- `02-embedding-model-choice.md` — Case B
+- `03-chunking-strategies.md` — Case B
+- `04-vector-databases.md` — Case B
+- `05-dense-vs-sparse.md` — Case B
+- `06-hybrid-retrieval-rrf.md` — Case B
+- `07-reranking.md` — Case B
+- `08-query-rewriting-hyde.md` — Case B
+- `09-stale-embeddings.md` — Case B
+- `10-incremental-indexing.md` — Case B
+- `11-rag.md` — Case B (the umbrella pattern)
+- `12-graphrag.md` — Case B
 
-1. `01-schema-as-retrieval.md` — the retrieval pattern that exists
-2. `02-schema-gated-coverage.md` — the gating pattern that sits on top of it
-3. `03-rag-concepts-not-yet-exercised.md` — the honest gap inventory
+## Where retrieval would fit in this codebase
+
+The natural corpus: **past diagnoses and their evidence**, plus **the demo snapshot's investigations**. A "similar past investigations" panel on the investigate page could pull three prior diagnoses with matching metrics/scopes as context for the current one. That's the shape of a RAG add that would earn its place.
+
+## Anchor shape
+
+LLM application engineering — RAG is in scope for the shape even when not currently exercised.
+
+## Curriculum
+
+Phase 2A/2B — concepts C2.1-C2.13.

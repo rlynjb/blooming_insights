@@ -1,136 +1,156 @@
 # Swarm / handoff
 
-**Industry standard.** Peer-to-peer control transfer, no central boss. **Not exercised** in this codebase.
+_Industry standard._
 
 ## Zoom out, then zoom in
 
-Sits as an alternative to supervisor-worker. Instead of a central coordinator dispatching to workers, agents themselves decide when to hand control to a peer specialist.
+Peer-to-peer control transfer, no central boss. Agents decide among themselves when to hand control to a specialist. This codebase rejects the swarm pattern *by design* — the supervisor is deterministic TypeScript, not an LLM voting on the next agent. This file names why supervisor-worker beats swarm for this problem and where swarm would actually be the better fit.
 
 ```
-  Zoom out — where this WOULD live
+  Zoom out — the shape blooming rejects
 
-  ┌─ Orchestration layer ───────────────────────────┐
-  │  Today: deterministic dispatch                   │
-  │  Would: ★ peer-to-peer handoff (no boss) ★      │ ← we are here
-  │  agents transfer the conversation between        │
-  │  themselves at the model's discretion            │
-  └──────────────────────────────────────────────────┘
+  ┌─ Swarm topology (NOT USED HERE) ─────────────────────────────┐
+  │                                                              │
+  │  ┌────────┐  "you take it"  ┌────────┐  "over to you"        │
+  │  │agent A │ ──────────────► │agent B │ ──────────►  agent C  │
+  │  └────────┘                 └────────┘                       │
+  │       ▲                                                      │
+  │       └──────── "back to A" ─────────────────────────────────┤
+  │                                                              │
+  │  No central log of who's running. No stateful supervisor.     │
+  │  The handoff decision lives in each agent's prompt.           │
+  └──────────────────────────────────────────────────────────────┘
 ```
+
+Zoom in: this codebase's control flow is written in `app/api/agent/route.ts`. Every worker transition is a top-level `await`, visible in one file, debuggable with a stack trace. Swarm would move those transitions inside worker prompts. That trade would buy flexibility at the cost of observability, and this repo's product surface (a streaming reasoning trace) makes observability the load-bearing property.
 
 ## Structure pass
 
-Layers: per-agent personality (each agent owns a specialty + a handoff catalog) → handoff decision (the active agent decides "this isn't my job, hand to peer X") → conversation transfer (the new agent takes over, with the prior context).
+**Layers:** agent A (initial) · handoff decision · agent B (specialist) · optional handoff back.
+**Axis:** *where does the "who runs next" decision live — code or prompt?*
+**Seam:** the handoff instruction. In swarm, it's a tool call (`handoff_to("expert-agent")`) or a special output shape. In supervisor-worker, it's a code branch.
 
-**Axis traced — "who's in control?":** the most-recently-active agent. Control flows peer-to-peer; there's no central "next agent" decision-maker.
+```
+  Where the routing decision lives
 
-**Seam:** the handoff message — a structured "I'm done here; you take over" the active agent emits, the runtime interprets, the next agent receives. OpenAI's Swarm SDK formalizes this as a structured handoff return value.
+  Swarm:                              Supervisor-worker (this repo):
+  routing lives in prompts            routing lives in route.ts
+
+  Agent A's prompt:                   route.ts:229-232:
+  "If the question is about X,        if (q && !insightId) → coordinator
+   hand off to Agent B by             else if (step === 'recommend')
+   emitting handoff('B')"                 → recommendation
+                                      else → diagnostic
+
+  cost: an LLM decision per hop       cost: 0 model calls per hop
+  observability: log the LLM output   observability: read the code
+```
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know the difference between a manager dispatching tasks and a team passing tickets between themselves. Supervisor-worker is the manager — the supervisor decides who handles each request. Swarm is the team — the first agent looks at the request, decides "this isn't mine," and tags in a peer specialist. The peer might tag back, or hand to a third peer, or finish.
+You've written React components that render conditionally based on internal state — a wizard's step component decides which sub-component to render next. That's swarm's control model: the *component itself* decides what runs next. Supervisor-worker is the opposite: a parent component decides, children just execute. Same debug question, opposite answer.
 
 ```
-  Swarm — peer handoff
+  Pattern: swarm handoff
 
-      ┌────────┐  "you take it"  ┌────────┐
-      │agent A  │ ──────────────► │agent B  │
-      └────────┘                 └───┬────┘
-           ▲                         │ "back to you"
-           └─────────────────────────┘
+     ┌────────┐  handoff("data_expert")  ┌────────────┐
+     │ Router │ ──────────────────────► │ DataExpert │
+     └────────┘                          └──────┬─────┘
+          ▲                                     │ handoff("summarizer")
+          │                                     ▼
+          │                              ┌───────────┐
+          └──── handoff("router") ────── │ Summarizer│
+                                         └───────────┘
+
+  The model itself picks the next agent, mid-loop.
 ```
 
-More flexible than supervisor-worker (no central bottleneck; agents can hand off in any topology). Harder to debug (no single point that knows the whole state) and prone to infinite handoff (A → B → A → B…) without explicit caps.
+### Move 2 — the walkthrough
 
-### Move 2 — step by step
+**Why blooming chose supervisor-worker over swarm.** Three concrete reasons, each measurable:
 
-#### Why this is rare in production
+- **Observability.** The streaming reasoning trace (`components/investigation/ReasoningTrace.tsx`) is the product's differentiator — "an analyst that shows its work." Every worker transition needs to be a clean event in the NDJSON stream. In supervisor-worker, transitions are top-level `await`s that emit `type: 'diagnosis'` or `type: 'recommendation'` events. In swarm, transitions would be model outputs interpreted as handoffs, which are harder to render as discrete phases in the stepper.
 
-Two reasons swarm is rare in shipped agent systems:
+- **Predictability.** The product has three UI phases (feed → investigate → recommend) that map 1:1 to three agents. The user's URL is the state (`/investigate/[id]/recommend`). Swarm's handoffs would decouple the topology from the URL — the model might decide to hand back and forth between diagnostic and recommendation, and the UI can't render that as a fixed three-step process.
 
-1. **Infinite handoff is easy to introduce.** A → B → A → B is the default failure mode when two agents both decide "this isn't really mine." The mitigation — a handoff counter that force-stops or escalates after N transfers — is part of the kernel, not bolt-on. OpenAI's Swarm SDK enforces this at the runtime.
-2. **Tracing is hard.** A request flows through N agents in sequence; the trace is N agent trajectories stitched together. Standard agent UIs (this repo's `StatusLog` included) show one agent's trajectory at a time; supporting "the conversation moved to agent B at turn 4" requires multi-agent trace plumbing the repo doesn't have.
+- **Cost.** Every swarm handoff is a model decision — cost per hop. Blooming's route runs 3 hops per full investigation (classify → diagnose → recommend). Swarm would add ~3 additional Sonnet-turn costs to decide "should I hand off now?" at each stage. That's a ~30% latency and cost increase for zero product benefit.
 
-The natural home is customer-support routing where the agent personalities map to support tiers — Tier 1 handles common questions, hands to Tier 2 specialist on complex ones, who hands to Tier 3 escalation when needed. The conversation feel of "specialist takes over" matches the user expectation.
+**Where swarm WOULD be the right fit.** Consider a customer-support agent (`06-orchestration-system-design-templates/02-agentic-support-system.md`) where the initial classifier can't know upfront whether to route to billing, tech, or account. A billing specialist might realize partway through that this is actually a fraud case and hand off to fraud specialists. The handoff decision is *emergent* — no upfront supervisor can enumerate the paths. That's when swarm earns its overhead. Blooming's domain isn't like that: the phases are known and the sequence is fixed.
 
-#### Why this repo wouldn't reach for swarm
+**The failure mode swarm introduces — infinite handoff.** A → B → A → B forever. Anthropic's "Building Effective Agents" (2024) names this specifically: swarms need a handoff counter or a hop budget, or they cycle indefinitely. `09-coordination-failure-modes.md` walks the mitigations. The counter has to persist across agent boundaries, which in a swarm topology means... a supervisor. That's the tension — the cure for swarm's biggest failure mode is exactly the thing swarm was designed to eliminate.
 
-The handoffs in this repo are deterministic (`monitoring → diagnose → recommend`) and known in advance. The user (not the model) drives transitions by clicking "see recommendations." There's no model decision about *which* agent to hand to next. Swarm would add the flexibility of model-driven transitions for a system whose transitions are deterministic; that's a feature mismatched to the domain.
+```
+  Layers-and-hops — the observability gap swarm creates
 
-A hypothetical use case where swarm would land: the QueryBox grows beyond "general query about your workspace" into specialty roles — "ask the campaign expert," "ask the segmentation expert," "ask the experimentation expert" — and each expert is a different agent with a different tool allowlist and a different conversational tone. Then peer handoff between the experts (and back to a triage agent) starts to make sense. But the design constraint that pushes this — wanting persistent agent personalities the user can address by role — isn't in this product's design.
-
-#### The infinite-handoff failure mode
-
-Worth detailing because it's the canonical swarm bug. Three pieces have to land for swarm to work safely:
-
-1. **Per-agent handoff catalog.** Each agent has a fixed list of peers it can hand to. Not "any agent in the swarm" — that's how cycles form.
-2. **Handoff counter.** The runtime tracks total handoffs in one conversation. Cap at N (typical: 5-8). When the cap fires, the runtime forces a final synthesis or escalates to human.
-3. **Forbidden return handoffs.** Sometimes the cleanest rule is "A can hand to B; B cannot hand back to A in the same conversation." Asymmetric handoff catalogs prevent the most common cycle.
-
-This repo would have all three for free if it adopted swarm, because the four agents have natural specialty boundaries that lend themselves to asymmetric catalogs. But adoption isn't on the roadmap.
+  Supervisor-worker (this repo):        Swarm (rejected):
+  ┌─ route.ts ──────────┐               ┌─ AgentA ────────────┐
+  │  await AgentA()     │               │  loop, then output  │
+  │  send('diagnosis')  │               │  "handoff('B')"     │
+  │  await AgentB()     │               └────────┬────────────┘
+  │  send('recommend')  │                        │
+  └─────────────────────┘                        ▼
+                                        ┌─ AgentB ────────────┐
+                                        │  reads handoff, runs│
+                                        │  loop, may hand back│
+                                        └─────────────────────┘
+                                          ↑
+                                  Where does the UI render the transition?
+                                  Where does the trace log which agent ran?
+```
 
 ### Move 3 — the principle
 
-**Swarm earns its complexity when the user benefits from talking to specialty agents with persistent personalities AND the dispatch decision is genuinely the agent's, not the engineer's.** Neither condition is true in this repo's design. Most agent systems should not reach for swarm — supervisor-worker covers the same dispatch surface with a cleaner trace and a single point of synthesis.
+Swarm is right when the routing decisions are emergent and cheap to be wrong about. Supervisor-worker is right when the routing is knowable upfront and observability matters. Blooming's product surface — streaming reasoning to a user watching phase-by-phase progress — makes observability the load-bearing property, so supervisor-worker wins by construction. The interview-grade version of this answer names the tradeoff (flexibility vs traceability) and lands the choice on the *product* consequence, not on preference.
 
 ## Primary diagram
 
 ```
-  Swarm topology (hypothetical, not in this repo)
+  Recap — swarm vs supervisor-worker, and why this repo picked one
 
-  ┌─ user query ─────────────────────────────────────────────────┐
-  │                                                                │
-  │   ┌─ Triage Agent ─────────────────────────────────────────┐ │
-  │   │   handoff_catalog: [CampaignExpert, SegmentationExpert, │ │
-  │   │                     ExperimentationExpert]               │ │
-  │   │   decides: "this is about a campaign perf drop"          │ │
-  │   │   emits: handoff(CampaignExpert)                         │ │
-  │   └────────────────────────┬─────────────────────────────────┘ │
-  │                            ▼                                    │
-  │   ┌─ CampaignExpert ─────────────────────────────────────────┐ │
-  │   │   handoff_catalog: [SegmentationExpert, Triage]          │ │
-  │   │   investigates campaign data                              │ │
-  │   │   discovers segment-specific issue                        │ │
-  │   │   emits: handoff(SegmentationExpert)                     │ │
-  │   └────────────────────────┬─────────────────────────────────┘ │
-  │                            ▼                                    │
-  │   ┌─ SegmentationExpert ─────────────────────────────────────┐ │
-  │   │   handoff_catalog: [CampaignExpert] (asymmetric — can't  │ │
-  │   │                     hand back to Triage to prevent cycle) │ │
-  │   │   investigates segment data                               │ │
-  │   │   finds answer; emits final text (no handoff)             │ │
-  │   └──────────────────────────────────────────────────────────┘ │
-  │                                                                  │
-  │   Runtime enforces: handoff counter <= 5                         │
-  │                     forbidden return handoffs respected           │
-  └────────────────────────────────────────────────────────────────┘
+  Swarm (rejected):                    Supervisor-worker (this repo):
+  ┌──────────────────────────┐        ┌──────────────────────────┐
+  │ agent decides next agent │        │ route.ts decides         │
+  │ via handoff tool          │        │ via TypeScript branch    │
+  │                           │        │                          │
+  │ + flexible               │        │ + observable             │
+  │ + emergent routes         │        │ + cheap                  │
+  │ - hard to log             │        │ + debuggable             │
+  │ - hop cost is per-model   │        │ - inflexible if routes   │
+  │ - infinite handoff risk   │        │   change per request     │
+  └──────────────────────────┘        └──────────────────────────┘
+
+  Blooming picks supervisor-worker because the product surface
+  (streaming trace, three-phase UI, URL-as-state) needs observability
+  more than it needs runtime flexibility.
 ```
 
 ## Elaborate
 
-OpenAI's Swarm SDK (released October 2024 as an experimental pattern) is the canonical formalization of this topology. The SDK shapes handoffs as structured return values — an agent's response can include a `handoff` field that the runtime interprets as "transfer the conversation to agent X." The receiving agent gets the conversation history plus its own system prompt + tool allowlist. The runtime tracks the handoff count and enforces an upper bound.
+Swarm as a formal topology was popularized by OpenAI's `swarm` reference implementation (2024) — a research demo showing minimal agent-to-agent handoffs. It's an elegant pattern for problems with *unpredictable routing* (customer support with unknown escalation paths, research agents that don't know what specialists to call until they've explored). It's the wrong pattern for problems with *predictable routing* (a fixed three-phase workflow).
 
-The Anthropic SDK doesn't have a built-in swarm primitive, but you can express the same pattern by wrapping `runAgentLoop` calls — the active agent returns a structured intent, the wrapper inspects it for handoff, dispatches to the next agent's loop. That's exactly the indirection a SDK would add automatically.
+Anthropic's "Building Effective Agents" (2024) is more skeptical: they explicitly recommend deterministic supervisor + task-specialist workers as the default, with swarm reserved for cases where the specialist set genuinely can't be enumerated. Blooming inherits that posture — the three phases are known, the specialists are known, no case for swarm.
 
-Production swarm deployments tend to converge on 3-5 agents with tight specialty boundaries and asymmetric handoff catalogs. Beyond ~5 agents the coordination surface (which agent can hand to which?) becomes unmanageable; the cycle-prevention rules become a coordination subproblem of their own. Most teams that try larger swarms either collapse back to supervisor-worker or shard the swarm into independent sub-swarms each handling a domain.
+The one place blooming has an LLM-driven routing decision is `classifyIntent` (see `01-reasoning-patterns/07-routing.md`). That's a *scoped* LLM route inside a deterministic supervisor: the LLM picks the intent, then the supervisor deterministically dispatches based on it. That's the "cascade" pattern Anthropic recommends — code where predictable, LLM at the specific sub-decision where flexibility matters.
 
 ## Interview defense
 
-> **Q: Would swarm make sense for this codebase?**
->
-> No. The handoffs in this repo are deterministic — `monitoring → diagnose → recommend` is a fixed pipeline driven by the user clicking "see recommendations." There's no model decision about which agent handles a request; the orchestration code dispatches. Swarm's value is *model-driven* peer handoff when the user benefits from specialty personalities. This product's user experience is "an analyst that shows its work," not "talk to the campaign expert vs the segmentation expert" — there's no specialty role surface in the UI. Swarm would add coordination complexity for no UX win.
+**Q: Why not swarm handoff for this system?**
+A: Three reasons. Observability first — the product's differentiator is a streaming reasoning trace with a three-phase UI, and supervisor-worker makes each phase transition a clean event in the NDJSON stream. Swarm would push those transitions inside worker prompts, harder to render as discrete phases. Cost second — every swarm handoff is a model decision, adding ~30% latency and cost for a workflow whose routing is already known upfront. Predictability third — the three phases map 1:1 to URL routes, and swarm's flexible routing would decouple the topology from the URL, breaking the back/forward navigation model. Swarm would be the right choice for a customer-support agent where escalation paths are emergent; it's the wrong choice here because the sequence is fixed.
 
-> **Q: When would swarm make sense?**
->
-> When the user benefits from agent specialty personalities and the dispatch is genuinely runtime-decided. Customer support is the canonical example: Tier 1 handles common questions, hands to Tier 2 on complex ones, who hands to Tier 3 on escalation. The user experiences distinct conversational tone shifts as specialists take over. The handoff decision is model-driven because the question complexity isn't enumerable in code. For analytical agent systems like this one, the same flexibility is overhead.
+Diagram: the two topologies side-by-side, with a callout on observability as the load-bearing property.
+Anchor: `app/api/agent/route.ts` (the deterministic supervisor) vs the hypothetical swarm.
 
-> **Q: What's the infinite-handoff failure mode?**
->
-> The default failure when two agents both decide "this isn't really mine." Agent A hands to B; B hands back to A; A hands to B again. The conversation never terminates because the handoff IS the termination signal. The fix is part of the kernel: (1) per-agent fixed handoff catalogs so A can only hand to a limited set, (2) a global handoff counter the runtime caps at N transfers, (3) asymmetric catalogs that explicitly forbid common return cycles. OpenAI's Swarm SDK enforces all three; a hand-rolled swarm needs to do the same. The general pattern is the multi-agent version of the budget exit from the single-agent loop skeleton.
+**Q: What's the failure mode swarm introduces that supervisor-worker doesn't have?**
+A: Infinite handoff — A → B → A → B forever. Swarms need a hop counter or a budget that persists across agent boundaries, and the natural place to put that counter is... a supervisor. Which is the thing swarm was designed to eliminate. That tension is the load-bearing critique: cure for swarm's biggest failure mode looks a lot like supervisor-worker. Supervisor-worker doesn't have this mode because the supervisor is the single control point — no cycles unless the supervisor writes them.
+
+Diagram: the A→B→A→B cycle and the missing hop counter.
+Anchor: `09-coordination-failure-modes.md` for the counter pattern.
 
 ## See also
 
-- → `02-supervisor-worker.md` — the centralized alternative to swarm
-- → `09-coordination-failure-modes.md` — infinite handoff and its mitigation
-- → `01-when-not-to-go-multi-agent.md` — the gate that should reject swarm for this repo's domain
+- `02-supervisor-worker.md` — the shape this repo actually uses.
+- `07-graph-orchestration.md` — the alternative for cases where the topology needs to be flexible AND observable.
+- `09-coordination-failure-modes.md` — infinite handoff and its mitigation.
+- `06-orchestration-system-design-templates/02-agentic-support-system.md` — where swarm would fit.

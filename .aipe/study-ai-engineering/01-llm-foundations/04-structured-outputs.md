@@ -1,87 +1,77 @@
-# Structured outputs
+# 04 — Structured outputs
 
-*Industry standard — tool calling as the structured-output mechanism*
+**Type:** Industry standard. Also called: tool calling with schema, JSON mode, function calling.
 
-## Zoom out — where this concept lives
+## Zoom out, then zoom in
 
-When you want the model to return typed data, not free prose, you have two options: ask for JSON in the prompt and hope, or give the model a tool schema and let the SDK enforce it. This codebase takes option 2 — every "structured output" is technically a `tool_use` content block, and the schema is the typed contract.
+The typed boundary between the LLM and the rest of the system. In this repo, the tool_use schema is the ONLY way the model produces actionable output — no free-form JSON parsing, no regex-scraping the assistant text.
 
 ```
-  Zoom out — structured output as a tool-use block
+  Zoom out — where the typed boundary sits
 
-  ┌─ Agent layer ────────────────────────────────┐
-  │  needs typed output:                          │
-  │  Anomaly[], Diagnosis, Recommendation[]       │
-  └────────────────────┬─────────────────────────┘
-                       │  build ModelRequest with tools[]
-                       ▼
-  ┌─ ★ Adapter sets tools on the request ★ ──────┐ ← we are here
-  │  toAnthropicTool(tool) at aptkit-adapters:78 │
-  │  passes name + description + inputSchema      │
-  └────────────────────┬─────────────────────────┘
-                       │
-                       ▼
-  ┌─ Anthropic API ──────────────────────────────┐
-  │  model constrained to emit either text OR a   │
-  │  tool_use block matching one of the schemas   │
-  └──────────────────────────────────────────────┘
+  ┌─ TypeScript world (Anomaly / Diagnosis / Recommendation) ─────────┐
+  │   lib/mcp/types.ts — the domain contracts                          │
+  └─────────────────────────────┬─────────────────────────────────────┘
+                                │  same types
+  ┌─ Agent layer ───────────────▼─────────────────────────────────────┐
+  │   AptKit agents return typed values                                │
+  │   ★ THIS CONCEPT ★ — the schema at the model boundary              │
+  └─────────────────────────────┬─────────────────────────────────────┘
+                                │  tool_use / tool_result blocks
+  ┌─ Anthropic API ─────────────▼─────────────────────────────────────┐
+  │   messages.create({tools: [{name, description, input_schema}]})    │
+  └───────────────────────────────────────────────────────────────────┘
 ```
 
-**Zoom in.** No JSON-mode, no Zod schema at the LLM boundary. The structured-output contract IS the tool schema. Every `Anomaly`, `Diagnosis`, `Recommendation` in this codebase comes out as a `tool_use` block — typed, validated, parsed.
+Zoom in. The model's output that matters is one of two shapes: `text` (free-form; feeds `onText` → `reasoning_step` events → the UI) or `tool_use` (structured; the input matches a JSON Schema you registered as a tool). AptKit's agents use tool_use as the mechanism for the model to say "I've reached my conclusion, here's the final `Diagnosis` in this schema." Not free-form JSON. Not "please output as JSON, thanks." An actual `tool_use` block against a schema.
 
-## Structure pass — layers · axes · seams
+## Structure pass
 
-**Layers:** TypeScript type → MCP tool inputSchema (JSON Schema) → Anthropic tools[] → model output (`tool_use` block) → parsed back to typed object.
+**Layers:**
+- Outer: TypeScript types (`Anomaly`, `Diagnosis`, `Recommendation`) — what the app renders
+- Middle: JSON Schema — what the model is constrained to
+- Inner: `tool_use.input` — the raw block the model emits
 
-**Axis: where does the type contract live?** TypeScript: at compile time, on your side. JSON Schema: at runtime, in the tool definition. The boundary is `lib/agents/aptkit-adapters.ts:78` — the conversion that hands a JSON-schema-typed tool to the SDK.
+**Axis: what enforces the shape?**
+- Outer: TypeScript at compile time — types can lie about runtime data
+- Middle: the Anthropic server refuses to emit `tool_use` blocks whose input doesn't validate against the schema
+- Inner: post-processing / validation code as a safety net for shapes that pass the schema but violate business rules
 
-**Seam:** the `inputSchema` field on the tool definition. That's where your TypeScript types become runtime constraints the model is held to.
+**Seam:** the tool definition passed to `messages.create()`. `input_schema` is the contract. Everything above the seam speaks TypeScript; everything below speaks JSON Schema.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know how a TypeScript function signature constrains what the caller can pass? A tool schema is the same idea, applied at the LLM boundary. The model is the "caller"; the schema is the signature; the parser is the runtime guard.
+You've defined a form component with an input type — `<input type="email">`. The browser rejects `"foo"` before it ever reaches your handler. Structured outputs are that, at the LLM boundary: instead of the model returning `"here's my diagnosis: { \"conclusion\": ... }"` as a string you'd have to parse and validate, it returns a `tool_use` block whose `input` is guaranteed by the API to match the schema you registered.
 
 ```
-  Tool calling as a typed function call across a boundary
+  Structured output as a typed boundary
 
-  ┌─ Your TypeScript ─────────────────────────────┐
-  │  type Anomaly = {                             │
-  │    metric: string;                            │
-  │    scope: string[];                           │
-  │    change: { value, direction, baseline };    │
-  │    severity: 'critical'|'warning'|'info'|...; │
-  │  };                                           │
-  └────────────────────┬──────────────────────────┘
-                       │  expressed as JSON Schema
-                       ▼
-  ┌─ Tool schema ─────────────────────────────────┐
-  │  { name: 'emit_anomaly',                      │
-  │    description: '...',                        │
-  │    input_schema: {                            │
-  │      type: 'object',                          │
-  │      properties: { metric, scope, change, ...} │
-  │    } }                                        │
-  └────────────────────┬──────────────────────────┘
-                       │  passed to model as tools[]
-                       ▼
-  ┌─ Model output ────────────────────────────────┐
-  │  { type: 'tool_use', name: 'emit_anomaly',   │
-  │    input: { metric: 'conversion_rate', ... } }│
-  │  ← input is constrained to match the schema │
-  └───────────────────────────────────────────────┘
+  ┌───────────────────────┐    tool_use.input matching   ┌──────────────┐
+  │  schema (JSON Schema) │ ◄──── the input_schema ───►  │  the model   │
+  └───────────┬───────────┘                              └──────┬───────┘
+              │                                                  │
+              │                                                  ▼
+              │                             {type: 'tool_use',
+              │                              name: 'submitDiagnosis',
+              │                              input: {conclusion: '...',
+              │                                      evidence: [...],
+              │                                      ...}}
+              │                                                  │
+              ▼                                                  │
+  TypeScript type (Diagnosis) ◄─── typed value on your side ─────┘
+  (declared in lib/mcp/types.ts)     (no runtime parsing needed)
 ```
 
-### Move 2 — the step-by-step walkthrough
+### Move 2 — walk the mechanism
 
-**Part 1 — tool schemas come from MCP, not from this app.**
+**Where tools are defined for the model.**
 
-This is unusual but load-bearing: the agents don't define their own tool schemas. They get them from the Bloomreach MCP server via `dataSource.listTools()` at `app/api/agent/route.ts:243-247`. So the entire tool surface — `execute_analytics_eql`, `list_funnels`, `get_event_segmentation`, etc. — is defined upstream.
-
-From `lib/agents/aptkit-adapters.ts:78-84`:
+`lib/agents/aptkit-adapters.ts:233-239` — the `toAnthropicTool` helper — is the point where AptKit's `ModelTool` shape becomes Anthropic's `Tool`. `input_schema` passes straight through.
 
 ```typescript
+// lib/agents/aptkit-adapters.ts:233-239
 function toAnthropicTool(tool: ModelTool): Anthropic.Messages.Tool {
   return {
     name: tool.name,
@@ -91,116 +81,122 @@ function toAnthropicTool(tool: ModelTool): Anthropic.Messages.Tool {
 }
 ```
 
-Three fields. The `input_schema` is plain JSON Schema. Anthropic validates the model's output against it.
+The tools list has two categories in this codebase:
+1. **Data tools** — the MCP tools (`execute_analytics_eql`, `list_customers`, etc.) that fetch information from the workspace. Registered via `BloomingToolRegistryAdapter.listTools()`.
+2. **Structured-output tools** — internal to AptKit's agent contracts. `DiagnosticInvestigationAgent` and `RecommendationAgent` register a "submit conclusion" tool that the model calls to signal done + return the typed result. The AptKit runtime intercepts that tool call, extracts the `input`, and returns it as the typed `Diagnosis` / `Recommendation[]`.
 
-**Part 2 — agent allowlists narrow the surface.**
-
-Each agent only gets a subset of the MCP server's tools (`lib/mcp/tools.ts`). Monitoring gets 13, diagnostic gets 17, recommendation gets 7. The filtering happens at `lib/agents/tool-schemas.ts:9-21`:
+**The contract lives in `lib/mcp/types.ts`.**
 
 ```typescript
-export function filterToolSchemas(
-  all: McpToolDef[],
-  allowed: readonly string[],
-): Anthropic.Messages.Tool[] {
-  const set = new Set(allowed);
-  return all
-    .filter((t) => set.has(t.name))
-    .map((t) => ({
-      name: t.name,
-      description: t.description ?? '',
-      input_schema: t.inputSchema as Anthropic.Messages.Tool['input_schema'],
-    }));
+// lib/mcp/types.ts (shape reference; not copied verbatim)
+export interface Diagnosis {
+  conclusion: string;
+  evidence: Array<{ tool: string; result: unknown }>;
+  hypothesesConsidered: Array<{
+    hypothesis: string;
+    supported: boolean;
+    reasoning: string;
+  }>;
+  affectedCustomers?: number;
+  confidence?: 'high' | 'medium' | 'low';
 }
 ```
 
-This is structural prompt-injection defense: the model literally cannot emit a tool name outside its agent's allowlist. The recommendation agent has no way to call `execute_analytics_eql` — it's not in its tool list.
+`Recommendation` is bigger — `id`, `title`, `rationale`, `bloomreachFeature: 'scenario' | 'segment' | 'campaign' | 'voucher' | 'experiment'`, `steps[]`, `estimatedImpact`, `confidence`. The union on `bloomreachFeature` is what "structured output" buys you at the domain layer: the UI's `RecommendationCard` can `switch` on that literal type and render the right feature chip.
 
-**Part 3 — the agent's structured output is what AptKit reduces from the tool calls.**
+**What the schema enforces.**
 
-Here's the subtle part: when `MonitoringAgent.scan()` returns `Anomaly[]`, it's not because the model emitted an `Anomaly[]` directly. It's because AptKit's `AnomalyMonitoringAgent` runs the tool-call loop, collects the results, and synthesizes the typed `MonitoringAnomaly[]` from the accumulated evidence. The boundary at `lib/agents/monitoring.ts:88` then maps `MonitoringAnomaly → Anomaly`:
+Only the shape — required fields present, types correct, unions in the allowed set. It doesn't enforce that the diagnosis is *right*. It doesn't enforce that the evidence traces to real tool results (that's the eval rubric's `evidence_grounding` dim). But it does mean you never have to write `try { JSON.parse(response.text) } catch { ... }` — the JSON parse errors that plague hand-rolled LLM output disappear at the boundary.
 
-```typescript
-return (await agent.scan({ signal: hooks?.signal })).map(toBloomingAnomaly);
-```
+**The one place raw text still leaks through.**
 
-The structured output you see at the agent boundary is the *result* of many tool-use blocks, parsed and reduced. The schema-enforcement happens at the per-tool level inside the loop.
+The retired system prompts in `lib/agents/legacy-prompts/*.md` (e.g. `legacy-prompts/diagnostic.md`) had the model return a ```json fenced block that the old `DiagnosticAgent` regex-extracted. That approach IS the "before" picture. The current runtime uses AptKit's schema-based agents and doesn't do this anymore.
 
 ### Move 3 — the principle
 
-**The schema is the contract; the loop reduces tool-use blocks into the agent's output type.** This is a different shape from "ask the model for JSON" — it's typed at the call level, not the response level. The tradeoff: you can't get arbitrary structured outputs without defining a tool for them. Worth it because tool schemas are already on the wire (MCP).
+Types at the boundary or types nowhere. Structured outputs let you have one shape end-to-end: TypeScript `Diagnosis` on the app side, JSON Schema `input_schema` at the model boundary, typed `input` block in the tool_use. Removing the raw-JSON-parse step doesn't just save a few lines — it removes an entire class of failure (malformed JSON, missing field, wrong type) from your production surface.
 
-## Primary diagram — the full recap
+## Primary diagram
+
+The typed boundary in full — one shape, three representations.
 
 ```
-  Structured outputs end to end
+  Structured output — one shape, three views
 
-  ┌─ MCP server (Bloomreach) ──────────────────────────────────┐
-  │  defines tools with JSON Schema input_schema               │
-  │  example: { name: 'execute_analytics_eql',                 │
-  │             input_schema: { type:'object', properties:{    │
-  │               project_id, eql, execution_time              │
-  │             }, required: ['project_id', 'eql']             │
-  │          } }                                               │
-  └────────────────────┬───────────────────────────────────────┘
-                       │  listTools() at session start
-                       ▼
-  ┌─ Agent allowlist filter (tool-schemas.ts:9) ───────────────┐
-  │  narrow to this agent's allowed tools                      │
-  └────────────────────┬───────────────────────────────────────┘
-                       │  pass tools[] to model
-                       ▼
-  ┌─ Model — constrained to schema ────────────────────────────┐
-  │  emits tool_use blocks with input matching schema          │
-  │  { type:'tool_use', name:'execute_analytics_eql',          │
-  │    input:{ project_id:'…', eql:'select count event…' } }   │
-  └────────────────────┬───────────────────────────────────────┘
-                       │  AptKit loop executes the tool, feeds result
-                       ▼
-  ┌─ Agent boundary — typed return ────────────────────────────┐
-  │  AnomalyMonitoringAgent.scan() → MonitoringAnomaly[]       │
-  │  toBloomingAnomaly() → Anomaly[]                           │
-  │  (the structured output the route layer emits)             │
-  └────────────────────────────────────────────────────────────┘
+  ┌─ app / UI layer ──────────────────────────────────────────────────┐
+  │  interface Diagnosis {                                             │
+  │    conclusion: string;                                             │
+  │    evidence: Array<{tool: string; result: unknown}>;               │
+  │    hypothesesConsidered: Array<{                                   │
+  │      hypothesis: string; supported: boolean; reasoning: string;    │
+  │    }>;                                                             │
+  │    affectedCustomers?: number;                                     │
+  │  }                                                                 │
+  └────────────────────────────┬──────────────────────────────────────┘
+                               │  (same shape, at build time)
+  ┌─ agent contract (AptKit) ──▼──────────────────────────────────────┐
+  │  tool: {                                                           │
+  │    name: 'submitDiagnosis',                                        │
+  │    input_schema: {                                                 │
+  │      type: 'object',                                               │
+  │      required: ['conclusion', 'evidence', 'hypothesesConsidered'], │
+  │      properties: {                                                 │
+  │        conclusion: {type: 'string'},                               │
+  │        evidence: {type: 'array', items: {...}},                    │
+  │        ...                                                         │
+  │      }                                                             │
+  │    }                                                               │
+  │  }                                                                 │
+  └────────────────────────────┬──────────────────────────────────────┘
+                               │  (server-enforced at request time)
+  ┌─ model output ─────────────▼──────────────────────────────────────┐
+  │  {                                                                 │
+  │    type: 'tool_use',                                               │
+  │    name: 'submitDiagnosis',                                        │
+  │    input: {                                                        │
+  │      conclusion: 'Payment processor timeout on credit_card mobile',│
+  │      evidence: [...],                                              │
+  │      hypothesesConsidered: [...],                                  │
+  │      affectedCustomers: 9340                                       │
+  │    }                                                               │
+  │  }                                                                 │
+  └───────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-**Why this codebase doesn't use JSON mode or Zod.** Two reasons:
+Structured outputs came in three waves. First there was "output JSON please" (regex-parsing prose responses; fragile). Then JSON mode (`response_format: {type: 'json_object'}`) — server-side enforces JSON is *valid* but not shape. Then tool calling / function calling (both OpenAI and Anthropic converged on the same shape) — server enforces the JSON Schema. That third wave is what this codebase uses through AptKit's agent contracts.
 
-  1. **The tool surface is already typed.** MCP tools come with JSON Schema definitions. Wrapping them in an additional Zod layer would duplicate the contract.
-  2. **The agents produce reduced outputs, not raw model outputs.** `Anomaly[]` is the *result* of running the loop, not the model's direct response. The schema enforcement that matters is at the per-tool-call level, not the per-agent-return level.
-
-**The tradeoff named.** If you ever need an agent to return something that isn't reducible from MCP tool calls (e.g. a freeform poem), this pattern doesn't help. You'd need to introduce a synthetic "emit_response" tool with a schema matching your typed output and have the model call it as the last step. The recommendation agent comes closest to this pattern: it eventually calls a synthesis step that emits `Recommendation[]` as structured output.
-
-**Where the type story is weakest.** The cast at `lib/agents/aptkit-adapters.ts:82` — `tool.inputSchema as Anthropic.Messages.Tool['input_schema']` — is unchecked. If the MCP server ever ships a tool with an invalid JSON Schema, the SDK will accept it and the model will be free to emit invalid `tool_use` blocks. There's no runtime validation step here.
+There's a fourth wave underway — thinking blocks and reasoning models with structured internal state — but Sonnet 4.6 without extended thinking behaves like the "tool calling" wave, which is where this repo sits.
 
 ## Project exercises
 
-### Exercise — Add Zod validation at the tool-call result boundary
+### Exercise — versioned schemas + migration path
 
-  → **Exercise ID:** B1.4
-  → **What to build:** Define Zod schemas for the four most-used Bloomreach tool result envelopes (`execute_analytics_eql` result, `get_event_schema`, `list_funnels`, `get_funnel`). Wrap `BloomingToolRegistryAdapter.callTool()` to parse the result through the Zod schema if one matches, log a warning when validation fails, and pass the typed result through.
-  → **Why it earns its place:** the cast at `aptkit-adapters.ts:82` is the weakest point in the type story. The model is constrained by schema on the way *in*, but tool *results* coming back from MCP are typed as `unknown` and passed back to the model verbatim. Zod parsing at the boundary catches silent schema drift from the server.
-  → **Files to touch:** new file `lib/data-source/result-schemas.ts` (Zod schemas), `lib/agents/aptkit-adapters.ts` (wrap `callTool`'s return), `test/data-source/result-schemas.test.ts` (cover the four envelope shapes), `test/agents/aptkit-adapters.test.ts` (assert validation warnings + passthrough behavior).
-  → **Done when:** running the synthetic data source through the full agent loop produces zero validation warnings, and an artificially-broken envelope (test fixture) raises a warning without breaking the loop.
-  → **Estimated effort:** 1–2 days.
+- **Exercise ID:** C1.4-A · Case A (concept exercised).
+- **What to build:** `Diagnosis` and `Recommendation` are shipped types read from committed demo snapshots (`lib/state/demo-*.json`). Add a `schemaVersion` field to both types, gate `unwrap`/reader helpers to accept v1 (missing field) and v2 (present); write a small migration test to prove backward-compatibility. This locks the contract so a future field rename doesn't invalidate every committed snapshot.
+- **Why it earns its place:** proves you can extend a schema at the LLM boundary without breaking committed demo data. Interviewer signal: "the boundary is typed, and I've thought about how it evolves."
+- **Files to touch:** `lib/mcp/types.ts` (add `schemaVersion`), `lib/mcp/validate.ts` (accept both versions), `lib/agents/diagnostic.ts` (populate on write), `__tests__/validate.test.ts` (add migration test).
+- **Done when:** existing committed snapshots continue to load; new investigations write `schemaVersion: 2`; a test proves both parse.
+- **Estimated effort:** 1-2 days.
 
 ## Interview defense
 
-**Q: "How do you get structured output from your agents?"**
+**Q: Why not just prompt the model to output JSON?**
 
-Tool calling. Each agent receives a filtered subset of MCP tool schemas (JSON Schema). The model can emit either text or a `tool_use` block; the `tool_use` blocks are schema-constrained. AptKit's reusable agents collect tool results across the loop and reduce them to typed outputs — `Anomaly[]`, `Diagnosis`, `Recommendation[]`. The contract lives at the per-tool-call level, not the per-response level.
+Because prompted JSON output fails 1-5% of the time on real workloads — missing brace, trailing comma, hallucinated field, wrong type on a nested value. Structured outputs move that failure from "runtime JSON parse error in production" to "the API rejects the malformed tool_use before you see it." The model retries on the API side, not yours.
 
-*Anchor: "Tool schemas are the contract; the agent loop reduces tool calls into the typed return."*
+**Q: What does "server-enforced" actually mean?**
 
-**Q: "What stops the recommendation agent from running EQL queries?"**
+Anthropic's server won't emit a `tool_use` block whose `input` doesn't validate against the `input_schema` you registered. If the model wants to emit a bad shape, the sampling layer rejects that continuation and picks a different token. From your side, if you get a `tool_use` block, its `input` conforms to the schema. Business-rule validation (is the diagnosis actually right?) still happens in your code and evals.
 
-Allowlist at `lib/mcp/tools.ts:28-36`. The recommendation agent gets 7 tools — `list_scenarios`, `get_scenario`, `list_segmentations`, etc. — and `execute_analytics_eql` isn't in the list. `filterToolSchemas()` at `lib/agents/tool-schemas.ts:9` only ships those 7 schemas to the model. There's no way for the model to emit a `tool_use` for a tool it doesn't have a schema for — the SDK would reject it.
+**Q: What's the difference between the schema at the boundary and TypeScript types in `lib/mcp/types.ts`?**
 
-*Anchor: "Allowlist at `tools.ts`; filter at `tool-schemas.ts:9`; the model literally cannot pick what isn't shipped."*
+Same shape, different enforcement. TypeScript catches you at compile time — but it lies about runtime data (a wrong cast at parse time and TS believes it forever). The `input_schema` catches at model-emit time. Together they mean the value hits your app already-shaped: no runtime parse errors, no defensive type guards, no "what if evidence is undefined."
 
 ## See also
 
-  → `04-agents-and-tool-use/02-tool-calling.md` — the loop that uses these schemas
-  → `04-agents-and-tool-use/04-tool-routing.md` — how intent classification picks the agent (and therefore the allowlist)
-  → `06-production-serving/03-prompt-injection.md` — how this pattern doubles as injection defense
+- `lib/mcp/types.ts` — the typed contracts
+- `lib/mcp/validate.ts` — the runtime validation seam
+- `04-agents-and-tool-use/02-tool-calling.md` — the same tool_use mechanism used for data-fetch tools
+- `06-production-serving/03-prompt-injection.md` — schema-constrained outputs are the primary defense

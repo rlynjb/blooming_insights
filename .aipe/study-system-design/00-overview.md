@@ -1,137 +1,82 @@
-# Overview — blooming_insights system map
+# 00-overview — the whole system on one page
 
-The one-page map. If you read only one file in this folder, read this one.
+Everything below is what actually runs today. No planned architecture, no aspirational boxes.
 
-## The whole system in one diagram
+## The full-system diagram
 
 ```
-  blooming_insights — end-to-end system map
+  blooming insights — the full system, one frame
 
-  ┌─ UI (browser) ───────────────────────────────────────────────────────────┐
-  │  app/page.tsx          investigate/[id]/page.tsx    recommend/page.tsx    │
-  │     │                            │                          │             │
-  │     │ uses                       │ uses                     │ uses        │
-  │     ▼                            ▼                          ▼             │
-  │  useBriefingStream         useInvestigation           useInvestigation     │
-  │  (313 LOC)                 (202 LOC)                  (same hook)          │
-  │     │                            │                          │             │
-  │     └──── fetch + readNdjson ────┴──────────────────────────┘             │
-  │                            │  (one kernel — lib/streaming/ndjson.ts 64L)  │
-  └────────────────────────────┼─────────────────────────────────────────────┘
-                               │  HTTP — content-type: application/x-ndjson
-                               │  events: AgentEvent + briefing-only variants
-  ┌─ Next.js routes ──────────▼─────────────────────────────────────────────┐
-  │  app/api/briefing/route.ts        app/api/agent/route.ts                 │
-  │  (336 LOC, maxDuration=300)       (345 LOC, maxDuration=300)              │
-  │     │                                       │                            │
-  │     │ getOrCreateSessionId() ──────────────┴──────────► bi_session cookie│
-  │     │                                       │                            │
-  │     ▼                                       ▼                            │
-  │  makeDataSource(mode, sessionId)  ◄── factory (lib/data-source/index.ts) │
-  │     │                                                                    │
-  │     │ branches on ?mode= : 'live-bloomreach' | 'live-synthetic'         │
-  └─────┼────────────────────────────────────────────────────────────────────┘
-        │
-        │  THE LOAD-BEARING SEAM
-        │  port: `DataSource` (lib/data-source/types.ts) — `callTool`, `listTools`
-        │  envelope: { result, durationMs, fromCache }
-        ▼
-  ┌─ Adapters behind the seam ──────────────────────────────────────────────┐
-  │  ┌──────────────────────────────┐   ┌─────────────────────────────────┐ │
-  │  │ BloomreachDataSource         │   │ SyntheticDataSource             │ │
-  │  │ (214 LOC, HTTPS over MCP)    │   │ (516 LOC, in-process fixtures)  │ │
-  │  │  • OAuth/PKCE/DCR session    │   │  • deterministic fake data       │ │
-  │  │  • 1.1s spacing, retry ladder│   │  • real agent loop, no network   │ │
-  │  │  • 60s response cache        │   │                                  │ │
-  │  └──────────────┬───────────────┘   └─────────────────────────────────┘ │
-  └─────────────────┼────────────────────────────────────────────────────────┘
-                    │  HTTPS (StreamableHTTPClientTransport)
-                    ▼
-  ┌─ External provider ────────────────────────────────────────────────────┐
-  │  loomi-mcp-alpha.bloomreach.com/mcp   (Bloomreach Engagement workspace) │
-  │  rate-limited ~1 req/s, alpha-grade auth (revokes tokens after minutes) │
-  └────────────────────────────────────────────────────────────────────────┘
+  ┌─ Browser (Next.js App Router client) ────────────────────────────────────┐
+  │                                                                            │
+  │   app/page.tsx            useBriefingStream    useInvestigation            │
+  │     ├─ InsightCard        (fetch → readNdjson)  (fetch → readNdjson)      │
+  │     ├─ StatusLog          + reconnect policy    + sessionStorage stash    │
+  │     ├─ ProcessStepper                                                      │
+  │     └─ QueryBox (hidden)  bi:mode in localStorage: demo | live-bloomreach  │
+  │                                              | live-synthetic              │
+  └─────┬──────────────────────────────────────────────────┬──────────────────┘
+        │  GET /api/briefing?mode=…                        │  GET /api/agent?…
+        │  NDJSON stream                                   │  NDJSON stream
+        ▼                                                  ▼
+  ┌─ Vercel serverless (maxDuration = 300) ─────────────────────────────────┐
+  │                                                                          │
+  │   app/api/briefing/route.ts          app/api/agent/route.ts              │
+  │     ├─ demo?  → replay demo-insights.json (creds-free NDJSON)            │
+  │     ├─ live? → makeDataSource(mode, sid)                                 │
+  │     │           ├─ live-bloomreach → BloomreachDataSource (OAuth)        │
+  │     │           └─ live-synthetic  → SyntheticDataSource (in-process)    │
+  │     ├─ bootstrap → WorkspaceSchema                                       │
+  │     └─ MonitoringAgent | DiagnosticAgent | RecommendationAgent | Query   │
+  │            ▼                                                              │
+  │        ┌─ @aptkit/core (provider-neutral primitives) ───────────────┐    │
+  │        │  ModelProvider  ← AnthropicModelProviderAdapter            │    │
+  │        │  ToolRegistry   ← BloomingToolRegistryAdapter              │    │
+  │        │  TraceSink      ← BloomingTraceSinkAdapter                 │    │
+  │        │                    + BudgetTracker ceiling gate            │    │
+  │        │                    + onCapabilityEvent forwarding          │    │
+  │        └───────────────────────────────────────────────────────────┘    │
+  │              │                       │                                    │
+  └──────────────┼───────────────────────┼───────────────────────────────────┘
+                 │ HTTPS                 │ HTTPS
+                 ▼                       ▼
+        ┌─ Anthropic API ─┐    ┌─ Bloomreach loomi connect MCP ─┐
+        │  claude-sonnet  │    │  StreamableHTTPClientTransport │
+        │  -4-6 (agents)  │    │  + PKCE + DCR                  │
+        │  claude-haiku   │    │  ~1 req/s spacing              │
+        │  -4-5 (intent)  │    │  retry ladder on rate-limit    │
+        └─────────────────┘    └────────────────────────────────┘
 
-  ┌─ Agent runtime (sits beside the routes) ───────────────────────────────┐
-  │  MonitoringAgent / DiagnosticAgent / RecommendationAgent / QueryAgent  │
-  │      │  each is a ~50-line wrapper over @aptkit/core agents             │
-  │      ▼                                                                  │
-  │  AptKit primitive (the agent loop, library-owned)                       │
-  │      ├─ ModelProvider   ◄── AnthropicModelProviderAdapter (this repo)   │
-  │      ├─ ToolRegistry    ◄── BloomingToolRegistryAdapter   (this repo)   │
-  │      └─ CapabilityTraceSink ◄── BloomingTraceSinkAdapter  (this repo)   │
-  │           │                                                             │
-  │           └── emits onToolCall / onToolResult / onText hooks            │
-  │               which the route turns into NDJSON events on the wire      │
-  └────────────────────────────────────────────────────────────────────────┘
-
-  ┌─ Server state (process memory) ────────────────────────────────────────┐
-  │  lib/state/insights.ts        Map<sessionId, SessionFeed>               │
-  │  lib/state/investigations.ts  (committed demo-*.json fallbacks)         │
-  └────────────────────────────────────────────────────────────────────────┘
+  ── offline (never in the request path) ──────────────────────────────────
+  eval/  goldens + rubrics + judge + baseline.json + regression gate
+         wraps SyntheticDataSource in FaultInjectingDataSource for load runs
+         → CI (.github/workflows/ci.yml) typechecks + tests + builds
 ```
 
-## Legend — what each component is, owns, and talks to
+## Legend — what each box is, what it owns, what it talks to
 
-The map above has nine layers. Here's what each one is responsible for.
+**Browser (Next.js App Router client)** — the marketer-facing surface. Owns runtime toggle state (`bi:mode` in localStorage), the reconnect policy for token-revoke recovery, and per-investigation stashes in sessionStorage so back-nav hydrates instantly. Talks only to its own `/api/*` routes; never to Anthropic or Bloomreach directly (API keys stay server-side).
 
-### UI (browser)
+**app/api/briefing/route.ts** — one endpoint, three code paths: demo replay, live-Bloomreach, live-synthetic. Owns the NDJSON stream contract, the coverage-gate narration, and the per-phase timing log. Composes the DataSource factory with the `MonitoringAgent`.
 
-| Component | What it owns | Talks to |
-|-----------|--------------|----------|
-| `app/page.tsx` (461 LOC) | the feed page — mode toggle, header, two-column layout, query box | `useBriefingStream`, `useDemoCapture`, `useReconnectPolicy` |
-| `app/investigate/[id]/page.tsx` | the diagnostic step page | `useInvestigation` (step=diagnose) |
-| `app/investigate/[id]/recommend/page.tsx` | the recommendation step page | `useInvestigation` (step=recommend) |
-| `useBriefingStream` (313 LOC) | the `/api/briefing` fetch + the 9-case NDJSON dispatcher | `readNdjson`, callbacks into the reconnect policy |
-| `useInvestigation` (202 LOC) | the `/api/agent` fetch + the per-step replay + `sessionStorage` stash | `readNdjson` |
-| `useDemoCapture` (146 LOC) | dev-only one-click "capture this as the demo snapshot" | `/api/mcp/capture-demo` |
-| `useReconnectPolicy` (123 LOC) | the auto-reconnect dance for revoked Bloomreach tokens | `/api/mcp/reset`, full page reload |
+**app/api/agent/route.ts** — one endpoint, four code paths: cached replay, free-form query, diagnose step, recommend step. Owns the anomaly-resolution fallback chain (client → in-memory → demo snapshot) and step-filtered replay. Composes the DataSource factory with `DiagnosticAgent` + `RecommendationAgent` + `QueryAgent`.
 
-### Streaming kernel
+**makeDataSource factory** (`lib/data-source/index.ts`) — the injection point. Branches on `LiveMode`, returns `{ dataSource, bootstrap, dispose }`. Routes hold the abstract `DataSource` type, never the concrete adapter.
 
-`lib/streaming/ndjson.ts` (64 LOC) — one `readNdjson` function. Consumed by four streaming surfaces (briefing, investigation, capture, query). Producers always terminate with `\n`; the kernel flushes the trailing buffer at end-of-stream, polls a `cancelOn` predicate between reads, and silently skips malformed lines.
+**BloomreachDataSource** (`lib/data-source/bloomreach-data-source.ts`, 214 LOC) — the live adapter. Wraps the connected MCP transport with ~1 req/s spacing, rate-limit retry, 60s response cache, and abort composition. Owns the OAuth session (via `lib/mcp/auth.ts`).
 
-### Next.js routes
+**SyntheticDataSource** (`lib/data-source/synthetic-data-source.ts`, 516 LOC) — the in-process adapter. Deterministic fake data; no network. Used by the `live-synthetic` mode AND by every eval run. Ships with a matching `syntheticWorkspaceSchema` so `bootstrap()` skips the orchestrator.
 
-| Route | What it owns | Notes |
-|-------|--------------|-------|
-| `app/api/briefing/route.ts` (336 LOC) | the monitoring scan: schema → coverage gate → MonitoringAgent → insights | `maxDuration = 300` (Vercel Pro), NDJSON response, demo branch replays `lib/state/demo-insights.json` |
-| `app/api/agent/route.ts` (345 LOC) | per-step investigation: diagnose or recommend, with the diagnosis handed forward | `maxDuration = 300`, NDJSON, demo branch replays `demo-investigations.json` filtered per step |
-| `app/api/mcp/{call,callback,reset,tools,tools/check,capture,capture-demo}/` | the short OAuth + dev tooling routes — direct Bloomreach adapter usage (skipCache is Bloomreach-specific) | not on the user's hot path |
+**FaultInjectingDataSource** (`lib/data-source/fault-injecting.ts`, 167 LOC) — a *decorator*, not a swap. Wraps any `DataSource` with configurable failure rates (timeout / rate-limit / server-error / malformed-JSON). Offline only — the load harness uses it; production never sees it.
 
-### Factory + DataSource seam
+**@aptkit/core primitives** (`node_modules/@aptkit/core`, v0.3.0) — the provider-neutral vocabulary Blooming's agents run on. `ModelProvider`, `ToolRegistry`, `CapabilityTraceSink`. All three are ports; Blooming's `lib/agents/aptkit-adapters.ts` (263 LOC) is the three-class bridge.
 
-The interface `DataSource` (the port) is in `lib/data-source/types.ts`. The factory `makeDataSource` (`lib/data-source/index.ts`) takes `(mode, sessionId)` and returns a connected adapter plus a `bootstrap(signal)` callback and a `dispose()`. The routes only see the abstract surface; they never construct a concrete adapter.
+**BudgetTracker** (`lib/agents/budget.ts`) — a cross-cutting ceiling. Created once per investigation, threaded through `AgentHooks` into `AnthropicModelProviderAdapter`, checked *before* every `messages.create` dispatch. Throws `BudgetExceededError` on the next turn if the accumulated spend has passed the limit.
 
-### Adapters
+**Session-keyed insights** (`lib/state/insights.ts`) — an outer `Map<sessionId, SessionFeed>`. Each session gets its own `insights` / `investigations` / `anomalies` sub-maps. `putInsights` only clears the *inner* maps; the outer map survives so a warm serverless instance can serve concurrent users without one briefing wiping another. No database.
 
-Two adapters live behind the seam today:
+**demo replay** (`lib/state/demo-*.json`) — committed snapshots. Serve as instant-loading canonical presentations, and as the fallback resolution for `resolveAnomaly` in `/api/agent`. The demo path never touches Anthropic or Bloomreach.
 
-- **`BloomreachDataSource`** (`lib/data-source/bloomreach-data-source.ts`, 214 LOC) — wraps a connected `StreamableHTTPClientTransport`, carries OAuth/PKCE/DCR session, 1.1s proactive spacing, rate-limit retry ladder, 60s response cache.
-- **`SyntheticDataSource`** (`lib/data-source/synthetic-data-source.ts`, 516 LOC) — deterministic in-process fixtures. Lets the real agent loop run end-to-end against fake data, no network.
+**eval harness** (`eval/`) — offline tier-2 hardening. Ten goldens, two rubrics (diagnosis + recommendation), judge → receipts → baseline → regression gate. Wraps `SyntheticDataSource` in `FaultInjectingDataSource` for load runs. Never runs in `npm test`; runs in `npm run eval:*` and (as a gate) in CI.
 
-Historical note: an Olist (SQL) adapter lived behind this seam during Phase 2 and was removed in PR #8 (commit `62c24d7`, 2026-06-18); the `eval/` harness was retired the same week. Two adapter swaps later, the seam's caller surface still hasn't changed.
-
-### External provider
-
-`https://loomi-mcp-alpha.bloomreach.com/mcp` — the Bloomreach Engagement workspace under analysis. Alpha-grade: per-user global rate limit of ~1 req/s, OAuth tokens revoked after minutes. Every reliability mechanic in `BloomreachDataSource` and `useReconnectPolicy` exists because of these two facts.
-
-### Agent runtime
-
-The agent loop itself lives in `@aptkit/core@0.3.0` — the library owns the loop, this repo owns the boundary. Three adapter classes in `lib/agents/aptkit-adapters.ts` (206 LOC) bind the library to this repo's primitives:
-
-| Adapter | Library port | This repo's adapter | Bridges to |
-|---------|--------------|---------------------|------------|
-| Model provider | `ModelProvider` | `AnthropicModelProviderAdapter` | the `@anthropic-ai/sdk` client (`claude-sonnet-4-6`) |
-| Tool registry | `ToolRegistry` | `BloomingToolRegistryAdapter` | the `DataSource` port (above) |
-| Trace sink | `CapabilityTraceSink` | `BloomingTraceSinkAdapter` | this repo's `onToolCall` / `onToolResult` / `onText` hooks → NDJSON events |
-
-The five active agent files (`monitoring.ts`, `diagnostic.ts`, `recommendation.ts`, `query.ts`, `intent.ts`) are thin wrappers — they construct the adapters and call `agent.scan(…)` or `agent.run(…)`. The legacy hand-rolled loop is preserved at `lib/agents/base-legacy.ts:86-176` as a rollback receipt.
-
-### Server state (process memory)
-
-There is no database. State is a `Map<sessionId, SessionFeed>` in `lib/state/insights.ts` — keyed by the session cookie so a warm Vercel instance serving multiple users doesn't bleed feeds. The concurrent-user wipe bug (where `putInsights().clear()` would erase another user's data) is resolved by the per-session keying. Demo snapshots (`lib/state/demo-*.json`) are the durable fallback.
-
-## The load-bearing finding
-
-If you remember one thing from this map: **the `DataSource` port is the seam that earned its keep.** It's the only abstraction in this repo that has been swapped twice (Olist added Phase 2, then removed in PR #8; Synthetic added) without changing a caller. Every other component takes a `DataSource` and asks no questions. That's why `03-datasource-seam.md` is the canonical port/adapter teaching file in this folder.
+**CI** (`.github/workflows/ci.yml`) — typecheck + unit/integration tests + build on every push and PR. Eval + gate wire up separately (documented, not yet on the required-checks list).

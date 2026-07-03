@@ -1,45 +1,91 @@
-# Security study — blooming insights
+# Security — trust axis of blooming insights
 
-A trust-axis audit of this repo. The single question: **what can an attacker reach, and what happens when they do?** Every finding traces back to a boundary, a trust assumption, and what breaks if it's wrong.
+The only question: what can an attacker reach, and what happens when they do?
 
-## Through-line — trace the trust axis
+This guide traces that question across every boundary in the repo — where untrusted input enters, who's allowed past, what's hidden vs exposed, and what the dependencies drag in. Every finding cites a real file and line range. When a control is load-bearing enough to earn a deep walk, it gets a numbered pattern file.
 
-```
-  Trust axis — what can each side see, reach, or tamper with?
-
-  ┌─ untrusted ─────────────────┐    seam     ┌─ trusted ─────────────────┐
-  │ browser, IdP redirect,      │ ═════╪═════► │ Next.js route handlers,    │
-  │ MCP tool results, LLM text  │             │ Anthropic / Bloomreach     │
-  └─────────────────────────────┘             └────────────────────────────┘
-            ▲                                            ▲
-            └────── 3 trust boundaries (see 00-overview.md) ──────┘
-                    every boundary either enforces a trust
-                    decision or leaks one
-```
-
-## Map
-
-```
-  .aipe/study-security/
-    README.md                       ← you are here
-    00-overview.md                  ← trust map + 3 highest-risk findings
-    audit.md                        ← Pass 1: the 8-lens audit
-    01-encrypted-auth-cookie.md     ← Pass 2: AES-256-GCM bi_auth + ALS store
-    02-oauth-pkce-dcr-boundary.md   ← Pass 2: OAuth 2.1 + PKCE + DCR
-    03-per-agent-tool-allowlist.md  ← Pass 2: capability gating (+ regression)
-    04-model-output-type-guard.md   ← Pass 2: type guard at model-output boundary
-    05-secret-redaction.md          ← Pass 2: token-shape redaction before logs
-    06-session-isolation.md         ← Pass 2: per-session state on shared instances
-```
+---
 
 ## Reading order
 
-1. **`00-overview.md`** — verdict per primitive + the three highest-risk findings.
-2. **`audit.md`** — the 8 lenses, each with `file:line` grounding or `not yet exercised`.
-3. **Pass 2 files** — open in the order they're cross-linked from `audit.md`.
+Start at the top, stop when the map is enough.
 
-## Cross-links
+```
+  ┌─ Orient ────────────────────────────────────────────────┐
+  │  00-overview.md    the trust map + the three highest    │
+  │                    risks + a one-line verdict per lens  │
+  └──────────────────────────────┬──────────────────────────┘
+                                 │
+  ┌─ Full audit ─────────────────▼──────────────────────────┐
+  │  audit.md          8 lenses walked over the real repo   │
+  │                    with file:line grounding             │
+  └──────────────────────────────┬──────────────────────────┘
+                                 │
+  ┌─ Deep walks on load-bearing controls ────────────────────┐
+  │  01-encrypted-cookie-auth-store.md                       │
+  │  02-oauth-pkce-with-dcr.md                               │
+  │  03-read-only-tool-allowlist.md                          │
+  │  04-model-output-type-guards.md                          │
+  │  05-budget-ceiling-defense.md                            │
+  │  06-log-secret-redaction.md                              │
+  └──────────────────────────────────────────────────────────┘
+```
 
-- Trust boundaries map → `study-system-design/audit.md`'s system map.
-- The `parseAgentJson` validator → `study-software-design`'s interface chapter.
-- The DataSource adapter (the Bloomreach client) is treated as a port + adapter in `study-software-design`; this guide treats it as a trust seam.
+---
+
+## The trust axis at a glance
+
+Three trust boundaries in this repo. The Bloomreach loomi connect server is the only third party the agents reach; the Anthropic API is the model provider (fully server-side, key never touches the browser); the browser is where the analyst sits.
+
+```
+  Trace the trust axis across three hops
+
+  ┌─ Browser (untrusted) ──────────────────────────┐
+  │  React app, QueryBox, sessionStorage insights   │
+  │  can send: any JSON in ?insight= / ?diagnosis=  │
+  └──────────────────────┬─────────────────────────┘
+                         │  hop 1: HTTP request
+                         │  → sid cookie (httpOnly)
+                         │  → bi_auth cookie (AES-256-GCM)
+                         ▼
+  ┌─ Next.js server (trusted core) ────────────────┐
+  │  app/api/{briefing,agent,mcp/*}                 │
+  │  ALS-scoped RequestStore, type-guarded output   │
+  │  ★ every trust decision lives here ★            │
+  └──────┬──────────────────────────┬───────────────┘
+         │                          │
+         │ hop 2a: HTTPS + Bearer  │ hop 2b: HTTPS + API key
+         ▼                          ▼
+  ┌─ Bloomreach MCP ──────┐   ┌─ Anthropic API ────┐
+  │  OAuth 2.1 / PKCE      │   │  claude-sonnet-4-6  │
+  │  data provider         │   │  model provider     │
+  │  (semi-trusted)        │   │  (semi-trusted:     │
+  │                        │   │   its output       │
+  │                        │   │   is UNTRUSTED)    │
+  └────────────────────────┘   └─────────────────────┘
+```
+
+**The one that carries the weight:** hop 2b's return direction. Anthropic is a trusted counterparty for the request but its response is untrusted input crossing back into your system. `parseAgentJson` + the `isAnomalyArray` / `isDiagnosis` / `isRecommendationArray` type guards in `lib/mcp/validate.ts` are the seam that keeps model output from flowing straight to the UI.
+
+---
+
+## Where to look for what
+
+| Question | File |
+|---|---|
+| What are the highest risks right now? | `00-overview.md` |
+| Does this repo do X? (any lens) | `audit.md` |
+| How does the encrypted cookie actually work? | `01-encrypted-cookie-auth-store.md` |
+| How does OAuth flow across the redirect? | `02-oauth-pkce-with-dcr.md` |
+| Why can the client only call some tools? | `03-read-only-tool-allowlist.md` |
+| Where is model output validated? | `04-model-output-type-guards.md` |
+| What stops a runaway agent from burning $$? | `05-budget-ceiling-defense.md` |
+| Where do we scrub tokens from logs? | `06-log-secret-redaction.md` |
+
+---
+
+## Cross-links to sibling guides
+
+- **`study-system-design`** — architecture, request flow, streaming NDJSON contract. Non-security-shaped concerns about how the pieces fit together.
+- **`study-data-modeling`** — the `Insight` / `Anomaly` / `Diagnosis` / `Recommendation` types. Security says who's allowed to read/write them; data modeling says what they look like.
+- **`study-software-design`** — deep modules, layering, information hiding. Security is a lens *through* the design, not the design itself.

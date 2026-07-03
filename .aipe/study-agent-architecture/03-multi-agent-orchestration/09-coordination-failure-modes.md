@@ -1,184 +1,194 @@
 # Coordination failure modes
 
-**Industry standard.** The failures that don't exist in single-agent systems. **Mostly prevented by topology choice** in this codebase — the deterministic pipeline sidesteps the failure modes that come with LLM coordination.
+_Industry standard._
 
 ## Zoom out, then zoom in
 
-Sits as a meta-pattern across every topology. When you escalate from single-agent to any multi-agent shape, you inherit a class of failures single-agent can't have. This file enumerates them and names the mitigations.
+The failures that don't exist in single-agent systems. Multi-agent adds classes of bug that no single loop can produce — infinite handoff, cost blowup that compounds silently across workers, synthesis of contradictory sub-results, context bloat as shared state grows. Blooming's mitigations are code-driven (BudgetTracker, per-call timeouts, type-guard validation, `is_error` graceful degradation), and this file walks the specific failure ⇄ mitigation pairs.
 
 ```
-  Zoom out — where this concept lives
+  Zoom out — the failure surface multi-agent adds
 
-  ┌─ Multi-agent topology ──────────────────────────┐
-  │  Whichever you picked: supervisor, debate, swarm │
-  │  ★ Coordination failure modes you now inherit ★ │ ← we are here
-  │  (each topology brings a subset of these)        │
-  └──────────────────────────────────────────────────┘
+  ┌─ Single-agent failures ─────────────────────────────────────┐
+  │  bad tool arg, infinite loop on one path, hallucinated output│
+  │  (all bounded by one iteration cap)                          │
+  └──────────────────────────────────────────────────────────────┘
+
+  ┌─ Multi-agent adds these ────────────────────────────────────┐
+  │  · infinite handoff (A→B→A→B)                                │
+  │  · tool-call cascade (per-agent budgets compound)            │
+  │  · context bloat (shared state grows)                        │
+  │  · synthesis failure (contradictory worker outputs)          │
+  │  · cost blowup (2-5x overhead compounds silently)            │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-This repo, by staying deterministic-pipeline, sidesteps most of these. The ones that *could* still apply (cost blowup, tool-call cascade within a single agent's loop) are bounded by the control envelope from `04-agent-infrastructure/05-guardrails-and-control.md`.
+Zoom in: each failure has a specific mitigation in this repo, or a specific reason it doesn't apply. This file names the pairing.
 
 ## Structure pass
 
-Layers: failure mode (the named thing that goes wrong) → topology it lives in (which shapes can produce it) → mitigation (the specific control that bounds it).
+**Layers:** detection · bounding · graceful degradation · trace preservation.
+**Axis:** *at what point in the run does this failure become terminal, and what bounds it?*
+**Seam:** the boundary between "budget-exceeded" (recoverable — emit graceful error) and "system error" (unrecoverable — trace it, but abort). BudgetExceededError is caught by the route handler; anything else propagates.
 
-**Axis traced — "what does this failure mode require?":** each one needs at least one multi-agent feature to exist. Infinite handoff needs handoffs. Synthesis failure needs a merger. Tool-call cascade is the only one that can fire in single-agent too.
+```
+  Failures ranked by "who bounds this?"
 
-**Seam:** the specific control that catches each failure. Caps, budgets, validators, schemas.
+  Infinite handoff       — supervisor is code, no handoff exists
+  Tool-call cascade      — BudgetTracker check-before-dispatch
+  Context bloat          — schemaSummary caps + prompt caching
+  Synthesis failure      — type guards (isDiagnosis, isRecommendationArray)
+  Cost blowup            — BudgetTracker (tokens AND USD ceilings)
+  Provider fault         — is_error graceful degradation
+```
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know the difference between a function and a microservice mesh. The function can crash. The mesh can crash, deadlock, cascade-fail, retry-storm, partition, or end up with two services convinced of different truths. Multi-agent has the same expansion: single-agent can produce wrong output or burn budget; multi-agent can do those AND fail in ways that require coordination to even exist.
+You've written a request handler with a timeout, a retry budget, and a validation guard on the response. Multi-agent needs those same three primitives but *across* agent boundaries, not just within one call. The BudgetTracker is a run-wide token budget; the type guards are run-wide response validation; the deterministic supervisor eliminates handoff as a failure mode entirely.
 
 ```
-  The failure-mode table
+  Pattern: bounded coordination
 
-  ┌──────────────────────┬──────────────────────────┐
-  │ Failure              │ Mitigation               │
-  ├──────────────────────┼──────────────────────────┤
-  │ Infinite handoff     │ Handoff counter; force    │
-  │ (A→B→A→B…)            │ stop or escalate to human │
-  ├──────────────────────┼──────────────────────────┤
-  │ Tool-call cascade    │ Per-agent and global      │
-  │ (one agent triggers  │ iteration caps; budget    │
-  │ a storm of calls)    │ ceiling that halts the run│
-  ├──────────────────────┼──────────────────────────┤
-  │ Context bloat as     │ Message passing / context │
-  │ agents accumulate    │ routing instead of a       │
-  │ shared state         │ shared blackboard          │
-  ├──────────────────────┼──────────────────────────┤
-  │ Synthesis failure    │ Validate worker outputs    │
-  │ (supervisor merges    │ against a schema before    │
-  │ contradictory)        │ synthesis; surface         │
-  │                      │ conflicts, don't average   │
-  ├──────────────────────┼──────────────────────────┤
-  │ Cost blowup          │ Per-run token budget;      │
-  │ (2-5x overhead       │ cheap models for workers,  │
-  │ compounds silently)  │ expensive only for the     │
-  │                      │ supervisor                 │
-  └──────────────────────┴──────────────────────────┘
+  ┌─ Run start ────────────────────────────────┐
+  │  BudgetTracker created (token+USD ceiling) │
+  └─────────────────┬──────────────────────────┘
+                    ▼
+  ┌─ Every model turn ─────────────────────────┐
+  │  1. check budget (fail fast if exceeded)   │
+  │  2. dispatch                                │
+  │  3. accumulate usage into tracker           │
+  └─────────────────┬──────────────────────────┘
+                    ▼
+  ┌─ Between agents ───────────────────────────┐
+  │  Type-guard validate the artifact           │
+  │  (isDiagnosis, isRecommendationArray)      │
+  └────────────────────────────────────────────┘
 ```
 
-### Move 2 — step by step
+### Move 2 — the walkthrough
 
-#### Failure 1 — infinite handoff
+**Failure: infinite handoff. Mitigation: no handoff exists.** The classic swarm failure — A → B → A → B forever — doesn't apply because blooming's supervisor is deterministic (see `02-supervisor-worker.md`). The dispatch is a top-level `await` in TypeScript, not a model decision. There is no code path in `route.ts` that lets DiagnosticAgent invoke RecommendationAgent, and vice versa. This failure mode is *architecturally eliminated*, not mitigated.
 
-**Where it lives:** swarm topology (`06-swarm-handoff.md`).
-**Doesn't apply here:** no handoffs, no peer transitions. The orchestrator is deterministic code.
+**Failure: tool-call cascade. Mitigation: BudgetTracker check-before-dispatch.** One agent triggers a storm of calls — a diagnostic loop that keeps re-querying with slight variations, never settling. `lib/agents/aptkit-adapters.ts:64` is the gate:
 
-If this repo adopted swarm, the mitigation would be a runtime handoff counter capped at ~5-8 transitions per conversation, plus asymmetric handoff catalogs (A can hand to B; B cannot hand back to A in the same conversation). OpenAI's Swarm SDK enforces both at the kernel level — a hand-rolled swarm has to do the same.
+```ts
+// aptkit-adapters.ts:64 — check BEFORE dispatching
+async complete(request: ModelRequest): Promise<ModelResponse> {
+  if (this.budget?.exceeded()) {
+    throw new BudgetExceededError(this.budget.snapshot(), this.budget.limit);
+  }
+  // ... dispatch to Anthropic ...
+  this.budget?.add({ inputTokens: response.usage.input_tokens, ... });
+}
+```
 
-#### Failure 2 — tool-call cascade
+Line-by-line:
 
-**Where it lives:** any agent loop. The single-agent version is "one runaway agent burning tool calls"; the multi-agent version is "supervisor spawns many workers, each runs its own loop, total tool calls × N." This is the only failure mode in the table that can fire in single-agent systems.
+- **`this.budget?.exceeded()` runs before the API call.** A runaway agent can't burn additional cost after the ceiling has already been hit. The check happens even if the agent's own iteration cap hasn't triggered.
+- **`throw new BudgetExceededError(...)`** — a typed error, not a generic exception. The route handler catches it specifically and emits a graceful NDJSON `error` event so the UI can render "budget exceeded" instead of showing a crash.
+- **`this.budget?.add(...)` after** — accumulates usage so the next check has current numbers. Cross-agent: the same tracker is threaded through DiagnosticAgent AND RecommendationAgent when both share an investigation, so Stage B sees Stage A's spend.
 
-**Mitigation in this repo:** every agent has hard caps.
+**Failure: context bloat. Mitigation: schemaSummary caps + prompt caching.** As agents accumulate shared context, prompts grow and lost-in-the-middle attacks the model's attention. `lib/agents/monitoring.ts:19-60` bounds the schema at 20 events × 10 properties + 30 customer props — small enough to fit in cached prefix. The full 112KB workspace schema is never in the prompt; only the summary is. The Anthropic ephemeral cache on `system` prompt (`aptkit-adapters.ts:85-89`) turns the fixed prefix into a `cache_read` on turn 2+, so the token cost of the shared context is amortized.
 
-- `maxTurns = 8` is the default in `runAgentLoop` (`run-agent-loop.js:21`). Monitoring overrides via the AptKit class.
-- `maxToolCalls = 6` for monitoring specifically (`monitoring-agent.js:56`). Other agents are bounded only by `maxTurns`.
-- `maxTokens = 4096` per turn (`run-agent-loop.js:21`).
-- `maxDuration = 300` at the route level (`app/api/briefing/route.ts:19`, `app/api/agent/route.ts:22`). The whole request can't blow past 5 minutes.
+**Failure: synthesis failure. Mitigation: type guards at the seam.** The supervisor synthesizes worker outputs by passing them (see `08-shared-state-and-message-passing.md`). If a worker produces malformed structure — a Diagnosis missing `conclusion`, a Recommendation with an unknown `bloomreachFeature` — Stage B would consume garbage. The guards in `lib/mcp/validate.ts` reject before the next stage sees:
 
-The cascade can't compound across agents in this repo because the orchestrator is sequential — only one agent loop runs at a time. If the repo grew fan-out, the per-agent caps would multiply by N and need a global cap added on top.
+```ts
+// lib/mcp/validate.ts:29-35 — isDiagnosis
+export function isDiagnosis(v: unknown): v is Diagnosis {
+  if (!v || typeof v !== 'object') return false;
+  const d = v as any;
+  return typeof d.conclusion === 'string'
+    && Array.isArray(d.evidence)
+    && Array.isArray(d.hypothesesConsidered);
+}
 
-#### Failure 3 — context bloat
+// lib/mcp/validate.ts:42-56 — isRecommendationArray
+// enforces bloomreachFeature ∈ {scenario,segment,campaign,voucher,experiment}
+// enforces confidence ∈ {high,medium,low}
+```
 
-**Where it lives:** shared-state topologies (`08-shared-state-and-message-passing.md`). When every agent reads/writes a common context, the context grows with the topology size. Past ~30-50% of the model's nominal context length, the lost-in-the-middle problem fires.
+Line-by-line: the guards enforce shape *and* the fixed enums. The model can't propose a novel `bloomreachFeature` — it must pick one of five. The guards don't catch bad content (a strategically wrong recommendation of a valid shape), but they catch every structural failure the model can produce.
 
-**Doesn't apply here:** the repo uses message passing with small typed handoffs. The `Diagnosis` interface is hundreds of bytes; the `Anomaly` is similar. Each agent's context is its system prompt + its bounded input + its own running conversation — nothing inherited from sibling agents.
+**Failure: cost blowup. Mitigation: BudgetTracker with USD ceiling.** The tracker takes both `maxTokens` and `maxCostUsd` (see `lib/agents/budget.ts:21-26`). USD ceiling uses `estimateAnthropicCost` from `lib/agents/pricing.ts` — same numbers as the report. The eval load harness sets `budgetPerInvestigationUsd: 2` per case; the receipt from run `2026-07-03T05-21-12-237Z` shows `perInvestigationP50: $0.070` — well under. The ceiling is defensive, not typical-case.
 
-If the repo added a shared-state architecture for some reason (e.g. a long-running multi-step analysis with rich shared context), the mitigation would be: don't. Use multi-agent context routing instead — pass role-specific context to each agent. This is `04-agent-infrastructure/01-context-engineering.md` applied at the multi-agent boundary.
+**Failure: provider fault. Mitigation: `is_error` graceful degradation.** `FaultInjectingDataSource` (`lib/data-source/fault-injecting.ts`) proves the shape. When a tool call fails (timeout, 500, malformed JSON), AptKit's agent loop presents the failure as `tool_result` with `is_error: true`. The model reasons around it — "that query failed, let me try a different framing" — instead of the loop crashing. Load-harness receipt (`2026-07-03T05-21-12-237Z`, N=3 at 20% timeout + 20% malformed_json fault rates): **9 injected faults, 3 completed investigations, 0 failed runs**. Real receipt of the pattern working.
 
-#### Failure 4 — synthesis failure
+```
+  Layers-and-hops — how each failure gets bounded
 
-**Where it lives:** any topology with a merger — supervisor-worker, fan-out-fan-in, debate. The merger reads contradictory inputs and either averages them (hiding the conflict) or hallucinates a synthesis that doesn't follow from the inputs.
-
-**Doesn't apply here:** no LLM merger. Each stage produces a typed output the next consumes; there's no aggregation step. If a hypothetical fan-out version added a merger, the mitigation would be: validate worker outputs against a schema before synthesis; surface conflicts as explicit "these workers disagreed" data rather than letting the synthesizer average them.
-
-The closest cousin in this repo is the structured-output validators (`tryParseAnomalies`, `tryParseDiagnosis`, recommendation validators). They catch *structural* failures in one agent's output (the model emitted text that doesn't parse as JSON) but they're not synthesis-failure prevention because there's no synthesis to prevent.
-
-#### Failure 5 — cost blowup
-
-**Where it lives:** any multi-agent topology. The 2-5x coordination tax compounds silently across coordination messages, sub-agent runs, and per-turn context overheads. Without budget caps, the bill explodes before you notice.
-
-**Doesn't apply here in the multi-agent sense:** no coordination tax to compound. The cost ceiling is the deterministic pipeline's natural cost (one agent run per stage, no supervisor overhead). The per-request cost lands around $0.10-0.25 for a full investigation (monitoring + diagnose + recommend at Sonnet pricing).
-
-**Does apply in the single-agent sense:** a runaway agent loop with no budget cap can burn tokens indefinitely. Mitigations:
-
-- The skeleton's budget exit (`maxTurns`) is unbreakable — the `for` loop can't continue past it.
-- The per-tool-call cost is bounded by the per-call response size (capped at 16,000 chars in the tool result block — `run-agent-loop.js:2-4`).
-- Token-usage logging (`aptkit-adapters.ts:57-61`) emits per-call usage to console for observability; aggregating these would surface cost anomalies post-hoc.
-
-The piece this repo doesn't have: a hard per-run *dollar* budget that halts the run if the cumulative cost crosses a threshold. The `maxTurns` × `maxTokens` × per-call-cost give an effective ceiling (~$0.50 for the most expensive possible run) but no live cost gate. For a system with higher stakes (e.g. customer-facing agent that could fire 100s of times per day), adding a dollar gate would be cheap insurance.
-
-#### The fifth failure that's only in the spec table — multi-agent coordination latency
-
-The spec doesn't separate this from cost blowup, but it's worth a paragraph: in a multi-agent system, each coordination message adds wall-clock latency. The supervisor's "decide which worker runs" call is ~1-2s of latency added per dispatch; sequential coordination compounds. A four-stage pipeline with a supervisor at each handoff is roughly 8-15s of pure coordination overhead per request.
-
-This repo's deterministic pipeline doesn't pay this latency because the handoffs are zero-cost function calls. The whole investigation runs in ~50-120s wall-clock (the MCP tool calls are the dominant cost), not 50-120s + 8-15s of coordination.
+  ┌─ Route handler (outer try/catch) ─────────────────────────────┐
+  │  catches BudgetExceededError → NDJSON `error` event           │
+  │  catches everything else → NDJSON `error` event + log         │
+  └───────────────┬───────────────────────────────────────────────┘
+                  │
+                  ▼
+  ┌─ Agent (DiagnosticAgent, RecommendationAgent) ────────────────┐
+  │  runs AptKit loop bounded by maxTurns=8, maxToolCalls=6       │
+  │  every model turn: BudgetTracker check-before-dispatch        │
+  │  every tool result: `is_error: true` → model reasons around   │
+  └───────────────┬───────────────────────────────────────────────┘
+                  │
+                  ▼
+  ┌─ Data source (BloomreachDataSource + FaultInjectingDataSource)┐
+  │  rate limit retry (minIntervalMs=1100, retryCeilingMs=20_000) │
+  │  fault decorator surfaces provider errors as is_error=true    │
+  └───────────────────────────────────────────────────────────────┘
+```
 
 ### Move 3 — the principle
 
-**Multi-agent escalation buys quality at the cost of new failure modes.** Each topology brings a specific subset of the table above; you inherit them the moment you adopt the topology. The mitigations are well-known but they're not free — caps cost time-to-implement, validators cost design effort, budget gates cost monitoring infrastructure. The honest framing for any multi-agent decision: name the failure mode you're escalating to address, and name the failure modes you're now inheriting. If the inherited modes outweigh the addressed mode, don't escalate.
-
-This repo's deterministic-pipeline shape is the structural choice that prevents the inherited modes from existing in the first place. That's not absence-of-discipline; it's the discipline of "don't escalate before you need to."
+Every coordination failure in this repo has a specific bound, and the bound is usually *code, not prompt*. BudgetTracker is code; type guards are code; deterministic supervisor is code; graceful degradation via `is_error` is code. That's the interview-grade principle — multi-agent's 2-5x overhead only stays bounded when the controls that bound it are outside the model's decision surface. Prompts can be jailbroken or ignored; typed contracts and code-side budgets cannot.
 
 ## Primary diagram
 
 ```
-  Which failure modes this repo can vs cannot produce
+  Recap — coordination failure ⇄ mitigation pairs in this repo
 
-  ┌──────────────────────────────────────────────────────────────┐
-  │  Failure              | Can fire? | Why / mitigation          │
-  ├──────────────────────────────────────────────────────────────┤
-  │  Infinite handoff     | NO        | No handoffs in topology   │
-  │                        |           |                            │
-  │  Tool-call cascade    | YES       | maxTurns=8,                │
-  │  (within one agent)   |  (bounded) | maxToolCalls=6 (mon),     │
-  │                        |           | maxDuration=300s (route)   │
-  │                        |           |                            │
-  │  Context bloat        | NO        | Message passing, small     │
-  │                        |           | typed handoffs             │
-  │                        |           |                            │
-  │  Synthesis failure    | NO        | No LLM merger              │
-  │                        |           |                            │
-  │  Cost blowup          | YES       | Hard caps bound max cost   │
-  │  (within one agent's  |  (bounded) | per request to ~$0.50;    │
-  │  loop, in theory)     |           | no live dollar gate         │
-  │                        |           |                            │
-  │  Coordination latency | NO        | Zero-cost function-call    │
-  │                        |           | handoffs, no model         │
-  │                        |           | coordination               │
-  └──────────────────────────────────────────────────────────────┘
+  Failure                         Mitigation                       Site
+  ─────────────────────────────  ───────────────────────────────  ─────────
+  Infinite handoff               Deterministic supervisor          route.ts
+  Tool-call cascade              BudgetTracker check-before-       aptkit-adapters.ts:64
+                                 dispatch
+  Context bloat                  schemaSummary caps + prompt       monitoring.ts:19-60
+                                 cache on system prompt            aptkit-adapters.ts:85-89
+  Synthesis failure              Type guards at seam               mcp/validate.ts
+  Cost blowup                    BudgetTracker USD ceiling         lib/agents/budget.ts
+                                                                   lib/agents/pricing.ts
+  Provider fault                 is_error graceful degradation     fault-injecting.ts
+                                 (receipt: 9 faults / 0 failed)    load receipt 2026-07-03
 ```
 
 ## Elaborate
 
-The cost-blowup failure mode is the one production teams get bitten by most often, because it's silent. A misbehaving multi-agent system that produces wrong outputs is visible (you notice the wrong outputs). A misbehaving multi-agent system that produces correct outputs at 5x expected cost is invisible until the monthly bill arrives. The mitigation (per-run dollar budget) is cheap to add and surprisingly often missing in agent systems built by teams new to the topology.
+The 2-5x coordination overhead multi-agent adds shows up in three specific places, and this repo's controls target each:
 
-The synthesis-failure mode is the one most likely to ship invisibly when you DO adopt multi-agent. Two workers disagree on something subtle; the supervisor averages their outputs into a synthesis that doesn't follow from either side; the user reads it as authoritative. The fix — surface conflicts, don't average — requires the supervisor's prompt to explicitly handle conflict detection, plus structured-output validation on worker outputs so conflicts are detectable. Both are doable; both are commonly skipped.
+- **Token cost per hop.** Each additional agent turn is another model call. The BudgetTracker bounds the total; the Anthropic ephemeral cache on system prompts cuts the marginal cost of each turn.
+- **Latency stack-up.** Sequential agents add wall-clock (~50s diagnose + ~51s recommend). AptKit's `maxTurns=8` and `maxToolCalls=6` bound how deep each agent can dig; the 1-req/s data-source throttle bounds how many tool calls per second.
+- **Failure surface.** Every seam is a new opportunity for shape mismatch. Type guards on Diagnosis and Recommendation catch the shape-level failures; `is_error` handling catches the tool-level failures.
 
-The Anthropic multi-agent research blog post (2025) is candid about which of these failures their team has hit and how they handle them. Tool-call cascade is the one they call out as the most operationally annoying — a sub-research-agent that gets stuck in a tool-call loop burns budget that compounds across the supervisor's other sub-agents. Their mitigation is a per-agent tool-call cap plus a global per-run budget that halts the supervisor if any single sub-agent crosses its allotted share.
+The fault-injection load harness is the receipt that these controls actually work together. Running 3 investigations against a fault-injected data source at 20% timeout + 20% malformed_json rates: 9 faults presented to the model as `is_error: true` tool results, 3 investigations completed cleanly, 0 failed runs, $0.20 total spend. The system degrades gracefully in the face of injected chaos — the exact tier-2 story the fault decorator was built to defend.
+
+Blooming's failure controls all live in code that the model doesn't see. That's deliberate: a prompt-level control ("don't exceed the budget") can be jailbroken by adversarial input or ignored by a distracted model. A code-level control (`if (budget.exceeded()) throw`) cannot. The senior-grade version of this idea is "controls belong outside the model's decision surface."
 
 ## Interview defense
 
-> **Q: What multi-agent failure modes could this codebase produce?**
->
-> Mostly none, because the orchestration is deterministic. No infinite handoff (no handoffs). No context bloat (message passing). No synthesis failure (no LLM merger). Tool-call cascade can fire inside a single agent's loop in theory, but `maxTurns=8`, `maxToolCalls=6` for monitoring, `maxTokens=4096`, and `maxDuration=300s` at the route level bound it hard. Cost blowup within a single agent's loop is similarly bounded — the worst-case single investigation costs maybe $0.50 — but the repo doesn't have a live per-run dollar gate that halts at a threshold. That's the gap worth filling if the system grew to higher-volume use.
+**Q: What multi-agent failures does this system defend against, and where do the controls live?**
+A: Five failure classes, five specific controls, all in code (not prompts). Infinite handoff is eliminated by having a deterministic supervisor — there IS no handoff, just top-level `await`s in `route.ts`. Tool-call cascade and cost blowup are bounded by the BudgetTracker's check-before-dispatch pattern in `lib/agents/aptkit-adapters.ts:64` — every model turn checks the tracker BEFORE the API call, so a runaway loop can't burn cost after the ceiling. Context bloat is bounded by `schemaSummary` in `lib/agents/monitoring.ts:19-60` capping the shared context to a small prefix + Anthropic's ephemeral cache. Synthesis failure is caught by the type guards in `lib/mcp/validate.ts` — `isDiagnosis` and `isRecommendationArray` reject malformed shape and enforce the fixed feature enum. Provider fault is handled by `is_error: true` on tool results — the load harness shows 9 injected faults across 3 investigations with 0 failed runs.
 
-> **Q: What changes if you adopted a supervisor?**
->
-> You inherit synthesis failure as a real risk, plus coordination latency, plus deeper cost-blowup exposure. Mitigations: schema-validate worker outputs before the supervisor synthesizes (surface conflicts, don't average); add a per-run dollar budget that halts the supervisor at threshold; use cheap models (Haiku) for the workers and reserve the supervisor's expensive model for synthesis. The Anthropic multi-agent research blog post is candid that even with these mitigations the operational complexity is real — they keep their supervisor topology to ≤5 sub-agents per run because beyond that the failure-mode surface dominates.
+Diagram: the failure ⇄ mitigation table with sites in the code.
+Anchor: `lib/agents/aptkit-adapters.ts:64` (budget check) + `lib/agents/budget.ts` + `lib/mcp/validate.ts` + `lib/data-source/fault-injecting.ts`.
 
-> **Q: What's the failure mode you'd worry about most if you escalated?**
->
-> Synthesis failure — specifically the silent version where the supervisor averages contradictory worker outputs into a plausible-but-ungrounded synthesis. It ships invisibly because the output looks coherent; you only catch it by reading the worker outputs in the trace and noticing they disagree in ways the synthesis hides. The mitigation requires both schema-validation (so the supervisor can detect conflicts) and a prompt instruction to surface conflicts rather than reconcile them. Both are easy to skip and the failure mode is hard to detect post-hoc.
+**Q: Why is the BudgetTracker a code-side control instead of a prompt instruction?**
+A: Prompts can be ignored. If the system prompt says "don't exceed $2," the model might respect it, might not — and there's no enforcement. The BudgetTracker is a `if (this.budget.exceeded()) throw BudgetExceededError` right before every Anthropic API call, in the model provider adapter. The model can't jailbreak past it because the model never sees it. That's the senior-grade principle: controls belong outside the model's decision surface. Same reason we do type-guard validation in TypeScript instead of asking the model to "please return valid JSON."
+
+Diagram: the check-before-dispatch site, showing where the budget gate sits relative to the model.
+Anchor: `lib/agents/aptkit-adapters.ts:60-66`.
 
 ## See also
 
-- → `01-when-not-to-go-multi-agent.md` — the gate that prevents most of these by not escalating
-- → `04-agent-infrastructure/05-guardrails-and-control.md` — the control envelope that bounds the single-agent versions
-- → `05-production-serving/02-fan-out-backpressure.md` — the cost-blowup-during-fan-out story
-- → `05-production-serving/03-per-tool-circuit-breaking.md` — the tool-call-cascade story specifically
+- `04-agent-infrastructure/04-guardrails-and-control.md` — the full control envelope around the loop.
+- `05-production-serving/03-fault-injection-and-graceful-degradation.md` — the load-harness receipt in detail.
+- `05-production-serving/04-cost-controls.md` — the BudgetTracker + prompt cache + pricing helper together.
+- `01-when-not-to-go-multi-agent.md` — the 2-5x cost claim, now made concrete.

@@ -1,121 +1,125 @@
-# Audit — system design lenses, grounded in this repo
+# audit.md — the 8-lens walk
 
-Walks the 8 system-design lenses against the codebase. Each `##` section is one lens. When a finding is large enough to deserve its own pattern file, the lens cross-links to it instead of restating.
+One `##` section per lens. Each finding is grounded in `file:line`. When a finding is load-bearing enough to earn its own concept file, the audit links to it rather than restating it.
 
-## system-map-and-boundaries
+## 1. system-map-and-boundaries
 
-The system has six load-bearing layers — browser, Next.js routes, factory, port (`DataSource`), adapters, external provider — plus an agent runtime layer that sits beside the routes and an in-process state layer that survives across requests on a warm instance. See `00-overview.md` for the full map.
+The system is a single Next.js 16 App Router deployment on Vercel Pro plus two external dependencies (Anthropic, Bloomreach loomi connect MCP). There is no database, no queue, no worker. All state lives in per-session in-memory `Map`s and per-user cookies.
 
-The boundaries that matter:
+Six trust boundaries:
 
-- **UI ↔ route boundary** — HTTP, `content-type: application/x-ndjson`. The wire contract is the `AgentEvent` union in `lib/mcp/events.ts`. → see `01-request-flow.md`.
-- **Route ↔ adapter boundary** — the port (`DataSource`) at `lib/data-source/types.ts:63-71`. Two adapters today, two swaps in the seam's history without a caller change. → see `03-datasource-seam.md`.
-- **Adapter ↔ external boundary** — HTTPS via `StreamableHTTPClientTransport`, OAuth/PKCE/DCR session in the cookie. → see `02-auth-boundary.md`.
-- **Repo ↔ library boundary** — the three AptKit adapter classes at `lib/agents/aptkit-adapters.ts:26,75,100`. Library owns the loop, repo owns the boundary. → see `04-aptkit-primitive-boundary.md`.
-- **Trust boundary** — the Bloomreach server is the only externally-trusted surface; the synthetic adapter eliminates it for the local mode. AnthropicAPI is trusted-by-key (`ANTHROPIC_API_KEY`). No user-supplied tool call is executed without a prior schema introspection.
+- **browser ↔ Next server** — session cookie (`bi_auth`, AES-256-GCM) established server-side (`lib/mcp/auth.ts:73-77`); no API keys or OAuth tokens ever cross to the browser.
+- **Next server ↔ Anthropic** — `ANTHROPIC_API_KEY` in env, never in an env var prefixed `NEXT_PUBLIC_` (checked in every route: `app/api/briefing/route.ts:155`, `app/api/agent/route.ts:153`).
+- **Next server ↔ Bloomreach MCP** — OAuth 2.1 with PKCE + Dynamic Client Registration, one client per session, tokens live in the encrypted cookie (prod) or a gitignored file (dev). Details: `04-oauth-boundary.md`.
+- **route handler ↔ agent** — the `DataSource` interface (`lib/data-source/types.ts:63-71`) is the only surface between them. Details: `01-datasource-seam.md`.
+- **Blooming agent ↔ AptKit runtime** — three-class bridge (`lib/agents/aptkit-adapters.ts`, 260 LOC). Details: `02-aptkit-boundary.md`.
+- **live path ↔ offline eval** — the eval harness (`eval/`) only imports from `lib/`, never the reverse (documented in `eval/README.md:52`); production has no idea evals exist.
 
-External dependencies (third-party reach): `@anthropic-ai/sdk`, `@aptkit/core@0.3.0`, `@modelcontextprotocol/sdk`, the Bloomreach loomi connect server. Deployment target: Vercel Pro (`maxDuration = 300` on `/api/briefing` and `/api/agent`).
+## 2. request-response-and-data-flow
 
-## request-response-and-data-flow
+Three important end-to-end flows.
 
-Two important request flows. The third (dev-only capture) is operational tooling.
-
-**1. The briefing flow** — `GET /api/briefing?mode=…`:
+**Feed flow** (`GET /api/briefing`, streams NDJSON):
 
 ```
-  browser → fetch → /api/briefing → getOrCreateSessionId → makeDataSource
-       → bootstrap (Bloomreach orchestrator) → schema
-       → schemaCapabilities → coverageReport (10-cat checklist)
-       → listTools → MonitoringAgent.scan (AptKit loop)
-            → callTool ↔ DataSource (per category)
-            → emit reasoning_step / tool_call_start / tool_call_end events
-       → anomalies → anomalyToInsight → putInsights(sessionId, …)
-       → emit insight events → emit done
+  bootstrap schema → coverage gate → listTools → MonitoringAgent.scan
+    → per-category tool loop → anomalies → anomalyToInsight → session store
 ```
 
-The whole pipeline streams as NDJSON; the UI renders each insight as it arrives. Five phases are timed (`schema_bootstrap`, `coverage_gate`, `list_tools`, `monitoring_scan`, and the wall-clock total) and logged in the route's `finally` so the per-request line fires even on error (`app/api/briefing/route.ts:202-207, 317-324`). → see `01-request-flow.md`.
+Per-phase timings recorded in `phases[]` and dumped once per request in the route's `finally` block (`app/api/briefing/route.ts:317-324`). Real baseline p50 (Sonnet 4.6, 10 goldens): `schema_bootstrap` 50s, `list_tools` 38s, `monitoring_scan` 51s, `investigation` 90s.
 
-**2. The investigation flow** — `POST /api/agent` (with `step=diagnose|recommend`): the browser carries the `Insight` across instances by stashing it in `sessionStorage`, since on Vercel the briefing and the investigation can land on different functions. The diagnostic step returns a `Diagnosis`; the recommendation step takes that `Diagnosis` as input and produces `Recommendation`s.
+**Investigation flow** (`GET /api/agent?step=diagnose|recommend`, streams NDJSON):
 
-Parallel work: none in the hot path — the agent loop is sequential (the model decides what to call next). Fan-out lives inside the monitoring scan, where AptKit can run multiple categories concurrently within the rate-limit envelope. Waterfalls: the briefing's `bootstrap → listTools → scan` is a forced sequence (the agent needs the tool schemas to plan).
+```
+  resolveAnomaly (client → session → demo) → bootstrap → listTools →
+    if step=diagnose: DiagnosticAgent.investigate → emit diagnosis, done
+    if step=recommend: parse handed-over diagnosis → RecommendationAgent.propose
+```
 
-## state-ownership-and-source-of-truth
+Client hands the diagnosis between steps via `sessionStorage` (`bi:diag:<id>`), not via server state — the Vercel per-instance memory can't be trusted across a page navigation.
 
-Five state owners, each with a different lifetime:
+**Demo replay** (`?demo=cached` or cached investigation): reads `lib/state/demo-*.json`, emits the same NDJSON events with a `REPLAY_DELAY_MS = 140/180` between them so the UI reveals at a human pace (`app/api/briefing/route.ts:25`, `app/api/agent/route.ts:103`). Same UI code, same event contract — details: `03-ndjson-streaming.md`.
 
-| State | Owner | Lifetime | Notes |
-|-------|-------|----------|-------|
-| Session identity | `bi_session` cookie | 10 days (matches token life) | `httpOnly`, `SameSite=None` + `Secure` in prod, `Lax` in dev (`lib/mcp/session.ts:10-14`) |
-| OAuth tokens (prod) | encrypted cookie `bi_auth` | 10 days | AES-256-GCM under `AUTH_SECRET`, seeded into `AsyncLocalStorage` per request (`lib/mcp/auth.ts:34-78`) |
-| OAuth tokens (dev) | gitignored file `.auth-cache.json` | until manually cleared | survives hot-reload; never committed |
-| Feed state | `Map<sessionId, SessionFeed>` in `lib/state/insights.ts` | warm-instance lifetime | per-session keying eliminates cross-user wipe |
-| UI replay/back-nav | `sessionStorage` | tab lifetime | `useInvestigation` writes the result so step-3 + back-nav hydrate instantly |
+## 3. state-ownership-and-source-of-truth
 
-Demo snapshots (`lib/state/demo-insights.json`, `lib/state/demo-investigations.json`) are committed JSON — the durable, deterministic source of truth for the demo path. → see `07-in-memory-state-ownership.md` and `08-demo-replay-as-reliability.md`.
+State is split across five owners; the split is deliberate.
 
-There is no SQL DB and no Redis. Every other state question lands in one of the five owners above.
+- **Runtime toggle** — `localStorage['bi:mode']`, owned by the browser. Read once on mount (`app/page.tsx:68-84`), migrates legacy `'live'`/`'live-sql'` values to `'live-bloomreach'` inline. Details: `05-demo-vs-live-mode.md`.
+- **OAuth session** — encrypted cookie (`bi_auth`, prod) or `.auth-cache.json` (dev), keyed by session id. `AsyncLocalStorage` scopes the read/write per-request so concurrent requests on one instance don't cross-contaminate (`lib/mcp/auth.ts:41-46`).
+- **Insights + investigations** — per-session `Map`s in `lib/state/insights.ts:14`. Outer `Map<sessionId, SessionFeed>` never cleared; `putInsights` clears only the inner maps (`lib/state/insights.ts:64-71`) — this is the load-bearing detail that keeps a warm instance from wiping another user's feed.
+- **Client-side investigation stash** — `sessionStorage['bi:inv:<step>:<id>']`, populated at stream-complete; back-nav hydrates from it instead of re-running the agents (`lib/hooks/useInvestigation.ts:19-21`, `50-63`).
+- **Cached combined investigation** — dev only, on disk (`.investigation-cache.json`), only for the null-step combined capture run (`app/api/agent/route.ts:300-302`).
 
-## caching-and-invalidation
+There is no shared server state across Vercel instances. The system explicitly accepts the "each instance sees its own memory" tradeoff — details: `05-demo-vs-live-mode.md` explains why the client stashes the diagnosis instead of trusting server memory.
 
-Two caches, both inside the Bloomreach adapter (the only place upstream calls happen):
+## 4. caching-and-invalidation
 
-1. **Response cache** — `Map<name+args, {result, expiresAt}>`, 60s TTL by default (`lib/data-source/bloomreach-data-source.ts:122, 144-152`). Absorbs the same EQL query repeated across categories within one briefing run, which is the common case. Skipped via `skipCache` on dev paths (`/api/mcp/call`, `/api/mcp/capture`). **Errors are not cached** (`bloomreach-data-source.ts:178-181`) — a transient 5xx must not poison the next minute.
-2. **Tool-list** — not cached. Listed once per request via `dataSource.listTools` (`app/api/briefing/route.ts:250`). The tool set is stable per connection and listed rarely; caching would just add complexity.
+Two caches in the live path plus one on-disk cache in dev.
 
-Invalidation strategy: time-based only (60s expiry). No explicit invalidation surface — the briefing's 1-minute repeat cost is intentional. The synthetic adapter does no caching (it's a deterministic in-process fixture; cache adds nothing).
+- **BloomreachDataSource response cache** (60s TTL, `lib/data-source/bloomreach-data-source.ts`): absorbs repeated tool calls within a single investigation. Not invalidated — TTL is the whole invalidation strategy. Freshness matters less than budget: monitoring re-queries the same window if agents ask twice, and eating a repeat is worse than a 60s stale result.
+- **Anthropic prompt cache** on the system prompt (`lib/agents/aptkit-adapters.ts:83-89`): the system prompt is stable across every model turn in an investigation. Wrapping it in `cache_control: { type: 'ephemeral' }` makes the first turn a cache_creation (~1.25×) and every subsequent turn within 5 min a cache_read (~0.1×). For a ~10-turn diagnostic this is roughly an 80% reduction on system-prompt cost. Invalidation is Anthropic's 5-minute TTL; no code path invalidates it.
+- **`.investigation-cache.json`** (dev only, gitignored): on-disk cache of the last combined-capture run. Never trusted across sessions in prod; `?live=1` bypasses it.
 
-→ see `10-rate-limit-aware-mcp-client.md` for how caching, spacing, and retry compose.
+No CDN cache is set for the streaming routes — both routes emit `Cache-Control: no-store, no-transform` (`app/api/briefing/route.ts:149`, `app/api/agent/route.ts:107`).
 
-## storage-choice-and-durability-boundaries
+## 5. storage-choice-and-durability-boundaries
 
-**There is no durable database.** This is a deliberate choice with three load-bearing consequences:
+The honest answer: **there is no persistent datastore**. Three tiers of ephemerality:
 
-- The feed `Map` lives in process memory; a Vercel cold-start drops it. The demo snapshot file is the durable fallback.
-- OAuth tokens persist in an encrypted cookie (prod) or a gitignored file (dev) — both of which survive deployment rollovers, but neither of which is a shared store across regions.
-- Each session is a self-contained world: no cross-session aggregation, no analytics-on-analytics, no longitudinal trends.
+- **Runtime memory** — `Map<sessionId, SessionFeed>` (`lib/state/insights.ts:14`). Lost on every cold start / deploy / instance rotation. Acceptable because the client stashes what it needs for back-nav.
+- **Cookies** — the encrypted auth cookie is durable across requests but not across users, and never carries business data (only OAuth tokens).
+- **Committed JSON** (`lib/state/demo-*.json`) — the demo snapshot. Not a database — a *fixture* that the demo path replays. Version-controlled, updated by dev-only capture tooling.
 
-What would change if a DB were added: storage durability moves from the cookie to the DB; the agent's history becomes queryable across sessions; a worker queue likely shows up to decouple the briefing scan from the request. None of those are needed today. The system's job is to read live workspace data, not to remember its own outputs.
+For the schema shape of `Insight` / `Anomaly` / `Diagnosis` / `Recommendation` see `study-data-modeling` — that's what those types owe callers regardless of where they eventually persist. For the "what would need to change if we actually did add a database" analysis see lens 7 below.
 
-Cross-link: foundation-level engine concerns belong to `study-database-systems`; schema-shape concerns belong to `study-data-modeling` (the `Insight` / `Anomaly` / `Diagnosis` / `Recommendation` wire types are the data model in lieu of a schema).
+## 6. failure-handling-and-reliability
 
-## failure-handling-and-reliability
+Three graceful-degradation paths, all wired to real failure modes seen against the alpha Bloomreach server.
 
-Five failure modes, each with a named recovery path:
+- **Token revoke → auto-reconnect.** Bloomreach's alpha revokes tokens after minutes. `lib/hooks/useReconnectPolicy.ts` reacts to an `invalid_token` error message by calling `/api/mcp/reset` and reloading once, guarded by a session-scoped flag so a redirect loop is impossible.
+- **Rate limit → retry ladder.** `BloomreachDataSource` parses the server-stated retry window from the error text and sleeps `parsed + 500ms buffer` (`lib/data-source/bloomreach-data-source.ts:49`, `65-71`). Falls back to bounded backoff when no hint is parseable.
+- **Budget exceeded → NDJSON error.** `BudgetTracker` checks the accumulated spend *before* each model turn (`lib/agents/aptkit-adapters.ts:63-66`); throws `BudgetExceededError`; caught in the route's try/catch (`app/api/agent/route.ts:303-316`); emitted as a graceful `{ type: 'error', message }` NDJSON event the UI already knows how to render. Details: `06-budget-and-observability.md`.
 
-1. **Bloomreach rate limit (1 req/s, sometimes 1-per-10s)** — the adapter parses the server's stated window from the error text, sleeps that long plus a 500ms buffer, retries up to 3 times, with a 20s ceiling per wait (`bloomreach-data-source.ts:157-174`). Proactive spacing at 1.1s between calls prevents the first hit in most cases (`lib/mcp/connect.ts:96-100`). → see `10-rate-limit-aware-mcp-client.md`.
-2. **Bloomreach token revocation (alpha-server reality, minutes after issue)** — the UI hook `useReconnectPolicy` detects an auth-shaped error message, fires one reset + reload, and guards against re-firing in the same session. The error event flows through the NDJSON stream's `error` case; the policy is consulted before the message is surfaced (`lib/hooks/useBriefingStream.ts:274-284`). → see `02-auth-boundary.md`.
-3. **Per-request client cancel (tab close, mode flip, navigation)** — every async layer threads `signal`: `req.signal` from the route, threaded into `bootstrap(req.signal)`, `dataSource.listTools({signal})`, `dataSource.callTool({signal})`, and the Anthropic SDK's `{signal}` option. The route's `catch` swallows `AbortError` (it's not an error) but still runs the `finally` to log the partial-budget consumed (`app/api/briefing/route.ts:290-296`).
-4. **Setup throw (missing `ANTHROPIC_API_KEY`, missing `AUTH_SECRET`)** — caught before the stream is committed so the route can return JSON with the real message instead of opening a stream and emitting an error (`app/api/briefing/route.ts:166-178`).
-5. **Demo as the reliable fallback** — when Bloomreach is unreachable, slow, or the auth has rotted, the user flips to the demo mode and the committed snapshot replays as if it were a live NDJSON stream. The presentation path is never dependent on the live path. → see `08-demo-replay-as-reliability.md`.
+The route handlers' `finally` blocks are the incident-signal path: `phases[]` + `aborted` + `totalMs` logged as one JSON line per request, so a Vercel filter (`phases.phase = "schema_bootstrap"`) reads across both routes uniformly. Fires even on error, so an OOM/timeout at 299 seconds still leaves a receipt of how much budget was burned.
 
-Graceful degradation: monitoring runs only the **runnable** categories (the schema-gated subset); unsupported categories surface in the coverage grid as `no data source` or `limited` instead of failing the briefing. → see `09-schema-gated-coverage.md`.
+Offline, the fault-injection decorator (`lib/data-source/fault-injecting.ts`) forces those same failure modes at configurable rates against the synthetic adapter so the load harness exercises the recovery paths deterministically. The four fault kinds — timeout, rate_limit, server_error, malformed_json — are shaped to match Bloomreach's real error envelopes byte-for-byte (`lib/data-source/fault-injecting.ts:112-155`).
 
-Cross-link: coordination-correctness concerns under failure (exactly-once, consensus, ordering across instances) belong to `study-distributed-systems`. This repo's failure handling is single-process, single-request scoped.
+Cross-link to `study-distributed-systems` for coordination correctness across the OAuth boundary (the `AsyncLocalStorage` pattern in `lib/mcp/auth.ts` is the local-only mechanism that keeps concurrent requests on one instance from seeing each other's OAuth state; that's a single-process concurrency concern, not distributed).
 
-## scale-bottlenecks-and-evolution
+## 7. scale-bottlenecks-and-evolution
 
-What breaks first at 10x:
+What breaks first at 10× and what stays stable.
 
-- **Bloomreach rate limit** is the dominant constraint at any load. The 1-per-1s or 1-per-10s ceiling is per-user-global; 10 concurrent users do not get 10x throughput because the limit is enforced upstream. Mitigation today is the 60s response cache (absorbs the common case of repeated queries within a briefing) plus the synthetic adapter for any non-Bloomreach-specific work.
-- **In-process state** scales by the count of warm Vercel instances. A burst that creates 50 sessions on one warm instance is fine; a burst that spreads across 50 instances means none of them have the others' feed state. Today that's invisible because feed state is per-session, not cross-session; if it ever needs to be cross-session, a shared store (Redis) replaces the `Map`.
-- **`maxDuration = 300`** caps the live briefing at five minutes. The monitoring scan with 10 categories and ~6 tool calls each easily fits, but a workspace with deeper history could push it; the natural mitigation is to split the scan across requests (one category at a time) and have the UI orchestrate.
+**Breaks first at 10× traffic (concurrent users):**
 
-What stays stable: the port (`DataSource`), the AptKit primitive boundary, the streaming kernel, the session-scoped state model. None of those need to change for 10x users.
+- **Bloomreach rate limit** (~1 req/s per session). Ten concurrent live briefings = ten sessions, so the per-session limit doesn't add up — the rate ladder already handles it per-session. This scales.
+- **Vercel Pro 300s max duration.** A single live investigation runs ~100-115s under the rate limit; ten concurrent are still within the budget. Not the bottleneck.
+- **In-memory `Map<sessionId, ...>` per instance.** At 100 concurrent users, memory is fine; at 10,000, this becomes the pressure point *if* users start returning to warm instances expecting their state to still be there. Today the client stashes what it needs (`useInvestigation.ts:50-63`), so this scales further than it looks.
 
-What would force rearchitecture at 100x:
+**Breaks first at the feature axis, not the traffic axis:**
 
-- a need to share feed state across instances → adds Redis or a DB
-- a need to cross-tenant aggregate → ends the "session is the world" model
-- a need to react to events from Bloomreach (push, not pull) → introduces a webhook surface or a queue
+- **Adding a real database.** Would need to sit behind a new port (`lib/state/insights.ts`'s `putInsights` / `listInsights` signature is the natural boundary). The pattern for how to add it without a caller change is already exercised by the DataSource seam (`01-datasource-seam.md`).
+- **Multi-region + shared state.** Would break the "session-scoped in-memory" assumption. The cookie-based OAuth already survives instance rotation; the insights map does not. Session store (Redis) or per-user KV would be the move.
+- **Long-running background monitoring.** Today monitoring is on-demand per browser hit. A "scan every workspace overnight" job would need a scheduler (Vercel Cron), a queue for fan-out, and a real store for the resulting feed. This is the biggest gap between "the shape today" and "an actual analyst product."
 
-## system-design-red-flags-audit
+**Stays stable at 100×:** The `DataSource` seam (four adapters swapped without a caller change is the empirical proof), the AptKit boundary (any provider could be plugged in behind `ModelProvider`), the NDJSON contract (four surfaces speak it; adding a fifth is additive), the demo-mode fallback (a snapshot never gets faster or slower with load).
 
-Ranked architectural risks, each grounded.
+Cross-link to `study-distributed-systems` for what the multi-region shift specifically would need (coordination, invalidation, consistency).
 
-1. **The Bloomreach upstream is alpha-grade.** The OAuth tokens revoke after minutes, the rate limit is severe and sometimes-10s, and the error envelopes have at least two shapes the adapter has to parse (`bloomreach-data-source.ts:64-71`). The demo path exists in part because the live path cannot be presentation-reliable. *Risk: demo dependency.* Mitigation: the seam abstraction means the live path can swap to a non-alpha provider without touching callers (synthetic already proves the swap works).
-2. **No durable database.** This is a deliberate choice and is currently fine — there's no cross-session need — but it is a *design ceiling*: the system cannot remember anything across cold starts beyond what's committed to git. *Risk: any feature requiring history-of-history.* Mitigation: not needed yet; add a DB when the feature shows up.
-3. **`@aptkit/core` is at `0.3.0`.** A pre-1.0 library on the critical path. The legacy hand-rolled loop preserved at `lib/agents/base-legacy.ts` is the rollback receipt. *Risk: breaking change in 0.4 forces a bridge update.* Mitigation: the three adapter classes are the only place that touches the library — the blast radius of a library change is 206 LOC, not the whole agent layer.
-4. **Two adapters live behind `DataSource` today (Bloomreach + Synthetic), and the synthetic adapter is 516 LOC of fixtures.** That's more code than the real adapter (214 LOC). *Risk: drift between adapters.* Mitigation: both implement the same port, and the same agent loop runs against both — drift surfaces as a test failure.
-5. **OAuth + cookie storage logic is hand-rolled** (`lib/mcp/auth.ts`, 259 LOC). AES-256-GCM, AsyncLocalStorage seeded per request, dev/test/prod branching. The code is careful and tested but is not the kind of thing one wants to write twice. *Risk: subtle auth bugs.* Mitigation: the surface is narrow (`OAuthClientProvider` interface), and a single `_clearAuthStore` test helper lets the test suite reset between cases.
+## 8. system-design-red-flags-audit
 
-Findings 1, 4, 5 have dedicated pattern files. Findings 2, 3 stay in the audit — they are decisions, not patterns.
+Ranked by real risk to the running system, not by architectural taste.
+
+**1. No persistent store; a warm serverless instance is the only source of "your recent feed."** Rated: acceptable today because the demo path is the primary presentation surface and the live path is recovery-oriented. Rated: unacceptable the moment a customer expects "my briefing from this morning." Move: sit a KV/session store behind `putInsights`/`listInsights` in `lib/state/insights.ts`.
+
+**2. Bloomreach's alpha token revoke is a load-bearing UX assumption.** The reconnect policy is well-hardened, but every live session eats a UX event within minutes. Rated: known, mitigated. Move: when Bloomreach ships GA with longer tokens, delete the guard.
+
+**3. Legacy `-legacy.ts` duplicates in `lib/agents/`.** `base-legacy.ts`, `diagnostic-legacy.ts`, `monitoring-legacy.ts`, `recommendation-legacy.ts`, `intent-legacy.ts`, `query-legacy.ts`, `categories-legacy.ts`, `legacy-validate.ts`, `legacy-prompts/` — pre-AptKit implementations kept in-tree during the migration. Rated: dead code shipping in the deploy bundle. Move: schedule removal after the eval baseline confirms the AptKit paths lead by ≥5pp on every rubric dimension.
+
+**4. `page.tsx` at 461 LOC.** Well-organized (three hooks pulled out: `useBriefingStream`, `useReconnectPolicy`, `useDemoCapture`), but this file is the single one every engineer touches when the feed layout changes. Rated: acceptable now; watch for growth. Move: extract the mode toggle + header once a second header customer surface exists.
+
+**5. `SyntheticDataSource` at 516 LOC.** Large because it re-implements the response shapes of ~15 Bloomreach tools. Rated: intentional — this is a test double masquerading as a real adapter, and shrinking it means faking less. Move: none; treat it as fixture code.
+
+**6. Eval `judge_error` count of 6/10 on `root_cause_plausibility` in the current baseline.** (`eval/baseline.json:44-46`) — six cases the judge itself couldn't score. Rated: the baseline captures reality, but the reality is that the judge is fragile on this dimension. Move: tighten the rubric prompt or add a second-pass judge; regeneration gate stays honest either way.
+
+**7. No `lint` step in CI** (documented in `ci.yml:33-38`). Twenty-eight pre-existing errors. Rated: known-and-noted, not a red flag until the number stops shrinking. Move: dedicated cleanup PR.

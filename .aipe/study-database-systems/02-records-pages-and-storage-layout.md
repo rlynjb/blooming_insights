@@ -1,246 +1,278 @@
-# Records, pages, and storage layout — what a row looks like here
+# Records, pages, and storage layout
 
-*Industry standard / Project-specific* — there are no pages on disk; instead a row is a JS object inside a per-session `Map`, and the "table" is partitioned by a session-id primary key.
+*Physical layout / Language-agnostic*
 
 ## Zoom out, then zoom in
 
-In a real database the storage layout matters because rows are packed into fixed-size pages, pages live on disk, and locality determines how many disk pages a query has to touch. None of that applies here — rows are heap objects, "pages" are however JavaScript's `Map` lays things out internally, and locality is whatever V8 decides. So the version of this concept that *does* apply is the one about **partitioning**: how is the data sliced so two users don't collide?
+You know how in Postgres a row is a tuple, tuples pack into 8KB pages, pages live in a heap file, and the whole thing loves *locality* — rows read together should live together? That's the mental model behind "storage layout." Now: this repo has no pages, no heap file, no disk-block cost model. What it has is JavaScript objects in a `Map`. This file walks the standard model, then names where the equivalents live here and where they simply don't exist.
 
 ```
-  Zoom out — where this concept lives
+  Zoom out — where records physically live in this repo
 
-  ┌─ UI layer ───────────────────────────────────────────────┐
-  │  InsightCard reads from /api/briefing's stream            │
-  └────────────────────────────┬─────────────────────────────┘
-                               │  HTTP
-  ┌─ Service layer ────────────▼─────────────────────────────┐
-  │  putInsights(sid, items)                                  │
-  │  listInsights(sid) → ★ THE STORAGE LAYOUT ★                │ ← we are here
-  └────────────────────────────┬─────────────────────────────┘
-                               │
-  ┌─ Storage layer ────────────▼─────────────────────────────┐
-  │  state: Map<sessionId, { insights, investigations,        │
-  │                          anomalies }>                     │
-  │  └─ partitioned per-session                               │
+  ┌─ UI ─────────────────────────────────────────────────────┐
+  │  Insight, Anomaly, Investigation shapes render here      │
+  └────────────────────┬─────────────────────────────────────┘
+                       │  JSON over NDJSON
+  ┌─ Service (Vercel) ─▼─────────────────────────────────────┐
+  │                                                          │
+  │  ★ heap-shaped `Map` of JS objects                        │ ← this file's scope
+  │    lib/state/insights.ts:14                              │
+  │                                                          │
+  │  ★ JSON-encoded rows on disk (deploy-time)                │
+  │    lib/state/demo-*.json                                  │
+  │    eval/baseline.json, eval/receipts/*.json               │
+  │                                                          │
+  └────────────────────┬─────────────────────────────────────┘
+                       │
+  ┌─ Provider (Bloomreach) ▼─────────────────────────────────┐
+  │  the real pages / heaps / rows are in there — opaque     │
   └──────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: a "row" is an `Insight` object (see `lib/mcp/types.ts:36`). A "table" is `sessionState(sid).insights`. The primary key is `Insight.id`. The partition key is `sessionId`. The thing worth studying here is the partition — the rest is incidental to the language.
+**Zoom in.** Every `Insight` in memory is a plain JS object — a row. The V8 heap decides where it physically sits; we don't. But the *access pattern* still matters: which fields we read together, which we compute lazily, whether the "row" is one object or two joined shapes. That's the layout question here, minus the disk-block layer.
 
 ## Structure pass
 
-**Layers:**
+**Axis to hold constant: locality — what stays together when you read one row?**
+
+Three layers of "storage":
 
 ```
-  L1  state: Map<sessionId, SessionFeed>     ← partition layer
-  L2  SessionFeed.insights: Map<id, Insight>  ← table layer
-  L3  Insight object                          ← row layer
+  "what lives next to what?" — traced across the three layers
+
+  ┌─ Bloomreach page/heap (opaque) ───────────────────────┐
+  │  a purchase row lives in real DB pages we can't see    │  → engine decides locality
+  └───────────────────────────────────────────────────────┘
+      ┌─ in-memory JS object ────────────────────────────────┐
+      │  an Insight is one heap-allocated object with the     │
+      │  evidence[] and derived fields already denormalized in │  → we decide locality
+      │  (deriveInsightFields spreads into the row)            │    via the row shape
+      └──────────────────────────────────────────────────────┘
+          ┌─ on-disk JSON blob ─────────────────────────────────┐
+          │  demo-insights.json is one whole file per snapshot   │  → filesystem decides,
+          │  eval/receipts/*.json is one whole file per (case×run)│    we choose the split
+          └─────────────────────────────────────────────────────┘
 ```
 
-**Axis traced: who can read/write which row?**
-
-```
-  Trace one axis: who can read or mutate row R?
-
-  ┌─ L1 outer Map ────────────────────┐
-  │  no scope — module global         │   → any code can `state.get(...)`
-  └───────────────────────────────────┘
-                  (it flips)
-  ┌─ L2 SessionFeed ──────────────────┐
-  │  scoped to one sessionId          │   → only code with the matching sid
-  └───────────────────────────────────┘
-                  (it flips)
-  ┌─ L3 Insight row ──────────────────┐
-  │  scoped to one id within feed     │   → only code with sid AND id
-  └───────────────────────────────────┘
-
-  the partition seam is between L1 and L2 — that's the load-bearing one
-```
-
-**Seams** — one matters:
-
-- The L1 → L2 boundary is the partition. Cross it without the right `sessionId` and you read someone else's data. Every read/write helper in `lib/state/insights.ts` takes `sessionId` as its first parameter and goes through `sessionState(sid)` — that's the contract.
+The seam that flips the axis: **the "one row vs many rows" boundary between the object and the file.** In memory, one `Insight` is one object — atomic read. On disk, one snapshot is one file that contains *many* `Insight`s (`demo-insights.json`) — you either read the whole file or you don't read anything. That's a chunkier locality boundary than any real DB would let you have, and it's the right call here because we never partial-load a snapshot.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You've built a primary-key lookup before: `users.find(u => u.id === id)`. The shape here is the same, with one extra dimension on top — a partition key that selects which *bucket* of rows to search.
+Two ways to think about "a row" in any storage system:
 
 ```
-  Two-level keying — partition, then primary
+  row-oriented (Postgres, MySQL)          columnar (Parquet, ClickHouse)
+  ────────────────────────────           ─────────────────────────────
+  [id | severity | headline | ...]        [id, id, id, id, ...]
+  [id | severity | headline | ...]        [severity, severity, ...]
+  [id | severity | headline | ...]        [headline, headline, ...]
 
-  state          (outer Map)
-    │
-    ├─ sessionId "abc" ──► insights (Map)
-    │                        ├─ id "ins-1" → Insight
-    │                        └─ id "ins-2" → Insight
-    │
-    └─ sessionId "def" ──► insights (Map)
-                             ├─ id "ins-3" → Insight
-                             └─ id "ins-4" → Insight
-
-  lookup(sid, id) = state.get(sid)?.insights.get(id)
-  → O(1) outer + O(1) inner
+  fast: SELECT * WHERE id=?               fast: SELECT AVG(revenue)
+  slow: aggregate one column              slow: single-row point read
 ```
 
-That's the kernel. The rest is what the row shape looks like and why the partition matters.
+This repo is aggressively row-oriented. Every `Insight`, every `Anomaly`, every `Investigation` is a single JS object holding every field the UI needs — headline, severity, change, evidence, impact, history, category, and the derived fields spread on top. When you fetch it, you get all of it. There is no world in which we'd want to read just the `severity` of every insight without reading the headline too, because the UI renders the whole card as one unit.
 
-### Move 2 — the layout, one part at a time
+The kernel:
 
-#### The outer `Map` (the partition / shard)
+```
+  the row kernel — one object, all fields co-located
 
-```typescript
-// lib/state/insights.ts:14
-const state = new Map<string, SessionFeed>();
-
-function sessionState(sessionId: string): SessionFeed {
-  let s = state.get(sessionId);
-  if (!s) {
-    s = { insights: new Map(), investigations: new Map(), anomalies: new Map() };
-    state.set(sessionId, s);
+  Insight {
+    id, timestamp,
+    severity, headline, summary,           ← UI-critical fields
+    metric, change, scope, source,         ← analytical fields
+    evidence?, impact?, history?, category?, ← optional trace fields
+    ...deriveInsightFields(anomaly)        ← denormalized derived fields
   }
-  return s;
+
+  one Map.set() writes it whole; one Map.get() reads it whole.
+  no partial reads. no half-populated rows.
+```
+
+That's the load-bearing shape: **row = complete UI card**. The derived fields (`deriveInsightFields`) are spread into the row at write time, not computed at read time. That's a classic denormalize-for-read choice — you spend one CPU-microsecond on each write to save N read-time computations.
+
+### Move 2 — the primitives walked
+
+**A "row" is a JS object; a "table" is a `Map`.**
+
+```ts
+// lib/state/insights.ts:25-45
+export function anomalyToInsight(a: Anomaly): Insight {
+  const id = crypto.randomUUID();          // primary key
+  const sign = a.change.direction === 'down' ? '-' : '+';
+  const headline = `${a.scope.join(' ')} ${a.metric} · ${sign}${Math.abs(a.change.value)}%`.toLowerCase();
+  return {
+    id,                                    // ← PK
+    timestamp: new Date().toISOString(),
+    severity: a.severity,
+    headline,
+    summary: `${a.metric} ${a.change.direction} ${Math.abs(a.change.value)}% vs ${a.change.baseline}`.toLowerCase(),
+    metric: a.metric,
+    change: a.change,                      // ← nested object, not a foreign key
+    scope: a.scope,                        // ← array field, not a join table
+    source: 'monitoring',
+    evidence: a.evidence,                  // ← nested array of {tool, result}
+    impact: a.impact,
+    history: a.history,
+    category: a.category,
+    ...deriveInsightFields(a),             // ← denormalized derived fields spread in
+  };
 }
 ```
 
-Every `getInsight`, `putInsight`, `listInsights`, `putInvestigation` goes through `sessionState(sid)`. The function lazily creates a sub-feed on first touch — same shape as auto-creating a partition on first write.
+Read that top to bottom and you get the entire schema. Notice what isn't there: no foreign keys, no join tables, no separate `insight_evidence` normalized-out table. Everything the UI needs to render an `InsightCard` is on this one object. In Postgres you'd have `insights`, `evidence`, and `evidence_items` as three tables and reconstruct the row with two joins; here you `Map.get` and you're done.
 
-**What breaks if you flatten this to one Map.** The comment at `lib/state/insights.ts:5-7` tells the story: `putInsights` calls `.clear()` to replace the previous briefing. With one shared Map, `clear()` wipes every user's feed mid-briefing. The partition isn't a performance choice; it's a correctness fix.
+**A "page" doesn't exist; the JS heap chooses locality.**
+
+There is no 8KB page boundary. V8 allocates the object wherever it likes, and adjacent inserts don't have to be adjacent in memory. If you needed to make sequential reads of 100k insights fast, you'd feel this — but this repo's access pattern is *point read one insight by id*, not scan-and-project. The lookup cost is `O(1)` hash-table access; the physical layout is the runtime's problem.
+
+**Locality of reference — what is co-accessed?**
 
 ```
-  Why the partition is load-bearing
+  the access-pattern table — what gets read together
 
-  WITHOUT partition (one shared Map):
-    user A: putInsights(items_A)         insights = items_A
-    user B: putInsights([...])           insights.clear() — A's data gone
-                                         insights = items_B
-    user A: GET /feed                    sees items_B (B's data) ← bug
+  read path                          fields accessed
+  ─────────────────────────         ─────────────────────────────────
+  feed render (InsightCard × N)     id, severity, headline, summary,
+                                     change, scope, evidence, impact,
+                                     history, category, derived fields
+                                     → basically the whole row
 
-  WITH partition (outer Map keyed by sid):
-    user A: putInsights("sid-A", items_A)   state.get("sid-A").insights = items_A
-    user B: putInsights("sid-B", items_B)   state.get("sid-B").insights.clear()
-                                            state.get("sid-B").insights = items_B
-    user A: GET /feed (sid-A)               state.get("sid-A").insights → items_A ✓
+  investigation subject banner       id, headline, severity, metric,
+                                     scope, change
+                                     → still most of the row
+
+  investigate route lookup           id (PK lookup)
+                                     → PK only, but returns whole row
+
+  demo replay                        all rows, all fields, in order
+                                     → whole "table" scan
 ```
 
-#### The inner `Map` (the table)
+Every read path touches most of the row. That's why the denormalized row shape wins here — a normalized schema would force joins on every read for no benefit.
 
-```typescript
-// lib/state/insights.ts:9-12
-type SessionFeed = {
-  insights: Map<string, Insight>;
-  investigations: Map<string, Investigation>;
-  anomalies: Map<string, Anomaly>;
-};
+**On-disk layout — one snapshot per file.**
+
+```
+  lib/state/demo-insights.json           665 lines
+  ──────────────────────────
+  {
+    insights:  [ {...}, {...}, {...}, ... ],
+    workspace: { projectId, projectName, ... },
+    trace:     [ {...}, {...}, ... ]
+  }
+
+  lib/state/demo-investigations.json   3,487 lines
+  ──────────────────────────────────
+  {
+    "<insightId>": [ AgentEvent, AgentEvent, ... ],
+    "<insightId>": [ AgentEvent, AgentEvent, ... ],
+    ...
+  }
+
+  eval/receipts/*.json                   28 files
+  ────────────────────────
+  one file per (caseName, runId) — the atomic unit is
+  "one scored case in one eval run"
 ```
 
-Three sibling tables per session. They don't share keys (insights and investigations use different `id` namespaces — see `Insight.id` vs `Investigation.insightId` at `lib/mcp/types.ts:132-134`). The shape is "all of this user's stuff lives in one struct of typed maps" — the closest the codebase gets to a schema declaration.
+The chunk size is *deliberate*: a snapshot is one file because you always load it whole to replay it; each receipt is its own file because the regression gate iterates them by runId (`gate.eval.ts:64-66` reads with `.endsWith(\`${runId}.json\`)`). If you'd put all receipts in one file, adding a new run would rewrite the whole file every time; splitting them makes the git history readable per case.
 
-#### The row (the Insight)
+That's the "pages" analog here — the file boundary is your locality boundary.
 
-```typescript
-// lib/mcp/types.ts:36-62
-export interface Insight {
-  id: string;
-  timestamp: string;
-  severity: Severity;
-  headline: string;
-  summary: string;
-  metric: string;
-  change: { value: number; direction: 'up' | 'down'; baseline: string };
-  scope: string[];
-  source: 'monitoring' | 'query';
-  evidence?: { tool: string; result: unknown }[];
-  impact?: string;
-  // ... business-owner enrichments, all optional
-  revenueImpact?: { ... };
-  aov?: { ... };
-  funnel?: { ... };
-  affectedCustomers?: number;
-  history?: number[];
-  category?: CategoryId;
-}
+**The `Anomaly` vs `Insight` split — normalized in memory only.**
+
+```
+  lib/state/insights.ts:8-12
+  ──────────────────────────
+  type SessionFeed = {
+    insights:       Map<insightId, Insight>;
+    investigations: Map<insightId, Investigation>;
+    anomalies:      Map<insightId, Anomaly>;      ← same key, different table
+  };
 ```
 
-Two things to notice about the row shape:
+An `Insight` is what the UI renders; an `Anomaly` is what the diagnostic agent needs to re-investigate. Same primary key (the insight id), two different rows. This is the closest thing this repo has to *two joined tables*: `getAnomaly(sessionId, id)` and `getInsight(sessionId, id)` are two separate calls, and `resolveAnomaly` in `app/api/agent/route.ts:35-49` walks both. In a real DB this would be `SELECT ... FROM insights JOIN anomalies USING (id)`. Here it's two hash lookups.
 
-1. **The primary key is `id`** — a `crypto.randomUUID()` minted in `anomalyToInsight` at `lib/state/insights.ts:26`. No surrogate / autoincrement, no composite key — just a UUID.
-2. **Most enrichment fields are optional.** The `// new fields stay optional so older snapshots still validate` comment in `.aipe/project/context.md`'s "What must not change" section explains why: the row shape evolves additively because the demo JSON snapshots have to keep validating after the type grows.
+The reverse mapper `insightToAnomaly` (`insights.ts:53-55`) intentionally drops `evidence`, `impact`, `history`, `category` — comment on that function names the round-trip choice. The diagnostic agent only needs metric/scope/change/severity; the rest is regenerated downstream. That's the "which fields are the row's primary key material vs derived" question, answered without SQL.
 
-That last point is the JSON-snapshot version of schema migration: you cannot rename or remove a field without invalidating committed snapshots, so the schema only grows.
+### Move 2 variant — the load-bearing skeleton
 
-#### The `category` and `coverage` fields — almost a secondary index
+What is the smallest thing you can remove and still have a working record layer?
 
-`category?: CategoryId` on `Insight` is the closest the codebase gets to a secondary index — it tags each insight with which of the 10 coverage-grid categories it belongs to. Nothing actually indexes by it (there's no `Map<CategoryId, Insight[]>`); the UI just filters on read. But conceptually it's the shape a secondary index would take.
+1. **The row-completeness invariant.** Every `Insight` is either fully populated or absent — no half-rows. Break this and the UI has to null-check every field; today it null-checks a few (`evidence?`, `impact?`, `history?`, `category?`) as *optional* fields, not "populated later." The `anomalyToInsight` write happens once, all at once, and the row is done.
+2. **The stable primary key (`id = crypto.randomUUID()`, `insights.ts:26`).** Break this — reuse ids across runs, say — and the UI's card-stashing (`sessionStorage`) hydrates the wrong investigation on step 3. The UUID is what makes cross-session cross-run identity work.
+3. **The denormalized derived fields (`...deriveInsightFields(a)`, `insights.ts:44`).** Remove this and the UI has to re-derive on every render. Not a correctness break, but a real performance loss — the InsightCard renders 10-20 fields' worth of derivation logic per card.
+
+The rest — the sub-Map for `anomalies` keyed by the same id, the JSON file split at snapshot boundaries — is optimization, not skeleton.
 
 ### Move 3 — the principle
 
-When you have no real storage engine, "storage layout" reduces to one decision: **what's the partition key?** Pick wrong (or skip it) and a multi-tenant in-memory store leaks one tenant's writes into another tenant's reads. Pick right (sessionId here) and the lack of any other storage machinery costs nothing for correctness — only durability, which is a separate problem.
+**Layout follows access pattern; denormalize for reads when writes are one-shot and reads are many.** In a real DB you'd think in terms of 8KB pages and column-ordering. In this repo you think in terms of "one object per UI card, spread the derived fields at write time." Same principle, different physical unit. When your writes are batchy (one briefing produces N insights in one turn) and your reads are point-lookups (feed render, investigation deep-dive), the denormalized row is the fast path in either physical model.
 
 ## Primary diagram
 
 ```
-  Storage layout — partitioned in-memory tables
+  Records-and-pages, this-repo-flavored
 
-  ┌─ state: Map<sessionId, SessionFeed> ──────────────────────┐
-  │                                                            │
-  │   key="sess-abc" ──► SessionFeed ─┐                        │
-  │   key="sess-def" ──► SessionFeed ─┤                        │
-  │   key="sess-xyz" ──► SessionFeed ─┘                        │
-  │                                  │                         │
-  │                                  ▼                         │
-  │              ┌─ SessionFeed ────────────────────────┐      │
-  │              │  insights:        Map<id, Insight>    │      │
-  │              │  investigations:  Map<id, Inv>        │      │
-  │              │  anomalies:       Map<id, Anomaly>    │      │
-  │              └───────────────────────────────────────┘      │
-  │                                  │                          │
-  │                                  ▼                          │
-  │              ┌─ Insight (row) ──────────────────────┐      │
-  │              │  id (PK), timestamp, severity,       │      │
-  │              │  headline, summary, metric,          │      │
-  │              │  change{value,direction,baseline},   │      │
-  │              │  scope[], source,                    │      │
-  │              │  evidence?[], impact?,               │      │
-  │              │  + enrichments (all optional)        │      │
-  │              └──────────────────────────────────────┘      │
-  └────────────────────────────────────────────────────────────┘
+  ┌─ per-session in-memory "tables" ────────────────────────────┐
+  │                                                              │
+  │  Map<sessionId, SessionFeed>                                 │
+  │      ┌──────────────────────────────────────────────────┐    │
+  │      │  insights: Map<insightId, Insight>                │    │
+  │      │  ┌────────────────────────────────────────────┐   │    │
+  │      │  │ id, timestamp, severity, headline,          │   │    │
+  │      │  │ summary, metric, change, scope, source,     │   │    │
+  │      │  │ evidence?, impact?, history?, category?,    │   │    │
+  │      │  │ ...deriveInsightFields(anomaly)             │   │    │
+  │      │  └────────────────────────────────────────────┘   │    │
+  │      │       one row = one heap-allocated JS object       │    │
+  │      │                                                    │    │
+  │      │  anomalies: Map<insightId, Anomaly>                │    │
+  │      │  investigations: Map<insightId, Investigation>     │    │
+  │      └──────────────────────────────────────────────────┘    │
+  │                                                              │
+  └──────────────────────────────────────────────────────────────┘
 
-  partition key: sessionId       (outer Map)
-  primary key:   Insight.id      (inner Map)
-  durability:    process-scoped  (dies on restart)
+  ┌─ on-disk "pages" (JSON files in git) ───────────────────────┐
+  │                                                              │
+  │  lib/state/demo-insights.json                                │
+  │    { insights: [ ...N whole rows... ], workspace, trace }    │
+  │                                                              │
+  │  lib/state/demo-investigations.json                          │
+  │    { "<insightId>": [ AgentEvent, ... ], ... }               │
+  │                                                              │
+  │  eval/receipts/<case>-<runId>.json  (one row per file)       │
+  │                                                              │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The `_clear(sessionId?: string)` test helper at `lib/state/insights.ts:95-101` makes the partition contract explicit: pass a sid to clear one partition, pass nothing to wipe the whole outer map. Tests using "wipe everything" cannot run against production semantics — they're test-only because they violate the partition.
+The "row-oriented denormalized rows" choice is not radical — it's what every React app implicitly does with props. The name for it in DB literature is *materialized view*: the row you read is not the row you wrote, it's a pre-joined pre-derived view that lives at the same key. Materialized views are expensive to maintain in a real DB because inserts have to update the view too. Here the write is *the* view — `anomalyToInsight` is the join+derive step, and the output goes straight into the read cache. That's a cheap trick a live app can play only because there is exactly one writer per key per turn.
 
-Compare to a real OLTP database: this is the same pattern as a per-tenant schema in Postgres, or a sharded Redis with `{tenant}:` key prefixes. The difference is that in those systems the partition is enforced at the connection or namespace level; here it's enforced by *convention plus a helper function*. There's nothing physically stopping a buggy caller from writing `state.get('sid-A').insights.set(id, otherSidsInsight)`. The whole correctness story rests on every caller going through `sessionState(sid)`.
-
-If this ever moves to a real store, the partition key becomes a tenant-id column with a row-level security policy or a per-tenant schema. The shape doesn't change; only the enforcement does.
+If this app grew a cross-session query surface ("show me every insight where category=X, across all users") you'd feel the missing indexes immediately — every Map is per-session, so a cross-session scan means iterating the outer Map. `03-btree-hash-and-secondary-indexes.md` picks up that thread.
 
 ## Interview defense
 
-**Q: How is the in-memory state structured for multi-tenancy?**
+**Q: "How is data physically stored in this app?"**
 
-Two-level Map: outer keyed by sessionId, inner keyed by the row id. The outer Map is the partition; the inner Map is the table. Helper functions (`sessionState`, `getInsight(sid, id)`, `listInsights(sid)`) enforce that every access goes through the partition.
+Model answer: "There are three layers. Runtime: JS objects in a `Map<sessionId, SessionFeed>` at `lib/state/insights.ts:14` — one heap-allocated object per `Insight`, denormalized so the entire UI card is one row, no joins. V8 chooses physical placement. On disk at deploy time: whole-file JSON blobs — `lib/state/demo-*.json` for snapshots, `eval/receipts/*.json` split one file per (case × runId). The file boundary *is* the locality boundary — you either load the whole snapshot to replay it or you don't. Remote: the real Bloomreach pages we never see. The load-bearing choice is that every `Insight` is a *complete UI card* — derived fields are spread into the row at write time via `deriveInsightFields`, not computed at read."
 
-```
-  state ─► sessionId ─► { insights, investigations, anomalies } ─► id ─► row
-```
+Diagram to sketch: the "records-and-pages this-repo-flavored" recap, top half showing in-memory Maps, bottom half showing JSON files.
 
-**Q: What's the load-bearing detail in this layout?**
+**Q: "Why not normalize `Insight` and `Anomaly` into shared tables?"**
 
-The outer Map. The first version of this code was a module-level `Map<id, Insight>` — `putInsights` called `.clear()` to replace the previous briefing, and that wiped every user's feed on a warm Vercel instance. The fix was to add the outer partition Map and key everything by sessionId. The comment at `lib/state/insights.ts:5-7` explains it.
+Model answer: "There *is* a normalization here — they're separate inner Maps at `insights.ts:8-12`, both keyed by the same insight id. Two 'tables,' one key. The `Insight` holds what the UI renders; the `Anomaly` holds what the diagnostic agent needs to re-investigate. Splitting them means the reverse mapper `insightToAnomaly` at `insights.ts:53-55` can deliberately drop `evidence`, `impact`, `history`, `category` — the agent doesn't need them and they'd bloat the re-investigation input. So it's normalized where the *purpose* diverges (write path vs re-read for re-investigation), and denormalized where the purpose stays the same (UI card = one row). The join is two hash lookups in `resolveAnomaly` (`app/api/agent/route.ts:35-49`)."
 
-**Q: What happens if you add a new field to `Insight`?**
-
-It has to be optional, because the committed JSON snapshots in `lib/state/demo-*.json` were captured against the older shape and have to keep validating. The schema grows additively only. That's the migration discipline — there's no `ALTER TABLE`, but there is a "don't break older snapshots" invariant. Adding a required field is a generation failure for the demo replay path.
+Anchor: same PK, two sub-Maps, cheap "join" by identity.
 
 ## See also
 
-- `01-database-systems-map.md` — where this Map sits among the four storage analogs
-- `05-transactions-isolation-and-anomalies.md` — the one multi-step write that touches this layout
-- `06-locks-mvcc-and-concurrency-control.md` — why the partition makes locks unnecessary
-- `09-database-systems-red-flags-audit.md` — what could go wrong with this layout
+- `01-database-systems-map.md` — the full storage topology this file zooms in on.
+- `03-btree-hash-and-secondary-indexes.md` — the lookup structures over these rows.
+- `04-query-planning-and-execution.md` — how scans and joins would work over Maps.
+- `05-transactions-isolation-and-anomalies.md` — atomicity of the "replace the whole row" write.

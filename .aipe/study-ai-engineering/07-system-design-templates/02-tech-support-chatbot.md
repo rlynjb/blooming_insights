@@ -1,42 +1,42 @@
-# Tech support chatbot system design
+# 02 — Tech support chatbot system design
 
 - **The prompt:** "Design a tech support chatbot for a product. It must answer customer questions, escalate when it can't, and learn from agent corrections."
 
 - **Standard architecture:**
 
 ```
-  User message
-    │
-    ▼
-  ┌──────────────────────────────────┐
-  │ Intent classification            │
-  │  (heuristic + LLM)               │
-  └──────────────┬───────────────────┘
-                 │
-                 ▼
-  ┌──────────────────────────────────┐
-  │ RAG over knowledge base          │
-  │  (docs, past tickets, runbooks)  │
-  └──────────────┬───────────────────┘
-                 │
-                 ▼
-  ┌──────────────────────────────────┐
-  │ LLM response generation          │
-  │  (constrained to retrieved KB)   │
-  └──────────────┬───────────────────┘
-                 │
-            ┌────┴─────┐
-            │          │
-            ▼ confident ▼ unsure / out-of-scope
-       Respond     ┌──────────────────┐
-                   │ Escalate to      │
-                   │ human agent      │
-                   └──────────────────┘
-                            │
-                            ▼
-                   Agent answers, agent
-                   answer logged for
-                   KB update
+User message
+  │
+  ▼
+┌──────────────────────────────────┐
+│ Intent classification            │
+│  (heuristic + LLM)               │
+└──────────────┬───────────────────┘
+               │
+               ▼
+┌──────────────────────────────────┐
+│ RAG over knowledge base          │
+│  (docs, past tickets, runbooks)  │
+└──────────────┬───────────────────┘
+               │
+               ▼
+┌──────────────────────────────────┐
+│ LLM response generation          │
+│  (constrained to retrieved KB)   │
+└──────────────┬───────────────────┘
+               │
+          ┌────┴─────┐
+          │          │
+          ▼ confident ▼ unsure / out-of-scope
+     Respond     ┌──────────────────┐
+                 │ Escalate to      │
+                 │ human agent      │
+                 └──────────────────┘
+                          │
+                          ▼
+                 Agent answers, agent
+                 answer logged for
+                 KB update
 ```
 
 - **Data model:**
@@ -46,11 +46,11 @@
   - Feedback log: thumbs-up/down per response, free-text corrections from agents
 
 - **Key components:**
-  - *Intent classification:* detect category (billing, technical, account, out-of-scope) before retrieval. Decision: heuristic regex/keyword first, LLM classifier on ambiguous cases.
-  - *RAG retrieval:* hybrid retrieval over the knowledge base, scoped by intent category to reduce noise. Decision: chunk by section not by token, so retrieved chunks are semantically coherent.
-  - *Response generation:* LLM constrained to cite retrieved KB chunks. Decision: refuse to answer if no chunk above relevance threshold (better to escalate than hallucinate).
-  - *Escalation:* rule-based gate (intent = out-of-scope, or confidence < threshold, or user types "agent please") triggers handoff with full conversation context.
-  - *Feedback loop:* agent corrections are logged as gold-standard responses, fed back into eval set, used to identify KB gaps.
+  - *Intent classification*: detect category (billing, technical, account, out-of-scope) before retrieval. Decision: heuristic regex/keyword first, LLM classifier on ambiguous cases.
+  - *RAG retrieval*: hybrid retrieval over the knowledge base, scoped by intent category to reduce noise. Decision: chunk by section not by token, so retrieved chunks are semantically coherent.
+  - *Response generation*: LLM constrained to cite retrieved KB chunks. Decision: refuse to answer if no chunk above relevance threshold (better to escalate than hallucinate).
+  - *Escalation*: rule-based gate (intent = out-of-scope, or confidence < threshold, or user types "agent please") triggers handoff with full conversation context.
+  - *Feedback loop*: agent corrections are logged as gold-standard responses, fed back into eval set, used to identify KB gaps.
 
 - **Scale concerns:**
   - At ~10k conversations/day: LLM cost dominates. Solution: cache common question-answer pairs, route easy questions to cheaper model.
@@ -68,31 +68,18 @@
   - Stale knowledge base — bot tells users about a feature that was deprecated last week. Mitigation: KB freshness SLA, doc change → re-embed within 24h.
   - Tone drift — bot sounds inconsistent across conversations. Mitigation: system prompt defines persona, eval rubric scores tone adherence per response.
 
-- **Applies to this codebase:** `partially`.
+- **Applies to this codebase:** **partially**. `blooming_insights` isn't a support chatbot — the product is an analyst-workflow tool, not a Q&A surface. But the mechanisms overlap substantially:
+  - Intent classification: same shape exercised in `lib/agents/intent.ts` (Haiku classify → route to Diagnostic or Query agent)
+  - Response generation via ReAct: this codebase's DiagnosticAgent + RecommendationAgent are ReAct-shaped
+  - Structured outputs at the model boundary: `Diagnosis`, `Recommendation` in `lib/mcp/types.ts` — analogous to a chatbot's structured response with confidence + escalation flag
+  - Escalation-shaped gate: the diagnostic agent honestly reports "no signal" on no-signal cases (goldens 05, 06, 10 in `eval/goldens/`) instead of confabulating — that's the "escalate rather than hallucinate" pattern
+  - LLM-as-judge rubric: `eval/rubrics/*.ts` — the same scoring machinery a chatbot would use to grade responses in golden and adversarial sets
 
-  The multi-agent investigation flow has the *structural shape* of a chatbot's intent-classify → RAG → constrained-response pipeline:
+  What's missing to make it a chatbot: RAG over a knowledge base (see `03-retrieval-and-rag/*` — Case B), a conversational multi-turn interface (the `QueryBox` is single-turn today), a human-in-the-loop escalation path (users act on recommendations manually today).
 
-  | Tech support chatbot piece | blooming_insights equivalent |
-  |---|---|
-  | Intent classification | `lib/agents/intent.ts` (Haiku classifier, 4 intents) |
-  | RAG over knowledge base | Schema-as-retrieval (`03-retrieval-and-rag/01-schema-as-retrieval.md`) + live EQL queries |
-  | LLM response generation | The four Sonnet agents (monitoring, diagnostic, recommendation, query) |
-  | Constrained to cite sources | Diagnoses include `evidence[]` with tool result citations |
-  | Tool allowlist | `lib/mcp/tools.ts` (per-agent allowlist) |
-  | Refuses when no relevant context | Returns "no anomalies above threshold" rather than hallucinating |
-
-  What's missing: (1) **escalation** — there's no "I don't know, ask a human" path; the agent always produces *something*. (2) **Feedback loop** — agent corrections aren't captured; there's no "edit this recommendation, learn from the edit" path. (3) **Conversation history across sessions** — every chat query is fresh (see `04-agents-and-tool-use/05-agent-memory.md`).
-
-  Also: the *intent* is generation (find anomalies, propose actions), not Q&A. Users aren't asking support questions; they're investigating data.
-
-- **How to make it apply:**
-
-  Three concrete additions, in product-fit order:
-
-  1. **Add a "this recommendation isn't quite right — here's a correction" affordance** to the recommendation card. Capture the correction in a per-user feedback log. This is the feedback loop a tech support chatbot needs to improve over time. Adjacent benefit: turns the recommendation surface from one-way (LLM → user) into two-way (LLM ↔ user). Pre-requires the user-override-lock pattern (`B1.9` in `01-llm-foundations/09-user-override-locks.md`).
-
-  2. **Add escalation as a "talk to support" affordance** on any agent error or low-confidence diagnosis. Today, low-confidence diagnoses surface a `confidence: 'low'` badge but no path forward. An escalation surface (mailto link, Bloomreach support chat, etc.) plus a copy-conversation-context affordance gives users a real path when the agent can't help.
-
-  3. **Persist conversation history per user** (`B4.5` in `04-agents-and-tool-use/05-agent-memory.md`) so the query agent can follow up on prior questions. This is the structural change that turns the chat surface from one-shot Q&A into actual conversation. Pre-requires storage (Vercel KV or SQLite).
-
-  Reference exercises: `B1.9` (user override locks), `B4.5` (persist investigations), `B6.3` (action confirmation gate — relevant to "escalate to human" structurally).
+- **How to make it apply:** the retrofit path would be:
+  1. Extend `QueryBox` to a multi-turn conversation surface (keep conversation history across turns in `sessionStorage`, thread it into the QueryAgent's messages array).
+  2. Add RAG over a Bloomreach knowledge base — docs, feature descriptions, past investigation summaries (`03-retrieval-and-rag/11-rag.md` Case B path).
+  3. Add a per-response confidence field to the `QueryAgent`'s structured output; render an "escalate to human" button when confidence < 0.6.
+  4. Route escalations to a simple dev-side "unanswered queries" log, feed into eval set weekly to identify KB gaps.
+  This isn't the product I'm building — but the mechanism library is 80% there. Interview answer: "I haven't built a support chatbot, but I've built the ReAct + structured-output + evals + intent classification stack that a support chatbot needs. The retrofit is well-defined."

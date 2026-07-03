@@ -1,171 +1,159 @@
-# Lost-in-the-middle problem
+# 02 — Lost-in-the-middle
 
-*Industry standard — attention degradation in long contexts*
+**Type:** Industry standard. Also called: attention drop-off, positional bias, middle-of-context penalty.
 
-## Zoom out — where this concept lives
+## Zoom out, then zoom in
 
-Long contexts don't get attention uniformly. The model attends strongly to the *start* and *end* of context, weakly to the middle. This codebase doesn't have a long-context retrieval problem (the prompts are small), but the pattern still shapes one choice: where the schema summary lives in the prompt.
+The empirical pattern that models attend strongest to the start and end of the context window. Not directly measured in this codebase but shapes how tool_result content is structured.
 
 ```
-  Zoom out — where positional bias lives
+  Zoom out — where positional bias would show up
 
-  ┌─ Prompt assembly ────────────────────────────┐
-  │  System prompt                                │ ← START — highest attention
-  │  Schema summary                               │ ← still high
-  │  Tool definitions                             │
-  │  Prior conversation turns                     │ ← MIDDLE — weakest
-  │  Latest tool result                           │
-  │  Latest user-question / current task          │ ← END — high again
-  └────────────────────┬─────────────────────────┘
-                       │
-                       ▼
-  ┌─ Model — attention drops in the middle ──────┐
-  │   if relevant info is mid-prompt, it may be   │
-  │   underweighted or missed                     │
-  └──────────────────────────────────────────────┘
+  ┌─ messages array (grows across the loop) ──────────────────────────┐
+  │  [system]        ← START ─── attended strongly                    │
+  │  [user: anomaly]                                                  │
+  │  [asst: thought] ← MIDDLE ── attended less                        │
+  │  [user: tool_result]                                              │
+  │  ...many turns...                                                 │
+  │  [asst: latest thought]                                           │
+  │  [user: latest tool_result]  ← END ── attended strongly           │
+  │                                                                   │
+  │  ★ THIS CONCEPT ★                                                 │
+  └───────────────────────────────────────────────────────────────────┘
 ```
 
-**Zoom in.** This codebase doesn't currently stuff long contexts (~15-30k tokens typical, well below the long-context regime where this hurts most). But the *principle* matters for how prompts are ordered.
+Zoom in. Empirical result from research on Claude, GPT-4, and open models: attention weight is highest at the very beginning (system prompt, opening context) and at the very end (recent turns). Middle-of-context content is more likely to be ignored or misremembered. In this repo, the pattern is present in theory but our messages arrays are small enough (~35K peak) that we don't measurably hit it.
 
-## Structure pass — layers · axes · seams
+## Structure pass
 
-**Layers:** prompt position → model attention → output quality.
+**Layers:**
+- Outer: reader observation (agent forgets something from turn 3)
+- Middle: model's attention weights
+- Inner: transformer attention mechanics
 
-**Axis: where in the prompt does the load-bearing info sit?** This codebase puts the rules at the top (system prompt), the workspace shape next (schema summary), and the current task at the bottom (latest tool result + next-step instruction). Head and tail; the middle is tool definitions + prior turns.
+**Axis: model attention by position.**
+- Start (system, first user): strong attention
+- Middle (turns 3-6 of a 10-turn loop): weak attention
+- End (latest turns): strong attention
 
-**Seam:** the prompt assembly order. Today it's implicit (Anthropic SDK puts system first, messages in array order). Re-ordering is a soft lever that costs nothing.
+**Seam:** the messages array ordering. What goes first and last is what the model attends to; the middle is where lossy compression happens implicitly.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know how a long meeting goes — you remember what was said at the start and at the end, the middle is fuzzy? Transformer attention has the same shape, empirically.
+Think of a phone number someone tells you. First three digits and last four — easy. The middle two? You forget them and have to ask again. Same shape. Attention over a long context isn't uniform; middle content is systematically discounted.
 
 ```
-  Attention distribution across a long prompt (cartoon)
+  Attention weight by position (empirical, generalized)
 
-  attention
   weight
-    ↑
-    │ ██                                  ██
-    │ ██                                  ██
-    │ ██                                  ██
-    │ █████                            █████
-    │ ██████                          ██████
-    │ ████████  ░░░░░░░░░░░░░░░░░░  ████████
-    │ █████████░░░░░░░░░░░░░░░░░░██████████
-    │ ──────────────────────────────────────►  prompt position
-       START         MIDDLE              END
-
-  Anything load-bearing should land in the high-attention
-   regions: at the start (rules, schema) or at the end
-   (current task, latest input).
+    │
+    │▓                              ▓
+    │▓▓                           ▓▓▓
+    │▓▓▓                        ▓▓▓
+    │▓▓▓                       ▓▓▓
+    │▓▓▓▓                     ▓▓▓▓
+    │▓▓▓▓▓                   ▓▓▓▓▓
+    │▓▓▓▓▓▓                 ▓▓▓▓▓▓
+    │▓▓▓▓▓▓▓__▓_▓__▓_▓_▓___▓▓▓▓▓▓▓
+    └──────────────────────────────►
+      start        middle        end
+                position in context
 ```
 
-### Move 2 — the step-by-step walkthrough
+Origin of the "middle" penalty: transformer attention is bidirectional (each token attends to all others), but decoder-only autoregressive models are trained on next-token prediction, which biases them toward recent context (needed for generation) AND toward opening context (often instructions). The middle gets neither training signal strongly.
 
-**Part 1 — what this codebase puts at the start.**
+### Move 2 — walk the mechanism
 
-Monitoring's system prompt at `lib/agents/legacy-prompts/monitoring.md:1-37` opens with role + hard rules, in that order:
+**Where this WOULD hurt in this codebase.**
 
-```
-You are the monitoring agent in blooming insights...
+If a diagnostic investigation ran 20+ tool calls (it doesn't; capped at 6), the earliest tool_result blocks would sit in the middle of the messages array by turn 15. The model might weight the freshest 2-3 tool_results heavily and effectively ignore the early ones — even though early evidence might be critical to the diagnosis.
 
-## Role
-You run a fixed checklist of ecommerce anomaly categories...
+**Why we don't measurably hit it.**
 
-## Hard rules
-1. Pass project_id: {project_id} to every tool call.
-2. This workspace has no saved dashboards/funnels/trends...
-3. Make at most 6 tool calls total, then stop and return your JSON answer.
-...
-```
+Two design choices keep this codebase away from the failure mode:
 
-The hard rules are the most-important content. They land in the highest-attention region (start of the system prompt). The schema summary follows immediately.
+1. **The 6-tool-call budget.** With at most 6 tool calls, the messages array stays short (~35K peak). Everything is close enough to the "end" that positional bias barely matters.
+2. **Schema-constrained conclusion.** The agent's final output is a `Diagnosis` object with `evidence` array — the model has to explicitly cite what supports each hypothesis. That forces it to REFER to what's in the tool_results, which brings the referenced content back into the model's active attention rather than relying on positional recall.
 
-**Part 2 — what lives in the middle (and why that's OK here).**
+**What we'd do differently at higher tool-call counts.**
 
-After the system prompt come the tool definitions (in the `tools[]` array, ~800 tokens) and the accumulating conversation turns. These are the "middle" of a long agent loop. Two things keep this from biting:
+Two mitigations from the research:
+- **Summarize old turns.** After N turns, replace the earliest tool_result blocks with a running summary of "what we've learned so far." Trades detail for position — the summary lives at the start (strong attention) instead of the middle (weak).
+- **Move the question to the end.** Restate the anomaly / goal in the LATEST user message, not just the first one. The model attends to the end; restating the question there anchors the reasoning.
 
-  → **Tool definitions are reference material, not directives.** The model uses them when it decides to call a tool, not when it decides *whether* to call. The attention drop is OK.
-  → **Conversation turns are short.** Each `tool_call` + `tool_result` pair is a few hundred tokens. The "middle" is short enough that the attention drop is mild.
-
-**Part 3 — what lands at the end.**
-
-The latest tool result and the implicit "what's next?" are at the tail of the prompt every turn. From the model's perspective, the freshest context (which it needs to use to pick the next action) is in the high-attention zone at the end. This is built into the loop's shape — no special engineering required.
-
-**Part 4 — where the codebase would feel the bite.**
-
-If a future version pre-loaded the entire raw workspace schema (untruncated, ~50-100k tokens) at the start, the *current task* would be far in the tail of a long middle. The model might lose the thread of "what am I checking right now?" — classic lost-in-the-middle failure mode.
-
-The defense today: `schemaSummary` keeps the schema short (~500 tokens) so it's still in the start-of-prompt high-attention zone.
+Neither is implemented today because we haven't measured the failure mode. Case B exercise would be adding the summarization.
 
 ### Move 3 — the principle
 
-**Put load-bearing content at the start or end; the middle is for reference material.** This codebase's prompts are short enough that the bite is mild, but the *order* still matters as the prompts grow. Rules → schema → tool defs → conversation → current task is a sound ordering for this shape.
+Position in the messages array is a proxy for model attention. Put load-bearing information at the start (system prompt, the question) or at the end (fresh tool_result, restated goal). Don't bury the key finding in the middle of a long loop and expect the model to remember it. When you can't avoid it, summarize.
 
-## Primary diagram — the full recap
+## Primary diagram
 
 ```
-  This codebase's prompt order, mapped to attention regions
+  What "middle" looks like in this repo (turn 10 of a diagnostic)
 
-  Position in prompt          Content                         Attention
-  ──────────────────────────────────────────────────────────────────────
-  Start of system prompt   →  Role + Hard rules               ★★★★★  HIGH
-  Mid system prompt        →  Schema summary (capped)         ★★★★    high
-  End of system prompt     →  Category checklist + method     ★★★★    high
-  ──────────────────────────────────────────────────────────────────────
-  Start of tools[]         →  ~17 tool definitions            ★★      MID
-  ──────────────────────────────────────────────────────────────────────
-  Start of messages[]      →  Initial user prompt             ★★★     mid-high
-  Mid messages[]           →  Accumulated tool_use/tool_result★★      MID
-  End of messages[]        →  Latest tool result              ★★★★★   HIGH
-                              + next-step trigger              ★★★★★   HIGH
-
-  The load-bearing content (rules, schema, latest result) lives
-   in the high-attention regions by default. The risk is future
-   prompt-bloat shifting that.
+  ┌─ messages array (~35K tokens) ────────────────────────────────────┐
+  │                                                                   │
+  │  system         ▓▓▓ 2-3K     [START — strong attention]            │
+  │  tools          ▓▓  1-2K                                           │
+  │  user: anomaly  ▓   0.5K                                           │
+  │  ─────                                                            │
+  │  asst turn 2    ▓   0.3K                                           │
+  │  tool_result 2  ▓▓  1.2K     [MIDDLE — weak attention]             │
+  │  asst turn 3    ▓   0.3K                                           │
+  │  tool_result 3  ▓▓  1.8K     ↓                                     │
+  │  asst turn 4    ▓   0.4K     ↓ risk zone if history                │
+  │  tool_result 4  ▓▓  1.5K     ↓ grew much longer                   │
+  │  asst turn 5    ▓   0.3K                                           │
+  │  tool_result 5  ▓▓  1.9K                                           │
+  │  asst turn 6    ▓   0.4K                                           │
+  │  tool_result 6  ▓▓▓ 2.1K                                           │
+  │  ─────                                                            │
+  │  asst turn 7    ▓   0.4K     [END — strong attention]              │
+  │  final result   ▓   0.5K                                           │
+  │                                                                   │
+  │  Because history is short (~35K vs 200K limit), everything         │
+  │  is "close enough" to start/end. No measured misattention today.   │
+  └───────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-**Why this isn't a hot problem here today.** Three reasons:
+The finding comes from "Lost in the Middle: How Language Models Use Long Contexts" (Liu et al., 2023) which measured attention accuracy on multi-document QA at varying gold-position depth. Consistent finding across models: U-shaped accuracy curve, with a valley in the middle third of context.
 
-  1. **Short contexts.** ~15-30k tokens typical; lost-in-the-middle bites worst on 50k+ contexts.
-  2. **Structured outputs.** Tool calls are schema-constrained; "the model missed a key fact in the middle of the prompt" is hard to manifest as a wrong tool call.
-  3. **Short loops.** 6-call budget on monitoring, ~7-8 on diagnostic. The conversation history doesn't grow to lost-in-the-middle scale.
+The problem gets worse with longer contexts. At 200K, the middle-attention degradation is measurable in benchmarks. At 30K, it's within noise. This codebase runs at the low end of that range, which is why we don't see it as a practical issue.
 
-**Where this WOULD bite.** If RAG arrives later (a vector retrieval surface over the user's past investigations or the Bloomreach docs), the retrieved chunks would go *into* the prompt. Stuffing 20 retrieved chunks into the middle and asking a question is the canonical lost-in-the-middle scenario. Mitigations: rerank to put the most-relevant chunk first, summarize the middle chunks before they enter the prompt, or use a smaller `top-k` and trust the retrieval.
+Related failure modes: **needle in a haystack** (finding one specific fact in a long context — modern models do well on this at the ends, poorly in the middle); **long-context recall degradation** (attending to details from earlier in the conversation).
 
 ## Project exercises
 
-### Exercise — Reorder the diagnostic prompt to put hypothesis-priors at the start
+### Exercise — running summary for long investigations
 
-  → **Exercise ID:** B2.2
-  → **What to build:** In `lib/agents/legacy-prompts/diagnostic.md` (and the corresponding AptKit prompt), restructure so that any prior hypotheses already supported by evidence are surfaced at the *top* of the prompt, before any tool definitions. The current order puts them mid-prompt; the reorder lifts them into the high-attention zone.
-  → **Why it earns its place:** the retired Phase 3 eval finding of 30% conclusion instability had a positional component — when prior-turn hypothesis support landed in the conversation history middle, the model sometimes lost the thread. Reordering is a cheap soft lever before reaching for sampling changes.
-  → **Files to touch:** `lib/agents/legacy-prompts/diagnostic.md`, the AptKit prompt builder if it owns ordering, `test/agents/diagnostic.test.ts` (add a regression case: same anomaly, supported hypothesis from a prior synthetic turn, assert the conclusion references the right hypothesis).
-  → **Done when:** the prompt structure puts supported-hypothesis context at the top of the system prompt or as the first user message, and the regression test passes consistently across 10 runs.
-  → **Estimated effort:** 1–4hr.
+- **Exercise ID:** C2.2-B · Case B (concept not exercised; would matter if tool-call cap were raised).
+- **What to build:** when the tool-call count > 4, insert a "summary of findings so far" as an assistant message BEFORE the growing tool_result history. Model summarizes what earlier tool_results showed; each summary replaces the raw earlier turns in the messages array, keeping recent turns in full detail.
+- **Why it earns its place:** proves you know the failure mode and have a mitigation. Interviewer signal: "for longer loops I'd summarize old turns to keep the anchor at the start instead of letting it drift into the middle."
+- **Files to touch:** `lib/agents/aptkit-adapters.ts` (or a wrapper), a small summarization helper that intercepts the messages array before `complete()`.
+- **Done when:** running an artificially-extended diagnostic (raise cap to 12) shows the messages array has summaries instead of raw early turns; a test proves the summary preserves the key finding.
+- **Estimated effort:** 1-2 days.
 
 ## Interview defense
 
-**Q: "Do you worry about lost-in-the-middle?"**
+**Q: Does lost-in-the-middle affect this codebase?**
 
-Not in this codebase today — prompts run ~15-30k tokens, well below the long-context regime where positional attention degradation bites hard. But the *order* of the prompt still matters: rules at the start (highest attention), schema next, latest tool result at the end. The middle is tool definitions and prior conversation turns, which are reference material — the model uses them when it decides to call a tool, but they don't need to drive immediate decisions.
+Not measurably at today's usage. The 6-tool-call cap keeps the messages array around 35K peak; everything is close enough to the start or end that positional bias is within noise. If we raised the cap to 15-20 tool calls, the risk would show up — turn 3's tool_result would sit in the "middle" of a 100K+ context and the model might weight it low.
 
-If RAG ever lands here, the chunks would go in the middle. Then reranking to put the most-relevant chunk first becomes necessary.
+**Q: What would you do at higher tool-call counts?**
 
-*Anchor: "Short prompts today; the order is sound; RAG is the future bite point."*
+Summarize old turns. After turn N, replace the earliest tool_results with a running summary of "what we've learned so far." That trades detail for position — the summary sits at the start (strong attention) instead of raw content sitting in the middle (weak attention). Trade-off: some detail is compressed away, so the summarization prompt has to preserve what's diagnostically important.
 
-**Q: "Where would you put a critical instruction in a long prompt?"**
+**Q: How would you MEASURE if it was happening?**
 
-At the end, just before the model's next decision. Closing-instruction-at-the-end works better than buried-mid-prompt because the end is the second high-attention zone. The system-prompt-at-the-start also works, but it competes with all the other rules already there. End-of-prompt repetition is the cheap belt-and-suspenders move.
-
-*Anchor: "Critical → end of prompt (or repeated at start + end). Avoid mid-prompt for anything load-bearing."*
+Adversarial eval. Craft a case where the diagnosis-critical evidence appears in turn 2's tool_result, then extend the loop with irrelevant follow-up tools that push turn 2's evidence into the middle. Judge whether the diagnosis still cites turn 2's finding. If the citation rate drops as the loop gets longer, that's lost-in-the-middle. Not in the current harness — a candidate case for Adversarial set expansion (`05-evals-and-observability/01-eval-set-types.md`).
 
 ## See also
 
-  → `01-context-window.md` — the budget that frames how big "the middle" gets
-  → `03-prompt-chaining.md` — splitting work across calls keeps each prompt short
-  → `03-retrieval-and-rag/02-schema-gated-coverage.md` — the gating that keeps the schema summary small
+- `01-context-window.md` — the container this pattern lives in
+- `05-evals-and-observability/01-eval-set-types.md` — adversarial set could probe this
+- `04-agents-and-tool-use/06-error-recovery.md` — the 6-call cap that keeps us safe

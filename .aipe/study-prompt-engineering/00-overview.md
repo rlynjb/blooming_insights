@@ -1,112 +1,58 @@
-# Overview — the prompt-engineering surface of blooming insights
+# Prompt engineering — one-page map
 
-**Industry standard** · system overview, prompt-engineering lens
+Prompt engineering is the discipline of shipping LLM-backed features that survive Friday deploys, model upgrades, and PMs who ask you to "make it more creative." It is not writing better prompts. It is treating a prompt like production code — versioned, tested, evaled, budgeted, observable — and knowing which of the folklore techniques (chain-of-thought, few-shot, self-critique) actually earn their tokens for the problem you have.
 
-## Zoom out — where prompts live in this system
-
-blooming insights runs four LLM-backed agents (monitoring, diagnostic, recommendation, query) plus a one-token intent classifier. Every one of them has a system prompt template stored as markdown in the repo; every one of them validates the model's output at a typed boundary before the rest of the app touches it. The diagram below pins those two surfaces — prompts in, structured output out — across the stack.
+## Where each concept sits in the stack
 
 ```
-  Zoom out — the prompt-engineering surface
+  Prompt engineering — the stack
 
-  ┌─ UI layer ────────────────────────────────────────────────┐
-  │  app/page.tsx · components/chat/QueryBox.tsx              │
-  │  user-controlled text enters HERE                         │
-  └─────────────────────────────────┬─────────────────────────┘
-                                    │  POST /api/agent { q }
-  ┌─ API route layer ────────────────▼────────────────────────┐
-  │  app/api/agent/route.ts · app/api/briefing/route.ts        │
-  │  picks the agent · streams NDJSON                          │
-  └─────────────────────────────────┬─────────────────────────┘
-                                    │
-  ┌─ ★ PROMPT LAYER ★ ──────────────▼────────────────────────┐ ← we are here
-  │  system prompt templates:                                  │
-  │    lib/agents/legacy-prompts/{monitoring,diagnostic,       │
-  │                              recommendation,query}.md      │
-  │  slot interpolation: {schema}, {project_id}, {categories}, │
-  │                      {anomaly}, {diagnosis}, {intent}      │
-  │  active wrapping: @aptkit/core (consumes the same patterns)│
-  └─────────────────────────────────┬─────────────────────────┘
-                                    │  text in → text out
-  ┌─ Model + MCP layer ─────────────▼────────────────────────┐
-  │  Anthropic (claude-sonnet-4-6 / haiku-4-5 for intent)      │
-  │  tool registry: lib/mcp/tools.ts (per-agent allowlists)    │
-  │  per-result truncation: lib/agents/base-legacy.ts:34       │
-  └─────────────────────────────────┬─────────────────────────┘
-                                    │  JSON in a ```json fence
-  ┌─ Validator layer ───────────────▼────────────────────────┐
-  │  defensive parser:  parseAgentJson  (lib/mcp/validate.ts) │
-  │  type guards:       isAnomalyArray · isDiagnosis ·         │
-  │                     isRecommendationArray                  │
-  └─────────────────────────────────┬─────────────────────────┘
-                                    │  typed `Anomaly[]` / `Diagnosis` / ...
-  ┌─ State + UI ────────────────────▼────────────────────────┐
-  │  rendered as InsightCard, EvidencePanel, RecommendationCard│
-  └────────────────────────────────────────────────────────────┘
+  ┌─ discipline (how you work) ─────────────────────────────┐
+  │  01 anatomy         03 prompts-as-code                  │
+  │  05 eval-driven     04 token budgeting                  │
+  │  02 structured outputs (contract at the boundary)       │
+  └─────────────────────────────────────────────────────────┘
+              │
+              ▼
+  ┌─ techniques (what you reach for) ───────────────────────┐
+  │  06 single-purpose chains    07 output mode mismatch    │
+  │  08 few-shot                 09 chain-of-thought        │
+  │  10 self-critique            11 meta-prompting          │
+  │  13 forbidden patterns / rotating formulas              │
+  └─────────────────────────────────────────────────────────┘
+              │
+              ▼
+  ┌─ hardening (what breaks in production) ─────────────────┐
+  │  12 prompt injection defenses                           │
+  └─────────────────────────────────────────────────────────┘
 ```
 
-## Zoom in — what this notebook covers
+Read top to bottom. If you know discipline but jump straight to techniques you'll ship prompts that work in demos and regress silently in production.
 
-Thirteen concepts, organized so the operational discipline (anatomy, structured outputs, prompts-as-code, token budgeting, eval-driven iteration) comes before the specific techniques (few-shot, chain-of-thought, self-critique, meta-prompting). Two concepts cover specific failure modes (output mode mismatch, prompt injection); one covers a pattern this repo doesn't yet exercise (forbidden patterns / rotating formulas).
+## The 13 concepts — what each one gets wrong when done badly
 
-Every concept anchors to real code:
+**Operational discipline (read first):**
 
-  → prompt templates at `lib/agents/legacy-prompts/*.md`
-  → the schema-compaction helper (`schemaSummary`) at `lib/agents/monitoring.ts:19`
-  → the tool registry at `lib/mcp/tools.ts`
-  → the defensive parser (`parseAgentJson`) at `lib/mcp/validate.ts:3`
-  → the type guards at `lib/mcp/validate.ts:17-57`
-  → the per-result truncation at `lib/agents/base-legacy.ts:32-37`
-  → token usage logging at `lib/agents/aptkit-adapters.ts:57-61`
+- **01 · Anatomy of a production prompt** — junior mode dumps everything into one string. Sections drift, and now no one can change the schema line without breaking the role line. Fix: name the four sections explicitly.
+- **02 · Structured outputs** — "respond only in JSON" in a system prompt was the 2023 answer. In 2026 you use tool calling or `response_format`, validate the parse, retry with a stricter re-ask on schema fail. The bug: courteous models wrapping JSON in markdown fences.
+- **03 · Prompts as code** — prompts scattered as string literals across a repo cannot be reviewed, diffed, or version-paired with model versions. In this codebase the prompts live inside `@aptkit/core` as versioned template packages — that shape is the concept.
+- **04 · Token budgeting** — a chain that works fine on small inputs times out at scale because nobody counted tokens. In this codebase `schemaSummary()` caps the workspace schema to 20 events × 10 properties + 30 customer properties. That cap is the concept.
+- **05 · Eval-driven iteration** — vibes-based iteration means every prompt tweak is a stab in the dark. Golden set + judge + receipt is the discipline. This codebase has all three: 10 goldens, `RubricJudge`, per-case receipts.
 
-## The five agents at a glance
+**Techniques (reach for these when the problem calls for them):**
 
-```
-  Five agents, five system prompts — each with one job
+- **06 · Single-purpose chains** — one chain doing four jobs is where brittleness hides. This codebase runs four agents (`monitoring`, `diagnostic`, `recommendation`, `query`), each with one job, composed in the coordinator.
+- **07 · Output mode mismatch** — chain A returns JSON in a fence, chain B expects markdown, parser breaks. The failure mode is silent — schema validators catch it if you write them.
+- **08 · Few-shot prompting** — three good examples beats an instruction paragraph for format-sensitive tasks. Overused for open-ended generation, where they lock the model into repetition.
+- **09 · Chain-of-thought** — 2023's "let's think step by step" is largely subsumed by modern models doing CoT internally. The residue is still useful for cheaper models and structured hypothesis-testing loops.
+- **10 · Self-critique** — a model critiquing its own output has the same blind spots that produced the output. It works when the failure mode is "over-eager" (invented numbers), not "under-informed" (missing tool).
+- **11 · Meta-prompting** — using an LLM to draft prompts is fine as a first draft; it is not fine as the last step before production. The risk is prompts that read like LLM output instead of engineering specs.
+- **13 · Forbidden patterns** — LLMs converge on phrasings. Every caption from the same chain will start "Here's a" unless you name the forbidden opening and enumerate rotations.
 
-  ┌─ classifier ─────────────────────────────────────────────┐
-  │  intent (haiku-4-5)                                       │
-  │    one-token output: monitoring | diagnostic |            │
-  │                      recommendation                       │
-  │    16 max_tokens · no tools · 1 SDK call                  │
-  └───────────────────────────────────────────────────────────┘
+**Hardening (the security seam):**
 
-  ┌─ monitoring ─────────────────────────────────────────────┐
-  │  monitoring (sonnet-4-6)                                  │
-  │    output: JSON array of Anomaly{} (in ```json fence)     │
-  │    6 tool calls max · execute_analytics_eql + catalog     │
-  │    isAnomalyArray() validates · UI renders as cards       │
-  └───────────────────────────────────────────────────────────┘
+- **12 · Prompt injection defenses** — the second the prompt interpolates user-controlled content, the model is one clever payload away from following the user's instructions instead of yours. Defense-in-depth: instruction hierarchy in the system prompt, delimiter framings around user content, structured output as a defense, output validation.
 
-  ┌─ diagnostic ─────────────────────────────────────────────┐
-  │  diagnostic (sonnet-4-6)                                  │
-  │    output: JSON object Diagnosis{} (in ```json fence)     │
-  │    6 tool calls max · segments + time-series              │
-  │    isDiagnosis() validates · UI renders as EvidencePanel  │
-  └───────────────────────────────────────────────────────────┘
+## Reading order
 
-  ┌─ recommendation ─────────────────────────────────────────┐
-  │  recommendation (sonnet-4-6)                              │
-  │    output: JSON array Recommendation[] (in ```json fence) │
-  │    4 tool calls max · Bloomreach feature catalog          │
-  │    isRecommendationArray() validates · UI renders cards   │
-  └───────────────────────────────────────────────────────────┘
-
-  ┌─ query (free-form Q&A) ──────────────────────────────────┐
-  │  query (sonnet-4-6)                                       │
-  │    output: plain prose (NO json contract)                 │
-  │    ~6 tool calls · superset registry                      │
-  │    no validator · streamed straight to the UI             │
-  └───────────────────────────────────────────────────────────┘
-```
-
-Four of the five are JSON-structured outputs; one (the query agent) returns prose. That asymmetry shows up in every concept that follows — structured-output discipline applies to four agents, doesn't apply to one. Worth holding that contrast in your head as you read.
-
-## What the codebase is missing (the honest list)
-
-Two concepts get a "not yet exercised" treatment:
-
-  → **Eval-driven iteration with a real eval set.** The validator (`lib/mcp/validate.ts`) tests shape, not behavior. There's no golden set of (prompt, input, expected output) cases. The eval/ folder was retired (PR #8). Concept #5 covers what this means and what a buildable target looks like.
-  → **Rotating formulas / forbidden patterns.** No agent in this codebase is a generative chain run repeatedly for the same user, so the pattern doesn't fire here yet. Concept #13 covers when it would.
-
-The rest of the concepts have real anchors in real files. Read on.
+If you're new to the discipline: read **01 → 02 → 03 → 04 → 05** in order. Those five are the substrate — everything else assumes them. Then read the techniques (06–11, 13) in the order the problem in front of you demands. Read **12** before shipping anything that takes user input.

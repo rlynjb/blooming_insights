@@ -1,167 +1,241 @@
-# Database systems red flags — ranked audit
+# Database systems — red-flags audit
 
-*Industry standard / Project-specific* — ranked list of storage-engine and consistency risks grounded in this repo. Severity is "what's the worst that happens, today, given current usage."
+*Ranked storage-engine and consistency risks grounded in the repo. Every finding has `file:line` evidence. Verdicts first, mechanics second.*
 
-## Zoom out, then zoom in
+---
 
-Nothing in this repo is on fire. The honest top finding is that the codebase made deliberate choices to avoid a real database, and most of the "risks" listed below are latent — they bite *if* something changes (a new `await`, a second writer, a missing env var). The point of this audit is to name where the load-bearing assumptions are, so a future change doesn't break them by accident.
+## The scoring rubric
 
+Each finding names:
+- **Severity** — how bad if this triggers in production.
+  - `HIGH` — breaks user-visible behavior or silently corrupts state.
+  - `MEDIUM` — degrades performance or reliability under load; not seen in normal use.
+  - `LOW` — cosmetic or dev-only.
+- **Evidence** — file paths, line ranges, code.
+- **Mechanism** — what actually goes wrong.
+- **The move** — the concrete fix or the deliberate acceptance.
+
+---
+
+## Finding 1 — Cache key is non-canonical JSON (MEDIUM)
+
+**Evidence.** `lib/data-source/bloomreach-data-source.ts:144`
+
+```ts
+const cacheKey = `${name}:${JSON.stringify(args)}`;
 ```
-  Zoom out — where this concept lives
 
-  ┌─ this audit ────────────────────────────────────────────┐
-  │  walks 01-08, ranks the risks that fall out             │
-  │  severity = blast radius × likelihood-given-current-use  │
-  └─────────────────────────────────────────────────────────┘
+**Mechanism.** `JSON.stringify` serializes object properties in insertion order. If two call sites build `args` with different key insertion order — even for the same conceptual query — the cache keys differ and the cache misses. In practice this doesn't bite today because the agents build `args` via the same tool-schema-driven code path, so key order is stable. But it's the class of bug that lands as a *performance regression* rather than a correctness one — rate-limit retries begin dominating requests and nothing in observability points at the cache-miss root cause.
+
+**The move.** Two options: (a) canonical JSON serializer (`sortedJsonStringify`) — one function change, ~5 lines. (b) accept it and add a unit test locking in the current key-order invariant. I'd pick (a) — it's cheap and eliminates a whole failure mode. Anchor for the fix: right before line 144, replace `JSON.stringify(args)` with a canonical stringifier that sorts object keys recursively.
+
+**Cross-links.** `03-btree-hash-and-secondary-indexes.md` — the composite index discussion; `04-query-planning-and-execution.md` — plan-reuse via cache.
+
+---
+
+## Finding 2 — `getCachedInvestigation` file reads on every request (LOW–MEDIUM)
+
+**Evidence.** `lib/state/investigations.ts:22-28`
+
+```ts
+export function getCachedInvestigation(insightId: string): AgentEvent[] | null {
+  if (mem.has(insightId)) return mem.get(insightId)!;
+  const fromFile = PERSIST ? readJson(CACHE_FILE)[insightId] : undefined;
+  if (fromFile) return fromFile;
+  const fromDemo = readJson(DEMO_FILE)[insightId];  // ← reads the whole file every call
+  return fromDemo ?? null;
+}
 ```
 
-## Structure pass
+**Mechanism.** The `fromDemo` tier does `readFileSync` + `JSON.parse` on `lib/state/demo-investigations.json` (3487 lines, ~150KB) on every cache-miss lookup. That's fine at demo cadence (a few reads per session) but scales poorly if the demo file grows or if this path becomes the hot path. There's no memoization of the parsed DEMO file across calls.
 
-**Axis traced: blast radius** — if this risk fires, what does the user see?
+**The move.** Cache the parsed demo file on first read into a module-level variable. Two options: (a) simple lazy-load `let demoParsed: Record<string, AgentEvent[]> | null = null;` and re-use. (b) `fs.watch` for dev; static import for prod. (a) is fine — the file only changes at deploy time, so a warm-instance cache is perfect. Two-line change.
 
+**Cross-links.** `02-records-pages-and-storage-layout.md` — file-boundary as page boundary; `08-replication-and-read-consistency.md` — the "committed snapshot" replica tier.
+
+---
+
+## Finding 3 — Read-modify-write race on `.investigation-cache.json` (LOW — dev-only)
+
+**Evidence.** `lib/state/investigations.ts:30-41`
+
+```ts
+export function saveInvestigation(insightId: string, events: AgentEvent[]): void {
+  mem.set(insightId, events);
+  if (PERSIST) {
+    const all = readJson(CACHE_FILE);        // read
+    all[insightId] = events;                 // modify
+    try {
+      writeFileSync(CACHE_FILE, JSON.stringify(all));  // write
+    } catch { /* best effort */ }
+  }
+}
 ```
-  ┌─ R1 .. R3 ─────┐   user can't recover without redeploy / re-OAuth
-  ┌─ R4 .. R6 ─────┐   user sees a one-time wrong result, recoverable by retry
-  ┌─ R7 .. R8 ─────┐   user sees nothing; risk is to future maintainers
+
+**Mechanism.** Read at line 34, write at line 37 — no lock. Two concurrent writers can both read the old file, both mutate their in-memory copies, both `writeFileSync` — one wins, the other is lost. `PERSIST = NODE_ENV === 'development'` so this branch is dead in production.
+
+**The move.** Accepted. Documented in the "concurrency control" study file. If this ever needs to move to prod, use `writeFileSync` with an atomic tmpfile-rename dance (`writeFileSync(tmp)` + `renameSync(tmp, CACHE_FILE)`), or drop persistence entirely.
+
+**Cross-links.** `06-locks-mvcc-and-concurrency-control.md`.
+
+---
+
+## Finding 4 — `lastCallAt` rate-limit spacing is racy (LOW)
+
+**Evidence.** `lib/data-source/bloomreach-data-source.ts:190-205`
+
+```ts
+private async liveCall(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
+  const elapsed = Date.now() - this.lastCallAt;
+  if (elapsed < this.minIntervalMs) {
+    await new Promise((r) => setTimeout(r, this.minIntervalMs - elapsed));
+  }
+  try {
+    const result = await this.transport.callTool(name, args, { signal });
+    this.lastCallAt = Date.now();
+    return result;
+  }
+  ...
 ```
 
-## The ranked findings
+**Mechanism.** `elapsed` is read, then `await` yields the loop, and by the time the second racer reads it *its own* `elapsed` is stale — both may skip the spacing wait. Between two concurrent tool calls on the same `BloomreachDataSource` instance, the intended 200ms floor collapses. The retry ladder catches downstream rate-limit responses, but a preventive spacing floor would be tighter.
 
-### R1 — `AUTH_SECRET` missing in production wipes everyone's auth at once
+**The move.** Accepted. The Bloomreach server-side rate limit is the actual enforcer; local spacing is a courtesy. If this became load-bearing, replace with a proper sequential queue: every `callTool` acquires a promise from a chain `this.gate = this.gate.then(() => this._reallyCall(...))`, guaranteeing serial spacing.
 
-**Where:** `lib/mcp/auth.ts:53-58`
+**Cross-links.** `04-query-planning-and-execution.md`; `06-locks-mvcc-and-concurrency-control.md`.
 
-```typescript
+---
+
+## Finding 5 — All in-memory state is wiped on redeploy (HIGH by shape, MEDIUM by acceptance)
+
+**Evidence.**
+- `lib/state/insights.ts:14` — `Map<sessionId, SessionFeed>`
+- `lib/data-source/bloomreach-data-source.ts:122` — 60s TTL cache
+- `lib/state/investigations.ts:11` — in-mem investigation cache
+
+**Mechanism.** Every deploy (or Vercel warm-instance turnover) drops the entire feed for every session, the entire cache, and the entire in-mem investigation store. Users see their in-flight briefing die; the next request re-runs it. In-flight NDJSON streams get dropped.
+
+**The move.** Design accepts this. Recovery is idempotent (agent reruns produce equivalent output), the client's `sessionStorage` stash of the clicked Insight covers card-click hydration, and the `bi_auth` cookie survives so OAuth doesn't need to redo the handshake. If the app grew a "please don't lose my in-progress investigation on redeploy" requirement, that's the moment for durable server-side storage (Postgres + a `investigations` table with status column, or Vercel KV). Not before. Anchor for the recognition: `bi_auth` at `lib/mcp/auth.ts:38-104` is the one exception that already survives redeploys.
+
+**Cross-links.** `07-wal-durability-and-recovery.md`.
+
+---
+
+## Finding 6 — `demo-investigations.json` is loaded via `readJson` from a hot path (LOW)
+
+**Evidence.** Same as Finding 2 — `lib/state/investigations.ts:26-27`. The `readJson` helper does `existsSync + readFileSync + JSON.parse` on every call.
+
+**Mechanism.** A single filesystem read is cheap on Vercel (files bundled into the function image), but this is a pattern worth naming. The `readJson` helper at `investigations.ts:13-20` is fine as a defensive convenience wrapper; the issue is calling it repeatedly without caching the parsed result. This is really the same finding as #2 — I list it separately because it also applies in *production* (unlike Finding 2's dev tier), where a warm instance may service dozens of investigation lookups.
+
+**The move.** Same as Finding 2 — memoize the parsed demo file at module scope.
+
+**Cross-links.** `08-replication-and-read-consistency.md`.
+
+---
+
+## Finding 7 — Cache key is unbounded in memory (LOW — bounded by tool cardinality)
+
+**Evidence.** `lib/data-source/bloomreach-data-source.ts:122`
+
+```ts
+private cache = new Map<string, { result: unknown; expiresAt: number }>();
+```
+
+**Mechanism.** Nothing evicts expired entries; they just get overwritten by the next real call to the same key. Over a very long-lived warm instance (Vercel typically recycles them within an hour or two), the Map could accumulate stale entries for `(tool, args)` combinations that never repeat. In practice: tool count is small (~15 tools), args cardinality per tool is low (project_ids are stable per session), so this stays under a few hundred entries. No leak risk at current scale.
+
+**The move.** Accepted. If it grew, a periodic sweeper or an LRU cap would fix it — but at current cardinality it's noise.
+
+**Cross-links.** `03-btree-hash-and-secondary-indexes.md`.
+
+---
+
+## Finding 8 — `readdirSync` scan pattern in the regression gate is O(n) (LOW)
+
+**Evidence.** `eval/gate.eval.ts:64-66`
+
+```ts
+const files = readdirSync(RECEIPTS_DIR)
+  .filter((f) => f.endsWith(`${candidateRunId}.json`))
+  .sort();
+```
+
+**Mechanism.** Linear scan of every receipt file, filtered by filename suffix. At 28 receipts today, negligible; at 10,000 receipts it would still be sub-second on any modern SSD; at 100,000 you'd want a directory-per-run layout so the "index" is the filesystem tree.
+
+**The move.** Accepted for now. When receipts count crosses ~1,000, restructure to `eval/receipts/<runId>/<case>.json` so the runId lookup becomes a single directory listing.
+
+**Cross-links.** `03-btree-hash-and-secondary-indexes.md`; `04-query-planning-and-execution.md`.
+
+---
+
+## Finding 9 — No canonical schema versioning on committed JSON snapshots (LOW–MEDIUM)
+
+**Evidence.**
+- `lib/state/demo-insights.json`, `demo-investigations.json` — no `schemaVersion` field at the top level.
+- `eval/baseline.json:1-92` — has `runId` and `builtAt` but no `schemaVersion`.
+- `eval/receipts/*.json` — 28 files, structure implied by `Receipt` type at `eval/gate.eval.ts:34-47`.
+
+**Mechanism.** If the shape of `Insight`, `Anomaly`, `AgentEvent`, or the receipt structure changes, older committed snapshots become subtly incompatible. The `AGENTS.md` "what must not change" list already flags this ("new fields stay optional so older snapshots still validate") — that's the current mitigation: additive-only schema evolution. But there's no runtime version check; you catch the incompatibility by "the demo replay broke."
+
+**The move.** For low cost / high value: add `schemaVersion: 1` to the top level of each snapshot file, log a warning if the reader sees an unfamiliar version, add a matching field to the writer (capture flow, `computeBaseline`). Doesn't have to gate behavior today; just makes the eventual migration visible.
+
+**Cross-links.** `02-records-pages-and-storage-layout.md`; `study-data-modeling`.
+
+---
+
+## Finding 10 — bi_auth cookie has no rotation / re-encryption path (LOW — accepted)
+
+**Evidence.** `lib/mcp/auth.ts:51-79`
+
+```ts
 function aesKey(): Buffer {
   const secret = process.env.AUTH_SECRET;
-  if (!secret) {
-    throw new Error(
-      'AUTH_SECRET is required in production to encrypt the auth cookie. ' +
-        'Set it in your Vercel project environment variables.',
-    );
-  }
+  ...
   return createHash('sha256').update(secret).digest();
 }
 ```
 
-**What happens:** if `AUTH_SECRET` is unset in prod (deploy misconfiguration, env-var rotation gone wrong), every request that hits `withAuthCookies` throws synchronously the moment it tries to read the cookie. Every user sees a 500 immediately. The thrown error is the literal string, so logs make it obvious — but service is down for *every* session until the env var is restored.
+**Mechanism.** If `AUTH_SECRET` is rotated in Vercel env, every existing `bi_auth` cookie becomes undecryptable (the decrypt catch at `auth.ts:69-79` returns `{}`, which the app treats as "no auth"). Every active user gets forced through the OAuth flow again on their next request.
 
-**Blast radius:** all users, all sessions. Recovery: set the env var and redeploy.
+**The move.** Accepted. This is *the* rotation story — you rotate by accepting the log-out event. Since Bloomreach revokes tokens every few minutes anyway, users are already used to reconnecting. If long-lived server-side sessions ever mattered, a dual-key decryption path (`AUTH_SECRET` + `AUTH_SECRET_OLD`) for a grace window would fix it — 20 lines.
 
-**Why it's R1:** it's the only failure mode in the repo where ONE configuration mistake takes down EVERY user simultaneously. Single point of failure for the only durable state.
+**Cross-links.** `07-wal-durability-and-recovery.md`.
 
-**Mitigation:** the `connectMcp` setup throw is caught in the briefing route's setup block (`app/api/briefing/route.ts:170-179`), so the 500 carries the real message rather than a bare crash. That's the only safety net.
+---
 
-### R2 — Snapshot staleness in demo mode is invisible to the user
+## Summary — ranked by consequence
 
-**Where:** `app/api/briefing/route.ts:86-152` (replay path); `lib/state/demo-*.json` (the snapshots)
+```
+  1. HIGH-by-shape / MEDIUM-by-acceptance
+     ─ All in-memory state wiped on redeploy         (Finding 5)
+        → design decision; recovery is idempotent, cookie survives
 
-**What happens:** the demo snapshot is whatever someone captured and committed last. The UI has no "this data is from N days ago" indicator. A demo run weeks after capture shows numbers the user might think are current.
+  2. MEDIUM
+     ─ Non-canonical cache key                        (Finding 1)
+        → 5-line fix; eliminates silent perf regression class
 
-**Blast radius:** users on demo mode see stale data and don't know it's stale. No correctness bug — demo is explicitly opt-in via the `bi:mode` toggle and the docs make clear it's a fixed snapshot — but trust-affecting if someone walks into a meeting with a months-old demo.
+     ─ Repeated readJson on hot path                  (Findings 2 + 6)
+        → 2-line memoize; drops demo-tier read latency
 
-**Mitigation:** a "captured on YYYY-MM-DD" badge in the UI would close this. Today: documentation only.
+     ─ No schemaVersion on snapshots                  (Finding 9)
+        → cheap forward-compat insurance
 
-### R3 — A second writer for the same session could half-replace the feed
+  3. LOW / dev-only / accepted
+     ─ Dev-only file R-M-W race                       (Finding 3)
+     ─ Rate-limit spacing race                        (Finding 4)
+     ─ Unbounded cache Map                            (Finding 7)
+     ─ Linear directory scan                          (Finding 8)
+     ─ AUTH_SECRET rotation forces re-auth            (Finding 10)
+```
 
-**Where:** `lib/state/insights.ts:57-71` — `putInsights`
+The rank is honest about what's a *shape* issue (Finding 5 — nothing to fix without adding a database) versus what's a *5-minute fix* (Findings 1, 2, 6, 9). If I had one afternoon on this: I'd land canonical cache keys (Finding 1) and memoized demo reads (Findings 2 + 6), and add `schemaVersion` fields (Finding 9). That's it — the rest is either accepted-tradeoff or wait-until-scale.
 
-**What happens:** if two `/api/briefing` calls for the same `sessionId` ran concurrently (e.g. a user opens two tabs and refreshes both at once), the second's `.clear()` could land mid-way through the first's `.forEach()`. The session's feed would end up with a mix of items from both runs.
+## Cross-links
 
-**Blast radius:** one user, one session, until they refresh again.
-
-**Why it hasn't bitten:** the briefing button disables while in-flight, the auto-reconnect is guarded (one retry), and most users have one tab. But nothing in the server prevents the concurrent case.
-
-**Mitigation:** the cleanest fix is build-and-swap inside `putInsights` (build new Maps locally, assign at end — see `05-transactions-isolation-and-anomalies.md`'s interview answer). A per-session async lock would also work. Today: neither is in place.
-
-### R4 — Adding an `await` between `.clear()` and `.forEach()` in `putInsights` would create a dirty-read window
-
-**Where:** `lib/state/insights.ts:57-71`
-
-**What happens:** today `putInsights` is synchronous between `.clear()` and `.forEach()`, so no other JS can interleave. Adding any `await` in that window — telemetry call, validation, derived-fields recomputation that does I/O — opens a window where a reader sees an empty feed mid-briefing.
-
-**Blast radius:** one user during one briefing, until the function completes.
-
-**Why it's R4 (not higher):** the code is correct *today*. The risk is to a future change. The comment at `lib/state/insights.ts:57-63` warns about WHY `.clear()` is called but says nothing about the atomicity contract — a future maintainer adding an `await` won't see the warning.
-
-**Mitigation:** a "DO NOT add `await` between .clear() and .forEach()" comment. Or refactor to build-and-swap so the contract is enforced by construction.
-
-### R5 — Two concurrent cache misses for the same key cause a duplicate upstream call
-
-**Where:** `lib/data-source/bloomreach-data-source.ts:147-152` (cache read) + `:184-187` (cache write)
-
-**What happens:** two concurrent `callTool(name, args)` with the same key both miss the cache, both trigger `liveCall`, both write the result. The second upstream call burns one tick of the ~1 req/s rate budget.
-
-**Blast radius:** one extra upstream call per simultaneous miss. No correctness violation — both callers get a valid result.
-
-**Why it's R5:** the cost is genuinely small. The "fix" (request coalescing — first caller's pending Promise gets returned to subsequent callers) costs more code than the bug costs in practice.
-
-**Mitigation:** none needed today. If the agents ever fan out wider, request coalescing becomes worth it.
-
-### R6 — The `lastCallAt` race can produce a 429 that costs ~10s on retry
-
-**Where:** `lib/data-source/bloomreach-data-source.ts:190-205` — `liveCall`
-
-**What happens:** `lastCallAt` is read-modified-written across two `await`s. Two concurrent callers can both see "elapsed > minIntervalMs," both skip the spacing wait, both fire. The upstream returns a 429 to one. The retry path parses the wait hint (typically 10s for Bloomreach), sleeps, retries.
-
-**Blast radius:** one user, one extra ~10s on one call. Against the 300s `maxDuration` budget, this is significant if it hits during a long monitoring scan.
-
-**Why it's R6:** the repo *deliberately* chose retry-absorption over locking for this case (a lock would serialize every tool call across all concurrent sessions). The risk is by design; the audit point is "know the cost, don't be surprised by it in a Vercel log."
-
-**Mitigation:** the retry path. If the 10s+ tail latency ever becomes user-visible, a per-instance lock around `liveCall` would prevent it at the cost of cross-session serialization.
-
-### R7 — `JSON.stringify` key-order non-determinism could cause cache misses for logically-equal args
-
-**Where:** `lib/data-source/bloomreach-data-source.ts:144` — `${name}:${JSON.stringify(args)}`
-
-**What happens:** `JSON.stringify` preserves insertion order. Two calls with the same logical args but different key order (`{a:1, b:2}` vs `{b:2, a:1}`) hash to different cache keys. Both result in real upstream calls.
-
-**Blast radius:** extra upstream calls; no correctness bug.
-
-**Why it's R7:** in practice the agent builds args from a fixed JSON schema, so key order is stable per call site. The risk is to a future caller that hand-builds args (e.g. a future debug route, a new agent).
-
-**Mitigation:** sort keys before stringifying. The cost is trivial; the bug it prevents is rare. Either way, today not a problem.
-
-### R8 — No `EXPLAIN`-equivalent for EQL means slow queries hide in `durationMs` alone
-
-**Where:** `lib/data-source/bloomreach-data-source.ts:154-176` — the call timing path; `BloomreachDataSource` doesn't expose a plan summary
-
-**What happens:** when an EQL call is slow, the only signal is `durationMs` in the result envelope. There's no plan, no cost breakdown, no "this could be faster if you indexed X" hint. The agents can't choose between queries based on cost.
-
-**Blast radius:** none today — the model picks queries based on the prompt and tool schemas, not based on cost. The risk is "we won't catch a slow query in code review because we can't see the plan."
-
-**Why it's R8:** it's a maintainability finding, not a runtime risk. Listed for completeness — if the upstream ever exposes plan data, this is the place to surface it.
-
-**Mitigation:** roll up the existing `tool_call_end` events into a per-session plan summary (the data is on the wire already; just not aggregated).
-
-## Not yet exercised
-
-These are concepts the topic spec lists that genuinely don't apply, listed once so reviewers can verify the absence is honest:
-
-- **B-tree / LSM indexes** — no persisted storage.
-- **Real ACID transactions** — no store that supports them; the one multi-step write is R3/R4.
-- **MVCC version chains** — `Map` is single-version per key; no readers seeing stale snapshots while a writer commits.
-- **Backups / PITR** — the only durable state is the cookie; "backup" means "user re-runs OAuth."
-- **Streaming replication lag** — the demo snapshot is manual, lag = time since last commit.
-- **Failover** — no primary/replica failover because there's no primary in the database sense.
-
-## Interview defense
-
-**Q: What's the biggest risk in this app's data story?**
-
-`AUTH_SECRET` missing in production. It's the only thing where one config mistake takes down every user simultaneously, because it's the key for the only piece of durable state (the bi_auth cookie). The error message at `lib/mcp/auth.ts:53-58` is loud and the briefing route catches the setup throw to return a real message instead of a bare 500, so it's detectable — but until the env var is restored, every request fails.
-
-**Q: What's the load-bearing latent risk?**
-
-Someone adding an `await` between `.clear()` and `.forEach()` in `putInsights` at `lib/state/insights.ts:57`. Today the function is atomic-by-language; one async call in that window creates a dirty-read window where a concurrent reader sees an empty feed. The fix is to build the new Maps as locals and swap them in at the end — atomic by construction. Today the warning isn't in the code.
-
-**Q: What did the team *deliberately* choose not to fix?**
-
-Two things. The cache race (two concurrent misses → duplicate upstream call) — the fix is request coalescing, which costs more code than the bug costs in practice. The `lastCallAt` race (two callers race the spacing → second gets a 429) — the fix is a per-instance lock, which would serialize every tool call across every concurrent session and cost more than the occasional retry. Both are "absorb the failure rather than prevent it" choices, and both are correct.
-
-## See also
-
-- `00-overview.md` — the ranked findings condensed
-- `05-transactions-isolation-and-anomalies.md` — the multi-step write at R3/R4
-- `06-locks-mvcc-and-concurrency-control.md` — the race trade-offs at R5/R6
-- `07-wal-durability-and-recovery.md` — the cookie design that R1 puts at risk
+- `01-database-systems-map.md` — the storage topology every finding lives in.
+- `03-btree-hash-and-secondary-indexes.md` — Findings 1, 7, 8.
+- `05-transactions-isolation-and-anomalies.md` — Findings 3, 4.
+- `06-locks-mvcc-and-concurrency-control.md` — Findings 3, 4.
+- `07-wal-durability-and-recovery.md` — Findings 5, 10.
+- `08-replication-and-read-consistency.md` — Findings 2, 6, 9.
+- `study-system-design` — "should we add a database" belongs there, not here.
+- `study-testing` — the test coverage of `putInsights`' turn-atomicity is in `test/state/insights.test.ts`.

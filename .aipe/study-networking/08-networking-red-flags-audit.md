@@ -1,310 +1,316 @@
-# 08 · Networking red flags — audit
+# Networking red flags — audit
 
-## Subtitle
+*Ranked network-failure risks (Project-specific)* — the protocol and
+network-behavior risks grounded in this repo, ranked by consequence.
+Every finding is anchored to a `file:line`; the ones that are
+`not yet exercised` are named explicitly rather than fabricated.
 
-Ranked protocol and network-failure risks, grounded in the repo — Project-specific.
+## Zoom out — where this concept lives
 
-## Zoom out, then zoom in
-
-A ranked audit of where the network surface in this repo is most likely to bite, ordered by consequence. The top items are real failure modes a user can hit today; lower items are smaller-blast-radius issues or future concerns the architecture doesn't yet need to solve. Each one names the file, the failure mode, and the fix (or the deliberate non-fix).
-
-```
-  Zoom out — what each finding maps to
-
-  ┌─ UI layer ──────────────────────────────────────────────────┐
-  │  R6: client fetches have no timeout                          │
-  │  R7: no backpressure check on the read loop                  │
-  └────────────────────────────────────────────────────────────┘
-                            │
-                            ▼
-  ┌─ Service layer ─────────────────────────────────────────────┐
-  │  R1: rate-limit retry math can overshoot Hobby's 60s budget  │
-  │  R2: regex-based rate-limit window parsing is fragile         │
-  │  R3: per-request MCP connect — no socket reuse across calls │
-  │  R4: no controller.desiredSize backpressure                  │
-  │  R5: cookie size cap could bite if state grows               │
-  │  R8: state validation deliberately disabled (verified note)  │
-  └────────────────────────────────────────────────────────────┘
-                            │
-                            ▼
-  ┌─ Provider boundary ────────────────────────────────────────┐
-  │  R9: alpha Bloomreach endpoint may rotate without notice    │
-  │  R10: anthropic SDK retries opaque to app code              │
-  └────────────────────────────────────────────────────────────┘
-```
-
-## Ranking
-
-  - **R1** — rate-limit retry math can exceed Hobby's budget · medium consequence · easy fix on Pro (already on Pro; documented constraint).
-  - **R2** — regex-based rate-limit window parsing is fragile to envelope wording changes · medium consequence · falls back to backoff gracefully.
-  - **R3** — per-request MCP connect means TCP/TLS handshake per route invocation · low consequence today · scales-poorly later.
-  - **R4** — `controller.enqueue` doesn't check `desiredSize`; runtime buffers · low consequence at current volumes.
-  - **R5** — encrypted cookie holds OAuth state; 4KB browser cap is comfortable but not infinite · low consequence; future concern.
-  - **R6** — client-side `fetch(url)` has no AbortSignal; if route hangs past 300s the browser hangs forever · low consequence (route guarantees close).
-  - **R7** — `readNdjson` has no flow-control; reads as fast as bytes arrive · trivial at current volumes.
-  - **R8** — OAuth `state` validation deliberately off (SDK validates internally) · zero consequence today; flagged for awareness.
-  - **R9** — alpha Bloomreach endpoint may rotate · low consequence; env var swap.
-  - **R10** — Anthropic SDK's internal retry behavior is opaque to app code · low consequence; provider-managed.
-
-## How it works (each finding)
-
-### R1 · Rate-limit retry math vs route budget
-
-**Where:** `lib/data-source/bloomreach-data-source.ts:163-174`.
-
-**The failure mode:**
+This chapter is the payoff of the previous seven. Each finding names a
+specific mechanism the repo relies on, the failure mode it's exposed
+to, and the concrete move if it ever bites. Ranked by *consequence
+if it fires* — not by likelihood.
 
 ```
-  Worst-case single call under rate-limit, on Pro (300s budget):
+  Zoom out — the risk topology
 
-  call 1:    1.1s spacing + 0.5s exec     → 1.6s
-             rate-limited
-             retry 1: 10s + 0.5s cushion  → 10.5s wait
-  call 2:    1.1s spacing + 0.5s exec     → 1.6s
-             rate-limited
-             retry 2: 20s (ceiling)       → 20s wait
-  call 3:    1.1s spacing + 0.5s exec     → 1.6s
-             rate-limited
-             retry 3: 20s (ceiling)       → 20s wait
-  call 4:    1.1s spacing + 0.5s exec     → 1.6s
-             rate-limited
-             retries exhausted → throw     → caller sees the error
-
-  total on this one tool call: ~57s
+  ┌─ Client ─────┐
+  │              │  R6: NDJSON parser silent-skip
+  │              │  R8: reconnect regex divergence
+  └──────┬───────┘
+         │
+  ┌──────▼──────────────────────────────────────┐
+  │ Route                                         │
+  │                                                │
+  │  R1: retry-ladder budget arithmetic            │
+  │  R2: timeouts don't retry but everything else  │
+  │  R3: Vercel-instance cache scope               │
+  │  R5: no jitter / no circuit breaker            │
+  │  R7: fault-injector shape drift                │
+  └──────┬────────────────────────────────────┬──┘
+         │                                     │
+  ┌──────▼──────┐                       ┌──────▼──────┐
+  │ Bloomreach  │                       │ Anthropic   │
+  │             │  R4: token revocation │             │
+  │             │      mid-stream        │             │
+  └─────────────┘                       └─────────────┘
 ```
 
-On Vercel Pro's 300s budget, that's ~19% of the request. Manageable for one bad call. On Hobby's 60s budget, that one call alone would blow the budget. The repo deliberately requires Pro:
+## The structure pass
+
+The axis: **what's the recovery path from this failure?** Findings
+sort by *how much manual attention* is needed if the failure fires.
+
+  - **R1-R2**: silent degradation — user-visible delay, no crash. Recovery
+    is time.
+  - **R3-R4**: recoverable with app machinery already in place
+    (reconnect policy, retry ladder). User sees a hiccup.
+  - **R5-R6**: latent bugs that would show up only under specific
+    conditions. Silent when not triggered.
+  - **R7-R8**: correctness risks in the offline/eval path. Won't hurt
+    production directly.
+
+## The findings, ranked
+
+### R1 — Retry-ladder budget arithmetic under a per-call 30s cap
+
+**Severity: high (deliberate; requires Vercel Pro).** **Evidence:**
+`lib/mcp/transport.ts:38`, `lib/data-source/bloomreach-data-source.ts:135-136,163-174`.
+
+The retry ladder can wait up to `retryCeilingMs = 20_000` × `maxRetries = 3`
+= 60 seconds of wall clock on a single rate-limited call. On Vercel Pro
+(300s route budget) this is fine — even a worst-case call takes ~65s and
+you have room for several more. On Vercel Hobby (60s ceiling), a single
+rate-limited call would consume the entire budget.
+
+```
+  Worst-case wall clock: one rate-limited call
+
+  attempt 1: server responds fast, "1 per 10 second"
+    wait: min(10_500, 20_000) = 10.5s
+  attempt 2: still rate-limited
+    wait: min(10_500 OR 20_000, 20_000) = ~10.5-20s
+  attempt 3: still rate-limited
+    wait: same
+  attempt 4: give up (maxRetries = 3)
+
+  total: ~31s of retry waits + 4 × ~200ms fast responses ≈ 32s
+```
+
+**What's the move?** The `maxDuration = 300` on both routes (`briefing/route.ts:19`,
+`agent/route.ts:22`) is the guard. If the app ever moves to a plan
+with a smaller budget, `maxRetries` needs to drop to 1 or the ceiling
+needs to shrink.
+
+### R2 — Timeouts fail fast; only rate-limit *results* retry
+
+**Severity: medium (deliberate design choice; documented).** **Evidence:**
+`lib/mcp/transport.ts:44-48, 135-137`,
+`lib/data-source/bloomreach-data-source.ts:51-55, 164`.
+
+A stuck upstream (network partition, unresponsive server) takes exactly
+30s of `AbortSignal.timeout` and then throws `HTTP 0: timeout after 30000ms`.
+No retry. The retry ladder only fires on tool *results* whose
+`isError === true` text matches `/rate limit|too many requests/i`.
+
+This is the *right* call for a route with a fixed budget — retrying a
+timeout wastes another 30s learning nothing new. But it does mean that
+transient network blips lose the call entirely instead of retrying at
+a lower level. On Bloomreach specifically, transient blips are rare
+(the alpha server's failure modes are rate-limits and token revocation,
+not network flake), so the tradeoff holds.
+
+**What's the move?** No change needed for current traffic. If observed
+transient-error rate ever grew, add a small retry-on-timeout (1 attempt,
+short backoff) — but only after measuring.
+
+### R3 — 60s response cache is per-Vercel-instance
+
+**Severity: medium (functional degradation, not incorrect behavior).**
+**Evidence:** `lib/data-source/bloomreach-data-source.ts:122, 186`.
+
+The 60s response cache is a `Map<string, {result, expiresAt}>` on the
+`BloomreachDataSource` instance. Each Node instance on Vercel has its
+own; a briefing that runs across two instances (unlikely but possible)
+would hit the cache twice, once per instance. The retry ladder handles
+this fine — worst case is 2× cost on that briefing.
+
+Also: on production the `BloomreachDataSource` is constructed inside
+each request via `makeDataSource → connectMcp`, so the cache is *also*
+per-request. The comment at `lib/data-source/index.ts:63-65` documents:
+
+> Returns the already-connected BloomreachDataSource as a `DataSource`,
+> with a `dispose` no-op (the Bloomreach client outlives the request
+> via the cookie-scoped auth store — disposing here would not undo the
+> OAuth state).
+
+But the *client instance* is fresh per request; the cache is fresh
+per request. The 60s TTL only helps for repeated identical calls *inside
+one briefing* — which is exactly its intended use.
+
+**What's the move?** None. This is the pragmatic scope. Cross-request
+sharing would need a shared store (Redis/KV) which the app doesn't have
+and doesn't currently need.
+
+### R4 — Token revocation depends on the reconnect regex matching
+
+**Severity: medium (user-visible on regex miss; documented latent bug).**
+**Evidence:** `lib/hooks/useReconnectPolicy.ts:33-45`,
+`lib/mcp/transport.ts:139-142` (surfaces the raw server body).
+
+The alpha Bloomreach server revokes OAuth tokens after minutes. The
+route catches the resulting HTTP 401 and emits `{type:'error',
+message: 'HTTP 401: … invalid_token …'}` as an NDJSON event. The
+client's reconnect policy uses two regex variants to match:
 
 ```ts
-// app/api/briefing/route.ts:19 (and agent/route.ts:22)
-// 300s = Vercel Pro's max. The monitoring agent + ~1 req/s MCP spacing can run
-// well past Hobby's 60s ceiling, so the live briefing needs the higher budget.
-export const maxDuration = 300;
+  const AUTH_ERROR_RE_AUTO   = /invalid_token|unauthor|forbidden|401|session expired|reconnect/i;
+  const AUTH_ERROR_RE_BUTTON = /unauthor|forbidden|401|session expired/i;
 ```
 
-**Severity:** medium · documented constraint, deployment-platform aware.
+The comment at `useReconnectPolicy.ts:21-30` explicitly flags:
 
-**Fix:** stay on Pro. If a future deployment target capped at 60s, the choices are (a) lower `maxRetries` to 1, (b) lower `retryCeilingMs` from 20s to something like 5s, or (c) move expensive calls to a background job pattern. None of these are needed today.
+> There IS a latent bug worth flagging (the button regex is missing
+> `invalid_token` and `reconnect` matches) — filed as a future concern;
+> not this refactor's job.
 
-### R2 · Regex-based rate-limit window parsing
+**Concrete consequence**: if the token revocation manifests as *only*
+`invalid_token` in the error text (no `401`, no `unauthor…`), the
+manual reconnect button won't recognize it and the user can't recover
+without a full page reload.
 
-**Where:** `lib/data-source/bloomreach-data-source.ts:64-71`.
+**What's the move?** Unify the two regexes to the LONG variant after
+verifying against the live server. Ticket exists per the comment.
 
-**The failure mode:** `parseRetryAfterMs` matches two known shapes:
+### R5 — No jitter, no circuit breaker
+
+**Severity: low (not exercised at current scale).** **Evidence:**
+absence — grep `jitter|circuit` returns zero hits in `lib/`.
+
+Two production-grade features the app deliberately doesn't have:
+
+  - **Jitter on retries** — the retry ladder is deterministic. Fine at
+    one user. At N concurrent users hitting the same 1-per-10s
+    window, all N would retry at roughly the same wall-clock instant,
+    guaranteeing a second 429.
+  - **Circuit breaker** — after N consecutive timeouts on the same
+    origin, a circuit breaker would fail fast for a cool-down period
+    instead of absorbing 30s on every call. Not exercised.
+
+**What's the move?** Nothing for now. If the app ever fanned out to
+multiple concurrent users per Node instance, add ±1s jitter to
+retries (one line) and a simple last-N-failures circuit breaker
+(~10 lines).
+
+### R6 — NDJSON parser silently skips malformed lines
+
+**Severity: low (design choice; testable via `onMalformed`).**
+**Evidence:** `lib/streaming/ndjson.ts:42-49`.
 
 ```ts
-//   "Retry after ~12 second(s)"            → 12_000
-//   "rate limit reached (1 per 10 second)" → 10_000
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+    try {
+      onEvent(JSON.parse(line) as E);
+    } catch (err) {
+      opts?.onMalformed?.(line, err);   // silent by default
+    }
+  }
 ```
 
-If Bloomreach changes the wording — `"please wait 10 seconds before retrying"`, `"rate-limit window: 10s"`, anything not matching the two regexes — the parse returns `null` and the caller falls back to exponential backoff. The backoff math (10s, 20s, 20s) is still safe but may overshoot or undershoot the real window. In the worst case it triggers another rate-limit immediately by retrying inside the same penalty window.
+If a producer emits garbage between valid events, the parser drops it.
+This is defensible — it's the same shape the fault-injecting
+`malformed_json` mode tests (`fault-injecting.ts:139-154`) — but it
+does mean a truly broken producer would appear to be working from the
+client's perspective while silently skipping data.
 
-**Severity:** medium · graceful degradation (falls back to backoff), but the safe fallback is also the slower one.
+**What's the move?** No change. The `onMalformed` hook is available
+if a consumer needs to alert on it (currently no client passes it).
 
-**Fix:** when (if) Bloomreach exposes a structured `retry-after` field or header, swap the regex for the structured read. Today the envelope is text-only so the regex is the only option.
+### R7 — Fault injector shape drift
 
-### R3 · Per-request MCP connect
+**Severity: low (offline path only).** **Evidence:**
+`lib/data-source/fault-injecting.ts:112-137` — comments explicitly
+call out that the shapes match specific `lib/mcp/transport.ts` lines
+and `BloomreachDataSource` retry triggers.
 
-**Where:** `lib/data-source/index.ts:85` (calls `connectMcp(sessionId)` on every request).
+The `FaultInjectingDataSource` mimics real error shapes:
+  - `HTTP 0: timeout after 30000ms` (matches `transport.ts:137`)
+  - 429 with `Rate limited: please retry after 2000ms` (matches
+    `BloomreachDataSource` retry trigger)
+  - `HTTP 500: Internal server error`
+  - malformed body (unclosed JSON in text block)
 
-**The failure mode:** each route invocation runs:
+The shapes are hand-maintained. If the real transport ever changes its
+error format (`HTTP 0:` → `TIMEOUT:` say), the fault injector's
+regression tests would keep passing but production wouldn't recover
+the same way.
 
-  1. `connectMcp` → `withAuthCookies` → decrypt cookie → instantiate `BloomreachAuthProvider`.
-  2. `new StreamableHTTPClientTransport(...)`.
-  3. `client.connect(transport)` → TLS handshake to loomi-mcp-alpha.bloomreach.com.
+**What's the move?** Add a test that asserts both paths emit the same
+error string. Currently the two files reference each other in
+comments but the invariant isn't automated.
 
-Step 3 is a fresh TCP/TLS handshake every time. At a typical ~50-150ms for a TLS 1.3 handshake to a warm Bloomreach edge, that's the floor on every request. The OAuth tokens *persist* across requests (via the cookie store), but the socket doesn't.
+### R8 — Vercel edge caching is opted out with `no-store`, but only on the streams
 
-**Severity:** low today · scales poorly later.
+**Severity: low (correctness on route-level only).** **Evidence:**
+`app/api/briefing/route.ts:149, 333`, `app/api/agent/route.ts:107`.
 
-**Fix:** pool MCP `Client` instances across requests, keyed by session. The architectural seam is already drawn — `makeDataSource` is the construction point; a process-level `Map<sessionId, BloomreachDataSource>` with a TTL would intercept. The cost is correctness around OAuth-token refresh (the pooled client needs to honor token updates) and against Vercel's ephemeral runtime (a pool on one instance doesn't help requests routed to another). For the current single-user volume, the handshake cost is in the noise.
+The three streaming routes emit `Cache-Control: no-store, no-transform`.
+The other MCP routes (`/api/mcp/{call,tools,tools/check,reset,capture,capture-demo,callback}`)
+don't set explicit cache headers. Vercel defaults for API routes are
+"no cache" — but relying on defaults rather than being explicit is a
+small documentation risk.
 
-### R4 · No backpressure on the writer
+**Concrete consequence**: if Vercel ever changed its API-route caching
+default, or if a self-hosted deployment landed behind a different edge,
+the mutation routes (`/api/mcp/reset`, `/api/mcp/callback`) might cache
+briefly. `/api/mcp/callback` is a one-shot; caching it would be a
+security issue.
 
-**Where:** `app/api/briefing/route.ts:193`, `app/api/agent/route.ts:189`.
+**What's the move?** Add explicit `Cache-Control: no-store` to
+`/api/mcp/callback` at minimum, and to the other MCP routes as
+defense in depth.
 
-**The failure mode:**
-
-```ts
-const send = (e: BriefingEvent) =>
-  controller.enqueue(encoder.encode(JSON.stringify(e) + '\n'));
-```
-
-Synchronous enqueue, no `controller.desiredSize` check, no await. If the browser's read is slow (slow client device, slow network), the runtime buffers in memory. At this app's volumes (~30 events per stream, each truncated to 4KB by `trunc(v)` at `app/api/briefing/route.ts:71-75`), the total in-flight bytes are bounded under 120KB — trivial.
-
-The risk scenario is "thousands of events per stream to a slow reader" — not today's profile. If it became one, the writer would grow unbounded buffers in Vercel's edge or in Node's stream layer.
-
-**Severity:** low · current volumes are nowhere near the buffer ceiling.
-
-**Fix:** if event volume per stream grows, change `send` to `await controller.desiredSize < 0 ? new Promise(...)` style flow-control. The shape change is mechanical; trigger condition isn't here yet.
-
-### R5 · Cookie size cap
-
-**Where:** `lib/mcp/auth.ts:48` (`bi_auth` cookie).
-
-**The failure mode:** browsers cap one cookie at ~4KB. The encrypted blob holds:
-
-  - 12-byte IV + 16-byte GCM tag = 28 bytes overhead
-  - Encrypted JSON of: `clientInformation` (~500 bytes), `codeVerifier` (~128 bytes), `tokens` (access_token + refresh_token + id_token, ~1500-2000 bytes), `state` (~36 bytes if present)
-  - All base64url-encoded (adds ~33%)
-
-Total: typically ~3KB. Comfortable margin. If a future expansion adds more state per session — multiple OAuth providers, a session-tied audit log, per-flow PKCE history — the margin shrinks fast.
-
-**Severity:** low · future concern.
-
-**Fix:** if cookie size becomes a constraint, move state to Redis/Vercel KV. The seam is `withAuthCookies`; a different backend implementation is a one-file swap.
-
-### R6 · No client-side fetch timeout
-
-**Where:** `lib/hooks/useBriefingStream.ts:158`, `lib/hooks/useInvestigation.ts:180`, `components/chat/StreamingResponse.tsx:92`.
-
-**The failure mode:**
-
-```ts
-const res = await fetch(url);    // no { signal }, no timeout
-```
-
-If the route hangs past 300s (Vercel will terminate it then), the browser sits on `await fetch(url)` until the TCP connection actually closes. In practice this is fine because Vercel reliably closes the connection on `maxDuration`, but the app code doesn't have a backstop.
-
-**Severity:** low · relies on Vercel's termination guarantee.
-
-**Fix:** add `AbortController` + `setTimeout(controller.abort, ROUTE_BUDGET + 30_000)` per fetch, compose with the existing `cancelOn` ref. The shape change is one helper function; the risk it covers is small.
-
-### R7 · `readNdjson` has no flow-control
-
-**Where:** `lib/streaming/ndjson.ts:17-64`.
-
-**The failure mode:** the kernel reads as fast as bytes arrive. There's no consumer-side rate limit, no per-event acknowledgment, no pause-when-busy. If a future producer ships thousands of small events per second and each `onEvent(...)` triggers expensive `setState` work, the read loop dominates the main thread.
-
-**Severity:** trivial at current volumes (~30 events per stream).
-
-**Fix:** add an `onEvent` boundary that batches via `queueMicrotask` or `requestAnimationFrame` for UI-bound work. Not needed today.
-
-### R8 · OAuth `state` validation disabled
-
-**Where:** `app/api/mcp/callback/route.ts:22-26`, `lib/mcp/auth.ts:230` (`consumeState`).
-
-**The current state:** the callback does NOT re-validate the `state` parameter; the SDK validates it internally.
-
-```ts
-// NOTE: we do NOT re-validate the OAuth `state` here. The MCP SDK invokes the
-// provider's state() more than once during a single auth() flow, so our naive
-// "store-last, compare-on-callback" check rejected legitimate callbacks
-// ("state mismatch"). The SDK performs its own state handling; re-validating
-// at this layer is redundant. (Verified live 2026-05-27.)
-```
-
-The `consumeState` helper is kept (and tested) for a future shared-store implementation.
-
-**Severity:** zero today (SDK handles it) · flagged for awareness only.
-
-**Fix:** none needed. If the SDK's behavior ever changes (state validation becomes the integrator's job), the helper is ready.
-
-### R9 · Alpha endpoint may rotate
-
-**Where:** `lib/mcp/connect.ts:30-34`.
-
-```ts
-function mcpUrl(): URL {
-  const raw =
-    process.env.BLOOMREACH_MCP_URL ?? 'https://loomi-mcp-alpha.bloomreach.com/mcp/';
-```
-
-**The failure mode:** the default points at an *alpha*-band hostname. Alpha environments rotate, get retired, or change auth requirements without LTS-style notice. If the hostname goes away without a env-var swap, the app breaks for everyone on the default.
-
-**Severity:** low · one env-var change to fix.
-
-**Fix:** when Bloomreach ships GA, update the default. Until then, document the env-var override prominently in deployment notes (`BLOOMREACH_MCP_URL`).
-
-### R10 · Anthropic SDK retry behavior is opaque
-
-**Where:** `@anthropic-ai/sdk` calls in `lib/agents/base.ts` (`runAgentLoop` calls `anthropic.messages.stream({...})`).
-
-**The failure mode:** the SDK has its own retry behavior (configurable, but the app doesn't configure it). If Anthropic returns a 429, the SDK may retry silently; if it returns a 500, the SDK may retry silently. The app sees only the final outcome (success or final failure). The per-phase wall-clock log (`phases` in `route.ts`) shows total time including hidden retries, but doesn't break them down.
-
-**Severity:** low · provider-managed; rare in practice.
-
-**Fix:** if more visibility is needed, pass an explicit `maxRetries: 0` in the Anthropic constructor and own the retry loop, or pass a custom `fetch` to log every attempt. Not needed today.
-
-## Top finding
-
-**R1 + R2 together — the rate-limit dance under load.** The two findings are the same shape: a single Bloomreach call that gets rate-limited can swallow ~57s of the 300s route budget under worst-case retry math, and the regex-based hint parsing means a wording change at Bloomreach degrades the math from "honor the stated window" to "exponential backoff." Neither is a today-bug, both are real exposure under specific failure modes.
-
-The high-leverage fix isn't more retry logic — it's reducing the rate-limit hit-rate by raising the cache TTL beyond 60s for the EQLs the agent re-asks within one investigation. Today the cache helps within ~one investigation cycle; if it persisted across the whole 90-day window (which is the period-over-period unit the metrics analyze), most of the agent's queries would be served from cache and rate-limit retries would become rare.
-
-That's a bigger change — it implies a real cache layer (LRU + TTL + invalidation), not just an in-process `Map`. But it's the only intervention that addresses both R1 and R2 at the source rather than treating each one's symptom.
-
-## Primary diagram
+## Ranked summary
 
 ```
-  Audit map — finding → file → severity
+  Findings ranked by consequence
 
-  ┌─ /api/briefing + /api/agent ─────────────────────┐
-  │  R6  no client-side timeout    [low]              │  hooks/useBriefingStream.ts:158
-  │  R4  no backpressure check     [low]              │  app/api/briefing/route.ts:193
-  └────────────────────────────────────────────────────┘
-                  │
-  ┌─ lib/data-source/bloomreach-data-source.ts ─────┐
-  │  R1  retry math vs budget       [med]             │  :163-174
-  │  R2  regex window parsing       [med]             │  :64-71
-  └────────────────────────────────────────────────────┘
-                  │
-  ┌─ lib/data-source/index.ts ─────────────────────────┐
-  │  R3  per-request connect        [low]             │  :85
-  └────────────────────────────────────────────────────┘
-                  │
-  ┌─ lib/mcp/auth.ts ──────────────────────────────────┐
-  │  R5  cookie size cap            [low]             │  :48
-  │  R8  state validation off       [info]            │  :230 (+ callback:22-26)
-  └────────────────────────────────────────────────────┘
-                  │
-  ┌─ lib/streaming/ndjson.ts ──────────────────────────┐
-  │  R7  no flow-control            [trivial]         │  :17-64
-  └────────────────────────────────────────────────────┘
-                  │
-  ┌─ lib/mcp/connect.ts ──────────────────────────────┐
-  │  R9  alpha endpoint default     [low]             │  :32
-  └────────────────────────────────────────────────────┘
-                  │
-  ┌─ lib/agents/base.ts ──────────────────────────────┐
-  │  R10 Anthropic SDK retries      [low]             │  (SDK-managed)
-  └────────────────────────────────────────────────────┘
+  ┌─────────────────────────────────────────┬──────────┬──────────────────┐
+  │ finding                                  │ severity │ status           │
+  ├─────────────────────────────────────────┼──────────┼──────────────────┤
+  │ R1 retry-ladder budget arithmetic        │ high     │ deliberate,      │
+  │                                          │          │ requires Pro     │
+  │ R2 timeouts fail fast                    │ medium   │ deliberate       │
+  │ R3 60s cache per Node instance           │ medium   │ pragmatic scope  │
+  │ R4 reconnect regex divergence            │ medium   │ documented bug   │
+  │ R5 no jitter / no circuit breaker        │ low      │ not exercised    │
+  │ R6 NDJSON silent-skip on malformed       │ low      │ intentional      │
+  │ R7 fault-injector shape drift            │ low      │ hand-maintained  │
+  │ R8 MCP route cache headers not explicit  │ low      │ Vercel defaults  │
+  └─────────────────────────────────────────┴──────────┴──────────────────┘
 ```
 
-## Elaborate
+## Not yet exercised — flagged explicitly
 
-A few of these findings are interesting precisely because they're *not* worth fixing. R6 (no client-side timeout) and R7 (no flow-control) are conventional smells but their failure modes don't trigger in this app's profile. Adding the timeout means more code on a path that's already correct in practice; adding flow-control means optimizing for traffic that doesn't exist. Naming them is the value — knowing where the limits are means knowing where to look if the load profile changes.
+These wire behaviors don't exist in the repo. Flagged so a reader
+knows the absence is real, not an omission of this audit:
 
-R8 is the rarest kind of finding: a *deliberate non-fix* with a verification date. The note in the callback (`Verified live 2026-05-27.`) is itself the artifact — someone tried to validate state, observed the SDK's multi-call behavior breaking the naive check, and chose to leave validation off rather than re-implement properly today. That choice is documented in code; the helper is kept so the future implementation has a starting point. This is the right shape for "we know about this, here's why it's not a TODO."
+  - **DNS pinning** — no cached A-record; no fallback resolver.
+  - **HTTP/2 tuning** — the app doesn't override the platform default.
+    Undici negotiates HTTP/2 via ALPN if the upstream supports it, but
+    stream concurrency, flow control, and PING keepalive are
+    platform-defaulted.
+  - **HTTP/3 / QUIC** — not exercised.
+  - **mTLS** — no client certs; bearer tokens throughout.
+  - **Certificate pinning** — system CA store trusted end-to-end.
+  - **WebSockets** — not exercised anywhere (see 06 for the deliberate
+    choice).
+  - **Server-Sent Events** — considered and rejected (see 06).
+  - **CORS** — same-origin only.
+  - **Request coalescing / singleflight** — no dedupe of concurrent
+    identical in-flight requests. The 60s cache handles serial repeats;
+    concurrent duplicates would race.
+  - **Jitter on retries** — deterministic wait (see R5).
+  - **Circuit breaker** — no state kept across failures (see R5).
+  - **Connection pool tuning** — Undici defaults trusted.
+  - **Keepalive interval tuning** — no `Keep-Alive: timeout=N` header set
+    on responses; the app relies on the platform's default idle timeout.
+  - **Trailers** — no HTTP trailers used; final state travels in the
+    body as the `{type:'done'}` NDJSON event instead.
 
-R1 and R2 together are the highest-leverage area in the audit because they're the only findings that map to a user-visible failure mode (a long investigation timing out or returning an error after burning 30+ seconds of budget). The fix isn't in retry logic — it's in the cache layer. The current 60s in-process `Map` is the right shape for intra-investigation reuse; the missing piece is cross-investigation reuse over the 90-day metric window. That's a bigger architecture change (a real cache, with invalidation) than the scope of "audit findings" usually covers, but it's the actual move.
+## Cross-links
 
-The architectural shape of the audit overall is reassuring: most findings are either (a) low-consequence under current load, (b) graceful-degradation paths that work but suboptimally, or (c) deliberately deferred with a documented reason. There are no "this can corrupt user data" findings. There are no "this leaks credentials" findings (the `redactSecrets` infrastructure at `lib/mcp/transport.ts:66` covers the log paths). There are no "this opens a port to the world" findings (all wires are TLS+auth). The network surface is sound; the audit is mostly about how it'd behave under load it doesn't see today.
-
-## Interview defense
-
-**Q: What's the highest-leverage thing to fix in the network layer?**
-
-The rate-limit dance. R1 and R2 together describe a worst-case where a single rate-limited Bloomreach call eats ~57s of the 300s budget, and the math degrades to backoff if Bloomreach changes its error wording. The intervention isn't more retry logic — it's more aggressive caching, so the agent re-asks fewer EQLs within the same 90-day period-over-period window.
-
-**Q: What in the audit is deliberate?**
-
-Three things:
-
-  - **R8 (state validation off)** — explicitly noted as a tested-and-verified deferral because the SDK validates internally.
-  - **R6 + R7 (no client timeout, no flow-control)** — conventional smells whose failure modes don't trigger at current volumes; documented as load-profile-dependent.
-  - **`maxDuration = 300` on Vercel Pro** — a deployment-platform constraint that R1's retry math depends on; documented in the code comment.
-
-The audit is calibrated to "what's a real risk for this app" rather than "what does a checklist say."
-
-**Q: Anything genuinely missing?**
-
-Cross-instance cache (currently per-process), pooled MCP connections across requests, and a structured (not regex) rate-limit window parse — all upgrades, not bugs. The architecture leaves room for each but doesn't need them today.
-
-## See also
-
-  - `07-timeouts-retries-pooling-and-backpressure.md` — for the mechanics underlying R1, R2, R3, R4.
-  - `04-tls-and-trust-establishment.md` — for the mechanics underlying R5, R8.
-  - `06-websockets-sse-streaming-and-realtime.md` — for the mechanics underlying R6, R7.
-  - `.aipe/study-security/` — for the trust-boundary version of the audit (what each finding means for an attacker).
-  - `.aipe/study-distributed-systems/` — for the partial-failure version (what happens if Bloomreach is down rather than slow).
+  - **Trust boundaries at each hop** (whether encryption/auth is safe) —
+    see `.aipe/study-security/`.
+  - **Which network boundaries belong at the architecture level** —
+    see `.aipe/study-system-design/`.
+  - **The performance cost of these tradeoffs** —
+    see `.aipe/study-performance-engineering/`.
+  - **How the AbortSignal composition maps to runtime cancellation** —
+    see `.aipe/study-runtime-systems/`.
+  - **The observability of these failures on production** —
+    see `.aipe/study-debugging-observability/` (per-phase timings
+    logged at `briefing/route.ts:315-324` and `agent/route.ts:329-338`).

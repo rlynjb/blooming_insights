@@ -1,98 +1,77 @@
-# Overview — the AI stack in this codebase
+# AI engineering — overview
 
-One page. The whole LLM stack as a layered picture, what each box owns, what changes when a dependency rotates. If you have five minutes, read this and stop.
-
-## What this repo is, AI-side
-
-A Next.js app that runs the loop a human data analyst runs — *what changed → why → what to do* — against a Bloomreach Engagement workspace. Five agents (monitoring, diagnostic, recommendation, query, intent) each call `claude-sonnet-4-6` (intent uses `claude-haiku-4-5`), each holding a `ToolRegistry` backed by an MCP server. The agents' reasoning streams to the UI as NDJSON.
-
-The shape: LLM application engineering, not classical ML. No vector store, no embeddings, no trained models. The interesting AI work is in the agent loop, the tool surface, the structured-output contracts, and the schema-gating that decides what the monitoring agent is even allowed to ask about.
-
-## The system in one picture
-
-This is the orientation diagram. Every concept in this guide is a zoom-in on one of these boxes.
+## Zoom out — the shape of AI work in this repo
 
 ```
-  The AI stack — UI to LLM provider, layer by layer
+  blooming_insights — where AI actually sits
 
-  ┌─ UI layer (browser) ─────────────────────────────────────────┐
-  │  app/page.tsx · investigate/[id]/page.tsx · QueryBox          │
-  │  StatusLog ← ReasoningTrace (streams agent thinking live)     │
-  └──────────────────────────────┬───────────────────────────────┘
-                                 │  fetch() + ReadableStream reader
-                                 │  consumes NDJSON line-by-line
-                                 ▼
-  ┌─ Next.js route layer ────────────────────────────────────────┐
-  │  app/api/briefing/route.ts  · maxDuration = 300              │
-  │  app/api/agent/route.ts     · per-phase timings, cancellation │
-  │  → emits AgentEvent NDJSON  (lib/mcp/events.ts)              │
-  └──────────────────────────────┬───────────────────────────────┘
-                                 │  constructs an agent + hooks
-                                 ▼
-  ┌─ Agent layer (Blooming wrappers) ────────────────────────────┐
-  │  lib/agents/{monitoring,diagnostic,recommendation,query}.ts  │
-  │  thin wrappers around @aptkit/core's reusable agents          │
-  │  + lib/agents/intent.ts (the cheap classifier)                │
-  └──────────────────────────────┬───────────────────────────────┘
-                                 │  three adapter classes bridge to AptKit
-                                 ▼
-  ┌─ Adapter boundary ───────────────────────────────────────────┐
-  │  lib/agents/aptkit-adapters.ts   (206 LOC)                    │
-  │   AnthropicModelProviderAdapter   → implements ModelProvider  │
-  │   BloomingToolRegistryAdapter     → implements ToolRegistry   │
-  │   BloomingTraceSinkAdapter        → implements CapabilityTraceSink │
-  └─────────────┬───────────────────────────────────┬────────────┘
-                │ port: ModelProvider               │ port: ToolRegistry
-                ▼                                   ▼
-  ┌─ Provider layer ──────────────┐   ┌─ DataSource port ────────────┐
-  │  @anthropic-ai/sdk            │   │  lib/data-source/types.ts     │
-  │  claude-sonnet-4-6 (agents)   │   │   ↓ implementations:          │
-  │  claude-haiku-4-5-2025-10-01  │   │   - BloomreachDataSource      │
-  │   (intent classifier only)    │   │     (OAuth + rate-limit + cache)│
-  │  res.usage logged @ adapter   │   │   - SyntheticDataSource       │
-  │  (aptkit-adapters.ts:60,65)   │   │     (in-process, 516 LOC)     │
-  └───────────────┬───────────────┘   └──────────────┬───────────────┘
-                  │ HTTPS                            │ HTTPS / in-proc
-                  ▼                                  ▼
-          Anthropic API                       Bloomreach MCP server
-                                              (loomi connect, alpha)
+  ┌─ UI layer (Next.js 16 App Router) ─────────────────────────────────┐
+  │  app/page.tsx  ·  app/investigate/[id]/page.tsx                     │
+  │  StatusLog  ·  InsightCard  ·  EvidencePanel  ·  RecommendationCard │
+  └─────────────────────────────┬───────────────────────────────────────┘
+                                │  fetch → NDJSON stream (AgentEvent)
+  ┌─ Route layer (Next.js) ─────▼───────────────────────────────────────┐
+  │  app/api/briefing/route.ts    (monitoring scan)                     │
+  │  app/api/agent/route.ts       (diagnose | recommend | query)        │
+  └─────────────────────────────┬───────────────────────────────────────┘
+                                │  invoke agent → hooks stream traces
+  ┌─ Agent layer (AptKit + Anthropic) ★ THIS IS AI ★ ───────────────────┐
+  │  MonitoringAgent → DiagnosticAgent → RecommendationAgent            │
+  │  · Model provider: Anthropic (claude-sonnet-4-6, haiku for intent)  │
+  │  · Loop:           @aptkit/core (ReAct-shaped tool-use loop)        │
+  │  · Bridge:         lib/agents/aptkit-adapters.ts (263 LOC)          │
+  │  · Prompt cache:   ephemeral breakpoint on system prompt            │
+  │  · Budget gate:    per-investigation ceiling (BudgetTracker)        │
+  └─────────────────────────────┬───────────────────────────────────────┘
+                                │  callTool(name, args) via DataSource
+  ┌─ DataSource seam (the port) ▼───────────────────────────────────────┐
+  │  BloomreachDataSource   → live MCP (rate-limited, ~1 req/s)         │
+  │  SyntheticDataSource    → deterministic in-memory fixture (evals)   │
+  │  FaultInjectingDataSource → offline decorator (load + fault tests)  │
+  └─────────────────────────────┬───────────────────────────────────────┘
+                                │  MCP tools (EQL) / synthetic tables
+                                ▼
+                       ecommerce workspace data
 ```
 
-The picture is layered for a reason: every adapter swap (Bloomreach → Synthetic, Anthropic → another provider, AptKit → a different agent runtime) lands on exactly one of these boxes. The agent layer never knows.
+## Which of the three AI shapes this is
 
-## What each layer owns
+Three shapes the AI engineering spec recognizes: LLM application engineering, prompt engineering / meta-tooling, classical ML. `blooming_insights` is squarely the first one.
 
-  → **UI layer.** Renders insights, investigations, and recommendations. Consumes NDJSON via `fetch()` + `ReadableStream` (not `EventSource`). The streaming surface is itself a product feature — `StatusLog` shows the agents' reasoning trace as it happens.
+- LLM application engineering — YES. Multi-agent orchestration (`MonitoringAgent`, `DiagnosticAgent`, `RecommendationAgent`, `QueryAgent`, intent classifier) built on `@aptkit/core`'s ReAct-shaped tool-use loop, streamed to the UI as NDJSON, with an eval harness (10 goldens × 2 rubrics × 4 dimensions) and a regression gate.
+- Prompt engineering — present but not the primary discipline. Retired system prompts live in `lib/agents/legacy-prompts/`; the active runtime uses AptKit's built-in agent prompts. The prompt work here is inherited more than authored.
+- Classical ML — NO. No trained model, no training pipeline, no feature engineering. Every "reasoning" step is an LLM call.
 
-  → **Route layer.** The seam between the browser and the agent loop. Owns `maxDuration = 300`, `AbortSignal` threading, per-phase timings, cancellation. Constructs the agent, attaches hooks, pushes `AgentEvent`s onto the wire.
+The rest of this guide treats the repo as LLM application engineering. Sub-section 08 (Machine Learning) is generated honestly — most concepts are marked "not exercised" because they aren't. Sub-section 09 (ML system-design templates) walks through the templates as required by spec, with "Applies" set to `no` where they don't fit and "How to make it apply" naming the concrete refactor.
 
-  → **Agent layer.** Five Blooming-owned wrappers around `@aptkit/core` agents. Each one is a thin constructor that builds the three adapters and hands them to AptKit. The actual ReAct loop lives in the library, not here.
+## What's load-bearing in this codebase (rank order)
 
-  → **Adapter boundary.** `lib/agents/aptkit-adapters.ts` — 206 lines bridging Blooming's existing types (`AnthropicSDK`, `DataSource`, `ToolCall`) to AptKit's ports (`ModelProvider`, `ToolRegistry`, `CapabilityTraceSink`). The boundary is small on purpose: the more code lives here, the more the library has to know about this app.
+Not every concept in this guide is equal weight for this repo. The load-bearing ones — where interview signal and current portfolio value concentrate — are:
 
-  → **Provider layer.** Anthropic SDK + the DataSource port. `claude-sonnet-4-6` for agents, `claude-haiku-4-5` for the intent classifier (the only cheap-model use). `res.usage` is logged per call from inside the adapter — the only telemetry the AI stack has today.
+1. **The eval harness** (`eval/`) — 10 goldens × 2 rubrics × 4 dims × 3 verdicts, per-case receipt, judge-error resilience, signal-class-aware gate, calibration slice, load harness, fault-injection decorator, regression gate. This is the tier-2 story.
+2. **Multi-agent orchestration on AptKit** (`lib/agents/`) — `@aptkit/core@0.3.0` owns the ReAct loop; the repo owns the 263-LOC bridge (`aptkit-adapters.ts`) that wires Anthropic + Blooming's tool-registry + trace hooks into AptKit's ports.
+3. **Prompt caching + budget ceiling** (`AnthropicModelProviderAdapter`, `BudgetTracker`) — every `complete()` call wraps the system prompt in an ephemeral cache breakpoint (~80% cost reduction on the system-prompt prefix) and checks a per-investigation cost ceiling BEFORE dispatching.
+4. **The DataSource seam** (`lib/data-source/`) — the port that survived two adapter swaps (Olist added → removed, Synthetic added) and now carries a third decoration in `FaultInjectingDataSource`. The seam is what makes the eval and load harnesses possible.
+5. **NDJSON streaming of agent reasoning** (`app/api/*/route.ts` → `StatusLog`) — the product's pitch ("an analyst that shows its work") reduces to a stream of `reasoning_step | tool_call_start | tool_call_end | insight | diagnosis | recommendation` events. Agent trace is a first-class UI surface.
 
-## The load-bearing seams
+## What the codebase does NOT exercise
 
-There are two ports the entire AI stack pivots on:
+Being honest about this is part of the guide's job. The reader shouldn't defend patterns that aren't in the repo.
 
-1. **The `ModelProvider` port** (`@aptkit/core`). The agents talk to *a* model provider, not *the* Anthropic SDK. `AnthropicModelProviderAdapter` is the only adapter today, but the seam means switching to Bedrock or Vertex AI is a 1-file change.
+- **RAG.** Not present. No embeddings, no vector store, no chunking. The agents query structured event/customer data via MCP tools, not text over vectors. Sub-section 03 files are generated as "concept only, not exercised" per spec.
+- **Semantic caching.** Prompt caching (Anthropic ephemeral breakpoint) is live; semantic caching over query embeddings is not.
+- **Trained ML.** No supervised learning, no model artifacts, no train/val/test discipline. Sub-section 08 is largely "not exercised."
+- **Rate limiting on the outbound side.** The `BloomreachDataSource` has a ~1 req/s proactive spacing + retry ladder INBOUND (protecting the alpha MCP server), but the API routes themselves do not rate-limit incoming user requests.
+- **Circuit breaker.** Retry with backoff is present in `BloomreachDataSource`; a circuit breaker (open/half-open/closed state machine) is not.
 
-2. **The `DataSource` port** (`lib/data-source/types.ts`). The agents call tools through *a* data source, not *the* MCP transport. Two adapters live in the repo today: `BloomreachDataSource` (live, OAuth + rate-limit + 60s cache) and `SyntheticDataSource` (deterministic, in-process, used by `bi:mode=live-synthetic`). The agent layer cannot tell which is plugged in.
+## Reading order
 
-Together these are why a swap doesn't touch the agent code: AptKit owns the loop, the adapters own the boundary, the ports decide what's swappable.
+The sub-directories are ordered as a curriculum. If you're reading straight through: 01 → 02 → 04 → 05 → 06 → 07. Skip 03 (RAG) and 08 (ML) on first pass — they're the "not exercised, in scope for shape reasons" set. 09 is interview reframes; read it after 07.
 
-## What's NOT here (and where to go for it)
+If you're pattern-matching to what a specific interview will probe: LLM application engineer roles → 04 + 05 + 06 + 07. AI infra roles → 05 + 06 + 07 (eval harness + cost controls + load + fault). Product engineer roles composing AI → 01 + 04 + 05.
 
-  → **Embeddings, vector search, semantic similarity.** Not in the codebase. Section 03 covers what *is* here — schema-as-retrieval (the workspace schema is the corpus the monitoring agent retrieves from) and the 10-category gate that decides what's runnable.
+## See also
 
-  → **Trained models, supervised learning, on-device inference.** Not in this codebase. The base spec carries Section 08 (Machine Learning) and Section 09 (ML system-design templates); both are skipped here because the codebase is pure LLM application engineering.
-
-  → **The exact prompt anatomy.** Each agent's prompt lives at `lib/agents/legacy-prompts/{agent}.md`. The deep walk is in `study-prompt-engineering/`; this guide treats prompts as atoms.
-
-## Where to go next
-
-  → **Want the audit?** → `audit.md`
-  → **Want to know how an LLM call is shaped?** → `01-llm-foundations/`
-  → **Want to know how the agent loop runs?** → `04-agents-and-tool-use/`
-  → **Want the interview reframe of this codebase as a system-design prompt?** → `07-system-design-templates/`
+- `README.md` — the file index + reading order
+- `ai-features-in-this-codebase.md` — per-feature table of every AI-touching thing in the repo
+- `ml-features-in-this-codebase.md` — the honest short list (there's no trained ML in the repo)

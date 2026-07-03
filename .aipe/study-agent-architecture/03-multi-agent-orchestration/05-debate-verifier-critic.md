@@ -1,169 +1,150 @@
 # Debate / verifier-critic
 
-**Industry standard.** Two agents argue or critique to refine quality. **Not exercised** in this codebase.
+_Industry standard._
 
 ## Zoom out, then zoom in
 
-Sits as a quality-refinement wrapper around a producer agent. The producer emits a draft; the critic (or the second debater) judges; the loop revises until accepted or capped.
+Agents argue or critique to refine quality. This codebase does not use debate or a critic loop today — every stage produces its artifact and stops, no second-agent review pass. This file names *where* the pattern would earn its overhead if it were adopted, and *why* it isn't here yet.
 
 ```
-  Zoom out — where this WOULD live
+  Zoom out — the shape blooming does NOT have
 
-  ┌─ Reasoning layer ───────────────────────────────┐
-  │  Producer agent (one ReAct loop)                 │
-  │     ★ wrapped by debate or verifier-critic ★    │ ← we are here
-  │  Critic agent (separate model family ideally)    │
-  └──────────────────────────────────────────────────┘
+  ┌─ /api/agent (SUPERVISOR) ────────────────────────────────────┐
+  │  Stage A → Diagnosis (produced, not reviewed)                │
+  │  Stage B → Recommendation[] (produced, not reviewed)         │
+  │                                                              │
+  │  ★ NO CRITIC PASS. The judge in eval/report.eval.ts is       │
+  │    for grading TEST runs, not for gating PRODUCTION outputs. │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-The multi-agent expression of reflexion (`01-reasoning-patterns/05-reflexion-self-critique.md`). Same idea — catch plausible-but-wrong outputs — expressed as two named agents instead of one agent run twice.
+Zoom in: the eval judge (`eval/report.eval.ts`) is a Claude-based grader that scores diagnosis and recommendation quality against a rubric. It runs offline against goldens, not in the production loop. That's a distinction worth naming: a *test-time* judge is not the same as a *production critic loop*.
 
 ## Structure pass
 
-Layers: producer (the answer-generating agent) → critic or debate partner (the judging agent) → loop or judge.
+**Layers:** producer · critic · verdict · loop-or-return decision.
+**Axis:** *does the stake justify a second full agent turn per artifact?*
+**Seam:** the critic's verdict shape. In a production critic loop this must be a structured decision (`approve` | `revise-with-reasons` | `escalate-to-human`), not free text — otherwise the loop condition has to interpret prose.
 
-**Axis traced — "what catches mistakes?":** in plain ReAct nothing does. In debate, the two agents catch each other's mistakes through argument. In verifier-critic, the critic catches the producer's mistakes through one-sided judgment.
+```
+  Two flavors, both currently unused here
 
-**Seam:** the producer's draft is the typed handoff. The critic reads it (plus the trajectory that produced it) and emits a verdict. In symmetric debate, both agents see each other's drafts and a third "judge" agent picks.
+  Debate (symmetric):              Verifier-critic (asymmetric):
+  ┌────────┐   ┌────────┐          ┌──────────┐   ┌──────────┐
+  │agent A │◄─►│agent B │          │ producer │──►│ critic   │
+  │propose │   │counter │          │ (Stage A)│◄──│(review)  │
+  └────────┘   └────────┘          └──────────┘   └──────────┘
+       │            │                    loop until approved
+       └──────┬─────┘                   (cap the rounds)
+              ▼
+         judge picks
+```
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know code review. Producer writes the function; reviewer reads it; if there's a problem, the reviewer comments and the producer revises. Two roles, one workflow. Debate is the same with two reviewers arguing about whether the function is right.
-
-Two flavors:
+You've had a pull request reviewed. You wrote the code, someone else reviewed it, they approved or asked for changes, you iterated. A verifier-critic loop is that shape at the agent layer: producer writes the artifact, critic reads it, either approves or sends it back with specific reasons. The self-critique variant (Reflexion) is when the producer critiques its own draft — cheaper, but shares the blind spots that produced the draft (see `01-reasoning-patterns/05-reflexion-self-critique.md`).
 
 ```
-  Debate (symmetric):              Verifier-critic (asymmetric):
+  Pattern: verifier-critic loop
 
-  ┌────────┐   ┌────────┐          ┌──────────┐   ┌──────────┐
-  │agent A  │◄─►│agent B  │         │ producer │──►│ critic   │
-  │(propose)│   │(counter)│         │          │◄──│(approve/ │
-  └────────┘   └────────┘          └──────────┘   │ reject)  │
-       │            │                              └──────────┘
-       └─────┬──────┘                    loop until approved
-             ▼                           (cap the rounds)
-        judge picks
+  producer produces draft
+       │
+       ▼
+  ┌──────────────────┐
+  │ critic reviews   │
+  └────┬─────────────┘
+       │
+   ┌───┴────┐
+   ▼        ▼
+  approve  revise → producer again (bounded loop)
+   │
+   ▼
+  return
 ```
 
-Debate has two producers that disagree by design; a separate judge picks the winning argument. Verifier-critic has one producer and one critic; the critic accepts or sends back for revision.
+### Move 2 — the walkthrough
 
-### Move 2 — step by step
+**What's NOT here — a production critic on the recommendation.** The RecommendationAgent's output is not currently reviewed by a second agent. If a user gets a recommendation that says "run Scenario X for 14 days," that's what the model produced and nothing gated it. In practice the guardrail against bad recommendations is:
 
-#### Where this could land in this repo
+- the type-guard `isRecommendationArray` in `lib/mcp/validate.ts:42-56` (rejects malformed structure, not bad content),
+- the fixed `bloomreachFeature` enum (`scenario|segment|campaign|voucher|experiment` — the model can't propose an unknown feature),
+- the UI making the reasoning transparent (the ReasoningTrace surfaces the tool calls that produced the rec).
 
-The diagnostic agent is the natural producer. Its output (`Diagnosis`) has a structured `hypothesesConsidered` array with `supported: bool` flags — a critic could read the diagnosis and ask:
+These catch shape errors and hallucinated features. They don't catch "the recommendation is technically valid but strategically wrong."
 
-- Did the conclusion actually follow from the supported hypotheses?
-- Are there obvious alternative hypotheses that weren't tested?
-- Is the affected-customers count consistent with the evidence?
+**What IS here — the eval judge, offline only.** `eval/report.eval.ts` runs a Claude-based grader against golden cases. It scores diagnosis and recommendation on rubrics (evidence quality, actionability, groundedness). The judge is Sonnet 4.6, same family as the producer, which is *the exact self-preference bias* the pattern warns about — see the LLM-as-judge concept in `study-ai-engineering`. That's tolerable for offline eval (calibrated against human ratings in `eval/calibration/`), but promoting the judge into the production loop as a critic would inherit that bias.
 
-A verifier-critic wrapper:
+**Where debate would earn its keep — recommendation strategy.** The strongest case for a critic in this repo is recommendation. Diagnosis is grounded in evidence (EQL results either show the effect or they don't). Recommendation is a strategic call (should you segment or run a scenario?), and strategic calls have real disagreement. A critic-agent that asked "would a different Bloomreach feature fit better here?" and forced the producer to defend the choice would catch reasonable-but-wrong picks. Cost: another full ~50s Sonnet loop per investigation, roughly doubling recommend latency and cost.
 
-```ts
-// hypothetical lib/agents/diagnostic-with-critic.ts (not implemented)
-class CriticGatedDiagnosticAgent {
-  constructor(
-    private producer: DiagnosticAgent,
-    private critic: ModelProvider,  // ideally a DIFFERENT model family
-    // ... ports
-  ) {}
+**Where debate would NOT help — diagnosis.** A critic-agent reviewing a diagnosis would essentially re-run the diagnostic loop with a "does this evidence support the conclusion?" framing. That's Reflexion (self-critique on the same model), and the same-family blind spot problem applies. Better spend of tokens: sharpen the diagnostic prompt.
 
-  async investigate(anomaly: Anomaly, hooks: AgentHooks, maxRounds = 2): Promise<Diagnosis> {
-    let diagnosis = await this.producer.investigate(anomaly, hooks);
-    for (let round = 0; round < maxRounds; round++) {
-      const verdict = await this.critic.complete({
-        system: CRITIC_PROMPT,
-        messages: [{ role: 'user', content: JSON.stringify({ anomaly, diagnosis }) }],
-        maxTokens: 1024,
-      });
-      const parsed = parseVerdict(verdict.content);
-      if (parsed.accept) return diagnosis;
-      diagnosis = await this.producer.investigate(
-        { ...anomaly, criticNotes: parsed.notes },
-        hooks,
-      );
-    }
-    return diagnosis;  // out of rounds — return last draft
-  }
-}
 ```
+  Layers-and-hops — where a critic loop COULD sit
 
-The critic's per-round cost is one extra model call (~$0.01-0.02). The producer's per-round cost is a full agent run (~$0.05-0.10). With `maxRounds=2`, best case is 1.1x baseline; worst case is 3x baseline.
-
-#### The critic-model choice is load-bearing
-
-A model critiquing its own output shares the blind spots that produced it. If the producer is Claude Sonnet 4.6 and the critic is *also* Claude Sonnet 4.6, the critic will miss exactly the things the producer missed. This is the self-preference bias documented in (future) `study-ai-engineering`'s LLM-as-judge file.
-
-Mitigation: use a different model family for the critic. For this repo, the critic would want to be GPT-4 or a different Claude generation, not the same Sonnet. The `AnthropicModelProviderAdapter` (and a hypothetical `OpenAIModelProviderAdapter`) makes this swap a one-line change at construction.
-
-#### When debate beats verifier-critic
-
-Debate (symmetric) is better when the failure mode is "the producer is overconfident in one interpretation." Two agents arguing for opposite interpretations force the disagreement into the open; the judge has to weigh evidence rather than rubber-stamp one side. Verifier-critic (asymmetric) is better when the failure mode is "the producer makes correctness errors a check could catch" — the critic doesn't need to argue, just verify against a checklist.
-
-For this repo's diagnostic agent, verifier-critic is the right choice if added — the failure mode would be "wrong but plausible diagnosis," not "right vs alternative interpretation." Debate is overkill for a single-conclusion task.
-
-#### The cost ceiling
-
-Every round is a full producer-and-critic exchange. If 2 rounds are the cap, the worst-case cost is 3x baseline. The breakeven analysis: if the critic catches a wrong diagnosis 25% of the time AND the average cost of shipping a wrong diagnosis (user re-investigates manually, lost trust) is 3x a normal investigation, the critic earns its overhead. Below 25% catch rate, it's a tax for no win.
+  ┌─ /api/agent (SUPERVISOR) ───────────────────────────────────┐
+  │  Stage A: DiagnosticAgent → Diagnosis                       │
+  │  Stage B: RecommendationAgent → Recommendation[]            │
+  │           │                                                 │
+  │           ▼ ← ★ critic hook would go here ★                 │
+  │  ┌─ (hypothetical) CriticAgent ──────────────────────────┐  │
+  │  │  input: Anomaly + Diagnosis + proposed Recommendations│  │
+  │  │  output: approve | revise-with-reasons                │  │
+  │  └───────────────────────────────────────────────────────┘  │
+  │           │ if revise: back to Stage B (cap rounds = 2)     │
+  └──────────────────────────────────────────────────────────────┘
+```
 
 ### Move 3 — the principle
 
-**Verifier-critic catches a specific class of failures: plausible-but-wrong outputs.** The producer commits an answer that follows from the evidence and is structurally correct — but the conclusion is subtly off. The producer has no signal to catch this because the producer is the source of the mistake. The critic with a different prompt — and ideally a different model — has an independent shot. Debate is the variant for "two interpretations both have merit; pick one." Both are escalations from baseline ReAct; both pay a 2-3x cost; both are only worth it when the catch rate × the cost-of-shipping-wrong exceeds the overhead.
+Debate and critic loops trade tokens for reliability. The threshold is the stake: high-stakes outputs (a strategic recommendation, a production diff) can justify the 2x cost of a critic pass; low-stakes outputs cannot. The failure mode this always risks: the critic is the same model family as the producer, so blind spots are shared. If the stake justifies a critic, it usually justifies a *different-family* critic (Opus over Sonnet, or GPT-4 over Sonnet) so the disagreement is real, not cosmetic. Blooming doesn't run a critic today because the recommendation output goes to a human user who acts as the last-mile critic — that human-in-the-loop replaces the model critic at zero extra token cost.
 
 ## Primary diagram
 
 ```
-  Verifier-critic wrapping the diagnostic agent (hypothetical)
+  Recap — current shape vs the critic-loop upgrade
 
-  ┌─ CriticGatedDiagnosticAgent.investigate(anomaly) ─────────────┐
-  │                                                                  │
-  │  round = 0                                                       │
-  │  diagnosis = producer.investigate(anomaly)  // existing class    │
-  │                                                                   │
-  │  while round < maxRounds (2):                                    │
-  │     ┌─ critic.complete (DIFFERENT model family ideally) ──────┐ │
-  │     │  system: CRITIC_PROMPT                                   │ │
-  │     │  input: { anomaly, diagnosis }                           │ │
-  │     │  output: { accept: bool, notes?: string }                │ │
-  │     └────────────────────────┬─────────────────────────────────┘ │
-  │                              ▼                                    │
-  │     if verdict.accept: return diagnosis                          │
-  │     diagnosis = producer.investigate({                           │
-  │       ...anomaly,                                                 │
-  │       criticNotes: verdict.notes  // re-run with the feedback     │
-  │     })                                                            │
-  │     round++                                                       │
-  │                                                                   │
-  │  return diagnosis  // out of rounds — return last draft           │
-  └──────────────────────────────────────────────────────────────────┘
+  Current shape (no critic):
+  ┌─────────────┐   ┌────────────────┐
+  │ Diagnostic  │──►│ Recommendation │──► user
+  └─────────────┘   └────────────────┘
+
+  With critic loop (not implemented):
+  ┌─────────────┐   ┌────────────────┐   ┌──────────┐
+  │ Diagnostic  │──►│ Recommendation │──►│ Critic   │──► user
+  └─────────────┘   └────────────────┘   │ Opus     │
+                            ▲            └─────┬────┘
+                            │ revise           │
+                            └──────────────────┘
+                              cap: 2 rounds
 ```
 
 ## Elaborate
 
-The verifier-critic pattern shows up in production agent systems for high-stakes outputs — code-generating agents with a test-running critic, customer-facing summary agents with a "is this true to the source?" critic, autonomous-action agents with a "is this action safe?" critic. The shared property: the cost of shipping a wrong answer is meaningfully higher than the cost of one extra critic round, AND the wrong answer is detectable by a check the producer didn't run.
+The reason blooming doesn't use a critic loop in production is that the *user* is the critic. Recommendations render as cards with the full reasoning trace visible — the user sees the tool calls, the evidence, the rationale, and decides whether to act. That's human-in-the-loop critique, essentially free from a token-cost standpoint.
 
-Code-generating agents are the canonical successful case because the test runner IS the critic. The producer writes the code; the critic runs the tests; the verdict is exit-code 0 or not. The cost of wrong code (a bug ships) is high; the cost of running tests is low; the critic catches a high percentage of mistakes. All three conditions align.
+If blooming grew into an *autonomous* action-taker (the recommendation triggers a Bloomreach API call directly), the human critic disappears and a model critic becomes cheap by comparison. That's the natural adoption trigger. Section F's "agentic support system" template covers this shape — the moment the agent takes real actions, guardrails and critic passes move from "nice to have" to "required."
 
-The conditions don't align as cleanly for "diagnose an anomaly correctly." The cost of a wrong diagnosis is medium (the user has to think harder, maybe re-investigate); the critic call costs ~$0.01-0.02 per round; the catch rate is unknown but probably moderate (Claude critiquing Claude has self-preference bias; cross-family critics are better but still imperfect). For this repo today the math doesn't justify the overhead; for a future high-stakes use of the diagnostic agent (say, automatic action-taking based on the diagnosis) the math would change.
+Anthropic's "Building Effective Agents" (2024) names the tradeoff clearly: debate patterns produce measurable quality gains on high-stakes reasoning but at 2-5x token cost, and self-preference bias limits the gains when the critic shares a model family with the producer. Their production recommendation matches this repo's shape: cheap producer + human-in-the-loop until the stakes force a model critic.
 
 ## Interview defense
 
-> **Q: Does this codebase have a critic anywhere?**
->
-> No. Every agent's output is taken at face value. The closest thing is the structured-output validator chain — `tryParseAnomalies`, `tryParseDiagnosis`, recommendation validators — which checks *structure* but not *correctness*. A `Diagnosis` that parses correctly but has a wrong conclusion would ship as-is. If we started shipping diagnoses that customers identified as confidently wrong, that's the signal to add a verifier-critic with a different model family for the critic. Not yet a measured problem.
+**Q: Does this codebase use a critic loop, and if not, why not?**
+A: No — the RecommendationAgent's output is not reviewed by a second agent before the user sees it. Three reasons: the output goes straight to a human user who acts as the last-mile critic (free), the reasoning trace makes the derivation transparent so the human can evaluate quality without re-computing it, and the type-guards + enum constraint on `bloomreachFeature` catch shape errors. If blooming grew into an autonomous action-taker where recommendations triggered Bloomreach API calls directly, a critic loop would earn its overhead — probably a different-family model (Opus) reviewing Sonnet's proposal to avoid the same-family blind spot.
 
-> **Q: Verifier-critic vs debate — which would you pick here?**
->
-> Verifier-critic, if I had to pick. The diagnostic task is single-conclusion ("what caused this anomaly?"), not multi-interpretation ("here are three plausible causes; which wins?"). Debate's value is forcing disagreement into the open, which only helps when there are legitimate competing interpretations. The diagnostic agent's failure mode would be "wrong but plausible," not "right but missing alternatives" — verifier-critic addresses the former cheaper.
+Diagram: current shape (no critic) beside the hypothetical critic-loop shape.
+Anchor: `eval/report.eval.ts` (the offline judge, showing the shape exists at test time but not in production).
 
-> **Q: Why does the critic need to be a different model family?**
->
-> Self-preference bias. A model critiquing its own output rates its own answers higher than equivalent answers from a different model — it shares the blind spots that produced the answer. Claude Sonnet 4.6 critiquing Claude Sonnet 4.6 is essentially asking the same model "are you right?" — the answer is unreliable in the same direction the original answer was unreliable. Using a different model family (GPT-4 or a different Claude generation) gives the critic an independent shot at finding errors. The `AnthropicModelProviderAdapter` makes this swap a one-line construction change; adding an `OpenAIModelProviderAdapter` would be a one-class addition.
+**Q: Why isn't the eval judge just promoted to a production critic?**
+A: The eval judge is Sonnet 4.6, same family as the producer. That's fine for offline grading calibrated against human ratings, but promoting the same-family model to a production critic bakes in the self-preference bias — the critic will systematically over-approve outputs that "sound" like its own. For a production critic to catch real errors you'd want a different model family (Opus over Sonnet, or a competing provider). The eval infrastructure would still be useful for evaluating the *critic itself*, but the critic model is a separate choice.
+
+Diagram: the model-family bias — same family = same blind spots.
+Anchor: `eval/report.eval.ts`; cross-reference `study-ai-engineering`'s LLM-as-judge bias file.
 
 ## See also
 
-- → `01-reasoning-patterns/05-reflexion-self-critique.md` — the single-agent expression of the same idea
-- → `09-coordination-failure-modes.md` — what goes wrong when two same-family agents critique
-- → cross-reference (when generated): `study-ai-engineering`'s LLM-as-judge file — the self-preference bias
+- `01-reasoning-patterns/05-reflexion-self-critique.md` — the same-agent version.
+- `06-swarm-handoff.md` — the alternative topology (also rejected).
+- `04-agent-infrastructure/05-guardrails-and-control.md` — the guardrails that DO exist today.
+- `06-orchestration-system-design-templates/02-agentic-support-system.md` — the shape where a production critic becomes necessary.

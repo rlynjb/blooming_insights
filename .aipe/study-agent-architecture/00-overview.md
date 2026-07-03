@@ -1,82 +1,80 @@
-# 00 — Overview
+# Agent architecture — overview
 
-The whole guide on one page. Read this before the sub-sections so the shape is set before the mechanics.
+**Shape:** multi-agent (deterministic supervisor + 5 workers).
+**Runtime:** `@aptkit/core@0.3.0` — Blooming adapters bridge Anthropic + MCP into AptKit's provider-neutral surface.
+**Anchor claim:** The control flow is **written in TypeScript**, not decided by a router LLM. What's autonomous is what happens *inside* each worker (an AptKit ReAct loop with a tool budget).
 
-## What this repo is, agent-architecture-wise
-
-`blooming_insights` runs a **sequential pipeline of three single-agent ReAct loops** — the monitoring agent fires first, the diagnostic agent runs on a user-picked anomaly, and the recommendation agent runs after the diagnosis. There is a fourth agent — the free-form query agent — sitting on a different ingress path. Each agent is one reasoning loop with tools.
-
-There is **no LLM supervisor** in the topology. The orchestration code is deterministic TypeScript in two Next.js route handlers (`app/api/briefing/route.ts` and `app/api/agent/route.ts`), plus a deterministic intent classifier (`lib/agents/intent.ts`) that picks between query and investigation when the user types into the QueryBox.
+## The whole system in one picture
 
 ```
-  Shape — three pipelines, four single-agent loops, deterministic glue
+  Zoom out — blooming_insights, at the agent-topology level
 
-  ┌─ /api/briefing ─────────────────────────────────┐
-  │   bootstrap schema → coverage gate              │
-  │      → MonitoringAgent.scan() (1 ReAct loop)    │
-  │      → emit insights                            │
-  └─────────────────────────────────────────────────┘
-
-  ┌─ /api/agent (insightId)  ───────────────────────┐
-  │   resolveAnomaly → DiagnosticAgent.investigate()│
-  │   (step=diagnose)  → diagnosis                  │
-  │       — UI hands the diagnosis to step 3 —      │
-  │   → RecommendationAgent.propose()               │
-  │   (step=recommend) → recommendations            │
-  └─────────────────────────────────────────────────┘
-
-  ┌─ /api/agent (q)  ───────────────────────────────┐
-  │   classifyIntent (haiku) → QueryAgent.answer()  │
-  │   (one ReAct loop)         → final text         │
-  └─────────────────────────────────────────────────┘
+  ┌─ UI (Next.js App Router) ─────────────────────────────────────┐
+  │  app/page.tsx (feed)                                          │
+  │  app/investigate/[id]/page.tsx (diagnose)                     │
+  │  app/investigate/[id]/recommend/page.tsx (recommend)          │
+  │  StatusLog ← ReasoningTrace ← NDJSON stream                   │
+  └───────────────────────────┬───────────────────────────────────┘
+                              │ fetch + ReadableStream reader
+  ┌─ Service (route.ts) ──────▼───────────────────────────────────┐
+  │  /api/briefing  → runs MonitoringAgent (fan-out over 10 cats) │
+  │  /api/agent     → deterministic supervisor: classify or       │
+  │                    diagnose → recommend                       │
+  │                                                               │
+  │  ★ THE SUPERVISOR IS CODE, NOT AN LLM ★                       │
+  └───────────────────────────┬───────────────────────────────────┘
+                              │
+  ┌─ Worker agents (lib/agents, thin wrappers over AptKit) ───────┐
+  │  MonitoringAgent · DiagnosticAgent · RecommendationAgent      │
+  │  QueryAgent · classifyIntent (Haiku router)                   │
+  │                                                               │
+  │  each = AptKit ReAct loop (step → tool → observe → repeat)    │
+  │  bounded by maxTurns=8, maxToolCalls=6                        │
+  └───────────────────────────┬───────────────────────────────────┘
+                              │ tool_use via BloomingToolRegistryAdapter
+  ┌─ Data source (lib/data-source) ───────────────────────────────┐
+  │  BloomreachDataSource (MCP over OAuth+PKCE)                   │
+  │  SyntheticDataSource (deterministic fake)                     │
+  │  FaultInjectingDataSource (decorator, offline chaos)          │
+  └───────────────────────────────────────────────────────────────┘
 ```
 
-Each `MonitoringAgent`, `DiagnosticAgent`, `RecommendationAgent`, `QueryAgent` class in `lib/agents/` is a **thin wrapper** (40-120 LOC) over a corresponding AptKit class — `AnomalyMonitoringAgent`, `DiagnosticInvestigationAgent`, `RecommendationAgent`, `QueryAgent` from `@aptkit/core@0.3.0`. The AptKit runtime owns the actual ReAct loop (`runAgentLoop` in `@aptkit/runtime`). The Blooming wrappers exist to bridge three ports — model provider, tool registry, capability-trace sink — to Blooming-specific implementations.
+## The three shapes, and where this repo sits
 
-## The three-shapes call
+Workflow (chain) — engineer writes the steps in code. LLM fills slots but does not choose the next step.
+Single-agent — one ReAct loop with tools. Model decides which tool to call and when to stop.
+Multi-agent — many coordinating agents in a topology.
 
-Workflow / single-agent / multi-agent — which one is this repo?
+**This repo is a hybrid, and that's the interesting bit:**
 
 ```
-  ┌─ workflow / chain ──────┬─ single-agent ────────┬─ multi-agent ───┐
-  │ engineer writes steps;  │ one ReAct loop;       │ topology of     │
-  │ no autonomous loop      │ LLM picks next tool   │ coordinating    │
-  │                         │                       │ agents          │
-  ├─────────────────────────┼───────────────────────┼─────────────────┤
-  │ THE ORCHESTRATOR        │ EACH AGENT INTERNAL   │ NOT YET         │
-  │ (briefing + agent       │ (monitoring, diag,    │ (no LLM         │
-  │  route handlers)        │  rec, query — four    │  supervisor,    │
-  │                         │  ReAct loops)         │  no debate,     │
-  │                         │                       │  no handoff)    │
-  └─────────────────────────┴───────────────────────┴─────────────────┘
+  outer layer: deterministic pipeline (CODE picks the next agent)
+      ├─ classifyIntent (Haiku) → route to QueryAgent OR skip
+      ├─ MonitoringAgent (fan-out over runnable categories)
+      └─ DiagnosticAgent → RecommendationAgent (sequential)
+
+  inner layer: each agent runs a single-agent ReAct loop
+      └─ AptKit runAgentLoop (step + execute + accumulate + terminate)
+
+  innermost: tools (execute_analytics_eql, list_scenarios, …)
 ```
 
-The repo is a **workflow outside, single-agent inside**. The outer shell is a pipeline whose order is hard-coded; each stage in the pipeline is itself an autonomous ReAct loop with a bounded tool budget.
+The **outer topology is chain-shaped** — the sequence diagnose → recommend is written in `app/api/agent/route.ts`, not decided by an LLM. The **inner loop is agent-shaped** — inside DiagnosticAgent, the model chooses which EQL queries to run and when to stop. This is the recommended production posture: predictable control flow at the top, autonomous loops only where the path genuinely can't be predicted.
 
-This calls the weighting for the rest of the guide:
+## What this guide covers, by sub-section
 
-- **Section A — reasoning patterns:** full coverage. Every agent in the repo is an instance of these.
-- **Section B — agentic retrieval:** placement coverage. The repo does **agentic data-retrieval** (the agents drive their own EQL queries against Bloomreach via MCP), but it is not RAG over a vector store — there is no embedding layer.
-- **Section C — multi-agent orchestration:** structural coverage. The repo does *not* run an LLM supervisor, debate, handoff, or graph orchestration. The `01-when-not-to-go-multi-agent.md` file is load-bearing here — the deliberate non-escalation is the lesson. Topology files mark themselves "Not yet implemented" honestly.
-- **Section D — agent infrastructure:** full coverage. Context engineering (the schema-summary trick), tool calling and MCP (the connective tissue), agent evaluation (Vitest with injected fakes), guardrails (caps, budgets, allowlists, no-LLM-direct-side-effects) — all live and exercised.
-- **Section E — production serving:** full coverage. Cross-turn caching (the 60s DataSource cache + Anthropic prompt prefix), per-tool rate-limit / circuit-breaker (the BloomreachDataSource retry ladder), fan-out backpressure (the ~1 req/s spacing).
-- **Section F — orchestration system design templates:** all three generic templates appear; the "Applies to this codebase" bullet is the honest match.
+- **`01-reasoning-patterns/`** — the loop-shape substrate every worker sits on. Chains-vs-agents boundary, the AptKit ReAct kernel, plan-and-execute (not used), reflexion (not used), ToT (not used), routing (used: `classifyIntent`).
+- **`02-agentic-retrieval/`** — none of it is exercised here. The diagnostic loop retrieves via EQL as a general tool, not as a semantic-retrieval loop. Covered honestly with "not yet implemented" + the refactor that would introduce it.
+- **`03-multi-agent-orchestration/`** — the load-bearing section. Coordinator-worker (deterministic supervisor is a variant), sequential pipeline (diagnose → recommend), parallel fan-out (partial — monitoring runs categories concurrently but not agents), swarm (rejected — Anthropic's finding), graph orchestration (not used), shared state (session + workspace schema), coordination failure modes (BudgetTracker, per-call timeouts, `is_error` graceful degradation).
+- **`04-agent-infrastructure/`** — context engineering (schemaSummary + AptKit context builder), agent memory (working only — no episodic/long-term), tool calling + MCP (the substrate), agent evaluation (`eval/` harness — currently live), guardrails and control (BudgetTracker + BudgetExceededError, iteration caps, no HITL).
+- **`05-production-serving/`** — cross-turn caching (Anthropic ephemeral cache on system prompt, live), fan-out backpressure (no explicit limiter; ~1 req/s MCP throttle bounds it), per-tool circuit breaking (not implemented; FaultInjectingDataSource proves the agent already degrades gracefully via `is_error`).
+- **`06-orchestration-system-design-templates/`** — the three generic templates (research assistant, agentic support, coding agent), each mapped to "does this repo look like this?"
+- **`agent-patterns-in-this-codebase.md`** — the table of patterns this repo actually uses, with control envelope per pattern.
 
-## The settled vocabulary you'll see throughout
+## The one number to hold in your head
 
-The guide uses **industry terms** in prose with the **repo's local names** in parens on first mention. This is the same dependency-inversion vocabulary `lib/data-source/types.ts` already uses internally:
-
-- **Port** — `DataSource` (the abstract surface), plus the AptKit primitives `ModelProvider`, `ToolRegistry`, `CapabilityTraceSink`.
-- **Adapter** — `BloomreachDataSource`, `SyntheticDataSource`, plus the three bridge classes in `lib/agents/aptkit-adapters.ts` (`AnthropicModelProviderAdapter`, `BloomingToolRegistryAdapter`, `BloomingTraceSinkAdapter`).
-- **Client** — the four agent classes (`MonitoringAgent`, `DiagnosticAgent`, `RecommendationAgent`, `QueryAgent`).
-- **Factory** — `makeDataSource(mode, sessionId)` in `lib/data-source/index.ts`.
-- **Runtime** — `@aptkit/core@0.3.0` (re-exports `@aptkit/runtime`, `@aptkit/tools`, `@aptkit/context`, plus four `agent-*` packages).
-- **Supervisor / orchestrator** — the deterministic ROUTE code in `app/api/briefing/route.ts` and `app/api/agent/route.ts`. **NOT** an LLM supervisor.
-- **ReAct loop** — `runAgentLoop` in `node_modules/@aptkit/core/node_modules/@aptkit/runtime/dist/src/run-agent-loop.js` (the actual `while` loop with the `step / execute / accumulate / terminate` skeleton).
-- **Tool calling** — Anthropic-native `tool_use` / `tool_result` blocks; the message shape is built in `runAgentLoop` and adapted to Anthropic in `BloomingToolRegistryAdapter` + `AnthropicModelProviderAdapter`.
-- **Capability gating** — the per-agent `allowedTools` allowlist in each AptKit agent (`anomalyMonitoringToolPolicy`, `diagnosticInvestigationToolPolicy`, `recommendationToolPolicy`, `queryToolPolicy`); plus the schema-coverage gate in `lib/agents/categories.ts`.
-- **Intent classifier** — `classifyIntent` in `lib/agents/intent.ts` (Haiku-backed, deterministic single-shot, no loop).
+Per-case cost: **~$0.09**. Per-phase p50: diagnose ~50s, recommend ~51s. The Anthropic ephemeral cache turns a 3168-token cache_creation into cache_read hits across every ReAct loop turn.
 
 ## Reading order
 
-A → B → C → D → E → F, with `agent-patterns-in-this-codebase.md` at the root as the "what does my repo actually do" reference. The README has the full index.
+A → B → C → D → E → F. Then `agent-patterns-in-this-codebase.md` for the summary. If you're new to multi-agent, spend the most time on C — it's the load-bearing new material.

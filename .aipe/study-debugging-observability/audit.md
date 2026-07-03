@@ -1,171 +1,321 @@
-# Audit — debugging & observability (blooming_insights)
+# Audit — the 8 lenses, applied
 
-The 8-lens walk against current evidence. Each `##` section is one lens; cross-links into the pattern files point to the deep walks.
+One `##` section per lens. Each names what the codebase actually does
+(with `file:line`) or emits `not yet exercised` honestly. Cross-links
+into the Pass-2 pattern files for the deep walks.
 
-## observability-map
+## 1. observability-map — the evidence map
 
-The evidence map: what can be observed at each important boundary.
-
-```
-  blooming_insights observability map
-
-  ┌─ UI layer ────────────────────────────────────────────────┐
-  │  StatusLog (sticky sidebar) → ReasoningTrace               │
-  │  shows: every reasoning_step, every tool_call_start/end    │
-  │  reads: NDJSON over fetch (live), or replayed (demo)       │
-  └────────────────────────┬───────────────────────────────────┘
-                           │  AgentEvent (the wire contract)
-  ┌─ Service layer ────────▼───────────────────────────────────┐
-  │  /api/briefing, /api/agent — emit AgentEvent[] + a single  │
-  │  console.log({route, sessionId, phases[], totalMs, aborted})│
-  │  per request, in `finally` so it survives a thrown phase   │
-  └────────────────────────┬───────────────────────────────────┘
-                           │  callTool / listTools (with signal)
-  ┌─ Storage layer ────────▼───────────────────────────────────┐
-  │  BloomreachDataSource — emits durationMs + fromCache per    │
-  │  call; throws McpToolError tagged with toolName + detail   │
-  └────────────────────────┬───────────────────────────────────┘
-                           │  HTTP (StreamableHTTPClientTransport)
-  ┌─ Provider boundary ────▼───────────────────────────────────┐
-  │  Bloomreach loomi connect MCP server — opaque to us; the   │
-  │  capturing fetch records non-OK response bodies so the      │
-  │  error reaching console.error carries the REAL server text │
-  └────────────────────────────────────────────────────────────┘
-```
-
-What's observable per boundary:
-
-- **UI → Service.** Browser DevTools network panel sees the NDJSON stream byte-for-byte (`Content-Type: application/x-ndjson`); each `AgentEvent` JSON line is readable as it arrives. `lib/streaming/ndjson.ts` is the kernel.
-- **Service → DataSource.** Per-phase wall-clock at `app/api/briefing/route.ts:215-218` and `app/api/agent/route.ts:215-219` (the closure `recordPhase`). One JSON log line per request in `finally`. Cancellation reason is recorded as `aborted: req.signal.aborted`.
-- **DataSource → Bloomreach.** `BloomreachDataSource.callTool` returns `{ result, durationMs, fromCache }` (`lib/data-source/bloomreach-data-source.ts:36`). The rate-limit retry ladder logs no telemetry of its own — a retry is silent on the wire and only visible through the elongated `durationMs`.
-- **Bloomreach error path.** `makeCapturingFetch` (`lib/mcp/transport.ts:103-118`) records the body of each non-OK response into `HttpErrorHolder`; `SdkTransport.callTool` (`lib/mcp/transport.ts:129-146`) attaches the captured body to the thrown error. → see `04-server-error-body-capture.md`.
-- **Test runner.** Vitest writes to stdout/stderr; integration tests at `test/api/briefing.integration.test.ts:91` and `test/api/agent.integration.test.ts` actually exercise the error-event path with the same `console.error` and phase-log lines that production emits.
-
-Verdict: the map is dense at UI → Service → DataSource → Bloomreach. It is empty above the UI layer (no browser-side error reporting, no client-side performance telemetry) and empty across multiple requests (no aggregation, no metrics).
-
-## reproduction-and-evidence
-
-Minimal reproduction, hypotheses, controlled experiments, and evidence collection.
-
-The reproduction story here is unusually good for one reason: **the live wire format is the recording format.** A demo capture (`app/api/mcp/capture-demo/route.ts`) records a full briefing + each per-insight investigation as `AgentEvent[]` and writes it to `lib/state/demo-investigations.json` + `lib/state/demo-insights.json`. The demo replay route reads those files back and re-emits them as NDJSON, byte-compatible with the live stream. → see `05-replay-snapshot-as-fixture.md`.
-
-Practical consequences:
-
-- **Reproducing a UI rendering bug** doesn't require live credentials. Run with `?demo=cached` and the same trace plays back deterministically. The `REPLAY_DELAY_MS` constants (`app/api/briefing/route.ts:25`, `app/api/agent/route.ts:103`) preserve the *pacing* so timing-dependent UI bugs (progressive reveal, scroll-into-view) reproduce.
-- **Reproducing an agent-loop bug** is harder. The captured snapshot records only what the agent emitted, not what it *thought*. Re-running needs live Bloomreach + Anthropic credentials, which are non-deterministic (the model output varies turn to turn).
-- **Reproducing a Bloomreach error** uses the integration tests: `test/api/_helpers.ts` and `test/api/briefing.integration.test.ts:91-93` set up a fake Anthropic that throws (e.g. "Anthropic API: 529 overloaded") and verifies the route emits an `error` event AND prints the phase-log line. This is the regression guard for the error path.
-
-What's missing: there is no "Bloomreach response fixtures" library — when a new MCP error shape shows up in the wild, capturing it as a test fixture requires hand-copying the (already-redacted) error body out of Vercel logs into a test.
-
-## structured-logs-and-correlation
-
-Events, levels, context, correlation IDs, redaction, and searchable fields.
-
-Structured logging is partial. Two shapes:
-
-- **Per-request summary** (the strongest signal). `console.log(JSON.stringify({ route, sessionId, mode, totalMs, phases, aborted }))` at `app/api/briefing/route.ts:317-324` and `app/api/agent/route.ts:331-338`. Shared shape across both routes, so a single Vercel log filter (e.g. `phases.phase = "schema_bootstrap"`) reads across them. → see `02-per-request-phase-log.md`.
-- **Per-Anthropic-call usage** (narrower signal). `console.log(JSON.stringify({ site, sessionId, usage }))` from `AnthropicModelProviderAdapter.complete` at `lib/agents/aptkit-adapters.ts:57-61`, with `site` resolved per agent (e.g. `agents/monitoring:aptkit-model`, `agents/intent:classifyIntent`). Tracks token usage per agent per session.
-
-Error logs use a *prefix-tag* convention rather than structured JSON: `[briefing]`, `[agent]`, `[mcp-call]`, etc. These ride alongside the structured `console.log`. The trade-off is honest: humans grep by tag; machines parse the JSON line.
-
-Correlation ID: **`sessionId` (the `bi_session` cookie) is the only correlation key.** `lib/mcp/session.ts:18-25` creates one if absent. It joins all the per-request log lines for one user across both routes. There is no per-request `requestId` — when a user generates two briefings in 30 seconds, their phase logs are correlated by `sessionId` and disambiguated by `totalMs` + position in the log stream.
-
-Redaction: token-shaped substrings are stripped *before* the log write. `TOKEN_PATTERNS` at `lib/mcp/transport.ts:55-61` covers `Bearer`, `access_token`, `refresh_token`, `id_token`, `code_verifier`. `formatError` (`lib/mcp/transport.ts:82-97`) walks the `err.cause` chain so nested cause tokens are also redacted. → see `03-redaction-at-the-error-edge.md`.
-
-Verdict: structured-and-correlated for the per-request summary; ad-hoc for everything else. The single `sessionId` correlation key is sufficient at current scale; it stops being sufficient the moment cross-service tracing is added.
-
-## metrics-slis-slos-and-alerts
-
-Signals, service-level indicators, objectives, alerts, and actionable thresholds.
-
-`not yet exercised`.
-
-There are no metrics emitters, no SLIs, no SLOs, no alerts. The per-phase timings in the phase log carry the raw data that *would* feed an SLI (e.g. "p95 `monitoring_scan` < 60s") but no aggregator reads them. The 300s Vercel ceiling is a hard ceiling, not an SLO with headroom.
-
-When this becomes relevant: the moment more than one developer cares whether a request succeeded, or the moment a user other than the developer relies on a briefing landing in <2 minutes. At single-user demo scale, the absence is correct.
-
-The pre-existing hooks for adding metrics: every `recordPhase()` call site is a natural histogram emission point. Wiring them to OpenTelemetry would replace `console.log` with `tracer.startActiveSpan` and add no new instrumentation surface.
-
-## traces-and-request-lifecycles
-
-Request lifecycles, spans, causal chains, and latency attribution.
-
-The per-request phase log *is* the request lifecycle trace, flattened into a single line. `app/api/briefing/route.ts:317-324`:
+The system has three concentric evidence rings. Read them out from
+the browser and each ring exposes strictly more than the last.
 
 ```
-  { route: '/api/briefing',
-    sessionId: 'abc-...',
-    mode: 'live-bloomreach',
-    totalMs: 87432,
-    phases: [
-      { phase: 'schema_bootstrap',   durationMs: 4210 },
-      { phase: 'coverage_gate',      durationMs: 12 },
-      { phase: 'list_tools',         durationMs: 380 },
-      { phase: 'monitoring_scan',    durationMs: 82800 },
-    ],
-    aborted: false }
+  The three rings of evidence
+
+  ┌─ Ring 1 · live browser view ─────────────────────────────┐
+  │  ReasoningTrace + ToolCallBlock rendering the NDJSON      │
+  │  stream from /api/briefing or /api/agent                  │
+  │  gone the moment the tab closes                          │
+  └──────────────────────────────────────────────────────────┘
+                        ▲
+                        │ same events, one-shot
+                        │
+  ┌─ Ring 2 · in-process state ──────────────────────────────┐
+  │  saveInvestigation() → in-memory Map + dev-only JSON      │
+  │  file (.investigation-cache.json)                        │
+  │  route.ts:305 (COMBINED runs only)                       │
+  └──────────────────────────────────────────────────────────┘
+                        ▲
+                        │ synthetic-substrate only
+                        │
+  ┌─ Ring 3 · durable receipts on disk ──────────────────────┐
+  │  eval/receipts/<case>-<runId>.json — the debuggable       │
+  │  ledger; anomaly + diagnosis + judgment + tool trace     │
+  │  + usage + cost + budget                                 │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-The shape is shared with `/api/agent` (`phases: ['schema_bootstrap', 'list_tools', 'intent_classify' | 'diagnostic_investigate' | 'recommendation_propose', …]`), so a single filter reads both routes.
+**Ring 1 — the wire.** `AgentEvent` (`lib/mcp/events.ts:5-14`) is the
+8-variant discriminated union: `reasoning_step` / `tool_call_start` /
+`tool_call_end` / `insight` / `diagnosis` / `recommendation` / `done` /
+`error`. Producers use `encodeEvent(e)` (`events.ts:17`), consumers use
+`readNdjson` (`lib/streaming/ndjson.ts` — the 64-LOC kernel). This
+carries everything the UI has to show. → deep walk in
+`01-ndjson-live-trace.md`.
 
-What this gives you: latency attribution per phase within a request. What it does not give you: a span tree (each phase is flat, no parent-child), trace continuation across the Bloomreach hop (no `traceparent` propagated), or per-tool-call timing (Bloomreach `callTool` durations are inside `monitoring_scan` but not broken out — they live in the live trace as `tool_call_end.durationMs`, not in the phase log).
+**Ring 2 — server-side one-shot memory.** `lib/state/investigations.ts`
+holds combined `diagnose+recommend` runs in a per-session in-memory
+map, backed by a gitignored JSON file only in dev
+(`investigations.ts:7`). The split-step runs are held only on the
+client via `sessionStorage`, so they die with the tab.
 
-The `AgentEvent` stream *does* carry per-tool-call timing in `tool_call_end.durationMs` — that's where the per-call latency lives. It's just not aggregated into the phase log. → see `01-ndjson-reasoning-trace.md`.
+**Ring 3 — the receipts.** `eval/receipts/<case>-<runId>.json` is the
+only surface that survives across sessions with *provenance*:
+anomaly (input), diagnosis (agent output), diagnosisJudgment (judge
+output), tool-call trace, per-agent usage row, per-agent cost, and a
+budget snapshot. Sample receipt: 424 lines /
+`09-engagement-drop-email-campaign-2026-07-03T04-08-28-644Z.json`. →
+deep walk in `03-capability-trace-receipts.md`.
 
-Verdict: request-lifecycle attribution works inside a single Vercel function. Trace continuation across services does not exist; it would require adding `traceparent` to the MCP transport's outbound HTTP headers and surfacing it in the phase log.
+## 2. reproduction-and-evidence
 
-## state-snapshots-and-debugging-boundaries
+**Repro is genuinely cheap here — three modes.**
 
-State inspection, network traces, error output, and before/after snapshots.
+  → **`?demo=cached`** — plays back the committed snapshot
+    (`lib/state/demo-insights.json`) as NDJSON, delay-throttled to
+    140ms per event (`briefing/route.ts:25`, `agent/route.ts:104`). No
+    auth, no API cost, deterministic. This is the reliable presentation
+    path AND the reliable "make the UI render this exact scenario" tool.
 
-Three places state can be inspected at rest:
+  → **`SyntheticDataSource`** — an in-process fake data source that
+    both `eval/run.eval.ts` and `eval/load.eval.ts` bind to. Any bug
+    triggered by the golden cases is reproducible without touching
+    Bloomreach, and the schema is fixed
+    (`syntheticWorkspaceSchema`).
 
-1. **Dev cache files** (gitignored). `.investigation-cache.json` at the repo root (written by `saveInvestigation` in `lib/state/investigations.ts:30-41`, dev only — `PERSIST = process.env.NODE_ENV === 'development'`). `.auth-cache.json` at the repo root (written by the dev auth backend at `lib/mcp/auth.ts:34-36`). Both survive Next's hot reload, so an OAuth flow or a captured investigation is inspectable mid-development. **In production they don't exist** — Vercel's filesystem is read-only and state lives in encrypted cookies + in-memory maps.
+  → **`FaultInjectingDataSource`** — a decorator with configurable
+    per-call rates for `timeout / rate_limit / server_error /
+    malformed_json` (`lib/data-source/fault-injecting.ts:31-39`).
+    Deterministic when you set `FAULT_SEED` (`fault-injecting.ts:41`),
+    fully non-deterministic otherwise. This is how you exercise the
+    "Bloomreach 429'd mid-scan" path locally. → deep walk in
+    `05-fault-injecting-load-harness.md`.
 
-2. **Committed demo snapshots.** `lib/state/demo-insights.json` + `lib/state/demo-investigations.json`. These are the captured "good state" that the demo path replays. Versioned in git; a regression in rendering shows up as a diff against a committed snapshot. → see `05-replay-snapshot-as-fixture.md`.
+Hypotheses get tested by writing a golden case (`eval/goldens/`) with
+an expected-shape rubric, running the eval, and reading the judgment
+verdict + rationale off the receipt. This is closer to a science
+notebook than an ad-hoc `console.log`.
 
-3. **Network-tab snapshots.** Because the live trace is NDJSON over `fetch`, the browser's network panel shows every `AgentEvent` byte-for-byte. Save-as-HAR captures the full stream. This is the "before/after" surface for UI rendering bugs.
+## 3. structured-logs-and-correlation
 
-Error output: `console.error` calls everywhere are prefixed by route tag (`[briefing] error: …`) with the full redacted stack chain via `formatError`. The chain-walking matters — a Bloomreach error wrapped in an SDK error wrapped in `McpToolError` would otherwise lose the root cause to `String(e)`. → see `03-redaction-at-the-error-edge.md`.
+Server-side logs are `console.log(JSON.stringify(...))` in
+five load-bearing sites — all shipping structured records to Vercel's
+log pipeline via stdout scraping.
 
-Before/after snapshots are not formalized for tests — vitest's default assertion error is the diff. Snapshot tests would be a natural addition for the AgentEvent[] arrays that demo replays produce, but they're not in place today.
+| Site | Shape | Purpose |
+|---|---|---|
+| `app/api/briefing/route.ts:317-323` | `{ route, sessionId, mode, totalMs, phases[], aborted }` | one summary per request |
+| `app/api/agent/route.ts:331-337` | same shape | one summary per request (agent) |
+| `lib/agents/aptkit-adapters.ts:97-101` | `{ site, sessionId, usage }` | per model turn |
+| `lib/agents/base-legacy.ts:135`, `256` | `{ site, sessionId, usage }`, `{ site, ... }` | legacy — same shape |
+| `lib/agents/intent-legacy.ts:36` | `{ site, sessionId, usage }` | legacy classifier |
 
-## incident-analysis-and-prevention
+The shape is **deliberately shared** across the two streaming routes
+so a single Vercel filter (`route = "/api/briefing"` OR `phases.phase
+= "monitoring_scan"`) reads across both — the comment at
+`briefing/route.ts:316-319` names this explicitly. → deep walk in
+`02-per-phase-request-summary.md`.
 
-Root cause, contributing conditions, remediation, regression guards, and runbooks.
+**Correlation ID.** There is one: `sessionId` — the value of the
+`bi_session` cookie (`lib/mcp/session.ts:16-24`). It's stamped on
+every log line at every site listed above. There's **no request ID
+separate from the session**, so two concurrent requests from the same
+browser tab share a correlation key — this is acceptable at the
+current scale (one user, alpha demo) but starts to hurt once you have
+multiple parallel requests per session.
 
-The repo has a small portfolio of named incidents that left scar tissue in code comments:
+**Redaction.** `redactSecrets` (`lib/mcp/transport.ts:66-76`) strips
+Bearer headers and OAuth token JSON fields before they hit a log.
+Applied at every server-side `console.error` call site (via
+`formatError(e)` → `redactSecrets(...)`). The redaction is only for
+OAuth-shaped secrets; there is no PII redaction for Bloomreach
+customer data flowing through EQL results.
 
-- **The 300s Vercel ceiling incident.** A live investigation runs ~100-115s under the ~1 req/s MCP limit; 60s (Hobby) cannot fit it. Documented at `app/api/agent/route.ts:20-22` and `app/api/briefing/route.ts:17-19`. Prevention: hard-coded `export const maxDuration = 300` so the route doesn't silently truncate. The phase log is the diagnostic — when `totalMs` approaches 300_000 and `aborted: true`, the budget was the failure mode.
+## 4. metrics-slis-slos-and-alerts
 
-- **The cross-tenant feed wipe.** A single warm Vercel instance serves many users concurrently, so module-level Maps would bleed between sessions — and `putInsights`' clear() would wipe another user's feed mid-briefing. Documented at `lib/state/insights.ts:8-12`. Remediation: each session gets its own sub-feed map keyed by sessionId; the outer map is never cleared by a request. Regression guard: `test/state/insights.test.ts`.
+**not yet exercised** as a live metrics pipeline. No Prometheus, no
+Datadog, no OpenTelemetry metrics.
 
-- **The Bloomreach token revocation incident.** The alpha MCP server revokes tokens after minutes; without recovery, every refresh requires re-auth. Remediation: auto-reconnect on `invalid_token` (the feed in `app/page.tsx` catches the 401, resets auth, reloads once with a guard). The capturing fetch in `lib/mcp/transport.ts` is the upstream half — without it, the SDK's generic "Unauthorized" wouldn't surface `invalid_token` to the client recovery path. → see `04-server-error-body-capture.md`.
+What DOES exist is metrics computed on demand from the receipts:
 
-- **The rate-limit penalty window.** Bloomreach's observed window is ~10s ("1 per 10 second"); a sub-second retry just burned the attempt inside the same window. Remediation: parse the server-stated window from the error text, fall back to backoff, cap at `retryCeilingMs: 20_000`. Documented at `lib/data-source/bloomreach-data-source.ts:131-136`. Regression guard: `test/mcp/client.test.ts`.
+- `eval/report.eval.ts:78-96` — p50/p95/p99/max/mean per phase
+  (investigate / diag-judge / recommend / rec-judge / total).
+- `eval/report.eval.ts:130-141` — per-tool-call latency distribution.
+- `eval/baseline.eval.ts` — per-dimension pass rates + verdict
+  distributions across all cases in a run.
 
-- **The StrictMode mid-stream cancel.** React StrictMode in dev mounts → cleans up → re-mounts; cancelling the in-flight fetch on the first cleanup, with the started-guard blocking the re-mount, aborted the stream and left the logs empty. Remediation: the `useInvestigation` hook deliberately does NOT cancel on cleanup. Documented at `lib/hooks/useInvestigation.ts:32-37`.
+These are **eval-time SLIs** — computed after a run finishes, printed
+to stderr. There is no threshold, no page, no alert. The closest thing
+to an SLO is the regression gate in `eval/gate.eval.ts` — see lens 7.
 
-Runbook: **none formalized.** The closest thing is the comments in the route files explaining the budget and the recovery semantics. A new developer reading them gets the *what* and the *why* but no operational playbook for "monitoring_scan exceeded budget — what to do next." At single-developer scale this is correct; the moment a second developer joins, the runbook is the next gap to close.
+**When this starts to matter.** As soon as blooming insights sees
+sustained production traffic, "p95 total request latency" becomes a
+number someone wants to look at *between* runs, not just when
+Rein re-runs `npm run eval:report`. That's when you'd wire OTel
+metrics or ship the per-phase log lines into a real time-series DB.
 
-Prevention discipline: regression tests cover the named incidents. `test/state/insights.test.ts` guards the cross-tenant wipe. `test/mcp/client.test.ts` guards the rate-limit retry. `test/mcp/transport.test.ts` guards the redaction + body capture. `test/api/briefing.integration.test.ts:91` guards the error-event path under a thrown Anthropic call. Each incident has a test; the prevention loop is closed.
+## 5. traces-and-request-lifecycles
 
-## debugging-observability-red-flags-audit
+**Per-request tracing exists as the phase log,** at approximately
+"5 spans per request" granularity:
 
-Ranked by consequence; each verdict carries its evidence.
+Briefing route phases (`briefing/route.ts:221-281`):
+- `schema_bootstrap` → `coverage_gate` → `list_tools` → `monitoring_scan`
 
-1. **No per-request correlation ID beyond `sessionId`.** `lib/mcp/session.ts:18-25`. When one user generates two briefings inside 30 seconds, their phase logs are correlated by `sessionId` and disambiguated by position + `totalMs`. Adding a `requestId = crypto.randomUUID()` at the top of each route handler and threading it into every `console.log` is a 10-line change with high diagnostic payoff once log volume grows.
+Agent route phases (`agent/route.ts:236-295`, conditional on flow):
+- `schema_bootstrap` → `list_tools` → then EITHER `intent_classify` +
+  `query_answer` (free-form query) OR `diagnostic_investigate` +
+  `recommendation_propose` (investigation)
 
-2. **Rate-limit retries are silent on the wire.** `lib/data-source/bloomreach-data-source.ts:163-174`. When `BloomreachDataSource.callTool` waits 10-20s for a rate-limit window to clear, the only surface is the elongated `durationMs` returned to the caller. No `tool_call_end.event` distinguishes "took 12s because of a retry" from "took 12s because the EQL was complex." The UI shows a single tool call running for 12s with no hint that 10s of it was a retry wait.
+Each phase records via `recordPhase(name, startedTs)` (`route.ts:217`)
+into a per-request array, and the array ships as `phases[]` in the
+final summary log. The comment at `briefing/route.ts:200-202` names
+the design: **the finally block always fires, so we get the phase log
+even when a phase throws**, and can see how much of the 300s budget
+was burned before the failure.
 
-3. **No metrics or alerting.** Already named under the metrics lens. At current scale the absence is correct; the risk is that the *moment* a real user starts depending on the system, there is no signal to catch a regression. The 60s → 300s `maxDuration` decision was reversible because the developer is also the only user; the next budget surprise won't be.
+**Deeper drill-down happens inside the aptkit trace sink.**
+`BloomingTraceSinkAdapter.emit()` (`lib/agents/aptkit-adapters.ts:143-
+174`) receives every `CapabilityEvent` from aptkit — including
+`model_usage` events with per-turn cache_creation / cache_read token
+counts. The `onCapabilityEvent` hook forwards this to any caller that
+wants it (the eval runner does). → deep walk in
+`03-capability-trace-receipts.md`.
 
-4. **The Bloomreach error body is captured but never schematized.** `lib/mcp/transport.ts:103-118`. The error text reaches `console.error` as a free-form string. A growing taxonomy of Bloomreach errors (`invalid_token`, `expired_token`, `rate_limit_exceeded`, `eql_parse_error`, …) would benefit from a typed error shape so the UI can render distinct recovery affordances. Today only `invalid_token` triggers a specific UI path (the reconnect button) — every other Bloomreach error renders as generic.
+**What's NOT here:** no OpenTelemetry span IDs, no parent/child span
+relationships, no distributed context propagation. The whole stack is
+one Node process; the phase log is the trace.
 
-5. **`console.log` is the only structured log sink.** Vercel retains the lines, and grep-by-substring inside Vercel's UI is the only query interface. This is fine while there's one route and one user; it stops being fine the moment a developer wants to ask "what's my p95 `monitoring_scan` over the last 7 days." That question cannot be answered with the current setup.
+## 6. state-snapshots-and-debugging-boundaries
 
-6. **No fixture library for Bloomreach error responses.** Integration tests exist (`test/api/_helpers.ts`), but new Bloomreach error shapes are not captured as test fixtures when they're encountered in the wild. The path of least resistance when an error surfaces is to redact a Vercel log line and hand-paste it into a new test — there is no `test/fixtures/bloomreach-errors/` directory feeding parameterised tests.
+Three snapshot surfaces the debugger reaches for.
 
-7. **`StatusLog`'s scroll position is not preserved across reasoning_step floods.** `components/shared/StatusLog.tsx:36-46`. The trace is `overflowY: 'auto'` with `maxHeight: 'calc(100vh - 96px)'`. As events stream in, the user's manual scroll-up is fighting the natural append. This is a debugging-quality issue: when a developer is mid-investigation reading a `tool_call_end` payload, the next event can shift it. Auto-scroll-pinned-to-bottom *or* a scroll-position lock would help.
+**Snapshot A · in-flight NDJSON.** Pipe the stream to a file:
 
-8. **No `not yet exercised` formal documentation of the gaps.** This audit is the closest thing. There is no `OBSERVABILITY.md` in the repo root that says "we deliberately do not run metrics; here's when that flips." A new contributor inherits the gaps without inheriting the reasoning.
+```
+curl -s 'http://localhost:3000/api/briefing?mode=live-synthetic' > trace.ndjson
+```
+
+Each line is a self-describing `AgentEvent`. Everything the UI would
+have shown is reproducible from the file via `readNdjson`.
+
+**Snapshot B · the receipt.** Written by
+`eval/run.eval.ts:305-321`. Contains not just the outputs but the
+**full aptkit trace** the outputs were derived from (`diagnosisTrace`
++ `recommendationTrace` are held in memory during the run and
+summarized into the `usage` row on write). If a diagnosis is wrong,
+you have every model turn's token count and every tool call's args +
+result truncated to 4000 chars (`run.eval.ts:96` — `trunc()`) — enough
+to diagnose "the agent hallucinated a fact" vs "the tool returned bad
+data."
+
+**Snapshot C · captured HTTP error body.** `makeCapturingFetch`
+(`lib/mcp/transport.ts:103-118`) records the body of any non-2xx
+Bloomreach response into an `HttpErrorHolder`, so when the MCP SDK
+throws its generic `Unauthorized`, the transport can rethrow with the
+**real server body** attached (`transport.ts:139-143`). Without this,
+alpha-server errors would surface as generic "Unauthorized" with no
+clue what happened.
+
+## 7. incident-analysis-and-prevention
+
+**The prevention loop the repo actually runs:**
+
+```
+  golden case exercises a hypothesis
+        │
+        ▼
+  eval/run.eval.ts writes a per-case receipt
+        │
+        ▼
+  eval/baseline.eval.ts summarizes N receipts into
+    per-dimension pass rates + verdict distribution
+        │
+        ▼
+  committed to eval/baseline.json
+        │
+        ▼
+  next run: eval/gate.eval.ts compares candidate vs
+    baseline; blocks if any dimension regresses > 10pp
+```
+
+The gate is at `eval/gate.eval.ts:47-93`. Threshold default
+`GATE_MAX_REGRESSION=0.10` (10 percentage points), configurable per
+run. → deep walk in `04-baseline-and-regression-gate.md`.
+
+**Incidents observed in the current baseline (2026-07-03T04-08-28-644Z):**
+
+- `rec-judge` p99 outlier at case 09 (`819598ms total`,
+  `675185ms recommendationJudge` — see the sample receipt). The judge
+  retried multiple times on that case. The report surfaces this via
+  the p99 latency vs mean latency gap (`report.eval.ts:96`).
+- Judge-error verdicts appear in the baseline distribution:
+  `judge_error: 6` on diagnosis and `judge_error: 9` on
+  recommendation (`eval/baseline.json` — verdictDistribution). The
+  runner writes them as receipts (never throws) via
+  `buildJudgmentPlaceholder` (`run.eval.ts:87-99`) so they're
+  surfaced as a distinct outcome rather than lost. This is the
+  **"the observability captured what the judge model can't handle"**
+  case.
+
+**Runbooks.** Not yet exercised as a `docs/runbooks/` folder. The
+known alpha-server incident (revoked-token every ~5 min) is handled
+inline by `lib/hooks/useReconnectPolicy.ts:33-45` — the fix is coded
+into the client, not documented as a procedure.
+
+## 8. debugging-observability-red-flags-audit
+
+Ranked by consequence.
+
+**Red flag 1 — no correlation ID separate from the session.** Two
+concurrent requests from the same tab share a `sessionId` in the log
+line. This is fine at the alpha scale; the day someone opens two
+investigation tabs it becomes real work to disentangle their phase
+logs. **Fix cost:** low (add a `req.headers.get('x-request-id') ??
+crypto.randomUUID()` per handler, thread through the send helpers,
+stamp on both routes' summary log — one afternoon).
+
+**Red flag 2 — client-side trace is transient, split runs never reach
+the receipt path.** `saveInvestigation` (`agent/route.ts:305`) only
+fires on the combined run (`step == null`). The individual
+diagnose/recommend runs from the browser flow live in
+`sessionStorage` and die with the tab. A user reporting "the
+diagnosis was wrong" cannot hand you a receipt unless they were on
+the capture path. **Fix cost:** medium — writing per-step receipts
+that align with the eval receipt shape.
+
+**Red flag 3 — `console.log` is the only production ship path.**
+Vercel scrapes stdout, but there's no structured shipping, no PII
+redaction beyond OAuth tokens, no per-tenant fields. **Fix cost:**
+medium if you retrofit pino + a shipper; high if you add OTel.
+**When it matters:** the moment any real customer's data flows
+through the logs.
+
+**Red flag 4 — the p50/p95/p99 numbers depend on the reader running
+the report.** No automatic run, no dashboard, no alert. The
+"observability" is fully pull-based, not push. **Fix cost:** low if
+you just cron `npm run eval:report > report.txt` in CI; higher if
+you want a real dashboard.
+
+**Red flag 5 — cache-tier tokens under-counted.** `pricing.ts:6-13`
+documents this: `estimateAnthropicCost` uses only `inputTokens` and
+`outputTokens`. `cache_read_input_tokens` are excluded from the input
+count in aptkit's `model_usage` shape, so the report reads a **cost
+upper bound**. Fine for a budget ceiling (conservative is the right
+direction) but misleading if someone reads the receipt as a source of
+truth for "what did this cost."
+
+**Red flag 6 — judge_error is a real outcome, not a rare one.** The
+committed baseline has 6/40 diagnosis judgments and 9/60
+recommendation judgments as `judge_error`. That's ~15% of the signal
+being unusable — the observability surfaces this honestly (it's in
+`verdictDistribution`) but the fix belongs to prompt engineering, not
+this guide.
+
+**Red flag 7 — no PII redaction on Bloomreach EQL results.**
+`redactSecrets` strips OAuth tokens (`transport.ts:66-76`) but the
+tool-call results ship into `console.log(JSON.stringify({site, usage,
+...}))` and into eval receipts unredacted. Customer emails,
+customer IDs, and purchase details flow through unchanged.
+**When it matters:** the moment a receipt for a real customer's data
+ends up in a bug report or a public repo.
+
+---
+
+Cross-refs to the discovered patterns:
+
+- `01-ndjson-live-trace.md` — lenses 1, 3, 5, 6
+- `02-per-phase-request-summary.md` — lenses 3, 4, 5
+- `03-capability-trace-receipts.md` — lenses 1, 5, 6, 7
+- `04-baseline-and-regression-gate.md` — lenses 4, 7
+- `05-fault-injecting-load-harness.md` — lenses 2, 6

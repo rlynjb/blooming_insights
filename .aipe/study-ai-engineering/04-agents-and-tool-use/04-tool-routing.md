@@ -1,219 +1,139 @@
-# Tool routing
+# 04 — Tool routing
 
-*Industry standard — heuristic + LLM-decided routing*
+**Type:** Industry standard. Also called: tool selection, action dispatch.
 
-## Zoom out — where this concept lives
+## Zoom out, then zoom in
 
-This codebase routes work in two layers. **Intent routing**: which agent handles a free-form question (cheap Haiku classifier). **Tool routing**: within an agent, which tool the LLM picks (constrained by the per-agent allowlist). Heuristic up front (allowlist filter), LLM at the back (per-call tool choice from the filtered list).
+Within an agent loop, "which tool" is a decision. This codebase leaves that decision fully to the LLM — no heuristic gating inside the loop.
 
 ```
-  Zoom out — two-layer routing
+  Zoom out — where routing happens
 
-  ┌─ User free-form query ──────────────────────────────────┐
-  │  "why did revenue drop in USA?"                          │
-  └──────────────────────┬──────────────────────────────────┘
-                         │
-                         ▼
-  ┌─ Layer 1: Intent routing ★ (cheap LLM) ─────────────────┐ ← we are here
-  │  classifyIntent (Haiku) → 'diagnostic'                  │
-  │  picks the downstream agent                              │
-  └──────────────────────┬──────────────────────────────────┘
-                         │  invokes QueryAgent
-                         ▼
-  ┌─ Layer 2: Tool routing (allowlist + LLM) ───────────────┐
-  │  QueryAgent gets the union allowlist (37 tools)         │
-  │  LLM picks tools from that surface, per iteration       │
-  └─────────────────────────────────────────────────────────┘
+  agent turn                              ★ THIS CONCEPT ★
+    │
+    ▼
+  model picks tool from the registered list  ← LLM-routed
+    │
+    ▼
+  BloomingToolRegistryAdapter dispatches
 ```
 
-**Zoom in.** Heuristic-before-LLM at both layers — the allowlist is the heuristic; the LLM-driven pick is the model's job. The pattern repeats at two altitudes.
+Zoom in. The model has a list of ~30 MCP tools registered (`execute_analytics_eql`, `list_customers`, `list_scenarios`, etc.). Each turn, the model picks one (or two) based on the current messages array + tool descriptions. No heuristic layer inside the loop overrides the model's choice.
 
-## Structure pass — layers · axes · seams
+## Structure pass
 
-**Layers:** intent layer → agent layer → tool layer.
+Axis: who decides which tool to call?
+- Heuristic routing: code decides based on input pattern (fast path, cheap)
+- LLM routing: model decides based on its reasoning (flexible, correct on ambiguous inputs)
+- Hybrid: heuristic front + LLM fallback
 
-**Axis: who decides?** Intent: cheap LLM (Haiku). Agent: chain (route's hardcoded sequence). Tool: filtered allowlist + LLM pick.
-
-**Seam:** the allowlist at `lib/mcp/tools.ts`. That's where the routing surface is narrowed before the LLM ever sees it.
+**Seam:** the tool list registered with the model. Everything above the seam is "the agent picks"; everything below is "code runs whichever."
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1
 
-You know how a load balancer routes by hostname before any backend gets the request? Same idea at two altitudes. Intent classification picks which agent (which "backend") handles the request; the per-agent allowlist picks which tools that agent is allowed to use.
+You've written a router — `if path === '/api/foo' → handleFoo`. That's heuristic. LLM routing is the other end: give the model a list of possible destinations, let it decide.
 
 ```
-  Two-layer routing — picture
+  Two routing styles
 
-  user query                         allowlist (intent)
-       │                                  │
-       ▼                                  │
-  ┌─ Intent classify (Haiku) ─────────────┘
-  │                                  │
-  ▼                                  ▼
-  monitoring                  diagnostic           recommendation
-  agent                       agent                agent
-  ├ tool allowlist [13]       ├ tool allowlist [17] ├ tool allowlist [7]
-  │  ─ execute_analytics_eql  │  ─ execute_analytics_eql ─ list_scenarios
-  │  ─ list_dashboards        │  ─ get_funnel       │  ─ list_segmentations
-  │  ─ ...                    │  ─ list_customers   │  ─ list_voucher_pools
-  │                           │  ─ ...              │  ─ ...
-  │
-  ▼  per agent iteration:
-  LLM picks from its filtered allowlist
+  Heuristic                       LLM-routed (this codebase's agents)
+  ────────                        ────────────────
+  if query contains 'search'       give LLM tool defs + query
+    → search tool                  LLM emits tool_use with name
+  elif starts with 'delete'        loop dispatches
+    → delete tool
+  else
+    → llm route
 ```
 
-### Move 2 — the step-by-step walkthrough
+### Move 2
 
-**Part 1 — intent routing happens at the route boundary.**
+**Where LLM routing happens in this codebase.**
 
-`app/api/agent/route.ts:247-253` only fires the intent classifier on the free-form `q` path:
+Inside every agent's ReAct loop. AptKit's loop sends the tool list on every turn; the model returns a `tool_use` block naming which one. Zero code in this repo intervenes in that choice.
 
-```typescript
-if (q && !insightId) {
-  const intent = await classifyIntent(anthropic, q, sid, req.signal);
-  stepFor('coordinator', 'thought', `interpreting your question as a ${intent} query…`);
-  const queryAgent = new QueryAgent(anthropic, dataSource, schema, allTools, sid);
-  const answer = await queryAgent.answer(q, intent, { ...hooksFor('coordinator'), signal: req.signal });
-}
-```
+**Why no heuristic tier inside the loop.**
 
-When the user clicks a card (anomaly investigation), there's no classifier — the route already knows the agent path (diagnose → recommend). The classifier exists only for the chat surface.
+Because the agent's job IS the decision. Adding "if query mentions 'country' → force list_customers_by_country" would take away the flexibility the agent loop is buying. If we wanted rigid routing we'd have a chain (see `01-agents-vs-chains.md`), not an agent.
 
-**Part 2 — the QueryAgent receives the intent.**
+**Where heuristic routing DOES happen — one layer above.**
 
-`lib/agents/query.ts:24-32`:
+The intent classifier (`lib/agents/intent.ts`) picks which AGENT to invoke — diagnostic vs query. That's heuristic-shaped (Haiku classifies), but happens BEFORE the agent's tool-use loop begins. Inside the loop, it's fully LLM-driven.
 
-```typescript
-async answer(query: string, intent: Intent, hooks: AgentHooks = {}): Promise<string> {
-  const agent = new AptKitQueryAgent({
-    model: new AnthropicModelProviderAdapter(this.anthropic, 'coordinator', this.sessionId),
-    tools: new BloomingToolRegistryAdapter(this.dataSource, this.allTools),
-    workspace: this.schema,
-    trace: new BloomingTraceSinkAdapter(hooks, 'coordinator'),
-  });
+**The tool descriptions matter.**
 
-  return agent.answer(query, { intent, signal: hooks.signal });
-}
-```
+The LLM's ability to pick correctly depends entirely on tool descriptions. `synthetic-data-source.ts:120-152` has explicit `toolDescriptions` — `execute_analytics_eql: 'Run a synthetic EQL-style analytics query over the workspace.'`. Bad descriptions = wrong tool picked. Good descriptions include the WHEN as well as the WHAT ("use this when you need to segment by country").
 
-The `intent` is passed to AptKit's QueryAgent as a hint — the library uses it to shape its prompt (e.g. "you're answering a diagnostic-style question" vs "you're answering a monitoring-style question"). The TOOL surface is still the full union (37 tools) because the QueryAgent needs broad reach.
+**The 6-tool-call cap acts as an implicit routing constraint.**
 
-**Part 3 — tool allowlists are per-agent, defined in one file.**
+Because the agent has at most 6 tool calls, it has to be selective. Six calls to `execute_analytics_eql` is the useful path; three misspent calls to `list_experiments` (which is often empty) wastes budget. The cap forces the LLM to route toward the highest-value tool per turn.
 
-`lib/mcp/tools.ts` carries the four allowlists:
+### Move 3
 
-```typescript
-const monitoringToolsBloomreach = [13 tool names...] as const;
-const diagnosticToolsBloomreach = [17 tool names...] as const;
-const recommendationToolsBloomreach = [7 tool names...] as const;
+For loop-shaped agents, LLM routing beats heuristic — you're paying for flexibility, don't take it away. For chain-shaped or fixed pipelines, heuristic routing wins — you're paying for determinism, don't lose it to model whims.
 
-// The union for the query agent (37 deduplicated).
-export const queryTools = [
-  ...new Set<string>([...monitoringTools, ...diagnosticTools, ...recommendationTools]),
-] as const;
-```
-
-The allowlists are pinned constants. Adding a tool to an agent's surface is a one-line change. Removing one is also one line.
-
-**Part 4 — the filter wraps the live MCP tool list.**
-
-`lib/agents/tool-schemas.ts:9-21` is the filter that runs at agent construction:
-
-```typescript
-export function filterToolSchemas(
-  all: McpToolDef[],
-  allowed: readonly string[],
-): Anthropic.Messages.Tool[] {
-  const set = new Set(allowed);
-  return all
-    .filter((t) => set.has(t.name))
-    .map((t) => ({
-      name: t.name,
-      description: t.description ?? '',
-      input_schema: t.inputSchema as Anthropic.Messages.Tool['input_schema'],
-    }));
-}
-```
-
-Set membership check. The MCP server might expose 50 tools; the agent only sees the ones in its allowlist. Important: the model can ONLY pick tools whose schemas are in its `tools[]` array — the SDK rejects `tool_use` blocks for unknown tool names.
-
-This means the allowlist is a *hard* constraint, not a hint. The recommendation agent literally cannot emit a `tool_use` for `execute_analytics_eql` — the schema isn't shipped to it.
-
-### Move 3 — the principle
-
-**Constrain the choice space before the LLM picks.** Heuristic routing isn't necessarily a regex or a rule — it's any structural narrowing that runs before the model gets the input. Intent classification narrows agents; allowlists narrow tools. Both layers apply the same principle: don't let the LLM choose from options it shouldn't have.
-
-## Primary diagram — the full recap
+## Primary diagram
 
 ```
   Two-layer routing in this codebase
 
-  ┌─ User typed query ───────────────────────────────────────────┐
-  │  "why did revenue drop in USA?"                              │
-  └──────────────────────┬───────────────────────────────────────┘
-                         │  POST /api/agent?q=…
-                         ▼
-  ┌─ Layer 1: Intent routing ─────────────────────────────────────┐
-  │  classifyIntent (Haiku, ~$0.0003)                            │
-  │  parseIntent fallback: 'diagnostic'                           │
-  │   → 'monitoring' | 'diagnostic' | 'recommendation' | 'generic'│
-  └──────────────────────┬───────────────────────────────────────┘
-                         │  passes intent into QueryAgent
-                         ▼
-  ┌─ Agent selection (chain-decided per intent) ─────────────────┐
-  │  QueryAgent (with union allowlist)                            │
-  │   OR if user clicked card: DiagnosticAgent → RecommendationAgent│
-  └──────────────────────┬───────────────────────────────────────┘
-                         │  filterToolSchemas at construction time
-                         ▼
-  ┌─ Layer 2: Tool surface ──────────────────────────────────────┐
-  │  filtered tools[] handed to model                            │
-  │  monitoring: 13   diagnostic: 17   recommendation: 7   query:37│
-  └──────────────────────┬───────────────────────────────────────┘
-                         │  per ReAct iteration
-                         ▼
-  ┌─ LLM picks ──────────────────────────────────────────────────┐
-  │  model emits tool_use(name) ∈ filtered tools                  │
-  │  (schemas the model never saw cannot be picked)               │
-  └──────────────────────────────────────────────────────────────┘
+  ┌─ Above the agent (heuristic) ─────────────────────────────────────┐
+  │  user free-form query                                             │
+  │        │                                                          │
+  │        ▼                                                          │
+  │  classifyIntent (Haiku classifier)                                │
+  │        │                                                          │
+  │        ▼                                                          │
+  │  DiagnosticAgent  or  QueryAgent                                  │
+  └────────────────────┬──────────────────────────────────────────────┘
+                       │
+  ┌─ Inside the agent (LLM-routed) ▼──────────────────────────────────┐
+  │  ReAct loop                                                       │
+  │    turn 1: model picks tool_A from ~30 registered                 │
+  │    turn 2: model picks tool_B                                     │
+  │    turn 3: model picks tool_A again with different args           │
+  │    ...                                                            │
+  │    turn N: model picks submitDiagnosis (end)                      │
+  │                                                                   │
+  │  no code overrides the picks; model owns the choice               │
+  └───────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-**Why two layers, not one.** A single-layer router would have to know about every tool every agent might call — that's 37 tools and a much harder routing problem ("which TOOL handles this query?" instead of "which AGENT handles this query?"). The two-layer split pushes the heavy decision (broad agent surface) to the cheap classifier and keeps the precise decision (per-iteration tool pick) inside the agent loop where the LLM has full context.
+Some production agents add heuristic overrides for high-cost tools ("never call `expensive_search` more than once per investigation"). This codebase doesn't; the 6-tool-call cap serves the same purpose without needing per-tool rules.
 
-**Why heuristic at the allowlist layer, LLM at the per-call layer.** Each agent's tool set is fixed at deployment time — it's a structural property of the system. Hard-coding it as an allowlist is the right move. Per-call tool choice depends on the specific anomaly + the conversation so far — too dynamic for a hardcoded rule. LLM decides.
-
-**Where this codebase doesn't push routing further.** Inside the monitoring loop, each tool call's *arguments* (the specific EQL string) are LLM-decided. A more aggressive routing pattern would hard-code first-call EQL per category (the `B1.7` exercise) — pushing more routing into the heuristic layer to save LLM calls.
+Tool-routing can also be gated by CAPABILITY — reveal only a subset of tools to the model based on the workspace's actual schema. The categories capability filtering in `lib/agents/categories.ts:26-41` is a distant relative — it filters WHICH ANOMALY CATEGORIES to check based on which tools/events are available in the workspace.
 
 ## Project exercises
 
-### Exercise — Add a regex fast-path to the intent classifier
+### Exercise — measure tool-choice diversity per case
 
-  → **Exercise ID:** B4.4
-  → **What to build:** Before the Haiku intent call, check the user's query against a small set of keyword regexes — `/why\b|why did|what caused/i → 'diagnostic'`, `/show me|list|how many/i → 'monitoring'`, `/recommend|what should/i → 'recommendation'`. If a regex matches, skip the Haiku call entirely and return the regex's intent. Fall back to Haiku otherwise.
-  → **Why it earns its place:** ~50%+ of free-form queries match these patterns. Skipping the Haiku call saves ~150ms per matched query and a tiny per-call cost — small individually, real in aggregate on a chat surface. Pure heuristic-before-LLM at the intent layer.
-  → **Files to touch:** `lib/agents/intent.ts` (add a regex pre-check), `test/agents/intent.test.ts` (cover regex matches, fallthrough to Haiku).
-  → **Done when:** the per-phase log shows `intent_classify` taking ~0ms for queries matching the regex (vs ~150-300ms for fallthrough), the regex coverage is documented, and the existing intent tests pass.
-  → **Estimated effort:** <1hr.
+- **Exercise ID:** C4.4-A · Case A (concept exercised).
+- **What to build:** in the report, add "distinct tools called per case" and "tool call frequency by name across a run." Reveals whether the agent is over-reaching for `execute_analytics_eql` or actually using the tool variety it has access to.
+- **Why it earns its place:** turns routing into a measured discipline. Interviewer signal: "I know my agent's tool preferences — measured, not guessed."
+- **Files to touch:** `eval/report.eval.ts` (add distinct-tools table).
+- **Done when:** report shows tool-call frequency per case and identifies over-reliance patterns.
+- **Estimated effort:** 1-4hr.
 
 ## Interview defense
 
-**Q: "How does your system decide which agent runs?"**
+**Q: Do you route tools with regex before letting the LLM see them?**
 
-Two layers. First, the chain layer in the route — if the user clicked a card, the diagnostic agent runs (then the recommendation agent on the next click). No LLM involved. Second, for free-form questions, an intent classifier (Haiku, ~$0.0003) picks one of `'monitoring' | 'diagnostic' | 'recommendation' | 'generic'`. The QueryAgent then runs with that intent as a hint. Both layers apply heuristic-before-LLM at their altitude.
+No. Inside the agent loop, the LLM sees all ~30 tools and picks each turn. That's what the agent shape is buying — flexibility to compose tool calls based on what earlier observations showed. Regex-routing inside the loop would take that away.
 
-*Anchor: "Chain decides for clicks; cheap classifier decides for typed questions."*
+**Q: What routes what THEN?**
 
-**Q: "Why doesn't every agent get every tool?"**
+One layer up. The intent classifier (Haiku call) decides which AGENT to invoke — diagnostic vs free-form query. That's heuristic-in-shape at the agent-selection layer. Inside the chosen agent, no more heuristic routing.
 
-Three reasons. (1) Token budget — each tool's schema in the prompt costs ~50-100 tokens. 37 tools × 70 tokens ≈ 2600 tokens of schema in every prompt. Per-agent allowlists save ~50-70% of that. (2) Decision latency — fewer choices makes faster decisions. The monitoring agent doesn't need 17 tools; it needs the 13 that touch dashboards/trends/EQL. (3) Structural safety — the recommendation agent literally can't call `execute_analytics_eql` because the schema isn't shipped. That's structural prompt-injection defense: even a perfectly-injected prompt couldn't get the recommendation agent to run an EQL.
+**Q: How do you keep the LLM from picking wrong tools?**
 
-*Anchor: "Tokens + latency + safety. The allowlist is structural, not advisory."*
+Tool descriptions. If tool descriptions include not just WHAT the tool does but WHEN to use it, the LLM picks correctly. `synthetic-data-source.ts` has explicit per-tool descriptions. Weak descriptions = wrong picks. Also the 6-tool-call cap indirectly constrains the LLM to pick high-value tools.
 
 ## See also
 
-  → `02-tool-calling.md` — the per-tool mechanics this routes into
-  → `01-llm-foundations/07-heuristic-before-llm.md` — the intent classifier from the cheap-LLM lens
-  → `06-production-serving/03-prompt-injection.md` — the structural-safety property the allowlist provides
+- `03-react-pattern.md` — the loop the routing happens in
+- `01-llm-foundations/07-heuristic-before-llm.md` — the intent-classifier routing above the agent
+- `06-error-recovery.md` — what happens when a wrong tool is picked

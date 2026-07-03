@@ -1,124 +1,119 @@
 # AI features in this codebase
 
-The actual AI features this repo runs in production. Each feature is one of the five Blooming-owned agents — a thin wrapper around `@aptkit/core@0.3.0`'s reusable agent — plus the intent classifier that gates the free-form question surface.
+Every AI-touching thing in `blooming_insights`, with which pattern it uses and where it lives. The runtime is `@aptkit/core@0.3.0` (the ReAct loop, the tool-registry contract, the trace sink); the Blooming code owns the adapter bridge, the prompts (retired to `legacy-prompts/`; active prompts live inside AptKit), the tools (via MCP or synthetic), and the surrounding evals/observability.
 
-The shape: **LLM application engineering.** No ML models, no embeddings, no trained classifiers. Every "feature" here is an LLM call with a tool surface and a structured-output contract.
-
-## The feature table
+## The features, at a glance
 
 ```
-  ┌──────────────────────┬──────────────────┬──────────────────────────────────┐
-  │ Feature              │ Pattern used     │ Why this pattern                 │
-  ├──────────────────────┼──────────────────┼──────────────────────────────────┤
-  │ Monitoring scan      │ Tool-using agent │ open-ended search across the    │
-  │                      │ + schema gating  │ 10-category checklist; agent    │
-  │                      │                  │ decides which EQL to run         │
-  ├──────────────────────┼──────────────────┼──────────────────────────────────┤
-  │ Diagnostic           │ Tool-using agent │ multi-hop investigation; each   │
-  │ investigation        │ + hypothesis     │ EQL informs the next query       │
-  │                      │ testing          │                                  │
-  ├──────────────────────┼──────────────────┼──────────────────────────────────┤
-  │ Recommendation       │ Tool-using agent │ proposes Bloomreach actions     │
-  │ proposal             │ + structured     │ as typed Recommendation[] —     │
-  │                      │ output           │ steps, confidence, impact        │
-  ├──────────────────────┼──────────────────┼──────────────────────────────────┤
-  │ Free-form query      │ Tool-using agent │ user asks anything; agent runs  │
-  │                      │ + intent routing │ EQL to answer with citations    │
-  ├──────────────────────┼──────────────────┼──────────────────────────────────┤
-  │ Intent               │ Cheap-model      │ Haiku decides which downstream  │
-  │ classification       │ classifier       │ agent the query belongs to —    │
-  │                      │ (Heuristic-      │ saves a full Sonnet agent run    │
-  │                      │ before-LLM at    │ on out-of-scope questions        │
-  │                      │ the intent layer)│                                  │
-  └──────────────────────┴──────────────────┴──────────────────────────────────┘
+┌────────────────────────┬─────────────────┬────────────────────────────────────┐
+│ Feature                │ Pattern          │ Anchor (file / class)              │
+├────────────────────────┼─────────────────┼────────────────────────────────────┤
+│ Monitoring anomaly scan│ Single-agent    │ MonitoringAgent → AptKit's         │
+│                        │ tool-use loop   │ AnomalyMonitoringAgent             │
+│                        │                 │ lib/agents/monitoring.ts           │
+├────────────────────────┼─────────────────┼────────────────────────────────────┤
+│ Diagnostic investigation│Single-agent    │ DiagnosticAgent → AptKit's         │
+│                        │ tool-use loop   │ DiagnosticInvestigationAgent       │
+│                        │ (≤6 tool calls) │ lib/agents/diagnostic.ts           │
+├────────────────────────┼─────────────────┼────────────────────────────────────┤
+│ Recommendation gen.    │ Single-agent    │ RecommendationAgent → AptKit's     │
+│                        │ tool-use loop   │ RecommendationAgent                │
+│                        │                 │ lib/agents/recommendation.ts       │
+├────────────────────────┼─────────────────┼────────────────────────────────────┤
+│ Diagnose → recommend   │ Prompt chain    │ eval/run.eval.ts:198-269           │
+│ pipeline               │ (2-stage)       │ app/api/agent/route.ts             │
+├────────────────────────┼─────────────────┼────────────────────────────────────┤
+│ Free-form query        │ Single-agent    │ QueryAgent (AptKit)                │
+│                        │ tool-use loop   │ lib/agents/query.ts                │
+├────────────────────────┼─────────────────┼────────────────────────────────────┤
+│ Intent classification  │ Heuristic +     │ classifyIntent, haiku-4-5          │
+│                        │ cheap-LLM       │ lib/agents/intent.ts               │
+├────────────────────────┼─────────────────┼────────────────────────────────────┤
+│ Diagnosis-quality judge│ LLM-as-judge    │ RubricJudge (AptKit)               │
+│                        │ (rubric)        │ eval/rubrics/diagnosis-quality.ts  │
+├────────────────────────┼─────────────────┼────────────────────────────────────┤
+│ Recommendation-quality │ LLM-as-judge    │ RubricJudge (AptKit)               │
+│ judge                  │ (rubric)        │ eval/rubrics/recommendation-       │
+│                        │                 │ quality.ts                         │
+└────────────────────────┴─────────────────┴────────────────────────────────────┘
 ```
 
-The four `Sonnet` agents all use the same model (`claude-sonnet-4-6`) and the same ReAct loop inside AptKit. The only differences are: (a) the system prompt, (b) the allowed tool subset, and (c) the structured output type. The intent classifier is the lone use of `claude-haiku-4-5-20251001` (`lib/agents/intent.ts:16`).
+## Per-feature detail
 
-## Per-feature specs
+The template each row fills: **Inputs · Outputs · Model + provider · Approx. cost per call · Failure modes · Eval set (size, where stored).**
 
-### 1. Monitoring scan — detect anomalies in the workspace
+### Monitoring anomaly scan
 
-  → **File:** `lib/agents/monitoring.ts` (116 LOC). Wraps `AptKitAnomalyMonitoringAgent`.
-  → **Inputs (typed schema):** `WorkspaceSchema` (the bootstrapped workspace at `lib/mcp/schema.ts:9-26`), `AnomalyCategory[]` (the runnable subset of the 10-category checklist, post-gating, from `lib/agents/categories.ts:CATEGORIES`).
-  → **Outputs (typed schema):** `Anomaly[]` (`lib/mcp/types.ts:80-91`). Each anomaly carries `metric`, `scope[]`, `change{value,direction,baseline}`, `severity`, `evidence[]`, optional `impact`, `history[]`, `category`.
-  → **Model and provider:** `claude-sonnet-4-6` via Anthropic SDK (`AGENT_MODEL` at `lib/agents/base.ts:7`).
-  → **Tool surface:** `monitoringTools` at `lib/mcp/tools.ts:6-14` — 13 tools (`execute_analytics_eql` is the workhorse; the rest are list/get tools for dashboards, trends, funnels, etc.).
-  → **Approximate token cost per call:** system prompt + schema summary ≈ 800–1200 input tokens before any tool calls. Each `tool_call_end` feeds back the (truncated to 4KB) result. A typical scan runs 6 tool calls × ~2k tokens each = ~12–15k input tokens, ~1–2k output. At Sonnet pricing: ~$0.05–$0.08 per scan.
-  → **Failure modes observed:**
-    - The 90-day window lands on the workspace's sparse tail → bogus ±100% swings (the schema prompt at `lib/agents/legacy-prompts/monitoring.md:26-36` is explicitly defended against this).
-    - Agent exceeds the 6-call budget → forced to answer with whatever it has (built-in to the AptKit loop).
-    - Bloomreach rate-limit during a scan → retry with parsed window adds up to 30s of latency.
-  → **Eval set:** retired. The Phase 3 4-pillar suite (detection / diagnosis / recommendation / regression) was built on Olist data and retired in PR #8 (2026-06-18). The next version targets `SyntheticDataSource`.
+- **Inputs (typed):** `WorkspaceSchema` (project id, event catalog, customer properties, catalogs, totals) + `AnomalyCategory[]` (the fixed checklist of ecommerce anomaly categories from `@aptkit/core`'s `ECOMMERCE_ANOMALY_CATEGORIES`, wrapped in Blooming's `AnomalyCategory` shape via `lib/agents/categories.ts`).
+- **Outputs (typed):** `Anomaly[]` — each has `{metric, scope[], change{value,direction,baseline}, severity, evidence[], impact?, history?, category?}`. Contract lives in `lib/mcp/types.ts`.
+- **Model + provider:** Anthropic `claude-sonnet-4-6` via `AnthropicModelProviderAdapter` (`lib/agents/aptkit-adapters.ts`).
+- **Approx. cost per call:** monitoring is ~1 model turn per anomaly-worth of tool calls; a full briefing is ~4-5 turns × ~1-2K input / ~500 output tokens each. Estimated cost per briefing: ~$0.02-0.05 uncached, ~$0.005-0.015 with prompt caching.
+- **Failure modes observed:** rate limit against the alpha Bloomreach MCP server (~1 req/s), token revocation mid-scan (auto-reconnect on the UI). No hallucination-of-numbers reported at eval time — the ecommerce-category checklist keeps the agent from inventing metrics.
+- **Eval set:** monitoring itself is not gated by the harness in `eval/run.eval.ts` (which evaluates `diagnose + recommend` against synthetic anomalies). Monitoring surfaces are exercised end-to-end via the committed demo snapshot (`lib/state/demo-*.json`).
 
-### 2. Diagnostic investigation — explain why an anomaly happened
+### Diagnostic investigation
 
-  → **File:** `lib/agents/diagnostic.ts` (49 LOC). Wraps `AptKitDiagnosticInvestigationAgent`.
-  → **Inputs (typed schema):** `Anomaly` (the monitoring agent's output, handed in via `app/api/agent/route.ts:264` after resolution from session/cache/snapshot).
-  → **Outputs (typed schema):** `Diagnosis` (`lib/mcp/types.ts:93-103`). Carries `conclusion`, `evidence[]`, `hypothesesConsidered[]`, optional `affectedCustomers`, `confidence`, `timeSeries[]`.
-  → **Model and provider:** `claude-sonnet-4-6` (same as monitoring).
-  → **Tool surface:** `diagnosticTools` at `lib/mcp/tools.ts:16-26` — 17 tools (EQL + segmentation + customer lookups + campaign/experiment list tools).
-  → **Approximate token cost per call:** ~15–20k input tokens (system prompt + schema summary + anomaly handoff + tool results) across ~5–8 tool calls. ~$0.07–$0.10 per investigation.
-  → **Failure modes observed:**
-    - Agent runs out of budget mid-hypothesis → returns a partial diagnosis with `confidence: 'medium'` or `'low'` (derivable client-side via `diagnosisConfidence()` at `lib/insights/derive.ts:53`).
-    - All hypotheses come back `supported: false` → `conclusion` says "no single cause identified"; the UI surfaces this directly.
-    - The Phase 3 eval surfaced **conclusion instability**: 30% of runs reached different conclusions on the same anomaly. Retired with the suite.
-  → **Eval set:** retired (same as monitoring).
+- **Inputs (typed):** one `Anomaly` (from monitoring) + `WorkspaceSchema` + full MCP tool catalog.
+- **Outputs (typed):** `Diagnosis` = `{conclusion, evidence[], hypothesesConsidered[{hypothesis, supported, reasoning}], affectedCustomers?, confidence?}`. Contract lives in `lib/mcp/types.ts`.
+- **Model + provider:** Anthropic `claude-sonnet-4-6` via `AnthropicModelProviderAdapter`.
+- **Approx. cost per call:** eval-measured at ~$0.03-0.05 per diagnosis (cached, from receipts in `eval/receipts/`). Median ~10 model turns, ~50s p50 wall time.
+- **Failure modes observed:** the biggest one in the committed baseline is `actionable_next_step` at 0% pass rate (dim 4 of the diagnosis rubric) — the agent's conclusions rarely include a specific named next step with a tool/query. `evidence_grounding` at 50% is the next largest — agent sometimes states conclusions that trace back only weakly to the tool results.
+- **Eval set:** 10 goldens (has-signal / partial-signal / no-signal / positive) in `eval/goldens/`, rubric in `eval/rubrics/diagnosis-quality.ts`. Committed baseline: `eval/baseline.json` (runId `2026-07-03T04-08-28-644Z`).
 
-### 3. Recommendation proposal — convert diagnosis into Bloomreach actions
+### Recommendation generation
 
-  → **File:** `lib/agents/recommendation.ts` (40 LOC). Wraps `AptKitRecommendationAgent`.
-  → **Inputs (typed schema):** `Anomaly` + `Diagnosis` (handed in via `app/api/agent/route.ts:296`).
-  → **Outputs (typed schema):** `Recommendation[]` (`lib/mcp/types.ts:117-131`). Each carries `id`, `title`, `rationale`, `bloomreachFeature: 'scenario' | 'segment' | 'campaign' | 'voucher' | 'experiment'`, `steps[]`, `estimatedImpact`, `confidence`. Optional enrichments: `effort`, `timeToSetUpMinutes`, `readResultInDays`, `prerequisites[]`, `successMetric`.
-  → **Model and provider:** `claude-sonnet-4-6`.
-  → **Tool surface:** `recommendationTools` at `lib/mcp/tools.ts:28-36` — 7 tools (list scenarios, initiatives, segmentations, campaigns, voucher pools, frequency policies).
-  → **Approximate token cost per call:** ~10–15k input tokens, ~1.5–3k output (recommendations are verbose). ~$0.05–$0.09 per proposal.
-  → **Failure modes observed:**
-    - `bloomreachFeature` defaults to `'scenario'` when the agent isn't confident — surfaces as generic recommendations.
-    - The Phase 3 eval surfaced **binary calibration**: model rated 29 of 30 runs as `confidence: 'high'`, clearly miscalibrated. Retired with the suite.
-  → **Eval set:** retired (same as monitoring).
+- **Inputs (typed):** `Anomaly` + `Diagnosis` + `WorkspaceSchema` + full MCP tool catalog. Note: RecommendationAgent receives the diagnosis and can call tools to enrich (segment sizes, campaign lists) before proposing.
+- **Outputs (typed):** `Recommendation[]` — each has `{id, title, rationale, bloomreachFeature: scenario|segment|campaign|voucher|experiment, steps[], estimatedImpact, confidence}`.
+- **Model + provider:** Anthropic `claude-sonnet-4-6` via `AnthropicModelProviderAdapter`.
+- **Approx. cost per call:** ~$0.04-0.06 per recommendation set. Median p50 wall time 51s.
+- **Failure modes observed:** in the baseline — `impact_realism` at 43% pass rate is the lowest. Rec impact estimates are frequently disproportionate to the anomaly magnitude or missing the linking assumption. `diagnosis_response` at 48% — recs sometimes address a symptom instead of the diagnosed root cause. `step_actionability` at 100% is the strong one (steps are specific enough to execute).
+- **Eval set:** same 10 goldens as diagnosis; rubric in `eval/rubrics/recommendation-quality.ts`.
 
-### 4. Free-form query — answer any question about the workspace
+### The diagnose → recommend chain
 
-  → **File:** `lib/agents/query.ts` (34 LOC). Wraps `AptKitQueryAgent`.
-  → **Inputs (typed schema):** `query: string` (the user's free-form question), `intent: Intent` (output of the intent classifier).
-  → **Outputs:** Plain `string` (natural-language answer). The agent may cite EQL it ran along the way (visible in the `StatusLog` panel via the tool-call trace).
-  → **Model and provider:** `claude-sonnet-4-6`.
-  → **Tool surface:** `queryTools` at `lib/mcp/tools.ts:43-45` — the union of monitoring + diagnostic + recommendation tools (so the agent can answer anything across the three surfaces).
-  → **Approximate token cost per call:** wide variance — a one-sentence answer might cost ~5k tokens; a multi-tool investigation that re-derives an anomaly costs ~15–20k. ~$0.02–$0.10.
-  → **Failure modes observed:**
-    - User asks something outside the workspace's data → agent runs an empty query, returns "I couldn't find anything matching that."
-    - Prompt injection surface: the user's question is concatenated into the agent's prompt. Defense is structural (the agent can only call MCP tools, no arbitrary actions); see `06-production-serving/03-prompt-injection.md`.
-  → **Eval set:** none. The free-form query agent has no eval today.
+- **Pattern:** prompt chain — output of diagnostic agent (a `Diagnosis`) becomes input to recommendation agent, along with the original anomaly. Two sequential agent invocations, each with its own tool-use loop, sharing an investigation's `BudgetTracker`.
+- **Where it lives:** the eval runner walks it explicitly (`eval/run.eval.ts:198-269`); the route handler at `app/api/agent/route.ts` walks it stage-by-stage based on the `step=diagnose|recommend|null` param.
+- **Why chain not one big agent:** each stage has one job (diagnose the cause, propose the action) — the failures are isolated, the trace surfaces are separable, and either stage can be swapped independently. The recommendation stage receives the diagnosis's structured conclusion as context, not the diagnostic agent's whole tool-call trace.
+- **Cost:** ~$0.09/case total in the committed baseline (agent-side, cached).
 
-### 5. Intent classification — cheap classifier in front of the query agent
+### Free-form query (natural-language Q&A)
 
-  → **File:** `lib/agents/intent.ts` (38 LOC). Wraps `classifyAptKitIntent` from `@aptkit/core`.
-  → **Inputs (typed schema):** `query: string`.
-  → **Outputs (typed schema):** `Intent` = `QueryIntent` from `@aptkit/core` — one of a fixed enum, defaulting to `'diagnostic'` via `parseIntent` (`lib/agents/intent.ts:13`).
-  → **Model and provider:** `claude-haiku-4-5-20251001` — the cheap, fast Anthropic model. The ONLY non-Sonnet use in the codebase.
-  → **Tool surface:** none — intent classification is a single completion call, no tool loop.
-  → **Approximate token cost per call:** ~500 input tokens, ~10 output. At Haiku pricing: ~$0.0003 per classification — negligible.
-  → **Failure modes observed:**
-    - Ambiguous query → defaults to `'diagnostic'` (the parser's fallback at `lib/agents/intent.ts:13`).
-    - Haiku occasionally returns non-enum text → `parseIntent` swallows it and uses the default.
-  → **Eval set:** none today.
+- **Pattern:** single-agent tool-use loop with a broader tool set than diagnostic.
+- **Inputs:** a free-form text query + `WorkspaceSchema` + full MCP tool catalog.
+- **Outputs:** streamed text response with cited tool calls.
+- **Model:** Anthropic `claude-sonnet-4-6`.
+- **Where it lives:** `lib/agents/query.ts` (thin wrapper) → `@aptkit/core`'s `QueryAgent`. Surfaced via `QueryBox` (bottom of feed).
+- **Live only.** In demo mode the `QueryBox` is shown but inert.
 
-## What's NOT a feature
+### Intent classification (query router)
 
-Things that look like AI features but aren't, in this codebase:
+- **Pattern:** heuristic-before-LLM (spec's "heuristic-before-LLM" concept, though today it's LLM-only using a cheaper model — Haiku).
+- **Inputs:** raw user query string.
+- **Outputs:** `Intent` (currently one of `'diagnostic'` etc., re-exported from `@aptkit/core`'s `QueryIntent`).
+- **Model + provider:** Anthropic `claude-haiku-4-5-20251001` — deliberately the cheap fast model, since intent classification is one turn and doesn't need Sonnet's reasoning depth.
+- **Approx. cost per call:** ~$0.0001-0.0005 per classify.
+- **Where it lives:** `lib/agents/intent.ts` (thin adapter around AptKit's `classifyIntent`).
 
-  → **The 10-category checklist** at `lib/agents/categories.ts:CATEGORIES`. That's rule-based gating, not AI — it's a fixed list of anomaly categories the monitoring agent is *allowed* to check, derived from `@aptkit/core`'s `ECOMMERCE_ANOMALY_CATEGORIES`. The AI part is the agent deciding *what to do* within a runnable category, not the category list itself.
-  → **The schema-gating layer** at `lib/agents/categories.ts:24` (`coverageFor`, `runnableCategories`). Set intersection — does the workspace's schema expose the events this category requires? Pure rules.
-  → **The 60s response cache** at `lib/data-source/bloomreach-data-source.ts:140`. Standard request-level cache, nothing AI about it.
-  → **The demo replay** at `app/api/briefing/route.ts:81-152`. Replays a committed NDJSON snapshot as if it were live. Looks like AI from the UI; it's a static file getting fed back through the same stream contract.
+### Diagnosis-quality LLM-as-judge
 
-These are deliberate. The agents handle the open-ended decisions; the rules handle everything that has a right answer.
+- **Pattern:** LLM-as-judge with a rubric (4 dimensions × 1-5 scale × 3 verdicts).
+- **Inputs:** the diagnosis JSON to score + context (the anomaly, the golden case's `knownCorrect` notes, the tool-call trace, the signal class).
+- **Outputs:** `{dimensions: {dim → {score, reason}}, verdict, fix, reasoning}`.
+- **Model:** Anthropic `claude-sonnet-4-6` — same model as the agent-under-test. Known self-preference bias risk (see `05-evals-and-observability/03-llm-as-judge-bias.md`). Session D pilot ran a Haiku judge for calibration.
+- **Approx. cost per call:** ~$0.04 per judgment (maxTokens=4096, no cache — each case has different context).
+- **Failure modes:** in the baseline, the diagnosis judge had 6/10 `judge_error` verdicts (model failed to produce parseable structured output within budget). Placeholder-verdict handling in `eval/run.eval.ts:82-108` prevents these from crashing the run.
 
-## Where to read each feature's deep walk
+### Recommendation-quality LLM-as-judge
 
-  → Monitoring's loop, structured outputs, tool surface → `04-agents-and-tool-use/`
-  → Diagnostic's hypothesis-testing pattern → `04-agents-and-tool-use/03-react-pattern.md`
-  → Recommendation's structured output → `01-llm-foundations/04-structured-outputs.md`
-  → Free-form query's intent routing → `04-agents-and-tool-use/04-tool-routing.md`
-  → Intent's heuristic-before-LLM at the intent layer → `01-llm-foundations/07-heuristic-before-llm.md`
+Same shape as the diagnosis judge, different rubric. Scores each recommendation independently (baseline had 30 total judgments across 10 cases; 9 were `judge_error`).
+
+## The DataSource seam (not a feature but load-bearing)
+
+The seam that makes swapping between live Bloomreach, synthetic evals, and fault-injected load tests possible without any agent code changing. `BloomreachDataSource` (live MCP), `SyntheticDataSource` (deterministic in-memory), `FaultInjectingDataSource` (offline decorator). All conform to `DataSource` in `lib/data-source/types.ts`. See `04-agents-and-tool-use/02-tool-calling.md` for the walkthrough.
+
+## What's NOT in this table
+
+- No RAG feature. No embeddings, no vector store.
+- No trained model. Every "reasoning" step is an LLM call.
+- No semantic cache. Prompt caching (Anthropic ephemeral) IS live; semantic caching is not.
+- No fine-tuned model. Base Sonnet 4.6 out of the box.

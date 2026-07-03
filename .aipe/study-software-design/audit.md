@@ -1,297 +1,381 @@
-# audit — AOSD lenses walked against the current repo
+# The audit — 8 lenses through this codebase
 
-Pass 1 of the two-pass output. Eight `##` sections, one per lens from `study-software-design.md`. Each lens reports what this repo actually does, with `file:line` grounding. When a finding earns its own Pass 2 file, this audit cross-links rather than restating the deep walk.
+Walks the AOSD design lenses against the current repo. Each lens
+names findings with `file:line`. When a finding is significant
+enough to have its own deep walk, this file cross-links to the
+pattern file (`01-` through `06-`) instead of restating it.
+
+The lens order is diagnostic → structural → readability →
+capstone. Complexity first (where does it hurt?), depth and
+hiding next (how do we bury it?), layering and pull-down after
+(who should own the decision?), errors and readability last
+(when the shape is right, is the surface honest?). Red flags at
+the end as the actionable index.
 
 ---
 
 ## 1. complexity-in-this-codebase
 
-The diagnostic overview. AOSD names three symptoms: change amplification (one decision forces edits in many files), cognitive load (the module nobody wants to touch), and unknown-unknowns (you can't tell what's safe to change without reading everything).
+The diagnostic overview. Three symptoms to locate: amplified
+change (one edit touches many files), high cognitive load (the
+module nobody wants to touch), unknown-unknowns (surprises
+hiding behind an interface).
 
-### Top 3 complexity hotspots
+**Three highest-complexity hotspots today, ranked:**
 
-  **`lib/data-source/synthetic-data-source.ts` (516 LOC).** The single largest module in the repo. The complexity isn't accidental — it's a 30-tool dispatch `switch` covering Bloomreach's MCP surface for offline use. But every new tool the agents reach for becomes a new `case` here AND a new entry in `lib/agents/tool-schemas.ts`. Change amplification factor: ~2 files per added tool. Acceptable for a fixture; worth knowing when planning a new agent capability.
+1. **`lib/agents/*-legacy.ts` — 9 files, ~1000 LOC of frozen
+   duplication.** Every one is a shadow of its non-legacy sibling:
+   `base-legacy.ts` (270) shadows `base.ts` (14 — the aptkit
+   bridge), `monitoring-legacy.ts` (138) shadows `monitoring.ts`
+   (116), etc. The legacy chain runs a hand-rolled ReAct loop; the
+   non-legacy chain delegates to aptkit through the three-class
+   adapter bundle (see `02-aptkit-bridge.md`). Only two test files
+   (`test/agents/base.test.ts`, `test/agents/synthesis-instruction.test.ts`)
+   still import from them, and they import from `base-legacy.ts`
+   only. **Symptom: cognitive load.** A reader arriving at
+   `lib/agents/` sees the same agent named twice and has to work
+   out which one is live. **Fix: delete the seven unreferenced
+   files; keep `base-legacy.ts` only if the two tests can't be
+   rewritten against the live path this week.**
 
-  **`lib/agents/*-legacy.ts` (~1000 LOC across 9 files).** The retired pre-AptKit agent stack. Imported only by two test files (`test/agents/synthesis-instruction.test.ts:12` and `test/agents/base.test.ts:4`) and by other `-legacy` files self-referentially — nothing in `app/` or `components/` touches them. This is cognitive load that pays zero rent. → red flag: dead-code parallel structure (see lens 8).
+2. **`app/page.tsx` — 461 LOC.** Down from a heavier version (the
+   `useBriefingStream`, `useDemoCapture`, `useReconnectPolicy`
+   hooks were extracted — see `lib/hooks/`). What's left is
+   *layout code*: header + mode toggle + two-column shell + the
+   coverage-grid section + the query-box section. Individually
+   each block is fine; together it's still a long file with three
+   concerns interleaved. **Symptom: amplified change.** A
+   header-copy edit and a stepper-status edit sit in the same
+   file. **Fix: extract `<FeedHeader />`, `<FeedModeToggle />`,
+   and `<FeedLayout />` — the concerns are already visible in the
+   comments.**
 
-  **`app/api/agent/route.ts` (345 LOC) and `app/api/briefing/route.ts` (336 LOC).** The two streaming routes. Each does: validation → cache lookup → DataSource bootstrap → schema bootstrap → agent invocation → NDJSON streaming → phase timing → AbortSignal threading → DataSource disposal. The phase-timing + AbortSignal-threading parts are duplicated almost verbatim. Pulling them into a single helper (`runAgentRoute({ phases, bootstrap, body }))` would halve the surface; the duplication is real and named.
+3. **`lib/data-source/synthetic-data-source.ts` — 516 LOC.** By far
+   the longest single file in `lib/data-source/`. It's a fixture
+   generator that produces plausible EQL responses for the agents
+   to reason over — a lot of it is data tables (event catalogues,
+   segment shapes, plausible customer counts). Reads dense but
+   the split between "shape of a synthetic response" and "the
+   generator that emits it" isn't visible from the file layout.
+   **Symptom: unknown-unknowns.** Editing a synthetic response
+   shape risks silently breaking a golden case. **Fix: split
+   `synthetic-fixtures.ts` (the data) from
+   `synthetic-data-source.ts` (the adapter).**
 
-### What this repo handles well
-
-The agents themselves are tiny (`MonitoringAgent` 116 LOC, `DiagnosticAgent` 49 LOC, `RecommendationAgent` 40 LOC, `QueryAgent` 34 LOC) because the bridge in `aptkit-adapters.ts` does the work. That's deliberate depth — see lens 2 and `03-aptkit-bridge-information-hiding.md`.
-
----
+The number that ties them together: three files carry ~2000 LOC.
+Cut the legacy chain and you're back under a healthy total.
 
 ## 2. deep-vs-shallow-modules
 
-Module depth = functionality ÷ interface size. Deep modules hide a lot behind a small surface; shallow modules expose almost as much as they hide. AOSD's word for shallow-everywhere is **classitis**.
+Modules ranked by depth — functionality relative to interface
+size. Deep = big body, small surface; shallow = surface nearly as
+complex as the body (classitis).
 
-### The deepest module — `DataSource` (`lib/data-source/types.ts:63-71`)
+**Deepest module — the standout example.**
+`DataSource` (`lib/data-source/types.ts` — 71 LOC total, of which
+the interface is `callTool` + `listTools`, two methods, ~15 LOC of
+signature). Under that interface sits **~740 LOC of adapter work**:
+`BloomreachDataSource` (214), `SyntheticDataSource` (516),
+`FaultInjectingDataSource` (167 — see `03-fault-injecting-decorator.md`).
+The client (the agents) only ever holds a `DataSource` reference;
+they don't know which adapter they're calling. This is the deepest
+module in the repo and the seam has now shipped in four live uses
+(Olist add, Olist remove, Synthetic add, FaultInjecting wrap). Deep
+walk: `01-datasource-port.md`.
 
-The port. **2 methods** (`callTool`, `listTools`), each with a 1-line option type. Behind that surface sits 700+ LOC of behavior across two adapters: OAuth dance, 60s response cache, ~1 req/s rate-limit spacing, rate-limit retry ladder honoring server-stated penalty windows, AbortSignal composition with per-call 30s ceiling, typed error envelopes (`BloomreachDataSource`); plus a 30-tool dispatch switch with realistic envelope shapes (`SyntheticDataSource`). The agent layer holds a `DataSource`; it never knows which one.
+**Shallowest module — the worst offender.**
+`lib/agents/base.ts` — 14 LOC. Exports one constant (`AGENT_MODEL`)
+and one type alias (`McpCaller`). Nothing else. Its interface is
+100% of its body. This is textbook classitis — a module that
+exists to be named. Compare against `base-legacy.ts` (270 LOC of
+the hand-rolled ReAct loop it *used* to hold). **The rename was
+correct** — the ReAct loop moved into aptkit — but what's left
+should be inlined into the two files that import it (`aptkit-adapters.ts`,
+`monitoring.ts`, `diagnostic.ts`, `recommendation.ts`) or merged
+with `aptkit-adapters.ts` as a single `agents/base` module. The
+14-line file is one grep step nobody needs to take.
 
-→ see `01-port-and-adapter-data-source.md` for the full walk.
-
-### The next-deepest — `readNdjson` (`lib/streaming/ndjson.ts:17-64`)
-
-48-LOC body, ~10-line public type, consumed by 4 streaming surfaces (`useBriefingStream`, `useInvestigation`, `useDemoCapture`, `StreamingResponse`). Each consumer passes one `onEvent` callback and a `cancelOn` predicate — the kernel hides the reader/decoder/buffer/parse/cancel dance.
-
-→ see `02-streaming-ndjson-kernel.md` for the full walk.
-
-### The shallowest module — `lib/mcp/client.ts` (19 LOC, all re-exports)
-
-```ts
-export {
-  BloomreachDataSource as McpClient,
-  McpToolError,
-  type CallToolOptions,
-  type ListToolsOptions,
-  type CallToolResult,
-} from '../data-source/bloomreach-data-source';
-```
-
-Zero behavior. A pure compatibility shim. **This is fine** — the file's comment explicitly names its job (let legacy `McpClient` imports compile while callers migrate). The shallow-module rule is a smell, not a rule against named shims with a defined sunset.
-
-### The shallowest module that ISN'T fine — `lib/agents/base.ts` (14 LOC)
-
-```ts
-export const AGENT_MODEL = 'claude-sonnet-4-6';
-export type McpCaller = Pick<DataSource, 'callTool'>;
-```
-
-Two declarations the AptKit adapters use. Borderline classitis — both could live inline in `aptkit-adapters.ts` where their only consumers are. Not load-bearing enough to be a finding; named for the inventory.
-
-### The classitis case — the parallel `-legacy.ts` files
-
-`lib/agents/base-legacy.ts` (270 LOC), `monitoring-legacy.ts` (138), `diagnostic-legacy.ts` (112), `recommendation-legacy.ts` (105), `query-legacy.ts` (53), plus `categories-legacy.ts`, `intent-legacy.ts`, `legacy-validate.ts`, `legacy-prompts/`. Together they re-implement everything the new files do. **Fix:** if the tests in `test/agents/base.test.ts` and `test/agents/synthesis-instruction.test.ts` still cover behaviour the AptKit-wrapped versions need, port them; otherwise delete the legacy files entirely. The parallel structure is the single largest cognitive load this repo carries.
-
----
+**Runner-up shallow module.** `lib/agents/pricing.ts` — 61 LOC — is
+borderline. It exports one function (`estimateAnthropicCost`) that
+is short. But its purpose is genuinely narrow (fill the aptkit
+gap for Anthropic pricing) and it's called from three sites
+(`budget.ts`, `eval/run.eval.ts`, `eval/load.eval.ts`). This is
+*narrow* not *shallow* — the interface is one function because the
+job is one function. Keep as-is.
 
 ## 3. information-hiding-and-leakage
 
-A decision leaks when two modules know the same fact and have to change together. The good news: the major hides in this repo are clean. The bad news: a few small leaks are worth naming.
+Facts that live in two modules and force them to change together.
+Config that exposes internals. Temporal decomposition where every
+step of a process gets its own file.
 
-### The cleanest hide — the AptKit bridge
+**Best-hidden decision.**
+"Which vendor SDK is the Anthropic-shaped one" lives entirely
+inside `lib/agents/aptkit-adapters.ts` (263 LOC). The three adapter
+classes — `AnthropicModelProviderAdapter`, `BloomingToolRegistryAdapter`,
+`BloomingTraceSinkAdapter` — plus their private converter functions
+(`toAnthropicMessage`, `toAnthropicTool`, `toModelContentBlock`, etc.)
+sit in one file. Every one of `monitoring.ts` / `diagnostic.ts` /
+`recommendation.ts` imports the three adapter classes as a bundle
+and never sees the anthropic SDK or the aptkit type surface
+directly. That fence is what lets the Bloomreach-side code type-check
+without pulling `@anthropic-ai/sdk` types into every agent file.
+Deep walk: `02-aptkit-bridge.md`.
 
-`lib/agents/aptkit-adapters.ts` (206 LOC) holds the three adapter classes (`AnthropicModelProviderAdapter`, `BloomingToolRegistryAdapter`, `BloomingTraceSinkAdapter`) that translate between Blooming's domain types and `@aptkit/core`'s provider-neutral types. Blooming code touches `Anthropic.Messages.MessageParam`; AptKit touches `ModelMessage`. They never meet outside this file. Swap `@aptkit/core@0.3.0` for a future version, only `aptkit-adapters.ts` changes.
+**Leaked fact — same knowledge, edited in two places.**
+The Anthropic model name `'claude-sonnet-4-6'` appears in five
+files: `lib/agents/base.ts:5` (`AGENT_MODEL`), `lib/agents/budget.ts:47`
+(the `BudgetTracker` constructor default), `eval/run.eval.ts:219`
+(the `estimateCost` fallback in the diagnosis-cost branch),
+`eval/run.eval.ts:273` (same, recommendation branch),
+`eval/load.eval.ts:299` and `:302` (both cost estimates). If
+you upgrade to a new Sonnet SKU, all five must move together.
+**Fix: `BudgetTracker` and the eval cost-estimator should read
+`AGENT_MODEL` from `base.ts`, not hardcode it.** The default in
+`BudgetTracker`'s constructor is where the leak started — it names
+the model to compute a cost, but the cost is about "whatever model
+the agents actually run." Depend on the constant.
 
-→ see `03-aptkit-bridge-information-hiding.md` for the full walk.
+**Second leak — the `ToolResult` open shape.**
+`lib/data-source/types.ts:32` — `ToolResult` declares `[key: string]:
+unknown` on the interface to let `structuredContent` ride through
+the seam without appearing in the type. This is the escape hatch
+that makes `unwrap<T>(result)` in `lib/mcp/schema.ts` work. But the
+interface doesn't say that — a reader has to trace to `unwrap()`
+to learn why the type is open. **Fix: name `structuredContent` on
+the `ToolResult` interface explicitly, as `structuredContent?:
+unknown`, and drop the open index signature.** The one field that
+actually rides through gets named; the type stops promising
+anything to callers.
 
-### The cleanest correctness hide — session-keyed state
-
-`lib/state/insights.ts` (101 LOC) hides the fact that a single warm Vercel instance serves many users. The outer `Map<sessionId, SessionFeed>` is module-private; callers pass `sessionId` and get back a per-session sub-feed. The `putInsights` function clears *this session's* sub-maps without touching another user's feed — a correctness hide.
-
-→ see `05-session-keyed-state.md` for the full walk.
-
-### Leak #1 — two regex variants in `useReconnectPolicy.ts:33-34`
-
-```ts
-const AUTH_ERROR_RE_AUTO   = /invalid_token|unauthor|forbidden|401|session expired|reconnect/i;
-const AUTH_ERROR_RE_BUTTON = /unauthor|forbidden|401|session expired/i;
-```
-
-Two predicates over the same fact (is this an auth error?), with the button version missing `invalid_token` and `reconnect`. The file's comment explicitly flags this as a latent bug filed for later. **This is the textbook AOSD red flag of "same knowledge edited twice."** Two predicates means two places to update when the Bloomreach server changes its error wording. **Fix:** unify behind a single predicate, with an explicit allowlist for the button case (e.g. `isAuthErrorAuto(msg) && !msg.includes('invalid_token')` if the button variant genuinely needs to exclude that token-shaped error). Manual verification against the live alpha server is the gate the comment names.
-
-### Leak #2 — tool-name lists in three places
-
-`bootstrapTools`, `monitoringTools`, `diagnosticTools`, `recommendationTools`, `queryTools` live in `lib/mcp/tools.ts:6-59`. The synthetic dispatcher's `switch` in `lib/data-source/synthetic-data-source.ts:334-493` re-enumerates those same names. Adding a new tool means: update `tools.ts`, add a `case` in `synthetic-data-source.ts`, add a description in the `toolDescriptions` map at line 120. The leak is mild (tool lists rarely change), but it's three edits per addition. **Fix:** when this changes more often, generate the synthetic dispatch from a single declarative table.
-
-### Leak #3 — the NDJSON event union in two places
-
-`lib/mcp/events.ts:4-12` defines `AgentEvent` (the shared contract). `lib/hooks/useBriefingStream.ts:36-45` defines `BriefingEvent` as a superset adding `workspace`, `coverage_item`, `coverage`. The route handler at `app/api/briefing/route.ts:56-60` defines yet another `BriefingEvent` as `AgentEvent | { type: 'workspace'... }`. Three definitions of overlapping unions. **Fix:** lift `BriefingEvent` (or the `workspace`/`coverage*` variants) into `events.ts` so the producer and consumer reference one source of truth. Low-risk; one PR.
-
-### Praise — the captured fetch wrapper
-
-`lib/mcp/transport.ts:103-118` (`makeCapturingFetch`). The fact that the MCP SDK's surface error message hides the real server body is hidden behind a fetch-wrapper that stores the body for the `SdkTransport` to attach to thrown errors. Callers never know there's a body holder. That's the right hide.
-
----
+**Third leak — the `pricing.ts` regex list.**
+`lib/agents/pricing.ts:26-33` — the Anthropic pricing table has
+three model families. If Anthropic prices change or a new family
+ships, both the table here and any hardcoded model in `base.ts`
+must be edited. Not urgent, but the same knowledge (model
+identity) is expressed as a regex here and a literal there.
 
 ## 4. layers-and-abstractions
 
-Pass-through methods (a method that just forwards to another) and pass-through variables (a parameter the caller threads through purely so the bottom of the stack can read it) signal layers that don't earn their place.
+Pass-through methods and pass-through variables. Layers that don't
+earn their place — a call chain where a wrapper just forwards.
 
-### The legitimate forward — `lib/mcp/client.ts`
+**Genuine pass-through: `RecommendationAgent.propose`.**
+`lib/agents/recommendation.ts:26-46` — the class wraps `AptKitRecommendationAgent`
+and its `propose()` method forwards to `agent.propose(anomaly,
+diagnosis, { signal })`. The wrapper does five things: builds the
+model adapter, builds the tool registry, builds the trace sink,
+builds the aptkit agent, and calls its `propose`. The header
+comment on line 16 names this honestly ("Compatibility wrapper:
+Blooming keeps this constructor while AptKit owns the reusable
+agent"). Same shape in `lib/agents/diagnostic.ts:37-63`.
 
-The 19-line compatibility shim re-exports from `lib/data-source/bloomreach-data-source.ts`. This is a deliberate name-pass-through, not a layer-pass-through, and its sunset is named in the file comment.
+**Is this a pass-through worth removing?** No — but recognize why.
+The wrapper does one load-bearing job: it converts aptkit's
+`DiagnosticDiagnosis` type back to Blooming's `Diagnosis` type
+(`toBloomingDiagnosis` on line 65), which today happens to be an
+identity function. The conversion function exists so that when
+aptkit's shape drifts from ours, there's already a seam to
+insert the mapping into. **This is speculative future-hardening**
+by AOSD standards, which normally recommends against it — but in
+this specific case the two adapters and the trace-sink bundle
+argue that the API-shape drift is likely enough to justify the
+seam. Live with it; annotate why.
 
-### The legitimate forward — `bootstrap` in the DataSource factory
-
-`lib/data-source/index.ts:67-100` returns `bootstrap: (signal?) => bootstrapSchema(bloomreachDs, { signal })` for live-bloomreach and `bootstrap: async () => syntheticWorkspaceSchema` for synthetic. Each branch adapts a real, different operation to the same call signature — that's not pass-through, that's the polymorphism the factory exists for.
-
-### The honest pass-through chain — `signal`
-
-The `AbortSignal` threading is *necessary* pass-through (the bottom of the stack genuinely needs it), but worth naming so a future reader sees the chain:
-
-```
-  route.signal → bootstrap(signal) → bootstrapSchema(_, {signal})
-                                  → callOrThrow(_, _, _, {signal})
-                                  → dataSource.callTool(_, _, {signal})
-                                  → transport.callTool(_, _, {signal})
-                                  → composeSignals(signal, timeout)
-                                  → SDK client.callTool({signal})
-```
-
-Six hops. Every hop adds a `signal?` to a function signature and forwards it. That's the cost of cancellation that actually works — when AOSD says "pass-through is a smell," it means the parameter is read by *nothing in between*. Every layer here is the right place for `signal` to exist; the cost is just the verbose signatures. The current design is correct.
-
-### The questionable pass-through — `sessionId` through agent constructors
-
-`MonitoringAgent`, `DiagnosticAgent`, `RecommendationAgent`, and `QueryAgent` each accept `sessionId?: string` as a constructor argument they use only to forward to `AnthropicModelProviderAdapter` for log tagging. That's a true pass-through — none of the agent classes themselves read `sessionId`. **Fix when the agent classes refactor:** factor the adapter triplet construction into a helper (`buildAptKitDeps(anthropic, dataSource, schema, allTools, sid, agentName)`) that returns `{ model, tools, trace }`, so each agent class drops the `sessionId` parameter from its body.
-
----
+**No pass-through variables.** The hooks bag (`AgentHooks`) is
+threaded from route handler → agent method → adapter → trace sink,
+but every layer *reads* from it (`hooks.budget`, `hooks.signal`,
+`hooks.onCapabilityEvent`), so no field is a bare forward.
 
 ## 5. pull-complexity-downward
 
-The right place for a knob is inside the module that has enough information to make it itself. AOSD: avoidable config exposed to callers is the red flag.
+Knobs the module has enough information to decide itself but
+pushes up to callers.
 
-### Top pull — the streaming kernel `readNdjson`
+**Best example of complexity pulled down.** The NDJSON reader
+(`lib/streaming/ndjson.ts` — 64 LOC). Three callers used to run
+the same fetch → reader → TextDecoder → buffer → split('\n') →
+JSON.parse → dispatch shape inline: `useBriefingStream.ts`,
+`useDemoCapture.ts`, `useInvestigation.ts`. Every one had to know
+about the trailing-buffer flush, the malformed-line skip, and the
+cancel-between-reads polling. The kernel owns all three concerns
+now; callers pass a `body` stream, an `onEvent` handler, and
+optionally a `cancelOn` predicate. Deep walk: `06-ndjson-kernel.md`.
 
-`lib/streaming/ndjson.ts:17-64`. Pulled the buffer/decoder/split/parse/cancel loop down. Four callers (`useBriefingStream`, `useInvestigation`, `useDemoCapture`, `StreamingResponse`) each pass one `onEvent` callback. The kernel decides: when to flush the trailing buffer, when to swallow malformed JSON, how to cancel between reads. Callers don't see any of it. **This is the cleanest pulled-complexity-down move in the repo.**
+**Knob still exposed that could be owned.** `AnthropicModelProviderAdapter`
+takes six constructor params: `anthropic, agent, sessionId, model,
+logSite, budget`. Two of them (`model`, `logSite`) have defaults
+that the two agent call sites always accept. The call sites
+pass `undefined, undefined, hooks.budget` positionally
+(`lib/agents/diagnostic.ts:52-54`, `lib/agents/recommendation.ts:36-38`).
+**Fix: convert to a named-options object.** `new AnthropicModelProviderAdapter({
+anthropic, agent, sessionId, budget: hooks.budget })` reads
+straight. The two undefined positional args are a red flag by
+themselves.
 
-→ see `02-streaming-ndjson-kernel.md`.
-
-### Pull — `composeSignals` in `lib/mcp/transport.ts:173-189`
-
-The transport composes the route-level cancel signal with its own 30s ceiling using `AbortSignal.any` (with a manual `AbortController` fallback for older runtimes). Callers pass *one* signal; the transport composes. The OR is hidden.
-
-### Pull — rate-limit retry ladder in `BloomreachDataSource.callTool`
-
-`lib/data-source/bloomreach-data-source.ts:139-188`. The 60s response cache, the ~1 req/s spacing, the rate-limit-retry honoring the server's stated penalty window — all inside the adapter, none of it leaks to agents. The agent loop calls `dataSource.callTool(name, args, {signal})` and is done. Compare to a world where the agent had to check `isRateLimited()` itself.
-
-### Anti-pull — the `whyItMatters` regex chain in `InsightCard.tsx:41-71`
-
-```tsx
-function whyItMatters(insight: Insight): string {
-  const m = insight.metric.toLowerCase();
-  let role: string;
-  if (/revenue|purchase|sales|order|spend|aov|ltv|gmv/.test(m))
-    role = 'a top-line revenue metric — a move here flows straight to income';
-  else if (/conversion|checkout|cart|funnel|abandon/.test(m))
-    role = 'a funnel metric — it tracks how efficiently visits turn into orders';
-  // ... 6 more arms
-}
-```
-
-This is a **fallback for when the monitoring agent's `insight.impact` field is missing**. It belongs next to `deriveInsightFields` in `lib/insights/derive.ts`, where the rest of the evidence-derivation lives. The UI shouldn't carry agent fallback logic. The pull is downward, not upward — out of the React component into the pure-logic module that already exists for exactly this. **Fix:** move the function, re-export, call it from the component.
-
-### Anti-pull — `forcedDemo` flag in `app/page.tsx:61`
-
-`const forcedDemo = process.env.NEXT_PUBLIC_DEMO_ONLY === '1';` is read in the component body, used to decide whether to render the demo/live toggle. The flag itself is fine (it's an explicit deployment switch). But the component also reads `process.env.NODE_ENV !== 'production'` at line 360 to gate the capture button. Two env reads in one component, both gating UI affordances. **Fix:** when this grows a third, lift into a `useFeatureFlags()` hook that returns `{ forcedDemo, showCaptureButton }`.
-
----
+**One knob that's correctly pulled down.** `BudgetTracker`'s
+`exceeded()` method reads the limits from the tracker itself; the
+adapter (`aptkit-adapters.ts:64`) only asks "did you exceed?" and
+throws if yes. The adapter never sees the limit values. The
+tracker owns both accumulation and the ceiling check — the
+adapter is a pass-through to the tracker, not the other way around.
 
 ## 6. errors-and-special-cases
 
-AOSD's strongest advice on errors: define them out of existence where you can; aggregate at the right layer otherwise. Avoid scattering `try/catch` at every call site.
+Where exception handling is scattered across call sites, and
+where a different definition would erase a class of special cases
+altogether.
 
-### The right aggregation — `BloomreachDataSource.callTool`
+**Special case defined out.** `readNdjson` (`lib/streaming/ndjson.ts:52-60`)
+handles the "producer forgot the trailing newline" case by
+flushing the buffer at end-of-stream. Every caller *could* have
+handled that itself, badly. The kernel absorbs it once and every
+caller inherits the correct shape.
 
-Tool errors are aggregated into a single typed `McpToolError` (`lib/data-source/bloomreach-data-source.ts:101-110`) that carries the tool name + a redacted server detail. Every layer above the adapter catches one error type; the underlying SDK throw with its `cause` chain is hidden. Compare to a world where every route handler checked `err.code === 'rate_limited'` itself.
+**Well-defined error class.** `BudgetExceededError`
+(`lib/agents/budget.ts:85-95`) carries the snapshot and the limit
+as fields, so the route handler can emit a graceful NDJSON `error`
+event without reconstructing the state. The class documents its
+own emission path in the constructor comment. This is the
+right shape.
 
-### The right transport-level aggregation — `composeSignals` and `formatError`
+**Error handling that's still scattered — the fault injector.**
+`FaultInjectingDataSource` fires four failure modes
+(`fault-injecting.ts:112-155`): three throw, one returns a
+malformed envelope. Each fire method is short but the shape isn't
+uniform — a reader has to check whether each mode throws or
+returns. **This is deliberate** — the whole point is that agents
+handle both throw and malformed-envelope paths, and the injector
+exercises both. But it's worth naming in the type: today, `roll <
+threshold` returns `Promise<DataSourceCallResult>` from three of
+the four branches by throwing, and one branch by returning. The
+signature doesn't tell you that. **Fix (minor): document the
+"three throw + one return" shape at the top of the file.**
 
-`composeSignals` (`lib/mcp/transport.ts:173-189`) and `formatError` (`lib/mcp/transport.ts:82-97`) define the "cancel OR timeout" decision and the "walk-the-cause-chain-into-a-redacted-string" decision out of every caller. The route handlers each just write `console.error('[briefing] error:', redactSecrets(formatError(e)))` — one line.
+**No scattered try/except.** The only two `catch` blocks in
+`lib/` are in `ndjson.ts` (the malformed-line handler) and
+`app/page.tsx` (the `localStorage.getItem` guard). Both are
+one-line silent-swallow catches with a clear comment. This is
+clean.
 
-### The right defined-out — empty `evidence` array in `insightToAnomaly`
+## 7. readability
 
-`lib/state/insights.ts:53-55`. The reverse mapper intentionally drops `evidence/impact/history/category` — *the agent loop only needs `metric/scope/change/severity` to investigate; the rest is regenerated downstream.* This is "define the special case out of existence" — instead of conditionally handling "what if evidence is stale," the function guarantees an empty array, and the diagnostic agent regenerates real evidence in its own pass.
+Names, comments, consistency, obviousness. Four facets, ranked
+list per facet.
 
-### Try/catch sprawl in the streaming routes
+### names
 
-`app/api/briefing/route.ts` and `app/api/agent/route.ts` each carry 2-3 `try { } catch (e) { ... }` blocks: one outer for setup errors, one inner for the stream body, one inside `finally` for dispose. This is the right number — each catch handles a different layer's failure with a different recovery — but the pattern is duplicated between the two routes. **Fix (cross-references lens 1):** the duplication itself is the smell, not the try/catch count.
+Strong. The port is `DataSource`, adapters end in `-DataSource`,
+the aptkit bridge classes end in `-Adapter`, the trace sink is
+`BloomingTraceSinkAdapter`. When names get long they get precise:
+`AnthropicModelProviderAdapter` is nine syllables and reads exactly
+what it does.
 
-### `localStorage` / `sessionStorage` try/catch sprawl
+Worst names:
+- `hooks` (`lib/agents/diagnostic.ts:46`, everywhere) — the AgentHooks
+  bag is called `hooks`. This is fine until you realise there are
+  React hooks in the same repo. **Fix: `agentHooks` at the call
+  site, `hooks` inside the type is fine.**
+- `McpCaller` (`lib/agents/base.ts`) — this is the client-facing
+  type of the `DataSource` port's tool-call surface. The name says
+  "an MCP caller" but the seam has been renamed to `DataSource`
+  and this alias hasn't followed. **Fix: rename to `ToolCaller`
+  or drop and use `DataSource` directly.**
 
-Six `try { ... } catch { /* ignore */ }` blocks across `app/page.tsx`, `useInvestigation.ts`, `useBriefingStream.ts`, `useReconnectPolicy.ts`. Each guards a Storage API call that throws when blocked (private browsing, quota-full, no Storage in SSR). The repeat is honest but pulled-down would help: a `safeStorage.get(key)` / `.set(key, value)` helper that swallows the throw at one site. **Fix:** add `lib/storage/safe.ts` next time a fourth consumer appears.
+### comments
 
----
+Strong. Every load-bearing file (`types.ts`, `fault-injecting.ts`,
+`budget.ts`, `pricing.ts`, `ndjson.ts`, `aptkit-adapters.ts`)
+opens with a purpose comment that names what the file exists to
+solve. `pricing.ts:1-14` is a good example — it says which gap
+this fills, what the upstream shape is (`estimateCost` returns
+undefined for anthropic), and what caveats matter (cache-tier
+pricing not included).
 
-## 7. readability (names · comments · consistency · obviousness)
+Missing interface comment worth adding:
+- `DataSource` itself (`types.ts:63`) has an inline JSDoc line but
+  no comment explaining *when a caller would want to swap
+  adapters* — the seam's story. The existing header says "Currently
+  `BloomreachDataSource` is the only implementation — an Olist
+  (SQL-backed) adapter previously lived behind this seam and was
+  removed," which is history but not motivation. **Fix: add one
+  paragraph on the interface itself: "Callers hold this type, not
+  a concrete adapter. Adapters live in `bloomreach-data-source.ts`,
+  `synthetic-data-source.ts`, `fault-injecting.ts` (decorator)."**
 
-Four facets in one lens.
+Comment that restates the code — not many. `app/page.tsx` has one
+weak comment (`// re-runs the briefing fetch below` at :94) that
+adds nothing. Cleanest interface-comment in the repo:
+`aptkit-adapters.ts:76-88` on the cache-control decision.
 
-### Names — strong
+### consistency
 
-The names in this repo carry weight: `DataSource`, `BloomreachDataSource`, `SyntheticDataSource`, `readNdjson`, `runAgentLoop`, `composeSignals`, `formatError`, `redactSecrets`, `makeCapturingFetch`, `McpToolError`, `parseLiveMode`, `makeDataSource`. Each one names a real concept. **No `data`, `obj`, `tmp`, or `manager` to flag.**
+Two hooks-bag shapes coexist:
+1. `MonitorHooks` (`lib/agents/monitoring.ts:66-71`) — 4 fields.
+2. `AgentHooks` (`lib/agents/diagnostic.ts:16-35`) — 5 fields.
 
-The one borderline name: `McpCaller` in `lib/agents/base.ts:14` is defined as `Pick<DataSource, 'callTool'>`. The name reads as "thing that calls MCP" but the type means "thing that *exposes* a callTool method." `DataSourceCallSurface` or `CallableDataSource` would read more accurately. Minor.
+`AgentHooks` has `onCapabilityEvent` and `budget`; `MonitorHooks`
+doesn't. `RecommendationAgent` imports `AgentHooks` from
+`diagnostic.ts` rather than defining its own. **Fix: rename
+`AgentHooks` to `InvestigationHooks` (since it's used by
+diagnostic + recommendation) or fold `MonitorHooks` into `AgentHooks`.**
+Two type names for the same job is the classic red flag.
 
-### Comments — strong, especially the longer files
+Second consistency issue: five different filename shapes under
+`lib/agents/`:
+- `monitoring.ts` / `monitoring-legacy.ts` (no dashes vs one)
+- `aptkit-adapters.ts` (dashes)
+- `tool-schemas.ts` (dashes)
+- `base.ts` / `base-legacy.ts`
 
-Where this repo shines. Three exemplary blocks:
+The `-legacy` suffix is the problem — it reads as if legacy files
+are first-class members of the module tree. **Fix: move them to
+`lib/agents/_legacy/` or delete.**
 
-  → `lib/data-source/bloomreach-data-source.ts:1-14` — the file-level comment names what `BloomreachDataSource` carries (OAuth, 60s cache, rate-limit ladder, AbortSignal composition, retry ceiling logic) and the history (was `McpClient` in `lib/mcp/client.ts` before PR A). A reader gets oriented in 14 lines.
-  → `lib/hooks/useReconnectPolicy.ts:1-31` — the file-level comment names the two regex variants are NOT unified (and why), cross-links the refactor spec where the unification work is filed, and explicitly calls out the latent bug. This is the right way to comment a knowingly-imperfect module.
-  → `lib/state/insights.ts:1-12` — the type and module comment explain *why* the outer Map is never cleared (concurrent users on a warm Vercel instance) and what the failure mode would be if it were. A reader who has never seen the file knows the load-bearing invariant in 12 lines.
+### obviousness
 
-### Comments — the borderline cases
+The "huh?" spot: `AnthropicModelProviderAdapter` positional args.
+Call site: `new AnthropicModelProviderAdapter(this.anthropic,
+'diagnostic', this.sessionId, undefined, undefined, hooks.budget)`
+(`diagnostic.ts:48-55`). Two `undefined`s in a row is the code
+telling you the interface is wrong. Named options would erase
+the surprise.
 
-Inline comments inside `useBriefingStream.ts` are occasionally narrative ("revoked-token reconnect policy (state + one-shot guard + reset+reload)" at line 51 of `app/page.tsx`). They're not wrong, but they restate what the next few lines already say. Acceptable for a complex page module; would be noise in a 30-line helper.
-
-### Consistency — one significant inconsistency
-
-The `-legacy` suffix vs the lack of one. Some legacy files use the suffix (`base-legacy.ts`); the `legacy-prompts/` folder uses a `legacy-` prefix instead. The new code never carries a marker (`base.ts`). Inconsistent enough that a reader has to learn both. **Fix:** when the legacy code is deleted (lens 2), the inconsistency disappears.
-
-### Obviousness — the surprise spots
-
-Two spots a reader might trip on:
-
-  → **`useInvestigation.ts:36-37`** — the comment block explains *why* the hook deliberately does NOT cancel its fetch on cleanup (React StrictMode mount → cleanup → re-mount would abort the stream). Without that comment a reader would "fix" the missing cleanup and break the dev experience. The comment is the saving grace; the surprise is real.
-  → **`app/page.tsx:77`** — `else if (saved === 'live-sql' || saved === 'live') setMode('live-bloomreach'); // legacy`. The two legacy `localStorage` values are migrated to the current value silently. A reader scanning the mode switch sees three modes; the migration arm is the surprise. The `// legacy` comment is correct; consider naming `LEGACY_MODE_VALUES = ['live-sql', 'live']` for the inventory.
-
----
+Second surprise: `hooks.budget` is optional (`AgentHooks.budget`
+has `?:`), but when set, it's a *shared instance* across
+`DiagnosticAgent.investigate` and `RecommendationAgent.propose`
+in the same investigation. `eval/run.eval.ts:212,267` shares one
+`budget` between two agent calls to accumulate the total. The
+sharing isn't visible from the type — it's just that the caller
+holds a reference. **Fix: name the shared-instance contract in the
+type comment.**
 
 ## 8. red-flags-audit
 
-The capstone lens. AOSD's red flags as a review checklist, marked against this repo.
+Ousterhout's red flags as a review checklist, marked against this
+repo. `fires` / `doesn't` / `N/A`, with location + one-line fix
+where it fires. Sorted by severity.
 
-```
-  flag                          status            location / fix
-  ───────────────────────────── ───────────────── ─────────────────────────────
-  shallow module                doesn't fire      base.ts is borderline; everything
-                                                  else is named/sized appropriately
-  classitis                     FIRES             lib/agents/*-legacy.ts (9 files,
-                                                  ~1000 LOC) — delete or migrate
-                                                  the 2 tests still importing them
-  information leakage           FIRES             (a) two regex variants in
-                                                  useReconnectPolicy.ts:33-34
-                                                  (b) BriefingEvent defined 3 times
-                                                  (events.ts, useBriefingStream.ts,
-                                                  briefing/route.ts)
-  temporal decomposition        doesn't fire      modules are decomposed by concept
-                                                  (data-source, agents, state,
-                                                  streaming, hooks), not by phase
-  same knowledge edited twice   FIRES             tool-name lists in tools.ts and
-                                                  synthetic-data-source.ts switch;
-                                                  two regex variants above
-  pass-through method           doesn't fire      see lens 4 — every layer earns
-                                                  its place; sessionId pass-through
-                                                  is the one minor case
-  pass-through variable         doesn't fire (1)  signal pass-through is necessary;
-                                                  sessionId in agent constructors
-                                                  is the borderline minor case
-  vague names                   doesn't fire      see lens 7 — names carry weight
-  comments restate code         rare / minor      occasional in app/page.tsx,
-                                                  acceptable for a complex page
-  missing interface comment     doesn't fire      every public module has a
-                                                  file-level comment
-  try/catch everywhere          doesn't fire      see lens 6 — aggregation is right
-  special-case sprawl           doesn't fire      see lens 6 — `evidence: []` is
-                                                  the cleanest defined-out
-  avoidable config exposed      FIRES (mild)      whyItMatters() in InsightCard
-                                                  belongs in lib/insights/derive.ts
-  generic decoration            doesn't fire      no generic wrappers without depth
-  layer not earning its place   doesn't fire      see lens 4 — the factory and the
-                                                  client.ts shim are intentional
-  hidden control flow           doesn't fire      every async/cancellation path
-                                                  is named in the comments
-```
+| Red flag                       | Status  | Location + fix                                                                                   |
+|:-------------------------------|:--------|:--------------------------------------------------------------------------------------------------|
+| Shallow module (classitis)     | fires   | `lib/agents/base.ts` — 14 LOC, one constant + one type. Inline or merge into `aptkit-adapters.ts`. |
+| Duplicated modules             | fires   | `lib/agents/*-legacy.ts` — 9 files, only 2 test imports remain. Delete 7; migrate the 2 tests.     |
+| Information leakage            | fires   | `'claude-sonnet-4-6'` in 5 sites. Read `AGENT_MODEL` from `base.ts` in `budget.ts` + evals.        |
+| Avoidable config exposed       | fires   | `AnthropicModelProviderAdapter` 6-positional-arg constructor. Convert to named options.            |
+| Vague name                     | fires   | `McpCaller` (should be `ToolCaller` or drop); `hooks` at call sites (should be `agentHooks`).      |
+| Two conventions for one job    | fires   | `MonitorHooks` (4 fields) vs `AgentHooks` (5 fields) — fold or rename.                             |
+| Interface leakage              | fires   | `ToolResult.[key: string]: unknown` (`types.ts:32`) hides the `structuredContent` escape hatch.    |
+| Comment restates code          | fires   | `app/page.tsx:94` — "re-runs the briefing fetch below". Delete.                                    |
+| Pass-through method            | fires but justified | `RecommendationAgent.propose` (`recommendation.ts:26-46`) — kept as drift-buffer against aptkit shape changes. Annotate. |
+| Special-case sprawl            | doesn't | Errors are defined-out (readNdjson buffer flush; `BudgetExceededError`).                          |
+| Try/except everywhere          | doesn't | Two catches in `lib/`; both narrow and commented.                                                  |
+| Untyped generic                | doesn't | `DataSource.result` is `unknown` by choice (unwrap at call site).                                  |
+| Hidden control flow            | doesn't | Every async path threads `signal`; no orphaned promises.                                          |
+| Same knowledge edited twice — dates | doesn't | No date/timestamp literals repeated across files.                                                 |
+| Temporal decomposition         | doesn't | Files are organized by concept (agent / data-source / mcp), not by step of a process.             |
+| Deep interface hides too little | doesn't | `DataSource` is 2 methods; adapters are 200+ LOC each. Depth ratio ~1:100.                        |
 
-### Ranked by severity for this repo
-
-  1. **classitis — the parallel `-legacy.ts` files.** Largest LOC, zero production callers, two stranded tests. The single biggest readability cost.
-  2. **same knowledge edited twice — the two regex variants in `useReconnectPolicy.ts`.** A named latent bug. Highest fix-value per LOC.
-  3. **information leakage — `BriefingEvent` defined three times.** Low-risk one-PR fix; lifts the contract into the existing `events.ts` source of truth.
-  4. **avoidable config exposed — `whyItMatters` in `InsightCard.tsx`.** Cross-cutting fix: move to `lib/insights/derive.ts`. Tightens the lens-5 anti-pull and the lens-3 leak in one move.
-  5. **same knowledge edited twice — tool-name lists.** Lowest urgency (tool lists rarely change); worth a declarative table when the next agent capability ships.
-
-The Pass 2 files take the deep walks on the design moves these red flags either preserve (the legitimate hides) or violate (the leaks). Read in the order the README names — overview, then audit, then the design move whose primitive matters most to you today.
+**Highest-severity fires, in order:** duplicated modules (legacy),
+shallow `base.ts`, model-name leak, positional-arg constructor.
+The first two are the highest-leverage cleanup in the repo —
+delete-only work, no behavior change.

@@ -1,15 +1,17 @@
-# 04 — Agent infrastructure
+# Section D — Agent infrastructure
 
-Anchor: single-agent + multi-agent (both)
+**Anchor:** single-agent + multi-agent (both). The cross-cutting disciplines that matter more than any single topology.
 
-The cross-cutting disciplines that matter more than any single topology. These are the parts that separate a demo from a shipped agent system.
+Context engineering, memory, tool calling, guardrails, observability. Blooming exercises four of these five in production; agent evaluation lives adjacent (`eval/` harness) and gets its own file.
 
-This sub-section is **deeply exercised** in the repo. Every file below has a live anchor in the code.
+## Files
+
+1. **`01-context-engineering.md`** — the discipline. What goes in every agent's window: system prompt, schemaSummary, tools, past turns.
+2. **`02-agent-memory-tiers.md`** — working memory only (in-context). No episodic, no long-term. Where each would go if adopted.
+3. **`03-tool-calling-and-mcp.md`** — the connective tissue. MCP as the protocol; BloomingToolRegistryAdapter as the aptkit ToolRegistry bridge.
+4. **`04-guardrails-and-control.md`** — the control envelope. BudgetTracker + BudgetExceededError, type guards, iteration caps, cancellation via AbortSignal.
+5. **`05-observability-hook.md`** — `onCapabilityEvent` — the additive hook that captures every raw AptKit trace event.
 
 ## Reading order
 
-1. `01-context-engineering.md` — the discipline RAG and prompt engineering are subsets of. The `schemaSummary` token-budget trick is the load-bearing example.
-2. `02-agent-memory-tiers.md` — working/episodic/long-term. This repo runs working memory only.
-3. `03-tool-calling-and-mcp.md` — the connective tissue under every pattern. The full MCP wire path.
-4. `04-agent-evaluation.md` — the Vitest-with-injected-fakes pattern; 144 tests; trajectory eval surface.
-5. `05-guardrails-and-control.md` — the control envelope. The strongest infrastructure piece in this repo.
+01 → 03 → 04 → 05 → 02. Context engineering first (it sets the stage); tool calling and guardrails next (they operate on context); observability captures everything; memory tiers close by naming what's NOT here.

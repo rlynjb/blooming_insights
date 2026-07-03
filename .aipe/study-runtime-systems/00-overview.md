@@ -1,99 +1,102 @@
-# Runtime Systems — Overview
+# Runtime systems — overview
 
-> the question: where does work execute, what resources does it own, and what breaks under concurrency or overload?
+Where work executes in blooming insights, what resources it owns, and what breaks under concurrency or overload — anchored to real files.
 
-## The runtime, in one picture
-
-Three execution bands. One ONE-process Node serverless function, one Vercel platform layer above it, and one browser tab below.
+## The three bands
 
 ```
-  blooming insights — the three runtime bands
+The whole runtime, in one picture
 
-  ┌─ Browser tab (Chromium/Safari/Firefox) ──────────────────────────────┐
-  │   React 19 client (useBriefingStream / useInvestigation)             │
-  │   one main thread · NDJSON reader (lib/streaming/ndjson.ts)          │
-  │   AbortController via fetch's req.signal (cancel on cleanup)         │
-  └──────────────────────┬───────────────────────────────────────────────┘
-                         │  HTTPS · application/x-ndjson
-  ┌─ Vercel platform ────▼───────────────────────────────────────────────┐
-  │   Serverless function instances (Node 20+, ephemeral, may be warm    │
-  │   reused for >1 request). maxDuration = 300s on /api/briefing and    │
-  │   /api/agent. No autoscaler visible to the function.                 │
-  └──────────────────────┬───────────────────────────────────────────────┘
-                         │  spawns
-  ┌─ Node process (ONE) ─▼───────────────────────────────────────────────┐
-  │   single-threaded JS event loop                                      │
-  │   AsyncLocalStorage-scoped per-request store (lib/mcp/auth.ts:47)    │
-  │   module-level Maps (lib/state/insights.ts:14)                       │
-  │   no child_process · no worker_threads · no cluster                  │
-  └──────────────────────────────────────────────────────────────────────┘
+┌─ Browser ────────────────────────────────────────────────────────┐
+│  React 19 components + hooks                                      │
+│  useBriefingStream / useInvestigation                             │
+│  fetch() → NDJSON reader (Web Streams)                           │
+└────────────────────────────┬─────────────────────────────────────┘
+                             │ HTTPS, one connection per request
+                             │ req.signal on unmount
+┌─ Vercel serverless (Node) ─▼─────────────────────────────────────┐
+│  app/api/briefing/route.ts  · maxDuration = 300s                 │
+│  app/api/agent/route.ts     · maxDuration = 300s                 │
+│  ReadableStream<Uint8Array> body                                 │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │ ONE Node process per warm instance                          │ │
+│  │  · module-scoped: session Maps, mcp Client, prompt strings  │ │
+│  │  · request-scoped: AsyncLocalStorage (auth cookie store)    │ │
+│  │  · call-scoped: AbortSignal timeout (30s) + client cancel   │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+└────────────────────────────┬─────────────────────────────────────┘
+                             │ HTTPS (per-user rate-limited ~1 req/s)
+                             │ AbortSignal.any(client, 30s timeout)
+┌─ Provider (external) ──────▼─────────────────────────────────────┐
+│  Anthropic API (claude-sonnet-4-6)                               │
+│  Bloomreach loomi connect MCP server                             │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-A previous build had a fourth band — an Olist SQL subprocess behind the same `DataSource` port — that was retired before this guide was written. The seam survives (`lib/data-source/index.ts` still has a `dispose()` hook on the result envelope), but only two adapters live behind it now: `BloomreachDataSource` (live MCP) and `SyntheticDataSource` (in-process fake), both running inside the same Node process as their caller.
+Three bands, not four. There is no worker, no child process, no OS thread that the app forks or manages. Every task inside the Node band lives on the single event loop; every task inside the Browser band lives on the single event loop. The whole codebase is `grep -r 'worker_threads\|child_process' → 0 hits`.
 
-## What's load-bearing
+## The load-bearing verdict
 
-Three primitives carry the runtime weight. The rest hangs off them.
+The interesting runtime work in this repo happens **at the boundaries between the bands**, not inside them:
 
-| Primitive | Where it lives | What it bounds |
-| --- | --- | --- |
-| the per-request store (`AsyncLocalStorage` → `requestStore`) | `lib/mcp/auth.ts:47` | OAuth state isolation between concurrent users on one warm instance |
-| the cancel signal composition (`AbortSignal.any(client, timeout)`) | `lib/mcp/transport.ts:131, 173` | per-call 30s ceiling OR'd with the route's `req.signal` |
-| the route budget (`maxDuration = 300`) | `app/api/agent/route.ts:22`, `app/api/briefing/route.ts:19` | the absolute wall-clock budget every retry/spacing/turn-count tunable defends |
+1. **Cancellation is threaded, not implicit.** The client can close a tab at any moment. `req.signal` composes with a per-call `AbortSignal.timeout(30_000)` in the MCP transport (`lib/mcp/transport.ts:131`), and both flow down through every async layer — MCP calls, Anthropic calls, agent loops. Whichever fires first wins.
+2. **Shared state is scoped by construction.** Vercel warm instances multiplex many sessions on one Node process. Session-keyed `Map`s (`lib/state/insights.ts:14`), request-scoped `AsyncLocalStorage` (`lib/mcp/auth.ts:47`), and instance-scoped `BudgetTracker` (`lib/agents/budget.ts:41`) each pick the right scope. No shared mutable state is unscoped.
+3. **Bounded work is enforced at every gate.** `maxDuration = 300s` on the route. `TOOL_TIMEOUT_MS = 30_000` per MCP call. `maxRetries = 3`, `retryCeilingMs = 20_000` per retry. `BUDGET_PER_INVESTIGATION_USD = 2.0` per investigation. `LOAD_CONCURRENCY = K` workers in the load harness. Every ceiling ends the work; none of them silently fail open.
 
-Pull any one and the system breaks differently. Pull ALS and two concurrent users on one warm instance start sharing OAuth tokens. Pull signal composition and a single hung MCP call burns the entire 300s budget. Pull the 300s ceiling and the Vercel platform kills the request before the agent emits `done`.
+The rest of this study walks the mechanisms behind those three verdicts.
 
-## Ranked findings — what the runtime gets right, and where it leaks
+## Ranked findings — what to read closely
 
-Walk these in order; the audit (`08-runtime-systems-red-flags-audit.md`) covers each in depth.
+Ordered by consequence. Each ranks the *risk* of an execution-model failure, grounded in `file:line`.
 
-1. **Schema cache leaks across sessions (lib/mcp/schema.ts:138).** A module-level `let cached: WorkspaceSchema | null` survives between requests on the same warm Vercel instance and is keyed on NOTHING. User A's `projectId` / `projectName` returns to user B. Every other piece of session state in the repo is session-keyed (see `state.get(sessionId)` in `lib/state/insights.ts`); this one isn't. The fix is a `Map<sessionId, WorkspaceSchema>` or just deleting the cache (schema bootstrap is 4 sequential MCP calls — slow once per request, but correctness-preserving).
-2. **The 60s response cache is shared across users (lib/data-source/bloomreach-data-source.ts:122, 144).** `BloomreachDataSource` instances are constructed PER REQUEST inside `connectMcp`, so this one is actually OK — but the proximity to finding #1 is uncomfortable. Worth a comment noting the per-instance scope.
-3. **`disposeDataSource()` is a no-op for the only live adapter.** The seam is wired in `app/api/{agent,briefing}/route.ts` finally blocks, but `lib/data-source/index.ts:98` returns `dispose: async () => {}` for the Bloomreach branch. Comment explains why (cookie-scoped lifetime), but a future adapter with real resources would need this to actually fire.
-4. **`useInvestigation` deliberately does NOT cancel on cleanup (lib/hooks/useInvestigation.ts:36-37).** This is a documented choice to survive React StrictMode's mount→cleanup→remount. The cost: a closed-tab investigation keeps running server-side until it hits `maxDuration`. Acceptable for a low-traffic alpha; would matter at scale.
-5. **The `lastCallAt` rate-limit gate is not actually atomic (lib/data-source/bloomreach-data-source.ts:191-202).** Two concurrent `callTool` calls on the same `BloomreachDataSource` can both read `lastCallAt`, both compute `elapsed < minIntervalMs` as false, both fire immediately. Since `BloomreachDataSource` is per-request, this only matters if a single request fires parallel tool calls — which the agent loop today does not (tools run sequentially per turn).
+  1. **Runaway agent loops burn cost fastest.** The AptKit agent loop can call the model many times. Without a budget ceiling checked *before* each dispatch, one bad case eats the entire route budget. Fixed at `lib/agents/aptkit-adapters.ts:64-66` — `BudgetTracker.exceeded()` gate, throws `BudgetExceededError` before the API call. Interview-defense-tier detail: the check runs *pre-dispatch*, not post.
 
-## What's NOT exercised
+  2. **AbortSignal composition or timeouts, not just one.** `lib/mcp/transport.ts:131, :150` composes `opts?.signal` (client cancel) with `AbortSignal.timeout(30_000)` (per-call ceiling). Falls back to `AbortController` glue on older runtimes. First to fire wins. Without this, one hung Bloomreach call would burn the whole 300s.
 
-These show up in the spec's concept list but the repo doesn't reach for them. Each gets one honest line in its own file rather than invented behavior.
+  3. **AsyncLocalStorage as the seam for per-request state.** `lib/mcp/auth.ts:47` — `RequestStore` seeded from cookie once, read many times by the SDK's OAuth provider methods, flushed to cookie once. Without ALS, Vercel's "read your write in the same request" cookie split returned stale values every call.
 
-- **Workers / threads / subprocesses.** `not yet exercised` — single-process Node only.
-- **Locks / atomics / channels.** `not yet exercised` — single-threaded JS event loop means no shared-memory races; ALS solves the per-request isolation problem that locks would solve in a threaded runtime.
-- **Manual GC tuning / heap snapshots.** `not yet exercised` — Vercel's default V8 settings; no `--max-old-space-size` overrides; no `process.memoryUsage()` logging.
-- **File descriptor management / streams beyond `ReadableStream`.** `not yet exercised` for Node streams — the repo uses Web Streams (`ReadableStream` for NDJSON output) and synchronous `readFileSync` for tiny config/cache files. No `createReadStream` / no descriptor pools / no fs watches.
-- **Graceful shutdown / signal handlers.** `not yet exercised` — serverless functions are killed by the platform; the app has nothing to flush.
+  4. **Session-keyed shared state, cleared per session only.** `lib/state/insights.ts:14, :62-71` — outer `Map<sessionId, SessionFeed>` is never cleared by a request; only the caller's own sub-feed is cleared. Without this, `putInsights` would wipe another user's feed mid-briefing on a warm instance.
+
+  5. **Monotonic-clock spacing gate.** `lib/data-source/bloomreach-data-source.ts:123, :190-198` — `lastCallAt` clock check spaces MCP calls at `minIntervalMs = 1100` on the same instance. This is the closest thing to a mutex in the codebase; races don't matter because the miss cost is one extra HTTP call, not corrupt state.
+
+  6. **StrictMode-safe once-per-mount.** `lib/hooks/useInvestigation.ts:44, :48-49` — `useRef` latch prevents React 19 dev double-mount from double-fetching *and* deliberately does NOT cancel the fetch on cleanup. Cancelling on cleanup + started-guard aborted the stream and left logs empty; the current shape is intentional.
+
+  7. **Semaphore-based worker pool.** `eval/load.eval.ts:171-211` — N indices in one shared queue, K async workers `shift()` from it until exhausted, `Promise.all(workers)`. The standard JS-runtime concurrency primitive when you don't have threads: no shared memory to guard, just async workers sharing a queue.
+
+  8. **Retry ladder capped so worst case fits the budget.** `lib/data-source/bloomreach-data-source.ts:163-174, :127-137` — parsed retry-after hint OR exponential backoff, capped at `retryCeilingMs = 20_000`, at most `maxRetries = 3`. A single rate-limited call worst-cases at ~30s, well under the 60s Hobby ceiling that used to run this app.
+
+  9. **Session-scoped cache is instance-local.** `lib/data-source/bloomreach-data-source.ts:122, :144-152` — 60s TTL Map per adapter instance. On Vercel a warm instance serves many sessions from the same cache; on a cold start the cache is empty. No cross-instance cache; the demo snapshot fills that gap for the presentation path.
 
 ## Reading order
 
-```
-  00-overview                  ← you are here
-   │
-   ▼
-  01-runtime-map               processes, resources, lifetimes — the as-built map
-   │
-   ▼
-  02-processes-threads-tasks   one process, no threads — what fills that vacuum
-   │
-   ▼
-  03-event-loop-and-async-io   microtasks, ReadableStream pull, blocking hazards
-   │
-   ▼
-  04-shared-state-races        the four state stores and how they stay isolated
-   │
-   ▼
-  05-memory-stack-heap-gc      what lives across requests, what dies
-   │
-   ▼
-  06-filesystem-streams        ReadableStream lifecycle, fs in dev vs prod
-   │
-   ▼
-  07-backpressure-bounded      AbortSignal composition, retries, route budget
-   │
-   ▼
-  08-runtime-red-flags-audit   ranked risks, evidence per verdict
-```
+Start at 01 (the runtime map) to place every mechanism on the picture. Then 02–07 walk the mechanisms in dependency order. 08 ranks the risks, with every verdict anchored to a `file:line`.
 
-## See also (other guides)
+  1. `01-runtime-map.md` — the map of processes, tasks, and resources.
+  2. `02-processes-threads-and-tasks.md` — where work runs. Threads and child processes are *not yet exercised*.
+  3. `03-event-loop-and-async-io.md` — the single loop, and how blocking is avoided.
+  4. `04-shared-state-races-and-synchronization.md` — session-keyed state, ALS, and the monotonic-clock spacing gate.
+  5. `05-memory-stack-heap-gc-and-lifetimes.md` — allocation, cache lifetime, and the module-load-time reads.
+  6. `06-filesystem-streams-and-resource-lifecycle.md` — file reads (dev only), Web Streams, and the NDJSON kernel.
+  7. `07-backpressure-bounded-work-and-cancellation.md` — every ceiling, every retry cap, and how the eval harness bounds concurrency.
+  8. `08-runtime-systems-red-flags-audit.md` — ranked risks with evidence.
 
-- `study-system-design` — WHERE components live (the bands as architecture, not as runtime). The DataSource seam, the OAuth boundary, the streaming contract.
-- `study-testing` — HOW runtime behavior is verified deterministically. The fake-transport pattern that lets agent loops test without a real event loop or real MCP server.
+## Not yet exercised
+
+Named honestly so no one goes hunting.
+
+  → **Worker threads (`worker_threads`)** — not used. The heaviest CPU work in the request path (JSON parse of large tool results, cost math) fits well under the tick budget.
+  → **Child processes (`child_process`)** — not used. The Olist prototype is documented in prose; there is no `spawn` / `exec` in production code.
+  → **OS threads, cluster** — Vercel manages process lifecycle. No app-level `cluster.fork`.
+  → **Locks, mutexes, atomics** — single-threaded event loop, no shared memory. The closest thing is the `lastCallAt` monotonic-clock check; that guards a spacing hint, not a correctness invariant.
+  → **`node:stream` (Readable / Writable / Transform)** — routes use Web Streams (`ReadableStream<Uint8Array>`), not Node's stream module. The two are different APIs even though the name overlaps.
+  → **Queues, brokers (Kafka / Redis Streams / SQS)** — no background job system. Work executes inside the request that started it, bounded by `maxDuration`.
+  → **`SIGTERM` / graceful shutdown handlers** — the platform kills the function. There is nothing to flush.
+  → **Connection pools** — the MCP client is per-request; there is no long-lived pool. The Anthropic SDK owns its own HTTP agent under the hood.
+  → **Manual GC tuning (`--max-old-space-size`, `global.gc`)** — none. Vercel's Node runtime defaults are the runtime memory story.
+
+## Cross-links to adjacent guides
+
+  → `study-networking` — HTTP semantics, retry ladders, the ~1 req/s rate-limit dance, and TLS live there. The retry-ladder timing bounds this guide reads about are for *runtime* budgeting; the semantics of the retries themselves are networking.
+  → `study-system-design` — the DataSource seam (`lib/data-source/types.ts`), the three-band architecture, and the Vercel + serverless deployment shape.
+  → `study-testing` — how runtime behavior is verified deterministically (Vitest with injected fakes; the fault-injecting DataSource at `lib/data-source/fault-injecting.ts`).
+  → `study-debugging-observability` — the per-request `console.log(JSON.stringify({phases…}))` summary in the `finally` block of each route.

@@ -1,606 +1,365 @@
-# Progressive skeleton with stepper
+# progressive skeleton with stepper
 
-**Subtitle:** progressive loading + skeleton screens + indeterminate progress (industry-standard perceived-performance pattern), composed as a four-tier reveal across the page. Local terms: the skeleton (`Skeleton`), the process stepper (`ProcessStepper`), the coverage grid (`CoverageGrid`), the status log (`StatusLog`), the fade-in keyframe (`bi-fade-up`).
+**Progressive disclosure / streaming-render composition** — Industry standard (as a pattern; the four-tier composition is project-specific).
 
 ## Zoom out, then zoom in
 
-**Zoom out — where this concept lives.** Monitoring takes 30-60 seconds. The user is staring at the screen the whole time. Without this pattern they'd be staring at a spinner; with it, they're watching the agent work — the stepper says where in the pipeline we are, the coverage tiles check in one category at a time, the trace fills in line by line, and when an insight finally lands it fades in instead of popping.
+You've built a form with a spinner. Loading state → spinner. Success state → form. Error state → red text. This is the same idea multiplied by four surfaces stacked on the same page, driven by the same NDJSON event stream.
 
 ```
-  Zoom out — where the four reveal surfaces live on one page
+  Zoom out — where the progressive composition lives
 
-  ┌─ UI / app/page.tsx ────────────────────────────────────────────────┐
-  │                                                                    │
-  │  ┌──────────────────────────────────────────────────────────────┐  │
-  │  │ ★ ProcessStepper ★      ① monitoring  ② diagnostic  ③ rec    │  │ ← tier 1
-  │  │   "scanning your workspace…" (active step pulses)            │  │
-  │  └──────────────────────────────────────────────────────────────┘  │
-  │                                                                    │
-  │  ┌─ col 1 (2/3) ─────────────────────────────┐ ┌─ col 2 (1/3) ──┐  │
-  │  │ ★ CoverageGrid ★                          │ │ ★ StatusLog ★  │  │
-  │  │   10 tiles · checking <n>/10…             │ │  bi-progress   │  │ ← tiers 2 + 3
-  │  │   [tile][tile][checking…]                 │ │  bi-dots       │  │
-  │  │                                           │ │                │  │
-  │  │ ★ Skeleton × 4 ★                          │ │  ReasoningTrace│  │ ← tier 4
-  │  │   ▒▒▒▒▒▒▒▒▒▒  ← animate-pulse             │ │   line·line·   │  │
-  │  │   ▒▒▒▒▒▒▒▒▒▒                              │ │   tool·result  │  │
-  │  │                                           │ │                │  │
-  │  │ insights ↓ bi-fade-up on each arrival     │ │                │  │
-  │  └───────────────────────────────────────────┘ └────────────────┘  │
-  └────────────────────────────────────────────────────────────────────┘
+  ┌─ Browser (app/page.tsx) ─────────────────────────────────┐
+  │  ┌─ tier 1: ProcessStepper ────────────────────────────┐ │
+  │  │  monitoring [1] → diagnostic [2] → recommendation [3]│ │
+  │  │  pending · active · complete · error                │ │
+  │  └─────────────────────────────────────────────────────┘ │
+  │  ┌─ tier 2: CoverageGrid (10 category tiles) ──────────┐ │
+  │  │  pending → clear · limited · anomaly                │ │
+  │  └─────────────────────────────────────────────────────┘ │
+  │  ┌─ tier 3: Skeleton × 4 (card placeholders) ─────────┐  │
+  │  │  gray boxes → real InsightCard as each lands       │  │
+  │  └────────────────────────────────────────────────────┘  │
+  │  ┌─ tier 4: StatusLog / ReasoningTrace (sidebar) ─────┐  │
+  │  │  connecting → reasoning + tool calls stream in     │  │
+  │  └────────────────────────────────────────────────────┘  │
+  └────────────────────────┬─────────────────────────────────┘
+                           │  all four tiers driven by
+                           │  ★ ONE useBriefingStream call ★
+                           ▼
+                    NDJSON stream from /api/briefing
 ```
 
-**Zoom in — narrow to the concept.** You know how a `fetch()` UI usually looks: button → spinner → results, with nothing in between? This is the same loading state stretched across four surfaces that each tell a different story while the same network request runs. The pattern is **progressive composition** — instead of one boolean `isLoading` controlling one spinner, you have one `status` driving four different visual treatments, each pulled forward in time as soon as it has anything to show.
+**Zoom in — the concept.** A monitoring agent takes 20-40 seconds to check the workspace. The naive UI is a spinner for 30 seconds and then a page of insight cards. That's not the product — the product is *watching* the agent work. So the UI opens four tiers of feedback that fill in progressively, each carrying a different level of "what's happening": the stepper says which phase, the coverage grid says which categories have been checked, the skeleton says how many cards to expect, the status log says the exact query. All four tiers read from the *same* event stream.
 
-The question this concept answers: **how do you make a 30-60-second agent run feel like the system is working the whole time, not just at the start and end?**
+## The structure pass
 
-## Structure pass
-
-Layers, axis, seams.
-
-### Layers
+Layers — four tiers of feedback, all reading the same stream:
 
 ```
-  outer — the page (app/page.tsx)
-          owns layout, conditional reveals, the data → UI map
+  One stream, four tiers, one axis (specificity)
 
-      middle — the four reveal surfaces
-               ProcessStepper, CoverageGrid, Skeleton ×4, StatusLog
-               (each is its own component, each has its own "I'm loading" shape)
-
-          inner — the per-element entrance animation
-                  bi-fade-up keyframe + animate-pulse Tailwind utility
-                  (the css that makes the reveal feel intentional)
+  ┌─ tier 1 — ProcessStepper ──────────────────────────┐
+  │  which PHASE   (monitoring / diagnostic / decision) │  most abstract
+  │  state ∈ pending · active · complete · error        │
+  └──────────────────────────┬──────────────────────────┘
+                             │  derived from FeedStatus
+  ┌─ tier 2 — CoverageGrid ──▼──────────────────────────┐
+  │  which CATEGORY was checked, with what result       │  ↓
+  │  10 tiles: pending → clear / limited / anomaly      │  more specific
+  └──────────────────────────┬──────────────────────────┘
+                             │  driven by 'coverage_item' events
+  ┌─ tier 3 — Skeleton ──────▼──────────────────────────┐
+  │  how MANY cards to expect, in the layout            │  ↓
+  │  4 gray boxes → replaced by InsightCards as they    │
+  │  land in the 'done' collected array                 │
+  └──────────────────────────┬──────────────────────────┘
+                             │  driven by 'insight' + 'done'
+  ┌─ tier 4 — StatusLog / ReasoningTrace ──────────────┐
+  │  the exact QUERY the agent just ran                 │  most specific
+  │  driven by every 'reasoning_step' and 'tool_call_*' │
+  └─────────────────────────────────────────────────────┘
 ```
 
-### Axis — perceived time
+**Axis: specificity.** Trace it top to bottom.
+- Tier 1 (stepper) — "we're checking things." One of three states, one phase.
+- Tier 2 (coverage grid) — "we checked cart-abandonment, and it's clear." One of 10 categories, one of 4 outcomes.
+- Tier 3 (skeleton → cards) — "here are the specific anomalies we found." Actual card content.
+- Tier 4 (status log) — "we're running `execute_analytics_eql` with this filter." Verbatim agent thought / tool call.
 
-We trace ONE question down the layers: **what does the user see at t = 200ms, t = 2s, t = 15s, t = 30s?**
+The axis flips at every tier. If a user glances at the page, they get the phase. If they focus, they get the category. If they read, they get the anomaly. If they dive in, they get the query itself. **Same stream, four altitudes.**
 
-```
-  Tracing "what does the user see at time t" down the layers
-
-  t = 200ms          t = 2s              t = 15s              t = 30s
-  ────────           ─────               ──────               ──────
-  outer:
-    stepper          ✓     ✓ active        ✓ active (pulsing) ✓ "5 found"
-    grid             skeleton tiles      6/10 checked         all 10 in
-    col-1 skel       ▒▒▒▒▒▒              ▒▒▒▒▒▒              cards fading in
-    sidebar log      "connecting…"       2 tool calls         11 tool calls
-
-  middle:
-    Skeleton         animate-pulse       animate-pulse        unmount on loaded
-    CoverageGrid     all tiles pending   tiles streaming in   all tiles present
-    StatusLog        bi-dots loader      ReasoningTrace rows  scrolling trace
-    ProcessStepper   active + pulse      active + pulse       complete (✓ ø)
-
-  inner:
-    bi-fade-up       —                   per-row entrance     per-card entrance
-    bi-progress      indeterminate bar   indeterminate bar    unmount
-    bi-dots          three pulsing dots  three pulsing dots   unmount
-```
-
-The pattern's value is in the contrast across columns. At every column the user has something specific to look at.
-
-### Seams
-
-```
-  Two seams worth studying
-
-  parent owns status  ═══════════════════ child owns reveal
-        │                                       │
-        │                                       ▼
-        │           seam 1: prop-driven loading
-        │           (every reveal surface takes a `loading` /
-        │            `scanning` / `status` boolean — the parent
-        │            decides; the child decides how to render it)
-        │
-        ▼
-  not-yet-arrived item  ════════════════ arrived item
-        │                                       │
-        │                                       ▼
-            seam 2: per-item bi-fade-up
-            (a 400ms CSS animation marks the
-             transition between absence and
-             presence; with prefers-reduced-motion
-             it collapses to a 0ms substitution)
-```
-
-Seam 1 is the data flow: `useBriefingStream` reports `status`, the page passes `loading={status === 'loading'}` (or `scanning={!complete}`) to each of the four surfaces, and each one renders its own skeleton variant. Seam 2 is the entrance animation: when `coverage_item` lands in state, the new tile renders with `.bi-fade-up`, which the CSS turns into a `translateY(8px) → translateY(0)` + opacity ramp.
-
-Hand off to How it works.
+Seams: two matter. Seam A is `useBriefingStream` → the four tiers (all four read the same hook's return shape). Seam B is between tiers 3 and 4 — the skeleton and status log render in parallel via `grid-cols-1 lg:grid-cols-3` at `page.tsx:270`; column 1 is tier 3, column 2 is tier 4. Neither blocks the other.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know how a list of cards usually appears: data arrives → `setState` → all cards render at once. This pattern slows that final step down on purpose, by stacking *four* different loading affordances and revealing them in time order:
+You've built a `<Suspense fallback={<Spinner />}>` before. Same shape, four times: each tier declares its own "loading" (skeleton), "empty" (nothing to show), "loaded" (real content), and (where relevant) "error" states. The skeleton shape matches the real content shape — same height, same rough layout — so when the real content lands there's no layout shift.
 
 ```
-  The pattern — four tiers staged across the load
+  The pattern — each tier is a state machine reading the same events
 
-  t = 0  ────►  ProcessStepper       "active" — pulse on the badge
-                  └─ "scanning your workspace…" sub-line
-                CoverageGrid         skeleton tiles  ▒▒▒▒  ▒▒▒▒
-                                     "checking 0/10…"
-                Skeleton × 4         ▒▒▒▒▒▒▒▒▒▒  (animate-pulse)
-                StatusLog            "connecting…" + bi-dots loader
-                                     + bi-progress indeterminate bar
+  event stream:  workspace → coverage_item × N → tool_call_start
+                          → reasoning_step → tool_call_end → insight
+                          → ... → done
 
-  t = 2s ────►  ProcessStepper       (still active)
-                CoverageGrid         tile 1 fades in (real)
-                                     "checking 1/10…"
-                Skeleton × 4         (unchanged)
-                StatusLog            row 1: "tool_call_start: list_..."
-                                     bi-fade-up entrance
+  tier 1 (stepper):     [monitoring: active] → [monitoring: complete]
+  tier 2 (coverage):    []                    → [tile ✓]              → [tile ✓ tile ✓]  → ...
+  tier 3 (cards):       [skeleton x 4]        → [skeleton x 4]        → [skeleton x 4]   → [card x N]
+  tier 4 (status log):  [connecting…]         → [tool_call_start...]  → [thought...]     → ...
 
-  t = 15s ───►  CoverageGrid         9/10 tiles in, 1 still skeleton
-                Skeleton × 4         (unchanged — insights not yet committed)
-                StatusLog            8 rows of trace, bi-progress running
-
-  t = 30s ───►  ProcessStepper       "complete" — ✓ "5 changes found"
-                CoverageGrid         all 10 tiles, some firing
-                Skeleton × 4         unmount
-                InsightCard × 5      fade in one at a time
-                StatusLog            bi-progress unmounts, trace done
+                        │◄──────────────── all reading the same stream ────────────────►│
 ```
 
-That's the staged reveal. Each tier has its own "still loading" shape — they don't all collapse to one spinner.
+The load-bearing bit is that the tiers **update at different rates**. The stepper flips once (loading → complete). The coverage grid ticks up 10 times. The status log streams every event (dozens). The card list fills in at the end. Each tier decides its own granularity. Miss that and you either (a) update the stepper on every event (over-communication) or (b) update the status log only on completion (loses the point).
 
-### Move 2 — step by step
+### Move 2 — the walkthrough
 
-Four moving parts. One sub-heading each. Then the composition at the page level.
+#### Sub-move A — the ProcessStepper (tier 1)
 
-#### Part 1 — the process stepper (`ProcessStepper`)
-
-The narrative surface. Three stages identically named on every route — `monitoring anomalies → investigating the issue → decision & recommendation` — so the user always knows where they are in the pipeline. Each step has a state (`pending | active | complete | error`) and a sub-line (the live status text). The active step's badge pulses.
+Three step slots, each with a `state ∈ pending | active | complete | error` and an optional `sub` line. State comes from the parent — the feed page derives `monitoringState(status)` from `FeedStatus`, the investigate pages derive their own from the diagnosis/recommendation state.
 
 ```
-  ProcessStepper — three slots, one shared visual contract
+  The stepper — one input per step, deterministic render
 
-  ┌──────────────┬──────────────────┬──────────────────────┐
-  │ ① pulsing    │ ② pending        │ ③ pending             │
-  │ monitoring   │ investigating    │ decision & rec        │
-  │ "scanning…"  │ "opens when…"    │ "opens when…"         │
-  └──────────────┴──────────────────┴──────────────────────┘
-
-  same component on:
-    app/page.tsx                            (monitoring = active)
-    app/investigate/[id]/page.tsx           (monitoring = ✓, diagnostic = active)
-    app/investigate/[id]/recommend/page.tsx (① ✓, ② ✓, ③ = active)
+  ┌─ input for step ─────────────────────────────────────┐
+  │  { state: 'pending' | 'active' | 'complete' | 'error'│
+  │    sub?: string           (status line)              │
+  │    href?: string          (turns step into a Link)   │
+  │  }                                                   │
+  └───────────────────────┬──────────────────────────────┘
+                          │  × 3 (monitoring, diagnostic, recommendation)
+                          ▼
+  ┌─ render ─────────────────────────────────────────────┐
+  │  [1][2][3]  labels + sub lines                       │
+  │  ‗ active step: badge pulses (animate-pulse)         │
+  │  ‗ complete: green ✓ badge                           │
+  │  ‗ pending: outlined circle                          │
+  │  ‗ error: red '!' badge                              │
+  └──────────────────────────────────────────────────────┘
 ```
 
-Real code, annotated:
+The subtle design choice — the **active step never shows ✓**. When the user is *on* the diagnose page, `diagState = 'active'` (`investigate/[id]/page.tsx:46`), even after the diagnosis lands. Only when they leave the page for step 3 does step 2 flip to `complete`. This is documented in the project context ("the **current** step stays `active` (never ✓) while the user is on it").
 
-```ts
-// components/shared/ProcessStepper.tsx:25-29 — the labels are fixed
-const STEPS = [
-  { key: 'monitoring',     label: 'monitoring anomalies' },
-  { key: 'diagnostic',     label: 'investigating the issue' },
-  { key: 'recommendation', label: 'decision & recommendation' },
-] as const;
-
-// components/shared/ProcessStepper.tsx:108-112 — the active badge pulses
-<span
-  aria-hidden
-  className={state === 'active' ? 'animate-pulse' : undefined}
-  style={badgeStyle(state)}
->
-  {state === 'complete' ? '✓' : state === 'error' ? '!' : i + 1}
-</span>
-```
-
-The page maps its `status` to the stepper state through a pure function (`app/page.tsx:20-24`):
-
-```ts
-function monitoringState(status: FeedStatus): StepState {
-  if (status === 'loading') return 'active';
-  if (status === 'error') return 'error';
-  return 'complete'; // loaded | empty
-}
-```
-
-And derives a sub-line that's specifically not a generic "loading…" — it surfaces the real query the monitoring agent is running (`app/page.tsx:26-40`):
-
-```ts
-function monitoringSub(status, statusText, queryCount, insightCount): string {
-  if (status === 'loading') {
-    const q = statusText.trim();
-    if (q) return queryCount > 0 ? `query ${queryCount} · ${q}` : q;
-    return 'scanning your workspace…';
-  }
-  if (status === 'empty') return 'no notable changes';
-  if (status === 'error') return 'scan failed';
-  return `${insightCount} change${insightCount === 1 ? '' : 's'} found`;
-}
-```
-
-What breaks if you remove it: the user loses the *where am I* signal. They see things happening on the page but don't know whether the system has moved on to a new stage or is stuck on the first one.
-
-#### Part 2 — the coverage grid (`CoverageGrid`)
-
-The progressive surface. Ten categories, each with three possible states (`pending` while waiting on its NDJSON event, `live` with real data, `planned` when the workspace doesn't emit the required events). The grid renders all ten tile slots immediately; each slot starts as a pulsing skeleton and is replaced atomically when the corresponding `coverage_item` event arrives.
-
-```
-  CoverageGrid — three tile variants, same grid slot
-
-  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
-  │ ⚙ checking…      │  │ ⚠ anomaly         │  │ ⓘ no data source │
-  │ ▒▒▒▒▒▒▒▒▒        │  │ revenue_drop      │  │ inventory         │
-  │ animate-pulse    │  │ usa: -38.4%       │  │ planned · needs   │
-  │ opacity: 0.5     │  │ severity-coral    │  │   stock event     │
-  └──────────────────┘  └──────────────────┘  └──────────────────┘
-   pending tile          live (firing) tile    planned (ghost) tile
-```
-
-Real code at `components/feed/CoverageGrid.tsx:124-153` for the pending tile:
+Code (`components/shared/ProcessStepper.tsx:83-92`):
 
 ```tsx
-if (!report && loading) {
-  return (
-    <div key={cat.id} className="animate-pulse" style={{ ...pendingStyle }}>
-      <Icon size={13} color="var(--text-tertiary)" />
-      <span style={{ ...microMono, color: 'var(--text-tertiary)' }}>checking…</span>
-      <div style={{ ...labelMono, color: 'var(--text-tertiary)' }}>{cat.label}</div>
-      <Skeleton height={9} width="80%" />
-    </div>
-  );
-}
+const labelColor =
+  state === 'pending'
+    ? 'var(--text-tertiary)'                    // faded
+    : state === 'error'
+      ? 'var(--accent-coral)'                   // red
+      : 'var(--text-primary)';                  // white — active AND complete both bright
 ```
 
-The grid header gets its own progressive counter — "10 categories · 3 monitored · 1 firing · checking 4/10…" — that ticks up as tiles arrive (`CoverageGrid.tsx:74, 97-101`):
+The badge gets `background: var(--accent-teal)` for both `complete` and `active` states (line 59-60) — the difference is the *content* (`✓` vs `i + 1`) and the `animate-pulse` class on `active` (line 109). Consistent visual language: green means "you're in it or past it," gray means "not yet."
+
+**Where it breaks if you strip it:** without the stepper, the user has no idea whether the app is *starting*, *middle of a phase*, or *between phases*. The reasoning log alone doesn't answer "how far along am I?" because reasoning steps look identical whether it's step 5 of 30 or step 25 of 30.
+
+#### Sub-move B — the CoverageGrid (tier 2)
+
+Ten anomaly-category tiles, one per `CategoryId` in `lib/agents/categories.ts`. Each tile has three visual states:
+
+```
+  Coverage tile lifecycle — one tile
+
+  ┌─ pending ─────────┐  server hasn't reported this category yet
+  │  gray icon        │  animate-pulse, opacity 0.5
+  │  "checking…"      │  Skeleton bar at bottom
+  │  category label   │
+  └──────────┬────────┘
+             │  coverage_item event lands for this category
+             ▼
+  ┌─ resolved ────────┐  server reported: coverage ∈ full | limited | unavailable
+  │  colored icon     │
+  │  status label     │  clear · limited · anomaly · no data source
+  │  finding text     │  agent's one-line finding for this category
+  └───────────────────┘
+```
+
+The load-bearing move is the **accumulator pattern in the event handler** (`useBriefingStream.ts:209-214`):
+
+```tsx
+case 'coverage_item':
+  setCoverage((prev) =>
+    prev.some((c) => c.category === evt.item.category)
+      ? prev
+      : [...prev, evt.item],
+  );
+  break;
+```
+
+Each `coverage_item` event pushes ONE tile's report into the accumulator. `CoverageGrid.tsx:117-153` renders one tile per `CATEGORIES[i]`, looking up its status from the coverage map — if the category isn't in the map yet AND `loading === true`, the tile renders as pending. This means the grid fills in progressively, tile by tile, as the monitoring agent reports each category.
+
+The counts at the top (`CoverageGrid.tsx:70-73`) update on every re-render:
 
 ```tsx
 const checked = coverage.length;
 const monitored = coverage.filter((c) => c.coverage !== 'unavailable').length;
 const firing = CATEGORIES.filter((c) => insightByCat.has(c.id)).length;
-const settling = loading && checked < CATEGORIES.length;
-// ...
-{settling && (
-  <span className="animate-pulse" style={{ color: 'var(--text-tertiary)' }}>
-    {' '}· checking {checked}/10…
-  </span>
-)}
+const skipped = coverage.filter((c) => c.coverage === 'unavailable');
 ```
 
-This is the load-bearing UX claim of the whole pattern: the grid *can* render its skeleton because the gate emits `coverage_item` events incrementally, and the grid *does* render the real tile the instant the event lands. The component bridges the streaming back-end to a progressive front-end without buffering.
+Not memoized — cheap enough at N=10 that recomputing per render is fine. If N grew to 100+ this would warrant `useMemo`; see `audit.md → frontend-red-flags-audit` red flag #2.
 
-What breaks if you remove the pending tiles: the grid pops into existence at t=30s, after the stepper has been "scanning…" for half a minute with nothing else to look at. The two surfaces stop telling the same story.
+**Where it breaks if you strip it:** without the coverage grid, the user sees "5 anomalies" but has no idea whether the agent checked 5 categories or 50. The grid is the **completeness signal** — "we looked at these 10 things, and here's what came back." Without it, the pitch drops from "your workspace, in bloom" to "here are five things we noticed."
 
-#### Part 3 — the skeleton placeholder (`Skeleton`)
+#### Sub-move C — the Skeleton and the card fill (tier 3)
 
-The local surface. Four skeleton cards stand in for the insights that will eventually arrive (`app/page.tsx:278-285`):
+Four gray rectangles while loading (`page.tsx:278-285`), replaced by the real `InsightCard`s at once when the `done` event lands (`useBriefingStream.ts:266-273`):
 
 ```tsx
-{status === 'loading' && !reconnectPolicy.reconnecting && (
-  <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-    <Skeleton height={96} />
-    <Skeleton height={96} />
-    <Skeleton height={96} />
-    <Skeleton height={96} />
-  </div>
-)}
+// during 'loading':
+<Skeleton height={96} />
+<Skeleton height={96} />
+<Skeleton height={96} />
+<Skeleton height={96} />
+
+// on 'done':
+case 'done':
+  setInsights(collected);           // ← the accumulated insights land here
+  stashInsights(collected);         // ← + sessionStorage stash for the investigation page
+  callbacksRef.current?.onStreamComplete?.();
+  setStatus(collected.length === 0 ? 'empty' : 'loaded');
+  break;
 ```
 
-The `Skeleton` component is 18 lines (`components/shared/Skeleton.tsx`):
+Note the choice: individual `case 'insight'` events push to a **local `collected: Insight[]`** at `useBriefingStream.ts:202,264` — they do NOT go to state as they arrive. Only on `done` does the whole array land in `setInsights(collected)` at once.
+
+This is a deliberate pacing choice. Cards popping in one-at-a-time competes for attention with the tier-4 status log, which IS updating in real time. Batching card display at `done` gives the eye ONE thing to look at (the log) during the run, then delivers the payoff (the cards) once. Compare the alternative:
+
+```
+  Comparison — card streaming vs batch-on-done
+
+  ┌─ streaming (alt) ──────┐   ┌─ batch on 'done' (this) ─┐
+  │ card 1 pops in         │   │ [skeleton × 4] holds     │
+  │ card 2 pops in         │   │ [skeleton × 4] holds     │
+  │ card 3 pops in         │   │ [skeleton × 4] holds     │
+  │ log is scrolling       │   │ log is scrolling         │
+  │ eye jumps back & forth │   │ eye stays on log         │
+  │ card 4 pops in         │   │ done → cards land at once│
+  └────────────────────────┘   │ eye moves to cards       │
+                                └──────────────────────────┘
+   two things competing         one thing at a time
+   for the same eye             then handoff
+```
+
+The `Skeleton` component itself is 18 LOC — a `div` with `background: 'var(--bg-elevated)'` and a `bi-fade-up` animation. Trivial. What earns its keep is that the four skeletons **match the eventual card height** (`height={96}`) — so when the cards land there's no layout shift. That's the value: not the gray box, but the shape.
+
+**Where it breaks if you strip it:** without the skeletons, the "loading" state is either an empty column (user thinks it's broken) or a plain spinner (no sense of scale). With four `Skeleton height={96}` boxes the user sees "there's going to be roughly this many things, roughly this size" before any content arrives.
+
+#### Sub-move D — the StatusLog + ReasoningTrace (tier 4)
+
+The sticky sidebar. Reads `traceItems: TraceItem[]` from the same hook, streams every reasoning step and tool call as it arrives. Lives in a right-column `aside` at `page.tsx:386-452` (and again wrapped in the `StatusLog` component at `investigate/[id]/page.tsx:214`).
+
+The `TraceItem` shape at `ReasoningTrace.tsx:6-24` is a discriminated union:
+
+```ts
+type TraceItem =
+  | { kind: 'step';  id; agent; stepKind; content; ts? }
+  | { kind: 'tool';  id; toolName; status; durationMs?; result?; error?; ts? };
+```
+
+The dispatch in `useBriefingStream.ts:218-262` is the interesting part. `tool_call_start` pushes a new `{ kind: 'tool', status: 'running' }`; `tool_call_end` finds the last matching tool by name and status, and mutates it in place:
 
 ```tsx
-export default function Skeleton({ height = 80, width = '100%' }: SkeletonProps) {
-  return (
-    <div
-      className="animate-pulse"
-      style={{
-        background: 'var(--bg-surface)',
-        borderRadius: 4,
-        height,
-        width,
-      }}
-    />
-  );
-}
+case 'tool_call_end':
+  setTraceItems((prev) => {
+    const next = [...prev];
+    for (let i = next.length - 1; i >= 0; i--) {
+      const it = next[i];
+      if (it.kind === 'tool' && it.toolName === evt.toolName && it.status === 'running') {
+        next[i] = { ...it, status: 'done', durationMs: evt.durationMs, result: evt.result, error: evt.error };
+        break;
+      }
+    }
+    return next;
+  });
+  break;
 ```
 
-Tailwind's `animate-pulse` is the shimmer. The `bg-surface` token keeps the skeleton in palette. The 96px height is sized to roughly match the eventual `InsightCard` so the layout doesn't jump when the cards arrive.
+The `for (let i = next.length - 1; i >= 0; i--)` — reverse scan — is a subtle correctness fix. Two concurrent tool calls with the same name (the monitoring agent runs multiple `execute_analytics_eql`s in parallel) would produce two `tool_call_start` events before either `tool_call_end`. Reverse-scanning matches the most recent running one, so the completion of tool A closes tool A's row (the older entry) and tool B's completion closes tool B's row (the newer entry). Forward-scan would close A twice.
 
-What breaks if you remove it: layout shift. The column-1 region is empty until t=30s, then suddenly shoves the page down by ~500px when five cards land. The skeleton *reserves the space* and *previews the shape*.
+Cross-linking: this is identical to the pattern used in `useInvestigation.ts:87-96` (the `replaceRunningTool` helper). Same reverse-scan, same reasoning. When the same pattern shows up in two places without being extracted, that's a signal — either it's still finding its shape, or it's stable and worth pulling out. Here it's stable enough; the extraction is a `refactor` candidate, not a `study` finding.
 
-#### Part 4 — the status log (`StatusLog`)
-
-The provenance surface. The agent's live reasoning trace + tool calls, with two distinct loading affordances: the `bi-progress` indeterminate bar in the header (`components/shared/StatusLog.tsx:64-66`) and the `bi-dots` three-dot loader next to the empty-state text (`StatusLog.tsx:73-80`).
-
-```ts
-// components/shared/StatusLog.tsx — the header and the empty state
-<div className="lowercase" style={{ ...headerStyle }}>
-  {title}
-  {countLabel ? ` · ${countLabel}` : ''}
-  {scanning ? ' · running…' : ''}
-  {scanning && <div className="bi-progress" style={{ marginTop: 8 }} aria-hidden />}
-</div>
-<div style={{ padding: '10px 16px 16px' }}>
-  {items.length > 0 ? (
-    <ReasoningTrace items={items} />     // real trace
-  ) : (
-    <p className="lowercase" style={{ ...muted }}>
-      {emptyMessage}
-      {scanning && (
-        <span className="bi-dots" aria-hidden>
-          <span>·</span><span>·</span><span>·</span>
-        </span>
-      )}
-    </p>
-  )}
-</div>
-```
-
-The CSS keyframes (`app/globals.css:44-76`) own the look:
-
-```css
-@keyframes bi-indeterminate {
-  0%   { left: -40%; width: 40%; }
-  50%  { left: 25%;  width: 50%; }
-  100% { left: 100%; width: 40%; }
-}
-.bi-progress::after {
-  content: '';
-  position: absolute;
-  height: 100%;
-  background: var(--accent-teal);
-  animation: bi-indeterminate 1.2s ease-in-out infinite;
-}
-
-@keyframes bi-dot { 0%, 80%, 100% { opacity: 0.25; } 40% { opacity: 1; } }
-.bi-dots > span { animation: bi-dot 1.2s ease-in-out infinite; }
-.bi-dots > span:nth-child(2) { animation-delay: 0.2s; }
-.bi-dots > span:nth-child(3) { animation-delay: 0.4s; }
-```
-
-What breaks if you remove the sidebar: the user has no idea *what* the agent is doing. Without it the page reads as "loading… loading… (30 seconds) … done." With it, the page reads as "the agent ran `list_cloud_organizations`, then `list_projects`, then `execute_analytics_eql` for purchase events …" — which is the entire product pitch.
-
-#### The composition — page-level orchestration
-
-The four surfaces don't talk to each other. They each take props from the page and render their own piece. The page (`app/page.tsx:213-453`) does the wiring:
-
-```ts
-// app/page.tsx:213-220 — stepper driven by status
-<ProcessStepper
-  monitoring={{
-    state: monitoringState(status),
-    sub: monitoringSub(status, stepStatus, queryCount, insights.length),
-  }}
-  diagnostic={{ state: 'pending', sub: 'opens when you investigate' }}
-  recommendation={{ state: 'pending', sub: 'opens when you investigate' }}
-/>
-
-// app/page.tsx:276 — grid driven by coverage + status
-<CoverageGrid
-  coverage={coverage}
-  insights={insights}
-  loading={status === 'loading' && !reconnectPolicy.reconnecting}
-/>
-
-// app/page.tsx:278-285 — skeletons driven by status alone
-{status === 'loading' && !reconnectPolicy.reconnecting && (
-  <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-    <Skeleton height={96} /><Skeleton height={96} />
-    <Skeleton height={96} /><Skeleton height={96} />
-  </div>
-)}
-
-// app/page.tsx:348-354 — insights replace skeletons on 'loaded'
-{status === 'loaded' && (
-  <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
-    {insights.map((insight) => <InsightCard key={insight.id} insight={insight} />)}
-  </div>
-)}
-```
-
-`status` is one of `'loading' | 'error' | 'empty' | 'loaded'`. Each surface conditionally renders against it (or against the streaming substate it owns). There's no central "reveal coordinator" — the prop fan-out from the hook to the four surfaces IS the coordinator.
-
-#### The per-item entrance — `bi-fade-up`
-
-Every appended item gets the `bi-fade-up` class. New `InsightCard` (`InsightCard.tsx:179`), every `CoverageGrid` tile container (`CoverageGrid.tsx:77`), every row in `ReasoningTrace` (`ReasoningTrace.tsx:66, 94`), every `EvidencePanel` body (`EvidencePanel.tsx:107`). The CSS (`globals.css:37-42`):
-
-```css
-@keyframes bi-fade-up {
-  from { opacity: 0; transform: translateY(8px); }
-  to   { opacity: 1; transform: translateY(0); }
-}
-.bi-fade-up { animation: bi-fade-up 0.4s ease both; }
-@media (prefers-reduced-motion: reduce) { .bi-fade-up { animation: none; } }
-```
-
-A 400ms entrance — short enough not to feel like waiting, long enough to register as intentional. And it's gated on `prefers-reduced-motion` so a vestibular-sensitive user gets the data without the motion.
-
-#### The flow — layers-and-hops
-
-What the user sees at the end of the stream, traced from the wire down to the pixel.
-
-```
-  Layers-and-hops — one coverage_item event lights one tile
-
-  ┌─ Network ──────────┐    hop 1: {"type":"coverage_item",        ┌─ Client / kernel ─┐
-  │  HTTP chunk        │ ────────────"item":{"category":           │ readNdjson        │
-  │                    │              "revenue_drop",…}}\n         │  → JSON.parse     │
-  └────────────────────┘                                            └─────────┬─────────┘
-                                                                              │ hop 2: onEvent(evt)
-                                                                              ▼
-                                                                    ┌─ Client / hook ────┐
-                                                                    │ useBriefingStream  │
-                                                                    │ case 'coverage_item│
-                                                                    │ setCoverage(p =>   │
-                                                                    │   [...p, evt.item])│
-                                                                    └─────────┬──────────┘
-                                                                              │ hop 3: re-render
-                                                                              ▼
-                                                                    ┌─ Client / React ───┐
-                                                                    │ <CoverageGrid      │
-                                                                    │   coverage={...}/> │
-                                                                    └─────────┬──────────┘
-                                                                              │ hop 4: byCat.get(cat.id)
-                                                                              │        finds the new tile
-                                                                              ▼
-                                                                    ┌─ Client / DOM ─────┐
-                                                                    │ skeleton div       │
-                                                                    │ replaced by        │
-                                                                    │ real tile div      │
-                                                                    │ .bi-fade-up runs   │
-                                                                    └────────────────────┘
-```
-
-Hop 4 is the moment of the reveal: the conditional in `CoverageGrid.tsx:124` (`if (!report && loading)`) flips from `true` to `false`, the skeleton unmounts, and the real tile mounts with the entrance animation.
+**Where it breaks if you strip it:** this IS the pitch. Everything else is packaging. Without the reasoning trace, blooming insights becomes "an anomaly detector" — a category that already exists and has commodity vendors. WITH the trace, it's "an analyst that shows its work" — which is the differentiator. The trace visible to the user is the point.
 
 ### Move 3 — the principle
 
-**One status, four reveal surfaces, each told to stay specific.** The principle generalizes past this app: when work takes longer than a spinner can defend (anything past ~2 seconds), don't show one loading state — show as many as the work has stages. The trick isn't sophistication, it's *non-genericness*. The stepper says "monitoring is the active stage." The coverage grid says "category 3 of 10 just came back." The skeleton says "the cards will land here, in this shape." The status log says "the agent just ran `execute_analytics_eql` for purchase events." Four sentences worth of information, each owned by its own surface.
+**Progressive disclosure is a *composition*, not a single component.** Four tiers reading the same event stream, each rendering at its own granularity — coarse → fine, from phase to query. The value isn't in any tier individually (a stepper alone is a decoration; a status log alone is chaos). It's in the *composition* — every tier answers "what's happening?" at a different altitude, so the user's eye can land wherever their attention is right now.
 
-The cross-cutting version: **make the loading state as informative as the loaded state.** A spinner is a loading state with one bit of information ("something is happening"). A progressive composition is a loading state with as many bits as the back-end is willing to stream. The CSS — `animate-pulse`, `bi-fade-up`, `bi-progress`, `bi-dots` — is the polish; the streaming substrate is the substance.
+The broader principle: streaming UIs need multiple **rate-adapted feedback tiers** off the same event source. Fast events (log lines) belong at the finest tier; slow state transitions (phase changes) belong at the coarsest. Trying to jam everything into one tier — either a single spinner or a single log — fails predictably: too abstract to inform, or too specific to skim.
 
-## Primary diagram
+## Primary diagram — recap
 
-The four-tier reveal, end to end.
+All four tiers, the shared stream, and where each derives its state.
 
 ```
-  Progressive skeleton with stepper — the full reveal
+  The full composition — one hook, four tiers, one stream
 
-  TIME →  t=0                  t=2s                  t=15s                t=30s
-  ─────────────────────────────────────────────────────────────────────────────────
-
-  STATUS  status='loading'     status='loading'      status='loading'     status='loaded'
-          coverage=[]          coverage=[item1]      coverage=[6 items]   coverage=[10 items]
-          insights=[]          insights=[]           insights=[]          insights=[5]
-          traceItems=[]        traceItems=[2]        traceItems=[8]       traceItems=[11]
-
-  TIER 1  ┌──ProcessStepper──┐ ┌──ProcessStepper──┐  ┌──ProcessStepper──┐ ┌──ProcessStepper──┐
-          │ ① active (pulse) │ │ ① active (pulse) │  │ ① active (pulse) │ │ ① ✓ "5 found"     │
-          │ "scanning…"      │ │ "query 1 · purch.│  │ "query 6 · sess.│ │ ② pending          │
-          │ ② pending        │ │ ② pending        │  │ ② pending        │ │ ③ pending          │
-          └──────────────────┘ └──────────────────┘  └──────────────────┘ └──────────────────┘
-
-  TIER 2  ┌──CoverageGrid────┐ ┌──CoverageGrid────┐  ┌──CoverageGrid────┐ ┌──CoverageGrid────┐
-          │ checking 0/10…   │ │ checking 1/10…   │  │ checking 6/10…   │ │ 3 monitored ·    │
-          │ [▒][▒][▒][▒][▒]  │ │ [✓][▒][▒][▒][▒]  │  │ [✓✓✓✓✓✓][▒][▒]  │ │  1 firing · 6   │
-          │ animate-pulse    │ │ tile fade-up     │  │ tiles fade-up    │ │  no data source │
-          └──────────────────┘ └──────────────────┘  └──────────────────┘ └──────────────────┘
-
-  TIER 3  ┌──Skeleton ×4─────┐ ┌──Skeleton ×4─────┐  ┌──Skeleton ×4─────┐ ┌──InsightCard ×5──┐
-          │ ▒▒▒▒▒▒▒▒▒▒▒▒    │ │ ▒▒▒▒▒▒▒▒▒▒▒▒    │  │ ▒▒▒▒▒▒▒▒▒▒▒▒    │ │ each fades in    │
-          │ ▒▒▒▒▒▒▒▒▒▒▒▒    │ │ ▒▒▒▒▒▒▒▒▒▒▒▒    │  │ ▒▒▒▒▒▒▒▒▒▒▒▒    │ │ via bi-fade-up    │
-          │ ▒▒▒▒▒▒▒▒▒▒▒▒    │ │ ▒▒▒▒▒▒▒▒▒▒▒▒    │  │ ▒▒▒▒▒▒▒▒▒▒▒▒    │ │                  │
-          └──────────────────┘ └──────────────────┘  └──────────────────┘ └──────────────────┘
-
-  TIER 4  ┌──StatusLog───────┐ ┌──StatusLog───────┐  ┌──StatusLog───────┐ ┌──StatusLog───────┐
-          │ "connecting…"·   │ │ tool: list_organ.│  │ 11 rows trace    │ │ trace complete   │
-          │   bi-dots        │ │ tool: execute_an.│  │ bi-progress bar  │ │ bi-progress      │
-          │ bi-progress bar  │ │ bi-progress bar  │  │ scrolling        │ │ unmount          │
-          └──────────────────┘ └──────────────────┘  └──────────────────┘ └──────────────────┘
-
-  the four tiers move at different rates, but together they tell one story:
-  "the system is working, here's exactly what it's doing right now"
+  ┌─ /api/briefing NDJSON stream ─────────────────────────────────┐
+  │  workspace → coverage_item × 10 → tool_call_start →           │
+  │  reasoning_step → tool_call_end → insight × N → done          │
+  └─────────────────────────────┬─────────────────────────────────┘
+                                │  readNdjson (see 01-*)
+                                ▼
+  ┌─ useBriefingStream (return shape) ────────────────────────────┐
+  │  status | insights | workspace | coverage | traceItems |      │
+  │  errorMessage | stepStatus | queryCount | demoSuffix          │
+  └──┬──────────────┬──────────────┬──────────────┬──────────────┘
+     │              │              │              │
+     ▼              ▼              ▼              ▼
+  ┌────────┐   ┌────────┐   ┌─────────────┐   ┌──────────────┐
+  │ TIER 1 │   │ TIER 2 │   │  TIER 3     │   │  TIER 4      │
+  │ Stepper│   │ Grid   │   │  Skeleton × │   │  StatusLog + │
+  │        │   │        │   │  4  → cards │   │  ReasoningTr.│
+  ├────────┤   ├────────┤   ├─────────────┤   ├──────────────┤
+  │ reads: │   │ reads: │   │ reads:      │   │ reads:       │
+  │ status │   │ coverage│   │ status,     │   │ traceItems   │
+  │        │   │ insights│   │ insights    │   │              │
+  ├────────┤   ├────────┤   ├─────────────┤   ├──────────────┤
+  │ updates│   │ updates│   │ updates on  │   │ updates on   │
+  │ 1×     │   │ 10×    │   │ 'done' only │   │ every event  │
+  └────────┘   └────────┘   └─────────────┘   └──────────────┘
+   phase        category      anomaly           query
 ```
 
 ## Elaborate
 
-**Where this pattern comes from.** Skeleton screens were popularized by Facebook around 2013 and have since become standard in any app with a noticeable load time (LinkedIn, YouTube, Slack, GitHub). The classic skeleton-screen pattern is one boolean `isLoading` controlling one set of skeletons. The progressive variant — staging multiple loading affordances at different granularities — is the natural extension when the back-end is streaming-shaped rather than request-shaped.
+**Where the pattern comes from.**
 
-The blooming insights variant earns its keep because the monitoring agent's runtime is *long* (30-60s) and *staged* (10 categories checked in sequence, each producing 0-N tool calls, each emitting events as it goes). A single skeleton would have hidden all of that; the four-tier composition exposes it.
+Progressive disclosure has been a UX term since Nielsen (early 90s) — start with the coarse summary, let the user drill deeper. What this repo does is the *streaming* variant: not "hide details until asked" but "reveal details as they become known." Related patterns:
 
-**Adjacent patterns.**
-- *Stale-while-revalidate* — render the previous data while the new data loads. Not used here; the briefing always starts from empty state when the mode toggles.
-- *Optimistic UI* — render the assumed result before the network confirms it. Not used here; the app is read-only.
-- *Streaming SSR with `<Suspense>`* — the React 19 / Next 16 way to stream a server-rendered tree progressively. Not used here; everything is client-side, and the streaming substrate is the NDJSON kernel (see `01-ndjson-stream-reader-hook.md`), not RSC.
-- *Layout shift prevention* — the broader category the `Skeleton`-sized-to-the-real-card move belongs to. CLS (cumulative layout shift) measurement belongs to `study-performance-engineering`.
+- **Skeleton screens** — Facebook popularized these (~2013) as a replacement for spinners. Same idea used here in tier 3.
+- **Streaming SSR** (Next.js, Remix) — server-side counterpart. The server ships HTML in chunks; the browser renders as it arrives. This repo does NOT do streaming SSR (all pages are `'use client'`); it does client-side streaming from an NDJSON API.
+- **Suspense with `<Await>`** (Remix) / `<Suspense>` (React) — a compiler-supported form of the tier composition. Each `<Suspense>` boundary is a tier. This repo could refactor to use `<Suspense>` if the fetches moved to route loaders; today the `useEffect + useState` pattern does the same job without the framework buy-in.
 
-**What this pattern doesn't yet solve.**
-- *Accessibility for the stream* — the status log has no `aria-live` region (`audit.md` → frontend-red-flags-audit ranks this #1). A blind user sees nothing. The pattern as shipped is sighted-user-only.
-- *Reduced motion as a first-class state* — the `bi-fade-up`/`bi-progress`/`bi-dots` keyframes all check `prefers-reduced-motion: reduce`, which is correct. But the *information* in the progressive reveal is still preserved with motion off (the same status text + counter still updates). Worth naming because the pattern doesn't degrade — it gracefully simplifies.
-- *Error states across the four tiers* — when monitoring fails, the stepper turns to `error` state but the coverage grid stays in its last partial state. There's no "the load broke; here's what we got before it broke" recovery affordance.
+**Adjacent concepts.**
 
-**See also.** The data side of this pattern (where the events come from, how they're parsed) lives in `01-ndjson-stream-reader-hook.md`. The same `bi-fade-up` keyframe runs on every appended `ReasoningTrace` row inside the `StatusLog`, which is the pattern's smallest unit.
+- **Optimistic UI** — same "show something now, correct later" philosophy applied to writes. This repo doesn't do writes, so it's not exercised. If the QueryBox were re-enabled (`page.tsx:16` — `SHOW_QUERY_BOX = false`) and free-form queries persisted, this would apply.
+- **Virtualization** — when the trace grows past ~100 items the sidebar becomes long. This repo doesn't virtualize (`ReasoningTrace.tsx:64-105` maps over all items). At current lengths it's fine; at 500+ it becomes a `react-virtuoso` / `react-window` candidate.
+- **State machines** — each tier is implicitly a state machine (`FeedStatus = 'loading' | 'error' | 'empty' | 'loaded'`, `StepState = 'pending' | 'active' | 'complete' | 'error'`). None are formalized with XState or similar — the string unions do the job.
+
+**What would change if this were RSC.**
+
+React Server Components with streaming HTML would push each tier to the server. Instead of `useState` accumulating events, the server would render each tier's DOM as data arrived and stream the HTML. Advantages: no client JS for the render, initial HTML has content. Disadvantages here: the four consumers reading the same event stream would each need their own suspense boundary; the "click a card, go to investigate" hydration would still need the client stash (`bi:insight:<id>`). Net: for a live-agent pitch, the client stream + client render is genuinely simpler. The migration is not on the roadmap.
 
 ## Interview defense
 
-**Q: Why four loading states instead of one spinner?**
+**Q: You have a 30-second server operation. What does the UI do?**
 
-A — *the diagram you sketch:*
-
-```
-  One spinner vs. four progressive reveals
-
-  one spinner                            four progressive reveals
-  ───────────                            ───────────────────────
-  "is the page loading?"                 stepper:    where in the pipeline?
-  one bit of information                 grid:       which categories checked?
-                                         skeletons:  what shape will land?
-                                         status log: what's the agent doing now?
-  works for ≤ 2s                         works for 30-60s
-  works for one-shot fetch               works for streaming
-  user → "is it broken?" at 5s           user → "I can see it working"
-```
-
-The work takes 30-60 seconds. A spinner past two seconds reads as broken. Four reveals each tell a different specific story — together they cover the gap.
-
-*Anchor:* the four-tier composition lives in `app/page.tsx:213-453`; the streaming substrate that makes it possible is in `01-ndjson-stream-reader-hook.md`.
-
----
-
-**Q: What's the load-bearing part — the one people forget?**
-
-A — *the diagram:*
+Diagram:
 
 ```
-  The load-bearing part: progressive surfaces require progressive events
-
-  ┌─ Wire format ──────────────────────────────────────────────────┐
-  │  one big "result" event at the end    →  one big reveal at end │
-  │  one event per category               →  tiles stream in       │
-  │  one event per tool call              →  trace fills line by   │
-  │                                          line                  │
-  └────────────────────────────────────────────────────────────────┘
-
-  The pattern depends on the back-end emitting:
-    - coverage_item per category (not one final 'coverage')
-    - reasoning_step + tool_call_start + tool_call_end per tool
-    - insight per anomaly (not one final 'insights')
-
-  Without that, all four surfaces collapse to "loading… (30s) … done."
+  ┌─ Stepper: monitoring [active] ─┐  ← flips once
+  ├─ Grid: 10 tiles filling in ────┤  ← ticks 10 times
+  ├─ 4 skeletons →  4 cards       ─┤  ← flips once (at done)
+  └─ Log: streams every event ────┘  ← ticks 20-40 times
+                                      updates at different rates
+                                      off ONE event stream
 ```
 
-The load-bearing part isn't the CSS or the skeletons — it's that the producer streams an event per category, an event per tool call, an event per insight. The visual progressive reveal IS a wire-format choice. If the route emitted one final result, the UI would be a spinner regardless of how many `Skeleton` components you stacked.
+Answer: four tiers of feedback off the same event stream. Coarse-to-fine — phase (stepper), category (grid), anomaly (cards), query (log). Each tier updates at its own rate. The stepper flips once. The grid ticks 10 times. The log streams every event. The cards batch on `done` to avoid competing with the log for the user's attention. All four read from `useBriefingStream`, which owns the fetch, the NDJSON parse, and the event dispatcher.
 
-*Anchor:* `lib/hooks/useBriefingStream.ts:36-45` for the 9-case event union; the dispatcher at `:204-286` is where streaming events become progressive state.
+The load-bearing part people forget: **cards batch on `done`, not per-event.** The individual `insight` events push to a local `collected` array (not to state); only `done` calls `setInsights(collected)`. This is deliberate — cards popping in one at a time distracts from the log that IS updating in real time. Batching the payoff at the end gives the eye ONE thing to watch during the run. Anchor: `useBriefingStream.ts:202,264-273`.
 
----
+**Q: How do you avoid layout shift when the skeletons swap to real content?**
 
-**Q: Where does this pattern break, and what would you do next?**
+The `Skeleton` component takes an explicit `height` prop (`page.tsx:280-283` — `<Skeleton height={96} />`). 96 pixels matches the eventual `InsightCard` compact height. When the cards land, the container stays the same height — no CLS. Same trick on the coverage tiles: `minHeight: 96` on both the pending tile (`CoverageGrid.tsx:135`) and the resolved tile (`CoverageGrid.tsx:168, 231`).
 
-A — *the diagram:*
+**Q: The four tiers all re-render on every event. Isn't that wasteful?**
 
-```
-  Three break points, ranked
+Yes, and it's documented in the audit as red flag #2. Today the payload is small enough (10 coverage items + ~30 trace items) that the eye doesn't see jank — the `bi-fade-up` animation on each new item masks it. When the trace hits ~200 items the map-over-all-items on every event becomes measurable, and `React.memo` on `TraceItem` rows keyed by `id` becomes the fix. Actual measurement belongs in `study-performance-engineering`. Not a bug today; a documented deferrable.
 
-  ① no aria-live on the trace            blind user sees nothing
-                                          fix: role="log" aria-live="polite"
-                                               on the trace container
+**Q: Why not `<Suspense>`?**
 
-  ② error mid-stream                     stepper goes red, grid frozen at partial
-                                          fix: an "incomplete coverage" affordance
-                                               on the grid that names what's missing
-
-  ③ no virtualization on long traces      ReasoningTrace re-renders all items per
-                                          appended event
-                                          fix: React.memo on row + windowed render
-                                               at the threshold (~100 items)
-```
-
-The accessibility one is the most user-visible. The error one is the next most likely to surface in real usage (the alpha Bloomreach server revokes tokens after minutes). The virtualization one is a future-tense concern at today's trace lengths.
-
-*Anchor:* the audit's `frontend-red-flags-audit` ranks these same three at the top of the list.
+Suspense pairs with a route loader or an RSC-side data fetch — both require moving the fetch out of `useEffect` into a framework-owned data layer. The four fetches this repo does (briefing / agent × 3) all live in `useEffect` because they're driven by user state (`bi:mode`, insight ID, StrictMode-safe start guards). Refactoring to route loaders would work but doesn't buy anything the current shape doesn't have — each tier is already its own state machine, already renders its own loading / empty / loaded / error branches. Suspense is the answer when you have deeply nested async boundaries; here there are four parallel siblings, not a nested tree.
 
 ## See also
 
-- `01-ndjson-stream-reader-hook.md` — the streaming substrate that makes the progressive reveal possible. Without per-category events, the four-tier composition collapses to one spinner.
-- `audit.md` → `styling-and-design-system` — the design-token + keyframe inventory the pattern reaches for (`bi-fade-up`, `bi-progress`, `bi-dots`, `animate-pulse`).
-- `audit.md` → `component-architecture` — `StatusLog` extracted from `app/page.tsx`; the page's inline copy still duplicates the sidebar shape.
-- `audit.md` → `frontend-red-flags-audit` — the `aria-live` gap, the duplication, the per-row memoization risk.
-- Neighbor: `study-performance-engineering` — CLS (cumulative layout shift) measurement; the skeleton-sized-to-the-real-card move would be the first thing it'd vindicate.
-- Neighbor: `study-runtime-systems` — the React scheduler's behavior when one `setState` lands per arriving line under StrictMode. This file owns the visual composition; the runtime owns the render scheduling.
+- `01-ndjson-stream-reader-hook.md` — the *source* of the events these four tiers consume; how bytes become the `AgentEvent` / `BriefingEvent` values dispatched to each tier's state.
+- `audit.md` — the state-architecture lens for the six state seams, the component-architecture lens for the sizes and boundaries, and the frontend-red-flags lens for the missing `aria-live` (which lives on tier 4).
+- `study-performance-engineering` — measurement of the re-render cost, FCP/LCP for the initial skeleton paint, and where memoization would pay off.
+- `study-runtime-systems` — how the async NDJSON reader and the four `useState` cascades interact with React's scheduler.
+- `study-software-design` — the reasoning for centralizing `readNdjson` and NOT centralizing the `TraceItem` reverse-scan mutation (two callers, still stable, not yet worth extracting).

@@ -1,233 +1,333 @@
-# Anatomy of a production prompt
+# 01 · Anatomy of a production prompt
 
-**Industry standard** · prompt sections, decomposition
+**Prompt sections / structured system prompt — Industry standard**
 
-## Zoom out — where prompt anatomy lives
+## Zoom out, then zoom in
 
-Every LLM call in this codebase is built out of four sections that flow into the SDK's `messages.create()` call: the system prompt, context that's interpolated into it at call-time, optional few-shot examples baked into the template, and the user message. The whole anatomy lives in the prompt layer; nothing below it sees the prompt as anything but text.
-
-```
-  Zoom out — the prompt-assembly seam
-
-  ┌─ UI ──────────────────────────────────────────────────────┐
-  │  QueryBox · clicked InsightCard · ProcessStepper button   │
-  └───────────────────────────┬───────────────────────────────┘
-                              │  triggers a route call
-  ┌─ Route layer ────────────▼────────────────────────────────┐
-  │  app/api/{briefing,agent}/route.ts                         │
-  │    knows: which agent · which schema · which anomaly       │
-  └───────────────────────────┬───────────────────────────────┘
-                              │
-  ┌─ ★ PROMPT ASSEMBLY ★ ───▼────────────────────────────────┐ ← we are here
-  │  read the .md template → interpolate {slots} →             │
-  │  build { system, messages: [{ role: 'user', content }] }   │
-  └───────────────────────────┬───────────────────────────────┘
-                              │  Anthropic.messages.create()
-  ┌─ Model ──────────────────▼────────────────────────────────┐
-  │  claude-sonnet-4-6 / claude-haiku-4-5                      │
-  └────────────────────────────────────────────────────────────┘
-```
-
-## Zoom in
-
-A production prompt is not one string. It's four sections, each with a different job and a different lifecycle. When teams write a single string and call it "the prompt," they end up with a system message that mixes constant rules with per-call data — and then they can't reason about why one call drifted differently from another. The decomposition rule is: one job per section, named explicitly.
-
-## Structure pass
-
-**Layers.** The prompt-assembly path has three nested altitudes: the static `.md` template on disk, the interpolated string built per call, and the message array the SDK consumes. Each layer adds one thing.
-
-**Axis traced — lifecycle.** Hold one question constant: *when does this content come into existence?*
+Every LLM call in this codebase ends up as one HTTP request to Anthropic, and the payload is a `system` string plus a `messages` array. That's it. All the discipline you're about to learn is discipline about what goes into those two fields — because the model doesn't care about your intent, only your bytes.
 
 ```
-  One axis — when does each section materialize?
+  Zoom out — where the anatomy sits in the stack
 
-  ┌─ template on disk (build-time / commit-time) ────────────┐
-  │   monitoring.md · diagnostic.md · query.md ·              │
-  │   recommendation.md                                       │
-  │   → reviewed in PRs, versioned in git                     │
-  └─────────────────────────────────────────────────────────┬─┘
-                                                            │
-  ┌─ per-call interpolation (request-time, in route) ───────▼┐
-  │   {schema}      ← rebuilt per session from MCP            │
-  │   {project_id}  ← from the resolved org                   │
-  │   {categories}  ← from runtime capability check           │
-  │   {anomaly} | {diagnosis} | {intent} ← upstream output    │
-  └─────────────────────────────────────────────────────────┬─┘
-                                                            │
-  ┌─ message array (SDK call, single request) ──────────────▼┐
-  │   { system: interpolated_template,                        │
-  │     messages: [{ role: 'user', content: userPrompt }] }   │
-  └───────────────────────────────────────────────────────────┘
-```
-
-**Seams.** Two boundaries carry contracts. The first is template-on-disk → interpolated string: the slot names are the contract — `{schema}`, `{project_id}`, `{categories}`, `{anomaly}`, `{diagnosis}`, `{intent}`. Rename a slot in the `.md` without updating the `.replace()` call and the prompt silently ships with `{categories}` literal in the system message. The second is interpolated string → SDK message array: the convention here is "constant rules + interpolated context → `system`, the per-call ask → first user message." Move something across that boundary by accident and the model treats it differently (the SDK caches the system prefix; cache invalidates when the user message changes).
-
-## How it works
-
-### Move 1 — the four sections, as one picture
-
-Think of a prompt the way you'd think of a React component's props split: there's `propTypes` (the contract — constant, reviewed), `props` (the per-render data), `children` (slot-style content from outside), and what the parent passes (the user's actual request). LLM prompts have the same four roles, named differently.
-
-```
-  The four sections — one prompt, four jobs
-
-  ┌─────────────────────────────────────────────────────────┐
-  │  SYSTEM PROMPT (constant per agent)                      │
-  │    "You are the monitoring agent... your role is..."     │
-  │    rules, output schema, error patterns to avoid         │
-  │    ← committed in the .md file                           │
-  ├─────────────────────────────────────────────────────────┤
-  │  CONTEXT INJECTION (per call, but still in `system`)     │
-  │    {schema}      — workspace catalog (1× per session)    │
-  │    {project_id}  — resolved org id                       │
-  │    {categories}  — runtime-gated checklist                │
-  │    {anomaly} | {diagnosis} ← upstream agent output       │
-  ├─────────────────────────────────────────────────────────┤
-  │  FEW-SHOT EXAMPLES (constant, in the .md template)       │
-  │    the worked Anomaly JSON in monitoring.md:73-85         │
-  │    the conclusion → evidence shape in diagnostic.md       │
-  ├─────────────────────────────────────────────────────────┤
-  │  USER MESSAGE (the actual ask, per call)                 │
-  │    "Work through your category checklist..."             │
-  │    "Investigate this anomaly: ..."                       │
+  ┌─ Route layer (Next.js) ─────────────────────────────────┐
+  │  /api/agent — NDJSON stream                             │
+  └────────────────────────┬────────────────────────────────┘
+                           │
+  ┌─ Agent layer (blooming wrappers) ───▼───────────────────┐
+  │  DiagnosticAgent · MonitoringAgent · RecommendationAgent │
+  └────────────────────────┬────────────────────────────────┘
+                           │
+  ┌─ AptKit reusable agent (@aptkit/core) ▼─────────────────┐
+  │  DiagnosticInvestigationAgent.investigate()             │
+  │      renderPromptTemplate(system, {schema, anomaly})    │
+  └────────────────────────┬────────────────────────────────┘
+                           │
+  ┌─ Provider adapter ─────▼────────────────────────────────┐
+  │  AnthropicModelProviderAdapter.complete()                │
+  │      → ★ this is where the prompt anatomy is assembled ★│ ← we are here
+  │      params.system = [{type:'text', text, cache_control}]│
+  │      params.messages = messages                          │
+  └────────────────────────┬────────────────────────────────┘
+                           │  HTTPS
+  ┌─ Provider ─────────────▼────────────────────────────────┐
+  │  Anthropic API (Sonnet 4.6)                             │
   └─────────────────────────────────────────────────────────┘
 ```
 
-### Move 2 — walk one example end to end
+**Zoom in.** A production prompt has four sections, and mixing them is how prompts drift. Role (who the model is), rules/schema (what it must do), context (variable data for this call), and task (the user's immediate ask). Junior mode dumps all four into one system string with no boundaries. Senior mode names each section explicitly and knows which slot each byte lives in.
 
-The monitoring agent is the cleanest one to walk because all four sections show up.
+## Structure pass
 
-**System prompt (constant, committed).** The header of `lib/agents/legacy-prompts/monitoring.md` declares the agent's role, the hard rules, the period-over-period method, the common errors to avoid, and the output schema. None of this changes per call. It's reviewed in PRs and versioned in git.
+Before walking the mechanics, three foundations.
 
-```
-  monitoring.md header (lines 1-9, the constant part)
-  ┌────────────────────────────────────────────────────────┐
-  │ You are the monitoring agent in blooming insights...    │
-  │ ## Role                                                 │
-  │ You run a fixed checklist of ecommerce anomaly          │
-  │ categories... 90d vs prior 90d... emit an `Anomaly`...  │
-  └────────────────────────────────────────────────────────┘
-```
+### Axes — the dimension we're tracing
 
-**Context injection (per call, into `system`).** The `.replace()` calls in `lib/agents/monitoring-legacy.ts:95-98` interpolate three slots. `{schema}` becomes the output of `schemaSummary()` (token-bounded — see concept #4). `{project_id}` becomes the resolved org id. `{categories}` becomes the runnable-category checklist computed at request time from the workspace's capabilities.
+For anatomy, the axis is **cost per call**. Every section of a prompt has a different cost profile — some are stable across the whole session (system prompt, constant), some vary per call (context, per-anomaly), some vary per user turn (task, per-message). Trace this axis and the sections separate themselves.
 
-```
-  // lib/agents/monitoring-legacy.ts:95-98
-  const system = PROMPT
-    .replace('{schema}', schemaSummary(this.schema))    // ← schema slot
-    .replace(/\{project_id\}/g, this.schema.projectId)  // ← project slot (global re)
-    .replace('{categories}', checklist);                // ← capability-gated slot
-```
+### Seams — where the axis flips
 
-The `/\{project_id\}/g` regex is load-bearing: `{project_id}` appears in multiple places in the template (the hard-rules header and the worked example). A non-global replace would substitute the first occurrence and ship the literal `{project_id}` to the model on the second. That's the kind of small bug that ships and stays shipped until someone notices the model is asking for "the project id".
+There are three seams inside a single Anthropic API call:
 
-**Few-shot examples (constant, in the .md template).** Lines 73-85 of `monitoring.md` carry a worked `Anomaly` object inside a ```json fence — a single example that pins both the output shape and the tone of the `impact` field. The few-shot file (concept #8) covers why this kind of example constrains output more than instructions do.
+- **system vs messages** — the boundary between "stable across the loop" (system) and "changes every turn" (messages).
+- **stable system prefix vs variable context** — inside the system string, the front is static and cacheable; the back has the anomaly / diagnosis injected fresh each call.
+- **model-visible vs adapter-visible** — the model sees the flat string; the adapter code wraps it in a cache-control block. That wrap is a load-bearing seam Anthropic reads and the model doesn't.
 
-**User message (per call).** The route assembles a short user message that says what to do *right now*, given the system already says what to do *in general*. For monitoring, that's:
+### Layered decomposition
+
+Same question — "what varies here?" — asked at three altitudes:
 
 ```
-  // lib/agents/monitoring-legacy.ts:105-107
-  userPrompt:
-    'Work through your category checklist (each as 90d vs prior 90d) and ' +
-    'return the anomaly JSON array — stamp each flagged anomaly with its `category`.',
+  "What varies here?" — held constant down the layers
+
+  ┌───────────────────────────────────────────┐
+  │ outer: session (a whole investigation)     │  role, rules, schema
+  │   → CONSTANT                               │  don't vary
+  └───────────────────────────────────────────┘
+      ┌─────────────────────────────────────┐
+      │ middle: one API call inside the loop │  system prefix stable
+      │   → PARTIAL                          │  context slot varies
+      └─────────────────────────────────────┘
+          ┌─────────────────────────────────┐
+          │ inner: one user turn             │  task varies per turn
+          │   → VARIABLE                     │  everything else stable
+          └─────────────────────────────────┘
 ```
 
-This is short on purpose. The system prompt already describes the job; the user message says "do it now." Putting the same instructions in both places doesn't help — and putting per-call data in the user message that should have been in `system` (or vice versa) is how prompts drift.
+The lesson: the four sections aren't co-equal. They live at different altitudes of variance, and prompt caching (see `04-token-budgeting.md`) works by exploiting exactly this hierarchy.
 
-### Move 2 — the decomposition rule in code
+## How it works
 
-The mistake every team makes once: bundling everything into the user message because "that's where the user's question goes." Watch what happens when you do that — the model loses the prefix-cache hit on every call (every call has a different user message; nothing is stable to cache), the per-agent rules get duplicated across every flow, and changing a rule means editing every call-site.
+### Move 1 — the mental model
+
+You know how a `fetch()` has a URL, headers, body, and query params — four distinct slots, each with its own semantics, and mixing them (putting the body content in the URL) is how you get bugs? A prompt has four analogous slots, each with its own semantics.
 
 ```
-  WRONG — everything in user, system is empty
+  Prompt anatomy — the four slots
+
+  ┌───────── system string ─────────┐    ┌─── messages array ───┐
+  │                                 │    │                      │
+  │  ┌─ role ────────────────────┐  │    │  ┌─ user turn ─────┐ │
+  │  │ "you are a diagnostic     │  │    │  │ "Run the anomaly│ │
+  │  │  investigation agent"     │  │    │  │  checklist…"    │ │
+  │  └───────────────────────────┘  │    │  └─────────────────┘ │
+  │                                 │    │                      │
+  │  ┌─ rules / schema ──────────┐  │    │  ┌─ tool_result ───┐ │
+  │  │ "Make at most 6 tool      │  │    │  │ {…tool JSON…}   │ │
+  │  │  calls. Return ONLY JSON  │  │    │  └─────────────────┘ │
+  │  │  in a fenced block…"      │  │    │                      │
+  │  └───────────────────────────┘  │    │  ┌─ assistant ─────┐ │
+  │                                 │    │  │ "I'll query…"   │ │
+  │  ┌─ context (interpolated) ──┐  │    │  └─────────────────┘ │
+  │  │ {schema}     ← workspace  │  │    │                      │
+  │  │ {anomaly}    ← case       │  │    └──────────────────────┘
+  │  └───────────────────────────┘  │
+  └─────────────────────────────────┘
+
+    stable across the ReAct loop         changes every model turn
+```
+
+Role, rules, context on one side of the seam. Task and its evolving turn history on the other. That's the whole anatomy.
+
+### Move 2 — the step-by-step walkthrough
+
+**The role slot — who the model is.**
+
+The first paragraph of every prompt in this codebase names the agent's identity. From `@aptkit/prompts/dist/src/diagnostic.js:1`:
+
+```js
+export const DIAGNOSTIC_PROMPT = `You are a diagnostic investigation agent for an analytics workspace.
+
+Your job is to investigate why one specific anomaly occurred. You generate 2-3 competing hypotheses, query the available tools to test them, and return the best-supported explanation with evidence. You do not propose remediation.
+```
+
+Two lines and you know the agent's job and its guardrail (does not propose remediation — that's the recommendation agent's job). The negation ("You do not propose remediation") is doing real work: it stops the model from bleeding into the recommendation agent's territory. If you remove it, the diagnosis starts to include "and here's what to do next," and now the recommendation agent is either redundant or contradicted.
+
+```
+  Role slot — what breaks if it's missing
+
   ┌─────────────────────────────────────────┐
-  │ system: ""                              │
-  │ user: "You are the monitoring agent.    │
-  │        Here are the rules. Here is the  │
-  │        schema. Here is the checklist.   │
-  │        Now do the job."                 │
+  │  "You are a diagnostic ... agent."      │  identity
+  │  "You generate 2-3 hypotheses..."       │  method
+  │  "You do NOT propose remediation."      │  guardrail (negation)
   └─────────────────────────────────────────┘
-  → no prefix cache · rules spread · drift
-
-  RIGHT — constants in system, ask in user
-  ┌─────────────────────────────────────────┐
-  │ system: <committed .md> + <schema>      │
-  │         + <checklist>                   │
-  │ user: "Work through the checklist now." │
-  └─────────────────────────────────────────┘
-  → prefix cached · rules versioned · stable
+        │
+        │  strip it → the agent bleeds into
+        │  recommendation territory. Downstream
+        │  agent gets confused input.
+        ▼
 ```
 
-The decomposition rule from the spec: *one job per section, named explicitly*. The system has the constant rules. The interpolated context has the per-session data (schema, project, capability checklist). The few-shot has the worked example. The user message has the per-call ask. Don't mix.
+**The rules/schema slot — what the model must do.**
+
+Hard rules and the output contract. Same file, lines 6-45:
+
+```js
+Hard rules:
+- Make at most 6 tool calls, then conclude.
+- Use the tool catalog you receive at runtime; do not assume a tool exists.
+- Every evidence item must cite data you actually observed.
+...
+Return ONLY a JSON object in a \`\`\`json fenced block with this shape:
+{
+  "conclusion": "string",
+  "evidence": ["string"],
+  "hypothesesConsidered": [ { "hypothesis": "string", "supported": true, ...
+```
+
+Two things live here: **behavioral rules** (tool call budget, honesty about tools, evidence traceability) and the **output schema shape**. Blooming validates the parse afterwards (`lib/mcp/validate.ts:29`, `isDiagnosis`), but the model gets the shape in-prompt so its default emission matches what the parser accepts.
+
+**The context slot — variable data for this call.**
+
+Template placeholders like `{schema}` and `{anomaly}` get filled at runtime by `renderPromptTemplate`. In this codebase, `schemaSummary(schema)` (`lib/agents/monitoring.ts:19-60`) produces the string that goes into `{schema}` — token-budgeted to 20 events × 10 properties + 30 customer properties, because the raw schema is ~112KB and would blow the context window.
+
+```
+  Layers-and-hops — how the anatomy is assembled
+
+  ┌─ template file ──────────────┐
+  │  @aptkit/prompts/            │  hop 1: prompt string with {vars}
+  │  diagnostic.js DIAGNOSTIC_   │──────────────────────────────►
+  │  PROMPT                      │
+  └──────────────────────────────┘
+
+  ┌─ variables ──────────────────┐
+  │  schemaSummary(workspace)    │  hop 2: rendered variables
+  │  JSON.stringify(anomaly)     │──────────────────────────────►
+  └──────────────────────────────┘
+                                          ┌─ renderPromptTemplate ─┐
+                                          │  substring replacement │
+                                          │  {schema} → schemaText  │
+                                          │  {anomaly} → JSON      │
+                                          └───────────┬────────────┘
+                                                      │  hop 3: assembled system
+                                                      ▼
+  ┌─ AnthropicModelProviderAdapter ──────────────────────────────┐
+  │  aptkit-adapters.ts:85-89                                    │
+  │  params.system = [{type:'text', text, cache_control:...}]    │
+  │  params.messages = [...user + tool_result turns...]          │
+  └──────────────────────────────────────────────────────────────┘
+                          │  hop 4: HTTPS to Anthropic
+                          ▼
+  ┌─ Anthropic API ──────────────────────────────────────────────┐
+  │  reads system as one flat string; reads messages as turns    │
+  └──────────────────────────────────────────────────────────────┘
+```
+
+**The task slot — the user turn.**
+
+Sits in `messages`, not `system`. In this codebase it's static per agent, injected at loop start. From `@aptkit/core`'s `AnomalyMonitoringAgent.scan()`:
+
+```js
+userPrompt: 'Run the anomaly checklist using the available tools. Return only the anomaly JSON array in a json fence, or [] if no meaningful anomaly is found.',
+```
+
+One line. That's the whole task. Everything about *what* to run is in the system prompt's checklist (`{categories}` interpolation from `formatCategoryChecklist()`). The user turn just says "go."
+
+Why? Because the system prompt is cached (see `AnthropicModelProviderAdapter.complete()` at `lib/agents/aptkit-adapters.ts:85-89` — the `cache_control: { type: 'ephemeral' }` breakpoint). Bytes in the user turn are *not* cached, so keeping the user turn tiny keeps every ReAct-loop iteration cheap.
+
+### Move 2 variant — the load-bearing skeleton
+
+The kernel of a production prompt anatomy is four sections, in this order:
+
+```
+  role → rules/schema → context → task
+
+  (stable, session)    (stable, session)   (varies, per call)  (varies, per turn)
+```
+
+What breaks if you strip each:
+
+- **Strip role** — the model default-personifies as a generic assistant, ignores your specific method, and the output starts to feel like ChatGPT instead of a diagnostic analyst.
+- **Strip rules/schema** — output shape drifts. Sometimes JSON, sometimes prose. Your parser fails intermittently. This is the bug people file as "the LLM is unreliable" when it's actually "the prompt has no schema."
+- **Strip context** — the model tries to answer from priors ("what's typical for ecommerce"). It sounds plausible and is completely disconnected from your workspace.
+- **Strip task** — the model doesn't know when to stop. It rambles, asks clarifying questions, or invents a task.
+
+Hardening layered on top of the skeleton (not part of it): few-shot examples (see `08-few-shot.md`), forbidden-openings (see `13-forbidden-patterns.md`), CoT scaffolding (see `09-chain-of-thought.md`). All optional. The four sections are not.
 
 ### Move 3 — the principle
 
-Production prompts decompose along lifecycle boundaries: what's stable across all calls goes in the system template, what's per-session goes into interpolated slots, what shapes the output goes in few-shot examples, what asks for *this* result goes in the user message. The decomposition isn't aesthetic — it's how you keep the prompt reviewable, the prefix cacheable, and the drift contained to one section at a time.
+**Prompts are structured payloads, not blobs of text.** The reader sees prose; the model sees tokens; the seam between "stable" and "variable" is where cost, cacheability, and iteration all live. Treat every prompt as if it were a request body with named fields — because as far as your ability to iterate on it is concerned, it is.
 
 ## Primary diagram
 
 ```
-  Monitoring agent — full anatomy, one frame
+  A production prompt — everything at once
 
-  ┌─ TEMPLATE LAYER (committed in git) ────────────────────────────┐
-  │  lib/agents/legacy-prompts/monitoring.md                        │
-  │  ┌─ system prompt (constant) ──────────────────────────────┐   │
-  │  │ "You are the monitoring agent..."                        │   │
-  │  │ ## Role · ## Hard rules · ## Period-over-period method   │   │
-  │  └─────────────────────────────────────────────────────────┘   │
-  │  ┌─ few-shot (constant, in same .md) ───────────────────────┐  │
-  │  │   ```json                                                │  │
-  │  │   [{ "metric": "purchase_revenue", "category": ...}]     │  │
-  │  │   ```                                                    │  │
-  │  └─────────────────────────────────────────────────────────┘   │
-  │  ┌─ slots awaiting interpolation ──────────────────────────┐   │
-  │  │   {schema}  {project_id}  {categories}                  │   │
-  │  └─────────────────────────────────────────────────────────┘   │
-  └────────────────────────────────────────┬───────────────────────┘
-                                           │  .replace(...)
-  ┌─ INTERPOLATED STRING (per call) ───────▼───────────────────────┐
-  │  the full system string · static prefix cacheable               │
-  └────────────────────────────────────────┬───────────────────────┘
-                                           │
-  ┌─ MESSAGE ARRAY (SDK call) ─────────────▼───────────────────────┐
-  │  {                                                              │
-  │    system: <interpolated>,                                      │
-  │    messages: [                                                  │
-  │      { role: 'user', content: "Work through the checklist..." } │
-  │    ],                                                           │
-  │    tools: [...allowed by lib/mcp/tools.ts]                      │
-  │  }                                                              │
-  └────────────────────────────────────────────────────────────────┘
+  ┌───────────────── Anthropic API call ─────────────────┐
+  │                                                       │
+  │  params.system = [                                    │
+  │    { type: 'text',                                    │
+  │      text: renderPromptTemplate(                      │
+  │              DIAGNOSTIC_PROMPT,                       │
+  │              { schema, anomaly, project_id }          │
+  │            ),                                         │
+  │      cache_control: { type: 'ephemeral' } }           │
+  │  ]                                                    │
+  │      │                                                │
+  │      └─ contains, in order:                           │
+  │         ┌─ role ───────────────────────┐              │
+  │         │ "You are a diagnostic ...    │              │
+  │         │  You do NOT propose remed."  │              │
+  │         └──────────────────────────────┘              │
+  │         ┌─ rules ──────────────────────┐              │
+  │         │ "Make at most 6 tool calls…" │              │
+  │         │ "Return ONLY JSON in a fence"│              │
+  │         └──────────────────────────────┘              │
+  │         ┌─ schema (embedded example) ──┐              │
+  │         │ {"conclusion":"","evidence":…│              │
+  │         └──────────────────────────────┘              │
+  │         ┌─ context (interpolated) ─────┐              │
+  │         │ {schema} ← schemaSummary()   │  var         │
+  │         │ {anomaly} ← JSON.stringify() │  var         │
+  │         └──────────────────────────────┘              │
+  │                                                       │
+  │  params.messages = [                                  │
+  │    { role: 'user',                                    │
+  │      content: 'Run the anomaly checklist…' } ← task   │
+  │    ...tool_result and assistant turns as loop runs... │
+  │  ]                                                    │
+  └───────────────────────────────────────────────────────┘
+
+     system → stable prefix, cached          messages → varies per turn
 ```
 
 ## Elaborate
 
-The four-section decomposition is older than LLMs — it mirrors what good prompt engineering picked up from systems thinking. The system prompt is the *config*; the interpolated context is the *runtime data*; the few-shot examples are the *type signature*; the user message is the *function call*. Tools that try to dissolve this distinction ("just one big prompt!") consistently produce worse results because they make the lifecycle question unanswerable.
+The four-section shape is the working consensus across Anthropic and OpenAI documentation, though neither vendor names it exactly this way. Anthropic's prompt engineering guide splits into "role, task, examples, output format." OpenAI's cookbook uses "system, few-shot, user." Both are the same four sections with different names for the boundaries. The names don't matter — what matters is that you can point at each section in your own prompt and say "this is the role" without hunting.
 
-Anthropic's prompt engineering guide and the OpenAI cookbook both lead with this decomposition for a reason. When you read other people's prompts, look for the seam between *what's true for every call* and *what's true for this call only*. If you can't find the seam, the prompt is going to drift, and you won't know why.
+The tradeoff nobody names: **more structure = more brittle to iterate on**. If you add a fifth section for "priority overrides" or "conditional rules," you now have five things to keep in sync. Four is the sweet spot most production prompts settle at. If you find yourself wanting a fifth, ask whether it belongs in the rules section instead.
+
+A word on XML tags. Anthropic's guide recommends wrapping sections in XML-like tags (`<role>`, `<rules>`, `<context>`). This codebase does not use XML tags — the sections are separated by markdown headings (`## Role`, `## Hard rules`) because the reader is a human first, model second. Both work. Pick one and stay consistent. Mixing markdown headings and XML tags is where prompts get unreadable.
+
+Related concepts:
+- **Prompts as code** (`03-prompts-as-code.md`) — once the anatomy is stable, treating the prompt as a versioned artifact is the next discipline.
+- **Token budgeting** (`04-token-budgeting.md`) — the context slot is where token discipline earns its keep.
+- **Prompt injection defenses** (`12-prompt-injection-defense.md`) — the seam between "the system says" and "the user says" is what injection attacks target.
 
 ## Interview defense
 
-**Q: Why split into four sections — why not just one long user message?**
+**Q: Walk me through the sections of a production prompt. Why does the ordering matter?**
 
-A: Three reasons. **Prefix caching** — providers cache the static prefix of a prompt across calls. Put your stable rules in `system` and the per-call ask in `user`, and you pay the cache discount; put everything in `user` and every call is a cache miss. **Review velocity** — the constant part lives in a committed `.md` you can diff in a PR; the per-call interpolation is a small set of slot names you can grep for. Bundle them and you're diffing prose against runtime data. **Drift containment** — when something breaks, you can tell which section caused it: did the slot interpolation fail, did the user message change, did the few-shot drift? With one big string you can only say "the prompt is bad."
+Four sections: role, rules and schema, context, task. Role first because it primes the model's persona and constrains everything downstream. Rules and schema next because they set behavioral guardrails and the output shape — the model reads them before it reads any variable data. Context after, because it's the variable slot and its position matters for prefix caching — the stable stuff has to come *before* the variable stuff or you get zero cache hits. Task last, in the user message, because that's the "go" signal, and it's also where per-turn state (tool results, follow-up user turns) accumulates.
 
 ```
-  one anchor diagram I'd sketch while answering:
+  Interview whiteboard sketch
 
-  system  = constant rules + interpolated context (cacheable)
-  user    = "do it now"                            (per call)
-  schema  = how the answer should be shaped       (in template)
-  output  = JSON in a fence, validated downstream
+  system:  [ role ] → [ rules/schema ] → [ context vars ]
+                    ↑ stable prefix, cached
+                                        ↑ varies per call
+
+  messages: [ user "go" ] → [ tool_result ] → [ assistant ] → …
+                              ↑ evolves every ReAct turn
 ```
 
-**Q: What's the rename-a-slot bug — concrete example?**
+Anchor: `AnthropicModelProviderAdapter.complete()` at `lib/agents/aptkit-adapters.ts:59-121` — see the `cache_control` breakpoint on line 87.
 
-A: In `monitoring-legacy.ts` line 97, the `{project_id}` interpolation uses `/\{project_id\}/g` — a global regex. If someone "simplified" it to `.replace('{project_id}', id)` (no regex, no `/g` flag), only the first occurrence in the template would be replaced. The hard-rules header still gets the project id; the worked example a few sections later ships with literal `{project_id}` text. The model sees that and either pastes it into a tool call (which fails) or hallucinates an id. The validator catches the symptom (no anomalies returned, or every tool call fails) but not the cause. You'd debug for hours before grepping for `{project_id` in the captured prompt.
+**Q: What's the load-bearing part people forget?**
+
+Negations in the role slot. "You do NOT propose remediation" in the diagnostic prompt (`@aptkit/prompts/dist/src/diagnostic.js:4`). Positive instructions constrain what the model does; negations stop it from bleeding into a neighboring agent's territory. Every multi-agent system I've shipped has needed at least one negation per agent role, and every one where I forgot led to bleed-through.
+
+```
+  Negation as guardrail
+
+  agent A "you do X"        ┐
+                            │   without negations,
+  agent B "you do Y"        ┤   both agents start
+                            │   also doing Z
+  agent C "you do Z"        ┘
+
+  with "you do NOT do Y" in A's role:
+  A stays in its lane
+```
+
+**Q: Someone hands you a prompt as one giant blob. First thing you do?**
+
+Highlight the four sections. If I can't find the role in the first paragraph, that's finding #1. If the rules and the schema are interleaved with prose that's context, that's finding #2. If the task is embedded in the system string instead of the user message, that's the reason it's not cacheable. The refactor is almost mechanical: extract to four named blocks, run the eval set, keep the diff if scores hold.
+
+Anchor: `lib/agents/legacy-prompts/monitoring.md` is a good example of a well-structured version — the `## Role`, `## Hard rules`, `## Output` headings make each section addressable in code review.
 
 ## See also
 
-- [02-structured-outputs.md](./02-structured-outputs.md) — how the output schema declared in `## Output` becomes a typed value downstream
-- [03-prompts-as-code.md](./03-prompts-as-code.md) — the committed-in-git lifecycle of the system-prompt section
-- [04-token-budgeting.md](./04-token-budgeting.md) — why `{schema}` is the output of `schemaSummary()` and not the raw 112KB blob
-- [08-few-shot.md](./08-few-shot.md) — what the worked `Anomaly` example in lines 73-85 is doing
+- `02-structured-outputs.md` — the schema section in more depth.
+- `03-prompts-as-code.md` — versioning the anatomy.
+- `04-token-budgeting.md` — why the stable-before-variable ordering matters.
+- `12-prompt-injection-defense.md` — the section boundaries as security boundaries.

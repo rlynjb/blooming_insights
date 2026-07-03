@@ -1,203 +1,184 @@
-# Eval methods
+# 02 — Eval methods
 
-*Industry standard — exact match · fuzzy · rubric · LLM-as-judge · pairwise · human*
+**Type:** Industry standard. Also called: eval strategy, scoring methodology.
 
-## Zoom out — where this concept lives
+## Zoom out, then zoom in
 
-Once you have an eval set (`01-eval-set-types.md`), you need a scoring method. Six standard methods, ordered cheap-to-expensive. The retired Phase 3 suite leaned on **LLM-as-judge** because the agents emit prose (diagnoses, recommendations) that exact-match couldn't score. The next iteration will mix exact-match (for structured fields) + LLM-as-judge (for prose) + human spot-check (for calibration).
+The ladder from exact-match to human-eval. This repo uses rubric-based LLM-as-judge with 4 dimensions × 1-5 scale × 3 verdicts.
 
 ```
-  Zoom out — methods, cheap to expensive
+  Zoom out — the ladder (cheap → expensive → precise)
 
-  cheap, automated                          expensive, high-signal
-   ────────────────                          ──────────────────────
-   exact match  →  fuzzy match  →  rubric  →  LLM-as-judge  →  pairwise  →  human eval
-
-   What this codebase needs:
-    - exact match on structured fields (metric, scope, severity)
-    - LLM-as-judge on prose (conclusion, rationale)
-    - human spot-check to calibrate the judge (Phase 3 used 8/8 + 3/3)
+  exact match          → free, brittle
+  fuzzy match          → cheap, sloppy
+  rubric (LLM-judge)   → cheap-ish, structured  ← ★ THIS CODEBASE ★
+  pairwise (A/B)       → cheap, comparative
+  human eval           → gold standard, doesn't scale
 ```
 
-**Zoom in.** Cheap methods scale; expensive methods anchor. The Phase 3 suite's LLM-as-judge wasn't trusted blindly — it was calibrated against a small manual spot-check (8 of 8 + 3 of 3 agreed), then trusted at scale.
+Zoom in. Rubric-based LLM-as-judge is the sweet spot for LLM output scoring at this scale — structured (4 dims), scalable (LLM does the work), and measurable enough that regression detection works (baseline.json + gate.eval.ts). The two rubrics live in `eval/rubrics/`.
 
-## Structure pass — layers · axes · seams
+## Structure pass
 
-**Layers:** agent output → scoring method → score → aggregated result.
+Axis: cost per judgment vs signal per judgment.
+- Exact match: near-free per, near-zero signal on generated text
+- Rubric-LLM-judge: ~$0.04 per judgment, structured signal across dims
+- Human: hours per judgment, high signal
 
-**Axis: cost vs signal.** Exact match: cheap, low signal (only works for byte-identical outputs). Human eval: expensive, highest signal. LLM-as-judge: in between, requires calibration.
-
-**Seam:** the choice of method per *field*. Same eval set can use exact-match for `metric`, rubric for `conclusion`, LLM-as-judge for `rationale`. One eval, multiple methods.
+**Seam:** the rubric definition. Above: the judgment call. Below: whatever mechanism scores it (LLM, human, exact-match check).
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1
 
-You know how a test assertion can be `===` (exact), `toMatch(regex)` (loose), or `toMatchSnapshot()` (rubric-like)? Same shape — different assertion strengths for different field shapes.
-
-```
-  Methods at a glance
-
-  ┌──────────────────────┬──────────────────────────────────────┐
-  │ Method               │ Use when                             │
-  ├──────────────────────┼──────────────────────────────────────┤
-  │ Exact match          │ Structured outputs (enum, ID,        │
-  │                      │  scoped tuple). Score: 0/1           │
-  │                      │ Example: metric == 'revenue_drop'    │
-  ├──────────────────────┼──────────────────────────────────────┤
-  │ Fuzzy match          │ Prose where wording varies but        │
-  │                      │  semantics shouldn't                  │
-  │                      │ Example: BLEU-style overlap on        │
-  │                      │  expected keywords                    │
-  ├──────────────────────┼──────────────────────────────────────┤
-  │ Rubric               │ Multi-criteria scoring (tone,         │
-  │                      │  accuracy, structure)                  │
-  │                      │ Example: human rates each on 1-5      │
-  │                      │  Likert per dimension                  │
-  ├──────────────────────┼──────────────────────────────────────┤
-  │ LLM-as-judge         │ Scalable rubric. LLM scores using    │
-  │                      │  the same rubric a human would.      │
-  │                      │ Cheap; biased; needs calibration     │
-  │                      │  (see 03-llm-as-judge-bias.md)       │
-  ├──────────────────────┼──────────────────────────────────────┤
-  │ Pairwise             │ "Is A better than B?" for             │
-  │                      │  comparing prompt or model variants  │
-  ├──────────────────────┼──────────────────────────────────────┤
-  │ Human eval           │ Calibration gold standard.            │
-  │                      │  Slow; doesn't scale; the anchor for  │
-  │                      │  every cheaper method                 │
-  └──────────────────────┴──────────────────────────────────────┘
-```
-
-### Move 2 — the step-by-step walkthrough
-
-**Part 1 — what the retired Phase 3 suite used.**
-
-  → **Detection pillar.** Exact-match on `metric` (did the agent find the right anomaly?). Exact-match on `scope` (did it localize to the right country/segment?). Threshold check on `change.value` (did it report the right magnitude?).
-  → **Diagnosis pillar.** LLM-as-judge with a rubric:
-    - Did the conclusion identify the *right cause*?
-    - Did the evidence cite the *correct tool results*?
-    - Did the hypotheses considered include the *actual cause* as one of them?
-    Each rated 1-5. Aggregate score = mean.
-  → **Recommendation pillar.** LLM-as-judge with a rubric:
-    - Is the proposed Bloomreach feature appropriate?
-    - Are the steps actionable?
-    - Is the estimated impact plausible?
-  → **Regression pillar.** Per-bug exact-match assertions (e.g. "AOV must not exceed R$10,000 in BRL workspace").
-
-LLM-as-judge for both diagnosis and recommendation = ~30 LLM-judge calls per K=10 run (3 dimensions × 10 runs). At Sonnet judge cost ≈ $0.05 per call, ~$1.50 per pillar per K=10 run. Not free, not breaking the bank.
-
-**Part 2 — the calibration that made LLM-as-judge trusted.**
-
-8/8 + 3/3 manual spot-check: 8 random samples from the diagnosis pillar were manually scored by a human; LLM-as-judge agreed on all 8. 3 random samples from the recommendation pillar; agreed on all 3. Trust threshold met; full eval ran with LLM-as-judge.
-
-This isn't "the LLM is always right"; it's "the LLM agrees with the human on the cases we checked, so trust it for the cases we don't have time to check." Calibration is the *only* way to make LLM-as-judge defensible.
-
-**Part 3 — what the next iteration needs.**
+You've picked between assertion styles — `assertEqual` (exact) vs regex vs custom matcher. Same shape at the eval boundary: pick the scoring method that matches the shape of your outputs.
 
 ```
-  Per-field method choice for the next eval iteration
+  The ladder — pick by output shape
 
-  ┌────────────────────────────┬──────────────────┬─────────────────────┐
-  │ Field                      │ Method            │ Why                 │
-  ├────────────────────────────┼──────────────────┼─────────────────────┤
-  │ Anomaly.metric             │ Exact match       │ Enum, byte-identical│
-  │ Anomaly.scope[]            │ Exact match       │ Set equality        │
-  │ Anomaly.severity           │ Exact match       │ Enum                │
-  │ Anomaly.change.direction   │ Exact match       │ Enum                │
-  │ Anomaly.change.value (±)   │ Threshold (±10%)  │ Fuzzy ≈             │
-  ├────────────────────────────┼──────────────────┼─────────────────────┤
-  │ Diagnosis.conclusion       │ LLM-as-judge      │ Prose, semantic     │
-  │ Diagnosis.evidence[]       │ LLM-as-judge      │ Multi-sentence list │
-  │ Diagnosis.hypotheses[]     │ LLM-as-judge      │ Same as above       │
-  ├────────────────────────────┼──────────────────┼─────────────────────┤
-  │ Recommendation.feature     │ Exact match       │ Enum                │
-  │ Recommendation.title       │ LLM-as-judge      │ Prose               │
-  │ Recommendation.steps[]     │ LLM-as-judge      │ Actionability       │
-  │ Recommendation.confidence  │ Distribution check│ NOT exact — measure │
-  │                            │ across K=30 runs  │  calibration spread │
-  └────────────────────────────┴──────────────────┴─────────────────────┘
+  classifier out {A, B, C}     → exact match
+  ID or number                  → exact match
+  short generated text          → fuzzy (BLEU, ROUGE) or LLM judge
+  long structured output        → rubric with dims
+  qualitative preference        → pairwise or human eval
 ```
 
-**Part 4 — pairwise for prompt iteration.**
+### Move 2
 
-Pairwise eval is best when iterating on the agent's prompt. Question becomes "is prompt-v2 better than prompt-v1 on the same input?" instead of "does prompt-v2 hit some absolute quality bar?" Pairwise is more reliable than absolute scoring because the judge only has to compare, not measure. Phase 3 didn't use pairwise; the next iteration probably should for prompt revisions.
+**The two rubrics.**
 
-### Move 3 — the principle
+- `eval/rubrics/diagnosis-quality.ts` — 4 dims × 1-5 scale × 3 verdicts.
+- `eval/rubrics/recommendation-quality.ts` — same shape, different dims.
 
-**Pick the method per field, not per eval.** Exact match for structured; LLM-as-judge for prose; threshold for numeric near-equality; pairwise for variant comparison. The eval framework that ships with this codebase eventually should accept all of them and let each field declare its method.
+Each dim has: `{id, label, description, scale: [{score: 1-5, description}]}`. Verdicts: `pass` (all dims ≥4), `pass_with_notes` (any dim = 3), `fail` (any dim ≤ 2).
 
-## Primary diagram — the full recap
+Diagnosis dims:
+- `root_cause_plausibility` — does the conclusion name a plausible mechanism?
+- `evidence_grounding` — does it cite actual signals from the tool results?
+- `scope_coherence` — does it stay in the anomaly's scope?
+- `actionable_next_step` — is there a specific named next action?
+
+Recommendation dims:
+- `diagnosis_response` — does the rec address the root cause?
+- `feature_choice_fit` — is `bloomreachFeature` the right lever?
+- `step_actionability` — are steps executable, not aspirational?
+- `impact_realism` — is `estimatedImpact` proportional?
+
+**The judge.**
+
+`RubricJudge` from `@aptkit/core`. Takes a rubric + subject text + context object. Emits `{dimensions, verdict, fix, reasoning}`. In this repo, ~$0.04 per judgment at `temperature: 0`, `maxTokens: 4096`.
+
+**How the judge is invoked (`eval/run.eval.ts:229-247`):**
+
+```typescript
+const diagnosisJudge = new RubricJudge({
+  model: judgeModel,
+  rubric: diagnosisQualityRubric,
+  capabilityId: 'blooming.eval.diagnosis-judge',
+  maxTokens: 4096,
+  temperature: 0,
+});
+const result = await diagnosisJudge.judge({
+  subject: JSON.stringify(diagnosis, null, 2),
+  context: {
+    anomaly: JSON.stringify(anomaly, null, 2),
+    known_correct_shape: JSON.stringify(goldenCase.knownCorrect, null, 2),
+    case_intent: goldenCase.intent,
+    signal_class: goldenCase.signalClass,
+    tool_calls_trace: formatToolCallTrace(diagnosisToolCalls),
+  },
+});
+```
+
+Notice the `tool_calls_trace` context — the judge sees not just the diagnosis but WHAT TOOL CALLS produced it. That means the `evidence_grounding` dim can verify that cited numbers are traceable to actual tool results.
+
+**Judge-error handling.**
+
+When RubricJudge returns `{ok: false}`, `eval/run.eval.ts:334-339` writes a `judge_error` placeholder. See `01-llm-foundations/04-structured-outputs.md` — structured output failures are the failure mode. In the baseline run, 6/10 diagnosis judgments returned `judge_error` (the model produced JSON the aptkit runtime couldn't parse within maxTokens). The placeholder pattern prevents these from crashing the run.
+
+### Move 3
+
+Match the method to the output shape. Exact match for classifiers, rubric for generative outputs, pairwise for A/B, human for anything subjective. Don't use exact match on generated text and call it "eval failed" when the model paraphrased.
+
+## Primary diagram
 
 ```
-  Eval methods for this codebase, per field
+  Rubric-based LLM-as-judge — this codebase
 
-  Anomaly output:
-   ┌─ metric          ─ exact match          (enum)
-   ├─ scope[]         ─ exact match          (set equality)
-   ├─ severity        ─ exact match          (enum)
-   ├─ change.dir      ─ exact match          (enum)
-   └─ change.value    ─ threshold (±10%)     (fuzzy numeric)
-
-  Diagnosis output:
-   ┌─ conclusion      ─ LLM-as-judge         (prose rubric)
-   ├─ evidence[]      ─ LLM-as-judge         (citation accuracy)
-   └─ hypotheses[]    ─ LLM-as-judge         (coverage rubric)
-
-  Recommendation output:
-   ┌─ feature         ─ exact match          (enum)
-   ├─ title           ─ LLM-as-judge         (prose)
-   ├─ steps[]         ─ LLM-as-judge         (actionability)
-   └─ confidence      ─ distribution check   (calibration over K runs)
-
-  Cross-field:
-   ─ Prompt iteration ─ pairwise             (v2 vs v1)
-   ─ Calibration       ─ human spot-check    (anchor for LLM-as-judge)
+  ┌─ Input to judge ──────────────────────────────────────────────────┐
+  │  subject:  JSON.stringify(diagnosis, null, 2)                     │
+  │  context:                                                          │
+  │    - anomaly                                                       │
+  │    - knownCorrect (golden case guidance)                          │
+  │    - signalClass                                                   │
+  │    - tool_calls_trace  ← judge can trace claims to real results    │
+  └────────────────────────┬──────────────────────────────────────────┘
+                           │
+  ┌─ Rubric (4 dims × 1-5 × 3 verdicts) ▼─────────────────────────────┐
+  │  diagnosisQualityRubric =                                          │
+  │    dimensions: [                                                   │
+  │      {id: 'root_cause_plausibility', label, scale: [{1..5}]},      │
+  │      {id: 'evidence_grounding', ...},                              │
+  │      {id: 'scope_coherence', ...},                                 │
+  │      {id: 'actionable_next_step', ...},                            │
+  │    ]                                                               │
+  │    verdicts: [pass, pass_with_notes, fail]                        │
+  │    checks: [...binary checks]                                     │
+  └────────────────────────┬──────────────────────────────────────────┘
+                           │
+  ┌─ Judge output ─────────▼──────────────────────────────────────────┐
+  │  {                                                                 │
+  │    dimensions: {                                                   │
+  │      root_cause_plausibility: {score: 4, reason: "…"},             │
+  │      evidence_grounding:      {score: 3, reason: "…"},             │
+  │      scope_coherence:         {score: 4, reason: "…"},             │
+  │      actionable_next_step:    {score: 2, reason: "…"},             │
+  │    },                                                              │
+  │    verdict: 'fail',   // ← any dim ≤ 2                             │
+  │    fix: "add a specific next action",                              │
+  │    reasoning: "…",                                                 │
+  │  }                                                                 │
+  └───────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-**Why LLM-as-judge needs the human anchor.** LLM-as-judge alone is cheap but biased (position, verbosity, self-preference — see `03-llm-as-judge-bias.md`). Without a small manual spot-check (Phase 3 used 8/8 + 3/3), you have no way to know if the judge's scores are tracking real quality or some bias artifact. The anchor is what makes the judge defensible.
+Rubric-based scoring has three big advantages over pass/fail eval:
+1. **Structured signal.** Per-dim scores tell you WHICH dimension is weak, not just "it failed."
+2. **Regression at dim granularity.** `baseline.json` tracks per-dim pass rates, so a regression in `evidence_grounding` alone can gate the PR without hiding it in an overall pass rate.
+3. **Judge disagreement is localized.** Two judges disagreeing on one dim is a smaller issue than disagreeing on overall verdict.
 
-The discipline: every time you change the rubric, re-run the human spot-check. The judge can drift; the human check catches the drift.
-
-**Why exact match for `feature` even though it's prose-adjacent.** `Recommendation.bloomreachFeature` is a typed enum (`'scenario' | 'segment' | 'campaign' | 'voucher' | 'experiment'`). The agent emits one of these or it's structurally wrong. Exact match is the right method — no rubric needed.
-
-The pattern: any field with a finite, typed set of valid values gets exact match. Any field with prose gets LLM-as-judge (with rubric and calibration). Numeric fields get threshold-fuzzy. Don't reach for the expensive method where the cheap one suffices.
-
-**The pairwise trap to avoid.** Pairwise eval can mislead if you compare against a weak baseline. "v2 is better than v1" is meaningless if v1 was already bad — you need an *absolute* anchor (golden set) somewhere in the loop. Use pairwise for iteration, golden for grounding.
+Common alternatives: **BLEU / ROUGE** (n-gram overlap; useful for translation, worthless for divergent-answer eval); **LLM-as-judge on overall quality only** (loses per-dim signal); **pairwise ranking** (works when you have a baseline to compare against).
 
 ## Project exercises
 
-### Exercise — Multi-method eval runner with per-field method declarations
+### Exercise — pairwise A/B eval for prompt tweaks
 
-  → **Exercise ID:** B5.2
-  → **What to build:** Build the `eval/run.ts` from `B5.1` (in `01-eval-set-types.md`) to accept a per-field method declaration: `{ field: 'Anomaly.metric', method: 'exact-match' }`, `{ field: 'Diagnosis.conclusion', method: 'llm-judge', rubric: {...} }`, etc. Use the right method for each field; aggregate scores into a per-anomaly + overall report.
-  → **Why it earns its place:** lets one eval suite cover both structured outputs (exact match) and prose (LLM-as-judge) without bolting two separate runners together. Forces the runner to be method-agnostic, which makes adding pairwise or threshold methods cheap later.
-  → **Files to touch:** `eval/run.ts` (the runner), new `eval/methods.ts` (the method implementations), `eval/seeds.ts` (the per-field declarations alongside expected outputs), `eval/judge.ts` (the LLM-judge implementation with rubric support).
-  → **Done when:** running `npm run eval` produces a report showing per-field method + score, the LLM-judge calls go through the existing `BloomreachDataSource` rate-limit machinery (don't re-implement), and the report distinguishes between "exact-match fail" and "LLM-judge low score" so a regression is debuggable.
-  → **Estimated effort:** ≥1 week.
+- **Exercise ID:** C3.2-B · Case B (rubric exercised; pairwise not).
+- **What to build:** for each golden case, run the diagnostic agent with prompt version A vs prompt version B. Present both diagnoses to a third-party judge, ask "which is better and why?". Prompts iterate faster with pairwise than with absolute rubric scores — the judge doesn't have to calibrate.
+- **Why it earns its place:** rubric is for measuring absolute quality; pairwise is for comparing changes. Both have their place.
+- **Files to touch:** `eval/pairwise.eval.ts` (new), `eval/rubrics/pairwise.ts` (new pairwise rubric).
+- **Done when:** running `npm run eval:pairwise` on 5 goldens produces a per-case A vs B verdict, useful for prompt-iteration decisions.
+- **Estimated effort:** 1-2 days.
 
 ## Interview defense
 
-**Q: "How do you score your agent's outputs?"**
+**Q: Why rubric instead of exact match?**
 
-Method per field. Structured fields (`metric`, `severity`, `bloomreachFeature`) use exact-match — they're typed enums. Numeric fields with tolerance (`change.value`) use threshold-fuzzy (±10%). Prose fields (`conclusion`, `rationale`, recommendation steps) use LLM-as-judge with a rubric, calibrated against a small human spot-check (Phase 3 used 8/8 + 3/3 — manual check matched LLM-judge on all of them). For calibration itself (e.g. `confidence` distribution), distribution checks across K runs.
+Because diagnosis output is generated prose + structured JSON. Exact match on the conclusion sentence never passes — the model paraphrases, and paraphrase isn't wrong. Rubric-based scoring measures WHAT MATTERS (plausibility, evidence grounding, scope, actionability) without punishing legitimate variation.
 
-Don't reach for LLM-judge where exact match works; don't trust LLM-judge without the human anchor.
+**Q: What are the rubric dims?**
 
-*Anchor: "Per-field method; LLM-judge needs human calibration; the Phase 3 8/8 + 3/3 is the template."*
+Four per rubric. Diagnosis: root_cause_plausibility, evidence_grounding, scope_coherence, actionable_next_step. Recommendation: diagnosis_response, feature_choice_fit, step_actionability, impact_realism. Each dim is scored 1-5 with description per score. Verdict is derived: pass if all ≥4, pass_with_notes if any = 3, fail if any ≤ 2.
 
-**Q: "What did Phase 3's LLM-as-judge cost?"**
+**Q: How does the judge see the tool calls?**
 
-Roughly $1.50 per pillar per K=10 run, judging at the Sonnet rate. For the 4 pillars × K=10 × 3 seeded anomalies, the per-iteration cost was around $20-30. Not free, not breaking the bank — eval is real money but tractable relative to the value of catching conclusion instability and binary calibration before they reach users.
-
-The next iteration will use the same shape — LLM-judge at Sonnet, calibrated by spot-check, same cost order. Maybe lower if I use Haiku as judge for the simpler rubric items; that's a tradeoff between cost and judge-bias.
-
-*Anchor: "$20-30 per full Phase 3 iteration; comparable for next; Haiku-as-judge for cheap rubric items is a tradeoff."*
+Passed as context. `tool_calls_trace` is a formatted trace of `--- call N: tool_name --- args: … result: …` per line. That means the `evidence_grounding` dim can verify that numbers cited in the diagnosis actually appear in the tool results. Without the trace, the judge would score `evidence_grounding` on prose plausibility alone.
 
 ## See also
 
-  → `01-eval-set-types.md` — the eval sets these methods score
-  → `03-llm-as-judge-bias.md` — the bias modes the calibration is defending against
-  → `04-llm-observability.md` — the telemetry that complements eval (different but related)
+- `01-eval-set-types.md` — what gets scored
+- `03-llm-as-judge-bias.md` — what the judge can get wrong
+- `04-llm-observability.md` — the receipt structure the judgment lands in
+- `eval/rubrics/` — the two rubrics
+- `eval/run.eval.ts` — the invocation

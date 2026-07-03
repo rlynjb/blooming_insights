@@ -1,76 +1,92 @@
-# Overview — DSA Foundations in `blooming_insights`
+# DSA Foundations — overview
 
-The one-page map. If you read only one file in this folder, read this one.
+Industry names: data structures & algorithms, computational thinking. Type: Language-agnostic.
 
-## What this repo actually exercises
+## Zoom out — where DSA lives in this repo
 
-This is a flat Map+Set codebase. The data-structure work is shallow on purpose — Bloomreach is the storage, the agents are the compute, and everything in memory is a session-scoped index or a stream buffer. The reusable structures that show up:
-
-```
-  the DSA surface of blooming_insights
-
-  ┌─ data structures ──────────────────────────────────────────────┐
-  │                                                                 │
-  │   hash map      lib/state/insights.ts:14                        │
-  │   (Map)         lib/state/investigations.ts:11                  │
-  │                 lib/agents/aptkit-adapters.ts:101                │
-  │                 lib/data-source/bloomreach-data-source.ts:122    │
-  │                 lib/mcp/auth.ts:36                               │
-  │                                                                 │
-  │   set           lib/agents/categories-legacy.ts:120              │
-  │   (Set)         lib/agents/tool-schemas.ts:13                    │
-  │                 lib/mcp/tool-coverage.ts:40                      │
-  │                                                                 │
-  │   array +       schema.events, anomaly[], evidence[], steps[]   │
-  │   linear scan   all over lib/agents/ and lib/insights/          │
-  │                                                                 │
-  │   string +      lib/streaming/ndjson.ts:30 (split('\n') buffer) │
-  │   buffer        lib/mcp/auth.ts:65    (Buffer.concat for AES)   │
-  │                                                                 │
-  └─────────────────────────────────────────────────────────────────┘
-
-  ┌─ algorithms ───────────────────────────────────────────────────┐
-  │                                                                 │
-  │   comparator sort  lib/agents/monitoring-legacy.ts:136          │
-  │                    (rank by severity, top 10)                   │
-  │                                                                 │
-  │   argmin reduce    components/feed/InsightCard.tsx:160          │
-  │                    (funnel-stage leak: smallest v)              │
-  │                                                                 │
-  │   linear filter    everywhere — categories, tool-schemas,       │
-  │                    evidence pulls, hypothesis tested counts     │
-  │                                                                 │
-  │   recursion        lib/agents/base-legacy.ts:114 — ONE level    │
-  │                    (the tool-use loop; flat `for`, not a tree)  │
-  │                                                                 │
-  └─────────────────────────────────────────────────────────────────┘
-```
-
-That's the whole DSA surface. No trees walked, no graphs traversed, no priority queue, no binary search, no DP, no backtracking. The list of *not yet exercised* primitives is long — see the per-file `not yet exercised` notes and the practice map at the end.
-
-## The verdict
-
-The structures are the right shape for what the code does. Hash-map indirection is the load-bearing primitive — the session map (`state`) keeps two warm Vercel users from clobbering each other's feed (`lib/state/insights.ts:14`); the response cache (`this.cache`) absorbs repeat tool calls under the 1 req/s rate limit (`lib/data-source/bloomreach-data-source.ts:122`); the active-tool-calls queue (`activeToolCalls`) lines `tool_call_start` up with its `tool_call_end` partner when both fire from the AptKit trace sink (`lib/agents/aptkit-adapters.ts:101`).
-
-Where the code reaches for *less* than it could: the monitoring agent re-ranks the anomaly list every time with a comparator sort then takes the top 10 (`lib/agents/monitoring-legacy.ts:136`). With ten anomalies and four severity buckets, a bucket sort or a fixed top-K heap is overkill — the comparator is the right cost. **The honest take is: this repo is comfortable in O(n) over small n, and that's correct.** The DSA gap isn't in the repo's code, it's in the foundations the repo never had to reach for. That's what this guide ranks at the end.
-
-## How to read this folder
-
-Reading order — each file uses the full `format.md` template (Zoom out → Structure pass → How it works → Primary diagram → Elaborate → Interview defense → See also):
+Blooming Insights is an agentic e-commerce anomaly detector: a Next.js edge layer talks to Claude (agent loop), Claude talks to Bloomreach through an MCP transport, and evals verify the whole thing offline. Most of the "algorithm" work here is boring on purpose — the *interesting* algorithms live in the agent, not the plumbing. But the plumbing has picked up more DSA over the last three weeks: a running-accumulator budget tracker, a worker-pool load harness, a seedable PRNG for fault injection, and percentile stats on receipts.
 
 ```
-  01-complexity-and-cost-models.md            ← cost vocabulary first
-  02-arrays-strings-and-hash-maps.md          ← the everyday primitives
-  03-stacks-queues-deques-and-heaps.md        ← ordering disciplines
-  04-trees-tries-and-balanced-indexes.md      ← mostly NOT yet exercised
-  05-graphs-and-traversals.md                 ← NOT yet exercised
-  06-sorting-searching-and-selection.md       ← one comparator sort + the gap
-  07-recursion-backtracking-and-dynamic-programming.md  ← one-level loop only
-  08-dsa-foundations-practice-map.md          ← ranked learning plan
+  Where reusable DSA shows up in the codebase
+
+  ┌─ UI layer ───────────────────────────────────────┐
+  │  React feed  ·  (no algorithms — pure display)   │
+  └────────────────────┬─────────────────────────────┘
+                       │  fetch NDJSON
+  ┌─ Service layer ────▼─────────────────────────────┐
+  │  Agent loop  ·  BudgetTracker (running accum)    │  ← DSA lives here
+  │  filterToolSchemas (Set membership)              │
+  │  monitoring sort-slice(10) (top-K by comparator) │
+  └────────────────────┬─────────────────────────────┘
+                       │  MCP callTool
+  ┌─ Transport layer ──▼─────────────────────────────┐
+  │  BloomreachDataSource: cache Map + rate ladder   │  ← DSA lives here
+  │  FaultInjectingDataSource: xorshift32 + weighted │
+  │    probabilistic selection                       │
+  └────────────────────┬─────────────────────────────┘
+                       │  HTTP MCP
+  ┌─ External ─────────▼─────────────────────────────┐
+  │  Bloomreach MCP · Anthropic API                  │
+  └──────────────────────────────────────────────────┘
+
+  ┌─ Offline test/eval layer (parallel to service) ──┐
+  │  percentiles() (sort + index)                    │  ← DSA lives here
+  │  load.eval worker pool (index queue + K workers) │
+  │  Set-based runId dedup                           │
+  └──────────────────────────────────────────────────┘
 ```
 
-Files 04, 05, and most of 07 teach foundations the repo does not currently exercise — they exist because the next AI-engineering interview will ask you to draw BFS on a whiteboard whether or not your shipped code uses it. The practice map (08) ranks where to spend hours.
+## Zoom in — what this guide covers
 
-## See also
+Eight concept files. Each starts from a real file in this repo and teaches the transferable vocabulary around it. Where the repo doesn't exercise a foundation — trees, graphs, heaps, DP, binary search — the file says `not yet exercised` plainly and teaches the primitive anyway, because it will show up in an interview even if it never shows up in this codebase.
 
-- `.aipe/study-system-design/00-overview.md` — the architectural shape these structures sit inside (sessions, routes, agent loop). Cross-link when a file needs the bigger box.
+## Ranked findings — what actually matters here
+
+1. **Percentile-by-sort (`percentiles()`) lives in two places.** `eval/report.eval.ts:161` and `eval/load.eval.ts:326` implement byte-identical `sort + index` percentile helpers. That's a duplication smell and also the repo's clearest example of a classic O(n log n) tradeoff — cheap to write, wrong at high N (streaming quantiles like t-digest would win). See `06-sorting-searching-and-selection.md`.
+
+2. **Worker pool beats naive `Promise.all` at `eval/load.eval.ts:171-211`.** Index-queue + K workers is the load harness's concurrency primitive. Uses `shift()` (O(n) at high N — flag it) and depends on the JS single-threaded event loop for atomicity. See `03-stacks-queues-deques-and-heaps.md`.
+
+3. **xorshift32 PRNG for reproducible faults at `lib/data-source/fault-injecting.ts:157-166`.** A three-line register PRNG plus a weighted-probabilistic accumulator (`acc += r.timeout; if (roll < acc)`) at `lib/data-source/fault-injecting.ts:84-100`. This is the repo's most compact DSA — worth reading twice. See `02-arrays-strings-and-hash-maps.md` (accumulator pattern) and `01-complexity-and-cost-models.md` (PRNG cost model).
+
+4. **Running-accumulator threshold in `BudgetTracker.add()` at `lib/agents/budget.ts:51-55`.** O(1) per turn, streaming over the agent loop. The single most important cost primitive in the repo — every model turn touches it. See `01-complexity-and-cost-models.md`.
+
+5. **Session-scoped `Map<string, ...>` in `lib/state/insights.ts:14`.** Nested Maps keyed by sessionId. Teaches why `Map` over plain object for user-controlled keys (prototype safety, iteration, size). See `02-arrays-strings-and-hash-maps.md`.
+
+6. **Bounded degenerate-tree walk in `formatError()` at `lib/mcp/transport.ts:82-97`.** Walks the `error.cause` chain — a tree where every node has degree 1, capped at depth 5. The repo's only recursion-shaped traversal (though written iteratively). See `04-trees-tries-and-balanced-indexes.md` and `07-recursion-backtracking-and-dynamic-programming.md`.
+
+## Reading order
+
+Follow the numeric order:
+
+1. `01-complexity-and-cost-models.md` — the vocabulary everything else needs (O-notation, amortized, streaming vs batch).
+2. `02-arrays-strings-and-hash-maps.md` — the heavy chapter for this repo. Almost every service-layer file uses `Map` or `Set`.
+3. `03-stacks-queues-deques-and-heaps.md` — one live queue (load harness), zero heaps (teach where a heap would win).
+4. `04-trees-tries-and-balanced-indexes.md` — mostly `not yet exercised`. One thin exception in `formatError()`.
+5. `05-graphs-and-traversals.md` — `not yet exercised`. Teaches the BFS/DFS kernel and names where a graph might land later.
+6. `06-sorting-searching-and-selection.md` — comparator sorts + percentile pattern + honest binary-search gap.
+7. `07-recursion-backtracking-and-dynamic-programming.md` — mostly `not yet exercised`. The iterative cause-chain walk is the one anchor.
+8. `08-dsa-foundations-practice-map.md` — the ranked drill plan; what to practice for interviews, tied to what this codebase would benefit from next.
+
+## Not yet exercised (be honest)
+
+The repo does not currently exercise:
+
+- **Trees** — no B-tree, no AVL, no red-black. The error-cause chain is the closest thing, and it's a degenerate list.
+- **Tries** — tool-schema lookups are `Set` membership + linear filter. A trie would be premature.
+- **Balanced indexes** — no ordered map, no interval tree, no BTreeMap. Percentiles resort every time instead.
+- **Graphs** — no adjacency list, no BFS, no DFS, no shortest-path. `category.requires` at `lib/agents/categories.ts:32` is structurally a DAG but treated as a flat array filter.
+- **Heaps / priority queues** — `monitoring-legacy.ts:136` does `sort + slice(10)` where a heap would be O(n log k) instead of O(n log n). Fine at n=50; wrong at n=50_000.
+- **Dynamic programming** — no memoization, no tabulation. The nearest thing is `BudgetTracker`'s running total (an accumulator, not DP).
+- **Binary search / quickselect** — every "find the p95" resorts the array; every "does this tool exist" is a `Set.has`. No binary search in the repo.
+- **Backtracking** — no state-space search. The agent loop is state-machine-ish but not a backtrack.
+
+Each of these gets a `not yet exercised` block in the relevant chapter that teaches the primitive anyway.
+
+## Cross-links to sibling guides
+
+- Architecture, scale, and where a data structure *would* need to land later — see `.aipe/study-system-design/`.
+- Big-O impact on real request latency and the p95 story — see `.aipe/study-performance-engineering/`.
+- Agent loop, ReAct, tool selection — the "algorithm" of Claude — see `.aipe/study-agent-architecture/`.
+- What's tested and what's a coverage gap — see `.aipe/study-testing/`.
+
+The rest of this guide sticks to reusable primitives: arrays, maps, sorts, PRNGs, and the shapes you'll get asked to whiteboard.

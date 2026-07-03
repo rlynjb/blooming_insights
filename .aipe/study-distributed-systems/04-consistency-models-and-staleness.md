@@ -1,190 +1,172 @@
-# Consistency models and staleness
+# consistency-models-and-staleness
 
-*Industry standard — read-your-writes, stale reads, monotonic reads, convergence.*
+*Session-scoped state · Warm-instance locality · Read-your-writes escape hatch · Industry standard*
 
-## Zoom out — where consistency matters
+## Zoom out — where this concept lives
 
-Consistency matters when **two callers can observe different views of the same underlying state** and the discrepancy is observable to the user. In `blooming_insights`, the cross-process surface is one HTTPS call to Bloomreach; the cross-request surface is in-process state (session-keyed Maps + one global cache). That second surface is where this file does the real work.
+The interesting consistency questions in this repo aren't about a database
+you own (you don't own one). They're about the client, the warm Vercel
+instance, the sessionStorage escape hatch, and how "what the user sees"
+lines up with "what the server just did." The load-bearing thing to
+recognize: **the client's sessionStorage is a more durable store than the
+server's in-memory Map**, and the app knows this.
 
 ```
-  Where consistency questions live in this codebase
+  Zoom out — where state lives in this app
 
-  ┌─ L1: Browser ────────────────────────────────────────────────┐
-  │  sessionStorage stash (per-tab, per-origin)                   │
-  │  multi-tab read-your-writes? NO — each tab has its own stash  │
-  └─────────────────────────┬────────────────────────────────────┘
+  ┌─ Client layer ────────────────────────────────────────────────┐
+  │  sessionStorage — per-tab investigation cache                 │
+  │  localStorage    — mode toggle (bi:mode)                      │
+  │  ★ SURVIVES WARM-INSTANCE CYCLING ★                           │ ← we are here
+  └─────────────────────────┬─────────────────────────────────────┘
                             │
-  ┌─ L2: Vercel route ──────▼────────────────────────────────────┐
-  │  ★ module-level state, per warm instance ★                    │
-  │  • lib/state/insights.ts:14         — session-keyed Maps      │
-  │  • lib/state/investigations.ts:11   — keyed by insightId      │
-  │  • lib/mcp/schema.ts:138            — ★ GLOBAL CACHE ★        │
-  └─────────────────────────┬────────────────────────────────────┘
+  ┌─ Service layer ─────────▼─────────────────────────────────────┐
+  │  Map<sessionId, SessionFeed> — insights, anomalies            │
+  │  Map<insightId, AgentEvent[]> — investigation trace           │
+  │  BloomreachDataSource.cache — per-instance 60s cache          │
+  │  ALL LIVE INSIDE ONE WARM INSTANCE                            │
+  │  scope: instance lifetime (minutes to hours)                  │
+  └─────────────────────────┬─────────────────────────────────────┘
                             │
-  ┌─ L3: BloomreachDataSource ──────────────────────────────────┐
-  │  60s response cache · per-instance · keyed by name+args       │
-  │  (per-request adapter; cache is per-adapter, not global)      │
-  └─────────────────────────┬────────────────────────────────────┘
-                            │
-  ┌─ L4: Bloomreach ────────▼────────────────────────────────────┐
-  │  workspace data (we don't own it)                             │
-  │  eventually-consistent ingest? unknown — opaque to us         │
+  ┌─ Provider layer ──────────────────────────────────────────────┐
+  │  Bloomreach — the actual source of truth for workspace data   │
+  │  Anthropic — stateless to us                                  │
   └────────────────────────────────────────────────────────────────┘
 ```
 
-Two caches and the underlying workspace. The 60s response cache is per-request-adapter and harmless. The module-level schema cache is global per warm instance and is the most interesting consistency hazard in the repo.
+Everything server-side is per-warm-instance. The client is the durable
+anchor.
 
-## Zoom in — the question this file answers
+## Structure pass
 
-> What can two callers see that disagrees, for how long, and what's the worst that happens?
-
-Three answers, in order of severity: the schema cache (load-bearing, has a real hazard), the response cache (bounded, safe), and Bloomreach's own ingest consistency (opaque, accepted).
-
-## Structure pass — the skeleton
-
-### Axes — trace staleness
-
-The axis is **how long can a stale value persist, and who sees it?**
+### Layers of consistency
 
 ```
-  One axis: "how stale can this get, and who sees it?"
+  Four questions, held constant across layers:
+  "when a write happens here, when does a read see it?"
 
-  cache layer                          max staleness    who sees it
-  ─────────                            ─────────────    ───────────
-  L1 sessionStorage stash              forever          one tab (per-origin)
-                                       (until cleared)
-
-  L2 schema cache (module-level)       until cold       EVERY user routed to
-                                       restart          that instance, INCLUDING
-                                                        a different Bloomreach user
-
-  L2 insights/investigations Maps       per session      only that session
-                                       (session-keyed)  (anomalies cleared per run;
-                                                         investigations sticky until
-                                                         instance dies)
-
-  L3 response cache (BloomreachDS)     60s              only this request
-                                                        (per-adapter, ephemeral)
-
-  L4 Bloomreach workspace               unknown          all callers
-                                       (their domain)
+  ┌───────────────────────────────────────────────┐
+  │ client (browser)                               │
+  │   write: sessionStorage.setItem(...)           │
+  │   read:  sessionStorage.getItem(...)           │
+  │   consistency: strong (same tab, same domain)  │  synchronous
+  └───────────────────────────────────────────────┘
+      ┌───────────────────────────────────────────────┐
+      │ warm Vercel instance                          │
+      │   write: state.set(sid, feed)                 │
+      │   read:  state.get(sid)                       │
+      │   consistency: strong within instance,         │  sticky is best-effort
+      │                NONE across instances           │
+      └───────────────────────────────────────────────┘
+          ┌───────────────────────────────────────────┐
+          │ Bloomreach                                 │
+          │   write: none (we don't write)             │
+          │   read:  execute_analytics_eql             │
+          │   consistency: whatever their engine        │  (out of scope)
+          │                offers                       │
+          └───────────────────────────────────────────┘
 ```
 
-The axis-answer doesn't change much between rows — it flips dramatically at the schema cache row. **Module-level + global + cross-user = the hazard.** Everywhere else, staleness is either per-session, per-request, or per-tab, and the consequence is bounded.
+The answer at the middle layer is the interesting one: **strong within an
+instance, nothing across.** That's the constraint the client-side
+sessionStorage exists to work around.
 
-### Seams — where consistency contracts live
+### One axis — "how does state survive a warm-instance cycle?"
+
+Trace it:
 
 ```
-  Three load-bearing seams
+  Vercel warm instance cycles: what survives, what doesn't?
 
-  seam 1: schema cache (module global)
-    contract: "the first request to bootstrap on this warm instance
-               sets the schema for every subsequent request"
-    failure mode: cross-user staleness if instance serves two distinct
-                  Bloomreach projects
+  before:          instance A serves user X → putInsights → Map has data
+  cycle:           instance A gets evicted / redeployed / cold-drained
+  after:           instance B serves user X → getInsight returns null
 
-  seam 2: session-keyed insights Map
-    contract: "each session sees its own latest briefing; putInsights
-               replaces (clears + sets) the session's sub-map"
-    failure mode: ephemeral — cold restart loses all sessions' state
-
-  seam 3: 60s response cache (per-adapter)
-    contract: "within one request, identical (name, args) returns the
-               first call's result"
-    failure mode: bounded — adapter dies with the request, cache with it
+  what survives?
+    ✗ in-memory Map<sid, SessionFeed>       (lost)
+    ✗ BloomreachDataSource.cache Map        (lost)
+    ✗ dev file .investigation-cache.json    (dev only)
+    ✓ committed lib/state/demo-*.json       (demo mode only)
+    ✓ encrypted bi_auth cookie              (client-owned)
+    ✓ bi_session cookie                     (client-owned)
+    ✓ sessionStorage per-tab data           (client-owned)
+    ✓ localStorage bi:mode                  (client-owned)
 ```
 
-The first one is where the consistency model is *implicit*. The other two are *explicit* (session-keying, per-request lifetime) and inherit their safety from that explicitness.
+The pattern: **client-owned survives, server-owned doesn't.** Which is
+why the `useInvestigation` hook exists — the app builds around this
+constraint rather than fighting it.
+
+### Seams
+
+- **The session-id seam** — `getOrCreateSessionId()` at
+  `lib/mcp/session.ts:16` gives every browser a stable id via the
+  `bi_session` cookie. This seam is what lets the server-side Map be
+  "per-session" instead of "shared across users on the same instance."
+  Load-bearing for isolation.
+
+- **The client-cache-first seam** — the `/api/agent` route at
+  `app/api/agent/route.ts:125-142` checks the on-disk cache
+  (`getCachedInvestigation`) BEFORE any live work. This is the seam
+  where "the answer might already exist" is honored, saving the whole
+  agent invocation. In production the disk cache is empty (serverless
+  FS), so this path only fires for the committed demo snapshot.
+
+- **The `sessionStorage → ?insight= param` seam** — the client stashes
+  the whole Insight object in sessionStorage on card click, then hands
+  it forward as `?insight=<JSON>` on the investigate route. The server
+  reads it via `resolveAnomaly` at `app/api/agent/route.ts:35-45`. This
+  seam is the app's read-your-writes escape hatch — see the next block.
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — the mental model: strong within an instance, sessionStorage across
 
-You've seen this in the browser: `localStorage` vs `sessionStorage` vs in-memory React state. Three lifetimes, three staleness profiles, three different mental models for what's safe to put where.
-
-> **In this repo there are three caches with three lifetimes (60s, request, instance-lifetime), and the only one that can produce a cross-user consistency surprise is the instance-lifetime one — the module-level schema cache.**
+You know how a React component's local `useState` lives only as long as
+that component is mounted? A Vercel warm instance's in-memory Map is the
+same idea, at a bigger scale — it lives only as long as the instance is
+warm. Whatever needs to survive longer has to move to a store the
+INSTANCE doesn't own.
 
 ```
-  Three caches, three lifetimes, three staleness profiles
+  The pattern — client is the durable store, server is the cache
 
-  ┌─────────────────┬───────────────┬──────────────────┬─────────────────┐
-  │ cache           │ lifetime      │ scope            │ staleness risk  │
-  ├─────────────────┼───────────────┼──────────────────┼─────────────────┤
-  │ response cache  │ 60s           │ per-request      │ tiny (60s, same │
-  │ (BloomreachDS)  │               │ adapter         │  request only)  │
-  ├─────────────────┼───────────────┼──────────────────┼─────────────────┤
-  │ insights Map    │ until cold    │ per-session       │ ephemeral —     │
-  │                 │ restart       │ inside instance   │ cold restart    │
-  │                 │               │                   │ wipes it        │
-  ├─────────────────┼───────────────┼──────────────────┼─────────────────┤
-  │ schema cache    │ until cold    │ ★ INSTANCE-WIDE ★ │ cross-user      │
-  │ (mcp/schema.ts) │ restart       │ (NOT keyed)      │ if two users    │
-  │                 │               │                   │ on diff projects│
-  │                 │               │                   │ share instance  │
-  └─────────────────┴───────────────┴──────────────────┴─────────────────┘
+     ┌─ client ─────────────────────┐
+     │  sessionStorage (per-tab)    │  ← DURABLE for a browsing session
+     │  localStorage   (per-domain) │  ← DURABLE across sessions
+     │  cookies        (per-domain) │  ← DURABLE, sent with each request
+     └──────────────┬───────────────┘
+                    │
+                    │  bi_session cookie (session id)
+                    │  ?insight=<JSON> (per-request payload)
+                    ▼
+     ┌─ warm instance ──────────────┐
+     │  Map<sid, SessionFeed>        │  ← EPHEMERAL, per-instance
+     │  BloomreachDataSource.cache   │  ← EPHEMERAL, per-instance, 60s TTL
+     └──────────────┬───────────────┘
+                    │
+                    ▼
+     ┌─ Bloomreach ─────────────────┐
+     │  source of truth              │  ← DURABLE but expensive to read
+     └───────────────────────────────┘
 ```
 
-The asterisks on the third row are the file's central finding.
+The consistency picture is: **each layer trades durability for latency**.
+Client is durable but slow to read into the server (requires a request).
+Server cache is fast but ephemeral. Bloomreach is durable but rate-limited
+and expensive.
 
-### Move 2 — walk the three caches
+### Move 2 — walk the mechanism
 
-#### Part 1 — the response cache (60s, per-adapter) — safe
+#### Session isolation — the outer Map is never cleared
 
-The simplest layer. Every `BloomreachDataSource` instance has its own `Map`:
+`lib/state/insights.ts:14` — `state = new Map<string, SessionFeed>()`.
+The outer map keyed by session id. `putInsights` clears only the
+caller's sub-map, never the outer map:
 
-```ts
-// lib/data-source/bloomreach-data-source.ts:121-188
-export class BloomreachDataSource implements DataSource {
-  private cache = new Map<string, { result: unknown; expiresAt: number }>();
-  // …
-  async callTool<T>(name, args, options) {
-    const cacheKey = `${name}:${JSON.stringify(args)}`;
-    const ttl = options.cacheTtlMs ?? 60_000;
-    if (!options.skipCache) {
-      const cached = this.cache.get(cacheKey);
-      if (cached && cached.expiresAt > Date.now()) {
-        return { result: cached.result as T, durationMs: 0, fromCache: true };
-      }
-    }
-    // … live call, retry, write-on-success only …
-  }
-}
-```
-
-Why it's safe:
-- Each route handler builds a fresh `BloomreachDataSource` via `connectMcp(sid)` (`lib/mcp/connect.ts:94-101`). The adapter (and its cache) live for the duration of *one* request and are garbage-collected when the route returns.
-- The cache key includes the full args, so two requests on the same instance with different `project_id` get different entries. (Within a request, two requests can't happen — one request, one adapter.)
-- The cache write happens **only on `isError !== true`** (`bloomreach-data-source.ts:179-187`). A rate-limit or transport error doesn't poison anything.
-- TTL 60s. Even if some path *did* share an adapter across requests (it doesn't today), 60s is short enough that "yesterday's data" is not a concern.
-
-**The staleness window** here is at most 60s, against a Bloomreach workspace whose ingest latency we don't measure but which is likely longer than 60s for new events (Bloomreach Engagement workspaces aren't real-time). **Net effect: the user-observable consistency is bounded by Bloomreach's own ingest, not by our cache.**
-
-#### Part 2 — session-keyed state Maps (insights, anomalies, investigations) — safe-by-design but ephemeral
-
-The state layer (`lib/state/insights.ts:14-23`):
-
-```ts
-type SessionFeed = {
-  insights: Map<string, Insight>;
-  investigations: Map<string, Investigation>;
-  anomalies: Map<string, Anomaly>;
-};
-const state = new Map<string, SessionFeed>();
-
-function sessionState(sessionId: string): SessionFeed {
-  let s = state.get(sessionId);
-  if (!s) {
-    s = { insights: new Map(), investigations: new Map(), anomalies: new Map() };
-    state.set(sessionId, s);
-  }
-  return s;
-}
-```
-
-The outer Map is keyed by `sessionId`. Each session gets its own inner Maps. The discipline in `putInsights` (`insights.ts:57-71`):
-
-```ts
-export function putInsights(sessionId, items, rawAnomalies?) {
+```typescript
+// lib/state/insights.ts:57-71
+export function putInsights(sessionId: string, items: Insight[], rawAnomalies?: Anomaly[]): void {
   // Replace the previous briefing for THIS session — each run IS the current
   // feed, not an addition. Without clearing, a warm serverless instance (or a
   // long-running dev server) accumulates stale insights from earlier runs, so
@@ -192,249 +174,307 @@ export function putInsights(sessionId, items, rawAnomalies?) {
   // keyed separately and untouched here. Only this session's sub-maps are
   // cleared — never the outer map, never another session's feed.
   const s = sessionState(sessionId);
-  s.insights.clear();    // ← clear THIS session's, not the global map
+  s.insights.clear();
   s.anomalies.clear();
-  // … repopulate …
+  items.forEach((i, idx) => {
+    s.insights.set(i.id, i);
+    if (rawAnomalies?.[idx]) s.anomalies.set(i.id, rawAnomalies[idx]);
+  });
 }
 ```
 
-This is the *right* shape for a multi-tenant warm instance: cross-session isolation by construction, intra-session "latest briefing wins" semantics.
+Bridge from what you know: this is the same shape as multi-tenant
+isolation in a shared React context — you key by tenant id, and the
+"clear my data" operation only clears the tenant's slice.
+
+**Load-bearing part: the two `.clear()` calls are on
+`s.insights` and `s.anomalies`, NOT on `state`.** If the code cleared
+`state` instead of `s.insights`, a `putInsights` on one session would
+wipe every other session's feed mid-briefing. In the shared warm
+instance model, that's a cross-tenant data leak by another name — one
+user's briefing wipes another user's feed. The comment at `:63-66`
+names this exact hazard.
+
+#### The 60s cache is per-instance (staleness across instances is fine)
+
+`BloomreachDataSource.cache` at `bloomreach-data-source.ts:122` is a
+per-instance `Map`. Two warm instances serving the same session-id
+each have their own copy. This is a "strong within instance, no
+guarantee across" consistency model, and it's fine because:
+
+- **60s TTL bounds the staleness** — even the most stale entry expires
+  within a minute
+- **Reads don't cross instances mid-request** — one request opens one
+  stream, lives on one instance
+- **The tools are read-only** — a stale answer is just an older number,
+  not a wrong write
+
+The consistency contract is "eventually consistent across instances,
+bounded by 60s." Which is exactly what you'd want for read-only data
+that's expensive to fetch.
+
+#### The client-side sessionStorage escape hatch — read-your-writes
+
+This is the piece that makes the whole story work. The user clicks
+an insight card on the feed, then navigates to the investigate page.
+The insight has to survive that navigation, and the warm instance's
+in-memory Map might not.
+
+Look at how the card handoff works:
 
 ```
-  Session keying — the invariant that makes it safe
+  sessionStorage as the read-your-writes hop
 
-  warm Vercel instance serves three users
-  ───────────────────────────────────────
-  state Map:
-    "sid-A" → { insights: {…3 entries…}, … }
-    "sid-B" → { insights: {…7 entries…}, … }
-    "sid-C" → { insights: {…0 entries…}, … }
+  feed page:
+    click insightCard
+    ────────────────►  sessionStorage.setItem(`bi:insight:${id}`, JSON.stringify(insight))
+    router.push(`/investigate/${id}?insight=<encoded>`)
 
-  user A starts a new briefing
-       │
-       ▼
-   putInsights("sid-A", newList)
-       │
-       ▼
-   sessionState("sid-A").insights.clear() ← ONLY A's
-       │
-       ▼
-   sessionState("sid-A").insights ← repopulated
+  investigate page:
+    reads ?insight= param OR sessionStorage
+    ────────────────────►  fetch('/api/agent?insightId=X&insight=<JSON>')
 
-   user B's sub-map is UNTOUCHED ★ this is the load-bearing invariant ★
+  server (route.ts:35-45):
+    resolveAnomaly:
+      1. try parse insightParam → use it if valid    ← THE ESCAPE HATCH
+      2. fall back to state.get(sid, id)              ← instance-local
+      3. fall back to committed demo snapshot         ← only in demo
 ```
 
-The other-side consistency story:
+The `insight` query param IS the client's answer to "I just wrote this
+insight; you might not remember it." The server prefers the parameter
+because it's the only source that survives Vercel's per-instance
+memory (comment at `app/api/agent/route.ts:35-38`).
+
+**Load-bearing part: the ORDER of the fallbacks in `resolveAnomaly`.**
+Client-provided wins. In-memory second. Committed snapshot last. If
+you flipped this order, a stale in-memory entry would win over the
+fresh one the client just sent — same class of bug as reading from a
+stale replica when the client just wrote to the leader.
+
+#### The two-step investigate flow — client-side handoff, not server-side
+
+Related pattern. The investigate page runs in two steps:
 
 ```
-  Ephemeral state — what survives an instance gap
+  Step 2 → Step 3 handoff
 
-  request 1 lands on instance X            request 2 (same user) lands on instance Y
-  ────────────────────────────              ────────────────────────────────────────
-  putInsights("sid-A", [...])               state.get("sid-A") → undefined
-  state(X).get("sid-A") = {3 insights}      no carry-over from X
-                                            request 2 must re-bootstrap
-
-  the route handles this in three ways:
-    - the feed re-runs the briefing (or replays demo)
-    - the investigation flow passes the Insight through sessionStorage
-      (browser-side) so the route can re-resolve from the param
-    - the demo snapshot is the source-of-truth fallback
+  investigate/[id]/page.tsx (step 2)         investigate/[id]/recommend/page.tsx (step 3)
+      │                                          │
+      │ runs DiagnosticAgent                     │ runs RecommendationAgent
+      │ produces `diagnosis`                     │ needs `diagnosis` as input
+      │                                          │
+      └── stash diagnosis in sessionStorage ─────┘
+          via useInvestigation hook               (server passes ?diagnosis=<JSON>)
 ```
 
-**This is the intentional design** — call it "eventually-consistent across Vercel instances by way of re-fetching the source." The route never assumes its state survives an instance gap; the client passes enough context (the full `Insight` JSON in the `?insight=` param, the diagnosis in `sessionStorage`) to rebuild the relevant state from scratch.
+The diagnosis goes through the client, not the server. The server has
+no cross-request memory of what step 2 produced. Same reason as
+insights: the client is the durable anchor.
 
-The comment block in `app/api/agent/route.ts:30-62` (the `resolveAnomaly` function) is the textbook example:
+Server-side proof:
 
-```ts
-// Prefers the client-provided insight (handed from the feed via
-// sessionStorage → `?insight=`), which is the only source that survives
-// Vercel's per-instance memory. Falls back to in-memory (same-instance /
-// dev, scoped to the caller's session) then the demo snapshot.
-```
-
-Three fallback sources, in priority order: client-provided (survives any gap) → in-memory (same instance) → demo snapshot (committed JSON). **The hierarchy is the consistency model**: the system is read-your-writes for the client, eventually-consistent across instances, deterministic from the demo file.
-
-#### Part 3 — the schema cache (module-level, instance-wide) — the hazard
-
-The single global variable:
-
-```ts
-// lib/mcp/schema.ts:138
-let cached: WorkspaceSchema | null = null;
-
-export async function bootstrapSchema(
-  dataSource: DataSource,
-  opts: BootstrapOpts = {},
-): Promise<WorkspaceSchema> {
-  if (cached) return cached;
-  const { projectId, projectName } = await resolveProject(dataSource, opts);
-  // … 4 more bootstrap calls …
-  cached = parseWorkspaceSchema({ … });
-  return cached;
+```typescript
+// app/api/agent/route.ts:267-272 (excerpt)
+if (step === 'recommend') {
+  // STEP 3: the diagnosis was handed over from step 2.
+  diagnosis = parseDiagnosis(diagnosisParam);
+  if (!diagnosis) {
+    throw new Error('no diagnosis was handed over — open the diagnosis step first');
+  }
 }
 ```
 
-`cached` is a module-level `let`, not session-keyed, not adapter-keyed, not args-keyed. The first request on a warm instance to call `bootstrapSchema` fills it; every subsequent request returns the same value, **regardless of which user, which session, which Bloomreach project**.
+`parseDiagnosis(diagnosisParam)` reads the client's handoff. If the
+handoff is missing, the server can't reconstruct — hard error.
 
-```
-  The schema cache hazard — cross-user staleness, drawn explicitly
+### The skeleton — what "consistency" reduces to
 
-  scenario: warm Vercel instance, two users with distinct Bloomreach
-            workspaces (e.g. via BLOOMREACH_PROJECT_ID env override,
-            or distinct DCR client registrations)
+Isolate the kernel. The pattern is: "client owns durable state, server
+owns ephemeral cache, requests carry state forward through query params
+and sessionStorage."
 
-  time      event                                   `cached` value
-  ─────     ──────────────────────────              ──────────────────
-  t=0       user A: GET /api/briefing
-            bootstrapSchema(A's dataSource)
-            resolveProject → project "wobbly-ukulele"
-            cached = wobbly-ukulele's schema       cached = schema(A)
-  ─────────────────────────────────────────────────────────────────────
-  t=1       user B: GET /api/briefing
-            bootstrapSchema(B's dataSource)
-            if (cached) return cached              ★ returns A's schema ★
-            B sees A's project name, A's event     ⚠ wrong workspace
-            schema, A's customer properties
+What breaks without each part:
 
-  the call never reaches Bloomreach for user B.
-  the agents run with the wrong schema in their prompt.
-  the EQL the agents emit references A's events against B's project_id.
-  Bloomreach errors on unknown events for project B.
+- **Drop the client-forward handoff (`?insight=`, `?diagnosis=`)** — a
+  warm instance cycle mid-investigation breaks step 2 → step 3. The
+  user clicks "see recommendations" and gets "no diagnosis was handed
+  over." Breaks the entire two-step flow.
+- **Drop session isolation (outer Map keyed by sid)** — every warm
+  instance's Map holds one user's data at a time, or worse, mixes
+  users. Cross-tenant leak.
+- **Drop the `isError` guard on the 60s cache** — a transient error
+  gets cached; every read within 60s returns the error. Recovery
+  takes 60s. (Same finding as file 03 — the mechanism serves both
+  delivery and consistency.)
+- **Drop the fallback order in `resolveAnomaly`** — the server prefers
+  stale in-memory data over what the client just wrote. Classic
+  stale-replica bug pattern.
 
-  net effect: B's briefing fails with cryptic Bloomreach errors that
-  look like "schema mismatch" but are actually our cache leaking.
-```
+### Optional hardening layered on top
 
-**Why this hasn't been observed in production:** today the single deployed instance authenticates to one Bloomreach account (`BLOOMREACH_PROJECT_ID` env pins one project). The hazard is gated by a deployment property, not by the code. If the deployment ever supports multi-tenant Bloomreach (one Vercel deployment serving multiple distinct Bloomreach OAuth identities), this fires.
-
-**The fix is one line:** key the cache by `projectId` (or session). The mechanism that *should* be there:
-
-```ts
-// pseudocode — what a safe version looks like
-
-const cache = new Map<string, WorkspaceSchema>();
-
-export async function bootstrapSchema(dataSource, opts = {}) {
-  const { projectId, projectName } = await resolveProject(dataSource, opts);
-  const hit = cache.get(projectId);
-  if (hit) return hit;
-  // … bootstrap …
-  cache.set(projectId, schema);
-  return schema;
-}
-```
-
-One Map, one key, same lifetime. The change is small; what makes it deferred is that the single-tenant deployment doesn't expose the hazard. **File 09 ranks this; this file diagnoses it.**
-
-#### Part 4 — what Bloomreach itself promises
-
-We're a client of Bloomreach. We don't get to choose its consistency model. What we *observe*:
-
-- **Reads are eventually consistent with ingest.** New events you POST to Bloomreach Engagement appear in EQL results minutes later, not seconds.
-- **Rate-limit state is global per user.** The 429 envelope's "1 per 10 second" is a property of the user's API quota, not per-region or per-shard. Two of our instances hitting Bloomreach for the same user share the rate limit.
-- **Tokens are server-side state.** Bloomreach can revoke tokens (the alpha server revokes "after minutes" per the project context). Our reset path (`/api/mcp/reset`) clears our auth state but doesn't revoke server-side — the cookie clearing is what makes us re-auth.
-
-For our purposes, the contract with Bloomreach is "eventually-consistent reads with no read-your-writes guarantee, against a global rate-limit window." We accept that contract and design around it (the 60s response cache is fine because Bloomreach's own staleness is at least that wide; the schema bootstrap is once-per-instance because the schema doesn't change minute-to-minute).
-
-### Move 2.5 — current state vs future state
-
-```
-  Today (single-tenant)                    Tomorrow (multi-tenant)
-  ───────────────────────────              ──────────────────────────────
-  schema cache: module-level let           schema cache: Map keyed by
-   (works because only one project)         projectId
-
-  insights state: session-keyed Map        same shape — already correct
-   (works for any tenancy)
-
-  no cross-instance state                  needs a shared store (KV /
-   (re-resolves from client / demo)         Redis) or sticky routing
-                                            (sticky routing is the
-                                            cheapest if Vercel supports it)
-
-  no read-your-writes for the agent's      same — agents don't write to
-   tool calls (every call is a read)        Bloomreach, so no R-Y-W needed
-```
-
-The current state is *correct for the current deployment*. The future-state work is bounded and named.
+- **The auth cookie's 10-day `maxAge`** at `lib/mcp/auth.ts:49` — bounds
+  how long an encrypted-cookie auth store outlives an instance cycle.
+  Tokens expire in minutes on the alpha, but the cookie carrying them
+  lives longer, so the app can prompt for re-auth without losing the
+  full session.
+- **`throwIfAborted()` sprinkled throughout the routes** — every phase
+  boundary in `/api/briefing` and `/api/agent` checks `req.signal`
+  before doing work. If the client navigated away, the server doesn't
+  keep computing values that no reader wants. Bounds staleness of the
+  ABORTED case.
+- **`useInvestigation` deliberately survives StrictMode double-mount**
+  — the hook does NOT cancel the in-flight fetch on cleanup, which is
+  intentional (comment cited in `.aipe/project/context.md`). React 19
+  StrictMode mounts twice; cancelling on the first cleanup would abort
+  a valid in-flight investigation and force a redo.
 
 ### Move 3 — the principle
 
-> **Module-level mutable state in a serverless runtime is a multi-tenant consistency hazard waiting for the right two users to arrive on the same warm instance. The fix is either keying (cache by tenant id) or scoping (move state to per-request). Choose one consciously — don't let "it works today" be the design.**
+**When the server can't remember, teach the client to remind it.** In
+a stateless-runtime architecture (Vercel serverless, AWS Lambda, Cloud
+Run), server memory is the least durable store in the whole system. The
+practical consistency model isn't "eventually consistent" — it's "the
+client owns the durable copy, the server is a cache, and every
+request carries the state forward that the server can't guarantee will
+still be there next request." Recognize this shape and design UI state
+around it; fight it and you'll write cache invalidation code
+indefinitely.
 
-The session-keyed Maps in `lib/state/` got this right: the outer key is the tenant, the lifetime is the instance. The schema cache got it wrong: no tenant key, instance lifetime. The same mistake, made differently. **Reviewing module-level state for tenant-keying is a checklist item, not a judgement call.**
-
-## Primary diagram — the staleness map
+## Primary diagram — the consistency picture in one frame
 
 ```
-  Consistency surfaces in blooming_insights — full picture
+  Consistency + durability, one frame
 
-  ┌─ Browser ─────────────────────────────────────────────────────┐
-  │  sessionStorage stash (per-tab, per-origin)                    │
-  │  ★ READ-YOUR-WRITES inside a tab; no cross-tab guarantee ★      │
-  └─────────────────────────┬─────────────────────────────────────┘
-                            │
-  ┌─ Route handler ─────────▼─────────────────────────────────────┐
-  │  in-memory state (per warm instance):                          │
-  │   • insights: Map<sessionId, {…}>     ← session-keyed, SAFE    │
-  │   • investigations: Map<insightId,…>   ← session-keyed, SAFE    │
-  │   • schema cache: ★ MODULE-LEVEL let ★  ← NOT keyed, HAZARD    │
-  │                                                                │
-  │  cross-instance: stateless (re-resolve from client or demo)    │
-  └─────────────────────────┬─────────────────────────────────────┘
-                            │
-  ┌─ DataSource adapter ────▼─────────────────────────────────────┐
-  │  60s response cache, per-adapter (per-request)                 │
-  │  keyed by name + JSON.stringify(args)                          │
-  │  ★ ALWAYS SAFE — adapter dies with the request ★               │
-  └─────────────────────────┬─────────────────────────────────────┘
-                            │
-  ┌─ Bloomreach ────────────▼─────────────────────────────────────┐
-  │  workspace: eventually-consistent with ingest (their domain)   │
-  │  rate-limit: global per user                                   │
-  │  tokens: server-side state, can be revoked                     │
-  └────────────────────────────────────────────────────────────────┘
-
-  consistency model:
-    • inside-request:        bounded by 60s response cache
-    • inside-session:        latest briefing wins (clear-on-put)
-    • cross-instance:        eventually-consistent via re-resolve
-    • cross-tenant (today):  ⚠ schema cache leaks if multi-tenant
+  ┌─ Client (browser) — DURABLE ─────────────────────────────────────────┐
+  │                                                                       │
+  │   sessionStorage `bi:insight:${id}`   → survives page nav in-tab      │
+  │   sessionStorage `bi:investigation:${id}` → survives step 2 → step 3  │
+  │   localStorage    `bi:mode`           → survives close/reopen         │
+  │   cookies         `bi_session`, `bi_auth` → sent with each request    │
+  │                                                                       │
+  └───────┬───────────────────────────────────────────────────────────────┘
+          │
+          │  request carries:
+          │    - bi_session cookie (session id)
+          │    - ?insight=<JSON>   (client's copy of the write)
+          │    - ?diagnosis=<JSON> (step 2's output for step 3)
+          ▼
+  ┌─ Warm instance — EPHEMERAL ──────────────────────────────────────────┐
+  │                                                                       │
+  │   state: Map<sessionId, SessionFeed>                                  │
+  │       ├─ insights: Map<insightId, Insight>                            │
+  │       ├─ investigations: Map<insightId, Investigation>                │
+  │       └─ anomalies: Map<insightId, Anomaly>                           │
+  │       (lib/state/insights.ts:8-14 — keyed by session, isolated)       │
+  │                                                                       │
+  │   BloomreachDataSource.cache: Map<`${name}:${args}`, cachedResult>    │
+  │       (bloomreach-data-source.ts:122 — 60s TTL, no cross-instance)    │
+  │                                                                       │
+  │   resolveAnomaly fallback order:                                      │
+  │     ①  client-provided ?insight=  (survives instance cycle)           │
+  │     ②  state.get(sid, id)         (this instance's memory)            │
+  │     ③  committed demo snapshot    (demo mode only)                    │
+  │                                                                       │
+  └───────┬───────────────────────────────────────────────────────────────┘
+          │  hop B (rate-limited)
+          ▼
+  ┌─ Bloomreach — source of truth ─────────────────────────────────────┐
+  │  authoritative workspace data                                      │
+  └────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The classifications used here come from Vogels and Brewer:
+The pattern you're seeing here — "durable client + ephemeral server +
+request-carries-state" — is the same shape as:
 
-- **Read-your-writes** (Vogels). A user who issues a write sees its result on a subsequent read. *In this codebase, the user's only "write" is starting a briefing or investigation; the next read on the same session sees its result (sessionStorage handoff or in-memory cache). R-Y-W holds for the client, eventually-consistent across instances.*
-- **Monotonic reads.** Once a user sees value V, they never subsequently see an older value. *Holds within a session because `putInsights` clears + sets atomically. Could break across instances if a slow-arriving stale result overwrote a newer one — doesn't today because each session has at most one inflight briefing.*
-- **PACELC** (Abadi). The extension to CAP: even when there's no partition, you trade Latency for Consistency. *Here we picked latency: the 60s response cache, the module-level schema cache, and the per-instance Maps all trade some consistency for speed. The schema-cache trade is the one we made implicitly; the others were explicit.*
+- **JWT-based auth** — every request carries the token; the server never
+  remembers you between requests. Same trade: instance-agnostic, no
+  shared store required.
+- **URL-as-state SPAs** — the URL carries the app state (filters,
+  selection, page); reload restores it. Same trade: bookmarkable,
+  shareable, but the URL gets long.
+- **React Server Components with client-provided context** — the RSC
+  runs stateless; the client feeds context forward with each render.
 
-The other reference worth knowing: **CRDT (conflict-free replicated data types).** Not used in this repo, not needed. The reason: there's no multi-writer scenario. The browser writes to `sessionStorage` (single writer per tab), the route writes to the session-keyed Map (single writer per request), the DataSource cache is single-writer per adapter. CRDTs solve multi-writer convergence; we don't have multi-writer.
+Where this pattern breaks in a larger system:
+
+- **When the state is too big to fit in a query param or a cookie** —
+  encrypted cookies max out at ~4KB in practice (browser limits are
+  larger but headers get expensive). This app's insight/diagnosis
+  objects fit; a full investigation trace does not (it's stashed in
+  sessionStorage, not the URL).
+- **When multiple tabs need to share state** — sessionStorage is
+  per-tab. If a user opens two tabs to the same insight, each runs
+  its own investigation. The system doesn't dedup across tabs.
+- **When you need read-your-writes across users** — this system is
+  strictly per-user; two users on one instance can't see each other's
+  insights (by design). If you had shared workspace state (team
+  view), the client-side stash wouldn't help — you'd need a real
+  shared store.
+
+The `useInvestigation` hook's decision to NOT cancel the in-flight
+fetch on StrictMode cleanup (`.aipe/project/context.md` line 84) is a
+consistency call: better to complete the write to the server than to
+abort it and possibly restart cold. That's a "prefer completing an
+in-flight write to starting a fresh one" rule — a small but real
+distributed-systems principle.
 
 ## Interview defense
 
-### "What's your consistency model for a user's briefing?"
+### Q: "How does state stay consistent across the browser and the server?"
 
-Inside a session, read-your-writes: a briefing run on instance X populates `state[sid].insights`, the same session's next request on instance X reads it back. Across instances, eventually-consistent via re-resolve: the client passes the `Insight` JSON through `sessionStorage` → `?insight=` so a different instance can rebuild the anomaly from scratch (`resolveAnomaly` in `app/api/agent/route.ts:30-62`). The demo snapshot is the deterministic fallback. The system is never *strongly* consistent across instances — and doesn't need to be, because every Bloomreach call is a read and the route can always re-run the briefing.
+Sketch this:
 
-*Anchor:* `lib/state/insights.ts:57-71` — `putInsights` clears-then-sets per-session; `app/api/agent/route.ts:30-62` — the three-source fallback hierarchy.
+```
+     client (durable)          server (ephemeral)
+     ────────────────          ──────────────────
+     sessionStorage ──────────► ?insight=<JSON>
+     sessionStorage ──────────► ?diagnosis=<JSON>
+     bi_session cookie ───────► Map<sid, SessionFeed>
+                                (this instance only)
+```
 
-### "Walk me through the schema cache and what's wrong with it."
+"The client is the durable store; the server is a cache. Every request
+carries the state forward that the server can't guarantee will be
+there — the insight object rides `?insight=<JSON>` from the feed to
+the investigate route, the diagnosis rides `?diagnosis=<JSON>` from
+step 2 to step 3. Server-side memory is a per-warm-instance Map keyed
+by session id — strong within an instance, no guarantee across.
+`resolveAnomaly` prefers the client-provided payload over the
+in-memory copy, which is the read-your-writes escape hatch. This is
+because a Vercel warm instance cycle mid-investigation would otherwise
+lose the state."
 
-`lib/mcp/schema.ts:138` declares a module-level `let cached: WorkspaceSchema | null = null`. First request to `bootstrapSchema` on a warm Vercel instance runs the bootstrap orchestrator (list_cloud_organizations → list_projects → 4 metadata calls), parses the result, and stores it. Every subsequent request on that instance returns the same `cached` value without re-running. Today it's safe because we deploy single-tenant — `BLOOMREACH_PROJECT_ID` pins one project, all requests resolve to the same workspace. The hazard is multi-tenant: if two distinct OAuth identities land on the same instance, the second sees the first's schema, which leaks A's event names into B's agent prompts and produces Bloomreach errors that look like schema mismatch. The fix is a `Map<projectId, WorkspaceSchema>` instead of a single `let`. Three-line change; deferred because the deployment property gates the hazard. File 09 ranks it.
+Anchors: `app/api/agent/route.ts:35-58` (resolveAnomaly),
+`lib/state/insights.ts:57-71` (session isolation),
+`lib/hooks/useInvestigation.ts` (the client-side stash).
 
-### "Why no shared cache (Redis/KV) across Vercel instances?"
+### Q: "What breaks if the outer Map key isn't the session id?"
 
-Because we don't need cross-instance read-your-writes for anything load-bearing. The two pieces of state that need to survive an instance gap — OAuth tokens and investigation results — already do, via different mechanisms: tokens via the encrypted cookie (`lib/mcp/auth.ts`), investigations via `sessionStorage` handoff + the in-memory cache on whichever instance serves the request. The 60s response cache is per-request, so cross-instance is irrelevant. The schema cache is global per instance, which is the hazard already discussed. Adding Redis would solve one real problem (the schema cache) and add complexity to four non-problems. The right shape today is the cookie + sessionStorage tactic; the right shape *tomorrow* if we go multi-tenant is keying the schema cache and probably moving the OAuth client info to KV. We're not there yet.
+"Cross-tenant leak. If the outer key were something shared across users
+(a global feed key), one user's `putInsights` would `.clear()` and
+overwrite everyone else's data. The comment at `lib/state/insights.ts:8`
+names this exact hazard — a single warm instance serves many users
+concurrently. The session-id partition is what keeps user A's briefing
+from wiping user B's feed mid-request."
 
-*Anchor:* `lib/mcp/auth.ts:38-104` — the cookie-as-distributed-state mechanism; `app/api/agent/route.ts:30-62` — the client-passes-context-back tactic.
+### Q: "What's the consistency model of the 60s response cache?"
+
+"Per-instance strong, cross-instance eventually consistent bounded by
+60s. Two warm instances serving the same session-id each have their
+own cache Map, so one instance can serve a stale answer for up to 60s
+after another instance saw a fresh one. Which is fine: the tools are
+read-only, staleness manifests as an older number, not a wrong write.
+If we needed cross-instance consistency, we'd use Vercel KV or
+Upstash — standard escape hatch. Don't need it yet."
 
 ## See also
 
-- `03-idempotency-deduplication-and-delivery-semantics.md` — the cache as dedup mechanism.
-- `07-clocks-coordination-and-leadership.md` — OAuth state survival, the other piece of distributed state.
-- `09-distributed-systems-red-flags-audit.md` — the schema cache hazard ranked.
-- `.aipe/study-system-design/` — the architectural shape that makes single-tenant safe today.
-- `.aipe/study-database-systems/` — datastore-local consistency (mostly `not yet exercised` here — no datastore we own).
+- 03-idempotency-deduplication-and-delivery-semantics.md — the cache
+  from the delivery-semantics angle
+- 07-clocks-coordination-and-leadership.md — the OAuth cookie survives
+  instance cycles for the same reason sessionStorage does
+- 09-distributed-systems-red-flags-audit.md — the "no shared cache"
+  risk ranking

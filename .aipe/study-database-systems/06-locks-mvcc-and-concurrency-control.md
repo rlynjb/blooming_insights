@@ -1,235 +1,311 @@
-# Locks, MVCC, and concurrency control — none, by partition
+# Locks, MVCC, and concurrency control
 
-*Industry standard / Project-specific* — there are zero locks and no MVCC. The repo gets away with this by partitioning state per-session and by relying on Node's single-threaded execution to serialize writes within a session.
+*Concurrency control / Language-agnostic*
 
 ## Zoom out, then zoom in
 
-Concurrency control becomes interesting the moment two callers can touch the same row. The repo's whole design is that they can't: every session owns its own sub-maps, every request is its own function invocation, and JavaScript is single-threaded. The one place where two callers *could* hit the same row is the rate-limit-spacing path inside `BloomreachDataSource` — and that's not protected by a lock, it's protected by a single timestamp variable that every caller reads and updates.
+You know how in Postgres two concurrent `UPDATE` statements on the same row block each other with a row lock, and MVCC lets readers see the pre-update snapshot without waiting? That's concurrency control. This repo has none of that machinery — no locks, no MVCC, no CAS, no compare-and-swap. Instead it leans on Node's single-threaded event loop and one clever runtime primitive: `AsyncLocalStorage`. This file walks the standard toolbox, then names which mechanism plays which role here.
 
 ```
-  Zoom out — where this concept lives
+  Zoom out — where "concurrency control" lives
 
-  ┌─ UI layer ───────────────────────────────────────────────┐
-  │  feed + investigation may run in the same browser tab     │
-  └────────────────────────────┬─────────────────────────────┘
-                               │  HTTP (potentially parallel)
-  ┌─ Service layer ────────────▼─────────────────────────────┐
-  │  /api/briefing  ──┐                                      │
-  │                   │  same Node process, different fn      │
-  │  /api/agent     ──┤                                      │
-  │                   ▼                                      │
-  │  BloomreachDataSource.liveCall                            │
-  │    lastCallAt ★ THE ONLY SHARED MUTABLE ★                  │ ← we are here
-  └────────────────────────────┬─────────────────────────────┘
-                               │
-  ┌─ Storage layer ────────────▼─────────────────────────────┐
-  │  sessionState (partitioned per sid — no contention)       │
-  └──────────────────────────────────────────────────────────┘
+  ┌─ UI (browser) ────────────────────────────────────────────┐
+  │  one tab = one concurrent reader/writer to this session    │
+  └────────────────────────┬──────────────────────────────────┘
+                           │
+  ┌─ Service (Vercel warm instance) ▼─────────────────────────┐
+  │                                                            │
+  │  ★ Node event loop = mutual exclusion between JS turns     │ ← this file's scope
+  │  ★ AsyncLocalStorage = request-scoped isolation            │
+  │  ★ sessionId partitioning = no cross-user contention       │
+  │                                                            │
+  │  no locks · no MVCC · no CAS · no optimistic retry          │
+  │                                                            │
+  └────────────────────────┬──────────────────────────────────┘
+                           │
+  ┌─ Provider (Bloomreach) ▼──────────────────────────────────┐
+  │  their concurrency controls are opaque; we experience them │
+  │  as rate limits (~1 req/s), not locks                      │
+  └────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: there are two questions worth asking. (1) Why are there no locks on the session state? Because the partition guarantees one writer at a time per session. (2) Why is `lastCallAt` safe without a lock? Because the worst case is "two callers under-space their requests and the second gets a 429 the retry path handles."
+**Zoom in.** The runtime and the data shape together do all the concurrency work. The interesting mechanism isn't locking — it's how the ALS store at `auth.ts:47` gives you request-scoped state without any lock at all.
 
 ## Structure pass
 
-**Layers:**
+**Axis to hold constant: what enforces "one writer at a time" on each piece of state?**
 
 ```
-  L1  per-session state          partitioned, no contention
-  L2  per-DataSource cache       single-writer per instance
-  L3  lastCallAt timestamp        read-modify-write, no lock
+  "what makes writes safe?" — traced across the state primitives
+
+  ┌─ per-session inner Map (insights, anomalies) ───────────┐
+  │  putInsights runs synchronously; JS event loop cannot    │  → event loop
+  │  interleave two turns' writes                            │    (turn atomicity)
+  │  insights.ts:57-71                                       │
+  └─────────────────────────────────────────────────────────┘
+      ┌─ BloomreachDataSource cache (Map) ──────────────────────┐
+      │  callTool writes cache.set(key, {result, expiresAt})     │  → event loop
+      │  synchronously after `await liveCall`; still turn-atomic │    (turn atomicity)
+      │  bloomreach-data-source.ts:185-187                       │
+      └─────────────────────────────────────────────────────────┘
+          ┌─ auth store (per request) ───────────────────────────┐
+          │  ALS ctx.store is scoped to ONE request via              │
+          │  requestStore.run(ctx, fn) — concurrent requests get    │  → AsyncLocalStorage
+          │  different ctx instances, no shared mutation            │    (request scoping)
+          │  auth.ts:47, 86-104                                     │
+          └─────────────────────────────────────────────────────────┘
+              ┌─ dev-only file cache (.investigation-cache.json) ──────┐
+              │  read-modify-write with no lock — not concurrency-safe │  → no protection
+              │  investigations.ts:30-41                                │    (accepted: dev)
+              └────────────────────────────────────────────────────────┘
 ```
 
-**Axis traced: where could two writers race?**
-
-```
-  Trace one axis: can two writers race for this state?
-
-  ┌─ L1: sessionState ───────────────────┐
-  │  outer Map keyed by sessionId         │   → no race: one sid, one request
-  └───────────────────────────────────────┘
-                  (it flips)
-  ┌─ L2: cache Map ──────────────────────┐
-  │  one cache per DataSource instance    │   → races possible but benign
-  └───────────────────────────────────────┘
-                  (it flips)
-  ┌─ L3: lastCallAt number ──────────────┐
-  │  one var, every caller reads + writes │   → races possible, handled by retry
-  └───────────────────────────────────────┘
-
-  the seam at L3 is where contention is theoretically real and pragmatically absorbed
-```
-
-**Seams** — one matters:
-
-- The L2 → L3 boundary is where "no race possible" becomes "race possible but cheap." Above this line you don't need a lock; below it you might, and the repo chose to absorb the cost in the retry path instead.
+The seam that flips the axis is **the async boundary within one request** — `await`. Before an `await`, you're a single-turn atomic block. After it, the loop may have run other code. That's the moment `AsyncLocalStorage` earns its keep: it gives you a store that follows the *async control flow* of your request rather than being reset by every yield.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You've used a `Map.get()` then `Map.set()` pattern before — read a value, modify it, write it back. In a single-threaded runtime this is atomic *as long as nothing yields*. As soon as there's an `await` between the read and the write, two callers can interleave. The whole concurrency-control story here is "where are the read-modify-writes, and do any of them have an `await` in the middle?"
+The concurrency-control toolbox, briefly:
 
 ```
-  The two patterns side by side
+  standard concurrency-control mechanisms
 
-  SAFE — fully synchronous:                  RACEY — await in the middle:
+  pessimistic locking    ─── take a lock before touching X, others wait
+                              (row locks, table locks, advisory locks)
 
-  let x = state.get(k)                       let x = state.get(k)
-  x.count++                                  x = await fetchUpdated(k)   ◄── yields
-  state.set(k, x)                            state.set(k, x)
+  optimistic locking     ─── read X + version; write "SET version+1
+                              WHERE version = old"; retry on mismatch
 
-  no other JS can interleave                 another caller can run between
-  here — Node serializes by                  the get and the set, write the
-  default                                    same key, and lose updates
+  MVCC                    ─── writers create a new version; readers
+                              see the version from their snapshot;
+                              no reader-writer blocking
+
+  CAS / atomic-op         ─── compare-and-swap primitive at the storage
+                              layer (Redis, atomic file rename, etc.)
+
+  serialization by design ─── organize so only one writer per key exists
+                              at a time (partition by user, event loop, etc.)
 ```
 
-That's the mental model. The rest is finding the places in the repo where each pattern lives.
+This repo picks the last one. All-in on "serialization by design." Then it uses `AsyncLocalStorage` as the mechanism to preserve *request identity* across async yields, which is a subtler form of the same idea — instead of locking a resource, you *scope* the resource to a control-flow context that can't be shared.
 
-### Move 2 — the concurrency story, one part at a time
-
-#### Session state — no contention because of the partition
-
-`sessionState(sid)` returns a per-session sub-feed. Two different sessions never touch the same `Map`. The same session (same `sid`) can in principle make two concurrent requests — e.g. a tab firing `/api/briefing` while another tab fires `/api/agent` — but they touch *different* sub-maps:
-
-- briefing writes `s.insights` and `s.anomalies`
-- agent writes `s.investigations`
+The kernel of the ALS trick:
 
 ```
-  Per-session sub-feed — three sibling tables, different writers
+  AsyncLocalStorage kernel — request-scoped state without a lock
 
-  s = sessionState(sid)
-       │
-       ├─ s.insights         ◄── /api/briefing writes (via putInsights)
-       ├─ s.investigations   ◄── /api/agent writes (via putInvestigation)
-       └─ s.anomalies        ◄── /api/briefing writes (via putInsights)
+  1. runtime tracks a "current context" that follows async continuations
+  2. requestStore.run(ctx, fn) sets ctx for the duration of fn (and every
+     await it produces)
+  3. concurrent calls to run(ctx, fn) with DIFFERENT ctx values do NOT
+     see each other's ctx — the two async chains have independent stores
+  4. inside fn, requestStore.getStore() returns THIS request's ctx —
+     even after an `await` that resumed another turn in between
+
+  what breaks if you remove:
+    step 2 → the store leaks between requests (module-level Map bleed)
+    step 3 → concurrent requests race on shared mutable state
+    step 4 → you can't read the store from deeply nested async helpers
 ```
 
-So even within one session there's no shared-row contention. Two writers, two different inner maps. No lock needed.
+That's the mechanism. It's not a lock; it's a *namespace* that follows your async chain.
 
-What *would* contend: two simultaneous `/api/briefing` calls for the same session, both racing into `putInsights`. The second's `.clear()` could land mid-way through the first's `.forEach()`. The UI doesn't trigger this (briefing is a single-button action and the button disables while running) but nothing in the server prevents it. The fix, if it ever became real, would be a per-session `Promise` lock — but again, today it's not happening.
+### Move 2 — the primitives walked
 
-#### Cache — single writer per instance, benign races
+**Node event loop = mutex-for-free.**
 
-The 60s response cache (`bloomreach-data-source.ts:122`) lives on a per-DataSource instance. There's one instance per session at most (constructed by `connectMcp`), so two requests for the same session share a cache. Two concurrent `callTool` calls for the same key can race:
-
+```ts
+// lib/state/insights.ts:57-71   (repeated from previous file)
+export function putInsights(sessionId: string, items: Insight[], rawAnomalies?: Anomaly[]): void {
+  const s = sessionState(sessionId);
+  s.insights.clear();
+  s.anomalies.clear();
+  items.forEach((i, idx) => {
+    s.insights.set(i.id, i);
+    if (rawAnomalies?.[idx]) s.anomalies.set(i.id, rawAnomalies[idx]);
+  });
+}
 ```
-  Two concurrent calls with the same key — what happens
 
-  T0: callA: cache.get(k) → MISS
-  T0: callB: cache.get(k) → MISS    ← B doesn't see A's pending work
-  T1: callA: liveCall → result A
-  T2: callB: liveCall → result B    ← duplicate network call
-  T3: callA: cache.set(k, resultA)
-  T4: callB: cache.set(k, resultB)  ← overwrites A; readers from T4+ see B
+No `async`, no `await`. From the outside, this function is *indivisible*. The event loop cannot pick up another callback in the middle of a synchronous statement. That's your mutex. There is nothing else guarding this Map — no `Promise.all` gate, no semaphore, no advisory lock. The single-threaded runtime is the concurrency control.
+
+**Same for the response cache write path.**
+
+```ts
+// lib/data-source/bloomreach-data-source.ts:185-187
+const now = Date.now();
+this.cache.set(cacheKey, { result, expiresAt: now + ttl });
+return { result: result as T, durationMs, fromCache: false };
 ```
 
-The race is real and the cost is "one extra upstream call." Both callers get a valid result (whichever one returned for them), the cache ends up holding the most-recent result, and there's no correctness violation — only a missed dedup. The repo accepts this rather than adding a "request coalescing" layer because the two-concurrent-call case is rare (each agent runs sequentially per session).
+Runs synchronously after `result` is resolved. Two concurrent tool calls on the same instance CAN both reach this line, but they run in separate turns — one finishes its `cache.set` before the other's turn starts. If two racers happened to have the same `cacheKey` (unusual — they'd both be after the same tool+args), the second write clobbers the first. Since both values are the same fresh result, there's no visible harm.
 
-#### `lastCallAt` — the only true race condition, absorbed by retry
+**AsyncLocalStorage as request-scoped isolation.**
 
-```typescript
+```ts
+// lib/mcp/auth.ts:44-48
+interface RequestStore { store: Store; dirty: boolean }
+const requestStore = new AsyncLocalStorage<RequestStore>();
+```
+
+`requestStore.run(ctx, fn)` at `auth.ts:91` sets `ctx` as the current context for the duration of `fn`. Every `await` inside `fn` — even nested calls, even into other modules — sees the *same* ctx via `requestStore.getStore()`. But a *sibling* request in flight on the same warm instance is running its own `requestStore.run(otherCtx, otherFn)` and sees only *its* ctx. Two requests, two contexts, zero shared mutation. No lock needed.
+
+```ts
+// lib/mcp/auth.ts:113-122
+function readAll(): Store {
+  const ctx = requestStore.getStore();
+  if (ctx) return ctx.store;               // ← inside a request: hit the ALS-scoped store
+  if (!PERSIST) return Object.fromEntries(memStore);
+  try {
+    if (existsSync(CACHE_FILE)) return JSON.parse(readFileSync(CACHE_FILE, 'utf8')) as Store;
+  } catch { /* corrupt/unreadable cache — treat as empty */ }
+  return {};
+}
+```
+
+Every read routes through ALS in production. The OAuth SDK's `saveTokens` → `readState` → `patchState` chain (`auth.ts:189-217`) does dozens of these per handshake, all against `ctx.store`, all consistent within the request.
+
+This is the *real* concurrency-control innovation in the repo. Nothing else here is doing anything you couldn't do in synchronous code.
+
+**Rate limit as external "concurrency control".**
+
+```ts
 // lib/data-source/bloomreach-data-source.ts:190-205
-private async liveCall(name, args, signal) {
+private async liveCall(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
   const elapsed = Date.now() - this.lastCallAt;
   if (elapsed < this.minIntervalMs) {
-    await new Promise((r) => setTimeout(r, this.minIntervalMs - elapsed));  // ◄── yields
+    await new Promise((r) => setTimeout(r, this.minIntervalMs - elapsed));
   }
-  try {
-    const result = await this.transport.callTool(name, args, { signal });   // ◄── yields
-    this.lastCallAt = Date.now();
-    return result;
-  } catch (err) {
-    this.lastCallAt = Date.now();
-    throw new McpToolError(name, errorDetail(err), { cause: err });
+  ...
+  this.lastCallAt = Date.now();
+  ...
+}
+```
+
+`this.lastCallAt` is a single number, mutated by every call. Two concurrent tool calls on the same `BloomreachDataSource` instance can both read `elapsed`, both decide "no wait needed," and both call the wire — the intended 1 req/s spacing collapses. This is *by acceptance*: within one process, one user's session tends to make sequential tool calls (the agent loop is serial), and the retry ladder catches any resulting rate-limit response. Between processes / warm instances, there's no shared coordination at all. Bloomreach's server-side global rate limit is the actual enforcer; this local spacing is a courtesy.
+
+**Dev-only file cache — the racy corner.**
+
+```ts
+// lib/state/investigations.ts:30-41 (repeated)
+export function saveInvestigation(insightId: string, events: AgentEvent[]): void {
+  mem.set(insightId, events);
+  if (PERSIST) {
+    const all = readJson(CACHE_FILE);
+    all[insightId] = events;
+    try {
+      writeFileSync(CACHE_FILE, JSON.stringify(all));
+    } catch { /* best effort */ }
   }
 }
 ```
 
-Two `await`s and a read-modify-write of `this.lastCallAt`. Two concurrent callers can both see "elapsed > minIntervalMs," both skip the wait, both fire — and the upstream returns a 429 to whichever one violated the rate limit. The retry path (`bloomreach-data-source.ts:163-174`) parses the wait hint, sleeps, and retries.
+The read-modify-write is not atomic across the read at line 34 and the write at line 37. Two dev routes hitting this simultaneously could both read the old file, both mutate their in-memory copies, both write — one loses. Accepted because it's dev, single-user, single-writer.
 
-**This is the only place in the repo where concurrent execution can produce a wrong-looking result, and it's deliberately absorbed by the retry rather than locked.** The reasoning: a lock would serialize all in-flight calls and cost more than the occasional retry penalty.
+### Move 2 variant — the load-bearing skeleton
 
-```
-  lastCallAt — race, then retry absorbs it
+Kernel of "safe concurrent access" in this repo:
 
-  T0: caller1 reads lastCallAt = 0,  elapsed = ∞,  skips wait
-  T0: caller2 reads lastCallAt = 0,  elapsed = ∞,  skips wait
-  T1: caller1 transport.callTool → ok
-  T1: caller2 transport.callTool → 429 rate-limited
-  T2: caller1: lastCallAt = T1
-  T2: caller2: lastCallAt = T1
-  T3: caller2 retry loop sees isRateLimited(result), parses wait,
-      sleeps, retries → success on T4
-```
+1. **The synchronous JS statement.** Every write happens inside a single turn. Break this (add an `await` between read and write) and you've introduced a race.
+2. **`AsyncLocalStorage.run(ctx, fn)`** wrapping every production request that touches auth. Break this and you're back to module-level Map bleed across concurrent requests.
+3. **The sessionId partitioning of the outer state Map.** Break this and you're back to cross-user clobbers.
 
-No lock, no MVCC, no version chain. The mechanism is "let it race, detect the failure, retry with a backoff."
-
-#### MVCC — none
-
-There are no version chains in this repo. `Map` stores one value per key; an update replaces the previous value. No `xmin`/`xmax`, no readers seeing stale snapshots while a writer commits. The closest thing to a snapshot is the committed JSON in `lib/state/demo-*.json` (frozen at capture time) and the encrypted cookie (one version per request via the dirty bit) — neither of those is MVCC, they're just point-in-time snapshots.
-
-#### Optimistic vs pessimistic — neither applies
-
-Both concurrency models assume contention that needs detection (optimistic) or prevention (pessimistic). The repo doesn't have contention worth either. The cache race is benign; the `lastCallAt` race is absorbed by retry; the session-state writes don't share rows.
+The rest — the 200ms rate-limit spacing, the dev file cache — is best-effort, not skeleton.
 
 ### Move 3 — the principle
 
-The strongest concurrency-control technique is **eliminating the contention**. When you partition state by tenant (here: sessionId), one writer at a time per tenant becomes a structural property — no lock needed because no race possible. The remaining races (cache fill, rate-limit spacing) become "benign vs absorbed" decisions you can make explicitly. Locks are what you reach for when the partition can't be drawn cleanly; this repo could draw it cleanly, so it doesn't reach.
+**When you can guarantee one writer per key per turn, you don't need locks.** Locks are how you defend against concurrent writers to the same resource. Remove concurrent writers *by shape* — session-scope every mutation, keep every write synchronous, wrap async chains in ALS scopes — and the machinery becomes unnecessary. The moment your shape allows two writers to the same key (a shared cache with cross-user reuse, a global counter, a shared file), locks or CAS come back into the picture.
 
 ## Primary diagram
 
 ```
-  Concurrency story — three layers, one race that matters
+  Every concurrency-control mechanism (and non-mechanism) here
 
-  ┌─ session state ─────────────────────────────────────────┐
-  │  partition by sessionId                                  │
-  │  no race: outer Map keyed, inner Maps per session         │
-  │  contract gap: two same-sid /api/briefing calls could     │
-  │                race in putInsights (today, not triggered) │
-  └──────────────────────────────────────────────────────────┘
+  ┌─ turn-level: the event loop ────────────────────────────────┐
+  │                                                              │
+  │     turn N:  putInsights runs to completion (sync)           │
+  │                       │                                      │
+  │     turn N+1:         ▼                                      │
+  │              some other request's callback                   │
+  │                                                              │
+  │     no interleave possible. event loop = mutex for free.     │
+  │     lib/state/insights.ts:57-71                              │
+  │     lib/data-source/bloomreach-data-source.ts:185-187        │
+  └──────────────────────────────────────────────────────────────┘
 
-  ┌─ response cache ────────────────────────────────────────┐
-  │  per-DataSource Map                                      │
-  │  race possible: 2 concurrent miss → 2 live calls → last  │
-  │                 writer wins, both callers get valid data │
-  │  cost: 1 extra upstream call (benign)                    │
-  └──────────────────────────────────────────────────────────┘
+  ┌─ request-level: AsyncLocalStorage ─────────────────────────┐
+  │                                                              │
+  │  request A                        request B                  │
+  │    requestStore.run(ctxA, fnA)      requestStore.run(ctxB,fnB)│
+  │       │                                │                     │
+  │       └── every await inside sees ctxA │                     │
+  │       └── readAll/writeAll → ctxA.store└── ctxB.store        │
+  │                                                              │
+  │  no shared mutation between them. ALS = request scoping.     │
+  │  lib/mcp/auth.ts:47, 86-104                                  │
+  └──────────────────────────────────────────────────────────────┘
 
-  ┌─ lastCallAt timestamp ──────────────────────────────────┐
-  │  single number, read-modify-write across awaits          │
-  │  race possible: 2 callers skip spacing, 1 gets 429       │
-  │  recovery: retry path parses wait hint, sleeps, retries   │
-  │  cost: ~10s on the second caller's retry                  │
-  └──────────────────────────────────────────────────────────┘
+  ┌─ data-level: sessionId partition ──────────────────────────┐
+  │                                                              │
+  │  state = Map<sessionId, SessionFeed>                         │
+  │                                                              │
+  │  session A's writes NEVER touch session B's Maps.            │
+  │  no lock needed because there is nothing to contend for.     │
+  │  lib/state/insights.ts:14                                    │
+  └──────────────────────────────────────────────────────────────┘
 
-  no locks, no MVCC, no snapshot isolation — by design
+  ┌─ accepted racy corners ────────────────────────────────────┐
+  │                                                              │
+  │  dev file cache read-modify-write   (single-writer env)     │
+  │    lib/state/investigations.ts:30-41                         │
+  │                                                              │
+  │  lastCallAt spacing counter         (external limit catches) │
+  │    lib/data-source/bloomreach-data-source.ts:190-205        │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The hidden assumption is "Node is single-threaded." That's true for JS execution but not for I/O completions — when two `await`s complete out of order, the order in which the resumed coroutines run is the JS scheduler's call. The repo relies on this for `putInsights` to be atomic (no `await` between the clear and the forEach), and on the retry path to absorb `lastCallAt` races. Both are correct, both are fragile to refactors that add `await`s where there were none.
+The ALS story deserves one more sentence because it's the interesting bit. `AsyncLocalStorage` is Node's built-in equivalent to a thread-local — except JS doesn't have threads, so it's continuation-local. When you `await` inside `requestStore.run(ctx, ...)`, the runtime remembers `ctx` so the resumed callback sees it. That means every helper called from your request handler — five modules deep, ten `await`s later — can read the same ctx without you passing it explicitly. And two concurrent requests can be doing this simultaneously with independent ctx values.
 
-Compare to a Postgres-backed equivalent: `putInsights` would be `DELETE ... WHERE sid = ?; INSERT ...` inside a transaction. The cache race would be solved by `INSERT ... ON CONFLICT DO NOTHING`. The rate-limit race would be solved by the upstream itself (or a token bucket in a Redis-backed shared store). All of those involve more infrastructure than the current design; the current design is "single-process, single-tenant-per-key, absorb the rest with retries."
+This is how Next apps get "request-scoped state" without singletons or locks. The code at `auth.ts:113-142` treats the cookie as the durability layer and the ALS store as the *within-request cache* that lets the OAuth SDK's synchronous read-then-set-then-read pattern actually work. Without ALS, every `saveTokens` would need to await a cookie flush, and every `readState` would need to await a cookie read; you'd serialize the OAuth handshake to a crawl and still hit the request-vs-response cookie split problem.
 
-The interesting design move is the explicit **"absorb the race rather than lock it"** choice for `lastCallAt`. A lock would serialize every tool call across every session sharing one Bloomreach client — which would multiply the rate-limit cost by the concurrency count. Accepting the occasional 429 + retry is cheaper.
+`study-runtime-systems` owns the deeper event-loop mechanics; `study-distributed-systems` owns the request-scoping pattern at coordination scale. Here the point is narrower: **ALS is the concurrency-control primitive in this repo**, and it's the one thing you couldn't remove without breaking OAuth.
+
+### `not yet exercised`
+
+- **Row / table locks.** No engine.
+- **MVCC snapshots, undo log.** No engine.
+- **Optimistic concurrency (version columns + retry).** No versioned rows.
+- **Compare-and-swap primitives, atomic file rename tricks.** No shared mutable state that needs them.
+- **Deadlock detection / prevention.** No locks that could deadlock.
+- **Advisory locks (`pg_advisory_lock`, Redis SETNX).** No coordination point.
+- **Distributed consensus / leader election.** No cluster.
 
 ## Interview defense
 
-**Q: How does this app handle concurrent writes to the same state?**
+**Q: "How is concurrent state managed here?"**
 
-It doesn't, because there's no shared state to contend for. State is partitioned per-session via the outer `Map` in `sessionState(sid)`, and within a session the three sub-maps (`insights`, `investigations`, `anomalies`) have different writers (briefing writes the first two, agent writes the third). No row is ever the target of two simultaneous writers in any normal flow.
+Model answer: "Three mechanisms at three scopes. At turn scope, Node's single-threaded event loop makes every synchronous block atomic — `putInsights` at `lib/state/insights.ts:57-71` can't be interleaved by any other handler. At request scope, `AsyncLocalStorage` at `lib/mcp/auth.ts:47, 86-104` gives each in-flight request its own store that follows async continuations, so the OAuth SDK's read-then-write-then-read chain sees consistent state across dozens of `await`s. At data scope, the outer `Map` in `lib/state/insights.ts:14` is keyed by sessionId, so no two users can ever contend for the same inner Map. There are no explicit locks anywhere because the shape guarantees one writer per key per turn."
 
-**Q: Is there any place where a race condition is possible?**
+Diagram to sketch: the "every concurrency-control mechanism" primary diagram, three-band stack.
 
-Two. The 60s response cache can have two concurrent misses for the same key produce two upstream calls — benign, last writer wins, both callers get valid data. And `lastCallAt` in `BloomreachDataSource.liveCall` is a read-modify-write across `await`s — two concurrent callers can both skip the spacing wait, the second gets a 429, and the retry path absorbs it. The repo deliberately chose retry-absorption over locking because a lock would serialize every tool call across every concurrent session.
+**Q: "Walk me through the AsyncLocalStorage pattern in `withAuthCookies`."**
 
-**Q: What's the load-bearing assumption?**
+Model answer: "The problem it solves is that Next's cookie API has request-vs-response split — reading a cookie *after* setting it in the same request returns the OLD value. The OAuth SDK does dozens of read-then-write cycles per handshake, so we can't route each one through `cookies().get/set` directly. The fix at `lib/mcp/auth.ts:86-104` is: seed an `RequestStore = {store, dirty}` from the cookie once at the top, run the OAuth flow with `requestStore.run(ctx, fn)`, and if anything wrote (`ctx.dirty`), re-encrypt and set the cookie once at the bottom. Every `readState`/`patchState` inside targets `ctx.store` via `requestStore.getStore()` — request-scoped consistency without any lock, because ALS is what follows the async continuation. Two concurrent requests get different ctxs, so they can't race on each other's state either."
 
-That Node executes JS synchronously between `await` points. `putInsights` (the only multi-step write on session state) has no `await` between `.clear()` and `.forEach()`, so it's effectively atomic. Add an `await` there and the partition stops being sufficient — you'd need a per-session lock. Today the comment at `lib/state/insights.ts:57-63` warns about WHY of `.clear()` but not the atomicity contract; that's the latent risk.
+Anchor: ALS = per-request namespace that survives every `await`.
+
+**Q: "What's the accepted race in the codebase?"**
+
+Model answer: "One real one, dev-only: `saveInvestigation` at `lib/state/investigations.ts:30-41` does read-modify-write on a JSON file with no lock. Two concurrent dev routes writing to the same file could lose one write. Mitigation is 'dev-only, single user, one process, `PERSIST` gates it off in prod.' In production the whole file branch is dead code. There's also a soft race on `lastCallAt` at `lib/data-source/bloomreach-data-source.ts:190-205` — two concurrent calls could both skip the 200ms spacing — but the retry ladder catches any resulting rate-limit and Bloomreach's server-side limit is the actual enforcer. Both are acceptances, not bugs."
+
+Anchor: dev file R-M-W is single-writer by convention; local rate spacing is a courtesy, not enforcement.
 
 ## See also
 
-- `02-records-pages-and-storage-layout.md` — the partition that makes locks unnecessary
-- `05-transactions-isolation-and-anomalies.md` — the multi-step write this concurrency story rests on
-- `04-query-planning-and-execution.md` — the retry path that absorbs the `lastCallAt` race
-- `09-database-systems-red-flags-audit.md` — the latent risks if these assumptions ever break
+- `01-database-systems-map.md` — the state topology this file zooms in on.
+- `05-transactions-isolation-and-anomalies.md` — the atomicity story that pairs with these locks/non-locks.
+- `07-wal-durability-and-recovery.md` — what happens when the "no-lock" state gets wiped on cold-start.
+- `study-runtime-systems` — deeper mechanics of the event loop and ALS.

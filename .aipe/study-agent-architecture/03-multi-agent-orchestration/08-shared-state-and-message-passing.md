@@ -1,205 +1,187 @@
 # Shared state and message passing
 
-**Industry standard.** Two models for how agents communicate. **Partially exercised** in this codebase — message passing via typed handoffs, no shared blackboard.
+_Industry standard._
 
 ## Zoom out, then zoom in
 
-Sits at the orchestration layer as a choice point: do agents read/write a common state, or do they only see what the previous stage explicitly passed?
+How agents communicate. Two models: shared state (blackboard — everyone reads and writes one context) and message passing (each agent sees only what's explicitly passed). This repo uses *both*: the workspace schema is shared state (every agent gets it in its system prompt), and the Diagnosis is a message (handed from Stage A to Stage B).
 
 ```
-  Zoom out — where this concept lives
+  Zoom out — both models coexist in this repo
 
-  ┌─ Orchestration layer ───────────────────────────┐
-  │  ★ shared state OR message passing? ★           │ ← we are here
-  │  (this repo: typed handoffs, message-passing)    │
-  └──────────────────────────────────────────────────┘
+  ┌─ Shared state (blackboard) ─────────────────────────────────┐
+  │  WorkspaceSchema — projectId, events, customer props        │
+  │  schemaSummary() injected into every agent's system prompt  │
+  │  every agent reads; no agent writes                         │
+  └─────────────────────────────────────────────────────────────┘
+  ┌─ Message passing ───────────────────────────────────────────┐
+  │  Diagnosis — handed from DiagnosticAgent → RecommendationAgent│
+  │  Anomaly — handed from feed → both agents                   │
+  │  Intent — handed from classifyIntent → QueryAgent           │
+  └─────────────────────────────────────────────────────────────┘
 ```
 
-This repo's choice (message-passing via typed handoffs) is exactly what the spec recommends as the production answer.
+Zoom in: the two models split by *what changes and what doesn't*. Read-mostly reference data (workspace schema) is shared. Investigation-specific artifacts (Diagnosis, Recommendation) are passed. That's the production-grade split — shared state for the immutable, messages for the flow.
 
 ## Structure pass
 
-Layers: the inter-agent communication primitive (shared store vs message) → the context each agent sees → the failure modes that follow from the choice.
+**Layers:** shared context (read-mostly reference) · message channel (typed artifacts) · trace channel (observation).
+**Axis:** *does this data change during the investigation, or is it stable across the run?*
+**Seam:** the type contract on messages. `Diagnosis` is a typed shape — Stage B can consume it without knowing which Stage A produced it. That decoupling is the seam.
 
-**Axis traced — "what does the next agent see?":** in shared state, the union of everyone's context. In message passing, only what was explicitly handed forward.
+```
+  Two models, one system
 
-**Seam:** the typed value at the handoff. In this repo, that's `Anomaly` (monitoring → diagnostic), `Diagnosis` (diagnostic → recommendation), `Recommendation[]` (recommendation → UI).
+  ┌─ Shared (blackboard) ──────────────────────┐
+  │  WorkspaceSchema                            │  ← read by all
+  │  Session state (Map<sessionId, SessionFeed>)│
+  └─────────────────────────────────────────────┘
+              ▲                       ▲
+              │ read                  │ read
+  ┌───────────┴──────┐     ┌──────────┴────────┐
+  │ DiagnosticAgent  │────►│ RecommendationAgent│  ← message
+  │                  │ Diag│                    │    passing
+  └──────────────────┘     └────────────────────┘
+```
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know the difference between global state and prop drilling in a React app. Global state is the shared blackboard — any component can read or write the context, simple to reason about until your context gets bloated. Prop drilling is message passing — each component sees only what its parent explicitly hands it, scoped and clean but you have to decide what to pass.
+You've written React apps with two shapes of data: Context (available to every component that reads it — theme, current user) and props (passed explicitly from parent to child — the row this component renders). Shared state is Context; message passing is props. The rule is the same: stable/read-only data goes in Context, per-flow data goes in props. Apply the same instinct to agent communication.
 
 ```
-  Two communication models
+  Pattern: two-channel communication
 
-  Shared state (blackboard):       Message passing:
-  ┌──────────────────────┐        agent A ──msg──► agent B
-  │   shared context     │        agent B ──msg──► agent C
-  │  (all agents read     │        (each agent sees only
-  │   and write here)     │         what's passed to it)
-  └──────────────────────┘
-   ▲      ▲       ▲
-   A      B       C
+  Channel 1 — shared (Context-like):
+    WorkspaceSchema → every agent's system prompt
+
+  Channel 2 — messages (props-like):
+    Anomaly → DiagnosticAgent
+    Diagnosis → RecommendationAgent
+    Recommendation → UI
 ```
 
-### Move 2 — step by step
+### Move 2 — the walkthrough
 
-#### What this repo does — typed message passing
-
-Open `lib/mcp/types.ts`. The three typed handoff interfaces are right there:
+**Shared state — workspace schema.** `lib/agents/monitoring.ts:19-60` builds `schemaSummary(schema)` — a compact prompt-safe summary of the workspace (top 20 events with property counts, top 30 customer properties, catalog names). This summary gets injected into every agent's system prompt so the model knows what data is queryable.
 
 ```ts
-// lib/mcp/types.ts:83-92 (Anomaly — monitoring output)
-export interface Anomaly {
-  metric: string;
-  scope: string[];
-  change: { value: number; direction: 'up' | 'down'; baseline: string };
-  severity: Severity;
-  evidence: { tool: string; result: unknown }[];
-  impact?: string;
-  history?: number[];
-  category?: CategoryId;
-}
-
-// lib/mcp/types.ts:95-104 (Diagnosis — diagnostic output)
-export interface Diagnosis {
-  conclusion: string;
-  evidence: string[];
-  hypothesesConsidered: { hypothesis: string; supported: boolean; reasoning: string }[];
-  affectedCustomers?: { count: number; segmentDescription: string };
-  confidence?: 'high' | 'medium' | 'low';
-  timeSeries?: { day: string; value: number }[];
-}
-
-// lib/mcp/types.ts:116-130 (Recommendation — recommendation output)
-export interface Recommendation {
-  id: string;
-  title: string;
-  rationale: string;
-  bloomreachFeature: 'scenario' | 'segment' | 'campaign' | 'voucher' | 'experiment';
-  steps: string[];
-  estimatedImpact: EstimatedImpact;
-  confidence: 'high' | 'medium' | 'low';
-  // ... business-owner enrichments
+// lib/agents/monitoring.ts:19-60 — the shared schema summary
+export function schemaSummary(schema: WorkspaceSchema): string {
+  // ... top 20 events, each with up to 10 properties
+  // ... top 30 customer properties
+  // ... catalog names
+  return [
+    `Project: ${schema.projectName} (${schema.projectId})`,
+    `Total customers: ${schema.totalCustomers.toLocaleString()}`,
+    `Top events (name, eventCount: properties):`,
+    eventsText,
+    `Customer properties: ${customerPropsText}`,
+  ].join('\n');
 }
 ```
 
-Each handoff is one of these three values. The next agent's constructor takes exactly the value(s) it needs and nothing else. There's no shared store; there's no "agent B reads from a context object agent A wrote to."
+Line-by-line:
 
-The diagnostic agent (`DiagnosticAgent.investigate(anomaly, hooks)`) takes one `Anomaly`. The recommendation agent (`RecommendationAgent.propose(anomaly, diagnosis, hooks)`) takes the `Anomaly` again *plus* the `Diagnosis`. The route handler is the one that holds both values during the request and decides what to pass.
+- **The compact summary is not the full 112KB schema.** The full schema would blow the system-prompt budget and trigger lost-in-the-middle. Twenty events × ten properties is roughly 1-2KB — small enough to sit in cached prefix (`05-production-serving/04-cost-controls.md` covers the Anthropic ephemeral cache on system prompts).
+- **Every agent reads the same summary.** DiagnosticAgent, RecommendationAgent, MonitoringAgent, QueryAgent — same summary function, same output. The model sees the same worldview across the whole investigation.
+- **No agent writes to it.** The schema is fetched once per session bootstrap and pinned. That immutability is what makes it safe to share — no synchronization concerns, no stale-read risk.
 
-#### Why message passing is the right choice here
-
-Three reasons:
-
-1. **The hand-off is small and bounded.** A `Diagnosis` is a few hundred bytes; an `Anomaly` is less. Passing them through the URL (the `?diagnosis=` query param in step 3) works because they're small. A shared blackboard would carry the same data plus everyone else's context — more bytes, more noise.
-
-2. **Each agent has a scoped context window.** The diagnostic agent's prompt is built around investigating ONE anomaly; it doesn't need to know about other anomalies the monitoring agent found, or the recommendations the recommendation agent will propose. Scoping its input to just the anomaly keeps its context tight.
-
-3. **No agent needs to coordinate with another mid-run.** The agents run sequentially; there's no "agent A and agent B both look at the same state simultaneously" pattern that shared state would enable. Without that pattern, shared state is overhead.
-
-#### The shared-state version — what it would look like
-
-For comparison, a shared-state version would have a `runContext` object the agents all read/write:
+**Message passing — Diagnosis handoff.** `app/api/agent/route.ts:266-297` is where the Diagnosis moves between agents. It's a typed value returned from Stage A, then passed as a positional argument to Stage B (see `03-sequential-pipeline.md` for the pipeline mechanics).
 
 ```ts
-// hypothetical shared-state version (not implemented)
-interface RunContext {
-  anomaly: Anomaly;
-  diagnosis?: Diagnosis;
-  recommendations: Recommendation[];
-  // every agent reads/writes this object
-}
+// route.ts — the message
+diagnosis = await diagAgent.investigate(inv, { ...hooksFor('diagnostic'), signal: req.signal });
+send({ type: 'diagnosis', diagnosis });  // also streamed to UI
 
-const context: RunContext = { anomaly, recommendations: [] };
-await monitoringAgent.scan(context);   // writes to context.anomaly (or context.anomalies[])
-await diagnosticAgent.investigate(context);  // reads context.anomaly, writes context.diagnosis
-await recommendationAgent.propose(context);  // reads both, writes context.recommendations
+// route.ts — the receive
+const recommendations = await recAgent.propose(inv, diagnosis!, { ...hooksFor('recommendation'), signal: req.signal });
 ```
 
-This is simpler to reason about — one object, one source of truth. The cost is that every agent sees everything, including stuff it doesn't need. For three agents with bounded inputs, that's manageable; for 8-12 agents with overlapping reads/writes, the shared context becomes a coordination subproblem (who's allowed to read what; what happens if two agents try to write the same key) AND the context bloat hurts model attention.
+Line-by-line:
 
-The lost-in-the-middle problem is the specific failure mode: when the shared context grows past the model's effective attention window (~30-50% of the nominal context length), the model starts ignoring middle content. For an 8-agent system with rich shared state, this fires fast. Message passing scopes each agent's context to its actual inputs, sidestepping the problem.
+- **`diagnosis` is `Diagnosis` (typed).** TypeScript enforces the contract. Stage B can't accidentally consume the wrong shape.
+- **The message is streamed to the UI at the boundary.** `send({ type: 'diagnosis', diagnosis })` makes the message visible to a third party (the browser). That's structurally the difference between message passing and shared state — messages have a *transit* the observer can watch.
+- **The message is also serializable to a URL.** Step 3 (`/investigate/[id]/recommend`) can receive the Diagnosis as a URL param, so a user navigating directly to the recommend page skips Stage A. That's the "URL as checkpoint" pattern (`07-graph-orchestration.md`).
 
-#### Multi-agent context routing — the production refinement
+**Session isolation — the shared state has a scope.** `lib/state/insights.ts:14` — `const state = new Map<string, SessionFeed>()` — keeps each user's data in a per-session sub-map. Without this, one user's briefing would leak into another user's feed on a warm Vercel instance. That's the load-bearing "shared but scoped" pattern — shared state is not the same as global state; it needs a scope key.
 
-The production heuristic, even within "message passing" systems, is to pass *role-specific context* to each agent rather than the full prior history. The diagnostic agent gets the anomaly + workspace schema, not the monitoring agent's chain-of-thought. The recommendation agent gets the diagnosis + anomaly + workspace schema, not the diagnostic agent's tool-call evidence (unless that evidence is specifically referenced in the diagnosis).
+```
+  Layers-and-hops — communication channels in one investigation
 
-This repo does this implicitly because the handoff types are small and don't carry trajectory data. The `Diagnosis` interface doesn't have a `producerTrajectory: ReasoningStep[]` field — it has the conclusion + evidence + hypotheses + customer count. The recommendation agent doesn't need to re-read the diagnostic's tool calls; it needs the diagnostic's *conclusions* about what was found.
-
-This is `04-agent-infrastructure/01-context-engineering.md` applied at the multi-agent boundary. The same discipline (curate what fills the window) extends to "which agent sees what."
+  ┌─ Session bootstrap ────────────────────────────────────────┐
+  │  fetch workspace schema once → build schemaSummary          │
+  └───────────────────────┬────────────────────────────────────┘
+                          │ pinned in system prompt (shared)
+                          ▼
+  ┌─ Stage A: DiagnosticAgent ─────────────────────────────────┐
+  │  reads: schema (shared) + anomaly (message)                │
+  │  writes: Diagnosis (message)                               │
+  └───────────────────────┬────────────────────────────────────┘
+                          │ Diagnosis passed by supervisor
+                          ▼
+  ┌─ Stage B: RecommendationAgent ─────────────────────────────┐
+  │  reads: schema (shared) + anomaly + Diagnosis (messages)   │
+  │  writes: Recommendation[] (messages)                       │
+  └────────────────────────────────────────────────────────────┘
+```
 
 ### Move 3 — the principle
 
-**Message passing scales better than shared state once you have more than 2-3 agents with rich inputs.** Shared state is simpler for small topologies but bloats fast; message passing requires deciding what to pass but keeps each agent's context tight. The right answer is *almost always* message passing with typed handoffs, with shared state reserved for cases where multiple agents genuinely need to coordinate over the same evolving structure (rare in practice).
+Shared state for the immutable; messages for the flow. Every agent needs the workspace schema — sharing it once is right. Every investigation produces a Diagnosis for that specific anomaly — passing it as a typed message is right. Getting this wrong in either direction has a specific failure: sharing the Diagnosis (blackboard style) risks bleed between concurrent investigations; passing the schema as a message wastes tokens on every hop. The senior-grade split is naming *what changes and what doesn't* and picking the model that fits.
 
 ## Primary diagram
 
 ```
-  Message passing in this repo's pipeline — typed handoffs, no shared store
+  Recap — the two channels of communication
 
-  ┌─ /api/briefing route ─────────────────────────────────────────┐
-  │   MonitoringAgent.scan(hooks, runnable)                        │
-  │     ─► returns Anomaly[]                                        │
-  │   ─► route emits 'insight' NDJSON events                        │
-  │   ─► UI stashes selected Insight in sessionStorage              │
-  └────────────────────────────────┬──────────────────────────────┘
-                                   │ via client navigation + sessionStorage
-                                   │ (the handoff carries just the typed Anomaly)
-                                   ▼
-  ┌─ /api/agent?step=diagnose route ──────────────────────────────┐
-  │   resolveAnomaly(insightId, ?insight=) → Anomaly               │
-  │   DiagnosticAgent.investigate(anomaly, hooks)                  │
-  │     ─► sees: anomaly + workspace schema + tools                 │
-  │     ─► does NOT see: monitoring agent's tool calls, other       │
-  │        anomalies in the briefing                                │
-  │     ─► returns Diagnosis                                         │
-  │   ─► route emits 'diagnosis' NDJSON                              │
-  │   ─► UI stashes Diagnosis in sessionStorage                      │
-  └────────────────────────────────┬──────────────────────────────┘
-                                   │ via client navigation + ?diagnosis=
-                                   │ (the handoff carries just the typed values)
-                                   ▼
-  ┌─ /api/agent?step=recommend route ─────────────────────────────┐
-  │   resolveAnomaly(insightId, ?insight=) → Anomaly               │
-  │   parseDiagnosis(?diagnosis=) → Diagnosis                       │
-  │   RecommendationAgent.propose(anomaly, diagnosis, hooks)       │
-  │     ─► sees: anomaly + diagnosis + workspace schema + tools    │
-  │     ─► does NOT see: diagnostic agent's tool calls,             │
-  │        diagnostic agent's chain-of-thought                      │
-  │     ─► returns Recommendation[]                                  │
-  └────────────────────────────────────────────────────────────────┘
+  ┌─ Shared context (read-mostly) ─────────────────────┐
+  │  WorkspaceSchema.summary → system prompt          │
+  │  Session identity → auth + isolation              │
+  │  Scope: session (per-user Map)                     │
+  └────────────────────────────────────────────────────┘
 
-  No shared blackboard. Each agent's context is exactly the typed
-  inputs it needs plus its own system prompt and allowed tools.
+  ┌─ Message channel (typed handoffs) ─────────────────┐
+  │  Anomaly (feed → agents)                           │
+  │  Diagnosis (DiagnosticAgent → RecommendationAgent) │
+  │  Recommendation (RecommendationAgent → UI)         │
+  │  Intent (classifyIntent → QueryAgent)              │
+  │  Scope: one investigation                          │
+  └────────────────────────────────────────────────────┘
+
+  ┌─ Trace channel (observation) ──────────────────────┐
+  │  NDJSON events (per-agent trace → UI)              │
+  │  Read-only observation, not communication          │
+  │  Scope: one request                                │
+  └────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The shared-state pattern (sometimes called "blackboard architecture") has academic AI roots and shows up in some agent frameworks (CrewAI's `Crew.context`, AutoGen's group-chat history) as the default. The simplicity is appealing for tutorials and demos; the bloat shows up in production when topology grows past ~3 agents.
+The design instinct here is straight from software engineering: prefer explicit interfaces over implicit shared state. Every artifact that flows between agents in blooming is a *typed message* (Anomaly, Diagnosis, Recommendation), not a mutation to a shared blackboard. The workspace schema is the exception, and it's exceptional for a reason: it's read-only reference data, not investigation state.
 
-The typed-handoff pattern this repo uses corresponds to what some agent frameworks call "agent-as-a-function" — each agent is a typed function (`(Anomaly) => Promise<Diagnosis>`) the orchestrator composes. The functional framing makes testing trivial (mock the inputs, assert the output) and forces the handoff contracts to be explicit (you can't accidentally read a sibling agent's context).
+The message-passing discipline pays off during evals. `eval/report.eval.ts` grades a Diagnosis against a rubric — it can do so because Diagnosis is a serializable typed value that a grader can inspect independently. If diagnosis lived on a mutable blackboard, isolating "what did Stage A produce for this case" would require a snapshot dance.
 
-The Vercel AI SDK's "tools" pattern is a hybrid: tools have typed schemas (forcing input scoping) but share the underlying chat conversation across calls. Most "multi-agent" implementations in production are some version of this — typed contracts for the agent's surface, shared conversation history for the threading. This repo's split — typed handoffs *and* fresh conversation per agent — is the more aggressive scoping choice and pays off in tighter per-agent contexts.
+The one place blooming has a *shared but scoped* pattern is session state — `SessionFeed` maps in `lib/state/insights.ts`. This is the multi-tenant version of shared state: shared within a session, isolated between sessions. Every long-running agent system in production needs this scope key or user data leaks. Blooming's warm-instance concurrency (a single Vercel process serving many users) makes the scope explicit; a single-user CLI could get away with global state.
 
 ## Interview defense
 
-> **Q: How do the agents in this codebase communicate?**
->
-> Typed message passing through the route handlers. Each agent class takes typed inputs (`Anomaly` for the diagnostic; `Anomaly + Diagnosis` for the recommendation) and produces a typed output the next stage consumes. There's no shared blackboard, no global context object. The orchestrator (route handler) is the only thing that holds all three values during one request; each agent sees just what it needs. The `Anomaly`, `Diagnosis`, and `Recommendation` interfaces in `lib/mcp/types.ts:83-130` are the contracts at the handoff seams.
+**Q: How do agents in this system communicate — shared state or messages?**
+A: Both, split by what changes. Shared state for read-mostly reference data — the workspace schema summary is injected into every agent's system prompt, same worldview across the run. Message passing for investigation state — the Diagnosis is a typed value handed from `DiagnosticAgent` to `RecommendationAgent` via the supervisor, and the same message gets streamed to the UI as an NDJSON event. The rule I follow: if the data is immutable and every agent needs it, share it; if the data is per-flow and typed, pass it. Wrong direction on either has a specific failure — sharing per-flow data leaks between concurrent investigations, passing shared data wastes tokens per hop.
 
-> **Q: Why message passing instead of shared state?**
->
-> Three reasons. Each agent has bounded inputs — the diagnostic agent doesn't need to see other anomalies the monitoring agent found, or the recommendations the next agent will write. Scoping its context to just the anomaly keeps the system prompt tight and the model's attention focused. The agents don't coordinate mid-run — they run sequentially with no shared writes, so the "blackboard concurrency" model has nothing to do here. And the handoff values are small (an `Anomaly` is hundreds of bytes), which means message passing has no cost penalty over shared state — both fit in a query param or a sessionStorage entry. The lost-in-the-middle problem hits shared-state topologies hard once they grow past 3-4 agents; message passing sidesteps it.
+Diagram: the two-channel picture with WorkspaceSchema on one side and Diagnosis on the other.
+Anchor: `lib/agents/monitoring.ts:19-60` (schema summary) + `app/api/agent/route.ts:266-297` (Diagnosis handoff).
 
-> **Q: What's the cost of getting message passing wrong?**
->
-> The cost is an agent acting on missing context. If the recommendation agent didn't get the diagnosis (we forgot to pass it), the recommendations would be ungrounded — proposed actions with no causal link to the anomaly. The mitigation is exactly the typed interface: TypeScript enforces "you must pass a `Diagnosis` to `RecommendationAgent.propose`," so the route handler can't accidentally omit it. The compile-time check is the safety net for the "what to pass" decision.
+**Q: What prevents concurrent investigations from bleeding into each other?**
+A: Session-scoped shared state. `lib/state/insights.ts:14` keeps a `Map<sessionId, SessionFeed>` — each user's feed lives in its own sub-map, keyed by the session cookie. A single warm Vercel instance can serve multiple users concurrently, and without this scope key, one user's `putInsights` would clear another's feed mid-briefing. This is the multi-tenant version of shared state: shared within a session, isolated between them. The pattern generalizes — any long-running agent system in production needs a scope key, or user data leaks under concurrency.
+
+Diagram: the session-scoped Map, with two concurrent users in isolated buckets.
+Anchor: `lib/state/insights.ts:14-23`.
 
 ## See also
 
-- → `03-sequential-pipeline.md` — the pipeline these typed handoffs run inside
-- → `09-coordination-failure-modes.md` — what goes wrong when message-passing decisions are buggy
-- → `04-agent-infrastructure/01-context-engineering.md` — the same "curate what's in the window" discipline applied per-agent
+- `03-sequential-pipeline.md` — the Diagnosis-as-message pattern in flow.
+- `04-agent-infrastructure/01-context-engineering.md` — the discipline that decides what goes in the system prompt (the shared state).
+- `04-agent-infrastructure/02-agent-memory-tiers.md` — the tier of memory this shared state lives at (working, in-context).
+- `09-coordination-failure-modes.md` — context bloat when shared state grows unchecked.

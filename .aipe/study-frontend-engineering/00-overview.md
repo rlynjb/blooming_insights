@@ -1,111 +1,116 @@
-# 00 — overview
-
-The frontend-engineering layer of `blooming_insights` in one page. Read this first; open `audit.md` for the 8-lens walk; open the `01-…` / `02-…` files for the two patterns that earn their own walkthrough.
-
-## What this repo is, in one sentence
-
-**Next.js 16 App Router app with a server shell and a fully client-side interactive tree, streaming agent events from serverless routes via NDJSON over `fetch` + `ReadableStream`, with progressive loading composed across four reveal surfaces.**
+# overview — frontend engineering (blooming insights)
 
 ## Rendering mode, in one sentence
 
-An SPA wearing an App Router shell: `app/layout.tsx` is the only server component in the user-facing tree (it boots `next/font/google` and renders children); every route page opens with `'use client'`; no `<Suspense>`, no RSC streaming, no route loaders. Streaming UX is hand-rolled in the browser, not delivered by React server rendering.
-
-## State architecture, in one diagram
+**Client-side single-page shell over the Next.js 16 App Router.** Every rendered surface is a `'use client'` component; nothing meaningful runs as an RSC. The App Router carries the routing and the API layer; the UI is a React 19 SPA that streams NDJSON off `/api/briefing` and `/api/agent`.
 
 ```
-  State graph — one slot per owner, no global store
+  Zoom out — where the UI sits in the system
 
-  ┌─ Local hook state (useState in custom hooks) ─────────────────────────┐
-  │  useBriefingStream      9 slots — status, insights, workspace,         │
-  │                                  coverage, traceItems, errorMessage,   │
-  │                                  stepStatus, queryCount, demoSuffix    │
-  │  useInvestigation       5 slots — items, diagnosis, recommendations,   │
-  │                                  complete, error                       │
-  │  useReconnectPolicy     1 slot  — reconnecting                         │
-  │  useDemoCapture         1 slot  — capturing                            │
-  │  app/page.tsx           2 slots — activeQuery, mode, ready             │
-  └────────────────────────────────┬──────────────────────────────────────┘
-                                   │ composes via callbacks
-                                   │  (no Context, no Redux, no Zustand)
-                                   ▼
-  ┌─ Browser-side persistence (the cross-page handoff layer) ─────────────┐
-  │  sessionStorage         bi:insight:<id>    feed → investigate          │
-  │                         bi:inv:<step>:<id> stash per step              │
-  │                         bi:diag:<id>       diagnosis → recommend       │
-  │                         bi:reconnecting    one-shot auto-reconnect    │
-  │  localStorage           bi:mode            persisted demo/live toggle  │
-  └───────────────────────────────────────────────────────────────────────┘
-
-  no React Context. no Redux. the hooks own the state; the page consumes
-  their return values; sessionStorage carries state across pages because
-  on Vercel different requests can hit different instances.
+  ┌─ Browser ───────────────────────────────────────────────┐
+  │  React 19 client (all pages: 'use client')              │
+  │   ├─ app/page.tsx                (the feed)             │
+  │   ├─ app/investigate/[id]/       (diagnose)             │
+  │   └─ app/investigate/[id]/       (recommend)            │
+  │      /recommend/                                        │
+  │                                                         │
+  │  streams NDJSON via fetch() + ReadableStream reader     │
+  │  state: useState + sessionStorage + localStorage        │
+  └────────────────────────┬────────────────────────────────┘
+                           │  HTTP (keep-alive)
+  ┌─ Next.js API routes ───▼────────────────────────────────┐
+  │  /api/briefing         monitoring agent, NDJSON out     │
+  │  /api/agent            investigate + free-form Q&A      │
+  │  /api/mcp/*            capture, reset, callback, call   │
+  └────────────────────────┬────────────────────────────────┘
+                           │
+  ┌─ Anthropic + Bloomreach MCP ───────────────────────────┐
+  │  claude-sonnet-4-6 · loomi connect MCP over OAuth      │
+  └────────────────────────────────────────────────────────┘
 ```
 
-## Network seam, in one diagram
+Not SSR, not SSG, not RSC. `app/page.tsx` opens `'use client';` on line 1. The `dark` class on `<html>` in `app/layout.tsx:22` is the only server-rendered thing on the page — everything under it hydrates and becomes client-side from `HomePage()` onward.
+
+## State graph, in one diagram
 
 ```
-  Network seam — fetch + NDJSON, four consumers, one kernel
+  State ownership — where each piece lives
 
-  ┌─ Client / components & hooks ──────────────────────────────────────────┐
-  │                                                                        │
-  │  useBriefingStream     useInvestigation     useDemoCapture (drain)     │
-  │  StreamingResponse                                                     │
-  │       │                       │                       │                │
-  │       └────────────┬──────────┴───────────┬───────────┘                │
-  │                    │                      │                            │
-  │                    ▼                      ▼                            │
-  │                ┌──────────────────────────────┐                        │
-  │                │  readNdjson(body, onEvent,   │  ← lib/streaming/      │
-  │                │             { cancelOn? })   │    ndjson.ts (64 LOC)  │
-  │                └──────────────┬───────────────┘                        │
-  └───────────────────────────────┼────────────────────────────────────────┘
-                                  │  HTTP, application/x-ndjson, chunked
-                                  ▼
-  ┌─ Server / Next.js route handlers ──────────────────────────────────────┐
-  │                                                                        │
-  │  /api/briefing       /api/agent                                        │
-  │   (monitoring)        (diagnose | recommend | combined | q=…)          │
-  │                                                                        │
-  │   new ReadableStream({ start(controller) {                             │
-  │     for await (const evt of agent) {                                   │
-  │       controller.enqueue(encoder.encode(encodeEvent(evt)))             │
-  │     }                                                                  │
-  │   }})                                                                  │
-  │                                                                        │
-  └────────────────────────────────────────────────────────────────────────┘
-
-  the wire contract is the BriefingEvent / AgentEvent union — "what must
-  not change" per the project context.
+                      ┌───────────────────────────────────┐
+                      │  demo snapshot (committed JSON)   │  ← server
+                      │  lib/state/demo-*.json            │
+                      └────────────────┬──────────────────┘
+                                       │ replayed at /api/briefing?demo=cached
+                                       ▼
+  ┌─ localStorage ──────────┐   ┌─ useState (page.tsx) ─────────────┐
+  │  bi:mode                │──►│  mode | ready | activeQuery       │
+  │  (demo / live-*)        │   └─────────────────┬─────────────────┘
+  └─────────────────────────┘                     │
+                                                  │ triggers
+                                                  ▼
+                                     ┌─ useBriefingStream ────────────┐
+                                     │  status · insights · workspace │
+                                     │  coverage · traceItems · error │
+                                     │  stepStatus · queryCount       │
+                                     │  demoSuffix                    │
+                                     └─────────────────┬──────────────┘
+                                                       │ on each insight
+                                                       ▼
+                                     ┌─ sessionStorage ───────────────┐
+                                     │  bi:insight:<id> (each)        │
+                                     │  bi:inv:<step>:<id> (result)   │
+                                     │  bi:diag:<id>     (handoff)    │
+                                     │  bi:reconnecting  (one-shot)   │
+                                     └─────────────────┬──────────────┘
+                                                       │ read by
+                                                       ▼
+                                     ┌─ useInvestigation (step page) ─┐
+                                     │  items · diagnosis             │
+                                     │  recommendations · complete    │
+                                     │  error                         │
+                                     └────────────────────────────────┘
 ```
 
-## Three highest-leverage frontend patterns
+**No global store.** No Redux, no Zustand, no Context Provider tree. Each hook owns its slice; the browser's `sessionStorage` is the cross-page carrier (feed stashes each insight so the investigation page can send it to `/api/agent` — Vercel serverless can't rely on in-memory server state because the feed and the investigation may hit different instances, `useBriefingStream.ts:53-60`).
 
-The whole guide ranks the frontend patterns the repo *actually* exercises. Three carry the most weight; the first two earn their own pattern files in this folder.
+`bi:mode` in `localStorage` is the one persistent UI setting (demo / live-bloomreach / live-synthetic). `useBriefingStream` re-runs when it changes. Legacy values (`live`, `live-sql`) migrate to `live-bloomreach` on read at `app/page.tsx:75-77`.
 
-**1. NDJSON stream reader hook → `01-ndjson-stream-reader-hook.md`.** The browser-side consumer for streaming agent events. One kernel (`lib/streaming/ndjson.ts`, 64 LOC), four consumers (`lib/hooks/useBriefingStream.ts:288`, `lib/hooks/useInvestigation.ts:194`, `lib/hooks/useDemoCapture.ts:84`, `components/chat/StreamingResponse.tsx:108`). The whole "the agent is working" UX surface depends on this — strip it out and the trace, the streamed insights, and the progressive coverage tiles all vanish. The pattern earns extra weight from the two distinct StrictMode adaptations: `useBriefingStream` cancels on cleanup (mode toggles re-fire); `useInvestigation` deliberately does NOT cancel (a started-guard makes the effect idempotent against the dev double-mount).
+## The three load-bearing frontend patterns
 
-**2. Progressive skeleton with stepper → `02-progressive-skeleton-with-stepper.md`.** The four-tier composition that fills the 30-60 second monitoring runtime with information instead of a spinner. Stepper says where in the pipeline (`components/shared/ProcessStepper.tsx`); coverage grid says which category just checked in (`components/feed/CoverageGrid.tsx`); skeletons reserve the card shapes (`components/shared/Skeleton.tsx`); status log streams the agent's tool calls in real time (`components/shared/StatusLog.tsx`). Three custom keyframes (`bi-fade-up`, `bi-progress`, `bi-dots`) own the polish, and all three respect `prefers-reduced-motion`. The pattern is the perceived-performance story — without it the page reads as broken at t=5s.
+Ranked by user-visible consequence. Strip any of these and you lose a specific capability the pitch depends on.
 
-**3. Custom-hook decomposition with callback composition.** Not a Pass 2 file because it's an organizational pattern more than an architectural one — but it's the third-most-load-bearing move. `app/page.tsx` was 1000+ LOC before the lift; three hooks (`useBriefingStream` 313 LOC, `useDemoCapture` 146 LOC, `useReconnectPolicy` 123 LOC) plus the cross-page `useInvestigation` (202 LOC) extract the streaming, the capture loop, and the auth-reconnect dance into ownership-clear units. The page composes them via callbacks (`app/page.tsx:110-113`) — `useBriefingStream` is handed `reconnectPolicy.handle` as `onAuthError` and `reconnectPolicy.clearFlag` as `onStreamComplete`. No global event bus, no provider tree; the page glues the hooks together by passing functions. See `audit.md` → `component-architecture` for the boundary placement, and `.aipe/audits/refactors/design-frontend-extract-usereconnectpolicy.md` for the lift rationale.
+### 1. NDJSON stream reader hook — the entire "shows its work" pitch
 
-## What's NOT in this layer (and where it lives)
+File: `lib/streaming/ndjson.ts:1-64` (the 64-line kernel), consumed by four surfaces:
 
-- The `runtime` semantics of the `ReadableStream` reader loop (event loop, async scheduling) → `study-runtime-systems`.
-- The wire format and HTTP/1.1 chunked-encoding mechanics → `study-networking`.
-- FCP / LCP / CLS / bundle-size measurement → `study-performance-engineering`.
-- XSS / CSP / token-storage trust boundaries → `study-security`.
-- The `AgentEvent` / `BriefingEvent` contract as a system seam; the multi-agent orchestration upstream of the stream → `study-system-design`.
-- Module / interface depth, the "deep modules" lens on `readNdjson` and the hooks → `study-software-design`.
-- Test design + the AI-eval seam → `study-testing` (221 passing tests across the repo).
+- `lib/hooks/useBriefingStream.ts:288` — the feed
+- `lib/hooks/useInvestigation.ts:194` — step 2 & 3
+- `components/chat/StreamingResponse.tsx:108` — free-form Q&A
+- `lib/hooks/useDemoCapture.ts:84` — dev-only capture
 
-## Reading order
+Strip it and the app becomes a request/response spinner. The agent's reasoning trace, tool calls, and coverage tiles all arrive as separate NDJSON events; the UI paints each as it arrives. That's the product.
 
-```
-  00-overview.md (this file)
-    ↓
-  audit.md                                  ← 8 lenses, full inventory
-    ↓
-  01-ndjson-stream-reader-hook.md           ← the streaming substrate
-    ↓
-  02-progressive-skeleton-with-stepper.md   ← the perceived-performance pattern
-```
+→ **See `01-ndjson-stream-reader-hook.md`**.
+
+### 2. Progressive skeleton with stepper — perceived-instant while the agent runs
+
+Four tiers of feedback, all wired to the same NDJSON event stream:
+
+- `components/shared/Skeleton.tsx` — coarse rectangles for card placeholders
+- `components/shared/ProcessStepper.tsx` — the three-stage pipeline (monitoring → diagnosing → recommending), each with `pending | active | complete | error` states
+- `components/feed/CoverageGrid.tsx` — 10 anomaly-category tiles that fill in as each `coverage_item` event lands
+- `components/shared/StatusLog.tsx` (wrapping `ReasoningTrace.tsx`) — the sticky sidebar streaming agent thoughts + tool calls
+
+Strip the stepper alone and the user has no idea which phase is running. Strip the coverage grid and the "clear · limited · anomaly" completeness signal collapses to "here are some cards." The composition is the load-bearing piece — not any one tier.
+
+→ **See `02-progressive-skeleton-with-stepper.md`**.
+
+### 3. Auto-reconnect on revoked token — the live path only survives because of this
+
+`lib/hooks/useReconnectPolicy.ts` (123 LOC): the alpha Bloomreach MCP server revokes OAuth tokens after minutes. A wire-format `switch` deep in `useBriefingStream.ts` sees an `invalid_token` error, hands it to the policy, which fires `POST /api/mcp/reset` and reloads with a `sessionStorage` one-shot guard so it can't loop.
+
+This one hasn't earned its own pattern file — it's a policy composed onto the briefing stream, not a distinct architectural shape. It shows up in the audit under state-architecture and network semantics. If it grows to include exponential backoff, retry budgets, or per-route customization, it earns a file. Right now it's honest to say `readNdjson` + progressive-composition are the two patterns worth walking, and everything else is application logic layered on them.
+
+## The one gap the audit surfaces first
+
+The reasoning trace has no `aria-live` region. The entire "shows its work" pitch — the streaming agent output on the feed and both investigate pages — is invisible to a screen reader. The UI updates; the assistive-tech user hears nothing. The fix is small (add `role="log"` + `aria-live="polite"` to the `StatusLog` header wrapper), the impact is large. **See `audit.md` → `frontend-red-flags-audit`.**

@@ -1,15 +1,15 @@
-# 06 — Orchestration system design templates
+# Section F — Orchestration system design templates
 
-Anchor: codebases reframed as interview templates
+**Anchor:** codebases reframed as interview templates. Same code, interview framing.
 
-Three generic system-design templates that mirror the same template-shape used in `study-ai-engineering`'s system-design sub-section. Each follows a fixed nine-bullet structure (prompt / standard architecture / data model / key components / scale concerns / eval framing / common failure modes / applies to this codebase / how to make it apply). The first seven bullets are generic to the template; the last two are answered against this repo.
+These reframe the studied codebase (blooming_insights) as the answer to "design an agentic X system." Every template uses the fixed nine-bullet shape from `study-ai-engineering.md`. All three appear regardless of current applicability — the `Applies to this codebase` bullet is honest, and `How to make it apply` names the concrete refactor.
 
-The point: same code, interview framing. The exercise of asking "could I describe this codebase as the canonical answer to template X?" surfaces what's there, what's partially there, and what the refactor would look like.
+## Files
 
-## The three templates and how they fit
+1. **`01-workflow-outside-agent-inside.md`** — blooming's actual shape: deterministic supervisor + ReAct workers. The interview answer when someone asks "how would you build this?"
+2. **`02-agentic-support-system.md`** — the contrast case. Where blooming DOESN'T look like a support agent — no autonomous actions, no escalation queue — and what would need to change.
+3. **`03-multi-agent-research-assistant.md`** — the LLM-supervisor shape. The template blooming rejected (deterministic beats it for known-flow work). Kept as reference for when it WOULD earn its keep.
 
-1. **`01-multi-agent-research-assistant.md`** — partial fit. The investigation pipeline does decompose-query → retrieve-evidence, but the synthesis is missing (no LLM merger; each agent's output is the final word for its stage).
+## Reading order
 
-2. **`02-agentic-support-system.md`** — partial fit. The QueryBox path is the closest match; the diagnostic agent + recommendation pipeline is a different shape. The "takes real actions" piece doesn't apply (recommendations are proposals, not auto-executed actions).
-
-3. **`03-agentic-coding-system.md`** — no fit. The repo isn't a coding agent. Included for completeness because the spec ships all three regardless of shape.
+01 (blooming's shape) → 02 (the contrast) → 03 (the rejected alternative).

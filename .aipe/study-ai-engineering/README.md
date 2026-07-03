@@ -1,39 +1,33 @@
-# Study — AI engineering (blooming_insights)
+# study-ai-engineering — index
 
-This folder is the per-repo AI-engineering study guide. The codebase shape is **LLM application engineering** — five Anthropic agents orchestrated through a `@aptkit/core@0.3.0` runtime, talking to a Bloomreach Engagement MCP server through a swap-in port (`DataSource`), with NDJSON streaming back to the UI as a first-class surface.
+Per-codebase AI engineering study guide for `blooming_insights` — a Next.js multi-agent AI analyst that runs the diagnose → decide loop over a Bloomreach Engagement workspace, built on `@aptkit/core@0.3.0` and streamed to the UI as NDJSON.
 
-There is no classical ML in this codebase. Sections 8 (Machine Learning) and 9 (ML system design templates) are not generated — every concept here is about driving LLMs in production.
+Start with `00-overview.md`. Then walk the sub-directories in order — each has its own README with a reading order.
 
-## Reading order
+## Sub-directories
 
-Open in this order — each sub-section leans on the orientation the previous one set.
+- `01-llm-foundations/` — the model as an IO function, tokens, sampling, structured outputs, streaming, cost, heuristic-before-LLM, provider abstraction, override locks.
+- `02-context-and-prompts/` — the finite context window, lost-in-the-middle, prompt chaining (the diagnose → recommend handoff is a chain).
+- `03-retrieval-and-rag/` — mostly "not exercised" for this repo. The agents query structured data, not text over vectors. Concept files present for shape completeness.
+- `04-agents-and-tool-use/` — the load-bearing sub-section. Agent-vs-chain, tool calling, ReAct, tool routing, agent memory, error recovery. AptKit owns the loop; this repo owns the adapter bridge.
+- `05-evals-and-observability/` — the tier-2 story. Eval sets, methods, LLM-as-judge biases, LLM observability. 10 goldens × 2 rubrics × 4 dims × 3 verdicts, per-case receipt, judge-error resilience, signal-class-aware gate.
+- `06-production-serving/` — prompt caching (live), cost optimization (Haiku for intent), prompt injection surface, rate limiting + backpressure (partial — inbound to the MCP server, not to the app), retry + circuit breaker (retry present, breaker not).
+- `07-system-design-templates/` — interview reframes: search-ranking (no), tech-support chatbot (partially — the ReAct loop is structurally similar).
+- `08-machine-learning/` — largely "not exercised." Files present per spec for shape recognition and Case B project exercises.
+- `09-ml-system-design-templates/` — interview reframes: recommender (no), anomaly detection (**partially — YES actually, the monitoring agent IS anomaly detection**), object detection (no).
 
-1. **`00-overview.md`** — one-page map. The whole AI stack in one diagram: ports, adapters, agents, streaming. Read first; skim only this if you have five minutes.
-2. **`audit.md`** — the seven-lens audit. One section per AI-engineering lens (LLM call surface, context discipline, retrieval, agent loop, evals + observability, production serving, system-design framings), each with `file:line` evidence or an honest `not yet exercised`.
-3. **Sub-section folders (`01-` through `07-`)** — the discipline broken into seven phases of an LLM app's life. Each folder owns one phase and has its own `README.md` that lists the files in reading order.
-4. **`ai-features-in-this-codebase.md`** — the actual AI features this repo runs: the five agents, what each one does, which patterns it exercises, what its failure mode looks like.
+## Two "features in this codebase" files at root
 
-## Sub-sections
+- `ai-features-in-this-codebase.md` — per-feature table of every AI-touching thing in the repo: which agent, which prompt, which pattern, which files.
+- `ml-features-in-this-codebase.md` — the honest short list. This codebase has no trained ML.
 
-| # | Folder | What it teaches |
-|---|--------|-----------------|
-| 01 | `01-llm-foundations/` | What the LLM actually is, tokenization, sampling, structured outputs, token economics, the heuristic-before-LLM router, the provider port |
-| 02 | `02-context-and-prompts/` | The fixed context window, lost-in-the-middle, prompt chaining (the diagnose → recommend handoff) |
-| 03 | `03-retrieval-and-rag/` | The schema-as-retrieval pattern this repo uses instead of vector search, and the gate that decides which categories to run |
-| 04 | `04-agents-and-tool-use/` | The five Anthropic agents, the ReAct loop inside `@aptkit/core`, tool calling against the MCP server, intent-based tool routing, error recovery |
-| 05 | `05-evals-and-observability/` | LLM observability today (per-call usage logs, per-phase timings, NDJSON traces) and the Phase 3 eval suite that was built and retired |
-| 06 | `06-production-serving/` | LLM caching (60s response cache + Anthropic prompt caching), cost via cheap-classifier routing, rate limiting against Bloomreach, retry-with-backoff, prompt-injection surface |
-| 07 | `07-system-design-templates/` | Interview reframes — the codebase walked as the IK "search ranking" and "tech support chatbot" templates |
+## What's real, what's stubbed
 
-## Cross-links to neighboring guides
+The overview (`00-overview.md`) has the current-state snapshot. Key numbers to anchor against, from the committed baseline run (`eval/baseline.json`, runId `2026-07-03T04-08-28-644Z`):
 
-- **`study-system-design`** — the *where* lives in that folder (request flow, port + adapters, streaming kernel). This folder is the *AI-engineering view* of the same code: the LLM call surface, the agent loop, the prompt boundary.
-- **`study-prompt-engineering`** — the per-prompt anatomy (the four agent prompts at `lib/agents/legacy-prompts/*.md`) lives there. This folder treats prompts as atoms; the prompt-engineering guide cracks them open.
-- **`study-data-modeling`** — the shape of `Anomaly` / `Diagnosis` / `Recommendation` (the structured outputs the agents produce) lives there.
-
-## On UPDATE
-
-- Add a concept file under a sub-section when the codebase grows a new AI pattern (e.g. a real RAG surface lands → add it under `03-retrieval-and-rag/`).
-- Update a concept file when its implementation changes (e.g. the agent loop swaps `@aptkit/core` for something else → update `04-agents-and-tool-use/`).
-- Move a concept to retired-historical framing (not delete) when it was built and removed — the Phase 3 eval suite is the canonical example.
-- Regenerate `audit.md` against current evidence on every run.
+- 10 golden cases, 4 signal classes (has-signal, partial-signal, no-signal, positive)
+- Per-case cost: ~$0.09 agent-side (cached). Total 10-case run: $0.913 agent + ~$0.40 judge estimate = ~$1.30
+- Per-phase p50 latency: diagnose 50s · diagnosis-judge 38s · recommend 51s · rec-judge 90s · total 225s
+- Diagnosis dim pass rates: root_cause_plausibility 75% · evidence_grounding 50% · scope_coherence 75% · actionable_next_step 0%
+- Recommendation dim pass rates: diagnosis_response 48% · feature_choice_fit 62% · step_actionability 100% · impact_realism 43%
+- Session D pilot calibration (AI-vs-AI, 6 cases): verdict agreement 6/6 (100%) · exact-match dims 13/24 (54%) · within-1 dims 24/24 (100%)

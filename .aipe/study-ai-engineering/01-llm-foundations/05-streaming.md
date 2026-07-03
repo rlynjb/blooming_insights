@@ -1,238 +1,214 @@
-# Streaming
+# 05 — Streaming responses
 
-*Industry standard — server-sent token streaming · also: NDJSON event streaming*
+**Type:** Industry standard. Also called: server-sent events (SSE), NDJSON stream, token streaming.
 
-## Zoom out — where streaming lives in this codebase
+## Zoom out, then zoom in
 
-Two layers can stream: the LLM call itself (token-by-token from Anthropic) and the route-to-browser channel (NDJSON events from the agent loop). **This codebase streams the second, not the first.** The user sees the agent's *reasoning* land live in the `StatusLog` panel; what they *don't* see is the model's tokens arriving incrementally.
+Streaming isn't just about token-by-token model output — in this repo it's the whole architecture of "show your work." The agent's reasoning is a first-class UX surface, not a log.
 
 ```
-  Zoom out — what streams, what doesn't
+  Zoom out — the NDJSON stream is the product
 
-  ┌─ Browser ────────────────────────────────────────────────┐
-  │  StatusLog ← ReasoningTrace                              │
-  │  consumes NDJSON via fetch() + ReadableStream reader     │
-  └──────────────────────┬───────────────────────────────────┘
-                         │  ★ STREAMS: AgentEvent NDJSON ★
-                         │  reasoning_step, tool_call_start,
-                         │  tool_call_end, insight, diagnosis,
-                         │  recommendation, done, error
-                         ▼
-  ┌─ Route layer (app/api/agent/route.ts) ──────────────────┐
-  │  emits one AgentEvent per agent step via encodeEvent()  │
-  │  to the ReadableStream                                  │
-  └──────────────────────┬───────────────────────────────────┘
-                         │  agent.invoke()
-                         ▼
-  ┌─ Agent layer (AptKit reusable agent) ───────────────────┐
-  │  loop: ask model → handle tool_use → ask again          │
-  └──────────────────────┬───────────────────────────────────┘
-                         │  DOES NOT STREAM: full completion
-                         │  per call (messages.create, not stream)
-                         ▼
-  ┌─ Anthropic API ──────────────────────────────────────────┐
-  │  full response per call                                  │
-  └──────────────────────────────────────────────────────────┘
+  ┌─ UI ──────────────────────────────────────────────────────────────┐
+  │  StatusLog · ReasoningTrace · ToolCallBlock                        │
+  │  (renders live AgentEvent stream)                                  │
+  └─────────────────────────────▲─────────────────────────────────────┘
+                                │
+                                │  fetch() + ReadableStream reader
+                                │
+  ┌─ Route ─────────────────────┴─────────────────────────────────────┐
+  │  app/api/agent/route.ts writes NDJSON via ReadableStream           │
+  │  ★ THIS CONCEPT ★                                                  │
+  └─────────────────────────────▲─────────────────────────────────────┘
+                                │  AgentEvent per turn
+  ┌─ Agent hooks ───────────────┴─────────────────────────────────────┐
+  │  onText, onToolCall, onToolResult fired from BloomingTraceSinkAdapter│
+  └───────────────────────────────────────────────────────────────────┘
 ```
 
-**Zoom in.** Two streaming surfaces, one used, one deliberately not. The product reason is good: the user cares about *which queries the agent is running*, not which tokens it's writing. The NDJSON wire delivers that. Streaming raw tokens would be noise.
+Zoom in. This codebase streams the AGENT's events — reasoning steps, tool call starts, tool call ends, insights, diagnoses, recommendations — as newline-delimited JSON. Not the model's token-by-token output. The model calls are non-streaming (`Anthropic.Messages.MessageCreateParamsNonStreaming`); the streaming happens at the agent-event granularity. That's a deliberate design choice — the interesting unit to render is "the agent called this tool" or "the agent concluded X," not "the agent emitted the token 'because'."
 
-## Structure pass — layers · axes · seams
+## Structure pass
 
-**Layers:** model → adapter → agent loop → route → browser.
+**Layers:**
+- Outer: the browser fetch reader parsing NDJSON lines
+- Middle: the route's `ReadableStream` writing one JSON object per turn
+- Inner: the agent's hooks firing on model text / tool events
 
-**Axis: at what altitude do we stream?** Token altitude (model side): NO. Event altitude (loop side): YES.
+**Axis: what's the streamed unit?**
+- Outer (UI): whole `AgentEvent` object
+- Middle (route): one NDJSON line per event
+- Inner (agent): individual model events (text block, tool_use block, tool_result)
 
-**Seam:** `messages.create()` vs `messages.stream()` at `lib/agents/aptkit-adapters.ts:50`. The adapter uses the non-streaming method. If you wanted token-level streaming, this is the seam to retrofit.
+**Seam:** the NDJSON contract in `lib/mcp/events.ts`. This is what "must not change" refers to in the project context — every event kind (`reasoning_step`, `tool_call_start`, `tool_call_end`, `insight`, `diagnosis`, `recommendation`, `done`, `error`) is a discriminated union both sides depend on.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know how a chat app like ChatGPT shows tokens appearing one-by-one? That's *token streaming* — the model streams tokens as it generates them. You can also stream at a higher altitude: emit one event per *step* in your loop. Same word ("streaming"), two different things.
+You've written `fetch('/api/data').then(r => r.json())` — one request, one response body, wait for the whole thing. Now imagine the server writing the response body in chunks, one JSON object per chunk separated by `\n`, and the client reading with a `ReadableStream` reader that parses each line as it arrives. That's NDJSON.
 
 ```
-  Two altitudes of streaming, same word
+  NDJSON — one JSON object per line, streamed as it happens
 
-  Token streaming (NOT in this codebase):
-   ─────────────────────────────────────
-   model produces:  "I"   →  "I'll"  →  "I'll check"  →  "I'll check the"  →  ...
-   browser sees:    "I"   →  "I'll"  →  "I'll check"  →  "I'll check the"  →  ...
-
-   tradeoff: perceived latency drops to <1s
-             but: harder to validate, harder to do structured-output mid-stream
-
-  Event streaming (THIS codebase):
-   ───────────────────────────────
-   loop iter 1: { reasoning_step: "checking the workspace schema…" }    ← NDJSON line
-   loop iter 2: { tool_call_start: "execute_analytics_eql" }            ← NDJSON line
-   loop iter 3: { tool_call_end: durationMs:7300, result: {...} }       ← NDJSON line
-   loop iter 4: { reasoning_step: "revenue dropped 38% in usa…" }       ← NDJSON line
-   loop iter 5: { insight: { headline:"usa purchase_revenue · -38%" } } ← NDJSON line
-   loop iter N: { done: true }                                          ← NDJSON line
-
-   tradeoff: each event is meaningful (a step, a tool, a result)
-             but: first-event latency = first-LLM-call latency
-                  (no incremental tokens within a call)
+  server writes:                    client sees:
+  ─────────────────                  ───────────────────
+  {"type":"reasoning_step",...}\n    (parse line, render)
+   ← ~2s wait                        (spinner, then update)
+  {"type":"tool_call_start",...}\n   (parse, render tool bubble)
+   ← ~800ms wait                     (waiting for result…)
+  {"type":"tool_call_end",...}\n     (parse, close the bubble)
+  {"type":"reasoning_step",...}\n    (next thought lands)
+   ...
+  {"type":"diagnosis",...}\n         (the payload)
+  {"type":"done"}\n                  (close the stream)
 ```
 
-### Move 2 — the step-by-step walkthrough
+### Move 2 — walk the mechanism
 
-**Part 1 — the adapter explicitly uses the non-streaming call.**
+**The event shape.**
 
-From `lib/agents/aptkit-adapters.ts:42-52`:
+`AgentEvent` in `lib/mcp/events.ts` is a discriminated union. Every variant carries a `type` field plus per-type fields. The `reasoning_step` type carries `{agent, content, ts}`; `tool_call_start` carries `{agent, toolName, args, id, ts}`; `diagnosis` carries the typed `Diagnosis` payload. There's a `done` sentinel and an `error` variant. The producers (route handlers) and consumers (`StatusLog`, `useInvestigation`) both depend on this shape — CHANGING IT breaks committed demo snapshots that replay events.
 
-```typescript
-async complete(request: ModelRequest): Promise<ModelResponse> {
-  const params: Anthropic.Messages.MessageCreateParamsNonStreaming = {
-                                          // ← non-streaming type
-    model: this.defaultModel,
-    max_tokens: request.maxTokens ?? 4096,
-    messages: request.messages.map(toAnthropicMessage),
-  };
-  ...
-  const response = await this.anthropic.messages.create(params, ...);
-  //                                    ^^^^^^ not .stream()
+**The producer side.**
+
+In `app/api/agent/route.ts` (and briefing/route.ts), the handler builds a `ReadableStream` and passes a `writeEvent` closure to the agent. Every agent-side callback (`onText`, `onToolCall`, `onToolResult`, plus terminal `insight` / `diagnosis` / `recommendation` events) writes one NDJSON line to the stream. Rough shape:
+
+```
+  Route handler shape (simplified)
+
+  return new Response(
+    new ReadableStream({
+      async start(controller) {
+        const write = (event) => controller.enqueue(
+          new TextEncoder().encode(JSON.stringify(event) + '\n')
+        );
+
+        try {
+          await diagnosticAgent.investigate(anomaly, {
+            onText: (text) => write({type: 'reasoning_step', agent: 'diagnostic', content: text, ts: Date.now()}),
+            onToolCall: (tc) => write({type: 'tool_call_start', ...}),
+            onToolResult: (tc) => write({type: 'tool_call_end', ...}),
+          });
+          write({type: 'diagnosis', payload: diagnosis});
+          write({type: 'done'});
+        } catch (err) {
+          write({type: 'error', message: String(err)});
+        } finally {
+          controller.close();
+        }
+      }
+    }),
+    {headers: {'Content-Type': 'application/x-ndjson'}}
+  );
 ```
 
-The Anthropic SDK exposes both `messages.create()` and `messages.stream()`. This codebase calls the first. The full response arrives, then the loop runs again.
+**The consumer side.**
 
-**Part 2 — the event stream is the route's job.**
+`lib/hooks/useInvestigation.ts` runs a `fetch()` and reads the body with `getReader()`. It buffers on partial lines (an event can arrive split across chunks), splits on `\n`, JSON-parses each complete line, and dispatches to the right state update. When `type: 'diagnosis'` arrives, the hook stashes the payload in `sessionStorage` so navigating back or forward hydrates instantly. When `type: 'done'` arrives, the reader exits.
 
-`app/api/agent/route.ts:182-211` constructs an `AgentEvent` wire protocol and emits one event per agent step. The hooks fired by `AptKit` (`onText`, `onToolCall`, `onToolResult`) are translated to `AgentEvent`s and enqueued onto the `ReadableStream`:
+**Why the agent events are streamed and the model output isn't.**
 
-```typescript
-const hooksFor = (agent: AgentName) => ({
-  onText: (t: string) => {
-    if (t.trim()) stepFor(agent, 'thought', t);     // → 'reasoning_step' event
-  },
-  onToolCall: (tc: ToolCall) => send({              // → 'tool_call_start' event
-    type: 'tool_call_start', toolName: tc.toolName, agent,
-  }),
-  onToolResult: (tc: ToolCall) => send({            // → 'tool_call_end' event
-    type: 'tool_call_end', toolName: tc.toolName, agent,
-    durationMs: tc.durationMs ?? 0,
-    result: trunc(tc.result),
-    error: tc.error,
-  }),
-});
-```
+Two reasons. (1) The interesting unit for the UI is "the agent decided to check payment_failure rates" (a reasoning step or a tool call) — not "the model emitted the word 'payment'." Token-level would fire hundreds of times and swamp the UI. (2) Every terminal payload — insight, diagnosis, recommendation — needs to be a whole, validated object. Streaming a half-built JSON schema-conformant object is possible but complex and buys nothing here. The model calls stay non-streaming (`Anthropic.Messages.MessageCreateParamsNonStreaming` at `lib/agents/aptkit-adapters.ts:68`).
 
-Each `send()` writes one NDJSON line through `encodeEvent()` (`lib/mcp/events.ts:14-16`):
+**Perceived latency.**
 
-```typescript
-export function encodeEvent(e: AgentEvent): string {
-  return JSON.stringify(e) + '\n';
-}
-```
-
-**Part 3 — the browser reads it as it arrives.**
-
-`lib/streaming/ndjson.ts:18-65` is the shared reader. Three consumer surfaces use it: the feed (`useBriefing`), the investigation hook (`useInvestigation`), and the chat surface. All three loop the same way:
-
-```typescript
-const reader = body.getReader();
-const decoder = new TextDecoder();
-let buf = '';
-while (true) {
-  if (opts?.cancelOn?.()) { await reader.cancel(); return; }
-  const { value, done } = await reader.read();
-  if (done) break;
-  buf += decoder.decode(value, { stream: true });
-  const lines = buf.split('\n');
-  buf = lines.pop() ?? '';                          // hold partial last line
-  for (const raw of lines) {
-    const line = raw.trim();
-    if (!line) continue;
-    try { onEvent(JSON.parse(line) as E); }
-    catch (err) { opts?.onMalformed?.(line, err); }
-  }
-}
-```
-
-**Part 4 — the cost of NOT token-streaming.**
-
-The recommendation agent's rationale is the most-visible piece of generated text — anywhere from 50 to 300 tokens of prose. At Sonnet's generation speed (~70 tokens/sec), that's 0.7–4.5s of "the LLM is writing" time. Today, the user sees nothing until the full rationale arrives. With token streaming, they'd see the first word in <1s.
-
-That's the trade. Worth it? Probably yes today (the per-step events already make the app feel live), but the recommendation rationale is a candidate for layered streaming — both per-step events AND per-token tokens within the synthesis step.
+The user sees the FIRST reasoning_step in about 3-5 seconds (first model call + first tool_use decision). Without streaming they'd wait ~225s (p50 total) staring at a spinner. With streaming they see steps arriving every 5-15 seconds and never wonder if the request hung. That's the whole latency win — total time is unchanged; perceived wait drops.
 
 ### Move 3 — the principle
 
-**Pick the altitude that matches what the user cares about.** If they care about progress (which step is happening), event-stream. If they care about perceived response time on long generations, token-stream. You can do both — at the cost of more complex client code.
+Stream the unit the user cares about, not the unit the underlying API produces. Anthropic can stream tokens; that's rarely what you want to render. In this codebase the interesting unit is one turn of the agent's reasoning + tool use, and that's what the NDJSON contract exposes. Design the streamed unit at the domain layer, then figure out the wire format.
 
-## Primary diagram — the full recap
+## Primary diagram
+
+The full stream, from agent event to rendered UI.
 
 ```
-  The two streaming surfaces in this codebase
+  NDJSON stream — one investigation, end to end
 
-  ┌─ NOT streamed today (would shorten first-token latency) ──┐
-  │  Anthropic API ──[full response]──→ Adapter               │
-  │  messages.create(), not messages.stream()                 │
-  │  lib/agents/aptkit-adapters.ts:50                         │
-  └────────────────────────────────────────────────────────────┘
-
-                              ●  agent loop runs ●
-
-  ┌─ Streamed today (live progress UI) ────────────────────────┐
-  │  Route ──[AgentEvent NDJSON, line per event]──→ Browser    │
-  │  encodeEvent() at lib/mcp/events.ts:14                     │
-  │  readNdjson() at lib/streaming/ndjson.ts:18                │
-  │                                                            │
-  │  Events:                                                   │
-  │    reasoning_step   ← agent's narration                    │
-  │    tool_call_start  ← which EQL is about to run            │
-  │    tool_call_end    ← result + duration                    │
-  │    insight          ← final anomaly card                   │
-  │    diagnosis        ← final diagnosis object               │
-  │    recommendation   ← one per recommendation               │
-  │    done             ← terminator                           │
-  │    error            ← terminator-with-message              │
-  └────────────────────────────────────────────────────────────┘
+  agent (AptKit loop)                                        UI
+  ─────────────────                                          ──
+      │                                                       │
+      │ onText("checking payment_failure rates…")             │
+      ▼                                                       │
+  TraceSinkAdapter fires hook                                 │
+      │                                                       │
+      ▼                                                       │
+  route.ts writeEvent(reasoning_step) ── NDJSON line ────►    │
+                                                              │
+                                                          fetch reader
+                                                          buffers
+                                                          splits on \n
+                                                          JSON.parse
+                                                              │
+                                                              ▼
+                                                     dispatch to state
+                                                     → ReasoningTrace
+                                                       renders bubble
+                                                              │
+      │                                                       │
+      │ onToolCall({name:'execute_analytics_eql', args:…})    │
+      ▼                                                       │
+  writeEvent(tool_call_start) ── NDJSON line ────────────►    │
+                                                    ToolCallBlock renders
+                                                    (spinner, tool name)
+      │                                                       │
+      │ (~1-5s wait for tool)                                  │
+      │                                                       │
+      │ onToolResult({result:…, durationMs:1234})              │
+      ▼                                                       │
+  writeEvent(tool_call_end) ── NDJSON line ──────────────►    │
+                                                    ToolCallBlock closes
+                                                    duration shown
+                                                    JSON expandable
+      │                                                       │
+      │ (loop repeats ~5-10 more turns)                        │
+      │                                                       │
+      ▼                                                       │
+  writeEvent(diagnosis, payload) ── NDJSON line ─────────►    │
+                                                    EvidencePanel populates
+                                                    session storage stash
+      │                                                       │
+      ▼                                                       │
+  writeEvent(done) ── NDJSON line ───────────────────────►    │
+  controller.close()                                     reader exits
 ```
 
 ## Elaborate
 
-**Why NDJSON over Server-Sent Events.** Three reasons in this codebase:
+NDJSON vs SSE — both are streaming formats. SSE (`EventSource`) has a specific text/event-stream format with `data:` prefixes and reconnection semantics; NDJSON is just JSON per line over any transport (HTTP, WebSocket, file). This codebase picked NDJSON because the client uses `fetch()` (not `EventSource`) — `EventSource` doesn't support custom headers, doesn't support POST, and its reconnection semantics conflict with the once-per-navigation model of an investigation. NDJSON over `fetch()` + reader is more flexible and equivalently trivial to parse.
 
-  1. **POST + body works with NDJSON; SSE wants GET.** Some routes accept a payload (the diagnosis handover from step 2 to step 3 via the `diagnosis` query param). SSE constrains you to GET; NDJSON over `ReadableStream` doesn't.
-  2. **Simpler client code.** No `EventSource`, no automatic reconnect logic to disable. Just `fetch() + reader + split('\n')`.
-  3. **One contract for events.** The same `AgentEvent` shape ships in both the live stream and the cached replay (demo snapshot). The demo replay (`app/api/briefing/route.ts:81-152`) emits the same NDJSON lines as the live route — identical decoder, identical UI behavior.
-
-**Why not retrofit token streaming.** Three real costs:
-
-  1. **Structured-output parsing on partial tokens is hard.** The recommendation agent emits structured `Recommendation[]` — you'd need to parse JSON incrementally to render partial recommendations, or just stream the rationale (which IS prose).
-  2. **The non-streaming path is simpler everywhere.** `await anthropic.messages.create()` returns a complete `response.usage`; the streaming path requires accumulating usage across deltas.
-  3. **`AbortSignal` semantics differ slightly.** The streaming SDK uses an async iterator; cancellation requires `iterator.return()` instead of `signal.abort()`. Plumbing through the existing `signal` flow needs care.
-
-Worth doing for the recommendation rationale specifically (see exercise). Not worth doing globally.
+The `Content-Type: application/x-ndjson` is a convention, not a standard registered mime type. Some proxies buffer streaming responses if they don't recognize the type — Vercel's edge network handles this fine for `text/plain` or `application/x-ndjson` when the response uses `Transfer-Encoding: chunked`.
 
 ## Project exercises
 
-### Exercise — Token-stream the recommendation rationale
+### Exercise — heartbeat pings during long tool calls
 
-  → **Exercise ID:** B1.5
-  → **What to build:** Add a `streamComplete()` method to `AnthropicModelProviderAdapter` that uses `anthropic.messages.stream()`. Have the recommendation agent (or its synthesis turn) call `streamComplete` instead of `complete`. Route token deltas through the existing `AgentEvent` channel as a new `text_delta` event (`{ type: 'text_delta', agent: 'recommendation', delta: 'The' }`). Have `RecommendationCard` render partial text as it arrives.
-  → **Why it earns its place:** the recommendation rationale is the longest piece of user-visible generated text in the app. Streaming it cuts perceived latency from ~3s to <1s. Forces you to design through the structured-output / streaming-tokens tension.
-  → **Files to touch:** `lib/agents/aptkit-adapters.ts` (add `streamComplete`), `lib/agents/recommendation.ts` (opt in), `lib/mcp/events.ts` (add `text_delta` variant to `AgentEvent`), `app/api/agent/route.ts` (route deltas), `components/investigation/RecommendationCard.tsx` (render partials), `test/` (cover stream cancellation).
-  → **Done when:** opening the recommend step shows the first rationale tokens within 1s of the synthesis turn starting, the existing `'recommendation'` event still fires at end-of-stream with the full typed object, and `req.signal` cancellation cleanly aborts mid-stream.
-  → **Estimated effort:** 1–2 days.
+- **Exercise ID:** C1.5-A · Case A (concept exercised).
+- **What to build:** when a tool call is running for > 5s, emit a `{type:'tool_call_progress', id, elapsedMs}` NDJSON line every 3s so the UI can update the elapsed counter without waiting for `tool_call_end`. Adds keepalive behavior on some proxies that buffer long-quiet streams.
+- **Why it earns its place:** proves the NDJSON contract can carry mid-flight state without breaking the discriminated union. Interviewer signal: "I extended the stream with a new event kind and used it to fix a real UX problem — the spinner-with-no-progress-during-slow-tools issue."
+- **Files to touch:** `lib/mcp/events.ts` (add `tool_call_progress` variant), `app/api/agent/route.ts` (setInterval during pending calls), `components/investigation/ToolCallBlock.tsx` (render elapsed).
+- **Done when:** running a synthetic case with an artificially slow tool renders a live "elapsed 5s… 8s… 11s…" counter next to that call.
+- **Estimated effort:** 1-4hr.
 
 ## Interview defense
 
-**Q: "Why doesn't your app stream LLM tokens?"**
+**Q: Why not use SSE?**
 
-Two reasons. First, the product reason: the user cares about *which queries the agent is running*, not which tokens it's writing. That's what the NDJSON event stream delivers — one event per agent step, rendered live in the `StatusLog` panel. Second, the practical reason: parsing structured outputs (`Anomaly[]`, `Recommendation[]`) on partial tokens is hard. The agent emits final typed objects, not free prose. The one exception is the recommendation rationale — that's a candidate for token-streaming because it IS prose.
+Two reasons. First: `EventSource` doesn't support POST and doesn't support custom headers. The investigation stream is behind auth and takes a body payload — SSE won't carry it. Second: NDJSON over `fetch()` + `ReadableStream` reader is trivially simple: one line = one JSON object, `TextDecoder` + `.split('\n')` + `JSON.parse`. SSE's specific format buys reconnection semantics we don't want anyway (an investigation is one-shot; a mid-stream disconnect means restart, not reconnect).
 
-*Anchor: "Event streaming is the product surface; token streaming is the candidate for recommendation rationale only."*
+**Q: Why not stream tokens from the model?**
 
-**Q: "How does the browser consume your NDJSON stream?"**
+The interesting unit for the UI is not the token — it's the reasoning step or the tool call. Token-level streaming would fire hundreds of times per turn and the UI would be constantly re-rendering half-built prose that eventually gets discarded when the model shifts to a tool_use block. The agent-event stream is coarser-grained, semantically meaningful, and each unit is validated before it's rendered.
 
-`fetch() + ReadableStream reader + TextDecoder + split('\n') + JSON.parse per line`. The kernel is `readNdjson()` at `lib/streaming/ndjson.ts:18`; three consumer surfaces (`useBriefing`, `useInvestigation`, the chat surface) share it. The decoder is stream-aware (`{ stream: true }`) so multi-byte UTF-8 chars at chunk boundaries don't corrupt. The trailing buffer flush at end-of-stream is a no-op in practice because producers always terminate with `\n`, but it's there for safety.
+**Q: What breaks if you change the NDJSON contract?**
 
-*Anchor: "One kernel, four producers, all NDJSON. The `\n` terminator is the wire contract."*
+The demo snapshot replay. Committed `lib/state/demo-insights.json` and `lib/state/demo-investigations.json` are captured event streams played back by `?demo=cached`. Changing the discriminated union's variants (renaming, removing) invalidates every snapshot. That's why the project context calls out `AgentEvent` explicitly under "What must not change" — additive fields are fine, breaking changes force a re-capture.
 
 ## See also
 
-  → `01-what-an-llm-is.md` — the `messages.create()` call this file decides not to stream
-  → `04-agents-and-tool-use/01-agents-vs-chains.md` — the loop whose steps become events
-  → `06-production-serving/04-rate-limiting-backpressure.md` — the rate-limit story that interacts with streaming
+- `lib/mcp/events.ts` — the AgentEvent discriminated union
+- `lib/hooks/useInvestigation.ts` — the client reader
+- `app/api/agent/route.ts` — the producer
+- `components/shared/StatusLog.tsx` — the UI consumer
+- `04-agents-and-tool-use/01-agents-vs-chains.md` — what's actually happening between two events on the wire

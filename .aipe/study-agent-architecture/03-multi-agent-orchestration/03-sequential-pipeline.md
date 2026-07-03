@@ -1,185 +1,192 @@
-# Sequential / pipeline
+# Sequential pipeline (chain of specialized agents)
 
-**Industry standard.** Output of one agent feeds the next. **Exercised** in this codebase as the orchestration shape — with the load-bearing distinction that the pipe between stages is deterministic code, not LLM coordination.
+_Industry standard._
 
 ## Zoom out, then zoom in
 
-Sits at the orchestration layer. The user-facing pipeline (`monitoring → diagnose → recommend`) is one chain of three agents; the handoff between diagnose and recommend is unusual — it goes through the *client's* `sessionStorage`, not server-side resumable state.
+Output of one agent feeds the next. In this repo the diagnose → recommend chain is the primary sequential pipeline: the diagnostic agent produces a `Diagnosis` artifact, the recommendation agent consumes it. The supervisor (`app/api/agent/route.ts`) is the plumbing between them.
 
 ```
-  Zoom out — where this concept lives
+  Zoom out — the sequential pipeline in this repo
 
-  ┌─ UI layer ──────────────────────────────────────┐
-  │  Feed page → Investigate step 2 → Investigate    │
-  │  step 3 (the user clicks through the pipeline)   │
-  └────────────────────────────┬────────────────────┘
-                               │
-  ┌─ Orchestration layer ─────▼────────────────────┐
-  │  briefing/route.ts    /api/agent (diagnose)      │ ← we are here
-  │      → MonitoringAgent    → DiagnosticAgent      │
-  │                            /api/agent (recommend)│
-  │                              → RecommendationAgent│
-  └──────────────────────────────────────────────────┘
+  ┌─ /api/agent (SUPERVISOR: TypeScript) ─────────────────────────┐
+  │                                                                │
+  │  ┌─ Stage A ───────┐   Diagnosis   ┌─ Stage B ──────────┐      │
+  │  │ DiagnosticAgent │ ─────────────►│ RecommendationAgent│      │
+  │  │ (evidence loop) │  (artifact)   │ (action-shape loop)│      │
+  │  └─────────────────┘               └────────────────────┘      │
+  │           ▲                                    │               │
+  │           │                                    ▼               │
+  │       NDJSON stream forwarded to browser (both stages)         │
+  └────────────────────────────────────────────────────────────────┘
 ```
+
+Zoom in: this is a two-stage chain. Stage A's output is Stage B's input, plumbed by the supervisor. Both stages are agents (autonomous ReAct loops inside), but the *pipeline* between them is deterministic — the supervisor decides "run Stage A, hand its result to Stage B."
 
 ## Structure pass
 
-Layers: stage 1 agent → typed output → stage 2 agent → typed output → stage 3 agent.
+**Layers:** stage A (produce artifact) · handoff (typed contract) · stage B (consume artifact) · trace (interleaved for the UI).
+**Axis:** *who owns state between stages, and what shape does it travel as?*
+**Seam:** the `Diagnosis` type. Stage A promises "returns a Diagnosis"; Stage B promises "accepts a Diagnosis." The seam is the type contract — swap Stage A's internal implementation and Stage B doesn't know.
 
-**Axis traced — "where does the next stage's input come from?":** the previous stage's typed output. Specifically: `Anomaly` (monitoring stage output) → `Diagnosis` (diagnostic stage output) → `Recommendation[]` (recommendation stage output). Each interface is in `lib/mcp/types.ts`.
+```
+  The handoff seam — one artifact, two agents
 
-**Seam:** the typed handoff. Each stage produces a TypeScript-typed value the next consumes; no shared blackboard, no coordination protocol.
+  ┌─ Stage A ─────────┐   returns Diagnosis    ┌─ Supervisor ────┐
+  │  DiagnosticAgent  │ ─────────────────────► │  parses, plumbs │
+  │  ~5 turns         │                        │                 │
+  └───────────────────┘                        └────────┬────────┘
+                                                        │ passes Diagnosis
+                                                        ▼
+                                               ┌─ Stage B ─────────┐
+                                               │RecommendationAgent│
+                                               │  ~5 turns         │
+                                               └───────────────────┘
+```
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know `.then().then().then()` — a Promise chain where each callback transforms the previous resolution. The agent pipeline is that, where each callback is a single-agent ReAct loop instead of a pure function.
+You've written a `fetch(...).then(json => process(json))` chain before. The first call's output is the second call's input; either can fail; the browser sees them as a single flow. A sequential agent pipeline is the same shape, except each stage is a full ReAct loop instead of a single HTTP call.
 
 ```
-  ┌─────────┐   anomaly  ┌─────────┐  diagnosis ┌─────────┐
-  │MonitorAg│ ─────────► │DiagAg   │ ─────────► │RecAg    │
-  │ (scan)  │            │(investig│            │(propose)│
-  └─────────┘            └─────────┘            └─────────┘
+  Pattern: sequential agent pipeline
 
-  Each stage is one ReAct loop. The arrows are typed handoffs.
+  input (Anomaly)
+       │
+       ▼
+  ┌──────────────┐
+  │  Stage A     │  ← autonomous loop, ~5 turns
+  │  Diagnostic  │
+  └──────┬───────┘
+         │ typed artifact (Diagnosis)
+         ▼
+  ┌──────────────┐
+  │  Stage B     │  ← autonomous loop, ~5 turns
+  │ Recommend    │
+  └──────┬───────┘
+         ▼
+    output (Recommendation[])
 ```
 
-Same isolation benefit as a single-purpose-functions chain: each stage is independently testable (the 144 Vitest tests prove this — each agent has its own test file with mocked predecessor inputs), failures are localized (you know which stage broke from the trace), and you can run a cheaper model on early stages if needed (today they're all Sonnet because the budget is fine).
+### Move 2 — the walkthrough
 
-The latency cost is the sum of all stages, by definition — no parallelism between them, because each depends on the previous one's output.
-
-### Move 2 — step by step
-
-#### Stage 1 — monitoring
-
-Lives in `app/api/briefing/route.ts`. The agent runs once, produces an `Anomaly[]`, the route emits `insight` NDJSON events to the UI. Investigations don't auto-start; the user picks one from the feed by clicking a card.
-
-#### The cross-stage gap — what's *not* server state
-
-When the user clicks an `InsightCard`, the UI stashes the picked `Insight` in `sessionStorage` (via `useBriefingStream.ts:56`) and navigates to `/investigate/[id]`. The investigation page's `useInvestigation` hook reads the stash. **This is the cross-stage handoff.**
-
-The server doesn't carry state across `/api/briefing` → `/api/agent`. The `insightId` is the lookup key; the actual `Insight` flows through the client's `sessionStorage` because Vercel's serverless instances don't share memory across requests. The in-memory `lib/state/insights.ts` map only works on a same-instance follow-up — and the alpha demo path uses the committed `lib/state/demo-insights.json` snapshot as the canonical resolution.
-
-The `resolveAnomaly` function (`app/api/agent/route.ts:35-60`) makes this explicit — it tries the client-provided `?insight=...` JSON first, then the in-memory map, then the demo snapshot. The cross-stage handoff is "client carries the typed value forward."
-
-#### Stages 2 and 3 — the two-step investigation
-
-The single `/api/agent` route handles BOTH stages, branching on the `step` query param:
-
-- `step=diagnose`: run `DiagnosticAgent.investigate(anomaly)`, emit `diagnosis` NDJSON, do **not** run the recommendation.
-- `step=recommend`: read the `diagnosis` from the `?diagnosis=...` query param (handed over from step 2), run `RecommendationAgent.propose(anomaly, diagnosis)`, emit `recommendation` NDJSON for each.
-
-The relevant code in `app/api/agent/route.ts:267-297` is straight `if/else` on `step`. The handoff between step 2 and step 3 again goes through the *client's* `sessionStorage` (see `useInvestigation.ts:134-140`):
+**The handoff — `app/api/agent/route.ts:270-294`.**
 
 ```ts
-// useInvestigation.ts:134-140 (abridged)
-sessionStorage.setItem(
-  stashKey(step, id),
-  JSON.stringify({ diagnosis: cDiag, ... }),
-);
-sessionStorage.setItem(diagHandoffKey(id), JSON.stringify({ diagnosis: cDiag }));
+// route.ts — Stage A
+const diagAgent = new DiagnosticAgent(anthropic, dataSource, schema, allTools, sid);
+diagnosis = await diagAgent.investigate(inv, { ...hooksFor('diagnostic'), signal: req.signal });
+send({ type: 'diagnosis', diagnosis });
+
+// route.ts — Stage B (only if step !== 'diagnose')
+if (step !== 'diagnose') {
+  const recAgent = new RecommendationAgent(anthropic, dataSource, schema, allTools, sid);
+  const recommendations = await recAgent.propose(inv, diagnosis!, {
+    ...hooksFor('recommendation'), signal: req.signal
+  });
+  for (const r of recommendations) send({ type: 'recommendation', recommendation: r });
+}
 ```
 
-The diagnosis is written to `sessionStorage` after step 2 completes, then the user clicks "see recommendations →" which navigates to `/investigate/[id]/recommend`. That page's `useInvestigation` hook reads the diagnosis back from sessionStorage and includes it in the step 3 fetch as the `?diagnosis=` query param.
+Line-by-line:
 
-**This client-side handoff is the unusual part.** Most server-side agent pipelines hand state directly between stages in process memory or in a state store (Redis, Postgres, etc.). This repo's design accepts the cost — the client carries the typed value — in exchange for not needing a session store on the server (matches `## What must not change` in the project context: "no database; state lives in in-memory maps").
+- **`diagnosis = await diagAgent.investigate(...)`** — the `await` is the whole pipeline joint. The supervisor blocks on Stage A completing (~50s of ReAct loop, ~5 turns, ~$0.045). Nothing about Stage B starts until this returns.
+- **`send({ type: 'diagnosis', diagnosis })`** — the artifact is streamed to the UI at the handoff boundary. The user sees "diagnosis complete" before Stage B starts. This is not just plumbing — it makes the pipeline *inspectable* mid-flight.
+- **`recAgent.propose(inv, diagnosis!, ...)`** — Stage B takes the anomaly (original input) AND the diagnosis (Stage A output). Two arguments, both required. The `!` is the load-bearing part: at this point in the flow, TypeScript can't prove diagnosis is set, but the `if (step !== 'diagnose')` gate above ensures it is.
+- **`for (const r of recommendations) send(...)`** — Stage B emits multiple recommendations; each streams as it lands. The UI renders them incrementally.
 
-The captured demo snapshot is the alternative path: when `live=false` and a cached investigation exists, the route replays the recorded NDJSON stream filtered by step (`app/api/agent/route.ts:125-141`). Then the diagnosis comes from the cached stream's `diagnosis` event, not from sessionStorage.
+**Stage skipping — the same pipeline serves three product phases.** The route accepts `step=diagnose|recommend|null` and skips stages accordingly:
 
-#### Why this is a pipeline and not a multi-agent system
+- `step=diagnose` — run Stage A only, emit diagnosis, stop. (The Investigate page.)
+- `step=recommend` — skip Stage A, parse the diagnosis from the URL param, run Stage B only. (The Recommend page after the user navigated back.)
+- `step=null` — run both (used by the demo capture).
 
-The agents never talk to each other. The pipeline is:
+This is a pipeline with a *resume point*. The seam between stages isn't just typed — it's serializable, so Stage B can be resumed against a prior Stage A output. The URL is the persistence layer.
+
+**The trace is interleaved, not sequential.** Even though the stages run sequentially, the NDJSON stream shows Stage A's steps, then the `diagnosis` event, then Stage B's steps — all in one channel. The `hooksFor(agent)` factory (Move 2 in `02-supervisor-worker.md`) tags each event with the agent name so the UI can group them.
 
 ```
-Monitoring → emits Anomaly[] (typed)
-   ▼ via client sessionStorage
-Diagnostic → emits Diagnosis (typed)
-   ▼ via client sessionStorage
-Recommendation → emits Recommendation[] (typed)
-```
+  Layers-and-hops — the two-stage pipeline
 
-Each stage receives a typed value and produces a typed value. The orchestration is *deterministic code* — the route handler decides which stage runs based on `step`, the client decides which step is "next" based on the user's click. There's no LLM coordination. This is what the spec calls "the pipeline shape with the load-bearing distinction that the orchestrator is code, not a model."
+  ┌─ UI (browser) ──────────────────┐
+  │  StatusLog reads NDJSON stream  │
+  └─────┬────────────▲──────────────┘
+        │            │ interleaved trace + `diagnosis` event
+        ▼            │
+  ┌─ /api/agent (SUPERVISOR) ─────────────┐
+  │  awaits Stage A → forwards `diagnosis`│
+  │  awaits Stage B → forwards each rec   │
+  └────┬──────────────────────┬───────────┘
+       │ new DiagnosticAgent   │ new RecommendationAgent
+       ▼                       ▼
+  ┌─ Stage A ────────┐   ┌─ Stage B ─────────┐
+  │  AptKit ReAct     │   │  AptKit ReAct      │
+  │  ~5 turns · ~50s │   │  ~5 turns · ~51s   │
+  └──────────────────┘   └────────────────────┘
+```
 
 ### Move 3 — the principle
 
-**Sequential pipelines work when the stage order is genuinely known and stages don't need to coordinate.** The handoff is a typed value, not a coordination message. The latency cost (sum of stages) is the price you pay for the structural simplicity (every stage is independently testable, traceable, retryable).
-
-The variant in this repo — handing state through the client between stages — is unusual but appropriate when the server is stateless by design. The cost is: state is lost if the user closes the tab between steps. The mitigation: the demo path's committed snapshot acts as a canonical investigation; live investigations are recoverable from the URL + the client's sessionStorage; the unrecoverable failure mode is "user closed tab mid-investigation" which is just "they have to start over."
+Sequential pipelines are the right shape when the work has *inherent order* — you can't recommend without diagnosing first, you can't diagnose without an anomaly first. The type contract between stages is what makes the pipeline maintainable: each stage promises a shape, the next stage consumes it, either can be refactored independently as long as the seam holds. Latency is the sum of stages (no parallelism to buy back), but each stage is independently debuggable — when a run is bad, the trace tells you which stage produced the badness.
 
 ## Primary diagram
 
 ```
-  The full pipeline — three agents, two route handlers, client-side handoffs
+  Recap — the diagnose → recommend pipeline
 
-  USER CLICKS "monitoring is fresh"  (loads feed page)
-        │
-        ▼
-  ┌─ /api/briefing ─────────────────────────────────────────────────┐
-  │   bootstrap schema → coverage gate                               │
-  │     → MonitoringAgent.scan() [1 ReAct loop, maxToolCalls=6]      │
-  │     → emit insights[] as NDJSON                                  │
-  └─────────────────────────────┬───────────────────────────────────┘
-                                │  insights[] over NDJSON wire
-                                ▼
-  ┌─ UI ─────────────────────────────────────────────────────────────┐
-  │   feed page renders InsightCards                                  │
-  │   USER CLICKS A CARD                                              │
-  │   sessionStorage.setItem('bi:insight:${id}', JSON.stringify(i))   │
-  │   navigate to /investigate/${id}                                  │
-  └─────────────────────────────┬───────────────────────────────────┘
-                                │
-                                ▼
-  ┌─ /api/agent?insightId=...&step=diagnose ─────────────────────────┐
-  │   resolveAnomaly (reads ?insight= param or session map or demo)   │
-  │     → DiagnosticAgent.investigate(anomaly) [1 ReAct loop]         │
-  │     → emit diagnosis NDJSON                                       │
-  │     → DO NOT run recommendation (step is 'diagnose')              │
-  └─────────────────────────────┬───────────────────────────────────┘
-                                │  diagnosis over NDJSON wire
-                                ▼
-  ┌─ UI ─────────────────────────────────────────────────────────────┐
-  │   EvidencePanel renders                                           │
-  │   sessionStorage.setItem(diagHandoffKey(id), {diagnosis})         │
-  │   USER CLICKS "see recommendations →"                             │
-  │   navigate to /investigate/${id}/recommend                        │
-  └─────────────────────────────┬───────────────────────────────────┘
-                                │
-                                ▼
-  ┌─ /api/agent?insightId=...&step=recommend&diagnosis=... ──────────┐
-  │   resolveAnomaly (same)                                           │
-  │   parseDiagnosis from ?diagnosis= query param                     │
-  │     → RecommendationAgent.propose(anomaly, diagnosis) [1 ReAct]   │
-  │     → emit recommendation NDJSON per item                         │
-  └──────────────────────────────────────────────────────────────────┘
+  Anomaly (from feed click)
+       │
+       ▼
+  ┌────────────────────────────────────────────────────┐
+  │  Stage A — DiagnosticAgent                          │
+  │  input:  Anomaly + workspace schema                 │
+  │  loop:   ~5 turns (EQL evidence gathering)          │
+  │  output: Diagnosis { conclusion, evidence[],        │
+  │                       hypothesesConsidered[] }      │
+  └────────────────────┬────────────────────────────────┘
+                       │ typed handoff (Diagnosis)
+                       ▼
+       send({ type: 'diagnosis', diagnosis })  ← UI sees this
+                       │
+                       ▼
+  ┌────────────────────────────────────────────────────┐
+  │  Stage B — RecommendationAgent                      │
+  │  input:  Anomaly + Diagnosis                        │
+  │  loop:   ~5 turns (Bloomreach feature selection)    │
+  │  output: Recommendation[]                           │
+  └────────────────────┬────────────────────────────────┘
+                       │
+                       ▼
+       for each: send({ type: 'recommendation', ... })
 ```
 
 ## Elaborate
 
-The "client-side handoff" pattern this repo uses is unconventional but defensible when the server is stateless by design. Most production agent pipelines run on infrastructure with a per-session store (Redis, Postgres, Convex), and the server can hand state through between stages without involving the client. This repo's "no database" constraint (see `lib/state/` — in-memory maps that don't survive across serverless instances) forces the client to be the state carrier.
+Sequential pipelines are the oldest orchestration shape — Unix pipes, ETL jobs, function composition. Agent pipelines add one twist: each stage is autonomous, so its runtime is variable (5-8 turns depending on how many EQL queries the model wants). That variability compounds — a 30s diagnose plus a 50s recommend can drift to a 60s + 80s outlier when a hard case makes both stages think harder.
 
-The alternative would be: combined `/api/agent` with `step=null` (which still exists — used by the demo-snapshot capture path) runs both diagnose and recommend back-to-back in one request, no client handoff needed. The split into two steps exists for the user-facing flow because the diagnosis takes 50-80s to produce and the user wants to read it (and potentially abandon the flow) before paying for the recommendation. The two-step flow saves recommendation cost when the user reads the diagnosis and decides not to drill further.
+The reason this shape works well for diagnose → recommend specifically: the two stages are *asymmetric* on tools (diagnostic uses evidence-gathering tools, recommendation uses action-shape tools like `list_scenarios`), *asymmetric* on prompts (investigate vs propose), and *asymmetric* on failure modes (bad evidence vs inappropriate feature). That's the three-criteria test from `01-when-not-to-go-multi-agent.md` — the split earns its keep.
 
-The diagnosis-via-query-param is a small but load-bearing detail. The query param is JSON-stringified, URL-encoded, and can carry ~5-10KB of diagnosis (which fits typical diagnoses — `Diagnosis` is small: a conclusion string, an evidence array of strings, a hypotheses array). For larger handoffs the URL would overflow and a server-side store would become necessary. The current shape is "lightweight enough to fit the URL," which is fine for this domain.
+The Recommendation input includes the original Anomaly, not just the Diagnosis. Recommendation needs both — the numeric change (from Anomaly) and the causal reasoning (from Diagnosis) — to write a proposal that says "given a 38% drop, run Scenario X for 14 days." Passing only the Diagnosis would starve Stage B of the metric baseline.
 
 ## Interview defense
 
-> **Q: How does the investigation flow work, end to end?**
->
-> Three deterministic stages. Stage 1: `/api/briefing` runs the monitoring agent and emits anomalies as an NDJSON stream the UI renders as `InsightCard`s. The user clicks a card, which writes the picked insight to `sessionStorage` and navigates to `/investigate/[id]`. Stage 2: `/api/agent?step=diagnose&insightId=...` reads the insight (from the client's stash or the demo snapshot fallback), runs the diagnostic agent, emits the diagnosis. The UI renders it and writes it back to `sessionStorage`. The user clicks "see recommendations" and navigates to `/recommend`. Stage 3: `/api/agent?step=recommend&insightId=...&diagnosis=...` reads the diagnosis from the query param, runs the recommendation agent, emits the recommendations. The whole pipeline is deterministic — no model picks which stage runs.
+**Q: Why not run diagnose and recommend in parallel?**
+A: Recommend needs the diagnosis. It's not "diagnosis helps" — the recommendation prompt literally receives the `Diagnosis` object as input and reasons over it ("your evidence shows checkout latency was up 40%, therefore propose a Segment for the affected users"). Without the diagnosis, recommend has no basis. This isn't a parallel-eligible fan-out; it's an inherent-order pipeline. If we tried to parallelize, we'd get generic recommendations that don't ground in the evidence.
 
-> **Q: Why does the diagnosis go through the client's sessionStorage instead of staying on the server?**
->
-> Vercel serverless instances don't share memory across requests, and the project intentionally avoids a database. So between step 2 (`/api/agent?step=diagnose`) and step 3 (`/api/agent?step=recommend`), the server has no place to store the diagnosis it produced. The client carries the typed `Diagnosis` value forward via `sessionStorage` and submits it back as the `?diagnosis=` query param in step 3. The route reads it via `parseDiagnosis` in `app/api/agent/route.ts:84-95`. The unusual handoff path is a direct consequence of the no-database constraint. The failure mode is recoverable — closing the tab loses the diagnosis, the user has to start over.
+Diagram: the data-flow arrow from Diagnosis → RecommendationAgent, labelled "input dependency."
+Anchor: `app/api/agent/route.ts:280` (`recAgent.propose(inv, diagnosis!, ...)`).
 
-> **Q: Is this pipeline a multi-agent system?**
->
-> No. Three single-agent loops dispatched by deterministic code, with typed values handed between stages. The agents never talk to each other; the orchestrator is TypeScript, not an LLM. This is the "workflow with agent steps" shape, not multi-agent. Multi-agent vocabulary (supervisor, coordination protocol, handoff) doesn't apply because there's no LLM coordination layer.
+**Q: What happens if Stage A fails midway?**
+A: The error propagates up through the `await`. The route handler's outer try/catch emits an NDJSON `error` event, the client sees the failure. Stage B never runs — no half-finished pipeline state. That's the safety property of sequential + await: either you get through Stage A cleanly, or the pipeline halts. Common failures are: schema-gate error (Bloomreach rejects an EQL), rate-limit retry ceiling hit, and BudgetExceededError from the tracker. All three surface as graceful `error` events, not silent hangs.
+
+Diagram: the try/catch envelope around the pipeline; failure short-circuits before Stage B.
+Anchor: `app/api/agent/route.ts` (the outer try/catch); `04-agent-infrastructure/04-guardrails-and-control.md` for BudgetTracker.
 
 ## See also
 
-- → `01-when-not-to-go-multi-agent.md` — the deliberate non-escalation that produced this shape
-- → `02-supervisor-worker.md` — what this would become with an LLM coordinator
-- → `08-shared-state-and-message-passing.md` — the typed-handoff pattern in this pipeline
-- → `04-parallel-fan-out.md` — what stages 1 and 2 could become if independent queries grew
-- → cross-reference (when generated): `study-system-design`'s streaming NDJSON pattern — the wire format every stage's output rides on
+- `02-supervisor-worker.md` — the supervisor that plumbs the pipeline.
+- `08-shared-state-and-message-passing.md` — the Diagnosis is a message (not shared state).
+- `04-parallel-fan-out.md` — the other shape, and why it doesn't fit diagnose → recommend.
+- `09-coordination-failure-modes.md` — synthesis failures at the handoff.

@@ -1,9 +1,17 @@
 # 02 — Context and prompts
 
-What goes into the model's context window, what gets dropped, and how multi-step flows split work across multiple LLM calls. Three concepts:
+The finite container everything else has to fit in, and the load-bearing pattern this repo actually exercises: chaining stages so each has one job.
 
-  1. `01-context-window.md` — the fixed container, what competes for space, how this codebase budgets
-  2. `02-lost-in-the-middle.md` — why position matters, and where this codebase puts the most-important content
-  3. `03-prompt-chaining.md` — the diagnose → recommend handoff as the canonical chain in this repo
+## Files
 
-Read in this order. Each file is short — the load-bearing content for prompt internals lives in `study-prompt-engineering/`.
+- `01-context-window.md` — the finite container. In this repo the diagnostic loop grows the messages array across 5-10 turns; prompt caching absorbs most of the cost.
+- `02-lost-in-the-middle.md` — the empirical attention pattern. Not directly measured in this codebase but shapes how we constrain tool_result content.
+- `03-prompt-chaining.md` — the diagnose → recommend chain. Two agents, each with one job, sharing a `BudgetTracker`.
+
+## Anchor shape
+
+LLM application engineering (primary). The chain in `03-prompt-chaining.md` is the load-bearing pattern for this codebase — it's the diagnose → recommend split at the heart of the product.
+
+## Curriculum
+
+Phase 1 — concepts C1.2, prompt chaining.

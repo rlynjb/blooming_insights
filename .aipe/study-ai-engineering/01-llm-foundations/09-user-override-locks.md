@@ -1,211 +1,150 @@
-# User-override locks
+# 09 — User-override locks
 
-*Industry standard — `_overridden_at` lock pattern (concept; not yet exercised here)*
+**Type:** Industry standard. Also called: override tracking, override-aware re-classification, human-in-the-loop preservation.
 
-## Zoom out — where this concept lives
+## Zoom out, then zoom in
 
-In codebases where the LLM writes fields the user can also edit, you need a lock — a per-field timestamp that says "the user touched this, don't let the LLM overwrite it on the next sync." **This codebase does not yet exercise the pattern** — there's no user-editable LLM-written field. But it's an honest gap worth naming, because the moment the recommendation card grows an "edit" button, the pattern matters.
+Not exercised in this repo. This concept file is generated per spec because it's in scope for the LLM-app-engineering shape and would apply if the product grew a user-editable field the LLM re-classifies.
 
 ```
-  Zoom out — where the lock would sit
+  Zoom out — where this pattern would sit in this codebase
 
-  ┌─ UI ─────────────────────────────────────────────────────┐
-  │  RecommendationCard / EvidencePanel                      │
-  │  TODAY: read-only display of LLM-written fields           │
-  │  FUTURE: user edits title / rationale / impact            │
-  └──────────────────────┬───────────────────────────────────┘
-                         │
-                         ▼
-  ┌─ ★ The lock layer (not implemented) ★ ───────────────────┐ ← we are here
-  │  per-field `_source` + `_overridden_at` timestamps        │
-  │  agent checks before writing                              │
-  └──────────────────────┬───────────────────────────────────┘
-                         │
-                         ▼
-  ┌─ Storage ────────────────────────────────────────────────┐
-  │  in-memory + dev-file cache                              │
-  │  (no DB to schema-migrate)                               │
-  └──────────────────────────────────────────────────────────┘
+  ┌─ UI ──────────────────────────────────────────────────────────────┐
+  │  User edits a field on an insight/diagnosis                        │
+  │  (does not exist today — no editable fields)                       │
+  └─────────────────────────────┬─────────────────────────────────────┘
+                                │
+  ┌─ Persistence ───────────────▼─────────────────────────────────────┐
+  │  Would need: field + _source ('llm'|'user') + _overridden_at       │
+  │  (no persistent DB today; insights live in-memory / demo snapshots)│
+  └─────────────────────────────┬─────────────────────────────────────┘
+                                │
+  ┌─ Re-classification ─────────▼─────────────────────────────────────┐
+  │  When agent re-runs, checks _overridden_at before overwriting      │
+  │  ★ THIS CONCEPT (would apply here) ★                               │
+  └───────────────────────────────────────────────────────────────────┘
 ```
 
-**Zoom in.** Honest framing: this is a *gap* file, not an *implementation* file. The pattern is named, the mechanism is walked, and the file points at where it would land if the product grows the surface that needs it.
+Zoom in. The pattern's mechanism is simple: any field the user can manually edit gets an `_overridden_at` timestamp; the LLM re-runs check that timestamp and don't overwrite if it's set. In this codebase, no field is user-editable — the UI is read-only over the agent's output. So there's nothing to lock.
 
-## Structure pass — layers · axes · seams
+## Structure pass
 
-**Layers:** user input → editable field → storage → agent re-run.
+**Layers:**
+- Outer: the reader's edited value
+- Middle: the persistence layer
+- Inner: the re-classification decision
 
-**Axis: who's the source of truth?** Today, the LLM is the only writer to recommendation fields — there's no contention. The pattern matters the moment a user can also write to those same fields and the agent re-runs.
+**Axis: authority.**
+- Outer: user wins (the edit is the truth)
+- Middle: persistence records the override
+- Inner: agent respects the override
 
-**Seam:** the field write-back path. Today, agent output goes straight into in-memory state and the demo snapshot. There's no "merge user edits with agent output" merge layer, because there are no user edits yet.
+**Seam:** the `_source` / `_overridden_at` fields on the row. Above: the app treats them as normal fields. Below: any re-classification code branches on them.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know how Git refuses to overwrite your uncommitted changes when you pull? Same idea, applied per-field. The LLM is a "pull" of generated content; user edits are "uncommitted changes"; the lock is the refusal to overwrite.
+You've written an `updated_at` timestamp on a database row. Same shape here: an `_overridden_at` timestamp on a field records "the user touched this at time X." Then before the LLM re-runs, you check `if (_overridden_at != null) skip`. That's the whole pattern.
 
 ```
-  Lock pattern — field-level, three-way state
+  Field with override tracking (industry pattern)
 
-  field schema:
-    title:                "Boost USA revenue via cart recovery"
-    title_source:         "llm"         ← who wrote it
-    title_overridden_at:   null          ← timestamp if user edited
+  {
+    severity: "critical",              ← current value
+    severity_source: "user",           ← who set it
+    severity_overridden_at: "2026-06-30T14:00:00Z"  ← when
+  }
 
-  next LLM run:
-    if (title_overridden_at != null) {
+  On re-classification:
+    if (severity_overridden_at != null) {
       // user edited this; do NOT overwrite
-      keep_user_value();
+      skipReclassification();
     } else {
-      title = llm.generate();
-      title_source = "llm";
+      severity = agentClassify(...);
+      severity_source = "llm";
     }
 ```
 
-### Move 2 — the step-by-step walkthrough
+### Move 2 — walk the mechanism (as it would work here)
 
-**Part 1 — what the pattern would look like in this codebase.**
+**Where this WOULD apply in this codebase, hypothetically.**
 
-The `Recommendation` shape today (`lib/mcp/types.ts:117-131`) has plain fields:
+If the product added:
+- Editable `severity` on an `Insight` — user marks a `warning` as `critical` before triaging.
+- Editable `bloomreachFeature` on a `Recommendation` — user changes the suggested lever from `scenario` to `campaign`.
+- Editable `conclusion` on a `Diagnosis` — user re-writes the agent's conclusion after reviewing.
 
-```typescript
-export interface Recommendation {
-  id: string;
-  title: string;
-  rationale: string;
-  bloomreachFeature: 'scenario' | 'segment' | 'campaign' | 'voucher' | 'experiment';
-  steps: string[];
-  estimatedImpact: EstimatedImpact;
-  confidence: 'high' | 'medium' | 'low';
-  // ... optional enrichments
-}
-```
+Each of those fields would need a `_source` + `_overridden_at` companion.
 
-If the recommendation card grew an "edit title" affordance, the shape would need:
+**Why nothing has this today.**
 
-```typescript
-export interface Recommendation {
-  id: string;
-  title: string;
-  title_source: 'llm' | 'user';          // who wrote it
-  title_overridden_at: string | null;    // when user edited (ISO)
-  rationale: string;
-  rationale_source: 'llm' | 'user';
-  rationale_overridden_at: string | null;
-  // ... per editable field
-}
-```
+The UI is read-only over agent output. Users click into investigations, expand tool calls, export markdown — but no field is edited. The re-classification problem doesn't arise because there's no re-classification: each investigation is one-shot, results are stashed in `sessionStorage`, and the demo snapshot is captured once and committed.
 
-The agent (or its writer side) would check `_overridden_at` before writing:
+**The pattern's real cost.**
 
-```typescript
-// pseudocode for the next recommendation re-run
-for (const field of EDITABLE_FIELDS) {
-  if (recommendation[`${field}_overridden_at`] != null) {
-    continue;  // user has edited this — preserve their value
-  }
-  recommendation[field] = newRecommendation[field];
-  recommendation[`${field}_source`] = 'llm';
-}
-```
-
-**Part 2 — what the agent loop would need to know.**
-
-The agent itself doesn't write to storage today — the route does, via `putInsights()` at `lib/state/insights.ts:62`. The lock check belongs at the *write boundary*, not inside the agent. The agent emits a fresh `Recommendation`; the merge logic compares against the stored one and respects overrides.
-
-This is the right separation: the agent stays stateless (every run is fresh); the merge logic stays small (one function, easy to test) and lives where storage lives.
-
-**Part 3 — the demo-snapshot wrinkle.**
-
-If user edits land, the demo snapshot at `lib/state/demo-investigations.json` needs a story. Two options:
-
-  1. **Treat the snapshot as canonical, no editing in demo mode.** Simplest. The UI disables edit buttons when `bi:mode === 'demo'`.
-  2. **Persist edits to a separate per-session overlay.** More complex; means demo sessions accumulate state, which contradicts the "demo is reliable presentation" framing.
-
-Option 1 is the right move for this codebase's product shape (demo IS the presentation path).
+Every editable field gains a column (or a nested field in the JSON). Migration of existing data (mark all pre-override rows as `_source: 'llm', _overridden_at: null`). The override state has to survive re-runs, syncs, imports/exports.
 
 ### Move 3 — the principle
 
-**Any LLM-writable field the user can also edit needs a per-field `_overridden_at` lock.** The merge logic is small but load-bearing — without it, user edits silently disappear on the next agent run. Lock pattern + write-time merge + read-time honest provenance display.
+The user is the source of truth for anything they can edit. The LLM is the source of truth for anything they can't. Encode that split in the schema — a `_source` field and a `_overridden_at` timestamp — and every re-classification becomes trivially safe. Skip the pattern and every re-run silently erases user corrections.
 
-## Primary diagram — the full recap
+## Primary diagram
 
 ```
-  User-override lock — three-way state (not implemented today)
+  What the pattern looks like at the schema level (industry standard)
 
-  ┌─ Storage ────────────────────────────────────────────────────┐
-  │  Recommendation {                                            │
-  │    title: "...",   title_source: "llm",   _overridden_at: ?  │
-  │    rationale: "...", rationale_source: "llm", _overridden_at:?│
-  │    ...                                                       │
-  │  }                                                           │
-  └──────────────────────┬───────────────────────────────────────┘
-                         │
-                         ▼
-  ┌─ Read path (UI) ─────────────────────────────────────────────┐
-  │  if (_overridden_at):  render with "edited by you" badge     │
-  │  else:                 render with "from agent" badge        │
-  └──────────────────────────────────────────────────────────────┘
-                         │
-                         ▼
-  ┌─ Write path A: user edit ────────────────────────────────────┐
-  │  user types in title field, blurs                            │
-  │  → write title = new value                                   │
-  │  → write title_source = "user"                               │
-  │  → write title_overridden_at = now                           │
-  └──────────────────────────────────────────────────────────────┘
-                         │
-                         ▼
-  ┌─ Write path B: agent re-run ─────────────────────────────────┐
-  │  agent emits new Recommendation                              │
-  │  for each editable field:                                    │
-  │    if (stored._overridden_at != null): skip                  │
-  │    else: stored[field] = new[field], _source = "llm"         │
-  └──────────────────────────────────────────────────────────────┘
+  ┌─ record ──────────────────────────────────────────────┐
+  │  {                                                     │
+  │    id: '...'                                           │
+  │    severity: 'critical',                               │
+  │    severity_source: 'user' | 'llm',                    │
+  │    severity_overridden_at: null | ISO8601 timestamp,   │
+  │    ...                                                 │
+  │  }                                                     │
+  └────────────────────┬──────────────────────────────────┘
+                       │
+                       ▼
+  Re-classification path:
+    for each editable field:
+      if overridden_at != null:  keep user value
+      else:                       recompute from agent
 
-  Today: write paths A and B don't exist. The whole picture is
-         the gap to be designed when the surface grows.
+  This codebase: no editable fields → no records need this shape yet.
 ```
 
 ## Elaborate
 
-**Why this is worth a file even though it's not implemented.** Three reasons:
+The pattern comes from products with dense human-in-the-loop editing over automated classifications — support-ticket categorization, moderation labels, spam filters. Anywhere the model runs on a schedule AND the human can override.
 
-  1. **The pattern is interview-standard.** Anyone who's built an LLM app where the model writes user-editable fields knows this trap. Naming the gap (vs faking implementation) makes the file honest.
-  2. **The product is one click from needing it.** The recommendation card currently has a "copy to clipboard" affordance, not "edit." The moment an "edit rationale" button lands — and product instinct says it will, because analysts want to tweak the language before sharing — the lock matters. Designing the schema *before* the surface ships is cheaper than retrofitting.
-  3. **The audit's "what's not yet exercised" lens lives here.** This is part of being honest in the audit, not aspirational in the implementation.
-
-**The trap to avoid when implementing.** The naive version stores `_source: 'llm' | 'user'` only — no timestamp. That breaks when:
-  - User edits, then agent runs. Source flips back to `'llm'`. User edit lost silently.
-  - The fix is the *timestamp*: once it's set, it stays set, and the agent skips the field forever (or until the user explicitly resets it). The source field becomes purely informational.
+Adjacent patterns: **soft delete** (a `deleted_at` timestamp instead of an actual DELETE, so the record survives for audit); **change tracking** (`updated_at` per field, not just per row); **conflict resolution in local-first sync** (which write wins when two devices edit the same field). All three use timestamps as the arbiter. Override locks are the LLM-specific version.
 
 ## Project exercises
 
-### Exercise — Add edit affordances to RecommendationCard with proper lock semantics
+### Exercise — editable severity on insights (with lock)
 
-  → **Exercise ID:** B1.9
-  → **What to build:** Add an "edit title" and "edit rationale" affordance to `components/investigation/RecommendationCard.tsx`. Extend the `Recommendation` shape with `_source` and `_overridden_at` fields for `title` and `rationale`. Implement the merge logic at the storage write boundary (in `lib/state/insights.ts` or a new `lib/state/recommendations.ts`) that respects `_overridden_at` on agent re-runs. UI shows an "edited by you" badge when present.
-  → **Why it earns its place:** introduces a load-bearing pattern any LLM app eventually needs; turns the "not yet exercised" audit finding into "exercised correctly". Forces you to design the merge logic at the storage boundary, not in the agent or UI.
-  → **Files to touch:** `lib/mcp/types.ts` (extend `Recommendation` with `_source` / `_overridden_at` per editable field), new `lib/state/merge.ts` (write-time merge with lock respect), `components/investigation/RecommendationCard.tsx` (edit affordances + badge), `test/state/merge.test.ts` (cover all three write paths: fresh, user-edit, agent-re-run-after-user-edit).
-  → **Done when:** an integration test demonstrates a user edit surviving an agent re-run, the UI surfaces the "edited by you" badge, and the demo mode disables edit affordances (per the snapshot-as-canonical decision).
-  → **Estimated effort:** 1–2 days.
+- **Exercise ID:** C1.14-B · Case B (concept not yet exercised).
+- **What to build:** add an inline "change severity" control on `InsightCard`. Persist edits to a new `insight_overrides` map keyed by insight id, holding `{severity, severity_source, severity_overridden_at}`. When re-running the monitoring agent, the coordinator checks the override map before overwriting severity in the emitted `Anomaly`.
+- **Why it earns its place:** grows the read-only UI into an edit-then-re-classify surface, and the override lock is what keeps re-runs from erasing edits. Interviewer signal: "I know when an LLM's re-classification would erase a user's correction, and here's how I designed around it."
+- **Files to touch:** `lib/mcp/types.ts` (add override fields to `Insight`), `lib/state/insights.ts` (persist override map), `components/feed/InsightCard.tsx` (edit control), `lib/agents/monitoring.ts` (apply override on emit).
+- **Done when:** editing an insight's severity in the UI persists across re-runs; the demo snapshot capture picks up the override; a test proves re-classification doesn't overwrite a marked override.
+- **Estimated effort:** 1-2 days.
 
 ## Interview defense
 
-**Q: "Why isn't this in the codebase yet?"**
+**Q: Does this codebase have user-override locks?**
 
-Because the surface doesn't exist. Today there's no user-editable LLM-written field — the recommendation card shows the agent's output read-only. The pattern only matters once a user can edit a field the agent will overwrite on its next run. I've named the gap in the audit and shaped the implementation so it lands cleanly when the product grows the affordance.
+No. The UI is read-only over the agent's output — no field is user-editable, so no re-classification can silently erase an override. If we added editability (severity, feature choice, conclusion), each editable field would need a `_source` and `_overridden_at` companion, and the re-run code would need to branch on it. Case B exercise above walks the shape.
 
-*Anchor: "Not yet exercised; the implementation lands the moment the recommendation card grows an edit button. Pattern is per-field `_overridden_at` + write-time merge."*
+**Q: What's the failure mode without this pattern?**
 
-**Q: "Why a timestamp instead of just a source flag?"**
+User edits a field, feels satisfied. Agent re-runs on a schedule (or on next investigation), overwrites the edit silently. User's correction is gone. Next time they look, they see the agent's output as if the edit never happened. Trust in the tool erodes fast.
 
-Because the source flag alone is fragile — agent re-runs would flip `source` back to `'llm'` and silently overwrite the user's edit. A timestamp, once set, is sticky: the agent skips the field forever unless the user explicitly resets it. The source field becomes informational; the lock is the timestamp.
+**Q: Where else does the same principle show up?**
 
-*Anchor: "Timestamp is the lock; source is the badge. The naive `source` flag alone breaks on re-runs."*
+Any place a human-provided value competes with an automated recomputation. Support-ticket categorization (rep re-categorizes; system re-runs). Content moderation (moderator marks safe; classifier re-runs). Fraud scoring (analyst clears; scoring pipeline re-runs). Same shape: timestamp the human touch; the automated path skips overridden rows.
 
 ## See also
 
-  → `04-structured-outputs.md` — the typed contracts the lock would attach to
-  → `04-agents-and-tool-use/06-error-recovery.md` — adjacent concept: what the agent does when its write is blocked
-  → `study-data-modeling` — the data-modeling guide carries the broader schema-evolution story this would slot into
+- `lib/mcp/types.ts` — the current `Insight` / `Diagnosis` / `Recommendation` shapes (no override fields)
+- `04-agents-and-tool-use/05-agent-memory.md` — related persistence surface (long-term memory) which would also need override awareness

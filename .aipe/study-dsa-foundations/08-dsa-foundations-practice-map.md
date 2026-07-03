@@ -1,432 +1,239 @@
-# DSA Foundations Practice Map
+# DSA foundations — the practice map
 
-The ranked learning plan — Project-specific
+Industry names: interview prep, algorithm portfolio, LeetCode drills. Type: Project-specific curriculum.
 
-## Zoom out — where this concept lives
+## Zoom out — two lists, ranked by leverage
 
-This file is the audit's final word: a ranked map of what to drill, in what order, with what evidence anchor. It sits *outside* the running code — it's the bridge from "what `blooming_insights` exercises" to "what the next AI-engineering interview will ask you to whiteboard."
-
-```
-  Zoom out — the practice plan in two halves
-
-  ┌─ what the codebase ALREADY exercises ─────────────────────────┐
-  │  hash map (Map) · set · array · string buffer                 │
-  │  comparator sort + slice (top-K via sort)                     │
-  │  argmin via reduce                                            │
-  │  iterative bounded loop (recursion shape, iterative impl)     │
-  │                                                                │
-  │  → these are SHIPPED. drill maintenance only — name them      │
-  │     well in an interview and move on.                          │
-  └────────────────────────────────────────────────────────────────┘
-
-  ┌─ what the codebase does NOT exercise (the real practice list) ─┐
-  │  Tier 1 (must drill, asked constantly):                        │
-  │     · binary search                                            │
-  │     · BFS / DFS                                                │
-  │     · heap / priority queue                                    │
-  │     · two pointers + sliding window                            │
-  │                                                                │
-  │  Tier 2 (asked in mid/senior loops):                           │
-  │     · dynamic programming (1D + 2D)                            │
-  │     · backtracking                                             │
-  │     · binary search tree (balanced semantics)                  │
-  │     · Dijkstra / shortest path                                 │
-  │     · union-find                                               │
-  │                                                                │
-  │  Tier 3 (signal for senior+, niche real-world):                │
-  │     · trie                                                     │
-  │     · topological sort                                         │
-  │     · segment tree / Fenwick tree                              │
-  │     · monotonic stack/queue                                    │
-  └────────────────────────────────────────────────────────────────┘
-```
-
-## Zoom in — the concept
-
-The practice plan ranks by **interview frequency × distance from your portfolio**. Things you've shipped (BFS, DFS, Dijkstra, BSTs, heaps in `reincodes`) need maintenance drills, not first-time learning. Things you've *never* shipped (binary search, two-pointer/sliding-window, DP, backtracking, union-find, trie) need the most hours.
-
-The honest framing: the gap isn't in `blooming_insights`'s code — the code is right for its scale. The gap is in what the code never had to reach for. This file names that gap and ranks the hours.
-
-## Structure pass — layers · axes · seams
-
-One axis traced: **how much interview-time does each topic warrant, ranked by frequency × current weakness?**
+Every previous chapter said what's here and what isn't. This chapter turns that into a plan. Two lists in priority order: (a) concepts this codebase *does* exercise — lock them in with drills, because you can talk to your own code; (b) foundations the codebase doesn't touch — drill them for interview readiness because they'll come up anyway.
 
 ```
-  one axis — "where does each hour invested pay off most?"
+  The practice map — two lists, one axis (leverage)
 
-  ┌─ Tier 0 — already exercised in blooming_insights ────────────┐
-  │   hash map, set, array scan, sort+slice, argmin reduce        │
-  │   → maintenance: name them precisely; can be drawn in 30s     │
-  └──────────────────────────────────────────────────────────────┘
-  ┌─ Tier 0.5 — already shipped in reincodes portfolio ──────────┐
-  │   BFS, DFS, Dijkstra, BST, BinaryHeap, PriorityQueue,         │
-  │   sorting algorithms (selection / bubble / insertion /        │
-  │   merge / quick / heap), Eulerian cycle, connected components │
-  │   → maintenance: re-read the code, rebuild ONE from scratch   │
-  │     under timed conditions before the next interview          │
-  └──────────────────────────────────────────────────────────────┘
-  ┌─ Tier 1 — high frequency, weak coverage ─────────────────────┐
-  │   binary search (every loop, every variant)                   │
-  │   two pointers + sliding window                               │
-  │   heap / priority queue (top-K applied, not just impl)        │
-  │   BFS/DFS APPLIED to grids and matrices                       │
-  │   → these are the next 20 hours of focused drilling           │
-  └──────────────────────────────────────────────────────────────┘
-  ┌─ Tier 2 — mid/senior frequency, no coverage ─────────────────┐
-  │   dynamic programming (1D first, then 2D)                     │
-  │   backtracking (N-queens, subsets, permutations)              │
-  │   balanced BST semantics (AVL / red-black: API not internals) │
-  │   union-find (Kruskal, connected components on edges)         │
-  │   Dijkstra APPLIED (you've implemented; drill the application)│
-  │   → these are the next 30 hours after Tier 1                  │
-  └──────────────────────────────────────────────────────────────┘
-  ┌─ Tier 3 — senior+ signal, low frequency ─────────────────────┐
-  │   trie (autocomplete, prefix sum, IP routing)                 │
-  │   topological sort (DAG scheduling, dependency resolution)    │
-  │   segment tree / Fenwick (range sum / range update)           │
-  │   monotonic stack / queue (sliding-window max, NGE)           │
-  │   → these are the signal-for-senior topics                    │
-  └──────────────────────────────────────────────────────────────┘
+  ┌─ Exercised in the repo — lock these in ────────┐
+  │  1. Percentile-by-sort (n log n)                │  eval/report.eval.ts:161
+  │  2. Worker-pool concurrency                     │  eval/load.eval.ts:171-211
+  │  3. Set/Map for allow-list + cache              │  agents/tool-schemas.ts:13
+  │  4. Weighted probabilistic selection            │  data-source/fault-injecting.ts:84
+  │  5. xorshift32 PRNG                             │  data-source/fault-injecting.ts:157
+  │  6. Running accumulator threshold               │  agents/budget.ts:51
+  │  7. Regex extraction to structured value        │  data-source/bloomreach:64
+  └─────────────────────────────────────────────────┘
 
-  the seam: tier 1 = "asked constantly, you have no portfolio anchor"
-            tier 0.5 = "shipped, just keep sharp"
+  ┌─ Not exercised — drill for interviews ─────────┐
+  │  1. Binary search (all four framings)           │  ← highest leverage
+  │  2. BFS / DFS + visited set                     │  ← second-highest
+  │  3. Top-K with a heap                           │  ← would improve real code
+  │  4. Quickselect / partition                     │
+  │  5. Trie / prefix tree                          │
+  │  6. Backtracking (N-queens, permutations)       │
+  │  7. Classic DP (knapsack, LCS, edit distance)   │
+  │  8. Topological sort (Kahn's, DFS-tri-color)    │
+  │  9. Union-find with path compression            │
+  │ 10. Sliding-window / two-pointer                │
+  └─────────────────────────────────────────────────┘
 ```
 
-## How it works
+## Structure pass — leverage across the two axes
 
-### Move 1 — the mental model
+Axis for exercised concepts: **can you talk to your own code with fluency?** If you can pull up `eval/load.eval.ts:171` and walk the worker-pool pattern from memory, that's the highest-leverage story you have — it's *real* and *yours*, and it beats any LeetCode answer for signaling seniority.
 
-This is a **prioritized backlog**, not a syllabus. The ordering is interview-pull-weighted: tier 1 topics show up in nearly every front-end / AI-engineering loop, tier 3 topics show up in senior+ system-design-adjacent rounds. **Drill top-down**: never spend an hour on tier 2 until tier 1 is solid.
+Axis for missing foundations: **what's the ROI of drilling this?** Binary search shows up in every FAANG interview loop. Top-K with a heap fixes real code in this repo. DP is the topic most candidates fumble. Rank drills by that ROI, don't spray uniformly.
 
-The maintenance tier (0.5) is the cheapest leverage: you've already shipped these. Rebuilding `BinaryHeap.ts` from scratch in 30 minutes under timed conditions before an interview is more useful than learning a tier-3 topic cold — interviewers prefer mastery of fundamentals over breadth of buzzwords.
+## The plan — drills, ranked
 
-```
-  the practice loop — per topic
+### Part A: Exercised concepts — build muscle memory on your own code
 
-  read     → re-derive on paper, no IDE
-   ↓
-  pattern  → name the kernel parts (what BREAKS if removed?)
-   ↓
-  impl     → code from scratch, no library
-   ↓
-  apply    → solve 3-5 problems that use the structure
-   ↓
-  defend   → write the interview answer; rehearse it cold
-```
+Each drill points at a real file. The "done when" test is whether you can pull it up in an interview and walk through it without hedging.
 
-### Move 2 — the moving parts
+#### A1 — Percentile-by-sort, then defend the batch choice
 
-#### Tier 0 — already exercised in `blooming_insights`
+- **What to build:** Nothing new. Read `eval/report.eval.ts:161-179` and `eval/load.eval.ts:326-333`. Consolidate the two duplicate implementations into one shared helper (this is also a `.aipe/audit-refactor` candidate).
+- **Why it earns its place:** Two identical implementations is the kind of thing an interviewer will notice on a code walkthrough — either you own the smell and have a plan, or you get caught not knowing your own repo.
+- **Files to touch:** `eval/report.eval.ts`, `eval/load.eval.ts`. Move `percentiles()` to a shared `eval/lib/stats.ts`.
+- **Done when:** You can (1) write `percentiles()` from memory, (2) explain the O(n log n) cost and the `Math.min` clamp, (3) name three alternatives (quickselect for one-off, order-stat tree for streaming, t-digest for scale) and when each wins.
+- **Estimated effort:** 30 minutes drill; 30 minutes refactor.
 
-These are real anchors you can name in an interview. Maintenance only.
+#### A2 — Worker pool from scratch
 
-```
-  Tier 0 — your shipped surface in blooming_insights
+- **What to build:** Reimplement `eval/load.eval.ts:171-211` from memory in a scratch file. Then compare to the real version and notice what you missed.
+- **Why it earns its place:** The concurrency question is the top-3 backend interview shape. You've built this; you should be able to reproduce it in five minutes.
+- **Files to touch:** New scratch — `scratch/worker-pool.ts` (not committed).
+- **Done when:** You can (1) reproduce the index-queue + K workers shape, (2) explain why per-worker try/catch matters, (3) name the O(n) shift() cost and its scale-out fix.
+- **Estimated effort:** 45 minutes.
 
-  hash map        lib/state/insights.ts:14  · activeToolCalls per tool
-                  lib/data-source/bloomreach-data-source.ts:122  · TTL cache
-                  + 3 other Maps (auth, investigations, sub-feeds)
+#### A3 — Set/Map choice: whiteboard the three tradeoffs
 
-  set             lib/agents/categories-legacy.ts:120  · schemaCapabilities
-                  lib/agents/tool-schemas.ts:13         · filterToolSchemas
-                  lib/mcp/tool-coverage.ts:40           · cross-check
+- **What to build:** Prep a one-minute answer to *"why Map instead of a plain object here?"* pointing at `lib/state/insights.ts:14`. Three tradeoffs: prototype safety, iteration order, O(1) size.
+- **Why it earns its place:** Interviewers ask it constantly; strong answer signals you think about the container's contract, not just its convenience.
+- **Files to touch:** none — pure prep.
+- **Done when:** You can deliver the answer in under 90 seconds without reading, with `Set`/`Map` complexity call-outs.
+- **Estimated effort:** 15 minutes.
 
-  string buffer   lib/streaming/ndjson.ts:30  · NDJSON line buffer
+#### A4 — Weighted probabilistic selection
 
-  comparator sort lib/agents/monitoring-legacy.ts:136  · top-10 by severity
+- **What to build:** Read `lib/data-source/fault-injecting.ts:84-100`. Reimplement the "roll once, walk an accumulator" pattern for a *different* problem (weighted A/B routing).
+- **Why it earns its place:** This is the most compact DSA in the repo and the pattern generalizes to any weighted choice problem — load balancing, weighted sampling, roulette wheel selection in genetic algorithms.
+- **Files to touch:** scratch.
+- **Done when:** You can explain why it's O(k) where k = number of options (not O(n) over inputs), and why *rolling once* keeps the failure modes independent.
+- **Estimated effort:** 30 minutes.
 
-  argmin reduce   components/feed/InsightCard.tsx:160  · funnel leak
+#### A5 — xorshift32 PRNG
 
-  iterative loop  lib/agents/base-legacy.ts:114  · agent tool-use loop
-```
+- **What to build:** Read `lib/data-source/fault-injecting.ts:157-166`. Understand the three shifts (`13, 17, 5`) as register scrambling; explain why the seed makes runs deterministic.
+- **Why it earns its place:** PRNGs come up in system-design and testing questions. Being able to say "I used xorshift32 because I needed reproducibility across test runs" is signal.
+- **Files to touch:** none — read only.
+- **Done when:** You can explain the difference between a *pseudo-random* number generator (deterministic given seed) and true randomness, and why seedable is the right choice for tests.
+- **Estimated effort:** 20 minutes.
 
-**What to do**: when an interviewer asks "what's interesting in your code, complexity-wise?" — these are the answers. You don't need to study them; you just need to be able to name them and the seam each one sits at (file 01 has the cost map; files 02, 03, 06, 07 have the deep walks).
+#### A6 — Running-accumulator threshold
 
-#### Tier 0.5 — already shipped in `reincodes`, drill maintenance
+- **What to build:** Read `lib/agents/budget.ts:41-77`. Prep the "streaming vs batch" story pointing at this file: three counters, O(1) add, O(1) check, decoupled from turn count.
+- **Why it earns its place:** The streaming pattern generalizes to rate limiters, circuit breakers, and every "check a running total against a threshold" shape.
+- **Files to touch:** none — prep.
+- **Done when:** You can contrast this with the batch percentile pattern (`eval/report.eval.ts:161`) and name why one is O(1)-per-op and the other is O(n log n)-once.
+- **Estimated effort:** 20 minutes.
 
-You have working implementations of these. The interview risk is that they go stale.
+#### A7 — Regex-to-structured-value
 
-```
-  Tier 0.5 — your reincodes portfolio
+- **What to build:** Read `lib/data-source/bloomreach-data-source.ts:64-71`. Understand the two regex variants and why loose matching (`[^0-9]*`, `i` flag) is the right call for unstructured error strings.
+- **Why it earns its place:** String-parsing questions are common; owning a real example where you had to parse two variants of the *same* server error is a differentiator.
+- **Files to touch:** none — read only.
+- **Done when:** You can walk through both regexes and explain what would break if you tightened either one.
+- **Estimated effort:** 15 minutes.
 
-  Graph (adj list)        Graph.ts          BFS, DFS, Eulerian, valid-tree
-  Graph2 (node+edge)      Graph2.ts         weighted, drives Dijkstra
-  Binary Search Tree      BinarySearchTree.ts  full insert/delete/traversals
-  Binary Heap             BinaryHeap.ts     min + max, heapifyUp/Down
-  Priority Queue          PriorityQueue.ts  heap-backed, updatePriority
-  Tree (n-ary)            Tree.ts           pre/post traversal, generators
-  Sorting (5)             utils/notes/Sorting/  bubble/insertion/selection
-                                                 + merge/quick + heap +
-                                                 React visualizers
-  State-space search      PG.ts             BFS over river-crossing puzzle
-```
+### Part B: Missing foundations — drill for interview readiness
 
-**What to do** (in order of leverage):
-1. **30 min before an interview**: re-read ONE — pick whichever the role's domain leans toward. Frontend role → re-read your sort visualizers. AI/agents role → re-read `PG.ts` (state-space BFS — that's the right anchor for "how would you explore branching agent paths?").
-2. **Weekly maintenance**: implement one from scratch from memory, timed (20 minutes). Rotate which one. The act of rebuilding catches what's drifted; the time pressure simulates the interview.
-3. **Before any DSA round**: rebuild `BinaryHeap.ts` from scratch. It's the load-bearing primitive — touches sorting (heapsort), graphs (Dijkstra), top-K, scheduling. One implementation buys you four interview hooks.
+Each item: (1) what to build, (2) why it earns its place, (3) how to know you're done. In descending ROI.
 
-#### Tier 1 — high frequency, weak coverage (next 20 hours)
+#### B1 — Binary search, all four framings
 
-These are the topics asked in nearly every loop where you have no shipped anchor.
+- **What to build:** Solve these five problems: LC 704 (basic), LC 34 (first/last position), LC 33 (rotated sorted array), LC 875 (Koko eating bananas — binary search on the answer), LC 4 (median of two sorted arrays).
+- **Why it matters:** Binary search shows up in ~30% of coding-loop interviews. The "binary search on the answer" reframe (Koko-style) is the pattern that separates mid-level from senior candidates.
+- **Done when:** You can write the loop without any off-by-one bugs on the first try, and you recognize the "monotonic predicate" framing on sight.
+- **Estimated effort:** 3 hours across a week.
 
-```
-  Tier 1 — drill order, ~5 hours each
+#### B2 — BFS/DFS with visited set
 
-  1. binary search (and ALL its variants)
-     - find target (basic)
-     - first occurrence / last occurrence (with comparator twist)
-     - find insertion point (lower_bound / upper_bound)
-     - binary search the answer (peak finding, allocation problems)
-     - rotated sorted array search
-     anchor problems: LC 704, 34, 33, 162, 875, 1011
-     why: this is THE most-asked easy/medium. low effort, huge ROI.
-     pattern files: 04 (BST cousin), 06 (the searching half)
+- **What to build:** LC 200 (number of islands — both BFS and DFS), LC 133 (clone graph — DFS with hash map), LC 210 (course schedule — topological sort with Kahn's).
+- **Why it matters:** Second most-tested category after arrays/strings. The topological-sort variant tests whether you understand what BFS *is* vs the standard "shortest path" framing.
+- **Done when:** You can write the BFS kernel (frontier + visited set + expand) from memory and name why marking visited on enqueue not dequeue matters.
+- **Estimated effort:** 4 hours.
 
-  2. two pointers + sliding window
-     - two pointers from opposite ends (sorted-array two-sum, palindrome)
-     - two pointers same direction (remove dupes, partition)
-     - sliding window (max/min/sum in window of size K)
-     - sliding window with hash map (longest substring no-repeat)
-     anchor problems: LC 167, 26, 283, 643, 3, 76, 209
-     why: zero portfolio coverage, asked constantly, pattern transfers
-     to manyOther problems. visualize bars sliding (your sorting visualizer
-     instinct works here).
+#### B3 — Top-K with a heap
 
-  3. heap / priority queue APPLIED (you have the impl, drill the use)
-     - top-K via fixed-size heap (the upgrade from sort+slice — file 06)
-     - merge K sorted lists (heap of heads)
-     - K-closest points (max-heap of size K)
-     - find median in a stream (two-heap pattern)
-     anchor problems: LC 215, 23, 973, 295
-     why: your reincodes BinaryHeap + PriorityQueue gives you the structure;
-     these problems give you the application. "I shipped this — here's how
-     I'd apply it" is a strong interview opener.
+- **What to build:** LC 215 (kth largest — both quickselect and heap-of-size-K solutions), LC 347 (top K frequent — heap + hash map).
+- **Why it matters:** Directly improves `lib/agents/monitoring-legacy.ts:136`. Owning a real code-change proposal ("I'd swap this to a bounded heap at scale") beats the hypothetical answer.
+- **Done when:** You can implement a min-heap from scratch (push, pop, sift-up, sift-down) and know when to use language-provided vs hand-rolled.
+- **Estimated effort:** 3 hours.
 
-  4. BFS / DFS APPLIED to grids and matrices (you have graph impl)
-     - number of islands (DFS / BFS on a grid)
-     - flood fill (the classic grid BFS)
-     - rotting oranges (multi-source BFS — important pattern)
-     - word ladder (BFS on implicit graph)
-     - course schedule (DFS + cycle detection on a DAG)
-     anchor problems: LC 200, 733, 994, 127, 207
-     why: you have BFS/DFS implemented as abstract algorithms; the
-     "grid as implicit graph" trick is what these problems test.
-```
+#### B4 — Quickselect / partition
 
-#### Tier 2 — mid/senior frequency, no coverage (next 30 hours after Tier 1)
+- **What to build:** Implement quickselect from scratch. Solve LC 215 with it (already noted above but do this one twice).
+- **Why it matters:** The one-pass alternative to sort-then-index. Ties directly to `percentiles()` at `eval/report.eval.ts:161`.
+- **Done when:** You can explain the pivot-choice pitfall (worst-case O(n²)) and how random or median-of-3 pivots avoid it.
+- **Estimated effort:** 2 hours.
 
-```
-  Tier 2 — drill order, ~6 hours each
+#### B5 — Trie / prefix tree
 
-  1. dynamic programming — 1D first (file 07)
-     - climbing stairs (the canonical "DP is fib")
-     - house robber (decision per element)
-     - coin change (min coins for amount)
-     - longest increasing subsequence (O(n²) DP, then optional O(n log n))
-     pattern: define dp[i] in one English sentence; base cases; recurrence
-     anchor problems: LC 70, 198, 322, 300
+- **What to build:** LC 208 (implement a trie), LC 212 (word search II — trie + DFS + backtracking).
+- **Why it matters:** Word search II is the classic multi-technique problem — trie for prefix pruning, DFS for grid walk, backtracking for the visited-set undo. Solving it cleanly is a strong signal.
+- **Done when:** You can implement trie insert/search/startsWith from memory and use it inside a grid DFS.
+- **Estimated effort:** 3 hours.
 
-  2. dynamic programming — 2D
-     - unique paths in a grid
-     - longest common subsequence
-     - edit distance (Levenshtein)
-     - 0/1 knapsack
-     anchor problems: LC 62, 1143, 72, 416
-     why: 2D DP is the signal-for-senior — the table layout is the lesson
+#### B6 — Backtracking
 
-  3. backtracking (file 07)
-     - permutations / combinations / subsets (the three siblings)
-     - N-queens (the canonical apply/undo)
-     - word search (DFS + backtracking on a grid)
-     - generate parentheses (constraint-driven)
-     anchor problems: LC 46, 78, 51, 79, 22
+- **What to build:** LC 46 (permutations), LC 78 (subsets), LC 51 (N-queens), LC 39 (combination sum).
+- **Why it matters:** State-space search shows up in mid-difficulty questions constantly. The "recurse + undo" shape is what interviewers test.
+- **Done when:** You can write the kernel `apply → recurse → undo` without thinking, and you never forget the undo.
+- **Estimated effort:** 4 hours.
 
-  4. balanced BST semantics (API, not internals)
-     - "what does TreeMap give you that HashMap doesn't?"
-     - range queries, floor/ceiling, ordered iteration
-     - implementing a simplified TreeMap-like API on top of your BST
-     anchor problems: LC 729 (calendar), 855 (exam room), 220 (contains nearby dupe III)
-     why: you have BST; drill the ORDERED queries that hash maps can't answer
+#### B7 — Classic DP
 
-  5. union-find (disjoint sets) — completely new
-     - implementation: parent array + path compression + union by rank
-     - applications: connected components on edges, Kruskal's MST, redundant edge
-     anchor problems: LC 547, 684, 200 (alt soln), 1319
-     why: small implementation, huge interview ROI, no portfolio coverage
+- **What to build:** LC 70 (climbing stairs), LC 322 (coin change), LC 1143 (LCS), LC 72 (edit distance), LC 139 (word break).
+- **Why it matters:** DP is the topic most candidates fumble. Getting solid on these five covers 80% of DP interview questions.
+- **Done when:** For any of these, you can (1) define the state, (2) write the recurrence, (3) choose top-down or bottom-up and justify. Under ten minutes per problem.
+- **Estimated effort:** 8 hours across two weeks.
 
-  6. Dijkstra APPLIED (you have the impl)
-     - network delay time (basic Dijkstra)
-     - cheapest flights within K stops (Dijkstra variant)
-     - swim in rising water (Dijkstra on a grid)
-     anchor problems: LC 743, 787, 778
-```
+#### B8 — Topological sort
 
-#### Tier 3 — senior+ signal, low frequency (after Tier 2)
+- **What to build:** LC 210 (course schedule II) with both Kahn's algorithm and DFS + tri-color marking.
+- **Why it matters:** Ties to the DAG shape hiding in `lib/agents/categories.ts:32`. Also the algorithm behind every build tool.
+- **Done when:** You can name the cycle-detection variant of both approaches (Kahn: nodes left over; DFS: hitting a gray node).
+- **Estimated effort:** 2 hours.
+
+#### B9 — Union-find with path compression
+
+- **What to build:** LC 547 (number of provinces), LC 684 (redundant connection).
+- **Why it matters:** The nearly-O(1) inverse-Ackermann amortized cost is a beautiful example of the amortized analysis technique from `01-complexity-and-cost-models.md`.
+- **Done when:** You can implement both path compression and union-by-rank, and cite the α(n) complexity.
+- **Estimated effort:** 2 hours.
+
+#### B10 — Sliding window / two pointers
+
+- **What to build:** LC 3 (longest substring without repeat), LC 76 (minimum window substring), LC 42 (trapping rain water).
+- **Why it matters:** Foundational array-manipulation pattern; O(n) alternatives to O(n²) brute force. Very common in phone screens.
+- **Done when:** You recognize "find shortest / longest subarray satisfying condition C" as a sliding-window problem on sight.
+- **Estimated effort:** 3 hours.
+
+## Primary diagram — the whole plan on one page
 
 ```
-  Tier 3 — drill order, ~4-6 hours each
+  The 60-day drill map — leverage-ordered
 
-  1. trie (file 04)
-     - implementation: nested map of char → node
-     - applications: autocomplete, word search II (trie + DFS), prefix sum
-     anchor problems: LC 208, 211, 212, 648
+  Week 1 — the two must-haves
+    · B1 binary search      (3h)  ← highest interview leverage
+    · B2 BFS/DFS            (4h)  ← second-highest
+    · A2 worker pool drill  (0.75h) ← your codebase story
+    · A1 percentile refactor (1h) ← real repo debt
 
-  2. topological sort (file 05)
-     - Kahn's algorithm (BFS-based, indegree counting)
-     - DFS post-order reversal
-     - applications: course schedule, build order, parallel job scheduling
-     anchor problems: LC 207, 210, 269, 1462
+  Week 2 — the two that fix your own code
+    · B3 top-K with heap    (3h)  ← would replace monitoring:136
+    · B4 quickselect        (2h)  ← would replace percentiles()
 
-  3. segment tree / Fenwick tree (binary indexed tree)
-     - range sum query with point update
-     - range min / max query
-     - Fenwick is the lighter, less-flexible cousin
-     anchor problems: LC 307, 315, 218
-     why: senior-only, but the pattern is elegant — drill if interviewing
-     at companies that go deep on algorithmic rounds (Google, Citadel)
+  Week 3 — the multi-technique story
+    · B5 trie + DFS + backtrack   (3h)
+    · B6 backtracking             (4h)
+    · A4 weighted selection       (0.5h)
 
-  4. monotonic stack / monotonic queue
-     - next greater element (monotonic decreasing stack)
-     - largest rectangle in histogram (the canonical monotonic stack)
-     - sliding window max (monotonic deque)
-     anchor problems: LC 496, 84, 239
-     why: the pattern that "looks like" you need DP but actually needs
-     a clever stack discipline. impressive to nail in an interview.
-```
+  Week 4 — the topic candidates fumble
+    · B7 DP (5 canonical)         (8h)
 
-### Move 3 — the principle
+  Week 5 — the graph tail
+    · B8 topological sort         (2h)
+    · B9 union-find               (2h)
+    · B10 sliding window          (3h)
+    · A3-A7 finish the repo prep  (1.5h)
 
-The DSA practice plan is **portfolio-aware**: the topics you've already shipped are maintenance work, not first-time learning. The topics that show up constantly in interviews but never landed in your code are where the marginal hour pays off. **Drill top-down through the tiers; within a tier, drill in the order listed.** When the next interview's loop is announced, re-read the relevant Tier 0/0.5 anchor (which lives in your shipped code) — that's the 30-minute prep that makes Tier 1+ drills land as "applied" instead of "abstract."
-
-## Primary diagram
-
-The recap — the whole practice surface, ranked.
-
-```
-  blooming_insights DSA practice map — full picture
-
-  ┌─ Tier 0 — shipped in blooming_insights (maintenance only) ────┐
-  │  hash map · set · string buffer · array scan                  │
-  │  comparator sort + slice · argmin reduce · iterative loop     │
-  │  → name these in 30s; cite line numbers (files 01, 02, 03, 06)│
-  └──────────────────────────────────────────────────────────────┘
-
-  ┌─ Tier 0.5 — shipped in reincodes (warm-up before interviews) ─┐
-  │  BFS · DFS · Dijkstra · BST · BinaryHeap · PriorityQueue      │
-  │  sorting (selection / bubble / insertion / merge / quick /    │
-  │  heap) · Tree n-ary · Eulerian cycle · state-space BFS        │
-  │  → 30 min re-read OR 20 min rebuild before each DSA round     │
-  └──────────────────────────────────────────────────────────────┘
-
-  ┌─ Tier 1 — drill next, ~20 hours total ────────────────────────┐
-  │  1. binary search (all variants)        ~5 h                  │
-  │  2. two pointers + sliding window       ~5 h                  │
-  │  3. heap APPLIED (top-K, K-merge)       ~5 h                  │
-  │  4. BFS/DFS APPLIED (grids, matrices)   ~5 h                  │
-  └──────────────────────────────────────────────────────────────┘
-
-  ┌─ Tier 2 — drill after Tier 1, ~30 hours total ────────────────┐
-  │  5. 1D DP                                ~5 h                  │
-  │  6. 2D DP                                ~6 h                  │
-  │  7. backtracking                         ~5 h                  │
-  │  8. balanced BST semantics (TreeMap-API) ~4 h                  │
-  │  9. union-find                           ~4 h                  │
-  │ 10. Dijkstra APPLIED                     ~4 h                  │
-  └──────────────────────────────────────────────────────────────┘
-
-  ┌─ Tier 3 — senior+ signal (after Tier 2) ──────────────────────┐
-  │ 11. trie                                 ~4 h                  │
-  │ 12. topological sort                     ~4 h                  │
-  │ 13. segment tree / Fenwick               ~6 h                  │
-  │ 14. monotonic stack / queue              ~4 h                  │
-  └──────────────────────────────────────────────────────────────┘
-
-  total path:  Tier 1 (~20h) → Tier 2 (~30h) → Tier 3 (~18h)
-  the 20-hour Tier-1 push is the highest-ROI investment.
+  total: ~ 40 hours over 5-6 weeks
 ```
 
 ## Elaborate
 
-This map is portfolio-shaped, not curriculum-shaped. A standard DSA curriculum (CLRS, Skiena) covers all of this in textbook order — sorting before graphs before DP — and that's correct for first exposure. **You're past first exposure.** Your `reincodes` portfolio shows you've mastered the graph + tree + heap layer; the IK curriculum gave you structured exposure to the standard algorithms; what's left is **applied drilling on the topics most likely to be asked** in your next AI-engineering interview, ranked by where the hours pay off most.
+The two-list structure is deliberate. Part A (exercised) is your *portfolio* — the things you can point at and say "I built this, here's why." Part B (missing) is your *coverage* — the things every interviewer will ask about regardless of what you've shipped. The mistake candidates make is drilling only Part B and losing the story-telling advantage of owning a real codebase. The other mistake is only knowing their own code and blanking when asked about anything else.
 
-**On LeetCode anchor problems**: I name them by number throughout. Working LC at this point isn't about learning the topic — it's about **applying** a structure you already understand. The 5-problem-per-topic rule isn't arbitrary: 3-5 problems is the threshold where pattern recognition kicks in. After 5 sliding-window problems you don't *think* about the pattern; you see it.
+The 40-hour estimate is conservative if you can already write the basics from memory. If you can't reproduce a BFS kernel without looking it up, add 50% — you're building the skill, not just refreshing it.
 
-**On time estimates**: the ~5 hours per Tier-1 topic is real-time, focused, no-distractions. Skim-reading a topic in 20 minutes doesn't count. The hour budget is the time it takes to read the pattern, derive the kernel on paper, implement from scratch with no library, solve 3-5 problems with the pattern, and write the interview defense.
-
-**On the AI-engineering shift**: AI/agents companies test classical DSA — they're hiring engineers, not LLM prompt operators. The shift in interview content is that **system-design** rounds add LLM-specific patterns (RAG, agents, eval); the **coding** rounds stay classical (binary search, BFS, DP). This file covers the classical layer.
-
-Read the rest of this folder for the per-concept depth; this file is the ordering. The right reading sequence from here: re-read file 01 (cost models) → pick the first Tier-1 topic → use file 06 (binary search) or file 03 (heap) or file 05 (graphs) as the depth reference while drilling.
+For real interview prep, pair this list with **NeetCode 150** (the curated LC subset) and grind the Blind 75 as a warmup layer. But if you only have 40 hours, this repo-anchored plan is a stronger use of them because it leans on stories you can actually tell.
 
 ## Interview defense
 
-### Q: Walk me through the most interesting data structure in your codebase.
+**Q: Pick one concept in your repo that shows real DSA thinking and walk it through.**
 
-The two-level session map. `blooming_insights` runs on Vercel; a single warm instance serves multiple users at once. The naive shape would be `Map<insightId, Insight>` — but `putInsights` calls `clear()` on every briefing, which on a flat shared map would wipe **every user's** feed when one user kicked off a new briefing.
+Answer: The worker pool at `eval/load.eval.ts:171-211`. Index queue, K workers, per-item try/catch, `Promise.all` at the end. The event loop is the implicit lock — `queue.shift()` is atomic because JavaScript can't interleave synchronous code. The `if (index == null) return` guard handles the race between two workers seeing `queue.length > 0`. The load-bearing insight is that per-worker try/catch is what prevents one investigation's failure from stopping the rest — a `Promise.all` at the top level would fail-fast, but the pool's try/catch keeps N-1 workers running.
 
-The fix is a Map of Maps: `state: Map<sessionId, SessionFeed>`, where `SessionFeed` is itself three Maps (insights, investigations, anomalies). The outer Map is never cleared; the inner Maps are cleared per-session per-briefing. Both `.get()` calls are O(1), so the namespacing costs nothing.
+Then push scale: at N=20 the O(n) shift is invisible; at N=100k I'd swap to a linked-list queue or a ring buffer with head pointer. That's the shape interviewers want — recognize the current scale, know the limit, know the fix.
 
-```
-  the multi-tenant bug a flat map would have
+**Q: What DSA gap in this codebase would you fix first?**
 
-  flat:    user A briefs → clear() → user B's items gone
-  nested:  user A's sessionState("A").insights.clear() →
-           user B's sessionState("B") untouched
-```
+Answer: `lib/agents/monitoring-legacy.ts:136` does `sort + slice(10)` — O(n log n) — where a bounded min-heap would give O(n log 10). At today's n≈50 it's invisible; if the anomaly count ever grew, the heap-of-size-K is the right shape. That's a clean 20-line refactor with a clear tradeoff — good candidate for `.aipe/refactor/` when the time comes.
 
-The lesson: **for multi-tenant in-memory state, namespace by the tenant key before the data key.** Same principle works for cache partitioning, rate-limiter token buckets, anything where multiple identities share a process.
+**Q: Which interview topics should you drill first, given this codebase?**
 
-Anchor: `lib/state/insights.ts:8-23`.
-
-### Q: What's the next data structure you'd add to this codebase if it grew?
-
-Two candidates, depending on what grew:
-
-1. **A fixed-size min-heap for top-K anomaly ranking.** The monitoring agent currently uses `sort+slice` to take the top 10 anomalies by severity (`lib/agents/monitoring-legacy.ts:136`). With n=10 today that's fine. If we ever ran exploratory anomaly generation — Claude producing hundreds of candidates and us picking the top 10 — I'd swap to a fixed-size heap. O(n log K) instead of O(n log n), and it streams (no need to hold the full array).
-
-2. **A graph + topological sort for category dependencies.** Today the categories list is flat — each category names its required event types and they're checked against a Set. If categories ever depended on each other (e.g., "run 'revenue drop' analysis only after 'conversion drop' has produced a result"), that's a DAG and I'd reach for topological sort to compute the run order. Cycle detection at config time catches bad inputs.
-
-Neither is needed today; the honest answer is "the current structures match the current scale." But knowing the upgrade path is the senior signal — it's the difference between "this works" and "this works AND I know when it'll stop working."
-
-Anchors: `lib/agents/monitoring-legacy.ts:136` (the current sort), `lib/agents/categories-legacy.ts` (the flat deps).
-
-### Q: How would you sequence your DSA study if you had 50 hours before a senior frontend / AI loop?
-
-Top-down through this practice map, with a 30-minute warm-up the morning of each interview.
-
-**Hours 1-20 — Tier 1.** Binary search (all variants — 5h), two pointers + sliding window (5h), heap applied (5h), BFS/DFS applied to grids (5h). These are the four topics asked constantly that I have no shipped anchor for. Each gets ~5 hours: read the pattern, derive the kernel on paper, code from scratch, solve 3-5 LeetCode problems with the pattern, write the interview defense answer.
-
-**Hours 21-50 — Tier 2.** 1D DP (5h), 2D DP (6h), backtracking (5h), balanced BST semantics (4h), union-find (4h), Dijkstra applied (4h). Skip Tier 3 unless the role is signal-for-senior-algo at a company that goes deep (Google, Citadel, Two Sigma).
-
-**The morning-of warm-up.** 30 minutes re-reading the shipped anchor closest to the role's domain. AI/agents role → `reincodes/PG.ts` (state-space BFS over a river-crossing puzzle — the right narrative for "explore branching agent paths"). Frontend role → the sorting visualizers (the React + animation + DSA combo). The warm-up turns Tier 1 drills from "abstract patterns" into "applied — like the time I did X in my project."
-
-```
-  the 50-hour plan, drawn
-
-  ┌── morning of  ──┐ 30 min reincodes warm-up
-  ├── pre-loop     ─┤
-  │                 │
-  │   Tier 1: 20 h  │  binary search · sliding window · heap · BFS/DFS
-  │   ────────────  │  the "asked constantly, no anchor" topics
-  │                 │
-  │   Tier 2: 30 h  │  DP 1D · DP 2D · backtracking · BST API ·
-  │                 │  union-find · Dijkstra applied
-  │                 │  the "mid/senior signal" topics
-  └─────────────────┘
-       total: 50 h    skip Tier 3 unless senior-algo company
-```
-
-The principle: **drill what's asked, not what's interesting.** Tier 3 topics are interesting; Tier 1 topics are the ones the interviewer will actually ask. Allocate hours by frequency × current weakness, not by personal curiosity.
-
-Anchors: the entire practice map above; the shipped portfolio in `reincodes` (cross-referenced in `me.md`).
+Answer: Binary search and BFS/DFS. Not because the codebase uses them (it doesn't) but because they're the highest-frequency FAANG interview topics — probably 60% of coding-loop questions. Everything else in Part B is second-order.
 
 ## See also
 
-- 00-overview.md — the codebase's DSA surface, one-page.
-- 01-complexity-and-cost-models.md — for the cost vocabulary every drill should produce.
-- 03-stacks-queues-deques-and-heaps.md — for the heap that Tier 1 #3 drills.
-- 04-trees-tries-and-balanced-indexes.md — for Tier 2 #4 (BST API) and Tier 3 #1 (trie).
-- 05-graphs-and-traversals.md — for Tier 1 #4 (BFS/DFS applied) and Tier 2 #10 (Dijkstra).
-- 06-sorting-searching-and-selection.md — for Tier 1 #1 (binary search, all variants).
-- 07-recursion-backtracking-and-dynamic-programming.md — for Tier 2 #5-7 (DP, backtracking).
-- `.aipe/study-system-design/00-overview.md` — for the architectural anchors when the interviewer pivots from coding to system design.
+- `00-overview.md` — the ranked findings this plan enumerates.
+- `01-complexity-and-cost-models.md` through `07-recursion-backtracking-and-dynamic-programming.md` — the conceptual chapters this plan operationalizes.
+- `.aipe/rehearse-interview-defense/` — for the story-telling layer over this DSA plan.
+- `.aipe/audit-refactor/` — for the `percentiles()` deduplication as an actual code change.

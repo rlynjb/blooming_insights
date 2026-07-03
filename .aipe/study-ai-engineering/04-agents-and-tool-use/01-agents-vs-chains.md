@@ -1,234 +1,209 @@
-# Agents vs chains
+# 01 — Agents vs chains
 
-*Industry standard — agent (loop, LLM-decided) vs chain (linear, code-decided)*
+**Type:** Industry standard. Also called: static pipeline vs dynamic loop, deterministic composition vs LLM-driven control.
 
-## Zoom out — where this concept lives
+## Zoom out, then zoom in
 
-This codebase has both shapes. **Agents** (monitoring, diagnostic, recommendation, query) each run a ReAct-style loop where the LLM decides which tool to call next. **A chain** sits *between* them: the route layer runs `bootstrap → diagnose → recommend` in fixed order, where the LLM never picks the next step. Hybrid: pipeline outside, loop inside.
+The shape distinction between "the code decides the steps" and "the LLM decides the steps." This codebase has BOTH: chains between agents (diagnose → recommend) and ReAct loops inside each agent.
 
 ```
-  Zoom out — where the loop and the chain sit
+  Zoom out — both shapes in this repo
 
-  ┌─ Route layer (the CHAIN — code-decided) ────────────────┐
-  │  bootstrap → scan (monitoring) → click card →           │
-  │  → diagnose → click "see recs" → recommend              │
-  │  every transition between agents is YOUR code's call    │
-  └────────────────────┬────────────────────────────────────┘
-                       │  invokes one agent per step
-                       ▼
-  ┌─ Inside each agent (the LOOP — LLM-decided) ────────────┐
-  │  while not done:                                         │
-  │    LLM thinks                                            │
-  │    LLM picks a tool from the allowlist                   │
-  │    YOUR code runs the tool                               │
-  │    LLM sees the result                                   │
-  │  done = LLM emits final synthesis OR call budget hit     │
-  └─────────────────────────────────────────────────────────┘
+  ┌─ Outer: chain (code-decided) ─────────────────────────────────────┐
+  │  MonitoringAgent → user picks → DiagnosticAgent → RecommendationAgent│
+  │  code owns the order; LLM owns each stage                          │
+  └─────────────────────────────┬─────────────────────────────────────┘
+                                │
+  ┌─ Inner: agent loop (LLM-decided) ──▼──────────────────────────────┐
+  │  Thought → Action → Observation → Thought → ... → Conclusion       │
+  │  LLM owns the order; code owns tool dispatch                       │
+  │  ★ THIS CONCEPT — the distinction ★                                │
+  └───────────────────────────────────────────────────────────────────┘
 ```
 
-**Zoom in.** Pipeline outside, loop inside. The pipeline's fixed because the user's mental model is fixed (`what changed → why → what to do`). The loop's flexible because each "why" investigation needs different EQL depending on the anomaly.
+Zoom in. Chain = static composition, one order, deterministic. Agent = dynamic loop, LLM picks the next step, non-deterministic count of iterations. This repo composes them: a fixed chain between stages, a ReAct loop inside each stage.
 
-## Structure pass — layers · axes · seams
+## Structure pass
 
-**Layers:** product flow (chain) → agent (loop) → tool call.
+**Layers:**
+- Outer: the whole product flow
+- Middle: individual stages
+- Inner: what happens inside one stage
 
-**Axis: who decides what happens next?** Chain layer: CODE decides. Loop layer (inside each agent): LLM decides. The decision-flip lives at the agent entry point.
+**Axis: who decides control flow?**
+- Outer (product flow): CODE decides (monitoring → user click → investigate step 2 → step 3)
+- Middle (stage): CODE decides (each stage is one agent call)
+- Inner (stage internals): LLM decides (thought → tool_use → observation → thought → ...)
 
-**Seam:** the agent constructor call (`new MonitoringAgent(...).scan(...)`, `new DiagnosticAgent(...).investigate(anomaly)`). Outside that call, your code is in control. Inside, the LLM is.
+**Seam:** the boundary between chain-level and agent-level. Above: `app/api/agent/route.ts` orchestrates stages by `step=diagnose|recommend`. Below: AptKit's agent loop runs until the model says done.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know how a `for` loop runs a fixed number of times but a `while` loop runs until a condition? Same shape — chains have a fixed step list (`for step of steps`); agents loop until a condition (`while not done`).
+You've written a build pipeline (`lint → test → deploy`) and a while loop (`while (not done) { work }`). Same shapes, different scales.
 
 ```
-  Chains vs agents — the loop structure
+  Chain — code-decided, fixed order
 
-  Chain (fixed steps):
-   ─────────────────
-   input  →  step 1  →  step 2  →  step 3  →  output
-            (LLM)      (LLM)       (LLM)
+  input → step1 → step2 → step3 → output
+       (compile-time count of steps)
 
-   YOU define the steps; the LLM only chooses what to write within each.
 
-  Agent (loop, unpredictable count):
-   ──────────────────────────────────
-   input  →  ┌──────────────────────────┐
-             │  thought → action → obs   │
-             │  thought → action → obs   │
-             │  thought → action → obs   │  ← LLM decides each iteration
-             │     ...                   │
-             │  thought → final answer   │
-             └──────────────────────────┘
-                       │
-                       ▼
-                     output
+  Agent loop — LLM-decided, dynamic
+
+  input
+    │
+    ▼
+  ┌─────────┐
+  │Thought  │ ← LLM: "what next?"
+  └────┬────┘
+       │
+       ▼ pick tool
+  ┌─────────┐
+  │Action   │ ← code runs the tool
+  └────┬────┘
+       │
+       ▼
+  ┌─────────┐
+  │Observation│ ← LLM reads result
+  └────┬────┘
+       │
+       └──── loop or stop (LLM decides)
 ```
 
-### Move 2 — the step-by-step walkthrough
+### Move 2 — walk the mechanism
 
-**Part 1 — the chain lives in the route.**
+**The chain in this codebase.**
 
-`app/api/agent/route.ts:280-296` is the chain. It runs the diagnostic agent, emits the diagnosis, then runs the recommendation agent. No LLM is involved in deciding "should I run recommendation next?" — that's hardcoded:
+Monitoring → user selects an insight → Diagnostic → Recommendation. Each hand-off is deterministic. Anomaly + selected insight go to diagnostic; anomaly + diagnosis go to recommendation. Split across three files:
+- `lib/agents/monitoring.ts` — `MonitoringAgent.scan()`
+- `lib/agents/diagnostic.ts` — `DiagnosticAgent.investigate()`
+- `lib/agents/recommendation.ts` — `RecommendationAgent.propose()`
 
-```typescript
-// STEP 2 (diagnose) or the combined run: run the diagnostic agent.
-if (step === 'recommend') {
-  diagnosis = parseDiagnosis(diagnosisParam);
-  if (!diagnosis) throw new Error('no diagnosis was handed over — open the diagnosis step first');
-} else {
-  const diagAgent = new DiagnosticAgent(anthropic, dataSource, schema, allTools, sid);
-  diagnosis = await diagAgent.investigate(inv, hooksFor('diagnostic'));
-  send({ type: 'diagnosis', diagnosis });
-}
+Each stage is invoked exactly once per investigation. Order is fixed. No re-planning at the chain level.
 
-// STEP 3 (recommend) or the combined run: run the recommendation agent.
-if (step !== 'diagnose') {
-  const recAgent = new RecommendationAgent(anthropic, dataSource, schema, allTools, sid);
-  const recommendations = await recAgent.propose(inv, diagnosis!, hooksFor('recommendation'));
-  for (const r of recommendations) send({ type: 'recommendation', recommendation: r });
-}
-```
+**The agent loop inside a stage.**
 
-Fixed two-step pipeline. The conditional is on `step` (the user-facing UX choice), not on any LLM decision.
-
-**Part 2 — the loop lives inside each agent (in AptKit).**
-
-When `diagAgent.investigate(anomaly)` runs, it doesn't return on the first LLM call. It enters a ReAct loop:
+`DiagnosticAgent.investigate(anomaly, hooks)` at `lib/agents/diagnostic.ts:46-63` delegates to `AptKitDiagnosticInvestigationAgent.investigate()`. AptKit runs the loop:
 
 ```
-  LLM call 1 (system + user "investigate this anomaly"):
-    → output: { text: "I need to check…", tool_use: 'execute_analytics_eql' }
-   Your code executes the EQL via DataSource.callTool.
-   The result becomes a 'tool_result' content block.
+  (inside AptKit — simplified from @aptkit/core)
 
-  LLM call 2 (system + user + assistant + tool_result):
-    → output: { text: "now let me check…", tool_use: 'get_funnel' }
-   Your code runs the tool. Result fed back.
+  const messages = [system, user(anomaly)];
+  while (turnsRemaining > 0) {
+    const response = await modelProvider.complete({ messages, tools });
+    messages.push({ role: 'assistant', content: response.content });
 
-  LLM call 3 (... + tool_result + tool_result):
-    → output: { text: "Cart abandonment is up because…", tool_use: null }
-   No tool call this turn → done.
+    const toolUse = response.content.find(b => b.type === 'tool_use');
+    if (!toolUse) break;                   // model finished thinking
 
-  Loop exits. Final synthesized Diagnosis returned.
+    if (toolUse.name === 'submitDiagnosis') {
+      return toolUse.input as Diagnosis;   // final answer
+    }
+
+    const result = await toolRegistry.callTool(toolUse.name, toolUse.input);
+    messages.push({ role: 'user', content: [{ type: 'tool_result', ... }] });
+    turnsRemaining--;
+  }
 ```
 
-The number of calls is LLM-decided, capped at the agent's budget (`monitoring.md:18` enforces 6; diagnostic has its own cap inside AptKit). This codebase's agents typically run 5-8 tool calls per investigation.
+The loop is deterministic mechanics; the DECISIONS inside the loop (which tool, when to submit, how to phrase the thought) are the model's. That's why it's an "agent loop" — code owns the loop; the model owns the loop's body decisions.
 
-**Part 3 — both shapes are valid; pick by the decision shape.**
+**Why chain-of-agents rather than one big agent.**
 
-```
-  When to use a chain                When to use an agent
-   ─────────────────────              ─────────────────────
-   Steps known in advance              Steps depend on results
+Three reasons (also covered in `02-context-and-prompts/03-prompt-chaining.md`):
+1. Evaluability — separate rubrics per stage
+2. Streaming — two-page product UI maps to two agents
+3. Independent iteration — change one prompt without retesting the other
 
-   Latency matters (fewer LLM calls)   Coverage matters more than latency
+**Why an agent loop rather than a chain of prompts inside a stage.**
 
-   Each step has one clear job         Each "step" is "do whatever it takes"
-
-   Deterministic UX                    Open-ended investigation
-
-   Example: bootstrap →                Example: diagnose anomaly
-            scan →                              (which EQL? depends on
-            insight                              anomaly shape, depends
-                                                  on results so far)
-```
-
-**Part 4 — this codebase's choice, named.**
-
-Chain at the product flow: the user thinks `what → why → what to do`, in that order, always. No LLM should decide whether to "skip diagnosis." The fixed three-step shape *is* the product.
-
-Loop inside each agent: each "what" or "why" is open-ended. Different anomalies need different tool sequences. The 10 anomaly categories share one agent because the categories are reference material; the EQL choices are not.
+Because the diagnostic path IS unpredictable at the tool-call level. The agent might need 3 tool calls or 6. Which specific EQL queries to run depends on what the earlier results showed. A hard-coded chain of prompts would either miss cases (too rigid) or be enormous (branch on every possibility).
 
 ### Move 3 — the principle
 
-**Pipeline outside, loop inside.** The outer shape (product flow) is what you design; the inner shape (per-agent reasoning) is what the LLM is good at. Where the line falls between them is the load-bearing design decision. Get the line right and your app is testable, debuggable, and fast; get it wrong and either the user sees a black box or the agent makes brittle structural decisions.
+Compose. Fixed order at the product-flow layer where determinism matters (each investigation has three well-defined stages). Dynamic loop inside a stage where the model has to react to what it discovers. The right shape at the right layer — chains all the way down is too rigid; agents all the way up is too flexible.
 
-## Primary diagram — the full recap
+## Primary diagram
+
+Full picture — both shapes in this repo.
 
 ```
-  Pipeline outside, loop inside
+  Chain + agent-loop composition in blooming_insights
 
-  ┌─ Pipeline (chain) — code-decided ───────────────────────────┐
-  │                                                              │
-  │   bootstrap                                                  │
-  │       │                                                      │
-  │       ▼                                                      │
-  │   monitoring scan (briefing) ─────► insight list             │
-  │       │ user clicks a card                                   │
-  │       ▼                                                      │
-  │   diagnostic investigation ───────► Diagnosis                │
-  │       │ user clicks "see recs"                               │
-  │       ▼                                                      │
-  │   recommendation proposal ────────► Recommendation[]         │
-  │                                                              │
-  └─────────┬────────────────────────────────────────────────────┘
-            │  for each pipeline step, invoke one agent
-            ▼
-  ┌─ Agent loop — LLM-decided ──────────────────────────────────┐
-  │                                                              │
-  │  ┌──── while not done ──────────────────────────────────┐    │
-  │  │                                                      │    │
-  │  │   model.complete(prompt + history)                   │    │
-  │  │      ↓                                               │    │
-  │  │   ContentBlock[] — text and/or tool_use blocks       │    │
-  │  │      ↓                                               │    │
-  │  │   for each tool_use:                                 │    │
-  │  │     dataSource.callTool(name, input)                 │    │
-  │  │     append tool_result to history                    │    │
-  │  │                                                      │    │
-  │  │   if no tool_use this turn:                          │    │
-  │  │     extract final structured output                  │    │
-  │  │     break                                            │    │
-  │  │                                                      │    │
-  │  │   if call budget hit:                                │    │
-  │  │     force final answer                               │    │
-  │  │     break                                            │    │
-  │  │                                                      │    │
-  │  └──────────────────────────────────────────────────────┘    │
-  └──────────────────────────────────────────────────────────────┘
+  ┌─ Product flow (CHAIN — code decides) ─────────────────────────────┐
+  │                                                                   │
+  │   MonitoringAgent.scan()                                          │
+  │        │                                                          │
+  │        ▼                                                          │
+  │   emits Anomaly[]                                                 │
+  │        │                                                          │
+  │        ▼  ← user picks an anomaly (human-in-the-loop step)         │
+  │                                                                   │
+  │   DiagnosticAgent.investigate(anomaly)                            │
+  │        │                                                          │
+  │        │ [inner: agent loop]                                       │
+  │        │  ┌──────────────────────────────────────┐                │
+  │        │  │  T → A → O → T → A → O → ... → done  │                │
+  │        │  │  ≤ 6 tool calls · ≤ 10 model turns   │                │
+  │        │  └──────────────────────────────────────┘                │
+  │        │                                                          │
+  │        ▼                                                          │
+  │   emits Diagnosis                                                 │
+  │        │                                                          │
+  │        ▼                                                          │
+  │   RecommendationAgent.propose(anomaly, diagnosis)                 │
+  │        │                                                          │
+  │        │ [inner: agent loop, own tools loop]                       │
+  │        │                                                          │
+  │        ▼                                                          │
+  │   emits Recommendation[]                                          │
+  │                                                                   │
+  └───────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-**Why both, not just one.** Pure chain would force the codebase to hard-code which EQL to run for each anomaly category — brittle, doesn't scale to 10+ categories. Pure agent would let the LLM decide "should I diagnose before recommending?" — wrong call, because the user already decided that by clicking "see recs."
+The "agent vs chain" distinction landed as vocabulary around 2022-2023 (LangChain named it; the ReAct paper had the mechanism). Before that, "agents" meant AI research agents (goal-directed RL policies) and "chains" meant Unix pipelines. The AI-app-eng usage narrowed both: chain = deterministic composition of LLM calls; agent = LLM-controlled tool-use loop.
 
-The hybrid lands where the decisions live: structural at the chain level, semantic at the loop level.
-
-**Why the agent loop lives in AptKit, not this repo.** AptKit's `AnomalyMonitoringAgent`, `DiagnosticInvestigationAgent`, etc. each implement a tuned version of the ReAct loop for their domain (monitoring has 6-call budget + category checklist; diagnostic has hypothesis-testing structure; recommendation has feature-selection logic). Building those loops correctly is a library's job — testing, error recovery, budget enforcement, prompt design — and this codebase delegates by depending on the abstraction (`@aptkit/core`).
-
-The 206 LOC of adapter glue at `lib/agents/aptkit-adapters.ts` is the entire boundary between "this codebase" and "the agent runtime."
+Modern production reality is almost always compositional — chains of agents. The tradeoffs favor chain-when-you-can, agent-when-you-must. Chain-of-thought reasoning inside a single non-tool-using LLM call is a third shape (agent-like reasoning without agent-like tool use); this codebase uses it implicitly (the model's `text` blocks are its reasoning, streamed as `reasoning_step` events), but the primary control is agent-loop shape.
 
 ## Project exercises
 
-### Exercise — Turn the briefing scan from "always monitor" to LLM-decided category prioritization
+### Exercise — force a chain-only diagnostic and measure
 
-  → **Exercise ID:** B4.1
-  → **What to build:** Add an *outer* LLM call before the monitoring scan that prioritizes which categories to run based on recent activity (e.g. "the last 3 anomalies were revenue-related — prioritize revenue_drop and conversion_drop over inventory and fraud this scan"). Pass the prioritized order to `MonitoringAgent.scan()`. Pure agent layer added in front of the existing chain.
-  → **Why it earns its place:** demonstrates pushing decision-making from the chain layer (today: run all runnable categories) to a thin LLM layer (smart-prioritize before scanning). The pattern transfers to any chain step where the "always do all of these" rule is wasteful.
-  → **Files to touch:** new `lib/agents/category-prioritizer.ts` (a small Haiku-backed prioritizer), `lib/agents/monitoring.ts` (accept a prioritized order), `app/api/briefing/route.ts` (run the prioritizer before scan), `test/agents/category-prioritizer.test.ts` (cover the prioritization shape).
-  → **Done when:** the briefing scan now runs categories in a prioritized order (typically 4-5 in the front, others at the back), the per-call log shows the prioritization step costs ~$0.0003 (Haiku), and the existing scan behavior is preserved when the prioritizer falls back.
-  → **Estimated effort:** 1–2 days.
+- **Exercise ID:** C4.1-A · Case A (concept exercised; measure the trade).
+- **What to build:** implement a `ChainDiagnosticAgent` variant that runs a hard-coded 3-step sequence: (1) `execute_analytics_eql` for the metric time-series, (2) `execute_analytics_eql` for a country breakdown, (3) synthesize with one final model call. No LLM-decided tool routing. Run against the 10 goldens and compare quality vs the agent-loop version.
+- **Why it earns its place:** proves you know the agent-loop is a design choice, not a default. Interviewer signal: "I know when a chain would suffice and when the loop is buying real flexibility — here's the measurement."
+- **Files to touch:** `lib/agents/chain-diagnostic.ts` (new), `eval/run.eval.ts` (two-arm run).
+- **Done when:** report shows per-dim pass rates for chain-only vs agent-loop on the 10 goldens. Expected: chain-only wins on happy-path cases (01-04) and loses on partial-signal (05, 06).
+- **Estimated effort:** 1-2 days.
 
 ## Interview defense
 
-**Q: "Are your agents chains or agents?"**
+**Q: Is diagnostic an agent or a chain?**
 
-Both. The product flow is a chain — bootstrap → scan → diagnose → recommend, in fixed order, decided by the user's clicks and the route's hardcoded sequence. Inside each step, an agent runs a ReAct-style loop: the LLM picks a tool from its allowlist, my code executes it, the result feeds back, the LLM decides next. Pipeline outside, loop inside. The outer chain is the product; the inner loop is what the LLM is good at.
+Both, at different scales. At the product-flow layer it's a chain — Monitoring → Diagnostic → Recommendation, fixed order. Inside the Diagnostic stage, it's an agent — a ReAct loop that decides what to query next based on what previous queries showed. The chain gives determinism where I want it; the agent gives flexibility where I need it.
 
-*Anchor: "Pipeline outside, loop inside. Decision-flip at the agent constructor call."*
+**Q: Why not one big agent that does monitoring + diagnostic + recommendation?**
 
-**Q: "Why isn't the recommendation agent allowed to call diagnostic tools?"**
+Because "diagnose this anomaly" and "propose a recommendation" have different rubrics. Merging them into one agent's loop would mean one rubric scoring both jobs at once — I couldn't tell whether a failure was in the diagnosis or the recommendation. Two agents = two rubrics = clean signal.
 
-Allowlist at `lib/mcp/tools.ts:28-36`. The recommendation agent has 7 tools, all for proposing Bloomreach actions (`list_scenarios`, `list_segmentations`, `list_voucher_pools`, etc.). It can't call `execute_analytics_eql` because that's a diagnostic-shaped tool — once you're recommending, you've already accepted the diagnosis. If the agent's allowed to re-diagnose mid-recommendation, it'll spend its budget questioning the handoff instead of proposing actions.
+```
+  Chain gives me:
+   · separable rubrics per stage
+   · streaming boundary between UI pages
+   · independent prompt iteration
+```
 
-This is the chain layer's job (deciding "we're past diagnosis now"); the agent layer respects it by tool-list narrowing.
+**Q: Why not chains-inside-stages?**
 
-*Anchor: "Chain decides which agent runs; agent's tool allowlist narrows what the LLM can pick."*
+Because the diagnosis path is unpredictable at the tool-call level. Some anomalies need 3 queries (clear signal); some need 6 (multi-scope digging). Some need a country breakdown; some need a device breakdown. A hard-coded chain would either miss cases (too rigid) or fan out to a big decision tree (equivalent to an agent anyway, just harder to iterate on).
 
 ## See also
 
-  → `02-tool-calling.md` — the per-tool mechanics
-  → `03-react-pattern.md` — the loop's inner shape
-  → `02-context-and-prompts/03-prompt-chaining.md` — the same pattern from the prompt-chain lens
+- `02-tool-calling.md` — the mechanism the agent loop uses
+- `03-react-pattern.md` — the specific shape of the loop
+- `02-context-and-prompts/03-prompt-chaining.md` — the chain shape at product-flow level
+- `lib/agents/diagnostic.ts`, `lib/agents/recommendation.ts`

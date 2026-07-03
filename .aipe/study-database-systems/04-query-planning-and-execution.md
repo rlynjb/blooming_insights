@@ -1,253 +1,313 @@
-# Query planning and execution — planning happens elsewhere
+# Query planning and execution
 
-*Industry standard / Project-specific* — there is no local query planner. The agents emit EQL strings; the Bloomreach server plans and executes them; we see only the result. This concept file is mostly about the *planning we do have* — which is "an LLM picks a tool and writes the query string."
+*Query execution / Language-agnostic*
 
 ## Zoom out, then zoom in
 
-A query planner takes a declarative query, picks a plan, and executes it. In this repo the declarative query is an EQL string the model wrote, the planner is whatever runs inside Bloomreach's analytics engine, and we never see the plan. What *we* control is the tool-selection step that happens before the query is sent — and the duplicate-suppression step (the cache) that happens after.
+You know how in Postgres you write SQL, the planner picks between "seq scan" and "index scan" and various join algorithms, and `EXPLAIN` shows you what it chose? This repo has none of that machinery. It has agents that pick their own EQL queries against Bloomreach, and it has hardcoded scan-shaped reads on the local Maps. There is no plan to explain because there is nothing to plan.
 
 ```
-  Zoom out — where this concept lives
+  Zoom out — where "query execution" happens
 
-  ┌─ UI layer ───────────────────────────────────────────────┐
-  │  StatusLog shows tool calls + EQL text as they run        │
-  └────────────────────────────┬─────────────────────────────┘
-                               │  HTTP / NDJSON
-  ┌─ Service layer ────────────▼─────────────────────────────┐
-  │  monitoring/diagnostic/recommendation agents              │
-  │      │                                                    │
-  │      ▼                                                    │
-  │  runAgentLoop  ──►  pick a tool, build args  ──► callTool│
-  │                          ★ TOOL-CHOICE PLANNING ★          │ ← we are here
-  └────────────────────────────┬─────────────────────────────┘
-                               │  callTool('execute_analytics_eql', { eql })
-  ┌─ Storage / external ───────▼─────────────────────────────┐
-  │  Bloomreach MCP server                                    │
-  │    ↓ EQL planner (opaque to us)                           │
-  │    ↓ analytics engine                                     │
-  │  → result envelope                                         │
+  ┌─ UI ─────────────────────────────────────────────────────┐
+  │  a card render is a "SELECT" against the session Map      │
+  └────────────────────┬─────────────────────────────────────┘
+                       │
+  ┌─ Service ──────────▼─────────────────────────────────────┐
+  │                                                          │
+  │  ★ agent-generated EQL → sent to Bloomreach              │ ← this file's scope
+  │    lib/agents/*.ts + lib/agents/prompts/*.md              │
+  │                                                          │
+  │  ★ hardcoded Map iteration/filter                         │
+  │    listInsights, resolveAnomaly, gate.eval.ts scans       │
+  │                                                          │
+  │  no planner · no EXPLAIN · no join algorithm choice        │
+  │                                                          │
+  └────────────────────┬─────────────────────────────────────┘
+                       │ execute_analytics_eql (MCP tool)
+  ┌─ Provider (Bloomreach) ▼─────────────────────────────────┐
+  │  their planner runs EQL, returns rows                     │
   └──────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: the "query planning" that lives in this repo is the model deciding which of ~30 tools to call and what `eql` string to put in the args. That's a planning step in the loosest sense — there's no rule-based optimizer, no cost model, no statistics. It's an LLM with a tool catalog.
+**Zoom in.** The "planner" in this repo is *the agent's prompt*. The monitoring agent decides what EQL to run based on how it's prompted; Bloomreach executes it. Everything local is fixed-shape access — no query language, no choices to make.
 
 ## Structure pass
 
-**Layers:**
+**Axis to hold constant: who decides the access shape?**
 
 ```
-  L1  agent loop                LLM picks tool + args
-  L2  DataSource.callTool       cache check, rate spacing
-  L3  Bloomreach MCP server     EQL planner + executor (opaque)
+  "who chooses the query shape?" — traced across the layers
+
+  ┌─ agent layer ────────────────────────────────────────────┐
+  │  the monitoring/diagnostic/recommendation agent decides   │  → LLM decides
+  │  which tool + which EQL to send                           │
+  │  lib/agents/base.ts (runAgentLoop)                        │
+  └──────────────────────────────────────────────────────────┘
+      ┌─ MCP client ────────────────────────────────────────────┐
+      │  BloomreachDataSource caches, spaces, retries — but       │  → CODE decides
+      │  never rewrites the tool call                             │    (pass-through)
+      │  lib/data-source/bloomreach-data-source.ts               │
+      └─────────────────────────────────────────────────────────┘
+          ┌─ Bloomreach execution ─────────────────────────────────┐
+          │  their planner runs EQL. Opaque. Latency + rate limits  │ → their planner
+          │  are what we observe.                                   │
+          └────────────────────────────────────────────────────────┘
 ```
 
-**Axis traced: who plans the query?**
-
-```
-  Trace one axis: who decides what runs?
-
-  ┌─ L1: agent (Claude) ──────────────────┐
-  │  picks tool, writes EQL string         │   → LLM decides
-  └────────────────────────────────────────┘
-                  (it flips)
-  ┌─ L2: DataSource ──────────────────────┐
-  │  caches, spaces, retries; no semantics │   → mechanical, no choice
-  └────────────────────────────────────────┘
-                  (it flips)
-  ┌─ L3: Bloomreach server ───────────────┐
-  │  parses EQL, picks plan, scans events  │   → server-side planner
-  └────────────────────────────────────────┘
-
-  the planner-choice flips twice: LLM → cache → server
-  we own L1; we own nothing in L3
-```
-
-**Seams** — two matter:
-
-- L1 → L2: the `callTool(name, args)` signature is where the agent stops being able to influence execution. Once the args go in, the cache+server pipeline is mechanical.
-- L2 → L3: the wire protocol (MCP over HTTP). The cache hit/miss decision flips here; the rest is a remote procedure call we don't see inside of.
+The seam that flips the axis: **the MCP boundary between our code and Bloomreach.** On our side, no query is ever rewritten or replanned; on their side, EQL gets planned properly. That's why the interesting execution mechanics here are agent-side (which EQL to send) rather than engine-side (how to run it).
 
 ## How it works
 
 ### Move 1 — the mental model
 
-In a relational system the planner sees `SELECT * FROM events WHERE customer_id = ? AND ts > ?` and picks an index + a scan strategy. Here the analog is: the agent sees the prompt + tool schemas, picks `execute_analytics_eql`, writes the EQL, and ships it. The model is the planner — but with no statistics, no plan cache, no rewrite rules. Just "given these tools and this question, what do I call?"
+Standard shape of a query in a real DB:
 
 ```
-  Two-stage execution — local planner, remote executor
+  standard planner path
 
-       user question (anomaly to diagnose)
-              │
-              ▼
-       ┌─ L1: agent (LLM) ──────────┐
-       │  pick tool: execute_eql     │   "planning"
-       │  write eql string           │
-       │  build args                 │
-       └────────────┬────────────────┘
-                    │ callTool(name, args)
-                    ▼
-       ┌─ L2: DataSource ───────────┐
-       │  cache hit? return early    │   "caching"
-       │  cache miss? send live      │
-       └────────────┬────────────────┘
-                    │ HTTP
-                    ▼
-       ┌─ L3: Bloomreach ───────────┐
-       │  parse eql, plan, execute   │   "real execution"
-       │  return result envelope     │   (opaque)
-       └─────────────────────────────┘
+  SQL ──► parser ──► logical plan ──► planner ──► physical plan
+                                        │
+                                        └── picks index-scan vs seq-scan,
+                                            hash-join vs merge-join,
+                                            sort strategy, etc.
+                                        │
+                                        ▼
+                                     executor
+                                        │
+                                        ▼
+                                     rows out
 ```
 
-That's the kernel. The rest is what each layer actually does.
-
-### Move 2 — the planner, one part at a time
-
-#### L1 — the agent loop (the "planner")
-
-The agent loop is the only part of the planner we own. The relevant facts (from `lib/agents/base.ts` and the per-agent files):
-
-- Default model is `claude-sonnet-4-6`; intent classification uses `claude-haiku-4-5-20251001` (cheaper, faster — see `.aipe/project/context.md`).
-- Each agent (monitoring, diagnostic, recommendation, query) gets a different tool subset from `lib/agents/tool-schemas.ts`. That's a coarse permissions model: monitoring can call `execute_analytics_eql` but not `list_campaigns`; recommendation can call `list_scenarios` but not `execute_analytics_eql`.
-- The agent loop hands Claude the tool schemas, gets back a `tool_use` block, calls `dataSource.callTool(name, args)`, sends the result as a `tool_result` block, and loops until Claude emits a final text response.
+This repo's shape:
 
 ```
-  The agent loop — a degenerate planner with no statistics
+  this-repo path — the "planner" is a prompt
 
-  prompt + tool schemas
-        │
-        ▼
-  Claude.messages.create({ tools, messages })
-        │
-        ▼
-  response.stop_reason
-   ┌────┴──────────┐
-   │               │
-  "tool_use"   "end_turn"
-   │               │
-   ▼               ▼
-  pick the         emit final text
-  tool block       (the answer)
-   │
-   ▼
-  dataSource.callTool(name, args)
-   │
-   ▼
-  append tool_result, loop
+  agent turn ──► LLM decides tool + args ──► MCP tool call
+                        │
+                        └── tool = execute_analytics_eql
+                            args = { eql, timezone, ... }
+                        │
+                        ▼
+                Bloomreach executes (opaque)
+                        │
+                        ▼
+                    result JSON
+                        │
+                        ▼
+                agent unwraps, may plan another turn
 ```
 
-The planning quality is whatever the model can do with the tool catalog plus the prompt. There's no plan cache (Claude doesn't remember "I did this EQL last briefing"), no cost-based reasoning, no learning. The prompts in `lib/agents/prompts/*.md` are the only place we can tune the planner.
+The load-bearing insight: **query planning happens in prompt space.** The `lib/agents/prompts/*.md` files (monitoring, diagnostic, recommendation, query) describe *how* the agent should decide what to query. `lib/agents/tool-schemas.ts` describes *what* the agent can call. The LLM picks the next tool call each turn — that's the planning step. There is no `EXPLAIN` for it.
 
-#### L2 — the DataSource (the "executor wrapper")
+### Move 2 — the primitives walked
 
-The DataSource is mechanical. It does not parse, rewrite, or reason about the query — it caches by exact args (`03-btree-hash-and-secondary-indexes.md`), spaces calls at ~1 req/s, and retries on rate-limit errors with a parsed wait hint.
+**The agent loop is the executor.**
 
-```typescript
-// lib/data-source/bloomreach-data-source.ts:139-188 (callTool, condensed)
-async callTool<T>(name, args, options) {
-  const cacheKey = `${name}:${JSON.stringify(args)}`;
-  if (cache hit && unexpired) return { fromCache: true, durationMs: 0 };
+```
+  lib/agents/base.ts — runAgentLoop skeleton
+  ──────────────────
+  loop:
+    send message history + tool schemas to Claude
+    receive: (a) text response  OR  (b) tool_use block(s)
+    if tool_use:
+      for each tool_use:
+        result = dataSource.callTool(name, args, { signal })
+        append tool_result to history
+      continue
+    else:
+      break  (agent said "done")
+```
 
-  let result = await this.liveCall(name, args, options.signal);
-  while (isRateLimited(result) && retries < maxRetries) {
-    await sleep(parseRetryAfterMs(result) ?? backoff);
-    result = await this.liveCall(name, args, options.signal);
+That's the shape. It's not a query planner in the DBMS sense — it's an interactive planner where each step is one tool call, and the model picks the next step based on what came back. The `for each tool_use` fan-out is the closest thing to *parallel scans* in the codebase: multiple tools can be called in one turn.
+
+**The tool call is the query.**
+
+Every read from Bloomreach goes through one tool. The catalog lives at `lib/mcp/tools.ts`. The three most-used ones in the analytical path:
+
+```
+  bootstrap chain (every request replays it):
+    list_cloud_organizations   → get org id
+    list_projects              → get project_id
+                                 (see MEMORY.md — bootstrap chain rule)
+
+  analytical:
+    execute_analytics_eql      → the actual "SELECT" — pass EQL, get rows
+    get_project_overview       → workspace-level facts
+    get_event_schema           → what event types exist
+```
+
+`execute_analytics_eql` is the only tool that takes a query language as argument. Everything else is fixed-shape ("give me the customer schema," "list catalogs"). That's the seam where "our code" ends and "their planner" begins.
+
+**Caching = plan reuse.**
+
+```ts
+// lib/data-source/bloomreach-data-source.ts:144-152
+const cacheKey = `${name}:${JSON.stringify(args)}`;
+const ttl = options.cacheTtlMs ?? 60_000;
+
+if (!options.skipCache) {
+  const cached = this.cache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return { result: cached.result as T, durationMs: 0, fromCache: true };
   }
-  if (!isError(result)) cache.set(cacheKey, { result, expiresAt: now + ttl });
-  return { result, durationMs, fromCache: false };
 }
 ```
 
-This is what a database driver does, with three customizations for Bloomreach's quirks: the cache (since the upstream is slow), the spacing (since the upstream rate-limits globally), and the retry-after parsing (since the upstream states its penalty window in the error text).
+Same tool + same args = cached result for 60s. In DB terms this is *prepared-statement result caching* — you're not saving on planning (the plan wasn't ours), you're saving on execution and network. The cache key IS the full query; there's no plan-shape reuse below that granularity.
 
-#### L3 — the Bloomreach EQL planner (opaque)
+**Local "queries" are hardcoded scan shapes.**
 
-We do not have an `EXPLAIN` for EQL. We see a result and a duration; we infer planning behavior from response time. Two observable signals:
-
-- A simple `count` query over a 90-day window returns in ~1-2s. A complex segmentation in ~5-10s. The cache (L2) collapses repeats to 0ms.
-- Errors come back as an `isError: true` envelope with text describing what failed (parse error, rate limit, unauthorized). The error text is the only debugging surface.
-
-This is the same situation you'd have hitting any third-party analytics API. The planner is a black box; you only see the boundary.
-
-#### The 90-day window — the only "query rewrite" we do
-
-```
-  Window-bound rewrite — done in the prompt, not at runtime
-
-  user/agent intent  →  "what changed recently"
-                              │
-                              ▼
-  prompt forces       →  current 90d vs prior 90d
-                              │
-                              ▼
-  EQL emitted         →  WHERE ts BETWEEN (now-90d, now)
-                         WHERE ts BETWEEN (now-180d, now-90d)
+```ts
+// lib/state/insights.ts:81-84
+export function listInsights(sessionId: string): Insight[] {
+  const s = state.get(sessionId);
+  return s ? [...s.insights.values()] : [];
+}
 ```
 
-`.aipe/project/context.md` is explicit: short windows (7d) hit the dataset's sparse tail and produce bogus ±100% swings. The prompts in `lib/agents/prompts/` enforce 90d to avoid that. This is a "query rewrite" in the loosest sense — done at prompt-design time, not at runtime.
+This is a `SELECT * FROM insights WHERE session_id = ? ORDER BY insertion_order`. Fixed shape. No `WHERE severity = 'critical'`, no `LIMIT`, no `ORDER BY severity DESC`. The caller sorts or filters in the UI if needed. Same for `resolveAnomaly` at `app/api/agent/route.ts:35-49` — two point-lookups (`getAnomaly` then fallback to `getInsight`), no planner choice.
 
-#### N+1 behavior — none, by construction
+**The "join" step lives at the composition layer.**
 
-The monitoring agent issues one EQL per category × scope (current, prior). The diagnostic agent issues one EQL per hypothesis. There is no place in the code that issues one EQL per row of a previous result — the agent loop's natural shape is "issue a few queries, reason on the results" rather than "iterate over results and re-query."
+```ts
+// app/api/agent/route.ts:35-49
+function resolveAnomaly(sessionId: string, insightId: string, insightParam?: string | null): Anomaly | null {
+  const a = getAnomaly(sessionId, insightId);
+  if (a) return a;
+  const i = getInsight(sessionId, insightId);
+  if (i) return insightToAnomaly(i);
+  ...
+}
+```
 
-The closest thing to N+1 risk is in the demo replay (`app/api/briefing/route.ts:122-138`) which iterates over recorded `trace[]` items and emits one event per item. That's not a query — it's a recorded playback — and the items are bounded by how many tool calls the original briefing made.
+Two "table" lookups keyed by the same id — the `anomalies` inner Map first, then fall back to `insights` and back-derive. That's a *nested-loop join with early exit* on a table of size 1. In a real DB the planner would decide "hash join, merge join, or nested loop" based on cardinality estimates; here the cardinality is 1 and the join is spelled out inline.
+
+**Gate: full-scan-with-filter over the receipts directory.**
+
+```ts
+// eval/gate.eval.ts:63-71
+const candidateRunId = pickRunId(process.env.RUN_ID);
+const files = readdirSync(RECEIPTS_DIR)
+  .filter((f) => f.endsWith(`${candidateRunId}.json`))
+  .sort();
+if (files.length === 0) throw new Error(`No receipts for candidate runId ${candidateRunId}`);
+
+const receipts: Receipt[] = files.map(
+  (f) => JSON.parse(readFileSync(resolve(RECEIPTS_DIR, f), 'utf8')) as Receipt,
+);
+const candidate = computeBaseline(candidateRunId, receipts);
+```
+
+That's a `SELECT * FROM receipts WHERE run_id = ?` executed as:
+1. **Scan** — readdirSync the whole dir (28 entries).
+2. **Filter** — string-suffix match on the filename.
+3. **Materialize** — JSON.parse each match.
+4. **Aggregate** — `computeBaseline` folds them into one Baseline row.
+
+Then step 5 is a *lookup join* against the committed baseline row:
+
+```ts
+// eval/gate.eval.ts:53-58
+const baselinePath = resolve(EVAL_DIR, baselineFile);
+let baseline: Baseline;
+try {
+  baseline = JSON.parse(readFileSync(baselinePath, 'utf8')) as Baseline;
+}
+```
+
+Read one row (`eval/baseline.json`). Compare per-dimension pass rates against the candidate. This IS a query with a real plan — filter, materialize, aggregate, lookup — just spelled out in TypeScript rather than SQL.
+
+### Move 2 variant — the load-bearing skeleton
+
+The minimum viable "execution layer" here is:
+
+1. **The agent loop's tool-use fan-out.** `runAgentLoop` at `lib/agents/base.ts`. Remove it and the agents can't run multi-step diagnoses — the whole "form hypothesis → test with EQL → refine" flow depends on iterated tool calls.
+2. **`execute_analytics_eql` as the sole analytical query surface.** Remove it and there is no way to compute a metric that isn't in a pre-built tool. The whole "period-over-period 90d" method (`context.md`) depends on it.
+3. **The response cache as plan-reuse.** Remove it and the bootstrap chain (list_cloud_organizations + list_projects on every call) burns 3 real requests per agent turn, hitting the ~1 req/s limit within seconds.
+
+The rest — `listInsights` returning insertion order, the receipts filter+sort — is optimization or shape choice.
 
 ### Move 3 — the principle
 
-When most of "query planning" lives behind an external boundary, your job shrinks to: (a) constrain what the *local* planner is allowed to ask (tool catalogs, prompt-enforced windows), and (b) shield the upstream from your local planner's mistakes (cache, spacing, retry). You can't optimize a plan you can't see, but you can absolutely bound the number of plans you produce and the cost of repeats.
+**When the planner isn't yours, cache aggressively and rate-govern honestly.** You can't optimize Bloomreach's query plan from outside — you can only avoid asking it twice and avoid asking it too fast. The 60s TTL + ~1 req/s spacing + parsed retry-after ladder (`bloomreach-data-source.ts:64-72, 163-174`) is what makes an alpha rate-limited backend usable. The "planning" work you do here is *at the agent prompt layer*: teach the agent to pick queries that answer the question with fewer round-trips. That's the actual query-optimization surface in an AI-agent-in-front-of-a-DB shape.
 
 ## Primary diagram
 
 ```
-  Query planning + execution — full path, three layers
+  Query execution end to end
 
-  ┌─ agent loop (LLM) ──────────────────────────────────────┐
-  │  prompt: "investigate this anomaly"                      │
-  │  tools: [execute_analytics_eql, list_segmentations, …]   │
+  ┌─ agent turn ──────────────────────────────────────────────┐
+  │                                                            │
+  │  Claude decides:  "call execute_analytics_eql with EQL X"  │  ← the "planner"
+  │                        │                                   │
+  └────────────────────────┼───────────────────────────────────┘
+                           │
+                           ▼
+  ┌─ BloomreachDataSource.callTool ───────────────────────────┐
+  │  1. compute cacheKey = `${name}:${JSON.stringify(args)}`   │
+  │  2. check cache; return if hit                             │  ← plan reuse
+  │  3. proactive ~1 req/s spacing                             │  ← rate governor
+  │  4. transport.callTool → over the wire                     │
+  │  5. on rate-limit: parse retry-after, retry ≤ maxRetries   │
+  │  6. cache successful result 60s                            │
+  │                                                            │
+  │  bloomreach-data-source.ts:139-188                         │
+  └────────────────────────┬───────────────────────────────────┘
+                           │
+                           ▼
+  ┌─ Bloomreach loomi connect ───────────────────────────────┐
+  │  their planner runs EQL, returns { structuredContent }    │
+  └────────────────────────┬─────────────────────────────────┘
+                           │
+                           ▼
+  ┌─ back into the agent loop ───────────────────────────────┐
+  │  unwrap<T>(result) — prefer structuredContent, else       │
+  │  content[0].text                                          │
+  │  lib/mcp/schema.ts:33-42                                  │
   │                                                           │
-  │  Claude picks: { name: "execute_analytics_eql",           │
-  │                  args: { eql: "select count … where …" }} │
-  └──────────────────────────────┬──────────────────────────┘
-                                 │ callTool(name, args)
-  ┌─ BloomreachDataSource ───────▼──────────────────────────┐
-  │  key = `${name}:${JSON.stringify(args)}`                 │
-  │  cache.get(key)?  ──► HIT  → return { fromCache: true }  │
-  │                  └─► MISS → liveCall(...)                │
-  │     ↓                                                    │
-  │  spacing: wait until 1.1s since lastCallAt               │
-  │  retry-on-429 with parsed window hint                    │
-  └──────────────────────────────┬──────────────────────────┘
-                                 │ HTTP / MCP
-  ┌─ Bloomreach MCP server ──────▼──────────────────────────┐
-  │  parse EQL → plan → scan events → aggregate → respond    │
-  │  (opaque to us — no EXPLAIN, only durationMs + result)   │
-  └─────────────────────────────────────────────────────────┘
+  │  append tool_result to message history, loop again        │
+  └───────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The interesting design choice is that the planner is the model, not a hand-written rule engine. Earlier versions of analyst-style products (and the synthetic adapter in `lib/data-source/synthetic-data-source.ts`) hard-coded the queries: "given this anomaly category, run THIS EQL." That's faster and cheaper but brittle — every new anomaly type needs new code. The LLM-as-planner approach pays per-query in tokens and latency but generalizes to anomalies the prompt didn't anticipate.
+There's a real analog to database query optimization here, and it's *prompt engineering*. The monitoring agent's prompt (`lib/agents/prompts/monitoring.md`) is the query-plan hint layer — it teaches the LLM which tools to reach for first, how to batch, how to compose EQL for 90-day windows. Bad prompts = expensive plans = burned rate-limit budget. This is the surface the app actually spends time optimizing, and it maps neatly onto DB planner tuning:
 
-The repo handles the cost side with the tool subset (monitoring can't call diagnostic's tools, so the planning space is smaller per agent) and the prompt design (the prompts in `lib/agents/prompts/` are tight and enumerate the patterns to look for). That's the closest thing to a cost-based optimizer here — "restrict the search space at the source."
+- **Cardinality estimates** ↔ the prompt tells the agent "there are ~N countries; only drill down when the global change is > threshold."
+- **Index hint** ↔ "prefer `get_event_schema` before writing EQL that references event properties."
+- **Materialized view** ↔ the 60s cache — same call, no re-run.
+- **Query rewrite** ↔ the agent restating the question after a failed tool call.
 
-If you wanted real `EXPLAIN`-style visibility, the place to add it would be in `BloomreachDataSource.callTool` — capture `name`, `args`, `durationMs`, `fromCache` in a per-session trace, then surface them in the existing `StatusLog`. The trace data is already on the wire (`tool_call_end` events carry `durationMs` and the result); it's just not aggregated into a plan summary.
+`study-ai-engineering` and `study-prompt-engineering` own this thread; here it's just enough to say *the query-optimization surface exists*, it's just not where you'd expect.
+
+### `not yet exercised`
+
+- **`EXPLAIN` / `EXPLAIN ANALYZE` on any local query.** No local planner to explain.
+- **Join algorithms — hash join, merge join, nested loop.** The only "join" is a two-hash-lookup composition in `resolveAnomaly`.
+- **Query rewrite / view expansion / CTE optimization.** No SQL locally.
+- **Cost-based optimization, statistics collection, ANALYZE.** No planner.
+- **Prepared statements / parameterized query caching at the DBMS layer.** Cache keys are computed by us; there's no separate "plan cache."
+- **N+1 detection.** No ORM issuing per-row queries — the agent decides shot count directly.
 
 ## Interview defense
 
-**Q: How does query planning work here?**
+**Q: "How does query execution work here?"**
 
-Three layers: the model picks a tool and writes the query string (the planner), the DataSource caches/spaces/retries (the executor wrapper), the Bloomreach server actually plans and runs EQL (opaque). We own only the first layer and have prompts that constrain what plans the model is allowed to produce — most importantly the 90-day window rule, since shorter windows produce bogus ±100% swings on a sparse dataset.
+Model answer: "There's a two-layer split. Locally there's no planner — every read is a hardcoded scan or a hash lookup. The 'planner' in the DBMS sense lives across the MCP boundary, inside Bloomreach. Between the two, `BloomreachDataSource.callTool` at `lib/data-source/bloomreach-data-source.ts:139-188` handles the parts that a DBMS would call plan-reuse and rate-governance: a 60s response cache keyed by `${name}:${JSON.stringify(args)}`, proactive ~1 req/s spacing, and a retry ladder that parses Bloomreach's own retry-after hint. The interesting 'query optimization' surface isn't SQL — it's the agent's prompt, which decides which tools to call in what order. That's where round-trip count comes from."
 
-**Q: What's your story for N+1 queries?**
+Diagram to sketch: the "query execution end to end" primary diagram — agent decides, cache checks, wire crosses, unwrap, loop.
 
-It's structurally avoided. The agent loop's natural shape is "issue a few queries, reason on the result" — there's no place that iterates over rows of one result and issues a query per row. The monitoring agent runs one EQL per category × current/prior, bounded by the 10 categories minus whatever the coverage gate rejects. The diagnostic agent runs one EQL per hypothesis, bounded by the prompt to ~3-5 hypotheses. The cache (60s TTL, keyed by `name + JSON.stringify(args)`) collapses any accidental repeats to 0ms.
+**Q: "How does the app avoid N+1?"**
 
-**Q: What would you change if you wanted query observability?**
+Model answer: "By design, not by tooling. There's no ORM issuing per-row queries. The agent gets a batch of tools per turn and can fan out in one message — that's the parallel-scan analog. The tool-use handling in `runAgentLoop` iterates every `tool_use` block in one response, so 'give me the schemas for these 5 events' is one turn, not five. The place N+1 could bite is if the *prompt* asked the agent to loop over N things one at a time; that's caught at eval time in `eval/receipts/` when the tool-call count exceeds budget. The per-investigation budget ceiling landed in Week 3D — it's the guardrail."
 
-Aggregate the trace data already in `tool_call_end` events into a per-session plan summary — tool name, durationMs, fromCache, rough args fingerprint. That gives you the moral equivalent of `EXPLAIN ANALYZE` without changing the upstream contract. Today that data is on the wire but not summarized; the UI shows it per-call in `StatusLog` but doesn't roll it up.
+Anchor: agent fan-out per turn + eval-time budget ceiling replaces DB-side N+1 detection.
 
 ## See also
 
-- `03-btree-hash-and-secondary-indexes.md` — the cache that collapses repeat plans
-- `06-locks-mvcc-and-concurrency-control.md` — why per-call spacing is the only contention story
-- `07-wal-durability-and-recovery.md` — what happens when an agent's planning step fails mid-way
-- `09-database-systems-red-flags-audit.md` — the lack of EXPLAIN visibility
+- `01-database-systems-map.md` — where this executor sits in the storage picture.
+- `03-btree-hash-and-secondary-indexes.md` — the local hash lookups that stand in for indexed reads.
+- `05-transactions-isolation-and-anomalies.md` — atomicity of the multi-tool agent turn.
+- `08-replication-and-read-consistency.md` — the demo replay as a cached "materialized view."

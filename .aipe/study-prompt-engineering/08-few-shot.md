@@ -1,317 +1,345 @@
-# Few-shot prompting
+# 08 · Few-shot prompting
 
-**Industry standard** · examples that constrain output
+**Few-shot / in-context examples / example-driven prompting — Industry standard**
 
-## Zoom out — where examples live in this codebase
+## Zoom out, then zoom in
 
-Three of blooming's four structured-output prompts (monitoring, diagnostic, recommendation) carry a worked output example inside the `## Output` section. The fourth, query, doesn't — because prose doesn't need an example to constrain its shape. The intent classifier has its "examples" embedded in the prompt as parenthetical hints (`monitoring (what changed / what is new)`). Each choice is deliberate.
+Examples constrain output more tightly than instructions do. Show a model three examples of the exact JSON shape you want, and it will emit that shape. Write three paragraphs of prose describing the same shape, and it will emit *close* to that shape, most of the time. This is the specific reason production prompts lean on few-shot when the output is format-sensitive — and it's also the reason to *not* few-shot when the output is meant to be creative or open-ended.
 
 ```
-  Zoom out — examples per prompt template
+  Zoom out — where few-shot sits
 
-  ┌─ Prompt templates ──────────────────────────────────────┐
-  │  monitoring.md:73-85                                     │
-  │    └─ 1 worked Anomaly object, full schema               │
-  │  diagnostic.md:60-81                                     │
-  │    └─ 1 worked Diagnosis object, full schema             │
-  │  recommendation.md:51-74                                 │
-  │    └─ 1 worked Recommendation object, full schema        │
-  │  query.md                                                │
-  │    └─ no example (prose mode)                            │
-  │  intent prompt (inline in intent.ts:29-31)               │
-  │    └─ inline hints: monitoring/diagnostic/recommendation │
-  └─────────────────────────────────────────────────────────┘
+  ┌─ Instruction-only prompt ────────────────────────────────┐
+  │  "Return a JSON array of anomaly objects with these       │
+  │   fields: metric, scope, change, severity."               │
+  │  ↓ variance in emission style: medium-high                │
+  └──────────────────────────────────────────────────────────┘
+
+  ┌─ Few-shot prompt ────────────────────────────────────────┐
+  │  "Return a JSON array of anomaly objects like this:      │
+  │                                                           │
+  │   [{"metric":"purchase_revenue","category":"revenue_drop",│
+  │     "scope":["global"],"change":{...},"severity":"critical"│
+  │    }]"                                                    │
+  │  ↓ variance in emission style: low                        │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-## Zoom in
-
-Few-shot examples constrain output more than instructions do. You can write "return JSON with these fields" three different ways and get three slightly different shapes; you can show *one example object* and get that shape back, every time. The pattern works because the model is trained to match patterns in its context — and an example is a denser, more legible pattern than a list of rules. The cost: examples consume context tokens. The discipline: pick examples that pin the shape, not examples that pin the answer.
+**Zoom in.** Few-shot has three positions in the prompt anatomy (see `01-anatomy.md`): (a) inline in the rules/schema section as literal expected-output examples, (b) as a separate "here are three examples" block, (c) as trailing user/assistant turn pairs at the end of the messages array. This codebase uses (a) — the monitoring, diagnostic, and recommendation prompts each embed one example JSON output right in the "## Output" section. That embedded example is the few-shot.
 
 ## Structure pass
 
-**Layers.** Two: the *instruction layer* (the prose rules in `## Output` or `## Hard rules`) and the *example layer* (the worked object inside a ```json fence).
+### Axes — the dimension we're tracing
 
-**Axis traced — leverage.** Hold one question constant: *for a given token spend, which gives the model more clarity about the output shape?*
+**How tightly does the emission shape need to match?** For format-sensitive outputs (JSON, tags, structured objects), tight matching matters and few-shot earns its tokens. For open-ended generation (a summary, a narrative recommendation), tight matching is a *failure* — every output starts to sound like the example.
+
+### Seams — where the example flips utility
+
+Two seams:
+
+- **Format-sensitive vs open-ended** — the same technique (show an example) either constrains the model helpfully or locks it into repetition depending on which side of this seam you're on.
+- **Positive example vs edge-case example** — a canonical happy-path example teaches shape. An edge-case example (empty result, malformed input) teaches "here's what to do when the happy path doesn't apply." Both work; they teach different things.
+
+### Layered decomposition
+
+"What is the example doing here?" — traced across three altitudes:
 
 ```
-  Axis = leverage — what gives the most shape per token?
+  "What is this example teaching?" — same question, three altitudes
 
-  ┌─ prose rules ────────────────────────────────────────────┐
-  │   "severity is one of critical, warning, info, positive"  │
-  │   "change.value is a positive number"                     │
-  │   "wrap in a ```json fence"                               │
-  │     ~30 tokens, easy to misinterpret                      │
-  │     "is it 'positive number' or 'positive integer'?"      │
-  └──────────────────────────────────────────────────────────┘
-                              │  vs
-  ┌─ one worked example ─────▼───────────────────────────────┐
-  │   { "severity": "critical", "change": { "value": 30.0 }, │
-  │     ... }                                                 │
-  │     ~120 tokens, zero ambiguity                           │
-  │     the example IS the spec                               │
-  └──────────────────────────────────────────────────────────┘
+  ┌────────────────────────────────────────────────┐
+  │ outer: the whole prompt                         │  → what job the agent has
+  └────────────────────────────────────────────────┘
+      ┌────────────────────────────────────────────┐
+      │ middle: the ## Output section              │  → the exact shape to emit
+      └────────────────────────────────────────────┘
+          ┌────────────────────────────────────────┐
+          │ inner: the JSON literal in the section  │  → the exact bytes to emit
+          └────────────────────────────────────────┘
 ```
 
-**Seams.** The instruction → example seam is where the model resolves ambiguity. When the rules say "severity is one of four values" and the example shows `"severity": "critical"`, the model has both the constraint and the canonical form. Instructions without examples force the model to invent the form; examples without instructions don't tell the model what's required vs optional. Both belong; the example is the load-bearing one.
+The inner altitude is the few-shot: not "your output should look like X" but "here is X, emit something that pattern-matches."
 
 ## How it works
 
-### Move 1 — what an example does that an instruction can't
+### Move 1 — the mental model
 
-You know how a TypeScript type definition is *one shape* but the comments around it explain *what each field means*? Few-shot examples are the type. The instructions around them are the doc-comments. The model reads both; the type does the constraining; the comments do the explaining.
-
-```
-  Pattern — example as the constraint, instructions as the gloss
-
-  ┌─────────────────────────────────────────────────────────┐
-  │  ## Output                                               │
-  │                                                          │
-  │  Return ONLY a JSON array of anomaly objects... wrapped  │ ← what to do
-  │  in a ```json fenced block:                              │
-  │                                                          │
-  │  [                                                       │
-  │    {                                                     │ ← THE example
-  │      "metric": "purchase_revenue",                       │   (the constraint)
-  │      "category": "revenue_drop",                         │
-  │      "scope": ["global"],                                │
-  │      "change": {                                         │
-  │        "value": 30.0,                                    │
-  │        "direction": "down",                              │
-  │        "baseline": "90d"                                 │
-  │      },                                                  │
-  │      "severity": "critical",                             │
-  │      "impact": "Revenue down 30% versus...",             │
-  │      "evidence": [...]                                   │
-  │    }                                                     │
-  │  ]                                                       │
-  │                                                          │
-  │  Field rules:                                            │ ← the gloss
-  │  - `category` — REQUIRED. the checklist `id` ...         │
-  │  - `severity` — `"critical"` (>20%), `"warning"` ...     │
-```
-
-The example pins everything that's hard to specify in prose: exact field names, exact nesting, exact JSON syntax, exact string casing (`"down"` not `"DOWN"`, `"critical"` not `"Critical"`), exact wrapping (the ```json fence). The field rules pin everything that's easy to specify in prose: which fields are required, what each one means, what range the value should be in.
-
-### Move 2 — the worked Anomaly object, annotated
-
-Open `lib/agents/legacy-prompts/monitoring.md` at line 73. The example object that lives there is doing six jobs at once:
+You know how a code review comment "please match the style of the existing tests" is less effective than pasting one existing test into the PR description and saying "match this shape"? Same reason. The model pattern-matches better against a literal example than it does against a description of what the example would look like.
 
 ```
-  monitoring.md:73-85 — one example, six jobs
+  Few-shot vs instruction — what the model sees
 
-  ┌─────────────────────────────────────────────────────────┐
-  │  [                                                       │ ← job 1: array wrapper
-  │    {                                                     │
-  │      "metric": "purchase_revenue",                       │ ← job 2: snake_case names
-  │      "category": "revenue_drop",                         │ ← job 3: a real category id
-  │      "scope": ["global"],                                │ ← job 4: array of strings
-  │      "change": {                                         │ ← job 5: nested object
-  │        "value": 30.0,                                    │      → positive number
-  │        "direction": "down",                              │      → enum value
-  │        "baseline": "90d"                                 │      → string slug
-  │      },                                                  │
-  │      "severity": "critical",                             │ ← job 6: matched to value
-  │      "impact": "Revenue down 30%...",                    │      (>20% → critical)
-  │      "evidence": [                                       │
-  │        { "tool": "execute_analytics_eql",                │
-  │          "result": { "metric": "...",                    │
-  │                      "current": 4200000,                 │
-  │                      "prior": 6000000 } }                │
-  │      ]                                                   │
-  │    }                                                     │
-  │  ]                                                       │
-  └─────────────────────────────────────────────────────────┘
+  instruction only:                      few-shot:
+  "Return an anomaly object with          "Return an anomaly like this:
+    metric, scope, change, severity"
+                                          {"metric":"purchase_revenue",
+                                           "category":"revenue_drop",
+                                           "scope":["global"],
+                                           "change":{"value":30,"direction":"down","baseline":"90d"},
+                                           "severity":"critical",
+                                           "impact":"Revenue down 30% ..."}"
+
+  model has to:                          model has to:
+  - infer field types                    - pattern-match the shape
+  - infer array/object nesting            - substitute values
+  - infer value formats                   - copy structure
+
+  emission variance: medium               emission variance: low
 ```
 
-Each part of the example is doing real work. The example chooses the magnitudes to match the rule (`30%` triggers `critical` per the rules; if the example were `5%` with `severity: critical`, the model would learn the wrong threshold). The `evidence` structure shows the model that `result` is a free-form object with arbitrary shape, not a fixed schema. The `category` field shows what kind of value goes there (snake_case slug, not a random string).
+### Move 2 — the step-by-step walkthrough
 
-### Move 2 — when examples constrain more than instructions
+**Step 1 — the monitoring prompt embeds a full example.**
 
-The "respond only in JSON" anti-pattern is the contrast worth holding. You write:
-
-```
-  Don't do this in 2026:
-
-  ## Output
-  Respond only in valid JSON, exactly matching this format:
-  - `metric` is a string
-  - `severity` is one of: critical, warning, info, positive
-  - `change` is an object with value, direction, baseline
-  ...
-
-  Make sure your response is parseable. Do not include any
-  text outside the JSON. Be valid JSON.
-```
-
-And you get: roughly 90% of calls return JSON. The other 10% return JSON wrapped in markdown code fences, JSON with a chatty preamble ("Here's the anomaly:..."), JSON with trailing prose ("Let me know if you need more!"), or invalid JSON because the model put a comment in. Each is the model trying to be helpful in a way the instruction didn't anticipate.
-
-The example-based version:
+`lib/agents/legacy-prompts/monitoring.md:71-85`:
 
 ```
-  Do this:
+Return ONLY a JSON array of anomaly objects, at most 10 items, sorted by severity (critical → warning → info → positive), wrapped in a ```json fenced block:
 
-  ## Output
-  Return ONLY a JSON array ... wrapped in a ```json fenced block:
-
-  [
-    { "metric": "...", "severity": "critical", ... }
-  ]
+[
+  {
+    "metric": "purchase_revenue",
+    "category": "revenue_drop",
+    "scope": ["global"],
+    "change": { "value": 30.0, "direction": "down", "baseline": "90d" },
+    "severity": "critical",
+    "impact": "Revenue down 30% versus the prior 90 days on a baseline of ~12k purchases — a sustained drop at this magnitude pulls the quarterly topline by several million in lost sales, and if the trend holds it compounds across the channel mix.",
+    "evidence": [
+      { "tool": "execute_analytics_eql", "result": { "metric": "purchase_revenue", "current": 4200000, "prior": 6000000 } }
+    ]
+  }
+]
 ```
 
-Now the model has seen the wrapper (```json fence), the shape (array of objects), the casing, the punctuation. Compliance jumps because the model is *pattern-matching to the example*, not interpreting prose rules. Internet advice from 2022 was "tell the model to be valid JSON." Internet advice from 2024+ is "show the model an example of valid JSON." The example wins not because the instruction is wrong but because it's underspecified.
+One example. Not three, not ten — one. It's the canonical happy-path example: revenue down 30%, global scope, critical severity, with a real business-impact sentence and evidence citation. The model reads this and knows exactly what shape to emit.
 
-### Move 2 — the intent classifier's inline-hint version
+Two things worth noting. First, the `impact` field's example sentence is *long* and specific — that's teaching the model that impact is not a token-count-conscious field, it's the "why the user should care" sentence and should have real content. Second, the `evidence[0].result` is a real-shaped tool result with `current` and `prior` numbers — that teaches the model to cite specific numbers, not vague summaries.
 
-The intent classifier doesn't have a JSON example because its output isn't JSON. But it does have something example-shaped — inline parenthetical hints:
+**Step 2 — the recommendation prompt teaches format via inline literals.**
 
-```
-  // lib/agents/intent-legacy.ts:29-31
-  system:
-    'Classify the user query as exactly one word: ' +
-    'monitoring (what changed / what is new), ' +
-    'diagnostic (why did something happen), or ' +
-    'recommendation (what should I do). Reply with ONLY the one word.',
-```
-
-Each label has a paraphrase of what it means. That's not a few-shot example in the strict sense (no input/output pair), but it serves the same function: pinning what each label *covers*. Without the parentheses, the model might classify "what's the conversion rate?" as `diagnostic` (because it sounds like a question about a number); with the parentheses, "what changed" anchors it to `monitoring`.
-
-True few-shot for this classifier would look like:
+`@aptkit/prompts/dist/src/recommendation.js:54-70`:
 
 ```
-  Examples:
-    Q: "What's our revenue this month?"      → monitoring
-    Q: "Why did mobile drop yesterday?"      → diagnostic
-    Q: "Should we send a recovery email?"    → recommendation
+Each object must have:
+
+- title: string
+- rationale: string
+- bloomreachFeature: scenario | segment | campaign | voucher | experiment
+- steps: string[]
+- estimatedImpact: string OR { range: string, rangeUsd?: { low: number, high: number }, assumption: string }
+- confidence: high | medium | low
+- effort?: low | medium | high
+- timeToSetUpMinutes?: number
+- readResultInDays?: number
+- prerequisites?: { label: string, satisfied: boolean }[]
+- successMetric?: string
 ```
 
-It would cost ~40 more tokens per call. The inline-hint version costs ~15 and gets you most of the benefit. For a 16-max-token classifier, the cost matters; for a 4096-token agent, it wouldn't.
-
-### Move 2 — when NOT to use few-shot
-
-The query agent doesn't have a JSON example because its output is prose. Showing the model a worked answer ("Here's an example of a good answer: 'Conversion rate fell 18% in the US last week.'") would *narrow* the model's response style — it would parrot the example's structure and tone. For prose generation where the answer shape depends on the question shape, examples hurt more than they help.
-
-The rule: few-shot examples constrain output. That's good when you want constraint (structured output, classifier labels, format-sensitive fields). It's bad when you want flexibility (open-ended generation, prose answers to varying questions). blooming uses examples in every place where shape matters and skips them in the one place where shape doesn't.
-
-### Move 2 — the cost-per-example math
-
-Three examples cost roughly 3× the tokens of one example, and they don't add 3× the value. The marginal benefit of the second example is real (it shows the shape with different content, so the model learns "the shape is invariant"); the marginal benefit of the third is small (the model already has the shape pinned); the marginal benefit of the tenth is near zero.
+This is a *hybrid* — not a full JSON example, but a field-by-field schema with type annotations. It's teaching the shape via a description that reads like TypeScript. The model pattern-matches the description too, but less tightly than a literal example. This codebase is honest about the tradeoff: for recommendations, the *content* varies enough per case (title, rationale, steps are all context-specific) that a canonical example would over-constrain the emissions. The field-list-with-types is the middle ground.
 
 ```
-  Few-shot diminishing returns
+  Two flavors of few-shot in this codebase
 
-  examples  │  shape clarity  │  prompt token cost  │  ROI
-  ──────────┼─────────────────┼─────────────────────┼──────
-  0         │  low (guess)    │  0                  │  bad
-  1         │  high           │  ~120               │  great
-  3         │  very high      │  ~360               │  good
-  5         │  marginal +     │  ~600               │  ok
-  20        │  near zero +    │  ~2400              │  bad
+  ┌── literal JSON example (monitoring) ──────────────┐
+  │  full example object with real values             │
+  │  teaches: exact shape + tone of `impact` sentences │
+  │  risk: emissions become too similar to example    │
+  └───────────────────────────────────────────────────┘
+
+  ┌── field-schema example (recommendation) ──────────┐
+  │  field-by-field type annotations                  │
+  │  teaches: shape only, not content                 │
+  │  risk: shape drift because the constraint is soft │
+  └───────────────────────────────────────────────────┘
 ```
 
-blooming uses one example per structured agent. The data the codebase has (committed demo snapshots) suggests this is enough — the rejected-output rate at the type guard is low (when the guards reject, it's mostly because of edge cases the example didn't cover, not because of basic shape mismatch). Adding a second example would mostly be insurance for edge cases; adding ten would be wasteful.
+**Step 3 — the diagnostic prompt embeds the output shape as JSON.**
 
-The spec's rule of thumb — "3–5 good examples beats 20 mediocre ones" — applies to classifiers where coverage matters (one example per class). For shape constraints, even one example is usually enough.
+`@aptkit/prompts/dist/src/diagnostic.js:26-45`:
 
-### Move 2 — the few-shot + structured-output interaction
+```
+Return ONLY a JSON object in a \`\`\`json fenced block with this shape:
 
-The most interesting use of few-shot in this codebase is that *the example IS the structured-output contract*. The `## Output` section's worked Anomaly object simultaneously:
+{
+  "conclusion": "string",
+  "evidence": ["string"],
+  "hypothesesConsidered": [
+    { "hypothesis": "string", "supported": true, "reasoning": "string" }
+  ],
+  "affectedCustomers": { "count": 0, "segmentDescription": "string" },
+  "timeSeries": [{ "day": "w-3", "value": 0 }]
+}
 
-- declares the schema (every field appears)
-- pins the wrapping (```json fence)
-- provides the few-shot demonstration (the model pattern-matches)
-- doubles as documentation (a human reading the prompt understands what comes back)
+Omit affectedCustomers or timeSeries when you cannot support them from observed data.
 
-That's four jobs in one block of code. The discipline that makes it work: the example matches the type guard exactly. If the type guard requires `category`, the example has `category`. If the type guard allows `impact` to be optional, the example *still includes it* — because showing it teaches the model to produce it. The example is more generous than the guard; the guard is more lenient than the example. Both agree on what's required.
+If you cannot determine a cause, return:
+{
+  "conclusion": "Insufficient data to determine a cause for this change.",
+  "evidence": [],
+  "hypothesesConsidered": []
+}
+```
+
+Two examples here. The first is the happy-path shape. The second is the *edge case* — what to emit when the investigation fails to find a cause. That second example is the load-bearing few-shot: without it, the model would try to invent a conclusion when it should confess "insufficient data." With it, the model has a template for "I couldn't figure it out" that emits a valid Diagnosis shape and lets the downstream validator accept it.
+
+```
+  Edge-case few-shot — teaching the "I can't" shape
+
+  happy path example:              edge case example:
+  { "conclusion":"…mechanism…",     { "conclusion":"Insufficient data…",
+    "evidence":["…"],                 "evidence": [],
+    "hypothesesConsidered":[{…}]}    "hypothesesConsidered": [] }
+
+  without the edge case, the model tries to invent a conclusion
+  even when there's no signal.
+  with the edge case, the model has a template for "I can't."
+```
+
+**Step 4 — when to *not* few-shot.**
+
+Two places in this codebase where few-shot is deliberately absent. First: **the intent classifier** (`@aptkit/agent-query/dist/src/intent.js:13`):
+
+```
+'Classify the user query as exactly one word: monitoring (what changed / what is new), diagnostic (why did something happen), or recommendation (what should I do). Reply with ONLY the one word.'
+```
+
+No examples. Just a one-line instruction with the three allowed outputs enumerated. Why? Because the output is one of three literal words, the instruction is fully specified, and adding examples would (a) grow the prompt, (b) risk the model over-fitting to the example queries, (c) not add signal beyond the three-word enumeration. Few-shot has a cost (tokens) and no benefit here.
+
+Second: **the impact sentences** inside monitoring outputs. Look at the example impact: "Revenue down 30% versus the prior 90 days on a baseline of ~12k purchases — a sustained drop at this magnitude pulls the quarterly topline by several million in lost sales, and if the trend holds it compounds across the channel mix." That's *one* example, and the risk is that every impact sentence in every emission starts to sound like it (see `13-forbidden-patterns.md` for the specific bug — model convergence on phrasings). This codebase mitigates by making the example prose long enough that direct copying is obviously wrong; a shorter example would be more prone to being echoed.
+
+**Step 5 — the 3-to-5 rule.**
+
+Working consensus: **3–5 good examples beats 10 mediocre ones**. Three examples give the model enough variance to pattern-match on shape without over-fitting to any single example. Ten examples eat tokens and add marginal signal past the fifth. Zero examples leaves emission variance high.
+
+This codebase uses *one* example per output shape in most prompts. That's below the 3-to-5 rule. Why? Two reasons. First, the examples are load-bearing for shape but not for content variance — the content varies by anomaly, and the model handles that naturally. Second, adding more examples would grow the system prompt and push the stable-prefix cache boundary further — see `04-token-budgeting.md`; every added byte of few-shot is a byte you pay for once at cache_creation and then read cheaply, so the tradeoff isn't per-call cost, it's cache creation cost + prompt readability.
+
+```
+  Few-shot count — the tradeoff curve
+
+  0 examples:  emission variance HIGH, prompt tokens LOW
+  1 example:   emission variance MEDIUM (shape locked, content free), tokens LOW
+  3-5 exampls: emission variance LOW (well-locked), tokens MEDIUM
+  10+:         emission variance LOW (over-fit risk), tokens HIGH,
+                readability POOR
+```
+
+### Move 2 variant — the load-bearing skeleton
+
+The kernel of few-shot in this codebase is three moves:
+
+```
+  canonical happy-path example + edge-case example + no example for classifiers
+```
+
+What breaks if you skip each:
+
+- **Skip "canonical happy-path"** — emission variance grows. Half your outputs are well-shaped; the other half have subtle field drift.
+- **Skip "edge-case"** — the model confabulates when it should confess. Diagnostic without the "Insufficient data" template invents diagnoses on no-signal cases (see `10-no-signal-*` cases in `eval/goldens/` — these are the specific cases this few-shot addresses).
+- **Skip "no example for classifiers"** — you add examples where they don't earn tokens. Same output, larger prompt, worse cache economics.
+
+Hardening layered on top: rotating examples across chain calls (see `13-forbidden-patterns.md` for the related concept), edge-case examples per known failure mode, negative examples ("do NOT emit this shape").
 
 ### Move 3 — the principle
 
-Few-shot examples are the highest-leverage tool in the prompt-engineering toolkit when output shape matters. One worked example pins shape better than ten lines of prose rules; the cost is ~100 tokens per call; the benefit compounds with every call (consistent output, low parser failure rate, easy code review). Use examples wherever shape matters; skip them where flexibility matters. The choice is per-prompt, not per-codebase.
+**Examples are the fastest way to constrain shape and the slowest way to constrain content.** For format-sensitive outputs (JSON, tags, structured objects), one example locks the shape better than three paragraphs of description. For open-ended outputs (a narrative recommendation, a creative summary), examples over-constrain content and every output starts to sound like the example. Reach for few-shot when the answer to "what should the output look like exactly" is a specific bytes-pattern; skip it when the answer is "it depends on the input."
 
 ## Primary diagram
 
 ```
-  Few-shot in blooming — example placement, why each is the way it is
+  Few-shot in Blooming — where each prompt uses what
 
-  ┌─ monitoring.md ───────────────────────────────────────────┐
-  │  ## Output                                                 │
-  │  ┌─ INSTRUCTIONS ────────────────────────────────────┐    │
-  │  │ "Return ONLY a JSON array ... wrapped in ```json" │    │
-  │  └────────────────┬──────────────────────────────────┘    │
-  │                   │                                        │
-  │  ┌─ EXAMPLE (the few-shot) ───────────────────────────┐   │
-  │  │ [                                                   │   │
-  │  │   { "metric": "purchase_revenue",                   │   │
-  │  │     "category": "revenue_drop",                     │   │
-  │  │     "change": { "value": 30, "direction": "down",   │   │
-  │  │                 "baseline": "90d" },                │   │
-  │  │     "severity": "critical",  ← magnitude matches    │   │
-  │  │     "impact": "Revenue down 30%..." }               │   │
-  │  │ ]                                                   │   │
-  │  └─────────────────────────────────────────────────────┘   │
-  │  ┌─ FIELD RULES (the gloss) ─────────────────────────┐    │
-  │  │ "- severity — critical (>20%), warning (10-20%)..."│    │
-  │  └────────────────────────────────────────────────────┘    │
-  └────────────────────────────────────────────────────────────┘
+  ┌── monitoring prompt ────────────────────────────────────┐
+  │  ## Output                                              │
+  │  Return ... ```json fenced block:                       │
+  │  [ { "metric": "purchase_revenue", ... } ]              │  ← 1 full literal
+  │                                                          │    example (30% rev drop)
+  │  purpose: teach exact shape + tone of `impact` sentence  │
+  └─────────────────────────────────────────────────────────┘
 
-  ┌─ intent (intent-legacy.ts:29-31) ──────────────────────────┐
-  │  inline parenthetical hints, not full examples              │
-  │  "monitoring (what changed)..."                             │
-  │  → fits the 16-token budget                                 │
-  └────────────────────────────────────────────────────────────┘
+  ┌── diagnostic prompt ────────────────────────────────────┐
+  │  Return ... with this shape: { conclusion, ... }        │  ← happy-path shape
+  │                                                          │
+  │  If you cannot determine a cause, return:                │  ← edge-case example
+  │  { conclusion: "Insufficient data ...", ... }            │    (the load-bearing part)
+  └─────────────────────────────────────────────────────────┘
 
-  ┌─ query.md ─────────────────────────────────────────────────┐
-  │  NO example — prose output, examples would narrow voice    │
-  └────────────────────────────────────────────────────────────┘
+  ┌── recommendation prompt ────────────────────────────────┐
+  │  Each object must have:                                 │
+  │  - title: string                                        │  ← field-schema example
+  │  - bloomreachFeature: scenario|segment|...              │    (types, no full example)
+  │                                                          │
+  │  purpose: shape without over-constraining content        │
+  └─────────────────────────────────────────────────────────┘
 
-  pattern: examples where shape matters · skip where flexibility matters
+  ┌── intent classifier ────────────────────────────────────┐
+  │  "Classify ... Reply with ONLY the one word."           │  ← NO examples
+  │                                                          │
+  │  purpose: output is fully specified by the instruction   │
+  └─────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The "respond only in JSON" anti-pattern is canonical because it was good advice in 2022 and bad advice by 2024. Models in 2022 needed the instruction because they hadn't been trained heavily on tool-calling and JSON-output use cases. Models in 2024+ have been trained on enough JSON-emitting work that the *example* is what pins the shape; the instruction is mostly noise. This is one of the cases where reading dated blog posts will lead you astray — what was best practice three years ago is mediocre practice today, because the underlying model behavior has shifted.
+The 3-to-5 rule came out of empirical work on GPT-3-era models where prompt lengths were expensive and every example counted. Modern models (Sonnet 4.6, GPT-4.5) are more sample-efficient — one good example often gets you 90% of the shape-locking effect, and each additional example adds diminishing returns. This codebase's use of *one* example per prompt is a working reflection of that: the cost of adding more examples (prompt size, over-fit risk) exceeds the marginal signal past the first.
 
-The Anthropic prompt engineering guide leans hard on examples as the primary tool for shape constraint, with explicit advice to put them inside XML-like tags for Claude's training preferences. blooming uses ```json fences instead of `<example>...</example>` tags, partly because the model handles either fine and the fence is more readable to a human reviewer. This is the kind of vendor-specific quirk worth knowing but not building around: the underlying pattern (one worked example > ten prose rules) survives across providers; the *exact tag syntax* varies.
+The interaction between few-shot and structured output is worth naming: **a few-shot example is itself a structured-output example**. When the prompt says "return this JSON" and shows the JSON, you're doing few-shot at the schema level. This is why the anatomy of the "## Output" section in every prompt in this codebase is functionally identical across chains — it's the schema-few-shot pattern, applied per chain.
 
-The query agent's deliberate absence of examples is the underrated half of this concept. When the answer shape varies per question, an example narrows the model's range in unwanted ways. The reader's loopd portfolio probably exercises this — chain prompts where every output sounds the same because the few-shot showed it how to sound. The fix in those cases is to *remove* the example, or to make the example explicitly varied ("here are three different answers in three different shapes; respond in whichever fits the question").
+Anthropic's prompt engineering guide leans heavily on this: their canonical recommendation is "wrap examples in `<example>` tags." This codebase doesn't use XML tags — the examples are markdown-fenced JSON blocks — but the shape is the same. Either works; pick one, stay consistent.
 
-The eugeneyan.com blog has good material on example selection — particularly the point that *which* example you pick matters as much as *how many*. An example with `severity: "critical"` and `change.value: 30` teaches the model "30% triggers critical." An example with `severity: "info"` and `change.value: 5` teaches the model "5% might still be reportable." Pick the example that pins the boundary you care about. blooming's monitoring example picks `critical / 30%` — biasing the model toward emitting `critical` for serious changes, which is the right bias for a monitoring agent (false negatives are worse than false positives).
+Two failure modes I've watched happen with few-shot:
+
+- **The "leaked example" bug.** Someone puts a real customer's data into the example. Six months later a support engineer sees the model quote that customer's name in an unrelated response. Fix: use synthetic data for examples, always.
+- **The over-fit bug.** The example uses a specific phrasing ("Revenue down 30%") and every emission starts with "Revenue down X%" regardless of what the actual metric is. Fix: use variable phrasings across the example if it's a template, or use forbidden-patterns discipline (see `13-forbidden-patterns.md`).
+
+Related concepts:
+- **Anatomy** (`01-anatomy.md`) — few-shot sits in the rules/schema section.
+- **Structured outputs** (`02-structured-outputs.md`) — a schema example IS a few-shot example.
+- **Forbidden patterns** (`13-forbidden-patterns.md`) — the specific bug when few-shot causes convergence.
+- **Chain-of-thought** (`09-chain-of-thought.md`) — few-shot of reasoning is a related but distinct technique.
 
 ## Interview defense
 
-**Q: When would you use few-shot, and when would you skip it?**
+**Q: When do you use few-shot in a production prompt, and when don't you?**
 
-A: Use few-shot when output *shape* matters — structured outputs, classifiers, format-sensitive fields where the model needs to learn the exact syntax. Skip few-shot when output *flexibility* matters — open-ended prose generation where the answer should adapt to the question. blooming uses examples in three of five agents (monitoring, diagnostic, recommendation — all structured) and skips them in two (intent uses inline hints to fit a 16-token budget; query produces prose where examples would narrow the voice). The decision rule: if showing the model a specific instance would push the answer in an unwanted direction, skip; if showing it pins the shape, use.
-
-```
-  what I'd sketch:
-
-  use example when:      skip example when:
-  ────────────────       ──────────────────
-  shape is fixed         shape varies per input
-  classifier labels      open-ended generation
-  format-sensitive       prose where voice matters
-  parser at boundary     human consumer
-```
-
-**Q: What's the courteous-model bug, and how do examples help?**
-
-A: The courteous-model bug: you tell the model "return JSON only," and most of the time it does. Sometimes — especially if the prompt also tells it to "be concise" or "explain your reasoning" — it gets chatty and wraps the JSON in a markdown code fence as a politeness ("Here you go:\n```json\n...\n```"). The parser breaks. Examples help because the example *includes* the fence — when the model sees the example wrapped in ```json...```, it learns "the wrapper is part of the output," not "the wrapper is something I should avoid." blooming's worked Anomaly object lives inside a ```json fence in the prompt, which teaches the model that ```json fences are part of the contract. Combined with `parseAgentJson` (which strips the fence on the way back), the system is robust to both fence-included and fence-omitted output — the example normalizes one common form; the parser handles the other.
+Use it when the output is format-sensitive — JSON, tags, a specific structured shape — because one literal example locks the shape tighter than three paragraphs of description. Don't use it when the output is open-ended (a narrative, a creative summary) because every emission will start to echo the example. Don't use it when the instruction is fully specified — the intent classifier in this codebase is a one-line instruction with three allowed outputs, and adding examples would grow the prompt without adding signal. In this codebase, the monitoring / diagnostic / recommendation prompts use one embedded example each for the JSON shape; the classifier uses zero.
 
 ```
-  example contains the wrapper → model emits the wrapper → parser strips it
+  Decision — few-shot yes/no
 
-  prompt:  example shown as  ```json\n[...]\n```
-  model:   emits             ```json\n[...]\n```
-  parser:  strips the fence, JSON.parse the inside
-
-  → discipline: example + parser are co-designed
-                example sets the model's preferred form;
-                parser handles the form the model picks anyway.
+  format-sensitive output?   → yes, embed 1-3 examples
+  open-ended generation?      → no, examples cause convergence
+  instruction fully specified? → no, examples add tokens without signal
+  edge case needs a template? → yes, one edge-case example
 ```
+
+Anchor: monitoring prompt's example at `lib/agents/legacy-prompts/monitoring.md:71-85`; diagnostic edge-case example at `@aptkit/prompts/dist/src/diagnostic.js:41-45`.
+
+**Q: The diagnostic agent starts confabulating a conclusion on no-signal cases. What's the fix?**
+
+Look at whether the prompt has an edge-case example for "insufficient data." In this codebase it does: `@aptkit/prompts/dist/src/diagnostic.js:41-45` — "If you cannot determine a cause, return: { conclusion: 'Insufficient data ...', evidence: [], hypothesesConsidered: [] }". That literal template gives the model a shape to emit when the happy path doesn't apply. Strip it, and the model tries to invent a conclusion from priors instead of confessing the miss. The specific eval cases where this shows up are the `05-no-signal-*`, `06-no-signal-*`, and `10-no-signal-*` goldens — they test whether the diagnostic agent uses the template or invents. When the eval fails on those cases, the first thing to check is whether the template example is still in the prompt.
+
+```
+  Edge-case few-shot — the specific bug it prevents
+
+  without edge-case example:         with edge-case example:
+  no-signal case                     no-signal case
+    │                                   │
+    ▼                                   ▼
+  model has no template for            model emits the template:
+  "I can't figure this out"            { conclusion: "Insufficient data..." }
+    │                                   │
+    ▼                                   ▼
+  invents a plausible conclusion       eval passes (no confabulation)
+  eval fails on no-signal cases        gate is satisfied
+```
+
+**Q: What's the load-bearing part people forget?**
+
+The edge-case example. Everyone remembers the happy-path example. The load-bearing few-shot is the "here's what to emit when you can't do the job" template — because without it, the model tries to do the job anyway and invents. In this codebase, the diagnostic prompt's "Insufficient data" template at `@aptkit/prompts/dist/src/diagnostic.js:41-45` is the specific example. Every no-signal case in the eval set (`05-no-signal-retention-subscribers`, `06-no-signal-price-sensitivity-luxury`, `10-no-signal-seo-organic`) is testing whether the model uses that template instead of confabulating. Miss the template and half your no-signal cases regress.
 
 ## See also
 
-- [01-anatomy.md](./01-anatomy.md) — the example lives inside the system-prompt section
-- [02-structured-outputs.md](./02-structured-outputs.md) — the example IS the contract that the type guard enforces
-- [04-token-budgeting.md](./04-token-budgeting.md) — the example costs ~100 tokens; one is plenty for shape
-- [07-output-mode-mismatch.md](./07-output-mode-mismatch.md) — keeping the example in sync with the type guard is how mismatches don't ship
+- `01-anatomy.md` — the rules/schema section where few-shot lives.
+- `02-structured-outputs.md` — a schema example IS a few-shot example.
+- `09-chain-of-thought.md` — few-shot of reasoning is a related pattern.
+- `13-forbidden-patterns.md` — the failure mode when few-shot causes convergence.

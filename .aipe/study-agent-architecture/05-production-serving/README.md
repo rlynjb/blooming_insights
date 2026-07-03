@@ -1,21 +1,16 @@
-# 05 — Production serving for agents
+# Section E — Production serving for agents
 
-Anchor: single-agent + multi-agent (both)
+**Anchor:** single-agent + multi-agent (both). What single-call serving concerns become once the unit is an autonomous loop or a topology.
 
-What changes when the unit of execution is a loop (single-agent) or a topology (multi-agent), where the same single-call problems compound across turns and concurrent agents.
+`study-ai-engineering`'s production-serving section covers single-call caching, cost, rate-limit, retry. This sub-section covers the concerns that only show up once you have a loop or a topology issuing many calls, often against the same tool, often concurrently.
 
-This sub-section does **not** re-teach single-call serving (caching, cost, rate limiting/backpressure, retry/circuit-breaker for one model call). Those mechanics would live in `study-ai-engineering`'s production-serving sub-section when generated. What lives here is the three places where the single-call version is insufficient because the unit is now a loop or topology.
+## Files
 
-## How this maps to the repo
-
-All three patterns are exercised. The most live is **per-tool retry** in `BloomreachDataSource` — the rate-limit retry ladder that turns "MCP returned 429" into "sleep parsed retry-after window, try again, up to 3x."
-
-Fan-out backpressure isn't exercised in the multi-agent sense (no fan-out topology), but the proactive `minIntervalMs=200ms` spacing primitive is the same one a fan-out cap would use.
-
-Cross-turn caching is live at two layers: provider-side prompt-prefix caching (implicit at Anthropic) and intra-run memoization (the 60s `BloomreachDataSource` cache).
+1. **`01-rate-limit-compliance.md`** — the 1-req/s spacing gate + retry ladder in `BloomreachDataSource`. The de-facto backpressure on every fan-out.
+2. **`02-fan-out-backpressure.md`** — semaphore-based load harness in `eval/load.eval.ts`. Concurrency cap = worker count.
+3. **`03-fault-injection-and-graceful-degradation.md`** — `FaultInjectingDataSource` decorator + the receipt (9 faults / 3 investigations / 0 failed).
+4. **`04-cost-controls.md`** — the four cost levers together: BudgetTracker, prompt caching, Anthropic pricing helper, per-tool budgets.
 
 ## Reading order
 
-1. `01-cross-turn-caching.md` — the layered cache story.
-2. `02-fan-out-backpressure.md` — the concurrency-cap primitive (the rate-limit spacing IS this).
-3. `03-per-tool-circuit-breaking.md` — the retry ladder; the failure-as-observation pattern.
+01 → 02 → 03 → 04. Rate-limit compliance sets the ceiling every fan-out runs against; the load harness exercises the fan-out against that ceiling; fault injection proves the shape holds under chaos; cost controls close by naming the compound levers.

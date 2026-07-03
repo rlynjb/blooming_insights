@@ -1,226 +1,174 @@
-# Agent memory
+# 05 — Agent memory
 
-*Industry standard — short-term (in-context) vs long-term (retrieved)*
+**Type:** Industry standard. Also called: conversation memory, short-term vs long-term memory.
 
-## Zoom out — where this concept lives
+## Zoom out, then zoom in
 
-The classic split: short-term memory is what fits in the context window for this run; long-term memory is anything persistent across sessions (vector DB, conversation history, user preferences). **This codebase has only short-term memory**, and even that is limited to within-a-single-invocation (the AptKit loop's accumulating message history). There is no cross-session memory.
+Two layers of memory in this codebase. Short-term (the messages array within one investigation). Long-term (session storage, demo snapshots — human-scale persistence, not RAG retrieval).
 
 ```
-  Zoom out — what memory exists in this codebase
+  Zoom out — memory layers
 
-  ┌─ Within a single agent invocation ──────────────────────┐
-  │  message history grows turn by turn                      │
-  │  (tool_use + tool_result blocks accumulate)              │
-  └──────────────────────┬──────────────────────────────────┘
-                         │  ends at agent.return()
-                         ▼
-  ┌─ ★ Between agents in the same investigation ★ ──────────┐ ← we are here
-  │  Diagnosis object passed from step 2 → step 3           │
-  │  via sessionStorage + query param                       │
-  │  this IS the long-term memory in this codebase          │
-  └──────────────────────┬──────────────────────────────────┘
-                         │  ends at the browser tab closing
-                         ▼
-  ┌─ Between sessions ──────────────────────────────────────┐
-  │  NOTHING. No vector DB, no user history, no             │
-  │  conversation-across-sessions, no persisted preferences │
-  └─────────────────────────────────────────────────────────┘
+  ┌─ Short-term (in-context, this turn) ──────────────────────────────┐
+  │  messages array — grows across the ReAct loop                     │
+  │  disappears when the investigation ends                            │
+  └───────────────────────────────────────────────────────────────────┘
+
+  ┌─ Long-term (persisted, across investigations) ────────────────────┐
+  │  sessionStorage (per browser tab) — useInvestigation hook stash    │
+  │  demo snapshot (committed lib/state/demo-*.json)                   │
+  │  NOT retrieved by the agent — accessible only via UI               │
+  └───────────────────────────────────────────────────────────────────┘
 ```
 
-**Zoom in.** The "memory" between agents in this codebase is a typed structured handoff (the `Diagnosis` object). No agent has memory of *prior* sessions; every briefing is fresh; every investigation starts from the anomaly + workspace shape and accumulates only within itself.
+Zoom in. Short-term memory is standard — every LLM app has it (the messages array). Long-term memory in this codebase is HUMAN-facing (the user navigates back to a completed investigation) but NOT AGENT-facing (the diagnostic agent doesn't retrieve past investigations at runtime). The RAG-shaped long-term memory would be Case B (see `03-retrieval-and-rag/11-rag.md`).
 
-## Structure pass — layers · axes · seams
+## Structure pass
 
-**Layers:** within-agent → between-agents (within investigation) → cross-session.
+**Layers:**
+- Outer: what the AGENT can access at runtime
+- Middle: what the APP persists across sessions
+- Inner: what the UI shows the user
 
-**Axis: how long does memory last?** Within-agent: seconds (one invocation). Between-agents: minutes (one investigation, one browser tab). Cross-session: NONE.
+**Axis: who accesses this memory?**
+- Short-term messages array: the model (during the loop)
+- Session storage: the UI (navigation, refresh)
+- Demo snapshot: the UI + capture tooling (committed as source of truth for demo mode)
+- (missing) Long-term retrieved memory: would be agent-accessible via RAG
 
-**Seam:** the `Diagnosis` handoff (`02-context-and-prompts/03-prompt-chaining.md`) is the memory between agents. SessionStorage + query param is the persistence layer.
+**Seam:** the boundary between "in the loop's messages" and "on disk." The agent only sees what's in messages. Everything else is UI persistence.
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1
 
-You know how a Python REPL forgets everything between sessions but remembers what you typed in this session? Same shape — every variable persists across calls *within* the REPL, but once you close it, gone. This codebase's agents are like that — they remember within a session but not across.
-
-```
-  Three altitudes of memory, only two exist here
-
-  ┌─ Short-term, within agent ────────────────────────────┐
-  │  Loop's message history                                │  EXISTS — AptKit's
-  │  - assistant text (Thoughts)                          │  internal accumulator
-  │  - tool_use blocks (Actions)                          │
-  │  - tool_result blocks (Observations)                  │
-  │  Disappears when agent.invoke() returns               │
-  └────────────────────────────────────────────────────────┘
-  ┌─ Mid-term, between agents in same investigation ───────┐
-  │  Diagnosis object handoff                              │  EXISTS — see
-  │  - structured (typed)                                  │  02-context-and-prompts/
-  │  - browser sessionStorage + query param                │  03-prompt-chaining.md
-  │  Disappears when browser tab closes                    │
-  └────────────────────────────────────────────────────────┘
-  ┌─ Long-term, across sessions ───────────────────────────┐
-  │  Past investigations                                   │  NOT EXERCISED
-  │  Past anomalies                                        │  no DB, no vector store,
-  │  User-specific preferences ("show me USA first")       │  no user-history persistence
-  │  → would require: vector DB + retrieval per session    │
-  └────────────────────────────────────────────────────────┘
-```
-
-### Move 2 — the step-by-step walkthrough
-
-**Part 1 — short-term: the message history inside one agent invocation.**
-
-When `diagAgent.investigate(anomaly)` runs, AptKit maintains a message history that grows with every iteration:
+You've distinguished between "state in a React component" (short-term, dies with the component) and "state in localStorage" (long-term, survives reload). Same shape for agent memory: what's in the messages array is short-term (dies with the loop); what's in sessionStorage / demo snapshot is long-term (survives the investigation).
 
 ```
-  Iteration 1 messages:
-   [ system, user("investigate this anomaly: …") ]
+  Two memory layers
 
-  After iteration 1 tool call:
-   [ system,
-     user(...),
-     assistant({ text, tool_use("execute_analytics_eql", ...) }),
-     user({ tool_result(...) }) ]
+  ┌─ Short-term ──────────────────────────────────────┐
+  │  the messages array — everything the model sees    │
+  │  dies at loop end                                  │
+  └───────────────────────────────────────────────────┘
 
-  After iteration 2:
-   [ system, user, assistant, user,
-     assistant({ text, tool_use("get_funnel", ...) }),
-     user({ tool_result(...) }) ]
-
-  ... and so on, until the LLM emits no tool_use → loop exits
+  ┌─ Long-term (this codebase — not retrieved) ───────┐
+  │  sessionStorage per-tab   (useInvestigation)       │
+  │  demo snapshot on disk    (lib/state/demo-*.json)  │
+  │  UI hydrates from these; agent does NOT            │
+  └───────────────────────────────────────────────────┘
 ```
 
-The history is the agent's memory for this invocation. By iteration N, the prompt carries the full accumulated context. This is bounded by AptKit's iteration cap (no infinite growth).
+### Move 2
 
-**Part 2 — mid-term: the Diagnosis handoff.**
+**Short-term: the messages array.**
 
-When the diagnostic agent finishes, it returns a `Diagnosis`. The route emits it as a `'diagnosis'` event on the stream; the browser stashes it in sessionStorage. When the user clicks "see recommendations →", the diagnosis goes back to the server as a query param and the recommendation agent receives it as structured input.
+Every model turn re-sends the whole history. That's the entire "memory" during the loop. See `02-context-and-prompts/01-context-window.md` for the mechanics. Dies at investigation end — the diagnostic agent's next invocation on a different anomaly starts fresh.
 
-From `app/api/agent/route.ts:81-92` (the validator):
+**Long-term type 1: sessionStorage.**
 
-```typescript
-function parseDiagnosis(param: string | null): Diagnosis | null {
-  if (!param) return null;
-  try {
-    const d = JSON.parse(param);
-    if (d && typeof d.conclusion === 'string' && Array.isArray(d.evidence) && Array.isArray(d.hypothesesConsidered)) {
-      return d as Diagnosis;
-    }
-  } catch { /* ignore */ }
-  return null;
-}
-```
+`lib/hooks/useInvestigation.ts` (per project context) stashes the diagnosis + recommendations in `sessionStorage`. Purpose: the user can navigate back to step 2 or forward to step 3 without re-running the agent. Survives StrictMode double-mount. Dies when the tab closes.
 
-The Diagnosis is structured, validated, and limited in scope (one investigation's findings). It's NOT a free-form conversation buffer; it's a typed object the recommendation agent treats as a fact.
+**Long-term type 2: the demo snapshot.**
 
-**Part 3 — long-term: nothing exists today.**
+`lib/state/demo-insights.json` and `lib/state/demo-investigations.json`. Committed. Captured once locally via the dev-only capture button; replayed by `?demo=cached`. Instant, no auth, no live agents. This is the "reliable presentation path" — same NDJSON events the live path emits, replayed from disk.
 
-```
-  What this codebase explicitly does NOT have:
+**Why no retrieved long-term memory (RAG-shaped) today.**
 
-  - No 'past investigations' surface — the briefing shows TODAY's anomalies only.
-  - No user profile — there's no per-user history of "what this user asked about".
-  - No conversation history across sessions — every chat query starts fresh.
-  - No vector DB — see 03-retrieval-and-rag/03-rag-concepts-not-yet-exercised.md
-  - No preferences — "the user always wants USA first" isn't a notion the agents know.
+Two reasons: (1) volume of past investigations is low; (2) the diagnostic agent has strong tool-call grounding to CURRENT DATA, so retrieving prior reasoning is additive not necessary. See `03-retrieval-and-rag/11-rag.md` for the shape it would take if added.
 
-  The in-memory state at lib/state/insights.ts:62 is per-process, cleared
-   on every briefing run (putInsights() calls .clear() per session).
-   That's a feed-state cache, not memory.
-```
+**The retrieval question, if it were added.**
 
-**Part 4 — why no long-term memory yet.**
+Would look like: on `DiagnosticAgent.investigate(anomaly)`, first embed the anomaly, retrieve top-3 similar past diagnoses from a vector store, prepend their conclusions to the initial user message as "context from similar past cases." Same ReAct loop; enriched initial context. Case B exercise below.
 
-Two reasons. First, the user pattern hasn't asked for it — analysts run a briefing each morning, investigate what looks interesting, and don't currently say "remind me about that thing from last week." Second, the storage layer doesn't exist — adding a vector DB or even a Postgres table is a sizeable lift relative to the current "no DB, in-memory + session cookies" shape (see `study-system-design`).
+### Move 3
 
-The natural shape if it lands: a per-user `Map<userId, PastInvestigation[]>` stored in something like Vercel KV (or Postgres), with optional vector retrieval over past diagnoses if "find me similar past anomalies" becomes a feature.
+Short-term memory is unavoidable — it IS the messages array. Long-term memory is a design decision: what's worth persisting, who accesses it (UI or agent), how it's retrieved (direct lookup or similarity). This codebase persists for UI navigation but not for agent access. That's a shape, not a limitation.
 
-### Move 3 — the principle
-
-**Memory has altitudes; pick the altitude that matches what the product needs.** Most LLM-app conversations about "agent memory" assume long-term persistence. This codebase deliberately stays in the short-term + mid-term band because the product is investigation-shaped, not chat-shaped. Honest framing: long-term memory isn't missing; it's not needed.
-
-## Primary diagram — the full recap
+## Primary diagram
 
 ```
-  Three altitudes of memory in this codebase
+  Memory layers in this codebase
 
-  Short-term (per agent invocation):
-   ┌─ AptKit loop's message history ────────────────────────┐
-   │  accumulates: system + user + (assistant + user)*       │
-   │  bounded by: iteration cap                              │
-   │  lifetime:   seconds; cleared at agent.return()         │
-   └─────────────────────────────────────────────────────────┘
+  ┌─ Loop-scoped (short-term) ────────────────────────────────────────┐
+  │                                                                   │
+  │  messages array                                                   │
+  │    [system, user(anomaly), asst, user(tool_result), asst, ...]    │
+  │    grows across ~5-10 turns                                       │
+  │    dies at DiagnosticAgent.investigate() return                    │
+  │                                                                   │
+  └───────────────────────────────────────────────────────────────────┘
 
-  Mid-term (within one investigation):
-   ┌─ Diagnosis handoff ────────────────────────────────────┐
-   │  step 2 emits Diagnosis → sessionStorage                │
-   │  → query param on step-3 nav                            │
-   │  → parseDiagnosis at route boundary                     │
-   │  → recommendation agent receives structured input       │
-   │  bounded by: typed shape (conclusion, evidence,         │
-   │              hypothesesConsidered)                      │
-   │  lifetime:   minutes; cleared at tab close              │
-   └─────────────────────────────────────────────────────────┘
+  ┌─ Browser-tab-scoped (medium-term) ────────────────────────────────┐
+  │                                                                   │
+  │  sessionStorage (useInvestigation hook)                            │
+  │    stashes {trace, diagnosis, recommendations} keyed by insight id │
+  │    survives navigation between step 2 and step 3                   │
+  │    dies at tab close                                               │
+  │                                                                   │
+  └───────────────────────────────────────────────────────────────────┘
 
-  Long-term (cross-session):
-   ┌─ NOT EXERCISED ─────────────────────────────────────────┐
-   │  Would require: persistent storage + retrieval surface  │
-   │  Natural shape: per-user investigations array, optional │
-   │                  vector retrieval over past diagnoses   │
-   │  Why not today: product is investigation-shaped, not   │
-   │                  chat-shaped — analysts don't ask       │
-   │                  follow-ups across sessions             │
-   └─────────────────────────────────────────────────────────┘
+  ┌─ Repo-scoped (permanent, committed) ──────────────────────────────┐
+  │                                                                   │
+  │  lib/state/demo-insights.json                                     │
+  │  lib/state/demo-investigations.json                               │
+  │    committed snapshots; replay engine                             │
+  │    used by ?demo=cached for auth-free demo path                   │
+  │                                                                   │
+  └───────────────────────────────────────────────────────────────────┘
+
+  ┌─ (missing) Agent-retrievable long-term memory ────────────────────┐
+  │                                                                   │
+  │  Vector store over past diagnoses (Case B)                        │
+  │  Agent-side retrieval on each new investigation                    │
+  │  Would let agent "remember" similar past cases                    │
+  │                                                                   │
+  └───────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-**Why structured handoff beats free-form memory.** The recommendation agent receives a `Diagnosis` object, not a "here's everything the diagnostic agent thought" message dump. Three benefits:
+The industry pattern for agent long-term memory:
+- **Episodic memory** — full conversation logs, retrieved by similarity to current query.
+- **Semantic memory** — extracted facts / claims / preferences, indexed and retrieved.
+- **Working memory** — the current loop's messages array (short-term).
 
-  1. **Typed contract.** `parseDiagnosis()` validates the shape; malformed input fails loudly.
-  2. **Smaller prompt.** The recommendation agent's prompt embeds the diagnosis as structured fields, not as a transcript. Saves tokens.
-  3. **Testable seam.** A test can construct a `Diagnosis` directly and call `RecommendationAgent.propose()` — no need to first run the diagnostic agent.
-
-Free-form conversation memory ("the agent remembers everything that's been said") trades all three of those for flexibility you don't need at this product shape.
-
-**Where long-term memory would land if added.** Two surfaces would benefit most:
-
-  1. **"Show me similar past anomalies."** Vector retrieval over past diagnoses' `conclusion` field. Adds context to a fresh investigation without re-running prior work.
-  2. **User preferences in the prompt.** "This user always cares about USA more than other countries" surfaces in the briefing agent's prompt. Light memory (per-user kv store), not a full vector DB.
-
-Both are post-MVP territory. Adding them prematurely would saddle the codebase with storage complexity it doesn't need yet.
+Modern agent frameworks (LangGraph, CrewAI) bake all three in as first-class concepts. AptKit today ships working memory (the messages array) and lets the caller layer episodic / semantic on top. This codebase uses only working memory + UI persistence; no retrieved memory of any shape.
 
 ## Project exercises
 
-### Exercise — Persist investigations to a queryable store with "show me past investigations" surface
+### Exercise — retrieved episodic memory over past investigations
 
-  → **Exercise ID:** B4.5
-  → **What to build:** Add a persistent store for completed investigations (Vercel KV or a SQLite file in dev). Each completed `Investigation` (anomaly + diagnosis + recommendations) is written when the chain finishes. Add a new feed surface — "past investigations" — that lists prior ones with filters (date range, severity, category). Optional: vector retrieval over diagnoses' `conclusion` field, exposed as a `search_past_investigations(query)` tool the query agent can call.
-  → **Why it earns its place:** turns the "no cross-session memory" gap into a real product feature. Demonstrates the storage + retrieval pattern at a sane corpus size (one user's past investigations is small but useful). The optional vector layer puts the codebase's first taste of real RAG into a genuinely useful spot.
-  → **Files to touch:** new `lib/state/past-investigations.ts` (the store), new `app/past/page.tsx` (the surface), `lib/agents/query.ts` (optional: add the new tool to the query agent's allowlist), `test/state/past-investigations.test.ts` (cover write + query + filter).
-  → **Done when:** completed investigations land in the store, the past-investigations page renders them with filters, an opt-in vector-retrieval flag enables the query agent's new tool, and the test suite covers both the store and the optional retrieval.
-  → **Estimated effort:** ≥1 week.
+- **Exercise ID:** C4.5-B · Case B (short-term exercised; long-term retrieval not).
+- **What to build:** if the RAG stack from `03-retrieval-and-rag/*` is present, wire the diagnostic agent to retrieve top-3 similar past diagnoses at the start of each investigation and prepend them to the initial user message.
+- **Why it earns its place:** turns the codebase's long-term memory from UI-persistence into agent-accessible. Interviewer signal: "my agents can remember; here's the retrieval that enables it."
+- **Files to touch:** `lib/agents/diagnostic.ts` (accept optional retrieved context), `lib/rag/retrieve.ts` (call before invoke), `eval/run.eval.ts` (measure quality with vs without).
+- **Done when:** enabling retrieved memory shows measurable per-dim quality change on the 10-case eval.
+- **Estimated effort:** 1 week (assumes RAG stack from earlier exercises is built).
 
 ## Interview defense
 
-**Q: "Does your agent have memory?"**
+**Q: What memory do the agents have?**
 
-Three altitudes, two exist. Within an agent invocation, AptKit's loop maintains a message history — assistant text + tool_use + tool_result blocks accumulate, bounded by the iteration cap, gone when the agent returns. Between agents in the same investigation, the `Diagnosis` object hands off from step 2 to step 3 via `sessionStorage` + query param — typed, validated, scoped to one investigation, gone when the tab closes. Cross-session? Nothing. No vector DB, no user history, no conversation-across-sessions.
+Only the current investigation's messages array — short-term, in-context. When an investigation ends, the messages array is discarded. Long-term persistence in this repo is UI-side (sessionStorage for navigation, committed demo snapshots for the demo path); the agents don't retrieve from it.
 
-That's deliberate: the product is investigation-shaped (one anomaly at a time), not chat-shaped (an ongoing conversation). Long-term memory would solve a problem the product doesn't have yet.
+```
+  short-term:  messages array (dies at loop end)
+  medium-term: sessionStorage (dies at tab close)
+  long-term:   demo snapshot (committed, UI-only)
+  retrieved:   (missing — Case B RAG add)
+```
 
-*Anchor: "Two altitudes exist (in-loop + handoff); cross-session deliberately doesn't."*
+**Q: What would agent-side long-term memory look like?**
 
-**Q: "When would you add long-term memory?"**
+RAG over past diagnoses. Embed each conclusion; on new investigation, retrieve top-3 similar past cases; prepend to initial user message. Would let the agent apply prior reasoning. Not built today because past-investigation volume is low and the tool-call grounding already gives the agent strong current-data access.
 
-Two triggers. (1) The product grows a "show me similar past anomalies" surface — that needs vector retrieval over past diagnoses. (2) Users start asking follow-up questions across sessions ("yesterday you said X, what about Y") — that needs conversation history per user. Until one of those happens, adding memory infrastructure is overhead without payoff. The `B4.5` exercise lays out the shape if it lands.
+**Q: Why the sessionStorage stash?**
 
-*Anchor: "Wait for the product trigger; don't add memory infrastructure speculatively."*
+Because the two-page product flow (investigate step 2 → step 3) needs to survive navigation without re-running the ~225s agent chain. Stashing lets step 3 hydrate instantly with the diagnosis from step 2. Not a "memory" the agent uses — it's a UX cache.
 
 ## See also
 
-  → `02-context-and-prompts/03-prompt-chaining.md` — the Diagnosis handoff as a chain step
-  → `03-retrieval-and-rag/03-rag-concepts-not-yet-exercised.md` — the vector retrieval gap that would underlie long-term memory
-  → `study-system-design/07-in-memory-state-ownership.md` — the state ownership story this would extend
+- `02-context-and-prompts/01-context-window.md` — the mechanics of short-term memory
+- `03-retrieval-and-rag/11-rag.md` — what agent-side long-term memory would look like
+- `lib/hooks/useInvestigation.ts` — the medium-term stash

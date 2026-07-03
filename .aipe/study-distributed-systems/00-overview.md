@@ -1,124 +1,275 @@
 # Distributed Systems — overview
 
-The whole repo, asked one question: *what stays correct when work crosses a boundary and the other side can be slow, duplicated, stale, or unavailable?*
+You have ONE distributed surface in this repo, and that's the whole point.
+Bloomreach's `loomi-mcp-alpha` server, reached over HTTPS through the MCP
+StreamableHTTP transport. The Olist SQL adapter is retired. The synthetic
+adapter is in-process — no network, no partial failure. So the coordination
+budget you get to spend, you spend on one boundary: the client's browser and
+the Vercel serverless function on one side; Anthropic's model API and the
+Bloomreach MCP server on the other.
 
-Most of this codebase runs in one process. The interesting part — the load-bearing part — is one boundary that crosses the wire.
+That single boundary is where every distributed-systems concept in this repo
+either lives or is honestly absent. Below is the coordination map, the
+ranked findings, and the reading order.
 
-## The shape — one distributed surface
+## The coordination map — one picture
 
 ```
-  The blooming_insights system, drawn as distributed surfaces
+  The whole system, one distributed hop
 
-  ┌─ Browser (client) ───────────────────────────────────────────┐
-  │  React 19 · fetch() + ReadableStream reader · sessionStorage  │
-  └─────────────────────────────┬────────────────────────────────┘
-                                │ hop A: HTTPS · NDJSON stream
-                                │ (route ↔ browser — same origin)
-  ┌─ Vercel serverless ─────────▼────────────────────────────────┐
-  │  Next.js 16 App Router · per-request stream                  │
-  │  /api/briefing, /api/agent, /api/mcp/{call,callback,reset,…}  │
-  │                                                              │
-  │  ┌─ in-process ──────────────────────────────────────────┐   │
-  │  │  agents (Claude tool-use loop) ── DataSource (port)   │   │
-  │  │  state Maps (session-scoped, per-instance)            │   │
-  │  │  SyntheticDataSource (zero distributed surface)       │   │
-  │  └─────────────────────────┬─────────────────────────────┘   │
-  └────────────────────────────┼─────────────────────────────────┘
-                               │ hop B: HTTPS + OAuth · the ONE
-                               │ distributed call, made by
-                               │ BloomreachDataSource.callTool
-                               ▼
-              ┌─ Bloomreach loomi connect MCP ──┐
-              │  https://loomi-mcp-alpha.…/mcp  │  ← rate limit + token
-              │  (server we do not own)         │     revocation lives here
-              └─────────────────────────────────┘
+  ┌─ Client (browser) ──────────────────────────────────────────────┐
+  │  fetch('/api/briefing?mode=live-bloomreach')                    │
+  │  fetch('/api/agent?...&step=diagnose')                          │
+  │  NDJSON stream reader — parses tool_call, insight, done         │
+  └────────────────────────┬────────────────────────────────────────┘
+                           │  hop A · HTTPS to same-origin
+                           │  cancellable (AbortController)
+  ┌─ Vercel Serverless (Node) ─────▼───────────────────────────────┐
+  │  app/api/briefing/route.ts   maxDuration = 300s                │
+  │  app/api/agent/route.ts      maxDuration = 300s                │
+  │                                                                │
+  │  ReadableStream → NDJSON → req.signal composed downward:       │
+  │    MonitoringAgent / DiagnosticAgent / RecommendationAgent     │
+  │        │                                                       │
+  │        │  hop C · Anthropic HTTPS       hop B · MCP HTTPS      │
+  │        ▼                                    ▼                  │
+  └───┬─────────────────────────────────────────┬──────────────────┘
+      │                                         │
+  ┌─ Provider ─▼──────┐              ┌─ Provider ▼──────────────┐
+  │  Anthropic API    │              │  Bloomreach loomi        │
+  │  claude-sonnet-4-6│              │  mcp-alpha               │
+  │  claude-haiku-4-5 │              │  OAuth PKCE + DCR        │
+  │                   │              │  ~1 req/s per user       │
+  │  no state at ours │              │  revokes tokens after    │
+  │                   │              │  minutes on the alpha    │
+  └───────────────────┘              └──────────────────────────┘
+
+  layer boundaries labelled: Client · Serverless · Provider (2)
+  data-flow direction: request down, NDJSON up, tool-call out and back
 ```
 
-Two boundaries; one of them is the only true distributed surface.
-
-- **Hop A — route ↔ browser.** Same origin, server-sent NDJSON over a `ReadableStream` (not a network boundary in the distributed-systems sense — it's same-process delivery to a same-origin client, and there's no other consumer to disagree with).
-- **Hop B — route ↔ Bloomreach MCP.** This is the one. Different service, different operator, real wire, real auth, real rate limit, real partial failure. **Every distributed-systems property in this codebase lives behind this hop.**
-
-Synthetic mode (`SyntheticDataSource` at `lib/data-source/synthetic-data-source.ts:314`) implements the same `DataSource` port but answers in-process — zero distributed surface.
+Three hops. Every distributed-systems mechanism in this repo hangs off one
+of them. `hop A` is same-origin browser→function. `hop B` is where all the
+interesting failure is (rate limits, token revocation, timeouts, malformed
+JSON — the Bloomreach hop is why `BloomreachDataSource` exists). `hop C` is
+the Anthropic hop and it's the quietest one — cost management, retry-on-5xx
+by the SDK, that's about it.
 
 ## The ranked findings
 
-The big one first; everything else is downstream of it.
+You get one ranked list because a flat tour teaches less. Here's the order,
+with the file that walks each in full.
 
-1. **One distributed surface, and it's coordinated by exactly two mechanisms: a spacing gate and a bounded retry ladder.** `BloomreachDataSource` (`lib/data-source/bloomreach-data-source.ts:121`) is the only place in the codebase where partial failure is a real concern, and the mechanisms it uses to survive it — `minIntervalMs: 1100` proactive spacing, server-hint-aware retry (`parseRetryAfterMs` at :64), per-call 30s transport timeout composed with the route's cancel signal (`transport.ts:38`, `transport.ts:131`), no-cache-on-error (`bloomreach-data-source.ts:179`) — are the entire distributed-systems story. → see `02-partial-failure-timeouts-and-retries.md`.
+### #1 — the load-bearing thing: partial failure at hop B, absorbed by the model's tool_result loop
 
-2. **No idempotency keys; safe because the only mutation crossing the boundary is OAuth token exchange.** Every tool call is a read (`list_*`, `get_*`, `execute_analytics_eql`). The retry ladder retries `isError: true` rate-limit envelopes (`bloomreach-data-source.ts:164`) without a dedup key, and that's fine because Bloomreach reads have no duplicate-write hazard. → see `03-idempotency-deduplication-and-delivery-semantics.md`.
+Not by an invocation-level catch. Not by a circuit breaker. The mechanism
+that keeps this system upright when Bloomreach returns malformed JSON, times
+out at 30s, or 429s past three retries — it's AptKit's agent loop wrapping
+the failed tool call as a `tool_result` block with `is_error: true`, then
+letting the model reason about the failed call and decide whether to retry
+or move on.
 
-3. **Schema bootstrap caches across requests in module memory; the cache is global per warm instance, not per session.** `lib/mcp/schema.ts:138` (`let cached: WorkspaceSchema | null = null`) — first request on a warm Vercel instance fills it; every subsequent request on that instance returns the same workspace. This is a real distributed-systems hazard: if two users authenticate to different Bloomreach projects on the same instance, the second sees the first's cached schema. → see `04-consistency-models-and-staleness.md` and `09-distributed-systems-red-flags-audit.md`.
+Proof: the Week 4B fault-injection smoke test at `FAULT_TIMEOUT=0.2
+FAULT_MALFORMED_JSON=0.2 FAULT_SEED=42`, LOAD_N=3 — **9 faults injected (5
+malformed_json + 4 timeouts), 0 investigations failed**. Receipt at
+`eval/load-receipts/load-2026-07-03T05-21-12-237Z.json`.
 
-4. **State is session-scoped in-memory Maps, with no cross-instance coordination.** `lib/state/insights.ts:14` and `lib/state/investigations.ts:11`. Vercel scales horizontally — a follow-up request can land on a cold instance with an empty Map. The investigation flow papers over this by passing the full `Insight` through `sessionStorage` and re-resolving server-side, and the demo snapshot replays from a committed JSON file. → see `09-distributed-systems-red-flags-audit.md`.
+The load-bearing part everyone forgets: this only works because AptKit's
+run-agent-loop CATCHES the throw at
+`node_modules/@aptkit/core/node_modules/@aptkit/runtime/dist/src/run-agent-loop.js:81-86`
+— if it didn't, the throw would bubble out of the agent, past the route
+handler, and land on the client as an NDJSON `{type:"error"}`. The
+"graceful degradation" is one try/catch in a library you don't own.
 
-5. **OAuth flow needs three pieces of state to survive a cross-instance gap (PKCE verifier, DCR client info, tokens), solved with an encrypted cookie + AsyncLocalStorage in production.** `lib/mcp/auth.ts:47` (the `requestStore`) seeds an in-request store from the cookie once at entry and flushes once at exit — every `OAuthClientProvider` method call hits the store, never the cookie API directly. This is the only "distributed state" mechanism in the repo. → see `07-clocks-coordination-and-leadership.md`.
+→ 02-partial-failure-timeouts-and-retries.md
 
-6. **Streaming is one writer, one reader, no fan-out, no ordering hazard.** NDJSON over a `ReadableStream` (`lib/streaming/ndjson.ts`), terminator `\n`. The producer is the route's `controller.enqueue`; the consumer is the browser's `readNdjson` loop. No broker, no queue, no consumer group, no replay log. → see `06-queues-streams-ordering-and-backpressure.md`.
+### #2 — timeout composition: three signals, first-fires-wins
 
-7. **Most distributed-systems machinery is `not yet exercised`.** No replication, no partitioning, no quorum, no leader election, no sagas, no transactional outbox, no message queue, no cross-region anything. The repo's distributed surface is minimal *on purpose* — it's one HTTPS dependency with one operator's rate limit on the other side. → see `05-replication-partitioning-and-quorums.md`, `08-sagas-outbox-and-cross-boundary-workflows.md`.
+`req.signal` (client cancelled) is composed with `AbortSignal.timeout(30_000)`
+(per-call MCP ceiling) at `lib/mcp/transport.ts:131` via `composeSignals`. The
+result is a single `AbortSignal` that fires on whichever comes first. This is
+the mechanism that prevents one hung Bloomreach call from burning the entire
+300s route budget.
+
+Load-bearing part: `AbortSignal.any([...])` (Node 20+) is the primitive; the
+manual `AbortController`-glue fallback at `lib/mcp/transport.ts:180-188` is
+belt-and-braces. If either the client abort or the 30s timeout is stripped,
+a single stuck call runs to the route's 300s ceiling and takes the whole
+request with it.
+
+→ 02-partial-failure-timeouts-and-retries.md
+
+### #3 — retry ladder that respects the server's stated window
+
+Bloomreach 429s tell you how long to wait ("Retry after ~12 second(s)",
+"rate limit reached (1 per 10 second)"). `parseRetryAfterMs` at
+`lib/data-source/bloomreach-data-source.ts:64-71` reads the hint;
+`callTool` at `:164-174` waits it out with `retryCeilingMs: 20_000` as
+the cap and `retryDelayMs: 10_000` as the fallback base. maxRetries=3.
+
+Load-bearing part: the `+ RETRY_BUFFER_MS` cushion at
+`bloomreach-data-source.ts:49` and `:169` — retrying exactly on the boundary
+of the server's stated window lands inside the window and burns another
+attempt. The 500ms buffer is what keeps the retry from being self-defeating.
+
+→ 02-partial-failure-timeouts-and-retries.md
+
+### #4 — no-cache-on-error (circuit-breaker-adjacent)
+
+At `lib/data-source/bloomreach-data-source.ts:179-181`: results with
+`isError: true` are returned but NOT cached. The 60s response cache
+absorbs repeats of successful calls; error envelopes bypass it so a
+transient 401 doesn't poison the cache for a minute.
+
+This is not a full circuit breaker — there's no half-open state, no failure
+counter. It's a rule about what enters the cache. Which is exactly the
+right size for a system with ONE upstream and ONE consumer per session.
+
+→ 02-partial-failure-timeouts-and-retries.md
+
+### #5 — proactive spacing gate (client-side rate limiting)
+
+Bloomreach rate-limits globally per user. `BloomreachDataSource` enforces
+`minIntervalMs: 1100` at construction time
+(`lib/mcp/connect.ts:97`), and every call sleeps the difference between
+`Date.now() - this.lastCallAt` and 1100ms
+(`bloomreach-data-source.ts:190-194`). Belts before braces: the retry
+ladder is the braces.
+
+Why 1100ms specifically: the alpha server has been observed at both "1 per
+1 second" and "1 per 10 second" windows. Spacing at 10s would burn ~60s on
+a 6-call investigation and blow the 300s route budget. So 1100ms is the
+optimistic spacing; 10s retries handle the pessimistic case.
+
+→ 06-queues-streams-ordering-and-backpressure.md
+
+### #6 — session as the tenant boundary
+
+`lib/state/insights.ts:14` — `state = new Map<string, SessionFeed>()`. A
+single warm Vercel instance serves multiple users concurrently; the outer
+map is keyed by session id, and only the caller's sub-map is `.clear()`ed
+when `putInsights` runs a new briefing (`insights.ts:57-70`). Without this,
+`putInsights.clear()` would wipe another user's feed mid-briefing.
+
+Same shape at `lib/mcp/auth.ts:34-47` — production auth is per-request
+ALS-scoped from an encrypted cookie; dev/test is a per-session file / Map.
+
+→ 04-consistency-models-and-staleness.md
+
+### #7 — session-scoped OAuth in a stateless runtime
+
+Vercel serverless functions are ephemeral: the connect request and the
+OAuth callback request may land on different instances. The MCP SDK's
+`OAuthClientProvider` needs the PKCE `code_verifier` from the connect
+request to survive to the callback request. `lib/mcp/auth.ts` solves this
+three different ways depending on environment:
+production stores in an encrypted (AES-256-GCM) httpOnly cookie
+(`auth.ts:47-104`); development stores in a gitignored file
+(`.auth-cache.json`); test uses in-memory Map.
+
+The cookie is the interesting one for distributed systems: it's how you
+get "session state" without a shared store when you can't guarantee
+sticky instances.
+
+→ 07-clocks-coordination-and-leadership.md
+
+### #8 — no queues, no streams (into the analyst)
+
+The analyst produces one NDJSON stream OUT to the browser, but consumes
+tool results synchronously. There is no message queue, no event stream
+into the agents, no fan-out worker pool. This is a deliberate absence:
+the shape of the product is one-user-per-investigation, and everything
+runs inside the 300s route.
+
+Where you'd feel it: if you wanted to batch Bloomreach queries across
+users, or if the alpha server dropped webhook events at you, there is no
+queue mechanism to consume from. `not yet exercised`.
+
+→ 06-queues-streams-ordering-and-backpressure.md
+
+### #9 — no replication, no partitioning, no leader election
+
+There is no data store you own. Insights are in `Map<string,SessionFeed>`
+inside one Vercel instance. Two warm instances serving the same user
+each hold their own copy, and they don't reconcile — the client's
+sessionStorage is what actually survives across pages
+(`lib/hooks/useInvestigation.ts`). Nothing here votes, nothing has a
+quorum, nothing has a follower.
+
+→ 05-replication-partitioning-and-quorums.md
+
+### #10 — the fault-injection subsystem itself is a distributed-systems tool
+
+`lib/data-source/fault-injecting.ts` is a `DataSource` decorator (the same
+seam as `BloomreachDataSource` and `SyntheticDataSource`) that fires four
+canonical failure modes at configurable probabilities:
+
+- `timeout` — throws `HTTP 0: timeout after 30000ms` (mimics
+  `lib/mcp/transport.ts:137`)
+- `rate_limit` — throws `status=429` + retry-after hint
+- `server_error` — throws `status=500`
+- `malformed_json` — returns a `ToolResult` with unclosed JSON in a text
+  block; the downstream unwrap rejects it
+
+Deterministic when `FAULT_SEED` set (xorshift32). This is how you exercise
+the tier-2 story — the same paths that fire against real Bloomreach when
+the alpha server times out or 429s — WITHOUT paying the real-network cost
+or waiting for the alpha to actually misbehave.
+
+→ 09-distributed-systems-red-flags-audit.md (Finding #1)
 
 ## Reading order
 
-The files are in dependency order — each builds on the picture the previous one drew.
+Read in this order — each file assumes the ones before it.
+
+  01. distributed-system-map            — the coordination map in full
+  02. partial-failure-timeouts-and-retries — the load-bearing findings
+                                             (#1–#4 above)
+  03. idempotency-deduplication-and-delivery-semantics — the 60s cache is
+                                             the only dedup surface; the
+                                             agent's tool-call loop is
+                                             at-least-once by construction
+  04. consistency-models-and-staleness  — session-scoped state, warm
+                                          instances, and the sessionStorage
+                                          escape hatch
+  05. replication-partitioning-and-quorums — mostly `not yet exercised`;
+                                             says when it becomes relevant
+  06. queues-streams-ordering-and-backpressure — the spacing gate is the
+                                                 only backpressure
+                                                 mechanism; no queues
+  07. clocks-coordination-and-leadership — OAuth session survival across
+                                           ephemeral instances, no leader
+  08. sagas-outbox-and-cross-boundary-workflows — the two-step
+                                                   diagnose→recommend flow
+                                                   as a lightweight saga
+                                                   (with a rough edge)
+  09. distributed-systems-red-flags-audit — ranked risks + verdicts
+
+## What's `not yet exercised`
+
+Named honestly here so no file below has to pad:
+
+- **Replication / partitioning / quorums** — no owned data store
+- **Leader election / consensus** — nothing votes, nothing has a term
+- **Message queues / streams** — inbound is synchronous per-request;
+  outbound is NDJSON to one client
+- **Multi-region** — Vercel edge cache is disabled on both routes
+  (`cache-control: no-store, no-transform`)
+- **Sagas with compensation** — the two-step diagnose→recommend flow has a
+  handoff but no compensation on step-3 failure
+- **Transactional outbox** — no outbox because no DB
+- **Distributed transactions** — none
+
+## Where this partition sits
 
 ```
-  the map         then partial failure        then everything downstream
-  ───────         ─────────────────────       ───────────────────────────
-  01-distributed-system-map
-        │
-        ▼
-  02-partial-failure-timeouts-and-retries   ← the load-bearing file
-        │
-        ▼
-  03-idempotency-deduplication-and-delivery-semantics
-        │
-        ▼
-  04-consistency-models-and-staleness       ← the cached-schema hazard
-        │
-        ▼
-  05-replication-partitioning-and-quorums   ← not yet exercised
-        │
-        ▼
-  06-queues-streams-ordering-and-backpressure
-        │
-        ▼
-  07-clocks-coordination-and-leadership     ← the OAuth state survival trick
-        │
-        ▼
-  08-sagas-outbox-and-cross-boundary-workflows  ← not yet exercised
-        │
-        ▼
-  09-distributed-systems-red-flags-audit    ← ranked risks + evidence
+  distributed-systems (this)   correctness ACROSS coordination boundaries
+                               → hop B (Bloomreach) partial failure
+                               → hop C (Anthropic) less interesting
+                               → session-as-tenant-boundary at hop A
+  system-design                architectural shape and scale tradeoffs
+  database-systems             datastore-local consistency mechanisms
+                               (mostly `not yet exercised` — no DB)
 ```
 
-If you only have time for two, read `02` and `09`.
-
-## Explicit `not yet exercised`
-
-The repo is small on the distributed-systems axis. Listing the absences is part of the orientation — so you know what's *not* on the map you just looked at.
-
-- **Replication / partitioning / quorums** — there is no datastore the repo owns. State lives in process Maps (cleared on cold start), the demo snapshot is a committed JSON file (read-only), and Bloomreach is opaque. → `05`.
-- **Leader election / consensus / distributed locks** — there is no work the system claims; every request is independent. → `07`.
-- **Message queues / streams / consumers / poison-message handling / backpressure** — NDJSON over a single ReadableStream is one-writer/one-reader and the only stream surface. → `06`.
-- **Sagas / transactional outbox / compensating actions** — there are no multi-step distributed workflows. The recommendation agent proposes Bloomreach actions in *prose*; nothing is executed across services. → `08`.
-- **Exactly-once delivery / idempotency keys** — every Bloomreach call is a read; there is no write to deduplicate. → `03`.
-- **Distributed tracing / span propagation** — the per-phase `console.log` (`app/api/briefing/route.ts:317`, `app/api/agent/route.ts:331`) is the entire observability story across the one boundary. → `09`.
-
-These are the holes in the picture — and the picture is honest about which ones are *fine to leave open* for this product shape and which are real future risks.
-
-## Verified anchors
-
-Every file path in this guide is grounded in the current tree as of the audit date. The two files that carry the whole distributed-systems story are:
-
-- `lib/data-source/bloomreach-data-source.ts` — the adapter, with the spacing gate (`:130`, `:191`), retry ladder (`:164`), and cache-on-success-only (`:179`).
-- `lib/mcp/transport.ts` — the SDK wrapper, with the per-call 30s timeout (`:38`), the AbortSignal composition (`:131`, `:173`), and the capturing fetch for error bodies (`:103`).
-
-The 221-test suite passes against these mechanisms; the rate-limit retry behavior in particular is covered end-to-end in `test/mcp/client.test.ts:111-167`.
-
-## See also
-
-- `.aipe/study-system-design/` — architectural shape and scale tradeoffs (the wider picture this distributed surface sits in).
-- `.aipe/study-database-systems/` — datastore-local consistency mechanisms (mostly `not yet exercised` here too — the repo has no datastore it owns).
-- `.aipe/study-networking/` — the HTTP/TLS/transport layer underneath the one distributed call.
+Cross-links point to the neighbor rather than re-teaching.

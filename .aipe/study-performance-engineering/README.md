@@ -1,43 +1,32 @@
-# Study — Performance Engineering
+# study-performance-engineering — blooming insights
 
-What is measurably slow or expensive in this repo, why, and which change improves it
-without moving the bottleneck. Grounded in the actual files, the actual ceilings, the
-actual budgets the code already defends.
+Applied audit of what's measurably slow or expensive in this repo, why, and which change would improve it without moving the bottleneck.
 
 ## Reading order
 
-1. `00-overview.md` — the repo's performance map: where the budget is, where the
-   ceiling is, the top three risks, what's `not yet exercised`.
-2. `audit.md` — the 8-lens walk. Pass 1. Read this once, then dip back per lens.
-3. `01-spacing-gate-vs-backpressure.md` — the load-bearing distinction. The
-   `minIntervalMs = 1100` in `connect.ts:97` is **rate-limit compliance** to a
-   provider quota, not **backpressure** against a slow consumer. Knowing which one
-   it is, is the difference between tuning it correctly and tuning it wrong.
-4. `02-rate-limit-retry-ladder.md` — parsing the provider's stated penalty window
-   off the 429 envelope, capping any single retry wait at 20s, bounding worst-case
-   retry cost so the 300s route budget survives.
-5. `03-per-call-timeout-ceiling.md` — `TOOL_TIMEOUT_MS = 30_000`. The thing that
-   stops one hung MCP call from eating the entire 300s budget.
-6. `04-response-cache-with-no-cache-on-error.md` — the 60s response cache. Throughput
-   absorber that intentionally refuses to remember failures.
-7. `05-streaming-perceived-latency.md` — NDJSON streaming as a **perceived-latency**
-   tool. Total wall-clock barely moves; the felt-time collapses from "120s of nothing"
-   to "the agent is talking the whole time."
+1. `00-overview.md` — the map. Ranked findings, the one weight-bearing distinction (spacing-compliance vs backpressure), and where each pattern file lives.
+2. `audit.md` — Pass 1. The 8-lens walk with `file:line` grounding. Every lens either names what's there or emits `not yet exercised`.
+3. Pattern files — Pass 2. One per significant mechanism this repo exercises:
+   - `01-prompt-caching.md` — ephemeral cache breakpoint on the system prompt; ~80% reduction on prefix input cost across a ReAct loop.
+   - `02-per-investigation-budget-ceiling.md` — check-before-dispatch token/cost ceiling per investigation.
+   - `03-observability-report.md` — receipts on disk + a report that emits p50/p95/p99 latency + tokens/cost.
+   - `04-load-harness-with-fault-injection.md` — semaphore-based concurrency harness; a decorator that injects timeouts/429s/500s/malformed JSON.
+   - `05-rate-limit-spacing-and-retry-ladder.md` — `minIntervalMs = 1100` proactive spacing + parsed-window retry ladder on 429s. This is rate-limit compliance, not backpressure.
+   - `06-response-cache-and-demo-replay.md` — the 60s response cache and the demo-snapshot NDJSON replay path.
 
-## Cross-links to neighboring guides
+## Neighbors — cross-links
 
-- `../study-runtime-systems/` — explains the execution mechanisms (event loop,
-  `AbortSignal`, `ReadableStream`, `setTimeout`) this guide measures.
-- `../study-system-design/` — explains the architecture-scale tradeoffs (provider
-  rate limits, route budgets, demo-vs-live) this guide quantifies.
-- `../study-distributed-systems/` — owns the partial-failure semantics of the
-  rate-limit retry + per-call timeout when the provider is degraded.
-- `../study-debugging-observability/` — owns the `phases[]` summary log and `res.usage`
-  shape; this guide uses those signals but doesn't teach them.
+- `study-runtime-systems` — the execution model: `AbortSignal.timeout` composition, the ReAct loop's per-turn shape, cancellation propagation.
+- `study-system-design` — the architecture-scale tradeoffs: the `DataSource` seam, DIY vs Vercel Pro's 300s cap, the demo vs live split.
 
-## How to use this
+Findings that belong to those neighbors are cross-linked from `audit.md`, not restated here.
 
-If you're tuning a number — `minIntervalMs`, `cacheTtlMs`, `TOOL_TIMEOUT_MS`,
-`maxDuration` — read `00-overview.md` and the relevant pattern file before
-changing it. Each of those numbers defends a ceiling. Moving one without
-understanding which ceiling it defends moves the bottleneck somewhere else.
+## What this repo does NOT exercise (yet)
+
+- Multi-region deployment / horizontal scale
+- Persistent queues (Kafka, Redis Streams) — no work queue exists; investigations run inside the request
+- Client-side rendering budget or bundle-size optimization — the UI is dark-mode-only Tailwind v4 with no perceptible startup-cost work
+- Database indexes / query plans — there is no database
+- CPU profiling of hot loops — the hot path is model + MCP calls, not local compute
+
+These lenses emit `not yet exercised` in `audit.md` with an honest note about when they'd become relevant.

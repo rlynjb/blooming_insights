@@ -1,322 +1,359 @@
-# Self-critique and self-consistency
+# 10 · Self-critique and self-consistency
 
-**Industry standard** · the recovery turn vs the full eval-then-revise loop
+**Self-critique / LLM-as-judge / self-consistency / verify-then-emit — Industry standard**
 
-## Zoom out — where self-critique sits in this codebase
+## Zoom out, then zoom in
 
-blooming has one self-critique-shaped thing: the one-turn tool-less recovery in `runAgentLoop`. When the agent's final answer doesn't parse against the type guard, the loop runs one *additional* tool-less turn with a synthesis instruction, and re-parses. That's a stripped-down form of self-critique: not "evaluate your output and revise" but "your output didn't parse — try again with a stricter focus." Full self-critique (model judges its own output against a rubric, revises) and self-consistency (run N times, vote) are not in this codebase.
+A model critiquing its own output has the same blind spots that produced the output. That's the honest headline. The technique still works — under specific conditions — because critique and generation are different modes and the model does catch a class of errors on critique that it missed on generation. In this codebase, self-critique is realized as **LLM-as-judge** (see `05-eval-driven-iteration.md`) — a *different* prompt (the RubricJudge) scores the diagnostic agent's output against a rubric. Not the same LLM turn critiquing itself; a *secondary* LLM call with different context, different task, and different scoring criteria. That's the shape that earns tokens.
 
 ```
-  Zoom out — what's actually here vs what self-critique can become
+  Zoom out — where self-critique sits
 
-  ┌─ what's here: the recovery turn ────────────────────────┐
-  │  base-legacy.ts:208-219 + 239-269                        │
-  │  on parse failure → one tool-less turn with synthesis    │
-  │  cost: ~1 extra model call (worth it: avoids dropped     │
-  │         briefings)                                       │
-  └─────────────────────────────────────────────────────────┘
-
-  ┌─ what's NOT here ──────────────────────────────────────┐
-  │  full self-critique:                                    │
-  │    "evaluate your output against this rubric and        │
-  │     revise if it falls short"                           │
-  │  self-consistency:                                      │
-  │    run the same prompt 5x, vote on the answer           │
+  ┌─ Generation ────────────────────────────────────────────┐
+  │  DiagnosticAgent produces Diagnosis                     │
+  │  Same LLM, same context, same call                      │
+  └────────────────────────┬────────────────────────────────┘
+                           │
+  ┌─ ★ CRITIQUE STAGE ★ ────▼───────────────────────────────┐
+  │  RubricJudge scores the Diagnosis                       │  ← we are here
+  │  DIFFERENT prompt, DIFFERENT context (rubric-shaped),   │
+  │  same underlying model, temperature 0                   │
+  │  outputs: dimensions{}, verdict, fix                    │
+  └────────────────────────┬────────────────────────────────┘
+                           │
+  ┌─ Consumer ─────────────▼────────────────────────────────┐
+  │  eval receipt writes judgment alongside diagnosis        │
+  │  regression gate: has-signal + partial-signal must not   │
+  │  verdict as fail                                         │
   └─────────────────────────────────────────────────────────┘
 ```
 
-## Zoom in
-
-Self-critique is the pattern where you ask the model to evaluate its own output against a rubric and revise. Self-consistency is the pattern where you run the same prompt N times and vote on the answer. Both cost 2-5x the token budget for one extra dimension of reliability. Both have a known weakness: the critic and the doer have the same blind spots. This concept covers the trimmed-down version blooming uses (recovery turn for parse failures), why the full versions aren't in place yet, and when they'd earn their place.
+**Zoom in.** Self-critique has three common shapes: (1) **same-turn critique** — "produce an answer, then critique it, then revise" in one long generation. Cheap but blind. (2) **secondary-call critique** — a different LLM call reads the output and scores it. This is what's in production. (3) **self-consistency** — run the same prompt N times, majority-vote the answer. Expensive but catches the "one weird sample" case. This codebase uses shape (2) as LLM-as-judge in the eval pipeline. Shape (1) is not used in the agent loop itself — production diagnoses don't get re-verified before shipping to the UI.
 
 ## Structure pass
 
-**Layers.** Three altitudes: *no retry* (single-shot, accept what you get), *parse-retry* (one extra turn if the output doesn't parse — what blooming does), *self-critique* (model evaluates the answer's quality and revises if needed).
+### Axes — the dimension we're tracing
 
-**Axis traced — cost vs reliability.** Hold one question constant: *how much extra do I pay for one more dimension of confidence?*
+**What is the critique blind to?** A model critiquing its own output tends to be blind to *the same blind spots* that produced the output — because it reads the output the same way. A rubric-anchored critique with different context (like `tool_calls_trace`) can catch different things because the *context* forces different attention. Trace this axis and you find where self-critique earns tokens and where it's ceremony.
+
+### Seams — where critique catches vs misses
+
+Three seams:
+
+- **Same-turn vs secondary-call** — same-turn critique is generation continuing under the same context; secondary-call critique is a fresh generation with a different prompt shape. The secondary call has the option to see things (rubric criteria, tool traces) the generating call never had.
+- **Rubric-anchored vs free-form** — rubric-anchored critique scores against named dimensions; free-form critique produces "here are three things I could improve" prose. Rubric-anchored is parseable and gates decisions; free-form is a dashboard read.
+- **Judge-of-answer vs self-consistency** — judge-of-answer scores one output. Self-consistency runs N outputs and votes. Different failure modes; different costs.
+
+### Layered decomposition
+
+"What does the critique see that generation missed?" — traced down:
 
 ```
-  Axis = cost per reliability dimension
+  "What does critique catch?" — same question, three altitudes
 
-  ┌─ single-shot ────────────────────────────────────────────┐
-  │   1× cost                                                 │
-  │   reliability: shape-pass rate (whatever the model gives) │
-  └──────────────────────────────────────────────────────────┘
-                              │  + ~1× cost
-  ┌─ parse-retry (today) ────▼───────────────────────────────┐
-  │   ~1.1× cost (only on miss, ~5-10% of calls)              │
-  │   reliability: shape-pass rate ↑ (recovery catches some)  │
-  │   what blooming has                                       │
-  └──────────────────────────────────────────────────────────┘
-                              │  + 1-2× cost
-  ┌─ self-critique ──────────▼───────────────────────────────┐
-  │   2-3× cost (on every call, not just misses)              │
-  │   reliability: quality dimension (rubric-pass rate)       │
-  │   not in this codebase                                    │
-  └──────────────────────────────────────────────────────────┘
-                              │  + 4× cost
-  ┌─ self-consistency ───────▼───────────────────────────────┐
-  │   5× cost                                                 │
-  │   reliability: majority-vote agreement                    │
-  │   not in this codebase                                    │
-  └──────────────────────────────────────────────────────────┘
+  ┌────────────────────────────────────────────────┐
+  │ outer: format bugs (JSON malformed, wrong fields│  → validators already
+  │        missing)                                 │    catch these
+  └────────────────────────────────────────────────┘
+      ┌────────────────────────────────────────────┐
+      │ middle: content bugs (invented numbers,     │  → critique catches
+      │         out-of-scope claims)                │    when it has the
+      │                                             │    tool_calls_trace
+      └────────────────────────────────────────────┘
+          ┌────────────────────────────────────────┐
+          │ inner: reasoning bugs (wrong root       │  → critique often
+          │        cause given the evidence)        │    misses because
+          │                                          │    critique-mode has
+          │                                          │    same priors
+          └────────────────────────────────────────┘
 ```
 
-**Seams.** The parse-success → parse-failure seam is where blooming's recovery turn fires. The output → judge seam is where full self-critique would fire (and doesn't, in this codebase). The "did the model produce something usable" question is well-covered today; the "did the model produce something *good*" question is not.
+The middle layer is where LLM-as-judge is most useful. The inner layer — deep reasoning bugs — is where self-critique tends to be blind, because critique-mode brings the same priors that generation brought.
 
 ## How it works
 
-### Move 1 — the parse-retry pattern, as one picture
+### Move 1 — the mental model
 
-You know how a transactional database retries a deadlock by re-running the transaction? The recovery turn is the LLM equivalent for shape failures. The loop ran, the model produced text, the parser tried to extract structured output, the parser failed. Instead of giving up, run one more turn with no tools and an explicit "your output didn't parse — emit ONLY the structured answer" instruction. Re-parse the new output. If it parses, return it; if not, accept the failure.
-
-```
-  Pattern — the recovery turn
-
-  ┌─ main loop runs ────────────────────────────────────────┐
-  │   N turns of (assistant → tool_use → tool_result)        │
-  │   final assistant turn → text                            │
-  └──────────────────────────────┬──────────────────────────┘
-                                 │  finalText
-  ┌─ try to parse + validate ───▼───────────────────────────┐
-  │   parsed = parseResult(finalText)                        │
-  │   if (parsed !== null) return parsed   ← happy path      │
-  └──────────────────────────────┬──────────────────────────┘
-                                 │  parsed === null
-  ┌─ recovery turn ──────────────▼──────────────────────────┐
-  │   recoveryText = await runRecoveryTurn(opts,             │
-  │                    recoveryPrompt(toolCalls))            │
-  │   parsed = parseResult(recoveryText)                     │
-  │   return parsed                       ← might still fail │
-  └──────────────────────────────────────────────────────────┘
-```
-
-### Move 2 — the recovery turn in code
-
-The recovery hook lives in `lib/agents/base-legacy.ts:208-219`:
+You know how a code review by the *same engineer* who wrote the code catches typos but misses the wrong-abstraction bug — because you read your own code with the assumptions you had when writing it? Self-critique is that. A *different reviewer* (or the same person after a day of distance) catches more. LLM-as-judge is engineering that distance: a fresh prompt shape, different task framing, sometimes different context, so the "same model" comes at the output cold.
 
 ```
-  // base-legacy.ts:208-219 — recovery wired into the loop
-  let parsed: T | null = null;
-  if (opts.parseResult) {
-    parsed = opts.parseResult(finalText);
-    if (parsed === null && opts.recoveryPrompt) {
-      const recoveryText = await runRecoveryTurn(
-        opts,
-        opts.recoveryPrompt(toolCalls)
-      );
-      parsed = recoveryText === null ? null
-              : opts.parseResult(recoveryText);
-    }
-  }
-  return { finalText, toolCalls, parsed };
+  Same-turn critique vs secondary-call critique
+
+  same-turn (weak):                       secondary-call (this codebase):
+
+  ┌── one LLM call ───────────────┐        ┌── generation call ──┐   ┌── critique call ──┐
+  │  "Produce a diagnosis, then    │        │  agent context      │   │  judge context     │
+  │   critique it, then revise."  │        │  (anomaly, tools,   │──▶│  (subject +       │
+  │                                │        │   loop history)     │   │   rubric +         │
+  │  same context, same priors    │        │                     │   │   tool_calls_trace)│
+  └────────────────────────────────┘        └─────────────────────┘   └────────────────────┘
+
+  reads own output as author              reads output as reviewer,
+  catches: format bugs                    catches: shape + grounding
+  misses: reasoning bugs                  catches: reasoning bugs
+                                          (with tool_calls_trace)
 ```
 
-Two conditions gate the recovery turn: the caller passed `parseResult` (so the loop knows what counts as parseable) AND the caller passed `recoveryPrompt` (so the loop knows what to ask on retry). Either omitted, no recovery — the loop is the legacy single-shot version. Callers that opt in get the safety net; callers that don't, don't.
+### Move 2 — the step-by-step walkthrough
 
-The recovery turn itself is at lines 239-269:
+**Step 1 — the secondary call has a different prompt shape.**
 
-```
-  // base-legacy.ts:239-269 — the recovery turn (simplified)
-  async function runRecoveryTurn(opts, recoveryUserContent) {
-    try {
-      opts.signal?.throwIfAborted();
-      const res = await opts.anthropic.messages.create({
-        model: AGENT_MODEL,
-        max_tokens: 2048,            ← smaller cap than main loop
-        system:
-          'You are concluding a completed investigation. Output ' +
-          'ONLY the structured answer in the requested shape. ' +
-          'Never ask for more data.',
-        messages: [{ role: 'user', content: recoveryUserContent }],
-      }, opts.signal ? { signal: opts.signal } : undefined);
-      console.log(JSON.stringify({
-        site: 'agents/base:runRecoveryTurn',
-        sessionId: opts.sessionId,
-        usage: res.usage
-      }));
-      return res.content.filter(b => b.type === 'text')
-                        .map(b => b.text).join('');
-    } catch (err) {
-      if (err instanceof DOMException && err.name === 'AbortError') throw err;
-      return null;
-    }
-  }
+`@aptkit/core/node_modules/@aptkit/evals/dist/src/rubric-judge.js:61-77`:
+
+```js
+return [
+    `You are a rubric judge for: ${rubric.title}.`,
+    rubric.task,
+    '',
+    'Score the subject against the rubric. Score meaning and evidence, not style preferences unless the rubric asks for style.',
+    'Never rewrite the subject. Return one highest-leverage fix, not a list.',
+    '',
+    'Rubric dimensions:',
+    dimensions,
+    '',
+    'Allowed verdicts:',
+    verdicts,
+    checks.trimEnd(),
+    ...
+    'Output JSON only. No prose. No markdown fences. Use exactly this shape:',
+    JSON.stringify(outputShape),
+].filter(Boolean).join('\n');
 ```
 
-Three things to notice. **No tools** — the recovery turn doesn't pass `tools`, so the model literally cannot call another tool. The only thing it can do is produce text. **Smaller max_tokens** — 2048 instead of 4096; the recovery output should be the structured answer, not another exploration. **Hard-coded system message** — "You are concluding a completed investigation. Output ONLY the structured answer." This is the stricter system prompt the spec calls for: when shape failed once, the recovery prompts tightens the screws.
+The judge prompt is not "here's a diagnosis, is it good?" — it's a *rubric-shaped* prompt that names dimensions, scales, verdicts, and a specific output structure. The task framing is "you are a rubric judge," not "review this diagnosis." That reframing pushes the model into critique-mode with specific criteria, not generation-mode with continuation instincts.
 
-The cost: roughly one extra model call per failed parse. If parse-fail rate is 5-10% (which feels right for this codebase based on the demo snapshots and informal observation), the average cost overhead is 5-10% on top of the base call cost. Worth it: the alternative is the route returning an empty array and the user seeing an empty briefing.
+**Step 2 — the context makes critique grounded rather than vibes-based.**
 
-### Move 2 — what recovery does NOT catch
+`eval/run.eval.ts:238-247`:
 
-The recovery turn is a *shape* retry, not a *quality* retry. If the model emits:
-
-```
-  {
-    "metric": "fabricated_metric",
-    "severity": "critical",
-    "change": { "value": 99, "direction": "down", "baseline": "90d" },
-    "evidence": []
-  }
-```
-
-The shape is valid. The type guard passes. The recovery turn doesn't fire. The product ships an anomaly the model invented — confidently, with a critical severity, against a fabricated metric. The recovery turn catches "the model rambled and forgot to emit JSON"; it does not catch "the model emitted clean JSON with garbage content."
-
-That's the gap full self-critique would fill, and it's the gap eval-driven iteration (concept #5) would fill differently. Self-critique catches it at runtime, per-call; evals catch it at iteration time, per-prompt-change. Neither is in this codebase today.
-
-### Move 2 — what full self-critique would look like
-
-Full self-critique would add a second model call after the agent produces its output:
-
-```
-  Hypothetical self-critique flow (not implemented)
-
-  ┌─ agent produces output ─────────────────────────────────┐
-  │   diagnosis = { conclusion: "...",                       │
-  │                 hypothesesConsidered: [...], ... }       │
-  └──────────────────────────────┬──────────────────────────┘
-                                 │
-  ┌─ critic call ────────────────▼──────────────────────────┐
-  │   prompt:                                                │
-  │     "Evaluate this diagnosis against these criteria:     │
-  │      - Are the hypotheses concrete and testable?         │
-  │      - Does the evidence support the conclusion?         │
-  │      - Are affected customers quantified where possible? │
-  │      Return: { passes: bool, issues: string[] }"         │
-  │   ↳ separate model call (could be cheaper model)         │
-  └──────────────────────────────┬──────────────────────────┘
-                                 │  passes? → return original
-                                 │  fails? → revise call
-  ┌─ revise call (if needed) ────▼──────────────────────────┐
-  │   prompt:                                                │
-  │     "Here is the diagnosis. Here are the issues found.   │
-  │      Revise the diagnosis addressing each issue."        │
-  └──────────────────────────────────────────────────────────┘
+```ts
+const diagnosisJudgmentResult = await diagnosisJudge.judge({
+  subject: JSON.stringify(diagnosis, null, 2),
+  context: {
+    anomaly: JSON.stringify(goldenCase.anomaly, null, 2),
+    known_correct_shape: JSON.stringify(goldenCase.knownCorrect, null, 2),
+    case_intent: goldenCase.intent,
+    signal_class: goldenCase.signalClass,
+    tool_calls_trace: formatToolCallTrace(diagnosisToolCalls),
+  },
+});
 ```
 
-Cost: 2-3× the base call cost (one critic call always, one revise call sometimes). Worth it when: the output is *hard to manually verify* (long diagnoses with many fields), the output is *high-stakes* (recommendations that affect real campaigns), or *low-trust* (the model is one you're piloting and want extra safety on).
+The context is what makes this critique valuable and not ceremony. Without `tool_calls_trace`, the judge is asked "is this a good diagnosis?" — it can only score in the abstract. With `tool_calls_trace`, the judge can verify "did the diagnosis cite a number that came from an actual tool result, or did it invent one?" — grounded critique. This is the specific reason self-critique tends to be blind to reasoning bugs unless you deliberately supply the context the original generation had *plus* something the original didn't have.
 
-The reason it isn't in blooming: the structured output already constrains a lot of the failure modes self-critique would catch (the type guard rejects bad shape, the prompt's rules pin severity thresholds, the evidence field requires the model to cite tool calls), and the cost/benefit hasn't moved enough to justify the extra latency (the briefing already takes 30+ seconds; adding 10+ seconds for self-critique on every step would be felt). If the agents start producing higher-stakes outputs (auto-executing recommendations, for example), self-critique becomes more attractive.
+```
+  Critique context — what makes it grounded
 
-### Move 2 — self-consistency, the multi-sample version
+  ┌── original generation saw ────────────────────────┐
+  │  anomaly, tool results (during loop), schema      │
+  │  BUT NOT: the rubric, the known-correct shape     │
+  └────────────────────────┬──────────────────────────┘
+                           │
+  ┌── critique sees ───────▼──────────────────────────┐
+  │  anomaly (same)                                    │
+  │  tool_calls_trace (same, but as one artifact)      │
+  │  known_correct_shape (NEW — generation didn't have)│
+  │  rubric dimensions (NEW — generation didn't have)  │
+  │  signal_class (NEW — generation didn't have)       │
+  └────────────────────────────────────────────────────┘
 
-Self-consistency is a different shape: run the same prompt N times (typically 3-5), collect the outputs, vote on the answer (majority or most-common). The cost is N× the base call cost. The benefit is robustness — a single model run might pick a fluke; five runs are more likely to converge on the correct answer.
+  the NEW context is what lets critique catch what generation missed
+```
 
-This works well for:
-- Classification (intent picker) — vote on the label
-- Numerical answers (rare in blooming) — vote or average
-- Decision tasks where the answer is one of a small set
+**Step 3 — the outputs are structured, not free-form.**
 
-It works poorly for:
-- Open-ended generation (the query agent's prose) — five different prose answers don't combine
-- Long structured outputs (diagnosis with many fields) — voting per-field is awkward
+The judge returns:
 
-blooming doesn't use it. The intent classifier is the natural place it would land (run Haiku 3 times, pick the majority label) — but the classifier is already cheap, fast, and accurate enough that the 3× cost wouldn't earn its place. If the intent classifier started misrouting more than ~2% of queries, this would be the next move.
+```json
+{
+  "dimensions": {
+    "root_cause_plausibility": { "score": 4, "reason": "…" },
+    "evidence_grounding":       { "score": 5, "reason": "…" },
+    ...
+  },
+  "checks": { "cites at least one number from the tool results": true, ... },
+  "verdict": "pass",
+  "fix": "The one highest-leverage improvement…",
+  "reasoning": "…"
+}
+```
 
-### Move 2 — the diminishing-returns problem
+Structured critique is the difference between "this is a dashboard read" and "this gates a decision." The eval harness reads `verdict`, gates on `pass|pass_with_notes|fail`, and aggregates `dimensions` across cases. A free-form critique ("here are some thoughts on the diagnosis…") can't gate anything.
 
-The spec calls this out explicitly: a model critiquing its own output has the same blind spots that produced the output. If Sonnet produced a diagnosis with a subtle factual error, Sonnet (as the critic) probably won't catch it — it would believe its own analysis. The fix is using a *different* model as the critic (Haiku critiquing Sonnet, or vice versa), which gets you a different angle on the output but also a different (often weaker) set of blind spots.
+**Step 4 — the specific bug that self-critique catches in this codebase.**
 
-The deeper truth: self-critique is good at catching *shape* errors and *internal inconsistency* (the conclusion says X, the evidence says Y). It's bad at catching *fabrication* (the model confidently asserts something that isn't true; the critic looks at the assertion and asks "is this internally consistent?" and the answer is yes). Evals against ground truth catch fabrication; self-critique doesn't. They're complementary, not substitutable.
+Look at the `evidence_grounding` dimension in `eval/rubrics/diagnosis-quality.ts:41-55`:
+
+```ts
+{
+  id: 'evidence_grounding',
+  label: 'Evidence grounding',
+  description: 'Does the diagnosis cite the actual signals the substrate exposed? Bonus if it names the co-occurring signals (e.g. the payment_failure spike alongside the conversion drop). Penalty for invented numbers or claims not derivable from the tool results.',
+  scale: [
+    { score: 1, description: 'Numbers or claims that contradict the evidence.' },
+    { score: 2, description: 'Vague evidence references; no specific numbers cited.' },
+    { score: 3, description: 'Cites at least one specific number from the evidence.' },
+    { score: 4, description: 'Cites multiple specific signals; notes at least one co-occurring signal.' },
+    { score: 5, description: 'Cites the primary and co-occurring signals; every claim is traceable to a tool result.' },
+  ],
+},
+```
+
+Score 1 explicitly says "numbers or claims that contradict the evidence." This is the confabulation bug — the model invents a plausible-sounding number that isn't in the tool results. Same-turn self-critique tends to miss this because the same generative priors that invented the number will accept it as plausible on re-read. Secondary-call critique WITH the tool_calls_trace catches it — because the judge is asked "is this number in the trace?" and the trace is right there to check.
+
+```
+  Confabulation — what critique catches when it has the trace
+
+  generation:   "payment failures rose 31.2%" (real)
+                "payment failures rose 45%"   (invented — sounds right)
+
+  same-turn critique:   both look plausible; skims accept both
+  secondary + trace:    checks 31.2% against trace → found
+                        checks 45% against trace → NOT found → flag
+                        evidence_grounding score drops to 1
+```
+
+**Step 5 — where self-consistency lives (and doesn't).**
+
+Self-consistency is running the same prompt N times and voting. This codebase does not use it for the main agent output — the diagnostic agent runs once per anomaly, and its output ships. There is a related pattern in the eval infrastructure: the calibration slice at `eval/compute-agreement.eval.ts` and `eval/calibration/` measures judge-vs-human agreement, and if agreement is low the whole judge-as-signal argument collapses. That's a *different* discipline — measuring the reliability of the judge — but it borrows the self-consistency idea (multiple observations of the same case, do they agree?).
+
+Where I'd reach for real self-consistency: high-stakes classification where wrong is costly (say, content moderation) and the cost of running the classifier 3-5 times and voting is small. Not for the diagnostic loop, which is already ~50 seconds per case and would triple in cost for marginal reliability gain.
+
+**Step 6 — the diminishing returns problem.**
+
+A model critiquing its own output has the same blind spots that produced the output. If the diagnostic agent's priors say "payment processor issue" is the most likely cause for any conversion drop, its self-critique also says "payment processor issue" is the most likely cause. The critique will happily *confirm* the primary hypothesis and miss that the actual cause was something else the model's priors don't emphasize. The fix is not "critique harder" — it's *changing the context* (rubric criteria that force different attention, tool_calls_trace that grounds claims) so the critique-mode reads the output through a different lens.
+
+```
+  The blind-spot problem — why "critique harder" doesn't help
+
+  generation priors:  "conversion drop → payment"
+  critique priors:    "conversion drop → payment"    ← same priors
+  self-critique:      "payment hypothesis looks fine"
+                                              → same conclusion.
+
+  fix: change the CONTEXT of the critique
+       supply rubric that scores "rival mechanisms considered"
+       supply tool_calls_trace so grounding is verifiable
+       the priors don't change, but the attention does
+```
+
+### Move 2 variant — the load-bearing skeleton
+
+The kernel of production self-critique is three moves:
+
+```
+  secondary call (not same-turn) → rubric-shaped prompt → grounded context (with trace)
+```
+
+What breaks if you skip each:
+
+- **Skip "secondary call"** — same-turn critique reads the output with the same priors. Catches typos, misses reasoning bugs.
+- **Skip "rubric-shaped prompt"** — free-form critique produces prose. Not parseable, not gate-able, ends up as dashboard read.
+- **Skip "grounded context"** — the judge scores in the abstract. Can say "reads plausible" but can't verify "cites a real number."
+
+Hardening layered on top: self-consistency across judge runs (run the judge N times, look at variance), human-vs-judge calibration (`eval/compute-agreement.eval.ts`), rubric evolution (add dimensions as new failure modes surface).
 
 ### Move 3 — the principle
 
-Self-critique trades cost for reliability *along one specific dimension* — typically internal consistency or rubric compliance. It doesn't trade for *correctness* (the critic shares the doer's blind spots). Use it where the cost is worth the reliability gain and the failure mode you're catching is the consistency kind, not the fabrication kind. blooming's recovery turn is the trimmed version that catches the most common failure (parse failure) at the lowest cost; full self-critique is on the table when the stakes go up.
+**Critique is only as good as the context you give it.** A model reading its own output with the same context that produced it will make the same mistakes. A model reading with rubric criteria that force different attention, and with a trace that anchors grounding, can catch what generation missed. The trick isn't running critique — it's engineering the context so critique reads through a different lens.
 
 ## Primary diagram
 
 ```
-  Self-critique surface — what's here, what's not, what's it cost
+  Self-critique in this codebase — the two calls
 
-  ┌─ today: the recovery turn ─────────────────────────────────────┐
-  │  base-legacy.ts:208-219 wires recovery into the loop            │
-  │  base-legacy.ts:239-269 implements runRecoveryTurn              │
-  │                                                                  │
-  │  main loop                                                       │
-  │    ↓ produces finalText                                          │
-  │  parseResult(finalText) → null?                                  │
-  │    ↓ YES                                                         │
-  │  runRecoveryTurn:                                                │
-  │    - no tools (model can't query)                                │
-  │    - smaller max_tokens (2048)                                   │
-  │    - strict system: "output ONLY the structured answer"          │
-  │    ↓ produces recoveryText                                       │
-  │  parseResult(recoveryText) → ?                                   │
-  │                                                                  │
-  │  cost: ~5-10% overhead (only fires on parse failure)             │
-  │  catches: shape errors (model rambled or forgot fence)           │
-  │  misses: content errors (model fabricated cleanly)               │
-  └────────────────────────────────────────────────────────────────┘
-
-  ┌─ not here: full self-critique ─────────────────────────────────┐
-  │  would add: separate critic call after every agent run          │
-  │  cost: 2-3× per call                                            │
-  │  would catch: internal inconsistency · rubric violations        │
-  │  doesn't earn place yet: structured output + type guards        │
-  │                          already constrain most failures        │
-  │  would earn place if: stakes go up (auto-execute), or model     │
-  │                       changes to one with looser shape compliance│
-  └────────────────────────────────────────────────────────────────┘
-
-  ┌─ not here: self-consistency ───────────────────────────────────┐
-  │  would add: run same prompt N times, vote                       │
-  │  cost: N×                                                       │
-  │  works for: classifiers, decision tasks                         │
-  │  doesn't earn place yet: intent classifier is already accurate  │
-  │                          enough; structured agents have outputs │
-  │                          too rich to vote on                    │
-  └────────────────────────────────────────────────────────────────┘
+  ┌── generation call ──────────────────────────────────────┐
+  │  DiagnosticAgent.investigate(anomaly)                    │
+  │  model: Sonnet 4.6                                       │
+  │  system: diagnostic prompt (role, rules, schema)          │
+  │  context: schema, anomaly                                │
+  │  tools: analytics tools (allowlist)                       │
+  │  output: Diagnosis JSON                                   │
+  └────────────────────────┬────────────────────────────────┘
+                           │  (subject)
+  ┌── critique call ───────▼────────────────────────────────┐
+  │  RubricJudge.judge({ subject, context })                 │
+  │  model: Sonnet 4.6 (same underlying model,               │
+  │         DIFFERENT prompt shape, temperature 0)           │
+  │  system: buildRubricJudgeSystemPrompt(rubric)             │
+  │  context: anomaly + known_correct_shape + case_intent    │
+  │           + signal_class + tool_calls_trace              │
+  │  tools: NONE                                              │
+  │  output: { dimensions, verdict, fix, checks }             │
+  └────────────────────────┬────────────────────────────────┘
+                           │
+  ┌── consumer ────────────▼────────────────────────────────┐
+  │  eval receipt: writes both diagnosis AND judgment        │
+  │  regression gate: fail on has-signal + partial-signal    │
+  │                   verdicts of `fail`                     │
+  │  per-dimension pass rate: aggregated in afterAll         │
+  └─────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The recovery turn is a kind of *minimum-viable self-critique*. It doesn't ask the model "is your output good?" — it asks "did you give me parseable output? if not, try again with no distractions." The minimal version catches the most common failure (a chatty model wrapped the JSON in unparseable preamble, or the model got cut off mid-output and the JSON is malformed) at the lowest cost (one extra call per failure, not one extra call per success). It's the kind of pragmatic engineering choice that distinguishes shipped systems from research demos — the research literature talks about self-consistency with N=5 and rubric-based critique; production systems mostly do parse-retries and call it a day.
+Self-consistency was named by Wang et al. 2022 ("Self-Consistency Improves Chain of Thought Reasoning") — the specific technique of sampling multiple reasoning paths and taking the majority vote. It was a real improvement on math and logic benchmarks at the time. Modern models have absorbed enough of this that per-sample variance on well-shaped tasks is low, and running the loop N times often produces the same output N times. The residue: self-consistency is worth reaching for on tasks with high per-sample variance (edge cases, ambiguous inputs), not for stable tasks.
 
-The full self-critique pattern earns its place in higher-stakes systems. Anthropic's own constitutional AI work uses self-critique at scale — but they're training models, not running production agents. For application-layer self-critique, the pattern shows up most often in safety filters (run the model, run a separate safety-classifier on the output, block if flagged) rather than in quality-improvement loops. The safety-filter version is a relative of self-critique that blooming also doesn't have — and probably should consider once the agents are running on real customer data (the query agent in particular could emit something the user shouldn't see in some edge case).
+LLM-as-judge as a discipline came out of the Anthropic and OpenAI eval teams around 2023-2024. Hamel Husain's writing is the canonical practitioner-side reference — the specific point that "your LLM eval is only as good as the context you give the judge" is his, and it's why this codebase's judge context includes `tool_calls_trace` (which is the specific bit Hamel would call out as load-bearing).
 
-Self-consistency's main production use today is in math/code generation, where the answer is unambiguous (the code runs or it doesn't; the math is right or wrong) and the model's first sample is often close but slightly wrong. For analytics agents, the outputs are more interpretive — what counts as a "good" anomaly description is fuzzy — and voting on prose answers doesn't make sense. blooming's structured outputs (Anomaly, Diagnosis, Recommendation) are the kind of thing where per-field voting could be made to work (vote on severity, vote on category, average the change.value) but the engineering complexity isn't paying off the way it does for math problems.
+Two failure modes I've watched:
 
-The diminishing-returns warning is the part that catches teams off guard. You add self-critique, you ship it, you measure the accuracy improvement — and it's smaller than expected. Then you look at what's still failing and realize the critic is reliably approving outputs that turn out to be wrong, because the critic uses the same internal model that produced the output. The fix is either to use a *different* model as the critic (which has its own blind spots) or to use a *non-model* critic (a deterministic check, an external API, a human reviewer). For most production use cases, the deterministic check (which is what the type guard is) gets you 80% of the value at 10% of the cost.
+- **The "judge model is the generator model" bug.** Team uses GPT-4 to generate and GPT-4 to judge. Judge scores everything at 4.5 because it reads its own reasoning style as good. Fix: use a different model for judging, or use rubric-shaped prompts that force different attention. This codebase uses the same underlying model (Sonnet 4.6) but a different prompt shape and different context — that's the mitigation.
+- **The "critique that never fails" bug.** The judge scores every output as `pass` because the rubric levels are too fuzzy ("score 3 = adequate," "score 4 = good"). Fix: anchor scale levels with specific behavior descriptions (as this codebase does — "score 1 = restates the symptom, score 5 = rival mechanisms considered"). Concrete anchors force discrimination.
+
+Related concepts:
+- **Eval-driven iteration** (`05-eval-driven-iteration.md`) — the full loop that LLM-as-judge sits inside.
+- **Chain-of-thought** (`09-chain-of-thought.md`) — the reasoning that critique reads.
+- **Structured outputs** (`02-structured-outputs.md`) — the judge itself uses structured output.
 
 ## Interview defense
 
-**Q: blooming has a "recovery turn" — is that self-critique?**
+**Q: Does this codebase run self-critique on production diagnoses before shipping to the UI?**
 
-A: It's a stripped-down version: the model's output didn't parse against the type guard, so the loop runs one more tool-less turn with a stricter system prompt ("output ONLY the structured answer, never ask for more data") and re-parses. It's catching one specific failure mode — the model rambled, forgot the fence, or got cut off mid-output — at low cost (only fires on parse failure, ~5-10% of calls). Full self-critique would be a separate critic call after *every* agent run, evaluating the output against a quality rubric and revising if it falls short. That'd cost 2-3× per call, every call, not just on misses. blooming doesn't have it because the structured output + type guards already constrain a lot of the failures self-critique would catch, and the latency budget on a briefing is already tight. The recovery turn is the engineering pragmatic version: catch the most common failure cheaply; don't pay for a full critique on every call.
-
-```
-  what I'd sketch:
-
-  parse-retry (today):       cost: ~5-10% overhead
-                              catches: shape errors
-                              cheap insurance · ships
-
-  full self-critique:        cost: 2-3× every call
-                              catches: rubric/consistency errors
-                              earns place when stakes go up
-```
-
-**Q: When would self-consistency (running N times and voting) be worth adding?**
-
-A: For the intent classifier, if accuracy slipped. It's a classification task with a small label space (3 values), each call is cheap (Haiku, 16 tokens), and voting is well-defined (most-common label wins). Three runs would cost ~$0.0003 instead of $0.0001 per classification — still fractions of a cent — and could catch the ~2% of edge cases where the single-shot version misroutes. The structured agents (monitoring, diagnostic, recommendation) are worse fits because their outputs are too rich to vote on coherently (you'd be voting on each field independently, which is awkward, or you'd be picking one whole output, which discards the diversity that made the multi-sample worthwhile). For prose outputs (the query agent), self-consistency is essentially meaningless — five different prose answers don't combine into a "voted" answer. Intent classifier is the one place it could land here, and only if the cheaper single-shot version starts misbehaving.
+No, and the reason is honest. Self-critique costs a second LLM call per output — roughly doubling per-case latency and cost. The eval pipeline runs the judge on every golden case, so regressions in critique-visible qualities (grounding, scope, plausibility) surface at eval time and gate deploys. Production diagnoses ship un-critiqued because the eval discipline is the check. If a specific class of production failure started showing up that evals miss, the answer might be adding a lightweight in-line critique for that class — but it would be shaped around the specific failure, not a blanket "critique everything."
 
 ```
-  self-consistency fits when:
+  Where critique runs in this codebase
 
-  output space is small        ← classifier labels: yes
-  outputs combine via vote     ← classification: yes
-                                 long structured: no
-                                 prose: no
-  per-call cost is low         ← haiku classifier: yes
-                                 sonnet agent: marginal
+  eval loop:         diagnostic → judge (LLM-as-judge)
+                                    scores against rubric
+                                    gates on has-signal / partial-signal
 
-  → blooming would add it to the intent classifier first if needed.
+  production loop:   diagnostic → UI (NO critique)
+                                    trust the eval discipline
+                                    saves latency + cost
 ```
+
+Anchor: `eval/run.eval.ts:229-247` for the judge invocation in eval.
+
+**Q: The judge scores every case as `pass_with_notes`. What's wrong?**
+
+The rubric's scale levels aren't specific enough, so the judge can't discriminate. If score 3 means "adequate" and score 4 means "good," those are vibes — the judge picks 3 or 4 by feel. The fix is anchoring scale levels with specific behavior descriptions. This codebase does it right at `eval/rubrics/diagnosis-quality.ts:29-38`: score 1 = "restates the symptom," score 5 = "rival mechanisms are considered." The judge has to check specific things to pick a score. Second thing to check: the escape-hatch distinct-score-count check at `eval/run.eval.ts:516-523` — if a dimension shows only one distinct score across all cases, the substrate is too homogeneous and the judge isn't discriminating even with a good rubric.
+
+```
+  Vague rubric vs specific rubric
+
+  vague:                              specific:
+   score 3 = adequate                   score 3 = plausible mechanism,
+   score 4 = good                                weakly evidenced
+   score 5 = excellent                  score 4 = specific mechanism,
+                                                evidence supports it
+                                       score 5 = specific mechanism +
+                                                evidence supports +
+                                                rival mechanisms considered
+
+  judge: picks by feel                 judge: verifies each level explicitly
+   → clusters at 3-4                    → uses full 1-5 range
+```
+
+**Q: What's the load-bearing part people forget?**
+
+The tool_calls_trace in the judge context. Everyone builds a rubric with a "cites evidence" dimension. Nobody remembers to pass the tool results into the judge. So the judge scores "did this diagnosis cite evidence?" in the abstract — it looks at the diagnosis's evidence field and says "yes, there are three bullet points, seems evidenced." What it can't do without the trace is verify "the number cited in evidence[0] actually came from the third tool call, not the model's priors." The trace is what turns "reads plausible" into "verifiably grounded." Every self-critique setup I've built without the trace was easier to game than any I've built with one.
+
+Anchor: `tool_calls_trace` field at `eval/run.eval.ts:246` and its truncation in `formatToolCallTrace` at `eval/run.eval.ts:132-152`.
 
 ## See also
 
-- [02-structured-outputs.md](./02-structured-outputs.md) — the type guard whose failure triggers the recovery turn
-- [04-token-budgeting.md](./04-token-budgeting.md) — recovery turn uses a smaller max_tokens (2048 vs 4096)
-- [05-eval-driven-iteration.md](./05-eval-driven-iteration.md) — evals catch fabrication that self-critique misses
-- [09-chain-of-thought.md](./09-chain-of-thought.md) — CoT is reasoning forward; self-critique is reasoning about output
+- `05-eval-driven-iteration.md` — LLM-as-judge is the eval loop's critique layer.
+- `09-chain-of-thought.md` — the reasoning the critique reads.
+- `11-meta-prompting.md` — the judge system prompt is built from data (`buildRubricJudgeSystemPrompt`).

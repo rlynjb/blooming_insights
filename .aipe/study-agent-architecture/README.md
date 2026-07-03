@@ -1,43 +1,24 @@
-# Agent architecture — `blooming_insights`
+# Study — agent architecture (blooming_insights)
 
-A per-codebase study guide for the agent-architecture topic, applied to this repo.
+Per-codebase study guide for agent reasoning patterns, retrieval-as-a-capability, and multi-agent orchestration.
 
 ## Reading order
 
-Start with `00-overview.md`. Then walk the sub-sections in order:
+1. **`00-overview.md`** — the whole system, one diagram.
+2. **`01-reasoning-patterns/`** — the loop that sits underneath every worker.
+3. **`02-agentic-retrieval/`** — cross-references `study-ai-engineering`; none of the retrieval-loop patterns are exercised here.
+4. **`03-multi-agent-orchestration/`** — the load-bearing new material. Start with `01-when-not-to-go-multi-agent.md`.
+5. **`04-agent-infrastructure/`** — context, memory, tools, evals, guardrails.
+6. **`05-production-serving/`** — caching, backpressure, breakers scoped to the loop.
+7. **`06-orchestration-system-design-templates/`** — three interview templates.
+8. **`agent-patterns-in-this-codebase.md`** — the summary table.
 
-1. **`01-reasoning-patterns/`** — how one agent thinks. The substrate every loop sits on.
-2. **`02-agentic-retrieval/`** — placement of this repo's retrieval (live MCP data, not vector RAG).
-3. **`03-multi-agent-orchestration/`** — what's *above* one agent. The deliberate non-escalation lives here.
-4. **`04-agent-infrastructure/`** — context, memory, tools, evaluation, guardrails. Cross-cutting.
-5. **`05-production-serving/`** — what changes when the unit is a loop, not a single call.
-6. **`06-orchestration-system-design-templates/`** — interview-shaped reframings.
+## Shape classification
 
-At the root:
+Hybrid: **outer chain / inner single-agent**, with the classifyIntent router being the closest thing to a full multi-agent supervisor. This is a *deterministic-supervisor multi-agent* system per Anthropic's own taxonomy. See `03-multi-agent-orchestration/02-supervisor-worker.md`.
 
-- `00-overview.md` — the shape, the three-shapes call, the settled vocabulary.
-- `agent-patterns-in-this-codebase.md` — the actual patterns this repo runs, named.
-- `audit.md` — checklist against every pattern in the spec, honest verdicts.
+## Cross-references
 
-## What this repo *is*, in one line
-
-A sequential pipeline of three single-agent ReAct loops (`MonitoringAgent` → `DiagnosticAgent` → `RecommendationAgent`) plus a fourth `QueryAgent` on a separate ingress, dispatched by deterministic TypeScript in two Next.js route handlers (`app/api/briefing/route.ts`, `app/api/agent/route.ts`). The agent loop itself comes from `@aptkit/core@0.3.0`; this repo's `lib/agents/*.ts` files are thin adapters (40–120 LOC each) over four AptKit agent classes.
-
-## Three-shapes weighting
-
-```
-  workflow outside   ◄── this repo
-  single-agent inside ◄── this repo
-  multi-agent         ◄── not yet (deliberately)
-```
-
-So: A and D are deep; C is mostly "deliberately not." Section C still has full breadth, because the value is teaching the topology family and naming the deliberate non-escalation — not pretending the repo runs a debate loop.
-
-## The cross-references
-
-This guide cites two sibling guides that aren't in this repo yet but would live alongside it:
-
-- `study-ai-engineering` — for ReAct mechanics, tool-calling mechanics, RAG mechanics, single-call caching / cost / rate-limit / circuit-breaker mechanics, LLM-as-judge bias, prompt-injection defenses.
-- `study-system-design` — for the request flow, the OAuth boundary, the streaming NDJSON pattern, the provider abstraction (the same `DataSource` seam this guide leans on).
-
-This file (and every file under it) covers what's *only* agent-architecture.
+- Retrieval mechanics (embeddings, chunking, RAG, GraphRAG) live in `.aipe/study-ai-engineering/03-retrieval-and-rag/` — not re-taught here.
+- ReAct Thought-Action-Observation mechanics live in `.aipe/study-ai-engineering/04-agents-and-tool-use/03-react-pattern.md` — placed here in the family, not re-taught.
+- Single-call caching / cost / retry mechanics live in `.aipe/study-ai-engineering/06-production-serving/` — the loop-level variants live in `05-production-serving/`.

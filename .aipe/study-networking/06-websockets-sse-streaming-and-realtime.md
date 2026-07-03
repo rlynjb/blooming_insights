@@ -1,359 +1,473 @@
-# 06 · WebSockets, SSE, streaming, and realtime
+# WebSockets, SSE, streaming, and realtime
 
-## Subtitle
+*Realtime transports (Industry standard)* — long-lived connections,
+streaming, and reconnect logic. This repo's answer: **NDJSON over
+`fetch`** — one choice, one kernel, one reconnect policy, and no
+WebSockets or SSE anywhere.
 
-Long-lived connections and realtime delivery — Industry standard (the family); NDJSON over fetch (this repo's pick).
+## Zoom out — where this concept lives
 
-## Zoom out, then zoom in
-
-The product is realtime in feeling but unidirectional in shape — the agent talks, the browser listens. Three options on the table for that shape: WebSocket, Server-Sent Events (SSE), or just-stream-over-fetch. This repo picks the third, with newline-delimited JSON (NDJSON) as the framing. The hook that consumes it — the briefing-stream hook (`useBriefingStream`) — and the one kernel that parses it — `readNdjson` (`lib/streaming/ndjson.ts:17`) — are the load-bearing pieces.
+Every "live" surface in this app streams the same way: the route
+constructs a `ReadableStream`, writes NDJSON lines into it, and the
+browser consumes it with `fetch` + a stream reader. There is no
+`EventSource`, no `WebSocket`, no `socket.io`. One kernel
+(`readNdjson`) handles the browser side; one helper (`encodeEvent`)
+handles the server side; and one hook (`useReconnectPolicy`) handles
+the alpha-server token-revocation dance.
 
 ```
-  Zoom out — where realtime lives
+  Zoom out — where realtime lives in this repo
 
-  ┌─ UI layer ──────────────────────────────────────────────────┐
-  │  hooks read the stream:                                      │
-  │   useBriefingStream     → drives the feed                    │
-  │   useInvestigation      → drives the diagnose/recommend page │
-  │   StreamingResponse     → drives the chat answer             │
-  │  ★ all three call ONE kernel ★ → readNdjson()                │
-  └─────────────────────────────────────────────────────────────┘
-                            │   ★ THIS CONCEPT ★
-                            │   fetch + ReadableStream + NDJSON
-                            ▼
-  ┌─ Service layer ─────────────────────────────────────────────┐
-  │  routes write the stream:                                    │
-  │   /api/briefing  /api/agent                                  │
-  │   ReadableStream<Uint8Array> · controller.enqueue per event  │
-  │   Content-Type: application/x-ndjson; charset=utf-8          │
-  └─────────────────────────────────────────────────────────────┘
+  ┌─ Browser hooks ──────────────────────────────────────────────┐
+  │  useBriefingStream, useInvestigation, StreamingResponse       │
+  │  ★ ALL SHARE ONE KERNEL: readNdjson ★                         │
+  └───────────────────────┬──────────────────────────────────────┘
+                          │  fetch → response.body (ReadableStream)
+                          │  chunked transfer, HTTP/1.1 or HTTP/2 stream
+                          ▼
+  ┌─ Route (Node) ───────────────────────────────────────────────┐
+  │  new ReadableStream({ start(controller) { …                   │
+  │    controller.enqueue(encodeEvent(e))                          │
+  │  } })                                                          │
+  │  headers: Content-Type: application/x-ndjson; no-store         │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-The whole "an analyst that shows its work" pitch is downstream of this one technical choice. The reasoning trace, the tool calls, the insights — all of it rides over a single fetch that stays open for ~30 seconds. There's no fallback, no second transport, no upgrade path.
+That's it. One transport choice, applied everywhere.
 
-## Structure pass
+## The structure pass
 
-  - **Layers** — the transport (HTTPS chunked transfer), the framing (NDJSON = one JSON object per line), the parser (`readNdjson` kernel), the event dispatcher (per-hook `switch (e.type)`), the UI update (React `setState`).
-  - **Axis traced — "what gets one wire's worth of work and what gets pushed elsewhere?"** Hold across the framing options:
-      - **WebSocket** would give bidirectional + framing + heartbeats + auto-reconnect-able subprotocols. The app needs none of those — except framing, which NDJSON provides over plain HTTP.
-      - **SSE** would give server-push, automatic reconnection, last-event-ID resumption. The app deliberately doesn't want auto-reconnect (the reconnect policy is custom and one-shot) and doesn't need resumption (a new briefing run starts fresh).
-      - **NDJSON over fetch** gives framing, abort via `AbortSignal`, full header control (cookies for auth, custom cache directives), binary safety. Exactly the surface area needed; nothing more.
-  - **Seams** — two of them, both load-bearing:
-      1. **The `AgentEvent` contract** (`lib/mcp/events.ts:4-12`) — what writer and reader both speak.
-      2. **The `readNdjson` kernel** (`lib/streaming/ndjson.ts:17`) — one parser shared by three consumer hooks. Change it, all three break; fix it once, all three benefit.
+The axis: **who owns reconnect, and what triggers it?** Different
+realtime transports answer this differently, and the choice here is
+deliberate.
+
+```
+  Axis: "who reconnects when the connection breaks?"
+
+  ┌──────────────────────────────────────────┐
+  │ EventSource / SSE                        │  → BROWSER decides
+  │ (auto-reconnect built into the API)     │    (fires on close)
+  └──────────────────────────────────────────┘
+      ┌──────────────────────────────────────┐
+      │ WebSocket                            │  → APP decides
+      │ (no auto-reconnect; app must wrap)   │    (usually a hook)
+      └──────────────────────────────────────┘
+          ┌──────────────────────────────────┐
+          │ NDJSON over fetch (this repo)   │  → APP decides
+          │ (no auto-reconnect; useReconnect │    with policy hook,
+          │  Policy owns it)                  │    fired on 'error' event
+          └──────────────────────────────────┘
+```
+
+The seam that matters: when the alpha Bloomreach server revokes an
+OAuth token mid-briefing, the stream doesn't die — it emits an `error`
+NDJSON event with an auth-shaped message. The reconnect policy hook
+matches the message and fires a one-shot `/api/mcp/reset` + reload.
+That's the app-owned reconnect that SSE's built-in retry couldn't
+handle (it doesn't know how to run an OAuth reset).
 
 ## How it works
 
 ### Move 1 — the mental model
 
-Think of the streaming response as one `fetch()` whose body is a long string the server keeps writing into. The client reads chunks of bytes as they arrive, splits them on `'\n'`, parses each line as JSON, and dispatches. That's it. There's no protocol upgrade, no framing layer, no special headers — just HTTP with the response held open.
+You've built a `fetch()` before and read the response body. `fetch()`
+returns a `Response` with `.body`, which is a `ReadableStream<Uint8Array>`.
+Normally you call `res.json()` and it drains the whole body first.
+But you can also read it *while* the server is still writing — one
+chunk at a time. Combine that with the NDJSON convention (one JSON
+object per line, `\n` terminated) and you have a streaming protocol
+that uses nothing beyond `fetch`.
 
 ```
-  Pattern — the NDJSON streaming kernel
+  The pattern — NDJSON kernel
 
-  fetch(url) ─► response                          server side
-     │                                            ───────────
-     ▼                                            new ReadableStream({
-  res.body.getReader()                              start(controller) {
-     │                                                while (work to do):
-     ▼                                                  controller.enqueue(
-  loop:                                                   encoder.encode(
-    {value, done} = read()                                  JSON.stringify(e) + '\n'
-    if done: break                                        ))
-    buf += decode(value)                                controller.close()
-    lines = buf.split('\n')                           }
-    buf = lines.pop()       ← keep the trailing  })
-    for line in lines:
-      try: parse + dispatch
-      catch: skip silently
-  flush(buf)
+    ┌─ server ─────────────┐            ┌─ client ────────────┐
+    │  producer writes:    │  chunked   │  reader reads:      │
+    │                      │  transfer  │                     │
+    │  {"type":"a"}\n      │ ──────────►│  buf += chunk       │
+    │                      │            │  lines = buf.split(\n)
+    │  {"type":"b"}\n      │ ──────────►│  buf = lines.pop()  │
+    │                      │            │  for line: JSON.parse│
+    │  {"type":"done"}\n   │ ──────────►│                     │
+    │                      │            │  onEvent(each)      │
+    └──────────────────────┘            └─────────────────────┘
+
+  the split-on-\n + keep-partial-in-buffer is the whole kernel
 ```
 
-The bit a lot of streaming-newcomers get wrong is the trailing-buffer dance: a single network read can split a JSON line in the middle. So you keep the unterminated tail in a buffer, append the next chunk, re-split, and only emit on `\n`. The kernel in `lib/streaming/ndjson.ts` does exactly that.
+### Move 2 — the load-bearing skeleton
 
-### Move 2 — the moving parts
+**Isolate the kernel.** The smallest thing that is still the pattern:
 
-#### The kernel — `readNdjson`
+```
+  NDJSON kernel — the four irreducible parts
+
+    while (true):
+      chunk ← reader.read()               ← 1. keep reading
+      if done: break
+      buffer ← buffer + decode(chunk)      ← 2. accumulate
+      lines ← buffer.split('\n')           ← 3. slice on newline
+      buffer ← lines.pop()                 ← 4. keep partial line
+      for each complete line:
+        onEvent(JSON.parse(line))
+```
+
+**Name each part by what breaks when missing:**
+
+  - Drop the loop and you read one chunk and stop, losing everything after.
+  - Drop the buffer accumulation and a JSON object split across two
+    chunks parses as two malformed halves.
+  - Drop the `\n` split and you can't know where one event ends and
+    the next begins.
+  - Drop the `pop()` of the partial line and you try to `JSON.parse` an
+    incomplete `{"type":"reasoning_step","step":{"…` and throw on
+    every read.
+
+The real kernel — `lib/streaming/ndjson.ts:32-64`:
 
 ```ts
-// lib/streaming/ndjson.ts:17-64
-export async function readNdjson<E>(
-  body: ReadableStream<Uint8Array>,
-  onEvent: (event: E) => void,
-  opts?: {
-    cancelOn?: () => boolean;
-    onMalformed?: (line: string, err: unknown) => void;
-  },
-): Promise<void> {
-  const reader = body.getReader();
-  const decoder = new TextDecoder();
-  let buf = '';
-  try {
-    while (true) {
-      if (opts?.cancelOn?.()) {             // ← polled between reads; lets the
-        await reader.cancel();              //    consumer break out cleanly
-        return;
-      }
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });   // ← streaming decode:
-      const lines = buf.split('\n');                    //   handles multi-byte
-      buf = lines.pop() ?? '';                          //   chars split across
-      for (const raw of lines) {                        //   reads
-        const line = raw.trim();
-        if (!line) continue;
-        try {
-          onEvent(JSON.parse(line) as E);
-        } catch (err) {
-          opts?.onMalformed?.(line, err);   // ← default: silent skip
-        }
+  while (true) {
+    if (opts?.cancelOn?.()) {
+      await reader.cancel();
+      return;
+    }
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split('\n');
+    buf = lines.pop() ?? '';               // ← 4. keep partial line for next read
+    for (const raw of lines) {
+      const line = raw.trim();
+      if (!line) continue;
+      try {
+        onEvent(JSON.parse(line) as E);
+      } catch (err) {
+        opts?.onMalformed?.(line, err);   // silent by default
       }
     }
-    // flush trailing buffer — a no-op when the producer always terminates with '\n'
-    const tail = buf.trim();
-    if (tail) {
-      try { onEvent(JSON.parse(tail) as E); }
-      catch (err) { opts?.onMalformed?.(tail, err); }
-    }
-  } finally {
-    reader.releaseLock();
   }
-}
-```
-
-Six parts. Pull any of them and something breaks:
-
-  - **`getReader()` + `releaseLock()` in `finally`** — the lock is exclusive; not releasing it means the next attempt to read the body throws. The `finally` makes the cleanup unconditional.
-  - **`TextDecoder` with `{ stream: true }`** — UTF-8 multi-byte characters can split across reads (a 3-byte glyph at byte 1023-1025 spans two chunks). `{ stream: true }` tells the decoder to buffer the incomplete tail.
-  - **`buf += ... ; split('\n'); buf = lines.pop()`** — the canonical "keep the tail" trick. The last element of `split('\n')` is whatever came after the last newline — which is either an empty string (terminator present) or an unterminated line.
-  - **Silent skip on `JSON.parse` throw** — a malformed line shouldn't kill the whole stream. The `onMalformed` callback exists for observability if you want it.
-  - **`cancelOn` polled between reads** — a consumer that unmounts (React effect cleanup) can flip a `cancelledRef` and the loop exits at the next read boundary instead of hanging.
-  - **Trailing-buffer flush** — handles producers that don't terminate the last event with `\n`. Today's producers (the routes' `send` helpers) always append `\n`, so it's a no-op — but it's correct shape for any future producer.
-
-The whole kernel is about 50 lines. Three different hooks call into it; without it, each would re-implement the read/decode/split/parse dance and they'd drift apart.
-
-#### The writer side — what the route does
-
-```ts
-// app/api/briefing/route.ts:191-194 (write side)
-const stream = new ReadableStream<Uint8Array>({
-  async start(controller) {
-    const send = (e: BriefingEvent) =>
-      controller.enqueue(encoder.encode(JSON.stringify(e) + '\n'));   // ← one event per enqueue
-```
-
-That `+ '\n'` is the framing. `encoder.encode(...)` turns the string into bytes; `controller.enqueue(...)` hands them to the runtime's HTTP layer, which writes them as a chunked-transfer chunk. No framing protocol; just newlines.
-
-Both streaming routes share this shape. The `encodeEvent` helper in `lib/mcp/events.ts:15` exists for the `/api/agent` route to use the same convention:
-
-```ts
-// lib/mcp/events.ts:15-17
-export function encodeEvent(e: AgentEvent): string {
-  return JSON.stringify(e) + '\n';
-}
-```
-
-#### The contract — `AgentEvent`
-
-```ts
-// lib/mcp/events.ts:4-12
-export type AgentEvent =
-  | { type: 'reasoning_step'; step: ReasoningStep }
-  | { type: 'tool_call_start'; toolName: string; agent: AgentName }
-  | { type: 'tool_call_end'; toolName: string; agent: AgentName; durationMs: number; result?: unknown; error?: string }
-  | { type: 'insight'; insight: Insight }
-  | { type: 'diagnosis'; diagnosis: Diagnosis }
-  | { type: 'recommendation'; recommendation: Recommendation }
-  | { type: 'done' }
-  | { type: 'error'; message: string };
-```
-
-Discriminated union. The `type` field is the discriminator; downstream `switch` statements get exhaustive type narrowing. Both `/api/briefing` and `/api/agent` write this (briefing extends it with `workspace` and `coverage_item`/`coverage` variants); both `useBriefingStream` and `useInvestigation` read it.
-
-#### The consumer — how the hooks dispatch
-
-```ts
-// lib/hooks/useInvestigation.ts:98-152 (excerpt)
-const handle = (e: AgentEvent) => {
-  switch (e.type) {
-    case 'reasoning_step':       // append to items
-    case 'tool_call_start':      // append a running tool to items
-    case 'tool_call_end':        // mark the matching running tool as done
-    case 'diagnosis':            // setDiagnosis
-    case 'recommendation':       // append to recommendations
-    case 'done':                 // setComplete(true); stash to sessionStorage
-    case 'error':                // setError(e.message)
+  // flush trailing buffer — a no-op when the producer always terminates with '\n'
+  const tail = buf.trim();
+  if (tail) {
+    try { onEvent(JSON.parse(tail) as E); }
+    catch (err) { opts?.onMalformed?.(tail, err); }
   }
-};
 ```
 
-The dispatcher is per-hook; the kernel is shared. This is the right partition — the parsing is generic; the *meaning* of each event is page-specific.
+**Separate skeleton from hardening.**
 
-#### Cancellation through the stream
+  - Kernel: the four steps above.
+  - Hardening layered on top:
+    - `cancelOn()` polling (client-side unmount cancel)
+    - `onMalformed` callback (defaults to silent skip)
+    - Trailing buffer flush at end-of-stream (defensive, mostly no-op
+      because `encodeEvent` always terminates with `\n`)
+    - `TextDecoder` with `stream: true` (handles multi-byte UTF-8
+      split across chunks)
 
-The cancellation story spans both sides:
+The interview payoff: naming the partial-line-carry-over as
+load-bearing signals you've *built* a streaming parser, not just used
+one. Every naive implementation forgets step 4 and produces mysterious
+half-parsed events at the boundaries.
 
-```
-  Layers-and-hops — cancellation propagation
+#### The producer side — one line at a time, always
 
-  ┌─ Browser ──────────────────┐         ┌─ Route handler ────────────────┐
-  │ user navigates away         │         │  req.signal (AbortSignal)       │
-  │  → React effect cleanup     │         │     ▲                           │
-  │  → cancelledRef.current=true│         │     │ fires when client         │
-  │                             │         │     │ closes the connection     │
-  │ next readNdjson loop iter:  │         │                                 │
-  │  cancelOn() → true           │ ──TCP─►│  agent loop polls               │
-  │  reader.cancel()             │  FIN    │  req.signal.throwIfAborted()    │
-  │  → fetch sends FIN          │         │  at coarse boundaries           │
-  └─────────────────────────────┘         │  → throws AbortError            │
-                                          │  → controller.close()           │
-                                          │  → finally: dispose + log       │
-                                          └─────────────────────────────────┘
-```
+`lib/mcp/events.ts:14-17`:
 
-The `cancelOn` polling is intentionally between-reads, not mid-read. A `reader.read()` that's already waiting on bytes from the network won't return until either bytes arrive or the underlying fetch is aborted — calling `cancel()` from outside achieves that.
-
-Note the subtle bit in `useInvestigation`: it deliberately does NOT cancel on cleanup (`useInvestigation.ts:33-37`). React StrictMode mounts-unmounts-remounts; cancelling on the first cleanup left the stream half-consumed. The `startedRef` guard prevents the double-mount from starting a second fetch; the first one completes and `setState` after unmount is a safe no-op.
-
-#### Why not WebSocket
-
-```
-  WebSocket gives                 NDJSON-over-fetch gives
-  ───────────────                 ───────────────────────
-  bidirectional                   unidirectional (which is what we need)
-  framing                         framing (via \n)
-  binary frames                   binary-safe (Uint8Array)
-  ping/pong heartbeats            HTTP keepalive (free, lower-level)
-  auto-reconnect protocols        deliberately custom reconnect policy
-  separate auth handshake         cookie auth on the fetch (free)
-  no header control after handshake full HTTP header control
-  needs Upgrade negotiation       runs on existing HTTPS
+```ts
+  export function encodeEvent(e: AgentEvent): string {
+    return JSON.stringify(e) + '\n';
+  }
 ```
 
-For a chat or collaborative-editing product, the bidirectional + framing + heartbeats are worth the upgrade complexity. For a "stream me a transcript" product, you're paying for capabilities you don't use.
+Called at every emission point in the routes — one JSON object per line,
+always terminated with `\n`. The comment in `ndjson.ts:10-13` notes:
 
-#### Why not SSE
+> Producers (briefing + agent routes via `encodeEvent`) always
+> terminate each event with '\n', so in practice the trailing-buffer
+> flush is a no-op — but keeping it preserves the correct shape for
+> any future producer that omits the terminal newline.
+
+That's a defensive kernel — works even if some future producer
+forgets the terminator.
+
+#### The reconnect policy — one-shot, fires on auth-shaped errors
+
+This is where the app-owned reconnect lives. Instead of trying to
+detect connection-level disconnects (SSE would do that automatically),
+the route *always* returns a graceful `{ type: 'error', message: … }`
+NDJSON event on a caught throw
+(`briefing/route.ts:294-302`, `agent/route.ts:308-316`), and the
+client policy inspects the message text.
+
+`lib/hooks/useReconnectPolicy.ts:33-45`:
+
+```ts
+  const AUTH_ERROR_RE_AUTO = /invalid_token|unauthor|forbidden|401|session expired|reconnect/i;
+  const AUTH_ERROR_RE_BUTTON = /unauthor|forbidden|401|session expired/i;
+  const FLAG_KEY = 'bi:reconnecting';
+
+  export function isAuthErrorAuto(msg: string): boolean {
+    return AUTH_ERROR_RE_AUTO.test(msg);
+  }
+
+  export function isAuthErrorButton(msg: string): boolean {
+    return AUTH_ERROR_RE_BUTTON.test(msg);
+  }
+```
+
+The `handle` function runs the one-shot logic
+(`useReconnectPolicy.ts:84-111`):
+
+```ts
+  const handle = useCallback(
+    (msg: string): boolean => {
+      if (!isAuthErrorAuto(msg)) return false;
+      if (typeof window === 'undefined') return false;
+      let alreadyTried = false;
+      try { alreadyTried = sessionStorage.getItem(FLAG_KEY) === '1'; } catch {}
+      if (alreadyTried) {
+        try { sessionStorage.removeItem(FLAG_KEY); } catch {}
+        return false;   // give up — user must click reconnect
+      }
+      try { sessionStorage.setItem(FLAG_KEY, '1'); } catch {}
+      fireReset();      // POST /api/mcp/reset then window.location.href = '/'
+      return true;
+    },
+    [fireReset],
+  );
+```
+
+Layers-and-hops for the auto-reconnect:
 
 ```
-  SSE gives                       NDJSON-over-fetch gives
-  ─────────                       ───────────────────────
-  EventSource API in browser      fetch() — full header control
-  auto-reconnect with             one-shot, controlled reconnect via the
-    last-event-id                   custom useReconnectPolicy hook
-  text-only (UTF-8)               binary-safe (Uint8Array)
-  GET only, no POST headers       any method, custom headers
-  fixed framing (event/data/id)   any framing you want (\n)
-  no AbortController support       AbortSignal works natively
-  built-in CORS sensitivity       same-origin = no CORS at all
+  Auto-reconnect on token revocation
+
+  ┌─ Route ────────────────────────────────────────────┐
+  │  callTool → HTTP 401 invalid_token                  │
+  │  catch → send({type:'error', message: '…invalid_token…'})│
+  └────────────────────┬───────────────────────────────┘
+                       │ NDJSON: {"type":"error","message":"…invalid_token…"}
+                       ▼
+  ┌─ Client hook (useBriefingStream) ──────────────────┐
+  │  case 'error': callbacksRef.current?.onAuthError?  │
+  │  (msg) → reconnectPolicy.handle(msg)                │
+  └────────────────────┬───────────────────────────────┘
+                       │
+                       ▼
+  ┌─ Reconnect policy ─────────────────────────────────┐
+  │  matches /invalid_token|unauthor|…/                 │
+  │  first time this session? YES:                     │
+  │  ├─ setItem('bi:reconnecting', '1') (guard)         │
+  │  └─ POST /api/mcp/reset                            │
+  │     → window.location.href = '/'                    │
+  └────────────────────┬───────────────────────────────┘
+                       │
+                       ▼
+  ┌─ Reload / (page.tsx) ──────────────────────────────┐
+  │  bi:mode still 'live' → fresh briefing              │
+  │  auth already reset → connectMcp returns authUrl    │
+  │  → OAuth roundtrip → back to feed with fresh tokens │
+  └────────────────────────────────────────────────────┘
+
+  On the SECOND consecutive failure, the flag is set — handle()
+  returns false and the UI shows the manual "reconnect" button
+  instead of looping.
 ```
 
-The deal-breaker is `EventSource` not supporting custom headers (or the AbortSignal API), combined with the auto-reconnect behavior being wrong for this app (the Bloomreach token revokes after minutes; we want to redirect to OAuth, not silently retry).
+The one-shot guard is what stops an infinite reload loop when auth is
+genuinely broken (e.g. the user revoked access from the Bloomreach
+side). First attempt: auto-reconnect. Second attempt (guard already
+set): fall through to the manual button.
+
+### Move 2.5 — why NDJSON over fetch, not SSE or WebSocket
+
+This is a *chosen* transport. The alternatives were considered; each
+has a reason it was rejected.
+
+```
+  Transport comparison — three options, one chosen
+
+  ┌──────────────┬──────────────────────┬──────────────────────────┐
+  │ transport    │ what you get free     │ why not chosen           │
+  ├──────────────┼──────────────────────┼──────────────────────────┤
+  │ NDJSON over  │ - AbortSignal-native  │ ★ CHOSEN — cancellation, │
+  │ fetch        │ - Cookie-attached     │ auth path, and demo/live │
+  │ (this repo)  │ - branchable          │ branch all work with the │
+  │              │  Content-Type          │ same fetch primitive     │
+  ├──────────────┼──────────────────────┼──────────────────────────┤
+  │ SSE          │ - auto-reconnect      │ - `.close()` isn't       │
+  │ (EventSource)│ - Last-Event-ID       │   AbortSignal-composed   │
+  │              │ - retry: hint          │ - auto-reconnect fights  │
+  │              │                       │   the auth-reset policy  │
+  │              │                       │ - Content-Type is fixed  │
+  │              │                       │   text/event-stream       │
+  ├──────────────┼──────────────────────┼──────────────────────────┤
+  │ WebSocket    │ - bidirectional       │ - overkill for one-way   │
+  │              │ - full-duplex frames  │   agent → UI              │
+  │              │                       │ - Cookie handling in WS  │
+  │              │                       │   upgrade is finicky      │
+  │              │                       │ - would need a separate  │
+  │              │                       │   auth pathway            │
+  └──────────────┴──────────────────────┴──────────────────────────┘
+```
+
+The single biggest reason: cancellation composes. The client cancels
+via `cancelledRef.current = true`, `readNdjson` cancels the reader,
+the fetch's request signal fires `AbortError` on the server, and every
+in-flight upstream call (Bloomreach, Anthropic) picks up the abort via
+their composed signals. Same primitive end-to-end. SSE gives you
+`.close()`, but that doesn't compose into your upstream `AbortController`s.
 
 ### Move 3 — the principle
 
-The right realtime transport is the smallest one that satisfies the actual interaction shape. "Realtime" is a feeling, not a protocol — it's produced by keeping ONE response open long enough to write multiple meaningful events into it. If your interaction is unidirectional, a streaming HTTP response is enough. WebSocket and SSE are answers to harder questions; reach for them only when the questions actually exist.
+If your realtime need is *one-way, cancellation-first, cookie-auth'd*,
+NDJSON over fetch is the simplest thing that works. Reach for SSE when
+you want the browser to handle reconnect for you (and you can live
+with its auto-retry). Reach for WebSocket when you actually need
+bidirectional frames.
 
 ## Primary diagram
 
 ```
-  Full streaming surface — one frame
+  Primary — the NDJSON pipeline end to end
 
-  ┌─ Browser ────────────────────────────────────────────────────────┐
-  │  useBriefingStream  /  useInvestigation  /  StreamingResponse    │
-  │                                                                   │
-  │  fetch(url, {…})                                                  │
-  │   ├─ res.status === 401  →  redirect to authUrl                   │
-  │   ├─ res.status !== 200  →  surface error                         │
-  │   ├─ content-type != ndjson  →  parse as JSON (demo path)         │
-  │   └─ content-type == ndjson  →  readNdjson(res.body, handle, …)   │
-  │                                                                   │
-  │  readNdjson kernel (lib/streaming/ndjson.ts:17)                   │
-  │    getReader → loop {                                             │
-  │      cancelOn? → cancel + return                                  │
-  │      read → decode(stream:true) → buf + '\n' split                │
-  │      JSON.parse each line → onEvent(event)                        │
-  │      malformed → silent skip (or onMalformed callback)            │
-  │    } → flush tail → releaseLock                                   │
-  │                                                                   │
-  │  handle(event) — per-hook switch (e.type):                        │
-  │    reasoning_step | tool_call_start | tool_call_end |             │
-  │    insight | diagnosis | recommendation | done | error            │
-  │                                                                   │
-  └──────────────────────────┬───────────────────────────────────────┘
-                             │ HTTPS chunked transfer
-                             │ Content-Type: application/x-ndjson
-                             │ Cache-Control: no-store, no-transform
-                             ▼
-  ┌─ Route handler (/api/briefing, /api/agent) ──────────────────────┐
-  │  new ReadableStream({ start(controller) {                        │
-  │    send = (e) => controller.enqueue(                              │
-  │              encoder.encode(JSON.stringify(e) + '\n'))            │
-  │    try {                                                          │
-  │      … many send(…) calls over ~30s …                             │
-  │      send({type:'done'})                                          │
-  │    } catch (e) { send({type:'error', message: ...}) }             │
-  │    finally { dispose; log; controller.close() }                   │
-  │  }})                                                              │
-  └──────────────────────────────────────────────────────────────────┘
+  ┌─ Route ────────────────────────────────────────────────────────┐
+  │  encodeEvent(e) = JSON.stringify(e) + '\n'                      │
+  │  new ReadableStream({                                           │
+  │    async start(controller) {                                    │
+  │      const send = (e) => controller.enqueue(                    │
+  │        encoder.encode(encodeEvent(e)))                          │
+  │      try {                                                      │
+  │        send({type:'workspace', …})                              │
+  │        send({type:'reasoning_step', …})                         │
+  │        // … many events over ~50-100s …                          │
+  │        send({type:'done'})                                      │
+  │      } catch (e) {                                              │
+  │        if (e instanceof DOMException && e.name === 'AbortError')│
+  │          return                                                 │
+  │        send({type:'error', message: …})                         │
+  │      } finally {                                                │
+  │        controller.close()                                       │
+  │      }                                                          │
+  │    }                                                            │
+  │  })                                                             │
+  └───────────────────────────┬────────────────────────────────────┘
+                              │  chunked HTTPS response body
+                              ▼
+  ┌─ Client kernel (readNdjson) ───────────────────────────────────┐
+  │  reader = res.body.getReader()                                  │
+  │  buf = ''                                                       │
+  │  loop:                                                          │
+  │    if cancelOn(): reader.cancel(); return                       │
+  │    { value, done } = reader.read()                              │
+  │    if done: flush(buf); break                                   │
+  │    buf += decode(value)                                         │
+  │    lines = buf.split('\n')                                      │
+  │    buf = lines.pop()                                            │
+  │    for line: onEvent(JSON.parse(line))                          │
+  └───────────────────────────┬────────────────────────────────────┘
+                              │  dispatched events
+                              ▼
+  ┌─ Hook state (useBriefingStream / useInvestigation) ────────────┐
+  │  switch (evt.type) {                                            │
+  │    case 'reasoning_step': setStepStatus(evt.step.content)       │
+  │    case 'tool_call_start': setQueryCount(n => n+1)              │
+  │    case 'tool_call_end':   setTraceItems(update running → done) │
+  │    case 'insight':         collected.push(evt.insight)          │
+  │    case 'done':            setInsights(collected)               │
+  │    case 'error':           reconnectPolicy.handle(msg) ?? show  │
+  │  }                                                              │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The choice of NDJSON over alternatives is one of the more defensible architecture decisions in this repo, because it falls out of the actual requirements rather than from "the cool kids use WebSockets." The requirements are:
+The `TextDecoder` with `stream: true` matters and is easy to miss.
+UTF-8 multi-byte characters (emojis, non-ASCII text) can split across
+chunk boundaries. Without `{ stream: true }`, decoding a chunk that
+ends mid-character produces a replacement character `�`. With
+`{ stream: true }`, the decoder buffers the trailing partial bytes and
+prepends them to the next chunk.
 
-  - Unidirectional (agent → browser).
-  - Authenticated via cookies (already same-origin, no token gymnastics).
-  - Cancellable (user navigates away, route should stop work).
-  - Tolerant of mid-stream parse errors (a malformed event shouldn't kill the connection).
-  - Compatible with React's effect/cleanup model (StrictMode double-mount).
+The "trailing buffer flush" at end-of-stream (`ndjson.ts:53-60`)
+handles the theoretical case where a producer forgets the terminal
+`\n`. Not exercised — but the guard is cheap and prevents a whole
+class of future bug.
 
-NDJSON over fetch satisfies all five with no extra infrastructure, no library, no protocol handshake. The 50-line kernel in `lib/streaming/ndjson.ts` is the entire transport layer.
+The reconnect policy's *two regex variants* are explicitly not
+unified. `useReconnectPolicy.ts:15-30` notes:
 
-The piece worth dwelling on: the `cancelOn` polling pattern. Most engineers reach for `AbortController` as the cancellation primitive (it's the modern idiom). But `AbortController` only cancels the *fetch* — once you have the body's `ReadableStream`, you need a separate mechanism to break out of the read loop, which is what `cancelOn` provides. Wiring them both is correct: `AbortController` cancels the network round-trip (so the server sees a FIN and can clean up); `cancelOn` cancels the local read loop (so the consumer hook stops calling `setState` after unmount). The repo only uses `cancelOn` because `useBriefingStream` doesn't pass an `AbortSignal` to the fetch — but if it did, both would compose.
+> Unifying them would require manual verification against the live
+> Bloomreach server, which is not available in the current session.
+> There IS a latent bug worth flagging (the button regex is missing
+> `invalid_token` and `reconnect` matches) — filed as a future concern.
 
-Future work the repo doesn't do but could: an `AgentEvent` schema validator (Zod or similar) at the parse boundary so a malformed-but-parseable line gets caught at the dispatcher rather than later when a `setState` reads a missing field. Today the discriminated-union `switch` covers known types and the `default` case ignores unknown ones — fine for now, would matter if the contract grew externally-versioned consumers.
+That's an example of *pragmatic scoping* — the strict-preservation
+lift keeps behavior identical, and the risk is documented rather than
+"fixed" without verification.
 
 ## Interview defense
 
-**Q: Why NDJSON and not WebSocket or SSE?**
+**Q: You're streaming from the server to the browser. Why NDJSON over
+fetch and not Server-Sent Events?**
+
+  Verdict first: cancellation composes with the rest of the app's
+  AbortSignal machinery, and the auth-reset dance can't be
+  auto-reconnected the way SSE would try to do.
 
 ```
-   shape needed                  WebSocket     SSE       NDJSON-over-fetch
-   ────────────                  ─────────     ───       ─────────────────
-   unidirectional                ✓ (overkill)  ✓         ✓
-   custom headers (auth cookies) ✗ (handshake) ✗ (GET)   ✓
-   AbortSignal cancellation       partial        ✗         ✓
-   custom reconnect policy        manual         fights you ✓
-   binary-safe                    ✓             ✗          ✓
-   no protocol upgrade            ✗              ✓         ✓
+  answer sketch — composition wins
+
+  fetch's ReadableStream          EventSource
+  ────────────────────           ────────────
+  cancel via AbortSignal          cancel via .close()
+  composes with upstream           doesn't compose
+  AbortController naturally        with server-side signals
+  ↓
+  one abort at the client
+  cancels every hop in flight
 ```
 
-**Anchor:** every "✓" SSE or WebSocket would give comes with a capability we don't use; every capability NDJSON has, we use.
+  Anchor: `lib/streaming/ndjson.ts:32-51`,
+  `useBriefingStream.ts:288-299` (composition with `cancelledRef`).
 
-**Q: What's the load-bearing part of the streaming kernel?**
+**Q: Talk me through the NDJSON parser. Where does it typically go
+wrong?**
 
-The trailing-buffer split. `buf = lines.pop()` keeps the unterminated tail across reads. Without it, any JSON object that happens to span a chunk boundary fails to parse and gets silently dropped — which would manifest as "the third tool call is missing about 5% of the time and we can't reproduce it." Plus `TextDecoder({ stream: true })` for the multi-byte UTF-8 equivalent at the byte level.
-
-**Q: What happens when the user closes the tab mid-stream?**
+  Verdict first: the load-bearing part everyone forgets is *carrying
+  the partial final line between reads*.
 
 ```
-   browser closes tab
-       ↓
-   underlying TCP/HTTP connection FIN
-       ↓
-   route's req.signal fires
-       ↓
-   route hits req.signal.throwIfAborted() at next phase boundary
-       ↓
-   throws AbortError → handler skips error event → finally runs
-       ↓
-   dispose + log + controller.close()
+  parser sketch — one detail matters more than the rest
+
+  buf += decode(chunk)
+  lines = buf.split('\n')
+  buf = lines.pop() ←── this. the partial final line survives to the next read.
+  for line in lines: JSON.parse
+
+  drop the pop() and every JSON that spans a chunk boundary throws.
 ```
 
-On the client, the read loop is already gone (the React effect unmounted). On the server, the route cleans up budget-tracking, then closes the stream gracefully.
+  Anchor: `lib/streaming/ndjson.ts:40-41`.
+
+**Q: The Bloomreach server revokes OAuth tokens after a few minutes.
+How does the app handle a token expiry mid-stream?**
+
+  Direct: the route catches the `invalid_token` from the transport and
+  sends an NDJSON `error` event with the message. The client's
+  reconnect policy inspects the message text — if it matches
+  `/invalid_token|unauthor|forbidden|401|…/`, it fires a one-shot
+  `POST /api/mcp/reset` + full-page reload. The one-shot guard is a
+  `bi:reconnecting` flag in sessionStorage so a second consecutive
+  failure falls through to a manual "reconnect" button instead of
+  looping.
+
+  Anchor: `lib/hooks/useReconnectPolicy.ts:33-111`.
 
 ## See also
 
-  - `01-network-map.md` — for where the streaming wire sits in the overall topology.
-  - `05-http-semantics-caching-and-cors.md` — for the headers (`Content-Type: application/x-ndjson`, `Cache-Control: no-transform`) that make the stream work in practice.
-  - `07-timeouts-retries-pooling-and-backpressure.md` — for how the route bounds the work that runs while the stream is open.
+  - `05-http-semantics-caching-and-cors.md` — the Content-Type branch
+  - `07-timeouts-retries-pooling-and-backpressure.md` — the AbortSignal
+    composition that makes cancellation end-to-end
+  - `.aipe/study-frontend-engineering/` — the client hooks + StrictMode

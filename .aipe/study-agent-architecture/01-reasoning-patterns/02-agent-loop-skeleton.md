@@ -1,289 +1,208 @@
 # The agent loop skeleton
 
-**Industry standard.** The kernel every named reasoning pattern instantiates.
+_Industry standard._
 
 ## Zoom out, then zoom in
 
-Sits in the runtime — below the agent class, above the model provider. Every named pattern (ReAct, plan-and-execute, reflexion, every multi-agent topology) is this skeleton with a different step function or composition rule.
+Every ReAct / plan-execute / reflexion pattern — every worker in Section C — is *this same kernel* with a different step function. Learn the kernel once here; the rest is prompt-shaping.
 
 ```
-  Zoom out — where this concept lives
+  Zoom out — where the skeleton lives
 
-  ┌─ Reasoning layer ───────────────────────────────┐
-  │  MonitoringAgent.scan()  →  AptKit class .scan()│
-  └────────────────────────────┬────────────────────┘
-                               │  delegates to
-  ┌─ Runtime layer ───────────▼────────────────────┐
-  │  ★ runAgentLoop (the skeleton) ★                │ ← we are here
-  │  for (turn = 0; turn < maxTurns; ...)           │
-  └────────────────────────────┬────────────────────┘
+  ┌─ Service ─────────────────────────────────────────────────┐
+  │  DiagnosticAgent.investigate(anomaly, hooks)              │
+  │  RecommendationAgent.propose(anomaly, diagnosis, hooks)   │
+  │  MonitoringAgent.scan(hooks, categories)                  │
+  │  QueryAgent.answer(query, intent, hooks)                  │
+  └────────────────────────────┬──────────────────────────────┘
+                               │  each delegates to
+                               ▼
+  ┌─ AptKit runtime ──────────────────────────────────────────┐
+  │  ★ runAgentLoop(...) — one kernel, four wrappers ★         │
+  │  run-agent-loop.js:25-105                                  │
+  └────────────────────────────┬──────────────────────────────┘
                                │
-  ┌─ Provider layer ──────────▼────────────────────┐
-  │  ModelProvider.complete()  + ToolRegistry.callTool()│
-  └─────────────────────────────────────────────────┘
+  ┌─ ModelProvider / ToolRegistry ───────────▼────────────────┐
+  │  AnthropicModelProviderAdapter · BloomingToolRegistry     │
+  └───────────────────────────────────────────────────────────┘
 ```
 
-Chains-vs-agents told you "is there a loop at all." This file tells you "what's in the loop, and which parts are load-bearing." Same skeleton runs the monitoring scan, the diagnostic investigation, and the recommendation proposal — three agents, one shape.
+Zoom in: the loop is `step + execute + accumulate + terminate`, and termination has TWO exits. The budget exit is the one people forget.
 
 ## Structure pass
 
-Layers: model call (one turn) → message accumulator (the running conversation) → tool harness (executes the model's emitted intent).
+**Layers:** state (messages array) · step function (LLM call) · execute (tool dispatch) · termination (two exits).
+**Axis:** *what breaks if this part is missing?*
+**Seams:** the message-array boundary (accumulate happens here); the tool_use → callTool boundary (execute crosses from model to code).
 
-**Axis traced — "what breaks if I remove this?":** the load-bearing test from the spec. Removing the message accumulator: every turn is amnesiac, you get N independent calls. Removing the tool harness: the model can ask for tools but nothing runs them. Removing the iteration cap: the model can loop forever.
+```
+  Four parts of the kernel, ranked by what breaks
 
-**Seam — the model never touches the tool directly.** The model emits a `tool_use` intent in its response content; the harness reads that, calls the tool, appends the result as a `tool_result` block to the next user message. That boundary IS the safety story (no model-to-tool side channel) and the observability story (every call passes through the trace sink).
+  ┌──────────────┬──────────────────────────────────────────┐
+  │ state        │ without it: every turn is amnesiac, N    │
+  │ (messages[]) │ independent calls, not a loop            │
+  ├──────────────┼──────────────────────────────────────────┤
+  │ step (LLM)   │ without it: nothing chooses next action  │
+  │              │ (the only "smart" part; rest is plumbing)│
+  ├──────────────┼──────────────────────────────────────────┤
+  │ execute      │ without it: model emits intent, nothing  │
+  │ (tool call)  │ runs; also the safety boundary           │
+  ├──────────────┼──────────────────────────────────────────┤
+  │ terminate    │ TWO exits required:                       │
+  │              │  success: model emits final (no tool_use)│
+  │              │  budget:  maxTurns / maxToolCalls        │
+  │              │ without budget exit: silent burn         │
+  └──────────────┴──────────────────────────────────────────┘
+```
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know the shape of `Array.prototype.reduce` — a callback runs against each element, an accumulator carries state forward, the loop terminates when there are no more elements. An agent loop is the same shape, with two extra wrinkles: the model decides whether there's a "next element" (the next tool to call), and the loop also has a hard budget cap so a runaway model can't burn forever.
+You've written a paginated `fetch` loop before — `while (hasMore) { const page = await fetch(...); results.push(...page); hasMore = page.next; }`. Four parts: state (`results`), the request (`fetch`), accumulate (`push`), termination (`hasMore`). The agent loop is the same shape with `fetch` replaced by `model.complete` and termination is *both* "model said done" AND "we hit the cap".
 
 ```
-  The kernel — the smallest thing that's still an agent
+  Pattern: the agent loop kernel
 
-  ┌──────────────────────────────────────────────────┐
-  │  state = [initial user prompt]                    │
-  │  while (turn < maxTurns):                         │
-  │     response = model.complete(state)              │← the step function
-  │     state.push(response)                          │← accumulate
-  │     if (response has no tool_use):                │
-  │         return final text  ◄── SUCCESS EXIT       │
-  │     for each tool_use in response:                │
-  │         result = tools.callTool(name, args)       │← execute
-  │         state.push(tool_result(result))           │← accumulate
-  │  return fallback / final-forced text  ◄─ BUDGET   │
-  └──────────────────────────────────────────────────┘
+  ┌───────────────────────────────────────────────────────┐
+  │   messages = [{ user: prompt }]                       │
+  │   for turn in 0..maxTurns:                             │
+  │     ┌──────────────┐                                    │
+  │     │ step         │ ← LLM decides                     │
+  │     │ (LLM call)   │                                    │
+  │     └──────┬───────┘                                    │
+  │            ▼                                            │
+  │       tool_uses?                                        │
+  │     ┌───────┴────────┐                                  │
+  │     │ none           │ tool_uses                        │
+  │     ▼                ▼                                  │
+  │  success exit    for each: callTool → tool_result      │
+  │  (final text)    append to messages · loop             │
+  │                                                          │
+  │   if we exit the for without break: BUDGET exit         │
+  │   (runtime forces a synthesis turn — see forceFinal)    │
+  └───────────────────────────────────────────────────────┘
 ```
 
-Four load-bearing parts. Two exits, both required. Everything else is hardening.
+### Move 2 — the load-bearing skeleton walkthrough
 
-### Move 2 — step by step (load-bearing skeleton)
-
-Open `node_modules/@aptkit/core/node_modules/@aptkit/runtime/dist/src/run-agent-loop.js`. The whole file is 138 lines; the kernel is lines 20-105.
-
-#### Part 1 — state (the message accumulator)
+**The kernel — `run-agent-loop.js:25-105`.** This is the whole pattern. Nothing removable.
 
 ```js
-// run-agent-loop.js:22
-const messages = [{ role: 'user', content: userPrompt }];
-```
-
-A single array. Every turn appends the model's response *and* (if the model called tools) the tool results as the next user message. The next `model.complete(messages)` gets the whole history — that's how the model knows what it already asked, what came back, and what it already tried.
-
-**What breaks if you remove it:** every turn is amnesiac. The model sees only the initial prompt. It re-asks the same tool, gets the same answer, never makes progress. The thing that makes it a *loop* and not N independent calls is this accumulator.
-
-You can see it being used: line 48 (`messages.push({ role: 'assistant', content: response.content })`) and line 104 (`messages.push({ role: 'user', content: toolResults })`).
-
-#### Part 2 — the step function (the single LLM call)
-
-```js
-// run-agent-loop.js:29-35
-const response = await model.complete({
-  system: forceFinal && synthesisInstruction ? `${system}\n\n${synthesisInstruction}` : system,
-  messages,
-  tools: forceFinal ? undefined : toolSchemas,
-  maxTokens,
-  signal,
-});
-```
-
-One call to the model provider per turn. This is the only "smart" part of the loop — everything else is plumbing. The model gets the system prompt, the running conversation, the available tools (or no tools, on the forced final turn — see below), and emits a response that has either `text` blocks, `tool_use` blocks, or both.
-
-The `ModelProvider` port is generic (`@aptkit/runtime/dist/src/model-provider.d.ts`); the Blooming repo adapts Anthropic to it in `AnthropicModelProviderAdapter` (`lib/agents/aptkit-adapters.ts:26-72`). Swapping providers — OpenAI, Gemini, a local model — is one adapter class, not a rewrite of the loop.
-
-**What breaks if you remove it:** nothing decides the next action. You'd be running a `for` loop with no body. The model is what makes it an agent.
-
-#### Part 3 — execute (run the tool, feed the result back)
-
-```js
-// run-agent-loop.js:59-103 (the per-tool-use inner block, abridged)
-for (const toolUse of toolUses) {
-  // trace start
-  let isError = false, resultContent;
-  try {
-    const { result, durationMs } = await tools.callTool(
-      toolUse.name, toolUse.input, { signal },
-    );
-    resultContent = truncate(JSON.stringify(result));
-  } catch (error) {
-    isError = true;
-    resultContent = truncate(JSON.stringify({ error: error.message }));
-  }
-  // trace end
-  toolResults.push({
-    type: 'tool_result',
-    toolUseId: toolUse.id,
-    content: resultContent,
-    ...(isError ? { isError: true } : {}),
+// node_modules/@aptkit/core/node_modules/@aptkit/runtime/dist/src/run-agent-loop.js:25
+for (let turn = 0; turn < maxTurns; turn += 1) {
+  signal?.throwIfAborted();                                    // ← cancellation seam
+  const budgetSpent = maxToolCalls !== undefined && toolCalls.length >= maxToolCalls;
+  const forceFinal = turn === maxTurns - 1 || budgetSpent;     // ← BUDGET exit trigger
+  const response = await model.complete({
+    system: forceFinal && synthesisInstruction ? `${system}\n\n${synthesisInstruction}` : system,
+    tools: forceFinal ? undefined : toolSchemas,               // ← strip tools on final
+    ...
   });
-}
-messages.push({ role: 'user', content: toolResults });
-```
-
-The model emits *intent* (an array of `tool_use` blocks naming tools and their args). The harness reads that, calls each one through the `ToolRegistry` port, packages the result back as a `tool_result` block in a user message, and goes around the loop.
-
-**The seam:** the model never touches the tool directly. It emits a JSON-like intent; the harness owns the actual call. That boundary is what makes the per-agent tool allowlist (`anomalyMonitoringToolPolicy.allowedTools`) work — the model can only call what the harness exposes. It's also what makes the trace sink possible — every call passes through the harness, every call gets logged.
-
-**What breaks if you remove it:** the model asks for tools but nothing runs them. You'd see infinite `tool_use` emissions in the trace and zero actual tool calls. Some hobby agent loops have this exact bug.
-
-The Blooming bridge is `BloomingToolRegistryAdapter` (`lib/agents/aptkit-adapters.ts:75-97`):
-
-```ts
-// lib/agents/aptkit-adapters.ts:89-96
-async callTool(name, args, options?) {
-  const { result, durationMs } = await this.dataSource.callTool(name, args, options);
-  return { result, durationMs };
+  messages.push({ role: 'assistant', content: response.content });   // ← ACCUMULATE
+  const toolUses = toolUsesFromContent(response.content);
+  if (toolUses.length === 0) { finalText = text; break; }      // ← SUCCESS exit
+  for (const toolUse of toolUses) {                             // ← EXECUTE
+    const { result, durationMs } = await tools.callTool(toolUse.name, toolUse.input, { signal });
+    toolResults.push({ type: 'tool_result', toolUseId: toolUse.id, content: ... });
+  }
+  messages.push({ role: 'user', content: toolResults });        // ← ACCUMULATE
 }
 ```
 
-Eight lines. The `DataSource` port (`lib/data-source/types.ts:63-71`) is on one side; the AptKit `ToolRegistry` port is on the other; this adapter is the bridge. The MCP transport + rate-limit retry + 60s cache all live under `dataSource.callTool` — the agent loop sees none of that.
+Line-by-line:
 
-#### Part 4 — termination (TWO exits, both required)
+**state** — `messages` array. Every turn pushes assistant response, then tool_result. Without this the model would decide fresh every turn with no memory of what it already queried. That's not a loop, it's a scattershot.
 
-This is the part people actually forget. The loop has two ways out.
+**step** — `model.complete(...)`. The only line where the model runs. In this codebase that call goes through `AnthropicModelProviderAdapter.complete` (`lib/agents/aptkit-adapters.ts:59`), which is where the ephemeral cache breakpoint gets set and the budget tracker gets checked.
 
-**Success exit** — the model said "I'm done":
+**execute** — `tools.callTool(...)`. The model emitted `tool_use` intent; this is where the harness actually runs it. Through `BloomingToolRegistryAdapter.callTool` (`aptkit-adapters.ts:138`) → `dataSource.callTool` → the MCP call. **The model never touches the tool directly** — that boundary is the whole control story. Every guardrail (allowlist, timeout, rate limit, injection defense) hangs here.
 
-```js
-// run-agent-loop.js:54-57
-const toolUses = toolUsesFromContent(response.content);
-if (toolUses.length === 0) {
-  finalText = text;
-  break;
-}
+**terminate — two exits.** SUCCESS: `toolUses.length === 0` (model returned pure text, `break` the loop). BUDGET: the `for` completes without break — the `forceFinal` flag at `turn === maxTurns - 1` strips `tools` from the request so the model *must* produce final text. This is the load-bearing part. `maxTurns=8` and `maxToolCalls=6` are hard-coded in `diagnostic-agent.js:55-56`; without them a runaway loop burns tokens until Vercel's 300s wall clock kills the request.
+
+```
+  Layers-and-hops — one turn of the loop
+
+  ┌─ AptKit runtime ─────────┐  turn N: build request        ┌─ Anthropic API ──┐
+  │  run-agent-loop.js:29    │ ────────────────────────────►  │  Sonnet 4.6       │
+  │                          │  content blocks + tool_use ◄── │                   │
+  └──────────┬───────────────┘                                └───────────────────┘
+             │ push assistant to messages
+             ▼
+  ┌─ AptKit runtime ─────────┐  for each tool_use:            ┌─ BloomingTool    ┐
+  │  run-agent-loop.js:59    │ ────────────────────────────►  │  Registry        │
+  │                          │  {result, durationMs} ◄────── │  callTool         │
+  └──────────┬───────────────┘                                └─────────┬─────────┘
+             │                                                          │ dataSource.callTool
+             │ push tool_result to messages                             ▼
+             │                                                ┌─ BloomreachData  ┐
+             └──── loop back to top                           │  MCP over OAuth  │
+                                                              └───────────────────┘
 ```
 
-The model's response had no `tool_use` blocks. It emitted only text. The harness interprets that as "this is the final answer" and breaks out.
+**Optional hardening (NOT skeleton):**
 
-**Budget exit** — the `for` loop completed without `break`:
-
-```js
-// run-agent-loop.js:25
-for (let turn = 0; turn < maxTurns; turn += 1) { ... }
-```
-
-`maxTurns` defaults to 8 (line 21). The monitoring agent additionally enforces `maxToolCalls = 6` (`@aptkit/agent-anomaly-monitoring/.../monitoring-agent.js:56`). When the budget runs out the loop just exits; `finalText` keeps whatever value the last successful synthesis produced (often the empty string, which is why monitoring's `tryParseAnomalies` returns `[]` on failure).
-
-**What breaks if you remove the budget exit:** the model can loop forever. Nothing in the kernel guarantees it ever emits a tool-free response. An agent shipped without a budget cap burns tokens in a silent loop until you notice the bill. The cap is not bolt-on hardening; **it is part of the skeleton.**
-
-Naming the budget exit unprompted in an interview signals you actually built one of these, not just read about it.
-
-#### The forced final turn (a small twist on termination)
-
-AptKit adds a wrinkle the canonical kernel description doesn't have. On the *last* turn (or when `maxToolCalls` is spent), it strips the tool definitions from the request *and* injects a synthesis instruction:
-
-```js
-// run-agent-loop.js:27-32 (the relevant part)
-const budgetSpent = maxToolCalls !== undefined && toolCalls.length >= maxToolCalls;
-const forceFinal = turn === maxTurns - 1 || budgetSpent;
-const response = await model.complete({
-  system: forceFinal && synthesisInstruction ? `${system}\n\n${synthesisInstruction}` : system,
-  messages,
-  tools: forceFinal ? undefined : toolSchemas,  // ← no tools on the final turn
-  ...
-});
-```
-
-Without this, the model on its last allowed turn might emit another `tool_use` (which the harness would then have to ignore, since the budget is spent). With it, the model is forced to synthesize from what it already has. The monitoring agent's synthesis instruction is "Stop querying now and output your final answer. Respond with ONLY a JSON array of anomaly objects in a json fence, or [] if nothing meaningful was found, based on the data you have already gathered" (`@aptkit/agent-anomaly-monitoring/.../monitoring-agent.js:57`). Test coverage lives in `test/agents/synthesis-instruction.test.ts`.
-
-Everything past these four parts (plus the forced-final twist) is **optional hardening**, not skeleton:
-
-- retry/backoff on tool failure (in `BloomreachDataSource`, not the loop)
-- scratchpad/memory store when state outgrows the context window (not in this repo — the loops are short enough)
-- step-transition logging for observability (the `CapabilityTraceSink` port)
-- structured-output validation before you trust the final text (`tryParseAnomalies`, `tryParseDiagnosis`, etc. — applied *after* the loop returns)
-- the recovery prompt (a second pass that re-asks the model with just the evidence — see `04-agent-infrastructure/04-agent-evaluation.md`)
-
-#### Single-turn vs multi-turn isn't two patterns
-
-It's the same skeleton with `maxTurns=1` vs `maxTurns=8`. A one-pass detector exits the `while` after one step; a multi-step retrieval loop runs it several times. The intent classifier (`classifyIntent` in `lib/agents/intent.ts`) is the single-turn case — no tools, one call, parse the answer. Same skeleton, smaller loop count.
+- **Recovery prompt** — `run-agent-loop.js:110`. If the final text failed to parse (missing JSON), a second turn is fired with a stricter "output ONLY the diagnosis object" prompt. This is *structured-output rescue*, not reflexion — the model isn't critiquing itself, the harness caught a schema violation.
+- **BudgetTracker** — `lib/agents/budget.ts`. A hard token/cost ceiling across all agents in one investigation. Checked before *every* `model.complete` in `AnthropicModelProviderAdapter.complete:63`. This is above-and-beyond the `maxTurns` skeleton exit — it protects against runaway even when maxTurns=8 turns are individually cheap.
+- **Trace sink** — `BloomingTraceSinkAdapter`. Forwards every `CapabilityEvent` to hooks that push NDJSON to the browser. Observability, not skeleton.
+- **`signal?.throwIfAborted()`** — cancellation. Thread from `req.signal` → the loop → the tool call → the Anthropic call. Hardening for the "user closed the tab" case.
 
 ### Move 3 — the principle
 
-**An agent is `step + execute + accumulate + terminate`, and termination needs BOTH a success condition and a hard budget.** Naming the budget exit unprompted is the signal you built one. The four parts compose into every other named pattern: ReAct is this skeleton with a Thought-Action-Observation prompt; plan-and-execute is two of these skeletons stacked (one for planning, one per execute step); reflexion is this skeleton with the step function wrapping a critic call. Multi-agent is N of these skeletons composed — but only "N independent loops merged" when the agents are genuinely independent (true fan-out). The moment one agent's output feeds another, you're traversing a dependency DAG of agents and you need an orchestrator and a merge strategy — covered in `03-multi-agent-orchestration/`.
+An agent is `step + execute + accumulate + terminate`, and termination needs BOTH a success condition AND a hard budget. Naming the budget unprompted is the signal you shipped an agent, not read about one. Everything else — reflexion, plan-and-execute, retrieval loops — is a different step-function shape wrapped around this same kernel.
 
 ## Primary diagram
 
 ```
-  The full skeleton — the kernel + the forced-final twist
+  Recap — the full agent loop kernel, with hardening seam
 
-  ┌─ runAgentLoop  (node_modules/.../runtime/.../run-agent-loop.js) ────┐
-  │                                                                     │
-  │  messages = [user prompt]                                           │
-  │  toolCalls = []                                                     │
-  │                                                                     │
-  │  for turn in 0..maxTurns-1:                                         │
-  │     ┌────────────────────────────────────────────────────────────┐  │
-  │     │  signal.throwIfAborted()                                    │  │
-  │     │  forceFinal = (last turn) OR (maxToolCalls reached)         │  │
-  │     │                                                             │  │
-  │     │  ┌─ model.complete ──────────────────────────────────────┐  │  │
-  │     │  │ system  : base prompt (+ synthesis instr if forceFinal│  │  │
-  │     │  │ messages: running conversation                        │  │  │
-  │     │  │ tools   : toolSchemas (or NONE if forceFinal)         │  │  │
-  │     │  └───────────────────────────────────────────────────────┘  │  │
-  │     │            │                                                │  │
-  │     │            ▼                                                │  │
-  │     │  response = { content: [text|tool_use, ...], usage }        │  │
-  │     │  emit trace(model_usage, step)                              │  │
-  │     │  messages.push({role:assistant, content:response.content})  │  │
-  │     │                                                             │  │
-  │     │  toolUses = response.content.filter(type=tool_use)          │  │
-  │     │  if toolUses.empty:                                         │  │
-  │     │     finalText = text                                        │  │
-  │     │     break  ◄────────────────── SUCCESS EXIT                 │  │
-  │     │                                                             │  │
-  │     │  for toolUse in toolUses:                                   │  │
-  │     │     emit trace(tool_call_start)                             │  │
-  │     │     try: result = tools.callTool(name, args, {signal})      │  │
-  │     │     catch e: result = {error: e.message}, isError = true   │  │
-  │     │     emit trace(tool_call_end)                               │  │
-  │     │     toolResults.push(tool_result block)                     │  │
-  │     │                                                             │  │
-  │     │  messages.push({role:user, content:toolResults})            │  │
-  │     └────────────────────────────────────────────────────────────┘  │
-  │  end for  ◄──────────────────────────── BUDGET EXIT                 │
-  │                                                                     │
-  │  if parseResult provided: parsed = parseResult(finalText)           │
-  │  if parsed == null && recoveryPrompt provided:                      │
-  │      recoveryText = runRecoveryTurn(...)  // single-shot recovery    │
-  │      parsed = parseResult(recoveryText)                             │
-  │                                                                     │
-  │  return { finalText, toolCalls, parsed }                            │
-  └─────────────────────────────────────────────────────────────────────┘
+  ┌─ SKELETON (irreducible) ──────────────────────────────────┐
+  │  messages = [user prompt]                                 │
+  │                                                            │
+  │  for turn in 0..maxTurns:                                  │
+  │    ┌─ step ──────────────────────────────────────────┐    │
+  │    │ response = model.complete(messages, tools)      │    │
+  │    └────────┬────────────────────────────────────────┘    │
+  │             ▼                                              │
+  │        tool_uses?                                          │
+  │      ┌──────┴──────┐                                       │
+  │      │ none        │ tool_uses                             │
+  │      ▼             ▼                                       │
+  │  SUCCESS EXIT   execute: for each tool_use                 │
+  │  return text      result = callTool(name, input)           │
+  │                   messages.push(tool_result)                │
+  │                                                            │
+  │  → after maxTurns: BUDGET EXIT (forceFinal strips tools)   │
+  └────────────────────────────────────────────────────────────┘
+  ┌─ HARDENING (optional) ────────────────────────────────────┐
+  │  cancellation signal · recovery prompt · budget tracker   │
+  │  trace sink · retry/backoff · schema validation           │
+  └───────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The canonical "agent kernel" diagram in most agent-framework documentation shows three boxes (Thought, Action, Observation) and a loop arrow. That's accurate for ReAct *as a prompting strategy* but it hides the load-bearing termination story. The two-exits framing — success and budget — is the part that separates an agent you can ship from an agent you can't.
+The kernel was first named cleanly in the ReAct paper (Yao et al. 2022) as Thought-Action-Observation. AptKit's `runAgentLoop` is a modern implementation with `forceFinal` handling the budget exit gracefully (strip tools + inject synthesis instruction) instead of the older pattern of raising `MaxIterationsError`. The graceful approach is materially better for user-facing systems because you get *a* diagnosis (based on evidence gathered so far) instead of a 500.
 
-The forced final turn is a less-discussed but production-essential trick. Without it, your last-turn behavior is "the model emits another tool_use; the harness discards it; the final text is whatever leaked into the response by accident." With it, the last-turn behavior is "the model has no tool option; the harness asks for synthesis explicitly; the final text is structured." The Anthropic SDK docs cover the mechanics; the *escalation* to having this in your kernel comes from one production debugging session where you watch the model burn its budget on a tool that didn't help and then emit empty text.
-
-The recovery prompt (lines 106-114) is a smaller-stakes equivalent for structured-output failures. When `tryParseAnomalies(finalText)` returns null — the model didn't emit a valid JSON array — the harness runs a *single* additional model call with just the tool-call evidence and a "convert this to the structured form" instruction. It's bounded (one call, no tools) so it can't blow the budget; it's gated (only fires when `parseResult` returns null AND `recoveryPrompt` is provided) so it only runs when needed. In this repo, only `AnomalyMonitoringAgent` configures a `recoveryPrompt` (`monitoring-agent.js:59`); the other agents either parse trivially or accept the raw text.
+The subtle bit that separates senior from mid: recognizing the recovery prompt in `run-agent-loop.js:116` is NOT reflexion. It only fires if `parseResult` returned null — a schema failure. The model doesn't grade its own answer; the harness noticed it wasn't parseable and fired one rescue turn. Reflexion (see `05-reflexion-self-critique.md`) is fundamentally different.
 
 ## Interview defense
 
-> **Q: Sketch the agent loop. What are the load-bearing parts?**
->
-> Four parts: state, step, execute, terminate. State is the message accumulator — without it every turn is amnesiac. Step is the single model call — the only "smart" part. Execute is the tool harness — the model emits intent, the harness runs the tool. Terminate has TWO exits: success (model emits no `tool_use`, harness breaks) and budget (the `for` loop hits `maxTurns`). Both are required. Without the budget exit, the model can loop forever and burn tokens silently — that's the part people forget when they read about ReAct in a blog post and ship it.
->
-> Anchor: `node_modules/.../runtime/.../run-agent-loop.js:25-57`.
+**Q: Walk me through the agent loop kernel.**
+A: `step + execute + accumulate + terminate`. State is the messages array. Step is the model.complete call. Execute is tools.callTool — the model emits intent, the harness runs it, that boundary is the safety story. Accumulate pushes assistant + tool_result back into messages. Termination is TWO exits: success (model returns pure text) and budget (`maxTurns` / `maxToolCalls` — in AptKit at 8 and 6). The budget exit is not hardening — it's part of the skeleton, because nothing guarantees the model reaches success. Without it a loop burns tokens silently.
 
-> **Q: Why does the harness sit between the model and the tools?**
->
-> Three reasons. Safety: the per-agent tool allowlist (`anomalyMonitoringToolPolicy.allowedTools`) only works because the model can't call anything not in the harness's registry. Observability: every call passes through the trace sink, which is how the UI gets its "how this was gathered" panel — the `CapabilityTraceSink` adapter emits `tool_call_start` / `_end` events on the NDJSON wire. Substitution: the model emits a JSON intent; the harness can swap in a fake tool registry for tests (which is how the 144 Vitest tests run without network). The model-to-tool boundary IS the control story.
+Diagram: the four-part kernel + the two exits.
+Anchor: `node_modules/@aptkit/core/.../run-agent-loop.js:25-105`.
 
-> **Q: What's the forced final turn and why does AptKit have it?**
->
-> On the last allowed turn — `turn === maxTurns - 1` OR `maxToolCalls` is spent — the harness strips the tool definitions from the request and prepends a synthesis instruction to the system prompt. Without it the model might emit another `tool_use` block the harness has no budget to run; the final text would be empty or partial. With it the model has no choice but to synthesize from what it already has. For the monitoring agent the synthesis instruction is literally "Stop querying now and output your final answer. Respond with ONLY a JSON array of anomaly objects, or []."
->
-> Anchor: `run-agent-loop.js:27-32`; AptKit adds this on top of the canonical kernel.
+**Q: What breaks if you remove maxTurns?**
+A: The model can cycle tool calls indefinitely — same query, slight variations, no convergence. On Vercel we'd hit the 300s wall clock and 504 the request; on a raw runtime the loop runs until token budget or infra gives out. In diagnose mode that would be ~$0.09 per case ballooning to hours-long stalls. AptKit picks 8 turns because empirically the diagnostic path converges in 5-8 turns; anything past that is thrash, and the graceful forceFinal produces a "based on evidence so far…" diagnosis instead of a 500.
+
+Diagram: the loop counter incrementing past 8, forceFinal firing, strip tools, produce final.
+Anchor: `run-agent-loop.js:27-32` (the `forceFinal` branch).
 
 ## See also
 
-- → `01-chains-vs-agents.md` — the *outer* layer that wraps this skeleton
-- → `03-react.md` — the prompting strategy this skeleton runs in this repo
-- → `04-agent-infrastructure/05-guardrails-and-control.md` — the full control envelope around this skeleton
-- → `05-production-serving/03-per-tool-circuit-breaking.md` — what `tools.callTool` does under the hood in `BloomreachDataSource`
-- → cross-reference (when generated): `study-ai-engineering`'s `04-agents-and-tool-use/03-react-pattern.md` — the prompt-level Thought-Action-Observation mechanics
+- `01-chains-vs-agents.md` — when to reach for this kernel at all.
+- `03-react.md` — the default prompt shape *inside* the step function.
+- `04-agent-infrastructure/05-guardrails-and-control.md` — the BudgetTracker as a control envelope around this kernel.
+- Cross-reference: `.aipe/study-ai-engineering/04-agents-and-tool-use/` for the ReAct step-function mechanics.

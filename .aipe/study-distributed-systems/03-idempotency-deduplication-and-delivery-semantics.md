@@ -1,419 +1,436 @@
-# Idempotency, deduplication, and delivery semantics
+# idempotency-deduplication-and-delivery-semantics
 
-*Industry standard — duplicate work, idempotency keys, at-most-once / at-least-once / exactly-once.*
+*Deduplication cache · At-least-once semantics · Read-only tools · Industry standard*
 
-## Zoom out — where delivery semantics matter
+## Zoom out — where this concept lives
 
-Delivery semantics matter when *the same logical operation might be sent more than once* and *the duplicate could change observable state*. In `blooming_insights`, that's a narrow seam — and most of it is on the safe side of the fence.
-
-```
-  Where this concern lives — and where it doesn't
-
-  ┌─ L1: Browser ─────────────────────────────────────────────┐
-  │  user clicks a card · navigates · React StrictMode mounts  │
-  │  → could trigger duplicate fetches → consumer-side dedup    │
-  └─────────────────────────┬─────────────────────────────────┘
-                            │
-  ┌─ L2: Route ─────────────▼─────────────────────────────────┐
-  │  GET /api/briefing — idempotent (reads the workspace)      │
-  │  GET /api/agent      — idempotent (reads investigation)    │
-  │  POST /api/mcp/call  — wraps one read call (idempotent)    │
-  │  GET /api/mcp/callback — OAuth code exchange (★ MUTATIVE ★) │
-  └─────────────────────────┬─────────────────────────────────┘
-                            │
-  ┌─ L3: BloomreachDataSource ────────────────────────────────┐
-  │  retry ladder retries isError envelopes — safe because…    │
-  └─────────────────────────┬─────────────────────────────────┘
-                            │
-  ┌─ L4: Bloomreach MCP ────▼─────────────────────────────────┐
-  │  every tool call is a READ                                 │
-  │   list_*, get_*, execute_analytics_eql                     │
-  │  no tool in the allowlist mutates Bloomreach state         │
-  └────────────────────────────────────────────────────────────┘
-```
-
-This file's load-bearing claim: **every tool call this codebase makes is a read, so the retry ladder is safe without an idempotency key**. The exception is OAuth code exchange in the callback route — that's the one place a duplicate could hurt, and the SDK handles it.
-
-## Zoom in — the question this file answers
-
-> When the same request, tool call, or React mount fires twice, does the system end up in a different state than if it had fired once?
-
-Short answer: no, with three asterisks (the OAuth callback, the cache key, the React-StrictMode mount). The rest of this file unpacks why.
-
-## Structure pass — the skeleton
-
-### Axes — trace mutability
-
-The right axis is **does this operation change observable state?** Trace it across the layers.
+This is the file where you have to be honest about what "delivery
+semantics" means in a repo where the only external side effect is a
+read-only EQL query. There IS a dedup surface here (the 60s cache), and
+the retry ladder DOES produce at-least-once execution — but because the
+tools don't mutate anything, at-least-once and exactly-once are
+observationally identical. That is the load-bearing insight.
 
 ```
-  One axis: "does this change state visible to anyone else?"
+  Zoom out — dedup and delivery live in the adapter
 
-  L1 Browser
-    fetch(...) twice           → idempotent if the route is
-    sessionStorage write twice → same key, same value → no-op
-
-  L2 Route
-    GET /api/briefing twice    → idempotent (read-only on the wire)
-    GET /api/agent twice       → idempotent (read-only on the wire)
-    POST /api/mcp/call twice   → idempotent (wraps a read call)
-    GET /api/mcp/callback twice → ★ NOT IDEMPOTENT ★
-      (consumes the one-time OAuth code; second call should 401)
-
-  L3 DataSource
-    callTool retry             → safe because the call is a read
-
-  L4 Bloomreach
-    list_*, get_*, execute_*   → READS · all idempotent
-    (no writes in the allowlist) → no idempotency key needed
+  ┌─ Client layer ──────────────────────────────────┐
+  │  no dedup — every fetch() opens a fresh stream  │
+  └───────────────────────┬─────────────────────────┘
+                          │
+  ┌─ Service layer ───────▼─────────────────────────┐
+  │  ★ THE 60s CACHE + RETRY LADDER LIVE HERE ★     │ ← we are here
+  │                                                  │
+  │  BloomreachDataSource                            │
+  │  - cache: Map<name+args, {result, expiresAt}>    │
+  │  - retry ladder (at-least-once execution)        │
+  │  - no-cache-on-error (poison guard)              │
+  └───────────────────────┬─────────────────────────┘
+                          │  hop B — Bloomreach
+                          ▼
+  ┌─ Provider ──────────────────────────────────────┐
+  │  execute_analytics_eql · all read-only           │
+  │  no idempotency-key protocol offered             │
+  └─────────────────────────────────────────────────┘
 ```
 
-The axis flips exactly once — at the OAuth callback. Everywhere else, the answer is "no, this is a read."
+## Structure pass
 
-### Seams — where duplicate-work could enter
-
-```
-  Three places a duplicate could be born — and what catches it
-
-  source of duplicate                              caught by
-  ────────────────────                              ─────────
-  React StrictMode double-mount in dev              startedRef guard
-                                                    (lib/hooks/useInvestigation.ts:46)
-
-  Auto-reconnect on 401 invalid_token               replays the same GET
-                                                    (idempotent — wire is a read)
-
-  Retry ladder retries an isError envelope          safe because every
-                                                    tool is a read
-                                                    (bloomreach-data-source.ts:164)
-```
-
-The first one is interesting because it's the only place in the codebase where a *consumer-side dedup* is the load-bearing mechanism. The other two are safe by construction.
-
-### Layered decomposition — the same question, two altitudes
+### Layers of "is this a duplicate?"
 
 ```
-  "What does duplicate work cost?" — held constant down
+  What "duplicate" means, at three layers
 
-  outer: HTTP request           cost: time + Bloomreach rate-limit budget;
-                                no state change (reads only)
-
-  inner: in-process retry        cost: time + 1.1s spacing wait;
-                                no state change (reads only)
-
-  innermost: cache lookup        cost: nothing — same key, same value,
-                                consumer reads cache, never hits wire
+  ┌───────────────────────────────────────────────┐
+  │ agent (model)                                  │
+  │   "duplicate" = same tool + same args in the   │
+  │    same investigation. Cache absorbs; model    │
+  │    sees the cached result.                     │
+  └───────────────────────────────────────────────┘
+      ┌───────────────────────────────────────────────┐
+      │ adapter (BloomreachDataSource)                │
+      │   "duplicate" = same name+args within 60s.    │
+      │   Cache key = `${name}:${JSON.stringify(args)}`│
+      │   (bloomreach-data-source.ts:144)             │
+      └───────────────────────────────────────────────┘
+          ┌───────────────────────────────────────────┐
+          │ provider (Bloomreach)                     │
+          │   "duplicate" = doesn't exist in the      │
+          │    protocol. Bloomreach doesn't dedup.    │
+          │    Every call is a new EQL execution.     │
+          └───────────────────────────────────────────┘
 ```
 
-The cost of a duplicate falls as you descend. At the wire, a duplicate costs a Bloomreach round-trip. Inside the request, the 60s cache makes the second call free. Inside the request *and* across requests on the same warm instance, the cache makes it free again — until TTL or restart. **The cache is the deduplication layer the system doesn't call deduplication.**
+The answer flips at every layer. At the agent, dedup is a latency win. At
+the adapter, dedup is a rate-limit win. At the provider, there IS no
+dedup — every EQL call re-executes on their side.
+
+### One axis — trace "how many times can this side effect happen?"
+
+```
+  "how many times can this call's side effect happen?"
+
+  ┌───────────────────────────────────────────────┐
+  │ EQL queries via execute_analytics_eql          │
+  │   → 0 side effects (read-only)                 │  at-least-once == exactly-once
+  │   → duplicate calls just re-compute            │  OBSERVATIONALLY
+  └───────────────────────────────────────────────┘
+      ┌───────────────────────────────────────────┐
+      │ HYPOTHETICAL: campaign_send tool           │
+      │   → N side effects if called N times       │  at-least-once ≠ exactly-once
+      │   → would need idempotency key             │  NEEDS PROTOCOL SUPPORT
+      └───────────────────────────────────────────┘
+```
+
+The current answer is "0 side effects" for every tool the agents actually
+call — the monitoring/diagnostic loop reads only. That's why the retry
+ladder is safe and the cache is a pure win. **The moment a tool that
+mutates ships (voucher issue, campaign send, segment update), this
+axis flips and every mechanism in this file needs revisiting.**
+
+### Seams
+
+- **Cache key seam** — `${name}:${JSON.stringify(args)}` at
+  `bloomreach-data-source.ts:144`. If args come back in a different key
+  order, `JSON.stringify` produces different keys and the cache misses.
+  Not a bug today (Anthropic sends the same arg shape on each turn), but
+  a landmine.
+- **The `isError: true` guard** at `bloomreach-data-source.ts:179-181` —
+  the seam where "should this result enter the cache?" is decided. This
+  is the only distinction between cached and uncached responses; if
+  removed, an error envelope would be cached and every subsequent call
+  within 60s would return the error without trying.
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — the mental model: at-least-once + read-only = observationally exactly-once
 
-You've handled this in the frontend: `useEffect` with a `key`, React Query's `staleTime`, a debounce on a search input. The same primitive applies here — **a cache keyed by `(operation, inputs)` is the cheapest deduplicator**, and that's what `BloomreachDataSource.cache` is.
-
-> **Because every Bloomreach tool call is a read, "duplicate work" reduces to "wasted time + rate-limit cost." The 60s response cache (keyed by `name + JSON.stringify(args)`) is the dedup mechanism. No idempotency keys needed.**
+You know how HTTP GET requests are supposed to be idempotent — you can
+retry them safely because they don't mutate anything? Same idea here,
+but explicitly: **every tool the agents call is a read-only EQL query
+or a schema introspection.** So retry is safe by construction.
 
 ```
-  The dedup kernel — cache-as-deduplicator
+  The pattern — read-only tools make at-least-once free
 
-  call 1: callTool('get_event_schema', {project_id: 'wobbly-ukulele'})
-              │
-              ▼
-        cacheKey = "get_event_schema:{\"project_id\":\"wobbly-ukulele\"}"
-              │
-              ▼
-        cache miss → wire → 1.4s → result → cache.set(key, result, 60s)
-              │
-              ▼
-        return { fromCache: false }
+     agent calls tool
+           │
+           ▼
+     cache HIT (within 60s) ────► return cached result   at-most-once
+                                  (side effect: 0)         within window
+           │
+           ▼
+     cache MISS ────► liveCall  ────► success ────► cache write, return
+                                       │              side effect: 0
+                                       │              (read-only)
+                                       ▼
+                                     failure
+                                       │
+                                       ▼
+                                   retry ladder ────► success on retry N
+                                                      side effects: N × 0 = 0
+                                                      OBSERVATIONALLY = 1 call
 
-  call 2: (same args, 10s later)
-              │
-              ▼
-        cacheKey = same
-              │
-              ▼
-        cache hit, expiresAt > now → return cached
-              │
-              ▼
-        return { fromCache: true }  ← no wire hop, no dedup needed
+  because every call has 0 side effects on Bloomreach's side,
+  N calls and 1 call look identical to the world.
 ```
 
-The mechanism is two lines (`bloomreach-data-source.ts:144-152`):
+The lesson: the reason the retry ladder is safe is not that it retries
+carefully. It's that the tools it retries have no side effects worth
+worrying about.
 
-```ts
-const cacheKey = `${name}:${JSON.stringify(args)}`;
-const ttl = options.cacheTtlMs ?? 60_000;
+### Move 2 — walk the mechanism
 
-if (!options.skipCache) {
-  const cached = this.cache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) {
-    return { result: cached.result as T, durationMs: 0, fromCache: true };
+#### The 60s cache — dedup within a warm instance
+
+Every successful tool result is cached for 60 seconds keyed by
+name+args:
+
+```typescript
+// lib/data-source/bloomreach-data-source.ts:139-188 (excerpt)
+async callTool<T = unknown>(
+  name: string,
+  args: Record<string, unknown>,
+  options: CallToolOptions = {},
+): Promise<CallToolResult<T>> {
+  const cacheKey = `${name}:${JSON.stringify(args)}`;
+  const ttl = options.cacheTtlMs ?? 60_000;
+
+  if (!options.skipCache) {
+    const cached = this.cache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      return { result: cached.result as T, durationMs: 0, fromCache: true };
+    }
   }
-}
+  // ... liveCall + retry ladder
+  if ((result as any)?.isError === true) {
+    return { result: result as T, durationMs, fromCache: false };  // NO CACHE
+  }
+  const now = Date.now();
+  this.cache.set(cacheKey, { result, expiresAt: now + ttl });
 ```
 
-### Move 2 — walk it one part at a time
+Bridge: this is the exact shape of `useMemo` in React — a cache keyed by
+inputs. The differences: the key is `name+JSON.stringify(args)`, TTL is
+time-based not deps-based, and there's the load-bearing `isError` guard.
 
-#### Part 1 — the cache key (the dedup contract)
+**Load-bearing part: the `isError` early-return at `:179-181`.** Without
+it, an error result would enter the cache under the same key as a
+successful result. A transient 401 (token revoked mid-investigation)
+would then be returned from cache for the next 60s to every retry — the
+retry ladder wouldn't even see fresh errors because it'd get the cached
+one. This is the "poison-cache" failure mode, and this three-line early
+return is the guard.
 
-`${name}:${JSON.stringify(args)}` is the dedup contract. Two calls share a cache entry iff their tool name and their args stringify identically. There's a real subtlety here.
+The `fromCache: true` marker (`:151`) rides through the whole stack up
+to the UI's "how it was gathered" panel — so a cache hit is visible in
+the trace, not silent.
 
-```
-  Cache key gotcha — JSON.stringify on objects is order-sensitive
+#### The retry ladder produces at-least-once
 
-  call A: callTool('execute_analytics_eql', { eql: 'a', project_id: 'p' })
-       key: "execute_analytics_eql:{\"eql\":\"a\",\"project_id\":\"p\"}"
+Section 02 walked the retry ladder in detail. The delivery-semantics
+angle: **each retry is a fresh call to the transport**, so a call that
+succeeds on attempt 3 has executed on Bloomreach's side 3 times.
 
-  call B: callTool('execute_analytics_eql', { project_id: 'p', eql: 'a' })
-       key: "execute_analytics_eql:{\"project_id\":\"p\",\"eql\":\"a\"}"
-                                              ↑
-                                              DIFFERENT KEY
-                                              → both calls hit the wire
-                                              → cache stores two entries
-                                              → no dedup
-```
-
-In practice this is not currently observed because the agents pass args via the same Claude-generated tool-call JSON, which doesn't reorder keys between turns. But it's a real load-bearing assumption: **the dedup works because object key order is stable across calls in this codebase**. If a future caller normalizes args differently, the cache misses silently. Worth a comment in the code; not currently flagged in tests.
-
-The cache key includes `args`, not `project_id` alone — so two project_ids on the same warm instance correctly get separate cache entries. That's not the gap; the schema bootstrap cache is. → see file 04.
-
-#### Part 2 — the retry ladder is safe because every tool is a read
-
-The retry ladder (`bloomreach-data-source.ts:164-174`) re-issues the same `(name, args)` until success or `maxRetries` exhaustion. With a normal API, that's an *at-least-once* delivery — and "at least once" matters if the call mutates state. Here it doesn't, because the only calls made are reads.
-
-The allowlist of tools the route layer permits, from `app/api/mcp/call/route.ts:15-20`:
-
-```ts
-const ALL_KNOWN = new Set<string>([
-  ...monitoringTools,
-  ...diagnosticTools,
-  ...recommendationTools,
-  ...bootstrapTools,
-]);
-```
-
-And from `lib/mcp/tools.ts` — every name in those four lists is `list_*`, `get_*`, or `execute_analytics*`. Zero writes.
+Trace it:
 
 ```
-  Tool name shapes — pattern, not exhaustive
+  Retry ladder as a delivery-semantics view
 
-  list_*         e.g. list_cloud_organizations, list_projects, list_catalogs
-                 list_segmentations, list_email_campaigns, list_voucher_pools
-                 ALL READS
+  attempt 1 → transport.callTool → 429   → 1 execution on Bloomreach
+  wait 10.5s
+  attempt 2 → transport.callTool → 429   → 2nd execution
+  wait 10.5s
+  attempt 3 → transport.callTool → 200   → 3rd execution
+  ─────────────────────────────────────────
+  agent sees:  1 successful result
+  Bloomreach:  3 EQL executions
 
-  get_*          e.g. get_project_overview, get_event_schema,
-                 get_customer_property_schema, get_funnel
-                 ALL READS
-
-  execute_analytics(_eql)
-                 runs an EQL query against the workspace, returns rows
-                 NO MUTATION (EQL is analytical, not transactional)
+  → at-least-once from the agent's POV
+  → 3× the compute on Bloomreach's side
+  → 0 side effects (because EQL is read-only)
 ```
 
-**What breaks if a writeable tool gets added to the allowlist.** A `create_scenario` or `update_segmentation` tool, retried under rate-limit, would create the same scenario twice. The retry ladder has no idempotency key to dedupe with. The fix is one of: (a) an idempotency key in the request args (matched on the server), (b) the retry ladder learns to skip mutating tool names, (c) the new tool gets a different code path entirely. **None of these exist today; if the product grows write-back-to-Bloomreach actions, this becomes urgent.** → file 09.
+The Bloomreach side pays 3× compute cost for a call that got throttled
+on the first two attempts. This is a real cost — the retry ladder is
+NOT free, it's paid on the provider's side even when we retry
+identically. **Which is one reason `minIntervalMs=1100` exists**: better
+to space out and pay 1× compute per call than to burn 3× compute per
+rate-limited call.
 
-The recommendation agent today addresses this by *proposing* Bloomreach actions in prose (a `Recommendation { steps[], bloomreachFeature, … }` object the UI renders), not by *executing* them. That's the discipline that keeps the wire read-only.
+#### What "duplicate" looks like across two warm Vercel instances
 
-#### Part 3 — the OAuth callback is the only mutative call
-
-The callback at `app/api/mcp/callback/route.ts:17-33`:
-
-```ts
-const code = params.get('code');
-if (!code) return NextResponse.json({ error: 'missing code' }, { status: 400 });
-const sid = await readSessionId();
-if (!sid) return NextResponse.json({ error: 'no session' }, { status: 400 });
-
-try {
-  await completeAuth(sid, code);
-  return NextResponse.redirect(new URL('/', req.url));
-} catch (e) {
-  return NextResponse.json({ error: String(e) }, { status: 401 });
-}
-```
-
-The `completeAuth` call exchanges the one-time OAuth `code` for tokens. The code is *single-use* by spec — a duplicate exchange should be rejected by the IdP with `invalid_grant`. So:
+Vercel serverless functions are ephemeral. Two warm instances serving
+the same user each have their own `BloomreachDataSource.cache` Map
+(`bloomreach-data-source.ts:122`). Same investigation, request routed
+to instance A, then a follow-up request to instance B — the cache is
+cold on B.
 
 ```
-  Callback idempotency — relies on the IdP, not on us
+  Cache locality across warm instances
 
-  duplicate GET /api/mcp/callback?code=ABC
-       │
-       ▼
-   first call:  IdP exchanges code ABC for tokens, saveTokens(sid, t)
-       │
-       ▼
-   second call: IdP rejects code ABC with invalid_grant
-       │
-       ▼
-   we return 401 JSON (the catch branch above)
-       │
-       ▼
-   tokens stored from first call remain valid; second call is a no-op
-       from the perspective of our auth state
+  Request 1 → Instance A → cache MISS → liveCall → cache SET → response
+                                                    (60s TTL on A)
+  Request 2 → Instance A → cache HIT (within 60s)   → response
+                                                    (fast)
+  Request 3 → Instance B → cache MISS (B is cold)   → liveCall
+                                                    (repeats the work)
 ```
 
-This is the right design — the IdP is the source of truth for code-single-use, and our callback handler relays its verdict. **What we don't do** is also instructive: we don't re-validate the OAuth `state` parameter (`callback/route.ts:22-26` calls this out). The MCP SDK calls the provider's `state()` multiple times per flow, so our naive store-last-compare-on-callback rejected legitimate callbacks; we removed it and trust the SDK's state handling. That's *consume-state-as-a-side-effect-once* delegated to a library — a defensible call, anchored in a live verification dated 2026-05-27.
+The "duplicate" is dedup'd within an instance, not across them. There is
+no shared cache. This is fine for this system because:
 
-#### Part 4 — the StrictMode dedup in the React hook
+- investigation runs are self-contained (one request opens one stream,
+  never crosses two instances)
+- the 60s TTL is short enough that cross-instance duplication is bounded
+- the demo path (`?demo=cached`) bypasses this entirely by replaying a
+  file-based snapshot
 
-The other place a duplicate could be born is the dev-mode React StrictMode double-mount. The investigation hook (`lib/hooks/useInvestigation.ts:46-49`) guards against it explicitly:
+#### `skipCache: true` — the write-through path
 
-```ts
-useEffect(() => {
-  if (!id) return;
-  if (startedRef.current) return; // run once per mount (survives StrictMode)
-  startedRef.current = true;
-  // … fetch …
-}, [/* … */]);
+`/api/mcp/call?skipCache=true` (and the debug tooling) bypasses the read
+but still writes on success:
+
+```typescript
+// bloomreach-data-source.ts:184-187 (excerpt)
+// Note: a skipCache call still refreshes the cache (write-through), which is
+// the desired behavior for the /debug "force fresh" path.
+const now = Date.now();
+this.cache.set(cacheKey, { result, expiresAt: now + ttl });
 ```
 
-This is a *consumer-side dedup* — the fetch is idempotent (it's a read on the route side), but firing it twice would consume two units of Bloomreach rate-limit budget for one user action. The `startedRef.current` guard is the fix.
+The comment names the tradeoff explicitly. Debug tooling wants "make me a
+fresh call" but shouldn't leave the cache stale for the next non-debug
+caller. Write-through gives both.
 
-The comment in the file is precise about the failure mode it fixes: cancelling on cleanup *and* using the guard means the cleanup aborts the in-flight stream and the re-mount short-circuits — empty log. The current design: guard set on first mount, no cleanup cancellation, second mount short-circuits, in-flight stream completes naturally.
+### The skeleton — what "duplicate" and "delivery" reduce to
 
-```
-  StrictMode double-mount — three designs, one survives
+Isolate the kernel of dedup+delivery in this repo. The pattern is:
+"read-only tools + cache-on-success + retry-safe-because-idempotent."
 
-  design                         dev StrictMode behavior          verdict
-  ──────                         ────────────────────             ───────
-  no guard, no cancel             two fetches fire in parallel    fail (dup work)
-  no guard, cancel on cleanup     first fires, gets cancelled,    fail (one cancelled
-                                  second fires, completes          before any logs)
-  guard, no cancel                first fires, second short-       ★ WORKS ★
-                                  circuits, first completes        (current design)
-  guard, cancel on cleanup        first fires + immediately        fail (cancel + guard
-                                  cancels, second is blocked       leaves nothing)
-                                  by guard, nothing runs
-```
+What breaks without each part:
 
-The fourth row is the one that broke and forced the rule — see the inline comment at `useInvestigation.ts:30-37` for the war story.
+- **Drop the cache** — every repeat call goes to Bloomreach. 3× the
+  rate-limit pressure, 3× the compute cost on their side, same
+  behavior on ours. Doesn't break correctness; kills the budget.
+- **Drop `isError` guard on the cache write** — a transient 401 poisons
+  the cache for 60s; every subsequent call within the window returns
+  the same 401. Breaks recovery (the retry ladder can't help because
+  the cache short-circuits before it runs).
+- **Drop the read-only constraint on tools** — every retry has real
+  side effects. `campaign_send` runs 3 times, sends 3 emails.
+  **Everything about at-least-once semantics needs revisiting.**
+- **Drop the `fromCache: true` marker** — cache hits are invisible to
+  the trace. UI still works; observability breaks (you can't tell in
+  a receipt whether the investigation used cached or fresh data).
 
-#### Part 5 — delivery semantics on the NDJSON stream
+### Optional hardening layered on top
 
-The stream from route to browser is *at-most-once* per event. There's no replay, no offset, no resend on disconnect. If the browser closes the tab mid-stream, the events not yet read are lost — but the route also detects this via `req.signal.aborted` and stops emitting (`app/api/agent/route.ts:308-310`).
-
-```
-  NDJSON delivery — one writer, one reader, no replay
-
-  controller.enqueue(line)  ──HTTPS──►  reader.read()
-       │                                       │
-       │                                       │
-       └─ if browser closes, request aborts ───┘
-          (req.signal.aborted in the route detects it)
-          route emits no further events, request completes
-          events already in the OS buffer may or may not
-          reach the reader — there is no acknowledgement
-```
-
-This is **at-most-once with no retry, no offset, no exactly-once**. It's fine because:
-- the *result* of a briefing or investigation is cacheable in the route's in-memory store (`saveInvestigation`, `putInsights`); a reconnect re-runs the briefing or replays from cache
-- there's no consumer that *needs* exactly-once — the browser renders state, not a financial ledger
-
-If a future consumer needs exactly-once (e.g. a webhook receiver, an event sink in a downstream system), this transport is the wrong tool. → file 09.
-
-### Move 2.5 — current state vs future state
-
-```
-  Today (read-only)              vs.   Tomorrow (write-back)
-  ─────────────────────────             ──────────────────────────
-  every tool is a read                  proposed Recommendations
-                                         become executable in
-                                         Bloomreach (POST scenarios,
-                                         create segments, etc.)
-
-  retry ladder is safe                  retry ladder is dangerous
-   because reads are idempotent          without idempotency keys
-
-  60s cache deduplicates                cache must NOT serve a
-   reads transparently                   write — skipCache always
-
-  no need for a request-id              would need a request-id
-                                         per write, matched server-side
-```
-
-The product's whole "an analyst that shows its work" pitch is read-only by design; recommendations are *prose*, not *POSTs*. That's not a missing feature, it's the load-bearing product decision that keeps the delivery-semantics surface this clean. If the product ever ships the "one-click apply" version of recommendations, this file's content gets a section called *idempotency keys and the write seam*.
+- **`cacheTtlMs` per-call override** at `bloomreach-data-source.ts:145`
+  — most calls use 60s but a caller can pass its own TTL. Used by the
+  `/api/mcp/tools/check` route which wants a shorter TTL for the
+  tool-list sanity check.
+- **`fromCache: false` on error** — `bloomreach-data-source.ts:180` sets
+  `fromCache: false` on the error return path even though nothing was
+  actually cached. This is deliberate: it means "this result did NOT
+  come from cache," which is true.
 
 ### Move 3 — the principle
 
-> **Idempotency is a property of the operation, not the protocol. If everything you do is a read, you don't need an idempotency key — the read itself IS your dedup contract. If you do one mutation, design that one path with care; don't generalize.**
+**"At-least-once vs exactly-once" is only interesting when the
+operation has a side effect worth counting.** In a read-only system,
+the delivery-semantics conversation collapses to "is the retry safe?"
+and the answer is trivially yes. The moment a mutating tool ships, this
+whole file gets rewritten around idempotency keys and dedup tokens.
+The current architecture ISN'T wrong for not having those — it's
+correctly not having them, because it doesn't need them. Recognize
+which side of that line you're on before you build the machinery.
 
-The discipline this file demonstrates is *naming the writes*. The callback is the only one. Everything else is a read, dedup'd by cache. The framework for thinking about a new feature is *which side of this fence does it land on?* — and if it's on the write side, the work to do is named and bounded.
-
-## Primary diagram — the dedup map
+## Primary diagram — the dedup + delivery picture
 
 ```
-  Delivery semantics, drawn flat
+  60s cache + at-least-once retry ladder, one frame
 
-  ┌─ L1 Browser ──────────────────────────────────────────────┐
-  │  StrictMode dev double-mount                                │
-  │   → useInvestigation.ts:46 startedRef guard (consumer dedup) │
-  │  Auto-reconnect on 401                                       │
-  │   → re-issues idempotent GET (route is a read)               │
-  └─────────────────────────────────────────────────────────────┘
-                          │ HTTPS · NDJSON · at-most-once
-                          ▼
-  ┌─ L2 Route ────────────────────────────────────────────────┐
-  │  GET /api/briefing   read                                   │
-  │  GET /api/agent      read                                   │
-  │  POST /api/mcp/call  read-only wrapper (allowlist enforced) │
-  │  GET /api/mcp/callback ★ MUTATIVE: OAuth code exchange ★    │
-  │   (single-use enforced server-side by IdP)                  │
-  └─────────────────────────────────────────────────────────────┘
-                          │
-                          ▼
-  ┌─ L3 BloomreachDataSource ─────────────────────────────────┐
-  │  60s cache · key = `${name}:${JSON.stringify(args)}`        │
-  │  retry ladder re-issues same args until success/exhaustion  │
-  │  safe because every call is a read                          │
-  └─────────────────────────────────────────────────────────────┘
-                          │
-                          ▼
-  ┌─ L4 Bloomreach ───────────────────────────────────────────┐
-  │  list_* · get_* · execute_analytics(_eql) — READ-ONLY      │
-  │  no write tool in the allowlist                            │
-  └─────────────────────────────────────────────────────────────┘
+  agent.callTool('execute_analytics_eql', { eql })
+                        │
+                        ▼
+     ┌──────────────────────────────────────────────┐
+     │ cacheKey = `${name}:${JSON.stringify(args)}` │
+     └────────────┬─────────────────────────────────┘
+                  │
+      ┌──── HIT (within 60s) ────┐
+      │                          │
+      ▼                          ▼
+  return {                MISS: fall through
+    result,              │
+    durationMs: 0,       ▼
+    fromCache: true      liveCall → transport.callTool
+  }                      │
+                         │       ┌── success ─────┐
+                         │       │                │
+                         │       ▼                ▼
+                         │   isRateLimited?     !isError
+                         │       │                │
+                         │       ▼                ▼
+                         │   retry ladder     cache.set(key,
+                         │   (at-least-once)  { result, expiresAt })
+                         │       │                │
+                         │       │                ▼
+                         │       ▼           return uncached
+                         │   fresh result      {fromCache: false}
+                         │
+                         │       ┌── failure ─────┐
+                         │       │                │
+                         │       ▼                ▼
+                         │   isError: true     RETURN UNCACHED
+                         │   in envelope       (poison-cache guard)
+                         │       │
+                         │       ▼
+                         │   { result, durationMs, fromCache: false }
+                         │   → AptKit wraps as tool_result is_error:true
+                         │   → model reasons about it (band 4 in file 02)
 ```
 
 ## Elaborate
 
-The "read-only by design" stance is the deepest source of safety in this codebase. The same posture shows up in:
+Where this pattern shows up elsewhere: React Query's cache-then-refetch,
+SWR's stale-while-revalidate, GraphQL client normalized caches. All the
+same shape: a key derived from inputs, a TTL, a policy on what to do
+with errors. This file's `isError` guard is the same idea as React
+Query's `retryOnMount: false` for failed queries.
 
-- **CQRS (Command/Query Responsibility Segregation, Greg Young).** Queries and commands as separate code paths with separate semantics. Here, the "query" path is everything; the "command" path doesn't exist yet (recommendations are prose).
-- **REST safety (RFC 7231 §4.2.1).** GET is safe and idempotent by spec; POST is neither. The route layer uses GET for all read-only paths and POST only for the OAuth callback's inverse (`/api/mcp/reset`, which clears auth — also idempotent in the sense that "clearing twice" leaves the same state).
-- **Idempotency keys at Stripe / GitHub.** The canonical pattern for mutating APIs. Worth knowing the shape even though the codebase doesn't need it today: client generates a UUID, server stores `(key, response)` for some window, second request with same key returns the stored response. The work to graft this onto a future `execute_recommendation` tool is mostly server-side at Bloomreach, not ours.
+Where this pattern breaks in a real distributed system:
 
-The interesting comparison is **at-most-once vs at-least-once vs exactly-once.** This codebase is at-most-once on the wire-out (NDJSON stream — no replay) and at-least-once on the wire-in (Bloomreach retries up to 3x). Both choices are safe because of the read-only invariant. The famous "exactly-once is a lie" framing (Kreps, Confluent) applies if you ever need it: exactly-once on the wire is impossible; exactly-once *effects* are achieved by combining at-least-once delivery with idempotency. Today we get exactly-once effects for free because reads are naturally idempotent.
+- **Idempotency keys** — a real payment API takes an
+  `Idempotency-Key: <uuid>` header from the client, and the server
+  dedups requests with the same key. The retry is safe because the
+  server IS aware of duplicates. Bloomreach doesn't offer this
+  protocol, but since the tools are read-only it doesn't matter.
+- **Exactly-once delivery** — the standard result is that
+  exactly-once is impossible with independent participants;
+  the practical achievement is at-least-once + idempotent
+  operations, which gives you effectively-exactly-once. That is
+  exactly this system's stance, arrived at not by protocol but by
+  "the tools happen to be read-only."
+
+The Week 4B fault-injection story crosses this file too: `malformed_json`
+is a fault mode where the CALL succeeded (from Bloomreach's POV) but
+the CONTENT is broken (from our POV). At-least-once execution
+completed; the agent's downstream parse rejects it. So the retry
+happens at the agent-loop / model layer, not at the adapter. The
+delivery boundary is the model's tool-result interpretation, not the
+transport's HTTP status.
 
 ## Interview defense
 
-### "What's your delivery guarantee on the NDJSON stream?"
+### Q: "What are your delivery semantics?"
 
-At-most-once with no replay. The route emits each event with `controller.enqueue(encodeEvent(e))`; the browser reads them via `readNdjson` with `fetch + reader.read()`. There's no acknowledgement, no offset, no resend. The route detects browser disconnects via `req.signal.aborted` and stops emitting — clean failure, no zombie writes. This is fine because the *result* (insights, investigations) is recoverable: the route caches successful runs (`saveInvestigation` in `lib/state/investigations.ts`), and the demo path replays from a committed JSON snapshot. If the user disconnects mid-stream, reconnecting either replays from the in-memory cache (same instance) or re-runs the agent (different instance) — both deterministic enough to land in the same place.
+Sketch this:
 
 ```
-  Anchor: app/api/agent/route.ts:185-189 — controller.enqueue
-          lib/streaming/ndjson.ts:31-44 — read loop
-          app/api/agent/route.ts:308-310 — abort detection
+  at-least-once execution
+         +
+  read-only tools
+  ────────────────
+  observationally exactly-once
 ```
 
-### "Why is the retry ladder safe without an idempotency key?"
+"At-least-once at the transport, because the retry ladder makes each
+retry a fresh call. But every tool the agents call is read-only —
+`execute_analytics_eql`, schema introspection — so N executions and 1
+execution look identical to the world. Observationally exactly-once, by
+construction. The 60s cache on top of that dedups within a warm
+instance, keyed by `${name}:${JSON.stringify(args)}` — that's a
+latency win, not a correctness one. The moment we ship a mutating tool
+(voucher issue, campaign send), we'd need idempotency keys and this
+whole file would get rewritten."
 
-Because every Bloomreach tool call in the allowlist is a read — `list_*`, `get_*`, or `execute_analytics_eql`. There's no write to deduplicate. The retry ladder re-issues the same `(name, args)`; the second call returns the same data the first would have, plus or minus a rate-limit window. The first thing I'd change if the product added executable recommendations (POSTs to Bloomreach to create scenarios/segments) is to add per-call idempotency: either an idempotency key in the request (Bloomreach-side), or a code-path that skips the retry ladder for writes and surfaces failures eagerly.
+Anchors: `bloomreach-data-source.ts:144` (cache key),
+`bloomreach-data-source.ts:163-174` (retry ladder),
+`bloomreach-data-source.ts:179-181` (poison-cache guard).
 
-*Anchor:* `app/api/mcp/call/route.ts:15-20` — the allowlist is sourced from the same constants the agents use, so writes can't slip in via the agent path either.
+### Q: "What breaks if you delete the `isError` early return?"
 
-### "Is there exactly-once anywhere in the system?"
+"A transient 401 gets cached for 60s. Every subsequent call within the
+window returns the same 401 from cache without trying the transport.
+The retry ladder never sees a fresh error to retry against. Recovery
+takes 60s minimum instead of the next retry."
 
-No — and we don't need it. Exactly-once *delivery* doesn't exist anywhere; exactly-once *effects* live where they're forced (idempotent reads, IdP-enforced OAuth code single-use). The only mutative operation in the codebase is OAuth code exchange in the callback route, and its single-use guarantee is enforced server-side by the IdP (`invalid_grant` on the duplicate). We don't carry state across to dedupe ourselves. If the product grew an executable-recommendations flow tomorrow, we'd graft idempotency keys onto that one path; we wouldn't try to make the whole system exactly-once.
+### Q: "How do you dedup across two warm Vercel instances?"
+
+"You don't, today. Each instance has its own in-memory
+`BloomreachDataSource.cache` Map. This is fine because investigation
+runs are self-contained (one request opens one stream, never crosses
+two instances) and the 60s TTL is short. If we needed cross-instance
+dedup, we'd introduce a shared cache (Vercel KV, Upstash Redis) —
+that's the standard move. It'd be a distributed-systems complication
+we don't need yet."
 
 ## See also
 
-- `02-partial-failure-timeouts-and-retries.md` — the retry ladder this file justifies as safe.
-- `04-consistency-models-and-staleness.md` — why the 60s cache (the dedup mechanism) is safe across requests.
-- `07-clocks-coordination-and-leadership.md` — OAuth state survival, the only mutative seam.
-- `09-distributed-systems-red-flags-audit.md` — the write-back-to-Bloomreach risk ranked.
-- `.aipe/study-security/` — the allowlist as a security boundary, not just a delivery-semantics one.
+- 02-partial-failure-timeouts-and-retries.md — the retry ladder that
+  produces the at-least-once execution
+- 04-consistency-models-and-staleness.md — the "cache-across-instances"
+  problem from the consistency angle
+- 09-distributed-systems-red-flags-audit.md — mutating tools as a
+  ranked future risk

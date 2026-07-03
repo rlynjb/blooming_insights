@@ -1,187 +1,166 @@
-# Reflexion / self-critique
+# Reflexion / self-critique loop
 
-**Industry standard.** A loop structure layered on a base reasoning pattern. **Not yet implemented** in this codebase.
+_Industry standard._
 
 ## Zoom out, then zoom in
 
-Sits *outside* the inner agent loop — wraps it. The base pattern (ReAct) produces a draft; a critic step decides whether to accept or loop.
+The agent evaluates its own output and retries. **Not used in blooming_insights** as a reasoning pattern. This file names what IS in the codebase that looks similar (the recovery prompt in AptKit's runtime), what's actually different, and when true reflexion would earn its keep.
 
 ```
-  Zoom out — where this concept WOULD live
+  Zoom out — where reflexion would sit
 
-  ┌─ Reasoning layer ───────────────────────────────┐
-  │  ★ Reflexion wrapper (not in this repo) ★      │ ← we are here
-  │  loop { base ReAct → critic → accept or revise } │
-  └────────────────────────────┬────────────────────┘
-                               │
-  ┌─ Runtime layer ───────────▼────────────────────┐
-  │  runAgentLoop  (one base ReAct loop per draft)  │
-  └─────────────────────────────────────────────────┘
+  ┌─ Worker agent (e.g. DiagnosticAgent) ──────────────────────┐
+  │  Currently: ReAct → parse → return                         │
+  │                                                            │
+  │  With reflexion:                                           │
+  │    ReAct → parse → CRITIC('is this right?') → revise loop  │
+  │    (cap the rounds to prevent thrash)                      │
+  └────────────────────────────────────────────────────────────┘
 ```
 
-This file places reflexion in the escalation family alongside plan-and-execute. They're orthogonal — plan-and-execute escalates "the model wanders during reasoning"; reflexion escalates "the model produces plausible-but-wrong outputs."
-
-**The recovery prompt in `runAgentLoop` is not reflexion.** That confusion is worth heading off — see the next section.
+Zoom in: this file is placement + honest comparison. Blooming's `recoveryPrompt` (`run-agent-loop.js:110`) looks like reflexion but is actually structured-output rescue — mechanically different.
 
 ## Structure pass
 
-Layers: producer (the base reasoning loop) → critic (a separate prompt or model judging the producer's output) → revise loop (with a cap on rounds).
+**Layers:** producer (draft answer) · critic (evaluate) · reviser (retry) · round cap.
+**Axis:** *what does the second call examine?*
+**Seam:** the critic's contract — what "wrong" means (schema, factual, tone, correctness). Different definitions → different reliability of the critique.
 
-**Axis traced — "who catches mistakes?":** in plain ReAct, the model catches its own as it goes. In reflexion, a *separate prompt* (sometimes a separate model entirely) catches mistakes after the producer commits to an answer. The axis flips at the critic boundary.
+```
+  Reflexion (self-critique) vs recovery-prompt (schema rescue)
 
-**Seam:** the producer's draft output is the typed handoff. The critic reads it (plus the trajectory that produced it) and emits a verdict — accept, or revise with a specific failure named.
+  Reflexion (a reliability loop):
+  ┌────────────────┐       ┌─────────────────┐
+  │ Producer draft │  →   │ Critic ('good?')│
+  └────────────────┘       └────────┬────────┘
+                               ┌────┴────┐
+                               ▼         ▼
+                            return    revise → loop
+
+  Recovery prompt (schema rescue — what AptKit does):
+  ┌────────────────┐       ┌──────────────────┐
+  │ Producer draft │  →   │ tryParseSchema    │
+  └────────────────┘       └────────┬─────────┘
+                                    ▼ null
+                          ┌──────────────────┐
+                          │ Producer, strict │  ← ONE rescue turn,
+                          │ prompt, no tools │    not a critic
+                          └────────┬─────────┘
+                                   ▼
+                                 return
+```
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know the difference between writing a function and writing it after code review. Plain ReAct is writing the function — the model reasons, acts, observes, commits. Reflexion is writing it, then having a reviewer look at it before you ship — *"this output's hypotheses don't actually rule out the simpler explanation; revise."*
+You've written unit tests before — the assertion checks output, and if it fails, the fix is a code change. Reflexion is the runtime equivalent: after the model answers, a second model call *asserts* the answer against a criterion, and if it fails, the loop drafts again.
 
 ```
-  The reflexion loop — base pattern plus a critic gate
+  Pattern: reflexion (asymmetric)
 
-  ┌─ base pattern (one ReAct run) produces a draft ──┐
-  │  monitoring/diagnostic/recommendation agent      │
-  │  emits its structured answer                      │
-  └────────────────────┬─────────────────────────────┘
-                       ▼
-  ┌─ Critic step ──────────────────────────────────┐
-  │  separate model call: "is this correct /        │
-  │  complete / well-grounded?"                     │
-  └────────────────────┬─────────────────────────────┘
-              ┌─────────┴─────────┐
-              ▼ good              ▼ flawed
-          return            revise + loop
-          (commit)          (re-run producer
-                            with critic's notes)
-                                  │
-                                  └── cap the retries
+  ┌────────────┐            ┌────────────┐
+  │ producer   │ ──draft──► │  critic    │
+  │ (Sonnet)   │            │ (Sonnet or  │
+  └────────────┘            │  different) │
+       ▲                    └────┬────────┘
+       │ revise prompt           │
+       └───── loop ──────────────┘
+       cap rounds (2-3 max) — one bad critic makes it worse
 ```
 
-### Move 2 — step by step
+### Move 2 — the walkthrough
 
-#### What this would look like in this repo
+**What Blooming actually has — recovery prompt, NOT reflexion.** `run-agent-loop.js:106-138`:
 
-The diagnostic agent is the natural candidate. The diagnosis output has a `hypothesesConsidered` array (`lib/mcp/types.ts:97`) — each hypothesis tagged supported/unsupported. A critic could read the diagnosis and ask:
-
-- Does the conclusion actually follow from the supported hypotheses?
-- Are there obvious alternative hypotheses the producer didn't consider?
-- Does the affected-customers count match the evidence?
-
-Hypothetical wrapper:
-
-```ts
-// hypothetical lib/agents/reflexive-diagnostic.ts (not implemented)
-class ReflexiveDiagnosticAgent {
-  constructor(
-    private producer: DiagnosticAgent,    // today's class
-    private critic: ModelProvider,         // ideally a DIFFERENT model family
-    // ... other ports
-  ) {}
-
-  async investigate(
-    anomaly: Anomaly,
-    hooks: AgentHooks,
-    maxRounds = 2,
-  ): Promise<Diagnosis> {
-    let diagnosis = await this.producer.investigate(anomaly, hooks);
-    for (let round = 0; round < maxRounds; round++) {
-      const verdict = await this.critic.complete({
-        system: CRITIC_SYSTEM_PROMPT,
-        messages: [{ role: 'user', content: JSON.stringify({ anomaly, diagnosis }) }],
-        maxTokens: 1024,
-      });
-      const parsed = parseVerdict(verdict.content);
-      if (parsed.accept) return diagnosis;
-      // re-run with the critic's notes appended
-      diagnosis = await this.producer.investigate(
-        { ...anomaly, criticNotes: parsed.notes },
-        hooks,
-      );
-    }
-    return diagnosis;  // out of rounds — return the last draft
+```js
+let parsed = null;
+if (options.parseResult) {
+  parsed = options.parseResult(finalText);
+  if (parsed === null && options.recoveryPrompt) {
+    const recoveryText = await runRecoveryTurn(options, options.recoveryPrompt(toolCalls));
+    parsed = recoveryText === null ? null : options.parseResult(recoveryText);
   }
 }
 ```
 
-#### The hard limit that matters
+Line-by-line: `parseResult(finalText)` tries to extract a schema-valid `Diagnosis` from the model's final text. On null (schema failure) ONE rescue turn fires with a stricter prompt: "output ONLY the diagnosis JSON, no tool calls." **The critic here is a deterministic schema parser, not another LLM.** This is structured-output rescue, not reflexion. The model isn't grading its own reasoning; the harness caught a format failure and asked for a re-render.
 
-A model critiquing its own output shares the blind spots that produced the output. If the producer is Claude Sonnet 4.6 and the critic is *also* Claude Sonnet 4.6, the critic will miss exactly the things the producer missed. Self-critique catches format and obvious-error failures well; it catches subtle-reasoning failures poorly because the failure mode that produced the wrong answer is the same failure mode that grades it.
+**Why the distinction matters.** Reflexion says "your answer is *incorrect* — try again with different reasoning." Recovery says "your answer is *unparseable* — output it in the right shape." Different failure modes, different fixes. Confusing them is a common junior mistake.
 
-Mitigation: use a *different model family* for the critic when the stakes justify it. Anthropic blog post `claude-as-judge`: the self-preference bias is real and measurable. For this repo, a hypothetical reflexion wrapper would want the critic to be GPT-4 or a different Claude generation, not the same Sonnet that produced the diagnosis. This is the same bias-against-self problem named in (future) `study-ai-engineering`'s LLM-as-judge file.
+**True reflexion — hypothetical adoption.** For it to earn its keep in Blooming, a specific measured failure would need to be present: e.g. "the diagnostic conclusion contradicts the evidence 5% of the time." Then:
 
-#### The cost is 2-5x
+Hypothetical:
+```ts
+// hypothetical addition to DiagnosticAgent
+async investigate(anomaly, hooks) {
+  const draft = await this.runReActLoop(anomaly, hooks);
+  for (let round = 0; round < MAX_CRITIC_ROUNDS; round++) {
+    const critique = await this.critic.grade(draft, anomaly);
+    if (critique.pass) return draft;
+    draft = await this.runReActLoop(anomaly, {...hooks, feedback: critique.reason});
+  }
+  return draft;  // ran out of rounds; return best-effort
+}
+```
 
-One extra full agent turn per round (the critic call), plus potentially another full producer run per round if the critic rejects. Two rounds bounded means: best case 1x cost (critic accepts the first draft), worst case 3x cost (two revisions before the cap fires). The repo runs ReAct without this overhead because the existing failure rate doesn't justify the multiplier.
+Line-by-line: `grade` returns `{pass: boolean, reason: string}`; on fail the reason feeds back into the next iteration. Cost: 2-3x tokens for a hoped-for reliability lift. Not free.
 
-#### Why the recovery prompt is NOT reflexion
-
-A common confusion. `runAgentLoop`'s `recoveryPrompt` (lines 106-114 of `run-agent-loop.js`) fires when the structured-output parser (`tryParseAnomalies`) returns null — the model emitted text that wasn't a valid JSON array. The recovery prompt re-asks the *same model* with just the tool evidence and a "convert this to the structured form" instruction.
-
-That's structured-output recovery, not self-critique. The recovery prompt isn't asking "was the answer correct?" — it's asking "format the answer correctly." It has no critic. It has no notion of acceptance vs revision. It runs once unconditionally (when parse fails) and accepts whatever comes back.
-
-Reflexion is a *judgment loop*; recovery is a *format loop*. They look similar from a distance because both involve a second model call after the main loop, but the failure mode they address is different.
+**The bias failure mode.** A model critiquing its own output shares the blind spots that produced it. Self-critique catches format failures and *obvious* errors well; catches subtle-reasoning failures poorly. Mitigation named in `study-ai-engineering.md`'s LLM-as-judge file: use a different model family for the critic. In Blooming that'd mean Haiku critiquing Sonnet, or a cross-provider setup — not free, and only worth it if the reliability lift shows up in a golden-trajectory eval.
 
 ### Move 3 — the principle
 
-**Reflexion catches a specific class of failures: plausible-but-wrong outputs.** The producer's loop produces something that looks reasonable, follows from the evidence, and is structurally correct — but the conclusion is subtly off (the wrong hypothesis was followed, an obvious alternative wasn't tested, the affected-customer count is off by an order of magnitude). The producer has no signal to catch this because the producer is the source of the mistake. A critic with a different prompt — and ideally a different model — has an independent shot.
-
-The interview-grade move is to name the failure mode reflexion catches, not to add it preemptively. Adding reflexion to a pipeline whose failures are "format drift" or "tool-call errors" pays the 2-5x tax for no win.
+Reflexion catches what it can catch: format errors, obvious factuals, tone. It doesn't fix a model that reasoned wrong for the same reasons the critic will reason wrong. The senior move is *measuring* the failure mode reflexion would fix before adopting the 2-5x token cost. In this codebase, the measured failure is "sometimes returns non-JSON" (schema, caught by recovery prompt for free), not "sometimes reasons incorrectly" (which would need reflexion).
 
 ## Primary diagram
 
 ```
-  Reflexion as a wrapper around the base agent
+  Recap — the two things that look like reflexion in this codebase
 
-  ┌──────────────────────────────────────────────────────────┐
-  │  ReflexiveDiagnosticAgent.investigate(anomaly)            │
-  │                                                            │
-  │  ┌─ round 0 ──────────────────────────────────────────┐   │
-  │  │  producer.investigate(anomaly)                       │   │
-  │  │   ─► runAgentLoop (the base ReAct)                  │   │
-  │  │   ─► draft Diagnosis                                │   │
-  │  └─────────────────────┬──────────────────────────────┘   │
-  │                        ▼                                    │
-  │  ┌─ critic gate (different model family ideally) ─────┐   │
-  │  │  critic.complete({system: CRITIC_PROMPT, ...})      │   │
-  │  │  → verdict = { accept | revise + notes }            │   │
-  │  └─────────────────────┬──────────────────────────────┘   │
-  │           ┌─────────────┴─────────────┐                    │
-  │           ▼ accept                    ▼ revise              │
-  │       return diagnosis           round++; if < maxRounds:  │
-  │                                  producer.investigate(      │
-  │                                    {anomaly, criticNotes:   │
-  │                                     verdict.notes})         │
-  │                                  ─── else: return last draft│
-  └────────────────────────────────────────────────────────────┘
+  RECOVERY PROMPT (implemented — run-agent-loop.js:110):
+  ┌─────────────────┐    ┌────────────────┐
+  │ final text      │ →  │ parseDiagnosis │
+  └─────────────────┘    └────────┬───────┘
+                              null│      ok
+                                  ▼      ▼
+                          ┌────────────┐  return
+                          │ ONE rescue │
+                          │ turn       │
+                          └────────────┘
+                          Schema rescue, NOT critique.
+
+  TRUE REFLEXION (not implemented):
+  ┌─────────────────┐    ┌──────────────┐
+  │ producer draft  │ →  │ critic model │
+  └─────────────────┘    └──────┬───────┘
+        ▲                       │
+        │ revise                ▼
+        └─────── loop (cap rounds 2-3) ──── return
 ```
 
 ## Elaborate
 
-The original Reflexion paper (Shinn et al., 2023) framed it as agent learning across episodes: the agent runs a task, reflects on what went wrong, stores the reflection in a memory buffer, and the next attempt at a similar task pulls from that buffer. That's the cross-task version — multi-turn within an episode AND cross-episode learning. The version this file covers is the simpler intra-task variant: producer → critic → revise, within a single task.
+Reflexion was named in Shinn et al. 2023 ("Reflexion: Language Agents with Verbal Reinforcement Learning") as a training-time technique that also transfers to inference-time. The production version is simpler: producer + critic + revise loop. LangGraph implements it as a graph with the critic as a conditional edge; the pattern generalizes.
 
-The cross-task version is interesting for agents that handle a stream of similar tasks (e.g. a coding agent solving many bugs in the same repo) because the reflections accumulate into something like a learned playbook. It's less useful for this repo's shape — each anomaly investigation is one-off and the reflections wouldn't transfer to the next anomaly.
-
-The cousin pattern is *verifier-critic* in a multi-agent topology (`03-multi-agent-orchestration/05-debate-verifier-critic.md`). That's the same idea expressed as "two named agents, one produces, one critiques" rather than "one agent run twice with different prompts." Functionally equivalent; the multi-agent framing is just more explicit about the role separation.
+The related pattern this repo does exercise, quietly, is `diagnosisConfidence` (`diagnostic-agent.js:67-80`) — a deterministic post-hoc classifier that reads the hypotheses considered and downgrades a "high" confidence to "medium" if any tool call errored. That's a rule-based critic, cheaper and more reliable than an LLM critic for that specific criterion.
 
 ## Interview defense
 
-> **Q: Does this codebase do self-critique anywhere?**
->
-> No, and the absence is deliberate. The recovery prompt in `runAgentLoop` looks like self-critique from a distance but it isn't — it fires when the structured-output parser fails (the model emitted text instead of JSON) and re-asks the same model to format correctly. It's a format loop, not a judgment loop. The reason there's no judgment loop: the dominant failure modes in this repo are tool-call errors (the EQL returns an unexpected shape) and rate-limit retries, not "the diagnosis was plausible-but-wrong." If we started shipping diagnoses that customers told us were confidently wrong, that would be the signal to add reflexion — specifically, with a different model family as the critic to avoid the self-preference bias.
+**Q: Do you have self-critique in this system?**
+A: No. What looks like it — the `recoveryPrompt` path in AptKit's runtime — is structured-output rescue: if the final answer failed to parse as valid Diagnosis JSON, one rescue turn fires with a stricter prompt. The critic there is a deterministic parser, not another LLM. I'd introduce true reflexion only if I measured that the *reasoning* was wrong in a way parsing couldn't catch, and only with a different model family critic (Haiku critiquing Sonnet, or cross-provider) because a self-critique shares blind spots.
 
-> **Q: What's the self-preference problem and why does it matter here?**
->
-> A model critiquing its own output shares the blind spots that produced the output. Claude Sonnet 4.6 will systematically rate Claude Sonnet 4.6 outputs higher than equivalent outputs from GPT-4. If we ran self-critique with the same model on both sides, the critic would accept exactly the diagnoses we want it to catch. The fix is to use a different model family for the critic — different training data, different RLHF, different blind spots. That's a small change at the `ModelProvider` adapter layer (pass a different model to `AnthropicModelProviderAdapter`, or swap in an `OpenAIModelProviderAdapter`) but it's the load-bearing one.
+Diagram: the "these look alike, are not" side-by-side.
+Anchor: `run-agent-loop.js:106-138` (recovery), `diagnostic-agent.js:67-80` (confidence downgrade).
 
-> **Q: How is this different from plan-and-execute?**
->
-> Orthogonal escalations from baseline ReAct. Plan-and-execute solves "the model wanders during reasoning" by deciding the strategy up front. Reflexion solves "the model produces plausible-but-wrong outputs" by adding a critic after the producer commits. You'd add plan-and-execute when the path is knowable but long; you'd add reflexion when the path is fine but the answer is wrong. They can compose — plan-and-execute with a reflexion check after each execute step — but the cost of both layered on is 4-7x, which is rarely worth it.
+**Q: Reflexion vs a schema-strict re-prompt — same thing?**
+A: No. Same shape, different semantics. Schema-strict re-prompt catches "unparseable output" — a format failure. Reflexion catches "wrong output" — a correctness failure. The critic contract is what makes them different. A parser can't tell you if the diagnosis is *wrong*, only if it's malformed. That distinction is where I'd start if a stakeholder asked "why are diagnoses sometimes bad" — measure whether they're malformed (parser-caught, cheap to fix) or wrong (needs a real critic, expensive).
+
+Diagram: two funnels — "format check" vs "correctness check" — with the LLM below only the second.
+Anchor: same files as above.
 
 ## See also
 
-- → `03-react.md` — the producer pattern reflexion wraps
-- → `04-plan-and-execute.md` — the orthogonal escalation
-- → `03-multi-agent-orchestration/05-debate-verifier-critic.md` — the multi-agent version of the same idea
-- → cross-reference (when generated): `study-prompt-engineering`'s self-critique file — the prompt-level mechanics
-- → cross-reference (when generated): `study-ai-engineering`'s LLM-as-judge file — the self-preference bias
+- `02-agent-loop-skeleton.md` — recovery prompt as optional hardening.
+- `03-react.md` — the base pattern reflexion layers onto.
+- `04-agent-infrastructure/04-agent-evaluation.md` — the eval that would tell you if reflexion is worth adopting.
+- Cross-reference: `.aipe/study-ai-engineering/`'s LLM-as-judge bias file.

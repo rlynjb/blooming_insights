@@ -1,252 +1,171 @@
 # Retrieval routing
 
-**Industry standard.** When there are multiple knowledge sources, route the query to the right one before retrieving. Partially exercised in this repo at the tool-allowlist level.
+_Industry standard._
 
 ## Zoom out, then zoom in
 
-Sits in front of retrieval. The router picks the source; the retrieval runs against the picked source; the agent's loop continues.
+Route the query to the right knowledge source before retrieving. Vector store for paraphrase queries, relational store for exact lookups, live search for freshness. **Partially applicable to blooming_insights** — this repo *does* route across tools (analytical EQL vs metadata listings vs prediction scores), but it's not routing across *retrieval* sources; there is no retrieval source at all. Covered for pattern-recognition.
 
 ```
-  Zoom out — where this concept lives
+  Zoom out — retrieval-source routing (not present here)
 
-  ┌─ Agent loop ─────────────────────────────────────┐
-  │  model emits tool_use ◄── router lives here in   │ ← we are here
-  │  this repo (the model picks within its allow-     │
-  │  list; no separate router model)                  │
-  └────────────────────────────┬─────────────────────┘
-                               │
-  ┌─ Tool registry ───────────▼─────────────────────┐
-  │  per-agent allowedTools list filters which       │
-  │  tools the model sees (4 / 11 / 14 / 33 tools)   │
-  └────────────────────────────┬─────────────────────┘
-                               │
-  ┌─ Knowledge sources ───────▼─────────────────────┐
-  │  Bloomreach MCP server (the only source)         │
-  │  ~33 tools exposed; agent picks via tool_use     │
-  └──────────────────────────────────────────────────┘
+  ┌─ Query ─────────────────────────────────────────────────┐
+  │  "why did purchase revenue drop in the US?"             │
+  └────────────┬────────────────────────────────────────────┘
+               ▼
+  ┌─ Router (which source?) ────────────────────────────────┐
+  │  vector DB (paraphrase queries)                          │
+  │  relational DB (exact lookups)                           │
+  │  web search (fresh data)                                 │
+  └────────────┬────────────────────────────────────────────┘
+               │  In this repo: no vector DB, no web search.
+               │  The analog is the MODEL routing across MCP tools.
+               ▼
+  ┌─ TOOL routing (what this repo does) ────────────────────┐
+  │  execute_analytics_eql (EQL for revenue trends)         │
+  │  list_scenarios (metadata)                              │
+  │  get_customer_prediction_score (ML output)              │
+  └─────────────────────────────────────────────────────────┘
 ```
 
-The classic retrieval-routing diagram has 2-3 different storage substrates (vector DB, SQL, web search) and a router that picks among them. This repo has *one* substrate (Bloomreach MCP), so the routing collapses to a single layer — the per-agent tool allowlist that filters which subset of the 33 MCP tools each agent can call.
+Zoom in: the pattern is *same shape, different destinations*. The model choosing between EQL tool and metadata-list tool at each turn is retrieval-routing, just against analytical tools instead of retrieval sources.
 
 ## Structure pass
 
-Layers: query (model-emitted) → router decision (which source?) → retrieval against that source → result back into the loop.
+**Layers:** query · router · sources · combined result.
+**Axis:** *which store's shape fits this query?*
+**Seam:** the source contract — each source has a different query language / result shape. The router must pick the right one.
 
-**Axis traced — "what decides the source?":** in a canonical multi-source system, a router model. Here, the model picks a tool from the allowlist directly — there's no separate routing model.
+```
+  Source characteristics — why routing matters
 
-**Seam:** the per-agent `allowedTools` list (in each AptKit agent's policy). That's the coarse routing: monitoring sees 4 tools, diagnostic sees 11, recommendation sees 14, query sees 33. The model picks within its allowed surface.
+  vector DB       │ semantic paraphrase, top-k         │ noisy
+  relational DB   │ exact match, joins, aggregates      │ deterministic
+  web search      │ freshest, unstructured              │ latency
+  analytical query│ ad-hoc aggregates, time-windowed    │ this repo
+                     ↑ what Blooming has: EQL over Bloomreach
+```
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know the difference between using one database and using three. Single-source retrieval just queries the one source. Multi-source retrieval has to first ask "which source has the answer to this kind of question?" — vector DB for paraphrase-like questions, relational DB for exact lookups, web search for freshness. The router is the layer that picks before retrieving.
+You've built a `switch` on `contentType` before — JSON goes to the parser, XML to a different parser, plain text to nothing. Retrieval routing is the same: query shape decides destination. The router can be a heuristic (regex, keywords) or an LLM (short classifier call).
 
 ```
-  Multi-source retrieval routing (the canonical shape)
+  Pattern: retrieval routing
 
-  query ──► ┌─ router: which source? ──┐
-            └──────────┬───────────────┘
-          ┌────────────┼────────────┐
-          ▼            ▼            ▼
-       vector DB    SQL DB     web search
-       (semantic)   (exact)    (fresh)
+  query
+    │
+    ▼
+  ┌────────────────────────┐
+  │ router: which source?  │
+  └──────────┬─────────────┘
+        ┌────┼──────┐
+        ▼    ▼      ▼
+     vector  SQL   web
+     (para)  (exact)(fresh)
+        │    │      │
+        └────┼──────┘
+             ▼
+        combined
+        (each source's chunks
+         merged; sometimes reranked)
 ```
 
-This repo's substrate is one MCP server with ~33 tools; the canonical multi-source pattern collapses to **per-agent capability gating**: instead of routing across substrates, each agent is *constructed* with a narrower allowlist of which tools it can see.
+### Move 2 — the walkthrough
 
-```
-  This repo's routing — at the allowlist boundary
+**What Blooming has — tool routing done by the LLM, not by an explicit router.** In the DiagnosticAgent's ReAct loop, the model picks WHICH tool to call each turn from the 11-tool allowlist. That's implicit routing:
 
-  agent class is constructed                       
-  with a fixed allowedTools list:
-  
-    monitoring:    [execute_analytics_eql,
-                    get_metric_timeseries,
-                    get_segments,
-                    get_anomaly_context]  (4 tools)
-    
-    diagnostic:    [execute_analytics_eql,
-                    get_event_segmentation,
-                    list_email_campaigns,
-                    list_experiments,
-                    list_scenarios,
-                    list_banners,
-                    list_customers,
-                    get_customer_prediction_score,
-                    + 3 more]  (11 tools)
-    
-    recommendation: [list_scenarios, get_scenario,
-                     list_initiatives, list_recommendations,
-                     get_recommendation, list_segmentations,
-                     list_email_campaigns, list_voucher_pools,
-                     get_frequency_policies,
-                     + 5 more]  (14 tools)
-    
-    query:         [all of the above plus dashboards,
-                    trends, funnels, reports,
-                    customer events, catalog items,
-                    SMS / in-app / banners, …]  (33 tools)
-  
-  Within its allowlist, the model picks via tool_use.
-  Across allowlists, the agent class is the router —
-  the deterministic orchestrator picks which agent.
-```
-
-The route handlers in `app/api/briefing/route.ts` and `app/api/agent/route.ts` are the cross-agent router; the `allowedTools` policy is the within-agent constraint.
-
-### Move 2 — step by step
-
-#### How the allowlists are enforced
-
-Open `node_modules/@aptkit/core/node_modules/@aptkit/agent-anomaly-monitoring/dist/src/monitoring-agent.d.ts`:
-
-```ts
-export declare const anomalyMonitoringToolPolicy: {
-    capabilityId: string;
-    allowedTools: readonly [
-      "execute_analytics_eql",
-      "get_metric_timeseries",
-      "get_segments",
-      "get_anomaly_context"
-    ];
+```js
+// from node_modules/@aptkit/.../diagnostic-agent.js:8-23
+export const diagnosticInvestigationToolPolicy = {
+  capabilityId: 'diagnostic-investigation-agent',
+  allowedTools: [
+    'execute_analytics_eql',           // analytical
+    'get_event_segmentation',           // aggregate
+    'list_email_campaigns',             // metadata
+    'list_experiments',                 // metadata
+    'list_scenarios',                   // metadata
+    'list_banners',                     // metadata
+    'list_customers',                   // customer state
+    'get_customer_prediction_score',    // ML output
+    'get_metric_timeseries',            // pre-aggregated series
+    'get_segments',                     // segmentation
+    'get_anomaly_context',              // event context
+  ],
 };
 ```
 
-That `allowedTools` array is the routing surface. In `monitoring-agent.js:40`:
+Line-by-line: 11 tools grouped by shape — analytical (EQL) vs metadata listings vs pre-aggregated ML outputs. The model, when investigating a revenue drop, decides "EQL for the funnel shape, then get_metric_timeseries for the trend, then list_scenarios to see what campaigns might have changed." That's routing across tool categories, driven by the *content* of the investigation — same pattern as retrieval-source routing, different destination.
 
-```js
-const toolSchemas = filterToolsForPolicy(allTools, anomalyMonitoringToolPolicy);
-```
+**Where explicit source routing would land.** If a doc corpus got added, the pattern would need a *pre-loop* router: given the query, decide vector DB vs SQL vs web BEFORE the ReAct loop starts. Reason: the loop's system prompt has to know which tools are relevant, or the model will waste turns trying tools that don't apply.
 
-`filterToolsForPolicy` (in `@aptkit/tools`) takes the full 33-tool surface from the data source and filters down to the 4 the monitoring agent is allowed to see. Those 4 are what get passed as `toolSchemas` to `runAgentLoop`, which means those 4 are what the model can emit `tool_use` blocks for. The other 29 are invisible — the model can't pick them.
-
-Same shape for the other three agents — each AptKit agent class has its own `*ToolPolicy.allowedTools` constant filtered before the loop starts.
-
-#### Why this *is* routing, even though there's no router model
-
-The routing decision is made *before* the agent loop starts — at agent-class construction time, by the deterministic orchestrator. When `app/api/briefing/route.ts` constructs a `MonitoringAgent`, it's effectively routing "this is a monitoring task, send it to the agent that can only see the 4 anomaly-scanning tools." When `app/api/agent/route.ts` constructs a `DiagnosticAgent`, it's routing "this is a diagnostic task, send it to the agent that can see the 11 evidence-gathering tools."
-
-The route handler is the router, the agent class is the routed-to handler. No router model is needed because the *task* dictates the agent class deterministically: a briefing is always monitoring, an investigation step 2 is always diagnostic, step 3 is always recommendation. The model decisions happen *within* each agent's allowlist, not across them.
-
-#### Why intent classification doesn't count as multi-source routing
-
-The QueryBox path runs `classifyIntent` (`lib/agents/intent.ts`) before dispatching, but today it always dispatches to `QueryAgent` regardless of the classified intent. The intent flavors the prompt inside `QueryAgent.answer` — it doesn't pick a different agent class. So it's *routing within one agent's prompt*, not routing across knowledge sources.
-
-If the codebase grew to dispatch differently per intent (`case 'diagnostic': run DiagnosticAgent against a synthesized anomaly`), that would be true intent-driven routing across agents. The classifier is in place; the differentiated dispatch isn't.
-
-#### What this *would* look like with a second data source
-
-The repo doesn't have one today, but the shape is worth sketching. If the team added a second source — say, an internal documentation MCP server for explaining Bloomreach features — the routing would need a layer:
-
+Hypothetical:
 ```ts
-// hypothetical lib/data-source/composite.ts (not implemented)
-class CompositeDataSource implements DataSource {
-  constructor(
-    private bloomreach: BloomreachDataSource,
-    private docs: DocsDataSource,
-    private router: ModelProvider,  // Haiku-class router
-  ) {}
-
-  async callTool(name, args, options) {
-    // delegate to whichever data source exposes this tool
-    if (this.bloomreach.exposes(name)) return this.bloomreach.callTool(name, args, options);
-    if (this.docs.exposes(name)) return this.docs.callTool(name, args, options);
-    throw new Error(`No source for tool: ${name}`);
-  }
-
-  async listTools(options) {
-    // union of both sources' tools
-    const [a, b] = await Promise.all([
-      this.bloomreach.listTools(options),
-      this.docs.listTools(options),
-    ]);
-    return { tools: [...a.tools, ...b.tools] };
-  }
+// hypothetical query-flow with a real retrieval router
+async function answer(query: string) {
+  const source = await routeToSource(query);
+  // source: 'workspace-data' | 'playbook-corpus' | 'live-help-docs'
+  const toolPolicy = TOOL_POLICIES[source];
+  return runAgentLoop({ ...baseConfig, toolSchemas: toolPolicy });
 }
 ```
 
-In that world the model would emit `tool_use` blocks for tools from either source; the `CompositeDataSource` dispatches based on which source exposes the named tool. The "router" isn't a separate model — it's a name-based dispatch inside the composite. The model still picks the source implicitly by picking the tool.
+Line-by-line: `routeToSource` is one Haiku call at the top. The tool policy for the ReAct loop is scoped to that source's tools only — no wasted turns exploring irrelevant sources.
 
-A truly router-model-driven version would have the composite consult a model first ("here's a query; should I route this to Bloomreach or the docs?") and only expose the picked source's tools. That's heavier and only worth it when the source decision is genuinely ambiguous — when tool names overlap or when picking the wrong source wastes meaningful budget.
+**The interview-grade point.** A single vector store is rarely the whole answer in production. Routing between vector (paraphrase), relational (exact), and web (freshness) is what production retrieval looks like — the "just add pgvector" architecture works for demos and dies at the "compare this quarter's numbers to what we did last quarter" query.
 
 ### Move 3 — the principle
 
-**Retrieval routing is capability gating at the source granularity.** The point isn't to be clever about which source — it's to scope each agent (or each call) to the narrowest surface that can answer the question. In a single-source world (this repo today), that gating shows up as per-agent tool allowlists. In a multi-source world, it shows up as a router picking which source. The mechanism differs; the principle (narrow before retrieving) is the same.
-
-The production realization that single-vector-store retrieval rarely covers production needs maps to this repo's pattern: even with one substrate (Bloomreach), the 33 tools span semantically different *capabilities* (analytics queries, scenario reads, segment lookups, recommendation reads, customer event reads). Treating them as one undifferentiated surface and letting every agent see all 33 would mean every model call carries 33 tool definitions in its system prompt — wasted tokens and a worse picker (the model is more likely to pick a tangentially-related tool when the choice space is wider).
+Match source to query. Semantic queries → vector. Exact queries → relational. Fresh queries → web. This repo's version is the tool-selection substrate — the model routes across analytical tools instead of retrieval sources. The pattern is identical; the destinations differ.
 
 ## Primary diagram
 
 ```
-  This repo's routing — capability gating at agent-class construction
+  Recap — routing in this repo vs standard retrieval routing
 
-  ┌─ orchestrator (route handler) ──────────────────────────────────┐
-  │  briefing/route.ts:                                              │
-  │     new MonitoringAgent(...)        ←── routes to monitoring     │
-  │                                                                   │
-  │  agent/route.ts:                                                  │
-  │     if step is null or 'diagnose':                                │
-  │       new DiagnosticAgent(...)      ←── routes to diagnostic      │
-  │     if step is null or 'recommend':                               │
-  │       new RecommendationAgent(...)  ←── routes to recommendation  │
-  │     if q (free-form):                                             │
-  │       classifyIntent → new QueryAgent(...)  ←── routes to query   │
-  └──────────────────────────────┬──────────────────────────────────┘
-                                 │
-       ┌─────────────────────────┼───────────────────────────────┐
-       ▼                         ▼                               ▼
-  ┌────────────┐          ┌────────────┐                  ┌────────────┐
-  │ Monitoring │          │ Diagnostic │  ...             │   Query    │
-  │  4 tools   │          │  11 tools  │                  │  33 tools  │
-  │  allowed   │          │  allowed   │                  │  allowed   │
-  └─────┬──────┘          └─────┬──────┘                  └─────┬──────┘
-        │                       │                                │
-        │    each agent runs runAgentLoop; model picks tool_use │
-        │    within its allowlist via filterToolsForPolicy       │
-        ▼                       ▼                                ▼
-  ┌──────────────────────────────────────────────────────────────────┐
-  │  BloomreachDataSource (single source — one MCP server)            │
-  │  callTool dispatches by name; cache → spacing → wire → retry      │
-  └──────────────────────────────────────────────────────────────────┘
+  STANDARD (retrieval routing):
+  query → router → vector | SQL | web → retrieve → generate
+
+  THIS REPO (tool routing, inside ReAct loop):
+  query → DiagnosticAgent
+              │
+              ▼
+      ┌──────────────────┐
+      │ ReAct step:      │
+      │ model picks tool │  ← implicit routing per turn
+      └────────┬─────────┘
+    ┌─────────┼──────────┐
+    ▼         ▼          ▼
+  execute_    list_       get_metric_
+  analytics_  scenarios   timeseries
+  eql         (metadata)  (ML output)
+  (analytical)
 ```
 
 ## Elaborate
 
-The retrieval-routing pattern in canonical agentic RAG is about source heterogeneity — different storage substrates with different retrieval profiles (semantic for vector, exact for SQL, fresh for web). The single-substrate version this repo runs collapses the source decision but keeps the *capability* decision (which subset of tools fits this task).
+Retrieval routing at the query-source level is the standard production pattern named cleanly in LangGraph's "adaptive RAG" docs and the "AdaptiveRAG" paper (Jeong et al. 2024). The observation motivating it: even a great vector store has a shape it fits (paraphrase, semantic proximity); routing acknowledges that shape and dispatches other queries elsewhere.
 
-The cost of the bigger-allowlist approach (just give every agent all 33 tools and let the model pick) is real and measurable:
-
-- **Token cost per turn.** Tool schemas live in the system prompt. 33 tool schemas at ~200 tokens each = ~6,600 tokens of overhead per turn. With 4-7 turns per investigation, that's 25K-50K wasted input tokens. Per-agent narrowing cuts that to 1-3K tokens of overhead per turn.
-- **Picking quality.** Models are better at picking from a small menu of relevant tools than a large menu of mostly-irrelevant ones. The narrower the allowlist, the less likely the model picks a tangentially-related tool. This is a well-documented effect; the agent SDK guides all recommend narrowing tool surfaces per task.
-
-The per-agent policies are baked into AptKit's package design — each `agent-*` package ships its policy as a const. That's the right place: the policy belongs to the capability, not to the deploying app. The Blooming repo gets the policies for free by using AptKit's agent classes; if Blooming added a custom agent it would define its own policy alongside.
+The interesting version of this pattern in Blooming is that routing is done *by the model, per turn, inside the loop* rather than *by code, once, before the loop*. That's a subtler choice — it lets the model dynamically switch tool categories mid-investigation ("I checked the EQL trend; now let me see if a campaign changed"). The tradeoff: the loop has more freedom (more powerful) at the cost of unpredictable tool sequences (harder to debug). Blooming picks freedom because the domain is exploratory.
 
 ## Interview defense
 
-> **Q: How does this codebase route retrieval?**
->
-> Capability gating at the agent-class boundary, not source routing. There's one knowledge source (Bloomreach MCP, ~33 tools). Each agent class is constructed with a fixed `allowedTools` allowlist — monitoring sees 4 tools, diagnostic 11, recommendation 14, query 33 — via `filterToolsForPolicy`. The deterministic route handler picks which agent class to instantiate based on the task; within the agent, the model picks tools from its narrowed allowlist via `tool_use` blocks. The route handler is the cross-agent router; the allowlist is the within-agent constraint.
->
-> Anchor: `node_modules/.../@aptkit/agent-anomaly-monitoring/.../monitoring-agent.js:40` (the `filterToolsForPolicy` call) → each agent's `*ToolPolicy.allowedTools` const.
+**Q: Does blooming_insights route queries to different retrieval sources?**
+A: Not to retrieval sources — there aren't any. What it does route is *tool choice inside the ReAct loop*. The model picks from 11 allowed tools per turn — analytical (EQL), metadata (list_scenarios), ML output (get_customer_prediction_score). That's the same shape as retrieval routing, applied to tools instead of stores. If a doc corpus got added, I'd add a pre-loop router (Haiku classifier) picking which tool-policy to use for the whole loop.
 
-> **Q: Why narrow the allowlist instead of giving every agent all 33 tools?**
->
-> Two costs. First, tokens: tool schemas live in the system prompt, ~200 tokens each, ~6.6K tokens per turn if all 33 are exposed. Per-agent narrowing cuts that 4-6x. Second, picking quality: the model is better at picking from a small menu of relevant tools than a large menu with most irrelevant. The narrower surface produces sharper picks and reduces the "tangentially related tool" misroute. The pattern is industry-standard — every agent SDK guide recommends narrowing per task.
+Diagram: the two shapes side-by-side.
+Anchor: `diagnostic-agent.js:8-23` (the tool allowlist).
 
-> **Q: What would change if you added a second knowledge source?**
->
-> A composite `DataSource` adapter that fans out across both sources, with the routing collapsed into name-based dispatch (which source exposes this tool). The agents wouldn't need to change — they call through the `DataSource` port, the composite handles the source-picking. The agent's allowlist still narrows the capability surface; the composite handles "which substrate" given the picked tool name. A router model would only be necessary if tool names overlapped across sources or if the source decision was genuinely ambiguous — neither would be true in the obvious "add a docs MCP server" expansion.
->
-> Anchor: hypothetical `lib/data-source/composite.ts` implementing the `DataSource` interface from `lib/data-source/types.ts`.
+**Q: Why is the routing implicit (LLM-per-turn) instead of explicit (code-once-at-top)?**
+A: Exploratory domain. In a workspace investigation, the model doesn't know which tool it'll need on turn 3 until it sees turn 2's result. A pre-loop router that picked one tool category would over-constrain — the model would waste turns hitting the wrong tool. Implicit routing per turn lets the model adapt. The cost: harder to debug (no single point that logs "this went to vector, that went to SQL"). Mitigation: the trace sink emits every tool_call_start event, so the sequence is visible in `StatusLog`.
 
-> **Q: Where does the intent classifier fit in this routing story?**
->
-> One level up from the data-source routing. `classifyIntent` (`lib/agents/intent.ts`) decides *intent* (`query` | `diagnostic`) on the QueryBox path; today the dispatch always runs `QueryAgent` and just flavors its prompt with the intent. If the dispatch grew to pick *different agent classes* per intent — `case 'diagnostic': run a DiagnosticAgent` — that would be true intent-driven agent routing. The classifier is in place; the differentiated dispatch isn't. The cross-agent routing for the investigation path (briefing → diagnose → recommend) doesn't need a classifier because the task dictates the agent deterministically.
+Diagram: the fork — "predictable tool per query → explicit router; exploratory → implicit."
+Anchor: `lib/agents/aptkit-adapters.ts:157-166` for the trace sink.
 
 ## See also
 
-- → `01-agentic-rag.md` — the loop that runs after the routing decision
-- → `01-reasoning-patterns/07-routing.md` — the broader routing pattern at the agent-class level
-- → `04-agent-infrastructure/03-tool-calling-and-mcp.md` — the tool definitions the allowlist filters
-- → `04-agent-infrastructure/05-guardrails-and-control.md` — the allowlist as a security/control mechanism
+- `01-agentic-rag.md` — the loop this routing lives at the top of.
+- `01-reasoning-patterns/07-routing.md` — routing patterns generally.
+- `03-multi-agent-orchestration/02-supervisor-worker.md` — routing at the agent level.

@@ -1,28 +1,36 @@
-# Study — prompt engineering, anchored to blooming insights
+# Prompt engineering — index
 
-A working AI engineer's notebook on the prompt-engineering discipline as it shows up in this repo. The agents you'll read about — monitoring, diagnostic, recommendation, query, intent — live under `lib/agents/`. The prompt templates they consume live at `lib/agents/legacy-prompts/{monitoring,diagnostic,query,recommendation}.md`. The validator at the model-output boundary lives at `lib/mcp/validate.ts`. Every concept file points at one of these.
+Thirteen concepts, anchored to `blooming_insights`. Written in a working AI engineer voice — practitioner-skeptical, concrete-over-abstract, demo-vs-prod aware. If you're new here, read `00-overview.md` first for the one-page map.
 
 ## Reading order
 
-Operational discipline first, specific techniques after. If you read this in order, the early files give you the framing the later ones lean on (structured outputs assumes you understand the four prompt sections; eval-driven iteration assumes you've thought about prompts as code).
+The order below is not the alphabetical order of the files — it's the order to learn the discipline in. Operational discipline first (01–05); techniques second (06–11, 13); the security seam last (12).
 
-1. [00-overview.md](./00-overview.md) — the system in one frame, the prompt-engineering surface highlighted
-2. [01-anatomy.md](./01-anatomy.md) — the four prompt sections, how blooming's templates decompose them
-3. [02-structured-outputs.md](./02-structured-outputs.md) — JSON in a fence, parser at the boundary, type guards on the way back
-4. [03-prompts-as-code.md](./03-prompts-as-code.md) — `.md` files in git, slot interpolation, the aptkit handoff
-5. [04-token-budgeting.md](./04-token-budgeting.md) — the schema-summary helper, the per-result truncation, the 6-tool budget
-6. [05-eval-driven-iteration.md](./05-eval-driven-iteration.md) — the test suite at the model-output boundary, the gap
-7. [06-single-purpose-chains.md](./06-single-purpose-chains.md) — five agents, one job each, the coordinator that routes
-8. [07-output-mode-mismatch.md](./07-output-mode-mismatch.md) — JSON-mode prompts vs prose-mode prompts, the fence convention
-9. [08-few-shot.md](./08-few-shot.md) — the worked anomaly example in `monitoring.md`, why classifiers want examples
-10. [09-chain-of-thought.md](./09-chain-of-thought.md) — the "generate 2–3 hypotheses before your first tool call" pattern
-11. [10-self-critique.md](./10-self-critique.md) — the one-turn recovery path, what it doesn't catch
-12. [11-meta-prompting.md](./11-meta-prompting.md) — the category checklist generated from runtime capabilities
-13. [12-prompt-injection-defense.md](./12-prompt-injection-defense.md) — the QueryBox surface, instruction hierarchies, capability gating
-14. [13-forbidden-patterns.md](./13-forbidden-patterns.md) — what's NOT here yet, where the rotation problem would land
+**Operational discipline — the substrate**
 
-## What this notebook is, and isn't
+1. `01-anatomy.md` — Anatomy of a production prompt. Four named sections, one job each.
+2. `02-structured-outputs.md` — Tool calling and schemas as the modern contract, not "respond in JSON."
+3. `03-prompts-as-code.md` — Version-controlled, reviewed, model-version-paired prompts.
+4. `04-token-budgeting.md` — Counting tokens, the 80% rule, prefix caching, `schemaSummary`.
+5. `05-eval-driven-iteration.md` — Goldens, LLM-as-judge, receipts, regression suites.
 
-It's a teaching artifact about prompt engineering in production, taught off this codebase. It reads concept → mechanism → real file you can open. Where the codebase doesn't exercise a concept yet, the file says so honestly and names what a buildable target would look like.
+**Techniques — reach for them when the problem asks**
 
-It isn't a spec for what the prompts should say. The prompts in `lib/agents/legacy-prompts/` are the source of truth for product behavior; this notebook reads them and explains the patterns they exemplify.
+6. `06-single-purpose-chains.md` — One chain per job, composed into a pipeline.
+7. `07-output-mode-mismatch.md` — Every chain has one declared output mode; mismatches are silent.
+8. `08-few-shot.md` — Examples beat instructions for format-sensitive tasks.
+9. `09-chain-of-thought.md` — Reasoning prompts, when they earn their tokens.
+10. `10-self-critique.md` — Verify steps, self-consistency, and the blind-spot problem.
+11. `11-meta-prompting.md` — LLMs writing prompts, and where that stops being useful.
+13. `13-forbidden-patterns.md` — Rotating formulas for repeatable generative chains.
+
+**The security seam**
+
+12. `12-prompt-injection-defense.md` — Author-side defenses when the prompt eats user input.
+
+## What this guide is not
+
+- Not a vendor cookbook. Vendor-specific quirks (Anthropic prefers XML tags, OpenAI's JSON mode syntax) appear inside concept files where they matter, not as their own concepts.
+- Not academic prompt research. Tree of Thoughts, Constitutional AI, and jailbreak-attacker research are out of scope. If a technique isn't running in production somewhere, it's not in this guide.
+- Not multimodal. This codebase is text-in / text-out. Vision prompting stays out.
+- Not history. This is a working reference, not a timeline of how prompt engineering became a thing.

@@ -1,106 +1,143 @@
-# WAL, durability, and recovery — the auth cookie story
+# WAL, durability, and recovery
 
-*Industry standard / Project-specific* — there's no write-ahead log and no recovery for user data. The only state the repo durably protects is the OAuth session, stored as an AES-256-GCM-encrypted cookie. That cookie is the closest thing the repo has to a WAL, with an explicit dirty bit and a single flush per request.
+*Durability + recovery / Language-agnostic*
 
 ## Zoom out, then zoom in
 
-A WAL exists to make this promise: *"if you said COMMIT, the change survives a crash."* This repo makes that promise for exactly one thing — the user's Bloomreach OAuth session. Everything else (the briefing, the investigations, the cache, the workspace schema) is treated as cheap to recompute. Lose your auth and you have to redo the OAuth dance. Lose your briefing and you click "refresh."
+You know how Postgres flushes every commit to a write-ahead log before returning "success," so a crash mid-transaction can be replayed from the log? That's durability. This repo has no WAL, no fsync, no recovery loop. What it has is one AES-256-GCM encrypted cookie that survives on the client for ten days, some committed JSON in git, and a very deliberate policy of "the server owns no durable state." This file names each durability primitive and where the boundary sits.
 
 ```
-  Zoom out — where this concept lives
+  Zoom out — where "durability" lives in this repo
 
-  ┌─ UI layer ───────────────────────────────────────────────┐
-  │  feed renders; "session expired" panel on 401             │
-  └────────────────────────────┬─────────────────────────────┘
-                               │  HTTP (with cookies)
-  ┌─ Service layer ────────────▼─────────────────────────────┐
-  │  withAuthCookies(() => connectMcp(sid))                  │
-  │     ┌──────────────────────────────────────┐             │
-  │     │  read bi_auth cookie                  │             │
-  │     │  AsyncLocalStorage-scoped Store       │             │
-  │     │  ★ provider does many reads/writes ★   │ ← we are here
-  │     │  flush encrypted cookie if dirty      │             │
-  │     └──────────────────────────────────────┘             │
-  └────────────────────────────┬─────────────────────────────┘
-                               │  Set-Cookie: bi_auth=<ciphertext>
-  ┌─ Storage layer ────────────▼─────────────────────────────┐
-  │  browser cookie store (httpOnly, secure, SameSite=None)  │
-  └──────────────────────────────────────────────────────────┘
+  ┌─ UI (browser) ────────────────────────────────────────────┐
+  │  bi_auth cookie (AES-256-GCM, 10 days, httpOnly)           │  ← the ONLY prod durability
+  │  bi_session cookie (opaque UUID, session)                  │
+  │  localStorage: bi:mode                                     │
+  │  sessionStorage: stashed Insight for click-through nav     │
+  └────────────────────────┬──────────────────────────────────┘
+                           │
+  ┌─ Service (Vercel warm instance) ▼─────────────────────────┐
+  │                                                            │
+  │  session Map, TTL cache, McpClient cache                   │
+  │  → ALL wiped on cold-start / redeploy                      │
+  │                                                            │
+  │  dev-only: .investigation-cache.json, .auth-cache.json     │
+  │  → gitignored, local filesystem only                       │
+  │                                                            │
+  └────────────────────────┬──────────────────────────────────┘
+                           │
+  ┌─ git repository ────── ▼──────────────────────────────────┐
+  │  ★ lib/state/demo-*.json      committed snapshots           │  ← deploy-time durability
+  │  ★ eval/baseline.json         committed regression ref     │
+  │  ★ eval/receipts/*.json       committed per-run scores     │
+  │  ★ git tags (study-pre-regen-2026-07-03)  = "backup"       │
+  │                                                            │
+  └────────────────────────────────────────────────────────────┘
 ```
 
-Zoom in: the cookie is the only state in this repo that survives a Vercel cold start, an instance recycle, a deploy, a process OOM. Everything else dies and is recomputed. The mechanism that makes this work is `withAuthCookies` in `lib/mcp/auth.ts`, which uses AES-256-GCM, an AsyncLocalStorage-scoped store, and an explicit `dirty` bit.
+**Zoom in.** The server's serverless instances are *ephemeral by contract* — Vercel gives you no promise about their lifetime, no attached disk. So durability had to move somewhere else. Two places: the encrypted cookie on the client (for per-user state that has to survive a redeploy) and git (for state that has to survive the app's death). Everything else is a cache with extra steps.
 
 ## Structure pass
 
-**Layers:**
+**Axis to hold constant: what survives a redeploy?**
 
 ```
-  L1  HTTP request boundary       cookie comes in, cookie goes out
-  L2  withAuthCookies wrapper     ALS-scoped store, dirty bit
-  L3  BloomreachAuthProvider      MCP SDK interface, many read/write calls
-  L4  encryptStore / decryptStore AES-256-GCM, SHA-256(AUTH_SECRET) key
+  "does this survive `vercel deploy`?" — traced across the state primitives
+
+  ┌─ session Map<sessionId, SessionFeed> ─────────────────────┐
+  │  in-memory on the warm instance                            │  → NO. wiped every redeploy,
+  │  insights.ts:14                                            │    every cold-start.
+  └───────────────────────────────────────────────────────────┘
+      ┌─ BloomreachDataSource TTL cache ───────────────────────┐
+      │  in-memory on the warm instance                         │  → NO. wiped every redeploy.
+      │  bloomreach-data-source.ts:122                          │    (60s TTL anyway.)
+      └────────────────────────────────────────────────────────┘
+          ┌─ AsyncLocalStorage auth store ─────────────────────────┐
+          │  per-request only                                        │  → NO. dies at
+          │  auth.ts:47                                              │    request end.
+          └────────────────────────────────────────────────────────┘
+              ┌─ bi_auth cookie ───────────────────────────────────────┐
+              │  on the client, AES-256-GCM, 10-day max-age              │  → YES. redeploy
+              │  auth.ts:38-104                                          │    doesn't touch it.
+              └────────────────────────────────────────────────────────┘
+                  ┌─ committed JSON in git ─────────────────────────────────┐
+                  │  demo-*.json, baseline.json, receipts/*.json              │  → YES. survives
+                  │                                                            │    everything.
+                  └────────────────────────────────────────────────────────────┘
 ```
 
-**Axis traced: durability — what survives what?**
-
-```
-  Trace one axis: what survives each failure mode?
-
-  ┌─ session state Map ─────────────────────┐
-  │  in-process only                         │   → dies on instance recycle
-  └──────────────────────────────────────────┘
-                  (it flips)
-  ┌─ response cache ────────────────────────┐
-  │  in-process, 60s TTL                     │   → dies on recycle OR TTL
-  └──────────────────────────────────────────┘
-                  (it flips)
-  ┌─ bi_auth cookie ────────────────────────┐
-  │  client-side, AES-encrypted, 10 days      │   → survives recycle, deploy,
-  │                                          │     OOM, browser restart
-  └──────────────────────────────────────────┘
-
-  the seam between in-process and cookie is where the durability story flips
-```
-
-**Seams** — one matters:
-
-- The `withAuthCookies` boundary is where in-memory state becomes durable. Inside the wrapper everything looks like a normal `Map`; outside it the state is ciphertext in a cookie. The single flush at the end of the wrapper is the "commit" point.
+The seam that flips the axis is **the network boundary from server to client, plus the deploy-time boundary from repo to running app**. Nothing in the middle survives a redeploy. Two survivors: the client's cookie, and git.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-A WAL says "write your intent before you write the state, so if you crash mid-state-write you can recover from the intent log." The cookie here doesn't do *that* exactly — it's not a log, it's the state itself, encrypted. But it has the WAL's load-bearing property: **one flush per transaction, atomic from the reader's perspective.** Either the new cookie is set or it isn't; there's no half-written cookie.
+Standard shape of durability in a real database:
 
 ```
-  Cookie-as-WAL — read once, mutate in memory, flush once
+  standard WAL kernel
 
-       request in (with bi_auth cookie)
-              │
-              ▼
-       ┌──────────────────────────────────┐
-       │ decrypt cookie → Store (the state) │
-       │ run handler                        │
-       │   provider.tokens()  → reads Store │
-       │   provider.saveTokens(t)           │
-       │     → mutates Store, dirty = true  │
-       │   provider.codeVerifier() → reads  │
-       │   ... (many more reads/writes)     │
-       │ if dirty:                          │
-       │   encrypt Store → Set-Cookie       │   ◄── the "commit"
-       └──────────────────────────────────┘
-              │
-              ▼
-       response out (with new bi_auth)
+  1. write intent to log (append-only, sequential)
+  2. fsync the log → durable on disk
+  3. apply change to the in-memory buffer
+  4. lazy checkpoint → flush buffer to data pages later
+  5. on crash: replay log from the last checkpoint
+
+  key property: (2) happens BEFORE returning "committed"
 ```
 
-That's the kernel: ONE read at the start, many in-memory mutations, ONE write at the end. The cookie is never written mid-handler; if the handler throws, nothing flushes.
+This repo's equivalent:
 
-### Move 2 — the durability mechanism, one part at a time
+```
+  this-repo "durability" kernel
 
-#### The wrapper — `withAuthCookies`
+  in-memory Maps       ← no durability layer at all
+       │
+       │  (nothing to fsync)
+       │
+       ▼
+  bi_auth cookie       ← the "log" — writes are batched to the response cookie
+       │                  once per request via withAuthCookies flush
+       │
+       ▼
+  browser              ← the "durable disk" — the client holds it for 10 days
+       │
+       ▼
+  next request         ← the "recovery" — decrypt on read, seed ALS store
 
-```typescript
+  git repo             ← the "backup" — committed JSON survives everything
+```
+
+The load-bearing insight: **the cookie IS the WAL**. Every write to auth state is buffered in ALS during the request, then serialized-and-encrypted-and-set into the cookie at request end (`auth.ts:86-104`). The cookie makes it to the browser, becomes durable there. On the next request, `withAuthCookies` decrypts it into a fresh ALS store — that's the "recovery." The whole "log-then-apply" shape is there, just at the request granularity instead of the transaction granularity.
+
+### Move 2 — the primitives walked
+
+**`bi_auth` — encrypted-cookie durability.**
+
+```ts
+// lib/mcp/auth.ts:38-49
+const PERSIST = process.env.NODE_ENV === 'development';
+const CACHE_FILE = join(process.cwd(), '.auth-cache.json');
+const memStore = new Map<string, SessionAuthState>();
+
+interface RequestStore { store: Store; dirty: boolean }
+const requestStore = new AsyncLocalStorage<RequestStore>();
+const AUTH_COOKIE = 'bi_auth';
+const AUTH_COOKIE_MAX_AGE = 60 * 60 * 24 * 10; // 10 days, matches token lifetime
+```
+
+Three backends selected by env:
+- **dev** → gitignored file `.auth-cache.json` (survives dev-server restarts).
+- **test** → in-memory `memStore` (isolated per test run).
+- **prod** → encrypted `bi_auth` cookie on the client.
+
+The prod backend is the only one that matters for the durability story. AES-256-GCM (`auth.ts:62-79`) with a 12-byte random IV and 16-byte auth tag; the key is `sha256(AUTH_SECRET)`; a tampered or corrupt cookie decrypts to `{}` and the app treats it as "no auth" (`auth.ts:69-79`). The cookie carries the OAuth client info from Dynamic Client Registration, the tokens (access + refresh), and the PKCE `code_verifier` — everything a warm-instance-lost server needs to keep the OAuth flow alive across a serverless cold-start.
+
+The 10-day max-age matches Bloomreach's token lifetime — outliving that would just mean carrying dead tokens.
+
+**Cookie flush = commit.**
+
+```ts
 // lib/mcp/auth.ts:86-104
 export async function withAuthCookies<T>(fn: () => Promise<T>): Promise<T> {
   if (process.env.NODE_ENV !== 'production') return fn();
@@ -121,183 +158,194 @@ export async function withAuthCookies<T>(fn: () => Promise<T>): Promise<T> {
 }
 ```
 
-Four moves:
+Line 91: BEGIN — decrypt-and-load. Line 92: run the request with ALS scoping. Line 93-102: COMMIT — if any write happened during the request (`ctx.dirty === true`), re-encrypt and set the cookie. The response header is the durability barrier — once the browser receives it, the write survives redeploy, cold-start, and this warm instance's death.
 
-1. Read cookie once (`(await cookies()).get(AUTH_COOKIE)?.value`).
-2. Decrypt → an in-memory `Store`. Wrap it in a `RequestStore` with `dirty: false`.
-3. Run the handler under `requestStore.run(ctx, fn)` — the `AsyncLocalStorage` makes `ctx` visible to every nested function call without threading it through args.
-4. If anything inside `fn` set `dirty = true`, re-encrypt and write the cookie. Otherwise leave it untouched.
+Notice what's *not* here: no fsync, no checkpoint, no partial-write recovery. The cookie is either fully written (browser stores it, next request sees it) or it isn't (network error mid-response, next request sees the pre-write value). Because the OAuth SDK is idempotent — it can redo the DCR, re-request the tokens — losing a write is recoverable by rerunning the handshake. This is the design's tolerance for "no true WAL."
 
-The dev/test branches (`PERSIST` flag at `lib/mcp/auth.ts:34`) use a file (`.auth-cache.json`) or in-memory Map respectively — same interface, simpler backends.
+**In-memory state = zero durability by design.**
 
-#### The dirty bit — why it matters
+```ts
+// lib/state/insights.ts:14
+const state = new Map<string, SessionFeed>();
 
-```typescript
-// lib/mcp/auth.ts:125-131 (writeAll, abbreviated)
-function writeAll(store: Store): void {
-  const ctx = requestStore.getStore();
-  if (ctx) {
-    ctx.store = store;
-    ctx.dirty = true;     // ← every write sets the bit
-    return;
-  }
-  // ... dev/test branches
+// lib/data-source/bloomreach-data-source.ts:122
+private cache = new Map<string, { result: unknown; expiresAt: number }>();
+```
+
+Both die on redeploy, both die on cold-start. This is *accepted*. The insight surface is not audit data — it's ephemeral analyst thinking, and re-running the briefing is the right recovery move. The 60s TTL cache is by definition a cache; losing it costs one round-trip's worth of latency. Neither of these needs to survive.
+
+The client-side fallback for insight PK lookups (`useInvestigation.ts` stashes the whole `Insight` into `sessionStorage`) is what makes "server has no state anymore" survivable at the UX layer — the user clicks a card, the client already has the row, the server rebuilds the anomaly from `?insight=` (see `resolveAnomaly` at `app/api/agent/route.ts:35-49`, third fallback branch).
+
+**`eval/baseline.json` — durability via commit-to-git.**
+
+```ts
+// eval/gate.eval.ts:52-61
+const label = process.env.BASELINE_LABEL ?? '';
+const baselineFile = label ? `baseline-${label}.json` : 'baseline.json';
+const baselinePath = resolve(EVAL_DIR, baselineFile);
+let baseline: Baseline;
+try {
+  baseline = JSON.parse(readFileSync(baselinePath, 'utf8')) as Baseline;
+} catch {
+  throw new Error(`Missing baseline at ${baselinePath}. Build one with:  npm run eval:baseline`);
 }
 ```
 
-Every mutation routes through `writeAll`, which sets `dirty = true`. Reads via `readAll()` don't touch the bit. So the cookie only gets re-encrypted when the handler actually changed something — saving the CPU cost of AES-256-GCM + the bandwidth of a Set-Cookie header on read-only requests.
+The regression-gate's "reference row" is a committed JSON file. Durability is `git commit`. Recovery is `git checkout`. Backups are branches and tags. This is filesystem-as-committed-database at its most literal: a single JSON row whose durability guarantee is "as long as the git remote is intact."
 
-#### Why ALS, not request-arg threading
+Same story for `eval/receipts/*.json` (28 rows today, one per case × runId) — each is a self-contained committed file. Losing one means losing that scored case; you re-run the eval to regenerate. `lib/state/demo-*.json` is the same shape — committed snapshots, regenerable via the dev-only "capture" button.
 
-The Next.js cookie API has a known gotcha: `cookies().get(...)` after a `cookies().set(...)` in the same request returns the OLD value, not the just-set one. If the auth provider's many `tokens()` / `saveTokens()` calls each touched the cookie API directly, that bug would land repeatedly.
-
-The fix is to never touch the cookie API except at the request boundaries. AsyncLocalStorage lets `BloomreachAuthProvider`'s methods (`tokens()`, `saveTokens()`, `clientInformation()`, `saveClientInformation()`, `codeVerifier()`, `saveCodeVerifier()`) all hit the ALS-scoped Map without knowing a cookie exists. The comment at `lib/mcp/auth.ts:38-45` documents this explicitly.
+**Git tags as backup/rollback.**
 
 ```
-  Why ALS — avoiding Next's get-after-set bug
-
-  WITHOUT ALS (naive):
-    provider.tokens()        → cookies().get(...) → reads old
-    provider.saveTokens(t)   → cookies().set(...) → updates response
-    provider.tokens()        → cookies().get(...) → reads OLD again ← bug
-
-  WITH ALS:
-    provider.tokens()        → ctx.store.tokens
-    provider.saveTokens(t)   → ctx.store.tokens = t; ctx.dirty = true
-    provider.tokens()        → ctx.store.tokens ← sees the update
-    ← flush at the boundary writes the new cookie once
+  git tags in this repo (partial):
+    study-pre-regen-2026-06-28
+    study-pre-regen-2026-07-03
+    rehearse-pre-regen-2026-06-28
+    study-rehearse-pre-regen-v1.69.2
 ```
 
-#### The crypto — AES-256-GCM under `AUTH_SECRET`
+These are named restore points before large study/rehearse regenerations. `git checkout study-pre-regen-2026-07-03` is the human-scale equivalent of a PITR (point-in-time recovery). The retention policy is manual (tags don't garbage-collect), the granularity is coarse (one tag per major regen), and there's no automation — but it *works* and it's cheap.
 
-```typescript
-// lib/mcp/auth.ts:51-79 (key derivation + encrypt + decrypt)
-function aesKey(): Buffer {
-  const secret = process.env.AUTH_SECRET;
-  if (!secret) throw new Error('AUTH_SECRET is required in production...');
-  return createHash('sha256').update(secret).digest();  // 32 bytes → AES-256
-}
+**Dev-only file cache = local-filesystem durability.**
 
-function encryptStore(store: Store): string {
-  const iv = randomBytes(12);
-  const cipher = createCipheriv('aes-256-gcm', aesKey(), iv);
-  const enc = Buffer.concat([cipher.update(JSON.stringify(store), 'utf8'), cipher.final()]);
-  return Buffer.concat([iv, cipher.getAuthTag(), enc]).toString('base64url');
-}
+```ts
+// lib/state/investigations.ts:1-9
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import type { AgentEvent } from '../mcp/events';
 
-function decryptStore(token: string): Store {
-  try {
-    const buf = Buffer.from(token, 'base64url');
-    const decipher = createDecipheriv('aes-256-gcm', aesKey(), buf.subarray(0, 12));
-    decipher.setAuthTag(buf.subarray(12, 28));
-    const plain = Buffer.concat([decipher.update(buf.subarray(28)), decipher.final()]).toString('utf8');
-    return JSON.parse(plain) as Store;
-  } catch {
-    return {};  // tampered, rotated-secret, or corrupt cookie → treat as no auth
-  }
-}
+const PERSIST = process.env.NODE_ENV === 'development';
+const CACHE_FILE = join(process.cwd(), '.investigation-cache.json');
+const DEMO_FILE = join(process.cwd(), 'lib/state/demo-investigations.json');
 ```
 
-Three details worth pulling out:
+`.investigation-cache.json` is written from the dev branch of `saveInvestigation` (`investigations.ts:30-41`). It's gitignored — a dev-machine convenience for iterating on investigations without re-running the agents. Production is stateless (Vercel filesystem is read-only, and `PERSIST` is false anyway).
 
-- **Random 12-byte IV per encryption** — prevents two identical stores from producing the same ciphertext. Critical for GCM.
-- **Auth tag stored inline** — the `setAuthTag(buf.subarray(12, 28))` on decrypt validates that the cookie wasn't tampered with. A modified cookie throws and the catch returns `{}`, which the rest of the code treats as "no auth" → kick the user to re-OAuth.
-- **Key rotation just works** — change `AUTH_SECRET` and every existing cookie decrypts to `{}` because the auth tag fails. Users re-OAuth; no migration script needed. This is the closest thing to "graceful recovery" in the whole repo.
+### Move 2 variant — the load-bearing skeleton
 
-#### What's NOT durable — the explicit decisions
+Minimum viable durability layer:
 
-- **Session feed (`sessionState`)** — dies on instance recycle. Why: a briefing is cheap to re-run (≤30s), the alpha server rate-limits per user globally so persisting and replaying might cost more than just re-querying.
-- **Response cache** — dies on recycle or 60s TTL. Why: it's an optimization, not a source of truth.
-- **Workspace schema (`bootstrapSchema`'s cached value)** — dies on recycle. Why: 4 sequential MCP calls to rebuild; bounded cost.
-- **Investigations** — die on recycle in production; dev has a gitignored file cache (`.investigation-cache.json` at `lib/state/investigations.ts:8`). Why: same as briefing — cheap to re-run.
+1. **The bi_auth cookie itself.** Remove it (or drop `AUTH_SECRET`) and OAuth breaks the moment the warm instance turns over — the PKCE `code_verifier` from the `authorize` request is gone before the `callback` runs. This is the *only* production durability primitive that the app cannot function without.
+2. **The `ctx.dirty` gate.** Remove it and every request sets the cookie, whether or not it wrote — wastes response headers, slows every request slightly. Keep it.
+3. **The commit-to-git story for `eval/baseline.json`.** Remove it and the regression gate has no reference; every PR is either "no gate" or "run a fresh baseline every time" (which defeats the point).
 
-#### Recovery — none for user data, automatic for auth
-
-The repo has one recovery path: the auto-reconnect on `invalid_token` error (`app/page.tsx` resets auth and reloads once, guarded — described in `.aipe/project/context.md` under "Auto-reconnect"). That's the recovery from "the alpha server revoked your token after minutes." It re-runs the OAuth dance, writes a new bi_auth cookie, and the user's feed is back.
-
-For everything else: clicking "refresh" re-runs the briefing. There's no recovery because there's no log to recover from.
+Everything else — the demo snapshot, the dev file cache, the git tags — is convenience or backup.
 
 ### Move 3 — the principle
 
-A durability story is not a yes/no — it's a per-piece-of-state decision. The repo's choice for each piece is honest: "if losing this costs the user a 30-second re-run, don't pay for durability." The one piece that *would* cost the user a multi-minute OAuth dance got the full treatment (AES-GCM, atomic flush, dirty bit, key rotation that gracefully degrades). The discipline isn't "durability everywhere" or "durability nowhere"; it's "durability matched to recovery cost."
+**Push durability to the layer that already has it.** This repo doesn't try to build a WAL over Vercel's stateless serverless — it *inherits* durability from the browser (cookie) and from git (commit). The result is an app with zero server-side persistent storage that still recovers from redeploys, cold-starts, and instance death. The tradeoff is real: you can't store anything the client can't hold, and you can't durably persist anything that has to change between deploys. Every state design decision downstream of that reads as the natural consequence: sessions are ephemeral, insights are re-generated, investigations are re-runnable, baselines are git rows.
 
 ## Primary diagram
 
 ```
-  Durability + recovery — what survives what, and how
+  Durability, from a write to "safe past a redeploy"
 
-  ┌─ in-process (dies on recycle) ──────────────────────────┐
-  │  sessionState Map           ← recovery: click refresh    │
-  │  response cache             ← recovery: rebuild on demand│
-  │  workspace schema cache     ← recovery: re-bootstrap     │
-  │  investigation cache (dev)  ← recovery: re-run agent     │
-  └──────────────────────────────────────────────────────────┘
+  ┌─ per-request auth write ───────────────────────────────────┐
+  │                                                             │
+  │  request enters                                             │
+  │    │                                                        │
+  │    ▼                                                        │
+  │  withAuthCookies:                                           │
+  │    decrypt bi_auth   ─► ctx.store ─► requestStore.run(ctx)  │
+  │                                          │                  │
+  │                                          ▼                  │
+  │                                      OAuth SDK                │
+  │                                       many readState /       │
+  │                                       patchState calls        │
+  │                                       (all hit ctx.store)     │
+  │                                          │                    │
+  │                                          ▼                    │
+  │    if ctx.dirty: encrypt(ctx.store) ─► set bi_auth cookie    │
+  │    │                                     │                    │
+  │    │                                     ▼                    │
+  │    ▼                                Set-Cookie header          │
+  │  response leaves                    (COMMIT boundary)          │
+  │                                          │                    │
+  │                                          ▼                    │
+  │                                     browser stores it         │
+  │                                     for 10 days                │
+  │                                                                │
+  │  next request: decrypt ─► same round begins                    │
+  │                                                                │
+  │  lib/mcp/auth.ts:86-104                                        │
+  └───────────────────────────────────────────────────────────────┘
 
-  ┌─ filesystem (dies on deploy) ───────────────────────────┐
-  │  lib/state/demo-*.json      ← recovery: re-capture       │
-  └──────────────────────────────────────────────────────────┘
+  ┌─ deploy-time / eval durability (git) ──────────────────────┐
+  │                                                             │
+  │  npm run eval:baseline                                      │
+  │    → reads eval/receipts/*.json (28 rows)                   │
+  │    → aggregates via computeBaseline(runId, receipts)        │
+  │    → writes eval/baseline.json                              │
+  │    → committer commits it                                   │
+  │                                                             │
+  │  npm run eval:gate                                          │
+  │    → reads eval/baseline.json (durable "row")               │
+  │    → compares to candidate → passes/fails PR check          │
+  │                                                             │
+  │  eval/baseline.eval.ts:56-58                                │
+  │  eval/gate.eval.ts:53-91                                    │
+  │                                                             │
+  │  backup / rollback: git tags                                │
+  │    study-pre-regen-2026-07-03  ← human-scale PITR anchor    │
+  └────────────────────────────────────────────────────────────┘
 
-  ┌─ bi_auth cookie (THE durability story) ─────────────────┐
-  │                                                           │
-  │  request in ──► decrypt(cookie) ──► Store                 │
-  │                       │                                   │
-  │                       ▼                                   │
-  │                ALS-scoped Map                             │
-  │                       │                                   │
-  │                  many provider                            │
-  │                  reads/writes                             │
-  │                       │                                   │
-  │                       ▼                                   │
-  │                if dirty:                                  │
-  │                  encrypt(Store) ──► Set-Cookie            │
-  │                       │                                   │
-  │                       ▼                                   │
-  │                response out                               │
-  │                                                           │
-  │  guarantees:                                              │
-  │    AES-256-GCM (confidentiality + integrity)              │
-  │    random IV per write                                    │
-  │    auth tag validation                                    │
-  │    one flush per request (atomic from reader)             │
-  │    key rotation degrades to re-OAuth (no migration)       │
-  │    httpOnly + secure + SameSite=None (cross-site OAuth)   │
-  │    10-day MaxAge                                          │
-  └──────────────────────────────────────────────────────────┘
-
-  recovery model:
-    auth → auto-reconnect on invalid_token (single guarded retry)
-    data → re-run the agent
+  ┌─ what doesn't survive (accepted losses) ───────────────────┐
+  │                                                             │
+  │  session Map<sessionId, SessionFeed> — wiped on redeploy    │
+  │    → recovery: user re-runs briefing (agent is idempotent)  │
+  │                                                             │
+  │  BloomreachDataSource cache — wiped on redeploy             │
+  │    → recovery: 60s of extra Bloomreach hits                 │
+  │                                                             │
+  │  in-flight requests — dropped mid-flight on redeploy        │
+  │    → recovery: client's auto-reconnect on `invalid_token`   │
+  │      (see app/page.tsx feed logic)                          │
+  │                                                             │
+  └────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The reason this design works is the **stateless-by-default Vercel function model**. Vercel doesn't promise instance affinity, doesn't promise warm starts, doesn't promise local disk persistence beyond the build. Any state you want to survive across requests has to either go in the database (none here), in the cookie (auth tokens here), or in an external store (none here). The cookie path is the cheapest of those — no extra infrastructure, no extra cost, scales horizontally for free.
+The interesting philosophical point: **"the WAL is on the client"** is a pattern local-first apps have been articulating for years. This repo is not local-first — it's a serverless web app talking to a remote SaaS — but it borrowed the exact same durability idea for the auth layer. Encrypt the state, ship it to the client, let the client be the durable disk. The tradeoff you accept is a bounded state size (cookies are limited, browsers cap them at ~4KB per; check the encrypted-store size stays under that) and a max-age you have to pick honestly.
 
-Compare to Postgres's WAL: there the log records every change before applying it; on crash recovery the engine replays the log forward to bring the data files up to date. This cookie design has no replay because there's no "data file" separate from the log — the cookie IS the data, fully self-contained. That works because the data is tiny (a few hundred bytes of encrypted JSON) and self-sufficient (everything needed to reconstruct the session is in it).
+The eval-layer story is a different kind of durability: *versioning by commit*. `eval/baseline.json` isn't just a persisted row — it's a row whose *edits are code-reviewed*. Every time a baseline changes, someone opens a PR to change it, and the change is auditable in git history. That's a stronger durability guarantee than most production databases give you (you can `SELECT * FROM audit_log`, but you can't `git blame` a Postgres row without extra tooling).
 
-If the repo ever needs to durably store user data (insights, investigations), the natural extension is: keep the cookie for auth, add a real KV store for data. Splitting auth from data lets you swap the data store without re-encrypting cookies. Today there's no need.
+`study-system-design` owns the higher-level question of "which datastore was chosen" (answer: none for local state, Bloomreach for source-of-truth). Here the point is narrower: **the two durability primitives that DO exist are picked deliberately**, and they cover exactly the two failure modes the app can't ignore (OAuth surviving cold-start; eval baseline surviving PR review).
+
+### `not yet exercised`
+
+- **Write-ahead log (per-transaction append + fsync barrier).** No engine.
+- **Fsync / synchronous_commit / group commit.** No engine.
+- **Checkpoints and dirty-page flushing.** No engine.
+- **Backup automation (pg_dump, base backup + WAL archive).** Manual git tags only.
+- **Point-in-time recovery, PITR windows.** Coarse via `git checkout <tag>`.
+- **Replication as durability (log-shipping to standby).** See `08-replication-and-read-consistency.md`.
+- **Crash recovery replay from the log on startup.** Cookie decrypt on request-start is the analog, at request granularity.
 
 ## Interview defense
 
-**Q: What's the durability story for this app?**
+**Q: "How does this app persist data?"**
 
-One piece of state is durable: the `bi_auth` cookie. Everything else dies on Vercel cold start and gets recomputed. The cookie holds the OAuth session (client info, tokens, PKCE verifier, CSRF state) under AES-256-GCM, keyed off `AUTH_SECRET`. The wrapper at `lib/mcp/auth.ts:86` reads it once at the request start, runs the handler under AsyncLocalStorage so the auth provider can do many reads/writes against an in-memory store, then re-encrypts and writes back ONCE at the end — only if a dirty bit got set.
+Model answer: "Almost none of it, and that's deliberate. There are two durable primitives. One: the `bi_auth` cookie at `lib/mcp/auth.ts:38-104` — AES-256-GCM encrypted, 10-day max-age, holds OAuth client info + tokens + PKCE verifier. That survives redeploys because it's on the client. Everything the server needs to keep OAuth alive across a cold-start goes in this cookie. Two: committed JSON in git — `lib/state/demo-*.json` for demo replay, `eval/baseline.json` for regression-gate reference, `eval/receipts/*.json` for per-run scores. Those survive because they're in the repo. Between the two, the entire session Map, TTL cache, and MCP client cache are wiped on every redeploy — accepted, because the recovery move is 'user re-runs the briefing' and the agent is idempotent."
 
-**Q: Why a dirty bit?**
+Diagram to sketch: the "per-request auth write" flow — decrypt into ALS, mutate, dirty-check, encrypt-and-set on response.
 
-To skip the encrypt + Set-Cookie on read-only requests. Most agent flows touch `tokens()` but never call `saveTokens()` — so the cookie stays untouched. Without the dirty bit, every request would burn AES-GCM cycles and a Set-Cookie header on responses that didn't need them.
+**Q: "What's the WAL analog here?"**
 
-**Q: What's the recovery model?**
+Model answer: "The cookie flush at the end of `withAuthCookies` in `auth.ts:86-104`. Standard WAL is 'append to log, fsync, then return commit.' Here it's 'buffer to ALS store during the request, encrypt into cookie on response.' The response's Set-Cookie header is the commit barrier. It's request-granular rather than transaction-granular, but the shape is identical: you don't return success until the durable layer has the write. And like a real WAL, if the response never reaches the client (network error), the write is lost — but the OAuth handshake is idempotent, so recovery is just 'redo the flow.' That's the design's acceptance for not having a true fsync."
 
-Two paths. For auth, the auto-reconnect: when a tool call returns `invalid_token` (the alpha server revokes tokens after minutes), the UI resets auth and reloads once. The fresh OAuth dance writes a new cookie. For everything else, the recovery is "click refresh and re-run the briefing." There's no log to replay because there's nothing valuable enough to log. That's a deliberate choice — a briefing costs ≤30s to redo, and the alpha server's rate limits make persistence-and-replay more expensive than just re-querying.
+Anchor: cookie Set-Cookie header = commit barrier; response reaches client = "fsynced."
 
-**Q: What happens if you rotate `AUTH_SECRET`?**
+**Q: "How would you back up production data?"**
 
-Every existing cookie's auth-tag validation fails on the next decrypt, the catch at `lib/mcp/auth.ts:76` returns `{}`, the handler sees "no auth," and the user is sent through the OAuth dance to re-authenticate. There's no migration script, no downtime, no data loss. That's the closest the repo gets to "graceful recovery on schema change" — and it works precisely because the cookie is self-contained.
+Model answer: "There isn't any. Bloomreach owns the source of truth — customer data, event streams — and I don't back that up because I don't run it. My app's durable state is (1) `bi_auth` cookies on user browsers, which I can't back up and don't need to (they expire in 10 days and re-auth is fine), and (2) whatever's committed in the repo, which is backed up by the git remote. If I ever added server-side persistence — a Postgres for cross-session analytics, say — that's when I'd need backup automation. Right now the 'backup' is `git push origin main` plus tags like `study-pre-regen-2026-07-03` as human-scale restore points."
+
+Anchor: no server-side durable state → no backup needed. Backup = git remote + tags.
 
 ## See also
 
-- `01-database-systems-map.md` — where this cookie sits among the four storage analogs (L4)
-- `02-records-pages-and-storage-layout.md` — the session-state that does NOT have this durability story
-- `08-replication-and-read-consistency.md` — the demo snapshot as the other "survives a deploy" thing
-- `09-database-systems-red-flags-audit.md` — the risk if `AUTH_SECRET` is ever missing in prod
+- `01-database-systems-map.md` — the full storage picture this file zooms in on.
+- `05-transactions-isolation-and-anomalies.md` — the atomicity story that pairs with cookie-as-commit.
+- `06-locks-mvcc-and-concurrency-control.md` — the AsyncLocalStorage pattern that makes the cookie-flush idempotent.
+- `08-replication-and-read-consistency.md` — how the demo snapshot acts as a read replica.

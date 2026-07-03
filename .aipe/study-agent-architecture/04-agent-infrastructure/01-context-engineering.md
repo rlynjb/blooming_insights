@@ -1,88 +1,79 @@
 # Context engineering
 
-**Industry standard.** The discipline RAG and prompt engineering are subsets of. **Deeply exercised** in this repo — the `schemaSummary` token-budget trick is the load-bearing example.
+_Industry standard._
 
 ## Zoom out, then zoom in
 
-Sits across every component that fills the model's context window. Prompt engineering is one slice (the static instructions); retrieval is another (the dynamic facts); tool outputs are another (the observation blocks); user state is another. Context engineering is the discipline that decides what fills the window.
+The discipline that decides *what fills the window on every turn*. Prompt engineering gets the first good output; context engineering keeps the thousandth good. In this repo the surface is small and disciplined: a task-shaped system prompt + a bounded `schemaSummary` + the current investigation's tool trace, all cached by Anthropic's ephemeral cache breakpoint.
 
 ```
-  Zoom out — where this concept lives
+  Zoom out — what fills each agent's window
 
-  ┌─ Context engineering ───────────────────────────────────┐
-  │  (the superset discipline)                               │ ← we are here
-  │                                                          │
-  │   ┌─────────────┐  ┌─────────────┐                       │
-  │   │   prompt    │  │     RAG     │                       │
-  │   │ engineering │  │ (retrieval) │                       │
-  │   └─────────────┘  └─────────────┘                       │
-  │   ┌─────────────┐  ┌─────────────┐                       │
-  │   │   memory    │  │ tool outputs│                       │
-  │   └─────────────┘  └─────────────┘                       │
-  │   ┌─────────────┐  ┌─────────────┐                       │
-  │   │ history      │  │ user profile│                       │
-  │   └─────────────┘  └─────────────┘                       │
-  └─────────────────────────────────────────────────────────┘
+  ┌─ System prompt (cached prefix) ──────────────────────────────┐
+  │  · task-shaped instructions (investigate / propose / scan)   │
+  │  · schemaSummary (top 20 events, 30 customer props, catalogs)│
+  │  · tool descriptions (MCP tool defs)                         │
+  └───────────────────────┬──────────────────────────────────────┘
+                          │ cache_control: ephemeral
+                          ▼
+  ┌─ Conversation window (grows per turn) ───────────────────────┐
+  │  · anomaly (input) / diagnosis (Stage B input)               │
+  │  · tool_use ↔ tool_result blocks (each ReAct turn)            │
+  │  · model's step text (reasoning)                              │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-The reframe to hand the reader: most agent failures are not model failures — they are *context* failures. Stale retrieval, lost-in-the-middle on a bloated context, the wrong tool outputs in the window, no user state loaded. Bigger context windows don't solve this — they make room for more noise.
+Zoom in: the system prompt is the *context engineering surface*. Every choice about what to include, exclude, or summarize lives there. Blooming's version is deliberately compact — the full workspace schema is 112KB, but only a ~1-2KB summary reaches the window.
 
 ## Structure pass
 
-Layers: static context (system prompt, tool definitions) → dynamic context (retrieved facts, tool outputs, conversation history) → curated handoff (what passes to the next turn / agent).
+**Layers:** system prompt (stable across turns) · shared reference data (schemaSummary) · per-investigation input (Anomaly, Diagnosis) · trace (grows per turn).
+**Axis:** *does this content change during the loop, or is it stable across every turn?*
+**Seam:** the ephemeral-cache breakpoint. Everything above the breakpoint is cached across turns; everything below is fresh. Getting more content into the cached prefix is the single highest-leverage cost lever.
 
-**Axis traced — "what fills the window?":** for any given model call, the contents are deliberate, not accidental. Every block in the window earned its place; everything else is excluded.
+```
+  The cache breakpoint — what stays, what refreshes
 
-**Seam:** the per-turn message-building boundary. Before each `model.complete` call, *something* decides what goes in `system`, `messages`, and `tools`. That something is your context engineering — even if it's "everything plus a hardcoded prompt."
+  ┌─ Cached (system prompt) ───────────────────────────────────┐
+  │  task instructions + schemaSummary + tool defs             │  ← stable
+  └────────────────────────────────────────────────────────────┘
+      cache_control: { type: 'ephemeral' }
+  ┌─ Fresh (messages) ─────────────────────────────────────────┐
+  │  turn 1: user msg (Anomaly)                                │
+  │  turn 2: assistant msg (tool_use) + tool_result            │
+  │  turn 3: assistant msg (tool_use) + tool_result            │  ← grows
+  │  turn N: assistant msg (final structured output)           │
+  └────────────────────────────────────────────────────────────┘
+```
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know the difference between writing a search box and writing a curated landing page. The search box puts everything matching the query in front of the user; the curated page picks specific items for specific reasons. Prompt engineering is the search box — the model sees the question and a fixed instruction. Context engineering is the landing page — for each model call, you decide which of N possible context blocks earn their tokens.
+You've optimized an API endpoint by pulling stable data out of the request path — put it behind a cache, only recompute what changes per request. Context engineering is the same instinct at the LLM layer: identify what's *stable across every turn* (task instructions, schema summary, tools) and put it in the cached prefix. Everything downstream (the conversation) refreshes on every call.
 
 ```
-  Context engineering — the curating discipline
+  Pattern: cached prefix + fresh tail
 
-  available context (could fill the window):
-  ┌─────────────────────────────────────────────────────────────┐
-  │  full schema (112KB), all events, all customer props        │
-  │  ─── too big for the window even if useful                  │
-  │                                                              │
-  │  the user's last 100 questions                              │
-  │  ─── not relevant to the diagnostic                          │
-  │                                                              │
-  │  every Bloomreach scenario ever defined (~120)              │
-  │  ─── only 4-5 might be relevant                              │
-  │                                                              │
-  │  the agent's full chain-of-thought from the last 20 runs    │
-  │  ─── would let it learn; would also bloat fast               │
-  └─────────────────────────────────────────────────────────────┘
-
-  what actually fills the window (after curation):
-  ┌─────────────────────────────────────────────────────────────┐
-  │  system prompt (static): role, format, tools                │
-  │  schema summary (token-bounded): top 20 events, top 30 cprops│
-  │  this turn's user prompt / anomaly                          │
-  │  this run's tool results (truncated at 16,000 chars each)   │
-  └─────────────────────────────────────────────────────────────┘
+  ┌──────────────────────────────┐
+  │  Cached prefix               │ ← same across every turn
+  │  (system prompt)             │   cache_creation once,
+  └──────────────────────────────┘   cache_read every turn after
+  ┌──────────────────────────────┐
+  │  Fresh tail (messages)       │ ← grows per turn
+  └──────────────────────────────┘
 ```
 
-The win isn't "less context is better." The win is "the right context, in the right amount, for this specific call."
+### Move 2 — the walkthrough
 
-### Move 2 — step by step
-
-#### The load-bearing instance — `schemaSummary`
-
-Open `lib/agents/monitoring.ts:19-60`. The function `schemaSummary(schema: WorkspaceSchema): string` takes the raw Bloomreach workspace schema (which can be 112KB+ of events, properties, customer attributes) and returns a token-bounded summary the agent's system prompt embeds.
+**The schema summary — `lib/agents/monitoring.ts:19-60`.** The workspace schema in full is 112KB — event definitions, customer properties, catalogs, event counts. The summary bounds this to ~1-2KB before it reaches the prompt:
 
 ```ts
-// lib/agents/monitoring.ts:19-60 (abridged)
+// lib/agents/monitoring.ts:19-60 — bounded schemaSummary
 export function schemaSummary(schema: WorkspaceSchema): string {
   // Top 20 events, each capped at 10 properties
   const MAX_EVENTS = 20;
   const MAX_PROPS_PER_EVENT = 10;
-
   const eventsText = schema.events
     .slice(0, MAX_EVENTS)
     .map((e) => {
@@ -90,149 +81,124 @@ export function schemaSummary(schema: WorkspaceSchema): string {
       return `  - ${e.name} (${e.eventCount}): ${props || '(no properties)'}`;
     })
     .join('\n');
-
-  // Customer properties, cap at 30
-  const MAX_CPROPS = 30;
-  const customerPropsText = schema.customerProperties.slice(0, MAX_CPROPS).join(', ');
-
-  return [
-    `Project: ${schema.projectName} (${schema.projectId})`,
-    `Total customers: ${schema.totalCustomers.toLocaleString()}`,
-    `Total events: ${schema.totalEvents.toLocaleString()}`,
-    `Oldest data: ${oldestDate}`,
-    ...(horizonLine ? [horizonLine] : []),
-    `Catalogs: ${schema.catalogs.map((c) => c.name).join(', ') || 'none'}`,
-    '',
-    `Top events (name, eventCount: properties):`,
-    eventsText,
-    '',
-    `Customer properties: ${customerPropsText}`,
-  ].join('\n');
+  // ... Customer properties: cap at 30 ...
+  return [/* project + counts + horizon + events + customer props + catalogs */].join('\n');
 }
 ```
 
-Three curation decisions made explicit:
+Line-by-line:
 
-- **Top 20 events** by event count. The model needs to know the workspace's event vocabulary; it doesn't need every event ever. The top 20 covers ≥95% of the volume in typical Bloomreach workspaces.
-- **Top 10 properties per event.** Same logic — the most-emitted properties carry the most signal; the tail is noise.
-- **Top 30 customer properties.** Bloomreach workspaces commonly have 100+ customer properties; the model needs the dominant ones (country, segment, channel, lifecycle stage) and rarely needs the long tail.
+- **`MAX_EVENTS = 20`, `MAX_PROPS_PER_EVENT = 10`.** Two hard caps. If a workspace has 100 events with 50 properties each, the summary still fits. The full data isn't lost — it's still fetchable at tool-call time via `list_events` — but the *prompt* doesn't carry the tail.
+- **`.slice(0, MAX_EVENTS)`.** Sort order comes from the schema fetch; blooming trusts Bloomreach's order (implicitly popularity-ranked). If the top-20 misses a niche event the agent needs, the agent can still `execute_analytics_eql` on it — but the *summary* doesn't advertise it.
+- **The output is a single string** — plain-text, not JSON. Model reads it directly; no JSON parse tax on the model side.
 
-The result is roughly 2-4KB of text instead of 100KB+. The agent gets the schema's *shape* without the bloat that would push real content out of the model's attention window.
+**The system-prompt cache — `lib/agents/aptkit-adapters.ts:85-89`.** The whole system prompt (task instructions + schemaSummary + tool defs) sits behind Anthropic's ephemeral cache breakpoint:
 
-The same pattern repeats in AptKit's own `@aptkit/agent-anomaly-monitoring/.../schema-summary.js` (used inside the AptKit class); the Blooming wrapper's `schemaSummary` is provided as a reference / for tests, and the AptKit version is what the live monitoring loop actually uses. Both implement the same curation discipline.
-
-#### The system-prompt budget
-
-Open `lib/agents/aptkit-adapters.ts:42-55` — the `AnthropicModelProviderAdapter.complete` method. The system prompt comes from the AptKit agent class (which renders the prompt template from `@aptkit/prompts` with the schema summary + the category checklist). The total system-prompt size is roughly:
-
-- ~800 tokens of static instructions (per the AptKit prompt package).
-- ~500-1000 tokens of schema summary (from `schemaSummary`).
-- ~600-800 tokens of category checklist (for monitoring) or domain context (for the other agents).
-- ~200 tokens × N tool definitions (allowlist-filtered to 4-33 tools).
-
-For the monitoring agent: ~2500 tokens of system prompt + ~800 tokens of tool definitions (4 tools × 200 tokens) = ~3300 tokens of static overhead per turn. For the query agent (33 tools): ~2500 + ~6600 = ~9100 tokens. The query agent pays more per turn because its tool allowlist is wider.
-
-This is the cost the per-agent tool allowlist (`02-agentic-retrieval/03-retrieval-routing.md`) buys back: keeping the monitoring agent at 4 tools saves ~5800 tokens per turn × 8 turns max = ~46K tokens per run. At Sonnet input pricing that's roughly $0.14 per run saved. The narrower allowlist isn't just a quality decision — it's a context-engineering decision.
-
-#### Tool-result truncation — the dynamic-context cap
-
-`runAgentLoop` truncates every tool result at 16,000 characters (`run-agent-loop.js:2-7`):
-
-```js
-const MAX_TOOL_RESULT_CHARS = 16_000;
-function truncate(value) {
-    if (value.length <= MAX_TOOL_RESULT_CHARS) return value;
-    return `${value.slice(0, MAX_TOOL_RESULT_CHARS)}\n...[truncated]`;
+```ts
+// aptkit-adapters.ts:85-89 — the cache breakpoint
+if (request.system) {
+  params.system = [
+    { type: 'text', text: request.system, cache_control: { type: 'ephemeral' } },
+  ];
 }
+if (request.tools?.length) params.tools = request.tools.map(toAnthropicTool);
 ```
 
-Without this cap, a single large EQL result (some Bloomreach queries can return tens of thousands of customer rows) would push earlier tool results out of the model's effective attention window — the lost-in-the-middle problem. The 16,000-char cap is roughly 4,000 tokens; multiplied by the per-agent tool-call budget (6 for monitoring, ~8 typical for the others), the dynamic tool-result context tops out at ~24-32K tokens. Sonnet 4.6's 200K nominal context window comfortably holds that plus the system prompt plus the running conversation.
+Line-by-line:
 
-The truncation is fail-safe: when it fires, the truncation marker (`...[truncated]`) is visible in the tool result so the model knows the data was cut. The model can then either ask a narrower follow-up query or work with what it has.
+- **`cache_control: { type: 'ephemeral' }`** — the load-bearing five characters. Turn 1 is `cache_creation` (~1.25× normal input cost); turns 2-N are `cache_read` (~0.1× normal). For a diagnostic run's ~10 model turns this is roughly an 80% reduction on system-prompt token cost.
+- **Tools are cached transparently.** Anthropic caches the `tools` block when the SAME breakpoint is set on `system` — so the one `cache_control` covers both prefixes. No separate tool-cache config needed.
+- **The 5-minute TTL applies.** Within a diagnostic run (~50s) the cache always hits. Across sessions or when a run pauses > 5 min, cache misses and pays creation cost again.
 
-#### What this repo deliberately does NOT do
+**Per-investigation input — the messages, not the system prompt.** The Anomaly (Stage A input) and Diagnosis (Stage B input) go in the *first user message*, not the system prompt. That's the right placement — they change per investigation, so caching them wouldn't help. The system prompt stays stable across investigations; only the input changes.
 
-- **No conversation history across runs.** Each agent run starts fresh; the model doesn't see "your last 5 investigations."
-- **No accumulated memory store.** No vector DB of past diagnoses. The agent doesn't learn from previous runs.
-- **No user-profile context.** The model doesn't see "this user prefers detailed evidence" or anything similar.
-- **No catalog content embedded.** The agent knows the catalog *exists* (from `schemaSummary`'s `Catalogs:` line) but doesn't carry catalog items in its context — it would have to query for them.
+**In multi-agent — which agent sees what.** Every agent gets the *same* schemaSummary (see `03-multi-agent-orchestration/08-shared-state-and-message-passing.md`), but each gets a *different* task-shaped instruction. DiagnosticAgent's system prompt says "investigate this anomaly, form and test hypotheses"; RecommendationAgent's says "propose Bloomreach actions given this diagnosis." The context routing is per-agent — each specialist sees only what it needs to do its job.
 
-Each of these is a deliberate scoping choice. The product doesn't have a use case yet that justifies the cost of adding any of them. The interview-grade move is naming what you didn't add and the trigger that would change the call.
+```
+  Layers-and-hops — what fills the window on each turn
+
+  ┌─ System prompt (cached) ────────────────────────────────────┐
+  │  DiagnosticAgent:                                           │
+  │  "You are an analyst. Given an anomaly, investigate the      │
+  │   cause. Available data: <schemaSummary>. Tools: <defs>."   │
+  └───────────────────────────┬─────────────────────────────────┘
+                              │ cache_creation once
+                              ▼
+  ┌─ Turn 1 messages ───────────────────────────────────────────┐
+  │  user: "Anomaly: usa purchase_revenue down 38%..."           │
+  └───────────────────────────┬─────────────────────────────────┘
+                              ▼
+  ┌─ Turn 2 messages (cache_read on system) ────────────────────┐
+  │  user: <anomaly>                                             │
+  │  assistant: tool_use(execute_analytics_eql, {...})           │
+  │  user: tool_result(<query results>)                          │
+  └───────────────────────────┬─────────────────────────────────┘
+                              ▼
+                     ... continues until final output ...
+```
 
 ### Move 3 — the principle
 
-**Context engineering keeps the thousandth good output good.** Prompt engineering wins the first good output (carefully-crafted instructions land the model on the right behavior). Context engineering keeps that behavior reliable as the system runs in production — by ensuring every turn gets exactly the context that turn needs, no more, no less. Bigger context windows are not the answer; *curation* is. The job is deciding what fills the window for the next step, and in a multi-agent system, which agent sees what.
+Context engineering is the discipline of curating what fills the window. Bigger context windows do not fix the problem — they make room for more noise, and lost-in-the-middle attacks the middle of a bloated context. The senior-grade move is the opposite: bound the prefix, cache what's stable, keep the tail lean, decide per-agent what each specialist needs. Blooming's version bounds the schema at 20 events + 30 customer props, caches the whole system prompt via ephemeral breakpoint, and gives each agent a task-specific prompt so the model isn't confused about which mode it's in.
 
 ## Primary diagram
 
 ```
-  Context engineering applied to one monitoring agent turn
+  Recap — context engineering in this repo
 
-  ┌─ static context (set once, reused every turn) ───────────────┐
-  │  system prompt (from @aptkit/prompts, ~800 tokens):           │
-  │    "you are an anomaly scanner..."                            │
-  │                                                                │
-  │  schema summary (curated, ~500-1000 tokens):                  │
-  │    project: wobbly-ukulele (xxx)                              │
-  │    total customers: ~340K                                     │
-  │    total events: ~12M                                         │
-  │    top events: purchase (2.1M): total_price, country, ...     │
-  │      view_item (5.3M): product_id, category, ...              │
-  │      ...                                                       │
-  │    customer properties: country, lifecycle_stage, segment, ...│
-  │                                                                │
-  │  category checklist (for monitoring, ~600-800 tokens):         │
-  │    - revenue_drop: warning >= 10%, critical >= 25%, recipe:   │
-  │      sum event purchase.total_price...                        │
-  │    - conversion_drop: ...                                     │
-  │                                                                │
-  │  tool definitions (allowlist-filtered, 4 tools × 200 tokens): │
-  │    execute_analytics_eql, get_metric_timeseries,              │
-  │    get_segments, get_anomaly_context                          │
-  └────────────────────────────────────────────────────────────────┘
-
-  ┌─ dynamic context (grows per turn) ────────────────────────────┐
-  │  user prompt (one-line task): "Run the anomaly checklist."    │
-  │                                                                │
-  │  running conversation (turn N):                               │
-  │    turn 1 (assistant): "I'll start with revenue. Tool call..."│
-  │    turn 1 (user/tool_result): { current_90d, prior_90d } —   │
-  │      truncated at 16,000 chars                                │
-  │    turn 2 (assistant): "Drop confirmed. Localize..."          │
-  │    turn 2 (user/tool_result): { USA: -38, ... }               │
-  │    ...                                                         │
-  └────────────────────────────────────────────────────────────────┘
-
-  Total per turn: ~3.3K static + dynamic (grows 1-4K per tool call)
-  Cap at ~32K dynamic via tool-result truncation
-  Sonnet 4.6 nominal context: 200K (comfortable for this load)
+  ┌─ Every agent's system prompt (cached) ──────────────────────┐
+  │                                                             │
+  │  1. Task-shaped instruction (per agent)                     │
+  │     ─ DiagnosticAgent: "investigate the anomaly"            │
+  │     ─ RecommendationAgent: "propose Bloomreach actions"      │
+  │     ─ MonitoringAgent: "scan for anomalies against 10 cats"  │
+  │                                                             │
+  │  2. schemaSummary (shared, bounded to ~1-2KB)               │
+  │     ─ top 20 events × 10 properties                         │
+  │     ─ top 30 customer properties                            │
+  │     ─ catalogs, total counts, oldest data                   │
+  │                                                             │
+  │  3. Tool definitions (MCP tool defs, transparently cached)  │
+  │                                                             │
+  │  cache_control: ephemeral → 80% cost reduction on prefix    │
+  └─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+  ┌─ Per-investigation messages (fresh) ────────────────────────┐
+  │  Anomaly + Diagnosis (Stage B) + tool trace                 │
+  └─────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The "lost in the middle" effect (Liu et al., 2023) is the empirical foundation for context engineering being a discipline. Models trained on long contexts still attend most strongly to content near the start and end of the input; content in the middle is reliably under-weighted. The cure isn't "make the model smarter at long context" (the trend line is improving but the effect persists); it's "put the load-bearing content in the high-attention zones." Curation determines which content earns the high-attention zones.
+The reframe to hand a reader who's used to "prompt engineering": most agent failures are not model failures — they're context failures. Stale retrieval, lost-in-the-middle on a bloated context, no user state loaded, the wrong tool outputs in the window. Prompt engineering gets you the first good output; context engineering keeps you at the thousandth good.
 
-The discipline applies across every part of an agent system: prompt order (most-important instructions at the top), tool-result placement (tool results land as user messages, which sit at the end of the conversation — the high-attention zone for "what just happened"), retrieval ranking (the top-k chunks land in the user message — same zone), agent-to-agent handoff (the next agent's input is just the typed handoff, not the producer's full trajectory — keeping the next agent's high-attention zone clean).
+Blooming's specific application of the discipline is on two axes:
 
-The Anthropic blog post on context engineering (and the equivalent OpenAI/LangChain content) all converge on the same headline: prompt engineering is the easy half; context engineering is the hard half. The signal of someone who has shipped is naming context engineering as a discipline, not collapsing it into "prompt engineering."
+- **Bound the shared context.** `schemaSummary` caps the workspace schema at ~1-2KB. Without the cap the full 112KB schema would blow the system-prompt budget, poison the cache prefix (bloated prefixes still cost per-token to write), and drown the task-shaped instruction in reference data.
+- **Cache the shared context.** The ephemeral cache breakpoint on `system` makes the shared prefix effectively free on turns 2-N. Verified in live logs (cache_creation → cache_read pattern on every ReAct run).
+
+Where blooming deliberately does NOT engineer more context in: user profile, historical investigation context, prior recommendations. Those are episodic/long-term concerns and are called out in `02-agent-memory-tiers.md` — they don't exist here yet.
+
+The multi-agent angle: each agent gets a *task-shaped* system prompt. Legacy `lib/agents/base-legacy.ts` was a single 400+ line prompt covering monitor + diagnose + recommend; the model got confused about which phase it was in. Splitting into three narrow prompts fixed the confusion. That's context engineering at the topology level — the split isn't just about tools, it's about which context each agent's window carries.
 
 ## Interview defense
 
-> **Q: How does this codebase handle context engineering?**
->
-> Deliberately, at multiple layers. The `schemaSummary` function in `lib/agents/monitoring.ts:19-60` reduces a 100KB+ Bloomreach workspace schema to ~2-4KB by keeping top-20 events × top-10 properties + top-30 customer properties — the model gets the schema's shape without the bloat. Tool results are capped at 16,000 chars in `runAgentLoop` (`run-agent-loop.js:2-7`) so a large EQL result can't push earlier evidence out of the model's attention window. The per-agent tool allowlist narrows the system-prompt tool definitions from 33 to 4-14 depending on agent role, saving ~5-6K tokens per turn for the monitoring agent. And the message-passing pattern between agents (`03-multi-agent-orchestration/08-shared-state-and-message-passing.md`) keeps each agent's context scoped to its actual typed inputs — the recommendation agent doesn't carry the diagnostic agent's trajectory in its window.
+**Q: How is context engineering different from prompt engineering, and where does it show up in this codebase?**
+A: Prompt engineering asks "what's the best wording of the instruction?" Context engineering asks "what's the best set of information to put in the window at all?" Prompt engineering gets you the first good output; context engineering keeps you at the thousandth good. Blooming's version has two levers. Bounding: `schemaSummary` caps the workspace schema at ~1-2KB (top 20 events × 10 properties, 30 customer props), so the full 112KB schema never poisons the window. Caching: the ephemeral breakpoint on the system prompt turns the stable prefix into cache_read on turns 2-N, verified in live logs. Per-agent routing: each of the three agents gets a *task-shaped* system prompt, so the model isn't confused about which phase it's in — the previous single-prompt version (legacy `base-legacy.ts`) hit that failure mode.
 
-> **Q: What's the load-bearing instance of context engineering in this repo?**
->
-> The `schemaSummary` token-budget trick. Without it, the agent's system prompt would carry the full raw Bloomreach schema — 100KB+ of every event ever emitted, every property name, every customer attribute. That bloat would push the running conversation (the actual diagnostic reasoning) into the model's mid-attention zone and degrade quality. With the summary, the system prompt stays under 4K tokens and the dynamic context can grow naturally without competition. The cost of building the summary is one pure function — `slice(0, 20)` calls plus a `.map(...).join('\n')` — and the savings compound across every turn × every agent run.
+Diagram: the cached-prefix + fresh-tail picture, with the ~1-2KB summary label and the cache breakpoint marked.
+Anchor: `lib/agents/monitoring.ts:19-60` (schemaSummary) + `lib/agents/aptkit-adapters.ts:85-89` (cache breakpoint).
 
-> **Q: What would you add to context engineering here if you had a free week?**
->
-> A semantic cache layer for cross-run retrieval. Today the diagnostic agent doesn't know whether a similar anomaly was investigated yesterday — it always starts from scratch. Embedding past `Diagnosis` outputs and surfacing the top-3 similar past investigations as additional context for the current diagnostic would let the model say "this looks like the post-Black-Friday revenue dip we saw 4 weeks ago — the cause was X" instead of re-deriving from data. The cost is the embedding pipeline + a vector store (the project intentionally avoids these today). The win is faster + sharper diagnostics for recurring patterns. This would also unlock the episodic memory tier from `02-agent-memory-tiers.md`.
+**Q: Why not include the full workspace schema in every prompt — the context window is huge now?**
+A: Two reasons. First, cost. Even at cached rates, the tokens still get *written* to the cache on turn 1 (cache_creation is ~1.25× normal input cost). A 112KB schema is roughly 25K tokens; you'd pay ~$0.09 just to write it to cache once, then cache_read at ~$0.0075 per turn — dominating the per-investigation budget. Second, quality. Lost-in-the-middle attacks the middle of a long context — the model's attention degrades on tokens that aren't at the edges. Bounding the summary to 20 events + 30 customer props keeps the *whole* thing in the "high-attention" zone. If a niche event isn't in the summary, the model can still call `execute_analytics_eql` on it directly — the tool provides the fallback, not the prompt.
+
+Diagram: the lost-in-the-middle attention curve over a long context.
+Anchor: `lib/agents/monitoring.ts:24-38` (the MAX_EVENTS and MAX_PROPS caps).
 
 ## See also
 
-- → `02-agent-memory-tiers.md` — the next discipline up (memory as curated context across runs)
-- → `02-agentic-retrieval/01-agentic-rag.md` — retrieval as one specific form of dynamic context
-- → `03-multi-agent-orchestration/08-shared-state-and-message-passing.md` — the same discipline at the multi-agent boundary
-- → cross-reference (when generated): `study-ai-engineering`'s context-window and lost-in-the-middle files — the mechanics this discipline rests on
+- `03-multi-agent-orchestration/08-shared-state-and-message-passing.md` — the shared-vs-message split that makes context routing possible.
+- `05-observability-hook.md` — how token usage per turn gets measured (cache_creation vs cache_read).
+- `05-production-serving/04-cost-controls.md` — the cache is the load-bearing cost lever.
+- Cross-reference: `.aipe/study-ai-engineering/`'s context-window and lost-in-the-middle files for the mechanics.

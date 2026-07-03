@@ -1,13 +1,19 @@
 # 06 — Production serving
 
-The serving side: caching, cost optimization, prompt injection defense, rate limiting/backpressure, retry/circuit breaker. This codebase exercises real production-shaped serving against Bloomreach's rate-limited alpha MCP server — the 60s response cache, the parsed-window retry ladder, and `~1.1s` proactive spacing all live inside `BloomreachDataSource`.
+The cost, reliability, and security surfaces of running LLMs in production. This codebase exercises: prompt caching (live), cost optimization (Haiku for intent), prompt injection surface (structured outputs as primary defense), rate limiting (partial — inbound to MCP server, not to the app), retry (present in BloomreachDataSource; circuit breaker NOT present).
 
-The big honest gap: **Anthropic prompt caching is NOT wired today.** Long system prompts pay full price on every call. The cost analysis in `01-llm-foundations/06-token-economics.md` shows that fixing this is the single biggest dollar lever in the codebase.
+## Files
 
-## Reading order
+- `01-llm-caching.md` — prompt caching via Anthropic's ephemeral breakpoint. Live. Load-bearing cost move.
+- `02-llm-cost-optimization.md` — Haiku for intent, Sonnet for reasoning. Budget ceiling.
+- `03-prompt-injection.md` — the schema-constrained-output defense; MCP data as untrusted input.
+- `04-rate-limiting-backpressure.md` — the BloomreachDataSource ~1 req/s ladder (outbound). Inbound rate limiting is Case B.
+- `05-retry-circuit-breaker.md` — retry ladder present in BloomreachDataSource; circuit breaker not.
 
-1. `01-llm-caching.md` — three cache layers; what's shipped (60s response cache) and what's not (prompt caching)
-2. `02-llm-cost-optimization.md` — the cheap-classifier pattern, prompt caching, smart truncation
-3. `03-prompt-injection.md` — structural defenses (tool allowlist, MCP-only side effects)
-4. `04-rate-limiting-backpressure.md` — ~1.1s proactive spacing + parsed-window retry against Bloomreach
-5. `05-retry-circuit-breaker.md` — retry exists, circuit breaker doesn't (yet)
+## Anchor shape
+
+LLM application engineering. Directly exercised.
+
+## Curriculum
+
+Phase 5 — concepts C5.1-C5.8.
