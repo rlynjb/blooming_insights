@@ -1,31 +1,28 @@
 // eval/run.eval.ts
 //
-// Week-1 proof-of-path — the ONE golden case wired end-to-end:
-//   1. Instantiate SyntheticDataSource (deterministic, in-process, no OAuth)
-//   2. Run blooming's DiagnosticAgent over the golden anomaly → Diagnosis
-//   3. Instantiate RubricJudge from @aptkit/evals (via @aptkit/core)
-//   4. Judge the diagnosis against the diagnosis-quality rubric → RubricJudgment
-//   5. Print + write a JSON receipt
+// Week-2 harness — 10 golden cases wired through both rubrics.
 //
-// Runner: vitest (the same resolver `npm test` uses — needed because
-// `moduleResolution: "bundler"` + the `@aptkit/core → @rlynjb/aptkit-core`
-// npm alias trip up Node's ESM resolver via tsx). Excluded from `npm test`
-// by the default config's `include` pattern (test/**/*.test.ts).
-// `npm run eval` uses vitest.eval.config.ts which targets `eval/**/*.eval.ts`.
+// Shape:
+//   · `beforeAll` mints a shared runId all cases use
+//   · `it.each(goldens)` runs each golden case as its own test row
+//       - diagnose → judge diagnosis
+//       - recommend → judge each recommendation
+//       - write per-case receipt
+//   · `afterAll` walks the receipts for this run and prints a summary
+//     table (per-dimension pass rate, per-signal-class breakdown)
 //
-// ── Week 2 · Session A ──
-// Capture the tool-call trace during agent.investigate() via the
-// onToolResult hook, then feed it to the judge as `tool_calls_trace`
-// context. Fixes the Week-1 evidence_grounding false-positive: the judge
-// was flagging real numbers (e.g. "SP -24") as invention because it never
-// saw the get_event_segmentation call the agent made.
+// Cases run sequentially inside the file (vitest default), so Anthropic
+// rate limits stay tame. The whole run is ~15-40 min for 10 cases.
+//
+// Runner: vitest via `npm run eval` (uses vitest.eval.config.ts).
+// Excluded from `npm test`.
 
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import Anthropic from '@anthropic-ai/sdk';
 import { RubricJudge } from '@aptkit/core';
-import { describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { DiagnosticAgent } from '../lib/agents/diagnostic';
 import { RecommendationAgent } from '../lib/agents/recommendation';
@@ -37,11 +34,7 @@ import {
 import type { McpToolDef } from '../lib/agents/tool-schemas';
 import type { Recommendation, ToolCall } from '../lib/mcp/types';
 
-import {
-  goldenAnomaly,
-  knownCorrect,
-  caseId,
-} from './goldens/conversion-drop-mobile-checkout';
+import { goldens, type GoldenCase } from './goldens';
 import { diagnosisQualityRubric } from './rubrics/diagnosis-quality';
 import { recommendationQualityRubric } from './rubrics/recommendation-quality';
 
@@ -76,16 +69,37 @@ function loadEnvFromDotenv(): void {
 
 loadEnvFromDotenv();
 
-// ─── trace formatting ────────────────────────────────────────────────────────
+// ─── judge-failure placeholder ───────────────────────────────────────────────
 
 /**
- * Format the captured tool-call trace as a compact string for the judge.
- * Full JSON is verbose and eats the judge's context budget; each call gets a
- * numbered header with tool name + args + a summary of the result body.
- *
- * The judge's job is to verify that every claim in the diagnosis is traceable
- * to *some* line in this trace. Anything not present is invention.
+ * The shape RubricJudge returns on success. Duplicated (not imported) so the
+ * receipt shape is stable even if aptkit renames its internals.
  */
+type RubricJudgmentValue = {
+  dimensions: Record<string, { score: number; reason: string }>;
+  checks?: Record<string, boolean>;
+  verdict: string;
+  fix: string;
+  reasoning?: string;
+};
+
+/**
+ * When the judge model fails to produce structured output (parse error after
+ * retries), we still want a well-shaped judgment in the receipt so the summary
+ * block can distinguish "judge_error" from "fail" from "pass". Use a synthetic
+ * verdict tag so aggregation code sees it as a distinct outcome.
+ */
+function buildJudgmentPlaceholder(verdict: 'judge_error'): RubricJudgmentValue {
+  return {
+    dimensions: {},
+    verdict,
+    fix: '',
+    reasoning: 'Judge model failed to produce parseable structured output. See judgmentError.',
+  };
+}
+
+// ─── trace formatting ────────────────────────────────────────────────────────
+
 function formatToolCallTrace(calls: readonly ToolCall[]): string {
   if (calls.length === 0) return '(no tool calls recorded)';
   const lines: string[] = [];
@@ -98,11 +112,9 @@ function formatToolCallTrace(calls: readonly ToolCall[]): string {
     if (c.error) {
       lines.push(`error: ${c.error}`);
     } else if (c.result !== undefined) {
-      // The result may be an { ok, data } envelope or a bare object.
-      // Stringify with a size cap so an enormous synthetic result doesn't
-      // blow the judge's token budget.
       const raw = JSON.stringify(c.result);
-      const truncated = raw.length > 4000 ? raw.slice(0, 4000) + `… [truncated, ${raw.length} total chars]` : raw;
+      const truncated =
+        raw.length > 4000 ? raw.slice(0, 4000) + `… [truncated, ${raw.length} total chars]` : raw;
       lines.push(`result: ${truncated}`);
     }
     lines.push('');
@@ -112,176 +124,182 @@ function formatToolCallTrace(calls: readonly ToolCall[]): string {
 
 // ─── run ─────────────────────────────────────────────────────────────────────
 
-describe('eval: diagnosis + recommendation quality', () => {
-  it(
-    `${caseId}: agent produces a passing diagnosis and passing recommendations`,
-    async () => {
-      if (!process.env.ANTHROPIC_API_KEY) {
-        throw new Error(
-          'ANTHROPIC_API_KEY is not set. Put it in .env.local or export it before running.',
-        );
-      }
+const RECEIPTS_DIR = resolve(dirname(fileURLToPath(import.meta.url)), 'receipts');
 
-      const runId = new Date().toISOString().replace(/[:.]/g, '-');
-      const startedAt = performance.now();
+let sharedRunId: string;
+let sharedAnthropic: Anthropic;
 
-      const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+describe('eval · Week 2C — 10 goldens · diagnosis + recommendation quality', () => {
+  beforeAll(() => {
+    if (!process.env.ANTHROPIC_API_KEY) {
+      throw new Error(
+        'ANTHROPIC_API_KEY is not set. Put it in .env.local or export it before running.',
+      );
+    }
+    sharedRunId = new Date().toISOString().replace(/[:.]/g, '-');
+    sharedAnthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    mkdirSync(RECEIPTS_DIR, { recursive: true });
+    console.log(`\n[eval] runId: ${sharedRunId}`);
+    console.log(`[eval] cases:  ${goldens.length}`);
+  });
+
+  it.each(goldens.map((g) => [g.caseId, g]))(
+    'case %s',
+    async (_label, goldenCase: GoldenCase) => {
+      const caseStart = performance.now();
       const dataSource = new SyntheticDataSource();
       const schema = syntheticWorkspaceSchema;
-
       const listToolsRaw = await dataSource.listTools();
       const allTools = (listToolsRaw as { tools: McpToolDef[] }).tools;
+      const sessionId = `eval-${sharedRunId}-${goldenCase.caseId}`;
 
-      // ─── 1. investigate ─────────────────────────────────────────────────
-      console.log(`\n[eval] case: ${caseId}`);
       console.log(
-        `[eval] investigating anomaly (metric=${goldenAnomaly.metric}, scope=${goldenAnomaly.scope.join(',')})…`,
+        `\n[case ${goldenCase.caseId}] (${goldenCase.signalClass}) investigating…`,
       );
+
+      // ─── diagnose ─────────────────────────────────────────────────────
       const t0Investigate = performance.now();
       const diagnosticAgent = new DiagnosticAgent(
-        anthropic,
+        sharedAnthropic,
         dataSource,
         schema,
         allTools,
-        `eval-${runId}`,
+        sessionId,
       );
-
-      // Capture every tool call the agent makes. The judge sees this trace as
-      // context so it can verify the diagnosis's numbers against ground truth.
       const diagnosisToolCalls: ToolCall[] = [];
-      const diagnosis = await diagnosticAgent.investigate(goldenAnomaly, {
-        onToolResult: (tc) => {
-          // Push a shallow snapshot so later mutations of the internal
-          // ToolCall object (unlikely, but the AptKit trace sink reuses them)
-          // don't rewrite the trace.
-          diagnosisToolCalls.push({ ...tc });
-        },
+      const diagnosis = await diagnosticAgent.investigate(goldenCase.anomaly, {
+        onToolResult: (tc) => diagnosisToolCalls.push({ ...tc }),
       });
       const investigateMs = Math.round(performance.now() - t0Investigate);
-      console.log(
-        `[eval] diagnosis produced in ${investigateMs}ms (${diagnosisToolCalls.length} tool calls)`,
-      );
 
-      // ─── 2. judge the diagnosis ─────────────────────────────────────────
-      console.log('[eval] judging diagnosis…');
+      // ─── judge diagnosis ──────────────────────────────────────────────
       const t0DiagnosisJudge = performance.now();
       const judgeModel = new AnthropicModelProviderAdapter(
-        anthropic,
-        'diagnostic', // reused: judge log-site labels it as diagnostic-eval
-        `eval-${runId}`,
+        sharedAnthropic,
+        'diagnostic',
+        sessionId,
       );
       const diagnosisJudge = new RubricJudge({
         model: judgeModel,
         rubric: diagnosisQualityRubric,
         capabilityId: 'blooming.eval.diagnosis-judge',
-        maxTokens: 2048,
+        maxTokens: 4096, // bumped from 2048; 2048 truncated the JSON on
+                         // no-signal cases where the judgment reasoning
+                         // is longer
         temperature: 0,
       });
-
       const diagnosisJudgmentResult = await diagnosisJudge.judge({
         subject: JSON.stringify(diagnosis, null, 2),
         context: {
-          anomaly: JSON.stringify(goldenAnomaly, null, 2),
-          known_correct_shape: JSON.stringify(knownCorrect, null, 2),
+          anomaly: JSON.stringify(goldenCase.anomaly, null, 2),
+          known_correct_shape: JSON.stringify(goldenCase.knownCorrect, null, 2),
+          case_intent: goldenCase.intent,
+          signal_class: goldenCase.signalClass,
           tool_calls_trace: formatToolCallTrace(diagnosisToolCalls),
         },
       });
       const diagnosisJudgeMs = Math.round(performance.now() - t0DiagnosisJudge);
 
-      if (!diagnosisJudgmentResult.ok) {
-        throw new Error(
-          `Diagnosis RubricJudge failed to produce structured output: ${diagnosisJudgmentResult.error}`,
-        );
-      }
-      console.log(
-        `[eval] diagnosis judgment produced in ${diagnosisJudgeMs}ms · verdict: ${diagnosisJudgmentResult.value.verdict}`,
-      );
-
-      // ─── 3. propose recommendations ─────────────────────────────────────
-      console.log('[eval] proposing recommendations…');
+      // ─── recommend ────────────────────────────────────────────────────
       const t0Recommend = performance.now();
       const recommendationAgent = new RecommendationAgent(
-        anthropic,
+        sharedAnthropic,
         dataSource,
         schema,
         allTools,
-        `eval-${runId}`,
+        sessionId,
       );
       const recommendationToolCalls: ToolCall[] = [];
       const recommendations: Recommendation[] = await recommendationAgent.propose(
-        goldenAnomaly,
+        goldenCase.anomaly,
         diagnosis,
-        {
-          onToolResult: (tc) => {
-            recommendationToolCalls.push({ ...tc });
-          },
-        },
+        { onToolResult: (tc) => recommendationToolCalls.push({ ...tc }) },
       );
       const recommendMs = Math.round(performance.now() - t0Recommend);
-      console.log(
-        `[eval] ${recommendations.length} recommendation${recommendations.length === 1 ? '' : 's'} produced in ${recommendMs}ms (${recommendationToolCalls.length} tool calls)`,
-      );
 
-      // ─── 4. judge each recommendation ───────────────────────────────────
-      console.log('[eval] judging recommendations…');
+      // ─── judge each recommendation ────────────────────────────────────
       const t0RecommendJudge = performance.now();
       const recommendationJudge = new RubricJudge({
         model: judgeModel,
         rubric: recommendationQualityRubric,
         capabilityId: 'blooming.eval.recommendation-judge',
-        maxTokens: 2048,
+        maxTokens: 4096, // parity with diagnosis judge
         temperature: 0,
       });
-
       const recommendationTraceForJudge = formatToolCallTrace(recommendationToolCalls);
-      const recommendationJudgments = [];
+      const recommendationJudgments: Array<{
+        recommendationId: string;
+        recommendationTitle: string;
+        bloomreachFeature: string;
+        judgment: ReturnType<typeof buildJudgmentPlaceholder> | RubricJudgmentValue;
+        attempts: number;
+        judgmentError?: string;
+      }> = [];
       for (let i = 0; i < recommendations.length; i++) {
         const rec = recommendations[i];
-        const judgmentResult = await recommendationJudge.judge({
+        const rjResult = await recommendationJudge.judge({
           subject: JSON.stringify(rec, null, 2),
           context: {
-            anomaly: JSON.stringify(goldenAnomaly, null, 2),
+            anomaly: JSON.stringify(goldenCase.anomaly, null, 2),
             diagnosis: JSON.stringify(diagnosis, null, 2),
+            case_intent: goldenCase.intent,
+            signal_class: goldenCase.signalClass,
             tool_calls_trace: recommendationTraceForJudge,
           },
         });
-        if (!judgmentResult.ok) {
-          throw new Error(
-            `Recommendation RubricJudge failed on rec ${i + 1}: ${judgmentResult.error}`,
-          );
+        if (rjResult.ok) {
+          recommendationJudgments.push({
+            recommendationId: rec.id,
+            recommendationTitle: rec.title,
+            bloomreachFeature: rec.bloomreachFeature,
+            judgment: rjResult.value,
+            attempts: rjResult.attempts.length,
+          });
+        } else {
+          // Judge failed to produce structured output — record the failure
+          // in the receipt rather than throwing, so the summary block sees
+          // complete data.
+          recommendationJudgments.push({
+            recommendationId: rec.id,
+            recommendationTitle: rec.title,
+            bloomreachFeature: rec.bloomreachFeature,
+            judgment: buildJudgmentPlaceholder('judge_error'),
+            attempts: rjResult.attempts.length,
+            judgmentError: rjResult.error,
+          });
         }
-        recommendationJudgments.push({
-          recommendationId: rec.id,
-          recommendationTitle: rec.title,
-          judgment: judgmentResult.value,
-          attempts: judgmentResult.attempts.length,
-        });
-        console.log(
-          `[eval] rec ${i + 1}/${recommendations.length} (${rec.bloomreachFeature}) · verdict: ${judgmentResult.value.verdict}`,
-        );
       }
       const recommendationJudgeMs = Math.round(performance.now() - t0RecommendJudge);
 
-      // ─── 5. receipt ─────────────────────────────────────────────────────
+      // ─── receipt ──────────────────────────────────────────────────────
+      // If the diagnosis judge failed, we still write a receipt (with a
+      // placeholder judgment + the error) so the summary block can see the
+      // case as "judge_error" rather than have it disappear.
+      const diagnosisJudgment = diagnosisJudgmentResult.ok
+        ? diagnosisJudgmentResult.value
+        : buildJudgmentPlaceholder('judge_error');
+      const diagnosisJudgmentError = diagnosisJudgmentResult.ok
+        ? undefined
+        : diagnosisJudgmentResult.error;
+
       const receipt = {
-        case: caseId,
-        runId,
+        runId: sharedRunId,
+        case: goldenCase.caseId,
+        signalClass: goldenCase.signalClass,
+        intent: goldenCase.intent,
         durationMs: {
           investigate: investigateMs,
           diagnosisJudge: diagnosisJudgeMs,
           recommend: recommendMs,
           recommendationJudge: recommendationJudgeMs,
-          total: Math.round(performance.now() - startedAt),
+          total: Math.round(performance.now() - caseStart),
         },
-        model: {
-          agent: 'claude-sonnet-4-6',
-          judge: 'claude-sonnet-4-6',
-        },
+        model: { agent: 'claude-sonnet-4-6', judge: 'claude-sonnet-4-6' },
         anomaly: {
-          metric: goldenAnomaly.metric,
-          scope: goldenAnomaly.scope,
-          change: goldenAnomaly.change,
-          severity: goldenAnomaly.severity,
+          metric: goldenCase.anomaly.metric,
+          scope: goldenCase.anomaly.scope,
+          change: goldenCase.anomaly.change,
+          severity: goldenCase.anomaly.severity,
         },
         diagnosisToolCalls: diagnosisToolCalls.map((tc) => ({
           toolName: tc.toolName,
@@ -296,38 +314,140 @@ describe('eval: diagnosis + recommendation quality', () => {
           hasError: Boolean(tc.error),
         })),
         diagnosis,
-        diagnosisJudgment: diagnosisJudgmentResult.value,
+        diagnosisJudgment,
+        diagnosisJudgmentError,
         diagnosisJudgeAttempts: diagnosisJudgmentResult.attempts.length,
         recommendations,
         recommendationJudgments,
       };
 
-      console.log('\n[eval] ─── receipt: diagnosis judgment ───────────────────');
-      console.log(JSON.stringify(receipt.diagnosisJudgment, null, 2));
-      console.log('\n[eval] ─── receipt: recommendation judgments ─────────────');
-      console.log(JSON.stringify(receipt.recommendationJudgments, null, 2));
-      console.log('[eval] ────────────────────────────────────────────────────\n');
-
-      const outDir = resolve(dirname(fileURLToPath(import.meta.url)), 'receipts');
-      mkdirSync(outDir, { recursive: true });
-      const outPath = resolve(outDir, `${caseId}-${runId}.json`);
+      const outPath = resolve(RECEIPTS_DIR, `${goldenCase.caseId}-${sharedRunId}.json`);
       writeFileSync(outPath, JSON.stringify(receipt, null, 2) + '\n', 'utf8');
-      console.log(`[eval] receipt written to ${outPath}`);
-      console.log(`[eval] diagnosis verdict: ${receipt.diagnosisJudgment.verdict}`);
-      for (const rj of receipt.recommendationJudgments) {
-        console.log(`[eval] rec "${rj.recommendationTitle}" verdict: ${rj.judgment.verdict}`);
-      }
 
-      // Gate: no verdict may be FAIL. `pass` and `pass_with_notes` are both
-      // acceptable. `fail` on the diagnosis means the substrate or the prompt
-      // broke; `fail` on any recommendation means the same for that step.
-      expect(receipt.diagnosisJudgment.verdict).not.toBe('fail');
-      for (const rj of receipt.recommendationJudgments) {
-        expect(rj.judgment.verdict, `recommendation "${rj.recommendationTitle}"`).not.toBe(
-          'fail',
-        );
+      const dv = receipt.diagnosisJudgment.verdict;
+      const rvs = receipt.recommendationJudgments.map((rj) => rj.judgment.verdict).join(', ');
+      console.log(
+        `[case ${goldenCase.caseId}] done in ${Math.round((performance.now() - caseStart) / 1000)}s · diagnosis: ${dv} · recs: [${rvs || '(none)'}]`,
+      );
+
+      // Signal-class-aware gate:
+      //   has-signal / partial-signal → the agent SHOULD produce a
+      //     non-fail diagnosis. A fail is a bug.
+      //   no-signal / positive         → measured, not gated. A fail
+      //     here is a data point (confabulation or unhandled positive).
+      //   judge_error                  → never gated; the model output
+      //     failed to parse. Recorded in receipt, not a case failure.
+      const isGated =
+        goldenCase.signalClass === 'has-signal' ||
+        goldenCase.signalClass === 'partial-signal';
+      if (isGated) {
+        expect(receipt.diagnosisJudgment.verdict).not.toBe('fail');
+        for (const rj of receipt.recommendationJudgments) {
+          expect(
+            rj.judgment.verdict,
+            `case ${goldenCase.caseId} rec "${rj.recommendationTitle}"`,
+          ).not.toBe('fail');
+        }
       }
     },
-    600_000, // 10-minute timeout — diagnosis + recommendation + 2 judge phases
+    600_000, // 10 min per case
   );
+
+  afterAll(() => {
+    // Walk the receipts dir for files matching this run's runId; build a
+    // summary table across all cases.
+    if (!sharedRunId) return;
+    const files = readdirSync(RECEIPTS_DIR).filter((f) => f.endsWith(`${sharedRunId}.json`));
+    if (files.length === 0) {
+      console.error('\n[eval] afterAll: no receipts found for this run');
+      return;
+    }
+
+    type Receipt = {
+      case: string;
+      signalClass: string;
+      diagnosisJudgment: {
+        verdict: string;
+        dimensions: Record<string, { score: number }>;
+      };
+      recommendationJudgments: Array<{
+        judgment: {
+          verdict: string;
+          dimensions: Record<string, { score: number }>;
+        };
+      }>;
+    };
+
+    const receipts: Receipt[] = files.map(
+      (f) => JSON.parse(readFileSync(resolve(RECEIPTS_DIR, f), 'utf8')) as Receipt,
+    );
+    receipts.sort((a, b) => a.case.localeCompare(b.case));
+
+    const passish = (v: string) => v === 'pass' || v === 'pass_with_notes';
+
+    // ─── per-case summary ────────────────────────────────────────────────
+    console.error('\n╔══════════════════════════════════════════════════════════════════════════════╗');
+    console.error('║ Week 2C · 10 goldens · per-case verdicts                                    ║');
+    console.error('╠══════════════════════════════════════════════════════════════════════════════╣');
+    console.error('║ case                                          class         diag    recs    ║');
+    console.error('╟──────────────────────────────────────────────────────────────────────────────╢');
+    for (const r of receipts) {
+      const case_ = r.case.padEnd(45);
+      const cls = r.signalClass.padEnd(13);
+      const dv = r.diagnosisJudgment.verdict.padEnd(7);
+      const recCount = r.recommendationJudgments.length;
+      const recPass = r.recommendationJudgments.filter((rj) => passish(rj.judgment.verdict)).length;
+      const recs = `${recPass}/${recCount}`.padEnd(7);
+      console.error(`║ ${case_} ${cls} ${dv} ${recs} ║`);
+    }
+    console.error('╚══════════════════════════════════════════════════════════════════════════════╝');
+
+    // ─── per-dimension pass rate ─────────────────────────────────────────
+    const dimAgg = (
+      key: 'diagnosisJudgment' | 'recommendationJudgment',
+    ): Record<string, { pass: number; total: number; scores: number[] }> => {
+      const out: Record<string, { pass: number; total: number; scores: number[] }> = {};
+      for (const r of receipts) {
+        const judgments =
+          key === 'diagnosisJudgment' ? [r.diagnosisJudgment] : r.recommendationJudgments.map((rj) => rj.judgment);
+        for (const j of judgments) {
+          for (const [dim, val] of Object.entries(j.dimensions)) {
+            out[dim] ??= { pass: 0, total: 0, scores: [] };
+            out[dim].total++;
+            if (val.score >= 4) out[dim].pass++;
+            out[dim].scores.push(val.score);
+          }
+        }
+      }
+      return out;
+    };
+
+    const printDims = (label: string, agg: Record<string, { pass: number; total: number; scores: number[] }>) => {
+      console.error(`\n${label} pass rate (score ≥ 4)`);
+      console.error('─'.repeat(78));
+      for (const [dim, s] of Object.entries(agg)) {
+        const pct = s.total > 0 ? Math.round((s.pass / s.total) * 100) : 0;
+        const dist = s.scores.reduce<Record<number, number>>((acc, n) => {
+          acc[n] = (acc[n] ?? 0) + 1;
+          return acc;
+        }, {});
+        const distStr = [1, 2, 3, 4, 5].map((n) => `${n}:${dist[n] ?? 0}`).join(' ');
+        console.error(`  ${dim.padEnd(30)}  ${String(s.pass).padStart(3)}/${String(s.total).padEnd(3)}  (${String(pct).padStart(3)}%)   dist [${distStr}]`);
+      }
+    };
+
+    printDims('DIAGNOSIS', dimAgg('diagnosisJudgment'));
+    printDims('RECOMMENDATION', dimAgg('recommendationJudgment'));
+
+    // ─── escape-hatch check (Q1 pre-agreed criterion) ────────────────────
+    console.error('\nEscape-hatch check (≥3 distinct pass/fail patterns per dimension)');
+    console.error('─'.repeat(78));
+    const dAgg = dimAgg('diagnosisJudgment');
+    for (const [dim, s] of Object.entries(dAgg)) {
+      const distinct = new Set(s.scores).size;
+      const flag = distinct >= 3 ? '✓' : '✗ substrate too homogeneous';
+      console.error(`  ${dim.padEnd(30)}  ${distinct} distinct scores  ${flag}`);
+    }
+    console.error('');
+  });
 });
