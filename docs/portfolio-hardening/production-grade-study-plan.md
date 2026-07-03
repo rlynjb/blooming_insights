@@ -217,24 +217,108 @@ receipt). Defer until then.
 - [ ] `.aipe/rehearse-design-doc/` — cost controls as RFC shape (once
       Phase 3 ships, its shape becomes an RFC candidate).
 
-### Live decisions this reading unblocks
+### Sessions
 
-- **Prompt-cache seam choice** — cache just the system prompt, or also
-  the WorkspaceSchema? Cost of a cache miss vs. cache read informs
-  the answer; `01-prompt-caching.md` has the math.
-- **Model-routing threshold** — where does Haiku stop being enough?
-  `02-model-routing.md` names the pattern: cheap-model owns extraction
-  and classification; Sonnet owns synthesis. Practice on
-  `classifyIntent` first.
-- **Load harness N + pace** — how many investigations at what rate?
-  `01-spacing-gate-vs-backpressure.md` + the codebase's existing
-  `minIntervalMs = 1100` set the ceiling; the plan's "sustained ~1
-  req/s" is the target.
+- [x] **A — Phase 2 observability wiring** ✅ *implemented (`aca3ec9`)*
+      Added optional `onCapabilityEvent` hook to `AgentHooks`; runner
+      captures the aptkit trace, feeds it to `summarizeUsage` +
+      `estimateCost`; receipt gains `usage.{diagnose,recommend}`.
+      New `eval:report` script emits p50/p95/p99 latency per phase +
+      per-case tokens/cost + run totals. Zero contract change; existing
+      route handlers untouched.
+- [x] **B — Phase 3 prompt caching** ✅ *implemented (`89dc82b`)*
+      Wrapped the system prompt in an ephemeral cache breakpoint in
+      `AnthropicModelProviderAdapter.complete()`. First ReAct-loop turn
+      pays cache_creation (~1.25× normal); every subsequent turn within
+      5 min reads at ~0.1×. Live logs confirm the pattern —
+      `cache_creation_input_tokens 3168` on first call, matching
+      `cache_read_input_tokens 3168` on the next.
+- [x] **C — Blooming Anthropic pricing helper + routing decision**
+      ✅ *implemented (`4616052`)*
+      Aptkit's `estimateCost` only knows OpenAI. Added Blooming-side
+      `estimateAnthropicCost` covering sonnet/haiku/opus families.
+      Runner + report both fall through to it. **Monitoring routing
+      DEFERRED** — the eval skips the monitoring step (feeds golden
+      anomalies straight to DiagnosticAgent), so there's no cost
+      signal on it. Routing monitoring→Haiku blind would be the exact
+      anti-pattern the eval flywheel exists to prevent. Come back to
+      it when production traffic gives us data.
+- [x] **D — Phase 3 per-investigation budget ceiling**
+      ✅ *implemented (`9ad134c`)*
+      `BudgetTracker` + `BudgetExceededError` in `lib/agents/budget.ts`.
+      Threaded through `AgentHooks.budget` → the model adapter's
+      constructor. Check-before-dispatch: runaway loops can't burn cost
+      after the ceiling. Shared tracker across DiagnosticAgent +
+      RecommendationAgent so the ceiling counts total spend. Eval
+      runner defaults to `BUDGET_MAX_USD=2.0` (very generous vs
+      observed $0.09/case; here as proof-of-pipe).
+
+### Baseline numbers (runId 2026-07-03T04-08-28-644Z)
+
+Real observability from the 10-case run that validated caching + populated
+the report script:
+
+```
+Per-phase latency p50           diag 50s · d-judge 38s · rec 51s · r-judge 90s
+Per-case avg cost               ~$0.09 (agent-side only)
+Total 10-case cost              $0.913 (agent) + ~$0.40 (judge estimated)
+                                = ~$1.3-1.5 total, well under $3-4 budget
+Cache validation                cache_creation → cache_read pattern live
+                                in logs (case 09: 3168-token cache hits)
+Judge cost gap                  RubricJudge's own trace sink not hooked
+                                into the runner — separate wiring later
+One rec-judge outlier           case 09 at 675s (multiple retries);
+                                systemic issue not indicated
+```
+
+### Live decisions this reading unblocks (deferred to later phases)
+
+- **Monitoring routing threshold** — where does Haiku stop being
+  enough? Needs production-briefing cost data to decide. Deferred
+  until we have that.
+- **Load harness N + pace** — for Phase 4 (Week 4). See below.
 
 ---
 
-## Week 4 — Regression gate + ship (Phases 5, 6)
+## Week 4 — Phase 4 load + fault, then Phases 5, 6
 
-*Reading to add — baseline-vs-candidate gate, replay-runner, CI.*
+Week 3 shipped Phases 2 + 3. Phase 4 (load + fault injection) rolls into
+Week 4 alongside the original Week-4 material (Phase 5 regression gate +
+Phase 6 ops hygiene).
 
-- [ ] _tbd_
+### Sessions
+
+- [ ] **A — Phase 4 load harness** — `eval/load.ts` fires N
+      investigations through `live-synthetic` at a controlled cadence.
+      Distribution matters: **not N copies of case 01, or p99 is
+      meaningless.** Rotate through the 10 goldens (with duplication
+      to reach N). Pacing = 1 investigation every ~15s (matches the
+      briefing's 200-250s p50 duration; enough headroom for backpressure
+      testing later).
+- [ ] **B — Phase 4 fault-injection decorator** — wrap `DataSource`
+      with a decorator that forces per-call timeouts, malformed JSON,
+      rate-limits (429), and provider 500s at a configurable rate.
+      Uses the seam that already survived 2 adapter swaps — third
+      swap as an offline decoration. Assert graceful degradation
+      (the `error` event fires, the 30s timeout tags `HTTP 0:`, no
+      hang burns the 300s budget).
+- [ ] **C — Phase 5 regression gate** — baseline-vs-candidate: run
+      the Phase-1 eval on a candidate prompt/model change vs the
+      current baseline; block on a per-criterion pass-rate drop
+      beyond a threshold. aptkit's `evaluateReplayArtifactFiles` +
+      replay-runner is the baseline-vs-candidate primitive.
+- [ ] **D — Phase 6 ops hygiene** — CI (`.github/workflows/ci.yml`)
+      running typecheck + `npm test` + lint on every PR; the eval
+      gate from Session C above wired in as a PR check; replace
+      `create-next-app` boilerplate README with the tier-2 claims;
+      one-command reproducibility (`eval`, `load`, `report`).
+
+### Reading (add as sessions approach)
+
+- `.aipe/study-ai-engineering/05-evals-and-observability/04-llm-observability.md`
+  — already listed in Week 3; re-read for the replay + regression-gate
+  half.
+- `.aipe/study-performance-engineering/02-rate-limit-retry-ladder.md` —
+  informs the fault-injection decorator's error-shape choices.
+- `.aipe/study-testing/` — the whole folder, for the CI + regression
+  gate framing (baseline vs candidate = regression eval).
