@@ -45,6 +45,12 @@ type DimId = (typeof DIMENSION_IDS)[number];
 
 type Worksheet = {
   runId: string;
+  /**
+   * How the worksheet was labeled. Defaults to 'human' (the interview-
+   * defensible mode). If set to 'pilot-ai-vs-ai', the resulting agreement
+   * receipt is a pipeline-shape validation, NOT a real calibration number.
+   */
+  labelerMode?: 'human' | 'pilot-ai-vs-ai';
   cases: Array<{
     caseId: string;
     signalClass: string;
@@ -165,9 +171,15 @@ describe.skipIf(!shouldRun)('eval calibration · compute agreement', () => {
     }
 
     // ─── receipt ────────────────────────────────────────────────────────
+    const labelerMode = worksheet.labelerMode ?? 'human';
     const agreement = {
       runId,
       computedAt: new Date().toISOString(),
+      labelerMode,
+      pilotWarning:
+        labelerMode === 'pilot-ai-vs-ai'
+          ? 'PILOT: labels came from an AI labeler, not a blind human. This receipt validates the compute-agreement pipeline shape but is NOT an interview-defensible calibration number. Both roles (labeler + judge) are Claude with different prompts — this measures rubric self-consistency, not judge-vs-human agreement. Do a real blind human pass before citing.'
+          : undefined,
       totals: {
         verdictAgreement: { hits: verdictHits, total: verdictTotal, rate: rate(verdictHits, verdictTotal) },
         exactMatchDimensions: { hits: exactHits, total: dimTotal, rate: rate(exactHits, dimTotal) },
@@ -184,8 +196,17 @@ describe.skipIf(!shouldRun)('eval calibration · compute agreement', () => {
 
     // ─── stderr summary ──────────────────────────────────────────────────
     console.error('\n╔══════════════════════════════════════════════════════════════════════════════╗');
-    console.error('║ Session D · blind calibration · user-vs-judge agreement                     ║');
+    if (labelerMode === 'pilot-ai-vs-ai') {
+      console.error('║ Session D · PILOT (AI-vs-AI) · NOT interview-defensible                     ║');
+    } else {
+      console.error('║ Session D · blind calibration · user-vs-judge agreement                     ║');
+    }
     console.error('╚══════════════════════════════════════════════════════════════════════════════╝');
+    if (labelerMode === 'pilot-ai-vs-ai') {
+      console.error(
+        '\n⚠  PILOT MODE — labels came from an AI labeler. Both roles are Claude;\n   this measures rubric self-consistency, not judge-vs-human agreement.\n   Do a real blind human pass before citing this number anywhere.',
+      );
+    }
     console.error(`\nrunId:  ${runId}`);
     console.error(`\nTotals (across the ${verdictTotal} cases with judge output)`);
     console.error('─'.repeat(78));

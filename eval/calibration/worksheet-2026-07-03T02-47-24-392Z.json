@@ -252,25 +252,25 @@
       "judgeHasOutput": true,
       "yourScores": {
         "root_cause_plausibility": {
-          "score": null,
-          "note": ""
+          "score": 5,
+          "note": "names two specific mechanisms (processor + paused scenario), rivals considered, hedges honestly on the A/B"
         },
         "evidence_grounding": {
-          "score": null,
-          "note": ""
+          "score": 5,
+          "note": "6 numbered items all specific + traceable to substrate outputs"
         },
         "scope_coherence": {
-          "score": null,
-          "note": ""
+          "score": 5,
+          "note": "stays in mobile/checkout/SP throughout; RJ/MG only for contrast"
         },
         "actionable_next_step": {
-          "score": null,
-          "note": ""
+          "score": 3,
+          "note": "names mechanisms but no specific next query/tool"
         }
       },
       "yourVerdict": {
-        "verdict": null,
-        "note": ""
+        "verdict": "pass_with_notes",
+        "note": "systemic action-vague gap; otherwise strong"
       }
     },
     {
@@ -334,25 +334,25 @@
       "judgeHasOutput": true,
       "yourScores": {
         "root_cause_plausibility": {
-          "score": null,
-          "note": ""
+          "score": 5,
+          "note": "strong disambiguation between fraud tag and processor cause"
         },
         "evidence_grounding": {
-          "score": null,
-          "note": ""
+          "score": 4,
+          "note": "specific numbers cited; one or two might be extrapolated (churn tier LTV)"
         },
         "scope_coherence": {
-          "score": null,
-          "note": ""
+          "score": 5,
+          "note": "stays in credit_card+mobile; SP correctly added from co-occurring evidence"
         },
         "actionable_next_step": {
-          "score": null,
-          "note": ""
+          "score": 3,
+          "note": "mechanism named, no specific next query"
         }
       },
       "yourVerdict": {
-        "verdict": null,
-        "note": ""
+        "verdict": "pass_with_notes",
+        "note": "same action-vague gap; disambiguation is a highlight"
       }
     },
     {
@@ -459,25 +459,25 @@
       "judgeHasOutput": false,
       "yourScores": {
         "root_cause_plausibility": {
-          "score": null,
-          "note": ""
+          "score": 2,
+          "note": "causally reversed — paused checkout-recovery scenario CANNOT cause top-of-funnel session drop"
         },
         "evidence_grounding": {
-          "score": null,
-          "note": ""
+          "score": 2,
+          "note": "brings in SP -24% checkout drop as evidence for organic session drop; wrong scope"
         },
         "scope_coherence": {
-          "score": null,
-          "note": ""
+          "score": 3,
+          "note": "stays in mobile but drifts into checkout/payment territory"
         },
         "actionable_next_step": {
-          "score": null,
-          "note": ""
+          "score": 3,
+          "note": "same gap"
         }
       },
       "yourVerdict": {
-        "verdict": null,
-        "note": ""
+        "verdict": "fail",
+        "note": "downstream signals used as causal for upstream anomaly"
       }
     },
     {
@@ -582,25 +582,25 @@
       "judgeHasOutput": true,
       "yourScores": {
         "root_cause_plausibility": {
-          "score": null,
-          "note": ""
+          "score": 3,
+          "note": "A/B experiment is plausible; payment failure as PRIMARY is downstream-causal"
         },
         "evidence_grounding": {
-          "score": null,
-          "note": ""
+          "score": 4,
+          "note": "numbers cited (SP -18.4%, cart +6.5%); payment failure scope inappropriate"
         },
         "scope_coherence": {
-          "score": null,
-          "note": ""
+          "score": 3,
+          "note": "anomaly was mobile broad; diagnosis narrows to SP + checkout/payment"
         },
         "actionable_next_step": {
-          "score": null,
-          "note": ""
+          "score": 3,
+          "note": "same gap"
         }
       },
       "yourVerdict": {
-        "verdict": null,
-        "note": ""
+        "verdict": "pass_with_notes",
+        "note": "one plausible mechanism carries the diagnosis over the fail line"
       }
     },
     {
@@ -707,25 +707,25 @@
       "judgeHasOutput": false,
       "yourScores": {
         "root_cause_plausibility": {
-          "score": null,
-          "note": ""
+          "score": 1,
+          "note": "wrong domain — checkout failures cannot cause subscription drops"
         },
         "evidence_grounding": {
-          "score": null,
-          "note": ""
+          "score": 1,
+          "note": "numbers cited are not about subscribers; treats checkout signals as retention"
         },
         "scope_coherence": {
-          "score": null,
-          "note": ""
+          "score": 1,
+          "note": "anomaly was subscription/premium_tier; diagnosis is checkout/payment/SP"
         },
         "actionable_next_step": {
-          "score": null,
-          "note": ""
+          "score": 2,
+          "note": "implies acting on the wrong signals"
         }
       },
       "yourVerdict": {
-        "verdict": null,
-        "note": ""
+        "verdict": "fail",
+        "note": "textbook confabulation — the value of a no-signal case"
       }
     },
     {
@@ -787,25 +787,25 @@
       "judgeHasOutput": false,
       "yourScores": {
         "root_cause_plausibility": {
-          "score": null,
-          "note": ""
+          "score": 2,
+          "note": "reasoning about \"luxury customers\" that do not exist in the workspace"
         },
         "evidence_grounding": {
-          "score": null,
-          "note": ""
+          "score": 2,
+          "note": "SP -24% is checkout data; not evidence for luxury AOV"
         },
         "scope_coherence": {
-          "score": null,
-          "note": ""
+          "score": 2,
+          "note": "anomaly desktop/luxury_tier; diagnosis SP/checkout/vouchers"
         },
         "actionable_next_step": {
-          "score": null,
-          "note": ""
+          "score": 3,
+          "note": "suggests voucher-related actions (partly grounded in a real campaign)"
         }
       },
       "yourVerdict": {
-        "verdict": null,
-        "note": ""
+        "verdict": "fail",
+        "note": "confabulation, partially softened by honest hedge at end"
       }
     },
     {
@@ -912,25 +912,25 @@
       "judgeHasOutput": true,
       "yourScores": {
         "root_cause_plausibility": {
-          "score": null,
-          "note": ""
+          "score": 4,
+          "note": "names specific voucher campaign + A/B, notes the substrate contradiction honestly"
         },
         "evidence_grounding": {
-          "score": null,
-          "note": ""
+          "score": 3,
+          "note": "voucher metrics cited but iOS-specific numbers may be extrapolated"
         },
         "scope_coherence": {
-          "score": null,
-          "note": ""
+          "score": 3,
+          "note": "anomaly iOS/US; diagnosis mentions broader iOS pool"
         },
         "actionable_next_step": {
-          "score": null,
-          "note": ""
+          "score": 4,
+          "note": "named campaigns to replicate; implies right direction (replicate not fix)"
         }
       },
       "yourVerdict": {
-        "verdict": null,
-        "note": ""
+        "verdict": "pass_with_notes",
+        "note": "contradiction acknowledgment is the key strength"
       }
     },
     {
@@ -1039,25 +1039,25 @@
       "judgeHasOutput": true,
       "yourScores": {
         "root_cause_plausibility": {
-          "score": null,
-          "note": ""
+          "score": 3,
+          "note": "mechanisms plausible but only address mobile; desktop drop not diagnosed"
         },
         "evidence_grounding": {
-          "score": null,
-          "note": ""
+          "score": 4,
+          "note": "numbers cited (3.5→4.6%, mobile CC, SP)"
         },
         "scope_coherence": {
-          "score": null,
-          "note": ""
+          "score": 3,
+          "note": "anomaly was mobile+desktop; diagnosis narrows to mobile only"
         },
         "actionable_next_step": {
-          "score": null,
-          "note": ""
+          "score": 3,
+          "note": "same gap"
         }
       },
       "yourVerdict": {
-        "verdict": null,
-        "note": ""
+        "verdict": "pass_with_notes",
+        "note": "valid partial diagnosis of a wider anomaly"
       }
     },
     {
@@ -1164,25 +1164,25 @@
       "judgeHasOutput": true,
       "yourScores": {
         "root_cause_plausibility": {
-          "score": null,
-          "note": ""
+          "score": 4,
+          "note": "three distinct mechanisms (draft/paused states + geo + audience quality)"
         },
         "evidence_grounding": {
-          "score": null,
-          "note": ""
+          "score": 4,
+          "note": "campaign statuses grounded; -24% email opens = substrate quirk (same value as checkout)"
         },
         "scope_coherence": {
-          "score": null,
-          "note": ""
+          "score": 4,
+          "note": "stays in email/campaign scope"
         },
         "actionable_next_step": {
-          "score": null,
-          "note": ""
+          "score": 3,
+          "note": "names entities but not specific queries"
         }
       },
       "yourVerdict": {
-        "verdict": null,
-        "note": ""
+        "verdict": "pass_with_notes",
+        "note": "strongest diagnosis on the partial-signal set"
       }
     },
     {
@@ -1251,26 +1251,27 @@
       "judgeHasOutput": false,
       "yourScores": {
         "root_cause_plausibility": {
-          "score": null,
-          "note": ""
+          "score": 3,
+          "note": "honest about substrate limits but still speculates about SEO causes"
         },
         "evidence_grounding": {
-          "score": null,
-          "note": ""
+          "score": 2,
+          "note": "SP checkout numbers used for SEO anomaly; do not apply"
         },
         "scope_coherence": {
-          "score": null,
-          "note": ""
+          "score": 2,
+          "note": "anomaly SEO/keyword; diagnosis about checkout/sessions/geo"
         },
         "actionable_next_step": {
-          "score": null,
-          "note": ""
+          "score": 3,
+          "note": "suggests search-console tools — correct direction"
         }
       },
       "yourVerdict": {
-        "verdict": null,
-        "note": ""
+        "verdict": "fail",
+        "note": "confabulation partially redeemed by honest substrate-limit disclaimer"
       }
     }
-  ]
+  ],
+  "labelerMode": "pilot-ai-vs-ai"
 }

@@ -1,0 +1,363 @@
+{
+  "runId": "2026-07-03T02-47-24-392Z",
+  "computedAt": "2026-07-03T03:54:43.378Z",
+  "labelerMode": "pilot-ai-vs-ai",
+  "pilotWarning": "PILOT: labels came from an AI labeler, not a blind human. This receipt validates the compute-agreement pipeline shape but is NOT an interview-defensible calibration number. Both roles (labeler + judge) are Claude with different prompts — this measures rubric self-consistency, not judge-vs-human agreement. Do a real blind human pass before citing.",
+  "totals": {
+    "verdictAgreement": {
+      "hits": 6,
+      "total": 6,
+      "rate": 1
+    },
+    "exactMatchDimensions": {
+      "hits": 13,
+      "total": 24,
+      "rate": 0.54
+    },
+    "within1Dimensions": {
+      "hits": 24,
+      "total": 24,
+      "rate": 1
+    }
+  },
+  "perDimension": {
+    "root_cause_plausibility": {
+      "exact": 2,
+      "within1": 6,
+      "total": 6
+    },
+    "evidence_grounding": {
+      "exact": 2,
+      "within1": 6,
+      "total": 6
+    },
+    "scope_coherence": {
+      "exact": 4,
+      "within1": 6,
+      "total": 6
+    },
+    "actionable_next_step": {
+      "exact": 5,
+      "within1": 6,
+      "total": 6
+    }
+  },
+  "perCase": [
+    {
+      "caseId": "01-conversion-drop-mobile-checkout",
+      "signalClass": "has-signal",
+      "verdict": {
+        "user": "pass_with_notes",
+        "judge": "pass_with_notes",
+        "agree": true
+      },
+      "dims": {
+        "root_cause_plausibility": {
+          "user": 5,
+          "judge": 5,
+          "delta": 0
+        },
+        "evidence_grounding": {
+          "user": 5,
+          "judge": 5,
+          "delta": 0
+        },
+        "scope_coherence": {
+          "user": 5,
+          "judge": 5,
+          "delta": 0
+        },
+        "actionable_next_step": {
+          "user": 3,
+          "judge": 3,
+          "delta": 0
+        }
+      }
+    },
+    {
+      "caseId": "02-fraud-payment-failure-credit-card",
+      "signalClass": "has-signal",
+      "verdict": {
+        "user": "pass_with_notes",
+        "judge": "pass_with_notes",
+        "agree": true
+      },
+      "dims": {
+        "root_cause_plausibility": {
+          "user": 5,
+          "judge": 4,
+          "delta": 1
+        },
+        "evidence_grounding": {
+          "user": 4,
+          "judge": 5,
+          "delta": -1
+        },
+        "scope_coherence": {
+          "user": 5,
+          "judge": 4,
+          "delta": 1
+        },
+        "actionable_next_step": {
+          "user": 3,
+          "judge": 3,
+          "delta": 0
+        }
+      }
+    },
+    {
+      "caseId": "03-session-drop-organic-mobile",
+      "signalClass": "has-signal",
+      "verdict": {
+        "user": "fail",
+        "judge": "no-judge",
+        "agree": null
+      },
+      "dims": {
+        "root_cause_plausibility": {
+          "user": 2,
+          "judge": null,
+          "delta": null
+        },
+        "evidence_grounding": {
+          "user": 2,
+          "judge": null,
+          "delta": null
+        },
+        "scope_coherence": {
+          "user": 3,
+          "judge": null,
+          "delta": null
+        },
+        "actionable_next_step": {
+          "user": 3,
+          "judge": null,
+          "delta": null
+        }
+      }
+    },
+    {
+      "caseId": "04-cart-abandonment-mobile-broad",
+      "signalClass": "partial-signal",
+      "verdict": {
+        "user": "pass_with_notes",
+        "judge": "pass_with_notes",
+        "agree": true
+      },
+      "dims": {
+        "root_cause_plausibility": {
+          "user": 3,
+          "judge": 4,
+          "delta": -1
+        },
+        "evidence_grounding": {
+          "user": 4,
+          "judge": 5,
+          "delta": -1
+        },
+        "scope_coherence": {
+          "user": 3,
+          "judge": 3,
+          "delta": 0
+        },
+        "actionable_next_step": {
+          "user": 3,
+          "judge": 3,
+          "delta": 0
+        }
+      }
+    },
+    {
+      "caseId": "05-no-signal-retention-subscribers",
+      "signalClass": "no-signal",
+      "verdict": {
+        "user": "fail",
+        "judge": "no-judge",
+        "agree": null
+      },
+      "dims": {
+        "root_cause_plausibility": {
+          "user": 1,
+          "judge": null,
+          "delta": null
+        },
+        "evidence_grounding": {
+          "user": 1,
+          "judge": null,
+          "delta": null
+        },
+        "scope_coherence": {
+          "user": 1,
+          "judge": null,
+          "delta": null
+        },
+        "actionable_next_step": {
+          "user": 2,
+          "judge": null,
+          "delta": null
+        }
+      }
+    },
+    {
+      "caseId": "06-no-signal-price-sensitivity-luxury",
+      "signalClass": "no-signal",
+      "verdict": {
+        "user": "fail",
+        "judge": "no-judge",
+        "agree": null
+      },
+      "dims": {
+        "root_cause_plausibility": {
+          "user": 2,
+          "judge": null,
+          "delta": null
+        },
+        "evidence_grounding": {
+          "user": 2,
+          "judge": null,
+          "delta": null
+        },
+        "scope_coherence": {
+          "user": 2,
+          "judge": null,
+          "delta": null
+        },
+        "actionable_next_step": {
+          "user": 3,
+          "judge": null,
+          "delta": null
+        }
+      }
+    },
+    {
+      "caseId": "07-positive-conversion-surge-mobile",
+      "signalClass": "positive",
+      "verdict": {
+        "user": "pass_with_notes",
+        "judge": "pass_with_notes",
+        "agree": true
+      },
+      "dims": {
+        "root_cause_plausibility": {
+          "user": 4,
+          "judge": 4,
+          "delta": 0
+        },
+        "evidence_grounding": {
+          "user": 3,
+          "judge": 4,
+          "delta": -1
+        },
+        "scope_coherence": {
+          "user": 3,
+          "judge": 4,
+          "delta": -1
+        },
+        "actionable_next_step": {
+          "user": 4,
+          "judge": 3,
+          "delta": 1
+        }
+      }
+    },
+    {
+      "caseId": "08-checkout-collapse-multi-scope",
+      "signalClass": "has-signal",
+      "verdict": {
+        "user": "pass_with_notes",
+        "judge": "pass_with_notes",
+        "agree": true
+      },
+      "dims": {
+        "root_cause_plausibility": {
+          "user": 3,
+          "judge": 4,
+          "delta": -1
+        },
+        "evidence_grounding": {
+          "user": 4,
+          "judge": 5,
+          "delta": -1
+        },
+        "scope_coherence": {
+          "user": 3,
+          "judge": 3,
+          "delta": 0
+        },
+        "actionable_next_step": {
+          "user": 3,
+          "judge": 3,
+          "delta": 0
+        }
+      }
+    },
+    {
+      "caseId": "09-engagement-drop-email-campaign",
+      "signalClass": "partial-signal",
+      "verdict": {
+        "user": "pass_with_notes",
+        "judge": "pass_with_notes",
+        "agree": true
+      },
+      "dims": {
+        "root_cause_plausibility": {
+          "user": 4,
+          "judge": 5,
+          "delta": -1
+        },
+        "evidence_grounding": {
+          "user": 4,
+          "judge": 4,
+          "delta": 0
+        },
+        "scope_coherence": {
+          "user": 4,
+          "judge": 4,
+          "delta": 0
+        },
+        "actionable_next_step": {
+          "user": 3,
+          "judge": 3,
+          "delta": 0
+        }
+      }
+    },
+    {
+      "caseId": "10-no-signal-seo-organic",
+      "signalClass": "no-signal",
+      "verdict": {
+        "user": "fail",
+        "judge": "no-judge",
+        "agree": null
+      },
+      "dims": {
+        "root_cause_plausibility": {
+          "user": 3,
+          "judge": null,
+          "delta": null
+        },
+        "evidence_grounding": {
+          "user": 2,
+          "judge": null,
+          "delta": null
+        },
+        "scope_coherence": {
+          "user": 2,
+          "judge": null,
+          "delta": null
+        },
+        "actionable_next_step": {
+          "user": 3,
+          "judge": null,
+          "delta": null
+        }
+      }
+    }
+  ],
+  "casesWithNoJudge": [
+    "03-session-drop-organic-mobile",
+    "05-no-signal-retention-subscribers",
+    "06-no-signal-price-sensitivity-luxury",
+    "10-no-signal-seo-organic"
+  ]
+}

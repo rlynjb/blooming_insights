@@ -83,29 +83,33 @@ slice. Both drive real choices that were parked at the end of Week 1
       · Rec anti-pattern: agent proposes "pause the A/B experiment" as
         a rec on has-signal cases where the primary root cause is the
         payment processor. Judged as `fail` (correctly) on cases 01 + 08.
-- [ ] **D — Blind calibration** — tooling shipped; awaiting your labels
-      Part 1 (tooling) ✅ — shipped `eval/generate-worksheet.eval.ts` +
+- [x] **D — Blind calibration** — pipeline shipped; PILOT (AI-vs-AI) run
+      complete; real human blind pass still pending
+      Part 1 (tooling) ✅ — `eval/generate-worksheet.eval.ts` +
       `eval/compute-agreement.eval.ts` + `eval/calibration/README.md`,
-      npm scripts `eval:worksheet` and `eval:agreement`. Blank worksheet
-      for the latest run exists at
-      `eval/calibration/worksheet-2026-07-03T02-47-24-392Z.json` (10
-      cases; 6 with judge output for comparison, 4 flagged as
-      `judgeHasOutput: false`).
+      npm scripts `eval:worksheet` and `eval:agreement`.
 
-      Part 2 (labeling) — **your homework, ~30-60 min**:
-      · open the worksheet JSON
-      · read each case's anomaly + diagnosis
-      · fill `yourScores` (1-5 per dimension) + `yourVerdict`
-        (pass / pass_with_notes / fail) using the rubric in the file
-      · do NOT peek at `eval/receipts/`
+      Part 2 (labeling) — **PILOT run only (AI-vs-AI)** — I filled the
+      worksheet with `labelerMode: pilot-ai-vs-ai` after user opted
+      into the "validate the pipeline, redo with real labels later"
+      path. Both labeler and judge are Claude; this measures rubric
+      self-consistency, NOT judge-vs-human agreement. Receipt is
+      stamped with an explicit `pilotWarning` field to prevent
+      accidental interview use.
 
-      Part 3 (agreement) — `npm run eval:agreement` reads the filled
-      worksheet + receipts, writes `eval/calibration/agreement-<runId>.json`
-      with three metrics (verdict / exact-match / within-1) + per-dim
-      breakdown + per-case table.
+      Part 3 (agreement) ✅ — `eval/calibration/agreement-<runId>.json`
+      emitted. Real numbers from the pilot:
+      · Verdict agreement:       6/6 (100%)   — 4 no-judge cases skipped
+      · Exact-match dimensions:  13/24 (54%)
+      · Within-1 dimensions:     24/24 (100%) — no delta > 1
+      · Direction of disagreement: judge skews warmer on
+        `root_cause_plausibility` and `evidence_grounding`
+      · `actionable_next_step`   scored 3 across all cases (both sides)
+        — locks in the top Week-3 prompt-improvement target
 
-      The compute-agreement script refuses to run if any field is null,
-      so a partial run can never produce a misleading number.
+      Real Session D closes when a blind human pass produces a receipt
+      with `labelerMode: human`. Deferred until user regenerates
+      study materials + revisits with more depth.
 
 ### Required
 
