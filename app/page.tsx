@@ -11,6 +11,7 @@ import QueryBox from '@/components/chat/QueryBox';
 import { useBriefingStream, type BriefingMode, type FeedStatus } from '@/lib/hooks/useBriefingStream';
 import { useDemoCapture } from '@/lib/hooks/useDemoCapture';
 import { useReconnectPolicy, isAuthErrorButton } from '@/lib/hooks/useReconnectPolicy';
+import { McpConfigModal } from '@/components/settings/McpConfigModal';
 
 // the free-form "ask anything" box is hidden for now — flip to show it again.
 const SHOW_QUERY_BOX = false;
@@ -45,6 +46,7 @@ function formatCustomerCount(n: number): string {
 
 export default function HomePage() {
   const [activeQuery, setActiveQuery] = useState<string | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   // revoked-token reconnect policy (state + one-shot guard + reset+reload).
   // The alpha Bloomreach server revokes tokens after minutes — see
@@ -227,9 +229,41 @@ export default function HomePage() {
                   ? 'live agent · synthetic workspace data'
                   : 'live · real workspace data via mcp'}
             </span>
+            {mode === 'live-mcp' && (
+              <button
+                type="button"
+                onClick={() => setSettingsOpen(true)}
+                className="lowercase"
+                aria-label="mcp settings"
+                title="configure mcp server + auth"
+                style={{
+                  background: 'transparent',
+                  color: 'var(--text-tertiary)',
+                  border: '1px solid var(--border)',
+                  borderRadius: 4,
+                  cursor: 'pointer',
+                  fontFamily: 'var(--font-mono), monospace',
+                  fontSize: '0.68rem',
+                  padding: '2px 8px',
+                  marginLeft: 4,
+                }}
+              >
+                ⚙ settings
+              </button>
+            )}
           </div>
         )}
       </div>
+
+      <McpConfigModal
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        onSaved={() => {
+          // Fresh config → reload so the streaming fetch picks up the new
+          // header on a clean state.
+          if (typeof window !== 'undefined') window.location.reload();
+        }}
+      />
 
       {/* process stepper — monitoring runs here; the other two run on investigate */}
       <ProcessStepper

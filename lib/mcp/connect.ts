@@ -24,6 +24,7 @@ import {
   BloomreachAuthProvider,
   type McpAuthType,
 } from './auth-providers';
+import type { McpConfigOverride } from './config';
 
 /** ConnectResult.mcp is the concrete BloomreachDataSource (not just
  *  `DataSource`) so the 4 short MCP routes — /api/mcp/{call,tools,tools/check,capture}
@@ -34,12 +35,12 @@ export type ConnectResult =
   | { ok: true; mcp: BloomreachDataSource }
   | { ok: false; authUrl: string };
 
-function mcpUrl(): URL {
-  // Prefer generic MCP_URL; fall back to BLOOMREACH_MCP_URL for backward
-  // compat with pre-swappable configs. Final default is the Bloomreach alpha
-  // endpoint so an unset env still yields a working example config out of the
-  // box (Bloomreach as the "default preset").
+function mcpUrl(override?: McpConfigOverride): URL {
+  // Precedence: override.url (from UI settings modal, per-request header) →
+  // MCP_URL env → BLOOMREACH_MCP_URL env (legacy) → Bloomreach alpha default.
+  // Unset env still yields a working example config out of the box.
   const raw =
+    override?.url ??
     process.env.MCP_URL ??
     process.env.BLOOMREACH_MCP_URL ??
     'https://loomi-mcp-alpha.bloomreach.com/mcp/';
@@ -73,20 +74,30 @@ async function redirectUri(): Promise<string> {
  * Connect for a session. If the session has valid tokens, returns a ready
  * BloomreachDataSource. If not, the SDK's auth flow captures an authorize URL
  * via the provider, which we return so the caller can redirect the browser.
+ *
+ * `override` is an optional per-request MCP config from the UI settings modal
+ * (see lib/mcp/config.ts). When set, it takes precedence over env vars; when
+ * null/undefined, env-driven behavior is preserved exactly.
  */
-export async function connectMcp(sessionId: string): Promise<ConnectResult> {
+export async function connectMcp(
+  sessionId: string,
+  override?: McpConfigOverride | null,
+): Promise<ConnectResult> {
   // In production the auth store is the encrypted cookie; withAuthCookies seeds
   // it from the request once and flushes it once (see lib/mcp/auth.ts). In
   // dev/test it's a passthrough.
-  return withAuthCookies(() => connectMcpInner(sessionId));
+  return withAuthCookies(() => connectMcpInner(sessionId, override ?? undefined));
 }
 
-async function connectMcpInner(sessionId: string): Promise<ConnectResult> {
-  const provider = await buildAuthProvider(sessionId);
+async function connectMcpInner(
+  sessionId: string,
+  override?: McpConfigOverride,
+): Promise<ConnectResult> {
+  const provider = await buildAuthProvider(sessionId, override);
   // Capture the raw body of any non-OK HTTP response so tool failures can report
   // the real server error (e.g. the `invalid_token` JSON behind a 401).
   const httpErrors: HttpErrorHolder = { last: null };
-  const transport = new StreamableHTTPClientTransport(mcpUrl(), {
+  const transport = new StreamableHTTPClientTransport(mcpUrl(override), {
     authProvider: provider,
     fetch: makeCapturingFetch(httpErrors),
   });
@@ -128,15 +139,30 @@ async function connectMcpInner(sessionId: string): Promise<ConnectResult> {
   }
 }
 
-/** Build an AuthProvider for a session per env-configured MCP_AUTH_TYPE.
- *  Default is oauth-bloomreach for backward compat. */
-async function buildAuthProvider(sessionId: string): Promise<OAuthClientProvider> {
+/** Build an AuthProvider for a session. Per-request override (from the UI
+ *  settings modal) wins over env config. Default is oauth-bloomreach.
+ *
+ *  When a bearer override is set but the token is missing, we throw a clear
+ *  error — the modal validation should have caught this, but the server-side
+ *  guard keeps a malformed request from reaching the SDK's OAuth machinery. */
+async function buildAuthProvider(
+  sessionId: string,
+  override?: McpConfigOverride,
+): Promise<OAuthClientProvider> {
   const env = readAuthEnv();
+  const type: McpAuthType = override?.authType ?? env.type;
+  const bearerToken =
+    type === 'bearer' ? (override?.bearerToken ?? env.bearerToken) : undefined;
+  if (type === 'bearer' && !bearerToken) {
+    throw new Error(
+      'bearer auth type selected but no token provided — set one in Settings or via MCP_AUTH_TOKEN env.',
+    );
+  }
   return makeAuthProvider({
-    type: env.type,
+    type,
     sessionId,
-    redirectUri: env.type === 'oauth-bloomreach' ? await redirectUri() : undefined,
-    bearerToken: env.bearerToken,
+    redirectUri: type === 'oauth-bloomreach' ? await redirectUri() : undefined,
+    bearerToken,
   });
 }
 

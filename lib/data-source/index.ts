@@ -36,6 +36,7 @@
 
 import { connectMcp } from '../mcp/connect';
 import type { ConnectResult } from '../mcp/connect';
+import type { McpConfigOverride } from '../mcp/config';
 import { bootstrapSchema, type WorkspaceSchema } from '../mcp/schema';
 import { SyntheticDataSource, syntheticWorkspaceSchema } from './synthetic-data-source';
 import type { DataSource } from './types';
@@ -83,6 +84,7 @@ export function parseLiveMode(raw: string | null): LiveMode {
 export async function makeDataSource(
   mode: LiveMode,
   sessionId: string,
+  mcpConfigOverride?: McpConfigOverride | null,
 ): Promise<MakeDataSourceResult> {
   if (mode === 'live-synthetic') {
     const dataSource = new SyntheticDataSource();
@@ -96,10 +98,11 @@ export async function makeDataSource(
   }
 
   // live-mcp — defer to the existing connect path. It owns the auth flow
-  // (oauth-bloomreach / bearer / anonymous per MCP_AUTH_TYPE env), including
-  // the OAuth case where the session has no valid tokens (returns
-  // `{ ok: false, authUrl }` so the route can redirect).
-  const conn: ConnectResult = await connectMcp(sessionId);
+  // (oauth-bloomreach / bearer / anonymous per MCP_AUTH_TYPE env or per-
+  // request UI override), including the OAuth case where the session has
+  // no valid tokens (returns `{ ok: false, authUrl }` so the route can
+  // redirect).
+  const conn: ConnectResult = await connectMcp(sessionId, mcpConfigOverride);
   if (!conn.ok) {
     return { ok: false, mode, authUrl: conn.authUrl };
   }

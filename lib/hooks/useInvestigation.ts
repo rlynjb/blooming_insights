@@ -5,6 +5,7 @@ import type { AgentEvent } from '@/lib/mcp/events';
 import type { Diagnosis, Recommendation } from '@/lib/mcp/types';
 import type { TraceItem } from '@/components/investigation/ReasoningTrace';
 import { readNdjson } from '@/lib/streaming/ndjson';
+import { BI_MCP_CONFIG_HEADER, persistedConfigHeader } from '@/lib/mcp/config';
 
 export type InvestigationStep = 'diagnose' | 'recommend';
 
@@ -181,7 +182,13 @@ export function useInvestigation(id: string | undefined, step: InvestigationStep
           /* storage blocked — fall back to server-side lookup / cache */
         }
 
-        const res = await fetch(url);
+        // UI settings modal (Session D) persists MCP config in localStorage;
+        // send it as a header so /api/agent can override env-driven defaults.
+        // Unset → header omitted → env-driven behavior preserved.
+        const mcpHeader = persistedConfigHeader();
+        const res = await fetch(url, {
+          headers: mcpHeader ? { [BI_MCP_CONFIG_HEADER]: mcpHeader } : undefined,
+        });
         if (res.status === 401) {
           const b = await res.json().catch(() => ({}));
           if (b?.needsAuth && b?.authUrl) {

@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { Insight, CoverageItem, CoverageReport } from '@/lib/mcp/types';
 import type { TraceItem } from '@/components/investigation/ReasoningTrace';
 import { readNdjson } from '@/lib/streaming/ndjson';
+import { BI_MCP_CONFIG_HEADER, persistedConfigHeader } from '@/lib/mcp/config';
 
 /**
  * Briefing stream consumer. Owns the GET /api/briefing fetch, the
@@ -159,7 +160,13 @@ export function useBriefingStream(
 
     (async () => {
       try {
-        const res = await fetch(url);
+        // UI settings modal (Session D) persists MCP config in localStorage;
+        // send it as a header so the route can override env-driven defaults.
+        // Unset → header omitted → env-driven behavior preserved.
+        const mcpHeader = persistedConfigHeader();
+        const res = await fetch(url, {
+          headers: mcpHeader ? { [BI_MCP_CONFIG_HEADER]: mcpHeader } : undefined,
+        });
 
         // Auth + error cases come back as JSON (the route checks auth before it
         // commits to a stream), so handle those first.

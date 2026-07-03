@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import Anthropic from '@anthropic-ai/sdk';
 import { getOrCreateSessionId } from '@/lib/mcp/session';
 import { makeDataSource, parseLiveMode, type LiveMode } from '@/lib/data-source';
+import { BI_MCP_CONFIG_HEADER, decodeConfigHeader } from '@/lib/mcp/config';
 import { redactSecrets, formatError } from '@/lib/mcp/transport';
 // `bootstrapSchema` is now consumed indirectly via the DataSource factory's
 // `bootstrap()` — see lib/data-source/index.ts.
@@ -159,12 +160,16 @@ export async function GET(req: NextRequest) {
   // fake data. Legacy values fall back to Bloomreach.
   const mode: LiveMode = parseLiveMode(req.nextUrl.searchParams.get('mode'));
 
+  // UI settings modal (Session D) sends per-request MCP config via a header.
+  // Missing / malformed headers decode to null and fall through to env config.
+  const mcpConfigOverride = decodeConfigHeader(req.headers.get(BI_MCP_CONFIG_HEADER));
+
   // Construct the DataSource via the factory. Wrapped so a setup throw (e.g.
   // missing AUTH_SECRET breaking cookie encryption in production) returns the
   // real message instead of a bare 500.
   let dsResult: Awaited<ReturnType<typeof makeDataSource>>;
   try {
-    dsResult = await makeDataSource(mode, sid);
+    dsResult = await makeDataSource(mode, sid, mcpConfigOverride);
   } catch (e) {
     console.error('[agent] setup error:', redactSecrets(formatError(e)));
     return NextResponse.json(
