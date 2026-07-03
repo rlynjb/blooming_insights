@@ -152,9 +152,84 @@ Two questions Week 1 parked, waiting on this reading:
 
 ## Week 3 — Cost + load evidence (Phases 2, 3, 4)
 
-*Reading to add — usage-ledger, prompt caching, model routing, load + fault injection.*
+Reading to sharpen the three decisions this week demands: how to shape
+observability without over-instrumenting, which prompt-caching seams
+actually pay, and what makes a synthetic load number honest vs. theater.
 
-- [ ] _tbd_
+### Prereq (from Week 2)
+
+Substrate expansion is **not required** for Week 3. Phase 2 (observability)
+measures tokens/cost/latency which vary with prompt length + iterations,
+not with substrate content. Phase 3 (cost controls) is agent-side. Phase 4
+(load + fault injection) gets its variety from varied *input anomalies*
+(we have 10 diverse goldens), not from varied *tool responses*. Substrate
+expansion becomes load-bearing at Week 5 (regression gate needs signal
+variance) or at the real-blind-calibration re-run (better interview
+receipt). Defer until then.
+
+### Required
+
+**1. Observability — what to measure, what NOT to instrument**
+`.aipe/study-ai-engineering/05-evals-and-observability/`:
+
+- [ ] `04-llm-observability.md` — traces / spans / replay; what a
+      production trace-record actually contains; the anti-pattern of
+      "instrument everything then debug the instrumentation."
+      Load-bearing for Phase 2's `summarizeUsage` + `estimateCost`
+      aggregation.
+
+**2. Cost controls — the two levers that pay**
+`.aipe/study-ai-engineering/06-production-serving/`:
+
+- [ ] `01-llm-caching.md` — Anthropic cache-control mechanics; what
+      cache_creation vs cache_read tokens cost; the "stable prefixes"
+      pattern (system prompt + WorkspaceSchema) that pays biggest.
+- [ ] `02-llm-cost-optimization.md` — cheap-model routing (Haiku for
+      intent / classification / structured extraction) vs. escalation
+      to Sonnet for reasoning-hard steps. Which decisions justify the
+      escalation cost, and which don't. Also covers the token-budget
+      lever (`schemaSummary` in this codebase).
+- [ ] `04-rate-limiting-backpressure.md` — re-read the spacing-gate-vs-
+      backpressure distinction (already sharp in the codebase's own
+      `study-performance-engineering/`) — informs Phase 4's load
+      harness pacing.
+- [ ] `05-retry-circuit-breaker.md` — relevant for Phase 4's fault
+      injection design (what failures a decorator should simulate,
+      what recovery patterns already exist in `BloomreachDataSource`).
+
+**3. Load + fault injection**
+`.aipe/study-performance-engineering/`:
+
+- [ ] `01-spacing-gate-vs-backpressure.md` — the load-bearing teaching
+      point in this repo (`minIntervalMs = 1100` is rate-limit
+      compliance, NOT backpressure). Directly relevant to how the
+      load harness paces its N-per-second issuance.
+- [ ] `05-streaming-perceived-latency.md` — how p50 / p95 / p99 map to
+      user-visible experience; when p99 lies (small N, happy-path
+      distribution). The plan's warning about "not N happy-path
+      copies" lives here.
+
+### Optional — interview framing
+
+- [ ] `.aipe/rehearse-interview-defense/04-the-scale-story.md` — three
+      scale scenarios and what breaks first at 10x. The tier-2 story
+      Phase 4 arms you to defend.
+- [ ] `.aipe/rehearse-design-doc/` — cost controls as RFC shape (once
+      Phase 3 ships, its shape becomes an RFC candidate).
+
+### Live decisions this reading unblocks
+
+- **Prompt-cache seam choice** — cache just the system prompt, or also
+  the WorkspaceSchema? Cost of a cache miss vs. cache read informs
+  the answer; `01-prompt-caching.md` has the math.
+- **Model-routing threshold** — where does Haiku stop being enough?
+  `02-model-routing.md` names the pattern: cheap-model owns extraction
+  and classification; Sonnet owns synthesis. Practice on
+  `classifyIntent` first.
+- **Load harness N + pace** — how many investigations at what rate?
+  `01-spacing-gate-vs-backpressure.md` + the codebase's existing
+  `minIntervalMs = 1100` set the ceiling; the plan's "sustained ~1
+  req/s" is the target.
 
 ---
 
