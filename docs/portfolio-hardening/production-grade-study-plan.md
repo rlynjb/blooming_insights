@@ -1,3 +1,96 @@
+# How to study this project as a junior dev
+
+You've built something rare: the study guides, the code, and the evals are three
+views of *the same system*. Don't treat "study materials" and "the project" as two
+separate tasks — run them as one loop.
+
+The three views:
+- **`.aipe/study-*`** (16 guides) — the *why/what*. Each is written against your real files.
+- **`app/`, `lib/`, `components/`** — the *where*. The actual code the guides point to.
+- **`eval/`, `test/`** — the *prove it*. Where a claim becomes a receipt.
+- **`.aipe/drills/`, `.aipe/rehearse-*`** — turning understanding into muscle memory / interview answers.
+
+## The core loop (do this per topic, not once)
+
+For each study section, run one full lap:
+
+1. **Read the guide section** — but only the first screen. Stop at the first file path it names.
+2. **Open that exact file** and read the code it's describing. The guide tells you *where to
+   look* and *what to notice*; the code is the truth.
+3. **Run the thing.** Every guide maps to a command. Watch it actually happen.
+4. **Break it on purpose.** Change a number, delete a guard, flip a config — then rerun and
+   watch what fails (or scarily, *doesn't*).
+5. **Undo** (`git checkout .`) and write one sentence in your own words about what that piece
+   does and what breaks without it.
+
+The "break it → watch → undo" step is the whole game. Reading teaches recognition; breaking
+teaches understanding.
+
+## A concrete order (roughly 6 sessions)
+
+**Session 1 — Get it running, no theory yet.**
+```bash
+npm ci
+npm test              # 221 tests, no API cost — proves the machine works
+npm run dev           # localhost:3000, run an investigation, watch the reasoning stream
+```
+See the product breathe before you read a word about it. What you *don't* understand is your syllabus.
+
+**Session 2 — System design.** `.aipe/study-system-design/` + the README architecture diagram.
+Lock in one idea: **the supervisor is code, not an LLM** (`app/api/*`). Understand *why*
+deterministic control flow beats an LLM router here.
+
+**Session 3 — Agent architecture.** `.aipe/study-agent-architecture/` → `lib/agents/`. Model:
+*outer layer = deterministic pipeline; inner layer = each agent's ReAct loop bounded by
+`maxTurns`/`maxToolCalls`*. Trace one investigation through `lib/agents/aptkit-adapters.ts`.
+
+**Session 4 — The DataSource seam.** `.aipe/study-software-design/` + `lib/data-source/`. One
+interface, 3 implementations, 4 real uses, zero caller changes. Run the app with the Synthetic
+adapter, then with fault injection. That seam is *why* you can test without spending money.
+
+**Session 5 — Evals (the production-grade differentiator).** See below.
+
+**Session 6 — Do a drill.** `.aipe/drills/` — induce a real gap, fix it, prove the fix with an
+eval. That's the exact loop of a working AI engineer.
+
+## Running the evals — the part to slow down on
+
+Progression from free → expensive:
+
+```bash
+npm test                        # free. read a test file WHILE it runs.
+LOAD_N=5 FAULT_TIMEOUT=0.1 FAULT_MALFORMED_JSON=0.1 FAULT_SEED=42 \
+  npm run eval:load             # offline chaos, cheap. proves graceful degradation.
+npm run eval                    # the real thing: 10 goldens, ~$1.30, ~35 min
+npm run eval:report             # p50/p95/p99 latency + tokens + cost
+npm run eval:gate               # regression gate: fails if a dimension dropped
+```
+
+Understand as you run (this is where the learning is):
+- **Goldens** (`eval/goldens/`) — what "correct" means, frozen as data.
+- **Rubrics** (`eval/rubrics/`) — how a judge scores an answer (LLM-as-judge, a core AI-eng skill).
+- **Baseline + gate** — catch a regression *before* it ships. Run `eval:gate`, then intentionally
+  worsen a prompt in `lib/agents/`, rerun `eval` + `eval:gate`, watch the gate go red. The single
+  most valuable thing to witness firsthand.
+- **Blind calibration** (`eval:worksheet` → fill in scores → `eval:agreement`) — proving your
+  *judge* agrees with a *human*.
+
+## What to look out for (the junior traps)
+
+- **Don't confuse "I read it" with "I understand it."** The test: can you break it and predict what fails?
+- **Don't skip the free stuff to run the expensive eval.** A golden + a rubric teach you more than the $1.30 run. Spend money last.
+- **Watch cost every time you call the model.** This repo is built around cost discipline (budget
+  ceiling, prompt caching, synthetic adapter). Keep `LOAD_N` low; spend real budget only for quality checks.
+- **Read the "What's NOT in this repo" section** (README) and take it seriously. Knowing *why*
+  there's no database / no LLM supervisor / no React Query — and the trigger that would change that
+  — is what separates "I built it" from "I understand the tradeoffs." Interviewers dig exactly here.
+- **The `*-legacy.ts` files are a feature, not clutter.** They're the rollback receipt. Diff a legacy
+  hand-rolled loop against the AptKit version to see what the library bought you.
+- **Trust the code over the guide when they disagree.** The guides are excellent but the running
+  system is ground truth — verify a claimed line still exists before you lean on it.
+
+---
+
 # production-grade study plan — reading path
 
 > Companion to `blooming-insights-production-grade-plan.md`. Each week's reading is
