@@ -20,6 +20,14 @@ export type AptKitAgentHooks = {
   onToolCall?: (tc: ToolCall) => void;
   onToolResult?: (tc: ToolCall) => void;
   onText?: (text: string) => void;
+  /**
+   * Additive Phase-2-observability hook: forwards every raw
+   * `CapabilityEvent` from the AptKit trace sink. Optional; when unset,
+   * runtime behavior is exactly as before. Consumers use this to feed
+   * events into aptkit's `summarizeUsage` + `estimateCost` for
+   * per-invocation token + cost ledger rows.
+   */
+  onCapabilityEvent?: (event: CapabilityEvent) => void;
 };
 
 /** Adapts Blooming's Anthropic SDK client to AptKit's provider-neutral ModelProvider. */
@@ -106,6 +114,11 @@ export class BloomingTraceSinkAdapter implements CapabilityTraceSink {
   ) {}
 
   emit(event: CapabilityEvent): void {
+    // Additive Phase-2 observability: forward every event to the optional
+    // capability-event hook before existing per-type routing. Consumers
+    // that don't set the hook see identical behavior.
+    this.hooks.onCapabilityEvent?.(event);
+
     if (event.type === 'step') {
       this.hooks.onText?.(event.content);
       return;

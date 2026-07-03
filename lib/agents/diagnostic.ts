@@ -17,6 +17,11 @@ export interface AgentHooks {
   onToolCall?: (tc: ToolCall) => void;
   onText?: (text: string) => void;
   onToolResult?: (tc: ToolCall) => void;
+  /** Additive Phase-2-observability hook. Receives every raw
+   *  `CapabilityEvent` from AptKit's trace sink (including model_usage
+   *  rows), so callers can feed the trace into `summarizeUsage` +
+   *  `estimateCost`. Optional; unset callers see identical behavior. */
+  onCapabilityEvent?: (event: import('@aptkit/core').CapabilityEvent) => void;
   /** Cancellation signal threaded from the route's `req.signal` down through
    *  AptKit's agent loop to Anthropic and MCP. Optional — existing callers compile
    *  + pass unchanged. */

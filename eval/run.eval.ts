@@ -21,7 +21,14 @@ import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import Anthropic from '@anthropic-ai/sdk';
-import { RubricJudge } from '@aptkit/core';
+import {
+  RubricJudge,
+  estimateCost,
+  summarizeUsage,
+  type CapabilityEvent,
+  type CostEstimate,
+  type TokenUsageSummary,
+} from '@aptkit/core';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { DiagnosticAgent } from '../lib/agents/diagnostic';
@@ -98,6 +105,26 @@ function buildJudgmentPlaceholder(verdict: 'judge_error'): RubricJudgmentValue {
   };
 }
 
+// ─── usage / cost helper ─────────────────────────────────────────────────────
+
+/**
+ * Combine an aptkit `TokenUsageSummary` with its `CostEstimate` (may be
+ * undefined when pricing is unknown) into a single receipt-friendly row.
+ */
+function usageWithCost(usage: TokenUsageSummary, cost: CostEstimate | undefined) {
+  return {
+    inputTokens: usage.inputTokens,
+    outputTokens: usage.outputTokens,
+    totalTokens: usage.totalTokens,
+    turns: usage.turns,
+    modelName: usage.modelName,
+    estimated: usage.estimated,
+    costUsd: cost?.totalCost ?? null,
+    inputCostUsd: cost?.inputCost ?? null,
+    outputCostUsd: cost?.outputCost ?? null,
+  };
+}
+
 // ─── trace formatting ────────────────────────────────────────────────────────
 
 function formatToolCallTrace(calls: readonly ToolCall[]): string {
@@ -167,10 +194,14 @@ describe('eval · Week 2C — 10 goldens · diagnosis + recommendation quality',
         sessionId,
       );
       const diagnosisToolCalls: ToolCall[] = [];
+      const diagnosisTrace: CapabilityEvent[] = [];
       const diagnosis = await diagnosticAgent.investigate(goldenCase.anomaly, {
         onToolResult: (tc) => diagnosisToolCalls.push({ ...tc }),
+        onCapabilityEvent: (ev) => diagnosisTrace.push(ev),
       });
       const investigateMs = Math.round(performance.now() - t0Investigate);
+      const diagnosisUsage = summarizeUsage(diagnosisTrace);
+      const diagnosisCost = estimateCost('anthropic', diagnosisUsage, 'claude-sonnet-4-6');
 
       // ─── judge diagnosis ──────────────────────────────────────────────
       const t0DiagnosisJudge = performance.now();
@@ -210,12 +241,18 @@ describe('eval · Week 2C — 10 goldens · diagnosis + recommendation quality',
         sessionId,
       );
       const recommendationToolCalls: ToolCall[] = [];
+      const recommendationTrace: CapabilityEvent[] = [];
       const recommendations: Recommendation[] = await recommendationAgent.propose(
         goldenCase.anomaly,
         diagnosis,
-        { onToolResult: (tc) => recommendationToolCalls.push({ ...tc }) },
+        {
+          onToolResult: (tc) => recommendationToolCalls.push({ ...tc }),
+          onCapabilityEvent: (ev) => recommendationTrace.push(ev),
+        },
       );
       const recommendMs = Math.round(performance.now() - t0Recommend);
+      const recommendUsage = summarizeUsage(recommendationTrace);
+      const recommendCost = estimateCost('anthropic', recommendUsage, 'claude-sonnet-4-6');
 
       // ─── judge each recommendation ────────────────────────────────────
       const t0RecommendJudge = performance.now();
@@ -313,6 +350,12 @@ describe('eval · Week 2C — 10 goldens · diagnosis + recommendation quality',
           durationMs: tc.durationMs,
           hasError: Boolean(tc.error),
         })),
+        // Phase-2 observability: per-invocation token usage + cost, from
+        // aptkit's summarizeUsage + estimateCost over the captured trace.
+        usage: {
+          diagnose: usageWithCost(diagnosisUsage, diagnosisCost),
+          recommend: usageWithCost(recommendUsage, recommendCost),
+        },
         diagnosis,
         diagnosisJudgment,
         diagnosisJudgmentError,
