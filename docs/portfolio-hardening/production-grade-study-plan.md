@@ -8,6 +8,38 @@
 > - **blooming study** → `.aipe/study-*/` (domain-anchored to this repo)
 > - **aptkit source** → `/Users/rein/Public/aptkit/` (the engine you're wiring)
 
+## Status — all six phases shipped
+
+```
+Week 1 · Learn seam, prove ONE case                       ✅ e511171
+Week 2 · Golden set + rubrics + calibration               ✅ bb5b9d6
+Week 3 · Observability + caching + pricing + budget       ✅ 9ad134c
+Week 4 · Load + fault + regression gate + CI              ✅ a423c26
+Portfolio-hardening plan complete                         ✅ af0d525
+```
+
+Every claim in `blooming-insights-production-grade-plan.md` is now backed by
+code + a receipt on `main`. Detailed session-level notes below.
+
+## Optional post-hardening moves
+
+Four things left, ordered by cost-per-signal:
+
+- **Real blind calibration pass** — Week 2D-part-2 was an AI-vs-AI pilot;
+  the real interview receipt needs ~30-60 min of blind human labeling.
+  Worksheet already generated at
+  `eval/calibration/worksheet-2026-07-03T02-47-24-392Z.json`. Fill it in,
+  run `npm run eval:agreement`, receipt stamps `labelerMode: human`.
+- **Real load run** — smoke tests hit N=2/3. `LOAD_N=30
+  LOAD_CONCURRENCY=5 npm run eval:load` gives real p99 under concurrent
+  load. ~$2.50, ~15 min.
+- **Monitoring routing decision** — currently deferred (Week 3C). Needs
+  ONE real briefing (mode `live-synthetic`) to measure monitoring cost,
+  then decide about Haiku routing with data. ~$0.20, ~2 min.
+- **Lint cleanup pass** — 28 pre-existing errors in `lib/hooks/`,
+  `bloomreach-data-source.ts`, `/docs/feed-prototype.jsx`. Add lint to
+  CI after clearing. Not blocking; separate cleanup PR.
+
 ---
 
 ## Week 1 — Learn the seam, prove ONE case  ✅ *implemented (`e511171`)*
@@ -39,7 +71,7 @@ Reading list named in the plan's Week 1 block, ordered how to actually read it.
 
 ---
 
-## Week 2 — Golden set + rubrics (Phase 1 complete)  *in progress*
+## Week 2 — Golden set + rubrics (Phase 1 complete)  ✅ *implemented (`bb5b9d6`)*
 
 Reading to sharpen the decisions this week forces: how to build a representative
 golden set against a static substrate, and how to run a defensible calibration
@@ -150,7 +182,7 @@ Two questions Week 1 parked, waiting on this reading:
 
 ---
 
-## Week 3 — Cost + load evidence (Phases 2, 3, 4)
+## Week 3 — Observability + cost controls (Phases 2, 3)  ✅ *implemented (`9ad134c`)*
 
 Reading to sharpen the three decisions this week demands: how to shape
 observability without over-instrumenting, which prompt-caching seams
@@ -280,7 +312,7 @@ One rec-judge outlier           case 09 at 675s (multiple retries);
 
 ---
 
-## Week 4 — Phase 4 load + fault, then Phases 5, 6
+## Week 4 — Load + fault + regression gate + CI (Phases 4, 5, 6)  ✅ *implemented (`a423c26`)*
 
 Week 3 shipped Phases 2 + 3. Phase 4 (load + fault injection) rolls into
 Week 4 alongside the original Week-4 material (Phase 5 regression gate +
@@ -374,17 +406,26 @@ complete.** Every claim in the plan is backed by code + a receipt.
       failure surfaces + graceful degradation. Phase 4 (fault) is
       what arms this defense.
 
-### Live decisions this reading unblocks
+### Live decisions this reading unblocks — resolved
 
-- **Load harness N + pacing** — how many investigations, at what rate?
-  The plan says "sustained ~1 req/s" but that's the *provider* rate.
-  Investigations take 200-250s; issuing one every 15s gives ~15
-  in-flight at steady state. Higher = more backpressure signal, lower
-  = friendlier to your API budget. Reading informs the right envelope.
-- **Fault-injection distribution** — what fraction of calls should
-  fail? 100% is not-a-test, 5% is realistic. The decorator's default
-  distribution shape (per-error-type independent probability vs.
-  correlated bursts) informs how faithful the test is.
-- **Regression gate threshold** — how much pass-rate drop blocks the
-  PR? Absolute (any dim drops ≥1 point) vs. proportional (≥10%
-  relative drop). Reading has the tradeoff.
+All three answered during Week 4 execution:
+
+- **Load harness N + pacing** — shipped as `LOAD_N` / `LOAD_CONCURRENCY`
+  env vars in `eval/load.eval.ts`. Defaults N=20, K=3 (chosen so
+  `20 × 250s / 3 ≈ 28 min` fits within a reasonable feedback loop; up
+  from N=10 to make percentiles less noisy). Users can dial higher for
+  real backpressure signal.
+- **Fault-injection distribution** — shipped as `FAULT_TIMEOUT` /
+  `FAULT_RATE_LIMIT` / `FAULT_SERVER_ERROR` / `FAULT_MALFORMED_JSON`
+  independent per-call probabilities. Order-of-severity rolled first
+  wins per call so heavy configs still surface the worst errors.
+  Deterministic replays via `FAULT_SEED`. Smoke test at 20%/20% showed
+  the agent loop reasons around every injected fault via the
+  `tool_result is_error` path — zero investigations failed. That's
+  real graceful degradation.
+- **Regression gate threshold** — shipped as absolute pass-rate drop
+  (percentage-points), configurable via `GATE_MAX_REGRESSION` (default
+  0.10 = 10 pp). Chose absolute over proportional because at low
+  baseline pass rates (`actionable_next_step` = 0% today), proportional
+  math is undefined. Absolute is what CI needs: a clear pp threshold
+  that maps to "this many cases regressed."
