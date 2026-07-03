@@ -36,6 +36,12 @@ The what-AI-did / what-I-did split. Left column is decisions AI shaped; right is
   │  → Session-keyed feed map fix                                 │
   │    I found the bug in a code read; I designed the fix.        │
   │                                                               │
+  │  → Coordination-failure drill (Move 3, 2026-07-03)             │
+  │    Induced a handoff-leakage failure, isolated the mechanism   │
+  │    with a 3-run probe, shipped the fix, ran the eval, and      │
+  │    the eval regressed the number. I reverted. Negative-result  │
+  │    rep — the receipt is the discipline, not the outcome.       │
+  │                                                               │
   └───────────────────────────────────────────────────────────────┘
 
   ┌─ EVALUATED-AND-ACCEPTED decisions ────────────────────────────┐
@@ -84,7 +90,7 @@ The what-AI-did / what-I-did split. Left column is decisions AI shaped; right is
   └───────────────────────────────────────────────────────────────┘
 ```
 
-Three modes. Six deliberate. Four evaluated-and-accepted. Four defaulted-to. Every important decision fits into one of these three buckets, and the boundaries between them are honest. That's the map you defend from.
+Three modes. Seven deliberate. Four evaluated-and-accepted. Four defaulted-to. Every important decision fits into one of these three buckets, and the boundaries between them are honest. That's the map you defend from.
 
   ## The five treated questions
 
@@ -249,7 +255,9 @@ Say this:
 >
 > *Two is the hardening pass. Ten goldens with a two-rubric, four-dimension eval. Baseline committed. Regression gate at 10 percentage points blocking CI. Fault-injecting decorator with 9-fault-3-investigation-0-failures receipt. Prompt caching validated live in logs. Budget check-before-dispatch. GitHub Actions on every push. That's tier-2 production-grade, not tier-3 hackathon. Most AI projects at my level don't have any of that.*
 >
-> *The combination is unusual: the product surface (reasoning UI) plus the hardening pass. Either alone is common. Both together is what makes this specifically defensible in a senior interview."*
+> *And I can prove the hardening pass earns its keep. Last week I ran a drill on the multi-agent coordination surface — Move 3 of my recon queue. I induced a specific handoff-leakage failure (the recommendation agent producing recs targeting hypotheses the diagnosis had marked supported-false). A three-run isolation probe confirmed the mechanism. I shipped what looked like a targeted fix — one exported helper, five tests. Then I ran the 10-case eval. The number went DOWN across all four recommendation dimensions, by 13 to 23 percentage points. Turns out the rejected hypotheses were carrying load-bearing context I hadn't credited. I reverted, wrote up the negative result, replanned toward the alternative option. The commit is on main; the drill writeup is in the repo. That's what the hardening pass buys you — I have a receipt showing what my mental model got wrong and how the eval caught it before it shipped.*
+>
+> *The combination is unusual: the product surface (reasoning UI) plus the hardening pass with lived receipts. Either alone is common. Both together is what makes this specifically defensible in a senior interview."*
 
   ## The follow-up decision tree
 
@@ -288,6 +296,20 @@ The AI question has a distinct branching shape. Interviewers pick different foll
   │      design. The taste calls that shape the
   │      whole system.
   │
+  ├─► "How do you catch mistakes AI helps you
+  │    make?"
+  │      The eval. Not the tests — the tests are
+  │      shape contracts. The eval measures
+  │      quality. When I induced Move 3's
+  │      coordination failure last week and
+  │      shipped what looked like a clean fix, my
+  │      isolation probe said it worked, my type
+  │      system said it worked, my 268 unit tests
+  │      passed. The eval regressed the number by
+  │      20+pp on four dimensions and I reverted.
+  │      The eval is the last line where being
+  │      wrong is cheap.
+  │
   └─► "How do you think about AI tools going
        forward?"
         The tools are getting better. What's not
@@ -297,7 +319,10 @@ The AI question has a distinct branching shape. Interviewers pick different foll
         driven vs. avoidance, knowing which
         AI-defaulted decision needs a re-review.
         That taste is what I'm developing, and
-        the AI tools accelerate around it.
+        the AI tools accelerate around it —
+        including accelerating me to being
+        WRONG faster, which is what the eval
+        exists to catch.
 ```
 
   ## When you don't know
@@ -375,5 +400,6 @@ The defaulted-to list itself is the honest map. Nothing to change about the list
 
   → *"The third bucket is what most candidates hide. The senior-signal-positive move is naming it directly."*
   → *"AI generates code fine on the happy path. It breaks at boundaries — StrictMode, production, concurrency. That's the class of review I do."*
+  → *"AI tools accelerate me to being wrong faster. The eval is what catches that."*
 
-**What you'd change.** Tag decisions with decision mode at commit time on future projects, not retroactively. The rest of the framing carries forward as-is.
+**What you'd change.** Tag decisions with decision mode at commit time on future projects, not retroactively. The rest of the framing carries forward as-is. Also: run the eval BEFORE writing the tests, not after. On Move 3 my tests passed and my eval failed; the tests were shape contracts, the eval was quality. That ordering is a habit worth building.
