@@ -66,11 +66,23 @@ slice. Both drive real choices that were parked at the end of Week 1
       root cause. Side observation for Session D: root_cause_plausibility
       came back 5 here but 4 on Session A — same anomaly, same substrate.
       Conclusion-stability variance is real and measurable.
-- [ ] **C — Expand goldens to 10**
-      Vary category / scope / severity + 2–3 no-signal cases. Aggregate
-      per-criterion pass rates across all cases. Escape-hatch = ≥3 distinct
-      pass/fail patterns per dimension across 10 cases; below that,
-      propose expanding `SyntheticDataSource` as its own PR.
+- [x] **C — Expand goldens to 10** ✅ *implemented (`b23558d`)*
+      10 goldens shipped (has-signal / partial-signal / no-signal / positive
+      classes); runner uses `it.each()` + `afterAll()` aggregator per Q1's
+      design. Also shipped judge-error resilience (maxTokens 2048 → 4096,
+      failure produces a `judge_error` placeholder rather than throwing) and
+      a signal-class-aware gate.
+      **Findings**:
+      · **Escape hatch TRIGGERED** — 3 of 4 diagnosis dimensions had <3
+        distinct pass/fail scores across 10 cases. Substrate too
+        homogeneous; propose `SyntheticDataSource` expansion as its own
+        PR per Q1 option (c).
+      · Two systemic prompt gaps for Week 3: `actionable_next_step`
+        scored 3/5 on 100% of diagnoses; `feature_choice_fit` scored
+        3/5 on 50% of recs.
+      · Rec anti-pattern: agent proposes "pause the A/B experiment" as
+        a rec on has-signal cases where the primary root cause is the
+        payment processor. Judged as `fail` (correctly) on cases 01 + 08.
 - [ ] **D — Blind calibration** (protocol per Q2 decision — you score blind)
       I generate `eval/calibration/worksheet-<runId>.json` (anomaly +
       diagnosis, no judgment). You score 4 dimensions × 10 cases (~30–60
