@@ -93,12 +93,16 @@ export interface UseBriefingStreamResult {
 }
 
 /** The runtime modes the briefing supports:
- *   - `demo`            → replay the committed snapshot (no MCP/Anthropic).
- *   - `live-bloomreach` → run the agents against the Bloomreach MCP server.
- *   - `live-synthetic`  → run the real agents/model against local fake data.
- *  Legacy `'live'` and `'live-sql'` reads from localStorage migrate to
- *  `'live-bloomreach'` in page.tsx. */
-export type BriefingMode = 'demo' | 'live-bloomreach' | 'live-synthetic';
+ *   - `demo`           → replay the committed snapshot (no MCP/Anthropic).
+ *                        Hidden from the UI toggle; reachable via
+ *                        `?demo=cached` URL param or manual localStorage set.
+ *   - `live-mcp`       → run the agents against an MCP server (Bloomreach by
+ *                        default; env MCP_URL + MCP_AUTH_TYPE override).
+ *   - `live-synthetic` → run the real agents/model against local fake data.
+ *                        The default fresh-visitor UX.
+ *  Legacy `'live'`, `'live-sql'`, and `'live-bloomreach'` reads from
+ *  localStorage migrate to `'live-mcp'` in page.tsx. */
+export type BriefingMode = 'demo' | 'live-mcp' | 'live-synthetic';
 
 export function useBriefingStream(
   mode: BriefingMode,

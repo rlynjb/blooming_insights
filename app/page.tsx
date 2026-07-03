@@ -54,13 +54,14 @@ export default function HomePage() {
   // Demo vs live, toggled at RUNTIME (persisted in localStorage).
   // live-synthetic is the default UX — runs real agents/model against
   // Blooming-owned deterministic fake data. Shows the product working out of
-  // the box with no OAuth. live-bloomreach runs the agents against real
-  // Bloomreach (needs OAuth reconnect on the alpha server). demo replays the
-  // cached snapshot — still reachable via ?demo=cached URL param or by
-  // manually setting `bi:mode=demo` in localStorage (kept as a reliability
-  // path / dev tool / regression evidence), but no longer in the mode toggle.
-  // NEXT_PUBLIC_DEMO_ONLY=1 hard-locks demo and hides the toggle. Legacy
-  // `'live'` and `'live-sql'` localStorage values migrate to `'live-bloomreach'`.
+  // the box with no OAuth. live-mcp runs the agents against the env-configured
+  // MCP server (Bloomreach OAuth by default; MCP_AUTH_TYPE + MCP_URL env
+  // override). demo replays the cached snapshot — still reachable via
+  // ?demo=cached URL param or by manually setting `bi:mode=demo` in
+  // localStorage (kept as a reliability path / dev tool / regression evidence),
+  // but no longer in the mode toggle. NEXT_PUBLIC_DEMO_ONLY=1 hard-locks demo
+  // and hides the toggle. Legacy `'live'`, `'live-sql'`, and `'live-bloomreach'`
+  // localStorage values migrate to `'live-mcp'`.
   const forcedDemo = process.env.NEXT_PUBLIC_DEMO_ONLY === '1';
   const [mode, setMode] = useState<BriefingMode>('live-synthetic');
   const [ready, setReady] = useState(false);
@@ -75,9 +76,22 @@ export default function HomePage() {
       try {
         const saved = localStorage.getItem('bi:mode');
         if (saved === 'demo') setMode('demo'); // hidden entry point, still respected
-        else if (saved === 'live-bloomreach') setMode('live-bloomreach');
+        else if (saved === 'live-mcp') setMode('live-mcp');
         else if (saved === 'live-synthetic') setMode('live-synthetic');
-        else if (saved === 'live-sql' || saved === 'live') setMode('live-bloomreach'); // legacy
+        else if (
+          saved === 'live-bloomreach' ||
+          saved === 'live-sql' ||
+          saved === 'live'
+        ) {
+          // Legacy → live-mcp. Also rewrite the stored value so subsequent
+          // reads don't have to re-migrate.
+          setMode('live-mcp');
+          try {
+            localStorage.setItem('bi:mode', 'live-mcp');
+          } catch {
+            /* ignore write failure — just skip the write-through */
+          }
+        }
         // any other value (or null) → default `'live-synthetic'` stays
       } catch {
         /* localStorage blocked — default to live-synthetic */
@@ -177,7 +191,7 @@ export default function HomePage() {
               {(
                 [
                   { value: 'live-synthetic', label: 'live · synthetic' },
-                  { value: 'live-bloomreach', label: 'live · bloomreach' },
+                  { value: 'live-mcp', label: 'live · mcp' },
                 ] as const
               ).map((m) => (
                 <button
@@ -211,7 +225,7 @@ export default function HomePage() {
                 ? 'cached snapshot · instant'
                 : mode === 'live-synthetic'
                   ? 'live agent · synthetic workspace data'
-                  : 'live · real bloomreach workspace data'}
+                  : 'live · real workspace data via mcp'}
             </span>
           </div>
         )}

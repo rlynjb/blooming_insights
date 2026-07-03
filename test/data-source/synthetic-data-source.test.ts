@@ -66,13 +66,15 @@ describe('makeDataSource synthetic mode', () => {
     });
   });
 
-  it('parses only the explicit live-bloomreach mode; everything else defaults to live-synthetic', () => {
-    // Post-Session-A (synthetic-first plan): live-synthetic is the fresh-visitor
-    // default. Explicit 'live-bloomreach' still routes there; unknown / legacy /
-    // null values now land on the synthetic path so a fresh visitor sees the
-    // product working without OAuth.
+  it('parses live-mcp (accepting live-bloomreach as legacy alias); everything else defaults to live-synthetic', () => {
+    // Post-Session-C (synthetic-first plan): live-synthetic is the fresh-visitor
+    // default; live-mcp is the swappable MCP surface. The legacy 'live-bloomreach'
+    // string is accepted and normalized to 'live-mcp' so pre-Session-C
+    // localStorage values / URL params keep working. Unknown / null values land
+    // on the synthetic path so a fresh visitor sees the product without OAuth.
     expect(parseLiveMode('live-synthetic')).toBe('live-synthetic');
-    expect(parseLiveMode('live-bloomreach')).toBe('live-bloomreach');
+    expect(parseLiveMode('live-mcp')).toBe('live-mcp');
+    expect(parseLiveMode('live-bloomreach')).toBe('live-mcp'); // legacy alias
     expect(parseLiveMode('live-sql')).toBe('live-synthetic');
     expect(parseLiveMode(null)).toBe('live-synthetic');
   });

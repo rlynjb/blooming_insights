@@ -77,12 +77,12 @@ vi.mock('../../lib/data-source', async () => {
     ...real,
     makeDataSource: vi.fn(async () => {
       if (!currentConn.ok) {
-        return { ok: false as const, mode: 'live-bloomreach' as const, authUrl: currentConn.authUrl };
+        return { ok: false as const, mode: 'live-mcp' as const, authUrl: currentConn.authUrl };
       }
       const ds = currentConn.mcp as unknown as import('../../lib/data-source').DataSource;
       return {
         ok: true as const,
-        mode: 'live-bloomreach' as const,
+        mode: 'live-mcp' as const,
         dataSource: ds,
         bootstrap: (signal?: AbortSignal) => bootstrapSchema(ds, { signal }),
         dispose: async () => {},

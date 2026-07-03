@@ -157,12 +157,16 @@ export function useInvestigation(id: string | undefined, step: InvestigationStep
         try {
           const saved = typeof window !== 'undefined' ? localStorage.getItem('bi:mode') : null;
           // Match the feed's live mode so investigate/recommend uses the same
-          // data source. Legacy values still migrate to Bloomreach.
+          // data source. Legacy values ('live', 'live-sql', 'live-bloomreach')
+          // migrate to 'live-mcp'.
           const liveMode =
             saved === 'live-synthetic'
               ? 'live-synthetic'
-              : saved === 'live' || saved === 'live-sql' || saved === 'live-bloomreach'
-                ? 'live-bloomreach'
+              : saved === 'live-mcp' ||
+                  saved === 'live' ||
+                  saved === 'live-sql' ||
+                  saved === 'live-bloomreach'
+                ? 'live-mcp'
                 : null;
           if (liveMode) {
             url += '&live=1';

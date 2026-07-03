@@ -6,7 +6,8 @@ provenance (exact tool calls, current-vs-prior numbers, streamed reasoning
 trace). "An analyst that shows its work."
 
 Built on Next.js 16 + React 19 + [`@aptkit/core`](https://npmjs.com/package/@rlynjb/aptkit-core)
-agent runtime + Anthropic Claude Sonnet 4.6 + Bloomreach MCP / in-process
+agent runtime + Anthropic Claude Sonnet 4.6 + a swappable MCP server (Bloomreach
+by default; configurable via `MCP_URL` + `MCP_AUTH_TYPE`) or an in-process
 Synthetic adapter.
 
 ---
@@ -141,20 +142,32 @@ npm run lint
 │  ┌────────▼──────────────────┐         ┌──────────▼───────────────┐  │
 │  │  DataSource port          │         │  Blooming AptKit         │  │
 │  │  (lib/data-source/types)   │         │  adapters                │  │
-│  │  ├─ BloomreachDataSource   │         │  (aptkit-adapters.ts:    │  │
-│  │  ├─ SyntheticDataSource    │         │   3 classes, 206 LOC)    │  │
-│  │  └─ FaultInjecting         │         │  library owns the loop;  │  │
-│  │      (offline decorator)   │         │  we own the boundary     │  │
-│  └───────────────────────────┘         └──────────────────────────┘  │
+│  │  ├─ McpDataSource          │         │  (aptkit-adapters.ts:    │  │
+│  │  │   (BloomreachDataSource │         │   3 classes, 206 LOC)    │  │
+│  │  │    is the alias — same  │         │  library owns the loop;  │  │
+│  │  │    class, either name)  │         │  we own the boundary     │  │
+│  │  ├─ SyntheticDataSource    │         └──────────────────────────┘  │
+│  │  └─ FaultInjecting         │                                        │
+│  │      (offline decorator)   │                                        │
+│  └───────────────────────────┘                                        │
+│                                                                        │
+│  AuthProvider (lib/mcp/auth-providers/)                               │
+│  ├─ oauth-bloomreach (default; OAuth 2.1 + PKCE + DCR)                │
+│  ├─ bearer (static token via MCP_AUTH_TOKEN)                          │
+│  └─ anonymous (no auth; local dev MCP servers)                        │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
+- **Modes**: `live-synthetic` (default, no OAuth), `live-mcp` (env-configured
+  MCP server; Bloomreach is the default example config), and `demo` (hidden
+  from UI toggle but reachable via `?demo=cached` — preserved reliability
+  path). See `.env.example` for `MCP_URL` / `MCP_AUTH_TYPE` / `MCP_AUTH_TOKEN`.
 - **Frozen core**: the AptKit adapter bridge, the 4 active agents (thin
   wrappers), the `AgentEvent` NDJSON contract, the UI, and the demo replay
   path. `*-legacy.ts` siblings (the hand-rolled `runAgentLoop`) remain as
   the rollback receipt.
 - **Data flow**: browser → NDJSON stream ← route → agents → DataSource
-  (Bloomreach / Synthetic / FaultInjecting decorator).
+  (McpDataSource with an AuthProvider / Synthetic / FaultInjecting decorator).
 
 Detailed studies:
 - `.aipe/study-system-design/` — architecture, boundaries, flows
