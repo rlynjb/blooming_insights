@@ -28,13 +28,14 @@ import { RubricJudge } from '@aptkit/core';
 import { describe, expect, it } from 'vitest';
 
 import { DiagnosticAgent } from '../lib/agents/diagnostic';
+import { RecommendationAgent } from '../lib/agents/recommendation';
 import { AnthropicModelProviderAdapter } from '../lib/agents/aptkit-adapters';
 import {
   SyntheticDataSource,
   syntheticWorkspaceSchema,
 } from '../lib/data-source/synthetic-data-source';
 import type { McpToolDef } from '../lib/agents/tool-schemas';
-import type { ToolCall } from '../lib/mcp/types';
+import type { Recommendation, ToolCall } from '../lib/mcp/types';
 
 import {
   goldenAnomaly,
@@ -42,6 +43,7 @@ import {
   caseId,
 } from './goldens/conversion-drop-mobile-checkout';
 import { diagnosisQualityRubric } from './rubrics/diagnosis-quality';
+import { recommendationQualityRubric } from './rubrics/recommendation-quality';
 
 // ─── env ─────────────────────────────────────────────────────────────────────
 
@@ -110,9 +112,9 @@ function formatToolCallTrace(calls: readonly ToolCall[]): string {
 
 // ─── run ─────────────────────────────────────────────────────────────────────
 
-describe('eval: diagnosis quality', () => {
+describe('eval: diagnosis + recommendation quality', () => {
   it(
-    `${caseId}: agent produces a passing diagnosis`,
+    `${caseId}: agent produces a passing diagnosis and passing recommendations`,
     async () => {
       if (!process.env.ANTHROPIC_API_KEY) {
         throw new Error(
@@ -136,7 +138,7 @@ describe('eval: diagnosis quality', () => {
         `[eval] investigating anomaly (metric=${goldenAnomaly.metric}, scope=${goldenAnomaly.scope.join(',')})…`,
       );
       const t0Investigate = performance.now();
-      const agent = new DiagnosticAgent(
+      const diagnosticAgent = new DiagnosticAgent(
         anthropic,
         dataSource,
         schema,
@@ -146,29 +148,29 @@ describe('eval: diagnosis quality', () => {
 
       // Capture every tool call the agent makes. The judge sees this trace as
       // context so it can verify the diagnosis's numbers against ground truth.
-      const toolCallTrace: ToolCall[] = [];
-      const diagnosis = await agent.investigate(goldenAnomaly, {
+      const diagnosisToolCalls: ToolCall[] = [];
+      const diagnosis = await diagnosticAgent.investigate(goldenAnomaly, {
         onToolResult: (tc) => {
           // Push a shallow snapshot so later mutations of the internal
           // ToolCall object (unlikely, but the AptKit trace sink reuses them)
           // don't rewrite the trace.
-          toolCallTrace.push({ ...tc });
+          diagnosisToolCalls.push({ ...tc });
         },
       });
       const investigateMs = Math.round(performance.now() - t0Investigate);
       console.log(
-        `[eval] diagnosis produced in ${investigateMs}ms (${toolCallTrace.length} tool calls)`,
+        `[eval] diagnosis produced in ${investigateMs}ms (${diagnosisToolCalls.length} tool calls)`,
       );
 
-      // ─── 2. judge ───────────────────────────────────────────────────────
-      console.log('[eval] judging diagnosis with RubricJudge…');
-      const t0Judge = performance.now();
+      // ─── 2. judge the diagnosis ─────────────────────────────────────────
+      console.log('[eval] judging diagnosis…');
+      const t0DiagnosisJudge = performance.now();
       const judgeModel = new AnthropicModelProviderAdapter(
         anthropic,
         'diagnostic', // reused: judge log-site labels it as diagnostic-eval
         `eval-${runId}`,
       );
-      const judge = new RubricJudge({
+      const diagnosisJudge = new RubricJudge({
         model: judgeModel,
         rubric: diagnosisQualityRubric,
         capabilityId: 'blooming.eval.diagnosis-judge',
@@ -176,33 +178,99 @@ describe('eval: diagnosis quality', () => {
         temperature: 0,
       });
 
-      const subject = JSON.stringify(diagnosis, null, 2);
-      const traceForJudge = formatToolCallTrace(toolCallTrace);
-
-      const judgmentResult = await judge.judge({
-        subject,
+      const diagnosisJudgmentResult = await diagnosisJudge.judge({
+        subject: JSON.stringify(diagnosis, null, 2),
         context: {
           anomaly: JSON.stringify(goldenAnomaly, null, 2),
           known_correct_shape: JSON.stringify(knownCorrect, null, 2),
-          tool_calls_trace: traceForJudge,
+          tool_calls_trace: formatToolCallTrace(diagnosisToolCalls),
         },
       });
-      const judgeMs = Math.round(performance.now() - t0Judge);
-      console.log(`[eval] judgment produced in ${judgeMs}ms`);
+      const diagnosisJudgeMs = Math.round(performance.now() - t0DiagnosisJudge);
 
-      if (!judgmentResult.ok) {
+      if (!diagnosisJudgmentResult.ok) {
         throw new Error(
-          `RubricJudge failed to produce structured output: ${judgmentResult.error}`,
+          `Diagnosis RubricJudge failed to produce structured output: ${diagnosisJudgmentResult.error}`,
         );
       }
+      console.log(
+        `[eval] diagnosis judgment produced in ${diagnosisJudgeMs}ms · verdict: ${diagnosisJudgmentResult.value.verdict}`,
+      );
 
-      // ─── 3. receipt ─────────────────────────────────────────────────────
+      // ─── 3. propose recommendations ─────────────────────────────────────
+      console.log('[eval] proposing recommendations…');
+      const t0Recommend = performance.now();
+      const recommendationAgent = new RecommendationAgent(
+        anthropic,
+        dataSource,
+        schema,
+        allTools,
+        `eval-${runId}`,
+      );
+      const recommendationToolCalls: ToolCall[] = [];
+      const recommendations: Recommendation[] = await recommendationAgent.propose(
+        goldenAnomaly,
+        diagnosis,
+        {
+          onToolResult: (tc) => {
+            recommendationToolCalls.push({ ...tc });
+          },
+        },
+      );
+      const recommendMs = Math.round(performance.now() - t0Recommend);
+      console.log(
+        `[eval] ${recommendations.length} recommendation${recommendations.length === 1 ? '' : 's'} produced in ${recommendMs}ms (${recommendationToolCalls.length} tool calls)`,
+      );
+
+      // ─── 4. judge each recommendation ───────────────────────────────────
+      console.log('[eval] judging recommendations…');
+      const t0RecommendJudge = performance.now();
+      const recommendationJudge = new RubricJudge({
+        model: judgeModel,
+        rubric: recommendationQualityRubric,
+        capabilityId: 'blooming.eval.recommendation-judge',
+        maxTokens: 2048,
+        temperature: 0,
+      });
+
+      const recommendationTraceForJudge = formatToolCallTrace(recommendationToolCalls);
+      const recommendationJudgments = [];
+      for (let i = 0; i < recommendations.length; i++) {
+        const rec = recommendations[i];
+        const judgmentResult = await recommendationJudge.judge({
+          subject: JSON.stringify(rec, null, 2),
+          context: {
+            anomaly: JSON.stringify(goldenAnomaly, null, 2),
+            diagnosis: JSON.stringify(diagnosis, null, 2),
+            tool_calls_trace: recommendationTraceForJudge,
+          },
+        });
+        if (!judgmentResult.ok) {
+          throw new Error(
+            `Recommendation RubricJudge failed on rec ${i + 1}: ${judgmentResult.error}`,
+          );
+        }
+        recommendationJudgments.push({
+          recommendationId: rec.id,
+          recommendationTitle: rec.title,
+          judgment: judgmentResult.value,
+          attempts: judgmentResult.attempts.length,
+        });
+        console.log(
+          `[eval] rec ${i + 1}/${recommendations.length} (${rec.bloomreachFeature}) · verdict: ${judgmentResult.value.verdict}`,
+        );
+      }
+      const recommendationJudgeMs = Math.round(performance.now() - t0RecommendJudge);
+
+      // ─── 5. receipt ─────────────────────────────────────────────────────
       const receipt = {
         case: caseId,
         runId,
         durationMs: {
           investigate: investigateMs,
-          judge: judgeMs,
+          diagnosisJudge: diagnosisJudgeMs,
+          recommend: recommendMs,
+          recommendationJudge: recommendationJudgeMs,
           total: Math.round(performance.now() - startedAt),
         },
         model: {
@@ -215,20 +283,29 @@ describe('eval: diagnosis quality', () => {
           change: goldenAnomaly.change,
           severity: goldenAnomaly.severity,
         },
-        toolCallTrace: toolCallTrace.map((tc) => ({
+        diagnosisToolCalls: diagnosisToolCalls.map((tc) => ({
           toolName: tc.toolName,
           args: tc.args,
           durationMs: tc.durationMs,
           hasError: Boolean(tc.error),
         })),
-        toolCallCount: toolCallTrace.length,
+        recommendationToolCalls: recommendationToolCalls.map((tc) => ({
+          toolName: tc.toolName,
+          args: tc.args,
+          durationMs: tc.durationMs,
+          hasError: Boolean(tc.error),
+        })),
         diagnosis,
-        judgment: judgmentResult.value,
-        judgeAttempts: judgmentResult.attempts.length,
+        diagnosisJudgment: diagnosisJudgmentResult.value,
+        diagnosisJudgeAttempts: diagnosisJudgmentResult.attempts.length,
+        recommendations,
+        recommendationJudgments,
       };
 
-      console.log('\n[eval] ─── receipt ───────────────────────────────────────');
-      console.log(JSON.stringify(receipt.judgment, null, 2));
+      console.log('\n[eval] ─── receipt: diagnosis judgment ───────────────────');
+      console.log(JSON.stringify(receipt.diagnosisJudgment, null, 2));
+      console.log('\n[eval] ─── receipt: recommendation judgments ─────────────');
+      console.log(JSON.stringify(receipt.recommendationJudgments, null, 2));
       console.log('[eval] ────────────────────────────────────────────────────\n');
 
       const outDir = resolve(dirname(fileURLToPath(import.meta.url)), 'receipts');
@@ -236,12 +313,21 @@ describe('eval: diagnosis quality', () => {
       const outPath = resolve(outDir, `${caseId}-${runId}.json`);
       writeFileSync(outPath, JSON.stringify(receipt, null, 2) + '\n', 'utf8');
       console.log(`[eval] receipt written to ${outPath}`);
-      console.log(`[eval] verdict: ${receipt.judgment.verdict}`);
+      console.log(`[eval] diagnosis verdict: ${receipt.diagnosisJudgment.verdict}`);
+      for (const rj of receipt.recommendationJudgments) {
+        console.log(`[eval] rec "${rj.recommendationTitle}" verdict: ${rj.judgment.verdict}`);
+      }
 
-      // Week-1 gate: the diagnosis must not FAIL. `pass` and `pass_with_notes`
-      // are both acceptable; `fail` means the substrate or the prompt broke.
-      expect(receipt.judgment.verdict).not.toBe('fail');
+      // Gate: no verdict may be FAIL. `pass` and `pass_with_notes` are both
+      // acceptable. `fail` on the diagnosis means the substrate or the prompt
+      // broke; `fail` on any recommendation means the same for that step.
+      expect(receipt.diagnosisJudgment.verdict).not.toBe('fail');
+      for (const rj of receipt.recommendationJudgments) {
+        expect(rj.judgment.verdict, `recommendation "${rj.recommendationTitle}"`).not.toBe(
+          'fail',
+        );
+      }
     },
-    300_000, // 5-minute timeout — one diagnostic run + one judge call
+    600_000, // 10-minute timeout — diagnosis + recommendation + 2 judge phases
   );
 });
