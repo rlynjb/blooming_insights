@@ -1,21 +1,27 @@
 // lib/data-source/fault-injecting.ts
 //
 // Phase-4 fault-injection DataSource decorator. Wraps any concrete
-// DataSource (Bloomreach or Synthetic) and forces failures at
+// DataSource — the MCP client (McpDataSource, Bloomreach preset by
+// default) or the Synthetic in-process adapter — and forces failures at
 // configurable rates. Used offline (load harness, tests) to exercise
 // the agents' graceful degradation paths — the same paths that fire
-// against real Bloomreach when the alpha server times out or 429s.
+// against any live MCP server when it times out or 429s.
 //
-// The seam has already survived two adapter swaps (Olist added, Olist
-// removed, Synthetic added, all without a caller-surface change). The
-// fault injector is a third — offline decoration rather than a swap.
+// The seam has now shipped in FIVE uses without a caller-surface change:
+// Olist added, Olist removed, Synthetic added, this fault decorator, and
+// the McpDataSource / AuthProvider generalization (Session B of the
+// synthetic-first plan). This file is use #4 — the offline decoration
+// use — and its stability across all five is what makes the tier-2
+// graceful-degradation receipt (9 injected faults / 3 investigations /
+// 0 failed) defensible.
 //
 // Failure modes cover what the tier-2 story defends against:
 //   · timeout          — delays past the transport's 30s TOOL_TIMEOUT_MS,
 //                          or throws HTTP-0 style timeout error inline
-//   · rate_limit       — 429 error carrying a retry-after hint (the
-//                          BloomreachDataSource retry ladder shape)
-//   · server_error     — 500 error mimicking Bloomreach's error envelope
+//   · rate_limit       — 429 error carrying a retry-after hint. The
+//                          McpDataSource retry ladder handles it exactly
+//                          the way it handles a live server's 429.
+//   · server_error     — 500 error mimicking a stock HTTP error envelope
 //   · malformed_json   — returns a ToolResult with garbled content that
 //                          the agent's downstream JSON parse will reject
 //
@@ -54,7 +60,7 @@ export type FaultInjectorOptions = {
 /**
  * Wraps a DataSource so a configurable fraction of calls fail in known
  * ways. Preserves the DataSource interface exactly — the underlying
- * adapter (Bloomreach, Synthetic) is untouched.
+ * adapter (any MCP client, Synthetic, or a nested decorator) is untouched.
  */
 export class FaultInjectingDataSource implements DataSource {
   private callIndex = 0;
@@ -119,7 +125,10 @@ export class FaultInjectingDataSource implements DataSource {
 
   private fireRateLimit(toolName: string): never {
     this.options.onFault?.({ kind: 'rate_limit', toolName, callIndex: this.callIndex });
-    // Shape mimics BloomreachDataSource retry ladder trigger.
+    // Shape mimics an HTTP 429 with a retry-after hint — what any rate-
+    // limited MCP server returns and what the McpDataSource retry ladder
+    // (in bloomreach-data-source.ts, the alias source of truth) already
+    // handles for the Bloomreach preset.
     const err = new Error(`Rate limited: please retry after 2000ms`, {
       cause: new Error('injected fault: rate_limit'),
     });
