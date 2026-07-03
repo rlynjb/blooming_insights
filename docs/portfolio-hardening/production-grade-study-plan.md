@@ -313,12 +313,66 @@ Phase 6 ops hygiene).
       `create-next-app` boilerplate README with the tier-2 claims;
       one-command reproducibility (`eval`, `load`, `report`).
 
-### Reading (add as sessions approach)
+### Required reading
 
-- `.aipe/study-ai-engineering/05-evals-and-observability/04-llm-observability.md`
-  — already listed in Week 3; re-read for the replay + regression-gate
-  half.
-- `.aipe/study-performance-engineering/02-rate-limit-retry-ladder.md` —
-  informs the fault-injection decorator's error-shape choices.
-- `.aipe/study-testing/` — the whole folder, for the CI + regression
-  gate framing (baseline vs candidate = regression eval).
+**1. Load harness — pacing, distribution, and honest p99**
+`.aipe/study-performance-engineering/`:
+
+- [ ] `02-rate-limit-retry-ladder.md` — informs both the load harness's
+      pacing choice (don't hammer, don't sandbag) and the fault
+      decorator's 429/backoff simulation
+- [ ] `03-per-call-timeout-ceiling.md` — the 30s per-call timeout in
+      `lib/mcp/transport.ts:38` is the ceiling the fault decorator
+      forces to fire; understanding when it fires and what happens
+      after informs the decorator's error-shape choices
+
+**2. Fault injection — what to simulate**
+`.aipe/study-distributed-systems/`:
+
+- [ ] `02-partial-failure-timeouts-and-retries.md` — canonical failure
+      shapes (timeout / partial response / 500 / 429 / malformed
+      body); the decorator's menu of injections
+- [ ] `03-idempotency-deduplication-and-delivery-semantics.md` — why
+      the retry ladder is safe without idempotency keys in this repo
+      (informs what NOT to simulate — no duplicate-write bugs to
+      catch, so the decorator focuses on read-side failure modes)
+
+**3. Regression gate — baseline-vs-candidate methodology**
+`.aipe/study-ai-engineering/05-evals-and-observability/`:
+
+- [ ] `02-eval-methods.md` — rubric-driven vs pass-rate vs replay-diff
+      methods; the plan's regression gate uses per-criterion pass-rate
+      drop as the block signal
+
+**4. CI + testing (Phase 6)**
+`.aipe/study-testing/`:
+
+- [ ] `06-scripted-ndjson-integration-harness.md` — the pattern that
+      would extend to CI eval-run harness (a scripted 1-case eval as
+      a PR check without paying the full 10-case cost per PR)
+- [ ] `audit.md` — the 7-lens audit; informs which tests to run in CI
+      vs at merge vs at deploy
+
+### Optional — interview framing
+
+- [ ] `.aipe/rehearse-interview-defense/04-the-scale-story.md` — three
+      scale scenarios and what breaks first at 10x. Phase 4 (load) is
+      what arms this defense.
+- [ ] `.aipe/rehearse-interview-defense/05-the-failure-story.md` —
+      failure surfaces + graceful degradation. Phase 4 (fault) is
+      what arms this defense.
+
+### Live decisions this reading unblocks
+
+- **Load harness N + pacing** — how many investigations, at what rate?
+  The plan says "sustained ~1 req/s" but that's the *provider* rate.
+  Investigations take 200-250s; issuing one every 15s gives ~15
+  in-flight at steady state. Higher = more backpressure signal, lower
+  = friendlier to your API budget. Reading informs the right envelope.
+- **Fault-injection distribution** — what fraction of calls should
+  fail? 100% is not-a-test, 5% is realistic. The decorator's default
+  distribution shape (per-error-type independent probability vs.
+  correlated bursts) informs how faithful the test is.
+- **Regression gate threshold** — how much pass-rate drop blocks the
+  PR? Absolute (any dim drops ≥1 point) vs. proportional (≥10%
+  relative drop). Reading has the tradeoff.
