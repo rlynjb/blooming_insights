@@ -19,6 +19,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import { estimateAnthropicCost } from '../lib/agents/pricing';
 
 const RECEIPTS_DIR = resolve(dirname(fileURLToPath(import.meta.url)), 'receipts');
 
@@ -103,26 +104,30 @@ describe.skipIf(!shouldRun)('eval observability · latency + cost report', () =>
     let totalCost = 0;
     let totalIn = 0;
     let totalOut = 0;
-    let missingCost = 0;
+    let backfilledCost = 0;
     for (const r of receipts) {
       const d = r.usage?.diagnose;
       const rr = r.usage?.recommend;
-      const dCost = d?.costUsd ?? 0;
-      const rCost = rr?.costUsd ?? 0;
-      if (d?.costUsd == null && d != null) missingCost++;
-      if (rr?.costUsd == null && rr != null) missingCost++;
+      // Backfill cost from tokens when the receipt has null costUsd
+      // (older receipts written before the Blooming pricing helper).
+      const dCost = d?.costUsd ?? backfillCost(d);
+      const rCost = rr?.costUsd ?? backfillCost(rr);
+      if (d?.costUsd == null && dCost > 0) backfilledCost++;
+      if (rr?.costUsd == null && rCost > 0) backfilledCost++;
       totalCost += dCost + rCost;
       totalIn += (d?.inputTokens ?? 0) + (rr?.inputTokens ?? 0);
       totalOut += (d?.outputTokens ?? 0) + (rr?.outputTokens ?? 0);
       console.error(
-        `  ${r.case.padEnd(40)}  ${String(d?.inputTokens ?? '—').padStart(6)}  ${String(d?.outputTokens ?? '—').padStart(6)}  ${dollars(d?.costUsd)}  ${String(rr?.inputTokens ?? '—').padStart(6)}  ${String(rr?.outputTokens ?? '—').padStart(6)}  ${dollars(rr?.costUsd)}`,
+        `  ${r.case.padEnd(40)}  ${String(d?.inputTokens ?? '—').padStart(6)}  ${String(d?.outputTokens ?? '—').padStart(6)}  ${dollars(dCost)}  ${String(rr?.inputTokens ?? '—').padStart(6)}  ${String(rr?.outputTokens ?? '—').padStart(6)}  ${dollars(rCost)}`,
       );
     }
     console.error(
       `\n  Totals:  input ${totalIn.toLocaleString()}  output ${totalOut.toLocaleString()}  cost $${totalCost.toFixed(3)}`,
     );
-    if (missingCost > 0) {
-      console.error(`  Note: ${missingCost} row(s) had null costUsd (usage present but pricing lookup returned undefined)`);
+    if (backfilledCost > 0) {
+      console.error(
+        `  Note: ${backfilledCost} row(s) had null costUsd in the receipt (older run) — backfilled from tokens using Blooming's Anthropic pricing helper.`,
+      );
     }
     if (receipts.some((r) => !r.usage)) {
       const legacy = receipts.filter((r) => !r.usage).map((r) => r.case);
@@ -176,6 +181,21 @@ function percentiles(arr: readonly number[]): {
 function dollars(n: number | null | undefined): string {
   if (n == null) return '     —'.padStart(6);
   return `$${n.toFixed(3)}`.padStart(6);
+}
+
+/**
+ * Backfill Anthropic cost from token counts on receipts that predate the
+ * Blooming pricing helper. Assumes the run used claude-sonnet-4-6 (the
+ * documented agent + judge model in Sessions A-C). Returns 0 if the row
+ * is missing.
+ */
+function backfillCost(row: UsageRow | undefined): number {
+  if (!row) return 0;
+  const est = estimateAnthropicCost(
+    { inputTokens: row.inputTokens, outputTokens: row.outputTokens },
+    row.modelName ?? 'claude-sonnet-4-6',
+  );
+  return est?.totalCost ?? 0;
 }
 
 function pickRunId(fromEnv: string | undefined): string {

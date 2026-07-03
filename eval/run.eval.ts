@@ -34,6 +34,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { DiagnosticAgent } from '../lib/agents/diagnostic';
 import { RecommendationAgent } from '../lib/agents/recommendation';
 import { AnthropicModelProviderAdapter } from '../lib/agents/aptkit-adapters';
+import { estimateAnthropicCost } from '../lib/agents/pricing';
 import {
   SyntheticDataSource,
   syntheticWorkspaceSchema,
@@ -201,7 +202,11 @@ describe('eval · Week 2C — 10 goldens · diagnosis + recommendation quality',
       });
       const investigateMs = Math.round(performance.now() - t0Investigate);
       const diagnosisUsage = summarizeUsage(diagnosisTrace);
-      const diagnosisCost = estimateCost('anthropic', diagnosisUsage, 'claude-sonnet-4-6');
+      // aptkit's estimateCost only knows OpenAI pricing; fall back to
+      // Blooming's Anthropic pricing helper for our claude-* models.
+      const diagnosisCost =
+        estimateCost('anthropic', diagnosisUsage, 'claude-sonnet-4-6') ??
+        estimateAnthropicCost(diagnosisUsage, 'claude-sonnet-4-6');
 
       // ─── judge diagnosis ──────────────────────────────────────────────
       const t0DiagnosisJudge = performance.now();
@@ -252,7 +257,9 @@ describe('eval · Week 2C — 10 goldens · diagnosis + recommendation quality',
       );
       const recommendMs = Math.round(performance.now() - t0Recommend);
       const recommendUsage = summarizeUsage(recommendationTrace);
-      const recommendCost = estimateCost('anthropic', recommendUsage, 'claude-sonnet-4-6');
+      const recommendCost =
+        estimateCost('anthropic', recommendUsage, 'claude-sonnet-4-6') ??
+        estimateAnthropicCost(recommendUsage, 'claude-sonnet-4-6');
 
       // ─── judge each recommendation ────────────────────────────────────
       const t0RecommendJudge = performance.now();
