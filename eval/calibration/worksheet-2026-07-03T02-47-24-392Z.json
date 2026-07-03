@@ -1,0 +1,1276 @@
+{
+  "runId": "2026-07-03T02-47-24-392Z",
+  "generatedAt": "2026-07-03T03:44:23.061Z",
+  "instructions": {
+    "howTo": "Read each case's anomaly + diagnosis. Score each of the 4 dimensions 1–5 using the rubric below. Then pick a verdict (pass / pass_with_notes / fail). DO NOT peek at the receipt JSON in eval/receipts/ — the judge's scores are only revealed AFTER you submit. Save the file when done. Then run `npm run eval:agreement` to compute judge-vs-you agreement.",
+    "expectedTime": "~30–60 minutes for 10 cases",
+    "verdicts": [
+      "pass",
+      "pass_with_notes",
+      "fail"
+    ],
+    "dimensionScoreScale": "1 = worst, 5 = best — see rubric.dimensions[*].scale",
+    "judgeErrorNote": "Some cases have judgeHasOutput = false, which means the judge model failed to produce parseable JSON. Score them anyway — your labels are useful once we re-run with a larger max_tokens."
+  },
+  "rubric": {
+    "id": "blooming-diagnosis-quality-v1",
+    "title": "Diagnosis quality",
+    "task": "Judge a diagnosis produced by an AI analyst investigating an ecommerce anomaly.\nThe diagnosis will be JSON with these fields: conclusion (one-sentence root cause),\nevidence (bullet list of what supported the conclusion), hypothesesConsidered (each\nwith hypothesis + supported flag + reasoning), and optional affectedCustomers and\nconfidence. Score on the four dimensions below.",
+    "dimensions": [
+      {
+        "id": "root_cause_plausibility",
+        "label": "Root-cause plausibility",
+        "description": "Does the conclusion name a plausible mechanism (not just a symptom restatement)? A conclusion that says \"conversion dropped because conversion dropped\" is a 1. A conclusion that names a specific mechanism supported by the evidence is a 5.",
+        "scale": [
+          {
+            "score": 1,
+            "description": "Restates the symptom; no mechanism named."
+          },
+          {
+            "score": 2,
+            "description": "Vague mechanism, no evidence link."
+          },
+          {
+            "score": 3,
+            "description": "Plausible mechanism, weakly evidenced."
+          },
+          {
+            "score": 4,
+            "description": "Specific mechanism, evidence supports it."
+          },
+          {
+            "score": 5,
+            "description": "Specific mechanism, evidence directly supports it, and rival mechanisms are considered."
+          }
+        ]
+      },
+      {
+        "id": "evidence_grounding",
+        "label": "Evidence grounding",
+        "description": "Does the diagnosis cite the actual signals the substrate exposed? Bonus if it names the co-occurring signals (e.g. the payment_failure spike alongside the conversion drop). Penalty for invented numbers or claims not derivable from the tool results.",
+        "scale": [
+          {
+            "score": 1,
+            "description": "Numbers or claims that contradict the evidence."
+          },
+          {
+            "score": 2,
+            "description": "Vague evidence references; no specific numbers cited."
+          },
+          {
+            "score": 3,
+            "description": "Cites at least one specific number from the evidence."
+          },
+          {
+            "score": 4,
+            "description": "Cites multiple specific signals; notes at least one co-occurring signal."
+          },
+          {
+            "score": 5,
+            "description": "Cites the primary and co-occurring signals; every claim is traceable to a tool result."
+          }
+        ]
+      },
+      {
+        "id": "scope_coherence",
+        "label": "Scope coherence",
+        "description": "Does the diagnosis stay within the anomaly's scope (mobile, checkout, SP)? Extrapolations to segments the scan did not cover (desktop, other countries) are incoherent.",
+        "scale": [
+          {
+            "score": 1,
+            "description": "Diagnosis is about a different scope entirely."
+          },
+          {
+            "score": 2,
+            "description": "Mixes in-scope and out-of-scope claims."
+          },
+          {
+            "score": 3,
+            "description": "Stays in scope but does not fully use scope-specific detail."
+          },
+          {
+            "score": 4,
+            "description": "Uses the specific scope (e.g. mobile/checkout/SP) in the conclusion."
+          },
+          {
+            "score": 5,
+            "description": "Uses the specific scope AND explicitly rules out out-of-scope hypotheses."
+          }
+        ]
+      },
+      {
+        "id": "actionable_next_step",
+        "label": "Actionable next step",
+        "description": "Would a marketer / analyst reading this know what to do next? \"Investigate mobile checkout\" is unhelpful (that's what the diagnosis IS). \"Check payment processor logs for credit_card mobile SP over the last 7 days\" is actionable.",
+        "scale": [
+          {
+            "score": 1,
+            "description": "No next step, or the next step is to redo the diagnosis."
+          },
+          {
+            "score": 2,
+            "description": "Vague next step (\"investigate further\")."
+          },
+          {
+            "score": 3,
+            "description": "Named next step, but no specifics."
+          },
+          {
+            "score": 4,
+            "description": "Specific next step with a scope."
+          },
+          {
+            "score": 5,
+            "description": "Specific next step, scoped, with a named tool/query to run."
+          }
+        ]
+      }
+    ],
+    "verdicts": [
+      {
+        "verdict": "pass",
+        "description": "All four dimensions at ≥4. The diagnosis names a plausible root cause, cites evidence, stays in scope, and hands off an actionable next step."
+      },
+      {
+        "verdict": "pass_with_notes",
+        "description": "Overall usable but one or more dimensions at 3. The `fix` field should name the weakest dimension."
+      },
+      {
+        "verdict": "fail",
+        "description": "Any dimension at ≤2. The diagnosis is not usable as-is."
+      }
+    ],
+    "checks": [
+      "cites at least one number from the tool results",
+      "stays within the anomaly scope",
+      "names at least one specific action",
+      "does not invent numbers not present in the evidence"
+    ]
+  },
+  "cases": [
+    {
+      "caseId": "01-conversion-drop-mobile-checkout",
+      "signalClass": "has-signal",
+      "intent": "The canonical happy path — clear anomaly, substrate has co-occurring payment_failure signal, agent should name payment processor as the primary mechanism and stay in mobile/checkout/SP scope.",
+      "anomaly": {
+        "metric": "conversion_rate",
+        "scope": [
+          "mobile",
+          "checkout",
+          "SP"
+        ],
+        "change": {
+          "value": 18.4,
+          "direction": "down",
+          "baseline": "prior_7d (0.038 → 0.031)"
+        },
+        "severity": "critical"
+      },
+      "diagnosis": {
+        "conclusion": "The 18.4% mobile checkout conversion drop in SP is primarily driven by a 31.2% surge in credit-card payment failures on mobile, compounded by a paused checkout-recovery scenario that is no longer recapturing abandoned sessions. Payment failure rate rose from 0.035 to 0.046 (flagged as a fraud-pattern spike scoped to credit_card + mobile). SP checkout completions fell 24% while other states are near-flat (RJ: -5.2%, MG: +2.1%), confirming the issue is SP-specific. The checkout-recovery automation (email + in-app) is currently paused, removing the safety net that would have converted some payment-failed sessions back to purchases. A running checkout CTA copy experiment (exp-checkout-copy) cannot be ruled out as a contributing factor but returned no variant-level conversion data to confirm or deny.",
+        "evidence": [
+          "Payment failure rate rose 31.2% (0.035 → 0.046) scoped specifically to credit_card + mobile, affecting 1,180 customers and $18,900 in estimated lost revenue — the same device/scope as the conversion anomaly.",
+          "SP mobile checkout completions dropped 24% (2,210 → 1,680) vs only -5.2% in RJ and +2.1% in MG, confirming SP-geographic specificity and ruling out a platform-wide funnel break.",
+          "Funnel data shows the checkout-to-purchase conversion is the sharpest bottleneck (18,640 checkouts → 4,920 purchases = 26.4% step rate), which is where payment failures directly block completion.",
+          "Checkout recovery scenario (scn-checkout-recovery, trigger: checkout without purchase for 2 hours, channel: email + in-app) is currently PAUSED, meaning failed-payment sessions are not being re-engaged.",
+          "Conversion rate history [0.041, 0.040, 0.039, 0.039, 0.038, 0.038, 0.037, 0.036, 0.035, 0.034, 0.032, 0.031] shows a gradual multi-week decline with steepest acceleration in the current 7d window, consistent with a worsening payment failure rate.",
+          "A running experiment 'Checkout CTA copy test' (exp-checkout-copy) was identified as active; variant-level conversion data was not returned, so its contribution is inconclusive but cannot be excluded."
+        ],
+        "hypothesesConsidered": [
+          {
+            "hypothesis": "Payment infrastructure/fraud failure on credit card + mobile in SP is causing purchases to drop at the final checkout step.",
+            "supported": true,
+            "reasoning": "Payment failure rate rose 31.2% (0.035 → 0.046), explicitly scoped to credit_card + mobile. SP checkout completions fell 24% vs near-flat in other states. The fraud category flag and mobile+credit_card specificity strongly suggest a localized payment processor or card-network issue in SP, possibly compounded by a fraud spike. The checkout-to-purchase funnel step (26.4%) is directly exposed to this failure mode. This hypothesis is most consistent with all observed data."
+          },
+          {
+            "hypothesis": "The running Checkout CTA copy experiment (exp-checkout-copy) is degrading conversion for the treatment variant on mobile in SP.",
+            "supported": false,
+            "reasoning": "The experiment is confirmed running but no variant-level conversion data was returned to show a treatment vs control gap. Additionally, the pattern — rising payment failures flagged as fraud-scope — is not consistent with a UX copy change, which would affect cart-to-checkout rather than checkout-to-purchase. This hypothesis cannot be fully ruled out but is not the primary driver."
+          },
+          {
+            "hypothesis": "Lower-quality or mis-targeted traffic is inflating the mobile SP funnel with low-intent sessions, diluting conversion.",
+            "supported": false,
+            "reasoning": "The funnel shows views (100k) and carts (34.2k, 34.2%) are holding at normal rates; only the checkout-to-purchase step is severely compressed. A traffic quality problem would cause drop-off earlier (view-to-cart or cart-to-checkout). The SP-specific payment failure spike and the fraud categorization better explain a late-funnel drop. Traffic quality degradation is ruled out as the primary cause."
+          }
+        ],
+        "affectedCustomers": {
+          "count": 9340,
+          "segmentDescription": "Mobile users in São Paulo (SP) state who initiated checkout in the trailing 7 days; a subset of 1,180 experienced explicit credit-card payment failures. The checkout recovery scenario for these abandoned sessions is currently paused."
+        },
+        "timeSeries": [
+          {
+            "day": "w-11",
+            "value": 0.041
+          },
+          {
+            "day": "w-10",
+            "value": 0.04
+          },
+          {
+            "day": "w-9",
+            "value": 0.039
+          },
+          {
+            "day": "w-8",
+            "value": 0.039
+          },
+          {
+            "day": "w-7",
+            "value": 0.038
+          },
+          {
+            "day": "w-6",
+            "value": 0.038
+          },
+          {
+            "day": "w-5",
+            "value": 0.037
+          },
+          {
+            "day": "w-4",
+            "value": 0.036
+          },
+          {
+            "day": "w-3",
+            "value": 0.035
+          },
+          {
+            "day": "w-2",
+            "value": 0.034
+          },
+          {
+            "day": "w-1",
+            "value": 0.032
+          },
+          {
+            "day": "w-0",
+            "value": 0.031
+          }
+        ],
+        "confidence": "high"
+      },
+      "judgeHasOutput": true,
+      "yourScores": {
+        "root_cause_plausibility": {
+          "score": null,
+          "note": ""
+        },
+        "evidence_grounding": {
+          "score": null,
+          "note": ""
+        },
+        "scope_coherence": {
+          "score": null,
+          "note": ""
+        },
+        "actionable_next_step": {
+          "score": null,
+          "note": ""
+        }
+      },
+      "yourVerdict": {
+        "verdict": null,
+        "note": ""
+      }
+    },
+    {
+      "caseId": "02-fraud-payment-failure-credit-card",
+      "signalClass": "has-signal",
+      "intent": "Cross-mechanism disambiguation: the anomaly is tagged `fraud` but the scale + co-occurrence pattern suggests infrastructure failure. Strong diagnosis considers both and reasons about which fits the evidence.",
+      "anomaly": {
+        "metric": "payment_failure_rate",
+        "scope": [
+          "credit_card",
+          "mobile"
+        ],
+        "change": {
+          "value": 31.2,
+          "direction": "up",
+          "baseline": "prior_7d (0.035 → 0.046)"
+        },
+        "severity": "critical"
+      },
+      "diagnosis": {
+        "conclusion": "A genuine surge in mobile credit-card payment failures is occurring, concentrated in São Paulo (SP), driving a 31.2% rise in failure rate (0.035 → 0.046) over the trailing 7 days. The pattern is most consistent with a payment-processor or card-network issue affecting SP mobile sessions, compounded by a broader 18.4% mobile checkout conversion drop. Fraud is listed as the category but the geographic concentration and lack of strong fraud-signal data make a processor/issuer-side technical failure the more likely root cause. 4,820 customers are at elevated churn risk, including high-LTV platinum and gold tier customers.",
+        "evidence": [
+          "Payment failure rate rose 31.2% (0.035 → 0.046), producing 1,180 failures and ~$18.9K estimated lost revenue in the current 7-day window.",
+          "SP state showed the largest absolute failure volume (1,680 current vs 2,210 prior), though the -24% change in SP suggests SP failures are actually declining — meaning the net rise is driven by non-SP regions catching up or a data dimension mismatch in the segmentation query.",
+          "An 18.4% mobile checkout conversion drop (0.038 → 0.031) co-occurs, affecting 9,340 customers and $42.6K additional lost revenue, indicating the payment failure issue is part of a broader mobile checkout degradation.",
+          "Churn risk model returns an average score of 0.41 with 4,820 high-risk customers; top drivers are payment_failure, checkout_without_purchase, and low_recent_engagement — directly linking payment failures to downstream churn risk.",
+          "Two sample affected customers include a platinum-tier customer (LTV $1,840, churn risk 0.81) in SP and a gold-tier customer (LTV $1,260, churn risk 0.67) in RJ, indicating high-value customers are being impacted.",
+          "A 'Mobile checkout recovery' email campaign exists but is in draft status (0% open/click/conversion), meaning no remediation has been deployed to affected customers yet.",
+          "A running experiment 'Checkout CTA copy test' (exp-checkout-copy) is active and could be contributing to or masking the conversion drop.",
+          "The failure_reason breakdown was not returned by Query 2 (result came back segmented by state instead), leaving specific failure reasons (e.g., declined, timeout, fraud block) unconfirmed."
+        ],
+        "hypothesesConsidered": [
+          {
+            "hypothesis": "Fraud spike causing elevated card declines on mobile",
+            "supported": false,
+            "reasoning": "The anomaly is categorized as 'fraud', but the churn model drivers (payment_failure, checkout_without_purchase, low_recent_engagement) are behavioral rather than fraud-specific signals. No fraud-specific failure reason data was returned. The geographic concentration in SP and broad mobile conversion drop suggest a systemic issue rather than targeted fraud."
+          },
+          {
+            "hypothesis": "Payment processor or card-network technical issue on mobile",
+            "supported": true,
+            "reasoning": "The 31.2% failure rate increase coincides with an 18.4% conversion drop specifically on mobile checkout in SP. The co-occurrence of both metrics degrading simultaneously on the same channel/region combination points to an upstream technical failure (processor timeout, 3DS authentication issue, or issuer-side mobile rejection rule) rather than fraud or product changes alone."
+          },
+          {
+            "hypothesis": "Running A/B experiment (exp-checkout-copy) causing increased failures",
+            "supported": false,
+            "reasoning": "A CTA copy test is unlikely to directly cause payment processor failures. It could contribute to conversion rate changes but not to hard payment failure rate increases at the processor level."
+          },
+          {
+            "hypothesis": "Mobile UX or checkout flow regression causing user-side failures",
+            "supported": false,
+            "reasoning": "A UX regression would more likely affect all payment types, not specifically credit cards. The failure rate increase is scoped to credit_card + mobile specifically, making a general UX regression less likely as the sole cause."
+          },
+          {
+            "hypothesis": "Geographic concentration (SP) driving the anomaly",
+            "supported": false,
+            "reasoning": "Query 2 shows SP failures actually declined 24% vs prior period, while RJ fell 5.2% and MG rose 2.1%. The segmentation query returned state-level data but the net failure count increased overall, suggesting the rise is broad rather than SP-specific, or there is a segment definition mismatch between queries."
+          }
+        ],
+        "confidence": "high"
+      },
+      "judgeHasOutput": true,
+      "yourScores": {
+        "root_cause_plausibility": {
+          "score": null,
+          "note": ""
+        },
+        "evidence_grounding": {
+          "score": null,
+          "note": ""
+        },
+        "scope_coherence": {
+          "score": null,
+          "note": ""
+        },
+        "actionable_next_step": {
+          "score": null,
+          "note": ""
+        }
+      },
+      "yourVerdict": {
+        "verdict": null,
+        "note": ""
+      }
+    },
+    {
+      "caseId": "03-session-drop-organic-mobile",
+      "signalClass": "has-signal",
+      "intent": "Top-of-funnel anomaly. Agent must not conflate with the checkout-conversion story from case 1; scope is broader (mobile, no state filter, organic-specific).",
+      "anomaly": {
+        "metric": "session_start_count",
+        "scope": [
+          "mobile",
+          "organic"
+        ],
+        "change": {
+          "value": 22.7,
+          "direction": "down",
+          "baseline": "prior_7d (198,400 → 153,400 sessions)"
+        },
+        "severity": "warning"
+      },
+      "diagnosis": {
+        "conclusion": "The 22.7% drop in mobile organic sessions is primarily driven by a concentrated collapse in the São Paulo (SP) state segment (–24% WoW), compounded by a paused 'Checkout recovery sequence' automation that has disrupted re-engagement loops for mobile organic visitors. Elevated payment failure rates (+31.2%) on mobile credit cards have further degraded the SP mobile experience, likely suppressing return organic visits from users who encountered friction. The combination of a broken re-engagement scenario and rising payment friction in the workspace's largest mobile market (SP) accounts for the observed organic session loss.",
+        "evidence": [
+          "Initial anomaly data: mobile organic sessions fell 38.7% (68,500 → 42,000) WoW, far exceeding the paid channel decline of –14.2%, isolating the problem to organic acquisition.",
+          "Event segmentation by state: SP accounted for the steepest individual state decline at –24% (2,210 → 1,680 mobile organic sessions), while RJ fell only –5.2% and MG was flat (+2.1%), confirming SP as the geographic epicenter.",
+          "Scenario audit: the 'Checkout recovery sequence' (scn-checkout-recovery) is currently PAUSED. This scenario triggers on 'checkout without purchase for 2 hours' via email + in-app, meaning mobile organic users who drop off at checkout are no longer receiving re-engagement nudges that would drive return sessions.",
+          "Conversion analytics confirm a systemic mobile checkout problem: mobile conversion rate fell 18.4% (0.038 → 0.031) with the largest impact scoped explicitly to SP mobile sessions (9,340 affected customers, $42,600 estimated lost revenue).",
+          "Payment failure rate on mobile credit card rose 31.2% (3.5% → 4.6%), affecting 1,180 customers. This creates negative session experiences that suppress organic return visits — users who hit payment failures are less likely to re-engage organically.",
+          "Churn prediction model for SP mobile customers shows an average churn risk score of 0.41 with 4,820 high-risk customers; top drivers are 'payment_failure', 'checkout_without_purchase', and 'low_recent_engagement' — precisely the failure chain triggered by the paused recovery scenario and rising payment errors.",
+          "Conversion rate history shows a consistent 12-period downtrend (0.041 → 0.031), indicating this is not a sudden one-day shock but a structural deterioration, consistent with a scenario being paused rather than a one-time event like a search algorithm update."
+        ],
+        "hypothesesConsidered": [
+          {
+            "hypothesis": "Search engine algorithm update or UTM tracking degradation reduced organic discoverability on mobile",
+            "supported": false,
+            "reasoning": "If this were an external SEO/algorithm event, the decline would be geographically broad and not disproportionately concentrated in SP. RJ fell only –5.2% and MG was flat, which contradicts a global ranking change. Additionally, the 12-period gradual conversion rate decline (0.041→0.031) suggests an internal operational issue, not a sudden external rank event. Ruled out."
+          },
+          {
+            "hypothesis": "Paused automation scenario cut off re-engagement loops for mobile organic visitors, reducing return session volume",
+            "supported": true,
+            "reasoning": "The 'Checkout recovery sequence' is confirmed PAUSED. Its trigger — 'checkout without purchase for 2 hours' — directly targets users who abandon mid-funnel, which is the exact cohort experiencing rising payment failures (+31.2%). Without recovery nudges, these users do not return organically. The gradual 12-period downtrend in conversion aligns with scenario deactivation creating a compounding effect on re-engagement. This is the primary driver."
+          },
+          {
+            "hypothesis": "Specific mobile user cohort (SP state) disengaged or churned, concentrating the organic session loss demographically",
+            "supported": true,
+            "reasoning": "SP shows a disproportionate –24% mobile organic session decline vs. –5.2% for RJ and +2.1% for MG. Churn prediction scores for SP mobile customers average 0.41 with 4,820 high-risk users, driven by 'payment_failure' and 'checkout_without_purchase' — both of which are elevated in the current period. SP is the workspace's largest mobile market, so its attrition amplifies the aggregate metric. This is a contributing factor reinforcing the primary scenario-pause hypothesis."
+          }
+        ],
+        "affectedCustomers": {
+          "count": 9340,
+          "segmentDescription": "Mobile users in the SP (São Paulo) state who initiated organic sessions and encountered checkout friction; 4,820 are currently flagged as high churn risk by the predictive model, with top risk drivers of payment_failure, checkout_without_purchase, and low_recent_engagement."
+        },
+        "timeSeries": [
+          {
+            "day": "w-12",
+            "value": 0.041
+          },
+          {
+            "day": "w-11",
+            "value": 0.04
+          },
+          {
+            "day": "w-10",
+            "value": 0.039
+          },
+          {
+            "day": "w-9",
+            "value": 0.039
+          },
+          {
+            "day": "w-8",
+            "value": 0.038
+          },
+          {
+            "day": "w-7",
+            "value": 0.038
+          },
+          {
+            "day": "w-6",
+            "value": 0.037
+          },
+          {
+            "day": "w-5",
+            "value": 0.036
+          },
+          {
+            "day": "w-4",
+            "value": 0.035
+          },
+          {
+            "day": "w-3",
+            "value": 0.034
+          },
+          {
+            "day": "w-2",
+            "value": 0.032
+          },
+          {
+            "day": "w-1",
+            "value": 0.031
+          }
+        ],
+        "confidence": "high"
+      },
+      "judgeHasOutput": false,
+      "yourScores": {
+        "root_cause_plausibility": {
+          "score": null,
+          "note": ""
+        },
+        "evidence_grounding": {
+          "score": null,
+          "note": ""
+        },
+        "scope_coherence": {
+          "score": null,
+          "note": ""
+        },
+        "actionable_next_step": {
+          "score": null,
+          "note": ""
+        }
+      },
+      "yourVerdict": {
+        "verdict": null,
+        "note": ""
+      }
+    },
+    {
+      "caseId": "04-cart-abandonment-mobile-broad",
+      "signalClass": "partial-signal",
+      "intent": "Broader-scope anomaly than case 1. Agent should stay at the mobile-cart level and only mention SP as one contributor, not the whole story. Tests scope proportionality.",
+      "anomaly": {
+        "metric": "cart_to_checkout_rate",
+        "scope": [
+          "mobile"
+        ],
+        "change": {
+          "value": 11.9,
+          "direction": "down",
+          "baseline": "prior_7d (0.611 → 0.544)"
+        },
+        "severity": "warning"
+      },
+      "diagnosis": {
+        "conclusion": "The mobile cart-to-checkout rate decline of 11.9% is primarily driven by two concurrent issues centered on SP mobile: (1) a 31.2% spike in mobile credit card payment failure rate (0.035→0.046), which terminates checkout attempts that do begin, and (2) a running A/B experiment on checkout CTA copy ('exp-checkout-copy') that appears to have introduced friction at the cart→checkout progression step, reducing the share of cart users who even initiate checkout. SP mobile shows an 18.4% conversion drop — far exceeding other geographies — and cart volume is actually growing (+6.5%), ruling out traffic quality or demand-side causes. The decline is gradual and consistent across 12 days, consistent with an ongoing experiment or persistent payment infrastructure issue rather than a point-in-time incident.",
+        "evidence": [
+          "Mobile cart→checkout rate fell from 0.611 to 0.544 (−11.9%) over the current 7-day window vs prior 7-day window, with ~980 fewer checkouts from a higher cart volume (34,200 vs 32,100).",
+          "SP mobile is the sharpest affected segment: conversion rate fell 18.4% (0.038→0.031), affecting an estimated 9,340 customers with ~$42,600 in lost revenue.",
+          "Mobile credit card payment failure rate rose 31.2% (0.035→0.046), affecting 1,180 customers and accounting for $18,900 in lost revenue — confirming checkout attempts are being blocked post-initiation.",
+          "Cart volume increased week-over-week (+6.5%), ruling out traffic quality degradation or lower-intent sessions as the cause; the problem is in the cart→checkout transition and checkout completion, not cart additions.",
+          "A running experiment 'Checkout CTA copy test' (exp-checkout-copy) is live and could be suppressing checkout initiation by altering the CTA that drives users from cart to checkout flow.",
+          "Daily time-series history shows a smooth, progressive decline over 12 days (from 0.041 down to 0.031 for SP mobile), consistent with an active experiment or persistent infrastructure issue rather than a sudden incident."
+        ],
+        "hypothesesConsidered": [
+          {
+            "hypothesis": "H1 – Mobile checkout flow friction (e.g., running A/B experiment on CTA copy) is preventing cart users from initiating checkout",
+            "supported": true,
+            "reasoning": "A running experiment 'Checkout CTA copy test' (exp-checkout-copy) is confirmed active. Cart volume grew but checkouts fell, meaning the drop is at the cart→checkout transition step, not earlier in the funnel. The gradual 12-day decline matches an experiment rollout. SP mobile is most impacted, consistent with a targeted experiment variant."
+          },
+          {
+            "hypothesis": "H2 – Mobile payment failure spike is blocking checkout completion on credit card transactions",
+            "supported": true,
+            "reasoning": "Payment failure rate on mobile credit card transactions rose 31.2% (0.035→0.046), affecting 1,180 customers. This explains some of the checkout shortfall — users who initiate checkout are failing to complete it. However, this alone cannot explain the full cart-to-checkout drop since payment failures occur after checkout initiation, not before."
+          },
+          {
+            "hypothesis": "H3 – Lower-intent traffic or campaign quality shift on mobile inflated cart additions without checkout intent",
+            "supported": false,
+            "reasoning": "Cart_updates grew from 32,100 to 34,200 (+6.5%) while checkouts fell, which at first glance could suggest lower-intent users. However, session_start patterns and the SP-concentrated, gradual daily decline are inconsistent with a traffic quality shift, which would typically appear as a sudden step-change correlated with a campaign launch. The payment failure data and active experiment better explain the observed pattern."
+          }
+        ],
+        "affectedCustomers": {
+          "count": 9340,
+          "segmentDescription": "Mobile users in SP (São Paulo) who initiated cart updates during the current 7-day window but did not complete checkout; high predicted churn risk (0.81 for platinum-tier example customers), suggesting these are high-value customers at material retention risk."
+        },
+        "timeSeries": [
+          {
+            "day": "d-11",
+            "value": 0.041
+          },
+          {
+            "day": "d-10",
+            "value": 0.04
+          },
+          {
+            "day": "d-9",
+            "value": 0.039
+          },
+          {
+            "day": "d-8",
+            "value": 0.039
+          },
+          {
+            "day": "d-7",
+            "value": 0.038
+          },
+          {
+            "day": "d-6",
+            "value": 0.038
+          },
+          {
+            "day": "d-5",
+            "value": 0.037
+          },
+          {
+            "day": "d-4",
+            "value": 0.036
+          },
+          {
+            "day": "d-3",
+            "value": 0.035
+          },
+          {
+            "day": "d-2",
+            "value": 0.034
+          },
+          {
+            "day": "d-1",
+            "value": 0.032
+          },
+          {
+            "day": "d-0",
+            "value": 0.031
+          }
+        ],
+        "confidence": "high"
+      },
+      "judgeHasOutput": true,
+      "yourScores": {
+        "root_cause_plausibility": {
+          "score": null,
+          "note": ""
+        },
+        "evidence_grounding": {
+          "score": null,
+          "note": ""
+        },
+        "scope_coherence": {
+          "score": null,
+          "note": ""
+        },
+        "actionable_next_step": {
+          "score": null,
+          "note": ""
+        }
+      },
+      "yourVerdict": {
+        "verdict": null,
+        "note": ""
+      }
+    },
+    {
+      "caseId": "05-no-signal-retention-subscribers",
+      "signalClass": "no-signal",
+      "intent": "The workspace has no subscription tools, no cohort tools, no billing events. Agent should recognize the ask is unanswerable with the available data and say so — not confabulate.",
+      "anomaly": {
+        "metric": "monthly_active_subscribers",
+        "scope": [
+          "subscription",
+          "premium_tier"
+        ],
+        "change": {
+          "value": 8.3,
+          "direction": "down",
+          "baseline": "prior_month (24,800 → 22,740 active subscribers)"
+        },
+        "severity": "warning"
+      },
+      "diagnosis": {
+        "conclusion": "The 8.3% drop in premium-tier monthly active subscribers (24,800 → 22,740) is primarily driven by a sustained engagement decay and checkout conversion failure in the São Paulo mobile segment, compounded by the paused 'Checkout recovery sequence' automation and an unlaunched 'Mobile checkout recovery' email campaign. With no active re-engagement flow to intercept at-risk premium customers, 4,820 high-churn-risk subscribers have been lapsing without intervention. A secondary contributor is a 31.2% rise in credit-card payment failures on mobile (affecting ~1,180 customers), causing involuntary cancellations. The combination of declining engagement, absent automation, and rising mobile payment failures produced a net loss of ~2,060 active premium subscribers over the past month.",
+        "evidence": [
+          "Premium-tier session_starts in SP (largest market) fell 24% month-over-month (1,680 vs 2,210 prior), directly reducing active subscriber counts from the most important segment.",
+          "Weekly conversion rate has declined steadily for 12 consecutive weeks from 0.041 to 0.031 (-18.4%), concentrated in mobile + SP, indicating a persistent engagement erosion rather than a single-event shock.",
+          "4,820 premium-tier customers carry a high predicted churn risk (avg score 0.41); top drivers are payment_failure, checkout_without_purchase, and low_recent_engagement.",
+          "The 'Checkout recovery sequence' automation (trigger: checkout without purchase for 2 hours, email + in-app) is currently PAUSED, removing the primary re-engagement safety net for premium customers who reach checkout but abandon.",
+          "The 'Mobile checkout recovery' email campaign is in DRAFT status and has never been sent (open_rate: 0, click_rate: 0, conversion_rate: 0), confirming no active mobile re-engagement campaign has been running for premium subscribers.",
+          "Payment failure rate on credit card/mobile rose 31.2% (0.035 → 0.046), affecting ~1,180 customers and an estimated $18,900 in lost revenue, indicating involuntary churn as a secondary driver.",
+          "Only one scenario is active for premium retention — 'High value winback' (threshold: churn_risk > 0.70) — which is too narrow to catch the broader population of 4,820 at-risk premium subscribers with scores below 0.70."
+        ],
+        "hypothesesConsidered": [
+          {
+            "hypothesis": "Churn spike driven by low recent engagement and absent re-engagement automation",
+            "supported": true,
+            "reasoning": "Session starts in SP dropped 24%, checkout-without-purchase is a top churn driver for 4,820 high-risk premium customers, and the Checkout Recovery automation is paused with no substitute campaign active. This creates a systematic leak: customers reaching checkout but not purchasing are not being recovered, leading to natural lapse and subscriber count decline."
+          },
+          {
+            "hypothesis": "Payment failures causing involuntary churn among premium subscribers",
+            "supported": true,
+            "reasoning": "Credit card/mobile payment failure rate rose 31.2%, affecting ~1,180 customers. This is a real but secondary contributor — it explains roughly 1,180 of the ~2,060 lost subscribers at most. The broader engagement decline and automation gap account for the majority of the drop."
+          },
+          {
+            "hypothesis": "Campaign/acquisition failure reducing inflow of newly activated premium subscribers",
+            "supported": true,
+            "reasoning": "The 'Mobile checkout recovery' email campaign was never launched (draft status), and no active premium acquisition or re-engagement campaign exists beyond a high-threshold winback flow. This confirms inadequate inflow to replace naturally churning premium users, making the net active subscriber count fall sharper than it otherwise would."
+          }
+        ],
+        "affectedCustomers": {
+          "count": 4820,
+          "segmentDescription": "Premium-tier customers with high predicted churn risk (score ≥ 0.41), concentrated in São Paulo, primarily on mobile devices, exhibiting low recent engagement and checkout-without-purchase behavior."
+        },
+        "timeSeries": [
+          {
+            "day": "w-11",
+            "value": 0.041
+          },
+          {
+            "day": "w-10",
+            "value": 0.04
+          },
+          {
+            "day": "w-9",
+            "value": 0.039
+          },
+          {
+            "day": "w-8",
+            "value": 0.039
+          },
+          {
+            "day": "w-7",
+            "value": 0.038
+          },
+          {
+            "day": "w-6",
+            "value": 0.038
+          },
+          {
+            "day": "w-5",
+            "value": 0.037
+          },
+          {
+            "day": "w-4",
+            "value": 0.036
+          },
+          {
+            "day": "w-3",
+            "value": 0.035
+          },
+          {
+            "day": "w-2",
+            "value": 0.034
+          },
+          {
+            "day": "w-1",
+            "value": 0.032
+          },
+          {
+            "day": "w-0",
+            "value": 0.031
+          }
+        ],
+        "confidence": "high"
+      },
+      "judgeHasOutput": false,
+      "yourScores": {
+        "root_cause_plausibility": {
+          "score": null,
+          "note": ""
+        },
+        "evidence_grounding": {
+          "score": null,
+          "note": ""
+        },
+        "scope_coherence": {
+          "score": null,
+          "note": ""
+        },
+        "actionable_next_step": {
+          "score": null,
+          "note": ""
+        }
+      },
+      "yourVerdict": {
+        "verdict": null,
+        "note": ""
+      }
+    },
+    {
+      "caseId": "06-no-signal-price-sensitivity-luxury",
+      "signalClass": "no-signal",
+      "intent": "The workspace has no luxury-tier catalog or product categorization. Agent should confirm the tier does not exist (via list_catalogs / list_catalog_items) and say it cannot proceed — not invent price bands.",
+      "anomaly": {
+        "metric": "avg_order_value_luxury_tier",
+        "scope": [
+          "desktop",
+          "luxury_tier"
+        ],
+        "change": {
+          "value": 6.2,
+          "direction": "down",
+          "baseline": "prior_month ($318 → $298 AOV)"
+        },
+        "severity": "info"
+      },
+      "diagnosis": {
+        "conclusion": "The 6.2% AOV decline in desktop luxury-tier customers ($318 → $298) is most strongly associated with a geographic concentration effect: São Paulo (SP) luxury-tier desktop purchases fell 24% month-over-month (1,680 vs 2,210 prior), while SP voucher redemptions also dropped 24%. SP likely contains higher-spending luxury customers whose reduced activity pulled down overall AOV. A concurrent 'Summer voucher drop' email campaign (conversion rate only 1.9%) may have attracted more discount-driven, lower-AOV orders, further compressing the average. The data is partially inconclusive on category-level shifts and direct voucher discount magnitude.",
+        "evidence": [
+          "Desktop luxury-tier AOV fell from $318 to $298 (-6.2%) month-over-month (Query 1 baseline).",
+          "SP luxury-tier desktop purchases declined 24% (2,210 → 1,680), the largest geographic drop; RJ fell only 5.2% and MG grew 2.1% (Query 5).",
+          "SP luxury-tier desktop voucher redemptions also fell 24% (2,210 → 1,680), mirroring the purchase decline and suggesting SP engagement broadly contracted (Query 2).",
+          "Active 'Summer voucher drop' email campaign has a low conversion rate of 1.9% and click rate of 6.1%, suggesting it may be driving lower-intent, discount-motivated purchases that compress AOV (Query 3).",
+          "A 'Checkout CTA copy test' experiment is currently running, which could influence purchase behavior and order composition on desktop (Query 6).",
+          "Customer-level data (Query 4) returned only 2 non-luxury-tier customers (platinum/gold), indicating data coverage gaps but also suggesting SP high-value customers may be churning — cust-1001 (SP) has 0.81 predicted churn risk."
+        ],
+        "hypothesesConsidered": [
+          {
+            "hypothesis": "SP luxury-tier desktop customers reduced high-value purchases, dragging down overall AOV due to their disproportionate weight.",
+            "supported": true,
+            "reasoning": "SP showed a 24% purchase volume decline versus only -5.2% in RJ and +2.1% in MG. If SP customers historically place higher-AOV orders (consistent with being a premium urban market), their reduced activity would compress the average disproportionately."
+          },
+          {
+            "hypothesis": "Increased voucher/discount usage lowered average order values.",
+            "supported": false,
+            "reasoning": "Voucher redemptions in SP actually fell 24% alongside purchases, meaning fewer vouchers were redeemed, not more. The Summer voucher campaign has a low 1.9% conversion rate, suggesting it did not drive a surge in discount-heavy orders sufficient to explain the AOV drop on its own."
+          },
+          {
+            "hypothesis": "A product category mix shift toward lower-priced items caused AOV compression.",
+            "supported": false,
+            "reasoning": "Query 5 returned geographic breakdown data instead of category breakdown data, so no category-level evidence is available to support or refute this hypothesis. It remains inconclusive."
+          },
+          {
+            "hypothesis": "The running checkout CTA copy experiment (exp-checkout-copy) affected conversion quality and order size on desktop.",
+            "supported": false,
+            "reasoning": "The experiment exists and is running, but no results or variant-level AOV data were returned. Its contribution to AOV compression cannot be confirmed or ruled out from available data."
+          },
+          {
+            "hypothesis": "High churn-risk luxury customers in SP are disengaging, reducing the cohort of highest spenders.",
+            "supported": true,
+            "reasoning": "The SP customer flagged in Query 4 (cust-1001) has a 0.81 churn risk and $1,840 LTV. Combined with the 24% SP purchase drop, this pattern is consistent with high-value SP customers reducing engagement, which would mechanically lower AOV even if remaining customers maintain their spend."
+          }
+        ],
+        "confidence": "high"
+      },
+      "judgeHasOutput": false,
+      "yourScores": {
+        "root_cause_plausibility": {
+          "score": null,
+          "note": ""
+        },
+        "evidence_grounding": {
+          "score": null,
+          "note": ""
+        },
+        "scope_coherence": {
+          "score": null,
+          "note": ""
+        },
+        "actionable_next_step": {
+          "score": null,
+          "note": ""
+        }
+      },
+      "yourVerdict": {
+        "verdict": null,
+        "note": ""
+      }
+    },
+    {
+      "caseId": "07-positive-conversion-surge-mobile",
+      "signalClass": "positive",
+      "intent": "Positive-severity anomaly. Tests whether agent (a) handles good news as an opportunity (\"what worked, can we replicate?\"), (b) notes substrate contradicts (the synthetic data is negative), or (c) both. Poor response: \"no action needed\" — a positive anomaly worth diagnosing is still worth diagnosing.",
+      "anomaly": {
+        "metric": "conversion_rate",
+        "scope": [
+          "mobile",
+          "iOS",
+          "US"
+        ],
+        "change": {
+          "value": 12.6,
+          "direction": "up",
+          "baseline": "prior_7d (0.041 → 0.046)"
+        },
+        "severity": "positive"
+      },
+      "diagnosis": {
+        "conclusion": "The 12.6% iOS US conversion rate uplift (0.041 → 0.046) is most likely driven by the active 'Summer voucher drop' email campaign (cmp-summer-voucher), with a secondary contribution from the running 'Checkout CTA copy test' experiment. The voucher campaign shows a 28.4% open rate and 6.1% CTR, indicating strong engagement that would explain incremental purchase volume on iOS. The experiment on checkout CTA copy may have additionally smoothed friction at the final conversion step for iOS users. Note: the workspace EQL time-series returned a declining (not rising) conversion trend, suggesting the uplift is concentrated in a narrow sub-segment of iOS US sessions aligned with voucher-attributed or experiment-variant sessions rather than the overall iOS mobile pool.",
+        "evidence": [
+          "Active email campaign 'Summer voucher drop' (cmp-summer-voucher) has a 28.4% open rate and 6.1% CTR, indicating high-intent traffic being driven to iOS purchase flows.",
+          "Running A/B experiment 'Checkout CTA copy test' (exp-checkout-copy) is live across checkout sessions and could be boosting iOS US conversions through improved CTA copy.",
+          "Voucher_redeemed events total 9,420 across the dataset, consistent with an active promotion cycle coinciding with the conversion uplift window.",
+          "EQL daily time-series showed the broader iOS mobile conversion trending downward (0.041 → 0.031 over 12 days), meaning the +12.6% uplift is isolated to a voucher/campaign-attributed sub-segment of iOS US sessions rather than all iOS US traffic.",
+          "Current 7-day purchases for iOS US: 3,890 vs. prior 3,460 (+430 incremental purchases), generating estimated +$16,500/week revenue — consistent with a voucher-driven basket.",
+          "Customer segment lookup for iOS + US returned only Brazilian-geography customers (SP, RJ), indicating the workspace 'US' scope is likely a synthetic state label; the uplift is scoped correctly to that synthetic segment."
+        ],
+        "hypothesesConsidered": [
+          {
+            "hypothesis": "Summer Voucher Drop email campaign (cmp-summer-voucher) drove higher-intent iOS US traffic, lifting conversions via promotional incentive.",
+            "supported": true,
+            "reasoning": "The campaign is active with a strong 28.4% open rate and 6.1% CTR. Voucher_redeemed events (9,420 total) confirm active redemption. The timing aligns with the current 7-day conversion improvement. Voucher-driven purchases inherently increase conversion rate since only motivated buyers redeem codes."
+          },
+          {
+            "hypothesis": "The running 'Checkout CTA copy test' experiment (exp-checkout-copy) is producing a winning variant that reduces checkout drop-off for iOS US users.",
+            "supported": true,
+            "reasoning": "The experiment is confirmed running on checkout sessions. iOS users in the treatment arm with improved CTA copy would show elevated conversion vs. control. This is a plausible co-contributor, though the magnitude of the effect cannot be isolated without variant-level split data."
+          },
+          {
+            "hypothesis": "Organic traffic mix shift (e.g., higher share of returning/loyalty customers visiting iOS US) accounts for the conversion uplift without any campaign or experiment effect.",
+            "supported": false,
+            "reasoning": "The EQL query showed the broader iOS mobile conversion rate is actually declining over the same period, ruling out an organic traffic quality improvement. The uplift is localized to the voucher/experiment-influenced sub-segment, not a broad organic mix shift."
+          }
+        ],
+        "affectedCustomers": {
+          "count": 3890,
+          "segmentDescription": "iOS device users in the US geographic scope who completed purchases in the current 7-day window; estimated 430 incremental buyers vs. prior period, likely voucher-redeemed or experiment-variant sessions."
+        },
+        "timeSeries": [
+          {
+            "day": "d-12",
+            "value": 0.041
+          },
+          {
+            "day": "d-11",
+            "value": 0.04
+          },
+          {
+            "day": "d-10",
+            "value": 0.039
+          },
+          {
+            "day": "d-9",
+            "value": 0.039
+          },
+          {
+            "day": "d-8",
+            "value": 0.038
+          },
+          {
+            "day": "d-7",
+            "value": 0.038
+          },
+          {
+            "day": "d-6",
+            "value": 0.037
+          },
+          {
+            "day": "d-5",
+            "value": 0.036
+          },
+          {
+            "day": "d-4",
+            "value": 0.035
+          },
+          {
+            "day": "d-3",
+            "value": 0.034
+          },
+          {
+            "day": "d-2",
+            "value": 0.032
+          },
+          {
+            "day": "d-1",
+            "value": 0.031
+          }
+        ],
+        "confidence": "high"
+      },
+      "judgeHasOutput": true,
+      "yourScores": {
+        "root_cause_plausibility": {
+          "score": null,
+          "note": ""
+        },
+        "evidence_grounding": {
+          "score": null,
+          "note": ""
+        },
+        "scope_coherence": {
+          "score": null,
+          "note": ""
+        },
+        "actionable_next_step": {
+          "score": null,
+          "note": ""
+        }
+      },
+      "yourVerdict": {
+        "verdict": null,
+        "note": ""
+      }
+    },
+    {
+      "caseId": "08-checkout-collapse-multi-scope",
+      "signalClass": "has-signal",
+      "intent": "Multi-platform anomaly. Agent should treat mobile + desktop as parallel investigations, not collapse to one. Note whether the pattern is symmetric (shared cause) or asymmetric (platform-specific).",
+      "anomaly": {
+        "metric": "checkout_completion_rate",
+        "scope": [
+          "mobile",
+          "desktop",
+          "all_geos"
+        ],
+        "change": {
+          "value": 15.8,
+          "direction": "down",
+          "baseline": "prior_7d (0.278 → 0.234)"
+        },
+        "severity": "critical"
+      },
+      "diagnosis": {
+        "conclusion": "The 15.8% drop in checkout completion rate is primarily driven by a 31.2% spike in mobile credit card payment failures, compounded by the paused 'Checkout recovery sequence' automation scenario that previously re-engaged abandoners, and an actively running 'Checkout CTA copy test' experiment that may have introduced additional friction. The payment failure rate rose from 3.5% to 4.6% on mobile credit card transactions, concentrated in the SP region (São Paulo). With the checkout recovery scenario paused, abandoned sessions that previously converted via recovery email/in-app messaging are no longer being rescued, amplifying the net completion rate decline.",
+        "evidence": [
+          "Overall checkout completion rate fell from 0.278 to 0.234 (-15.8%); mobile dropped sharper (0.312 → 0.264, -15.4%) than desktop (0.237 → 0.198, -16.5%).",
+          "Payment failure rate increased 31.2% on mobile credit card sessions (prior rate: 0.035, current rate: 0.046), affecting an estimated 1,180 customers and representing ~$18,900 in directly lost revenue.",
+          "Mobile checkout conversion fell 18.4% with the largest impact concentrated in SP-state mobile sessions (9,340 affected customers, ~$42,600 estimated lost revenue).",
+          "The 'Checkout recovery sequence' scenario (trigger: checkout without purchase for 2 hours, channels: email + in-app) is currently PAUSED, meaning abandoned checkout sessions are receiving no recovery nudges.",
+          "A running A/B experiment 'Checkout CTA copy test' (exp-checkout-copy) is active during the anomaly window, potentially introducing UI/UX friction at the CTA step.",
+          "The funnel shows 18,640 checkout initiations vs only 4,920 purchases in the current 7-day window — a completion rate of ~26.4%, corroborating the reported anomaly.",
+          "The time-series history shows a sustained downward trend in conversion rate: [0.041, 0.040, 0.039, 0.039, 0.038, 0.038, 0.037, 0.036, 0.035, 0.034, 0.032, 0.031], suggesting the decline began ~10–12 days ago rather than abruptly.",
+          "SP-state payment failures declined 24% in absolute count (1,680 vs 2,210 prior), but as a rate relative to checkout volume, mobile credit card failures rose 31.2%, indicating SP checkout attempts also fell — consistent with funnel abandonment upstream."
+        ],
+        "hypothesesConsidered": [
+          {
+            "hypothesis": "A spike in mobile credit card payment failures caused users to abandon checkout.",
+            "supported": true,
+            "reasoning": "Payment failure rate rose 31.2% on mobile credit card (0.035 → 0.046). This is the strongest direct cause: users hitting a payment failure during checkout are highly likely to abandon rather than retry. The mobile-first nature of the spike matches the observation that mobile saw sharper decline. Affected ~1,180 customers directly with ~$18,900 in lost revenue attributed to this factor alone."
+          },
+          {
+            "hypothesis": "Pausing the 'Checkout recovery sequence' automation removed a re-engagement safety net, amplifying the rate drop.",
+            "supported": true,
+            "reasoning": "The 'Checkout recovery sequence' scenario (email + in-app trigger 2 hours post-abandoned checkout) is currently PAUSED. Previously, this scenario would have recovered a portion of abandoned checkouts. With it inactive, the effective completion rate suffers an additional multiplier effect on top of the payment failure spike. The gradual downward trend in time-series (10–12 days of decline) is consistent with a scenario that was paused rather than an acute event."
+          },
+          {
+            "hypothesis": "A campaign/experiment change (Checkout CTA copy test) introduced friction into the checkout funnel.",
+            "supported": false,
+            "reasoning": "The 'Checkout CTA copy test' experiment is running and may contribute marginal friction, but the magnitude of the decline (15.8%) is too large to attribute primarily to a copy change. The payment failure spike and paused recovery scenario account for the majority of the observed drop, making this hypothesis a secondary contributor at most rather than the root cause."
+          }
+        ],
+        "affectedCustomers": {
+          "count": 9340,
+          "segmentDescription": "Mobile users in SP state who initiated checkout but did not complete purchase in the current 7-day window; includes high-value segments (platinum and gold loyalty tier customers identified in SP and RJ with predicted churn risk 0.67–0.81)."
+        },
+        "timeSeries": [
+          {
+            "day": "w-11",
+            "value": 0.041
+          },
+          {
+            "day": "w-10",
+            "value": 0.04
+          },
+          {
+            "day": "w-9",
+            "value": 0.039
+          },
+          {
+            "day": "w-8",
+            "value": 0.039
+          },
+          {
+            "day": "w-7",
+            "value": 0.038
+          },
+          {
+            "day": "w-6",
+            "value": 0.038
+          },
+          {
+            "day": "w-5",
+            "value": 0.037
+          },
+          {
+            "day": "w-4",
+            "value": 0.036
+          },
+          {
+            "day": "w-3",
+            "value": 0.035
+          },
+          {
+            "day": "w-2",
+            "value": 0.034
+          },
+          {
+            "day": "w-1",
+            "value": 0.032
+          },
+          {
+            "day": "w-0",
+            "value": 0.031
+          }
+        ],
+        "confidence": "high"
+      },
+      "judgeHasOutput": true,
+      "yourScores": {
+        "root_cause_plausibility": {
+          "score": null,
+          "note": ""
+        },
+        "evidence_grounding": {
+          "score": null,
+          "note": ""
+        },
+        "scope_coherence": {
+          "score": null,
+          "note": ""
+        },
+        "actionable_next_step": {
+          "score": null,
+          "note": ""
+        }
+      },
+      "yourVerdict": {
+        "verdict": null,
+        "note": ""
+      }
+    },
+    {
+      "caseId": "09-engagement-drop-email-campaign",
+      "signalClass": "partial-signal",
+      "intent": "Marketing-channel anomaly with only partial substrate support (generic list_email_campaigns). Agent should use what is available, explicitly name the limits, and specify the tools it would want to complete the analysis.",
+      "anomaly": {
+        "metric": "email_click_through_rate",
+        "scope": [
+          "newsletter",
+          "transactional_recovery"
+        ],
+        "change": {
+          "value": 24.3,
+          "direction": "down",
+          "baseline": "prior_month (0.082 → 0.062)"
+        },
+        "severity": "warning"
+      },
+      "diagnosis": {
+        "conclusion": "The 24.3% email CTR drop is primarily driven by two compounding factors: (1) the transactional_recovery flow is effectively non-functional — the 'Mobile checkout recovery' campaign is in DRAFT status and the 'Checkout recovery sequence' scenario is PAUSED — meaning transactional_recovery sends generate near-zero clicks despite continued sends being counted; and (2) newsletter engagement declined in the SP state segment (−24% email opens), which mirrors the aggregate CTR drop, suggesting a geographic or content-targeting failure in the highest-volume state. A secondary contributing factor is that the active winback scenario targets high churn-risk customers (predicted_churn_risk > 0.70), who are structurally low-engagement recipients, dragging overall CTR further.",
+        "evidence": [
+          "The 'Mobile checkout recovery' campaign (transactional_recovery channel) is in DRAFT status with open_rate=0 and click_rate=0, meaning it generates no clicks despite being part of the measured send volume.",
+          "The 'Checkout recovery sequence' scenario is PAUSED, directly shutting off the trigger-based transactional_recovery email flow.",
+          "SP state email opens dropped 24% MoM (2,210 → 1,680), closely matching the aggregate CTR decline of 24.3% and indicating the newsletter audience in SP disengaged or was under-targeted.",
+          "The only active campaign ('Summer voucher drop') has a click_rate of 0.061, which is below the prior-month baseline CTR of 0.082, confirming newsletter-side CTR degradation as well.",
+          "Total sends were nearly flat (481K → 484K), ruling out large-scale list inflation as a standalone cause.",
+          "The active 'High value winback' scenario targets customers with predicted_churn_risk > 0.70 — a structurally low-engagement segment — compounding CTR dilution.",
+          "Average churn risk across opt-in customers is 0.41 with 4,820 flagged as high-risk, indicating the email list skews toward disengaged users."
+        ],
+        "hypothesesConsidered": [
+          {
+            "hypothesis": "Transactional recovery flow became non-functional (paused/draft), eliminating high-intent clicks from that segment.",
+            "supported": true,
+            "reasoning": "The 'Mobile checkout recovery' campaign is in DRAFT (click_rate=0) and the 'Checkout recovery sequence' scenario is PAUSED. Transactional recovery emails typically have higher CTR than newsletters; their functional shutdown would immediately deflate aggregate CTR even with stable send volume."
+          },
+          {
+            "hypothesis": "Audience composition shifted toward higher-churn, lower-engagement customer segments, diluting CTR.",
+            "supported": true,
+            "reasoning": "The winback scenario actively targets customers with predicted_churn_risk > 0.70, who are low-engagement by definition. With an average churn risk score of 0.41 and 4,820 high-risk recipients, this structural audience composition drags aggregate CTR downward."
+          },
+          {
+            "hypothesis": "Send-volume inflation with low-quality (dormant/inactive) recipients caused CTR dilution.",
+            "supported": false,
+            "reasoning": "Send volume was nearly flat at 481K → 484K (+0.6%), ruling out meaningful list expansion as a driver of the 24.3% CTR drop."
+          }
+        ],
+        "affectedCustomers": {
+          "count": 4820,
+          "segmentDescription": "High predicted churn-risk (>0.70) email opt-in customers, predominantly in SP state, enrolled in winback and newsletter flows with low baseline engagement propensity."
+        },
+        "timeSeries": [
+          {
+            "day": "w-12",
+            "value": 0.041
+          },
+          {
+            "day": "w-11",
+            "value": 0.04
+          },
+          {
+            "day": "w-10",
+            "value": 0.039
+          },
+          {
+            "day": "w-9",
+            "value": 0.039
+          },
+          {
+            "day": "w-8",
+            "value": 0.038
+          },
+          {
+            "day": "w-7",
+            "value": 0.038
+          },
+          {
+            "day": "w-6",
+            "value": 0.037
+          },
+          {
+            "day": "w-5",
+            "value": 0.036
+          },
+          {
+            "day": "w-4",
+            "value": 0.035
+          },
+          {
+            "day": "w-3",
+            "value": 0.034
+          },
+          {
+            "day": "w-2",
+            "value": 0.032
+          },
+          {
+            "day": "w-1",
+            "value": 0.031
+          }
+        ],
+        "confidence": "high"
+      },
+      "judgeHasOutput": true,
+      "yourScores": {
+        "root_cause_plausibility": {
+          "score": null,
+          "note": ""
+        },
+        "evidence_grounding": {
+          "score": null,
+          "note": ""
+        },
+        "scope_coherence": {
+          "score": null,
+          "note": ""
+        },
+        "actionable_next_step": {
+          "score": null,
+          "note": ""
+        }
+      },
+      "yourVerdict": {
+        "verdict": null,
+        "note": ""
+      }
+    },
+    {
+      "caseId": "10-no-signal-seo-organic",
+      "signalClass": "no-signal",
+      "intent": "SEO keyword ranking is out of scope for an ecommerce analytics platform (not just this substrate — any Bloomreach workspace). Agent should recognize this and refer the user to a search-console tool, not investigate.",
+      "anomaly": {
+        "metric": "organic_search_impressions",
+        "scope": [
+          "branded_keywords",
+          "top_10_ranking"
+        ],
+        "change": {
+          "value": 34.1,
+          "direction": "down",
+          "baseline": "prior_month (2.4M → 1.6M impressions)"
+        },
+        "severity": "warning"
+      },
+      "diagnosis": {
+        "conclusion": "The 34.1% drop in branded organic impressions (2.4M → 1.6M) and average position decline (3.1 → 4.8) is correlated with a broader session-level decline concentrated in the SP (São Paulo) region (-24% sessions), which also shows the worst mobile checkout conversion drop (-18.4%) and elevated payment failure rates (+31.2%). The organic ranking loss appears real and compounded by a geo-concentrated demand erosion in SP. However, the query results intended to diagnose branded search volume by device returned synthetic checkout-scan data rather than search-specific breakdowns, leaving the device-level and keyword-level causes of the ranking shift inconclusive. The most supported explanation is a combination of a search algorithm update or competitor ranking gain affecting top-10 branded positions, alongside a significant SP-market-specific traffic and engagement deterioration.",
+        "evidence": [
+          "Branded keyword organic impressions fell 34.1% MoM: 2.4M → 1.58M impressions",
+          "Average SERP position worsened from 3.1 to 4.8 for branded keywords in top-10",
+          "SP state sessions declined -24% (2,210 → 1,680), the largest regional drop; RJ -5.2%; MG +2.1%",
+          "Mobile checkout conversion rate fell 18.4% (0.038 → 0.031) with 9,340 affected customers and ~$42,600 estimated lost revenue",
+          "Payment failure rate rose 31.2% (0.035 → 0.046) on mobile/credit card, affecting 1,180 customers and ~$18,900 estimated lost revenue",
+          "Checkout recovery scenario (email + in-app) is currently paused, meaning abandoned-checkout re-engagement is not active",
+          "Only one experiment running: 'Checkout CTA copy test' — unlikely to explain the organic impression drop but may interact with conversion metrics",
+          "Queries intended to return branded search volume by device and organic sessions by landing page returned synthetic checkout-scan data instead, making device-level and page-level SEO diagnosis inconclusive"
+        ],
+        "hypothesesConsidered": [
+          {
+            "hypothesis": "A search engine algorithm update caused branded keyword rankings to drop, reducing impressions",
+            "supported": true,
+            "reasoning": "Average position worsened from 3.1 to 4.8 and impressions fell 34.1%, consistent with a ranking demotion. The evidence does not rule this out, and the impact aligns with an algorithm-driven position shift rather than purely reduced brand demand."
+          },
+          {
+            "hypothesis": "A competitor gained ranking on branded keywords, displacing the site from top positions",
+            "supported": true,
+            "reasoning": "Position decline from 3.1 to 4.8 on branded terms is consistent with competitor displacement. No competitor data was returned, so this cannot be confirmed directly, but it remains a strongly plausible co-cause."
+          },
+          {
+            "hypothesis": "The organic traffic decline is geo-concentrated in SP, amplifying the overall impression drop",
+            "supported": true,
+            "reasoning": "SP sessions fell -24% while other states were relatively stable (RJ -5.2%, MG +2.1%), indicating SP is the epicenter of the traffic loss, which aligns with the mobile/checkout degradation also flagged as SP-specific."
+          },
+          {
+            "hypothesis": "Mobile experience degradation (checkout failures, payment errors) reduced engagement signals, contributing to ranking loss",
+            "supported": false,
+            "reasoning": "While mobile checkout conversion fell 18.4% and payment failures rose 31.2%, these are downstream conversion metrics and do not directly cause organic impression drops. Engagement signals could theoretically feed back into rankings over time, but the timeframe and evidence do not confirm this causal link."
+          },
+          {
+            "hypothesis": "The paused checkout recovery scenario materially worsened the organic impression metric",
+            "supported": false,
+            "reasoning": "The checkout recovery scenario affects re-engagement of existing users post-session, not organic search impressions. Its paused status explains lost revenue recovery opportunity but not the SERP impression decline."
+          },
+          {
+            "hypothesis": "The branded search volume drop is device-specific (e.g., mobile searches declining)",
+            "supported": false,
+            "reasoning": "Queries designed to break down branded search by device returned irrelevant synthetic checkout data, making this hypothesis inconclusive rather than supported or refuted."
+          }
+        ],
+        "confidence": "high"
+      },
+      "judgeHasOutput": false,
+      "yourScores": {
+        "root_cause_plausibility": {
+          "score": null,
+          "note": ""
+        },
+        "evidence_grounding": {
+          "score": null,
+          "note": ""
+        },
+        "scope_coherence": {
+          "score": null,
+          "note": ""
+        },
+        "actionable_next_step": {
+          "score": null,
+          "note": ""
+        }
+      },
+      "yourVerdict": {
+        "verdict": null,
+        "note": ""
+      }
+    }
+  ]
+}

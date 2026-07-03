@@ -8,7 +8,9 @@
     "start": "next start",
     "lint": "eslint",
     "test": "vitest run",
-    "eval": "vitest run --config vitest.eval.config.ts"
+    "eval": "vitest run --config vitest.eval.config.ts eval/run.eval.ts",
+    "eval:worksheet": "RUN_WORKSHEET=1 vitest run --config vitest.eval.config.ts eval/generate-worksheet.eval.ts",
+    "eval:agreement": "RUN_AGREEMENT=1 vitest run --config vitest.eval.config.ts eval/compute-agreement.eval.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.99.0",

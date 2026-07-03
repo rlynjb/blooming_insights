@@ -83,11 +83,29 @@ slice. Both drive real choices that were parked at the end of Week 1
       · Rec anti-pattern: agent proposes "pause the A/B experiment" as
         a rec on has-signal cases where the primary root cause is the
         payment processor. Judged as `fail` (correctly) on cases 01 + 08.
-- [ ] **D — Blind calibration** (protocol per Q2 decision — you score blind)
-      I generate `eval/calibration/worksheet-<runId>.json` (anomaly +
-      diagnosis, no judgment). You score 4 dimensions × 10 cases (~30–60
-      min). Only after you commit labels do I reveal judge scores and
-      compute agreement per dimension + per verdict.
+- [ ] **D — Blind calibration** — tooling shipped; awaiting your labels
+      Part 1 (tooling) ✅ — shipped `eval/generate-worksheet.eval.ts` +
+      `eval/compute-agreement.eval.ts` + `eval/calibration/README.md`,
+      npm scripts `eval:worksheet` and `eval:agreement`. Blank worksheet
+      for the latest run exists at
+      `eval/calibration/worksheet-2026-07-03T02-47-24-392Z.json` (10
+      cases; 6 with judge output for comparison, 4 flagged as
+      `judgeHasOutput: false`).
+
+      Part 2 (labeling) — **your homework, ~30-60 min**:
+      · open the worksheet JSON
+      · read each case's anomaly + diagnosis
+      · fill `yourScores` (1-5 per dimension) + `yourVerdict`
+        (pass / pass_with_notes / fail) using the rubric in the file
+      · do NOT peek at `eval/receipts/`
+
+      Part 3 (agreement) — `npm run eval:agreement` reads the filled
+      worksheet + receipts, writes `eval/calibration/agreement-<runId>.json`
+      with three metrics (verdict / exact-match / within-1) + per-dim
+      breakdown + per-case table.
+
+      The compute-agreement script refuses to run if any field is null,
+      so a partial run can never produce a misleading number.
 
 ### Required
 
