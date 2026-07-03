@@ -12,6 +12,13 @@
 // npm alias trip up Node's ESM resolver via tsx). Excluded from `npm test`
 // by the default config's `include` pattern (test/**/*.test.ts).
 // `npm run eval` uses vitest.eval.config.ts which targets `eval/**/*.eval.ts`.
+//
+// ── Week 2 · Session A ──
+// Capture the tool-call trace during agent.investigate() via the
+// onToolResult hook, then feed it to the judge as `tool_calls_trace`
+// context. Fixes the Week-1 evidence_grounding false-positive: the judge
+// was flagging real numbers (e.g. "SP -24") as invention because it never
+// saw the get_event_segmentation call the agent made.
 
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
@@ -27,6 +34,7 @@ import {
   syntheticWorkspaceSchema,
 } from '../lib/data-source/synthetic-data-source';
 import type { McpToolDef } from '../lib/agents/tool-schemas';
+import type { ToolCall } from '../lib/mcp/types';
 
 import {
   goldenAnomaly,
@@ -66,6 +74,40 @@ function loadEnvFromDotenv(): void {
 
 loadEnvFromDotenv();
 
+// ─── trace formatting ────────────────────────────────────────────────────────
+
+/**
+ * Format the captured tool-call trace as a compact string for the judge.
+ * Full JSON is verbose and eats the judge's context budget; each call gets a
+ * numbered header with tool name + args + a summary of the result body.
+ *
+ * The judge's job is to verify that every claim in the diagnosis is traceable
+ * to *some* line in this trace. Anything not present is invention.
+ */
+function formatToolCallTrace(calls: readonly ToolCall[]): string {
+  if (calls.length === 0) return '(no tool calls recorded)';
+  const lines: string[] = [];
+  for (let i = 0; i < calls.length; i++) {
+    const c = calls[i];
+    lines.push(`--- call ${i + 1}: ${c.toolName} ---`);
+    if (Object.keys(c.args).length > 0) {
+      lines.push(`args: ${JSON.stringify(c.args)}`);
+    }
+    if (c.error) {
+      lines.push(`error: ${c.error}`);
+    } else if (c.result !== undefined) {
+      // The result may be an { ok, data } envelope or a bare object.
+      // Stringify with a size cap so an enormous synthetic result doesn't
+      // blow the judge's token budget.
+      const raw = JSON.stringify(c.result);
+      const truncated = raw.length > 4000 ? raw.slice(0, 4000) + `… [truncated, ${raw.length} total chars]` : raw;
+      lines.push(`result: ${truncated}`);
+    }
+    lines.push('');
+  }
+  return lines.join('\n');
+}
+
 // ─── run ─────────────────────────────────────────────────────────────────────
 
 describe('eval: diagnosis quality', () => {
@@ -101,9 +143,22 @@ describe('eval: diagnosis quality', () => {
         allTools,
         `eval-${runId}`,
       );
-      const diagnosis = await agent.investigate(goldenAnomaly);
+
+      // Capture every tool call the agent makes. The judge sees this trace as
+      // context so it can verify the diagnosis's numbers against ground truth.
+      const toolCallTrace: ToolCall[] = [];
+      const diagnosis = await agent.investigate(goldenAnomaly, {
+        onToolResult: (tc) => {
+          // Push a shallow snapshot so later mutations of the internal
+          // ToolCall object (unlikely, but the AptKit trace sink reuses them)
+          // don't rewrite the trace.
+          toolCallTrace.push({ ...tc });
+        },
+      });
       const investigateMs = Math.round(performance.now() - t0Investigate);
-      console.log(`[eval] diagnosis produced in ${investigateMs}ms`);
+      console.log(
+        `[eval] diagnosis produced in ${investigateMs}ms (${toolCallTrace.length} tool calls)`,
+      );
 
       // ─── 2. judge ───────────────────────────────────────────────────────
       console.log('[eval] judging diagnosis with RubricJudge…');
@@ -122,11 +177,14 @@ describe('eval: diagnosis quality', () => {
       });
 
       const subject = JSON.stringify(diagnosis, null, 2);
+      const traceForJudge = formatToolCallTrace(toolCallTrace);
+
       const judgmentResult = await judge.judge({
         subject,
         context: {
           anomaly: JSON.stringify(goldenAnomaly, null, 2),
           known_correct_shape: JSON.stringify(knownCorrect, null, 2),
+          tool_calls_trace: traceForJudge,
         },
       });
       const judgeMs = Math.round(performance.now() - t0Judge);
@@ -157,6 +215,13 @@ describe('eval: diagnosis quality', () => {
           change: goldenAnomaly.change,
           severity: goldenAnomaly.severity,
         },
+        toolCallTrace: toolCallTrace.map((tc) => ({
+          toolName: tc.toolName,
+          args: tc.args,
+          durationMs: tc.durationMs,
+          hasError: Boolean(tc.error),
+        })),
+        toolCallCount: toolCallTrace.length,
         diagnosis,
         judgment: judgmentResult.value,
         judgeAttempts: judgmentResult.attempts.length,
