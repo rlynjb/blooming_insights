@@ -1,82 +1,200 @@
-# Database Systems — overview
+# study — database systems (this repo)
 
-*Case B teaching (no DB): the primitives that fill the DB's roles in a repo that has no engine.*
+> The MECHANISMS used to execute and preserve reads and writes. This is the
+> partner to `study-data-modeling` (SHAPE of persistent data) and
+> `study-system-design` (WHICH datastore, and how it scales).
 
-**The verdict.** This repo has no database. It has three memory primitives, one committed JSON tree, and one encrypted cookie doing the storage-engine's job across three or four different responsibilities. Every study-database-systems concept below teaches the standard mechanism first, then names which of those primitives plays its role here — and which roles are `not yet exercised` at all.
+## The verdict, before we start
 
-The system, drawn once:
+There is **no database in this repo.** Not "we run Postgres in prod but the
+tests hit SQLite" — there is no relational engine, no document store, no
+`schema.sql`, no ORM, no migrations. `package.json` has zero DB clients.
+
+That's not a bug in the study. It's the shape you're studying.
+
+Every classical database-systems concept is here — a table exists, an index
+exists, durability exists, a "reference row" exists, a backup exists — but
+each one is **case B**: implemented as an in-memory Map, a TTL cache, a
+committed JSON snapshot, an encrypted cookie, a git tag. You get to see
+what a datastore is *actually doing* by watching this repo do the same jobs
+without one.
+
+## The full persistence hierarchy, at a glance
+
+Six tiers of durability, ordered by how long they live and where they live.
+Every mechanism in this study anchors to one of these tiers.
 
 ```
-  the whole storage picture — every "database" in this repo
+Persistence hierarchy in blooming_insights (no DB)
 
-  ┌─ Bloomreach Engagement (managed) ────────────────────────────┐
-  │  the real database. EQL over MCP. We don't operate it.       │ ← study-system-design owns this
-  └───────────────────┬──────────────────────────────────────────┘
-                      │ execute_analytics_eql (MCP)
-                      ▼
-  ┌─ Vercel serverless (Next 16 App Router) ─────────────────────┐
-  │                                                              │
-  │  session Map<sessionId, SessionFeed>       lib/state/insights.ts:14
-  │    → the "current" briefing per user      (in-memory, warm-start-wiped)
-  │                                                              │
-  │  TTL response cache (60s per call)         lib/data-source/…:122
-  │    → same tool+args returns instantly     (per warm instance)
-  │                                                              │
-  │  bi_auth AES-256-GCM cookie                lib/mcp/auth.ts:38-104
-  │    → OAuth tokens, PKCE verifier          (the ONLY prod durability)
-  │                                                              │
-  └───────────────────┬──────────────────────────────────────────┘
-                      │ read at request time
-                      ▼
-  ┌─ committed JSON in git ──────────────────────────────────────┐
-  │  lib/state/demo-*.json          — the "read replica"          │
-  │  eval/baseline.json             — the committed reference row │
-  │  eval/receipts/*.json           — 28 rows, per (case × runId) │
-  │  eval/goldens/*.ts              — fixture "seed data"         │
-  └──────────────────────────────────────────────────────────────┘
+┌─ Tier 1 · localStorage (client, per-browser) ────────────────────────┐
+│  bi:mcp_config           — the user's MCP server override            │
+│  bi:mode                 — 'demo' | 'live-mcp' | 'live-synthetic'   │
+│  survives tab close, browser restart, and app deploys                │
+└──────────────────────────────────────────────────────────────────────┘
+┌─ Tier 2 · sessionStorage (client, per-tab) ──────────────────────────┐
+│  bi:insight:<id>         — insight cache for the investigate page   │
+│  bi:diag:<id>            — diagnosis handoff step 2 → step 3        │
+│  bi:inv:<step>:<id>      — trace stash for re-visits / back-nav     │
+│  dies on tab close                                                   │
+└──────────────────────────────────────────────────────────────────────┘
+┌─ Tier 3 · In-memory Map (server, per-warm-instance) ─────────────────┐
+│  Map<sessionId, SessionFeed>  in lib/state/insights.ts:14           │
+│  dies on cold start / redeploy                                       │
+└──────────────────────────────────────────────────────────────────────┘
+┌─ Tier 4 · Server-signed cookies (per-user, cross-instance) ──────────┐
+│  bi_auth      — AES-256-GCM encrypted OAuth state (10 days)         │
+│  bi_session   — sessionId UUID (HttpOnly, SameSite=None on prod)    │
+└──────────────────────────────────────────────────────────────────────┘
+┌─ Tier 5 · File system (dev only) ────────────────────────────────────┐
+│  .auth-cache.json  — gitignored plaintext OAuth store               │
+│  survives Next hot-reload but not `rm`                               │
+└──────────────────────────────────────────────────────────────────────┘
+┌─ Tier 6 · Git-committed (durable, versioned) ────────────────────────┐
+│  eval/baseline.json                — reference row for the CI gate  │
+│  eval/receipts/*.json              — the "table" of judged runs     │
+│  lib/state/demo-insights.json      — frozen read replica            │
+│  lib/state/demo-investigations.json                                  │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-## Ranked findings — read these first
+The interesting thing about this hierarchy: **git is the most durable layer,
+and it is neither a database nor invisible to users.** The commit hash is
+the LSN. `git tag study-pre-regen-2026-07-03-p2` is today's backup
+(pre-regen safety tag). `git revert` is your rollback.
 
-1. **The session Map is the entire OLTP surface.** `lib/state/insights.ts:14` — a `Map<sessionId, SessionFeed>` where each `SessionFeed` is three inner maps (insights, investigations, anomalies). `putInsights` runs `clear()` then re-populates (`insights.ts:57-71`). Warm-start wipes it. Nobody outside the process sees it. This is the "table," and it costs you nothing to lose because no user depends on it surviving a redeploy. Concept file: `05-transactions-isolation-and-anomalies.md`.
+## The Case B analogy table
 
-2. **The 60s response cache is the only index.** `lib/data-source/bloomreach-data-source.ts:122` — `Map<string, {result, expiresAt}>` keyed by `${name}:${JSON.stringify(args)}`. That's a hash-table lookup on the exact tool call. There is no B-tree, no covering index, no range scan structure anywhere. Concept file: `03-btree-hash-and-secondary-indexes.md`.
+Every classical DB concept has a real analog somewhere in this codebase.
+The concept files walk each one with real `file:line` grounding.
 
-3. **`eval/baseline.json` is a committed row in git.** `eval/baseline.json:1-92` — one JSON object holding `perDimensionPassRate` and `verdictDistribution` for the frozen runId `2026-07-03T04-08-28-644Z`. `eval/gate.eval.ts:49-91` reads it as the reference "SELECT * FROM baseline WHERE runId = latest," compares against a candidate `computeBaseline(...)`, and fails the run when any dimension drops more than `GATE_MAX_REGRESSION` (0.10). Filesystem-as-committed-database is a Case B "table" — no engine, but the row is real. Concept files: `01-database-systems-map.md`, `08-replication-and-read-consistency.md`.
+| DB primitive              | Repo analog                                                   | File                                              |
+| ------------------------- | ------------------------------------------------------------- | ------------------------------------------------- |
+| **table**                 | `Map<sessionId, SessionFeed>`                                 | `lib/state/insights.ts:14`                        |
+| **primary key**           | `sessionId` (bi_session cookie UUID) → outer map key          | `lib/mcp/session.ts:3`                            |
+| **secondary key**         | `insight.id` (crypto.randomUUID) → inner map key              | `lib/state/insights.ts:26`                        |
+| **index / hot cache**     | 60 s TTL response cache per `${name}:${JSON.stringify(args)}` | `lib/data-source/bloomreach-data-source.ts:122`   |
+| **read replica**          | committed JSON snapshot                                       | `lib/state/demo-insights.json`                    |
+| **committed ref row**     | `eval/baseline.json` (frozen per-dim pass rates)              | `eval/baseline.json`                              |
+| **write-once durable row**| bi_auth cookie (AES-256-GCM encrypted OAuth store)            | `lib/mcp/auth.ts:34-104`                          |
+| **backup / point-in-time**| `git tag study-pre-regen-2026-07-03-p2`                       | git                                               |
+| **rollback**              | `git revert` / `git reset --hard <tag>`                       | git                                               |
+| **client-side KV store**  | `localStorage['bi:mcp_config']`                               | `lib/mcp/config.ts:34, 107, 121`                  |
+| **client-side cache**     | `sessionStorage['bi:insight:<id>']`                           | `lib/hooks/useBriefingStream.ts:57`               |
+| **WAL / redo log**        | `eval/receipts/*.json` — every judged run, append-only       | `eval/receipts/`                                  |
+| **replica lag**           | time since last `capture-demo` capture                        | `app/api/mcp/capture-demo/route.ts:34`            |
+| **serializable txn**      | not yet exercised                                             | —                                                 |
+| **MVCC / snapshot iso**   | not yet exercised (React's snapshot model is the nearest kin) | —                                                 |
+| **B-tree index**          | not yet exercised                                             | —                                                 |
 
-4. **The bi_auth cookie is the whole durability story.** `lib/mcp/auth.ts:38-104` — an AES-256-GCM encrypted httpOnly cookie holds OAuth client info, tokens, and the PKCE verifier. `AsyncLocalStorage` seeds a store from the cookie once at request start and flushes it once at the end (`auth.ts:86-104`), so the OAuth SDK's many synchronous reads/writes never race Next's request-vs-response cookie split. Warm-start wipes memory; the cookie survives on the client. Concept file: `07-wal-durability-and-recovery.md`.
+## What this study is going to cover, in order
 
-5. **`public/demo/` and `lib/state/demo-*.json` are frozen read replicas.** `lib/state/demo-insights.json` (665 lines) + `lib/state/demo-investigations.json` (3487 lines) are pre-captured briefing + investigation streams. `app/api/briefing/route.ts:78-149` reads them and replays as NDJSON when `?demo=cached`. Same replica pattern as a Postgres follower — deliberately stale, faster to serve, doesn't hit the real backend. Concept file: `08-replication-and-read-consistency.md`.
+Each file uses the full concept-file template (Zoom out → Structure pass →
+How it works → Diagram → Elaborate → Interview defense → See also). No
+Pass 1 / Pass 2 shape — this is a curriculum topic, not an audit.
 
-6. **Node's single-threaded loop is the concurrency control.** No locks, no MVCC, no CAS. `putInsights` (`insights.ts:57-71`) is safe against intra-instance concurrent callers only because it never `await`s between `clear()` and the final `.set()` — the JS event loop treats the whole synchronous block as an atomic turn. Between different requests on the same warm Vercel instance, the AsyncLocalStorage-scoped auth store (`auth.ts:47, 86-104`) is what prevents cross-request bleed. Concept file: `06-locks-mvcc-and-concurrency-control.md`.
+  1. **`01-database-systems-map`** — the whole persistence hierarchy in one
+     diagram. Where OLTP would sit if it existed; where every tier lives now.
 
-## `not yet exercised` — engine mechanics with no anchor in the repo
+  2. **`02-records-pages-and-storage-layout`** — records, pages, locality,
+     and the cost model. Anchored to the `SessionFeed` record shape, the
+     receipt files, and the localStorage layout.
 
-- **On-disk pages, extents, TOAST-style overflow storage** — everything lives in RAM or as whole JSON files. `02-records-pages-and-storage-layout.md`.
-- **B-tree, LSM tree, columnar indexes** — no ordered index of any kind. `03-btree-hash-and-secondary-indexes.md`.
-- **Query planner, EXPLAIN, join algorithms** — the agents choose queries, Bloomreach executes; we see no local plan. `04-query-planning-and-execution.md`.
-- **Multi-statement transactions, BEGIN/COMMIT, savepoints, 2PC** — no atomic unit larger than one synchronous JS turn. `05-transactions-isolation-and-anomalies.md`.
-- **Row locks, MVCC snapshots, SELECT FOR UPDATE, deadlock detection** — none of these exist because there is no concurrent writer. `06-locks-mvcc-and-concurrency-control.md`.
-- **Write-ahead log, fsync barriers, checkpoints, PITR** — no engine, no WAL. Git tags (`study-pre-regen-2026-07-03`) are the human-scale rollback story. `07-wal-durability-and-recovery.md`.
-- **Leader/follower replication, quorum reads, causal consistency, replication lag metrics** — the demo snapshot is a manually-refreshed replica; nothing streams changes. `08-replication-and-read-consistency.md`.
+  3. **`03-btree-hash-and-secondary-indexes`** — index structures, lookup
+     behavior, write costs, and index selection. Case B: the JS `Map`
+     hash-index, the 60 s response cache key.
+
+  4. **`04-query-planning-and-execution`** — plans, scans, joins, N+1. The
+     agent loop as the query planner; MCP tool calls as scans; per-request
+     cache as the buffer pool.
+
+  5. **`05-transactions-isolation-and-anomalies`** — atomicity, isolation,
+     the anomalies you get for free by never coordinating writes.
+     Anchored to `putInsights`'s `.clear()` race and the cookie
+     request-vs-response split.
+
+  6. **`06-locks-mvcc-and-concurrency-control`** — locks, MVCC, optimistic
+     vs pessimistic. Case B: the AsyncLocalStorage-scoped auth store as
+     "per-request MVCC," the module-level Map as "no locking, no isolation."
+
+  7. **`07-wal-durability-and-recovery`** — WAL, durability boundaries,
+     backup, restore. The receipts folder as the append-only log; the git
+     tag as the point-in-time snapshot; the baseline.json as the committed
+     reference row.
+
+  8. **`08-replication-and-read-consistency`** — replicas, lag, failover,
+     stale reads. Case B: `demo-insights.json` as the frozen replica;
+     capture-demo as the replication moment; `?demo=cached` as the
+     stale-read fallback.
+
+  9. **`09-database-systems-red-flags-audit`** — ranked storage-engine and
+     consistency risks in this codebase, top-down.
+
+## Ranked findings (the executive summary)
+
+Top three risks, ordered by consequence. Every one is anchored to a real
+file:line and explained in `09-database-systems-red-flags-audit.md`.
+
+  1. **The auth cookie IS your database.** `bi_auth` is the only production
+     durability layer for OAuth state. AES-256-GCM protects it; nothing
+     backs it up. Rotate `AUTH_SECRET` and every logged-in user is signed
+     out — `decryptStore()` at `lib/mcp/auth.ts:69` returns `{}` on a bad
+     tag and the app treats that as "no auth." (`lib/mcp/auth.ts:34-104`)
+
+  2. **`putInsights` has a between-request race.** The outer
+     `Map<sessionId, SessionFeed>` is not cleared, but the inner sub-map
+     is unconditionally `.clear()`-ed on every briefing. A user who kicks
+     off a second briefing while the first is still writing wipes the
+     first. No isolation, no versioning. (`lib/state/insights.ts:64-71`)
+
+  3. **The frozen replica has no lag metric.** `demo-insights.json` is
+     hand-refreshed via `/api/mcp/capture-demo` and committed to git.
+     There is no timestamp check; the demo mode will happily replay a
+     6-month-old snapshot with no warning. In DB terms: a read replica
+     with no lag alert. (`app/api/mcp/capture-demo/route.ts:34-58`)
+
+## What is `not yet exercised` in this repo
+
+Called out honestly so the concept files don't manufacture findings:
+
+  → **B-tree indexes** — no ordered index anywhere. `Map` is hash-only.
+  → **Multi-row transactions** — every write is a single map `.set()`.
+  → **MVCC / snapshot isolation** — no versioning; the AsyncLocalStorage
+    pattern in `withAuthCookies` is the nearest kin but is per-request,
+    not per-row.
+  → **Query planning / EXPLAIN** — the agent loop plans "which tool to
+    call next," but no cost-based optimizer sits between plan and
+    execution.
+  → **Two-phase commit / distributed txn** — Vercel warm instances share
+    nothing; consistency is "the browser carries the state."
+  → **WAL / redo log with recovery** — receipts are append-only but
+    never replayed; they're an audit log, not a recovery log.
+  → **Failover / high availability** — one Vercel deployment; no replica
+    promotion; no read/write split.
+
+Each of these gets one paragraph in the relevant concept file with a
+`not yet exercised` label — and a note on **when it becomes relevant.**
 
 ## Reading order
 
-Read in file-number order. Each concept file walks the standard mechanism first, then names which primitive (or which absence) plays its role here.
+Read `01-database-systems-map` first. That one puts every mechanism on the
+map. From there:
 
-1. `01-database-systems-map.md` — the whole storage picture, engines and non-engines named.
-2. `02-records-pages-and-storage-layout.md` — records / pages / locality.
-3. `03-btree-hash-and-secondary-indexes.md` — indexes and lookup structures.
-4. `04-query-planning-and-execution.md` — planning, scans, joins, N+1.
-5. `05-transactions-isolation-and-anomalies.md` — atomicity, isolation, anomalies.
-6. `06-locks-mvcc-and-concurrency-control.md` — concurrency mechanics.
-7. `07-wal-durability-and-recovery.md` — durability, backups, recovery.
-8. `08-replication-and-read-consistency.md` — replicas, staleness, failover.
-9. `09-database-systems-red-flags-audit.md` — ranked risks with evidence.
+  → If you want to reason about the storage engine — 02, 03, 04 in order.
+  → If you want to reason about concurrency and durability — 05, 06, 07.
+  → If you want the replica story — 08.
+  → For the ranked risk audit — 09.
 
-## Cross-links to adjacent generators
+The concept files stand alone; you can open any one and understand it. The
+map file is what makes them all point at the same picture.
 
-- **`study-data-modeling`** owns the *shape* of `Insight` / `Anomaly` / `Diagnosis` / `Recommendation` and whether the shape matches access patterns. This file owns the *mechanism* used to store and read those rows.
-- **`study-system-design`** owns *which datastore was selected* and how it scales. This file owns what happens *inside* that choice — including the choice to have no local engine.
-- **`study-distributed-systems`** owns coordination across processes/services. The AsyncLocalStorage isolation in `auth.ts:47, 86-104` gets treated there as request-scoping; here it shows up as concurrency control.
-- **`study-runtime-systems`** owns the event loop and process model. The reason `putInsights` is atomic without a lock (`insights.ts:57-71`) lives there; here we consume it as an isolation guarantee.
+## See also
+
+  → `study-data-modeling/` — the SHAPE of the same data (record layout,
+    relationships, integrity)
+  → `study-system-design/` — WHICH datastore was chosen and why (or,
+    here, why none was)
+  → `study-distributed-systems/` — coordination across replicas and warm
+    instances; the neighboring "many boxes, partial failure" concerns
+  → `study-runtime-systems/` — the process/instance model that makes the
+    Map-as-table story break under cold starts

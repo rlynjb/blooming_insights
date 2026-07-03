@@ -1,327 +1,392 @@
-# The data model and its shape
+# 01 — The data model and its shape
 
-**Industry term:** Entity relationship model (type-first / no-DB variant) · **Type:** Language-agnostic pattern, applied to a client-plus-server TS repo with no relational store.
+**Entity-relationship map · Case B (no relational DB) · zoom-out**
 
-## Zoom out, then zoom in
+## Zoom out — where this concept lives
 
-**Zoom out — where the data model lives.** blooming_insights has no database and no ORM. The "schema" is a set of TypeScript interfaces in `lib/mcp/types.ts` and `eval/goldens/types.ts`, materialized as in-memory objects during a request and (sometimes) serialized to JSON files. This is the whole persistence surface:
-
-```
-  blooming_insights — the persistence surface, layered
-
-  ┌─ UI layer ────────────────────────────────────────────────────┐
-  │  React components read Insight[]                               │
-  └────────────────────────────┬───────────────────────────────────┘
-                               │ JSON over NDJSON stream
-  ┌─ Service layer ─────────────▼──────────────────────────────────┐
-  │  app/api/briefing, app/api/agent — Next.js route handlers      │
-  │                             │                                   │
-  │            ┌────────────────▼──────────────────┐                │
-  │            │ ★ THE DATA MODEL ★                │ ← we are here  │
-  │            │ TypeScript interfaces in          │                │
-  │            │ lib/mcp/types.ts + eval/goldens   │                │
-  │            └────────────────┬──────────────────┘                │
-  └─────────────────────────────┼───────────────────────────────────┘
-                                │  serialize
-  ┌─ Storage layer ─────────────▼──────────────────────────────────┐
-  │  Map<sessionId, SessionFeed>   (in-memory, dies on cold start)  │
-  │  demo-insights.json / demo-investigations.json  (committed)    │
-  │  .investigation-cache.json / .auth-cache.json   (dev-only)     │
-  │  eval/receipts/*.json                           (per run)      │
-  └─────────────────────────────┬──────────────────────────────────┘
-                                │  fetch
-  ┌─ Provider layer ────────────▼──────────────────────────────────┐
-  │  Bloomreach loomi connect MCP · Anthropic API                  │
-  │  (the real source of truth for events + LLM outputs)           │
-  └───────────────────────────────────────────────────────────────┘
-```
-
-**Zoom in — the pattern.** The entities *aren't* rows in tables; they're **discriminated unions and interface trees** that get shaped by which stage of the pipeline you're in (`Anomaly` → `Insight` → `Investigation` → `Receipt`). There's one canonical source (`lib/mcp/types.ts`) plus one satellite (`eval/goldens/types.ts`) for eval-specific shapes. Everything downstream — the demo snapshots, the receipts, the load results — validates against these types.
-
-## Structure pass
-
-Skeleton before mechanics: name the layers, pick one question, trace it, then find where the answer flips.
-
-### The three layers of entities
+Every data-modeling audit starts the same way: draw the entities and their relationships. For a normal app that's an ERD from `schema.sql`. Here, there's no schema.sql, so the drawing has to come from the *TypeScript types* + the *tier they live in*. That's the whole zoom-out for this file.
 
 ```
-  Data-model layers — coarse to fine
+  Zoom out — the whole system, one picture
 
-  ┌─ Domain entities (the analyst's world) ─────────────────┐
-  │  WorkspaceSchema · Insight · Anomaly · Diagnosis        │
-  │  Recommendation · AgentEvent (8-variant DU)             │
-  │  → lib/mcp/types.ts + lib/mcp/events.ts + lib/mcp/schema│
-  └────────────────────────┬────────────────────────────────┘
-                           │
-  ┌─ Eval-subsystem entities (grading + regression) ────────┐
-  │  GoldenCase · Receipt · Baseline · Worksheet            │
-  │  Agreement · LoadReceipt · BudgetSnapshot               │
-  │  → eval/goldens/types.ts + shapes inline in run.eval.ts │
-  └────────────────────────┬────────────────────────────────┘
-                           │
-  ┌─ Wire / persistence shapes (thin wrappers) ─────────────┐
-  │  SessionFeed{ Map, Map, Map }   demo snapshot JSON keys │
-  │  → lib/state/insights.ts + lib/state/demo-*.json        │
-  └─────────────────────────────────────────────────────────┘
+  ┌─ Client (browser) ─────────────────────────────────────────┐
+  │  React components                                           │
+  │     ↓ persist                                               │
+  │  localStorage[bi:mode, bi:mcp_config]                       │  ← tier 1
+  │  sessionStorage[bi:insight:{id}]                            │
+  └─────────────────────────┬───────────────────────────────────┘
+                            │  HTTP (fetch + x-bi-mcp-config header)
+  ┌─ Service (Next.js route handlers) ─▼───────────────────────┐
+  │  ★ THIS FILE draws all of the below as one ERD-style map ★  │
+  │                                                             │
+  │  in-memory Map<sessionId, SessionFeed>       ← tier 2       │
+  │     ├── insights:       Map<id, Insight>                    │
+  │     ├── anomalies:      Map<id, Anomaly>                    │
+  │     └── investigations: Map<insightId, Investigation>       │
+  │                                                             │
+  │  signed cookie: bi_auth (AES-256-GCM)         ← tier 3      │
+  │     └── SessionAuthState (tokens, PKCE verifier, DCR info)  │
+  │                                                             │
+  │  dev-only files: .auth-cache.json,            ← tier 4      │
+  │                  .investigation-cache.json                  │
+  │                                                             │
+  │  eval subsystem (separate concern):                         │
+  │     GoldenCase → Receipt → Baseline (git-committed) ← tier 5 │
+  │     Worksheet ↔ Agreement (calibration artifacts)           │
+  └─────────────────────────────────────────────────────────────┘
 ```
 
-### One axis: **who owns this entity's identity?**
+The concept for this file: **the data model here is a lattice, not a schema.** Every entity has a home tier, and every relationship crosses at most one tier boundary. Draw the lattice, then draw the entities inside it — that's the ERD.
 
-Trace "which layer mints the id, and where is that id load-bearing?" down the stack:
+## The structure pass — layers, one axis, seams
+
+Before the ERD walk, hold one question constant across the tiers: **who owns the write?**
 
 ```
-  "who owns identity?" — one question, trace the answer down
+  Axis: "who has write authority for this fact?"
 
-  Domain:   Insight.id      → minted at anomalyToInsight (crypto.randomUUID())
-            Recommendation.id → minted by the agent's LLM output
-            AgentEvent      → no id (streams are ordered, not addressed)
-
-  Eval:     GoldenCase.caseId → hand-written literal (01-…, 02-…) — stable
-            Receipt          → composite key: (caseId, runId) → filename
-            Baseline         → single-file, self-identifying by content
-
-  Storage:  SessionFeed      → keyed by sessionId (opaque, request-scoped)
-            demo-*.json      → no id; the file *is* the whole snapshot
-
-  the answer flips: domain uses UUIDs (ephemeral), eval uses
-  hand-authored ids (stable), storage uses request-scoped opaque keys
+  ┌── tier 1: localStorage / sessionStorage ──┐
+  │  the BROWSER owns the write               │  → user-agent controls durability
+  └─────────────┬─────────────────────────────┘
+                │  seam A (crosses the network)
+  ┌── tier 2: in-memory Map (server) ────────▼┐
+  │  the running REQUEST owns the write       │  → dies with the instance
+  └─────────────┬─────────────────────────────┘
+                │  seam B (survives instance death)
+  ┌── tier 3: signed cookie (bi_auth) ───────▼┐
+  │  the SERVER writes, the BROWSER carries    │  → who owns it split
+  └─────────────┬─────────────────────────────┘
+                │  seam C (crosses restart)
+  ┌── tier 4: dev-only file ─────────────────▼┐
+  │  the DEV SERVER owns the write            │  → gone in prod
+  └─────────────┬─────────────────────────────┘
+                │  seam D (crosses deploys)
+  ┌── tier 5: git-committed JSON ────────────▼┐
+  │  the ENGINEER (you) owns the write        │  → durable across everything
+  └───────────────────────────────────────────┘
 ```
 
-### The seams — where the answer flips
-
-- **`anomalyToInsight` boundary (`lib/state/insights.ts:25`)** — the shape flips from a *pure agent output* (`Anomaly`) to a *presentation-enriched record* (`Insight` with derived fields spliced in). This is the seam where denormalization enters. → walked in `02-normalization-and-duplication.md`.
-- **The eval-receipt boundary (`eval/run.eval.ts:341`)** — a set of independently-produced facts (diagnosis, judgment, tool calls, cost, budget) get merged into a single denormalized JSON blob. This is the seam where a document store shape gets born from what could have been a set of related tables.
-- **The demo-snapshot boundary (`lib/state/investigations.ts:9`)** — the runtime `AgentEvent[]` stream gets frozen into a committed JSON file. That file is now the source of truth for demo mode. Live regenerates, demo replays.
-
-Skeleton mapped. Now walk the mechanics.
+Every seam is a place the *write-authority answer flips*. That's what makes them load-bearing: the moment a fact needs to survive a seam, it has to be *copied* into the next tier, and that copy is where duplication risk (file 02) lives.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-Think of the data model as a **pipeline of shapes** rather than a schema. The workspace's raw events (in Bloomreach) never enter your process directly — instead, each pipeline stage produces a *typed record* that summarizes the last stage plus the last stage's decision. Each shape is denser than the one before it.
+Think of it like the layered state you already know from a React app: `useState` inside a component (dies with unmount), `useContext` at the tree root (dies on refresh), `localStorage` (survives refresh, dies on browser data clear). Same pattern, longer stack. What React calls "component state → context → localStorage," this app calls "in-memory Map → cookie → localStorage → dev file → git." Each rung is more durable, harder to write, and more explicit about ownership.
 
 ```
-  The pipeline of shapes — each stage produces a denser record
+  The pattern — durability ladder, ranked
 
-  Bloomreach raw events
-        │
-        │ (queried via MCP)
-        ▼
-  Anomaly          { metric, scope, change, severity, evidence }
-        │
-        │ anomalyToInsight() splices in derived fields
-        ▼
-  Insight          Anomaly + { revenueImpact?, aov?, funnel?,
-                               affectedCustomers?, history?, ... }
-        │
-        │ diagnostic agent investigates
-        ▼
-  Diagnosis        { conclusion, evidence[], hypotheses[],
-                     affectedCustomers? }
-        │
-        │ recommendation agent proposes
-        ▼
-  Recommendation[] { title, rationale, feature, steps, impact }
-        │
-        │ eval run wraps all of the above + judgments + costs
-        ▼
-  Receipt          the whole trail as one denormalized document
+  short-lived   ┌── in-memory Map (per warm instance) ──┐   fast, disposable
+      ▲         │  Map<sessionId, SessionFeed>          │
+      │         └───────────────────────────────────────┘
+      │         ┌── localStorage / sessionStorage ──────┐
+      │         │  bi:mode, bi:mcp_config, bi:insight:* │
+      │         └───────────────────────────────────────┘
+      │         ┌── signed cookie (bi_auth) ────────────┐
+      │         │  encrypted SessionAuthState per sess. │
+      │         └───────────────────────────────────────┘
+      │         ┌── dev-only file (.auth-cache.json) ───┐
+      │         │  gitignored, dev-server-only          │
+      │         └───────────────────────────────────────┘
+      ▼         ┌── git-committed JSON ─────────────────┐   slow, permanent
+  long-lived    │  eval/baseline.json, demo-*.json      │
+                └───────────────────────────────────────┘
 ```
 
-Every arrow is *code* — a pure function that maps one shape to the next. There's no shared mutable state across stages, which is why the in-memory Map in `lib/state/insights.ts` can be as thin as it is: it's a cache of the final shape, not a database.
+Higher up = the *hot path* fact ("the current briefing feed"). Lower down = the *durable proof* fact ("what the eval baseline was on 2026-07-03"). The rung tells you a *ton* about the fact's lifecycle without opening any code.
 
-### Move 2 — the entities, walked one at a time
+### Move 2 — the entities, one at a time
 
-Each sub-section names one entity, shows the type from the actual file, and points at where it's created and read.
+Each sub-heading below picks one entity, names its tier, and shows the shape.
 
-#### The core five — `WorkspaceSchema`, `Anomaly`, `Insight`, `Diagnosis`, `Recommendation`
+#### `Insight` — the primary feed entity (tier 2, in-memory)
 
-The core of the domain. Every route handler and UI component you'll read is passing one of these five around.
+The insight is what the user actually sees on the home feed. Big shape — 15 fields including three optional enrichment groups.
 
+The industry term for what's happening here is a *denormalized read model*: it holds copies of facts that live authoritatively elsewhere (the raw `Anomaly` in the same map, the `Diagnosis` yet to be computed) so the client render doesn't have to fan out.
+
+Real code (`lib/mcp/types.ts:36-62`) — annotated:
+
+```typescript
+export interface Insight {
+  id: string;                                        // ← primary key (crypto.randomUUID)
+  timestamp: string;                                 // ← ISO 8601
+  severity: Severity;                                // ← 4-value discriminant
+  headline: string;                                  // ← rendered directly, no i18n
+  summary: string;
+  metric: string;
+  change: { value: number; direction: 'up'|'down'; baseline: string };
+  scope: string[];                                   // ← ["mobile", "checkout step"]
+  source: 'monitoring' | 'query';                    // ← origin discriminant
+  evidence?: { tool: string; result: unknown }[];    // ← denormalized from Anomaly
+  impact?: string;                                   // ← denormalized from Anomaly
+  revenueImpact?: { lostUsd; expectedUsd; currency };// ← Tier 1 enrichment
+  aov?: { current: number; prior: number };          // ← Tier 1 enrichment
+  funnel?: { view; cart; checkout; purchase };       // ← Tier 1 enrichment
+  affectedCustomers?: number;                        // ← denormalized from Diagnosis
+  history?: number[];                                // ← Tier 2 sparkline
+  downstreamReady?: { diagnosis; recommendations };  // ← pre-computed availability
+  category?: CategoryId;                             // ← denormalized from Anomaly
+}
 ```
-  Domain entity relationships (all in lib/mcp/types.ts)
 
-  WorkspaceSchema  (bootstrap-once, cached in module scope)
-        │
-        │ constrains what queries the agents can run
-        ▼
-  Anomaly ────► Insight ────► (Investigation)
-                                    │
-                                    ├── Diagnosis
-                                    │        │
-                                    │        │ Diagnosis.affectedCustomers.count
-                                    │        │ is COPIED into Insight.affectedCustomers
-                                    │        ▼ (denormalization — see file 02)
-                                    │      Insight
-                                    │
-                                    └── Recommendation[]
-```
+The load-bearing part: **the fields marked "denormalized from" are copies.** `Insight.evidence` is copied from `Anomaly.evidence`; `Insight.impact` is copied from `Anomaly.impact`; `Insight.affectedCustomers` is copied from `Diagnosis.affectedCustomers.count`. That copy happens once — at `anomalyToInsight()` in `lib/state/insights.ts:25-45` — and is never re-synced. If the underlying `Anomaly` were mutated, the `Insight` wouldn't know. In this app that never happens (writes are always "replace whole feed"), so the risk is latent, not live. File 02 walks it in detail.
 
-Straight from `lib/mcp/types.ts:82-92` — the `Anomaly` shape:
+#### `Anomaly` — the monitoring agent's raw output (tier 2, in-memory)
+
+The `Anomaly` is what the monitoring agent emits *before* the coordinator lifts it into an `Insight`. Same map, same session, different sub-map.
+
+Shape (`lib/mcp/types.ts:83-92`):
 
 ```typescript
 export interface Anomaly {
   metric: string;
-  scope: string[];                          // ["mobile", "checkout"]
-  change: { value: number; direction: 'up' | 'down'; baseline: string };
+  scope: string[];
+  change: { value: number; direction: 'up'|'down'; baseline: string };
   severity: Severity;
   evidence: { tool: string; result: unknown }[];
-  impact?: string;                          // one-sentence business impact (agent-written)
-  history?: number[];                       // 12 weekly values for the sparkline
-  category?: CategoryId;                    // the coverage-grid category
+  impact?: string;
+  history?: number[];
+  category?: CategoryId;
 }
 ```
 
-Read the annotations left to right: `metric` + `scope` + `change` is the *composite key* — nothing else identifies the anomaly. `evidence` is a **JSON blob field** (`result: unknown`) — the tool result is stored as-is, un-parsed. `impact` and `history` are **optional** because older snapshots produced by earlier agent code lacked them; the shape stays backward-compatible with committed demo data. This "optional-as-version-marker" trick recurs everywhere — → walked in `05-migrations-and-evolution.md`.
+The `Anomaly` has **no primary key**. It's stored in `SessionFeed.anomalies: Map<string, Anomaly>` keyed by the `Insight.id` that was minted for it (see `putInsights` at `lib/state/insights.ts:57-71`, `if (rawAnomalies?.[idx]) s.anomalies.set(i.id, rawAnomalies[idx])`). That's fine, but it means the `Anomaly` map is *dependent* on the `Insight` map — if you cleared insights without clearing anomalies, the anomaly rows would be orphans. `putInsights` clears both together (line 65-66) and that's the invariant the shape depends on.
 
-`Insight` (`lib/mcp/types.ts:36-62`) is the presentation-facing version — `Anomaly` **plus** a headline, an id, a timestamp, and five derived-for-the-UI fields (`revenueImpact`, `aov`, `funnel`, `affectedCustomers`, `history`, `downstreamReady`). Not a subtype — a *superset with copies*. That's the load-bearing shape choice; it makes rendering trivial but makes edits impossible without recomputation, which is the whole story of file 02.
+#### `Investigation` — the deep-dive artifact (tier 2, in-memory + tier 4 dev cache)
 
-`Diagnosis` and `Recommendation` (`lib/mcp/types.ts:95-130`) are agent outputs — one struct each, with optional business-owner enrichments (`effort`, `timeToSetUpMinutes`, `readResultInDays`, `prerequisites`, `successMetric`). Same optional-fields-as-capability-signals pattern.
+Investigation is the diagnosis + recommendations for one insight. It lives in the same session `Map`, but *also* has a second home in `.investigation-cache.json` (dev-only) and a third in `lib/state/demo-investigations.json` (committed demo seed).
 
-#### The discriminated union — `AgentEvent`
-
-`lib/mcp/events.ts:4-12`. This one type carries **the entire streaming contract** between the route handlers and the UI:
+Shape (`lib/mcp/types.ts:132-141`):
 
 ```typescript
-export type AgentEvent =
-  | { type: 'reasoning_step'; step: ReasoningStep }
-  | { type: 'tool_call_start'; toolName: string; agent: AgentName }
-  | { type: 'tool_call_end'; toolName: string; agent: AgentName; durationMs: number; result?: unknown; error?: string }
-  | { type: 'insight'; insight: Insight }
-  | { type: 'diagnosis'; diagnosis: Diagnosis }
-  | { type: 'recommendation'; recommendation: Recommendation }
-  | { type: 'done' }
-  | { type: 'error'; message: string };
-```
-
-Eight variants, one tag field (`type`). Discriminated unions **are the type-system equivalent of a polymorphic table** — one "table" with a `kind` column and different columns filled per variant. TypeScript's exhaustiveness check on the tag is the equivalent of a DB `CHECK` constraint on the discriminator, enforced at compile time instead of runtime. This is the *only* place in the codebase where the data shape is genuinely polymorphic, and it's shaped exactly right for the wire — one JSON object per NDJSON line, self-describing.
-
-#### The eval-subsystem shapes — `GoldenCase`, `Receipt`, `Baseline`
-
-Different lineage: these live in `eval/`, not `lib/`. `GoldenCase` (`eval/goldens/types.ts:20-38`) is the test-fixture record — 10 of them, one per file, hand-authored, imported into `eval/goldens/index.ts` as an ordered `readonly` array.
-
-```typescript
-export interface GoldenCase {
-  caseId: string;
-  signalClass: SignalClass;   // 'has-signal' | 'partial-signal' | 'no-signal' | 'positive'
-  intent: string;
-  anomaly: Anomaly;           // reused from lib/mcp/types.ts
-  knownCorrect: Record<string, unknown>;   // free-form judge context
+export interface Investigation {
+  insightId: string;                                 // ← foreign key back to Insight
+  reasoning: ReasoningStep[];
+  diagnosis: {
+    conclusion: string;
+    evidence: string[];
+    hypothesesConsidered: string[];                  // ← DIFFERENT shape than
+                                                     //   Diagnosis.hypothesesConsidered!
+  };
+  recommendations: Recommendation[];
 }
 ```
 
-Notice `signalClass` — a **string-literal discriminated union with four variants**, but it's flat data (a field, not a tag on a variant). It's used at `run.eval.ts:413-415` to decide whether a case is *gated* (has-signal / partial-signal — a fail is a bug) or *measured* (no-signal / positive — a fail is a data point). This is the classical "type as data" pattern — the value picks the code path.
+Watch the two-source-of-truth risk: `Investigation.diagnosis.hypothesesConsidered` is `string[]`, while `Diagnosis.hypothesesConsidered` is `{hypothesis, supported, reasoning}[]`. Same field name, different shape, different file. That's a modeling debt file 07 marks as a red flag.
 
-`Receipt` (constructed at `eval/run.eval.ts:341-395`) is the giant one — the entire trail of one case in one document. About 35KB serialized. There's no `Receipt` interface anywhere; the shape is defined by construction and re-derived at read time (`eval/baseline.eval.ts:26-39` names only the fields the baseline reader needs). That's a real cost — see file 04.
+The three-source persistence chain is worth showing as a diagram — it's how the app achieves demo-mode fallback without a database:
 
-`Baseline` (`eval/baseline.eval.ts:70-85`) is the committed reference — one file, one snapshot of aggregate stats, keyed by `runId`. It's the *only* eval artifact that's checked into git; every other receipt is gitignored.
+```
+  Investigation lookup — the three-source read chain
 
-#### The three runtime shapes — `SessionFeed`, `cached: WorkspaceSchema | null`, `BudgetTracker`
+  ┌── read: getCachedInvestigation(insightId) ────┐
+  │                                                │
+  │  1. mem.get(insightId)          ← in-process   │  fastest
+  │     ↓ miss                                     │
+  │  2. .investigation-cache.json   ← dev only     │  survives HMR
+  │     ↓ miss OR in production                    │
+  │  3. demo-investigations.json    ← git-committed│  always available
+  │     ↓ miss                                     │
+  │  4. null                                       │
+  └────────────────────────────────────────────────┘
 
-Tiny, but every one of them is the entire "storage layer" for its concern.
+  writes go to memory always; to the dev file in development;
+  never to the committed demo (that's a hand-edited seed).
+```
 
-`SessionFeed` (`lib/state/insights.ts:8-14`):
+Code lives at `lib/state/investigations.ts:22-28`. This is a real modeling decision: the same entity (`AgentEvent[]` per `insightId`) has *three homes*, and the read walks them in durability order. It's a poor person's cache hierarchy — L1 (in-memory), L2 (dev file), L3 (committed seed) — expressed as three JSON sources.
+
+#### `SessionAuthState` — the OAuth state (tier 3, encrypted cookie)
+
+Shape (`lib/mcp/auth.ts:12-17`):
 
 ```typescript
-type SessionFeed = {
-  insights: Map<string, Insight>;
-  investigations: Map<string, Investigation>;
-  anomalies: Map<string, Anomaly>;
-};
-const state = new Map<string, SessionFeed>();
+interface SessionAuthState {
+  clientInformation?: OAuthClientInformationMixed;   // ← from Dynamic Client Reg
+  tokens?: OAuthTokens;                              // ← the actual bearer + refresh
+  codeVerifier?: string;                             // ← PKCE
+  state?: string;                                    // ← OAuth CSRF nonce
+}
+type Store = Record<string, SessionAuthState>;       // ← keyed by app sessionId
 ```
 
-Nested Map-of-Maps — the outer partitions by `sessionId` (opaque, cookie-supplied), the inner is by entity id. The comment on lines 5-11 is worth reading in full: this partitioning is defensive against warm serverless instances leaking one user's feed into another's. Without it, `putInsights`'s `clear()` on line 66 would wipe every user's feed.
+The critical modeling call: **the entire `Store` fits in one cookie.** In production the `Store` is JSON-serialized, AES-256-GCM encrypted, base64url-encoded, and stuffed into `bi_auth`. Every request decrypts the whole store, mutates it in an `AsyncLocalStorage` context, then re-encrypts and re-sets on the way out (`lib/mcp/auth.ts:86-104`). That works because there's only ever one entry per browser — the `sessionId` inside is the app's own, and the cookie carries state for that one session only.
 
-`cached: WorkspaceSchema | null` at `lib/mcp/schema.ts:138`. One module-level `let`. It's a manually-managed **process-wide singleton cache** with an explicit reset (`_resetSchemaCache`, line 211). The schema doesn't change during a process lifetime — the pattern fits.
+If two sessions ever shared one cookie you'd overwrite each other. The `SameSite=None` config (`lib/mcp/auth.ts:97-98`) makes this a real concern to reason about — file 04 walks the integrity story.
 
-`BudgetTracker` (`lib/agents/budget.ts:41-77`) is a class, created fresh per investigation. It holds three counters (`inputTokens`, `outputTokens`, `turns`) and exposes `snapshot()` + `exceeded()`. Its persistence is *its object lifetime* — it dies when the investigation finishes.
+#### `McpConfigOverride` — the wire-format entity (tier 1 localStorage + wire)
 
-#### Move 2 variant — the load-bearing skeleton
+New in Session D. Persisted in `localStorage['bi:mcp_config']`, base64-JSON-encoded onto every fetch as the `x-bi-mcp-config` header, decoded server-side and merged over env defaults.
 
-The **kernel of this data model** is small. Strip everything you can:
+Shape (`lib/mcp/config.ts:27-31`):
+
+```typescript
+export interface McpConfigOverride {
+  url?: string;
+  authType?: McpAuthType;      // 'oauth-bloomreach' | 'bearer' | 'anonymous'
+  bearerToken?: string;
+}
+```
+
+All fields optional — that's the "partial override merges into env" contract. The shape is *validated on both ends* (`isMcpConfigOverride` at `lib/mcp/config.ts:50-60`), which is the strongest integrity story in the codebase. File 04 gives it the walkthrough.
+
+#### `GoldenCase` / `Receipt` / `Baseline` — the eval entities (tier 5, git-committed)
+
+These are the durable, git-committed shapes. The chain:
 
 ```
-  kernel:  Anomaly ──► Insight ──► Diagnosis ──► Recommendation[]
-                                                  │
-                                                  ▼
-                                                Receipt
-                    (a single denormalized envelope
-                     with every prior shape inlined)
+  Eval subsystem — the durable data flow
+
+  ┌── GoldenCase[10]  ────┐    hand-written, kebab-case-id, committed
+  │  eval/goldens/*.ts    │    signalClass ∈ {has-signal, partial-signal,
+  └──────────┬────────────┘                   no-signal, positive}
+             │  run.eval.ts   ← reads goldens, drives agents
+             ▼
+  ┌── Receipt[per run × 10]  ┐  denormalized per case: anomaly + tool calls +
+  │  eval/receipts/          │  diagnosis + judgments + durations + cost
+  │  {case}-{runId}.json     │  ~400-line JSON blob per file
+  └──────────┬───────────────┘
+             │  baseline.eval.ts   ← aggregates dims across cases
+             ▼
+  ┌── Baseline (one file) ─┐  aggregate: perDimensionPassRate,
+  │  eval/baseline.json    │  perDimensionScoreCounts, verdictDistribution
+  └────────────────────────┘  committed; regression-gate reference
 ```
 
-Name each part by what breaks if you drop it:
-
-- **Drop `Anomaly`** and the monitoring agent has no target output type — nothing to hand off to `anomalyToInsight`, the UI has no cards.
-- **Drop `Insight`** and the UI has to derive its presentation fields from `Anomaly` on every render, or two components disagree about what the "affected customers" count means.
-- **Drop `Diagnosis`** and step 2 of the investigate flow has no output; step 3 (recommendations) has no input.
-- **Drop `Recommendation`** and the whole product has no *decision* stage — this is the payoff shape.
-- **Drop `Receipt`** and the eval subsystem has nothing to aggregate; there's no baseline, no gate.
-- **Drop `AgentEvent`** and the UI streaming surface has no wire format; NDJSON is untyped garbage.
-
-Everything else — `revenueImpact`, `funnel`, `Insight.affectedCustomers`, `WorkspaceSchema.dataHorizon`, `BudgetTracker` — is **hardening.** Nice to have, doesn't break the pipeline if it's absent.
+Real numbers as of this writing: 10 goldens × 3 runs = 28 receipt files in `eval/receipts/`, plus one committed `baseline.json` from run `2026-07-03T04-08-28-644Z`. The receipt shape is *the* denormalized big-blob — everything for one case (anomaly, tool calls, tool results, diagnosis JSON, judge verdicts, durations, model IDs) in one file. That's an explicit tradeoff: it makes each receipt self-contained (open one file, see the whole story) at the cost of duplicating the anomaly across every receipt for the same case. Discussed in file 02.
 
 ### Move 3 — the principle
 
-**When the shape is the schema, use the type system as the schema tool.** blooming_insights has no ORM, no migration file, no `CREATE TABLE`. What it has is a single canonical TypeScript file (`lib/mcp/types.ts`) that every producer and every consumer imports. That file *is* the DDL. TypeScript exhaustiveness checks on discriminated unions replace `CHECK` constraints. Optional fields replace nullable columns. The pipeline of shapes replaces a set of joined tables — because the app never needs to *join* one shape to another; each successor already inlines what it needs from its predecessor. The principle transfers: **before reaching for a database, ask whether your access pattern is "join across time" or "hand off along the pipeline." If it's the latter, a set of well-typed records in memory + one document per outcome is often the right shape.** Reach for a database when you need to *query across* outcomes, not when you need to *store* them.
+The principle: **when you don't have a database, your type system becomes your schema.** Every persistent fact is defined by a TypeScript interface, validated by a type guard, and homed in a tier. The ERD is the *tier ladder* × the *type registry*. The moment you can draw both together, you can reason about the whole persistence story.
 
-## Primary diagram
+The strong version of this principle: *tier ladder + type unions + validation guards ≥ a database schema*. The weak version: without discipline, you get shape drift across tiers (see the `Diagnosis` vs `Investigation.diagnosis` mismatch above).
 
-The whole data model in one frame — every entity, every relationship, every persistence bucket.
+## Primary diagram — the full ERD
+
+The one recap picture the reader returns to. Every entity, every foreign key, every tier band.
 
 ```
-  blooming_insights — complete data-model recap
+  Blooming Insights — the schema, as a lattice
 
-  ┌─ lib/mcp/types.ts (canonical type file) ─────────────────────┐
-  │                                                              │
-  │   WorkspaceSchema ──► (constrains what queries agents run)   │
-  │                                                              │
-  │   Anomaly ─► Insight ─► Investigation ─┬─► Diagnosis         │
-  │                                        │      │              │
-  │                                        │      │ (copied into│
-  │                                        │      ▼   Insight)  │
-  │                                        │    Insight         │
-  │                                        │                    │
-  │                                        └─► Recommendation[] │
-  │                                                              │
-  │   AgentEvent (8-variant DU) — wire format only               │
-  └──────────────────────────┬───────────────────────────────────┘
-                             │
-        ┌────────────────────┼────────────────────┐
-        ▼                    ▼                    ▼
-  ┌─ Runtime ─────┐  ┌─ Committed ────┐  ┌─ Eval-only ────────┐
-  │ SessionFeed:  │  │ demo-insights  │  │ eval/goldens/*.ts  │
-  │ Map<sid,{ ...}│  │ demo-investig- │  │   GoldenCase × 10  │
-  │ 3-Map object} │  │ ations.json    │  │                    │
-  │               │  │                │  │ eval/baseline.json │
-  │ cached:       │  │ (source of     │  │   Baseline (agg)   │
-  │  WorkspaceSch │  │  truth for     │  │                    │
-  │  ema | null   │  │  demo mode)    │  │ eval/receipts/*    │
-  │               │  │                │  │   Receipt × N × R  │
-  │ BudgetTracker │  │                │  │ eval/load-receipts │
-  │ (per invest.) │  │                │  │   LoadReceipt      │
-  └───────────────┘  └────────────────┘  │ eval/calibration/  │
-                                          │   Worksheet+Agree │
-                                          └────────────────────┘
+  ┌─────────────────────────── tier 1: browser storage ──────────────────────────┐
+  │                                                                              │
+  │   ┌──── localStorage ────┐        ┌──── sessionStorage ────┐                 │
+  │   │  bi:mode             │        │  bi:insight:{id}       │                 │
+  │   │  bi:mcp_config       │        │    → Insight (JSON)    │                 │
+  │   │    → McpConfigOverride│       │  bi:step:{id}:*        │                 │
+  │   └──────────────────────┘        └────────────────────────┘                 │
+  └──────────────────────────────────┬──────────────────────────────────────────┘
+                                     │  x-bi-mcp-config header (base64 JSON)
+  ┌──────────────────────────── tier 2 + 3: server ─▼────────────────────────────┐
+  │                                                                              │
+  │   Map<sessionId, SessionFeed>  ─────  the primary hot-path store             │
+  │   ┌────────────────────────────────────────────────┐                         │
+  │   │ SessionFeed {                                   │                        │
+  │   │   insights:       Map<id, Insight>  ────────┐   │                        │
+  │   │   anomalies:      Map<id, Anomaly>  ────┐   │   │                        │
+  │   │   investigations: Map<insightId, Inv.>  │   │   │                        │
+  │   │ }                                        │   │   │                        │
+  │   └──────────────────────────────────────────┼───┼──┘                         │
+  │                                              │   │                            │
+  │   Insight ──id────► Anomaly (siblings)  ◄────┘   │                            │
+  │       ▲                                          │                            │
+  │       │ FK: insightId                            │                            │
+  │       │                                          │                            │
+  │   Investigation                                  │                            │
+  │     └── reasoning: ReasoningStep[]               │                            │
+  │     └── diagnosis: { conclusion, evidence,       │                            │
+  │                       hypothesesConsidered: str[]}◄─── shape drift vs         │
+  │     └── recommendations: Recommendation[]        │      lib/mcp/types Diagnosis│
+  │                                                  │                            │
+  │   ┌── tier 3: bi_auth cookie (AES-256-GCM) ─────▼──┐                          │
+  │   │  Store = Record<sessionId, SessionAuthState>    │                          │
+  │   │    { clientInformation, tokens, codeVerifier,   │                          │
+  │   │      state }                                    │                          │
+  │   └─────────────────────────────────────────────────┘                          │
+  └──────────────────────────────────┬───────────────────────────────────────────┘
+                                     │  fallback reads on cache miss
+  ┌───────────────────── tier 4 (dev): file system ─▼──────────────────────────┐
+  │  .auth-cache.json           mirrors bi_auth store, dev-only                 │
+  │  .investigation-cache.json  Record<insightId, AgentEvent[]>, dev-only       │
+  └──────────────────────────────────┬───────────────────────────────────────────┘
+                                     │  fallback reads on ALL misses
+  ┌───────────────────── tier 5: git-committed JSON ▼─────────────────────────┐
+  │  lib/state/demo-insights.json         seed for demo mode                    │
+  │  lib/state/demo-investigations.json   seed for demo mode                    │
+  │  public/demo/*.json                   baked golden fixtures                 │
+  │  eval/baseline.json                   regression-gate reference             │
+  │  eval/goldens/*.ts                    10 GoldenCase entities                │
+  │  eval/receipts/*.json                 28 committed receipts (Case × Run)    │
+  │  eval/calibration/*.json              worksheet + agreement per calib pass  │
+  └────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The type-first, no-DB shape isn't unusual for a **demo-heavy Next.js app** — it's actually the correct fit when the "real" data source is another system (Bloomreach) and your app is a *presentation + reasoning layer* over it. What's worth naming is the discipline it demands: because there's no schema migration to force the issue, changes to shapes have to be **additive** (new optional field) or **coordinated across every producer and consumer at once.** The commit history for `lib/mcp/types.ts` is where the "migrations" actually live — see file 05.
+Where this shape comes from: the app is a hackathon build (June 2026 deadline in the spec) that lived its whole life as a serverless Next.js app on Vercel. No relational database was ever added because the domain didn't demand one — the *briefing* is ephemeral (a new one each morning), the *deep dive* is short-lived (one session), and the *durable* stuff (evals, demo fallback) can be committed as JSON. That decision — "keep everything at the type-system level, use tiers instead of tables" — is the load-bearing choice this whole guide walks.
 
-If this app ever grows a need to *query across* investigations ("which recommendations that we labeled as 'campaign' failed most often?" or "show me every diagnosis in the last month where evidence_grounding scored ≤ 2"), the file-per-receipt layout hits its wall. That's the moment to introduce a store — probably SQLite for local eval work, Postgres if it goes to a product feature. → `06-access-patterns-and-storage-choice.md` names the trigger.
+Where it stops working: the moment a *user* accumulates history that outlives a session (bookmarks, subscriptions, saved investigations), the tier ladder runs out. Tier 2 dies with the instance; tier 3 dies at 10-day cookie expiry or on `AUTH_SECRET` rotation; tier 4 doesn't exist in production. There's no per-user durable tier, which means adding user-scoped history means adding tier 6: a real database. That's the next architectural inflection point.
+
+Related reading: *A Philosophy of Software Design* on information hiding (Ch. 5) — the tier-ladder is information-hiding for time. Each tier hides the fact from queries against tiers below it. Also worth: Fowler's *Patterns of Enterprise Application Architecture* on the *Data Mapper* pattern — the `anomalyToInsight` / `insightToAnomaly` pair in `lib/state/insights.ts:25-55` is a hand-rolled data mapper between two shapes of the same fact.
 
 ## Interview defense
 
-**Q: "Walk me through your data model."**
-Answer: "It's not a database — it's a pipeline of typed records. There are five domain entities in `lib/mcp/types.ts`: `Anomaly` from the monitoring agent, `Insight` (the presentation-enriched version of `Anomaly`), `Diagnosis` from the diagnostic agent, `Recommendation` from the recommendation agent, and `AgentEvent` — an eight-variant discriminated union that's the wire format for the streaming UI. Then there are eval-subsystem shapes for goldens, receipts, and baselines. Nothing is normalized; every downstream shape inlines what it needs from upstream. The persistence is a session-partitioned `Map` in memory plus JSON files on disk — committed for demo, gitignored for run artifacts." Draw the pipeline-of-shapes diagram from Move 1.
+### Q1 — "you don't have a database. Talk me through your data model."
 
-**Q: "Why no database?"**
-Answer: "Two reasons. First, the real source of truth for the data being analyzed is Bloomreach — we re-query it on every run. Second, the access pattern is write-once-per-request, read-many-times-within-that-request. A `Map` fits that exactly. The cost is that nothing survives a cold start, which we accept because the flow is architected around 'reconnect and re-run.' If we ever needed to query *across* runs — trend recommendations over time, find every case where a judgment dimension scored ≤ 2 — that's the moment SQLite or Postgres enters." Anchor: `lib/state/insights.ts:7-23` for the session-partitioned map; `eval/baseline.eval.ts:87-118` for the current cross-run aggregation, which is a linear file scan.
+Model answer, ~90 seconds:
+
+> Right. There's no relational DB in this codebase. What I have instead is a **five-tier persistence lattice**, and my entity model is defined by TypeScript interfaces that live in one of those tiers. Let me sketch it.
+
+```
+  the five tiers, ranked
+
+  tier 1 → localStorage / sessionStorage           (browser, ~forever)
+  tier 2 → Map<sessionId, SessionFeed> in memory   (server, until instance cools)
+  tier 3 → bi_auth cookie (AES-256-GCM)            (server writes, browser carries, ~10 days)
+  tier 4 → dev-only JSON files                     (dev server only, until deleted)
+  tier 5 → git-committed JSON                      (permanent — baseline, demo, goldens)
+```
+
+> My primary entity is `Insight` — that's the feed item. It lives in tier 2, keyed by a UUID, inside a per-session sub-map so warm serverless instances don't leak between users. It has a sibling `Anomaly` — the raw monitoring output before I lift it into an Insight — also in tier 2. And it has a foreign-key-style relationship to `Investigation`, which lives in tier 2 with fallbacks to tier 4 and tier 5.
+>
+> The reason it works without a real DB: the domain is ephemeral. Briefings are per-day, investigations are per-session, and the durable stuff (evals, demo fallback) is small enough to commit as JSON. The moment I add per-user persistent history, the lattice runs out and I need a tier 6 — a real DB.
+
+Anchor: "five tiers × the type registry."
+
+### Q2 — "your `Insight` denormalizes a lot from `Anomaly`. How do you keep them consistent?"
+
+Model answer:
+
+> I don't, really, and that's fine given the write pattern. Insights and Anomalies are both stored in `SessionFeed`, both cleared together in `putInsights`, and never mutated after write. So the copy from `Anomaly.evidence` into `Insight.evidence` happens once, at `anomalyToInsight()`, and stays consistent because nothing edits either side.
+>
+> If I *did* start mutating them, I'd have to either normalize (store `evidence` on `Anomaly` only, join at read) or add a version field and enforce joint updates. Right now the invariant is enforced by the write path — replace-whole-feed atomically.
+
+```
+  invariant: Insight.evidence === Anomaly.evidence, always
+
+  write path (enforcer):        Anomaly[]  ──anomalyToInsight──►  Insight[]
+                                    │                                │
+                                    └───────── same putInsights ─────┘
+                                        (clears both, sets both)
+
+  no partial-update path exists → invariant can't drift
+```
+
+Anchor: "invariant enforced by the write shape."
+
+### Q3 — "how do you version schemas without migrations?"
+
+> I don't have a versioning story, and that's a real gap. What I have is **optionality as forward compatibility**: every new field on `Insight` is `?`, so old snapshots in `lib/state/demo-insights.json` still validate. That's not a migration strategy — it's *lucky-additive*. The moment I need a *destructive* change (rename `impact` to `businessImpact`, change `history: number[]` to `history: {ts, val}[]`), the committed demo JSONs break with no migration path.
+>
+> The fix, when it becomes real: a `schemaVersion` field on `Insight`, and a `migrateInsight(anyShape) → InsightV{n}` at the read boundary. File 05 in my study covers this.
+
+Anchor: "optional fields = forward compat; not a strategy for destructive change."
 
 ## See also
 
-- `02-normalization-and-duplication.md` — the `anomalyToInsight` seam where denormalization enters.
-- `03-indexing-vs-query-patterns.md` — how the receipt layout is queried.
-- `06-access-patterns-and-storage-choice.md` — why the storage choice matches the access pattern (and where it doesn't).
+- `02-normalization-and-duplication.md` — where the `Insight` copies from `Anomaly` and where that copy goes wrong.
+- `04-transactions-and-integrity.md` — the wire-format validation on `McpConfigOverride`, and the invariant enforcement in `putInsights`.
+- `06-access-patterns-and-storage-choice.md` — why "no relational DB" was the right call given the access shape.
+- `07-data-modeling-red-flags-audit.md` — the two-source-of-truth on `Recommendation` and the round-trip lossiness on `insightToAnomaly` are marked here.

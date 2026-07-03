@@ -1,197 +1,234 @@
-# Supervisor-worker (deterministic supervisor variant)
+# Supervisor-worker
 
-_Industry standard._
+*Industry names: supervisor-worker / manager-workers / orchestrator-executors · Industry standard*
 
-## Zoom out, then zoom in
-
-The most common and most useful multi-agent topology. In this repo the supervisor is *deterministic* — written in TypeScript in `app/api/agent/route.ts` — not an LLM. That variant is Anthropic's recommended production shape.
+## Zoom out
 
 ```
-  Zoom out — the deterministic supervisor in this repo
+  Zoom out — the topology this repo actually ships
 
-  ┌─ UI ────────────────────────────────────────────────────┐
-  │  three product phases (feed / investigate / recommend)  │
-  └───────────────────────────┬─────────────────────────────┘
-                              │
-  ┌─ ★ SUPERVISOR (route.ts) ★ ────────────────────────────┐
-  │  code decomposes: which agent, in which order          │
-  │  monitors: NDJSON stream to UI (stepFor per phase)     │
-  │  synthesizes: passes diagnosis from step 2 to step 3   │
-  └───────┬──────────────┬──────────────┬──────────────────┘
-          ▼              ▼              ▼
-     ┌────────┐     ┌────────┐    ┌────────┐
-     │Monitor │     │Diagnose│    │Recomm. │
-     └────────┘     └────────┘    └────────┘
-       10-cat        evidence      actions
-       scan          gathering
+  ┌─ SECTION C topologies ──────────────────────┐
+  │  ★ supervisor-worker (this repo) ★           │ ← we are here
+  │  sequential pipeline (sub-shape here)        │
+  │  parallel fan-out                            │
+  │  debate / verifier / critic                  │
+  │  swarm / handoff                             │
+  │  graph orchestration                         │
+  └──────────────────────────────────────────────┘
 ```
 
-Zoom in: this is a manager component delegating to child components. The supervisor's job is routing + orchestration + synthesis, all of which are written by hand for predictability.
+## Zoom in
+
+The most common and most useful topology. A supervisor decomposes the task, delegates to specialist workers, and synthesizes their results. This repo's version has a **code supervisor** (a Next.js route handler) — a form of supervisor-worker with maximum determinism at the top. That distinction is load-bearing.
 
 ## Structure pass
 
-**Layers:** supervisor (decompose + route + synthesize) · workers (specialists) · shared state (workspace schema) · message passing (diagnosis handed to recommend).
-**Axis:** *who decides which worker runs when?*
-**Seam:** the supervisor→worker boundary. In this repo it's the `new DiagnosticAgent(...)` construction — deterministic supervisor, autonomous worker.
+Layers: **supervisor** (owns the task, picks workers, merges results) — **workers** (each owns one specialty) — **tools** (each worker's own tool set).
+
+Axis to hold constant: **who decides which worker runs?**
 
 ```
-  Deterministic supervisor vs LLM supervisor
+  Supervisor kinds — the axis that flips per implementation
 
-  Deterministic (this repo):        LLM supervisor (alternative):
-  supervisor = TypeScript in         supervisor = another Sonnet loop
-  route.ts. Code picks the           that reads the task and calls
-  next worker in a chain.            worker agents as tools.
+  supervisor kind         decides which worker runs
+  ─────────────────       ─────────────────────────
+  LLM supervisor          the LLM (per task)
+  code supervisor         the code (deterministic)
+  hybrid                  code for known paths,
+                          LLM for ambiguous ones
 
-  cost: 0 model calls per hop        cost: 1 model call per routing
-  latency: 0                         latency: 500-2000ms per hop
-  predictability: 100%               predictability: 90-95%
-  debugging: trivial                 debugging: log the LLM decisions
+  This repo: code supervisor.
 ```
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — the shape
 
-You've built a React `PageLayout` that composes header + main + sidebar components — each child owns its region, the parent decides the composition. Supervisor-worker is that shape at the agent layer: the parent chooses which children run, in which order; each child owns its specialization.
+You've written a React manager component that renders three child components based on props before — parent picks which child, passes props down, aggregates results back up. Supervisor-worker is that shape with LLM agents as the children.
 
 ```
-  Pattern: supervisor-worker
+  Supervisor-worker — the canonical shape
 
-  ┌──────────────────────────────────┐
-  │       Supervisor                  │
-  │  1. decompose the task            │
-  │  2. delegate to workers            │
-  │  3. synthesize worker outputs      │
-  └──┬───────────┬───────────┬────────┘
-     ▼           ▼           ▼
-  ┌─────┐    ┌─────┐    ┌─────┐
-  │work1│    │work2│    │work3│    ← each specialist
-  └──┬──┘    └──┬──┘    └──┬──┘
-     └──────────┼──────────┘
-                ▼
-       supervisor synthesizes
+  ┌───────────────────────────────────────────────┐
+  │              Supervisor                        │
+  │   (decomposes task, delegates, synthesizes)   │
+  └───────┬───────────────┬───────────────┬───────┘
+          ▼               ▼               ▼
+      ┌────────┐      ┌────────┐      ┌────────┐
+      │worker 1│      │worker 2│      │worker 3│
+      │(spec.) │      │(spec.) │      │(spec.) │
+      └────┬───┘      └────┬───┘      └────┬───┘
+           └───────────────┼───────────────┘
+                           ▼
+                  supervisor synthesizes
+                  worker results → answer
 ```
 
-### Move 2 — the walkthrough
+### Move 2 — the specific instance in this repo
 
-**The supervisor — `app/api/agent/route.ts:229-297`.** All in TypeScript. No LLM decides the flow.
+**Where the supervisor lives.** Two files, both Next.js route handlers:
+
+- `app/api/briefing/route.ts` — the supervisor for the monitoring stage. Constructs `MonitoringAgent`, wires hooks, streams to the browser.
+- `app/api/agent/route.ts` — the supervisor for the diagnostic + recommendation stages, and for the free-form Q&A path. Picks worker based on `?step=…` or `classifyIntent(q)`.
+
+Both are TypeScript. Neither runs an LLM to make the routing decision.
+
+**The route as supervisor — real code.**
 
 ```ts
-// route.ts:229-232 — the routing decision
-const leadAgent: AgentName =
-  q && !insightId ? 'coordinator' : step === 'recommend' ? 'recommendation' : 'diagnostic';
-stepFor(leadAgent, 'thought', 'reading the workspace schema…');
-
-// route.ts:266-297 — the sequential worker dispatch
-if (step === 'recommend') {
-  diagnosis = parseDiagnosis(diagnosisParam);
-} else {
+// app/api/agent/route.ts (route handler = supervisor)
+if (step === 'diagnose' || !step) {
+  stepFor('diagnostic', 'thought', 'starting diagnostic investigation…');
   const diagAgent = new DiagnosticAgent(anthropic, dataSource, schema, allTools, sid);
-  diagnosis = await diagAgent.investigate(inv, { ...hooksFor('diagnostic'), signal: req.signal });
+  const diagnosis = await diagAgent.investigate(anomaly, {
+    ...hooksFor('diagnostic'),
+    budget: sharedBudget,   // shared with recommendation
+    signal: req.signal,
+  });
   send({ type: 'diagnosis', diagnosis });
 }
-if (step !== 'diagnose') {
+if (step === 'recommend' || !step) {
   const recAgent = new RecommendationAgent(anthropic, dataSource, schema, allTools, sid);
-  const recommendations = await recAgent.propose(inv, diagnosis!, { ...hooksFor('recommendation'), signal: req.signal });
-  for (const r of recommendations) send({ type: 'recommendation', recommendation: r });
+  const recs = await recAgent.propose(anomaly, diagnosis, {
+    ...hooksFor('recommendation'),
+    budget: sharedBudget,   // continues from diagnostic
+    signal: req.signal,
+  });
+  for (const r of recs) send({ type: 'recommendation', recommendation: r });
 }
 ```
 
-Line-by-line:
+The route does three supervisor jobs explicitly:
 
-- **Routing** — one TypeScript ternary picks `leadAgent`. The URL param `step` is the routing input. Cost: zero. Reliability: 100%.
-- **Decomposition** — the whole flow "diagnose then recommend" is written as `if / else`. No LLM decomposes anything; the product decided the decomposition upfront (three product phases → three workers).
-- **Delegation** — `new DiagnosticAgent(...)` + `await agent.investigate(...)`. The `await` hides ~50s of inner ReAct loop. The supervisor doesn't watch the loop; it just waits for the return.
-- **Synthesis** — the supervisor's synthesis is *state handoff*. The `diagnosis` result from step 2 is passed via URL param (`diagnosisParam` in `parseDiagnosis`) or via the returned value to step 3. No aggregation logic — the workers produce structured artifacts, the supervisor just plumbs them.
+1. **Decompose** — reads `?step=…` and decides which workers to run.
+2. **Delegate** — constructs each worker with its dependencies (Anthropic client, DataSource, WorkspaceSchema, tool definitions, session id) and calls its main method.
+3. **Synthesize** — collects worker outputs (Diagnosis, Recommendation[]) and streams them to the UI as NDJSON.
 
-**The trace channel — how the supervisor "watches" the workers.** `route.ts:196-210`:
+Nothing in the LLM layer knows there are other workers. The workers see the DataSource + their own hooks; the route sees the sequence.
 
-```ts
-const hooksFor = (agent: AgentName) => ({
-  onText: (t: string) => { if (t.trim()) stepFor(agent, 'thought', t); },
-  onToolCall: (tc: ToolCall) => send({ type: 'tool_call_start', toolName: tc.toolName, agent }),
-  onToolResult: (tc: ToolCall) => send({...}),
-});
-```
-
-Line-by-line: each worker gets a hooks object that forwards its trace events (text steps, tool calls) to the shared NDJSON channel. That's how the supervisor surfaces worker progress to the UI without polling — the workers emit events, the stream forwards them, the browser reads them.
-
-**Tools-style vs handoff-style delegation.** This is a *tools-style* topology: the supervisor stays in control across the whole request. It could be *handoff-style* — the diagnostic worker could invoke recommendation directly at the end of its loop — but that would move control transfer inside the worker, making the sequence harder to trace. Tools-style keeps the topology debuggable.
+**The decision that stays explicit: workers-as-tools vs handoff.** The reader-grade question:
 
 ```
-  Layers-and-hops — one investigation, supervisor's view
+  Two ways the supervisor can call workers
 
-  ┌─ UI (browser) ──────┐  GET /api/agent?step=diagnose      ┌─ route.ts ──────┐
-  │                     │ ───────────────────────────────►   │  supervisor     │
-  │  StatusLog reads    │  NDJSON stream of events ◄─────── │                 │
-  │  NDJSON             │                                    └────┬────────────┘
-  └─────────────────────┘                                         │ new DiagnosticAgent
-                                                                   ▼
-                                                          ┌─ Diagnostic worker ┐
-                                                          │  runAgentLoop      │
-                                                          │  ~5 turns          │
-                                                          └─────────┬──────────┘
-                                                                    │ returns Diagnosis
-                                                                    ▼
-                                                          ┌─ route.ts sends    ┐
-                                                          │  diagnosis event   │
-                                                          │  onto NDJSON       │
-                                                          └────────────────────┘
+  Tools-style (this repo):        Handoff-style:
+    supervisor stays in control      control transfers to worker
+    knows about all workers          worker doesn't know about
+    can override / redirect          successor; supervisor may not
+                                     re-enter
+    easier to trace                  more flexible, harder to trace
+
+  This repo: tools-style. The route always regains control between
+  workers and always drives the next hop.
 ```
+
+Tools-style is the correct pick for this product because the sequence is fixed (feed → diagnose → recommend), and the UI depends on the supervisor knowing what stage the user is in.
+
+**The synthesis step, made concrete.** The supervisor synthesizes worker outputs by:
+
+1. Streaming each worker's `AgentEvent`s to the UI as they arrive (real-time synthesis for the user).
+2. Passing the Diagnosis from step 2 to step 3 via URL param + sessionStorage (`?diagnosis=<encoded>`), so the recommendation worker sees the diagnosis as context.
+3. Sharing the `BudgetTracker` across workers so they don't blow the ceiling independently.
+4. Sharing the `WorkspaceSchema` and tool list (fetched once at supervisor start) so workers don't redundantly bootstrap.
+
+**What breaks without the supervisor.** The workers would each have to bootstrap the schema, own their own budget, and figure out what stage they're in. The route consolidates all of that — worker construction is one line each.
+
+### Move 2.5 — code supervisor vs LLM supervisor, side-by-side
+
+```
+  Two supervisors, one topology
+
+  ┌── LLM supervisor ──────────────┐   ┌── Code supervisor (this repo) ─┐
+  │  Sonnet call per hop            │   │  Zero LLM calls to route        │
+  │  Cost:   ~$0.05 per decision    │   │  Cost:   $0                     │
+  │  Latency: ~2-3s per decision    │   │  Latency: nanoseconds           │
+  │  Decides which worker           │   │  Decides via if/switch           │
+  │  Adapts to novel decompositions │   │  Fails for undesigned paths     │
+  │  Hard to trace decisions        │   │  Every route is git-diffable    │
+  │  Prompt is the routing rules    │   │  Code is the routing rules      │
+  └────────────────────────────────┘   └────────────────────────────────┘
+```
+
+Neither is universally better. Code supervisor wins when the routing is stable; LLM supervisor wins when it isn't. This repo's product has three well-known stages that map 1:1 to UI screens — the routing is stable by design, so code wins.
 
 ### Move 3 — the principle
 
-Supervisor-worker with a deterministic supervisor is the recommended production shape when the workflow is knowable. Push the supervisor into code (predictable, cheap, debuggable). Push autonomy into the workers where it's genuinely needed (analytical exploration, etc.). LLM supervisors buy flexibility at the cost of predictability — reserve them for cases where the sequence of workers really can't be enumerated.
+The supervisor's core job is **routing (SECTION A) + synthesis**. The topology's power comes from the specialists at the worker layer, but the supervisor is where the coordination cost lives. Naming whether the supervisor is code or LLM up front tells you where the cost is going — and choosing code-routed when the sequence is stable is a strong senior-grade signal.
 
 ## Primary diagram
 
 ```
-  Recap — the deterministic supervisor topology
+  Supervisor-worker in this repo — code supervisor, four workers
 
-  ┌─ /api/agent (SUPERVISOR: TypeScript) ────────────────────────┐
-  │  const leadAgent = <route based on URL params>               │
-  │                                                              │
-  │  step === 'diagnose':                                        │
-  │     new DiagnosticAgent(...).investigate(anomaly)            │
-  │            │                                                 │
-  │            ▼ (returns Diagnosis)                             │
-  │     send({ type: 'diagnosis', diagnosis })                   │
-  │                                                              │
-  │  step === 'recommend':                                       │
-  │     new RecommendationAgent(...).propose(anomaly, diagnosis) │
-  │            │                                                 │
-  │            ▼ (returns Recommendation[])                      │
-  │     send({ type: 'recommendation', recommendation: r })      │
-  │                                                              │
-  │  Trace channel: hooksFor(agent) forwards worker events        │
-  │  to the NDJSON stream for the UI                             │
-  └──────────────────────────────────────────────────────────────┘
+  ┌─ Browser ─────────────────────────────────────────────────────────┐
+  │  useInvestigation / useBriefingStream                              │
+  └───────────────────────────┬───────────────────────────────────────┘
+                              │ /api/briefing or /api/agent
+  ┌─ SUPERVISOR (TypeScript route handler) ───────────────────────────┐
+  │                                                                    │
+  │  briefing route:                                                   │
+  │    stage 1  → MonitoringAgent                                      │
+  │                                                                    │
+  │  agent route:                                                      │
+  │    if step=diagnose  → DiagnosticAgent                             │
+  │    if step=recommend → RecommendationAgent (with diagnosis)        │
+  │    if q (free-form)  → classifyIntent → QueryAgent(intent)         │
+  │                                                                    │
+  │  shared across workers within a request:                           │
+  │    - Anthropic client                                              │
+  │    - DataSource (Bloomreach MCP, Synthetic, or Fault-injected)     │
+  │    - WorkspaceSchema (bootstrapped once)                           │
+  │    - tool list (listTools once)                                    │
+  │    - BudgetTracker (Diagnostic + Recommendation share one)         │
+  │    - req.signal (cancellation)                                     │
+  └──┬─────────────────────┬─────────────────────┬──────────────────┬──┘
+     ▼                     ▼                     ▼                  ▼
+  ┌───────────┐   ┌───────────────┐   ┌────────────────┐   ┌────────────┐
+  │Monitoring │   │  Diagnostic   │   │ Recommendation │   │   Query    │
+  │  (ReAct)  │   │   (ReAct)     │   │    (ReAct)     │   │  (ReAct)   │
+  │  find     │   │  test         │   │  propose       │   │  answer    │
+  │  anomalies│   │  hypotheses   │   │  Bloomreach    │   │  free-form │
+  │           │   │               │   │  actions       │   │  question  │
+  └─────┬─────┘   └───────┬───────┘   └────────┬───────┘   └─────┬──────┘
+        │                 │                    │                 │
+        └─────────────────┴────────────────────┴─────────────────┘
+                                    │ each worker calls
+                                    ▼ DataSource.callTool
+                          ┌───────────────────────┐
+                          │  DataSource seam      │
+                          │  → MCP or synthetic   │
+                          └───────────────────────┘
 ```
 
 ## Elaborate
 
-Supervisor-worker was named cleanly in Anthropic's "Building Effective Agents" (2024) as the primary orchestration workflow. The two flavors — deterministic supervisor (code) vs LLM supervisor — were the article's key contribution. The recommendation: default to deterministic; escalate to LLM supervisor only when the sequence of workers genuinely can't be enumerated (research-agent shape from Section F).
+Supervisor-worker traces to the AI-planning literature (STRIPS, HTN planners) and the actor-model (Erlang, Akka) supervision trees. The modern LLM incarnation surfaced with early LangChain "router chains" and matured through AutoGen's `GroupChat` + `Manager` pattern (2023) and LangGraph's `create_supervisor` (2024).
 
-Blooming's version is the deterministic variant with a small LLM router at one point (`classifyIntent` for query-flow). That's Anthropic's "cascade" pattern: code where predictable, LLM at the specific sub-decision where flexibility matters. It's a lot cheaper than a full LLM supervisor (one Haiku call vs a Sonnet loop per hop) and 95% as flexible.
+The recurring debate is LLM supervisor vs code supervisor. The industry is settling on: **use code when the sequence is stable, LLM when it isn't, hybrid when part of it is stable**. Anthropic's "Building Effective Agents" essay explicitly recommends the hybrid — deterministic outer flow with LLM decisions only at the ambiguous nodes. This repo's shape (fully deterministic outer flow) is the far end of that spectrum, which is the right pick for a product with UI-visible stages.
 
 ## Interview defense
 
-**Q: Is this a supervisor-worker system? Who's the supervisor?**
-A: Yes — and the supervisor is TypeScript, not an LLM. `app/api/agent/route.ts` decides which worker runs based on URL params, awaits each worker's structured output, plumbs artifacts between them, and streams the combined trace to the UI. Only one LLM-driven routing decision exists — `classifyIntent` for the query flow — and it's Haiku, not Sonnet. Deterministic supervisor is Anthropic's recommended production shape and it saves ~20% cost + ~30% latency vs an LLM supervisor for a workflow this predictable.
+**Q: What's your supervisor?**
 
-Diagram: the supervisor-worker topology with the "TypeScript" callout on the supervisor.
-Anchor: `app/api/agent/route.ts:229-297`.
+A Next.js route handler — `app/api/agent/route.ts` and `app/api/briefing/route.ts`. Code, not LLM. It decomposes the task by reading `?step=…` or a Haiku intent classification for free-form Q&A, constructs the specialist worker with shared dependencies (Anthropic client, DataSource, schema, budget tracker, cancellation signal), and streams the worker's `AgentEvent`s to the UI as NDJSON.
 
-**Q: Tools-style or handoff-style delegation?**
-A: Tools-style. The supervisor stays in control across the entire request — each worker returns its result to the supervisor, which then decides what to do next. Handoff would let the diagnostic worker invoke recommendation directly at the end of its loop, but that would hide the transition inside the worker and make debugging harder. Tools-style keeps the topology inspectable: every worker transition is a top-level `await` in route.ts.
+The decision to make code-routed vs LLM-routed: the three-stage sequence (monitor → diagnose → recommend) is stable and UI-visible, so an LLM supervisor would cost ~$0.05 per hop and buy nothing.
 
-Diagram: the two flavors side-by-side, with arrows showing where control lives at each step.
-Anchor: same `route.ts:266-297`.
+*Anchor visual:* the four-workers-under-code-supervisor diagram above.
+
+**Q: Workers-as-tools or handoff?**
+
+Tools-style. The route always regains control between workers. Reasons: (a) the sequence is fixed, (b) the UI depends on the supervisor knowing which stage the user is in, (c) tracing is much simpler — every hop is git-diffable code.
+
+Handoff would be right for a swarm where any worker can hand to any peer specialist. Not this product.
+
+**Q: What breaks if you removed the supervisor?**
+
+Each worker would have to bootstrap the schema, own its own budget, own its cancellation signal, and figure out what stage it's in. The route consolidates all of that — worker construction is one line each. Removing the supervisor means either duplicating that setup in every worker, or restructuring the workers into a single agent that adapts (which is the "collapse to single-agent" refactor, not viable given the different final output shapes).
 
 ## See also
 
-- `01-when-not-to-go-multi-agent.md` — the gate this topology passes.
-- `03-sequential-pipeline.md` — the chain shape between diagnose and recommend.
-- `06-swarm-handoff.md` — the alternative (rejected here).
-- `08-shared-state-and-message-passing.md` — how the supervisor plumbs data between workers.
-- `06-orchestration-system-design-templates/01-multi-agent-research-assistant.md` — where LLM supervisor DOES earn its keep.
+- **`01-when-not-to-go-multi-agent.md`** — the gate before picking this topology.
+- **`03-sequential-pipeline.md`** — how diagnostic → recommendation flows inside this supervisor.
+- **`08-shared-state-and-message-passing.md`** — how the supervisor passes context to workers.
+- **`04-agent-infrastructure/05-guardrails-and-control.md`** — how the supervisor enforces caps and budgets.

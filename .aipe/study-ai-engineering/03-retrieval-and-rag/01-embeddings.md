@@ -1,132 +1,162 @@
-# 01 — Embeddings
+# Embeddings
 
-**Type:** Industry standard. Also called: vector representations, dense embeddings, semantic vectors.
+## Subtitle
+
+Vector representation of text / dense semantic embedding — Industry standard.
 
 ## Zoom out, then zoom in
 
-**Not exercised in this codebase.** The agents query structured event data via MCP tools; no text is embedded.
+This codebase does not currently produce embeddings. The concept file exists because two candidate refactors would introduce them: past-investigation memory (embed the diagnosis text of every completed investigation) and EQL query library (embed each working query with its anomaly context).
 
 ```
-  Zoom out — where embeddings would sit (they don't, today)
+  Zoom out — where embeddings would fit
 
-  ┌─ Existing data ────────────────────────────────────────────────────┐
-  │  Past investigations (Diagnosis + evidence + tool trace)           │
-  │  Would-be corpus if RAG were added                                 │
-  └─────────────────────────────┬─────────────────────────────────────┘
-                                │  (missing) chunk + embed
-                                ▼
-  ┌─ (missing) Vector store ──────────────────────────────────────────┐
-  │  [0.12, -0.84, 0.33, ...]  ← embeddings                            │
-  │  ★ THIS CONCEPT ★                                                  │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌─ Agent code ────────────────────────────────────────┐
+  │  today: no embeddings                                │
+  │  tomorrow: embed on save (investigations) or         │
+  │            embed on demand (workspace catalog)       │
+  └───────────────────────┬──────────────────────────────┘
+                          ▼
+  ┌─ Vector store (new — not yet built) ★ ──────────────┐ ← we are here
+  │  candidate: sqlite-vec (local, no infra)             │
+  │  candidate: pgvector (if Postgres added)             │
+  └──────────────────────────────────────────────────────┘
 ```
 
-Zoom in. An embedding is a fixed-length vector that represents a piece of text in a high-dimensional space where semantically-similar texts land at similar positions. In this codebase there's nothing to embed today — no text corpus, no similarity search. The Case B exercise below is where it would come in.
+Zoom in: an embedding is a text-to-vector function. Similar meanings end up at nearby vectors. Vector distance ≈ semantic distance, approximately.
 
 ## Structure pass
 
-**Layers:**
-- Outer: readable text ("mobile checkout dropped 18%")
-- Middle: vector of 768-3072 floats
-- Inner: cosine or dot-product distance to other vectors
-
-**Axis: unit of comparison.**
-- Text (outer): strings, comparable by exact or fuzzy match
-- Vectors (middle): comparable by geometric distance
-- Vector space (inner): pre-trained by embedding model
-
-**Seam:** the embedding model call (`openai.embeddings.create`, `voyageai.embed`, etc.). Text goes in, vector comes out. The vector space is fixed by the model.
+- **Layers:** text → embedding model → vector → distance function → nearest neighbors. Five bands.
+- **Axis: representation.** Text is discrete symbols; vectors are dense numeric. The seam is the embedding model — the boundary that converts one to the other.
+- **Seam:** the embedding call itself. It's the only place text becomes vector.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You've done fuzzy string matching — Levenshtein distance, JaroWinkler. Same idea: convert text to numbers where similar inputs get similar numbers. Embeddings do that at a semantic level. "buy milk" and "purchase dairy" would have close vectors even though they share no letters.
+A vector in N-dimensional space (typically 768–3072 dims). Each text maps to one vector. Distance between two vectors correlates with semantic similarity.
 
 ```
-  Embeddings map text to points in space
-   ↑
-   │        stock market
-   │        (far away)
-   │
-   │
-   │              buy milk
-   │              purchase dairy
-   │              (close together)
-   └──────────────────────►
+  Embedding — the shape
+
+  "conversion drop mobile checkout"
+                 │
+                 ▼  embed()
+                 │
+     [0.12, -0.84, 0.33, ..., 0.07]   ← 1536 dims
+
+  Compared to:
+  "payment failure spike credit card" → nearby
+  "customer retention rate"           → far
+
+  2D projection (cartoon):
+       ↑
+       │ · "retention rate"
+       │
+       │
+       │       · "conversion drop"
+       │           · "payment failure"
+       │
+       └─────────────────────────────►
 ```
 
-### Move 2 — walk the mechanism
+### Move 2 — the step-by-step walkthrough
 
-**A vector, concretely.** Input text goes to an embedding model. Out comes a fixed-length array of floats — 1536 for OpenAI `text-embedding-3-small`, 768 for Cohere `embed-english-v3.0`, 3072 for OpenAI `text-embedding-3-large`. Same input, same vector. Different embedding models, different vectors (not comparable).
+**What the model does.** An embedding model is a transformer trained (or fine-tuned) so that texts with similar meanings produce nearby output vectors. You send text over an API; you get back a fixed-dimension float array.
 
-**Cosine similarity — the standard distance.**
+**What a refactor here would look like.** For past-investigation memory:
+
+- On completed investigation, embed the concatenation of `anomaly.metric + anomaly.scope + diagnosis.conclusion` — one embedding per investigation.
+- Store `{investigationId, embedding, diagnosis}` in a table (new `.investigation-index.json` in dev, sqlite-vec in prod).
+- On new investigation, embed the incoming anomaly the same way, look up top-3 nearest neighbors by cosine similarity, inject their diagnoses as few-shot context.
+
+Pseudocode of the embed-and-store step:
 
 ```
-  similarity(a, b) = dot(a, b) / (||a|| × ||b||)
-
-  cos = 1.0  → identical direction  (very similar meaning)
-  cos = 0.0  → orthogonal            (unrelated)
-  cos = -1.0 → opposite               (rare in practice)
+  onInvestigationComplete(inv):
+    text = inv.anomaly.metric
+         + " " + inv.anomaly.scope.join(",")
+         + " " + inv.diagnosis.conclusion
+    vec = embed(text)                     // Anthropic voyage or OpenAI ada
+    store { id: inv.id, vec, inv }
 ```
 
-In practice with modern embedding models, real-world text pairs sit in a narrow band (0.2 to 0.9 cosine). The threshold that separates "similar" from "not" is empirical per corpus.
+**What the retrieval step looks like at query time:**
 
-**What embeddings don't do.** They don't understand meaning. The model learned during pre-training that certain texts occur in similar contexts, and it emits vectors reflecting that co-occurrence. "milk" and "dairy" are close because they appear in similar contexts, not because the model knows what dairy is.
+```
+  onNewInvestigation(anomaly):
+    text = anomaly.metric + " " + anomaly.scope.join(",")
+    q = embed(text)
+    topK = index.nearestNeighbors(q, k=3)    // cosine similarity
+    if topK[0].distance < 0.3:                // "close enough"
+      inject topK as few-shot in system prompt
+    else:
+      no augmentation
+```
 
 ### Move 3 — the principle
 
-Embeddings turn semantic similarity into a numeric distance. That's the entire operational move — everything else in RAG (chunking, storage, retrieval, reranking) is scaffolding around this one primitive.
+Embeddings buy you semantic similarity as a distance function. You get to "find things like this thing" for free (or close to it — see cost math in **../01-llm-foundations/06-token-economics.md**). The tradeoff: the embedding is a lossy compression — two different sentences can have similar embeddings for the wrong reasons, and reranking (see **07-reranking.md**) is the standard fix.
 
 ## Primary diagram
 
 ```
-  Where embeddings would sit in a blooming_insights RAG
+  Embeddings + retrieval — the shape (would-be refactor)
 
-  text (past diagnosis conclusion)
-    │
-    ▼  embedding model call
-    │
-  [768 floats]
-    │
-    ▼  store in vector DB
-    │
-  ...on retrieval...
-    │
-  query text ─embed─► query vector ─cosine─► top-k similar past diagnoses
+  ┌─ Ingest ──────────────────────────┐
+  │  investigation completes           │
+  │       │                            │
+  │       ▼                            │
+  │  embed(anomaly + diagnosis)        │
+  │       │                            │
+  │       ▼                            │
+  │  index.upsert({id, vec, inv})      │
+  └────────────────────────────────────┘
+
+  ┌─ Query ───────────────────────────┐
+  │  new anomaly arrives               │
+  │       │                            │
+  │       ▼                            │
+  │  q = embed(anomaly)                │
+  │       │                            │
+  │       ▼                            │
+  │  topK = index.nearestNeighbors(q)  │
+  │       │                            │
+  │       ▼                            │
+  │  inject topK into diagnostic prompt│
+  └────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-Embedding models are one-way — you can't decode text from a vector. They're also model-locked: swap `text-embedding-3-small` for `text-embedding-3-large`, and every stored vector is worthless (see `09-stale-embeddings.md`). That's why picking an embedding model is a decision to commit to for the corpus's lifetime.
+The embedding-as-distance-function idea comes from word embeddings (word2vec, GloVe, 2013–14) and generalized to sentences with sentence-transformers (~2019) and modern hosted APIs (OpenAI, Cohere, Anthropic Voyage). The dimension count is a design choice — higher-dim tends to be more accurate but costs more storage.
+
+Related: **02-embedding-model-choice.md** (which model to pick), **04-vector-databases.md** (where to store the vectors), **07-reranking.md** (fixing the lossy-compression failure mode).
 
 ## Project exercises
 
-### Exercise — embed past diagnoses for similarity retrieval
+### B3.1 · Add investigation-memory retrieval to the diagnostic agent
 
-- **Exercise ID:** C2.4-B · Case B (RAG not exercised).
-- **What to build:** on each completed diagnosis, embed the `conclusion` text with OpenAI `text-embedding-3-small`. Store as `{investigationId, conclusion, vector}` in a new SQLite file or in `lib/state/embeddings.json`. Add a "similar past investigations" panel that retrieves top-3 by cosine similarity to the current diagnosis's conclusion.
-- **Why it earns its place:** the smallest meaningful RAG in this codebase. Interviewer signal: "I know where retrieval buys value in my product; here's what I built."
-- **Files to touch:** `lib/rag/embed.ts` (new — client + store), `lib/state/investigations.ts` (write embeddings on write), `components/investigation/SimilarPastPanel.tsx` (new).
-- **Done when:** completing an investigation surfaces 3 similar past investigations by cosine similarity ≥ 0.5.
-- **Estimated effort:** 1-2 days.
+- **Exercise ID:** B3.1 (Case B — not yet implemented)
+- **What to build:** On every completed investigation, embed the anomaly + diagnosis and store `{id, vec, inv}` in `.investigation-index.json`. On new investigation, retrieve top-3 nearest neighbors and inject as few-shot context if distance < 0.3.
+- **Why it earns its place:** The strongest RAG case in this codebase — memory of prior investigations directly improves diagnosis quality on recurring anomaly types. Measurable via the existing eval baseline.
+- **Files to touch:** New `lib/state/investigation-index.ts`, hook into `lib/state/investigations.ts:saveInvestigation` for the embed-on-save, extend `lib/agents/diagnostic.ts` to inject retrieved context.
+- **Done when:** rerunning the baseline with memory enabled shows a measurable change (up or down) in `root_cause_plausibility` pass rate; embeddings cost < $0.001/investigation.
+- **Estimated effort:** `1–2 days`.
 
 ## Interview defense
 
-**Q: Do embeddings understand meaning?**
+**Q: You don't have embeddings today. Why is that the right call?**
 
-No. They encode co-occurrence in training data — texts that appear in similar contexts get similar vectors. That LOOKS like meaning, and functionally is close enough for retrieval, but the model doesn't know what "milk" is. This matters when you have out-of-distribution text (technical jargon, code identifiers, non-English) — the model may not have learned useful co-occurrence patterns for those.
+The corpus doesn't yet exist. Past-investigation memory needs a corpus of past investigations; the codebase writes those to state but doesn't accumulate cross-session yet. Adding embeddings before the corpus is scaffolding for a load that doesn't exist. The concept file names the exact refactor and its exercise (`B3.1`) — I know what to build first if I decide the memory is worth the added complexity.
 
-**Q: What's the vector length matter?**
+**Q: If you add embeddings, which model?**
 
-Larger vectors = more expressive but bigger to store and slower to search. 768 is a common sweet spot (Cohere v3, BGE-base); 1536 is OpenAI's small default; 3072 is OpenAI's large. For a small corpus (< 10K docs), the difference is negligible. At millions of docs, the storage + latency add up.
-
-**Q: Why aren't embeddings in this codebase today?**
-
-Because the agents query structured data, not text. There's no corpus to embed. If we added "past investigations" as searchable text, we'd add embeddings. Case B exercise above walks the shape.
+Voyage-3 or OpenAI text-embedding-3-small — see **02-embedding-model-choice.md** for the decision tree. Cost is trivial (~$0.02/M tokens); the load-bearing choice is picking a family that's stable enough that re-embedding on model upgrades is bounded.
 
 ## See also
 
-- `02-embedding-model-choice.md` — picking one and committing
-- `09-stale-embeddings.md` — what happens when source text edits
-- `04-vector-databases.md` — where they get stored
+- [02-embedding-model-choice.md](02-embedding-model-choice.md) — which family to pick.
+- [11-rag.md](11-rag.md) — the full pipeline embeddings feed.
+- [../04-agents-and-tool-use/05-agent-memory.md](../04-agents-and-tool-use/05-agent-memory.md) — the memory shape retrieval would power.

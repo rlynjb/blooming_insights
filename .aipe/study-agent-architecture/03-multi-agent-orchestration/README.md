@@ -1,21 +1,30 @@
-# Section C — Multi-agent orchestration
+# 03 — Multi-agent orchestration
 
-**Anchor:** multi-agent (primary). **This is the load-bearing new material.**
+Anchor: **multi-agent** (primary)
 
-blooming_insights is a *deterministic-supervisor multi-agent system* — the outer supervisor is TypeScript (not an LLM), and the workers are ReAct-loop agents. This is the recommended production shape per Anthropic's "Building Effective Agents" (2024).
-
-## Files
-
-1. **`01-when-not-to-go-multi-agent.md`** — read this first. The single most important multi-agent decision is whether to be multi-agent at all.
-2. **`02-supervisor-worker.md`** — the shape this repo runs. Deterministic supervisor variant.
-3. **`03-sequential-pipeline.md`** — diagnose → recommend. Chain of specialized agents.
-4. **`04-parallel-fan-out.md`** — partial. Monitoring runs 10 categories concurrently (fan-out over queries, not over agents). Would fan out to worker agents if the diagnostic sub-questions grew.
-5. **`05-debate-verifier-critic.md`** — not used. Where it would earn its keep and why not here.
-6. **`06-swarm-handoff.md`** — rejected by design. Why supervisor-worker beats swarm for observability.
-7. **`07-graph-orchestration.md`** — not used. Where LangGraph-shape would help (human-in-the-loop pauses).
-8. **`08-shared-state-and-message-passing.md`** — this repo uses both: workspace schema (shared) + diagnosis-handed-to-recommend (message).
-9. **`09-coordination-failure-modes.md`** — what breaks and what bounds it. BudgetTracker, per-call timeouts, is_error graceful degradation, session isolation.
+This is the load-bearing new material. Everything above one agent.
 
 ## Reading order
 
-01 → 02 → 03 → 04 → 08 → 09 (the shapes this repo uses, then failures). 05, 06, 07 as reference for shapes rejected.
+The first file comes first by design — the single most important multi-agent decision is whether to be multi-agent at all.
+
+1. **[01-when-not-to-go-multi-agent.md](./01-when-not-to-go-multi-agent.md)** — the escalation gate. Start here.
+2. **[02-supervisor-worker.md](./02-supervisor-worker.md)** — the topology this repo uses (code-routed variant).
+3. **[03-sequential-pipeline.md](./03-sequential-pipeline.md)** — diagnostic → recommendation is this shape.
+4. **[04-parallel-fan-out.md](./04-parallel-fan-out.md)** — the latency lever this repo doesn't use.
+5. **[05-debate-verifier-critic.md](./05-debate-verifier-critic.md)** — quality lever; offline-only here.
+6. **[06-swarm-handoff.md](./06-swarm-handoff.md)** — peer control transfer; deliberately not used.
+7. **[07-graph-orchestration.md](./07-graph-orchestration.md)** — explicit state machine; the alternative to inline route sequencing.
+8. **[08-shared-state-and-message-passing.md](./08-shared-state-and-message-passing.md)** — how agents communicate.
+9. **[09-coordination-failure-modes.md](./09-coordination-failure-modes.md)** — where the 2-5x overhead shows up, and how to bound it.
+
+## The through-line
+
+Every topology in this section is a *shape* first — the diagram IS the mental model. Prose fills in the coordination mechanism, then names the overhead it buys and what it buys with it.
+
+**This repo is multi-agent, code-routed.** A route handler is the supervisor. The subsections here weight toward that shape:
+
+- **02-supervisor-worker** and **03-sequential-pipeline** get the full walk with real file paths — these are the topologies this repo instantiates.
+- **04-parallel**, **05-debate**, **07-graph** get "not yet implemented" with a concrete refactor spec in each file's Move 2 and in Section 06 templates.
+- **06-swarm-handoff** gets full coverage of the pattern + the honest reason it's not used here.
+- **08-shared-state** and **09-coordination-failures** are cross-cutting concerns that apply to every topology, including the ones this repo does use.

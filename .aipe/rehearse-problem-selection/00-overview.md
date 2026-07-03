@@ -53,13 +53,13 @@ Each file answers one review-room question. Walk them in order — later files a
 
 - **`01-problem-brief.md`** — the user, the pain, the evidence, the "why now." The core artifact. If the review room only reads one file, it's this.
 - **`02-scope-cuts-and-non-goals.md`** — what you cut and why. The cuts you *reconsidered and un-cut* are the L5 signal — showing the eval work, cost controls, and fault tolerance shipped end-to-end after being deferred.
-- **`03-options-and-opportunity-cost.md`** — the paths not taken. Own loop → aptkit migration. DataSource seam pattern (4 uses shipped). NDJSON over fetch stream. Portfolio hardening sequencing. Each with the opportunity cost named.
+- **`03-options-and-opportunity-cost.md`** — the paths not taken. Own loop → aptkit migration. DataSource seam pattern (5 uses shipped, including the auth-provider generalization that made MCP swappable). NDJSON over fetch stream. Portfolio hardening sequencing. Each with the opportunity cost named.
 - **`04-success-metrics-and-feedback-loop.md`** — real measured numbers from baseline `2026-07-03T04-08-28-644Z`. Per-phase latency, per-case cost, per-criterion pass rates. The regression gate that closes the loop.
 - **`05-skeptical-reviewer-questions.md`** — the six probes you'll actually get, each with the answer that holds under follow-up.
 
 ## The strongest defense in one line
 
-You built an AI analyst that runs the human-analyst loop for a Bloomreach ecommerce workspace — **and then spent 4 weeks shipping the eval + observability + cost-control + fault-tolerance + regression-gate flywheel around it, receipt-backed at every step.** The eval isn't a past-tense side story. It's the shipped centerpiece that lets you make claims like "actionable_next_step baseline is 0%, here's why, here's the fix, here's the gate that blocks regression on it" — which is what "an analyst that shows its work" looks like when you turn it on yourself.
+You built a swappable-MCP AI analyst that runs the human-analyst loop — shipped against Bloomreach as the default preset, with the seam proved by pointing the same agents at Olist, a Synthetic in-process source, a fault-injecting decorator, and (via the auth-provider generalization) any MCP server the user types into the config modal. **Then you spent 4 weeks shipping the eval + observability + cost-control + fault-tolerance + regression-gate flywheel around it, receipt-backed at every step.** The eval isn't a past-tense side story. It's the shipped centerpiece that lets you make claims like "actionable_next_step baseline is 0%, here's why, here's the fix, here's the gate that blocks regression on it" — which is what "an analyst that shows its work" looks like when you turn it on yourself.
 
 Everything else in this book is downstream of that move.
 

@@ -1,139 +1,168 @@
-# 04 — Tool routing
+# Tool routing
 
-**Type:** Industry standard. Also called: tool selection, action dispatch.
+## Subtitle
+
+Tool selection / heuristic + LLM routing hybrid — Industry standard.
 
 ## Zoom out, then zoom in
 
-Within an agent loop, "which tool" is a decision. This codebase leaves that decision fully to the LLM — no heuristic gating inside the loop.
+Two routing layers pick tools in blooming: a **schema coverage gate** filters tools *before* the agent runs (pure code), and the **LLM inside the agent loop** picks among the remaining tools *per turn*. The gate is heuristic-before-LLM applied to tool availability; the per-turn pick is LLM-routed. Both are live.
 
 ```
-  Zoom out — where routing happens
+  Zoom out — two routing stages
 
-  agent turn                              ★ THIS CONCEPT ★
-    │
-    ▼
-  model picks tool from the registered list  ← LLM-routed
-    │
-    ▼
-  BloomingToolRegistryAdapter dispatches
+  ┌─ Config-time / boot-time ───────────────────────────┐
+  │  runnableCategories(schema) — pure code             │
+  │  → drops categories the workspace can't answer      │
+  │  → filters the tool set the agent sees              │
+  └───────────────────────┬──────────────────────────────┘
+                          │  filtered tools
+                          ▼
+  ┌─ Per-turn LLM routing ★ ────────────────────────────┐ ← we are here
+  │  model picks from the surviving tools each turn      │
+  │  no explicit routing code — the model routes         │
+  └──────────────────────────────────────────────────────┘
 ```
 
-Zoom in. The model has a list of ~30 MCP tools registered (`execute_analytics_eql`, `list_customers`, `list_scenarios`, etc.). Each turn, the model picks one (or two) based on the current messages array + tool descriptions. No heuristic layer inside the loop overrides the model's choice.
+Zoom in: the gate is deterministic; the per-turn pick is LLM. Together they form the tiered pattern — cheap route at the front, smart route at the back.
 
 ## Structure pass
 
-Axis: who decides which tool to call?
-- Heuristic routing: code decides based on input pattern (fast path, cheap)
-- LLM routing: model decides based on its reasoning (flexible, correct on ambiguous inputs)
-- Hybrid: heuristic front + LLM fallback
-
-**Seam:** the tool list registered with the model. Everything above the seam is "the agent picks"; everything below is "code runs whichever."
+- **Layers:** all tools → schema gate → agent-filtered subset → LLM pick per turn → executed tool. Five bands.
+- **Axis: cost of the routing decision.** Gate: free (pure code). Per-turn: paid (part of the model turn's tokens).
+- **Seam:** the boundary between the filter step and the agent. The filter is one function call; the agent is a long-running loop.
 
 ## How it works
 
-### Move 1
-
-You've written a router — `if path === '/api/foo' → handleFoo`. That's heuristic. LLM routing is the other end: give the model a list of possible destinations, let it decide.
+### Move 1 — the mental model
 
 ```
-  Two routing styles
+  Two-stage routing — the shape
 
-  Heuristic                       LLM-routed (this codebase's agents)
-  ────────                        ────────────────
-  if query contains 'search'       give LLM tool defs + query
-    → search tool                  LLM emits tool_use with name
-  elif starts with 'delete'        loop dispatches
-    → delete tool
-  else
-    → llm route
+  ┌─ Stage 1: gate (pure code) ─────────────────────┐
+  │  runnableCategories(schema)                      │
+  │  drops tools whose required events are missing   │
+  │  · deterministic                                 │
+  │  · runs once per briefing                        │
+  └────────────────────────┬────────────────────────┘
+                           │
+                           ▼
+  ┌─ Stage 2: LLM (per-turn) ───────────────────────┐
+  │  model sees remaining tool schemas, picks one    │
+  │  · non-deterministic                             │
+  │  · runs per model turn                           │
+  └─────────────────────────────────────────────────┘
 ```
 
-### Move 2
+### Move 2 — the step-by-step walkthrough
 
-**Where LLM routing happens in this codebase.**
+**The schema gate.** `lib/agents/categories.ts:26-27` — `runnableCategories(schema)` iterates the fixed set of ecommerce anomaly categories, checks each `requires: string[]` list against the schema's exposed event set, and returns only categories whose requirements are fully met.
 
-Inside every agent's ReAct loop. AptKit's loop sends the tool list on every turn; the model returns a `tool_use` block naming which one. Zero code in this repo intervenes in that choice.
+Example — the "conversion drop" category might `require: ["view_item", "purchase"]`. If the workspace has both events, category is runnable. If either is missing, category is dropped and the monitoring agent never even sees it in the prompt. Zero wasted tool calls chasing something the substrate can't answer.
 
-**Why no heuristic tier inside the loop.**
+**Per-agent tool subsets.** `lib/agents/tool-schemas.ts:9` — `filterToolSchemas(all, allowed)` narrows the *full* MCP tool list down to the tools each agent's role justifies:
 
-Because the agent's job IS the decision. Adding "if query mentions 'country' → force list_customers_by_country" would take away the flexibility the agent loop is buying. If we wanted rigid routing we'd have a chain (see `01-agents-vs-chains.md`), not an agent.
+- Monitoring agent gets tools for running EQL queries, listing catalogs.
+- Diagnostic agent gets everything monitoring gets plus `submit_diagnosis`.
+- Recommendation agent gets `submit_recommendation` and enough analytics tools to size impact.
 
-**Where heuristic routing DOES happen — one layer above.**
+This filter reduces prompt size (fewer tool defs = fewer tokens in the fixed prefix) and reduces the LLM's search space per turn.
 
-The intent classifier (`lib/agents/intent.ts`) picks which AGENT to invoke — diagnostic vs query. That's heuristic-shaped (Haiku classifies), but happens BEFORE the agent's tool-use loop begins. Inside the loop, it's fully LLM-driven.
+**LLM routing at the turn level.** Given the filtered tool set, aptkit's agent loop invokes the model with `tools: filteredSchemas` per turn. The model reads the schemas as part of its context and emits a `tool_use` block naming the chosen tool. No explicit routing code — the model does the routing purely by pattern-matching over descriptions + args.
 
-**The tool descriptions matter.**
+Diagram of one briefing flowing through both routers:
 
-The LLM's ability to pick correctly depends entirely on tool descriptions. `synthetic-data-source.ts:120-152` has explicit `toolDescriptions` — `execute_analytics_eql: 'Run a synthetic EQL-style analytics query over the workspace.'`. Bad descriptions = wrong tool picked. Good descriptions include the WHEN as well as the WHAT ("use this when you need to segment by country").
+```
+  Briefing — two-stage routing
 
-**The 6-tool-call cap acts as an implicit routing constraint.**
+  workspace schema:
+    events: [purchase, view_item, session_start,
+             cart_update, checkout]     ← no payment_failure event
 
-Because the agent has at most 6 tool calls, it has to be selective. Six calls to `execute_analytics_eql` is the useful path; three misspent calls to `list_experiments` (which is often empty) wastes budget. The cap forces the LLM to route toward the highest-value tool per turn.
+  ┌─ Stage 1: schema gate ─────────────────────────┐
+  │  categories:                                    │
+  │    conversion_drop      ← requires present     │
+  │    payment_failure_rate ← requires MISSING     │
+  │      → DROPPED                                  │
+  │    session_drop         ← requires present     │
+  │  → agent sees only: conversion_drop, session_drop│
+  └──────────────────┬─────────────────────────────┘
+                     │
+                     ▼
+  ┌─ Stage 2: LLM per-turn routing ────────────────┐
+  │  turn 1: model picks execute_analytics_eql      │
+  │          (only relevant tool; no ambiguity)     │
+  │  turn 2: model picks execute_analytics_eql      │
+  │          (different EQL args this time)         │
+  │  ...                                             │
+  │  turn N: model picks submit_anomalies            │
+  └────────────────────────────────────────────────┘
+```
 
-### Move 3
+**Where a rules-based per-turn routing would earn its place.** If the input surface (QueryBox) had strong lexical patterns — "@catalog fetch X" always means catalog lookup — a regex prefix router could beat LLM routing on cost and latency. Blooming's QueryBox is free-form English, so LLM routing wins.
 
-For loop-shaped agents, LLM routing beats heuristic — you're paying for flexibility, don't take it away. For chain-shaped or fixed pipelines, heuristic routing wins — you're paying for determinism, don't lose it to model whims.
+### Move 3 — the principle
+
+Route cheap-first. The pure-code filter drops what can't work; the LLM picks among what remains. If any subset of "what remains" is predictable by rules, add a rules layer for it. The general principle: LLM routing is for cases rules can't cover; use rules everywhere else.
 
 ## Primary diagram
 
 ```
-  Two-layer routing in this codebase
+  Tool routing in blooming — full frame
 
-  ┌─ Above the agent (heuristic) ─────────────────────────────────────┐
-  │  user free-form query                                             │
-  │        │                                                          │
-  │        ▼                                                          │
-  │  classifyIntent (Haiku classifier)                                │
-  │        │                                                          │
-  │        ▼                                                          │
-  │  DiagnosticAgent  or  QueryAgent                                  │
-  └────────────────────┬──────────────────────────────────────────────┘
-                       │
-  ┌─ Inside the agent (LLM-routed) ▼──────────────────────────────────┐
-  │  ReAct loop                                                       │
-  │    turn 1: model picks tool_A from ~30 registered                 │
-  │    turn 2: model picks tool_B                                     │
-  │    turn 3: model picks tool_A again with different args           │
-  │    ...                                                            │
-  │    turn N: model picks submitDiagnosis (end)                      │
-  │                                                                   │
-  │  no code overrides the picks; model owns the choice               │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌─ All MCP tools (~50 tools from Bloomreach server) ──────┐
+  └───────────────────────┬─────────────────────────────────┘
+                          │
+                          ▼
+  ┌─ filterToolSchemas(all, agentAllowlist) ────────────────┐
+  │  lib/agents/tool-schemas.ts:9                           │
+  │  → per-agent subset (~10-15 tools per agent)            │
+  └───────────────────────┬─────────────────────────────────┘
+                          │
+                          ▼
+  ┌─ runnableCategories(schema)  (monitoring path only) ────┐
+  │  lib/agents/categories.ts                                │
+  │  → drops categories the workspace lacks events for       │
+  └───────────────────────┬─────────────────────────────────┘
+                          │
+                          ▼
+  ┌─ Agent loop: LLM routes per-turn ───────────────────────┐
+  │  model reads schemas in prompt, emits tool_use per turn  │
+  │  observed: 5-10 tool calls per investigation             │
+  └─────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-Some production agents add heuristic overrides for high-cost tools ("never call `expensive_search` more than once per investigation"). This codebase doesn't; the 6-tool-call cap serves the same purpose without needing per-tool rules.
+Tool routing conversations often present rules vs LLM as an either/or; production systems use both. The rules layer is where you catch predictable inputs; the LLM layer is where you handle ambiguity. Blooming's split is characteristic: pure-code coverage gate + tool filter (cheap, deterministic), then aptkit's LLM-driven pick (expensive per turn, but selection is embedded in the same call that would happen anyway).
 
-Tool-routing can also be gated by CAPABILITY — reveal only a subset of tools to the model based on the workspace's actual schema. The categories capability filtering in `lib/agents/categories.ts:26-41` is a distant relative — it filters WHICH ANOMALY CATEGORIES to check based on which tools/events are available in the workspace.
+The blooming gate has one extra property worth calling out: it prevents *silent budget burn*. Without it, the agent could pick a tool whose call fails (missing events), waste a rate-limited slot, and produce nothing. The gate stops that at boot.
+
+Related: **01-agents-vs-chains.md** (routing is one of the things the agent kernel does), **../01-llm-foundations/07-heuristic-before-llm.md** (the same idea at the query level).
 
 ## Project exercises
 
-### Exercise — measure tool-choice diversity per case
+### B4.4 · Add a per-tool cost budget to the routing decision
 
-- **Exercise ID:** C4.4-A · Case A (concept exercised).
-- **What to build:** in the report, add "distinct tools called per case" and "tool call frequency by name across a run." Reveals whether the agent is over-reaching for `execute_analytics_eql` or actually using the tool variety it has access to.
-- **Why it earns its place:** turns routing into a measured discipline. Interviewer signal: "I know my agent's tool preferences — measured, not guessed."
-- **Files to touch:** `eval/report.eval.ts` (add distinct-tools table).
-- **Done when:** report shows tool-call frequency per case and identifies over-reliance patterns.
-- **Estimated effort:** 1-4hr.
+- **Exercise ID:** B4.4 (Case A — schema gate live; add cost dimension)
+- **What to build:** Extend `runnableCategories()` to consider not just "does this category's tools work" but "given the remaining budget, is this category affordable." Route budget-heavy categories to the front so they run early, or drop them if the remaining budget can't fit them.
+- **Why it earns its place:** Turns the coverage gate into a *cost*-aware gate. Directly ties routing to the budget-tracker infrastructure (`lib/agents/budget.ts`).
+- **Files to touch:** `lib/agents/categories.ts` (extend with budget check), `lib/agents/budget.ts` (add per-category cost estimates), `test/agents/categories.test.ts`.
+- **Done when:** for a workspace with a $0.05 remaining budget, budget-heavy categories get skipped or deferred; a receipt row records the gate decision.
+- **Estimated effort:** `1–2 days`.
 
 ## Interview defense
 
-**Q: Do you route tools with regex before letting the LLM see them?**
+**Q: When does rule-based routing beat LLM routing?**
 
-No. Inside the agent loop, the LLM sees all ~30 tools and picks each turn. That's what the agent shape is buying — flexibility to compose tool calls based on what earlier observations showed. Regex-routing inside the loop would take that away.
+When the input surface has strong regularities. If 90% of QueryBox inputs are exact-form ("@catalog X" or "for last N days X"), a regex prefix router catches them at zero cost and zero latency. If the inputs are free-form English, the LLM router adapts to phrasing you couldn't enumerate. Blooming's inputs today are free-form; the classifier + coverage gate does the routing job.
 
-**Q: What routes what THEN?**
+**Q: The schema gate seems obvious. Isn't it just filtering?**
 
-One layer up. The intent classifier (Haiku call) decides which AGENT to invoke — diagnostic vs free-form query. That's heuristic-in-shape at the agent-selection layer. Inside the chosen agent, no more heuristic routing.
-
-**Q: How do you keep the LLM from picking wrong tools?**
-
-Tool descriptions. If tool descriptions include not just WHAT the tool does but WHEN to use it, the LLM picks correctly. `synthetic-data-source.ts` has explicit per-tool descriptions. Weak descriptions = wrong picks. Also the 6-tool-call cap indirectly constrains the LLM to pick high-value tools.
+Sort of. What makes it interesting is *what* it filters — categories whose required events are missing. That's a live-schema-aware gate; the agent doesn't waste tokens trying tools that structurally cannot work. Without it, the agent would burn 3–5 rate-limited MCP calls discovering the same thing on every briefing.
 
 ## See also
 
-- `03-react-pattern.md` — the loop the routing happens in
-- `01-llm-foundations/07-heuristic-before-llm.md` — the intent-classifier routing above the agent
-- `06-error-recovery.md` — what happens when a wrong tool is picked
+- [../01-llm-foundations/07-heuristic-before-llm.md](../01-llm-foundations/07-heuristic-before-llm.md) — the parallel pattern at the query level.
+- [02-tool-calling.md](02-tool-calling.md) — the tool_use / tool_result loop that runs after routing.
+- [06-error-recovery.md](06-error-recovery.md) — what happens when routing to a tool that then fails.

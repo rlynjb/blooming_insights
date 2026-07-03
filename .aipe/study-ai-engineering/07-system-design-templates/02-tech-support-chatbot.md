@@ -1,4 +1,4 @@
-# 02 — Tech support chatbot system design
+# Tech support chatbot system design
 
 - **The prompt:** "Design a tech support chatbot for a product. It must answer customer questions, escalate when it can't, and learn from agent corrections."
 
@@ -41,9 +41,9 @@ User message
 
 - **Data model:**
   - Knowledge base: docs, FAQs, past ticket resolutions. Each chunked, embedded, indexed.
-  - Conversation history per user with `{turn, role, content, tools_called, confidence_score, escalated}`
-  - Escalation log linking bot conversations to human-resolved outcomes (the training signal for future improvement)
-  - Feedback log: thumbs-up/down per response, free-text corrections from agents
+  - Conversation history per user with `{turn, role, content, tools_called, confidence_score, escalated}`.
+  - Escalation log linking bot conversations to human-resolved outcomes (the training signal for future improvement).
+  - Feedback log: thumbs-up/down per response, free-text corrections from agents.
 
 - **Key components:**
   - *Intent classification*: detect category (billing, technical, account, out-of-scope) before retrieval. Decision: heuristic regex/keyword first, LLM classifier on ambiguous cases.
@@ -58,9 +58,9 @@ User message
   - At ~1M KB chunks: retrieval latency grows. Solution: tiered retrieval (intent-scoped first, full corpus only on miss), pre-compute embeddings for hot KB entries.
 
 - **Eval framing:**
-  - Offline: golden set of resolved tickets (LLM answer vs human agent answer, rubric scored)
-  - Online: resolution rate without escalation, time to resolution, CSAT (customer satisfaction)
-  - Adversarial set: prompt injection attempts ("ignore previous instructions"), out-of-scope questions, hostile users
+  - Offline: golden set of resolved tickets (LLM answer vs human agent answer, rubric scored).
+  - Online: resolution rate without escalation, time to resolution, CSAT (customer satisfaction).
+  - Adversarial set: prompt injection attempts ("ignore previous instructions"), out-of-scope questions, hostile users.
 
 - **Common failure modes:**
   - Hallucinated answers when KB has nothing relevant. Mitigation: relevance threshold gates response, refuse + escalate.
@@ -68,18 +68,13 @@ User message
   - Stale knowledge base — bot tells users about a feature that was deprecated last week. Mitigation: KB freshness SLA, doc change → re-embed within 24h.
   - Tone drift — bot sounds inconsistent across conversations. Mitigation: system prompt defines persona, eval rubric scores tone adherence per response.
 
-- **Applies to this codebase:** **partially**. `blooming_insights` isn't a support chatbot — the product is an analyst-workflow tool, not a Q&A surface. But the mechanisms overlap substantially:
-  - Intent classification: same shape exercised in `lib/agents/intent.ts` (Haiku classify → route to Diagnostic or Query agent)
-  - Response generation via ReAct: this codebase's DiagnosticAgent + RecommendationAgent are ReAct-shaped
-  - Structured outputs at the model boundary: `Diagnosis`, `Recommendation` in `lib/mcp/types.ts` — analogous to a chatbot's structured response with confidence + escalation flag
-  - Escalation-shaped gate: the diagnostic agent honestly reports "no signal" on no-signal cases (goldens 05, 06, 10 in `eval/goldens/`) instead of confabulating — that's the "escalate rather than hallucinate" pattern
-  - LLM-as-judge rubric: `eval/rubrics/*.ts` — the same scoring machinery a chatbot would use to grade responses in golden and adversarial sets
+- **Applies to this codebase:** `no`. blooming is an analyst product, not a support chatbot. The domains don't overlap — no knowledge base of docs, no ticket resolution, no escalation to human. Two shared shapes are worth noting: (1) blooming's QueryBox (free-form user question) is structurally similar to a chatbot's input surface, and (2) the eval rubrics + LLM-as-judge in `eval/` are the same pattern a support chatbot's offline eval would use. But there's no support-chatbot feature to defend.
 
-  What's missing to make it a chatbot: RAG over a knowledge base (see `03-retrieval-and-rag/*` — Case B), a conversational multi-turn interface (the `QueryBox` is single-turn today), a human-in-the-loop escalation path (users act on recommendations manually today).
+- **How to make it apply:**
+  - Two paths, both stretch:
 
-- **How to make it apply:** the retrofit path would be:
-  1. Extend `QueryBox` to a multi-turn conversation surface (keep conversation history across turns in `sessionStorage`, thread it into the QueryAgent's messages array).
-  2. Add RAG over a Bloomreach knowledge base — docs, feature descriptions, past investigation summaries (`03-retrieval-and-rag/11-rag.md` Case B path).
-  3. Add a per-response confidence field to the `QueryAgent`'s structured output; render an "escalate to human" button when confidence < 0.6.
-  4. Route escalations to a simple dev-side "unanswered queries" log, feed into eval set weekly to identify KB gaps.
-  This isn't the product I'm building — but the mechanism library is 80% there. Interview answer: "I haven't built a support chatbot, but I've built the ReAct + structured-output + evals + intent classification stack that a support chatbot needs. The retrofit is well-defined."
+    - **As a thought experiment** — "I haven't built a support chatbot, but here's how I'd extend blooming: repurpose the QueryBox as a 'ask about your workspace' assistant. Build a small KB of Bloomreach feature docs. RAG over those docs. Escalate to a real support agent when the retrieved chunks don't cover the question. The intent classifier + tool-schema constraint + eval harness in blooming would all transfer. What's missing: the KB itself, the escalation surface, the human-agent workflow." That's a defensible interview answer even without shipping code.
+
+    - **As a real refactor** — build the "blooming user documentation" as a small KB (5–20 docs about how blooming itself works: "what does the diagnostic agent do?", "how does severity get scored?"). RAG over that for a help-me-use-blooming assistant surface in the app. Reuses everything the retrieval sub-section builds. Files: new `docs/blooming-kb/`, new `app/help/page.tsx`, new `lib/agents/help.ts` (RAG over the KB), extends the eval harness with a help-agent rubric.
+
+  - Estimated effort for the real refactor: `1–2 weeks`. Depends on the retrieval sub-section's `B3.11` aggregate exercise landing first.

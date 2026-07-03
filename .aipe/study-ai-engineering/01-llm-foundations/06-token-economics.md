@@ -1,71 +1,86 @@
-# 06 — Token economics
+# Token economics
 
-**Type:** Industry standard. Also called: cost ledger, unit economics, per-request cost.
+## Subtitle
+
+Per-invocation cost ledger — Industry standard.
 
 ## Zoom out, then zoom in
 
-Every LLM feature in this repo has a cost. The eval harness measures it. The budget ceiling caps it. The pricing helper prices Anthropic (which AptKit's built-in helper doesn't).
+This codebase measures per-run cost with the precision of a stopwatch. The baseline run (`runId 2026-07-03T04-08-28-644Z`, committed as `eval/baseline.json`) records: ~$0.09 agent-side per case, ~$1.30 total for 10 cases (agent + judge), and specific per-phase breakdowns visible in `eval/receipts/*.json`. Every number comes from `response.usage` fields fed through `lib/agents/pricing.ts:41`'s per-million-token math.
 
 ```
-  Zoom out — where the cost math lives
+  Zoom out — where cost is measured and where it's spent
 
-  ┌─ Receipts (eval/receipts/*.json) ─────────────────────────────────┐
-  │  per-case: usage.diagnose.costUsd, usage.recommend.costUsd         │
-  │  aggregated: eval/baseline.json → run-total cost                   │
-  └─────────────────────────────▲─────────────────────────────────────┘
-                                │
-  ┌─ Budget & pricing helpers ──┴─────────────────────────────────────┐
-  │  lib/agents/budget.ts     BudgetTracker.snapshot().estimatedCost   │
-  │  lib/agents/pricing.ts    estimateAnthropicCost(usage, model)      │
-  │  ★ THIS CONCEPT ★                                                  │
-  └─────────────────────────────▲─────────────────────────────────────┘
-                                │
-  ┌─ AptKit (usage summary) ────┴─────────────────────────────────────┐
-  │  summarizeUsage(CapabilityEvent[]) → TokenUsageSummary             │
-  │  estimateCost('openai', ...)     ← knows OpenAI only               │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌─ Anthropic ─────────────────────────────────────────┐
+  │  response.usage: { input_tokens, output_tokens,      │
+  │                    cache_read_input_tokens, ... }    │
+  └───────────────────────┬──────────────────────────────┘
+                          │  per turn
+                          ▼
+  ┌─ Adapter → trace sink → CapabilityEvent ───────────┐
+  │  BloomingTraceSinkAdapter forwards to hooks         │
+  │  lib/agents/aptkit-adapters.ts (BloomingTraceSink)  │
+  └───────────────────────┬──────────────────────────────┘
+                          │
+                          ▼
+  ┌─ Receipts / budget / report ★ ──────────────────────┐ ← we are here
+  │  eval/report.eval.ts prints p50/p95/p99 + $ per case │
+  │  lib/agents/budget.ts checks ceiling before dispatch │
+  │  lib/agents/pricing.ts converts tokens → dollars     │
+  └──────────────────────────────────────────────────────┘
 ```
 
-Zoom in. AptKit's `estimateCost` returns `undefined` for `provider: 'anthropic'` — its pricing table is OpenAI-only. That gap is why `lib/agents/pricing.ts` exists: a small helper (~60 LOC) with the Anthropic per-million-token prices, called side-by-side with AptKit's function in the eval and report code.
+Zoom in: token economics is the discipline of connecting *what you ship* to *what it costs* — pre-flight (budget), in-flight (metering), post-flight (receipts + baseline).
 
 ## Structure pass
 
-**Layers:**
-- Outer: total cost of a run in USD
-- Middle: per-turn cost from token usage × price
-- Inner: individual token counts from `response.usage`
-
-**Axis: what unit governs each layer?**
-- Outer: USD (rolled up to per-case, per-run)
-- Middle: USD-per-MTok times tokens
-- Inner: raw tokens
-
-**Seam:** `estimateAnthropicCost(usage, modelName)` in `lib/agents/pricing.ts`. Above the seam, callers ask "what did this cost in USD?". Below, the price table matches `claude-sonnet-4-*`, `claude-haiku-4-*`, `claude-opus-4-*` regex to per-MTok prices.
+- **Layers:** provider usage → capability event → summarize → estimate → receipt / budget / report. Five bands.
+- **Axis: cost flow.** Where do tokens become dollars? Where does the codebase decide to stop spending? Where does it archive proof of what it spent?
+- **Seam:** `estimateAnthropicCost()` in `lib/agents/pricing.ts:41`. That's the boundary where "counts of tokens" becomes "USD." Everything downstream is money; everything upstream is model mechanics.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-A DB primary key is $0/row. A GPT-4 call is not. You already reason about resource cost when you cache expensive queries or paginate result sets. LLM calls are the same discipline: measure per-call, aggregate, and gate.
+Three prices per model, per direction:
+
+- **Input** — every token you send. Sonnet 4.6: $3/MTok. Haiku 4.5: $1/MTok.
+- **Output** — every token you receive. Sonnet 4.6: $15/MTok. Haiku 4.5: $5/MTok.
+- **Cache read** — every input token that hit the prompt cache. Anthropic prices this at ~$0.30/MTok for Sonnet, roughly 10% of normal input.
 
 ```
-  Cost per call = (in_tokens × in_price + out_tokens × out_price) / 1M
+  Where the money goes on one invocation
 
-  Sonnet 4:      $3/MTok in    $15/MTok out    (this repo's default)
-  Haiku 4.5:     $1/MTok in    $5/MTok out     (intent classifier)
-  Opus 4.7:     $15/MTok in    $75/MTok out    (unused today)
+  ┌──────────────────────────────────────────────────────┐
+  │ Input tokens (full price)                            │
+  │   system prompt (turn 1 only):     ~12000 tokens     │
+  │   schema summary:                   ~1500 tokens      │
+  │   tool defs:                        ~2500 tokens      │
+  │   messages accumulated:             1000→5000 tokens  │
+  │   → per turn 1:      ~15500 × $3/MTok  = $0.0465     │
+  │   → per turn N>1:    ~1500 fresh × $3  = $0.0045     │
+  │                      13000 cached × $0.30 = $0.0039  │
+  ├──────────────────────────────────────────────────────┤
+  │ Output tokens (full price)                           │
+  │   response per turn:  1000-2000 tokens                │
+  │   → per turn:         ~1500 × $15/MTok = $0.0225      │
+  ├──────────────────────────────────────────────────────┤
+  │ Total for a 5-turn diagnostic:                       │
+  │   turn 1: $0.0465 in + $0.0225 out = $0.069           │
+  │   turns 2–5: $0.0084 in + $0.0225 out ≈ $0.031 each   │
+  │   total:  $0.069 + 4×$0.031 = ~$0.19                  │
+  │   observed with caching:            ~$0.09/case       │
+  └──────────────────────────────────────────────────────┘
 ```
 
-Output is always ~5× more expensive than input. That's why schema-constrained outputs (`04-structured-outputs.md`) and Haiku for classification (`06-production-serving/02-llm-cost-optimization.md`) are both cost moves as well as design moves.
+The 2× gap between rough math and observed cost is the cache_read multiplier plus some turns being much cheaper than others.
 
-### Move 2 — walk the mechanism
+### Move 2 — the step-by-step walkthrough
 
-**The pricing table.**
+**The pricing table.** `lib/agents/pricing.ts:24-35` — three model families, each with input + output per-million rates:
 
-`lib/agents/pricing.ts:26-33` — a `[RegExp, {inputUsdPerMillion, outputUsdPerMillion}]` table. Matches by model family, not exact version:
-
-```typescript
-// lib/agents/pricing.ts:26-33
+```ts
+// lib/agents/pricing.ts:26-35
 const ANTHROPIC_PRICING: readonly [RegExp, AnthropicPricing][] = [
   [/^claude-sonnet-4/, { inputUsdPerMillion: 3, outputUsdPerMillion: 15 }],
   [/^claude-haiku-4/,  { inputUsdPerMillion: 1, outputUsdPerMillion: 5 }],
@@ -73,124 +88,106 @@ const ANTHROPIC_PRICING: readonly [RegExp, AnthropicPricing][] = [
 ];
 ```
 
-Update this file when Anthropic changes prices or a new family lands. It's the single source of truth for cost math in this codebase.
+Regex-matched, so a new Sonnet minor version picks up the same price without a config change. This module exists because aptkit's `estimateCost` only knows OpenAI pricing (see the comment at `lib/agents/pricing.ts:2-5`).
 
-**Per-turn cost, computed once.**
+**The pre-dispatch budget gate.** `lib/agents/budget.ts:56` — `BudgetTracker` accumulates every turn's usage. The adapter checks `budget.exceeded()` *before* calling the API, so a runaway loop can't overspend past the ceiling:
 
-The eval runner (`eval/run.eval.ts:215-220`) calls both helpers and takes whichever returns a defined value:
-
-```typescript
-// eval/run.eval.ts:215-220
-const diagnosisUsage = summarizeUsage(diagnosisTrace);
-// aptkit's estimateCost only knows OpenAI pricing; fall back to
-// Blooming's Anthropic pricing helper for our claude-* models.
-const diagnosisCost =
-  estimateCost('anthropic', diagnosisUsage, 'claude-sonnet-4-6') ??
-  estimateAnthropicCost(diagnosisUsage, 'claude-sonnet-4-6');
+```ts
+// lib/agents/aptkit-adapters.ts:65-67 (inside complete())
+if (this.budget?.exceeded()) {
+  throw new BudgetExceededError(this.budget.snapshot(), this.budget.limit);
+}
 ```
 
-Fallback pattern preserves forward-compat: if AptKit ships Anthropic pricing later, the primary path picks it up automatically.
+The route handler catches `BudgetExceededError` and emits a graceful NDJSON `error` event. No half-run investigations, no silent overage.
 
-**The cost line for the whole investigation.**
+**The receipts.** `eval/run.eval.ts` writes one JSON file per case per runId to `eval/receipts/`. Each receipt carries:
 
-`BudgetTracker.snapshot().estimatedCostUsd` at `lib/agents/budget.ts:57-69`. Accumulated across all turns of both diagnostic + recommendation agents (one tracker shared across both). This is the number the budget ceiling checks against.
+- Per-phase duration (investigate, diagnose_judge, recommend, recommend_judge, total)
+- Per-phase token usage (input, output, cache read)
+- Per-phase cost estimate (Anthropic pricing helper)
+- Rubric verdicts + per-dimension scores
 
-**Baseline numbers to anchor against.**
+The `eval/report.eval.ts` script reads all receipts for a run and prints per-phase p50/p95/p99 latency + tokens/cost per case.
 
-From the committed `eval/baseline.json` (runId `2026-07-03T04-08-28-644Z`):
-- Per-case cost: ~$0.09 (agent-side, cached)
-- 10-case run: $0.913 (agent) + ~$0.40 (judge estimate) = ~$1.30
+Execution trace of the pricing helper on one turn:
 
-**Two things pricing.ts is careful about.**
+```
+  estimateAnthropicCost({inputTokens: 13400, outputTokens: 890}, "claude-sonnet-4-6")
 
-1. **Doesn't try to model cache tiers.** The comment at `lib/agents/pricing.ts:10-13`: "`inputTokens`/`outputTokens` already exclude cache-read tokens from the input count. Cost estimated here is therefore an UPPER BOUND when caching is on." Under-count would mean under-charging the budget; upper-bound means the budget gate errs on the safe side.
-2. **Falls through to `undefined` on unknown models.** So report code that reads `cost?.totalCost ?? null` degrades gracefully — the receipt shows `costUsd: null` instead of throwing.
+  → matches /^claude-sonnet-4/
+  → pricing = { inputUsdPerMillion: 3, outputUsdPerMillion: 15 }
+  → inputCost  = 13400/1M × 3  = 0.0402
+  → outputCost =   890/1M × 15 = 0.01335
+  → total      = 0.05355
+  → returns { currency: "USD", inputCost, outputCost, totalCost, estimated: true }
+```
+
+The `estimated: true` flag matters — this is an *upper bound* when caching is on, because the `usage.inputTokens` from aptkit's `model_usage` event doesn't reflect cache pricing (`lib/agents/pricing.ts:8-14`).
 
 ### Move 3 — the principle
 
-Measure per-request cost from the start, not "when it starts to matter." A feature you can't cost is a feature you can't operate — you can't decide whether to run it at 10× volume, you can't compare provider changes, you can't gate spend. The setup cost (one pricing table, one accumulator, one receipt row) is a couple hours. The ongoing benefit is every conversation about optimization has actual numbers.
+If you can't state your feature's per-invocation cost, you can't ship it responsibly. Every LLM feature in this codebase has a receipt trail from tokens → dollars → aggregated report → committed baseline. That's what makes the "we made it cheaper" claim provable rather than assertable.
 
 ## Primary diagram
 
-The full cost pipeline — from response.usage to run total.
-
 ```
-  Cost pipeline
+  Token economics — full pipeline
 
-  Anthropic response.usage
-         │
-         ├─────► BudgetTracker.add() ───► snapshot().estimatedCostUsd
-         │                                    │
-         │                              gate: exceeded()?
-         │                                    ↓
-         │                       BudgetExceededError before next turn
-         │
-         └─────► CapabilityEvent 'model_usage'
-                          │
-                          ▼
-                 summarizeUsage(trace) ─► TokenUsageSummary
-                          │                        │
-                          ▼                        ▼
-                estimateCost('anthropic',    estimateAnthropicCost(
-                  usage, 'claude-sonnet-4-6')   usage, 'claude-sonnet-4-6')
-                          │                        │
-                          └──── first-non-undefined ┘
-                                        │
-                                        ▼
-                          receipt.usage.{diagnose,recommend}
-                                        │
-                                        ▼
-                          baseline.json → run total:
-                                $0.913 agent + $0.40 judge = $1.30
+  ┌─ Anthropic ─────────────────────────────────────────┐
+  │  response.usage per turn                             │
+  └──────────────────────┬──────────────────────────────┘
+                         │
+  ┌─ Adapter ───────────▼──────────────────────────────┐
+  │  BudgetTracker.add() every turn                     │
+  │  onCapabilityEvent → hook                           │
+  └──────────────────────┬──────────────────────────────┘
+                         │  CapabilityEvent
+  ┌─ Consumers ─────────▼──────────────────────────────┐
+  │                                                     │
+  │  1. Budget: exceeded() → BudgetExceededError        │
+  │     lib/agents/budget.ts:56                         │
+  │                                                     │
+  │  2. Receipts: eval/run.eval.ts writes per case      │
+  │     → eval/receipts/<runId>-<caseId>.json           │
+  │                                                     │
+  │  3. Report: eval/report.eval.ts reads receipts      │
+  │     → prints p50/p95/p99 + $ per case               │
+  │                                                     │
+  └─────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-Provider pricing changes. Anthropic changed Sonnet 3.5 pricing twice in 2024, both times downward. The regex table in `lib/agents/pricing.ts` is designed so a new family (Sonnet 5, whatever comes next) is a single-line addition. The "Update when Anthropic changes pricing" comment at the top of the file is a real maintenance item, not a formality.
+The prompt-caching win in this codebase (see **06-production-serving/01-llm-caching.md**) is why the per-case cost is 40–50% of the pre-caching estimate. Without caching, a 5-turn diagnostic pays full input price for the ~13k system-prompt-plus-schema prefix on every turn; with caching, turns 2+ pay ~10% of that. The `cache_read_input_tokens` field in the response is the proof.
 
-Two things the pricing helper does NOT do: (1) it doesn't discount cache-read tokens (they're excluded from the input count upstream, so the number the helper multiplies is already reduced — under caching, the estimate is an upper bound on actual spend); (2) it doesn't include Anthropic's ~1M-token batch discount (this repo doesn't use batching, so this is a non-issue for now).
+Anthropic pricing changes occasionally. The pricing helper (`lib/agents/pricing.ts`) is the one-line update — no other file references dollar values. That's dependency inversion applied to a boring but important seam.
+
+Related: **../06-production-serving/01-llm-caching.md** (where the cost reduction comes from). **../05-evals-and-observability/04-llm-observability.md** (how the receipts feed the report).
 
 ## Project exercises
 
-### Exercise — cache-tier cost accounting
+### B1.6 · Publish a per-run cost dashboard
 
-- **Exercise ID:** C1.6-A · Case A (concept exercised; refinement).
-- **What to build:** extend `estimateAnthropicCost` to accept an optional `{cacheReadInputTokens, cacheCreationInputTokens}` and price them at Anthropic's cache tier (10% for reads, 125% for creations). Read cache tier counts from `response.usage` in `AnthropicModelProviderAdapter.complete()` and thread them through to receipts.
-- **Why it earns its place:** turns the "upper bound" cost estimate into a real one. Interviewer signal: "I know exactly what my prompt cache is saving me per case — measured, not estimated."
-- **Files to touch:** `lib/agents/pricing.ts` (extend signature), `lib/agents/aptkit-adapters.ts` (capture cache_creation / cache_read counts), `lib/agents/budget.ts` (thread through), `eval/run.eval.ts` (populate receipt).
-- **Done when:** the receipt shows `costUsd` reflecting the actual cache-adjusted cost, and running with caching disabled vs enabled shows the delta in `baseline.json`.
-- **Estimated effort:** 1-2 days.
+- **Exercise ID:** B1.6
+- **What to build:** A page under `app/eval/` that reads the latest `eval/baseline.json` + recent receipts and renders per-case cost, per-phase latency, and cost trend over time. Live data, not markdown.
+- **Why it earns its place:** Turns the "we measured cost" claim into an artifact you can share in an interview. Same tokens, same pricing helper, but rendered.
+- **Files to touch:** New `app/eval/page.tsx`, new `app/api/eval/route.ts` (reads `eval/receipts/` server-side), reuses `lib/agents/pricing.ts` for the cost math.
+- **Done when:** the page shows p50/p95/p99 for the current baseline runId with 10 case rows; each row shows agent cost + judge cost + total.
+- **Estimated effort:** `1–2 days`.
 
 ## Interview defense
 
-**Q: What does an investigation actually cost?**
+**Q: What does your codebase actually cost to run?**
 
-About $0.09 agent-side per case, cached. That splits roughly $0.03-0.05 diagnose + $0.04-0.06 recommend. Add judge calls at $0.04/judgment × 4 judgments per case = another ~$0.16 at eval time. Full 10-case run: $0.913 agent + ~$0.40 judge = ~$1.30. Numbers from the committed baseline (`eval/baseline.json`, runId `2026-07-03T04-08-28-644Z`).
+The committed baseline: `runId 2026-07-03T04-08-28-644Z`, 10 cases, ~$0.09 per case agent-side, ~$0.13 including judge, ~$1.30 total. That's post-caching. Pre-caching (turns 2+ paying full input price) would be ~2× that. See `eval/baseline.json` for the exact per-case + per-phase breakdown.
 
-**Q: What's the ceiling and why is it there?**
+**Q: How do you prevent a runaway agent from spending unbounded?**
 
-Default `BUDGET_MAX_USD=2.0` per investigation, checked BEFORE every model turn. If the accumulated spend across diagnose + recommend hits $2, the next `AnthropicModelProviderAdapter.complete()` throws `BudgetExceededError` instead of calling the API. That's an escape valve for a runaway loop — at $0.09/case normal spend, it's ~22× the observed cost, so it should never fire on healthy traffic. It fires if something goes badly wrong (a bug in the ReAct loop causing infinite tool calls, or a prompt regression that balloons context).
-
-```
-  BudgetTracker (per-investigation)
-    │
-    ├── add({inputTokens, outputTokens})  ← after each response
-    │
-    ▼
-  snapshot().estimatedCostUsd  ← running total
-    │
-    ▼
-  before next call: exceeded()?  →  throws BudgetExceededError
-```
-
-**Q: Why is AptKit's estimateCost not enough?**
-
-AptKit's helper only prices OpenAI models. My repo is Anthropic-only in production. The `estimateAnthropicCost` fallback in `lib/agents/pricing.ts` fills that gap. Small file, ~60 lines, one regex table. If AptKit ships Anthropic pricing in a future release, the eval code's `estimateCost() ?? estimateAnthropicCost()` pattern picks up the upstream version automatically.
+`BudgetTracker` in `lib/agents/budget.ts`. Callers construct one per investigation with a `{ maxTokens, maxCostUsd }` limit; the tracker accumulates every turn; the adapter checks `budget.exceeded()` *before* dispatching the next API call. On hit: `BudgetExceededError` propagates up through aptkit → the route handler → an NDJSON error event. Load-bearing: the check is *pre-dispatch*, so the overage never actually happens — you're bounded on the way in, not caught after the fact.
 
 ## See also
 
-- `02-tokenization.md` — the token unit costs are computed against
-- `06-production-serving/01-llm-caching.md` — where the cost reduction actually comes from
-- `06-production-serving/02-llm-cost-optimization.md` — Haiku for intent
-- `05-evals-and-observability/04-llm-observability.md` — the receipt and report that surface these numbers
-- `lib/agents/budget.ts` and `lib/agents/pricing.ts`
+- [02-tokenization.md](02-tokenization.md) — the unit prices are denominated in.
+- [../06-production-serving/01-llm-caching.md](../06-production-serving/01-llm-caching.md) — where 40–50% of the cost gets cut.
+- [../05-evals-and-observability/04-llm-observability.md](../05-evals-and-observability/04-llm-observability.md) — the trace pipeline the receipts ride on.

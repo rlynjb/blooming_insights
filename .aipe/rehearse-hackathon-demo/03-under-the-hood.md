@@ -1,8 +1,10 @@
 # Chapter 03 — Under the hood (6:00–8:00, two minutes)
 
-The demo landed. The room has seen the trace, the fault receipt, and the money table. Now they want to know how it works — and this is the chapter where you earn credibility without losing the room. Two minutes. One diagram. One mechanism. You go exactly one level deep and you stop.
+The demo landed. The room has seen the trace, the fault receipt, and (optionally) the live MCP swap. Now they want to know how it works — and this is the chapter where you earn credibility without losing the room. Two minutes. One diagram. One mechanism. You go exactly one level deep and you stop.
 
-The mechanism worth showing is the **DataSource seam**. Not the whole architecture, not the agent loop, not the OAuth chain. One boundary — the port that lets the same agents run against Bloomreach, synthetic data, or synthetic-data-with-injected-faults. This is the seam that made the whole live-synthetic path possible, made the fault-injection receipt possible, and is your strongest single technical signal.
+The mechanism worth showing is the **DataSource seam**. Not the whole architecture, not the agent loop, not the OAuth chain. One boundary — the port that lets the same agents run against **any MCP server**, synthetic data, or synthetic-data-with-injected-faults. This is the seam that made the whole live-synthetic path possible, made the fault-injection receipt possible, made the settings-modal live swap possible, and is your strongest single technical signal.
+
+The framing that matters here: **Bloomreach is the default MCP preset**, not the product's identity. The product is a multi-agent analyst that speaks MCP. Bloomreach is the server it was built against first, and it ships as the default in `MCP_URL`.
 
   ## The time-budget bar
 
@@ -43,20 +45,33 @@ The mechanism worth showing is the **DataSource seam**. Not the whole architectu
               │              │              │
               ▼              ▼              ▼
   ┌── adapter 1 ─────┐ ┌── adapter 2 ─────┐ ┌── adapter 3 ─────┐
-  │ Bloomreach       │ │ Synthetic         │ │ FaultInjecting   │
+  │ Mcp              │ │ Synthetic         │ │ FaultInjecting   │
   │ DataSource       │ │ DataSource        │ │ (decorator)      │
   │                  │ │                   │ │                  │
-  │ MCP over         │ │ in-process        │ │ wraps any        │
-  │ HTTPS +          │ │ deterministic     │ │ DataSource +     │
-  │ OAuth PKCE       │ │ ecommerce data    │ │ injects timeouts │
-  │                  │ │ (seeded PRNG)     │ │ + malformed JSON │
-  │ used in:         │ │                   │ │ (seeded PRNG)    │
-  │ live-bloomreach  │ │ used in:          │ │                  │
-  │                  │ │ live-synthetic    │ │ used in:         │
-  │                  │ │ + demo replay     │ │ eval:load        │
+  │ MCP over HTTPS   │ │ in-process        │ │ wraps any        │
+  │ + one of three   │ │ deterministic     │ │ DataSource +     │
+  │ AuthProviders:   │ │ ecommerce data    │ │ injects timeouts │
+  │   · bloomreach   │ │ (seeded PRNG)     │ │ + malformed JSON │
+  │     OAuth PKCE   │ │                   │ │ (seeded PRNG)    │
+  │   · bearer       │ │ used in:          │ │                  │
+  │   · anonymous    │ │ live-synthetic    │ │ used in:         │
+  │                  │ │ (default) +       │ │ eval:load        │
+  │ used in:         │ │ demo replay       │ │                  │
+  │ live-mcp         │ │                   │ │                  │
   └──────────────────┘ └───────────────────┘ └──────────────────┘
 
-  lib/data-source/{bloomreach,synthetic,fault-injecting}.ts
+  lib/data-source/{mcp-data-source,synthetic-data-source,
+                    fault-injecting}.ts
+  lib/mcp/auth-providers/{bloomreach,bearer,anonymous}.ts
+
+  ┌─ per-request UI override ──────────────────────────────────┐
+  │ x-bi-mcp-config: <base64(json)>                             │
+  │   { url?, authType?, bearerToken? }                          │
+  │                                                              │
+  │ modal → localStorage → header → route decode → makeDataSource│
+  │ Session D of the synthetic-first plan; the "swap on stage"   │
+  │ beat rides this transport.                                   │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
   You draw that on the whiteboard or click a diagram slide. Then you talk it.
@@ -73,11 +88,16 @@ The mechanism worth showing is the **DataSource seam**. Not the whole architectu
   center                              talk to a port — one
                                        interface, three methods."
   ────────────────────────            ──────────────────────────
-  highlight adapter 1                 "adapter one is the real
-  (BloomreachDataSource)              Bloomreach MCP server —
-                                       OAuth, PKCE, rate limits.
-                                       what the product uses in
-                                       production."
+  highlight adapter 1                 "adapter one is a real MCP
+  (McpDataSource + three               server — Bloomreach is the
+  AuthProviders)                       default preset, but any
+                                       HTTPS MCP endpoint works.
+                                       three auth strategies plug
+                                       in: bloomreach OAuth PKCE,
+                                       a bearer token, or
+                                       anonymous. that's what the
+                                       settings modal was toggling
+                                       between."
   ────────────────────────            ──────────────────────────
   highlight adapter 2                 "adapter two is deterministic
   (SyntheticDataSource)               synthetic ecommerce data,
@@ -96,9 +116,14 @@ The mechanism worth showing is the **DataSource seam**. Not the whole architectu
   highlight the arrow from            "same agents, three adapters.
   agents to the port                  the seam is what made the
                                        whole live-synthetic path
-                                       possible — and it's what
-                                       makes the fault injection
-                                       receipt honest."
+                                       possible, what makes the
+                                       fault injection receipt
+                                       honest, and what let the
+                                       settings modal swap a live
+                                       MCP server on stage. five
+                                       independent uses — that's
+                                       how i know the seam carries
+                                       the contract."
   ────────────────────────            ──────────────────────────
 ```
 
@@ -183,9 +208,10 @@ The mechanism worth showing is the **DataSource seam**. Not the whole architectu
   ║ Whiteboard not available AND slide fails:                          ║
   ║   → talk it verbally, one sentence per adapter:                    ║
   ║      "there's a port. three adapters plug into it. one talks to    ║
-  ║       the real MCP server. one generates synthetic data in-process.║
-  ║       one wraps either of them and injects faults. same agents,    ║
-  ║       three adapters."                                             ║
+  ║       any MCP server — bloomreach by default, bearer or anonymous   ║
+  ║       for any other. one generates synthetic data in-process. one   ║
+  ║       wraps either of them and injects faults. same agents, three   ║
+  ║       adapters."                                                    ║
   ║   → this is the last-resort script; four sentences, ~15 seconds    ║
   ║                                                                    ║
   ╚══════════════════════════════════════════════════════════════════╝
@@ -231,13 +257,14 @@ The mechanism worth showing is the **DataSource seam**. Not the whole architectu
   │    6:00  show the diagram                                 │
   │    6:15  "agents don't know where their data comes from   │
   │           — they talk to a port"                          │
-  │    6:30  point at BloomreachDataSource (adapter 1):       │
-  │           OAuth + MCP + production                        │
+  │    6:30  point at McpDataSource (adapter 1):              │
+  │           any HTTPS MCP; three auth providers             │
+  │           (bloomreach oauth / bearer / anonymous)         │
   │    6:50  point at SyntheticDataSource (adapter 2):        │
-  │           in-process, seeded, no creds                    │
+  │           in-process, seeded, default at page load        │
   │    7:10  point at FaultInjectingDataSource (adapter 3):   │
   │           decorator, injects timeouts + malformed JSON    │
-  │    7:30  "same agents, three adapters"                    │
+  │    7:30  "same agents, three adapters, five uses"         │
   │    7:40  axis trace (optional): "agent decides,           │
   │           adapter obeys"                                  │
   │    7:55  hand to Chapter 04                               │

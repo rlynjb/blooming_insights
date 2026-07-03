@@ -1,278 +1,471 @@
-# Records, pages, and storage layout
+# 02 · Records, pages, and storage layout
 
-*Physical layout / Language-agnostic*
+*Row layout, locality, and the cost model of persistence · Case B*
 
-## Zoom out, then zoom in
+## Zoom out — where this concept lives
 
-You know how in Postgres a row is a tuple, tuples pack into 8KB pages, pages live in a heap file, and the whole thing loves *locality* — rows read together should live together? That's the mental model behind "storage layout." Now: this repo has no pages, no heap file, no disk-block cost model. What it has is JavaScript objects in a `Map`. This file walks the standard model, then names where the equivalents live here and where they simply don't exist.
-
-```
-  Zoom out — where records physically live in this repo
-
-  ┌─ UI ─────────────────────────────────────────────────────┐
-  │  Insight, Anomaly, Investigation shapes render here      │
-  └────────────────────┬─────────────────────────────────────┘
-                       │  JSON over NDJSON
-  ┌─ Service (Vercel) ─▼─────────────────────────────────────┐
-  │                                                          │
-  │  ★ heap-shaped `Map` of JS objects                        │ ← this file's scope
-  │    lib/state/insights.ts:14                              │
-  │                                                          │
-  │  ★ JSON-encoded rows on disk (deploy-time)                │
-  │    lib/state/demo-*.json                                  │
-  │    eval/baseline.json, eval/receipts/*.json               │
-  │                                                          │
-  └────────────────────┬─────────────────────────────────────┘
-                       │
-  ┌─ Provider (Bloomreach) ▼─────────────────────────────────┐
-  │  the real pages / heaps / rows are in there — opaque     │
-  └──────────────────────────────────────────────────────────┘
-```
-
-**Zoom in.** Every `Insight` in memory is a plain JS object — a row. The V8 heap decides where it physically sits; we don't. But the *access pattern* still matters: which fields we read together, which we compute lazily, whether the "row" is one object or two joined shapes. That's the layout question here, minus the disk-block layer.
-
-## Structure pass
-
-**Axis to hold constant: locality — what stays together when you read one row?**
-
-Three layers of "storage":
+In a real DB, "storage layout" means: rows packed into pages, pages
+grouped into files, files hitting the disk. Locality determines how
+many pages you touch to answer a query. Here you don't have pages —
+but you still have **records** with a shape, and you still have
+**locality decisions** that determine how much work a read does.
 
 ```
-  "what lives next to what?" — traced across the three layers
+Zoom out — the storage-layout question, from record to disk
 
-  ┌─ Bloomreach page/heap (opaque) ───────────────────────┐
-  │  a purchase row lives in real DB pages we can't see    │  → engine decides locality
-  └───────────────────────────────────────────────────────┘
-      ┌─ in-memory JS object ────────────────────────────────┐
-      │  an Insight is one heap-allocated object with the     │
-      │  evidence[] and derived fields already denormalized in │  → we decide locality
-      │  (deriveInsightFields spreads into the row)            │    via the row shape
-      └──────────────────────────────────────────────────────┘
-          ┌─ on-disk JSON blob ─────────────────────────────────┐
-          │  demo-insights.json is one whole file per snapshot   │  → filesystem decides,
-          │  eval/receipts/*.json is one whole file per (case×run)│    we choose the split
-          └─────────────────────────────────────────────────────┘
+┌─ what a caller sees ────────────────────────────────────┐
+│  const insight = getInsight(sessionId, id)              │
+└──────────────────────────────┬──────────────────────────┘
+                               │
+┌─ ★ THIS CONCEPT ★ ──────────▼──────────────────────────┐
+│  the record shape          — what fields ride together │
+│  the container layout      — where rows sit relative to │
+│                              each other                 │
+│  the "page" boundary       — the unit that's fetched   │
+│                              or serialized as one blob  │
+└──────────────────────────────┬──────────────────────────┘
+                               │
+┌─ storage backend ────────────▼──────────────────────────┐
+│  Map · file · JSON blob · encrypted cookie              │
+└─────────────────────────────────────────────────────────┘
 ```
 
-The seam that flips the axis: **the "one row vs many rows" boundary between the object and the file.** In memory, one `Insight` is one object — atomic read. On disk, one snapshot is one file that contains *many* `Insight`s (`demo-insights.json`) — you either read the whole file or you don't read anything. That's a chunkier locality boundary than any real DB would let you have, and it's the right call here because we never partial-load a snapshot.
+## Zoom in — the pattern
+
+**The pattern:** *records grouped by access locality.* A row's fields
+travel together because they're read together. A page groups rows that
+tend to be scanned together. This repo has no pages, but it has three
+**page-like blobs** where the "group things read together" instinct is
+alive: the encrypted cookie, the demo snapshot, and the receipt JSON.
+
+## Structure pass — one axis across the record locations
+
+**Axis: "who owns the byte layout?"** (physical layout)
+
+```
+Trace ownership of the byte layout across the tiers
+
+  Tier                      Record shape decided by     Serialization
+  ────                      ─────────────────────       ─────────────
+  1. localStorage           JSON.stringify()            per-value blob
+  2. sessionStorage         JSON.stringify()            per-value blob
+  3. server Map             the JS engine (opaque)      none — objects live
+  4. bi_auth cookie         JSON.stringify + AES-GCM    ONE blob for ALL sessions
+  5. .auth-cache.json       JSON.stringify              ONE blob for ALL sessions
+  6. git-committed JSON     JSON.stringify(_, null, 2)  ONE blob per artifact
+```
+
+The seams that matter:
+
+  → **Tier 3 → Tier 4** (Map → cookie): the "one blob for all sessions"
+    seam. Inside the Map, each `SessionFeed` is independent. Encrypted
+    into `bi_auth`, they all live in one JSON blob. The cookie is a
+    **page** in the classical sense: writing one field rewrites the
+    whole page.
+
+  → **Tier 4 → Tier 6** (cookie → git): the crypto seam. The cookie's
+    layout is invisible to git; the git-committed JSON is pretty-printed
+    and diff-able. Two totally different serialization strategies for
+    the same shape of data.
+
+The **most load-bearing choice** here is which fields cluster in the
+`SessionFeed` object. Read it once — you get the story:
+
+```typescript
+// lib/state/insights.ts:8-12
+type SessionFeed = {
+  insights: Map<string, Insight>;
+  investigations: Map<string, Investigation>;
+  anomalies: Map<string, Anomaly>;
+};
+```
+
+That's a **clustered layout**. Three related maps live inside one
+object because they're always accessed together — the briefing writes
+all three, the investigate page reads two of them, the "put investigation"
+call reads `investigations` after `insights` was already touched. If
+these were three independent top-level `Map`s, every read would be
+three lookups. As one object, one outer `state.get(sessionId)` warms
+the reference for all three.
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — the pattern
 
-Two ways to think about "a row" in any storage system:
-
-```
-  row-oriented (Postgres, MySQL)          columnar (Parquet, ClickHouse)
-  ────────────────────────────           ─────────────────────────────
-  [id | severity | headline | ...]        [id, id, id, id, ...]
-  [id | severity | headline | ...]        [severity, severity, ...]
-  [id | severity | headline | ...]        [headline, headline, ...]
-
-  fast: SELECT * WHERE id=?               fast: SELECT AVG(revenue)
-  slow: aggregate one column              slow: single-row point read
-```
-
-This repo is aggressively row-oriented. Every `Insight`, every `Anomaly`, every `Investigation` is a single JS object holding every field the UI needs — headline, severity, change, evidence, impact, history, category, and the derived fields spread on top. When you fetch it, you get all of it. There is no world in which we'd want to read just the `severity` of every insight without reading the headline too, because the UI renders the whole card as one unit.
-
-The kernel:
+Think of it like a React component's `state` object. You could have
+five `useState` hooks; instead you often have one `useState({a, b,
+c})` because those three fields change together. Same instinct here:
+if fields belong to the same logical unit, group them so one lookup
+reaches all of them.
 
 ```
-  the row kernel — one object, all fields co-located
+Records-and-pages — pattern skeleton
 
-  Insight {
-    id, timestamp,
-    severity, headline, summary,           ← UI-critical fields
-    metric, change, scope, source,         ← analytical fields
-    evidence?, impact?, history?, category?, ← optional trace fields
-    ...deriveInsightFields(anomaly)        ← denormalized derived fields
-  }
+  record  = the smallest logical unit (one insight, one auth blob)
+  cluster = a group of records that travel together on read
+  page    = the smallest unit the storage layer serializes/loads
+            (page ≥ cluster ≥ record)
 
-  one Map.set() writes it whole; one Map.get() reads it whole.
-  no partial reads. no half-populated rows.
+  ┌────────────────────────────────────────────────┐
+  │  page: bi_auth cookie                           │
+  │                                                  │
+  │   ┌ cluster: session #A ──────┐                 │
+  │   │  record: clientInfo       │                 │
+  │   │  record: tokens           │                 │
+  │   │  record: codeVerifier     │                 │
+  │   └───────────────────────────┘                 │
+  │                                                  │
+  │   ┌ cluster: session #B ──────┐                 │
+  │   │  record: clientInfo       │                 │
+  │   │  record: tokens           │                 │
+  │   └───────────────────────────┘                 │
+  └────────────────────────────────────────────────┘
+
+  (one write to session #A's tokens rewrites the WHOLE page)
 ```
 
-That's the load-bearing shape: **row = complete UI card**. The derived fields (`deriveInsightFields`) are spread into the row at write time, not computed at read time. That's a classic denormalize-for-read choice — you spend one CPU-microsecond on each write to save N read-time computations.
+### Move 2 — walk the three page-like blobs
 
-### Move 2 — the primitives walked
+Three concrete "pages" in this repo. Each teaches a different property
+of storage layout.
 
-**A "row" is a JS object; a "table" is a `Map`.**
+#### Blob 1 — the encrypted cookie as a "shared page"
 
-```ts
-// lib/state/insights.ts:25-45
-export function anomalyToInsight(a: Anomaly): Insight {
-  const id = crypto.randomUUID();          // primary key
-  const sign = a.change.direction === 'down' ? '-' : '+';
-  const headline = `${a.scope.join(' ')} ${a.metric} · ${sign}${Math.abs(a.change.value)}%`.toLowerCase();
-  return {
-    id,                                    // ← PK
-    timestamp: new Date().toISOString(),
-    severity: a.severity,
-    headline,
-    summary: `${a.metric} ${a.change.direction} ${Math.abs(a.change.value)}% vs ${a.change.baseline}`.toLowerCase(),
-    metric: a.metric,
-    change: a.change,                      // ← nested object, not a foreign key
-    scope: a.scope,                        // ← array field, not a join table
-    source: 'monitoring',
-    evidence: a.evidence,                  // ← nested array of {tool, result}
-    impact: a.impact,
-    history: a.history,
-    category: a.category,
-    ...deriveInsightFields(a),             // ← denormalized derived fields spread in
-  };
+The `bi_auth` cookie is the clearest page-like structure in the repo.
+Look at what's in it:
+
+```typescript
+// lib/mcp/auth.ts:19-36
+interface SessionAuthState {
+  clientInformation?: OAuthClientInformationMixed;
+  tokens?: OAuthTokens;
+  codeVerifier?: string;
+  state?: string;
+}
+
+type Store = Record<string, SessionAuthState>;   // sessionId → SessionAuthState
+
+// Backends selected by env — production hits the cookie path
+```
+
+`Store` is a map from `sessionId` to `SessionAuthState`. All sessions
+for the same browser cookie live in ONE encrypted blob. In DB terms,
+this is a **heap file with one page**: every row is packed together,
+and any write means rewriting the page.
+
+```
+Layers-and-hops — one field write, the whole page rewrites
+
+┌─ agent route ────────────────────────────────────────────┐
+│  provider.saveTokens(newTokens)                          │
+└──────────────────┬───────────────────────────────────────┘
+                   │ hop 1: mutate ONE field in ctx.store[sid]
+                   ▼
+┌─ ALS-scoped Store (in memory during the request) ────────┐
+│  { "sid-A": {…, tokens: NEW}, "sid-B": {…}, … }         │
+│  ctx.dirty = true                                        │
+└──────────────────┬───────────────────────────────────────┘
+                   │ hop 2: encryptStore(ctx.store) — WHOLE STORE
+                   ▼
+┌─ AES-256-GCM ────────────────────────────────────────────┐
+│  iv || tag || ciphertext                                 │
+└──────────────────┬───────────────────────────────────────┘
+                   │ hop 3: cookies().set(AUTH_COOKIE, blob)
+                   ▼
+┌─ Set-Cookie header (bytes on the wire) ──────────────────┐
+│  bi_auth = <base64url of the entire encrypted page>     │
+└──────────────────────────────────────────────────────────┘
+```
+
+**Cost model:** updating one field costs `O(all sessions)` bytes on
+the wire, every request. In a real DB this is what page-level updates
+look like — the record is small, but the fsync unit is the page.
+
+**Why it's still fine:** each browser only has its own cookie (SameSite
++ per-user), and OAuth writes are rare. The page never grows past
+maybe two or three sessions in practice.
+
+**What breaks if the layout changes:** if you flatten `Store` to
+`Record<string, unknown>` and skip the `SessionAuthState` grouping,
+you lose the ability to atomically read "everything about this
+session" — you'd need per-field lookups and each one deserializes the
+whole cookie anyway. The cluster IS the read pattern.
+
+#### Blob 2 — `SessionFeed` as a "page in memory"
+
+The in-memory Map doesn't serialize, but it still has locality. Look
+at how `putInsights` writes:
+
+```typescript
+// lib/state/insights.ts:57-71
+export function putInsights(sessionId: string, items: Insight[], rawAnomalies?: Anomaly[]): void {
+  const s = sessionState(sessionId);        // ONE outer .get() → warm the cluster
+  s.insights.clear();                        // scoped clear — inner map only
+  s.anomalies.clear();
+  items.forEach((i, idx) => {
+    s.insights.set(i.id, i);                 // write clustered with anomalies
+    if (rawAnomalies?.[idx]) s.anomalies.set(i.id, rawAnomalies[idx]);
+  });
 }
 ```
 
-Read that top to bottom and you get the entire schema. Notice what isn't there: no foreign keys, no join tables, no separate `insight_evidence` normalized-out table. Everything the UI needs to render an `InsightCard` is on this one object. In Postgres you'd have `insights`, `evidence`, and `evidence_items` as three tables and reconstruct the row with two joins; here you `Map.get` and you're done.
+Notice: **one outer `state.get(sessionId)`, then N inner writes.** If
+`insights`, `investigations`, and `anomalies` were three separate
+module-level Maps, `putInsights` would `state.get()` three times
+(once per Map). Clustering them in `SessionFeed` amortizes the outer
+lookup — you pay for the hash once, then you're pointing at the
+cluster.
 
-**A "page" doesn't exist; the JS heap chooses locality.**
+This is exactly the **B-tree page** access pattern in a real DB:
+"find the page, then walk the rows." Except the page is a JS object
+and the walk is `.set()`.
 
-There is no 8KB page boundary. V8 allocates the object wherever it likes, and adjacent inserts don't have to be adjacent in memory. If you needed to make sequential reads of 100k insights fast, you'd feel this — but this repo's access pattern is *point read one insight by id*, not scan-and-project. The lookup cost is `O(1)` hash-table access; the physical layout is the runtime's problem.
-
-**Locality of reference — what is co-accessed?**
-
-```
-  the access-pattern table — what gets read together
-
-  read path                          fields accessed
-  ─────────────────────────         ─────────────────────────────────
-  feed render (InsightCard × N)     id, severity, headline, summary,
-                                     change, scope, evidence, impact,
-                                     history, category, derived fields
-                                     → basically the whole row
-
-  investigation subject banner       id, headline, severity, metric,
-                                     scope, change
-                                     → still most of the row
-
-  investigate route lookup           id (PK lookup)
-                                     → PK only, but returns whole row
-
-  demo replay                        all rows, all fields, in order
-                                     → whole "table" scan
-```
-
-Every read path touches most of the row. That's why the denormalized row shape wins here — a normalized schema would force joins on every read for no benefit.
-
-**On-disk layout — one snapshot per file.**
+**Comparison — how the layout affects the read pattern:**
 
 ```
-  lib/state/demo-insights.json           665 lines
-  ──────────────────────────
-  {
-    insights:  [ {...}, {...}, {...}, ... ],
-    workspace: { projectId, projectName, ... },
-    trace:     [ {...}, {...}, ... ]
-  }
+Comparison — one clustered object vs three flat Maps
 
-  lib/state/demo-investigations.json   3,487 lines
-  ──────────────────────────────────
-  {
-    "<insightId>": [ AgentEvent, AgentEvent, ... ],
-    "<insightId>": [ AgentEvent, AgentEvent, ... ],
-    ...
-  }
+  Clustered (what the code does):
 
-  eval/receipts/*.json                   28 files
-  ────────────────────────
-  one file per (caseName, runId) — the atomic unit is
-  "one scored case in one eval run"
+    state.get(sid)                    ← 1 outer hash lookup
+       │
+       ├─ .insights.set(id, i)         ← inner .set() reuses the ref
+       ├─ .anomalies.set(id, a)        ← same
+       └─ .investigations.set(...)     ← same
+
+    Total: 1 outer lookup + N inner ops
+
+
+  Flat (what it would cost):
+
+    insights.get(sid)                  ← lookup 1
+    anomalies.get(sid)                 ← lookup 2
+    investigations.get(sid)            ← lookup 3
+
+    Total: N outer lookups per row
 ```
 
-The chunk size is *deliberate*: a snapshot is one file because you always load it whole to replay it; each receipt is its own file because the regression gate iterates them by runId (`gate.eval.ts:64-66` reads with `.endsWith(\`${runId}.json\`)`). If you'd put all receipts in one file, adding a new run would rewrite the whole file every time; splitting them makes the git history readable per case.
+At scale that outer lookup is `O(1)` amortized, so the difference is
+constant-factor. But the SHAPE is exactly the "prefetch the page,
+then read the rows" story from database systems.
 
-That's the "pages" analog here — the file boundary is your locality boundary.
+#### Blob 3 — `eval/baseline.json` as a wide row
 
-**The `Anomaly` vs `Insight` split — normalized in memory only.**
+Now look at the third page-like blob — the committed reference row:
+
+```json
+// eval/baseline.json (excerpt, 92 lines total)
+{
+  "runId": "2026-07-03T04-08-28-644Z",
+  "builtAt": "2026-07-03T05:29:44.727Z",
+  "caseCount": 10,
+  "diagnosis": {
+    "perDimensionPassRate": { … 4 dimensions … },
+    "perDimensionScoreCounts": { … 4 dimensions × 5 buckets … },
+    "verdictDistribution": { … }
+  },
+  "recommendation": { … same shape as diagnosis … }
+}
+```
+
+This is a **single wide row** — one artifact, many nested fields.
+Compare it with the shape of `eval/receipts/*.json` (one file per
+case per run, dozens of files):
 
 ```
-  lib/state/insights.ts:8-12
-  ──────────────────────────
-  type SessionFeed = {
-    insights:       Map<insightId, Insight>;
-    investigations: Map<insightId, Investigation>;
-    anomalies:      Map<insightId, Anomaly>;      ← same key, different table
-  };
+Comparison — wide vs narrow row layout
+
+  baseline.json (wide, one row, many dimensions)
+
+    ┌───────────────────────────────────────────────────────┐
+    │ { runId, builtAt, caseCount,                          │
+    │   diagnosis: { passRate×4, scoreCounts×4×5, verdicts},│
+    │   recommendation: { … same … } }                      │
+    └───────────────────────────────────────────────────────┘
+
+    read: one fread, JSON.parse once → whole thing in memory
+    write: one fwrite atomically
+
+
+  receipts/*.json (narrow, N rows, per-case)
+
+    ┌────────────────────┐  ┌────────────────────┐
+    │ case 1, run 1      │  │ case 1, run 2      │  ...
+    └────────────────────┘  └────────────────────┘
+    ┌────────────────────┐  ┌────────────────────┐
+    │ case 2, run 1      │  │ case 2, run 2      │  ...
+    └────────────────────┘  └────────────────────┘
+
+    read: readdir + N × fread (the CI gate does this)
+    write: append per case (the eval runner does this)
 ```
 
-An `Insight` is what the UI renders; an `Anomaly` is what the diagnostic agent needs to re-investigate. Same primary key (the insight id), two different rows. This is the closest thing this repo has to *two joined tables*: `getAnomaly(sessionId, id)` and `getInsight(sessionId, id)` are two separate calls, and `resolveAnomaly` in `app/api/agent/route.ts:35-49` walks both. In a real DB this would be `SELECT ... FROM insights JOIN anomalies USING (id)`. Here it's two hash lookups.
+The gate at `eval/gate.eval.ts:64-72` reads all receipts for a runId
+and computes a new baseline shape from them — that's a **full scan**
+over the narrow rows to produce a wide row, then a **comparison** of
+two wide rows. Wide-row layout is right for the reference; narrow-row
+layout is right for the append-only log.
 
-The reverse mapper `insightToAnomaly` (`insights.ts:53-55`) intentionally drops `evidence`, `impact`, `history`, `category` — comment on that function names the round-trip choice. The diagnostic agent only needs metric/scope/change/severity; the rest is regenerated downstream. That's the "which fields are the row's primary key material vs derived" question, answered without SQL.
+**In DB terms:** `baseline.json` is a materialized view. `receipts/*`
+is the base table. The gate is the incremental refresh + compare.
 
-### Move 2 variant — the load-bearing skeleton
+**What breaks if you invert the layout:** if `baseline.json` were N
+files (one per dimension), the gate would N-way join every run. If
+`receipts/*` were one giant file, every eval run would need to
+rewrite it (write amplification).
 
-What is the smallest thing you can remove and still have a working record layer?
+### Move 2.5 — current state vs future state
 
-1. **The row-completeness invariant.** Every `Insight` is either fully populated or absent — no half-rows. Break this and the UI has to null-check every field; today it null-checks a few (`evidence?`, `impact?`, `history?`, `category?`) as *optional* fields, not "populated later." The `anomalyToInsight` write happens once, all at once, and the row is done.
-2. **The stable primary key (`id = crypto.randomUUID()`, `insights.ts:26`).** Break this — reuse ids across runs, say — and the UI's card-stashing (`sessionStorage`) hydrates the wrong investigation on step 3. The UUID is what makes cross-session cross-run identity work.
-3. **The denormalized derived fields (`...deriveInsightFields(a)`, `insights.ts:44`).** Remove this and the UI has to re-derive on every render. Not a correctness break, but a real performance loss — the InsightCard renders 10-20 fields' worth of derivation logic per card.
+Only one migration is close enough to matter here: **the receipts
+folder as a candidate table.** Today it's a heap of JSON files;
+tomorrow you might want SQL over it. The instructive part is what
+DOESN'T have to change.
 
-The rest — the sub-Map for `anomalies` keyed by the same id, the JSON file split at snapshot boundaries — is optimization, not skeleton.
+```
+Comparison — receipts today vs receipts on SQLite
+
+  TODAY (heap of JSON files)                    FUTURE (SQLite table)
+
+  eval/receipts/                                 CREATE TABLE receipts (
+    01-…-run1.json                                 case_id      TEXT,
+    01-…-run2.json                                 signal_class TEXT,
+    …                                              run_id       TEXT,
+                                                   diagnosis    JSON,
+  read: readdir + N × JSON.parse                   recommendation JSON,
+  filter: string suffix match                      PRIMARY KEY (case_id, run_id)
+  index: NONE                                    );
+
+  gate takes: ~50ms for 10 cases                 gate takes: ~5ms via query
+```
+
+The gate's `computeBaseline` (`eval/baseline.eval.ts:87-95`) is
+already shaped like an aggregate query — it reads receipts, groups by
+dimension, and computes pass rates. **The record layout doesn't need
+to change; only the container does.** That's the payoff of storing
+records with a clean shape today: the migration is a wrapping change,
+not a rewrite.
 
 ### Move 3 — the principle
 
-**Layout follows access pattern; denormalize for reads when writes are one-shot and reads are many.** In a real DB you'd think in terms of 8KB pages and column-ordering. In this repo you think in terms of "one object per UI card, spread the derived fields at write time." Same principle, different physical unit. When your writes are batchy (one briefing produces N insights in one turn) and your reads are point-lookups (feed render, investigation deep-dive), the denormalized row is the fast path in either physical model.
+**Locality is a consequence of access pattern, not a property of the
+data.** The `SessionFeed` groups three maps because the code touches
+all three together. The cookie packs all sessions into one blob
+because the crypto boundary is per-cookie, not per-row.
+`baseline.json` is one wide row because the CI gate reads all of it
+in one comparison.
 
-## Primary diagram
+Change the access pattern and the layout changes. This is why a real
+DB is hard to design: you're committing to a layout BEFORE you know
+every access pattern. In this repo you can watch the layout change
+as the code changes, because there's no DB frozen in the middle.
+
+## Primary diagram — the three page-like blobs
 
 ```
-  Records-and-pages, this-repo-flavored
+The three "pages" in blooming_insights — three different layout stories
 
-  ┌─ per-session in-memory "tables" ────────────────────────────┐
-  │                                                              │
-  │  Map<sessionId, SessionFeed>                                 │
-  │      ┌──────────────────────────────────────────────────┐    │
-  │      │  insights: Map<insightId, Insight>                │    │
-  │      │  ┌────────────────────────────────────────────┐   │    │
-  │      │  │ id, timestamp, severity, headline,          │   │    │
-  │      │  │ summary, metric, change, scope, source,     │   │    │
-  │      │  │ evidence?, impact?, history?, category?,    │   │    │
-  │      │  │ ...deriveInsightFields(anomaly)             │   │    │
-  │      │  └────────────────────────────────────────────┘   │    │
-  │      │       one row = one heap-allocated JS object       │    │
-  │      │                                                    │    │
-  │      │  anomalies: Map<insightId, Anomaly>                │    │
-  │      │  investigations: Map<insightId, Investigation>     │    │
-  │      └──────────────────────────────────────────────────┘    │
-  │                                                              │
-  └──────────────────────────────────────────────────────────────┘
+  ┌── Page 1: bi_auth cookie  ─────────────────────────────────────┐
+  │                                                                 │
+  │   {                                                             │
+  │     "sid-A": { clientInfo, tokens, codeVerifier, state },      │  ← cluster
+  │     "sid-B": { clientInfo, tokens, … },                        │  ← cluster
+  │   }                                                             │
+  │                        AES-256-GCM entire blob                  │
+  │                        → base64url → HTTP cookie                │
+  │                                                                 │
+  │   write amp: HIGH (any field → whole page rewritten)           │
+  │   read amp:  LOW  (one decrypt gets everything)                │
+  └────────────────────────────────────────────────────────────────┘
 
-  ┌─ on-disk "pages" (JSON files in git) ───────────────────────┐
-  │                                                              │
-  │  lib/state/demo-insights.json                                │
-  │    { insights: [ ...N whole rows... ], workspace, trace }    │
-  │                                                              │
-  │  lib/state/demo-investigations.json                          │
-  │    { "<insightId>": [ AgentEvent, ... ], ... }               │
-  │                                                              │
-  │  eval/receipts/<case>-<runId>.json  (one row per file)       │
-  │                                                              │
-  └──────────────────────────────────────────────────────────────┘
+  ┌── Page 2: SessionFeed (in-memory)  ────────────────────────────┐
+  │                                                                 │
+  │   Map<sessionId, {                                              │
+  │     insights: Map<id, Insight>,          ← inner "row" map     │
+  │     investigations: Map<id, Investigation>,                     │
+  │     anomalies: Map<id, Anomaly>,                                │
+  │   }>                                                            │
+  │                                                                 │
+  │   layout benefit: one outer .get() warms all three inner maps  │
+  │   partition:      by sessionId (never bleeds across users)      │
+  └────────────────────────────────────────────────────────────────┘
+
+  ┌── Page 3: eval/baseline.json  ─────────────────────────────────┐
+  │                                                                 │
+  │   { runId, builtAt, caseCount,                                  │
+  │     diagnosis: { rates, counts, verdicts },                     │
+  │     recommendation: { rates, counts, verdicts } }               │
+  │                                                                 │
+  │   wide row · JSON.stringify(_, null, 2) · atomic fwrite         │
+  │   read: one fread on every CI run                               │
+  │   role: materialized view of eval/receipts/*                    │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The "row-oriented denormalized rows" choice is not radical — it's what every React app implicitly does with props. The name for it in DB literature is *materialized view*: the row you read is not the row you wrote, it's a pre-joined pre-derived view that lives at the same key. Materialized views are expensive to maintain in a real DB because inserts have to update the view too. Here the write is *the* view — `anomalyToInsight` is the join+derive step, and the output goes straight into the read cache. That's a cheap trick a live app can play only because there is exactly one writer per key per turn.
+**Where does the "record cluster" instinct come from?** From
+row-oriented storage engines. Postgres pages hold row tuples packed
+together; when you `SELECT *` from a row, the whole row is on one page
+and you get every column in one fetch. Column stores flip this: they
+pack all values of ONE column together across many rows, because their
+access pattern is "read one column across a million rows" rather than
+"read one row entirely."
 
-If this app grew a cross-session query surface ("show me every insight where category=X, across all users") you'd feel the missing indexes immediately — every Map is per-session, so a cross-session scan means iterating the outer Map. `03-btree-hash-and-secondary-indexes.md` picks up that thread.
+The `SessionFeed` object is a row-oriented choice. If you were doing
+analytics — "for every session, count the insights" — column-oriented
+would be faster: one flat `Map<sessionId, number>` for counts, no
+inner map traversal. But this repo's access pattern is
+"give me all three related maps for this session, then work with them
+locally," which is exactly the row-store sweet spot.
+
+**When would you flip to a column store here?** When you start
+computing aggregates across all sessions in real time — a "total
+insights emitted today" gauge on a dashboard. That's a scan-heavy
+workload, and the current layout would require walking every
+`SessionFeed` and summing every inner map. A parallel flat counter
+would be one lookup.
 
 ## Interview defense
 
-**Q: "How is data physically stored in this app?"**
+**"How is data laid out for storage in this app?"**
 
-Model answer: "There are three layers. Runtime: JS objects in a `Map<sessionId, SessionFeed>` at `lib/state/insights.ts:14` — one heap-allocated object per `Insight`, denormalized so the entire UI card is one row, no joins. V8 chooses physical placement. On disk at deploy time: whole-file JSON blobs — `lib/state/demo-*.json` for snapshots, `eval/receipts/*.json` split one file per (case × runId). The file boundary *is* the locality boundary — you either load the whole snapshot to replay it or you don't. Remote: the real Bloomreach pages we never see. The load-bearing choice is that every `Insight` is a *complete UI card* — derived fields are spread into the row at write time via `deriveInsightFields`, not computed at read."
+Answer: *"Three page-like blobs, each with a different layout story.
+The `bi_auth` cookie packs all OAuth sessions into one AES-encrypted
+blob — that's page-level write amplification, but it's fine because
+OAuth writes are rare. The `SessionFeed` in-memory object clusters
+three related maps because the code touches them together — one outer
+lookup warms all three. The `eval/baseline.json` file is one wide row
+because the CI gate reads the whole thing in one comparison. Each
+layout matches its access pattern."*
 
-Diagram to sketch: the "records-and-pages this-repo-flavored" recap, top half showing in-memory Maps, bottom half showing JSON files.
+**"What does the write amplification look like on the cookie?"**
 
-**Q: "Why not normalize `Insight` and `Anomaly` into shared tables?"**
+Answer: *"Rewrites the entire encrypted store on every dirty request.
+The 'row' is a `SessionAuthState`; the 'page' is the `Store` record
+that holds all sessions. But the AsyncLocalStorage discipline in
+`withAuthCookies` batches every provider-method write into one commit
+at request end, so it's ONE cookie-set per request, not one per
+field. That's the reason ALS is there."*
 
-Model answer: "There *is* a normalization here — they're separate inner Maps at `insights.ts:8-12`, both keyed by the same insight id. Two 'tables,' one key. The `Insight` holds what the UI renders; the `Anomaly` holds what the diagnostic agent needs to re-investigate. Splitting them means the reverse mapper `insightToAnomaly` at `insights.ts:53-55` can deliberately drop `evidence`, `impact`, `history`, `category` — the agent doesn't need them and they'd bloat the re-investigation input. So it's normalized where the *purpose* diverges (write path vs re-read for re-investigation), and denormalized where the purpose stays the same (UI card = one row). The join is two hash lookups in `resolveAnomaly` (`app/api/agent/route.ts:35-49`)."
+**"What's the difference between `baseline.json` and `receipts/*`?"**
 
-Anchor: same PK, two sub-Maps, cheap "join" by identity.
+Answer: *"Wide row vs narrow rows. `baseline.json` is a materialized
+view: one file, all dimensions aggregated. `receipts/*` is the base
+table: one file per case per run. The gate reads all narrow rows,
+computes an aggregate shape identical to the baseline, and compares.
+That layout means every eval run is an append to the base table and
+a re-materialization of the view — write cost stays low, read cost
+stays low."*
+
+The load-bearing skeleton part interviewers routinely forget:
+**the clustered outer lookup in `sessionState()`.** Without it,
+`putInsights` would do three separate outer-map lookups (one per
+inner map). Naming that clustering explains WHY `SessionFeed` is one
+object and not three siblings.
 
 ## See also
 
-- `01-database-systems-map.md` — the full storage topology this file zooms in on.
-- `03-btree-hash-and-secondary-indexes.md` — the lookup structures over these rows.
-- `04-query-planning-and-execution.md` — how scans and joins would work over Maps.
-- `05-transactions-isolation-and-anomalies.md` — atomicity of the "replace the whole row" write.
+  → `01-database-systems-map.md` — the tier each of these pages lives on
+  → `03-btree-hash-and-secondary-indexes.md` — the outer lookup as a
+    hash-index probe
+  → `07-wal-durability-and-recovery.md` — `receipts/*` as the WAL

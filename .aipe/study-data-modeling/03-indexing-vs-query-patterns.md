@@ -1,303 +1,353 @@
-# Indexing vs query patterns
+# 03 — Indexing vs query patterns
 
-**Industry term:** Access-path analysis · secondary indexes · full-table scan (filesystem analog) · **Type:** Industry-standard concept, applied here to a repo where "the table" is a directory of JSON files.
+**Access-shape efficiency · Case B (no DB) · the in-memory `Map` as the "index"**
 
-## Zoom out, then zoom in
+## Zoom out — where this concept lives
 
-**Zoom out — where reads happen.** In a database-backed system, this concept is "for each hot query, is there an index that answers it in O(log n) instead of O(n)?" blooming_insights has no database, so the equivalent question becomes: "for each hot read path, does the storage layout let us answer it without touching every record?"
+In a database, indexes are the answer to "what queries do we run and what data structure makes them fast?" You look at your query patterns, add a B-tree here, a partial index there, a composite key on `(user_id, created_at)` where it hurts. Miss an index on a hot path and you get sequential scans that melt production.
 
-```
-  Hot read paths in blooming_insights — where does each one land?
-
-  ┌─ UI layer ──────────────────────────────────────────────────┐
-  │  read: getInsight(sessionId, id)  → one card                │
-  │  read: listInsights(sessionId)    → the feed                │
-  └──────────────────────────┬──────────────────────────────────┘
-                             │
-  ┌─ Service layer ──────────▼──────────────────────────────────┐
-  │  ★ THIS CONCEPT ★                                            │
-  │  In-memory Map<sid,{Map,Map,Map}> — O(1) by id per session   │
-  │                                                              │
-  │  Eval-time reads:                                            │
-  │    readdirSync + filter-by-runId-suffix + parse × N          │
-  │    → linear scan per aggregation                             │
-  └──────────────────────────┬──────────────────────────────────┘
-                             │
-  ┌─ Storage layer ──────────▼──────────────────────────────────┐
-  │  Map (RAM)         demo-*.json (single file)                │
-  │  eval/receipts/*.json (N per run, R runs)                   │
-  └─────────────────────────────────────────────────────────────┘
-```
-
-**Zoom in — the pattern.** Two read patterns dominate. The **hot request path** (feed → card → investigation) uses a Map keyed by id, per session: O(1) lookup, no index needed. The **eval aggregation path** (baseline build, gate compare, report) walks the receipts directory once per invocation: O(N × R) parses to answer questions that a DB with a single index would answer in O(log N).
-
-## Structure pass
-
-### Layers of read
+Here, there's no B-tree. There's no SQL. What there is:
 
 ```
-  Read patterns — sorted by frequency and hot-ness
+  Zoom out — where "indexing" happens without a DB
 
-  ┌─ Hot (per-request, sub-second) ─────────────────────────────┐
-  │  getInsight / listInsights / getInvestigation                │
-  │  → Map lookup, O(1)                                          │
-  │  → files 00–07 walk these first because they're the request │
-  │    path                                                      │
-  └────────────────────────┬────────────────────────────────────┘
-                           │
-  ┌─ Warm (per-run, seconds) ───────────────────────────────────┐
-  │  demo-snapshot read (once at startup for demo mode)          │
-  │  → single-file JSON.parse, ~665 lines                        │
-  └────────────────────────┬────────────────────────────────────┘
-                           │
-  ┌─ Cold (per-eval-run, tens of seconds) ──────────────────────┐
-  │  baseline aggregation, gate compare, report                  │
-  │  → readdirSync + filter + JSON.parse × N per aggregation     │
-  └─────────────────────────────────────────────────────────────┘
+  ┌─ Service ─────────────────────────────────────────────────┐
+  │  Map<sessionId, SessionFeed>                              │
+  │    ├── insights:       Map<id, Insight>       ← O(1) key   │
+  │    ├── anomalies:      Map<id, Anomaly>       ← O(1) key   │
+  │    └── investigations: Map<insightId, Inv>    ← O(1) key   │
+  │                                                            │
+  │  ★ THIS FILE ★ — do the access patterns match the         │
+  │  indexes (Map keys)? Where's the hot-path scan hidden?    │
+  │                                                            │
+  │  eval/receipts/ — 28 files, filename encodes the "index"   │
+  │  eval/goldens/  — glob-loaded on startup                   │
+  └────────────────────────────────────────────────────────────┘
 ```
 
-### One axis: **is the read pattern supported by the write layout?**
+The concept: **when you use a `Map`, the key IS the index.** The equivalent of "add an index on `insight_id`" is "use `Map<insightId, Investigation>` instead of `Investigation[]`." The equivalent of a *missing* index is looping through an array to find one item, or reading a whole directory to find one file.
 
-- Hot path: **yes.** Session Map keyed by sessionId + inner Map keyed by id — reads perfectly match writes.
-- Warm path: **yes.** Single-file demo snapshot loaded once at startup — one file, one shape, matches.
-- Cold path: **partial.** Receipts are keyed by `(caseId, runId)` in the filename. Filtering by `runId` scans the directory; filtering by `caseId` alone scans everything; querying "all receipts where `diagnosisJudgment.verdict === 'fail'`" requires parsing every file. The layout supports one query well and every other query linearly.
+## The structure pass — layers, one axis, seams
 
-### Seams — where the answer flips
+Hold one axis constant: **what's the access shape for this collection?**
 
-- **`lib/state/insights.ts:16-23` — `sessionState`.** Above the seam: the shared outer Map. Below: per-session sub-maps. The Map-of-Maps *is* the index — one hash lookup per level, and every hot request path uses both.
-- **`eval/baseline.eval.ts:44-51` — the `readdirSync + filter` loop.** Above: "which run am I aggregating?" (a `runId` string). Below: a full directory scan. This is where the query pattern flips from indexed to unindexed.
+```
+  Axis: "how is this collection accessed?"
+
+  ┌── collection ──────────────┬── access shape ─────────────┐
+  │                            │                             │
+  │ SessionFeed.insights       │ get by id     (hot: O(1))   │
+  │                            │ list all      (feed render) │
+  │                            │ replace all   (new brief)   │
+  ├────────────────────────────┼─────────────────────────────┤
+  │ SessionFeed.anomalies      │ get by id     (hot: O(1))   │
+  │                            │ ↑ only during investigation │
+  ├────────────────────────────┼─────────────────────────────┤
+  │ SessionFeed.investigations │ get by insightId (O(1))     │
+  │                            │ ↑ from the investigate page │
+  ├────────────────────────────┼─────────────────────────────┤
+  │ eval/receipts/*.json       │ read by runId (dir glob)    │
+  │  → filename pattern         │ read by caseId (dir glob)   │
+  │  = filesystem index        │ read latest (sort + pop)    │
+  ├────────────────────────────┼─────────────────────────────┤
+  │ eval/goldens/*.ts          │ read all (module import)    │
+  │                            │ list all (index.ts glob)    │
+  └────────────────────────────┴─────────────────────────────┘
+
+  seam: the "index" moves from Map keys (in-memory)
+        to filename patterns (on disk) at the eval boundary
+```
+
+The seam is important: **when the collection lives in memory, the index is a `Map` key; when it lives on disk, the index is a filename pattern.** Both are O(1) lookups if the query matches — and O(N) scans if it doesn't.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-Two mental models, one per pattern.
-
-**The hot path is a two-level hash table.** You've probably reached for `Map<userId, Map<key, value>>` before — the outer partitions the world, the inner is the actual store. blooming_insights uses this to keep session A's briefing from being wiped when session B posts a new one.
+You already know this from writing SQL: `WHERE user_id = ?` is fast when there's an index on `user_id`, slow when there isn't. Same shape here: `get(id)` is fast on a `Map<id, T>`, slow when you have to walk a `T[]` looking for the right one.
 
 ```
-  Two-level hash — the "index" that isn't a DB
+  The pattern — access shape matches (or doesn't match) the layout
 
-     "list this session's insights"
-                │
-                ▼
-     state.get(sessionId)   ◄── O(1), outer Map
-                │
-                ▼
-     .insights.values()      ◄── O(k), where k = insights in this feed
-                                  (typically 3-8)
+    query                          layout                       cost
+    ─────                          ──────                       ────
 
-  no index tree, no query planner — just Map lookup twice
+    getInsight(sessionId, id)      Map<id, Insight>             O(1)   ✓
+    listInsights(sessionId)        [...map.values()]            O(N)   ✓ (feed rendering)
+    getInvestigation(sess, id)     Map<insightId, Investigation> O(1)  ✓
+    getCachedInvestigation(id)     mem.get → readJson(file)      O(1) mem, O(F) disk
+                                    ↑ but disk read reparses
+                                      the whole cache file
+
+    receiptsForRunId(runId)        readdirSync + filter(endsWith) O(F) — F = files
+                                                                  scan the whole dir
 ```
 
-**The cold path is a file-system table scan.** Each receipt is a JSON file named `<caseId>-<runId>.json`. To "aggregate the latest run," the code reads the directory, filters filenames by suffix, parses each hit. There's no index; every parse is an O(size) cost.
+The good news: every server-side hot-path collection uses a `Map` keyed by the natural lookup key. The bad news: two access shapes are O(N) scans where they don't have to be — the dev-only investigation cache re-reads the whole JSON file every call, and the eval receipt loader scans the whole directory.
+
+### Move 2 — the actual query shapes
+
+Walk the collections one at a time. For each: what's the query, what's the layout, is it a match?
+
+#### `SessionFeed.insights` — the primary feed
+
+**Queries:**
+  → `getInsight(sessionId, id)` — one-off lookup during investigation open.
+  → `listInsights(sessionId)` — feed render, whole session.
+  → `putInsights(sessionId, items)` — replace all (clear + set N).
+
+**Layout:** `Map<string, Insight>` inside a per-session `SessionFeed` inside `Map<sessionId, SessionFeed>` (`lib/state/insights.ts:8-14`).
 
 ```
-  eval/receipts/ — the "table scan" pattern
+  Two-level Map — outer keyed by session, inner keyed by id
 
-     readdirSync(RECEIPTS_DIR)             ◄── list all files
-              │
-              ▼
-     .filter(f => f.endsWith(`${runId}.json`))   ◄── string match
-              │
-              ▼
-     for each file: JSON.parse(readFileSync)     ◄── the scan
-              │
-              ▼
-     for each receipt: aggregate                 ◄── the work
+  Map<sessionId, SessionFeed>
+    │
+    │ get(sessionId) → O(1)
+    ▼
+  SessionFeed { insights: Map<id, Insight>, anomalies, investigations }
+    │
+    │ get(id) → O(1)
+    ▼
+  Insight
 
-  cost:  O(total_files) directory listing
-       + O(runId_matches) parses × ~35KB each
+  end-to-end: O(1) for get, O(N) for list where N = insights in one session
 ```
 
-### Move 2 — the read paths, one at a time
+Verdict: **access shape and layout match.** The two-level `Map` is doing the job a `(sessionId, insightId)` composite index would do in a DB.
 
-#### Hot path A — `getInsight(sessionId, id)`
+The load-bearing decision: **why keyed by `sessionId` at all?** Because a single warm Vercel instance serves many users concurrently, and a module-level `Map<id, Insight>` would leak between sessions. The comment on `lib/state/insights.ts:6-8` names this directly: *"a single warm Vercel instance serves many users concurrently, so module-level Maps would bleed between sessions — and `putInsights`' clear() would wipe another user's feed mid-briefing."*
 
-**File:** `lib/state/insights.ts`
-**Function:** `getInsight` (lines 73-75)
+The DB analog is exactly the same: **you don't just index on `id`, you index on `(tenant_id, id)` — because "get row by id" without the tenant scope is a security bug, not just a slow query.**
+
+#### `SessionFeed.anomalies` — the sidecar
+
+**Queries:**
+  → `getAnomaly(sessionId, id)` — only during investigation open (agent needs the raw shape).
+  → cleared alongside insights in `putInsights`.
+
+**Layout:** `Map<string, Anomaly>` keyed by the **insight's** id, not by any anomaly-native identifier.
+
+That's a modeling choice: the anomaly *has no primary key* of its own. It borrows the insight's ID because they're always minted together. If you tried to store anomalies independently — say, from a different agent that doesn't produce insights — you couldn't; the anomalies map has no way to key them.
+
+Verdict: **borrowed-key layout, fine for the current access shape, breaks the moment you need a second producer.**
+
+#### `SessionFeed.investigations` — the deep-dive index
+
+**Queries:**
+  → `getInvestigation(sessionId, id)` — investigate-page render.
+  → `putInvestigation(sessionId, inv)` — after the agent loop completes.
+
+**Layout:** `Map<insightId, Investigation>` (`lib/state/insights.ts:86-92`) — natural foreign key from `Investigation.insightId` becomes the index key.
+
+Verdict: **access shape and layout match.** `insightId` is the natural lookup key, and the `Map` provides O(1) access. No "add this index" would help.
+
+#### `getCachedInvestigation` — the fallback chain (O(F) hidden scan)
+
+**Query:** `getCachedInvestigation(insightId)` — one lookup per investigate-page open in dev/demo mode.
+
+**Layout:** Three-source lookup (`lib/state/investigations.ts:22-28`):
+
+```
+  Cache chain — the hidden O(F) hop
+
+  1. mem.get(insightId)               O(1)  in-memory Map
+     ↓ miss
+  2. readJson(CACHE_FILE)[insightId]  O(F)  re-parses .investigation-cache.json
+     ↓ miss                                (F = size of the cache file)
+  3. readJson(DEMO_FILE)[insightId]   O(F)  re-parses lib/state/demo-investigations.json
+     ↓ miss                                (each call reparses from scratch!)
+  4. null
+```
+
+The hidden cost: **`readJson` reads and JSON.parses the entire file every call.** For a small cache file this is fine. For a growing dev file (every dev-mode investigation appends) it will eventually hurt.
+
+Verdict: **acceptable for dev/demo, would be a scan bug in prod.** The mitigation: dev mode isn't a hot path, and in production the file doesn't exist so tier 4 skips (line 24: `PERSIST ? readJson(CACHE_FILE)[insightId] : undefined`). Not something to fix now, something to *watch*.
+
+Pseudocode of the fix if it becomes real:
+
+```
+  cache the parsed JSON in memory, re-read only on mtime change
+
+  fileCache: Map<path, {mtimeMs: number, data: object}>
+
+  readJson(path):
+    stats = statSync(path)
+    entry = fileCache.get(path)
+    if entry and entry.mtimeMs == stats.mtimeMs:
+      return entry.data                    // O(1) — reuse parsed
+    data = JSON.parse(readFileSync(path))  // O(F) — only on change
+    fileCache.set(path, {mtimeMs: stats.mtimeMs, data})
+    return data
+```
+
+That converts the fallback from "O(F) every call" to "O(1) every call except after a write."
+
+#### `eval/receipts/` — the filename pattern IS the index
+
+**Queries:**
+  → `receiptsForRunId(runId)` — used by `baseline.eval.ts:44-46` and `load.eval.ts`.
+  → `receiptsForCaseId(caseId)` — implicit, when reviewing a case's history.
+  → `pickLatestRunId()` — pick the newest run.
+
+**Layout:** Files on disk, named `{caseId}-{runId}.json` (e.g. `01-conversion-drop-mobile-checkout-2026-07-03T04-08-28-644Z.json`).
+
+The filename pattern IS the index. `baseline.eval.ts:44-46` implements it:
 
 ```typescript
-export function getInsight(sessionId: string, id: string): Insight | null {
-  return state.get(sessionId)?.insights.get(id) ?? null;
-}
-```
-
-Two `Map.get()` calls, both O(1) on average. This is the read path that runs when the user clicks a feed card and lands on `/investigate/[id]`. It's about as fast as a read gets — no serialization, no parse, no allocation beyond the return.
-
-**What breaks if the outer Map is removed** (i.e., you go back to a flat `Map<insightId, Insight>`): sessions bleed. The `sessionState` boundary is the entire index-that-partitions-users. The comment at lines 5-11 (already cited in file 01) is worth re-reading — it's a data-modeling decision expressed as a comment.
-
-#### Hot path B — `listInsights(sessionId)`
-
-**File:** `lib/state/insights.ts`
-**Function:** `listInsights` (lines 81-84)
-
-```typescript
-export function listInsights(sessionId: string): Insight[] {
-  const s = state.get(sessionId);
-  return s ? [...s.insights.values()] : [];
-}
-```
-
-O(1) session lookup + O(k) values spread, where k is the number of insights in the feed (~3-8 in practice). This is the feed-page read. `Map.values()` returns iteration order = insertion order in V8, which the UI relies on implicitly (the briefing runner inserts in the order the monitoring agent found anomalies).
-
-**What breaks if you replace this with a filtered scan of a global list** (`allInsights.filter(i => i.sessionId === sid)`): the read cost goes from O(k) to O(all_sessions × avg_feed_size). Currently unnoticeable; matters the moment you have >100 concurrent sessions on one warm instance.
-
-#### Warm path — demo snapshot read
-
-**File:** `lib/state/investigations.ts` (lines 22-28) + demo files at `lib/state/demo-*.json`
-
-```typescript
-export function getCachedInvestigation(insightId: string): AgentEvent[] | null {
-  if (mem.has(insightId)) return mem.get(insightId)!;
-  const fromFile = PERSIST ? readJson(CACHE_FILE)[insightId] : undefined;
-  if (fromFile) return fromFile;
-  const fromDemo = readJson(DEMO_FILE)[insightId];
-  return fromDemo ?? null;
-}
-```
-
-Three-tier lookup: in-memory → dev cache file → committed demo file. Each JSON file is read + parsed on every miss (there's no in-memory cache of the file contents beyond the OS page cache). At demo-file size (~3487 lines / ~80KB for `demo-investigations.json`), a full parse is a few milliseconds — well below the network round-trip budget of the live path.
-
-**What breaks if you cache the parsed JSON in memory:** the dev-file cache stops picking up hot writes. As long as dev is the only consumer, either shape works; the current code prefers "re-read every time" for correctness over caching.
-
-#### Cold path A — the baseline aggregation
-
-**File:** `eval/baseline.eval.ts`
-**Function:** the vitest `it()` body at lines 42-65
-
-```typescript
-const runId = pickRunId(process.env.RUN_ID);
 const files = readdirSync(RECEIPTS_DIR)
   .filter((f) => f.endsWith(`${runId}.json`))
   .sort();
-if (files.length === 0) throw new Error(`No receipts for runId ${runId}`);
-
-const receipts: Receipt[] = files.map(
-  (f) => JSON.parse(readFileSync(resolve(RECEIPTS_DIR, f), 'utf8')) as Receipt,
-);
-
-const baseline = computeBaseline(runId, receipts);
 ```
 
-The query is: "give me every receipt for run X, then aggregate per-dimension pass rates." Cost:
-
-- `readdirSync`: O(total_receipts) — reads the whole directory listing.
-- `filter`: linear string match per name.
-- `readFileSync + JSON.parse`: per file, ~35KB each — the dominant cost.
-- `computeBaseline`: linear over the parsed receipts.
-
-At 10 cases × 3 runs = 30 files, this is milliseconds. At 200 cases × 50 runs = 10,000 files, `readdirSync` alone becomes measurable on some filesystems, and the parse cost dominates. `pickRunId` (lines 120-129) does an *additional* `readdirSync` + regex match to discover the latest runId — that's *two* full directory listings on one invocation.
-
-**What breaks if you index the filesystem:** you'd need a manifest file that says "run X consists of files [1..10]." At 10 cases the manifest is a rounding error; at 200 it's the difference between milliseconds and seconds per invocation.
-
-#### Cold path B — the regression gate
-
-**File:** `eval/gate.eval.ts`
-**Function:** the vitest `it()` body at lines 50-91
-
-Same pattern as baseline, but reads *two* runs — the committed `baseline.json` and the candidate run's receipts — then diffs pass rates per dimension. Lines 63-73:
-
-```typescript
-const candidateRunId = pickRunId(process.env.RUN_ID);
-const files = readdirSync(RECEIPTS_DIR)
-  .filter((f) => f.endsWith(`${candidateRunId}.json`))
-  .sort();
-if (files.length === 0) throw new Error(`No receipts for candidate runId ${candidateRunId}`);
-
-const receipts: Receipt[] = files.map(
-  (f) => JSON.parse(readFileSync(resolve(RECEIPTS_DIR, f), 'utf8')) as Receipt,
-);
-const candidate = computeBaseline(candidateRunId, receipts);
-```
-
-Notice that `baseline.json` is a **pre-aggregated summary** — it's the equivalent of a materialized view. The gate reads the pre-aggregated baseline in O(1) and only pays the scan cost on the candidate side. That's a real optimization; without `baseline.json`, the gate would scan both runs.
-
-#### Cold path C — the report
-
-**File:** `eval/report.eval.ts` (lines 60-70)
-
-Same shape: `readdirSync` + filter-by-runId + parse per file. This one reads `usage`, `durationMs`, and `toolCalls[]` from each receipt to print percentiles. Because it's percentile math, it inherently needs every receipt — no aggregation shortcut helps.
-
-#### Move 2 variant — the load-bearing skeleton
-
-The **kernel of "supporting a read pattern with the storage layout"** has three parts:
+That's an O(F) scan across the whole receipts dir (F = 28 files today, grows by ~10 per baseline run). For a hackathon-scale receipts folder this is trivial. For 10,000 receipts it'd be a real cost.
 
 ```
-  kernel of an "index" — three parts, applies to Map or file layout
+  The filename-as-index — three query shapes, all O(F)
 
-  1. a lookup key                      → the identifier the reader has
-  2. a store organized by that key     → O(1) or O(log n) direct lookup
-  3. an entry point that exposes it    → the function or file naming
+  eval/receipts/
+    01-conversion-drop-mobile-checkout-2026-07-03T02-12-17-099Z.json
+    01-conversion-drop-mobile-checkout-2026-07-03T02-47-24-392Z.json
+    01-conversion-drop-mobile-checkout-2026-07-03T04-08-28-644Z.json  ← latest
+    02-fraud-payment-failure-credit-card-2026-07-03T02-47-24-392Z.json
+    02-fraud-payment-failure-credit-card-2026-07-03T04-08-28-644Z.json
+    ...
+
+  ── query: "all receipts for runId X" ───────────
+     readdir + filter(endsWith(runId))     O(F)
+
+  ── query: "all receipts for caseId Y" ──────────
+     readdir + filter(startsWith(caseId))  O(F)
+
+  ── query: "latest runId" ───────────────────────
+     readdir + extract runIds + sort + pop O(F log F)
 ```
 
-Applied to the hot path:
-- Key: `(sessionId, insightId)`
-- Store: `Map<sessionId, { Map<insightId, ...> }>`
-- Entry point: `getInsight(sessionId, id)`
+Verdict: **fine at hackathon scale, but the shape is already there for it to matter later.** The two natural "indexes" — by runId and by caseId — are both prefix/suffix substrings of the filename, which means any future move to a real query engine (e.g. SQLite over the receipt corpus) would trivially reconstruct them.
 
-Applied to the cold path — this is the diagnostic:
-- Key: `runId`, `caseId` (composite in the filename)
-- Store: flat directory, no sub-directories
-- Entry point: `readdirSync + filter` (there is no `getReceipt(runId, caseId)` function)
+#### `eval/goldens/` — glob import at startup
 
-Drop the entry point (part 3) and every call site reimplements the scan. That's exactly what happens: `baseline.eval.ts`, `gate.eval.ts`, and `report.eval.ts` all open with the same `readdirSync + filter` boilerplate. When the same query is written three times, that's the missing abstraction — and it's a data-modeling smell, not just a code-duplication one.
+**Queries:** always "give me all goldens" (both `it.each(goldens)` in run and lookups by index).
 
-**The fix if the cost matters:** introduce a `receipts.ts` module with `listRunIds()`, `readRun(runId): Receipt[]`, and (if aggregation gets frequent) a lazily-built `runId → summary` cache. Or, when case count grows, back it with SQLite — a single indexed table with `(runId, caseId, dimension, score)` rows makes every aggregation an indexed lookup.
+**Layout:** `index.ts` re-exports each `NN-*.ts` file as an entry in a hand-maintained array. Cost: paid once at module load, then O(1) for the array.
+
+Verdict: **fine.** Access shape is "iterate all," and the array supports that in O(N).
 
 ### Move 3 — the principle
 
-**An index is a promise that a specific question can be answered without reading everything.** The Map-of-Maps for sessions makes `getInsight` cheap because it *is* an index — hashed by two keys, one lookup each. The filename encoding `<caseId>-<runId>.json` is *also* an index for the "give me one specific receipt" question, but every eval-time query today asks a different question: "give me *all* receipts for runId X," or worse, "aggregate scores across every run." Those questions have no index behind them; they scan. The rule you take home: **whenever you write the same `readdirSync + filter + parse` block a third time, you've built a database — badly.** That's the moment to either abstract the read path into one function (cheap) or introduce a store that actually indexes (bigger commit, real payoff). blooming_insights is at *two* copies of the pattern; the third is where the abstraction earns its way in.
+The principle: **`Map<key, T>` is your index; array iteration is your sequential scan.** For every collection, ask: "when I read from this, what's the lookup key I want?" If it's a natural identifier, use a `Map<identifier, T>`. If you don't know the identifier — you need to filter by predicate — that's an array `.filter()` and you should be honest about the O(N) cost.
 
-## Primary diagram
+The DB rule "add an index on the columns you filter/join by" translates directly: **choose the `Map` key by what your reads want, not what your writes produce.** The reason this repo's storage feels right is that it does exactly that — `insights` keyed by insight id (because the investigate page comes in with an id), `investigations` keyed by insightId (same reason), `Map<sessionId, ...>` at the outer level (because every request already knows its session).
 
-Every hot and cold read path, side by side, with the "index" (or lack of one) named.
+## Primary diagram — the query/layout match matrix
 
 ```
-  blooming_insights — reads and the layouts that support them
+  Every collection in this repo — is the layout right for the queries?
 
-  HOT PATH (per request, sub-ms)
-  ┌────────────────────┐   Map<sid, {Map,Map,Map}>   ┌────────────┐
-  │ getInsight(sid,id) │──►  O(1) session lookup  ──►│ Insight    │
-  │ listInsights(sid)  │──►  O(1) + O(k) values   ──►│ Insight[]  │
-  │ getInvestigation() │──►  O(1) both levels     ──►│ Investig.  │
-  └────────────────────┘                             └────────────┘
+  ─────────────────────────────────────────────────────────────────────
+  collection                    query                       layout   OK?
+  ─────────────────────────────────────────────────────────────────────
+  SessionFeed.insights          getInsight(id)              O(1)     ✓
+                                listInsights()              O(N)     ✓
+                                putInsights (clear + set N) O(N)     ✓
 
-  WARM PATH (per demo mode load)
-  ┌────────────────────┐   readFile + JSON.parse    ┌────────────┐
-  │ getCachedInvestig. │──►  single-file, ~80KB  ──►│ AgentEvent│
-  └────────────────────┘   (three-tier: mem/dev/dem) │ [] │
-                                                     └────┘
+  SessionFeed.anomalies         getAnomaly(id)              O(1)     ✓
 
-  COLD PATH (per eval run, seconds)
-  ┌────────────────────┐   readdirSync + filter    ┌────────────┐
-  │ baseline aggregate │──►  linear directory scan ─►│ Baseline  │
-  │ gate compare       │──►  + JSON.parse × N       │ GateResult │
-  │ report percentiles │──►  ~35KB per parse        │ printout   │
-  └────────────────────┘                             └────────────┘
-                              no query index —
-                              every question is a scan
+  SessionFeed.investigations    getInvestigation(id)        O(1)     ✓
+
+  Map<sessionId, SessionFeed>   sessionState(sessionId)     O(1)     ✓
+                                (isolate concurrent users)
+
+  .investigation-cache.json     getCachedInvestigation(id)  O(F)     ⚠
+    (via readJson)              ↑ re-parses whole file      dev-only,
+                                  every call                acceptable
+
+  eval/receipts/*.json          filter(endsWith(runId))     O(F)     ⚠
+                                filter(startsWith(caseId))  O(F)     scale
+                                sort + pop for latest       O(F log F) cliff
+                                                                     at ~1000
+                                                                     receipts
+
+  eval/goldens/*.ts             iterate all                 O(N)     ✓
+    (bundled at import)                                              (once)
+  ─────────────────────────────────────────────────────────────────────
+
+  Legend:
+    ✓  layout matches access shape
+    ⚠  scan cost latent; fine today, watch for growth
 ```
 
 ## Elaborate
 
-The two-tier Map is a hand-rolled **sharded index** — the outer Map is the shard key (session), the inner is the primary key (entity id). Every real database implements this same shape internally (Postgres partitioning, Redis clustering, MongoDB sharding) — it just puts it behind a query planner. In an in-process store, you build it yourself, in TypeScript.
+Where the pattern comes from: this is the same *access-path selection* logic a DB query planner does — but done at code-write time instead of query-plan time. When you write SQL, the planner reads your `WHERE`/`JOIN` clauses and picks an index. When you write TypeScript against `Map`s, *you* are the planner: you commit to an access path when you declare the `Map`'s key type.
 
-The receipts-directory pattern is a **write-optimized log** with no read-side index. Kafka is the archetype; append-only Postgres tables with only a sequence number are another. Both are fine *if* you consume them by scanning from a known offset. The moment consumers start asking questions like "find every row where field X has property Y," you need either (a) a secondary index on the log, (b) a materialized projection that answers the specific query, or (c) a real query engine. `baseline.json` is option (b) — it's a materialized projection that answers the gate's question in O(1). It's the right choice; it just happens to be the *only* one, and every other cross-run question is currently unanswered.
+The consequence: **once the key is chosen, the access path is fixed.** Changing "I want to query anomalies by (metric, scope, timestamp) instead of by insightId" means restructuring the `Map` or adding a secondary `Map<compositeKey, id>` — the DB analog of adding a covering index.
+
+The receipts-as-files pattern shows up widely — it's how CI systems store build artifacts, how Vercel stores deployment records, how `git` itself stores objects (a filename IS a hash IS an index). It scales further than you'd think, until it doesn't, and then you migrate to SQLite (github/actions did this) or an object store (Vercel).
+
+Related reading: PoEAA's *Query Object* pattern — when the collection you're reading is large enough that filename patterns aren't enough, you introduce a Query Object that knows how to serialize predicates. Not needed here; worth naming as the escape hatch.
 
 ## Interview defense
 
-**Q: "How does a request read data in this system?"**
-Answer: "The feed page calls `listInsights(sessionId)` which is a two-level Map lookup — `lib/state/insights.ts:81-84`. The outer Map is keyed by sessionId to partition users on a warm serverless instance; the inner is keyed by insight id. Both hits are O(1). Getting one card by id is the same pattern — `getInsight(sid, id)` on line 73. There's no database, no ORM, no query — it's a hashed lookup in RAM." Draw the two-level Map diagram from Move 1.
+### Q1 — "walk me through the indexes on your primary feed."
 
-**Q: "Where's the index in this codebase?"**
-Answer: "The hot path *is* an index — `Map<sessionId, {Map<id, Insight>, ...}>` acts as a two-key hash. Perfect for the read pattern. The eval subsystem is different: every aggregation reads `eval/receipts/` with `readdirSync + filter-by-runId + JSON.parse × N`. That's a table scan against the filesystem, done in Node memory. It's fine at 10 cases per run; it doesn't scale to 200. The one optimization we have is `eval/baseline.json` — a pre-aggregated summary the regression gate reads instead of re-scanning the baseline run. That's a materialized view." Anchor: `eval/baseline.eval.ts:44-51` for the scan; `eval/gate.eval.ts` for the gate that uses the materialized baseline.
+> There's no DB, so the "indexes" are the keys on the `Map` objects. My primary feed lives in `Map<sessionId, SessionFeed>` where `SessionFeed.insights` is `Map<insightId, Insight>`. That two-level `Map` is playing the role of a `(session_id, insight_id)` composite index — every get is O(1), and the outer level isolates concurrent users on a single warm serverless instance.
+>
+> The load-bearing decision: keying at the outer level by `sessionId` is what makes this safe under concurrency. Without it, a `Map<insightId, Insight>` at the module level would leak between users, and my `putInsights(items)` — which starts with `clear()` — would wipe another user's feed mid-briefing. Same rule as multi-tenant DB indexing: always scope by tenant.
 
-**Q: "When would you introduce a real store?"**
-Answer: "When we ask a cross-run question that the file layout can't answer without a scan. Right now the only cross-run question is 'did per-dimension pass rate drop by more than 10 percentage points?', and the pre-aggregated baseline answers it. The trigger would be: 'show me every case where evidence_grounding scored ≤ 2 in the last month.' That has no answer today short of parsing every file. SQLite would be the smallest jump — one table with `(runId, caseId, dimension, score)` rows, one index on `(dimension, score)`, and every trend query is O(log N)." Draw the scan diagram side by side with the indexed-lookup diagram.
+```
+  the two-level map = the composite index
+
+  outer: Map<sessionId, ...>         ← "tenant" scope
+   inner: Map<insightId, Insight>    ← "row" scope
+
+  get(sessionId, insightId): O(1)
+  put clears one tenant's rows at a time — never global
+```
+
+Anchor: "the outer `Map` key is my tenant discriminator; the inner is my row key."
+
+### Q2 — "where's the missing-index equivalent in this codebase?"
+
+> Two places, ranked. The hot path is fine — every server-side `Map` has the right key for its access shape. The scans are in the *cold* paths:
+>
+> 1. `getCachedInvestigation` re-parses `.investigation-cache.json` on every call (`lib/state/investigations.ts:15-20`). Dev-only, small file, not a bug today, but the shape means the cost grows linearly with cache size. Mitigation is a parsed-JSON memoization keyed on mtime.
+>
+> 2. `eval/baseline.eval.ts` scans the whole `eval/receipts/` directory to pick receipts for a runId (`readdirSync + filter`). O(F), fine at 28 files, would be a real cost at 10,000. Mitigation is subdirectories by runId, or an index file.
+>
+> Neither is a bug now. The point of noticing them is knowing *where* the DB migration would attack first when receipt storage outgrows the filename-pattern index.
+
+Anchor: "the scans are all cold-path; the hot path is O(1) throughout."
+
+### Q3 — "how would you handle a query like 'give me all insights with severity=critical across all sessions'?"
+
+> That's the query the current layout can't answer efficiently. My `Map<sessionId, SessionFeed>` is keyed for per-session reads; a cross-session query means iterating every session and every insight — O(sessions × insights per session).
+>
+> The reason it doesn't matter today: I don't have that query. Every route in this app starts with "which session are you?" and stays scoped. If I *did* need it, I'd add a secondary index — a `Map<severity, Set<{sessionId, insightId}>>` — updated alongside the primary in `putInsights`. That's the DB analog of a partial index on `severity WHERE severity='critical'`.
+>
+> The tradeoff is honest: a secondary index has to be *maintained* on every write, and `putInsights`'s clear-and-rebuild pattern makes that easy — clear the secondary too, rebuild both together. Two `Map`s, one write path.
+
+```
+  the fix for a cross-session query, sketched
+
+  primary:   Map<sessionId, SessionFeed>              ← unchanged
+  secondary: Map<severity, Set<{sess, id}>>           ← new
+
+  putInsights(sessionId, items):
+    # clear old entries for this session from the secondary
+    for i in currentInsights(sessionId): secondary.get(i.severity).delete({sess, i.id})
+    # rebuild primary
+    ...clear-and-set-both...
+    # rebuild secondary
+    for i in items: secondary.get(i.severity).add({sess, i.id})
+
+  # then: bySeverity('critical') = O(count of critical insights) instead of O(all)
+```
+
+Anchor: "current layout is right for the current queries; a new query shape → new secondary `Map`, atomic write."
 
 ## See also
 
-- `01-the-data-model-and-its-shape.md` — the shapes being read.
-- `04-transactions-and-integrity.md` — writes that would need atomicity if the store gets replaced.
-- `06-access-patterns-and-storage-choice.md` — the read-vs-write pattern analysis behind the storage choice.
+- `01-the-data-model-and-its-shape.md` — the ERD showing why `Map<insightId, Investigation>` was the natural key.
+- `04-transactions-and-integrity.md` — `putInsights`'s clear-and-rebuild pattern as the enforcer of index consistency.
+- `06-access-patterns-and-storage-choice.md` — where the access shape started to argue against a relational store.

@@ -1,217 +1,122 @@
-# sagas-outbox-and-cross-boundary-workflows
+# Sagas, Outbox, and Cross-Boundary Workflows
 
-*Two-step workflow · Client-side handoff · Compensation · Industry standard*
+*Industry name: saga pattern · transactional outbox · reconciliation · Type: Industry standard*
 
 ## Zoom out — where this concept lives
 
-The investigate flow runs in two agent-driven steps: diagnose (step 2)
-then recommend (step 3). This is a lightweight saga — a workflow that
-spans multiple invocations, each of which does external work, with a
-handoff between them. Because there's no persistent database and the
-tools are read-only, this saga doesn't need compensation for state
-consistency. But it DOES have a real coordination surface: what
-happens if step 3 fails after step 2 succeeded?
-
-There's no transactional outbox (no DB, nothing to reconcile). The
-"outbox" here is sessionStorage on the client. It's not a
-distributed-systems textbook outbox; it's a stateless-runtime version
-of the same idea.
+Multi-step workflows that span multiple services — where a partial failure could leave the system in a half-committed state — are **not yet exercised** in this repo. The two-step diagnose → recommend flow is a client-side handoff, not a saga. Explained here so you know when it becomes relevant.
 
 ```
-  Zoom out — the two-step investigate saga
+  Zoom out — the workflow surface in this repo
 
-  ┌─ Client layer ──────────────────────────────────────────────────┐
-  │  investigate/[id]/page.tsx           (step 2 — diagnose)         │
-  │  investigate/[id]/recommend/page.tsx (step 3 — recommend)        │
-  │  useInvestigation hook — stashes trace in sessionStorage         │
-  │  ★ THE HANDOFF LIVES IN THE CLIENT ★                             │ ← we are here
-  └────────────────────────┬────────────────────────────────────────┘
-                           │
-  ┌─ Service layer ─────── ▼────────────────────────────────────────┐
-  │  /api/agent?step=diagnose  → DiagnosticAgent → diagnosis         │
-  │  /api/agent?step=recommend&diagnosis=<JSON>                     │
-  │                            → RecommendationAgent → recs         │
-  │  each step is INDEPENDENT; server doesn't remember diagnosis    │
-  └────────────────────────┬────────────────────────────────────────┘
-                           │  hop B (each step)
-                           ▼
-  ┌─ Provider layer ────────────────────────────────────────────────┐
-  │  Bloomreach — read-only calls; no rollback needed if step 3     │
-  │  fails after step 2                                              │
-  └─────────────────────────────────────────────────────────────────┘
+  ┌─ Client (browser) ─────────────────────────────────────┐
+  │  investigate flow: step 2 (diagnose) → step 3 (recommend)│
+  │  handoff mechanism: sessionStorage carries the diagnosis│
+  │  ★ THIS IS NOT A SAGA — it's a client-side handoff ★    │
+  └─────────────────────────┬──────────────────────────────┘
+                            │  fetch /api/agent?step=diagnose
+                            │  fetch /api/agent?step=recommend&diagnosis=…
+                            ▼
+  ┌─ Server (Vercel function) ─────────────────────────────┐
+  │  route.ts: each step is a separate function invocation │
+  │  no cross-request state coordination                    │
+  │  no compensating action if step 3 fails                 │
+  └────────────────────────────────────────────────────────┘
 ```
+
+## Zoom in — narrow to the concept
+
+A saga is a sequence of local transactions across services, where each step has a compensating transaction that undoes it if a later step fails. Classic example: order → charge card → reserve inventory → ship. If shipping fails, you have to unreserve inventory AND refund the card. That's the saga.
+
+**Nothing in this repo has that shape** because nothing writes to more than one service. The diagnose → recommend flow *looks* like a two-step workflow, but it's:
+
+- All reads (no state to compensate).
+- Client-orchestrated, not server-orchestrated.
+- No commitment made by step 2 that step 3 needs to undo.
 
 ## Structure pass
 
-### Layers of "what does a workflow step commit?"
+### Layers — where cross-boundary workflows *could* live if they mattered
+
+- **Route** — currently: one HTTP request runs one phase (diagnose OR recommend, not both). Sequenced by the client via `?step=` param.
+- **AsyncLocalStorage auth store** — the closest thing to a per-request transaction context. Reads seed at start, writes flush at end. Not multi-service, though.
+- **State layer** — no database, no queue, no shared write log.
+
+### One axis held constant — "what happens if step N fails after step N-1 committed?"
 
 ```
-  "when a step completes, what has been permanently committed?"
+  Axis: partial-failure recovery in the diagnose → recommend flow
 
-  ┌───────────────────────────────────────────────┐
-  │ step 2 completes                               │
-  │   client:   diagnosis in sessionStorage        │  durable per-tab
-  │   server:   nothing (agent returned)           │  ephemeral
-  │   provider: N read-only EQL calls executed     │  no state change
-  └───────────────────────────────────────────────┘
-      ┌───────────────────────────────────────────────┐
-      │ step 3 completes                              │
-      │   client:   recommendations in state           │  ephemeral (UI)
-      │   server:   nothing (agent returned)           │  ephemeral
-      │   provider: N read-only EQL calls executed     │  no state change
-      └───────────────────────────────────────────────┘
+  step 2 diagnose success   → diagnosis returned to browser
+                              (browser stores it in sessionStorage)
+                              → NO write to any shared state
+                              → NO commitment to undo
+
+  step 3 recommend fails    → browser sees an error
+                              → user can retry step 3
+                              → no compensating action needed
+                              → because step 2 wrote nothing
+
+  the "workflow" doesn't need compensation
+  because it doesn't commit anything.
 ```
 
-Because Bloomreach commits nothing on our behalf (read-only), there
-is nothing to compensate. **The saga's "compensation" is trivial**:
-if step 3 fails, the user retries step 3 with the same diagnosis, or
-starts the whole investigation over. No side effect to undo.
-
-### One axis — "what does the server remember between steps?"
-
-```
-  "server-side memory of the workflow between steps"
-
-  step 2 running    →   agent loop, diagnosis in RAM
-  step 2 returns    →   RAM freed; server forgets
-  ────────────────  ↓
-                        (client stashes diagnosis in sessionStorage)
-  ────────────────  ↑
-  step 3 begins     →   server reads diagnosis from ?diagnosis=<JSON>
-  step 3 running    →   agent loop, recommendations in RAM
-  step 3 returns    →   RAM freed; server forgets
-```
-
-The server forgets between steps. The client remembers. Same pattern
-as file 04's read-your-writes escape hatch, now applied to workflow
-state.
-
-### Seams
-
-- **The `?step=diagnose | recommend | null` param** at
-  `app/api/agent/route.ts:115-117` — the seam where "what to do next"
-  is decided. Null is the legacy combined run (used by the
-  capture-demo script), diagnose runs only the diagnostic agent,
-  recommend runs only the recommendation agent.
-
-- **`parseDiagnosis` at `app/api/agent/route.ts:84-95`** — the seam
-  where "did step 2 hand something over?" is decided. If not, step 3
-  hard-errors with `"no diagnosis was handed over — open the diagnosis
-  step first"` (`route.ts:271`). No graceful reconstruction; the
-  client must supply it.
-
-- **`useInvestigation` hook** — the client-side seam where step 2's
-  output is stashed to sessionStorage before navigating to step 3.
-  Named in `.aipe/project/context.md` line 84 as deliberately NOT
-  cancelling the in-flight fetch on cleanup (StrictMode-survivability).
+The answer: **no compensation because no commitment**. That's the honest answer, and it's a design decision — write no shared state until the whole workflow succeeds.
 
 ## How it works
 
-### Move 1 — the mental model: a two-step saga with the client as the carrier
+### Move 1 — the mental model
 
-You know how a checkout flow has multiple pages — enter shipping,
-enter payment, confirm — and each step's data has to survive
-navigating to the next page? Same idea here. Step 2 produces a
-diagnosis; step 3 needs it. The client is the carrier.
+You've written a two-page form: page 1 collects name + email, page 2 collects address, submit at the end. If the user closes the tab on page 2, page 1's data lives in `sessionStorage` and is retried when they come back. That's the shape of a "workflow with in-flight state" — but crucially, nothing was written to the server between page 1 and page 2.
 
 ```
-  The pattern — two-step saga, client-side handoff
+  The pattern — client-side workflow, no server-side transaction
 
-  step 2: investigate/[id]/page.tsx
-      │
-      ▼
-  fetch('/api/agent?step=diagnose&insightId=X&insight=<JSON>')
-      │
-      ▼  NDJSON stream
-      diagnostic agent runs
-      emits reasoning_step, tool_call_*, diagnosis, done
-      │
-      ▼
-  client reads diagnosis from stream
-  stashes in sessionStorage[`bi:investigation:${id}`]
-      │
-      ▼
-  user clicks "see recommendations →"
-      │
-      ▼
-  step 3: investigate/[id]/recommend/page.tsx
-      │
-      ▼
-  reads diagnosis from sessionStorage
-  fetch('/api/agent?step=recommend&insightId=X&diagnosis=<JSON>')
-      │
-      ▼
-  recommendation agent runs against the passed diagnosis
+  step 2 (diagnose):                   step 3 (recommend):
+      │                                    │
+      │  server writes NOTHING             │  server writes NOTHING
+      │                                    │
+      │  → returns diagnosis object        │  → returns recommendations
+      │                                    │
+      ▼                                    ▼
+   browser stores in sessionStorage    browser displays
+   ────────────────────►                   │
+                       user clicks "next"  │
+                       browser sends       │
+                       diagnosis back      │
+                                           │
+   if step 3 fails: user retries; no cleanup needed.
 ```
 
-Bridge: this is a saga in the loose sense — a workflow that spans
-multiple invocations, each with its own external work. Not a saga in
-the strict compensation-required sense (nothing to compensate).
+The kernel: **defer all writes to the last step, OR write only to per-request state that dies naturally.** Either way, no compensation. That's the "just don't have a saga" pattern.
 
-### Move 2 — walk the mechanism
+### Move 2 — the walkthrough
 
-#### Step 2 — diagnosis is produced and sent
+#### The diagnose step — reads only, returns a value
 
-The route runs the diagnostic agent when `step === 'diagnose'` or when
-`step === null` (the combined-run path). The diagnosis is emitted as
-a NDJSON event before the stream closes:
+`app/api/agent/route.ts:278` (approx):
 
-```typescript
-// app/api/agent/route.ts:273-285 (excerpt)
-} else {
-  req.signal.throwIfAborted();
-  stepFor(
-    'diagnostic',
-    'thought',
-    `investigating "${inv.metric}" (${inv.change.direction} ${inv.change.value}% vs ${inv.change.baseline})…`,
-  );
+```ts
+// STEP 2 (diagnose)
+if (step === 'diagnose') {
+  stepFor('diagnostic', 'thought', `investigating "${inv.metric}"…`);
   const diagAgent = new DiagnosticAgent(anthropic, dataSource, schema, allTools, sid);
-  const t_diag = performance.now();
-  diagnosis = await diagAgent.investigate(inv, { ...hooksFor('diagnostic'), signal: req.signal });
-  recordPhase('diagnostic_investigate', t_diag);
+  const diagnosis = await diagAgent.investigate(inv, { ...hooksFor('diagnostic'), signal: req.signal });
   send({ type: 'diagnosis', diagnosis });
 }
 ```
 
-The `send({ type: 'diagnosis', diagnosis })` is the wire event. The
-client's stream reader picks it up. What the client does with it —
-stash to sessionStorage, render into the EvidencePanel — is the
-important part.
+What this DOES: streams reasoning + tool calls, ends with a `diagnosis` event carrying the structured `Diagnosis` object. What this does NOT: write to any shared state. The `saveInvestigation` call at line 307 is guarded — it only fires on the *combined* run, not the split steps.
 
-**Load-bearing part: the diagnosis is emitted BEFORE the recommendation
-agent runs**, so a step-2-only invocation streams it out and then
-`send({ type: 'done' })`. The client has the full diagnosis before the
-`done` event, so it can navigate away confidently.
+The browser reads the `diagnosis` event, stashes it in `sessionStorage`, and moves the user to step 3.
 
-#### The handoff — sessionStorage as the client-side outbox
+#### The recommend step — reads the client's payload, generates fresh
 
-`lib/hooks/useInvestigation.ts` (referenced in
-`.aipe/project/context.md`) stashes the trace and diagnosis in
-sessionStorage. When the user clicks "see recommendations," the
-recommend page reads it back and passes it to the server as a query
-param.
+`app/api/agent/route.ts:272`:
 
-Bridge from what you know: this is the same shape as a form wizard
-that passes state through URL params or React context between pages
-— you'd write the same code for a checkout flow. Here the params are
-JSON-encoded objects rather than plain values.
-
-**Why sessionStorage and not localStorage?** sessionStorage is
-per-tab. Two tabs running two investigations don't overwrite each
-other's state. If the user closes the tab, the investigation is
-abandoned; that's the correct behavior.
-
-**Why not just keep the whole thing on the server across the two
-requests?** Because the server can't remember. A warm instance cycle
-between step 2 and step 3 would lose the diagnosis. The client-side
-outbox survives.
-
-#### Step 3 — the server reads the handoff or hard-errors
-
-```typescript
-// app/api/agent/route.ts:266-272 (excerpt)
+```ts
 if (step === 'recommend') {
-  // STEP 3: the diagnosis was handed over from step 2.
+  // The diagnosis was handed over from step 2.
   diagnosis = parseDiagnosis(diagnosisParam);
   if (!diagnosis) {
     throw new Error('no diagnosis was handed over — open the diagnosis step first');
@@ -219,295 +124,177 @@ if (step === 'recommend') {
 }
 ```
 
-`parseDiagnosis` at `route.ts:84-95` validates the shape:
+The `?diagnosis=…` URL param carries the JSON that step 2 produced. `parseDiagnosis` validates the shape (`route.ts:85`). If it's missing or malformed, the route errors out clearly — the user is told to reopen the diagnosis step.
 
-```typescript
-function parseDiagnosis(param: string | null): Diagnosis | null {
-  if (!param) return null;
-  try {
-    const d = JSON.parse(param);
-    if (d && typeof d.conclusion === 'string' && Array.isArray(d.evidence) && Array.isArray(d.hypothesesConsidered)) {
-      return d as Diagnosis;
-    }
-  } catch {
-    /* ignore */
+**This is the failure mode**: step 3 can fail because step 2's diagnosis is missing. What compensates? *Nothing*, because step 2 wrote nothing. The user just re-runs step 2.
+
+```
+  Failure modes and their compensation
+
+  step 2 succeeds, step 3 fails:
+    → browser retries step 3 (with same diagnosis)
+    → NO server-side cleanup needed
+
+  step 2 diagnosis missing at step 3:
+    → route throws; browser shows error
+    → user reopens step 2
+
+  step 2 succeeds, browser closes tab:
+    → diagnosis lives in sessionStorage (per-tab)
+    → tab reopen → diagnosis still there → step 3 works
+    → tab closed permanently → diagnosis lost, user re-runs step 2
+```
+
+#### The AsyncLocalStorage auth store — a mini transaction context
+
+The closest thing to a transaction boundary in this codebase is the ALS-scoped auth store (`lib/mcp/auth.ts:86`):
+
+```ts
+export async function withAuthCookies<T>(fn: () => Promise<T>): Promise<T> {
+  if (process.env.NODE_ENV !== 'production') return fn();
+  const raw = (await cookies()).get(AUTH_COOKIE)?.value;
+  const ctx: RequestStore = { store: raw ? decryptStore(raw) : {}, dirty: false };
+  const result = await requestStore.run(ctx, fn);
+  if (ctx.dirty) {
+    (await cookies()).set(AUTH_COOKIE, encryptStore(ctx.store), {…});
   }
-  return null;
+  return result;
 }
 ```
 
-Returns null on missing, malformed, or wrong-shape input. The route
-converts null to a hard error. This is the strict boundary — no
-graceful reconstruction, no fallback to "run diagnostic on the fly."
-The user MUST have completed step 2 first.
+- **Read at the start**: decrypt the cookie into ALS.
+- **All reads/writes during**: go through ALS, not the cookie API.
+- **Flush at the end**: encrypt + re-set the cookie if `dirty`.
 
-**A rough edge worth naming honestly:** the step-3 hard error is a
-poor UX if the user hits `/investigate/[id]/recommend` cold (no step 2
-run yet). The natural fallback would be "run diagnose, then continue
-to recommend" — the combined-run path exists in code (`step === null`)
-but the split-step UI doesn't use it here. A follow-up would be to
-detect the missing-diagnosis case client-side and either redirect to
-step 2 or auto-run the combined path.
+This is **transactional-ish** at the request scope: either the entire request's mutations land (cookie is re-set) or none do (early throw → no set). But it's not a saga — there's only one participant (the cookie), no compensating action needed because a throw simply leaves the previous cookie value in place.
 
-#### The demo path — replay the saga from a snapshot
+**What would break the pattern**: if the auth flow needed to write to TWO places (say, a Redis session AND the cookie) and one write succeeded but the other failed, that's when a saga vocabulary would enter. Today: one place, one commit point, no compensation.
 
-`getCachedInvestigation` at `lib/state/investigations.ts:22-28` reads
-in this order: in-memory Map → dev cache file → committed
-`demo-investigations.json`. In production the disk cache is empty
-(serverless FS), so only demo hits.
+#### The load harness — sequential per-investigation semantics
 
-When it hits, the route replays the events with `filterByStep` at
-`route.ts:64-82`:
+`eval/load.eval.ts` runs N investigations at concurrency K. Each investigation is atomic-per-worker: it either completes (diagnose + recommend) or throws. Failures are recorded but don't cascade — other workers keep running. That's **at-most-once per investigation**, at-least-once for the load harness as a whole (which is what a load harness is *supposed* to do).
 
-```typescript
-function filterByStep(events: AgentEvent[], step: Step): AgentEvent[] {
-  return events.filter((e) => {
-    const agent =
-      e.type === 'reasoning_step'
-        ? e.step.agent
-        : e.type === 'tool_call_start' || e.type === 'tool_call_end'
-          ? e.agent
-          : null;
-    if (step === 'diagnose') {
-      if (e.type === 'recommendation') return false;
-      if (agent === 'recommendation') return false;
-      return true;
-    }
-    if (e.type === 'diagnosis') return false;
-    if (agent && agent !== 'recommendation') return false;
-    return true;
-  });
-}
+```
+  Load harness — each investigation is its own transaction
+
+  worker 1: [inv 1 diag → inv 1 rec] → done or FAILED
+  worker 2: [inv 2 diag → inv 2 rec] → done or FAILED
+  worker 3: [inv 3 diag → inv 3 rec] → done or FAILED
+
+  no cross-investigation state → no cross-investigation compensation
 ```
 
-This is a filter over a combined-run recording — the demo captures
-step 2 + step 3 as one stream, and the replay separates them by
-step. This means the demo path doesn't need the sessionStorage
-handoff — the client can navigate step 2 → step 3 and the server
-replays the appropriate subset.
+### Move 2.5 — current state vs future state
 
-The tradeoff: any event whose `agent` field is missing/null is
-included in BOTH steps. Coordinator-tagged events (from the query
-flow) don't collide because they don't appear in insight-based
-investigations, but the filter is loose enough that a future
-event type without an `agent` tag would leak across steps. Named
-here for future maintenance.
+```
+  Phase A (now):                    Phase B (when writes land):
+  ──────────────                    ──────────────────────────
 
-#### The other rough edge — cache saves only on the combined run
-
-```typescript
-// app/api/agent/route.ts:302 (excerpt)
-if (step == null) saveInvestigation(insightId!, collected);
+  · all tools read-only              · read tools + write tools
+  · no shared writes                 · write tools go through a
+  · diagnose → recommend is a          transactional outbox
+    client-side handoff              · sagas compose write tools:
+  · no compensation needed             each step has a compensating
+                                        action (e.g. delete_campaign
+                                        as compensation for
+                                        create_campaign)
+                                     · reconciliation job runs on
+                                        boundaries: "for each in-flight
+                                        saga older than N minutes,
+                                        replay the compensation chain"
 ```
 
-Only the combined-run path (used by the demo-capture script) writes
-to the cache. Split-step runs don't write. In the live flow, this
-means step 2 + step 3 execute fresh every time — no server-side
-persistence of the investigation trace. Which is fine (the client
-stashes it), but named honestly: this saga has NO server-side
-durable record of what happened.
-
-### The skeleton — what a two-step client-carried saga reduces to
-
-Isolate the kernel. The pattern is: "N discrete server invocations,
-each stateless; the client carries the state that connects them;
-if any invocation fails, the retry starts from that invocation
-with the same client-carried state."
-
-What breaks without each part:
-
-- **Drop the diagnosis-in-stream emission** — step 2 completes but the
-  client never sees the diagnosis; step 3 can't happen because the
-  client has nothing to hand forward.
-- **Drop the client-side stash** — step 2 completes and shows the
-  diagnosis; user navigates to step 3; no state carried forward;
-  server errors. Same rough-edge scenario.
-- **Drop the `parseDiagnosis` shape check** — malformed diagnosis
-  reaches the recommendation agent as unknown; agent misbehaves in
-  hard-to-debug ways. Named here as defensive validation.
-- **Drop the demo-mode `filterByStep`** — demo path replays the full
-  combined run on both step-2 and step-3 pages; each step shows all
-  events (including the other step's), UX breaks.
-
-### What a real distributed-systems saga would need that this doesn't
-
-Because most concepts don't apply, name them explicitly:
-
-- **Transactional outbox** — the pattern where a service atomically
-  writes its state change AND an outbox message to the same DB
-  transaction, then a poller ships the outbox message to a queue.
-  Not applicable here: no DB, no queue. If we grew persistent
-  investigations, this pattern would matter for "save investigation +
-  publish to team-feed" atomicity.
-- **Compensation** — the pattern where saga step N's failure triggers
-  a "undo" of steps 1..N-1. Not applicable here: read-only tools mean
-  nothing to undo.
-- **Long-running orchestrator** — a stateful coordinator that survives
-  each step and drives the workflow. Not applicable here: the client
-  IS the coordinator, and Vercel's stateless runtime is deliberately
-  the wrong platform for a stateful orchestrator.
-
-If we grew mutation tools (voucher issue, campaign send), all three
-above become load-bearing. Named honestly.
+The migration cost is real: any write-service you integrate with needs an idempotency-key contract AND a compensation contract. If Bloomreach ever exposes a write API (create a segment, update a campaign), that's the moment sagas earn their complexity.
 
 ### Move 3 — the principle
 
-**When the workflow spans invocations but the invocations are
-stateless, the client is the natural orchestrator.** Sagas in the
-textbook sense assume a stateful orchestrator that survives each
-step. In a stateless-runtime architecture, either you buy that
-statefulness (Temporal, AWS Step Functions, Vercel Workflows) OR
-you push the coordination to the client. This app pushes it to the
-client, correctly, because the workflow is user-facing and the
-user's browser is the natural anchor. Recognize which shape you're
-building and lean into it — a hybrid where the client thinks it's
-orchestrating but the server also has half a saga runtime is the
-worst of both worlds.
+**Don't have a saga if you can avoid it.** The right pattern for multi-step workflows is:
 
-## Primary diagram — the two-step saga in one frame
+1. **Defer all writes to the last step.** If steps 1-N are reads, only step N+1 writes, and step N+1 is atomic, you don't need compensation.
+2. **Failing that, make writes idempotent.** Idempotent writes tolerate retries; no compensation needed for a duplicate.
+3. **Failing that, use a transactional outbox.** Write the intent to your own DB in the same transaction as the local state change; a background worker replays the outbox to external services.
+4. **Failing that, use a saga.** Named steps, compensating actions, reconciliation on partial failure.
+
+This repo lives at level 1: defer all writes to nothing. That's the cleanest option; it just requires that the workflow shape supports it.
+
+## Primary diagram
+
+The two-step flow, one frame, with the "no writes" property called out:
 
 ```
-  Diagnose → Recommend, client-carried
+  Diagnose → recommend — client-orchestrated handoff, no saga
 
-  step 2 page                             server                        Bloomreach
-  ─────────                               ──────                        ──────────
-  loads investigate/[id]/page.tsx
-     │
-     │  fetch('/api/agent?step=diagnose&insightId=X&insight=<JSON>')
-     ├──────────────────────────────────►
-     │                                   dsResult = makeDataSource(...)
-     │                                   bootstrap(schema)
-     │                                   DiagnosticAgent.investigate(inv)
-     │                                        │
-     │                                        │  callTool('execute_analytics_eql', ...)
-     │                                        ├──────────────────────────────►
-     │                                        │  4-band defense: cache/spacing/timeout/retry
-     │                                        │◄──────────────────────────────
-     │  reasoning_step, tool_call_*, ...      │
-     │◄───────────────────────────────────────┤
-     │  diagnosis event                       │
-     │◄───────────────────────────────────────┤
-     │  done event                            │
-     │◄───────────────────────────────────────┤
-     │
-     │  useInvestigation stashes in sessionStorage[`bi:investigation:${id}`]
-     │
-  user clicks "see recommendations →"
-     │
-     ▼
-  step 3 page (recommend)
-     │
-     │  reads diagnosis from sessionStorage
-     │  fetch('/api/agent?step=recommend&insightId=X&diagnosis=<JSON>')
-     ├──────────────────────────────────►
-     │                                   parseDiagnosis(diagnosisParam)
-     │                                   ↑ if null → hard error
-     │                                   RecommendationAgent.propose(inv, diagnosis)
-     │                                        │
-     │                                        │  callTool(...) same 4-band defense
-     │                                        ├──────────────────────────────►
-     │                                        │
-     │                                        │◄──────────────────────────────
-     │  reasoning_step, tool_call_*, ...      │
-     │◄───────────────────────────────────────┤
-     │  recommendation events (N of them)     │
-     │◄───────────────────────────────────────┤
-     │  done event                            │
-     │◄───────────────────────────────────────┤
-     │
-     │  UI renders RecommendationCards
+  ┌─ Browser ──────────────────────────────────────────────┐
+  │  step 2 UI                                              │
+  │    fetch('/api/agent?step=diagnose&insight=…')          │
+  │                                                         │
+  │    reads NDJSON stream:                                 │
+  │      reasoning_step, tool_call, ..., diagnosis, done    │
+  │                                                         │
+  │    sessionStorage.setItem('diagnosis', JSON.stringify(d))│
+  │                                                         │
+  │  user clicks "propose actions"                          │
+  │                                                         │
+  │  step 3 UI                                              │
+  │    fetch('/api/agent?step=recommend&diagnosis=' + enc)  │
+  │                                                         │
+  │    reads NDJSON stream:                                 │
+  │      reasoning_step, tool_call, ..., recommendation×N,  │
+  │      done                                               │
+  └─────────────────────────────────────────────────────────┘
 
-  Note: server holds NOTHING between step 2 and step 3.
-  Note: split-step runs do NOT save to cache. Only combined-run (step=null) saves.
-  Note: no compensation needed — every call is read-only.
+  ┌─ Server (per-request, no cross-request state) ─────────┐
+  │  step=diagnose invocation:                              │
+  │    reads MCP tools                                      │
+  │    → returns diagnosis in stream                        │
+  │    → NO writes to shared state                          │
+  │    → NO commitment to undo                              │
+  │                                                         │
+  │  step=recommend invocation:                             │
+  │    reads MCP tools + client-supplied diagnosis          │
+  │    → returns recommendations in stream                  │
+  │    → NO writes to shared state                          │
+  │    → NO commitment to undo                              │
+  └─────────────────────────────────────────────────────────┘
+
+  compensation: not needed because nothing was committed.
 ```
 
 ## Elaborate
 
-The "client-orchestrated workflow" pattern shows up in:
+**Sagas** were named by Garcia-Molina and Salem in 1987, revived by microservices literature (Chris Richardson's *Microservices Patterns*). Two flavors: *choreography* (each service publishes events, others subscribe and compensate) and *orchestration* (a central coordinator drives the workflow, calling each service and compensating on failure).
 
-- **Multi-page form wizards** — same shape, state in URL/localStorage
-- **OAuth flows** — the browser IS the state carrier between authorize
-  and callback (see file 07)
-- **Sequential AI agent workflows in browser apps** — often built this
-  way when the server can't survive between steps
+**The transactional outbox pattern** — write the intent to your own DB row in the same transaction as the local state change, then a background worker reads the outbox and calls the external service — is the standard way to get "exactly-once" semantics for cross-service writes. Debezium + Kafka is one implementation.
 
-Real distributed-systems saga tooling (Temporal, AWS Step Functions,
-Vercel Workflows, Cadence, Camunda) buys you: durable state, retry
-policies, timeouts, compensating actions, observability of the whole
-workflow. When would you buy it?
+**Reconciliation** is the "eventual consistency of last resort" — a periodic job compares your local state to a source of truth (billing provider, inventory system) and repairs drift.
 
-- **When the workflow can outlive any user's browser session** — a
-  three-day fraud investigation, a nightly data pipeline
-- **When compensation is real** — mutations that must be undone on
-  downstream failure
-- **When you need whole-workflow observability** — regulatory audit,
-  incident replay, "which step failed"
+**None of this exists here** because this repo doesn't cross a write boundary. When the app grows a write tool — creating a campaign, updating a segment, saving an investigation to a durable store — the vocabulary above becomes load-bearing. Until then, "no saga because no writes" is the honest description.
 
-None of these are here. The current shape works.
-
-The rough edges named above (step 3 hard-error on missing diagnosis,
-split steps don't cache) are real but low-priority. The first is a
-one-day fix (client-side check for missing state → redirect to step 2
-or auto-run combined). The second is a design decision (do you want
-split-step traces to persist? if so, key them by step). Both are named
-in file 09.
+Related: the diagnose → recommend flow *is* a coordinated workflow — just not a distributed one. The coordination lives in the browser (sessionStorage carries the diagnosis; the user drives the transition). That's a valid design: keep the workflow orchestration where the state naturally lives, and don't manufacture server-side state you don't need.
 
 ## Interview defense
 
-### Q: "Do you have any long-running or multi-step workflows?"
+**Q: "Do you have sagas or multi-step transactional workflows?"**
 
-Sketch this:
+A: No. The two-step diagnose → recommend flow looks like a workflow, but it's a client-side handoff — the diagnosis lives in `sessionStorage` between requests, and the server writes nothing between step 2 and step 3. If step 3 fails, the browser retries; there's no compensating action because there was no commitment.
 
-```
-  step 2 (diagnose)        step 3 (recommend)
-       │                        │
-       │                        │
-   diagnosis ──stashed in─► sessionStorage ──> ?diagnosis=<JSON>
-                                                     │
-                                                     ▼
-                                           passed to server
-                                           parseDiagnosis or fail
-```
+**Load-bearing gotcha**: this works only because every MCP tool is read-only. The moment a write tool lands (create a campaign, update a segment), the workflow can't stay this simple — I'd need either an outbox pattern or a saga with compensating actions.
 
-"Yes — the investigate flow is two steps: diagnose then recommend.
-Each step is a separate /api/agent invocation. The diagnosis is
-handed forward client-side via sessionStorage → ?diagnosis=<JSON>
-query param on the step-3 request. The server holds nothing between
-steps; if a warm instance cycles between them, the state survives
-because the client carries it. It's a saga in the loose sense — a
-multi-invocation workflow — but not in the compensation-required
-sense, because all Bloomreach calls are read-only. Nothing to undo
-if step 3 fails."
+**Q: "What would push you toward a saga?"**
 
-Anchors: `app/api/agent/route.ts:115-117` (step param),
-`route.ts:266-285` (step branching),
-`route.ts:84-95` (parseDiagnosis).
+A: Any write that touches more than one service atomically. Say we grew a "save this investigation as a monitored alert" feature: it'd write a row in our own DB and register a webhook with Bloomreach. If the webhook registration fails after our row is written, we'd have a stale row. The two moves I'd consider:
 
-### Q: "What's the rough edge in this saga?"
+1. **Transactional outbox**: write the row + an outbox row in one local transaction; a background worker replays the webhook registration. Retries are safe because the outbox worker is idempotent.
+2. **Saga with orchestration**: a coordinator state machine — "register webhook, then write row" (both idempotent). If webhook succeeds but row write fails, cancel the webhook.
 
-"Two. First: step 3 hard-errors with 'no diagnosis was handed over'
-if the user opens `/investigate/[id]/recommend` cold. The natural
-fallback is to redirect to step 2 or auto-run the combined path.
-Second: split-step runs don't cache — the trace is stashed
-client-side but never written to `saveInvestigation`. If we wanted
-server-side persistence of split-step traces, we'd key them by step.
-Both are named honestly."
+For a small team, outbox first. Sagas are for when you have many write-services and clear ownership boundaries.
 
-### Q: "When would you introduce a real workflow engine like Temporal?"
+**Q: "What ordering guarantees do you have across the two steps?"**
 
-"Three conditions: the workflow can outlive a user's browser (a
-multi-day process), mutations require compensation on failure, or
-we need whole-workflow observability for audit. None apply now. The
-moment we shipped a 'schedule this investigation to run nightly' or
-'act on the recommendation by sending a campaign,' the calculus
-shifts — Temporal or Vercel Workflows becomes the natural fit."
+A: Strict, but client-driven. The browser sends step 3 only after step 2 completes and the user clicks. Server never re-orders. If two tabs of the same investigation ran concurrently, they'd each do their own step 2 and step 3 independently — no shared state, no conflict.
 
 ## See also
 
-- 04-consistency-models-and-staleness.md — the client-carried-state
-  pattern from the consistency angle
-- 03-idempotency-deduplication-and-delivery-semantics.md — why
-  compensation isn't needed (read-only tools)
-- 09-distributed-systems-red-flags-audit.md — the step-3 hard-error
-  as a ranked usability risk
+- `03-idempotency-deduplication-and-delivery-semantics.md` — the read-only tool invariant that lets this be simple.
+- `06-queues-streams-ordering-and-backpressure.md` — the streaming surface that carries the diagnosis.
+- `09-distributed-systems-red-flags-audit.md` — where "we don't need a saga yet" is a documented assumption.

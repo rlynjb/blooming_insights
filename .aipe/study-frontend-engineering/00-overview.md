@@ -1,116 +1,115 @@
-# overview — frontend engineering (blooming insights)
+# overview — the frontend layer in one page
 
-## Rendering mode, in one sentence
+The whole shape in one file. Read this and you know what the repo is.
 
-**Client-side single-page shell over the Next.js 16 App Router.** Every rendered surface is a `'use client'` component; nothing meaningful runs as an RSC. The App Router carries the routing and the API layer; the UI is a React 19 SPA that streams NDJSON off `/api/briefing` and `/api/agent`.
+## The rendering mode in one sentence
 
-```
-  Zoom out — where the UI sits in the system
+Next.js 16 App Router with React 19 running a **single client component page** (`app/page.tsx` opens with `'use client'`) that consumes NDJSON streams from route handlers under `app/api/*`. No RSC data flow; no server components rendering with the streamed data; no SSR handoff. The server side is a plain streaming endpoint, and the client owns everything downstream of `fetch()`.
 
-  ┌─ Browser ───────────────────────────────────────────────┐
-  │  React 19 client (all pages: 'use client')              │
-  │   ├─ app/page.tsx                (the feed)             │
-  │   ├─ app/investigate/[id]/       (diagnose)             │
-  │   └─ app/investigate/[id]/       (recommend)            │
-  │      /recommend/                                        │
-  │                                                         │
-  │  streams NDJSON via fetch() + ReadableStream reader     │
-  │  state: useState + sessionStorage + localStorage        │
-  └────────────────────────┬────────────────────────────────┘
-                           │  HTTP (keep-alive)
-  ┌─ Next.js API routes ───▼────────────────────────────────┐
-  │  /api/briefing         monitoring agent, NDJSON out     │
-  │  /api/agent            investigate + free-form Q&A      │
-  │  /api/mcp/*            capture, reset, callback, call   │
-  └────────────────────────┬────────────────────────────────┘
-                           │
-  ┌─ Anthropic + Bloomreach MCP ───────────────────────────┐
-  │  claude-sonnet-4-6 · loomi connect MCP over OAuth      │
-  └────────────────────────────────────────────────────────┘
-```
-
-Not SSR, not SSG, not RSC. `app/page.tsx` opens `'use client';` on line 1. The `dark` class on `<html>` in `app/layout.tsx:22` is the only server-rendered thing on the page — everything under it hydrates and becomes client-side from `HomePage()` onward.
-
-## State graph, in one diagram
+That's the seam to hold in your head:
 
 ```
-  State ownership — where each piece lives
+  Rendering mode — one client tree, streaming NDJSON server routes
 
-                      ┌───────────────────────────────────┐
-                      │  demo snapshot (committed JSON)   │  ← server
-                      │  lib/state/demo-*.json            │
-                      └────────────────┬──────────────────┘
-                                       │ replayed at /api/briefing?demo=cached
-                                       ▼
-  ┌─ localStorage ──────────┐   ┌─ useState (page.tsx) ─────────────┐
-  │  bi:mode                │──►│  mode | ready | activeQuery       │
-  │  (demo / live-*)        │   └─────────────────┬─────────────────┘
-  └─────────────────────────┘                     │
-                                                  │ triggers
-                                                  ▼
-                                     ┌─ useBriefingStream ────────────┐
-                                     │  status · insights · workspace │
-                                     │  coverage · traceItems · error │
-                                     │  stepStatus · queryCount       │
-                                     │  demoSuffix                    │
-                                     └─────────────────┬──────────────┘
-                                                       │ on each insight
-                                                       ▼
-                                     ┌─ sessionStorage ───────────────┐
-                                     │  bi:insight:<id> (each)        │
-                                     │  bi:inv:<step>:<id> (result)   │
-                                     │  bi:diag:<id>     (handoff)    │
-                                     │  bi:reconnecting  (one-shot)   │
-                                     └─────────────────┬──────────────┘
-                                                       │ read by
-                                                       ▼
-                                     ┌─ useInvestigation (step page) ─┐
-                                     │  items · diagnosis             │
-                                     │  recommendations · complete    │
-                                     │  error                         │
-                                     └────────────────────────────────┘
+  ┌─ Server (Next.js 16 Route Handlers) ────────────────────────┐
+  │  app/api/briefing/route.ts   → NDJSON stream                 │
+  │  app/api/agent/route.ts      → NDJSON stream                 │
+  │  app/api/mcp/*               → REST for auth / config        │
+  └─────────────────────────────┬────────────────────────────────┘
+                                │ HTTP + Content-Type: application/x-ndjson
+                                │ headers: x-bi-mcp-config (optional)
+                                ▼
+  ┌─ Client (one React tree) ───────────────────────────────────┐
+  │  'use client' at the page root                               │
+  │  useBriefingStream / useInvestigation                        │
+  │    → fetch → readNdjson kernel → dispatch → setState         │
+  │  ProcessStepper + CoverageGrid + InsightCard + ReasoningTrace│
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-**No global store.** No Redux, no Zustand, no Context Provider tree. Each hook owns its slice; the browser's `sessionStorage` is the cross-page carrier (feed stashes each insight so the investigation page can send it to `/api/agent` — Vercel serverless can't rely on in-memory server state because the feed and the investigation may hit different instances, `useBriefingStream.ts:53-60`).
+The router is file-based (`app/page.tsx`, `app/investigate/[id]/…`, `app/api/*/route.ts`) and dynamic segments carry ids. No route loaders, no `<Suspense>` boundaries defined at the route level, no route-level code splitting used deliberately — it's a small app.
 
-`bi:mode` in `localStorage` is the one persistent UI setting (demo / live-bloomreach / live-synthetic). `useBriefingStream` re-runs when it changes. Legacy values (`live`, `live-sql`) migrate to `live-bloomreach` on read at `app/page.tsx:75-77`.
+## The state graph in one diagram
 
-## The three load-bearing frontend patterns
+Every piece of state has a single owner. The rule the repo enforces without saying so out loud: server state that arrives via stream lives in the hook that owns the fetch; UI state that outlives one stream lives in `localStorage` or `sessionStorage`; nothing lives in a global store or React context.
 
-Ranked by user-visible consequence. Strip any of these and you lose a specific capability the pitch depends on.
+```
+  State ownership — one owner per box, no store, no context
 
-### 1. NDJSON stream reader hook — the entire "shows its work" pitch
+  ┌─ owned by the streaming hook (dies with the effect) ────────┐
+  │  useBriefingStream   →  insights, coverage, traceItems,     │
+  │  (app/page.tsx:129)     workspace, errorMessage, status     │
+  │                                                              │
+  │  useInvestigation    →  items, diagnosis,                    │
+  │  (per investigate/[id])   recommendations, complete, error  │
+  └──────────────────────────────────────────────────────────────┘
+                          ▲
+                          │  hooks read on mount
+                          │
+  ┌─ owned by browser storage (survives reload) ────────────────┐
+  │  localStorage['bi:mode']            → BriefingMode toggle    │
+  │  localStorage['bi:mcp_config']      → McpConfigOverride      │
+  │  sessionStorage['bi:insight:<id>']  → cross-page insight     │
+  │  sessionStorage['bi:inv:*:<id>']    → investigation hydrate  │
+  │  sessionStorage['bi:diag:<id>']     → diagnosis handoff      │
+  └──────────────────────────────────────────────────────────────┘
+                          ▲
+                          │  set by the modal / hook
+                          │
+  ┌─ owned by useState in the page ─────────────────────────────┐
+  │  activeQuery, settingsOpen, mode (mirrored from LS), ready  │
+  │  (app/page.tsx:48-50, 68-69)                                 │
+  └──────────────────────────────────────────────────────────────┘
+```
 
-File: `lib/streaming/ndjson.ts:1-64` (the 64-line kernel), consumed by four surfaces:
+No Redux / Zustand / Jotai / `useContext` provider tree. When a piece of data has to survive a reload (mode, MCP config) it hits Web Storage directly; when it has to cross an SPA-nav (feed → investigate) it uses `sessionStorage` with an `bi:` prefix. The rest lives in the effect that fetched it.
 
-- `lib/hooks/useBriefingStream.ts:288` — the feed
-- `lib/hooks/useInvestigation.ts:194` — step 2 & 3
-- `components/chat/StreamingResponse.tsx:108` — free-form Q&A
-- `lib/hooks/useDemoCapture.ts:84` — dev-only capture
+## The network seam in one diagram
 
-Strip it and the app becomes a request/response spinner. The agent's reasoning trace, tool calls, and coverage tiles all arrive as separate NDJSON events; the UI paints each as it arrives. That's the product.
+Every streaming surface goes through **one kernel** — `readNdjson` at `lib/streaming/ndjson.ts:17-64`. Four consumers share it: `useBriefingStream`, `useInvestigation`, `useDemoCapture`, and `StreamingResponse`. This is the highest-leverage seam in the frontend.
 
-→ **See `01-ndjson-stream-reader-hook.md`**.
+```
+  Network seam — one kernel, four consumers
 
-### 2. Progressive skeleton with stepper — perceived-instant while the agent runs
+  ┌─ Consumer hooks / components ───────────────────────────────┐
+  │  useBriefingStream    useInvestigation                       │
+  │  useDemoCapture       StreamingResponse                      │
+  └──────────────────────┬───────────────────────────────────────┘
+                         │  each calls fetch(), then:
+                         ▼
+              ┌──────────────────────────┐
+              │  readNdjson<E>(          │  lib/streaming/ndjson.ts
+              │    body, onEvent, opts) │        64 LOC total
+              │                          │
+              │  reader.read()           │  ← get chunk
+              │  decoder.decode(stream)  │  ← utf-8, streaming
+              │  buf.split('\n')         │  ← NDJSON framing
+              │  JSON.parse(line)        │  ← one event per line
+              │  onEvent(event)          │  ← consumer dispatch
+              │  cancelOn?() → cancel    │  ← unmount escape hatch
+              └──────────────────────────┘
+                         │
+                         ▼  strongly-typed events
+              ┌──────────────────────────┐
+              │  BriefingEvent / AgentEvent  9-case discriminated union
+              │  consumer's switch(e.type)   drives setState in the hook
+              └──────────────────────────┘
+```
 
-Four tiers of feedback, all wired to the same NDJSON event stream:
+Consumers own the event shape and the setState dispatch; the kernel owns the byte-level plumbing. Stripping the kernel and reimplementing per hook was ~250 LOC of drift before the extraction; keeping it single-sourced is the load-bearing frontend refactor.
 
-- `components/shared/Skeleton.tsx` — coarse rectangles for card placeholders
-- `components/shared/ProcessStepper.tsx` — the three-stage pipeline (monitoring → diagnosing → recommending), each with `pending | active | complete | error` states
-- `components/feed/CoverageGrid.tsx` — 10 anomaly-category tiles that fill in as each `coverage_item` event lands
-- `components/shared/StatusLog.tsx` (wrapping `ReasoningTrace.tsx`) — the sticky sidebar streaming agent thoughts + tool calls
+## The three highest-leverage patterns
 
-Strip the stepper alone and the user has no idea which phase is running. Strip the coverage grid and the "clear · limited · anomaly" completeness signal collapses to "here are some cards." The composition is the load-bearing piece — not any one tier.
+Named with file paths so a reader can open each one.
 
-→ **See `02-progressive-skeleton-with-stepper.md`**.
+  1. **NDJSON stream reader hook** — `lib/streaming/ndjson.ts` (kernel) + `lib/hooks/useBriefingStream.ts:299` + `lib/hooks/useInvestigation.ts:205`. The seam that lets streaming Just Work identically across 4 surfaces. If you strip it, you lose the "shows its work" progressive-render pitch and rebuild 4 near-copies of the loop. See `01-ndjson-stream-reader-hook.md`.
 
-### 3. Auto-reconnect on revoked token — the live path only survives because of this
+  2. **Progressive skeleton with stepper** — `app/page.tsx:269-341` (ProcessStepper + CoverageGrid + Skeleton stack + StatusLog). Four independent visual tiers each swap their placeholder for real data as the stream reports the matching level of detail. If you strip it, you lose the "watching the agent work" experience — the whole point of the streaming stack becomes invisible. See `02-progressive-skeleton-with-stepper.md`.
 
-`lib/hooks/useReconnectPolicy.ts` (123 LOC): the alpha Bloomreach MCP server revokes OAuth tokens after minutes. A wire-format `switch` deep in `useBriefingStream.ts` sees an `invalid_token` error, hands it to the policy, which fires `POST /api/mcp/reset` and reloads with a `sessionStorage` one-shot guard so it can't loop.
+  3. **Settings modal with localStorage persistence** — `components/settings/McpConfigModal.tsx` + `lib/mcp/config.ts` + fetch header pickup in the two streaming hooks. A visitor can swap the MCP target and auth without touching env, and the state survives a reload. If you strip it, the "bring your own MCP" portfolio pitch has no UI. See `03-settings-modal-with-localstorage-persistence.md`.
 
-This one hasn't earned its own pattern file — it's a policy composed onto the briefing stream, not a distinct architectural shape. It shows up in the audit under state-architecture and network semantics. If it grows to include exponential backoff, retry budgets, or per-route customization, it earns a file. Right now it's honest to say `readNdjson` + progressive-composition are the two patterns worth walking, and everything else is application logic layered on them.
+## The known frontend gap (top finding)
 
-## The one gap the audit surfaces first
+**The streaming trace has no `aria-live` region.** `ReasoningTrace` at `components/investigation/ReasoningTrace.tsx` renders inside a plain `<div>`. When the agent's tool calls and thoughts stream in, a screen reader gets nothing. The whole "shows its work" pitch — the sticky sidebar at `app/page.tsx:443-508` — is invisible to assistive tech. Fix is one prop: `aria-live="polite"` on the container `<ol>` inside `ReasoningTrace`, `role="log"` on the wrapper.
 
-The reasoning trace has no `aria-live` region. The entire "shows its work" pitch — the streaming agent output on the feed and both investigate pages — is invisible to a screen reader. The UI updates; the assistive-tech user hears nothing. The fix is small (add `role="log"` + `aria-live="polite"` to the `StatusLog` header wrapper), the impact is large. **See `audit.md` → `frontend-red-flags-audit`.**
+Full ranked risk list in `audit.md` → the `frontend-red-flags-audit` lens.

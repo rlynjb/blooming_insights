@@ -1,182 +1,138 @@
 # 05 · Eval-driven prompt iteration
 
-**Eval-driven prompting / golden sets / LLM-as-judge / rubric evaluation — Industry standard**
+**Industry name:** *eval-driven prompt iteration* / *LLM-as-judge* / *rubric-driven judgment* · Industry standard
 
-## Zoom out, then zoom in
+## Zoom out — where the eval sits in the pipeline
 
-The line between amateur and professional prompt work is this: an amateur iterates by vibes ("the response feels better now"). A professional iterates against a golden set with a rubric-based judge and per-case receipts, and only ships a prompt change when the judge scores hold or improve. In this codebase, the discipline is real: 10 golden cases, two rubrics with four dimensions each, a `RubricJudge` that scores every diagnosis and every recommendation, per-case JSON receipts, and a signal-class-aware gate that lets no-signal cases inform without turning into failures.
-
-```
-  Zoom out — where evals sit
-
-  ┌─ Agent under test ───────────────────────────────────────┐
-  │  DiagnosticAgent · RecommendationAgent                   │
-  │  produces: Diagnosis, Recommendation[]                    │
-  └────────────────────────┬────────────────────────────────┘
-                           │  subject
-  ┌─ Rubric ───────────────▼────────────────────────────────┐
-  │  diagnosisQualityRubric (4 dims × 5-point scale)         │
-  │  recommendationQualityRubric (4 dims × 5-point scale)    │
-  │  verdicts: pass, pass_with_notes, fail                    │
-  └────────────────────────┬────────────────────────────────┘
-                           │  input
-  ┌─ RubricJudge ──────────▼────────────────────────────────┐
-  │  ★ SECONDARY LLM CALL — JUDGE-AS-PROMPT ★                 │  ← we are here
-  │  system: buildRubricJudgeSystemPrompt(rubric)             │
-  │  user:   buildRubricJudgeUserPrompt({subject, context})   │
-  │  returns: structured judgment (dims + verdict + fix)      │
-  └────────────────────────┬────────────────────────────────┘
-                           │
-  ┌─ Receipt ──────────────▼────────────────────────────────┐
-  │  eval/receipts/<caseId>-<runId>.json                      │
-  │  written per case; walked in afterAll for the summary     │
-  └───────────────────────────────────────────────────────────┘
-```
-
-**Zoom in.** Three things live in this concept, and they compose into one loop. **Golden set** — hand-curated cases with a known-correct shape. **Rubric-based judge** — a secondary LLM call scored against a schema of dimensions and verdicts (see `02-structured-outputs.md` — the judge itself uses structured output). **Receipts + regression gate** — per-case JSON that lets you diff across runs and a test-runner gate that fails on regression. Miss any one and you're back to vibes.
-
-## Structure pass
-
-### Axes — the dimension we're tracing
-
-**Reproducibility of the judgment.** If the same input goes into the same rubric with the same judge model, do you get the same verdict? Trace this axis and you find the load-bearing parts of the eval infrastructure — the judge's system prompt structure, the context you pass in, the temperature setting, the judge model's own drift across versions.
-
-### Seams — where reproducibility flips
-
-Three seams:
-
-- **Agent output vs judge input** — the diagnosis JSON crosses from "produced" to "evaluated." What's carried across that boundary determines what the judge can score. If you pass only the diagnosis and not the anomaly + tool_calls_trace as context, the judge scores in the abstract instead of against the case.
-- **Rubric definition vs judge system prompt** — the rubric is a TypeScript object; the judge system prompt is a string. `buildRubricJudgeSystemPrompt` converts one to the other. That conversion is deterministic given the rubric, so rubric changes are the only way the judge's system prompt drifts.
-- **Judge model vs judge output** — the judge uses the same Sonnet 4.6 as the agent (temperature 0). Different session, different sampling, but same model. Judgment stability across runs is a *known variance* in this codebase — same anomaly on the same substrate produced `root_cause_plausibility: 5` on one run and `4` on another. This is documented in the task briefing as real, and it's why you look at *distributions across cases* rather than single-case scores.
-
-### Layered decomposition
-
-"What produced this verdict?" — traced across the layers:
+The eval harness is a sidecar. It runs the exact same agents the production route runs, against the same synthetic data source, and grades the outputs with a rubric judge.
 
 ```
-  "What produced this verdict?" — same question, three altitudes
+  Zoom out — the eval harness as a sidecar
 
-  ┌────────────────────────────────────────────────┐
-  │ outer: the whole run (10 cases)                 │  → runId + git SHA +
-  │                                                 │    prompt package versions
-  └────────────────────────────────────────────────┘
-      ┌────────────────────────────────────────────┐
-      │ middle: this specific case                  │  → caseId + signal_class
-      │        (01-conversion-drop-mobile-checkout)  │   + anomaly + goldens.knownCorrect
-      └────────────────────────────────────────────┘
-          ┌────────────────────────────────────────┐
-          │ inner: this specific judgment           │  → subject (Diagnosis JSON)
-          │        (root_cause_plausibility: 4)     │   + context (anomaly, trace)
-          │                                          │   + rubric.dimensions[i]
-          └────────────────────────────────────────┘
+  ┌─ Production path ─────────────────────────────────────────┐
+  │  briefing route → MonitoringAgent → DiagnosticAgent →      │
+  │                   RecommendationAgent → NDJSON stream to UI │
+  └────────────────────────────────────────────────────────────┘
+
+  ┌─ Eval sidecar (npm run eval) ─────────────────────────────┐
+  │  eval/run.eval.ts                                          │
+  │    for each of 10 goldens:                                 │
+  │      diagnose(golden.anomaly) → diagnosis                  │
+  │      RubricJudge(diagnosisQualityRubric).judge(diagnosis)  │
+  │      recommend(golden.anomaly, diagnosis) → recs           │
+  │      for each rec: RubricJudge(recQualityRubric).judge(rec)│
+  │      write receipt to eval/receipts/<case>-<runId>.json    │
+  │                                                            │
+  │  ★ THIS BLOCK — the whole discipline ★                    │
+  └────────────────────────────────────────────────────────────┘
 ```
 
-Every level answers the same question, and every level's answer becomes context for the level below.
+## Zoom in — three artifacts, one discipline
+
+The eval discipline in this codebase is three artifacts:
+
+1. **The golden set** — `eval/goldens/*` — 10 hand-curated cases spanning `has-signal`, `partial-signal`, `no-signal`, and `positive` classes.
+2. **The rubrics** — `eval/rubrics/{diagnosis,recommendation}-quality.ts` — 4 dimensions × 1-5 scale × 3 verdicts each.
+3. **The receipts** — `eval/receipts/<caseId>-<runId>.json` — one file per case per run, capturing every input, every output, every judgment, every tool call.
+
+The receipt is the artifact that lets you compare runs. Same case, different run = you can diff the judgments and see whether your prompt change made it better, worse, or noisy.
+
+## Structure pass — layers, axis, seams
+
+Trace one axis: *who is producing what*, from the top of the eval to the receipt on disk.
+
+- **Layer 1 — the golden case** (`GoldenCase`). Human-authored. Fixed. Names the anomaly + intent + `knownCorrect` shape + signal class.
+- **Layer 2 — the agent under test.** Same code as production. Produces diagnosis + recommendations.
+- **Layer 3 — the rubric definition.** A `RubricDefinition` (from `@aptkit/core`) — dimensions, verdicts, checks. Domain-specific data.
+- **Layer 4 — the judge.** `RubricJudge` — a general-purpose LLM-as-judge engine. Takes rubric + subject + context, returns structured judgment.
+- **Layer 5 — the receipt.** JSON file. Every input, output, and judgment for one case in one run.
+
+**The seam:** between rubric definition (domain data, lives in this repo) and rubric engine (`RubricJudge`, lives in `@aptkit/core`). Same shape as the seam in concept 03 — the reusable engine is packaged, the domain-specific content stays here.
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — the shape
 
-You know how a Jest test has a subject-under-test, an expected-value assertion, and a diff-on-fail? An eval is that, but the assertion is fuzzy — instead of `expect(x).toBe(y)` you have a rubric that scores 1-5 across dimensions, and instead of a single expected value you have a known-correct *shape* the diagnosis is supposed to match.
+You've written tests before. Same pattern here, one layer up. A test has:
+
+- **Input** — the fixture / arrange step.
+- **Assertion** — what the output has to be.
+- **Recorded outcome** — pass or fail.
+
+Eval-driven iteration is that pattern applied to LLM outputs where the assertion is fuzzy. Instead of `expect(x).toEqual(y)`, the assertion is a *rubric* — a 4-dimension × 5-point scoring rubric evaluated by a second LLM. Instead of pass / fail, the outcome is `pass` / `pass_with_notes` / `fail` plus a per-dimension score plus a `fix` string.
 
 ```
-  Eval — the pattern
+  Pattern — LLM eval as testing, one layer up
 
-  ┌─ golden case ───────────┐
-  │  anomaly                │  ← what to investigate
-  │  knownCorrect            │  ← what shape the diagnosis should have
-  │  signalClass             │  ← has-signal / no-signal / partial / positive
-  └────────────┬────────────┘
-               │
-               ▼
-  ┌─ agent runs ───────────────────────┐
-  │  diagnostic.investigate(anomaly)   │
-  │  → diagnosis                        │
-  │  → tool_calls_trace                 │
-  └────────────┬────────────────────────┘
-               │
-               ▼
-  ┌─ judge scores ─────────────────────┐
-  │  RubricJudge.judge({                │
-  │    subject: diagnosis,               │
-  │    context: {anomaly, known,         │
-  │      trace, intent, signalClass}     │
-  │  })                                  │
-  │  → judgment {dims, verdict, fix}     │
-  └────────────┬────────────────────────┘
-               │
-               ▼
-  ┌─ receipt ──────────────────────────┐
-  │  JSON per case, per run             │
-  │  aggregated in afterAll             │
-  └────────────────────────────────────┘
+  fixture               subject under test      grading
+  ┌─────────────┐       ┌──────────────────┐   ┌──────────────┐
+  │ golden case │ ────► │ DiagnosticAgent  │ ─►│ RubricJudge   │
+  │  · anomaly  │       │  runs same code  │   │  scores 4 dims │
+  │  · intent   │       │  as production   │   │  emits verdict │
+  │  · known-   │       └──────────────────┘   └──────┬───────┘
+  │    correct  │                                     │
+  │  · signal-  │                                     ▼
+  │    class    │                              ┌──────────────┐
+  └─────────────┘                              │ receipt.json │
+                                               └──────────────┘
 ```
 
-### Move 2 — the step-by-step walkthrough
+The gold isn't in the `pass` / `fail` bit. It's in the receipt. When you change a prompt and re-run, you compare receipts. The dimension scores and the `fix` fields tell you *what* changed.
 
-**Step 1 — the golden case is a specific shape.**
+### Move 2 — walking the mechanism
 
-`eval/goldens/01-conversion-drop-mobile-checkout.ts:9-60`:
+#### The golden set — one case per intent shape
 
-```ts
-const anomaly: Anomaly = {
-  metric: 'conversion_rate',
-  scope: ['mobile', 'checkout', 'SP'],
-  change: { value: 18.4, direction: 'down', baseline: 'prior_7d (0.038 → 0.031)' },
-  severity: 'critical',
-  evidence: [{ ...tool, result: { current_7d: {...}, prior_7d: {...}, funnel: {...} } }],
-  ...
-};
+`eval/goldens/*` (browsed via receipts):
 
-export const goldenCase: GoldenCase = {
-  caseId: '01-conversion-drop-mobile-checkout',
-  signalClass: 'has-signal',
-  intent: 'The canonical happy path — clear anomaly, substrate has co-occurring payment_failure signal, agent should name payment processor as the primary mechanism and stay in mobile/checkout/SP scope.',
-  anomaly,
-  knownCorrect: {
-    primary_signal: 'checkout → purchase step is where the funnel breaks; upstream steps are stable relative to prior week',
-    co_occurring_signal: 'payment_failure_rate rose 31.2% in the same window (0.035 → 0.046)',
-    most_likely_root_cause_candidates: [ 'payment processor issue affecting mobile credit_card in SP', ... ],
-    scope_should_stay_within: ['mobile', 'checkout', 'SP', 'credit_card'],
-    red_herrings_to_avoid: ['desktop conversion — no evidence in scan', ...],
-  },
-};
+- `01-conversion-drop-mobile-checkout` — `has-signal`. Canonical happy path. Substrate has co-occurring payment_failure signal; agent should name payment processor as the primary mechanism.
+- `04-cart-abandonment-mobile-broad` — `has-signal`. Multi-cause anomaly with red-herring risk (SP over-weighting).
+- `05-no-signal-retention-subscribers` — `no-signal`. Substrate lacks subscription data. Correct answer: acknowledge the gap. Failure mode: confabulate subscriber counts.
+- `07-positive-conversion-surge-mobile` — `positive`. Correct answer: recognize and characterize.
+- `10-no-signal-seo-organic` — `no-signal`. SEO / SERP-shaped question that Bloomreach doesn't answer at all.
+
+Each `GoldenCase` at `eval/goldens/types.ts` carries:
+
+- `anomaly` — the input.
+- `intent` — a paragraph of "what a correct diagnosis looks like for this case."
+- `knownCorrect` — a JSON structure of "correct shape" notes — the specific traps, the specific numbers.
+- `signalClass` — the meta-label that determines whether this case is *gated* (assertion enforced) or *measured* (recorded, not enforced).
+
+At `eval/run.eval.ts:413-424`:
+
+```
+const isGated =
+  goldenCase.signalClass === 'has-signal' ||
+  goldenCase.signalClass === 'partial-signal';
+if (isGated) {
+  expect(receipt.diagnosisJudgment.verdict).not.toBe('fail');
+  for (const rj of receipt.recommendationJudgments) {
+    expect(rj.judgment.verdict).not.toBe('fail');
+  }
+}
 ```
 
-Four things worth noting. First, `anomaly` is the *input* to the agent — what the monitoring layer would have handed the diagnostic layer. Second, `knownCorrect` is the *shape* the judge scores against — not a single expected string, but a set of primary signals, root-cause candidates, scope boundaries, and red herrings. Third, `signalClass` is the case's *character* (has-signal, no-signal, partial-signal, positive). Fourth, `intent` is prose that tells the judge (and the reader) what this case exists to prove.
+`has-signal` and `partial-signal` cases must not fail — a fail is a regression. `no-signal` and `positive` cases are measured — their outcomes are recorded but not gated, because "the agent confabulated" or "the agent handled a positive correctly" are data points, not correctness invariants.
 
-The reason `knownCorrect` isn't a single expected diagnosis: the diagnosis is inherently non-deterministic (the LLM chooses between the two most-likely candidates on a given run), and locking to one specific string would make the test fail on legitimate rewrites. The rubric scores against *shape*, not string.
+#### The rubric — 4 dimensions × 1-5 scale × 3 verdicts
 
-**Step 2 — the rubric defines the dimensions and the scale.**
+`eval/rubrics/diagnosis-quality.ts:15-108` defines the diagnosis rubric. Structure:
 
-`eval/rubrics/diagnosis-quality.ts:15-108` (excerpts):
-
-```ts
+```
 export const diagnosisQualityRubric: RubricDefinition = {
   id: 'blooming-diagnosis-quality-v1',
   title: 'Diagnosis quality',
-  task: `Judge a diagnosis produced by an AI analyst investigating an ecommerce anomaly.
-The diagnosis will be JSON with these fields: conclusion (one-sentence root cause),
-evidence (bullet list of what supported the conclusion), hypothesesConsidered...`,
+  task: `Judge a diagnosis produced by an AI analyst investigating an ecommerce anomaly. …`,
   dimensions: [
-    {
-      id: 'root_cause_plausibility',
-      label: 'Root-cause plausibility',
-      description: 'Does the conclusion name a plausible mechanism (not just a symptom restatement)?',
-      scale: [
-        { score: 1, description: 'Restates the symptom; no mechanism named.' },
-        { score: 2, description: 'Vague mechanism, no evidence link.' },
-        { score: 3, description: 'Plausible mechanism, weakly evidenced.' },
-        { score: 4, description: 'Specific mechanism, evidence supports it.' },
-        { score: 5, description: 'Specific mechanism, evidence directly supports it, and rival mechanisms are considered.' },
-      ],
-    },
-    // evidence_grounding, scope_coherence, actionable_next_step
+    { id: 'root_cause_plausibility', label: '…', description: '…', scale: [1..5 with descriptions] },
+    { id: 'evidence_grounding',      label: '…', description: '…', scale: [1..5] },
+    { id: 'scope_coherence',         label: '…', description: '…', scale: [1..5] },
+    { id: 'actionable_next_step',    label: '…', description: '…', scale: [1..5] },
   ],
   verdicts: [
-    { verdict: 'pass', description: 'All four dimensions at ≥4...' },
-    { verdict: 'pass_with_notes', description: 'Overall usable but one or more dimensions at 3...' },
-    { verdict: 'fail', description: 'Any dimension at ≤2...' },
+    { verdict: 'pass',            description: 'All four dimensions ≥4.' },
+    { verdict: 'pass_with_notes', description: 'Overall usable but one or more at 3.' },
+    { verdict: 'fail',            description: 'Any dimension ≤2.' },
   ],
   checks: [
     'cites at least one number from the tool results',
@@ -187,285 +143,202 @@ evidence (bullet list of what supported the conclusion), hypothesesConsidered...
 };
 ```
 
-Two structural notes. First, each dimension has all five scale levels named specifically — not "score 1 = bad, score 5 = good," but "score 1 = restates the symptom" and "score 5 = specific mechanism, evidence directly supports it, and rival mechanisms are considered." Anchoring the scale prevents the judge from drifting toward "3 for anything I'm not sure about." Second, `checks` are binary — the judge either can or can't verify the property. Binary checks are the ratchet that stops the fuzzy dimensions from being the only signal.
+Four dimensions. Each with a 1-5 scale where each point has a written description ("Restates the symptom; no mechanism named" through "Specific mechanism, evidence directly supports it, and rival mechanisms are considered"). Three verdicts derived from the dimension scores. Four binary sanity checks.
 
-**Step 3 — the judge builds a system prompt from the rubric.**
+The rubric is *structured prompting*. It's not a natural-language "please grade this diagnosis." It's a data structure the `RubricJudge` engine turns into a system + user prompt for the judge model, then parses the response into a typed judgment.
 
-`@aptkit/core/node_modules/@aptkit/evals/dist/src/rubric-judge.js:31-77`:
+The recommendation rubric at `eval/rubrics/recommendation-quality.ts` has the same shape — 4 dimensions × 5-point scale × 3 verdicts × 4 checks — but its dimensions are different (`diagnosis_response`, `feature_choice_fit`, `step_actionability`, `impact_realism`), and its task prompt explicitly says "you will receive the DIAGNOSIS that this recommendation is responding to as context. Recommendations are graded relative to that diagnosis, not in the abstract."
 
-```js
-export function buildRubricJudgeSystemPrompt(rubric) {
-    const dimensions = rubric.dimensions.map((d) => {
-        const scale = d.scale.map((l) => `  ${l.score} = ${l.description}`).join('\n');
-        return `${d.id} ${d.label}: ${d.description}\n${scale}`;
-    }).join('\n\n');
-    const verdicts = rubric.verdicts.map((r) => `- ${r.verdict}: ${r.description}`).join('\n');
-    const checks = rubric.checks?.length
-        ? `\nChecks to return as booleans:\n${rubric.checks.map((c) => `- ${c}`).join('\n')}\n`
-        : '';
-    // ... builds the JSON output shape
-    return [
-        `You are a rubric judge for: ${rubric.title}.`,
-        rubric.task,
-        '',
-        'Score the subject against the rubric. Score meaning and evidence, not style preferences unless the rubric asks for style.',
-        'Never rewrite the subject. Return one highest-leverage fix, not a list.',
-        '',
-        'Rubric dimensions:',
-        dimensions,
-        '',
-        'Allowed verdicts:',
-        verdicts,
-        checks.trimEnd(),
-        ...
-        'Output JSON only. No prose. No markdown fences. Use exactly this shape:',
-        JSON.stringify(outputShape),
-    ].filter(Boolean).join('\n');
-}
-```
+That "relative to that diagnosis" is the load-bearing bit. A recommendation that would be great for a *different* problem still scores badly if it doesn't address *this* diagnosis's root cause. Without that framing, the judge would score generically-well-written recs as good even when they miss the mark.
 
-The judge's system prompt is *generated from the rubric*, not hand-written. This is the load-bearing move: the rubric is the source of truth, and any change to the rubric changes the judge's system prompt deterministically. Two rubrics with the same shape produce two judges with the same anatomy. This is meta-prompting (see `11-meta-prompting.md`), applied to the evaluation seam specifically.
+#### The judge context — what lets a judge distinguish grounded from invented
+
+The diagnosis judge is called with:
 
 ```
-  Judge system prompt — assembled from the rubric
-
-  rubric.dimensions        →  "root_cause_plausibility: Does the ...
-                              1 = Restates the symptom.
-                              2 = Vague mechanism..."
-  rubric.verdicts           →  "- pass: All four dimensions at ≥4..."
-  rubric.checks             →  "cites at least one number from tool results"
-  rubric.task              →  "Judge a diagnosis produced by ..."
-
-  ────────────────────────  (concatenated in order)  ─────────────────────
-                                   │
-                                   ▼
-                    the JUDGE's system prompt
-                    (deterministic given the rubric)
-```
-
-**Step 4 — the judge user prompt carries the context that makes grounding possible.**
-
-`@aptkit/core/node_modules/@aptkit/evals/dist/src/rubric-judge.js:79-84`:
-
-```js
-export function buildRubricJudgeUserPrompt(input) {
-    const context = input.context && Object.keys(input.context).length > 0
-        ? `Context:\n${Object.entries(input.context).map(([k, v]) => `${k}: ${v}`).join('\n')}\n\n`
-        : '';
-    return `${context}Subject:\n${input.subject}`;
-}
-```
-
-Two blocks — context, then subject. Context is what the judge needs to score meaningfully; subject is what's being scored. In `eval/run.eval.ts:238-247`:
-
-```ts
-const diagnosisJudgmentResult = await diagnosisJudge.judge({
+diagnosisJudge.judge({
   subject: JSON.stringify(diagnosis, null, 2),
   context: {
-    anomaly: JSON.stringify(goldenCase.anomaly, null, 2),
+    anomaly:            JSON.stringify(goldenCase.anomaly, null, 2),
     known_correct_shape: JSON.stringify(goldenCase.knownCorrect, null, 2),
-    case_intent: goldenCase.intent,
-    signal_class: goldenCase.signalClass,
-    tool_calls_trace: formatToolCallTrace(diagnosisToolCalls),
+    case_intent:        goldenCase.intent,
+    signal_class:       goldenCase.signalClass,
+    tool_calls_trace:   formatToolCallTrace(diagnosisToolCalls),
   },
 });
 ```
 
-Five context fields. The `tool_calls_trace` is what distinguishes "grounded in the tool call" from "invented" — without it, the judge can't tell whether a number in the diagnosis came from a real tool result or from the model's priors. `formatToolCallTrace` (`eval/run.eval.ts:132-152`) truncates each result to 4000 chars so a single 40K JSON tool response doesn't blow the judge's context budget:
+`eval/run.eval.ts:238-247`. Five context fields:
 
-```ts
-const raw = JSON.stringify(c.result);
-const truncated =
-  raw.length > 4000 ? raw.slice(0, 4000) + `… [truncated, ${raw.length} total chars]` : raw;
-lines.push(`result: ${truncated}`);
+- **anomaly** — the input the diagnosis was supposed to explain.
+- **known_correct_shape** — human-written notes on the correct shape for *this* case (trap flags, expected mechanism).
+- **case_intent** — one paragraph on what a correct diagnosis looks like.
+- **signal_class** — meta-label.
+- **tool_calls_trace** — the actual tool calls the agent made, with results (truncated to 4000 chars).
+
+That last one — `tool_calls_trace` — is the load-bearing addition. Without it, a judge scoring a diagnosis has no way to tell whether the numbers cited in the diagnosis actually came from a tool result, or whether the agent made them up. With it, the judge can literally cross-reference every claim against the trace.
+
+From receipt `05-no-signal-retention-subscribers-2026-07-03T02-12-17-099Z.json`, the judge writes:
+
+> "The diagnosis cites numbers (31.2% payment failure rise, 4,820 high-risk customers, 18.4% conversion drop) but these numbers originate from tools that do not exist in the workspace or returned synthetic data unrelated to subscription/billing events. The known_correct_shape explicitly flags inventing subscriber counts, churn rates, and MRR numbers as a failure mode. Every cited number is either invented or from a tool whose output is synthetic noise, not grounded in actual subscription signals."
+
+That entire finding is only possible because the judge saw the tool_calls_trace and could see that no tool actually returned "4,820 high-risk customers." Without the trace, the judge would have taken the number at face value and given the diagnosis a higher score on `evidence_grounding`. This is the *judge-as-secondary-prompt* discipline: the judge needs its own context, or it grades in a vacuum.
+
+The recommendation judge gets a slightly different context set at `eval/run.eval.ts:298-304`:
+
 ```
-
-That 4000-char cap is the token-budget lever inside the eval — same discipline as `schemaSummary` (see `04-token-budgeting.md`), applied at the eval boundary rather than the agent boundary.
-
-```
-  Judge context — what makes grounded scoring possible
-
-  ┌─ anomaly ────────────┐  what the agent was investigating
-  ├─ known_correct_shape ┤  what the diagnosis should look like
-  ├─ case_intent         ┤  why this case exists (prose)
-  ├─ signal_class        ┤  has-signal / no-signal / …
-  └─ tool_calls_trace    ┘  what the agent actually queried and saw
-                             ↑
-                    without this, "cites a number" is unverifiable
-                    (the judge doesn't know what tools returned)
-```
-
-**Step 5 — the receipt is the audit trail.**
-
-`eval/run.eval.ts:341-395` builds the receipt. Every case, every run, one JSON file. Fields include timings, tool calls with args + durations, usage + cost (from `summarizeUsage` + `estimateCost`), budget snapshot, the diagnosis itself, the judgment (dimensions + verdict + fix), the recommendations, and their judgments. Files land in `eval/receipts/<caseId>-<runId>.json`. The `afterAll` block walks that directory, filters to this run's files, prints per-case verdicts, per-dimension pass rates, and a distinct-score-count check (the escape-hatch check — if a dimension shows only one distinct score across all cases, the substrate is too homogeneous and the judge isn't discriminating).
-
-**Step 6 — the gate that lets no-signal cases inform without failing.**
-
-`eval/run.eval.ts:407-424`:
-
-```ts
-const isGated =
-  goldenCase.signalClass === 'has-signal' ||
-  goldenCase.signalClass === 'partial-signal';
-if (isGated) {
-  expect(receipt.diagnosisJudgment.verdict).not.toBe('fail');
-  for (const rj of receipt.recommendationJudgments) {
-    expect(rj.judgment.verdict, `case ${goldenCase.caseId} rec "${rj.recommendationTitle}"`).not.toBe('fail');
-  }
+{
+  anomaly: JSON.stringify(goldenCase.anomaly, null, 2),
+  diagnosis: JSON.stringify(diagnosis, null, 2),
+  case_intent: goldenCase.intent,
+  signal_class: goldenCase.signalClass,
+  tool_calls_trace: recommendationTraceForJudge,
 }
 ```
 
-Only `has-signal` and `partial-signal` cases are gated as pass/fail. `no-signal` cases (where the anomaly is spurious and the agent *should* confabulate less rather than more) are measured but not gated — a fail on a no-signal case is a data point, not a build break. Same for `positive` (an improvement, where the agent should recognize the shift without over-recommending). This shape lets the eval carry cases the agent isn't optimized for without turning every ambiguous verdict into a red build.
+No `known_correct_shape` (that's diagnosis-specific), but *diagnosis* is passed so the judge can score the rec relative to the actual diagnosis the agent produced (not the golden's known-correct diagnosis). That relative framing prevents the judge from grading recs against an ideal diagnosis when the actual diagnosis was flawed.
 
-```
-  Signal-class-aware gate
+#### The receipt — one file per case per run
 
-  ┌─ signal class ───┬─ gated? ─┬─ meaning of fail ────────────┐
-  │ has-signal       │  YES      │ agent regressed on happy path│
-  │ partial-signal   │  YES      │ agent regressed on ambiguity │
-  │ no-signal        │  NO       │ data point — confabulation? │
-  │ positive         │  NO       │ data point — over-recommend? │
-  └──────────────────┴──────────┴──────────────────────────────┘
-```
+`eval/receipts/<caseId>-<runId>.json` at `eval/run.eval.ts:341-395` captures:
+
+- `runId`, `case`, `signalClass`, `intent`
+- `durationMs` — investigate, judge, recommend, judge, total
+- `model` — `{ agent: 'claude-sonnet-4-6', judge: 'claude-sonnet-4-6' }`
+- `anomaly`, `diagnosisToolCalls[]`, `recommendationToolCalls[]`
+- `usage` — per-invocation input/output tokens and cost
+- `budget` — snapshot of the shared `BudgetTracker`
+- `diagnosis`, `diagnosisJudgment`, `diagnosisJudgmentError`, `diagnosisJudgeAttempts`
+- `recommendations[]`, `recommendationJudgments[]`
+
+Everything you need to bisect a regression. The critical bits: `diagnosisJudgeAttempts` (retry count — if >1, the judge model failed to produce parseable JSON on the first try), `diagnosisJudgmentError` (string when the judge produced no parseable output at all, and the receipt fills in a `judge_error` verdict placeholder to keep aggregation stable).
+
+The `afterAll` block at `eval/run.eval.ts:429-525` walks all the receipts from one runId and prints:
+
+- Per-case verdicts (`diag: pass_with_notes`, `recs: 2/3`)
+- Per-dimension pass rate across all cases (`root_cause_plausibility 6/10 (60%) dist [1:0 2:1 3:3 4:4 5:2]`)
+- Escape-hatch check — at least 3 distinct scores per dimension, or the substrate is too homogeneous
+
+That escape-hatch check is the meta-discipline: if every case scores a 5 on a dimension, the dimension isn't measuring anything — it's a flatline. Force the goldens to span at least 3 distinct outcomes per dimension.
 
 ### Move 2 variant — the load-bearing skeleton
 
-The kernel of eval-driven prompt iteration is five moves, in order:
+The kernel of eval-driven iteration:
 
-```
-  golden set → rubric → judge (LLM secondary call) → receipt → regression gate
-```
+1. **A golden set that spans the intent shapes.** Drop it and you're grading on demo data. This repo has 10 cases across 4 signal classes.
+2. **A rubric with multi-dimensional scoring, not just pass/fail.** Drop it and you can't tell *what* got worse. Score-per-dimension is what enables diffing.
+3. **Judge context that includes the tool trace.** Drop it and the judge grades hallucinated numbers as correct because they look plausible.
+4. **Per-case receipts stored on disk.** Drop it and you can't diff runs. This is the artifact that makes iteration measurable.
+5. **A pre-declared gating rule that separates regressions from measurements.** `has-signal` gated, `no-signal` measured. Without it, a positive golden that the model handles surprisingly badly halts the whole eval.
 
-What breaks if you skip each:
-
-- **Skip "golden set"** — you're back to vibes. Every prompt change is a stab. You can't distinguish "the response feels better" from "I got lucky on the one case I checked."
-- **Skip "rubric"** — the judge scores in prose. The scores drift. You can't aggregate across cases because "pretty good, some issues" isn't a comparable value.
-- **Skip "judge as LLM secondary call"** — you're doing manual review. Scales to ~10 cases and dies. The moment you have 50 cases you cannot ship prompt changes because each PR takes an hour of eyeballing to review.
-- **Skip "receipt"** — you can't diff across runs. Every run is a fresh view; every regression is a "wait, was that always failing?"
-- **Skip "regression gate"** — evals are advisory. Team ships prompt changes that regress on cases nobody re-checked. The gate is what makes evals load-bearing instead of a dashboard nobody reads.
-
-Hardening layered on top: LLM-vs-human agreement calibration (`eval/compute-agreement.eval.ts` — the calibration slice that measures whether the judge's scores match a human's), signal-class breakdown in the summary (per-signal pass rate, not just overall), distinct-score-count check (guards against the substrate being too homogeneous for meaningful scores).
+Hardening on top: judgment stability testing (run the same case N times, check variance), calibration slices (compare judge scores to human scores on a subset), per-dimension trend charts, cost dashboards. None of that is the skeleton — the skeleton is: goldens + rubric + judge with context + receipt + gating rule.
 
 ### Move 3 — the principle
 
-**Evals are how prompt iteration becomes engineering.** Without them, prompts drift as fast as the person writing them can retype. With them, every change is a diff against a known set of cases and a measurable outcome. The discipline scales the moment you have more than three cases you can no longer eyeball, which is roughly week one of any real LLM feature.
+**The senior-vs-junior dividing line: a junior iterates by vibes ("the response feels better now"). A senior iterates against an eval set.** Skipping evals isn't faster; it's slower, because you'll iterate in circles. Every prompt change you make without an eval is a lottery ticket — sometimes you improve the model, sometimes you regress on a case you're not tracking, and either way you can't tell. The eval is the differencing engine. When it says "root_cause_plausibility went from avg 4.2 to avg 3.6," that's a real signal. When your gut says "the response feels better," that's not.
+
+Hamel Husain's writing is the canonical reference here. He's been saying this for two years, and every time an engineer skips the eval they end up rediscovering the same wall. Read his stuff before you touch a production prompt.
 
 ## Primary diagram
 
 ```
-  Eval-driven iteration — the full loop
+  Eval-driven iteration — the full recap
 
-  ┌── golden set (10 cases) ──────────────────────────────────┐
-  │  01-conversion-drop-mobile-checkout   (has-signal)         │
-  │  02-fraud-payment-failure-credit-card  (has-signal)        │
-  │  03-session-drop-organic-mobile        (has-signal)        │
-  │  04-cart-abandonment-mobile-broad      (partial-signal)    │
-  │  05-no-signal-retention-subscribers    (no-signal)         │
-  │  06-no-signal-price-sensitivity-luxury (no-signal)         │
-  │  07-positive-conversion-surge-mobile   (positive)          │
-  │  08-checkout-collapse-multi-scope      (has-signal)        │
-  │  09-engagement-drop-email-campaign     (has-signal)        │
-  │  10-no-signal-seo-organic              (no-signal)         │
-  └────────────────────┬──────────────────────────────────────┘
-                       │
-                       ▼  for each case:
-  ┌── agent under test ──────────────────────────────────────┐
-  │  DiagnosticAgent.investigate(anomaly) → diagnosis         │
-  │  RecommendationAgent.propose(anomaly, dx) → recs          │
-  │  captures: tool_calls_trace, usage, cost, budget          │
-  └────────────────────┬──────────────────────────────────────┘
-                       │
-                       ▼
-  ┌── judge (secondary LLM call) ────────────────────────────┐
-  │  system: buildRubricJudgeSystemPrompt(rubric)             │
-  │  user:   subject + context (anomaly, known,               │
-  │          case_intent, signal_class, tool_calls_trace)     │
-  │  returns: {dimensions{}, verdict, fix, checks{}}          │
-  └────────────────────┬──────────────────────────────────────┘
-                       │
-                       ▼
-  ┌── receipt per case ───────────────────────────────────────┐
-  │  eval/receipts/<caseId>-<runId>.json                       │
-  │  written by writeFileSync at end of each `it` case          │
-  └────────────────────┬──────────────────────────────────────┘
-                       │
-                       ▼  afterAll:
-  ┌── summary + gate ────────────────────────────────────────┐
-  │  per-case verdicts table                                  │
-  │  per-dimension pass rate (score ≥ 4)                      │
-  │  distinct-score-count check (escape hatch)                │
-  │  gate: has/partial-signal cases MUST not be `fail`        │
-  └───────────────────────────────────────────────────────────┘
+  ┌─ Fixture layer ──────────────────────────────────────────────┐
+  │  goldens/                                                     │
+  │    01-conversion-drop-mobile-checkout    (has-signal, gated)  │
+  │    02-fraud-payment-failure-credit-card  (has-signal, gated)  │
+  │    03-session-drop-organic-mobile        (has-signal, gated)  │
+  │    04-cart-abandonment-mobile-broad      (partial, gated)     │
+  │    05-no-signal-retention-subscribers    (no-signal, measured)│
+  │    06-no-signal-price-sensitivity-luxury (no-signal, measured)│
+  │    07-positive-conversion-surge-mobile   (positive, measured) │
+  │    …                                                          │
+  └────────────────────────┬─────────────────────────────────────┘
+                           │  for each case:
+  ┌─ Agent under test ─────▼─────────────────────────────────────┐
+  │  DiagnosticAgent.investigate(anomaly) → diagnosis             │
+  │  RecommendationAgent.propose(anomaly, diagnosis) → recs       │
+  │  budget tracker shared across both                            │
+  └────────────────────────┬─────────────────────────────────────┘
+                           │
+  ┌─ Judge layer ──────────▼─────────────────────────────────────┐
+  │  diagnosisJudge = new RubricJudge({ rubric: diagQualityRubric })│
+  │    .judge({ subject, context: {                               │
+  │       anomaly, known_correct_shape, case_intent,              │
+  │       signal_class, tool_calls_trace                          │
+  │    }})                                                        │
+  │  recommendationJudge = new RubricJudge({ rubric: recQuality })│
+  │    per rec, context: { anomaly, diagnosis, intent, class,     │
+  │                        tool_calls_trace }                     │
+  └────────────────────────┬─────────────────────────────────────┘
+                           │
+  ┌─ Receipt ─────────────▼─────────────────────────────────────┐
+  │  eval/receipts/<case>-<runId>.json                            │
+  │    diagnosis + judgment + toolCalls + usage + cost + attempts │
+  │    everything needed to diff two runs                         │
+  └────────────────────────┬─────────────────────────────────────┘
+                           │
+  ┌─ afterAll aggregation ▼─────────────────────────────────────┐
+  │  per-case verdicts table                                     │
+  │  per-dimension pass rate                                     │
+  │  escape-hatch check (≥3 distinct scores per dim)             │
+  └───────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-Hamel Husain's writing on evals is the canonical reference for this discipline. His posts on "your AI needs an eval set" and the working shape of LLM-as-judge are what most production teams reach for when they build the first version of an eval harness. If you read one thing after this file, read him.
+The judgment stability variance in this repo is real and worth naming. Between runs `2026-07-03T02-12-17-099Z`, `2026-07-03T02-47-24-392Z`, and `2026-07-03T04-08-28-644Z`, the same case scored `root_cause_plausibility` at 4 and at 5 depending on the run — same anomaly, same agent code, same rubric. The judge model is nondeterministic at temperature 0 (Anthropic doesn't guarantee determinism), and the reasoning path shifts slightly each time.
 
-The `RubricJudge` shape in `@aptkit/core` is a specific take on LLM-as-judge — dimensions on a 1-5 scale with named descriptions for each level, verdicts as the roll-up, binary checks as the ratchet, and a `fix` field for the highest-leverage suggestion. It's not the only shape. Some teams use pairwise comparisons (which of two outputs is better) instead of absolute scoring. Some use single-dimension binary judgments (was this a good answer, yes/no). The tradeoff: absolute scoring is easier to aggregate and correlate to prompt changes, but drifts more across judge model versions; pairwise is more stable but harder to interpret across cases.
+The pragmatic response: don't chase noise. A one-point change on one dimension on one case across two runs is inside the variance envelope. A one-point change across all cases in a dimension is a real signal. This is exactly why the aggregation table in `afterAll` reports per-dimension averages across the whole set — the average is more stable than any single score.
 
-Two specific gaps in this codebase worth naming honestly. First, judgment stability is a known variance: the task briefing documents that `root_cause_plausibility` came back 5 on one Session B run and 4 on Session A for the same anomaly on the same substrate. This is real, and it's why you look at *distributions across cases and runs*, not single-case scores. Second, the calibration slice (`eval/calibration/`) measures LLM-vs-human agreement — the load-bearing question of whether the judge is a proxy for a human's judgment. If agreement is low, the whole judge-as-signal argument collapses.
+The alternative — bumping to `temperature: 0` (already done at `eval/run.eval.ts:236,283`) plus running each judgment N=3 times and taking the median — would tighten the variance but triple the cost. This repo hasn't paid that yet. If a specific dimension's variance gets loud enough to hide real signal, that's when to invest.
 
-The 4000-char tool result truncation in `formatToolCallTrace` is the specific token-budget lever inside the eval. Same discipline as `schemaSummary` (see `04-token-budgeting.md`), applied at the eval boundary. If the judge starts scoring badly because it can't see the whole tool result, you widen the cap. If the judge's own input token bill grows unmanageable, you tighten.
+The rec anti-pattern from the baseline evidence: on has-signal cases where the diagnosis correctly identifies "payment processor" as the primary root cause, the recommendation would sometimes propose "pause the A/B experiment" (a secondary contributor mentioned in the diagnosis). The judge scored those `diagnosis_response = 2` (fail) because the rec was addressing a symptom rather than the diagnosed cause. This shows up in `receipts/04-cart-abandonment-mobile-broad-*.json`. That kind of specific, actionable, prompt-fixable finding is exactly what an eval discipline earns you — you couldn't have found this reading logs.
 
-Related concepts:
-- **Structured outputs** (`02-structured-outputs.md`) — the judge itself uses structured output; the rubric's outputShape is a JSON schema the judge must satisfy.
-- **Token budgeting** (`04-token-budgeting.md`) — the 4000-char truncation in the judge context.
-- **Meta-prompting** (`11-meta-prompting.md`) — `buildRubricJudgeSystemPrompt` is meta-prompting applied to the eval boundary.
+The eval takes 15-40 minutes for 10 cases against Anthropic Sonnet. That's the price. It's low enough to run on every meaningful prompt change, high enough that you don't run it on every commit. Hamel's advice: put the fast subset (2-3 cases) on CI, run the full set nightly and before shipping.
 
 ## Interview defense
 
-**Q: Walk me through the eval loop in this codebase from golden case to gate.**
+**Q: How do you know a prompt change is an improvement?**
 
-Ten golden cases in `eval/goldens/`, each with an anomaly, a `knownCorrect` shape, a signal class, and prose intent. For each case, the harness runs `DiagnosticAgent.investigate` then `RecommendationAgent.propose`, capturing tool calls, usage, and cost. Each output goes through a `RubricJudge` — a secondary LLM call using a rubric of four dimensions × 5-point scale plus binary checks plus verdict roll-up. The judge sees the subject plus context including the tool-calls trace (formatted with per-call args + truncated results), which is what lets it distinguish grounded numbers from invented ones. The output is a per-case JSON receipt in `eval/receipts/`. The `afterAll` block aggregates per-dimension pass rates and gates the run — `has-signal` and `partial-signal` cases must not verdict as `fail`; `no-signal` and `positive` cases are measured but not gated because they're testing confabulation and over-recommendation, not the happy path.
-
-Anchors: `eval/run.eval.ts` for the harness, `eval/rubrics/diagnosis-quality.ts:15-108` for the rubric shape, `@aptkit/core/node_modules/@aptkit/evals/dist/src/rubric-judge.js:31-77` for the judge system prompt builder.
+You don't, unless you have an eval. In this codebase the eval is `npm run eval` — 10 golden cases, each run through the real DiagnosticAgent and RecommendationAgent, each output graded by a `RubricJudge` on a 4-dimension × 5-point rubric. Every run writes per-case receipts to `eval/receipts/`. Diffing two receipts tells you which dimensions moved and by how much. Without that, you're iterating by vibes and you'll regress on cases you're not tracking. Hamel Husain has been the canonical voice on this for the last couple of years.
 
 ```
-  The gate — signal-class-aware
-
-  has-signal, partial-signal:  gated on `verdict !== fail`
-  no-signal, positive:          measured, not gated
+   prompt v1   ──► eval  ──► receipts v1  ┐
+                                          │  diff
+   prompt v2   ──► eval  ──► receipts v2  ┘
 ```
 
-**Q: You changed a prompt. The eval passes but the average judge score dropped from 4.2 to 3.9. Do you ship?**
+Anchor: `eval/run.eval.ts`, `eval/rubrics/diagnosis-quality.ts`, `eval/receipts/`.
 
-Depends on the distribution, not the average. Look at the per-dimension pass rates first — if `root_cause_plausibility` held at 90% pass but `evidence_grounding` dropped from 100% to 60%, that's a real regression on a specific dimension and I don't ship. If every dimension dropped by ~0.3 and the pass rate is unchanged (all cases still score ≥ 4), that's a judge drift artifact — the same rubric run against the same outputs won't produce identical scores across runs. Second thing I check: the distinct-score-count check in the escape-hatch block. If a dimension went from 3-distinct-scores to 1-distinct-score, the judge stopped discriminating and the "improvement" is meaningless. Third: I look at the `fix` field on the failing cases — that's where the highest-leverage regression signal is, per the rubric's own instruction.
+**Q: The judge scores vary across runs — how do you tell noise from signal?**
 
-```
-  Score dropped 4.2 → 3.9 — decision tree
-
-  per-dimension pass rate unchanged? → likely judge drift, ship
-  one dimension dropped hard?         → real regression, revert
-  distinct-score-count collapsed?     → judge stopped discriminating,
-                                        don't ship, fix the rubric
-```
-
-**Q: What's the load-bearing part people forget?**
-
-Context. Everyone builds a rubric and forgets to pass the tool_calls_trace to the judge. The rubric asks "does the diagnosis cite evidence?" — but if the judge doesn't see what evidence was available, it can't verify grounding. It scores in the abstract. The fix in this codebase — `context: { anomaly, known_correct_shape, case_intent, signal_class, tool_calls_trace }` at `eval/run.eval.ts:239-246` — is what turned the judge from "produces vibes-shaped scores" into "produces grounded scores you can debug from." Every eval I've built without a tool-call trace was easier to game than any I've built with one.
-
-Anchor: `formatToolCallTrace` at `eval/run.eval.ts:132-152` and its use as the `tool_calls_trace` context field.
+Between runs on the same case, `root_cause_plausibility` can score 4 or 5 for the same output. That's judge nondeterminism, even at temperature 0. The pragmatic move: don't chase single-case single-dimension changes. Compare per-dimension averages across the whole golden set — the average is stable in a way individual scores aren't. The `afterAll` block at `eval/run.eval.ts:429-525` prints exactly that: per-dimension pass rate and score distribution across all 10 cases. When an aggregate moves by 10%+, that's a real signal. When one dimension on one case moves by one point, that's noise.
 
 ```
-  Judge context — the tool-call trace is the load-bearing part
-
-  ┌── without tool_calls_trace ────────────────────────┐
-  │ judge sees: diagnosis, anomaly, known-correct       │
-  │ can score: "reads plausible," "in-scope"            │
-  │ CANNOT score: "invented number" vs "real citation"  │
-  └────────────────────────────────────────────────────┘
-
-  ┌── with tool_calls_trace ────────────────────────────┐
-  │ judge sees: everything above + every tool_call.args │
-  │             + truncated result                      │
-  │ CAN score: "cites a number that came from tool X"   │
-  └────────────────────────────────────────────────────┘
+   single case, single dim, single run  ← noise
+   ───────────────
+   all cases, single dim, avg          ← signal
 ```
+
+Anchor: `eval/run.eval.ts:479-513` (the dimension aggregator).
+
+**Q: Why does the judge need the tool trace as context?**
+
+Without the tool trace, the judge can't tell whether a number cited in the diagnosis actually came from a tool result or whether the agent made it up. Receipt `05-no-signal-retention-subscribers-2026-07-03T02-12-17-099Z.json` is the canonical example: the diagnosis confidently cites "4,820 high-risk customers" and "31.2% payment failure rise" — numbers that no tool in the workspace could have produced. Only because the judge sees the actual tool trace can it write: "these numbers originate from tools that do not exist in the workspace." That finding drives the `evidence_grounding` score to 1. Without the trace, the same diagnosis would look grounded and score higher. Judge context is a prompt engineering choice, and the tool trace is the load-bearing field.
+
+```
+  judge context = { anomaly, diagnosis, intent, signal_class, tool_calls_trace }
+                                                                     ▲
+                                                          the load-bearing addition
+```
+
+Anchor: `eval/run.eval.ts:238-247` (diagnosis judge context), `eval/run.eval.ts:298-304` (rec judge context).
 
 ## See also
 
-- `02-structured-outputs.md` — the judge itself uses structured output.
-- `04-token-budgeting.md` — the 4000-char truncation in `formatToolCallTrace`.
-- `10-self-critique.md` — LLM-as-judge is a specific shape of "another LLM checks the output."
-- `11-meta-prompting.md` — `buildRubricJudgeSystemPrompt` builds a prompt from data.
+- 02 · structured outputs — the RubricJudge uses structured output; `attempts` on the receipt records retries.
+- 03 · prompts as code — the rubric is versioned inline (`id: 'blooming-diagnosis-quality-v1'`).
+- 10 · self-critique — the judge is self-critique's cousin, but with a distinct agent doing the critique.
+- 04 · token budgeting — the per-case receipts include input/output tokens per call, which is how you measure a token-budget change's impact.

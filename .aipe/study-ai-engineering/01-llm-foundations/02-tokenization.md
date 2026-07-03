@@ -1,196 +1,179 @@
-# 02 — Tokenization
+# Tokenization
 
-**Type:** Industry standard. Also called: BPE (byte-pair encoding), subword tokenization.
+## Subtitle
+
+Byte-Pair Encoding / subword tokenization — Industry standard.
 
 ## Zoom out, then zoom in
 
-Tokens are the unit everything downstream in this repo is priced, budgeted, and rate-limited in.
+Every cost number in this codebase — the `$0.09/case` in the eval receipts, the `cache_read_input_tokens: 3168` win, the budget ceiling in `lib/agents/budget.ts` — is denominated in *tokens*, not characters. Tokenization is where "the prompt is 2000 characters" gets translated into "the prompt is 500 tokens." That translation happens on Anthropic's side; your code sees the token counts come back in the response `usage` field and pays accordingly.
 
 ```
-  Zoom out — where tokens land in the stack
+  Zoom out — where tokens are counted
 
-  ┌─ Agent layer ─────────────────────────────────────────────────────┐
-  │   messages array — measured in TOKENS                              │
-  │   response.usage.input_tokens / output_tokens ← ★ THIS CONCEPT ★  │
-  └─────────────────────────────┬─────────────────────────────────────┘
-                                │
-  ┌─ Observability & budget ────▼─────────────────────────────────────┐
-  │   BudgetTracker.add({inputTokens, outputTokens})                   │
-  │   BudgetTracker.exceeded() → gate before next call                 │
-  │   estimateAnthropicCost(usage) → USD per turn                     │
-  └─────────────────────────────┬─────────────────────────────────────┘
-                                │
-  ┌─ Receipts (eval/receipts/) ─▼─────────────────────────────────────┐
-  │   per-case token totals + cost, aggregated in baseline.json        │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌─ Agent code ─────────────────────────────────────────┐
+  │  messages: [{ role, content: "..." }]  ← chars       │
+  └───────────────────────┬──────────────────────────────┘
+                          │  POST /v1/messages
+  ┌─ Anthropic (tokenizer + model) ─▼───────────────────┐
+  │  ★ tokenize(text) → tokens ★                         │ ← we are here
+  │  next-token prediction over the tokenized input      │
+  └───────────────────────┬──────────────────────────────┘
+                          │  response.usage
+  ┌─ Adapter ─────────────▼──────────────────────────────┐
+  │  onCapabilityEvent → summarizeUsage → cost           │
+  │  lib/agents/aptkit-adapters.ts:113 (trace sink)      │
+  └───────────────────────────────────────────────────────┘
 ```
 
-Zoom in. Text becomes tokens before it enters the model, and cost/context-window/budget are all measured in tokens — not characters, not words. In this repo you never touch the tokenizer directly (Anthropic doesn't expose one in the SDK), but every cost line, every budget check, every receipt row is denominated in the number Anthropic tells us the request/response used.
+Zoom in: your code never sees the tokens. It sees the *count* of tokens (via `response.usage.input_tokens` / `output_tokens` / `cache_read_input_tokens`) and computes cost from that.
 
 ## Structure pass
 
-**Layers:**
-- Outer: what the reader sees — cost in USD per case (`~$0.09`)
-- Middle: the tokens the receipts and budget track
-- Inner: the encoding step Anthropic runs inside its API
-
-**Axis: what unit is this quantity in?**
-- USD/cost — a derived unit (tokens × per-MTok price)
-- Token counts — the ground-truth unit for pricing, budget, context
-- Characters — irrelevant to the model, only relevant to the human writing prompts
-
-**Seam:** the SDK response envelope (`response.usage.input_tokens`) — this is where "how much text did we send/receive" becomes "how much token." We consume that number; we don't compute it.
+- **Layers:** prompt strings → Anthropic tokenizer → token counts → cost estimate. Four bands.
+- **Axis: who owns the count?** Your code owns the input strings. Anthropic owns the tokenizer + count. Your code owns the pricing math and the budget check. So the count crosses one seam: string → count. Everything downstream is arithmetic on numbers you got back.
+- **Seam:** the `usage` field on the model response. That's the boundary where "text you wrote" becomes "tokens you pay for."
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You've eyeballed a JSON payload and thought "that's about 200 characters." Tokens are the same eyeball on a coarser grid. A rough rule for English + code: **1 token ≈ 4 characters** or **~0.75 words**. `{"metric":"conversion"}` is ~7 tokens. A 2000-char JSON is roughly 500 tokens.
+BPE (Byte-Pair Encoding) is the standard. Start with a vocabulary of bytes; iteratively merge the most common adjacent pairs until you have a fixed-size vocabulary (typically 100k–200k tokens for modern models). Common words end up as one token ("hello"), rare words split ("Bloomreach" might be `Bloom` + `reach`), and code / punctuation each get their own tokens.
 
 ```
-  How text becomes tokens (byte-pair encoding, ~4 chars/token English)
+  Text → tokens (BPE, sketched)
 
-  "Hello, world!"      →  ~4 tokens        →  the model sees vectors
-  "conversion_rate"    →  ~2 tokens        →  "_rate" tokenizes together
-  "{\"metric\":\"..."  →  more tokens/char →  punctuation-heavy JSON
-                          than prose         costs more per char
+  "The mobile checkout dropped 18.4%"
+                     │
+                     ▼  BPE tokenizer
+                     │
+    [The][ mobile][ checkout][ dropped][ 18][.4][%]
+        1      2         3         4       5    6  7
+                          7 tokens for 33 chars
+                          ≈ 4.7 chars per token (English prose)
 ```
 
-BPE learns pairs of characters that co-occur, iteratively. Common English chunks (`" the"`, `"tion"`) end up as single tokens; rare strings (long UUIDs, base64 blobs) get split fine, one or two chars per token. That's why an EQL query full of table/column names tokenizes worse than plain prose.
+Rules of thumb from the actual usage in this codebase:
 
-### Move 2 — walk the mechanism
+- English prose: ~4 characters per token.
+- Code / structured data (JSON, schemas): 2–3 chars per token — more tokens per character.
+- The workspace schema summary from `lib/agents/monitoring.ts:19-88`: ~180 events × 10 props each ≈ 1500 tokens.
 
-**Where token counts show up in this repo — three places.**
+### Move 2 — the step-by-step walkthrough
 
-1. `response.usage` on every model call. Every `AnthropicModelProviderAdapter.complete()` return value carries `input_tokens` and `output_tokens` (`lib/agents/aptkit-adapters.ts:97-101`). This is the ground truth.
+**Where token counts are consumed.** The trace sink is where token counts hit your code:
 
-```typescript
-// lib/agents/aptkit-adapters.ts:97-119 (the logging + budget accumulation)
-console.log(JSON.stringify({
-  site: this.logSite,
-  sessionId: this.sessionId,
-  usage: response.usage,          // ← authoritative token count
-}));
-
-this.budget?.add({
-  inputTokens: response.usage.input_tokens,
-  outputTokens: response.usage.output_tokens,
-});
+```ts
+// lib/agents/aptkit-adapters.ts (BloomingTraceSinkAdapter — the CapabilityTraceSink)
+// Every aptkit CapabilityEvent flows through here; model_usage events carry
+// { inputTokens, outputTokens, cacheReadTokens? } on the payload.
+onEvent(event: CapabilityEvent): void {
+  this.hooks.onCapabilityEvent?.(event);
+  // ... routing to tool/text hooks
+}
 ```
 
-2. `BudgetTracker.snapshot()` at `lib/agents/budget.ts:57-69`. Aggregated across all turns in one investigation (both diagnostic and recommendation agents share one tracker). This is where the ceiling check happens.
+The receipts pipeline in `eval/run.eval.ts` collects those events, calls `summarizeUsage()` from aptkit, then feeds the summary into `estimateAnthropicCost()` from `lib/agents/pricing.ts:41` to produce dollars.
 
-3. Receipts in `eval/receipts/`. Per-case `usage.diagnose` and `usage.recommend` rows, computed by `summarizeUsage` (from `@aptkit/core`) over the captured `CapabilityEvent[]` trace. See `eval/run.eval.ts:215-220`.
+**Where token counts are enforced.** The budget check in `lib/agents/budget.ts` reads the accumulated total across all model turns and blocks the next dispatch if the ceiling is hit:
 
-```
-  Token counts flow (per turn)
-
-  Anthropic response.usage
-         │
-         ├──────► console.log (per-turn observability)
-         │
-         ├──────► BudgetTracker.add() ── accumulated ──► exceeded()?
-         │                                                    │
-         │                                              throws BudgetExceededError
-         │
-         └──────► CapabilityEvent 'model_usage' ──► summarizeUsage(trace)
-                                                            │
-                                                    receipt.usage.diagnose
-                                                    receipt.usage.recommend
+```ts
+// lib/agents/budget.ts — BudgetTracker.add() then .exceeded()
+add(usage: { inputTokens: number; outputTokens: number }): void {
+  this.inputTokens += usage.inputTokens;
+  this.outputTokens += usage.outputTokens;
+  this.turns += 1;
+}
 ```
 
-**Where cache tokens split off.** Anthropic's response also includes `cache_creation_input_tokens` and `cache_read_input_tokens` when caching is on. In this repo, `response.usage.input_tokens` in the SDK type excludes cache-read tokens — so what the `BudgetTracker` accumulates is slightly conservative when caching is active. The note in `lib/agents/pricing.ts:10-13` is explicit about this: cost estimated is therefore an UPPER BOUND under caching.
+**Where tokens matter for the context window.** Sonnet 4.6's context window is 200k tokens. The system prompt + tools + workspace schema is roughly 12–15k tokens (a large but bounded fixed prefix). That leaves ~185k for messages, tool results, and the growing conversation history. A typical diagnostic run uses 20–40k of that ceiling.
 
-**Rough tokens per turn in this codebase.**
+Execution trace of a real run (case 01 from the baseline):
 
-- System prompt (diagnostic): ~2-3K tokens (cached after first turn — see `06-production-serving/01-llm-caching.md`).
-- Tools definitions: ~1-2K tokens (also cached via the same breakpoint).
-- User message + growing history: 500-3000 tokens per turn depending on how deep in the loop.
-- Output tokens per turn: 200-800 (mostly the assistant's brief thought + tool_use).
-- Total for a full diagnosis: ~15-40K input tokens (uncached-equivalent), ~2-5K output. With caching, effective input tokens drop by ~60-80% after the first turn.
+```
+  Token accounting — one investigation turn by turn
+
+  turn 1:  input=13400  cache_created=13400  output=890   ← cache built
+  turn 2:  input=310    cache_read=13400     output=1120  ← cache hit
+  turn 3:  input=890    cache_read=13400     output=780
+  turn 4:  input=650    cache_read=13400     output=940
+  turn 5:  input=1200   cache_read=13400     output=1450
+                                              ─────
+                                              5180 out tokens
+
+  billed:  input (13400 × 1.25 cache_created) + (3050 fresh)
+         + cache_read (13400 × 4 × 0.1)
+         + output (5180 full price)
+```
+
+The `cache_read × 0.1` multiplier is where prompt caching earns its place — turns 2+ pay 10% of normal input cost for the cached prefix. See **06-production-serving/01-llm-caching.md**.
 
 ### Move 3 — the principle
 
-You don't own the tokenizer. Anthropic does. Your job is to measure token counts as they come back, feed them into your cost/budget accounting, and design prompts to be cache-friendly (stable prefix, variable suffix). The "just count characters and divide by 4" estimate is good enough for capacity planning but not for billing — always use `response.usage` for anything that gates behavior.
+Tokens are the unit of both cost and context. Every optimization — trimming the schema summary, caching the system prompt, splitting a long response — pays or bills in tokens. Any code that estimates budget or cost in characters is off by whatever the current chars-per-token ratio is (typically 3–5×) and drifts silently as the input mix changes.
 
 ## Primary diagram
 
-Where every token count in this repo comes from and where it ends up.
-
 ```
-  Token flow — one turn to receipt
+  From string to bill — one frame
 
-  ┌─ Anthropic API ─────────────────────────────────────────────┐
-  │  response.usage = {                                          │
-  │    input_tokens: 3168,           ← excludes cache reads     │
-  │    output_tokens: 412,                                       │
-  │    cache_creation_input_tokens: 2900,  (first turn)          │
-  │    cache_read_input_tokens: 2900,      (subsequent turns)   │
-  │  }                                                           │
-  └────────────────────┬─────────────────────────────────────────┘
-                       │
-       ┌───────────────┼───────────────────────┐
-       ▼               ▼                       ▼
-  console.log    BudgetTracker.add       CapabilityEvent
-  (per-turn      (accumulated per-       'model_usage'
-   observability)  investigation)         (raw trace)
-                       │                       │
-                       ▼                       ▼
-                exceeded()?          summarizeUsage(trace)
-                       │                       │
-                throws or continues     receipt.usage row
-                                                │
-                                                ▼
-                                     baseline.json aggregates
-                                     $0.09/case total
+  ┌─ your TS code ─────────────────────────────────────┐
+  │  string prompts, JSON tool schemas                 │
+  └──────────────────────┬─────────────────────────────┘
+                         │ POST /v1/messages
+                         ▼
+  ┌─ Anthropic ────────────────────────────────────────┐
+  │  BPE tokenizer  →  model  →  response tokens       │
+  │  returns usage: { input_tokens, output_tokens,      │
+  │                    cache_read_input_tokens }        │
+  └──────────────────────┬─────────────────────────────┘
+                         │ ModelResponse
+                         ▼
+  ┌─ Adapter → trace sink → receipts ──────────────────┐
+  │  onCapabilityEvent → summarizeUsage → cost helper  │
+  │  eval/receipts/*.json contain per-turn tokens      │
+  └────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-Tokenization is where "how big is my prompt" and "how much will it cost" and "does it fit" all collapse into one number. BPE is the current standard (used by GPT-2 onward, Llama, and Anthropic's models — the exact vocabulary differs per model but the algorithm is the same). Older word-piece and character-level tokenizers still exist in specific research contexts.
+BPE was popularized by GPT-2's tokenizer; earlier models used word-level or character-level tokenizers, both of which had known failure modes (large vocabulary or extreme sequence length). Anthropic's exact BPE variant is proprietary but behaves similarly to `tiktoken` at rough estimation quality.
 
-Two under-discussed consequences show up in this codebase:
+Non-English text is more expensive per character — Japanese and Chinese tokenize at ~1–2 characters per token, roughly 3× the input cost of English for the same information. This codebase happens to be English-only (Bloomreach queries + Anthropic prompts), so the cost math stays predictable.
 
-1. **JSON tokenizes worse than prose.** The `execute_analytics_eql` tool responses come back as structured JSON with lots of punctuation. A 2000-char response is often ~600 tokens, not ~500. That matters when you're loading tool_result content back into the messages array on every turn.
-2. **Non-English is more expensive per character.** Bloomreach data can include Portuguese product names, Spanish country codes, etc. English averages ~4 chars/token; Portuguese is closer to ~2.5. Nothing to fix in this repo (the schema is machine-generated field names), but worth naming.
+Related: **06-token-economics.md** for the cost accounting derived from token counts, **01-llm-caching.md** for how caching changes what you pay per token.
 
 ## Project exercises
 
-### Exercise — surface token counts in the UI trace
+### B1.2 · Add a token counter to the trace sink
 
-- **Exercise ID:** C1.2-A · Case A (concept exercised in receipts, not exercised in UI).
-- **What to build:** the `StatusLog` already streams `reasoning_step` and `tool_call_*` events. Add a per-turn `usage` event that carries `{inputTokens, outputTokens, cachedTokens}` and render it as a small badge next to each reasoning step in `ReasoningTrace.tsx`.
-- **Why it earns its place:** turns the receipt-only observability into a live UX. Interviewer signal: "I made the cost of each turn visible in the product, not just the receipts — because a user watching the trace should see when a turn was cached vs uncached."
-- **Files to touch:** `lib/mcp/events.ts` (add `usage` event variant), `lib/agents/aptkit-adapters.ts` (emit the event from `BloomingTraceSinkAdapter`), `components/investigation/ReasoningTrace.tsx` (render badge), `components/investigation/TraceContent.tsx`.
-- **Done when:** running one investigation live in demo mode shows a small "3.2K in / 0.4K out / cache" badge next to each reasoning_step.
-- **Estimated effort:** 1-4hr.
+- **Exercise ID:** B1.2
+- **What to build:** Extend `BloomingTraceSinkAdapter` in `lib/agents/aptkit-adapters.ts` to sum input+output tokens across every turn and log a per-agent total when the agent completes. Surface it as a new `AgentEvent` variant so the UI's `StatusLog` can display it live.
+- **Why it earns its place:** Shows the interviewer you understand token accounting is not a batch-time-only concern; a good production surface exposes live tokens/cost per invocation.
+- **Files to touch:** `lib/agents/aptkit-adapters.ts` (BloomingTraceSinkAdapter), `lib/mcp/events.ts` (new event variant), `components/shared/StatusLog.tsx` (render it).
+- **Done when:** every completed investigation posts a `token_summary` event and the sidebar shows "used 45,320 tokens · ~$0.09" at the end.
+- **Estimated effort:** `1–4hr`.
 
 ## Interview defense
 
-**Q: How much does a diagnosis cost?**
+**Q: How do you estimate the cost of a new feature before you ship it?**
 
-About $0.09 per case in the committed baseline (agent-side, cached). That splits roughly $0.03-0.05 diagnose + $0.04-0.06 recommend. Judge calls add another ~$0.04 per judgment × 4 judgments per case (1 diagnosis + up to 3 recommendations) = ~$0.16 per case at judge time. Full 10-case run total: ~$1.30. Numbers from `eval/baseline.json` (runId `2026-07-03T04-08-28-644Z`) and per-case receipts in `eval/receipts/`.
-
-**Q: What's an input token vs output token?**
-
-Input tokens = every message sent TO the model (system prompt + user messages + assistant history + tool_result blocks). Output tokens = the content blocks the model produces THIS turn (text + tool_use). Anthropic's Sonnet 4 is $3/MTok input, $15/MTok output — output is 5× more expensive. That's why we design outputs to be concise: schema-constrained JSON, not free-form prose.
+Sketch the prompt at target length in characters, divide by 4 for English (or 2.5 for code / JSON), multiply by the number of expected turns for input tokens; estimate output at ~1000 tokens per turn as a starting point; apply `lib/agents/pricing.ts:41`'s per-million rates. For a 10-turn diagnostic with 15k input prefix, expect $0.05–$0.10 per case at Sonnet pricing. That's the pre-commit napkin; the eval receipts confirm or refute after the first live run.
 
 ```
-  Cost split per turn (Sonnet 4)
+  Napkin math
 
-  input:  ▓▓▓ $3/MTok    ← the whole history goes here
-  output: ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ $15/MTok ← the model's answer
-                            5× multiplier
+  input_prefix_chars / 4 = input_prefix_tokens
+  turns × (input_prefix + output_est) = total_tokens (roughly)
+  total × per-token price = $ per invocation
 ```
 
-**Q: What does prompt caching do to the token count?**
+**Q: What's `cache_read_input_tokens` and why does it matter here?**
 
-Cache-read tokens are billed at ~10% of normal input tokens (Anthropic's ephemeral tier). In this repo, wrapping the system prompt in `cache_control: ephemeral` means turn 2 onward pays ~10% of the system prompt's ~2-3K tokens instead of full price. Over a 10-turn diagnosis, that's roughly a 60-80% reduction on the input side. Trade: turn 1 pays a 25% cache-creation premium.
+It's the count of input tokens that hit the prompt cache and were therefore billed at ~10% of normal input price. In this codebase, every diagnostic and recommendation agent turn after the first reads ~13k cached tokens for the system prompt + workspace schema. That's the observed ~80% cost cut on the input side. See `lib/agents/aptkit-adapters.ts:75-98` for the cache_control breakpoint.
 
 ## See also
 
-- `06-token-economics.md` — the cost ledger this feeds
-- `06-production-serving/01-llm-caching.md` — the cache breakpoint that reshapes the input side
-- `06-production-serving/02-llm-cost-optimization.md` — Haiku for intent, Sonnet for reasoning
-- `lib/agents/budget.ts` — the tracker
-- `lib/agents/pricing.ts` — the Blooming Anthropic pricing table
+- [06-token-economics.md](06-token-economics.md) — turning token counts into dollars.
+- [../06-production-serving/01-llm-caching.md](../06-production-serving/01-llm-caching.md) — where the cache_read count comes from.
+- [../02-context-and-prompts/01-context-window.md](../02-context-and-prompts/01-context-window.md) — the ceiling all these tokens compete for.

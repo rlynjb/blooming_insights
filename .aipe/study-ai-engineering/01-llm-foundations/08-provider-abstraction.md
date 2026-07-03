@@ -1,226 +1,214 @@
-# 08 — Provider abstraction
+# Provider abstraction
 
-**Type:** Industry standard. Also called: model provider port, adapter pattern, LLM SDK abstraction.
+## Subtitle
+
+Dependency inversion for LLM providers / adapter pattern — Industry standard.
 
 ## Zoom out, then zoom in
 
-The seam that separates "which LLM vendor" from "the agent logic that uses one." In this repo, AptKit owns the port; Blooming owns one adapter (Anthropic).
+Every agent in this codebase depends on the `ModelProvider` port from `@aptkit/core`, not on the Anthropic SDK directly. The concrete `AnthropicModelProviderAdapter` in `lib/agents/aptkit-adapters.ts:37` is the *only* file that imports the Anthropic SDK type for `messages.create()`. If you wanted to swap OpenAI, Google, or a local model, you'd write one new adapter and change nothing else in the agent layer.
+
+That's the standard "hexagonal / ports-and-adapters" shape, applied to the model provider seam.
 
 ```
-  Zoom out — the ModelProvider port
+  Zoom out — the port between agents and providers
 
-  ┌─ AptKit agents (provider-neutral) ────────────────────────────────┐
-  │  DiagnosticInvestigationAgent, MonitoringAgent, RecommendationAgent│
-  │  · every model call: this.model.complete(request)                  │
-  │  · never touches an SDK directly                                   │
-  └─────────────────────────────┬─────────────────────────────────────┘
-                                │
-                                │  ModelProvider interface (AptKit)
-                                │  ★ THIS CONCEPT ★
-                                │
-  ┌─────────────────────────────▼─────────────────────────────────────┐
-  │  AnthropicModelProviderAdapter                                     │
-  │  lib/agents/aptkit-adapters.ts:35-121                              │
-  │  · maps ModelRequest → Anthropic.Messages.MessageCreateParams      │
-  │  · calls anthropic.messages.create                                 │
-  │  · maps response.content → ModelContentBlock[]                     │
-  └─────────────────────────────┬─────────────────────────────────────┘
-                                │
-  ┌─ Anthropic SDK ─────────────▼─────────────────────────────────────┐
-  │  @anthropic-ai/sdk (HTTP JSON to api.anthropic.com)                │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌─ Agent code (DiagnosticAgent, RecommendationAgent, ...) ─┐
+  │  depends on ModelProvider port                            │
+  └───────────────────────┬──────────────────────────────────┘
+                          │  ModelProvider.complete(ModelRequest)
+                          ▼
+  ┌─ Adapter (concrete impl of the port) ★ ────────────────┐ ← we are here
+  │  AnthropicModelProviderAdapter                          │
+  │  lib/agents/aptkit-adapters.ts:37                       │
+  └───────────────────────┬──────────────────────────────────┘
+                          │  anthropic.messages.create()
+                          ▼
+  ┌─ Anthropic SDK ────────────────────────────────────────┐
+  │  @anthropic-ai/sdk                                       │
+  └────────────────────────────────────────────────────────┘
 ```
 
-Zoom in. `ModelProvider` is a port (in the hexagonal-architecture sense — the interface the app depends on). `AnthropicModelProviderAdapter` is one adapter satisfying that port. Today it's the only one in this repo; the abstraction paid for itself when the agent layer moved from a hand-rolled loop into AptKit's shared runtime.
+Zoom in: the port is `ModelProvider`; the adapter is `AnthropicModelProviderAdapter`. Same shape whenever this codebase generalizes a boundary — see the parallel case for the data source (`DataSource` port, `McpDataSource` / `SyntheticDataSource` adapters).
 
 ## Structure pass
 
-**Layers:**
-- Outer: AptKit agents (own no SDK code, only depend on the port)
-- Middle: the adapter (SDK-specific, ~85 lines here)
-- Inner: `@anthropic-ai/sdk` (vendor-specific HTTP client)
-
-**Axis: dependency direction.**
-- Above the port: agents DEPEND ON `ModelProvider` (dependency inversion)
-- Below the port: adapter DEPENDS ON both the port AND the SDK
-- The port defines the vocabulary (`ModelRequest`, `ModelResponse`, `ModelContentBlock`)
-
-**Seam:** the `ModelProvider` interface (from `@aptkit/core`). Above the seam, everything speaks in typed `ModelRequest` / `ModelResponse` — no SDK types. Below the seam, the adapter maps to whichever vendor's shapes.
+- **Layers:** agent → port → adapter → SDK → HTTP → provider. Six bands.
+- **Axis: dependency direction.** Agents depend *on the port*, not on the adapter. The adapter depends on the SDK. That's dependency inversion applied cleanly — the agent doesn't know which provider is on the other side.
+- **Seam:** the `ModelProvider` interface itself. Everything above the seam is provider-agnostic; everything below is Anthropic-specific.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You've written a `logger.debug()` interface, then had `ConsoleLogger` and `PinoLogger` implementations. Same idea: the port names what the caller needs (`complete(request): Promise<Response>`); the adapter implements it against a specific tool. Swapping loggers is a config change, not a rewrite. Swapping model providers is the same shape.
+Think of the interface (`ModelProvider`) as a wall socket. Every consumer (agent) plugs into the same socket. Any provider that can supply the right shape can go behind the wall — Anthropic today, OpenAI tomorrow, a local Ollama variant next week. The consumers don't know or care.
 
 ```
-  Port + adapter — the standard pattern
+  Port + adapter — the pattern
 
-  ┌─── interface (the "port") ───┐
-  │  ModelProvider                │
-  │    complete(req): Promise<res>│
-  └───────────────┬───────────────┘
-                  │  implemented by
-    ┌─────────────┼─────────────┐
-    ▼             ▼             ▼
-  Anthropic    OpenAI        Google
-  adapter      adapter       adapter
-  (this repo)  (potential)   (potential)
-    │             │             │
-    ▼             ▼             ▼
-  @anthropic     openai         @google/
-    -ai/sdk      SDK              genai
+           ┌──────────────────────┐
+  agent ──▶│   ModelProvider port │  the "wall socket"
+           └──────────┬───────────┘
+                      │
+                 ┌────┴─────┬─────────────┬──────────┐
+                 ▼          ▼             ▼          ▼
+        AnthropicAdapter  OpenAIAdapter  Ollama  future...
+        (this repo)        (not built)   (not built)
 ```
 
-### Move 2 — walk the mechanism
+The value shows up the day you want to add a second provider. Because agents already depend on the port, adding an adapter is *purely additive* — no touching agents, no touching routes, no touching evals.
 
-**The port (imported from AptKit).**
+### Move 2 — the step-by-step walkthrough
 
-`@aptkit/core` defines `ModelProvider`:
+**The port shape.** `ModelProvider` from `@aptkit/core` defines:
 
-```typescript
-// simplified from @aptkit/core
-export interface ModelProvider {
-  readonly id: string;                                    // 'anthropic', 'openai', etc.
+```ts
+// conceptual — the real definition lives in @aptkit/core
+interface ModelProvider {
+  readonly id: string;
   readonly defaultModel: string;
   complete(request: ModelRequest): Promise<ModelResponse>;
 }
-
-export interface ModelRequest {
-  messages: ModelMessage[];
-  system?: string;
-  tools?: ModelTool[];
-  maxTokens?: number;
-  temperature?: number;
-  signal?: AbortSignal;
-}
-
-export interface ModelResponse {
-  content: ModelContentBlock[];
-  usage: { inputTokens: number; outputTokens: number };
-  model: string;
-}
 ```
 
-Vocabulary: messages, tools, content blocks. Same shape all three major vendors converged on. AptKit's agents write against this shape and this shape only.
+`ModelRequest` carries messages, tools, `maxTokens`, and optional temperature/top_p (see **03-sampling-parameters.md**). `ModelResponse` carries content blocks (text + tool_use) and usage.
 
-**The adapter (this repo's code).**
+**The Anthropic adapter.** `lib/agents/aptkit-adapters.ts:37-105` — one class, ~70 lines. It:
 
-`lib/agents/aptkit-adapters.ts:35-121`. `AnthropicModelProviderAdapter implements ModelProvider`. Three things happen inside:
+1. Holds the Anthropic SDK client, agent name, session id, model name, and optional budget tracker.
+2. On `complete()`, checks the budget ceiling (`lib/agents/aptkit-adapters.ts:65-67`).
+3. Translates `ModelRequest.messages` into Anthropic's `{role, content}` shape.
+4. Injects the cache_control breakpoint on the system prompt (`lib/agents/aptkit-adapters.ts:75-98`).
+5. Calls `anthropic.messages.create()`.
+6. Translates the response back into `ModelResponse` shape.
 
-1. **Map `ModelRequest` → Anthropic params.** The `toAnthropicMessage` and `toAnthropicTool` helpers walk the arrays and produce the SDK's `Anthropic.Messages.MessageParam[]` and `Anthropic.Messages.Tool[]`.
-2. **Call the SDK.** `this.anthropic.messages.create(params, ...)`.
-3. **Map response back.** `response.content.flatMap(toModelContentBlock)` unwraps `text` and `tool_use` blocks into AptKit's `ModelContentBlock[]`.
+That's the whole adapter contract. Every agent in this repo instantiates this adapter and passes it into aptkit's agent class:
 
-Plus two orthogonal behaviors the adapter is the right place for (both discussed at length in their own files): **prompt caching** (wraps the system prompt in `cache_control: ephemeral`) and **budget gating** (checks `BudgetTracker.exceeded()` before dispatching, throws `BudgetExceededError` if so).
-
-**Where the adapter is constructed.**
-
-Every agent constructor takes an Anthropic client + creates the adapter:
-
-```typescript
-// lib/agents/diagnostic.ts:46-63 (abbreviated)
-async investigate(anomaly, hooks = {}) {
-  const agent = new AptKitDiagnosticInvestigationAgent({
-    model: new AnthropicModelProviderAdapter(
-      this.anthropic,
-      'diagnostic',
-      this.sessionId,
-      undefined,             // model — falls back to AGENT_MODEL
-      undefined,             // logSite — falls back to default
-      hooks.budget,          // the shared BudgetTracker
-    ),
-    tools: new BloomingToolRegistryAdapter(this.dataSource, this.allTools),
-    workspace: this.schema,
-    trace: new BloomingTraceSinkAdapter(hooks, 'diagnostic'),
-  });
-  return toBloomingDiagnosis(await agent.investigate(anomaly, { signal: hooks.signal }));
-}
+```ts
+// lib/agents/diagnostic.ts:48 (inside investigate())
+const agent = new AptKitDiagnosticInvestigationAgent({
+  model: new AnthropicModelProviderAdapter(
+    this.anthropic, 'diagnostic', this.sessionId,
+    undefined, undefined, hooks.budget,
+  ),
+  tools: new BloomingToolRegistryAdapter(this.dataSource, this.allTools),
+  workspace: this.schema,
+  trace: new BloomingTraceSinkAdapter(hooks, 'diagnostic'),
+});
 ```
 
-Every agent (`MonitoringAgent`, `DiagnosticAgent`, `RecommendationAgent`) constructs its own adapter instance. Same pattern; the tools registry and trace sink also follow the port-adapter shape.
+Three adapters injected: model provider, tool registry, trace sink. All ports; all swappable.
 
-**Why not one shared adapter instance?**
+**The intent classifier reuses the same adapter, different model.** `lib/agents/intent.ts:19` — same class, different constructor argument for `CLASSIFIER_MODEL`. Provider abstraction plus model-per-call gives you fine-grained cost control.
 
-Each investigation needs its own `BudgetTracker` (the ceiling is per-investigation, not global). Since the tracker is injected into the adapter, the adapter is per-investigation too. Cheap to construct — no SDK reconnect, just a class instance holding references.
+**What's Anthropic-specific and hidden behind the seam.** Cache_control (only Anthropic supports it in this shape), the exact `MessageCreateParams.system` structure with `cache_control: { type: "ephemeral" }`, the `tool_choice` fields. Every one of these is inside the adapter; none leak upward.
+
+Diagram of one call in the port/adapter shape:
+
+```
+  One .complete() call — layers-and-hops
+
+  ┌─ agent ────────┐  hop 1: complete(ModelRequest)   ┌─ adapter ─────┐
+  │ DiagnosticAgent│ ──────────────────────────────► │ .complete()   │
+  └────────────────┘  hop 4: ModelResponse ◄──────── └──────┬────────┘
+                                                       hop 2│ anthropic.messages.create()
+                                                            ▼
+                                                     ┌─ SDK ──────────┐
+                                                     │ @anthropic-ai/ │
+                                                     │  sdk           │
+                                                     └──────┬─────────┘
+                                                       hop 3│ HTTP
+                                                            ▼
+                                                       provider
+```
+
+### Move 2.5 — current state vs future state
+
+The `ModelProvider` port is fully live and used by every agent. The Anthropic adapter is the only implementation. The plumbing for a second adapter is real — aptkit's port is provider-neutral by design, and this codebase's agent layer holds no Anthropic types directly.
+
+What would need to change to add OpenAI:
+
+- One new file: `lib/agents/openai-adapter.ts` implementing `ModelProvider`.
+- One env / config gate to pick which adapter each agent uses.
+- No change to `diagnostic.ts`, `recommendation.ts`, `monitoring.ts`, `query.ts`, `intent.ts`, or any route.
+
+The pricing helper (`lib/agents/pricing.ts`) would grow OpenAI rows; the receipts pipeline already carries a `modelName` so the report would attribute correctly.
 
 ### Move 3 — the principle
 
-Depend on the port, not the vendor. Every LLM SDK will change; every LLM provider's pricing will change; every provider's tool-call shape has minor differences. The port is what your agent loop touches; the adapter absorbs the specifics. When the swap happens — new vendor, new SDK version, migration to a self-hosted model — you rewrite one file, not the whole agent layer.
+Depend on ports, not on implementations. When a boundary is likely to change (provider, storage, transport), invert the direction so your consumers depend on an abstraction you own. The concrete implementation becomes a leaf you can swap or add without ripples.
 
 ## Primary diagram
 
-The port in full — from agent to SDK, in one frame.
-
 ```
-  Provider abstraction — the full path
+  Provider abstraction — full frame
 
-  ┌─ AptKit agent code ────────────────────────────────────────────────┐
-  │  class DiagnosticInvestigationAgent {                              │
-  │    constructor(cfg: { model: ModelProvider, tools, workspace, ... })│
-  │    async investigate(anomaly) {                                    │
-  │      const response = await this.model.complete({                  │
-  │        messages, system, tools, ...                                │
-  │      });                                                            │
-  │      // walks content, dispatches tool_use to tools registry       │
-  │    }                                                                │
-  │  }                                                                  │
-  └────────────────────┬───────────────────────────────────────────────┘
-                       │  ModelProvider interface
-                       │  (no SDK types, no vendor names)
-  ┌────────────────────▼───────────────────────────────────────────────┐
-  │  class AnthropicModelProviderAdapter implements ModelProvider {    │
-  │    async complete(request) {                                       │
-  │      if (this.budget?.exceeded()) throw BudgetExceededError;       │
-  │      const params = mapRequest(request);   // ModelRequest → SDK   │
-  │      params.system = wrapWithCacheControl(request.system);         │
-  │      const resp = await this.anthropic.messages.create(params);    │
-  │      this.budget?.add(resp.usage);                                 │
-  │      return mapResponse(resp);              // SDK → ModelResponse │
-  │    }                                                                │
-  │  }                                                                  │
-  └────────────────────┬───────────────────────────────────────────────┘
-                       │  @anthropic-ai/sdk
-  ┌────────────────────▼───────────────────────────────────────────────┐
-  │  Anthropic SDK client                                               │
-  │  · POST https://api.anthropic.com/v1/messages                       │
-  └────────────────────────────────────────────────────────────────────┘
+  ┌─ Agent layer (5 agents) ────────────────────────────────┐
+  │  DiagnosticAgent · RecommendationAgent · MonitoringAgent │
+  │  QueryAgent · classifyIntent                              │
+  │  all depend on ModelProvider port only                    │
+  └──────────────────────┬──────────────────────────────────┘
+                         │  ModelRequest → ModelResponse
+                         ▼
+  ┌─ ModelProvider port (from @aptkit/core) ────────────────┐
+  │  interface ModelProvider { complete(req): Promise<res> } │
+  └──────────────────────┬──────────────────────────────────┘
+                         │  implemented by
+                         ▼
+  ┌─ Concrete adapters ─────────────────────────────────────┐
+  │                                                          │
+  │  ★ AnthropicModelProviderAdapter (only impl today)       │
+  │      lib/agents/aptkit-adapters.ts:37                    │
+  │                                                          │
+  │  [OpenAIAdapter — not built; one file to add]           │
+  │  [OllamaAdapter — not built; one file to add]           │
+  │                                                          │
+  └──────────────────────┬──────────────────────────────────┘
+                         │
+                         ▼
+                     provider SDK
 ```
 
 ## Elaborate
 
-Provider convergence made this abstraction cheap. In 2023, OpenAI, Anthropic, and Google had three different tool-call formats. By 2025, they'd converged on essentially the same shape — a JSON Schema tool definition, a tool_use block in the response, a tool_result block in the next user turn. That's why a single `ModelProvider` interface can cover all three without leaking vendor-specific concepts into the port.
+The pattern this codebase uses matches the shape "ports and adapters" (Alistair Cockburn's hexagonal architecture, ~2005) applied to a single dependency. The value proposition is *swappability at a low blast radius* — swaps happen at a single file, not a code-wide grep.
 
-The parts that DON'T converge: prompt caching (Anthropic's ephemeral, OpenAI's automatic, Google's cached content), extended thinking / reasoning models (Anthropic's `thinking` parameter, OpenAI's reasoning models with different token accounting), fine-tuned model naming. These leak through as adapter-specific behaviors — this repo's Anthropic adapter has its own `cache_control` wrapping and its own logging; an OpenAI adapter would have its own equivalents.
+The port is only worth having when the underlying dependency is expected to change. LLM providers are — every 6-12 months a new model or provider becomes relevant. Storage engines change less; you might not port-abstract Postgres.
+
+Related: **04-structured-outputs.md** (the tool schema surface flows through the port cleanly). The DataSource seam in `lib/data-source/types.ts` — five uses without a caller-surface change — is the parallel case for the data provider port; see the AGENTS.md and the audit files for the systems view.
 
 ## Project exercises
 
-### Exercise — a second adapter (OpenAI)
+### B1.8 · Add a second ModelProvider adapter
 
-- **Exercise ID:** C1.8-A · Case A (concept exercised; second adapter validates the port).
-- **What to build:** `OpenAIModelProviderAdapter` in `lib/agents/aptkit-adapters.ts` (or a new file). Reads `OPENAI_API_KEY`, calls `openai.chat.completions.create()`, maps content blocks. Add a factory `getModelProvider(env)` that picks based on `MODEL_PROVIDER=anthropic|openai`. Run one golden case end-to-end against gpt-4o (or o3-mini) with no changes to the agents themselves.
-- **Why it earns its place:** the abstraction has been "used once" (Anthropic-only). Adding a second implementation is where the port either holds or leaks. Interviewer signal: "I built the port before I needed it; here's the second adapter I built when it was tested."
-- **Files to touch:** `lib/agents/aptkit-adapters.ts` (add adapter), `lib/agents/base.ts` (add factory + `MODEL_PROVIDER` env), `app/api/agent/route.ts` (read env, pick provider), `__tests__/openai-adapter.test.ts`.
-- **Done when:** `MODEL_PROVIDER=openai npm run eval` on one case produces a valid `Diagnosis`, receipt shows OpenAI usage rows, budget accounting works against OpenAI's pricing.
-- **Estimated effort:** 1-2 days.
+- **Exercise ID:** B1.8
+- **What to build:** Implement `OpenAIModelProviderAdapter` in `lib/agents/openai-adapter.ts`, mapping OpenAI's `chat.completions` API to aptkit's `ModelProvider` port. Add OpenAI pricing rows to `lib/agents/pricing.ts`. Wire an env flag to let the intent classifier use OpenAI while agents stay on Anthropic.
+- **Why it earns its place:** Turns "the port exists" into "the port is proven" — one adapter is architecture, two adapters is evidence.
+- **Files to touch:** New `lib/agents/openai-adapter.ts`, extend `lib/agents/pricing.ts` (add gpt-4o + gpt-4o-mini pricing), extend `lib/agents/intent.ts` (env-flag the classifier's provider), new `test/agents/openai-adapter.test.ts`.
+- **Done when:** the intent classifier runs on OpenAI with `AI_INTENT_PROVIDER=openai`, receipts carry the correct model + cost, and no agent code changes.
+- **Estimated effort:** `1–2 days`.
 
 ## Interview defense
 
-**Q: Why not just call Anthropic directly from the agent code?**
+**Q: Why not just call `anthropic.messages.create()` from the agents directly?**
 
-Because the agent code isn't mine — it's `@aptkit/core`. Multiple codebases use AptKit's agents; each one plugs in its own provider adapter. The port is what makes that possible: my repo says "here's an Anthropic adapter"; another repo could say "here's an OpenAI adapter"; the agent code and the loop logic are identical.
+Because the agents would then depend on the Anthropic SDK, and swapping providers would mean touching every agent. Right now the SDK import lives in exactly one file: `lib/agents/aptkit-adapters.ts`. Every agent imports `AnthropicModelProviderAdapter` (or aptkit's port type), never the SDK. The load-bearing part: if I need to add OpenAI tomorrow, I write one file and every agent works.
 
-**Q: What's the shape of the port?**
+```
+  What changes when we swap providers
 
-Three types matter: `ModelRequest` (messages, system, tools, maxTokens, temperature, signal), `ModelResponse` (content blocks, usage, model name), `ModelContentBlock` (a union of `{type: 'text', text}` and `{type: 'tool_use', id, name, input}`). No vendor names in any of those. That's what makes it a real port and not a leaky one.
+  before port:  every agent has `import Anthropic from ...`
+                → swap = 5 file changes + evals + judge
+  after port:   only the adapter has that import
+                → swap = 1 new adapter file, 0 agent changes
+```
 
-**Q: What's leaked through the port?**
+**Q: Doesn't aptkit already give you provider neutrality?**
 
-Two things. Model naming — the port takes a `string` for the model, but the format of that string is vendor-specific (`claude-sonnet-4-6` vs `gpt-4o`). And provider-specific features that don't have port equivalents — Anthropic's `cache_control` breakpoint is applied inside my adapter, not surfaced up to AptKit. That's a tradeoff: the port stays clean, but my adapter has more logic. I'd rather that than a leaky abstraction.
+Yes — aptkit's `ModelProvider` port is what makes this work. My code writes the *Blooming-side* adapter that maps our concrete Anthropic client into that port. Aptkit ships zero provider adapters itself; the port is the promise, and each app writes its own adapter. In practice this codebase is what proves the port is well-designed — 260 LOC of adapter code, and every eval + observability layer works unchanged.
 
 ## See also
 
-- `01-what-an-llm-is.md` — the single call the adapter mediates
-- `04-structured-outputs.md` — the tool_use shape that survives across providers
-- `06-production-serving/01-llm-caching.md` — the Anthropic-specific cache_control breakpoint
-- `lib/agents/aptkit-adapters.ts` — the adapter, in full
+- [01-what-an-llm-is.md](01-what-an-llm-is.md) — the primitive the adapter exposes.
+- [04-structured-outputs.md](04-structured-outputs.md) — the tool schemas that flow through the port.
+- [../06-production-serving/02-llm-cost-optimization.md](../06-production-serving/02-llm-cost-optimization.md) — per-agent model choice, made possible by this abstraction.

@@ -1,196 +1,366 @@
-# Security audit — the 8 lenses walked
+# audit.md — the 8-lens security sweep
 
-Eight lenses over blooming insights. Each names what the codebase actually does with `file:line` grounding, or emits `not yet exercised` honestly. When a finding earns a deep walk, the lens cross-links to a numbered pattern file rather than restating.
+One `##` section per lens. Real files, real line ranges. Where the repo doesn't
+exercise a lens, it says so and names what would earn it.
 
-Everything below is defensive: name the weakness, name the fix, no attack recipes.
+## Verdict up front
 
----
+**The one that would break you first.** Live agents run against every tool the
+MCP server exposes, not just the per-agent subset. The per-agent tool whitelist
+(`monitoringTools`, `diagnosticTools`, `recommendationTools` in
+`lib/mcp/tools.ts`) is only consumed by the `-legacy` classes — the live
+`MonitoringAgent` / `DiagnosticAgent` / `RecommendationAgent` / `QueryAgent`
+pass `allTools` directly to AptKit's registry (see `lib/agents/monitoring.ts:86`,
+`lib/agents/diagnostic.ts:56`, `lib/agents/recommendation.ts:40`,
+`lib/agents/query.ts:27`). This is the LLM/agent-security lens (§7) below —
+scope regression from the AptKit migration.
 
-## 1. Trust boundaries and attack surface
+**Second-worst.** The visitor-controlled MCP URL. UI now lets anyone paste an
+arbitrary URL (`components/settings/McpConfigModal.tsx:126`); that URL sees
+every tool call the agent makes. Warned in the UI, validated server-side, but
+it's a real new trust boundary — walked in
+`03-user-chosen-mcp-url-boundary.md`.
 
-The zoom-out. Three hops cross a boundary; every request into the trusted core enters through one of four channels.
+**What's actually strong.** The auth-cookie discipline
+(AES-256-GCM + ALS-scoped RequestStore + one seed + one flush) in
+`lib/mcp/auth.ts:86-104`, and the type-guard-at-model-output seam in
+`lib/mcp/validate.ts:17-57`. Both survive a hard look.
 
-```
-  Boundaries + channels that carry untrusted input
+## 1. trust-boundaries-and-attack-surface
 
-  Browser ──HTTP──► Next.js server ──HTTP──► Bloomreach MCP
-                        │
-                        └──HTTPS──► Anthropic API
-                             │        (response ⇐ untrusted)
-                             ▼
-                        model output back into the server
-```
+Three trust boundaries. Not four — the retired Olist synthetic subprocess is
+gone; only the AptKit-in-process synthetic remains
+(`lib/data-source/synthetic-data-source.ts`), which shares the route's trust
+domain.
 
-**Input channels the trusted core has to defend:**
+**Boundary 1 — browser ↔ Next routes.** Every request rides three surfaces:
 
-- `app/api/agent/route.ts:109-115` — query params `insightId`, `insight` (JSON), `q`, `live`, `step`, `diagnosis` (JSON). The two JSON params are parsed with a shape check (`route.ts:32-43` for `insight`, `82-92` for `diagnosis`) and drop malformed input silently — good.
-- `app/api/briefing/route.ts:77-98` — one param, `demo=cached`. Parsed as a boolean; the demo file is server-owned. Low surface.
-- `app/api/mcp/call/route.ts:22-30` — POST body `{ name, args }` where `name` is checked against `ALL_KNOWN` (the union of every constant in `lib/mcp/tools.ts`) before dispatch. This is the strongest gate in the repo → see `03-read-only-tool-allowlist.md`.
-- `app/api/mcp/callback/route.ts:15` — the OAuth `?code` return from Bloomreach. `state` is deliberately not re-validated at this layer (`callback/route.ts:22-27`); comment cites the SDK's own multi-call state handling.
+  → `bi_session` cookie (`lib/mcp/session.ts:1-24`) — the identity anchor;
+    `HttpOnly`, `SameSite=None` + `Secure` in prod, `Lax` in dev.
+  → `bi_auth` cookie (`lib/mcp/auth.ts:48-104`) — AES-256-GCM ciphertext of
+    the per-session OAuth store (DCR client info, PKCE verifier, tokens).
+  → `x-bi-mcp-config` header (`lib/mcp/config.ts:37`) — base64-JSON of the
+    UI-picked MCP config override, re-attached to every streaming fetch.
 
-**Model output as an input channel.** This is the load-bearing bit for an LLM app. The three agent outputs — anomalies, diagnosis, recommendations — are parsed via `parseAgentJson` (`lib/mcp/validate.ts:3`) and shape-checked before crossing back into the trusted state store or the UI. See `04-model-output-type-guards.md`.
+  Also relevant: query params on `/api/agent` (`insightId`, `q`, `insight`,
+  `diagnosis` — all JSON-shaped) and `/api/mcp/callback` (`code`, `error`).
 
-**Red flag: an input treated as trusted because it "comes from our own frontend."** Doesn't fire. The `?insight=` JSON param is parsed defensively (`route.ts:32-43`) and only extracts the five fields `insightToAnomaly` needs (`lib/state/insights.ts:53-55`) — extra fields are dropped. The client-side sessionStorage handoff to `?insight=` in the investigate flow does not grant trust; every field is re-validated server-side.
+**Boundary 2 — routes ↔ Anthropic.** Server-side, HTTPS, `ANTHROPIC_API_KEY`
+from env. No user-controlled path here — the key is server-owned.
 
----
+**Boundary 3 — routes ↔ MCP server.** The one that changed in Session D. Was
+"always Bloomreach loomi alpha," now: whatever URL the visitor's browser
+supplies via the config header (`components/settings/McpConfigModal.tsx:126`),
+falling through to `MCP_URL` env, `BLOOMREACH_MCP_URL` env, or the hardcoded
+alpha default. Precedence chain lives in `lib/mcp/connect.ts:38-48`. The MCP
+server sees every tool call. Deep walk in
+`03-user-chosen-mcp-url-boundary.md`.
 
-## 2. Authentication and authorization
-
-**Who-are-you** — encrypted-cookie session + Bloomreach OAuth. Two cookies, one purpose each:
-
-- `bi_session` (`lib/mcp/session.ts:3`) — a UUID keying the app's session identity. `httpOnly`, `SameSite=None + Secure` in prod (`session.ts:11-12`) so it survives the cross-site OAuth return; `SameSite=Lax` in local dev where `Secure` would drop the cookie over http.
-- `bi_auth` (`lib/mcp/auth.ts:48`) — AES-256-GCM ciphertext of the whole `Store` (client info + tokens + PKCE verifier), keyed off `AUTH_SECRET` via `createHash('sha256').update(secret).digest()` (`auth.ts:51-60`). GCM auth tag is stored inline. → deep walk: `01-encrypted-cookie-auth-store.md`.
-
-The Bloomreach handshake is OAuth 2.1 + PKCE + Dynamic Client Registration (`clientMetadata` in `auth.ts:172-181` declares public client, `token_endpoint_auth_method: 'none'`). → deep walk: `02-oauth-pkce-with-dcr.md`.
-
-**What-can-you-do** — one level of authorization: has-tokens. `hasTokens(sessionId)` at `auth.ts:220-222` gates whether the MCP transport is usable. There's no per-tenant or per-workspace scope beyond that; a session that has authenticated once can call any Bloomreach tool the app whitelist permits (`03-read-only-tool-allowlist.md`).
-
-**Red flag: an endpoint that checks logged-in but not allowed.** Partial fire — the endpoints do gate on session + auth, but the *investigation replay cache* in `lib/state/investigations.ts:22-28` skips both checks. See `00-overview.md` finding 2. The insights cache does not have this problem (`lib/state/insights.ts:73-79` is session-scoped).
-
----
-
-## 3. Input validation and injection
-
-**No SQL.** No relational database exists in the request path. State lives in in-memory Maps and gitignored JSON caches (`lib/state/*.ts`, `.auth-cache.json`, `.investigation-cache.json`). No string-built query anywhere in `lib/` or `app/`.
-
-**No shell.** No `child_process`, no `exec`, no `spawn`. No filesystem writes that take user-controlled paths (the dev-only capture route in `app/api/mcp/capture/route.ts:42` uses a fixed `test/fixtures/` prefix; the tool name is loop-bounded by the `BOOTSTRAP_TOOLS` constant).
-
-**EQL as a sink.** `execute_analytics_eql` is a whitelisted tool the model calls. The EQL string itself is emitted *by the model*, not the user — the input path is:
-
-```
-  user question (q) → intent classifier → QueryAgent → model → EQL → MCP
-                                                          ▲
-                                                          │
-                                                       untrusted
-```
-
-The mitigation is that the MCP server is read-only (all whitelisted tools are `list_*`, `get_*`, `execute_analytics_eql` reads — no writes or destructive ops in `lib/mcp/tools.ts:6-35`). A prompt-injected hostile EQL string can only exfiltrate data the authenticated session already has access to, not mutate it.
-
-**Prompt injection via retrieved content.** The model receives:
-- workspace schema (`lib/mcp/schema.ts` — server-side derived from bootstrap MCP calls)
-- tool results (Bloomreach responses)
-- the user's free-form question in the query flow
-
-None of these are hard-partitioned from the system prompt. The system prompt lives in `lib/agents/prompts/*.md` (server-owned). Tool results from Bloomreach are semi-trusted — a workspace admin could theoretically inject prompt fragments into event names or customer property strings. The blast radius stays bounded by (a) the read-only tool set and (b) the type-guard at model output (`04-model-output-type-guards.md`).
-
-**Red flag: string-built query or prompt with user input in it.** Half-fires. The system prompts are static files. But the free-form `q` in `app/api/agent/route.ts:112` flows into `classifyIntent` (`lib/agents/intent.ts:21-38`) and `QueryAgent.answer` (`lib/agents/query.ts:24-33`) as the user message — the model sees it verbatim. The intent classifier's job is precisely to route intent; the risk isn't the string reaching the model but the model treating a prompt-injection payload as a directive. See lens 7.
-
-**No XSS surface reached.** No `dangerouslySetInnerHTML` in `components/` or `app/`. No `innerHTML`. No `document.write`. All model output that reaches the UI passes through React's default text-escaping.
-
----
-
-## 4. Secrets and configuration
-
-Two secrets exist:
-
-- `ANTHROPIC_API_KEY` — server-only. Referenced at `app/api/agent/route.ts:154`, `app/api/briefing/route.ts:156`, and passed to `new Anthropic({ apiKey: ... })` in the same route files. Never crosses to a `NEXT_PUBLIC_*` var; never in a client bundle.
-- `AUTH_SECRET` — server-only. Referenced only in `lib/mcp/auth.ts:52-58`. `aesKey()` throws if unset in production, which surfaces as a real 500 message via the route's setup catch (`route.ts:163-171`) rather than a silent crypto fail.
-
-`BLOOMREACH_MCP_URL` (`lib/mcp/connect.ts:31`) and `APP_ORIGIN` (`connect.ts:56`) are config, not secrets.
-
-**Env hygiene.** `.gitignore` covers `.env*` with a `!.env.example` exception (`.gitignore` head). `.env.example`, `.env.local`, `.env.prod` and the two cache files live locally only. Grep for `sk-`, `key`, `secret` across the codebase turns up only variable *references* (`process.env.X`), not literals.
-
-**CI.** `.github/workflows/ci.yml:42-54` passes fake secrets at build time — `sk-fake-key-for-ci`, `ci-fake-auth-secret-32-chars-minimum-length`. Real secrets are Vercel deploy env, not CI. Correct posture.
-
-**Red flag: a secret in source, in a client bundle, or in logs.** None fire. The log-side is defended by `redactSecrets` (`lib/mcp/transport.ts:66-76`) which strips Bearer, `access_token`, `refresh_token`, `id_token`, `code_verifier` before the surfaced error text hits `console.error`. → deep walk: `06-log-secret-redaction.md`.
-
----
-
-## 5. Data exposure and privacy
-
-**Session-scoped state — mostly.** `lib/state/insights.ts:14-23` keys everything by `sessionId`; `getInsight`, `getAnomaly`, `listInsights` all narrow to `state.get(sessionId)`. A briefing run's `putInsights` (`insights.ts:57-71`) only clears the caller's sub-map, never another session's.
-
-**Investigation cache is NOT session-scoped.** `lib/state/investigations.ts:22-28`. See `00-overview.md` finding 2. This is the one leaky surface.
-
-**Verbose errors.** The `.catch` blocks in the routes surface `e.message` to the client (`app/api/agent/route.ts:314-315`, `app/api/briefing/route.ts`). Message content flows through `redactSecrets` before it hits `console.error`, but the response-body variant does NOT get redacted:
-
-- `app/api/agent/route.ts:313-316` — `send({ type: 'error', message: '/api/agent · ' + e.message })` — no redaction on the wire.
-- `app/api/mcp/call/route.ts:37-40` — same pattern for the 500 JSON.
-
-A rate-limit or 401 error from Bloomreach that carries a bearer echoback in the body would land in the client-visible error. The `SdkTransport.callTool` path already redacts the captured body (`transport.ts:107-118`) before storing it in the holder, so the specific "server bounced our bearer back" case *is* covered — but the `redactSecrets` call chain is not applied uniformly on the error-response side. Move the redaction into `formatError`'s output before it's substituted into the response body, and both paths are covered.
-
-**PII in logs.** The per-turn usage log (`aptkit-adapters.ts:97-102`) emits `sessionId` — a synthetic UUID, not PII — and `response.usage` (token counts). The briefing route's log payload (`briefing/route.ts:200+`) matches. No email, no user ids, no customer data.
-
-**Red flag: an error or API response that returns more than the caller is entitled to.** Fires for the investigation cache (finding 2). Doesn't fire for the insight endpoints.
-
----
-
-## 6. Dependencies and supply chain
-
-**Lockfile present.** `package-lock.json` in the repo (implied by `package.json` and `npm ci` in `ci.yml:29`).
-
-**Direct dependencies from `package.json`:**
+**Attack surface, in one picture.**
 
 ```
-  @anthropic-ai/sdk         ^0.99.0
-  @aptkit/core              npm:@rlynjb/aptkit-core@^0.3.0
-  @modelcontextprotocol/sdk ^1.29.0
-  lucide-react              ^1.17.0
-  next                      16.2.6
-  react                     19.2.4
-  react-dom                 19.2.4
+  Everything hostile until proven otherwise
+
+  visitor's browser
+    ├─ URL / query params ─────────┐
+    ├─ cookies (bi_session, bi_auth) │  → app/api/agent/route.ts
+    ├─ x-bi-mcp-config header ─────┤    app/api/briefing/route.ts
+    ├─ ?insight= (JSON blob) ──────┤    app/api/mcp/*/route.ts
+    └─ ?q= (free-form text) ───────┘
+
+  Anthropic response (model output)
+    └─ tool_use inputs ────────────► lib/mcp/validate.ts (type-guarded)
+
+  MCP server response
+    └─ JSON envelope ──────────────► lib/mcp/transport.ts (captured, redacted)
+
+  Environment
+    └─ MCP_URL / MCP_AUTH_TOKEN ───► trusted by shape; not by content
 ```
 
-**Notable:** `@aptkit/core` aliases to `@rlynjb/aptkit-core`, a namespaced package the repo owner publishes. The trust boundary is real — the agent loops and tool registry contract come from that package — but the ownership is internal. Manage it as a separate publish; a compromised aptkit publish is a compromised blooming_insights.
+Red flag caught: the query-param `?insight=` JSON blob is parsed with a
+loose `typeof/Array.isArray` shape check (`app/api/agent/route.ts:36-46`) and
+then handed straight to the agent. It doesn't cross a persistence boundary,
+but it does drive the diagnostic agent's prompt. A malformed blob is caught,
+but a well-shaped adversarial blob would pass. Prompt-injection concern only.
 
-**Next 16 + React 19.** Bleeding-edge versions. Not a security finding on its own, but a note the reviewer sees: security advisories for these are the recent kind you have to watch. `AGENTS.md` at repo root explicitly warns that Next 16 has breaking changes and points at `node_modules/next/dist/docs/` — the pattern is to read the shipped docs before writing route code.
+## 2. authentication-and-authorization
 
-**Postinstall / scripts.** None in `package.json`. Nothing runs on `npm ci` beyond the standard install.
+**Authn: strong. Authz: single-user-per-cookie.**
 
-**Red flag: no lockfile, or known CVEs unpatched.** Doesn't fire on lockfile. CVE posture requires an `npm audit` run outside this audit's scope — recommendation is to add `npm audit --production --audit-level=high` to CI's job (currently only `typecheck + test + build` per `ci.yml:31-48`).
+  → OAuth 2.1 + PKCE + Dynamic Client Registration to Bloomreach — walked in
+    `02-oauth-pkce-dcr-boundary.md`. The `BloomreachAuthProvider`
+    (`lib/mcp/auth-providers/bloomreach.ts`, re-exported from `lib/mcp/auth.ts`
+    for backward compat) drives the SDK's flow; PKCE verifier + client info
+    persist across the redirect via the encrypted cookie.
+  → New auth-provider abstraction (Session B) — `BloomreachAuthProvider`,
+    `BearerAuthProvider`, `AnonymousAuthProvider`, all under
+    `lib/mcp/auth-providers/`. Factory: `makeAuthProvider` at
+    `lib/mcp/auth-providers/index.ts:56-76`.
+  → Env parse with validation: `readAuthEnv()` at
+    `lib/mcp/auth-providers/index.ts:44-53` throws if
+    `MCP_AUTH_TYPE=bearer` but `MCP_AUTH_TOKEN` is unset. Server-side guard;
+    fails fast at process start rather than at first tool call.
 
----
+**Authz gap — real but small.** Session-scoped in-memory maps
+(`getAnomaly(sid, id)` in `lib/state/insights.ts`) mean visitor A can't read
+visitor B's anomalies on the same instance. Cross-instance (Vercel ephemeral
+functions), state is instance-local; a request routed to a different instance
+sees `null`. That's not an authz hole so much as no shared store — sessionStorage
+handoff (`?insight=` param) is the real cross-instance channel.
 
-## 7. LLM and agent security
+  Red flag NOT firing: no endpoint that "checks logged-in but not allowed" —
+  because there's only one user's data anyway. This lens fully lights up on a
+  multi-tenant repo; this repo is too small to exercise it.
 
-**Model output is untrusted input.** The top-of-mind defense. → deep walk: `04-model-output-type-guards.md`.
+## 3. input-validation-and-injection
 
-`parseAgentJson` (`lib/mcp/validate.ts:3-13`) extracts JSON from a fenced code block OR the first `[`/`{` in the text, and `JSON.parse` will throw on bad shapes. Three type guards (`isAnomalyArray:17`, `isDiagnosis:29`, `isRecommendationArray:42`) narrow the parsed value before the caller trusts it. What breaks if a guard is missing: an agent returning a plausibly-shaped-but-wrong payload flows into `putInsights` and populates the feed with model-generated garbage. What each guard specifically stops: `isAnomalyArray` requires `severity ∈ SEVERITIES`, `change.direction ∈ up|down`, `metric: string`. A payload with `severity: "urgent"` fails the guard and the anomaly is dropped.
+No SQL, no shell, no fs writes from user input, no server-rendered HTML.
 
-**Tool scope: per-agent gate regressed.** Live agents (`lib/agents/diagnostic.ts:56`, `monitoring.ts:83`, `recommendation.ts:40`, `query.ts:27`) hand `this.allTools` — the full catalog — to `BloomingToolRegistryAdapter`. The per-agent subsets in `lib/mcp/tools.ts` (`monitoringTools`, `diagnosticTools`, `recommendationTools`) exist but are only consumed by the four `*-legacy.ts` classes via `filterToolSchemas` (`tool-schemas.ts:9`). See `03-read-only-tool-allowlist.md` for the client-side gate and `00-overview.md` finding 1 for the fix.
+**Where user input reaches a sink:**
 
-**Tool set is read-only.** Even without per-agent scoping, none of the whitelisted tools mutate Bloomreach state — every entry in `monitoringToolsBloomreach`, `diagnosticToolsBloomreach`, `recommendationToolsBloomreach` (`lib/mcp/tools.ts:6-35`) is a `list_*` / `get_*` / `execute_analytics*` reader. The recommendation agent *proposes* actions (segment / campaign / voucher / experiment) but does not create them.
+  → LLM prompts — `?q=` (free-form) flows into the QueryAgent's system prompt.
+    The intent classifier (`lib/agents/intent.ts`) runs first, but the raw
+    string still lands in the model. Prompt injection is the exposed risk,
+    not string escape. Called out under §7.
+  → EQL queries — the agent (not the user) constructs EQL against the MCP
+    server. No direct user→EQL path.
+  → Header decode — `x-bi-mcp-config` decodes via base64 → JSON → type guard
+    (`lib/mcp/config.ts:87-100`). Malformed input decodes to `null`; bad
+    base64 caught inside the `try` block; unknown `authType` values rejected
+    by `isMcpConfigOverride`. Fail-safe: falls through to env.
+    Deep walk: `04-server-side-config-validation.md`.
+  → `?insight=` param — JSON.parse'd, then a shape check
+    (`typeof metric === 'string' && Array.isArray(scope) && …`)
+    at `app/api/agent/route.ts:36-46`. Malformed blob throws inside the try,
+    caught, falls through to server-side lookup. A well-shaped adversarial
+    blob would pass — but the only sink is the diagnostic agent's prompt, so
+    it collapses into prompt injection again.
 
-**Prompt injection via tool responses.** Bloomreach returns event names, customer property names, and analytics data — a workspace admin could theoretically inject instructions into a display name. The blast radius: (a) read-only tools cap what a hijacked model can do; (b) the type-guard at output cuts off structured injection; (c) unstructured "call this tool with these args" injection still costs a tool call before the model realizes it. This is where the budget ceiling matters most.
+**Red flag caught: no CSP, no strict `Content-Security-Policy` header.** The
+UI renders agent-supplied strings (`InsightCard`, `RecommendationCard` titles
++ rationale) via React — safe against DOM XSS by default (React escapes) — but
+without a CSP an `<img src=x onerror=…>` string that slipped through would
+still be a defense-in-depth gap. Fix: add CSP in `next.config.ts` (headers()
+function) with `default-src 'self'` and Anthropic + MCP hosts in `connect-src`.
 
-**Cost-abuse defense.** `BudgetTracker` + `BudgetExceededError` (`lib/agents/budget.ts`) → deep walk: `05-budget-ceiling-defense.md`. Built + tested; NOT wired into the routes yet. In eval (`eval/run.eval.ts:194-195`) the ceiling is enforced; in production a runaway loop burns whatever the 300s Vercel budget affords.
+## 4. secrets-and-configuration
 
-**Data exfil through tool calls.** The tool set is scoped to the authenticated session's Bloomreach data. Exfil would mean: a compromised model exfils *the current user's own data* to itself, then encodes it into a response the UI displays. The type guards limit what the UI accepts. What they don't do: prevent the model from packing exfil data into a valid-shaped `hypothesis.reasoning` string. If your threat model includes "attacker with prompt-inject access reads your Bloomreach data via the model's response," the current defense is: the attacker already has session auth, so they can already read that data directly.
+**What lives where:**
 
-**Red flag: an agent whose tool set exceeds its task.** Fires. See finding 1 in `00-overview.md`.
+  → `AUTH_SECRET` — env only. Derives the AES-256 key for the auth cookie via
+    `sha256(AUTH_SECRET)` (`lib/mcp/auth.ts:51-60`). Missing in prod → throws
+    a clear error at first cookie touch.
+  → `ANTHROPIC_API_KEY` — env only. Checked at `app/api/agent/route.ts:154-156`;
+    missing → 500 with a plain error.
+  → `MCP_AUTH_TOKEN` — env only, read by `readAuthEnv()`. Never client-visible.
+  → `MCP_URL` / `BLOOMREACH_MCP_URL` — env, non-secret.
+  → OAuth `code_verifier`, `access_token`, `refresh_token`, client info — live
+    inside the encrypted cookie in prod; a gitignored `.auth-cache.json` in
+    dev. Both paths noted in `lib/mcp/auth.ts:22-35`.
+  → **Bearer tokens NEVER land in the encrypted cookie.** The cookie is
+    reserved for OAuth (session-persisted). Bearer stays in localStorage
+    (client-only) or env (server-only). This is the design invariant that
+    keeps the cookie's threat model clean.
 
-**Red flag: model output flowing into a sink without a gate.** Doesn't fire — the gate is `parseAgentJson` + type guards.
+**.gitignore audit.** `.env*` (with `!.env.example` allowlist),
+`.auth-cache.json`, `.investigation-cache.json` — all excluded. No secrets
+committed. Lockfile present (`package-lock.json`).
 
----
+**Bundle-side secrets.** None. Every secret above is `process.env.*` reads
+inside `app/api/**` or `lib/mcp/**` — server-only surfaces. Client code only
+touches localStorage.
 
-## 8. Security red flags — the audit capstone
+**Log hygiene.** `redactSecrets` (`lib/mcp/transport.ts:66-76`) strips
+`Bearer …`, `access_token`, `refresh_token`, `id_token`, `code_verifier`
+matches from any string headed to `console.error`. Called at every error path
+in `/api/agent` and `/api/briefing` (`route.ts:174, 317`). Deep walk:
+`06-secret-redaction-in-errors.md`.
 
-The consolidated checklist, marked against this repo.
+**Red flag caught: dev auth cache holds tokens in plaintext.** Called out in
+`lib/mcp/auth.ts:32-33` — local-only, gitignored, but a stolen laptop with a
+dev checkout still exposes them. Live tokens rotate on the alpha server anyway
+(minutes-long window), so the residual exposure is small. Called out honestly,
+not fixed.
 
-| # | Red flag | Fires? | Where | One-line fix |
-|---|---|---|---|---|
-| 1 | Input treated as trusted because it "came from our frontend" | No | `route.ts:32-43` (?insight= re-validated) | — |
-| 2 | Endpoint checks logged-in but not allowed | Partial | `investigations.ts:22-28` (no session scope) | Key cache by `(sessionId, insightId)` |
-| 3 | String-built query / prompt with user input | Half | `q` reaches the classifier as user turn | System prompts static; risk is prompt-inject, not string concat |
-| 4 | Secret in source / client bundle / logs | No | `redactSecrets` covers logs; env-gated CI | — |
-| 5 | Response returns more than caller is entitled to | Yes | `investigations.ts:22` cache leak | Session-scope the cache |
-| 6 | No lockfile / unpatched known CVE | No lockfile-side; CVE side unknown | `package-lock.json` present | Add `npm audit --audit-level=high` to CI |
-| 7 | Agent has more tools than its task needs | Yes | Live agents get `allTools` unfiltered | Wire `filterToolSchemas` into the registry adapter → `03-read-only-tool-allowlist.md` |
-| 8 | Model output flows to a sink without a gate | No | `parseAgentJson` + type guards | — |
-| 9 | Missing CSRF on state-changing POSTs | N/A | POST endpoints require session cookie + are behind SameSite=None (which weakens the classical CSRF defense); mitigation is that the two POSTs (`/api/mcp/{call,reset}`) do reads/idempotent state-clear only | Consider a same-origin check if a state-mutating POST is added |
-| 10 | Verbose errors leak internals | Partial | Response bodies not passed through `redactSecrets`; captured HTTP bodies are | Route error-response substitution through `redactSecrets` too |
+## 5. data-exposure-and-privacy
 
-Two fire clearly (7, 5), two half-fire (2, 10), the rest don't.
+No PII storage. The workspace being analyzed is Bloomreach ecommerce data —
+customer counts, event counts, aggregate revenue. Individual customer records
+are fetched by the diagnostic agent via `list_customers` /
+`list_customers_in_segment`, then land in the tool-call `result` field, then
+into the ReasoningTrace UI, then into the demo snapshot if captured.
 
----
+**The exposure surfaces:**
 
-## Deep walks
+  → NDJSON stream — the agent's raw tool results ride the wire to the UI
+    (truncated at 4KB via `trunc()` in
+    `app/api/agent/route.ts:98-102`). If the MCP server returns a customer's
+    email in an event property, it lands on-screen. Acceptable for the
+    portfolio use case; would need scrubbing for real customer data.
+  → Demo snapshot capture — `lib/state/demo-*.json`, committed to the repo.
+    Real captures against the Bloomreach alpha workspace should be reviewed
+    before commit; the current committed snapshot uses the "wobbly-ukulele"
+    demo project.
+  → Error responses — `route.ts:174-179, 316-321` return the real error
+    message to the caller after redaction. Redaction covers OAuth secrets;
+    it does NOT scrub customer data that might appear in a tool-result error
+    envelope. Realistic gap.
 
-The load-bearing controls each get their own file:
+**Response-verbosity red flag.** Errors return `e.message` directly. On the
+bright side, `formatError()` walks `err.cause` (`transport.ts:82-97`) so
+stacks are complete in logs; the wire message is just the top-level `.message`,
+not the full chain. Cause chain stays server-side.
 
-- `01-encrypted-cookie-auth-store.md` — the AES-256-GCM `bi_auth` cookie and its ALS-scoped RequestStore.
-- `02-oauth-pkce-with-dcr.md` — OAuth 2.1 + PKCE + Dynamic Client Registration to Bloomreach.
-- `03-read-only-tool-allowlist.md` — the client-side POST-to-tool whitelist and the per-agent scope that regressed.
-- `04-model-output-type-guards.md` — `parseAgentJson` + the three shape guards at the model output boundary.
-- `05-budget-ceiling-defense.md` — `BudgetTracker` as a cost-abuse defense; built, not deployed.
-- `06-log-secret-redaction.md` — `redactSecrets` + `formatError` walking the cause chain.
+## 6. dependencies-and-supply-chain
+
+`package.json` audit:
+
+  → Locked with `package-lock.json`. Present at repo root.
+  → Runtime deps (5): `@anthropic-ai/sdk ^0.99`, `@aptkit/core` (published
+    as `@rlynjb/aptkit-core@^0.3.0`, your own package),
+    `@modelcontextprotocol/sdk ^1.29`, `lucide-react ^1.17`, `next 16.2.6`,
+    `react/react-dom 19.2.4`. Tight surface.
+  → Dev deps: Tailwind v4, Vitest 4, ESLint 9, TypeScript 5. Standard.
+  → No `postinstall` scripts in `package.json`.
+  → Bloomreach MCP SDK is the largest transitive surface; the SDK is the
+    trusted party at boundary 3.
+
+Red flag NOT firing: no known-vuln alerts because no scan is committed. Not a
+gap for the current shape (5 deps), but a `npm audit --production` at CI
+would earn its place before customer data lands anywhere.
+
+## 7. llm-and-agent-security
+
+This is where the sharpest findings live.
+
+**Finding 7.1 — per-agent tool scope regressed in the AptKit migration.**
+The legacy classes (`monitoring-legacy.ts`, `diagnostic-legacy.ts`,
+`recommendation-legacy.ts`, `query-legacy.ts`) each call
+`filterToolSchemas(this.allTools, monitoringTools)` (etc.) so the model only
+sees its allowed subset. The AptKit-based live classes
+(`monitoring.ts:86`, `diagnostic.ts:56`, `recommendation.ts:40`,
+`query.ts:27`) hand `allTools` to `BloomingToolRegistryAdapter` unfiltered —
+`aptkit-adapters.ts:130-136` exposes `this.allTools.map(...)` with no
+whitelist. The whitelists in `lib/mcp/tools.ts` are effectively dead code for
+the live path.
+
+  → What this defends when it's on: prompt-injection or model-drift attempts
+    to reach for a tool the current agent shouldn't (e.g. recommendation
+    calling `list_customer_events`, or monitoring calling `list_scenarios`).
+    The whitelist collapses the attack surface per-agent.
+  → What breaks it being off: monitoring can now propose recommendations,
+    diagnostic can list catalog items. No cost gate has landed either
+    (BudgetTracker exists in `lib/agents/budget.ts` but is optional at
+    construction; nothing forces it on).
+  → Fix: pass `filterToolSchemas(allTools, <agentName>Tools)` (or a
+    registry-side allowlist) into each agent's constructor and hand THAT to
+    `BloomingToolRegistryAdapter`. Keep the whitelists in `lib/mcp/tools.ts`;
+    delete the legacy classes or promote them.
+
+**Finding 7.2 — model output as trusted code, gated.** `parseAgentJson` +
+`isAnomalyArray` / `isDiagnosis` / `isRecommendationArray`
+(`lib/mcp/validate.ts:3-57`) sit at the model-output → app-state seam. Every
+agent's output flows through them before it becomes an `Anomaly` / `Diagnosis`
+/ `Recommendation` and reaches the UI. Deep walk:
+`05-model-output-validation.md`.
+
+  → The `severity`, `bloomreachFeature`, `confidence` enum checks are hard
+    gates — an out-of-range value from the model gets rejected at parse time.
+  → Fields the model might fabricate (like `evidence[].result`) aren't
+    schema-validated deeply — the UI just renders them. Acceptable: they're
+    displayed, not executed.
+
+**Finding 7.3 — free-form `?q=` param → coordinator agent.** The QueryAgent
+takes untrusted user text and runs it through Claude with the union of every
+tool. Prompt-injection concern:
+
+  → An attacker who controls the `?q=` param (e.g. via a malicious link
+    someone clicks while logged in) can steer the agent toward any tool in
+    `queryTools`. Combined with 7.1, this means every MCP tool.
+  → Intent classifier (`intent.ts`) narrows the response format, not the tool
+    scope.
+  → Mitigation: budget ceiling. `BudgetTracker` (`lib/agents/budget.ts`) is
+    the cost-abuse defense against runaway loops; passed through
+    `AnthropicModelProviderAdapter` at `aptkit-adapters.ts:60-66`. But it's
+    optional (`private readonly budget?: BudgetTracker`); the live agent
+    constructors don't wire one in. So the defense exists in code, not on
+    the live path.
+
+**Finding 7.4 — visitor-chosen MCP URL as a trust boundary.** The MCP server
+is the source of tool-call *responses* — data that flows back into the model
+context. A malicious MCP server can prompt-inject the agent by returning
+tool results shaped like instructions. The UI warns the user. Deep walk:
+`03-user-chosen-mcp-url-boundary.md`.
+
+## 8. security-red-flags-audit — the capstone checklist
+
+One line per red flag. `fires` / `doesn't` / `n/a` · location · severity ·
+one-line fix.
+
+```
+  ✓ = fires     · = doesn't      n/a = not exercised
+
+  fires  input treated as trusted because it's "from our own frontend"
+         severity: MEDIUM · sink: model prompt only, not sql/shell
+         location: app/api/agent/route.ts:36-46 (?insight= JSON blob)
+         fix: tighten the type guard; treat JSON.parse output as fully hostile
+
+  fires  an agent whose tool set exceeds its task
+         severity: HIGH · this is finding 7.1
+         location: lib/agents/{monitoring,diagnostic,recommendation,query}.ts
+         fix: reinstate filterToolSchemas at BloomingToolRegistryAdapter
+              construction; the whitelists in lib/mcp/tools.ts are ready
+
+  fires  model output flowing into a sink without a gate
+         severity: LOW · gated at the app-state boundary
+         location: lib/mcp/validate.ts:3-57 (parseAgentJson + type guards)
+         fix: none — this fires as "well-defended," not "missing"
+
+  ·      secret in source · secret in client bundle · secret in logs
+         all three don't fire — redactSecrets + gitignore + env-only reads
+
+  fires  no CSP / Content-Security-Policy header
+         severity: LOW-MEDIUM · defense-in-depth
+         location: next.config.ts (missing)
+         fix: add headers() with default-src 'self'; anthropic.com + MCP host
+              in connect-src
+
+  ·      no lockfile
+         doesn't fire — package-lock.json present
+
+  ·      known CVEs unpatched
+         not exercised — no npm audit committed at CI, honest gap
+
+  ·      SQLi / command inj / path traversal / SSRF / XSS
+         all n/a — no sql, no shell, no user-controlled fs paths, no
+         server-rendered html; SSRF is worth a look because Session D adds
+         a user-controlled URL (03-user-chosen-mcp-url-boundary.md)
+         — the server DOES fetch the URL; the fix is a scheme/host allowlist
+
+  fires  bearer token in localStorage
+         severity: MEDIUM · user-warned in the UI
+         location: components/settings/McpConfigModal.tsx:192-203
+         fix: none for portfolio use; a real deploy would move bearer into a
+              short-lived encrypted server cookie
+
+  ·      endpoint checks logged-in but not allowed
+         n/a — single-user-per-cookie, no per-resource authz to check
+
+  fires  cost-abuse defense present but not wired on the live path
+         severity: MEDIUM · finding 7.3 tail
+         location: lib/agents/budget.ts + aptkit-adapters.ts:60-66
+         fix: construct a BudgetTracker per investigation in the route
+              handler and thread it through the agent factories
+```
+
+## Where to go next
+
+Follow the pattern files for the controls that earned a deep walk:
+
+- `01-encrypted-auth-cookie.md` — why the AES-256-GCM + ALS design works
+- `02-oauth-pkce-dcr-boundary.md` — the OAuth 2.1 identity hop
+- `03-user-chosen-mcp-url-boundary.md` — the new trust boundary Session D adds
+- `04-server-side-config-validation.md` — the header decode + type guard
+- `05-model-output-validation.md` — the model→state gate
+- `06-secret-redaction-in-errors.md` — how tokens stay out of Vercel logs

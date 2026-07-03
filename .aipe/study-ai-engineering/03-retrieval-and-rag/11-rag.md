@@ -1,114 +1,177 @@
-# 11 — RAG (Retrieval-Augmented Generation)
+# RAG — retrieval-augmented generation
 
-**Type:** Industry standard. Also called: retrieve-then-generate, grounded generation.
+## Subtitle
+
+Retrieval + generation pipeline — Industry standard.
 
 ## Zoom out, then zoom in
 
-**Not exercised in this codebase.** The umbrella pattern. In this repo, "grounding" happens by tool_call (`execute_analytics_eql`) rather than by embedding retrieval — the agents fetch structured data on demand, not similar text from a vector store.
+RAG is the composite pattern: retrieve relevant chunks, stuff them into the LLM's prompt, generate. The retrieval brings in specific knowledge the model doesn't have; generation composes it into an answer. blooming does not do RAG today — the concept file explains the pattern and names the concrete places where it would fit.
 
 ```
-  Two flavors of grounding
+  Zoom out — the RAG pipeline
 
-  Classical RAG (not this codebase):        Tool-call grounding (this codebase):
-  query → retrieve → augment prompt → gen    query → agent → tool_call → data → gen
+  ┌─ User question ─────────────────────────────────────┐
+  └──────────────────┬──────────────────────────────────┘
+                     ▼
+  ┌─ Retrieve ★ ────────────────────────────────────────┐ ← we are here
+  │  embed query → nearest neighbors in vector index    │
+  │  (optionally hybrid + rerank)                        │
+  └──────────────────┬──────────────────────────────────┘
+                     │  top-k chunks
+                     ▼
+  ┌─ Augment ───────────────────────────────────────────┐
+  │  stuff chunks into system prompt                     │
+  └──────────────────┬──────────────────────────────────┘
+                     ▼
+  ┌─ Generate ──────────────────────────────────────────┐
+  │  LLM produces answer, cites retrieved chunks         │
+  └──────────────────────────────────────────────────────┘
 ```
 
 ## Structure pass
 
-Axis: how is the model grounded to fresh/private knowledge?
-- RAG: pre-embed a corpus; retrieve similar chunks; stuff into the prompt.
-- Tool-call (this repo): the agent decides what to fetch and fetches it live via structured tools.
-
-Both address the same failure mode (LLMs don't know your private data) — with different tradeoffs.
+- **Layers:** question → retrieve → augment → generate → answer. Five bands.
+- **Axis: knowledge source.** Retrieval brings *fresh, specific* knowledge; the model provides *general reasoning*. The split is the whole point.
+- **Seam:** the augment step — where retrieved chunks enter the prompt. That's the boundary between retrieval quality and generation quality.
 
 ## How it works
 
-### Move 1
+### Move 1 — the mental model
 
-Standard RAG has three phases: retrieve (dense/sparse over embedded corpus), augment (put retrieved chunks in the prompt), generate (model answers from the augmented prompt). This codebase does retrieve differently — it lets the agent call `execute_analytics_eql` with specific parameters, and the tool result is the "retrieved evidence" in structured form.
+Standard RAG has three moves: retrieve, augment, generate. The retrieval is agnostic to the model; the model treats the augmented context as ground truth.
 
 ```
-  Classical RAG                      This codebase (tool-call grounding)
-  ────────────                       ──────────────────────
-  question                            anomaly
-    │                                    │
-    ▼ embed + retrieve                   ▼ agent loop
-  top-k chunks                        tool_use decides which tool + args
-    │                                    │
-    ▼ stuff in prompt                    ▼ tool_result comes back
-  LLM generates from context          LLM reads structured data
+  RAG — the three moves
+
+  User: "why did mobile revenue drop last week"
+     │
+     ▼
+  Retrieve: find top-3 past investigations for similar anomalies
+     │  [investigation-42 (payment_failure), investigation-58 (a/b),
+     │   investigation-71 (holiday-effect)]
+     ▼
+  Augment: system prompt now includes the 3 investigations as
+           "here's what we found on similar anomalies:"
+     │
+     ▼
+  Generate: agent runs with the augmented context;
+            answer references the retrieved investigations
 ```
 
-### Move 2
+### Move 2 — the step-by-step walkthrough
 
-**Where classical RAG would earn its place here.**
+**Above-threshold rule.** Don't add RAG to features that work without it. In blooming, the diagnostic agent works on today's live data with schema summary + tool calls — no retrieval needed for the primary path. RAG earns its place when the *history* becomes valuable — investigation memory, EQL query library, catalog search.
 
-Past-investigation retrieval. A "similar past investigations" panel that pulls 3 relevant past diagnoses as CONTEXT for the current investigation would be classical RAG — embed the anomaly, retrieve top-3 by cosine, stuff summaries into the diagnostic agent's initial user message.
+**Where RAG would fit — three surfaces.**
 
-**Why we don't have it today.**
+1. **Past-investigation memory** (see **01-embeddings.md** `B3.1`). Retrieve top-3 past investigations for similar anomalies, inject as few-shot context. The diagnostic prompt gets: "here's what we found on similar anomalies. Use them as guidance, not gospel."
 
-Two reasons. (1) Volume — past investigation count is low; a "similar past" panel would often have no meaningful matches. (2) The tool-call flow already gives the agent structured, current data — the RAG add would be about retrieving PRIOR REASONING, not current facts. Prior reasoning helps when the corpus is large enough that patterns emerge; small corpora, less so.
+2. **EQL query library.** As working EQL patterns accumulate, retrieve the top-3 most similar queries when the monitoring agent composes a new one. The agent sees canonical examples instead of composing from scratch.
 
-**Above-threshold rule.**
+3. **Catalog search** (see **03-chunking-strategies.md** `B3.3`). New MCP tool `retrieve_catalog(query)` that returns matching products by embedding similarity. The agent uses it exactly like any other tool.
 
-Don't add RAG to features that work without it. In this codebase, diagnosis works without RAG because the agent has structured tool access. Adding RAG for "similar past" would earn its place if a measurable diagnosis-quality win could be shown against no-RAG.
+**Where RAG shouldn't go.**
 
-### Move 3
+- The primary diagnostic loop. Live workspace data is already retrieved via MCP tools; adding an embedding-based retrieval layer duplicates the work.
+- The recommendation agent's core reasoning. Recommendations should stay grounded in the diagnosis, not in a similar-recs-from-history retrieval — that would risk copying past recs that were wrong for the new context.
 
-RAG solves one problem: connecting an LLM to knowledge it wasn't trained on. This codebase solves the same problem with tool calls over structured data. Different approach, same goal. The "add RAG" decision is a design question about what knowledge shape helps — text similarity of prior reasoning, or structured live-data queries.
+**Cost math for the memory case.** Adding RAG adds: one embed per query ($0.00003), one embed per new investigation ($0.00003), storage (~60 MB for 10k vectors), retrieval latency (~10ms). All negligible against the ~$0.09/case agent cost.
+
+Diagram of the augmented prompt shape:
+
+```
+  Augment step — what the prompt looks like after retrieval
+
+  ┌─ system prompt ─────────────────────────────────────┐
+  │  You are a data analyst investigating an anomaly.   │
+  │  ...(unchanged)                                      │
+  │                                                     │
+  │  ┌── injected retrieved context ──────────────────┐ │
+  │  │ Related past investigations (top-3 by          │ │
+  │  │ semantic similarity to the current anomaly):   │ │
+  │  │                                                 │ │
+  │  │ #1  investigation-42, mobile checkout drop,    │ │
+  │  │     conclusion: payment processor failure.     │ │
+  │  │                                                 │ │
+  │  │ #2  investigation-58, similar timeframe...     │ │
+  │  │                                                 │ │
+  │  │ #3  investigation-71, holiday anomaly false    │ │
+  │  │     positive.                                   │ │
+  │  │                                                 │ │
+  │  │ Use these as guidance; verify against current  │ │
+  │  │ data before concluding.                         │ │
+  │  └───────────────────────────────────────────────┘  │
+  └─────────────────────────────────────────────────────┘
+```
+
+### Move 3 — the principle
+
+RAG earns its place when the model needs knowledge it doesn't have (private data, freshness, sheer volume). It doesn't earn its place when the same information is already available through direct tool calls or a bounded prefix. Measure retrieval quality before you measure generation quality — bad retrieval produces bad answers regardless of model.
 
 ## Primary diagram
 
 ```
-  Umbrella comparison
+  RAG — full frame
 
-  Classical RAG (would-be add)                Current tool-call flow
-  ──────────────────                         ──────────────────
-  anomaly text                                anomaly
-      │                                          │
-      ▼ embed + retrieve                        ▼ agent decides
-  top-3 similar past diagnoses               tool_use: execute_analytics_eql
-      │                                          │
-      ▼ stuff into diagnostic agent's           ▼ live data
-    initial user message                       tool_result
-      │                                          │
-      ▼                                          ▼
-    diagnose (with prior-reasoning context)   diagnose (with live data)
+  ┌─ User question ─────────────────────────────────────┐
+  │  "why did mobile revenue drop last week"             │
+  └──────────────────┬──────────────────────────────────┘
+                     │
+                     ▼
+  ┌─ (optional) Query augmentation ─────────────────────┐
+  │  rewrite or HyDE (see 08)                            │
+  └──────────────────┬──────────────────────────────────┘
+                     │
+                     ▼
+  ┌─ Retrieval ─────────────────────────────────────────┐
+  │  hybrid (dense + sparse) → RRF → top-10              │
+  │  (optional) cross-encoder rerank → top-3             │
+  └──────────────────┬──────────────────────────────────┘
+                     │  3 chunks
+                     ▼
+  ┌─ Augment ───────────────────────────────────────────┐
+  │  inject chunks into system prompt as bounded context │
+  └──────────────────┬──────────────────────────────────┘
+                     │
+                     ▼
+  ┌─ Generate (agent runs) ─────────────────────────────┐
+  │  DiagnosticAgent uses retrieved context + live tools │
+  │  → Diagnosis (cites which retrieved chunks helped)   │
+  └─────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The tradeoff: classical RAG surfaces PRIOR ANSWERS and reasoning; tool-call surfaces CURRENT DATA. They compose — a mature product often uses both. This codebase has strong tool-call grounding today; RAG would be additive if past-reasoning retrieval showed measured value.
+RAG (Lewis et al. 2020, "Retrieval-Augmented Generation") started as a specific model architecture and became the industry shorthand for any retrieve-then-generate pipeline. The pattern predates the term — search + summarize was a common shape before it had a name.
 
-Modern RAG variants: **agentic RAG** (agent decides when and what to retrieve, not always), **self-RAG** (agent reflects on retrieval quality before generating), **graphRAG** (see next file).
+The above-threshold rule is worth restating: adding RAG to a feature that works without retrieval usually makes it worse, not better. The retrieval layer adds latency, cost, and a new failure mode (bad chunks in context confuse the model).
+
+Related: **../04-agents-and-tool-use/05-agent-memory.md** (the memory-tool version of retrieval), **../05-evals-and-observability/01-eval-set-types.md** (how to measure retrieval quality with hit@k).
 
 ## Project exercises
 
-### Exercise — measure whether past-investigation RAG helps diagnosis
+### B3.11 · Ship past-investigation memory as an end-to-end RAG feature
 
-- **Exercise ID:** C2.14-B · Case B (RAG not exercised).
-- **What to build:** if the RAG stack from `01-04` is present, run each of the 10 goldens through the diagnostic agent TWICE — once with a "3 similar past investigations" prefix in the user message, once without. Compare per-dim pass rates in the harness.
-- **Why it earns its place:** the above-threshold test in action. Interviewer signal: "I don't add RAG on vibes — I measure whether it helps."
-- **Files to touch:** `eval/run.eval.ts` (two-arm run), `lib/agents/diagnostic.ts` (accept optional context).
-- **Done when:** report shows per-dim pass rates for with-RAG vs without-RAG on the 10 goldens.
-- **Estimated effort:** 1-2 days.
+- **Exercise ID:** B3.11 (Case B — the aggregate exercise)
+- **What to build:** Combine B3.1, B3.2, B3.4, B3.7, B3.9, B3.10 into one shipped feature: past-investigation memory as a retrieval layer over the diagnostic agent. Includes: embedding on save, in-memory + JSON index, hit@k eval, staleness tracking, full-rebuild endpoint.
+- **Why it earns its place:** The single largest interview payoff in this sub-section. Turns "we discussed RAG" into "we shipped RAG, measured its impact on the existing baseline, and can defend every layer choice."
+- **Files to touch:** All files named in B3.1 through B3.10. Baseline rerun with the memory enabled.
+- **Done when:** rerunning the eval baseline with memory enabled shows a measurable change in `root_cause_plausibility` pass rate (up or down — both are learnings); the receipt shows retrieval latency + count per case.
+- **Estimated effort:** `≥1 week`.
 
 ## Interview defense
 
-**Q: Does this codebase use RAG?**
+**Q: Why doesn't blooming have RAG today?**
 
-Not classical RAG (embedding + vector store). It uses tool-call grounding — the agents call `execute_analytics_eql` and other structured MCP tools to fetch current data on demand. Same goal (connect the LLM to knowledge it doesn't have), different mechanism.
+The primary path — diagnostic agent over live workspace data — doesn't need it. The workspace schema fits in a bounded summary. Data is retrieved via MCP tools that are already RAG-shaped (query → get top-k results). Adding an embedding-based retrieval layer would duplicate the work. The load-bearing answer: knowing when *not* to add RAG is as much of a signal as knowing when to add it.
 
-**Q: When would you add classical RAG here?**
+**Q: When would RAG earn its place here?**
 
-If past-reasoning retrieval showed measured value. A "similar past investigations" panel that pulls 3 relevant prior diagnoses as context for a new one — that's RAG earning its place if it lifts diagnosis-quality dim scores in an eval.
-
-**Q: Why the split (tool-call for facts, RAG for reasoning)?**
-
-Different knowledge shapes. Live data is best fetched fresh via tools — retrieval over stale embeddings of "how the workspace looked last week" would be worse than a fresh EQL query. But prior reasoning IS text, and similarity retrieval on it can surface applicable prior work.
+Investigation memory. When the codebase has accumulated hundreds of prior investigations, retrieving 3 similar ones as few-shot context for a new investigation is measurable value. The setup cost is low (~200 LOC, one endpoint, one JSON file); the impact is measurable via the existing eval baseline. See B3.11 for the shipped-feature exercise.
 
 ## See also
 
-- `04-agents-and-tool-use/02-tool-calling.md` — the tool-call grounding that stands in for RAG here
-- `12-graphrag.md` — the graph-shaped alternative
-- `07-system-design-templates/02-tech-support-chatbot.md` — a RAG-heavy system template
+- [01-embeddings.md](01-embeddings.md) — the primitive.
+- [12-graphrag.md](12-graphrag.md) — the graph-traversal variant.
+- [../04-agents-and-tool-use/05-agent-memory.md](../04-agents-and-tool-use/05-agent-memory.md) — the memory shape RAG powers.

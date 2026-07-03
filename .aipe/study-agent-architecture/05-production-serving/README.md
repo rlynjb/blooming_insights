@@ -1,16 +1,13 @@
-# Section E — Production serving for agents
+# 05 — Production serving for agents
 
-**Anchor:** single-agent + multi-agent (both). What single-call serving concerns become once the unit is an autonomous loop or a topology.
+Anchor: **single-agent + multi-agent (both)**
 
-`study-ai-engineering`'s production-serving section covers single-call caching, cost, rate-limit, retry. This sub-section covers the concerns that only show up once you have a loop or a topology issuing many calls, often against the same tool, often concurrently.
+Three serving concerns that only show up once the unit of execution is an autonomous loop or a topology, not a single LLM call.
 
-## Files
-
-1. **`01-rate-limit-compliance.md`** — the 1-req/s spacing gate + retry ladder in `BloomreachDataSource`. The de-facto backpressure on every fan-out.
-2. **`02-fan-out-backpressure.md`** — semaphore-based load harness in `eval/load.eval.ts`. Concurrency cap = worker count.
-3. **`03-fault-injection-and-graceful-degradation.md`** — `FaultInjectingDataSource` decorator + the receipt (9 faults / 3 investigations / 0 failed).
-4. **`04-cost-controls.md`** — the four cost levers together: BudgetTracker, prompt caching, Anthropic pricing helper, per-tool budgets.
+`.aipe/study-ai-engineering/` section 06 covers caching, cost, backpressure, and circuit-breaking for a *single LLM call*. This section does not re-teach those. It covers the three places where the single-call version is insufficient because the unit is now a loop or topology that issues many calls, often concurrently, often repeatedly against the same tool.
 
 ## Reading order
 
-01 → 02 → 03 → 04. Rate-limit compliance sets the ceiling every fan-out runs against; the load harness exercises the fan-out against that ceiling; fault injection proves the shape holds under chaos; cost controls close by naming the compound levers.
+1. **[01-cross-turn-caching.md](./01-cross-turn-caching.md)** — prefix caching + intra-run memoization + cross-run semantic cache.
+2. **[02-fan-out-backpressure.md](./02-fan-out-backpressure.md)** — concurrency cap + upward backpressure to bound a supervisor.
+3. **[03-per-tool-circuit-breaking.md](./03-per-tool-circuit-breaking.md)** — per-tool breaker that feeds state back to the agent so it routes around dead tools.

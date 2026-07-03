@@ -27,10 +27,12 @@ Here's the decision tree for the six choices, with the picked option highlighted
   └───────────────────────────┬─────────────────────────────┘
                               │
   ┌─ 3. Provider seam ───────▼──────────────────────────────┐
-  │  DataSource port ★  ←  picked, 4 uses receipt           │
+  │  DataSource port ★  ←  picked, 5 uses receipt           │
   │  vs. inline MCP calls at agent site                     │
   │  vs. facade on top of MCP client directly               │
   │  Mode: DELIBERATE                                       │
+  │  → 5th use: swappable MCP server (Bloomreach as         │
+  │    default PRESET, not codebase identity)               │
   └───────────────────────────┬─────────────────────────────┘
                               │
   ┌─ 4. Streaming transport ─▼──────────────────────────────┐
@@ -48,14 +50,14 @@ Here's the decision tree for the six choices, with the picked option highlighted
   └───────────────────────────┬─────────────────────────────┘
                               │
   ┌─ 6. Portfolio hardening ─▼──────────────────────────────┐
-  │  Sequenced 6-phase plan ★  ←  picked and shipped        │
+  │  Sequenced 6-phase plan ★  ←  picked, shipped, COMPLETE │
   │  vs. ship-then-harden-if-asked                          │
   │  vs. hardening as one-time audit                        │
   │  Mode: DELIBERATE (this is the L5 closer)               │
   └─────────────────────────────────────────────────────────┘
 ```
 
-Six choices. Six pickeds. Six modes named. Each defense below takes one and walks it.
+Six choices. Six pickeds. Six modes named. Each defense below takes one and walks it. Choice 3 (DataSource seam) has a second defense embedded — the "why swappable MCP" question — because the fifth use of that same port is the swappable-MCP receipt.
 
   ## Choice 1 — The framework
 
@@ -160,13 +162,43 @@ Say this:
 
 > *"The `DataSource` port is 71 lines in `lib/data-source/types.ts`. Callers depend on it. Adapters implement it. That's it — the classic port-and-adapter shape.*
 >
-> *The receipt is that it's shipped in four uses with zero caller-side changes. First: `BloomreachDataSource`, the live path. Second: `SyntheticDataSource`, which lets the eval flywheel run without touching Bloomreach — no MCP round-trips, no OAuth, no rate limits. Third: `FaultInjectingDataSource`, a decorator that wraps any DataSource and injects failures at configurable rates for fault-injection testing. And a historical fourth was swapping one demo adapter in and out — I added it, ran it, removed it, all with zero touch to the caller code.*
+> *The receipt is that it's shipped in five uses with zero caller-side changes. First: `McpDataSource`, the generic live path — that's an alias re-export of what used to be `BloomreachDataSource`, so Bloomreach is now the default preset, not the codebase identity. Second: `SyntheticDataSource`, which is now the default UX (`live-synthetic`) and also lets the eval flywheel run without touching any MCP server — no round-trips, no OAuth, no rate limits. Third: `FaultInjectingDataSource`, a decorator that wraps any DataSource and injects failures at configurable rates for fault-injection testing. Fourth: a historical demo adapter I added and removed with zero caller touch. Fifth: the swappable-MCP path — same port, but the running config now picks the target MCP server and auth strategy per request. That's the fifth independent use, and it's the one that turned the codebase from "Bloomreach app" into "MCP-generic app with Bloomreach preset."*
 >
-> *That's the strongest architectural receipt in the whole system. Anyone can draw an interface. Four independent uses with zero caller changes is the receipt that the interface is at the right seam.*
+> *That's the strongest architectural receipt in the whole system. Anyone can draw an interface. Five independent uses with zero caller changes is the receipt that the interface is at the right seam.*
 >
-> *The cost I'm paying: one extra indirection layer. When I'm debugging a live Bloomreach issue, the stack trace goes through the DataSource adapter, so I have to know that layer exists. That's a small cost. Worth it four times over."*
+> *The cost I'm paying: one extra indirection layer. When I'm debugging a live issue, the stack trace goes through the DataSource adapter, so I have to know that layer exists. That's a small cost. Worth it five times over."*
 
-The move: name what the port is (71 LOC), name the receipt (4 uses, 0 caller changes), name the cost (one extra layer). The receipt is what makes this defense different from every port-and-adapter defense you've read.
+The move: name what the port is (71 LOC), name the receipt (5 uses, 0 caller changes), name the cost (one extra layer). The receipt is what makes this defense different from every port-and-adapter defense you've read.
+
+  ### Choice 3b — Why did you make the MCP server swappable?
+
+This is the load-bearing follow-up to Choice 3. The fifth use of the DataSource port didn't have to happen. Defend the decision to generalize.
+
+┌─────────────────────────────────────────────────┐
+│ THEY ASK                                        │
+│   "Why did you make the MCP server swappable?    │
+│   You could have hardcoded Bloomreach."         │
+│                                                 │
+│ WHAT THEY'RE TESTING                            │
+│   Do you know when to generalize and when to    │
+│   stay specific? Can you defend an abstraction  │
+│   with a receipt, or does it read as premature? │
+└─────────────────────────────────────────────────┘
+
+Say this:
+
+> *"I generalized deliberately, and the L5 answer is that portfolio-grade code shouldn't be one-vendor-locked. If a reviewer sees this and only reads 'Bloomreach app,' they read a narrower story than the code actually tells. The code is an MCP-generic analyst with Bloomreach as the default preset.*
+>
+> *The reason I could do it in a day of work is that the seam already existed. The `DataSource` port had been sitting there through four uses already — `BloomreachDataSource`, `SyntheticDataSource`, `FaultInjectingDataSource`, one historical demo adapter. Adding a fifth use — a generic `McpDataSource` behind three `OAuthClientProvider` strategies — was 'lean into the seam you already built,' not 'design a new one.'*
+>
+> *The receipt is exactly that: the same `DataSource` port has now shipped in five uses without a single caller-surface change. If I'd been generalizing prematurely, at least one of those five uses would have forced me to change the port. None did. That's the retroactive validation that the port was at the right seam from the start.*
+>
+> *In the UI, Bloomreach is the default. In the code, Bloomreach is a preset. Those are different things, and the difference is what makes this defensible in a senior interview."*
+
+┃ "Bloomreach is the default preset, not the
+┃  codebase identity. Same DataSource port, now
+┃  in five uses without a caller-surface change —
+┃  that's the abstraction-pressure receipt."
 
   ## Choice 4 — NDJSON over SSE
 
@@ -335,7 +367,7 @@ The other five choices you'd make the same way. Framework, AptKit, DataSource, N
 
   ## The one-page summary
 
-**Core claim.** Six load-bearing choices. Each defended with the alternative considered, the axis picked on, and the cost paid. The six: Next.js 16 (streaming primitive), AptKit (own the boundary, library owns the loop), DataSource port (4 uses / 0 caller changes), NDJSON (POST support + framing control), deterministic supervisor (predictable cost, straight-line trace), portfolio hardening plan (six phases, all shipped).
+**Core claim.** Six load-bearing choices, plus the swappable-MCP follow-up embedded in Choice 3. Each defended with the alternative considered, the axis picked on, and the cost paid. The six: Next.js 16 (streaming primitive), AptKit (own the boundary, library owns the loop), DataSource port (5 uses / 0 caller changes; Bloomreach as default preset, not identity), NDJSON (POST support + framing control), deterministic supervisor (predictable cost, straight-line trace), portfolio hardening plan (six phases, all shipped, COMPLETE).
 
 **The pull quotes.**
 

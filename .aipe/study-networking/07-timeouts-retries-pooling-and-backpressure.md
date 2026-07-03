@@ -1,518 +1,466 @@
-# Timeouts, retries, pooling, and backpressure
+# 07 — timeouts, retries, pooling, and backpressure
 
-*Failure-domain budgets (Industry standard)* — timeouts, retries,
-jitter, pools, request collapsing, and overload behavior. This is the
-**load-bearing chapter** of the guide: everything the app does about
-partial failure on the wire lives here, and it composes into one
-three-tier budget.
+## Subtitle
 
-## Zoom out — where this concept lives
+Overload and failure containment on the outbound hops (Language-agnostic — the ceiling on any single call, the retry ladder for rate-limits, the response cache that absorbs repeats).
 
-Three budgets stacked. The outer 300s route ceiling (Vercel Pro's
-`maxDuration`) contains an inner 30s per-call transport timeout, which
-contains a per-call retry ladder that can wait up to 20s × 3 = 60s of
-wall clock on a single rate-limited tool. Every wait is capped;
-timeouts fail fast; only rate-limit results retry.
+## Zoom out, then zoom in
+
+Two upstream servers, both flaky enough to matter: Bloomreach rate-limits per user globally (~1 req/s, sometimes ~1 per 10s), and any HTTPS server anywhere can stall a socket indefinitely. This layer is the app's defense: a 30-second per-call ceiling composed via `AbortSignal.timeout`, a retry ladder that parses the server's own stated wait time from the error text, a 60-second in-memory response cache, and a proactive ~1.1-second gap between calls. Every one of these is inside `lib/mcp/transport.ts` or `lib/data-source/bloomreach-data-source.ts`.
 
 ```
-  Zoom out — three budgets, one composed AbortSignal
+  Zoom out — where overload defenses sit
 
-  ┌─ Vercel route (Vercel Pro) ──────────────────────────────────┐
-  │  maxDuration = 300 s                                          │
-  │  process killed on overshoot                                  │
-  │                                                                │
-  │  ┌─ MCP transport (per callTool) ────────────────────────────┐│
-  │  │  TOOL_TIMEOUT_MS = 30 s                                    ││
-  │  │  ★ AbortSignal.timeout composed with req.signal ★           ││
-  │  │  (whichever fires first wins)                              ││
-  │  │                                                             ││
-  │  │  ┌─ BloomreachDataSource retry ladder ───────────────────┐ ││
-  │  │  │  maxRetries = 3                                        │ ││
-  │  │  │  wait = min(hint OR retryDelayMs*2^(n-1), 20 s)        │ ││
-  │  │  │  fires ONLY on isError && "rate limit" text            │ ││
-  │  │  │  timeouts DO NOT retry (fail fast)                     │ ││
-  │  │  └────────────────────────────────────────────────────────┘ ││
-  │  └────────────────────────────────────────────────────────────┘│
-  └──────────────────────────────────────────────────────────────┘
+  ┌─ UI layer ─────────────────────────────────────────────────┐
+  │  browser fetch — no timeout, no retry                      │
+  │  (relies on route's stream + reconnect policy)             │
+  └────────────────────────┬───────────────────────────────────┘
+                           │
+                           ▼
+  ┌─ Service band (route) ─────────────────────────────────────┐
+  │  maxDuration = 300s (Vercel Pro budget)                    │
+  │  req.signal threaded to every async layer                  │
+  └────────────┬──────────────────────────────┬────────────────┘
+               │                              │
+               ▼                              ▼
+  ┌─ BloomreachDataSource ────────┐  ┌─ Anthropic call ───────┐
+  │  ★ THIS FILE ★                │  │  no explicit timeout;  │
+  │  · 60s cache                  │  │  relies on route abort │
+  │  · ~1.1s proactive gap        │  │  signal only           │
+  │  · retry ladder (3× max)      │  │                        │
+  └────────────┬──────────────────┘  └────────────────────────┘
+               │
+               ▼
+  ┌─ SdkTransport (lib/mcp/transport.ts) ──────────────────────┐
+  │  · AbortSignal.timeout(30_000) per call                    │
+  │  · composed with route's req.signal                        │
+  │  · first-fires wins                                        │
+  │  · timeout thrown as HTTP 0: timeout after 30000ms         │
+  └────────────────────────────────────────────────────────────┘
 ```
 
-Everything hangs on the composed signal at `lib/mcp/transport.ts:131`.
+Zoom in — this file walks every defense in order. The 30s ceiling. The retry ladder. The 60s response cache. The proactive spacing. Then the intentional gaps: no retry on timeout, no jitter on the retry hint, no connection pool tuning.
 
-## The structure pass
+## Structure pass
 
-Two axes matter here: **failure** (what kind of thing goes wrong?) and
-**cost** (how much wall clock does the response take, and who pays?).
-The load-bearing one is failure — because the retry policy depends on
-being able to distinguish "timeout" from "rate limit" from "5xx".
+**Layers:**
+- Route (300s budget, cancels on client abort)
+- BloomreachDataSource (cache, spacing, retry)
+- SdkTransport (per-call 30s timeout)
+- MCP server (rate-limits, returns 429 with stated window)
+
+**Axis — FAILURE (where does each failure mode terminate?):**
 
 ```
-  Axis: "how does this specific failure propagate?"
+  "who catches this failure?" — traced down the stack
 
-  ┌──────────────┬────────────────────┬───────────────────────────┐
-  │ failure mode │ where it fires      │ retry policy              │
-  ├──────────────┼────────────────────┼───────────────────────────┤
-  │ timeout      │ AbortSignal.timeout │ NO RETRY — fail fast      │
-  │ (30s)        │ inside transport    │ (retry would wait 30s     │
-  │              │                     │  more inside same budget) │
-  ├──────────────┼────────────────────┼───────────────────────────┤
-  │ rate limit   │ result.isError with │ RETRY up to 3 times       │
-  │ (429-shaped) │ "rate limit" text   │ honor parsed hint         │
-  │              │ (fast response!)    │ capped at 20s wait         │
-  ├──────────────┼────────────────────┼───────────────────────────┤
-  │ 5xx / other  │ throws from SDK     │ NO EXPLICIT RETRY         │
-  │              │                     │ (surfaces to caller)      │
-  ├──────────────┼────────────────────┼───────────────────────────┤
-  │ 401 invalid  │ throws with body    │ NO RETRY — auth-reset     │
-  │ _token       │ text                │ dance instead (client)    │
-  └──────────────┴────────────────────┴───────────────────────────┘
+  browser closes tab       → req.signal aborts
+                              → composed into transport signal
+                              → in-flight fetch aborts
+                              → route catches AbortError, exits clean
+  MCP call takes >30s      → AbortSignal.timeout fires
+                              → transport throws HTTP 0: timeout
+                              → NOT retried (deliberate)
+                              → surfaces as tool_call_end error event
+  MCP returns 429          → parseRetryAfterMs extracts window
+                              → sleep(min(hint + 500ms buffer, 20s))
+                              → retry, up to 3 attempts
+                              → if still 429 after 3, surfaces as error
+  Cached result available  → return immediately (0ms)
+                              → no call, no risk of failure
+  Same call within 1.1s    → sleep to enforce spacing
+                              → prevents self-inflicted 429
+
+  failure is contained at each seam;
+  timeouts fail fast, rate limits patiently wait, cache absorbs repeats
 ```
 
-The seam that matters: the **retry ladder distinguishes failure modes
-by inspecting the *result envelope*, not by catching an error.** A
-rate-limit response comes back *quickly* (the server returns an error
-envelope in milliseconds); a timeout means we got no response at all
-in 30 seconds. Retrying a timeout would just spend another 30 seconds
-learning nothing new; retrying a rate limit after the stated window
-usually succeeds.
+**Seams:**
+- Seam #1 — cache boundary: a hit means zero risk.
+- Seam #2 — the 30s ceiling: failure fast (no retry, so no chained latency).
+- Seam #3 — the retry ladder: failure patient (parses server hint, respects ceiling).
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You've written `Promise.race([fetch(url), timeout(30000)])` before to
-bound a request. `AbortSignal.timeout(30_000)` is the modern
-equivalent — one line, no manual `Promise.race`, and it *composes*
-with any other `AbortSignal` you have. That last property is the load-
-bearing one here. The route has its own `req.signal` (fires when the
-browser disconnects); the transport wants a 30s ceiling; whichever
-fires first should cancel. `AbortSignal.any([signalA, signalB])` gives
-you exactly that.
+Four rings of defense around every outbound MCP call, checked in order:
 
 ```
-  The pattern — one AbortSignal from two sources
+  Rings of defense around a single MCP callTool
 
-    req.signal (client disconnect)  ─┐
-                                     ├──►  AbortSignal.any([…])  ──► fetch({signal})
-    AbortSignal.timeout(30_000)     ─┘
-                                     first to fire wins
+    ┌──────────────────────────────────────────────┐
+    │  1. cache lookup                             │
+    │     if hit → return, 0ms, no network         │
+    └───────────────┬──────────────────────────────┘
+                    │ miss
+                    ▼
+    ┌──────────────────────────────────────────────┐
+    │  2. proactive spacing (~1.1s minInterval)    │
+    │     if lastCallAt < now - 1100ms:            │
+    │       sleep(1100 - elapsed)                  │
+    │     — avoids self-inflicted 429              │
+    └───────────────┬──────────────────────────────┘
+                    │
+                    ▼
+    ┌──────────────────────────────────────────────┐
+    │  3. per-call timeout ceiling (30s)           │
+    │     composed with route's req.signal         │
+    │     first-fires wins                         │
+    │     → HTTP 0: timeout after 30000ms          │
+    └───────────────┬──────────────────────────────┘
+                    │
+                    ▼
+    ┌──────────────────────────────────────────────┐
+    │  4. rate-limit retry ladder (up to 3×)       │
+    │     if result.isError && text ~= /rate limit/│
+    │       parse retry-after hint from error text │
+    │       sleep(min(hint + 500ms, 20s ceiling))  │
+    │       retry                                  │
+    └──────────────────────────────────────────────┘
 ```
 
-### Move 2 — the load-bearing skeleton
+Each ring catches a different failure class. Cache absorbs "already answered this." Spacing avoids "we caused a rate limit." Timeout catches "server stalled." Retry ladder patiently waits out "server rate-limited us anyway."
 
-Three layers of budget. Isolate each.
+### Move 2 — the walkthrough
 
-#### Layer 1: the composed AbortSignal at the transport seam
+#### The 30-second per-call ceiling (the load-bearing one)
 
-The kernel — `lib/mcp/transport.ts:129-133`:
+Every MCP call gets an `AbortSignal.timeout(30_000)` composed with the route's cancel signal. Whichever fires first cancels the in-flight fetch. From `lib/mcp/transport.ts:38, 129-146`:
 
 ```ts
-  async callTool(name: string, args: Record<string, unknown>, opts?: CallToolOpts): Promise<unknown> {
-    if (this.httpErrors) this.httpErrors.last = null;
-    const signal = composeSignals(opts?.signal, AbortSignal.timeout(TOOL_TIMEOUT_MS));
-    try {
-      return await this.client.callTool({ name, arguments: args }, undefined, { signal });
-```
+const TOOL_TIMEOUT_MS = 30_000;
 
-And `composeSignals` itself (`transport.ts:173-189`):
+// ...
 
-```ts
-  export function composeSignals(...signals: (AbortSignal | undefined)[]): AbortSignal {
-    const filtered = signals.filter((s): s is AbortSignal => !!s);
-    if (filtered.length === 0) return new AbortController().signal;
-    if (filtered.length === 1) return filtered[0];
-    if (typeof (AbortSignal as unknown as { any?: unknown }).any === 'function') {
-      return (AbortSignal as unknown as { any: (s: AbortSignal[]) => AbortSignal }).any(filtered);
+async callTool(name: string, args: Record<string, unknown>, opts?: CallToolOpts): Promise<unknown> {
+  if (this.httpErrors) this.httpErrors.last = null;
+  const signal = composeSignals(opts?.signal, AbortSignal.timeout(TOOL_TIMEOUT_MS));
+  try {
+    return await this.client.callTool({ name, arguments: args }, undefined, { signal });
+  } catch (err) {
+    // Timeout path — distinct `HTTP 0:` tag so callers can recognize it.
+    if (isTimeoutError(err)) {
+      throw new Error(`HTTP 0: timeout after ${TOOL_TIMEOUT_MS}ms`, { cause: err });
     }
-    const ac = new AbortController();
-    for (const s of filtered) {
-      if (s.aborted) {
-        ac.abort((s as unknown as { reason?: unknown }).reason);
-        return ac.signal;
-      }
-      s.addEventListener('abort', () => ac.abort((s as unknown as { reason?: unknown }).reason), { once: true });
+    const captured = this.httpErrors?.last;
+    if (captured) {
+      const body = captured.body.trim();
+      throw new Error(`HTTP ${captured.status}${body ? `: ${body}` : ''}`, { cause: err });
     }
-    return ac.signal;
+    throw err;
   }
+}
 ```
 
-`AbortSignal.any` (Node 20+, modern browsers) does the composition
-natively. The manual fallback is belt-and-braces — in this Node
-runtime it's not hit, but the code doesn't assume that.
+**Why this is the strongest single defense in the whole stack.**
 
-**Name each part by what breaks if missing:**
+Without it: a stuck Bloomreach socket could sit indefinitely (Node's default socket timeout is ~2 minutes, and even that's not guaranteed with active bytes flowing). One hung call would burn 100+ seconds of a 300-second route budget on nothing. The diagnostic loop, which runs ~5-15 tool calls, becomes brittle to any one of them stalling.
 
-  - Drop the `AbortSignal.timeout(30_000)` and a stuck upstream can burn
-    the whole 300s route budget on one call.
-  - Drop the `opts?.signal` composition and a client that closes the
-    tab can't cancel in-flight upstream calls — the browser hangs up
-    but the route keeps spending money on Anthropic tokens for another
-    30s.
-  - Drop the whole `composeSignals` and use two separate abort controllers
-    and you have a race condition where one signal's `abort()` doesn't
-    reach the other.
+With it: worst case, a single stuck call costs 30 seconds and returns `HTTP 0: timeout after 30000ms` to the caller. The loop moves on. The 300s budget stays predictable.
 
-#### Layer 2: the timeout error tag
+**The `HTTP 0:` tag is deliberate signaling.** No HTTP response was received (the socket was aborted before the server responded). Naming it as `HTTP 0` — distinct from `HTTP 4xx` or `HTTP 5xx` — lets pattern-matching consumers distinguish "server stalled" from "server said no." The fault-injection surface uses the same tag (`lib/data-source/fault-injecting.ts:121`) so tests exercise the same error path.
 
-Timeouts fail fast, and they fail *distinctly* — `transport.ts:44-48, 135-137`:
+**Why the retry ladder deliberately does NOT retry a timeout.** From the transport.ts comment (34-37):
+
+> The retry ladder in McpClient.callTool only retries successful-but-rate-limited results, so the timeout error fails fast — exactly what we want, since a retry would just risk another 30s wait inside the same route budget.
+
+Retrying a timeout with maxRetries=3 would blow the route budget: 30s + 30s + 30s + 30s = 120s on a single tool call. Instead, timeout fails fast and the ReAct loop can continue with the remaining budget.
+
+#### The retry ladder — for rate limits only
+
+`BloomreachDataSource` wraps every `callTool` in a retry loop that fires ONLY when the result comes back rate-limited. From `lib/data-source/bloomreach-data-source.ts:154-174`:
 
 ```ts
-  function isTimeoutError(err: unknown): boolean {
-    if (!err || typeof err !== 'object' || !('name' in err)) return false;
-    const name = (err as { name?: unknown }).name;
-    return name === 'AbortError' || name === 'TimeoutError';
-  }
+const start = Date.now();
+let result = await this.liveCall(name, args, options.signal);
 
-  // …later, inside callTool's catch…
-  if (isTimeoutError(err)) {
-    throw new Error(`HTTP 0: timeout after ${TOOL_TIMEOUT_MS}ms`, { cause: err });
-  }
+// Rate-limit retry. Bloomreach enforces a multi-second global window and
+// states it in the error text; honor the parsed hint, else exponential
+// backoff off retryDelayMs — every wait capped at retryCeilingMs.
+let retries = 0;
+while (isRateLimited(result) && retries < this.maxRetries) {
+  retries++;
+  const hintMs = parseRetryAfterMs(result);
+  const backoffMs = this.retryDelayMs * 2 ** (retries - 1);
+  const waitMs = Math.min(
+    hintMs != null ? hintMs + RETRY_BUFFER_MS : backoffMs,
+    this.retryCeilingMs,
+  );
+  await sleep(waitMs);
+  result = await this.liveCall(name, args, options.signal);
+}
 ```
 
-The `HTTP 0:` tag matters for observability. `HTTP 0` isn't a real
-status code — but it slots into the same error-shape scheme as
-`HTTP 401: …` or `HTTP 500: …`, so a log grep for `HTTP \d+` still
-matches timeout events. The fault-injection decorator mimics this shape
-exactly (`lib/data-source/fault-injecting.ts:115`) so offline tests
-exercise the same error path.
+**Walk it one part at a time:**
 
-#### Layer 3: the retry ladder — rate-limit only, capped
+1. `isRateLimited(result)` — pattern-matches on the result envelope's error text for `/rate limit|too many requests/i`. This is a *successful* HTTP response with an in-body error marker; Bloomreach returns 200 OK with `isError: true` for rate limits, not 429.
+2. `parseRetryAfterMs(result)` — pulls the wait hint out of the error message. Two observed shapes:
+   - `"Retry after ~12 second(s)"` → 12,000ms
+   - `"rate limit reached (1 per 10 second)"` → 10,000ms (the penalty window)
+3. `hintMs + RETRY_BUFFER_MS` — 500ms cushion so the retry lands just *after* the penalty window clears, not on its boundary.
+4. `Math.min(..., retryCeilingMs)` — 20-second ceiling. Even if Bloomreach stated 60s, wait no more than 20s. Prevents a single call from blowing the route budget.
+5. Fallback to `backoffMs = retryDelayMs * 2 ** (retries - 1)` — exponential backoff (10s, 20s, 40s) when no hint is parseable. Also capped at 20s.
 
-The whole ladder lives in `BloomreachDataSource.callTool`
-(`lib/data-source/bloomreach-data-source.ts:163-174`):
+```
+  Retry ladder — wait times per attempt
+
+  attempt 1:  → call, get 429 with "per 10 second"
+              → wait 10s + 500ms buffer = 10.5s (capped at 20s → 10.5s)
+
+  attempt 2:  → call, get 429 with "per 10 second"
+              → wait 10s + 500ms buffer = 10.5s
+
+  attempt 3:  → call, get 429 with "per 10 second"
+              → wait 10s + 500ms buffer = 10.5s
+
+  attempt 4:  (would have been the retry, but maxRetries=3 so stop)
+              → surface the 429 as the final error
+
+  total worst case: ~31s of waiting + 4 calls' HTTP latency
+  (against the 300s route budget)
+```
+
+**Load-bearing details worth naming:**
+
+- **maxRetries=3 is a budget decision, not a correctness one.** More retries would mean higher chance of success but also higher chance of blowing the route budget on one call. Three is the tension point.
+- **No jitter.** Bloomreach's rate limit is per-user global; multiple concurrent users hitting the same limit would ideally jitter their retries to avoid synchronizing. Not exercised because there's exactly one user per request in this app's model.
+- **Only rate-limit results retry.** Timeouts, 5xx errors, network errors — none retry. The retry ladder is scoped to a specific failure class where retrying is known to be productive.
+
+#### Proactive spacing — the ~1.1s minInterval
+
+Every call spaces itself from the last. From `lib/data-source/bloomreach-data-source.ts:190-194`:
 
 ```ts
-  let retries = 0;
-  while (isRateLimited(result) && retries < this.maxRetries) {
-    retries++;
-    const hintMs = parseRetryAfterMs(result);
-    const backoffMs = this.retryDelayMs * 2 ** (retries - 1);
-    const waitMs = Math.min(
-      hintMs != null ? hintMs + RETRY_BUFFER_MS : backoffMs,
-      this.retryCeilingMs,
-    );
-    await sleep(waitMs);
-    result = await this.liveCall(name, args, options.signal);
+private async liveCall(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
+  const elapsed = Date.now() - this.lastCallAt;
+  if (elapsed < this.minIntervalMs) {
+    await new Promise((r) => setTimeout(r, this.minIntervalMs - elapsed));
   }
+  // ...
+}
 ```
 
-**Trace execution.** Suppose the Bloomreach server has just told us
-"rate limit reached (1 per 10 second)":
+`minIntervalMs` defaults to 1100 (from `lib/mcp/connect.ts:120-125`, configured for the Bloomreach preset). The rationale — from that comment:
 
-```
-  Execution trace — rate-limited call, one server-stated window
+> Proactive spacing stays at ~1.1s on purpose: spacing at the full 10s window would cost ~60s for a 6-call investigation and blow the route's 60s budget (app/api/agent). Instead, BloomreachDataSource parses the stated window from each 429 and waits it out on retry.
 
-  retries = 0, result = { isError: true, content: [...'1 per 10 second'...] }
+So the strategy is: **stay just under the tightest documented window (1 per 1 second) on the happy path, react to 429s when the tighter window (1 per 10 seconds) is enforced.** Not perfect — you eat 429s sometimes — but it keeps the route budget realistic.
 
-  iter 1:
-    isRateLimited(result) = true, retries < 3 → enter loop
-    retries = 1
-    hintMs = parseRetryAfterMs → 10_000 ms  (parsed from "10 second")
-    backoffMs = 10_000 * 2^0 = 10_000
-    waitMs = min(10_000 + 500, 20_000) = 10_500 ms
-    sleep(10500)
-    result = liveCall(...)   ← same call again
+#### The 60-second response cache
 
-  Suppose result is still rate-limited:
-  iter 2:
-    retries = 2
-    hintMs = 10_000
-    backoffMs = 10_000 * 2^1 = 20_000
-    waitMs = min(10_500, 20_000) = 10_500  ← hint wins over backoff
-    sleep(10500)
-    result = liveCall(...)
-
-  Suppose result is finally ok:
-  loop exits, cache the result, return.
-
-  Total wall clock for one call: ~21s + call latency.
-  Total budget within maxRetries = 3: worst case ~31.5s of waits + 3 calls.
-```
-
-**Configuration values that produce this behavior**
-(`bloomreach-data-source.ts:129-137`):
+Every non-error `callTool` result gets cached under a key of `name:JSON.stringify(args)`. From `lib/data-source/bloomreach-data-source.ts:139-152, 178-187`:
 
 ```ts
-  constructor(private transport: McpTransport, opts: ClientOpts = {}) {
-    this.minIntervalMs = opts.minIntervalMs ?? 200;
-    this.maxRetries = opts.maxRetries ?? 3;
-    this.retryDelayMs = opts.retryDelayMs ?? 10_000;
-    this.retryCeilingMs = opts.retryCeilingMs ?? 20_000;
-  }
-```
+async callTool<T = unknown>(
+  name: string,
+  args: Record<string, unknown>,
+  options: CallToolOptions = {},
+): Promise<CallToolResult<T>> {
+  const cacheKey = `${name}:${JSON.stringify(args)}`;
+  const ttl = options.cacheTtlMs ?? 60_000;
 
-And the actual values passed at construction time
-(`lib/mcp/connect.ts:96-101`):
-
-```ts
-      mcp: new BloomreachDataSource(new SdkTransport(client, httpErrors), {
-        minIntervalMs: 1100,           // ← ~1.1s proactive spacing
-        retryDelayMs: 10_000,          // ← fallback base if no hint
-        retryCeilingMs: 20_000,        // ← per-wait ceiling
-        maxRetries: 3,
-      }),
-```
-
-**Skeleton vs hardening:**
-  - Kernel: the while-loop with a wait between attempts.
-  - Hardening:
-    - `parseRetryAfterMs` — parses the server's stated window from the
-      error text. This is what makes the wait match the *actual*
-      penalty rather than blind backoff.
-    - `RETRY_BUFFER_MS = 500` — added on top of the parsed hint so
-      the retry lands just *after* the penalty clears, not on its
-      boundary (which would race and get another 429).
-    - `retryCeilingMs = 20_000` — bounds any single wait, so a
-      pathological "please wait 5 minutes" hint doesn't blow the
-      route budget.
-    - `isError`-only retry — no throw catches; the retry inspects the
-      structured result.
-    - No-cache-on-error at `bloomreach-data-source.ts:179-181` — a
-      failed retry doesn't poison the 60s response cache.
-
-#### The proactive spacing — pre-emptive rate limiting
-
-Before the retry ladder even considers running, `liveCall` enforces a
-minimum interval between successful calls (`bloomreach-data-source.ts:190-198`):
-
-```ts
-  private async liveCall(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
-    const elapsed = Date.now() - this.lastCallAt;
-    if (elapsed < this.minIntervalMs) {
-      await new Promise((r) => setTimeout(r, this.minIntervalMs - elapsed));
+  if (!options.skipCache) {
+    const cached = this.cache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      return { result: cached.result as T, durationMs: 0, fromCache: true };
     }
-    try {
-      const result = await this.transport.callTool(name, args, { signal });
-      this.lastCallAt = Date.now();
+  }
+
+  // ... live call + retry ...
+
+  // Don't cache error results — they should not poison the cache.
+  if ((result as any)?.isError === true) {
+    return { result: result as T, durationMs, fromCache: false };
+  }
+  const now = Date.now();
+  this.cache.set(cacheKey, { result, expiresAt: now + ttl });
+  return { result: result as T, durationMs, fromCache: false };
+}
 ```
 
-`minIntervalMs = 1100` = 1.1 seconds. The comment at `connect.ts:87-92`
-explains why not 10 seconds:
+**Load-bearing details:**
 
-> Bloomreach rate-limits per user GLOBALLY and states the window in
-> the error text — observed as both "(1 per 1 second)" and "(1 per 10
-> second)". Proactive spacing stays at ~1.1s on purpose: spacing at
-> the full 10s window would cost ~60s for a 6-call investigation and
-> blow the route's 60s budget…
+- **60-second TTL matches the Bloomreach rate-limit window.** By the time cache entries expire, the rate limit has cleared for repeat calls.
+- **Errors don't cache.** A rate-limit error at t=0 would poison the cache for 60s and prevent the retry from ever succeeding. The explicit `isError === true` check excludes these.
+- **`skipCache` is per-call opt-out.** The `/debug` page's "force fresh" button sets this; the agent loop always uses cache.
+- **`skipCache` still refreshes on write-through.** A `skipCache=true` call bypasses the read but writes the fresh result back to cache. Correct for the "force fresh, then reuse" pattern.
 
-That's the tradeoff: pay a small amortized cost on every call to avoid
-running into the retry ladder on most of them, and reserve the ladder
-for the times when the observed window is actually 10s.
+The cache is process-local (`Map` in memory). On Vercel, each function instance has its own cache. A cache hit rate high enough to matter requires request affinity or a warm instance — which Vercel provides sometimes but doesn't guarantee. Best-effort optimization.
 
-#### Backpressure — none, and here's why
+#### The AbortSignal composition — why cancellation actually works
 
-There's no explicit backpressure mechanism (no queue depth limit, no
-in-flight-request counter, no `429`-shaped response back to the browser).
-The app doesn't need one because:
+The `composeSignals` helper in `lib/mcp/transport.ts:173-189` builds one signal that fires when any input signal fires:
 
-  - One user per session, ~15 calls per briefing, all serial (the
-    agent loop is sequential — one tool call, wait, next tool call).
-  - The 1.1s spacing acts as *implicit* backpressure: even a runaway
-    loop can't outpace the server faster than 1 call per 1.1 seconds.
-  - The route budget (300s) is the hard ceiling — a runaway loop hits
-    the process wall and Vercel kills it.
-
-If the app ever fanned out to multiple concurrent calls per user or
-multiple users on one Node instance, you'd want a semaphore around
-`liveCall` — the current `lastCallAt` state is per-instance and not
-concurrency-safe.
-
-### Move 2.5 — where each budget wins
-
-Three failure scenarios, one composition:
-
+```ts
+export function composeSignals(...signals: (AbortSignal | undefined)[]): AbortSignal {
+  const filtered = signals.filter((s): s is AbortSignal => !!s);
+  if (filtered.length === 0) return new AbortController().signal;
+  if (filtered.length === 1) return filtered[0];
+  if (typeof (AbortSignal as unknown as { any?: unknown }).any === 'function') {
+    return (AbortSignal as unknown as { any: (s: AbortSignal[]) => AbortSignal }).any(filtered);
+  }
+  // fallback for older runtimes ...
+}
 ```
-  Scenario A: user closes tab mid-stream
-  ────────────────────────────────────────
-   client disconnect → req.signal fires
-   composed signal fires immediately
-   in-flight callTool aborts
-   route finally runs, logs aborted: true
-   process exits (well under 300s)
 
-  Scenario B: Bloomreach hangs (network partition)
-  ─────────────────────────────────────────────────
-   callTool waits… no response…
-   AbortSignal.timeout(30_000) fires at 30s
-   isTimeoutError(err) → throw HTTP 0: timeout after 30000ms
-   NO RETRY — fail fast, next call proceeds
-   route may still succeed with the remaining calls
+Prefers `AbortSignal.any` (Node 20+ / modern browsers) which is the built-in "fire on first" primitive. Falls back to a manual `AbortController` glue for older runtimes.
 
-  Scenario C: Bloomreach rate-limits us
-  ─────────────────────────────────────────
-   callTool returns FAST with result.isError = true, "1 per 10 second"
-   isRateLimited(result) = true
-   parseRetryAfterMs = 10_000, wait 10_500ms
-   retry, likely succeeds now
-   total wall clock: ~11s for this call
+The load-bearing use: **the route's `req.signal` (fires when the browser closes the tab) composed with `AbortSignal.timeout(30_000)` (fires after 30s).** Whichever fires first cancels the fetch. Without composition, aborting the inbound socket doesn't propagate to the outbound socket — it would keep running until its own timeout, wasting cost.
 
-  Scenario D: Bloomreach revokes token mid-stream
-  ────────────────────────────────────────────────
-   callTool → HTTP 401 invalid_token
-   throws from SdkTransport
-   McpToolError wraps it
-   route sends {type:'error', message: "…invalid_token…"}
-   client's reconnect policy handles it (see file 06)
+#### Anthropic-side timeouts — not this file's job
+
+The Anthropic SDK call gets the route's `req.signal` threaded through, but no additional per-call ceiling. From `lib/agents/aptkit-adapters.ts:92-95`:
+
+```ts
+const response = await this.anthropic.messages.create(
+  params,
+  request.signal ? { signal: request.signal } : undefined,
+);
 ```
+
+The relationship is asymmetric: MCP calls get a 30s ceiling because Bloomreach can stall silently, but Anthropic calls rely on the route's 300s budget as the only ceiling. Anthropic's own SDK likely has internal timeouts; not explicitly set here.
+
+#### Connection pool — implicit, not tuned
+
+Node's `undici` (backing global `fetch`) pools TCP connections per host automatically. No explicit `Agent` or pool config in this repo (verified: `grep httpAgent|keep-alive|keepalive` → no matches). Pool size is `undici`'s default; keep-alive is default on.
+
+The consequence: first outbound call per host per function invocation pays a TCP+TLS handshake. Subsequent calls to the same host reuse the pooled connection. On a warm Vercel instance the pool persists across requests, so consecutive investigations see hot handshakes; on a cold instance the first call pays.
+
+Not tuned because there's no evidence tuning would help. If sustained load became a concern, this is where you'd add an explicit `undici.Agent` with a larger pool ceiling.
+
+#### No backpressure signaling to the browser
+
+The route's `controller.enqueue` calls don't await backpressure. If the browser reads slowly, bytes accumulate in Node's write buffer, but the route keeps pushing events. For the event sizes in this app (each event ~1-4KB) and the number of events per investigation (~20-50), the buffer doesn't fill in practice.
+
+Would matter if events got much larger or the browser was actually slow to consume. Not exercised.
 
 ### Move 3 — the principle
 
-Every failure has a distinct signal — timeout vs rate-limit vs 401 —
-and each signal has a distinct policy. Retrying a timeout is
-worse-than-useless (it wastes budget); retrying a rate limit after the
-stated window usually succeeds. The load-bearing move is *not the
-retry itself* — it's the classification that decides whether to
-retry, driven by inspecting the response envelope.
+**Fail fast where recovery is impossible; fail patiently where the server told you when to retry.** The 30s timeout says "if this call is stuck, admit it and move on — the ReAct loop can decide what to do next." The retry ladder says "if the server said 'wait 10 seconds,' wait 10.5 seconds and try again — the server is telling you the truth about when it'll accept." Which posture to take is a per-failure-mode decision, not a global one. This is why the transport doesn't retry timeouts and the data source only retries rate limits.
 
 ## Primary diagram
 
 ```
-  Primary — the three-tier budget composed
+  Every defense on one MCP call
 
-  ┌─ Route (maxDuration = 300s) ────────────────────────────────────┐
-  │                                                                   │
-  │  req.signal (fires on client disconnect)                          │
-  │      │                                                             │
-  │      │        ┌─ per callTool ───────────────────────────────────┐│
-  │      │        │                                                    ││
-  │      └───────►│  composeSignals(                                   ││
-  │  AbortSignal  │    req.signal,                                     ││
-  │  .timeout(30k)┼──►  AbortSignal.timeout(30_000)                    ││
-  │      │        │  )                                                  ││
-  │      │        │  transport.callTool(name, args, { signal })          ││
-  │      │        │      │                                                ││
-  │      │        │      │  network …                                     ││
-  │      │        │      ▼                                                ││
-  │      │        │  fast rate-limit response                             ││
-  │      │        │      │                                                ││
-  │      │        │      ▼                                                ││
-  │      │        │  isRateLimited(result)?                                ││
-  │      │        │      │ yes                                            ││
-  │      │        │      ▼                                                ││
-  │      │        │  wait = min(hint OR backoff, 20_000)                   ││
-  │      │        │  sleep(wait); retry up to maxRetries=3                ││
-  │      │        │                                                        ││
-  │      │        │  BUT if AbortSignal.timeout fires first:               ││
-  │      │        │      throw HTTP 0: timeout after 30000ms — NO RETRY   ││
-  │      │        └────────────────────────────────────────────────────┘  │
-  │                                                                       │
-  │  finally logs { phases, totalMs, aborted: req.signal.aborted }         │
-  └───────────────────────────────────────────────────────────────────┘
+  agent code:
+    result = await dataSource.callTool('foo', { arg: 1 }, { signal: req.signal })
+       │
+       ▼
+  ┌─ BloomreachDataSource.callTool ────────────────────────────┐
+  │                                                            │
+  │  cacheKey = 'foo:{"arg":1}'                                │
+  │                                                            │
+  │  ┌─ if !skipCache && cache.has(cacheKey) ─────────────┐    │
+  │  │   return { fromCache: true, durationMs: 0 }        │    │
+  │  └─────────────────────────────────────────────────────┘    │
+  │                                                            │
+  │  ┌─ retry loop, up to 3× ─────────────────────────────┐    │
+  │  │                                                    │    │
+  │  │  ┌─ liveCall ────────────────────────────────┐     │    │
+  │  │  │                                           │     │    │
+  │  │  │  if now - lastCallAt < 1100ms:            │     │    │
+  │  │  │    sleep(1100 - elapsed) ← proactive gap  │     │    │
+  │  │  │                                           │     │    │
+  │  │  │  ┌─ SdkTransport.callTool ────────────┐   │     │    │
+  │  │  │  │                                    │   │     │    │
+  │  │  │  │  signal = composeSignals(          │   │     │    │
+  │  │  │  │    req.signal,                     │   │     │    │
+  │  │  │  │    AbortSignal.timeout(30_000)     │   │     │    │
+  │  │  │  │  )                                 │   │     │    │
+  │  │  │  │                                    │   │     │    │
+  │  │  │  │  ┌─ fetch (undici) ────────────┐   │   │     │    │
+  │  │  │  │  │  pooled per-host connection │   │   │     │    │
+  │  │  │  │  │  HTTPS POST /mcp/           │   │   │     │    │
+  │  │  │  │  │  Authorization: Bearer ...  │   │   │     │    │
+  │  │  │  │  └─────────────────────────────┘   │   │     │    │
+  │  │  │  │                                    │   │     │    │
+  │  │  │  │  timeout? → HTTP 0: timeout...     │   │     │    │
+  │  │  │  │              (NOT retried)         │   │     │    │
+  │  │  │  │  non-2xx? → HTTP <status>: <body>  │   │     │    │
+  │  │  │  │              (redacted; NOT retried)│   │     │    │
+  │  │  │  │  ok?       → tool result envelope  │   │     │    │
+  │  │  │  └────────────────────────────────────┘   │     │    │
+  │  │  └───────────────────────────────────────────┘     │    │
+  │  │                                                    │    │
+  │  │  if isRateLimited(result):                         │    │
+  │  │    hint = parseRetryAfterMs(result)                │    │
+  │  │    wait = min(hint + 500ms || backoff, 20s)        │    │
+  │  │    sleep(wait); retry                              │    │
+  │  │                                                    │    │
+  │  └────────────────────────────────────────────────────┘    │
+  │                                                            │
+  │  if !isError: cache.set(cacheKey, result, ttl=60_000)      │
+  │  return { fromCache: false, durationMs, result }           │
+  │                                                            │
+  └────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-**Why fail-fast on timeout but retry on rate limit?** The information
-content of the two failures differs:
+**Why the 60s cache TTL matches the rate-limit window.** Bloomreach's tighter observed window is "1 per 10 seconds." If a call returns fresh at t=0, the same call at t=60s would be well past that window on the server. Caching for 60s is aggressive enough to absorb any within-investigation repeat but not so long that stale data leaks across investigations.
 
-  - Timeout = "no response received." Retrying gives you no new
-    information; you might just wait another 30s. The server is either
-    down or the network is partitioned; either way the app can't fix
-    it.
-  - Rate limit = "response received; server is telling you to wait
-    exactly N seconds and try again." Retrying is exactly what the
-    server asked for. The information (the parsed window) makes the
-    wait bounded and productive.
+**Why `HTTP 0:` as a tag.** The pattern is deliberate. `HTTP 0` means "no HTTP response ever came back" — distinct from an HTTP 4xx (server said no) or 5xx (server broke). Tests, fault injection, and future observability layers can all pattern-match on the prefix. `lib/data-source/fault-injecting.ts:121` uses the exact same shape:
 
-**Why 20s ceiling on any single wait when the observed window is
-10s?** Defense against a pathological server response ("please wait
-900 seconds"). The parsed hint is trusted only up to the ceiling; a
-malicious or buggy server can't burn the whole budget.
+```ts
+// Shape mimics lib/mcp/transport.ts:137 — `HTTP 0: timeout after 30000ms`.
+throw new Error(`HTTP 0: timeout after 30000ms`, {
+  cause: new Error('injected fault: timeout'),
+});
+```
 
-**Why no jitter?** The app has one client at a time, so thundering-herd
-doesn't apply. The `RETRY_BUFFER_MS = 500` acts as a fixed jitter that
-lands the retry just after the stated window. If the app ever ran with
-multiple concurrent users hitting the same `1 per 10 second` window, a
-±1s randomization would prevent synchronized retries.
+The fault-injection surface preserves the shape so the agent's error-handling paths get exercised offline.
 
-**Why 60s response cache in the middle of all this?** Two reasons:
-(1) repeated identical calls within a briefing skip the whole retry
-ladder — cache hit, no network, done in 0ms. (2) it lets the retry
-ladder be more conservative — if a call succeeds after 20s of retries,
-the next identical call within 60s is free.
+**The Anthropic call has no per-call timeout — why not.** Anthropic's own SDK has retries and internal timeouts, and the route's 300s budget acts as the final ceiling. Adding another explicit timeout would compound with the SDK's internals. If the Anthropic call started stalling routinely, this would be the file to add one — but so far the baseline says the diagnostic phase's 50s p50 is dominated by MCP calls, not Anthropic.
+
+**On not tuning the connection pool.** `undici`'s defaults handle this app's traffic just fine. If we saw evidence of pool exhaustion (calls waiting for a socket) or excessive handshake counts, we'd add an explicit `Agent`. No such evidence in the baseline metrics. Would matter more on a long-running Node server; on Vercel's ephemeral functions the pool discards on function end anyway.
+
+**What's not exercised.** Circuit breakers (per-host failure-rate tracking that opens the circuit and fails fast for a cool-down period). Load shedding (dropping requests when a queue backs up). Request collapsing (deduplicating in-flight identical requests instead of just cached ones). Adaptive concurrency (raising/lowering pool size based on observed latency). None are needed at current scale; all would become relevant with sustained high traffic.
+
+**The proactive gap and the retry ladder are complementary.** The gap keeps happy-path calls under the 1/s window (avoids the tighter 1/10s trigger). The retry ladder is the safety net when Bloomreach enforces the tighter window anyway. Together they aim to keep an investigation's tool count (~5-15 calls) inside the route's 300s budget most of the time.
 
 ## Interview defense
 
-**Q: You have a 300s route budget and each tool call can take up to
-30s + 60s of retry waits. What stops one bad call from eating the
-whole budget?**
+**Q: Walk me through what happens if one Bloomreach call hangs.**
 
-  Verdict first: the per-call 30s ceiling is on the *HTTP round-trip*
-  itself. The 60s of retry wall clock only applies when the *response*
-  comes back quickly (fast rate-limit envelope) — because the retry
-  runs after a fast failure. A stuck upstream fails at 30s once and
-  the ladder never fires.
+The `AbortSignal.timeout(30_000)` inside `SdkTransport.callTool` fires. `undici` cancels the fetch, the socket closes. The transport's catch checks `isTimeoutError` (matches `AbortError` or `TimeoutError` by name) and throws `HTTP 0: timeout after 30000ms`. `BloomreachDataSource.liveCall` catches, tags it as an `McpToolError('foo', 'HTTP 0: timeout after 30000ms')`, and rethrows.
+
+Crucially, the retry ladder does NOT catch this. Rate-limit retries are the only case; timeouts fail fast because retrying would risk another 30s wait inside the same 300s route budget. The agent's ReAct loop sees the error as a tool result, decides whether to try a different tool or give up, and the investigation continues (or terminates gracefully).
 
 ```
-  answer sketch — timeout ≠ retry-triggering
-
-  stuck upstream (no response):
-    30s AbortSignal.timeout → throw HTTP 0 → fail fast
-    no retry (isRateLimited(err) doesn't fire)
-    total: 30s, then next call proceeds
-
-  rate-limited (fast response):
-    ~200ms round trip → isError + "rate limit"
-    retry ladder: up to 3 waits × 20s = 60s wall clock
-    total: ~60s + 3 × ~200ms fast responses
-    but this only happens because the responses are fast
-
-  worst-case single call: 30s (timeout) + no retry = 30s
-  worst-case rate-limited call: 60s + fast round trips = ~61s
+  time budget on a stuck call:
+    without 30s timeout: possibly minutes → burns 300s route budget
+    with 30s timeout:    exactly 30s → 270s left for the loop to recover
 ```
 
-  Anchor: `lib/mcp/transport.ts:38, 131-138`,
-  `lib/data-source/bloomreach-data-source.ts:163-174`.
+Anchor: `lib/mcp/transport.ts:38, 131-137`.
 
-**Q: How does the client cancel an in-flight LLM call when the user
-navigates away?**
+**Q: How does the retry ladder decide how long to wait?**
 
-  Direct: one composed AbortSignal reaches every level. Client sets
-  `cancelledRef.current = true`; `readNdjson` calls `reader.cancel()`;
-  the underlying fetch's request signal fires `AbortError` on the
-  server; the route's `req.signal` is composed with the per-call 30s
-  timeout via `AbortSignal.any` and passed as the `signal` option on
-  every `callTool` and on `anthropic.messages.create`. So the same
-  abort that closed the browser stream cancels the in-flight upstream
-  LLM call.
+Three-step decision:
 
-```
-  answer sketch — one signal, three layers
+1. **Parse the server's own stated window.** Bloomreach returns 429 with text like `"rate limit reached (1 per 10 second)"` or `"Retry after ~12 second(s)"`. Regex extracts the number.
+2. **Add a 500ms buffer.** The retry lands just after the window clears, not on its boundary.
+3. **Cap at 20s ceiling.** Even if the server said 60s, wait no more than 20s. Prevents any single retry from blowing the route budget.
 
-  cancelledRef.current = true  (client cleanup)
-       ↓
-  reader.cancel() → RST_STREAM (HTTP)
-       ↓
-  req.signal.aborted = true (route)
-       ↓ composed with AbortSignal.timeout(30_000)
-  fetch({signal}) aborts (transport)
-       ↓
-  anthropic.messages.create({signal}) aborts (SDK)
-```
+If no hint is parseable, fall back to exponential backoff (`10s, 20s, 40s`) capped at 20s.
 
-  Anchor: `lib/streaming/ndjson.ts:33-36`,
-  `lib/mcp/transport.ts:131,173-189`,
-  `lib/agents/aptkit-adapters.ts:92-95`.
+Max 3 retries. Worst case: ~31s of waiting + 4 calls' latency, on the 300s route budget.
 
-**Q: What's missing from this retry policy that a production system
-at scale would want?**
+Anchor: `lib/data-source/bloomreach-data-source.ts:60-71, 154-174`.
 
-  Direct: three things. (1) *Jitter* — the current deterministic wait
-  creates thundering-herd risk if multiple users hit the same window;
-  fine at 1 user but not at N. (2) *Cross-request state* — the
-  1.1s spacing is per-instance; two Node instances handling two
-  requests can each fire in the same 1s window. A shared token
-  bucket (Redis) would fix that. (3) *Circuit breaker* — after N
-  consecutive timeouts on the same origin, stop calling entirely for
-  a cool-down period. Currently every call independently absorbs the
-  30s timeout.
+**Q: What's the load-bearing detail people forget when they build this shape?**
 
-  Anchor: same files; the absence is the point.
+The `AbortSignal` composition. If you set a per-call timeout but don't compose it with the route's cancel signal, closing the browser tab doesn't propagate to the outbound MCP call — it keeps running until its own timeout, wasting 30s of cost per stuck call.
+
+`composeSignals(req.signal, AbortSignal.timeout(30_000))` uses `AbortSignal.any` (Node 20+) so whichever fires first cancels the fetch. One line, but the cancellation story wouldn't work end-to-end without it.
+
+Anchor: `lib/mcp/transport.ts:131, 173-189`.
 
 ## See also
 
-  - `01-network-map.md` — where each timeout sits on the wire
-  - `03-tcp-udp-connections-and-sockets.md` — connection pooling under the hood
-  - `06-websockets-sse-streaming-and-realtime.md` — how the client-side abort
-    composes with the fetch stream
-  - `08-networking-red-flags-audit.md` — the ranked risks that come out of these
-    tradeoffs
+- `03-tcp-udp-connections-and-sockets.md` — how the 30s ceiling relates to socket lifecycle
+- `05-http-semantics-caching-and-cors.md` — the response cache in the broader HTTP-caching story
+- `08-networking-red-flags-audit.md` — where these defenses have gaps (no jitter, no circuit breaker, no Anthropic timeout)
+- `study-distributed-systems` — same rate-limit + retry topic seen from "coordination under partial failure"

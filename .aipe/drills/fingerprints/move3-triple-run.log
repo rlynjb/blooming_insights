@@ -1,0 +1,26 @@
+=== fingerprint run started 2026-07-03T09:40:42-07:00 ===
+
+=== 01-conversion-drop-mobile-checkout run 1 — start 2026-07-03T09:40:42-07:00 ===
+
+> app-scaffold@0.1.0 eval
+> vitest run --config vitest.eval.config.ts eval/run.eval.ts -t 01-conversion-drop-mobile-checkout
+
+
+ RUN  v4.1.7 /Users/rein/Public/blooming_insights
+
+
+ Test Files  1 passed (1)
+      Tests  1 passed | 9 skipped (10)
+   Start at  09:40:43
+   Duration  215.53s (transform 56ms, setup 0ms, import 92ms, tests 215.35s, environment 0ms)
+
+=== 01-conversion-drop-mobile-checkout run 1 — end 2026-07-03T09:44:18-07:00 (exit 0) ===
+
+=== 01-conversion-drop-mobile-checkout run 2 — start 2026-07-03T09:44:18-07:00 ===
+
+> app-scaffold@0.1.0 eval
+> vitest run --config vitest.eval.config.ts eval/run.eval.ts -t 01-conversion-drop-mobile-checkout
+
+
+ RUN  v4.1.7 /Users/rein/Public/blooming_insights
+

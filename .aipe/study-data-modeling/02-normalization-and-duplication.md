@@ -1,270 +1,352 @@
-# Normalization and duplication
+# 02 — Normalization and duplication
 
-**Industry term:** Denormalization / single source of truth (SSOT) violation · **Type:** Industry-standard concept, applied here to TypeScript types rather than to SQL tables.
+**Normalization / single source of truth · Case B (no DB) · information-hiding for data**
 
-## Zoom out, then zoom in
+## Zoom out — where this concept lives
 
-**Zoom out — where duplication lives.** Only three seams in this repo can produce the "same fact stored twice" problem, because only three places construct records that inline other records:
-
-```
-  Where facts can be stored twice — layered view
-
-  ┌─ UI layer ──────────────────────────────────────────────────┐
-  │  reads Insight — treats it as SSOT (never merges)           │
-  └────────────────────────┬────────────────────────────────────┘
-                           │
-  ┌─ Service layer ────────▼────────────────────────────────────┐
-  │                                                              │
-  │  seam 1: anomalyToInsight  (lib/state/insights.ts:25)        │
-  │            derives + splices 5 fields — one-time compute     │
-  │                                                              │
-  │  seam 2: Diagnosis.affectedCustomers ─► Insight.affectedCus- │
-  │            tomers (elsewhere in the pipeline) — cross-record │
-  │                                                              │
-  │  seam 3: Receipt construction (eval/run.eval.ts:341-395)     │
-  │            inlines diagnosis + tool calls + judgment + cost  │
-  │            into ONE document                                 │
-  │                                                              │
-  └────────────────────────┬────────────────────────────────────┘
-                           │  serialize
-  ┌─ Storage layer ────────▼────────────────────────────────────┐
-  │  Map<sessionId, SessionFeed>  (in-memory)                    │
-  │  demo-*.json  eval/receipts/*.json                           │
-  └─────────────────────────────────────────────────────────────┘
-```
-
-**Zoom in — the pattern.** In relational language, "the same fact editable in two places" is a normalization violation and it's the DB analog of information leakage (from software-design's information-hiding). blooming_insights doesn't have tables to normalize, but it has the *type-level* version of the same problem: an interface that includes fields derived from another interface, with no invalidation contract between them.
-
-## Structure pass
-
-### Layers of duplication
-
-Not all duplication is equal. Rank by cost:
+Normalization is *information-hiding for data*: a fact lives in exactly one place, and everyone who needs it reads from that one place. Duplication is the opposite — the same fact stored twice, editable in two places, drifting silently.
 
 ```
-  Duplication types — cheapest to most expensive
+  Zoom out — where duplication risk shows up in this repo
 
-  ┌─ 1. denormalized-for-write (write-once, no lifecycle) ──────┐
-  │  Receipt inlines Diagnosis + Recommendation + judgments     │
-  │  → written once, never updated → duplication is free        │
-  └────────────────────────┬────────────────────────────────────┘
-                           │
-  ┌─ 2. denormalized-for-read (present + past both derivable) ──┐
-  │  Insight.revenueImpact, .funnel — recompute from evidence   │
-  │  → source of truth stays in Anomaly.evidence, but the       │
-  │    derived form lives alongside it → invalidation is silent │
-  └────────────────────────┬────────────────────────────────────┘
-                           │
-  ┌─ 3. cross-record copy (worst — two shapes disagree) ────────┐
-  │  Diagnosis.affectedCustomers.count ─► Insight.affectedCust. │
-  │  → two records, one fact, no owner → true dup               │
-  └─────────────────────────────────────────────────────────────┘
+  ┌─ Client (browser) ─────────────────────────────────────┐
+  │  sessionStorage[bi:insight:{id}]  ← Insight copy #1     │
+  │  in-memory hook state             ← Insight copy #2     │
+  └────────────────────────┬────────────────────────────────┘
+                           │ HTTP
+  ┌─ Service ──────────────▼────────────────────────────────┐
+  │  Map<sessionId, SessionFeed>                            │
+  │    insights:  Insight  ─┐ ← same 4 fields               │
+  │                          │   (metric/scope/change/sev)   │
+  │    anomalies: Anomaly  ─┘   are in both by design       │
+  │                                                          │
+  │  ★ THIS FILE ★ — where is the same fact stored twice,   │
+  │  where is that OK, and where is it a bug?               │
+  │                                                          │
+  │  Investigation.diagnosis     ← shape drift vs            │
+  │  Diagnosis (types.ts)          same conceptual entity    │
+  │                                                          │
+  │  Receipt[N] × 10 cases       ← anomaly denormalized      │
+  │  eval/receipts/*.json          into every receipt        │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-### One axis: **who owns the fact?**
+The question this file answers: **for every fact in this app, is there a single source of truth — and where the fact is copied, is the copy deliberate (a read optimization) or accidental (a bug in waiting)?**
 
-- `Insight.revenueImpact` — owner: `Anomaly.evidence[0].result.{current,prior}` (derived at construction, `lib/insights/derive.ts:27-38`).
-- `Insight.affectedCustomers` — owner: `Diagnosis.affectedCustomers.count`, but stamped onto `Insight` too (the type comment at `lib/mcp/types.ts:58` calls it out: *"denormalized from Diagnosis.affectedCustomers.count"*).
-- `Receipt.diagnosis` — owner: the `Diagnosis` returned by the agent; the receipt is a *frozen copy* by definition.
+## The structure pass — layers, one axis, seams
 
-### Seams — where the answer flips
+Hold one axis constant: **who owns the write for this fact?**
 
-Two seams flip the answer from "one owner" to "two":
+```
+  Axis: "which tier is authoritative — and who owns the copy in each other tier?"
 
-- **`lib/state/insights.ts:25-45` — `anomalyToInsight`.** Before the call: `Anomaly` is the fact. After: `Insight` carries the fact **plus derived views of the fact.**
-- **The `Insight.affectedCustomers` write path** (produced somewhere in the investigation flow — the type comment names it). Before: `Diagnosis.affectedCustomers.count` is the fact. After: two records carry it.
+  ┌── fact: the current Insight[] for a session ─────────────────┐
+  │                                                              │
+  │  authoritative   Map<sessionId, SessionFeed>.insights         │
+  │                     (tier 2, in-memory server)                │
+  │                                                              │
+  │       │ read + copy on stream                                 │
+  │       ▼                                                       │
+  │  DERIVED         sessionStorage[bi:insight:{id}]              │
+  │                     (tier 1, browser) — read-only copy        │
+  │                                                              │
+  │  SEAM: the network. The copy on tier 1 is a cache; if it     │
+  │  drifts from tier 2, "stale" — no correctness bug because    │
+  │  the next stream replaces it.                                │
+  └──────────────────────────────────────────────────────────────┘
+
+  ┌── fact: Insight.evidence ←── Anomaly.evidence ───────────────┐
+  │                                                              │
+  │  authoritative   Anomaly.evidence (tier 2)                   │
+  │  DERIVED         Insight.evidence (tier 2, same map!)         │
+  │                                                              │
+  │  SEAM: none — same tier, same session, same request. The     │
+  │  copy is a *layout* choice, not a persistence choice.        │
+  │  Risk: if either is ever mutated independently, drift bug.   │
+  └──────────────────────────────────────────────────────────────┘
+```
+
+The seam matters: when the copy crosses a tier boundary, it's a **cache** (staleness = OK; next refresh replaces). When the copy stays in the same tier, it's a **layout** decision (drift = correctness bug).
 
 ## How it works
 
 ### Move 1 — the mental model
 
-If you've ever cached a computed field on a row (`user.follower_count`, `product.average_rating`), you already know this pattern — and the trap. The shortcut is fast: you don't have to recompute on every read. The cost is the **invalidation problem**: the moment the underlying data changes, the cached copy is stale, and nothing tells you.
+You already know this from React: when you `useMemo(() => deriveX(state), [state])`, you're storing a derived copy of `state`. That's fine because React re-runs the memo when `state` changes — the invariant "`derived === deriveX(state)`" is machine-enforced by the reactivity system.
+
+In this app there's no reactivity. Copies are hand-made in code, and the invariant "the copy matches the source" is enforced by **the write shape**: writes only ever *replace* whole entities, never mutate parts of them. That's the whole discipline — it's not a database enforcing referential integrity, it's a coding pattern enforcing "if you change the source, replace the copy too."
 
 ```
-  The denormalization pattern — the fact, the copy, the missing edge
+  The pattern — write-atomicity as the invariant enforcer
 
-              (SOURCE OF TRUTH)                    (DERIVED COPY)
-              ┌──────────────┐                     ┌──────────────┐
-              │  Anomaly     │                     │  Insight     │
-              │  .evidence   │──── derive ────────►│ .revenueImpa │
-              └──────┬───────┘   (one-way, at     └──────────────┘
-                     │            construction)
-                     │
-                     ▼
-              (if this ever changes,
-               nothing updates the copy)
-                     │
-                     ▼
-                 STALE
+    write shape                    invariant it enforces
+    ───────────                    ─────────────────────
+
+    putInsights(insights, anom):   Insight[N] and Anomaly[N] always
+      s.insights.clear()             cleared and set together — never
+      s.anomalies.clear()            just one or the other
+      items.forEach((i, idx) => {
+        s.insights.set(...)
+        if (rawAnom) s.anomalies.set(...)
+      })
+                                   → drift impossible IF nothing else
+                                     mutates either map afterwards
 ```
 
-For blooming_insights, "if this ever changes" is currently unreachable — the pipeline is one-shot, `Anomaly` is immutable once produced, so the copy is safe. But the *shape* has the vulnerability. The moment any edit path is added ("re-run the diagnosis with different scope"), the copy silently lies.
+The pattern generalizes: **when you can't enforce an invariant with a foreign key, enforce it with the write path.** Every place two facts must stay in sync gets one function that writes both, atomically, and no other write path.
 
-### Move 2 — the three duplications, walked
+### Move 2 — the specific copies, ranked
 
-#### Duplication A — the derived fields on `Insight`
+Not every copy is a bug. Rank them.
 
-**File:** `lib/state/insights.ts`
-**Function:** `anomalyToInsight` (lines 25-45) — and `deriveInsightFields` at `lib/insights/derive.ts:27-38`
-**What happens:**
+#### Copy 1 (deliberate) — `Insight.evidence` ← `Anomaly.evidence`
+
+Where: `lib/state/insights.ts:25-45`, `anomalyToInsight()`.
+
+The `Insight` returned to the UI carries the same `evidence` array the `Anomaly` had, plus other denormalized fields (`impact`, `history`, `category`, `affectedCustomers`). That's a **read-optimization**: the UI never has to join `Insight` to its `Anomaly` to render the card.
+
+Why it's fine here: the write path (`putInsights`) always writes both, always in the same call, and never mutates them afterward. The invariant "`Insight.evidence` matches `Anomaly.evidence`" is enforced by "nobody ever writes just one."
+
+Verdict: **deliberate denormalization, correctness enforced by the write shape.** Fine.
+
+#### Copy 2 (lossy round-trip) — `insightToAnomaly` drops fields
+
+Where: `lib/state/insights.ts:53-55`.
 
 ```typescript
-// lib/state/insights.ts:25-45
-export function anomalyToInsight(a: Anomaly): Insight {
-  const id = crypto.randomUUID();
-  const sign = a.change.direction === 'down' ? '-' : '+';
-  const headline = `${a.scope.join(' ')} ${a.metric} · ${sign}${Math.abs(a.change.value)}%`.toLowerCase();
-  return {
-    id,
-    timestamp: new Date().toISOString(),
-    severity: a.severity,
-    headline,                                                  // ← derived from a.scope + a.metric + a.change
-    summary: `${a.metric} ${a.change.direction} ${Math.abs(a.change.value)}% vs ${a.change.baseline}`.toLowerCase(),
-    metric: a.metric,
-    change: a.change,                                          // ← copied
-    scope: a.scope,                                            // ← copied
-    source: 'monitoring',
-    evidence: a.evidence,                                      // ← copied by reference
-    impact: a.impact,                                          // ← copied
-    history: a.history,                                        // ← copied
-    category: a.category,                                      // ← copied
-    ...deriveInsightFields(a),                                 // ← splices revenueImpact + more
-  };
+export function insightToAnomaly(i: Insight): Anomaly {
+  return { metric: i.metric, scope: i.scope, change: i.change,
+           severity: i.severity, evidence: [] };
 }
 ```
 
-Every field marked `← copied` is a redundant write. `Anomaly` still exists (`putInsights` keeps `rawAnomalies` in its own Map, `lib/state/insights.ts:65-70`) — so both records live in memory and both carry the same field. The type comment on `Insight.affectedCustomers` (`types.ts:58`) is worth quoting exactly:
+The comment above it (line 47-52) admits it: *"Intentionally drops evidence/impact/history/category — the agent loop only needs metric/scope/change/severity to investigate; the rest is regenerated downstream."*
+
+Why this is a *modeling* decision: the reverse mapper is **not a bijection with the forward mapper**. `anomalyToInsight ∘ insightToAnomaly` loses information. In a database this would be modeled as *"the `Anomaly` table has these 4 required columns and these 4 optional"* — and the loss would be obvious in the schema. In this codebase it's obvious only if you read the comment.
+
+```
+  Round-trip lossiness — annotated
+
+  Anomaly (full)                     Insight (denormalized)
+  ┌──────────────────┐                ┌──────────────────┐
+  │ metric           │──────────────► │ metric           │
+  │ scope            │──────────────► │ scope            │
+  │ change           │──────────────► │ change           │
+  │ severity         │──────────────► │ severity         │
+  │ evidence         │──────────────► │ evidence          │
+  │ impact           │──────────────► │ impact            │
+  │ history          │──────────────► │ history           │
+  │ category         │──────────────► │ category          │
+  └──────────────────┘                └──────────────────┘
+
+  reverse:  Anomaly'  ◄────────────  Insight
+  ┌──────────────────┐    lossy!
+  │ metric           │◄─── metric
+  │ scope            │◄─── scope
+  │ change           │◄─── change
+  │ severity         │◄─── severity
+  │ evidence: []     │  ← dropped
+  │ (no impact)      │  ← dropped
+  │ (no history)     │  ← dropped
+  │ (no category)    │  ← dropped
+  └──────────────────┘
+```
+
+Verdict: **intentional, tested (see `test/state/insights.test.ts`), but a source of surprise.** A newcomer reading the code will assume round-trip preserves shape. It doesn't.
+
+#### Copy 3 (shape drift, real risk) — `Investigation.diagnosis` vs `Diagnosis`
+
+Where: `lib/mcp/types.ts:94-104` (canonical `Diagnosis`) and `lib/mcp/types.ts:132-141` (`Investigation.diagnosis`).
+
+Two shapes, same conceptual entity, same file:
 
 ```typescript
-affectedCustomers?: number; // denormalized from Diagnosis.affectedCustomers.count
+// The canonical one — the diagnostic agent's output.
+export interface Diagnosis {
+  conclusion: string;
+  evidence: string[];
+  hypothesesConsidered: {
+    hypothesis: string;
+    supported: boolean;
+    reasoning: string;
+  }[];
+  affectedCustomers?: { count: number; segmentDescription: string };
+  confidence?: 'high' | 'medium' | 'low';
+  timeSeries?: { day: string; value: number }[];
+}
+
+// The other one — embedded in Investigation.
+export interface Investigation {
+  insightId: string;
+  reasoning: ReasoningStep[];
+  diagnosis: {
+    conclusion: string;
+    evidence: string[];
+    hypothesesConsidered: string[];   // ← DIFFERENT SHAPE
+  };
+  recommendations: Recommendation[];
+}
 ```
 
-The word "denormalized" is right there in the source. This is not accidental — it's a deliberate call to make rendering cheap. But the cost is:
+`hypothesesConsidered` is `{hypothesis, supported, reasoning}[]` in one place and `string[]` in the other. Same field name, same file, same conceptual entity. That's textbook "same fact editable in two places" — the DB analog of the information leakage red flag.
 
-**What breaks if you don't rebuild the copy:** `anomalyToInsight` is called once per anomaly in the briefing pipeline. If a downstream code path ever mutated `Anomaly.evidence` (say, to enrich it with a follow-up query result) without re-invoking `anomalyToInsight`, the `Insight.revenueImpact` derived from that evidence would be stale, and no compiler check catches it.
+Verdict: **latent bug in waiting.** If someone edits `Diagnosis.hypothesesConsidered` to add a field, the sibling shape in `Investigation.diagnosis` doesn't change. The two will drift until code that reads one under the wrong assumption panics at runtime.
 
-**The fix if it becomes real:** either move the derivations to *read time* (compute on render, delete the field from `Insight`), or introduce a version stamp on `Anomaly.evidence` and `Insight` and refuse to render mismatches. Read-time derivation is cheaper here — the derivations are pure functions of small inputs.
-
-#### Duplication B — `Diagnosis.affectedCustomers.count` copied into `Insight.affectedCustomers`
-
-**Files:** `lib/mcp/types.ts:58` (the type comment) — and wherever the copy is performed (search paths: the investigation-complete handler; the seam is named in the comment even where the assignment is elsewhere).
-**What happens:**
-
-```
-  Two records, one fact — the classic denormalization anti-pattern
-
-       Diagnosis                          Insight
-       ┌──────────────────────┐           ┌──────────────────────┐
-       │ affectedCustomers: { │           │ affectedCustomers?:  │
-       │   count: 9340,       │  ─copy──► │   9340               │
-       │   segmentDescription │           │                      │
-       │ }                    │           └──────────────────────┘
-       └──────────────────────┘
-              │
-              │ if any code updates Diagnosis
-              │ but not the Insight — silent drift
-              ▼
-       Insight.affectedCustomers is now a lie
-```
-
-**What breaks if the diagnosis is re-run:** the `Insight` card in the feed still shows the old count. Currently unreachable — diagnoses are computed once and never updated — but the *shape* invites the bug.
-
-**The fix if it becomes real:** delete `Insight.affectedCustomers`, add a lookup at render time from the investigation store (`lib/state/insights.ts` — `getInvestigation`). Reading through the diagnosis is 3 lines; the field on `Insight` is a "make the render function trivial" shortcut that costs a normalization violation.
-
-#### Duplication C — the receipt as a denormalized document
-
-**File:** `eval/run.eval.ts` (lines 341-395)
-**Function:** the anonymous case body inside `it.each(goldens.map(...))`.
+The fix, when it becomes real:
 
 ```typescript
-// eval/run.eval.ts:341-395 (abridged)
-const receipt = {
-  runId: sharedRunId,
-  case: goldenCase.caseId,
-  signalClass: goldenCase.signalClass,
-  intent: goldenCase.intent,
-  durationMs: { investigate, diagnosisJudge, recommend, recommendationJudge, total },
-  model: { agent: 'claude-sonnet-4-6', judge: 'claude-sonnet-4-6' },
-  anomaly: { metric, scope, change, severity },      // ← inlined from GoldenCase.anomaly
-  diagnosisToolCalls: [...],                         // ← the full trace
-  recommendationToolCalls: [...],                    // ← the full trace
-  usage: { diagnose, recommend },                    // ← per-agent token+cost
-  budget: { limit, snapshot, exceeded, budgetError },// ← whole tracker snapshot
-  diagnosis,                                         // ← the whole Diagnosis object
-  diagnosisJudgment,                                 // ← the whole judge output
-  diagnosisJudgmentError,
-  recommendations,                                   // ← the whole Recommendation[]
-  recommendationJudgments,                           // ← per-rec judgments
-};
+export interface Investigation {
+  insightId: string;
+  reasoning: ReasoningStep[];
+  diagnosis: Diagnosis;         // ← reuse the canonical shape
+  recommendations: Recommendation[];
+}
 ```
 
-Every field is a **snapshot of another record at the moment the case ran.** The `anomaly` in the receipt is a copy of `GoldenCase.anomaly`. The `diagnosis` is a copy of what the agent returned. The `usage` is a snapshot of what `summarizeUsage` computed from the trace.
+That's the whole change. Single source of truth for the shape.
 
-**Is this bad denormalization?** No — this is the **write-once immutable-log** case, and it's the *right* choice. A receipt exists to make the run replayable in isolation. If you had to join against the golden file, the tool-call trace, the judge output, and the pricing table to reconstruct what happened, the whole eval subsystem would be brittle to unrelated code changes. Inlining everything at write time makes each receipt self-contained.
+#### Copy 4 (deliberate blob) — `Anomaly` denormalized into every `Receipt`
 
-**But the tradeoff is real:** at 10 cases × ~35KB × N runs, the receipts directory is comfortable. At 200 cases × N runs, or if the receipts start being *queried* across runs, the file layout becomes the bottleneck. That's a shape-vs-query mismatch, walked in file 03.
+Where: `eval/receipts/*.json`.
 
-#### Move 2 variant — the load-bearing skeleton of "safe denormalization"
+Every receipt (~400 lines, 28 committed) carries the full `anomaly` field even though the anomaly comes from the golden case, which is the ground truth for the same case ID. That's ~10 KB duplicated across 28 files = ~280 KB of redundant JSON on disk.
 
-Three parts. Drop any one and the denormalization goes from cheap to costly.
+```
+  Receipts denormalize the anomaly on purpose
 
-1. **Write-once discipline.** The source can never change *after* the copy is made. `Receipt` gets this for free (the run finishes, the file is written, done). `Insight`-with-derived-fields *has* this, currently, but only by convention — no compiler check prevents mutation.
+  ┌── eval/goldens/01-conversion-drop-mobile-checkout.ts ─┐
+  │  goldenCase.anomaly  ← authoritative                   │
+  └───────────────────────┬────────────────────────────────┘
+                          │  run.eval.ts copies into every receipt
+                          ▼
+  ┌── eval/receipts/01-conversion-drop-*-2026-07-03*.json ┐
+  │  { "anomaly": {...same shape, copied...}, ... }        │
+  │                                                        │
+  │  three receipts committed for this one golden case     │
+  └────────────────────────────────────────────────────────┘
+```
 
-2. **A named ownership contract.** The type comment on `Insight.affectedCustomers` — *"denormalized from Diagnosis.affectedCustomers.count"* — is that contract, written down. Every denormalized field needs one. Without it, future you doesn't know which side to trust.
+Why it's fine: a receipt is *the whole story of one investigation run*. Opening one file has to show you the anomaly it started from, otherwise you have to cross-reference the golden by hand. The receipt is designed to be *self-contained* — that's an explicit choice, and the disk cost is negligible.
 
-3. **A recompute path if the source moves.** `deriveInsightFields` (lib/insights/derive.ts:27) is pure and callable — if evidence ever gets enriched mid-flight, `anomalyToInsight` can be called again to refresh. If a derived field has *no* recompute path (only the original anomalyToInsight can produce it), the denormalization has no escape hatch.
+Verdict: **deliberate, and the right call for the artifact's purpose.** The tradeoff is named: disk = cheap, human-review effort = expensive; optimize for the latter.
 
-If you're wondering why receipts don't need parts 2 and 3, the answer is part 1: they're immutable by construction. Discipline gets weaker the further you get from "written once, then read forever."
+#### Copy 5 (partial-shape mirror) — `MemoRAG`-style stashing in sessionStorage
+
+Where: `lib/hooks/useInvestigation.ts:54, 76, 135, 141` (`stashKey`, `diagHandoffKey`).
+
+Each investigation step's result is stashed to `sessionStorage` so re-visits / back-nav don't re-fetch. That's a browser-side cache of a server-side fact.
+
+Verdict: **cache, seam-crossing, so staleness only.** Fine — the copy lives on the wrong side of the network from the source, and if it drifts, the worst case is showing yesterday's diagnosis for two seconds before the new one loads.
 
 ### Move 3 — the principle
 
-**Denormalize on the write path when the record is immutable; normalize on the read path when it isn't.** Immutable logs (receipts, event streams, snapshots) *want* to be denormalized — that's the whole point of the pattern. Records with edit paths (`Insight` in a world where a user could re-scope a diagnosis) want the fact to live in exactly one place, with reads doing the join. The rule you take home: **the invalidation contract is where the design lives.** If you can't name what invalidates a derived field and where that invalidation is enforced, you've built a bug the compiler won't catch. In blooming_insights the contract is *"the pipeline is one-shot"* — as long as that stays true, the denormalization is free. The day it stops being true, the derived fields on `Insight` are the first thing to migrate.
+The principle: **when normalization can't be enforced by the storage engine (because there is no storage engine), enforce it by the write shape.** For every fact that appears in two places:
 
-## Primary diagram
+  1. Name the authoritative source.
+  2. Make the write path that touches the source *always* touch the copy too, atomically.
+  3. Never let another write path touch just the copy.
 
-The three duplications side by side, ranked by cost.
+Where you can't meet those three conditions, the fact will drift. The `Diagnosis` vs `Investigation.diagnosis` drift is real because nothing enforces "if you edit one, edit the other" — they're separately declared, separately imported, separately used.
+
+## Primary diagram — the copy map, ranked
 
 ```
-  Denormalization in blooming_insights — three duplications
+  Every copy in this repo — ranked by risk
 
-  ┌─ A. Insight ← Anomaly (derived fields) ──────────────────────┐
-  │  cost: low today (one-shot pipeline)                         │
-  │  vulnerability: any Anomaly mutation without rerun ─► stale  │
-  │  fix if it fires: compute at render, delete the field        │
-  └──────────────────────────────────────────────────────────────┘
+  ────────────────────────────────────────────────────────────────────
+  copy                                    risk         mitigation
+  ────────────────────────────────────────────────────────────────────
+  Investigation.diagnosis                 HIGH         reuse Diagnosis
+    vs Diagnosis (types.ts)                            interface
+    ← shape drift, same file
 
-  ┌─ B. Insight.affectedCustomers ← Diagnosis.affectedCustomers ─┐
-  │  cost: medium (cross-record, two owners, comment names it)   │
-  │  vulnerability: re-diagnose without re-stamp ─► card lies    │
-  │  fix if it fires: read through to Investigation on render    │
-  └──────────────────────────────────────────────────────────────┘
+  insightToAnomaly round-trip             MEDIUM       comment + tests
+    ← lossy, silent
+    (drops evidence/impact/history/                    (better: mark
+     category)                                          Anomaly fields
+                                                        as required or
+                                                        model explicitly)
 
-  ┌─ C. Receipt inlines everything ──────────────────────────────┐
-  │  cost: negligible — this is the correct shape for logs       │
-  │  vulnerability: only if you ever want to query ACROSS runs   │
-  │  fix if it fires: introduce a store; keep receipts as blobs  │
-  └──────────────────────────────────────────────────────────────┘
+  Insight.evidence ← Anomaly.evidence     LOW          write-atomicity
+    ← same tier, same map                              in putInsights
+    (deliberate denormalization)
+
+  sessionStorage[bi:insight:{id}]         LOW          stream re-writes
+    ← cache across the network                         on every briefing
+    (stale = OK, replaced next stream)
+
+  Receipt.anomaly ← Golden.anomaly        NEGLIGIBLE   disk is cheap;
+    ← disk-committed duplication                       self-contained
+    (~10 KB per file × 28 files)                       receipt is worth
+                                                        the redundancy
+  ────────────────────────────────────────────────────────────────────
 ```
 
 ## Elaborate
 
-The distinction between duplication-A (derived, single-record) and duplication-C (frozen log, multi-record) is exactly the distinction between a **materialized view** (SQL) and an **event log** (Kafka / append-only Postgres table). The trade-off framing is identical: materialized views amortize compute at the cost of an invalidation problem; event logs pay serialization cost once for permanent replayability. blooming_insights has one of each — it's just that both live as TypeScript records in memory or JSON on disk, not in a database.
+Where the pattern comes from: this is the DB analog of the *information hiding* rule from *A Philosophy of Software Design* (Ousterhout, ch. 5). In a schema, information hiding = normalization: put a fact in one column of one table, and every query reaches through the row to read it. In this codebase, there's no row — but the rule still applies. Every fact should have one *declaration site*, and every consumer should reach through a type import to read it. The `Diagnosis` case violates the rule because the fact has two declaration sites.
 
-This concept also cross-links to software-design's **information hiding**: normalization is the data analog. A well-normalized schema hides implementation details behind a single source-of-truth column; a denormalized one leaks the same fact across rows. When you see the type comment "*denormalized from…*" in `lib/mcp/types.ts`, that's the developer acknowledging the leak explicitly. → cross-link to `study-software-design/` for the code-level version.
+Related pattern: *derived fields as first-class members* (from Fowler's PoEAA — "Derived Property"). `Insight.affectedCustomers` is a derived field (denormalized from `Diagnosis.affectedCustomers.count`); the honest thing is to mark it with a comment saying so, which the code does (`lib/mcp/types.ts:58`). When derived fields drift, the fix isn't to remove the field — it's to move the derivation into a `deriveInsightFields()` helper that runs every time. `lib/insights/derive.ts` does exactly this for a subset of them.
 
 ## Interview defense
 
-**Q: "Show me the denormalization in this codebase."**
-Answer: "Three places. First, `lib/state/insights.ts:25-45` — `anomalyToInsight` splices five derived fields onto `Insight` at construction time; source of truth stays on `Anomaly.evidence`. Second, `Insight.affectedCustomers` at `lib/mcp/types.ts:58` — the type comment literally says 'denormalized from `Diagnosis.affectedCustomers.count`'. Two records, one fact. Third, the eval receipt at `eval/run.eval.ts:341-395` — it inlines everything (diagnosis, judgments, tool calls, cost) into one 35KB JSON blob per case per run." Draw the three-duplications diagram from Move 1.
+### Q1 — "you have `Insight` and `Anomaly` with overlapping fields. Isn't that a smell?"
 
-**Q: "Are any of those a problem?"**
-Answer: "None *today*, because the pipeline is one-shot — anomalies aren't mutated after `anomalyToInsight`, diagnoses aren't re-run into the same `Insight`. But two of the three have no compiler-enforced invalidation contract. The moment we add an edit path, `Insight`-with-derived-fields becomes the first bug. The receipt case is different — that's the immutable-log pattern, and it's the right shape." Anchor: `lib/insights/derive.ts:27-38` for the derivation; `types.ts:58` for the explicit "denormalized" comment.
+> It's a deliberate denormalization — a read-optimized `Insight` that carries the render-ready copy of `Anomaly`'s core fields. The invariant "they don't drift" is enforced by the write path: `putInsights` clears both maps and rewrites both together, atomically, and nothing else writes to either. There's no partial-update path, so drift can't happen.
+>
+> The one real smell in this space is *`Investigation.diagnosis` vs `Diagnosis`* — two shapes for the same conceptual entity, same file, `hypothesesConsidered` typed differently in each. That one's a bug in waiting; I'd fix it by reusing the `Diagnosis` interface in `Investigation`.
 
-**Q: "What would you change?"**
-Answer: "Delete `Insight.revenueImpact / .aov / .funnel / .affectedCustomers` and derive them at render time from `Anomaly.evidence` + the investigation store. It's a `.map()` in each component and it removes an entire class of stale-copy bug. The performance cost is nothing — this is display-time formatting, not a hot path." Diagram: source-fact-once-then-derive.
+```
+  the ranked answer
+
+  ┌── deliberate: Insight ↔ Anomaly ──┐   OK — write-atomicity
+  │  same tier, atomic write path      │   enforces invariant
+  └────────────────────────────────────┘
+
+  ┌── smell: Investigation.diagnosis ──┐   real drift risk —
+  │  vs Diagnosis (two shapes)         │   two declaration sites
+  └────────────────────────────────────┘   for one fact
+```
+
+Anchor: "atomic write path = the DB constraint substitute."
+
+### Q2 — "`insightToAnomaly` drops fields. Why isn't that a bug?"
+
+> It's intentional and tested. The comment names it (`lib/state/insights.ts:47-52`) and there's a round-trip test in `test/state/insights.test.ts`. The reason it works: the reverse mapper is used exactly one place — the agent loop, which only needs the four required fields (metric, scope, change, severity) to open an investigation. The dropped fields (evidence, impact, history, category) are *regenerated* downstream by the diagnostic and recommendation agents.
+>
+> That said, it's still surprising. A cleaner model would split `Anomaly` into `MinimalAnomaly` (the 4 required fields, what the agent needs) and `EnrichedAnomaly extends MinimalAnomaly` (what the monitoring agent emits). Then `insightToAnomaly` returns `MinimalAnomaly` and the type system makes the loss explicit.
+
+Anchor: "lossy round-trip, tested + commented, but a modeling improvement is available."
+
+### Q3 — "if you added a `favorites` feature (users can favorite an insight, favorites survive a session), how would you extend the model?"
+
+> That's the question that breaks the tier lattice. Favorites need to survive the session cookie's ~10-day lifetime and follow the user across devices. Tier 2 (in-memory Map) dies too fast; tier 3 (bi_auth cookie) is per-browser; tier 5 (git-committed) is engineer-write-only. So I'd need a new tier — a real database.
+>
+> The minimal shape: a `Favorite` table with `(userId, insightId, createdAt)`, unique on `(userId, insightId)`. `insightId` becomes a *durable identifier*, which means Insight can't be UUID-per-session anymore — it needs a stable ID scheme (probably `hash(metric + scope + baseline)` so the same anomaly re-firing on Tuesday points at the same favorite from Monday).
+>
+> That's the modeling change that's actually load-bearing: **once a fact has to survive the session, it needs a stable key that isn't a random UUID.** The current UUID scheme is a shortcut that works only because nothing outlives the session.
+
+```
+  the model change forced by "favorites"
+
+  today:   Insight.id = randomUUID()     ← ok, session-scoped
+             ↑ unstable across sessions
+
+  needed:  Insight.stableKey =
+             hash(metric + scope + baseline)   ← survives session boundary
+
+  Favorite table:
+    userId       string   FK → User
+    insightKey   string   FK → Insight.stableKey
+    createdAt    datetime
+    UNIQUE (userId, insightKey)
+```
+
+Anchor: "durable identifiers are the first thing that breaks when you add persistence."
 
 ## See also
 
-- `01-the-data-model-and-its-shape.md` — the pipeline of shapes each duplication rides on.
-- `04-transactions-and-integrity.md` — where invariants would need to live if these copies stopped being safe.
-- `07-data-modeling-red-flags-audit.md` — this concept's entries on the consolidated checklist.
+- `01-the-data-model-and-its-shape.md` — the ERD showing where each copy lives.
+- `04-transactions-and-integrity.md` — how the write-atomicity discipline in `putInsights` is a stand-in for DB transactions.
+- `05-migrations-and-evolution.md` — why optional-fields-as-forward-compat lets denormalized copies survive schema growth.
+- `07-data-modeling-red-flags-audit.md` — the `Diagnosis` vs `Investigation.diagnosis` finding is marked here.

@@ -1,157 +1,195 @@
-# 02 — LLM cost optimization
+# LLM cost optimization
 
-**Type:** Industry standard. Also called: model routing, tiered inference, budget ceiling.
+## Subtitle
+
+Model routing / budget enforcement / caching — Industry standard.
 
 ## Zoom out, then zoom in
 
-Three cost moves in this codebase: prompt caching (see previous file), Haiku for intent classification, budget ceiling per investigation.
+blooming stacks four cost knobs, three of which are live: **prompt caching** (see **01-llm-caching.md**), **cheap-model routing** for classification (Haiku for intent, Sonnet for agents), **budget ceiling** (`lib/agents/budget.ts` pre-dispatch check), and **schema-gated coverage** (the categories filter that drops unrunnable tools before they burn calls). The unshipped fourth: bounded tool_result size (see `B2.1` in the context-window file).
 
 ```
-  Zoom out — the cost surface
+  Zoom out — where each cost knob turns
 
-  ┌─ Prompt caching (~-40-50% per case) ─── previous file                 │
-  ┌─ Cheap-model routing ──── Haiku for intent classification              │
-  ┌─ Budget ceiling ─── per-investigation kill switch                       │
-  ┌─ ★ THIS FILE'S CONCEPT (the second + third)                             │
+  ┌─ Model choice ──────────────────────────────────────┐
+  │  Haiku for intent classifier (5× cheaper)            │
+  │  Sonnet for agents                                   │
+  └─────────────────────────────────────────────────────┘
+
+  ┌─ Prompt caching ────────────────────────────────────┐
+  │  ~40-50% off cost of the stable prefix               │
+  │  see 01-llm-caching.md                               │
+  └─────────────────────────────────────────────────────┘
+
+  ┌─ Budget ceiling ──── LIVE ──────────────────────────┐
+  │  BudgetTracker checks BEFORE dispatch                │
+  │  lib/agents/budget.ts                                │
+  │  runaway loop can't overspend                        │
+  └─────────────────────────────────────────────────────┘
+
+  ┌─ Schema-gated coverage ─── LIVE ────────────────────┐
+  │  runnableCategories(schema) drops unrunnable tools   │
+  │  lib/agents/categories.ts                            │
+  │  prevents ~5 wasted rate-limited calls per briefing  │
+  └─────────────────────────────────────────────────────┘
 ```
-
-Zoom in. Sonnet is the reasoning workhorse; Haiku is the classifier. Budget ceiling is a runaway-loop escape valve. Neither optimization is exotic; both are load-bearing.
 
 ## Structure pass
 
-Axis: which model runs each decision, and what stops runaway spend?
-- Cheap-fast model (Haiku): intent classification, potentially structured outputs on classification-shaped calls
-- Expensive-slow model (Sonnet): agent loops, judge
-- Budget: per-investigation ceiling, catches runaway loops before they spend $X
-
-**Seam:** the model factory + the budget check. Above: the caller (agents, intent classifier). Below: the model call.
+- **Layers:** input assembly → routing → dispatch → budget check → API call. Five bands.
+- **Axis: cost per invocation.** Each knob addresses a different multiplier — model rate, cache ratio, ceiling enforcement, gate filtering.
+- **Seam:** the pre-dispatch check in `AnthropicModelProviderAdapter.complete()`. That's where budget can veto before spending.
 
 ## How it works
 
-### Move 1
+### Move 1 — the mental model
 
-You've routed hot-path traffic to a fast queue and cold-path to a slow one. Same shape at the LLM boundary — cheap model for cheap decisions, expensive model for expensive decisions.
+Cost = model rate × tokens spent × (1 – cache ratio) × (1 – wasted calls prevented).
+
+Optimizing means turning each knob:
 
 ```
-  Model routing
+  Four cost knobs — each addresses a factor
 
-  intent classification    → Haiku 4.5   ($1/$5 per MTok)     ~$0.0001/call
-  agent loops (reasoning)  → Sonnet 4.6  ($3/$15 per MTok)    ~$0.05-0.09/case
-  judge (rubric scoring)   → Sonnet 4.6  ($3/$15 per MTok)    ~$0.04/judgment
+  Cost = rate × tokens × (1 - cache_ratio) - wasted_calls_prevented
+
+  ┌─ rate ──────────────────────────────────────────────┐
+  │  Haiku for cheap tasks (5× off input, 3× off output) │
+  │  Sonnet everywhere quality matters                   │
+  └─────────────────────────────────────────────────────┘
+
+  ┌─ tokens ────────────────────────────────────────────┐
+  │  schemaSummary() bounds the workspace schema         │
+  │  filterToolSchemas() bounds tool defs per agent      │
+  │  (would-be) bounded tool_result — see B2.1           │
+  └─────────────────────────────────────────────────────┘
+
+  ┌─ cache_ratio ───────────────────────────────────────┐
+  │  cache_control on system prompt                      │
+  │  turn 2+ pay ~10% on the cached prefix               │
+  └─────────────────────────────────────────────────────┘
+
+  ┌─ wasted_calls_prevented ────────────────────────────┐
+  │  runnableCategories(schema) drops unrunnable tools   │
+  │  BudgetTracker.exceeded() vetoes runaway spending    │
+  └─────────────────────────────────────────────────────┘
 ```
 
-### Move 2
+### Move 2 — the step-by-step walkthrough
 
-**Model routing — Haiku for intent.**
+**Model choice per surface.** `lib/agents/intent.ts:16` — `CLASSIFIER_MODEL = 'claude-haiku-4-5-20251001'`. Haiku costs $1/MTok input, $5/MTok output. Sonnet costs $3 / $15. For classification (~500 input, ~50 output), Haiku is roughly 5× cheaper end-to-end. For agents (long context, multi-turn), Sonnet's reasoning is worth the money.
 
-`lib/agents/intent.ts:16`: `const CLASSIFIER_MODEL = 'claude-haiku-4-5-20251001';`. All other agents default to `AGENT_MODEL` (`claude-sonnet-4-6`). One-decision classify tasks like intent don't need Sonnet's reasoning depth.
+**Prompt caching.** See **01-llm-caching.md** — one `cache_control` marker, 40–50% total per-case cost reduction. This is the single biggest lever.
 
-**Prompt caching (previous file).**
+**Budget ceiling.** `lib/agents/budget.ts` — `BudgetTracker` accumulates per-turn usage; the adapter checks `budget.exceeded()` *before* dispatching the next API call. A runaway agent loop that would have burned $5 gets stopped at the ceiling. The check is pre-dispatch, not post-facto — the overage is prevented, not just detected.
 
-Applied to every model call. Cuts effective input cost by ~40-50% per case.
+**Schema-gated coverage.** `lib/agents/categories.ts` — the filter drops anomaly categories whose required events aren't in the workspace schema. Without it, the monitoring agent might spend 3–5 rate-limited MCP calls discovering "this workspace has no payment_failure events" only after trying.
 
-**Budget ceiling — `BudgetTracker`.**
+**Two more knobs, not yet live.**
 
-`lib/agents/budget.ts:41-77`. Per-investigation ceiling. Default `BUDGET_MAX_USD=2.0` (env-configurable) — very generous vs the ~$0.09 observed. An escape valve, not a normal-path constraint.
+- Bounded tool_result at the model boundary (see `B2.1`) — a runaway tool response can't blow the context or waste tokens.
+- Provider routing at the adapter — if a request could be served by a cheaper hosted model, route there first. Would need a second `ModelProvider` adapter (see `B1.8`).
 
-Mechanism: `AnthropicModelProviderAdapter.complete()` checks `budget.exceeded()` BEFORE dispatching each turn:
+**Real numbers, per case.** Baseline runId `2026-07-03T04-08-28-644Z`:
 
-```typescript
-// lib/agents/aptkit-adapters.ts:60-66
-if (this.budget?.exceeded()) {
-  throw new BudgetExceededError(this.budget.snapshot(), this.budget.limit);
-}
+- Agent-side: ~$0.09/case (~$0.033 diagnose, ~$0.045 recommend, ~$0.01 other)
+- Judge-side: ~$0.04/case (two rubrics × 4-dim judgments)
+- Total 10-case run: ~$1.30 including judge
+
+Cost per case pre-caching (napkin): ~$0.19. Post-caching: ~$0.09. Delta: ~$1 saved on a 10-case run.
+
+Diagram of one turn's cost being shaped by every knob:
+
+```
+  One turn's cost — after every knob
+
+  raw model rate: Sonnet 4.6, $3 in / $15 out per MTok
+    │
+    ▼  cache_control turns the fixed 13k prefix into
+    │  10% of that: ~$0.004 instead of ~$0.039
+    ▼
+  effective input cost: 10% of full-price on cached content
+    │
+    ▼  bounded schemaSummary means only 1.5k prefix tokens
+    │  come from the schema, not 30k
+    ▼
+  effective token count: bounded
+    │
+    ▼  pre-dispatch budget check would veto if
+    │  cumulative spend > ceiling
+    ▼
+  effective dispatch: proceeds only if within budget
+    │
+    ▼  agent call runs; usage flows to receipt +
+    │  next-turn budget check
+    ▼
+  observed: ~$0.02/turn on turns 2+, $0.06 on turn 1
 ```
 
-`BudgetExceededError` propagates up through AptKit's loop → the agent wrapper → the route handler's try/catch, which emits a graceful NDJSON `error` event. Runaway loop caught cleanly, no runaway bill.
+### Move 3 — the principle
 
-**Shared tracker across the chain.**
-
-The same `BudgetTracker` instance flows from `DiagnosticAgent` to `RecommendationAgent` (via `hooks.budget`), so the ceiling counts total spend across both stages of an investigation. See `02-context-and-prompts/03-prompt-chaining.md`.
-
-**What the ceiling catches — hypothetical.**
-
-- A bug in the tool-use logic causing infinite tool calls (loop hits AptKit's turnsRemaining first, but if that were misconfigured, budget catches it next).
-- A prompt regression that suddenly balloons context (e.g. system prompt bloats from 3K to 30K tokens; budget flags spend > threshold before it's shipped).
-- An adversarial anomaly that induces excessive back-and-forth (see `05-evals-and-observability/01-eval-set-types.md` adversarial set).
-
-**What it doesn't catch.**
-
-- Slow drift over many runs — a prompt tweak that adds $0.01/case doesn't trip a per-investigation ceiling but adds $100 across 10K cases. That's what `eval/report.eval.ts` cost aggregation is for.
-
-### Move 3
-
-Three-layer cost defense: cache the stable prefix (Anthropic ephemeral), route classification to the cheap model (Haiku), gate runaway loops with a per-investigation ceiling (BudgetTracker). Any one of these missing = higher cost at scale. All three together = ~$0.09/case, no surprise bills.
+Cost optimization is layered. Prompt caching is the biggest single win; model routing for cheap tasks is second; pre-dispatch budget enforcement is what makes the whole thing bounded rather than best-effort. Don't over-index on any one knob; measure every layer's contribution and turn the highest-impact one first.
 
 ## Primary diagram
 
 ```
-  Cost surfaces in this codebase
+  Cost optimization in blooming — full frame
 
-  ┌─ Model routing ───────────────────────────────────────────────────┐
-  │  intent classification  → Haiku 4.5   $1 / $5 per MTok             │
-  │  agents (mon/diag/rec)  → Sonnet 4.6  $3 / $15 per MTok            │
-  │  judge (rubric)         → Sonnet 4.6  $3 / $15 per MTok            │
-  └─────────────────────────────┬─────────────────────────────────────┘
-                                │
-  ┌─ Prompt caching (per model call) ▼────────────────────────────────┐
-  │  system prompt wrapped in cache_control: ephemeral                 │
-  │  Anthropic transparently caches tools with same breakpoint         │
-  │  turn 1: cache_creation                                            │
-  │  turn 2-10: cache_read (10% of normal input cost)                  │
-  │  ~40-50% cost reduction per case                                   │
-  └─────────────────────────────┬─────────────────────────────────────┘
-                                │
-  ┌─ Budget ceiling (per investigation) ▼─────────────────────────────┐
-  │  BudgetTracker created at the top of each investigation            │
-  │  shared between DiagnosticAgent + RecommendationAgent               │
-  │  ceiling check BEFORE each model call                              │
-  │  throws BudgetExceededError → route emits NDJSON error              │
-  │  default: $2.0 (≈ 22× normal case cost — escape valve)             │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌─ Model routing ────────────────────────────────────────┐
+  │  intent classifier: Haiku 4.5 (5× cheaper than Sonnet)  │
+  │  agents:            Sonnet 4.6                          │
+  │  judge:             Sonnet 4.6                          │
+  └────────────────────────────────────────────────────────┘
 
-  Net per-case: ~$0.09 agent-side (cached). Per 10-case run: ~$0.913
-  agent + ~$0.40 judge = ~$1.30.
+  ┌─ Prompt caching (biggest lever) ───────────────────────┐
+  │  cache_control on system prompt                         │
+  │  turn 2+ input: ~10% of normal cost                     │
+  │  observed savings: 40-50% of per-case total             │
+  └────────────────────────────────────────────────────────┘
+
+  ┌─ Budget ceiling ───────────────────────────────────────┐
+  │  BudgetTracker pre-dispatch check                       │
+  │  runaway agent can't burn past ceiling                  │
+  └────────────────────────────────────────────────────────┘
+
+  ┌─ Schema-gated coverage ────────────────────────────────┐
+  │  runnableCategories(schema) drops unrunnable tools      │
+  │  ~5 wasted MCP calls prevented per briefing             │
+  └────────────────────────────────────────────────────────┘
+
+  Total per-case cost: ~$0.09 agent-side, ~$0.13 with judge
+  Committed baseline runId: 2026-07-03T04-08-28-644Z
 ```
 
 ## Elaborate
 
-Beyond these three, the standard cost-optimization playbook includes:
-- **Semantic caching** — cache answers to similar queries (not present here, would need embedding infra)
-- **Batch processing** — Anthropic's batch tier is 50% off input cost, up to 24hr latency (not applicable to real-time UX)
-- **Smaller embeddings** — use `text-embedding-3-small` over `-large` when quality is comparable (relevant only if RAG is added)
-- **Context compression** — summarize old turns to shrink the messages array (relevant only at longer loops than this repo runs)
+Cost optimization for LLM applications has settled around: (1) prompt caching, (2) model tiering (cheap-first, expensive fallback), (3) per-turn budget enforcement, (4) careful token accounting. Beyond that, the returns diminish; the load-bearing work is measuring where cost actually goes and turning knobs that address the observed dominant cost.
 
-The load-bearing three (cache, route, ceiling) are the ones with the largest cost delta at this repo's scale.
+Related: **01-llm-caching.md** (the biggest lever), **../01-llm-foundations/06-token-economics.md** (the math behind the numbers), **../01-llm-foundations/07-heuristic-before-llm.md** (the classifier-routes-first pattern).
 
 ## Project exercises
 
-### Exercise — cheap-model routing for the judge (opt-in)
+### B6.2 · Bound tool_result at the model boundary
 
-- **Exercise ID:** C5.2-A · Case A (routing exercised for intent; extend to judge).
-- **What to build:** add `JUDGE_MODEL` env var. Default remains Sonnet. When `JUDGE_MODEL=haiku`, use Haiku for judgments. Session-D pilot showed 100% verdict agreement between judges, so Haiku is defensible for gating (fast cheap sanity check on every PR), Sonnet for baseline (rigorous).
-- **Why it earns its place:** cost-savings on the judge path, without losing rigor on baseline. Interviewer signal: "I know when I need Sonnet's precision and when Haiku is enough — measured."
-- **Files to touch:** `eval/run.eval.ts` (accept JUDGE_MODEL), maybe move judge instantiation to a helper.
-- **Done when:** running `JUDGE_MODEL=haiku npm run eval` produces receipts at ~30% of the judge cost with same verdict distribution.
-- **Estimated effort:** 1-4hr.
+- **Exercise ID:** B6.2 (Case A — the UI trunc exists; extend to model)
+- **What to build:** As per `B2.1` (**../02-context-and-prompts/01-context-window.md**), cap raw JSON tool_result payloads at ~8kB before they reach the model. Prevents a runaway EQL result from spending unbounded tokens.
+- **Why it earns its place:** Adds the last unshipped cost knob. Interview payoff: showing the discipline of measuring where cost goes and closing the gap.
+- **Files to touch:** `lib/agents/aptkit-adapters.ts` (BloomingToolRegistryAdapter.execute — cap content), `test/agents/tool-schemas.test.ts` (add oversize test), receipt row for truncation events.
+- **Done when:** an oversized tool result gets truncated with a `"...(truncated, N more rows)"` marker; receipt captures the event.
+- **Estimated effort:** `1–4hr`.
 
 ## Interview defense
 
-**Q: What's your per-case cost?**
+**Q: What's the single most impactful cost knob you've added?**
 
-~$0.09 agent-side (cached) per the committed baseline. That's cache + Haiku for intent + Sonnet for reasoning. Without caching, per-case would be closer to $0.14. Without cheap-model routing for intent, add another $0.001/query. Neither is huge in absolute dollars for a demo; both are load-bearing at production scale.
+Prompt caching. One flag on one block in `lib/agents/aptkit-adapters.ts:75-98`; observed 40-50% total per-case cost reduction. Measurable via `cache_read_input_tokens` in the receipt (baseline runId shows 3168 per turn). Load-bearing: I can point at the exact flag, the exact tokens saved, and the exact per-case dollar impact.
 
-**Q: What stops runaway spend?**
+**Q: How do you prevent a runaway agent from spending unbounded?**
 
-`BudgetTracker` at `lib/agents/budget.ts`. Per-investigation ceiling (default $2), checked before every model call. Shared across DiagnosticAgent + RecommendationAgent so it counts total spend across the chain. Throws `BudgetExceededError` before the next call dispatches — no runaway loop can burn past the ceiling.
-
-**Q: What's the ceiling actually protecting against?**
-
-Bug conditions. A ReAct loop with a broken termination check. A prompt regression that inflates context. An adversarial anomaly that triggers back-and-forth. In normal operation the ceiling is never hit — at $2 vs $0.09/case, it's ~22× normal spend, which means the ceiling only fires when something has gone genuinely wrong.
+`BudgetTracker.exceeded()` check in the adapter's `complete()` — pre-dispatch, not post-facto. If cumulative spend exceeds ceiling, throws `BudgetExceededError` before the API call. The route catches it and emits an NDJSON error event. The user sees a graceful error; the budget is not overshot. Load-bearing: the check is before dispatch, so the overage can't happen — it's a gate, not a monitor.
 
 ## See also
 
-- `01-llm-caching.md` — the first cost move
-- `01-llm-foundations/06-token-economics.md` — the cost math
-- `01-llm-foundations/07-heuristic-before-llm.md` — the tier below Haiku (regex, not built)
-- `lib/agents/budget.ts`, `lib/agents/pricing.ts`, `lib/agents/intent.ts`
+- [01-llm-caching.md](01-llm-caching.md) — the biggest lever.
+- [../01-llm-foundations/06-token-economics.md](../01-llm-foundations/06-token-economics.md) — the numbers behind the claims.
+- [04-rate-limiting-backpressure.md](04-rate-limiting-backpressure.md) — the sibling knob for the tool-call side.

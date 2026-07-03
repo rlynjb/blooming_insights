@@ -1,165 +1,180 @@
-# 01 — The context window
+# Context window
 
-**Type:** Industry standard. Also called: context length, model context, input budget.
+## Subtitle
+
+Fixed input budget / token-bounded input container — Industry standard.
 
 ## Zoom out, then zoom in
 
-The finite container. Everything the model can consider on this turn — system prompt, history, tools, retrieved data, room for response — competes for space.
+Sonnet 4.6 has a 200k-token context window. This codebase uses ~15k of it on the fixed prefix (system prompt + tool defs + workspace schema summary) and lets the messages accumulate from there. That's plenty of headroom for a 10-turn diagnostic. It doesn't stay that way if you're careless: the workspace schema is `112KB` of raw JSON on some accounts, which is why `schemaSummary()` in `lib/agents/monitoring.ts:19` compresses it to a ~1500-token summary before it hits the prompt.
 
 ```
-  Zoom out — where the window pressure shows up in this repo
+  Zoom out — where context lives
 
-  ┌─ Agent loop (AptKit ReAct) ───────────────────────────────────────┐
-  │  messages array grows with every turn                              │
-  │  ★ THIS CONCEPT ★ — the messages array IS the context window       │
-  └─────────────────────────────┬─────────────────────────────────────┘
-                                │
-  ┌─ Every turn ────────────────▼─────────────────────────────────────┐
-  │  system prompt (~2-3K, cached)                                     │
-  │  tools def (~1-2K, cached)                                         │
-  │  user turn + assistant history + tool_result blocks (grows)        │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌─ Agent code ────────────────────────────────────────┐
+  │  builds ModelRequest.messages + system + tools       │
+  └───────────────────────┬──────────────────────────────┘
+                          │
+                          ▼
+  ┌─ Adapter ★ ─────────────────────────────────────────┐ ← we are here
+  │  packs system prompt (with cache_control),           │
+  │  tool defs, messages into MessageCreateParams        │
+  │  lib/agents/aptkit-adapters.ts:57                    │
+  └───────────────────────┬──────────────────────────────┘
+                          │  200k-token ceiling
+                          ▼
+  ┌─ Anthropic ─────────────────────────────────────────┐
+  │  reads entire context every turn                     │
+  └──────────────────────────────────────────────────────┘
 ```
 
-Zoom in. Sonnet 4.6's context window is 200K tokens. A typical diagnosis turn 6 has ~10-20K tokens in the messages array; turn 10 might be ~25-40K. We are nowhere near the limit — but the SHAPE of what's in the window is what determines cost and where the model attends.
+Zoom in: the window is a finite container. Everything you send competes for space.
 
 ## Structure pass
 
-**Layers:**
-- Outer: 200K token limit (the hard cap)
-- Middle: what's actually in the messages array on this turn
-- Inner: individual message content blocks
-
-**Axis: what fills the window?**
-- Stable (across turns): system prompt, tools def → cache targets
-- Growing (per turn): assistant text, tool_use, tool_result → uncached
-- Absent (in this codebase): retrieved context (no RAG)
-
-**Seam:** the messages array passed to `AnthropicModelProviderAdapter.complete()`. AptKit's loop builds it; the adapter mostly just wraps the system prompt with `cache_control`.
+- **Layers:** system prompt + tools + workspace schema + accumulated messages → all in one context per turn. Four bands, all in one bucket.
+- **Axis: space competition.** Each band takes a share of the 200k. Fixed things (system, tools, schema) sit at the front and stay put. Growing things (messages, tool results) push against the ceiling.
+- **Seam:** the `messages: [...]` array. Everything before it is fixed; everything in it grows.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-Every model call is a fresh call. Nothing persists in the model. The "conversation" is the entire messages array you pass. Long conversation = big array = big context window usage = big cost.
+Think of the window as a fixed-size buffer with named regions:
 
 ```
-  What the window holds (one turn, mid-investigation)
+  Context window — one turn's picture
 
-  ┌─ Context window (200K tokens, mostly empty) ─────────────────────┐
-  │                                                                   │
-  │   [system  ▓▓▓ 2-3K    cached★                                    │
-  │   [tools   ▓▓  1-2K    cached★                                    │
-  │   [user    ▓   0.5K    the anomaly to investigate                 │
-  │   [asst    ▓   0.3K    "checking payment_failure rates…"          │
-  │   [user    ▓▓  1.2K    tool_result: {counts, revenue}             │
-  │   [asst    ▓   0.4K    "and mobile checkout timing…"              │
-  │   [user    ▓▓  1.8K    tool_result: {funnel}                      │
-  │   [asst    ▓   0.5K    "let me confirm SP scope"                  │
-  │   [user    ▓▓▓ 2.1K    tool_result: {country breakdown}           │
-  │   [asst    ▓   0.4K    "conclusion: payment processor timeout…"   │
-  │                                                                   │
-  │   Room for response: ~180K available                              │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌────────────────────────────────────────────────────────┐
+  │  System prompt                    [██░░░░░░░░░░░░]    │
+  │  ~10-12k tokens (agent role, ecommerce framing, rules) │
+  ├────────────────────────────────────────────────────────┤
+  │  Tool definitions                 [░██░░░░░░░░░░░]    │
+  │  ~2-3k tokens (MCP tool schemas)                       │
+  ├────────────────────────────────────────────────────────┤
+  │  Workspace schema summary         [░░█░░░░░░░░░░░]    │
+  │  ~1500 tokens (schemaSummary(), trimmed)               │
+  ├────────────────────────────────────────────────────────┤
+  │  Messages (grows turn by turn)    [░░░████░░░░░░░]    │
+  │  1000 → 20000 tokens over 5-10 turns                   │
+  ├────────────────────────────────────────────────────────┤
+  │  Response space                   [░░░░░░░░░░████░]    │
+  │  ~4k tokens (bounded by max_tokens)                    │
+  └────────────────────────────────────────────────────────┘
+
+  Total: fixed at 200k for Sonnet 4.6.
+  Everything competes for space.
 ```
 
-### Move 2 — walk the mechanism
+### Move 2 — the step-by-step walkthrough
 
-**The system prompt.**
+**The fixed prefix.** `lib/agents/aptkit-adapters.ts:57` builds the system prompt with a cache_control breakpoint on the whole thing. That prefix is what caches — turns 2+ read it from cache at ~10% of normal input cost. Making it too large would defeat caching by exceeding the cache-window limit; making it too small means more per-turn assembly cost.
 
-AptKit's `DiagnosticInvestigationAgent` owns the built-in system prompt (not present in this repo's source — it's imported from `@aptkit/core`). The retired prompts in `lib/agents/legacy-prompts/*.md` show the shape: ~2-3K tokens, structured with role, hard rules, method, tool catalog, output shape. Stable across every turn of an investigation.
+**The schema summary.** `lib/agents/monitoring.ts:19-88` — `schemaSummary()` reads a `WorkspaceSchema` (up to 180 event types, dozens of properties each) and produces a bounded string:
 
-**Tools definition.**
+```ts
+// lib/agents/monitoring.ts:26-40 — bounded output
+const MAX_EVENTS = 20;
+const MAX_PROPS_PER_EVENT = 10;
 
-Every turn re-sends the full tools list. In this codebase, the tool catalog is the MCP tools from `BloomreachDataSource` / `SyntheticDataSource` — `execute_analytics_eql`, `list_customers`, `list_scenarios`, etc. Each tool definition is small (~50-200 tokens), but the full list is ~1-2K.
-
-**The growing part.**
-
-Every turn appends: the previous assistant message (with tool_use blocks), the tool_result blocks with the tool's output. Tool_result content is what dominates growth — `execute_analytics_eql` results come back as JSON that can be 500-3000 tokens per call.
-
-**Where this repo caps growth: the 6-tool-call budget.**
-
-The retired diagnostic prompt (`legacy-prompts/diagnostic.md:11`) is explicit: "Make at most 6 tool calls, then conclude." Retired but the pattern carries over to AptKit's built-in prompt. Effect: bounded loop, bounded messages array, bounded context usage. If tool calls were unbounded, one runaway loop could balloon the messages array past 100K.
-
-```
-  Bounded loop → bounded context growth
-
-  turn 1:  ~4K   messages (system + tools + user)
-  turn 3:  ~10K  (+ 2 assistant turns + 2 tool_results)
-  turn 6:  ~20K  (+ 5 assistant + 5 tool_results)
-  turn 10: ~35K  (conclude — hard-capped at 6 real tool calls)
-
-  Ceiling: 200K   Usage: ~35K max     ≈ 17% used
+const eventsText = schema.events
+  .slice(0, MAX_EVENTS)          // 20 events, not 180
+  .map((e) => {
+    const props = e.properties.slice(0, MAX_PROPS_PER_EVENT).join(', ');
+    return `  - ${e.name} (${e.eventCount}): ${props || '(no properties)'}`;
+  })
+  .join('\n');
 ```
 
-**Where prompt caching intersects.**
+Two hard caps: 20 events, 10 props each. That's the discipline — bounded output, regardless of input size. Events are already sorted by `eventCount` desc (see the `WorkspaceSchema` doc in `lib/mcp/schema.ts:14`), so the 20 you keep are the most-active ones.
 
-The stable prefix — system + tools — is what the ephemeral cache breakpoint targets (see `06-production-serving/01-llm-caching.md`). Turn 1 pays full price for that prefix + a 25% cache-creation premium. Turns 2-10 pay ~10% of that prefix. Over 10 turns, the effective input cost is roughly halved.
+**Messages growing over turns.** Every turn appends: the model's response (`assistant` role) and every tool result you fed back (`user` role, `tool_result` block). A 10-turn investigation with average 1500-token tool results ends up around 20k tokens of messages. Still comfortable inside 200k.
+
+Diagram of a diagnostic's context growth over turns:
+
+```
+  Context growth — turn by turn (Sonnet 4.6, 200k ceiling)
+
+  turn 1:  ~15500 tokens  (fixed prefix + first user message)
+  turn 3:  ~19000         (+ 2 tool results + assistant turns)
+  turn 5:  ~24000         (+ 2 more)
+  turn 10: ~40000         (~ 5 tool results, longer thinking)
+
+           still 5× headroom against ceiling
+```
+
+**Where it would break.** If a tool result is huge — say the raw `execute_analytics_eql` output contains 10k rows and returns 200kB of JSON — you can blow the window in a single tool call. Mitigation: `TRUNC = 4000` in `app/api/briefing/route.ts:73` caps tool result JSON at 4000 chars before streaming to the UI. The same trunc should also apply to what the model sees (currently the model gets the full result — a lurking risk).
 
 ### Move 3 — the principle
 
-The context window is the entire memory of the LLM. Not a database. Not a session. What you don't put in the messages array, the model doesn't know. What you DO put in, you pay for on every turn until the loop ends (or the conversation ends). Design the growing part to be minimal (schema-constrained tool_results, capped tool call budgets); design the stable part to be cacheable.
+The context window is a shared resource. Every token in the system prompt is a token you can't spend on a tool result. Every token in a tool result is a token you can't spend on the next thought. Design for the fixed prefix to be small and cache-friendly; design for tool results to be bounded; measure the growth so surprises show up in a receipt, not in production.
 
 ## Primary diagram
 
 ```
-  Context window pressure — one full investigation
+  Context window — full frame with cache boundary
 
-  ┌─ 200K token window (Sonnet 4.6) ──────────────────────────────────┐
-  │                                                                   │
-  │   Turn 1 messages array:                                          │
-  │     system (2-3K, cached★)                                        │
-  │     tools  (1-2K, cached★)                                        │
-  │     user   (anomaly, 0.5K)                                        │
-  │     ────────                                                      │
-  │     ~4K tokens                                                    │
-  │                                                                   │
-  │   Turn 10 messages array (end of loop):                           │
-  │     system (2-3K, cached★)                                        │
-  │     tools  (1-2K, cached★)                                        │
-  │     user + 9 assistant/user pairs of turns                        │
-  │     ~35K tokens                                                   │
-  │                                                                   │
-  │   Never approaches the 200K limit in normal operation.            │
-  │   The 6-tool-call cap in the retired prompt keeps growth bounded. │
-  │                                                                   │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌─ CACHED PREFIX (unchanged turn-to-turn) ──────────────┐
+  │                                                        │
+  │  System prompt   ~10-12k tokens                        │
+  │  Tool defs       ~2-3k tokens                          │
+  │  Schema summary  ~1.5k tokens                          │
+  │  ────────────────────────────────  ← cache_control     │
+  │                                    breakpoint          │
+  └────────────────────────────────────────────────────────┘
+                       │
+                       │  followed by growing conversation
+                       ▼
+  ┌─ MESSAGES (fresh every turn, not cached) ──────────────┐
+  │                                                         │
+  │  turn 1 user, assistant                                 │
+  │  turn 2 user (tool_result), assistant                   │
+  │  turn 3 user (tool_result), assistant                   │
+  │  ...                                                    │
+  │  ~1000 → 20000 tokens over 5-10 turns                   │
+  │                                                         │
+  └─────────────────────────────────────────────────────────┘
+                       │
+                       ▼
+  ┌─ RESPONSE SPACE ────────────────────────────────────────┐
+  │  bounded by max_tokens (4096 default)                   │
+  └─────────────────────────────────────────────────────────┘
+
+  Total budget: 200k for Sonnet 4.6.
+  Observed typical use: 25-40k per investigation. 5× headroom.
 ```
 
 ## Elaborate
 
-Context windows grew fast: GPT-4 launched at 8K, extended to 32K, then 128K; Claude 3 launched at 200K; Gemini reached 1M+. Bigger windows are useful for one-shot document-QA (stuff a whole book in) but they DON'T help agent loops that only need to remember 10-20 turns of history. This codebase would run fine on a 32K window — it never gets close to using more.
+The "context window" name is the industry-standard term. Older models had 4k or 8k; the modern floor is 100k+, with 1M-token models emerging. That doesn't mean your app should use 1M tokens — the same relevance-ordering rules apply (see **02-lost-in-the-middle.md**), and cost scales linearly.
 
-The interesting engineering pressure isn't the limit — it's the cost. Every token in the window is paid for on every turn (minus cache reads). So even at 200K available, the discipline is "keep the growing part small," not "use more of the 200K."
+The cache breakpoint's placement matters. Anthropic caches everything *before* the breakpoint; putting the breakpoint after all fixed content and before the first user message is the standard placement, and that's what this codebase does (`lib/agents/aptkit-adapters.ts:75-98`).
+
+Related: **02-lost-in-the-middle.md** (why fitting matters isn't the same as attention working). **../06-production-serving/01-llm-caching.md** (how the cache exploits the fixed prefix).
 
 ## Project exercises
 
-### Exercise — measure context growth per turn
+### B2.1 · Bound tool result size before it hits the model
 
-- **Exercise ID:** C2.1-A · Case A (concept exercised implicitly; measure it).
-- **What to build:** in `AnthropicModelProviderAdapter.complete()`, log the total prompt size (sum of message content lengths) before each call. Emit as a new `CapabilityEvent` type `context_growth` with `{turn, promptTokens, cacheHit}` — surface in the report as a per-turn growth curve.
-- **Why it earns its place:** turns "the context grows across the loop" into a measured number. Interviewer signal: "I know exactly how much context each turn adds and what that costs — measured, not estimated."
-- **Files to touch:** `lib/agents/aptkit-adapters.ts` (measure + log), `lib/mcp/events.ts` (add context_growth event), `eval/report.eval.ts` (aggregate + print growth curve).
-- **Done when:** running `npm run eval:report` on the latest run prints a "context growth per turn" table for one case.
-- **Estimated effort:** 1-4hr.
+- **Exercise ID:** B2.1
+- **What to build:** The `TRUNC = 4000` cap in `app/api/briefing/route.ts:73` only trims what the UI sees. Extend the same bounded-output discipline to what the *model* sees in `tool_result` blocks: cap raw JSON at say 8kB per result, replace overflow with `"...(truncated, N more rows)"`. Add a receipt row when truncation fires.
+- **Why it earns its place:** Closes a real lurking risk (a runaway EQL query result can blow the context) with a bounded, measured mitigation.
+- **Files to touch:** `lib/agents/aptkit-adapters.ts` (BloomingToolRegistryAdapter.execute or the tool_result wrap), `test/agents/tool-schemas.test.ts` (add oversize test).
+- **Done when:** a test that feeds a 100kB tool result into an agent turn produces an 8kB tool_result block with a truncation notice; the receipt records the truncation.
+- **Estimated effort:** `1–4hr`.
 
 ## Interview defense
 
-**Q: How much of the 200K window do you actually use?**
+**Q: How do you keep the workspace schema out of the way when it's 112kB of JSON?**
 
-Peak ~35K in a full 10-turn investigation, which is ~17%. The 6-tool-call cap in the diagnostic prompt keeps growth bounded; the window itself is nowhere near a limiting factor. What matters more is the COST of the window at each turn — with prompt caching, the stable prefix is ~10% price on turns 2-10, so effective spend halves over the loop.
+`schemaSummary()` in `lib/agents/monitoring.ts:19-88` caps output at 20 events (sorted by `eventCount` desc so the important ones stay) × 10 props each. That's ~1500 tokens. The full schema is retained server-side for `runnableCategories()` and coverage decisions, but the model never sees it in bulk. Load-bearing: the model doesn't need to know every event exists — only the ones with signal.
 
-**Q: What's in the growing part of the messages array?**
+**Q: Why not just push everything into a 200k-context model?**
 
-Assistant messages with tool_use blocks (~200-800 tokens each) and user messages with tool_result blocks (~500-3000 tokens each, dominated by tool JSON output). If a tool returns a big JSON payload, that's what fills the window most. `execute_analytics_eql` results are the biggest — one deep breakdown query can be 2K tokens on its own.
-
-**Q: What happens if you hit the 200K limit?**
-
-Anthropic returns an error before the model runs. In this codebase we'd never hit it under normal operation, but a runaway loop (bug in the ReAct decision logic making infinite tool calls) COULD. The `BudgetTracker` ceiling catches that first — a runaway loop hits the $2 budget ceiling long before the 200K token ceiling.
+Two reasons. (1) Cost — every token in the prefix is a token you pay for on every turn, cache or no cache. (2) Attention degrades in the middle of long contexts (see **02-lost-in-the-middle.md**), so a bigger context can produce a *worse* answer. The rule is fit-what-matters, not fit-everything.
 
 ## See also
 
-- `02-lost-in-the-middle.md` — where in the window the model attends
-- `01-llm-foundations/02-tokenization.md` — the unit the window is sized in
-- `06-production-serving/01-llm-caching.md` — how the stable prefix stops costing much
-- `04-agents-and-tool-use/06-error-recovery.md` — the 6-call cap that bounds context growth
+- [02-lost-in-the-middle.md](02-lost-in-the-middle.md) — why fitting isn't enough.
+- [../06-production-serving/01-llm-caching.md](../06-production-serving/01-llm-caching.md) — how the cache breakpoint on the prefix earns its place.
+- [../01-llm-foundations/06-token-economics.md](../01-llm-foundations/06-token-economics.md) — the cost implications of a bigger prefix.

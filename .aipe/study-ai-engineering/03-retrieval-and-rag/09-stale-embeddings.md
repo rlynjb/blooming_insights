@@ -1,93 +1,148 @@
-# 09 — Stale embeddings
+# Stale embeddings
 
-**Type:** Industry standard. Also called: embedding freshness, index invalidation.
+## Subtitle
+
+Freshness tracking / re-embed on source change — Industry standard.
 
 ## Zoom out, then zoom in
 
-**Not exercised in this codebase.** If RAG were added, edits to source text would leave the vectors out of sync until re-embedded.
+If a doc's text changes but its embedding doesn't, retrieval returns the *old* semantic content. That's silent bad data — the retrieval mechanically succeeds, but the answer is wrong. The mitigation: track `embedding_stale_at` per row, re-embed on the next idle pass.
+
+```
+  Zoom out — the freshness problem
+
+  ┌─ Doc row ─────────────────────────────────────────┐
+  │  { id, text, embedding, embedding_stale_at? }     │
+  └───────────────────────┬───────────────────────────┘
+                          │  text edit
+                          ▼
+  ┌─ Update ──────────────────────────────────────────┐
+  │  set text = newText                                │
+  │  set embedding_stale_at = now                      │
+  │  (embedding still points to old text's vector)    │
+  └───────────────────────┬───────────────────────────┘
+                          │  idle re-embed pass
+                          ▼
+  ┌─ Re-embed ────────────────────────────────────────┐
+  │  vec = embed(newText); set embedding = vec         │
+  │  clear embedding_stale_at                          │
+  └───────────────────────────────────────────────────┘
+```
 
 ## Structure pass
 
-Axis: does the vector reflect the current text? Yes = fresh; no = stale.
+- **Layers:** source text → embedding → staleness flag → re-embed. Four bands.
+- **Axis: freshness.** Text and embedding must stay in sync; the stale flag is the "in-sync?" bit.
+- **Seam:** the write path. Every text update must also set the stale flag.
 
 ## How it works
 
-### Move 1
+### Move 1 — the mental model
 
-You've cached a query result and had it go stale when the underlying row changed. Same problem, LLM-scale.
+Two writes on a text edit: update the text, mark the embedding stale. The stale-marker is what makes the re-embed pass targetable — you don't re-embed everything, only rows where `embedding_stale_at IS NOT NULL`.
 
 ```
-  Day 1:  text = "We use Sequelize ORM"      vector = e_v1
-  Day 30: text = "We use Drizzle ORM"         vector = STILL e_v1
+  Stale tracking — the shape
 
-  Query "what ORM do we use?" → retrieves e_v1 → answer wrong.
+  edit event  →  { text: "new", embedding: "old", stale_at: now }
+                        │
+                        ▼ background re-embed
+                 { text: "new", embedding: "new", stale_at: null }
 ```
 
-### Move 2
+### Move 2 — the step-by-step walkthrough
 
-**The problem.** Embeddings are a derivative of source text. If source changes, embeddings must be recomputed. If you skip that, retrieval succeeds (top-k still comes back) but the answer is based on stale content.
+**For blooming's would-be use case.** If the recommendation feature lets a user edit a rec's title/rationale after the fact (see the field-override exercise in **../01-llm-foundations/09-user-override-locks.md**), and the recommendation index (a future feature) uses those fields, editing the title should mark the row stale for re-embedding.
 
-**The fix.** Track `embedding_stale_at` per row. On text change, mark stale. Re-embed in an idle pass, or on-read (lazy invalidation).
+**When re-embed runs.** Idle pass — a background job or explicit endpoint that walks `WHERE stale_at IS NOT NULL`, re-embeds, clears the flag. Cadence depends on how quickly staleness matters; for slow-moving corpora, nightly is fine.
 
-**For this codebase.** If past diagnoses are ever edited (they aren't today — read-only), this becomes a concern. If the corpus is append-only (which past diagnoses would be), staleness is only a concern if the diagnosis schema evolves and existing rows need re-embedding.
+**What if you don't track staleness?** Two failure modes: (a) periodic full re-embed of the whole corpus (expensive at scale), or (b) never re-embed (silent bad retrieval). The stale flag lets you do incremental re-embed correctly.
 
-### Move 3
+Diagram of the write path:
 
-Any embedded corpus that mutates needs freshness tracking. Skip it and every mutation silently corrupts retrieval.
+```
+  Text edit — one row
+
+  user edits rec title
+    │
+    ▼
+  UPDATE recs SET title = ?, embedding_stale_at = NOW() WHERE id = ?
+    │
+    ▼ (embedding column unchanged)
+    │
+  idle pass every N minutes:
+    SELECT id, text FROM recs WHERE embedding_stale_at IS NOT NULL
+    for each:
+      vec = embed(text)
+      UPDATE recs SET embedding = ?, embedding_stale_at = NULL WHERE id = ?
+```
+
+### Move 3 — the principle
+
+An embedding is a snapshot of the text at embed-time. If you don't track when it went stale, you don't know when to re-embed, and retrieval quality decays silently. Explicit staleness tracking is the price of an incremental re-embed strategy.
 
 ## Primary diagram
 
 ```
-  Freshness tracking
+  Freshness tracking — full frame
 
-  {
-    id: '...',
-    text: '...',
-    text_updated_at: 2026-06-30T14:00:00Z,
-    embedding: [...],
-    embedding_computed_at: 2026-06-15T09:00:00Z,   ← stale (older than text)
-    embedding_stale: true,
-  }
+  ┌─ Row shape ────────────────────────────────────────┐
+  │  { id, text, embedding, embedding_stale_at?,       │
+  │     embedding_version }                             │
+  └────────────────────────────────────────────────────┘
 
-  Reader-side: check `embedding_stale`; recompute on read, or skip
-  the result if freshness matters.
+                           │
+  ┌─ Write path ─────────▼────────────────────────────┐
+  │  on text edit:                                     │
+  │    set text = newText                              │
+  │    set embedding_stale_at = NOW()                  │
+  │    (do NOT recompute embedding inline)             │
+  └────────────────────────────────────────────────────┘
 
-  Writer-side: text update sets `embedding_stale = true`.
-  Background job: sweep stale rows, re-embed, mark fresh.
+                           │
+  ┌─ Idle re-embed pass ─▼────────────────────────────┐
+  │  every N minutes:                                  │
+  │    SELECT * WHERE embedding_stale_at IS NOT NULL   │
+  │    for each: embed(text), update row               │
+  └────────────────────────────────────────────────────┘
+
+                           │
+  ┌─ Model upgrade (rare) ▼───────────────────────────┐
+  │  bump embedding_version constant                    │
+  │  mark all rows stale (single UPDATE)                │
+  │  re-embed pass sweeps the corpus                    │
+  └────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-Idle re-embedding is common. Every row has an update timestamp; a background job re-embeds rows whose text has changed since the vector was computed. Trade: reader-side you may briefly serve stale content.
+The `embedding_version` field is orthogonal to the staleness flag but often paired with it. Version tracks *which model produced this vector*; when you upgrade the model, bump the version constant and mark all rows stale. The re-embed pass then rebuilds using the new model.
 
-Lazy re-embedding on read is safer but slower — every retrieval checks freshness, re-embeds if stale. Simpler consistency; higher read latency.
+Related: **02-embedding-model-choice.md** (why version matters), **10-incremental-indexing.md** (the sister pattern for corpus growth).
 
 ## Project exercises
 
-### Exercise — freshness tracking on the past-investigation embeddings
+### B3.9 · Add embedding_stale_at to the would-be investigation index
 
-- **Exercise ID:** C2.12-B · Case B (RAG not exercised).
-- **What to build:** if any Case B RAG add includes editable source text, add `embedding_stale_at` per row. Sweep + re-embed in a scheduled job.
-- **Why it earns its place:** freshness is a real production concern; naming it in a design is a differentiator.
-- **Files to touch:** `lib/rag/store.ts`, `lib/state/investigations.ts`.
-- **Done when:** editing source text sets stale flag; sweep clears it.
-- **Estimated effort:** 1-2 days.
+- **Exercise ID:** B3.9 (Case B — depends on B3.1)
+- **What to build:** When the investigation-memory index (B3.1) lands, add `embedding_stale_at` per row. If the user edits an investigation's summary (a future feature), mark stale. Add an idle re-embed job.
+- **Why it earns its place:** Correctness. Interview payoff: naming the failure mode ("silent stale retrieval") and the fix.
+- **Files to touch:** `lib/state/investigation-index.ts`, new endpoint `/api/re-embed` (dev tool).
+- **Done when:** editing an investigation summary sets the stale flag; a next re-embed run clears it; retrieval reflects the new text.
+- **Estimated effort:** `1–4hr` on top of B3.1.
 
 ## Interview defense
 
-**Q: What causes staleness?**
+**Q: What happens if you don't track staleness?**
 
-Source text mutation between embedding computation and retrieval time. The vector reflects the OLD text; the retrieved doc's live text has since changed.
+Two bad options: (1) never re-embed — the corpus drifts and retrieval quality decays silently; (2) always re-embed everything on any change — expensive at scale, and impossible to schedule incrementally. Staleness tracking is what makes incremental re-embed correct.
 
-**Q: How do you detect it?**
+**Q: How do you handle model upgrades?**
 
-`text_updated_at > embedding_computed_at` → stale. That's the boolean.
-
-**Q: Fix strategies?**
-
-Idle re-embed (background sweep) or lazy re-embed (compute on read for stale rows). Idle is faster reads, slightly stale writes. Lazy is slow reads on the freshness edge, always-fresh retrieval.
+`embedding_version` field. On upgrade: bump the version constant, mark all rows stale with a single UPDATE, let the re-embed pass sweep. During the sweep, queries can use whichever version they find; results converge as re-embed completes.
 
 ## See also
 
-- `10-incremental-indexing.md` — the write path that would touch this
-- `01-embeddings.md` — the primitive being invalidated
+- [10-incremental-indexing.md](10-incremental-indexing.md) — the sibling pattern.
+- [02-embedding-model-choice.md](02-embedding-model-choice.md) — why version matters.
+- [11-rag.md](11-rag.md) — the pipeline this discipline serves.

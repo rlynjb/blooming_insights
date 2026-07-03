@@ -37,15 +37,23 @@ The visual anchor you keep coming back to. Every chapter opens with its own diag
   │  Legacy loop preserved: lib/agents/*-legacy.ts (rollback)       │
   │  BudgetTracker · pricing.ts (Anthropic-priced, not OpenAI)      │
   └────────────────────────┬───────────────────────────────────────┘
-                           │  DataSource port (71 LOC, 4 uses)
+                           │  DataSource port (71 LOC, 5 uses)
   ┌─ Provider layer ────────▼───────────────────────────────────────┐
-  │  BloomreachDataSource                                           │
-  │  SyntheticDataSource                                            │
-  │  FaultInjectingDataSource (decorator, 4 fault modes)            │
+  │  McpDataSource (generic; alias re-export of BloomreachDataSource)│
+  │    · Bloomreach is the DEFAULT preset, not the identity         │
+  │    · per-request McpConfigOverride (url · authType · bearer)    │
+  │  SyntheticDataSource        (default UX: live-synthetic)        │
+  │  FaultInjectingDataSource   (decorator, 4 fault modes)          │
   │       │                                                         │
   │       ▼                                                         │
-  │  loomi-connect MCP server  ─────►  Bloomreach Engagement       │
-  │  (OAuth PKCE + DCR, 30s per-call timeout, 300s route budget)    │
+  │  AuthProvider strategy (OAuthClientProvider conformance)        │
+  │    · BloomreachAuthProvider (OAuth PKCE + DCR)                  │
+  │    · BearerAuthProvider     (static token)                      │
+  │    · AnonymousAuthProvider  (no auth)                           │
+  │       │                                                         │
+  │       ▼                                                         │
+  │  ANY MCP server ────────►  target workspace                     │
+  │  (30s per-call timeout · 300s route budget)                     │
   └─────────────────────────────────────────────────────────────────┘
 
   Off to the side: the eval flywheel
@@ -66,7 +74,7 @@ The reader who only stares at this diagram for two minutes should be able to nam
 
   **02 — The architecture.** The whiteboard walk. Four bands, one request, one investigation. The diagram you re-draw from memory in 90 seconds without hesitation.
 
-  **03 — The choices.** Six load-bearing choices. Framework (Next.js 16). Own loop → AptKit migration. DataSource seam. NDJSON over SSE. Deterministic supervisor. And the closer: the sequenced portfolio hardening plan.
+  **03 — The choices.** Six load-bearing choices, plus a swappable-MCP defense embedded in Choice 3. Framework (Next.js 16). Own loop → AptKit migration. DataSource seam (5 uses, 0 caller changes; Bloomreach is the default preset, not the codebase identity — the swappable-MCP receipt lives here). NDJSON over SSE. Deterministic supervisor. And the closer: the sequenced portfolio hardening plan, COMPLETE.
 
   **04 — The scale story.** Three scenarios (10× users · 100× investigations · 10× peak QPS). Real p50 numbers. The bottleneck named for each.
 

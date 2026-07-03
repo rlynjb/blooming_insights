@@ -1,306 +1,530 @@
-# Database systems map — the storage picture in this repo
+# 01 · Database systems map
 
-*Storage topology / Language-agnostic*
+*The persistence hierarchy · Case B (there is no database)*
 
-## Zoom out, then zoom in
+## Zoom out — where this concept lives
 
-You know how most Next apps have exactly one Postgres they pray to? This one has none. So when you ask "which datastore does this hit," the honest answer is a list of five things, none of which is a database. Here's where each one sits:
-
-```
-  Zoom out — where every "storage" primitive lives
-
-  ┌─ UI (browser) ─────────────────────────────────────────────┐
-  │  React 19 + Next 16 App Router                              │
-  │  sessionStorage (client-only, per tab)                      │
-  │  localStorage: bi:mode = 'demo' | 'live'   app/page.tsx     │
-  └─────────────────────────┬──────────────────────────────────┘
-                            │  HTTP + NDJSON stream
-  ┌─ Service (Vercel serverless) ─────▼───────────────────────┐
-  │                                                            │
-  │  ★ session Map<sessionId, SessionFeed>  ★ session cookie   │
-  │    lib/state/insights.ts:14              lib/mcp/session.ts │
-  │                                                            │
-  │  ★ 60s TTL response cache               ★ bi_auth cookie   │
-  │    bloomreach-data-source.ts:122         lib/mcp/auth.ts    │
-  │                                                            │
-  │                                                            │ ← this file's scope
-  └─────────────────────────┬──────────────────────────────────┘
-                            │  MCP tool call
-  ┌─ Provider (Bloomreach) ─▼──────────────────────────────────┐
-  │  execute_analytics_eql — the real database over there      │
-  └────────────────────────────────────────────────────────────┘
-
-  ┌─ git (deploy-time storage) ────────────────────────────────┐
-  │  lib/state/demo-*.json   — frozen "replica" of a briefing  │
-  │  eval/baseline.json      — committed reference row         │
-  │  eval/receipts/*.json    — 28 rows, one per run+case       │
-  │  eval/goldens/*.ts       — fixture "seed data"             │
-  └────────────────────────────────────────────────────────────┘
-```
-
-**Zoom in.** Every storage-engine responsibility (hold rows, look them up fast, keep them across failures, replicate them for cheap reads) shows up somewhere in this repo — just never inside a database. This file names which primitive plays which role, and where the boundaries are.
-
-## Structure pass
-
-**Axis to hold constant: durability — how long does the write survive?**
-
-Three layers, one question:
+You're used to seeing a diagram where a service layer talks to "the
+database" — one box, one arrow, one storage system. That box is missing
+here. What replaces it is a **stack of six storage tiers**, each doing a
+subset of the jobs a real DB does. This concept file's job is to draw
+that whole stack so every other file in this study can point at it.
 
 ```
-  "how long does a write survive?" — traced across every storage primitive
+Zoom out — where the "database" would sit in a normal Next.js app
 
-  ┌─ in-memory state ─────────────────────────────────┐
-  │  session Map, TTL cache, McpClient cache          │
-  │                                                    │ → survives until warm-instance dies
-  │                                                    │   (minutes to hours; Vercel decides)
-  └───────────────────────────────────────────────────┘
-      ┌─ per-request cookie ────────────────────────────────┐
-      │  bi_session (opaque id), bi_auth (encrypted state)   │
-      │                                                      │ → survives 10 days on the client
-      │                                                      │   (bi_auth maxAge; auth.ts:49)
-      └─────────────────────────────────────────────────────┘
-          ┌─ committed files in git ────────────────────────────┐
-          │  demo-*.json, baseline.json, receipts/*.json         │
-          │                                                      │ → survives forever
-          │                                                      │   (or until we retag/regen)
-          └─────────────────────────────────────────────────────┘
+┌─ UI layer (React) ──────────────────────────────────────────────┐
+│  app/page.tsx  →  useBriefingStream  →  fetch('/api/briefing') │
+└────────────────────────────────┬───────────────────────────────┘
+                                 │ HTTPS + bi_session cookie
+┌─ Service layer (Next route) ───▼───────────────────────────────┐
+│  route handler  →  agent loop  →  DataSource (port)            │
+└────────────────────────────────┬───────────────────────────────┘
+                                 │
+┌─ Storage layer ────────────────▼───────────────────────────────┐
+│                                                                 │
+│   ★ THIS CONCEPT — the six tiers replacing "the database" ★    │
+│                                                                 │
+│   1. localStorage      2. sessionStorage   3. in-mem Map       │
+│   4. signed cookies    5. .auth-cache.json 6. git-committed    │
+│                                                                 │
+└────────────────────────────────────────────────────────────────┘
 ```
 
-The seam that flips the axis: **the network boundary between the browser and Vercel.** On the server side, every write is a warm-instance thing — cold-start eats it. Cross that seam back to the browser, and durability jumps to "10 days on the client" (`bi_auth`) or "as long as the tab lives" (`sessionStorage`). Cross it again to git, and durability jumps to "forever."
+## Zoom in — the pattern
 
-That's the load-bearing insight: **the server owns no durable state.** Every long-lived byte is either on the client or in the repo. Everything in RAM is a cache with extra steps.
+**The pattern:** *persistence-tier hierarchy without a datastore.* Every
+tier has a different failure mode, a different scope, a different
+lifespan. Together they cover what a single DB would cover in a
+conventional app — and expose the mechanics you normally never see,
+because a DB hides them behind ACID.
+
+## Structure pass — one axis across all six tiers
+
+Pick an axis. Trace it. Watch it flip.
+
+**Axis: "how long does the data live?"** (durability)
+
+```
+Trace durability across all six tiers — the answer flips at every seam
+
+  Tier                       Lives until...                Load-bearing seam
+  ─────────────────────────  ────────────────────────────  ─────────────────
+  1. localStorage            user clears browser data      cookie <-> js
+  2. sessionStorage          tab closes                    tab boundary
+  3. server in-mem Map       cold start / redeploy         instance boundary
+  4. signed cookie           10 days OR AUTH_SECRET change crypto boundary
+  5. .auth-cache.json        `rm` or dev restart           dev / prod
+  6. git commit              you `git push --force`        commit graph
+
+  → durability strictly grows as you go down
+  → each seam is where a DB engineer would ordinarily draw the fsync line
+```
+
+**The seams that matter** — where the axis-answer flips:
+
+  → **Tier 2 → Tier 3** (tab → server memory): a browser tab close
+    kills sessionStorage, but the server's Map survives (until cold
+    start). A "second tab, same user" reads the same server Map.
+
+  → **Tier 3 → Tier 4** (server memory → signed cookie): the ONE seam
+    that carries production durability. Below Tier 3, data dies on
+    redeploy. Above Tier 4, it survives across Vercel warm instances.
+
+  → **Tier 5 → Tier 6** (dev file → git): the dev/prod split. Tier 5
+    only exists locally (gitignored). Tier 6 is the only tier that
+    survives a `git clone` on a fresh machine.
+
+The **most load-bearing seam** is Tier 3 → Tier 4. That's your fsync
+boundary. Above it, the browser or the cookie carries the state
+somewhere durable. Below it, one cold start and it's gone.
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — the pattern
 
-Think of the way a `fetch()` call to a real Postgres app works: request lands → handler pulls a connection from a pool → runs `SELECT` → returns rows → connection goes back. Now delete the connection pool, delete Postgres, and replace both with "look it up in a `Map`." That's this repo.
-
-The kernel:
-
-```
-  the request-time storage kernel
-
-              ┌─────────────────────────────────────┐
-              │  request arrives                    │
-              └────────────────┬────────────────────┘
-                               │
-        ┌──────────────────────┴──────────────────────┐
-        │                                              │
-        ▼                                              ▼
-  ┌───────────────┐                          ┌──────────────────┐
-  │ needs auth?   │                          │ needs data?      │
-  │ read bi_auth  │                          │ check TTL cache  │
-  │ (cookie)      │                          │ (Map, 60s)       │
-  └───────┬───────┘                          └────────┬─────────┘
-          │                                            │
-          ▼                                            ▼ miss
-  ┌───────────────┐                          ┌──────────────────┐
-  │ decrypt into  │                          │ call MCP tool    │
-  │ ALS store     │                          │ → Bloomreach     │
-  │ (per-request) │                          │ → cache result   │
-  └───────┬───────┘                          └────────┬─────────┘
-          │                                            │
-          └───────────────┬────────────────────────────┘
-                          ▼
-              ┌─────────────────────────────────────┐
-              │ agents run, write results into      │
-              │ session Map<sessionId, SessionFeed> │
-              │ (in-memory, warm-instance-scoped)   │
-              └─────────────────────────────────────┘
-```
-
-Every arrow above is either a Map lookup, a cookie read, or a remote MCP call. There is nothing to `SELECT` from and nothing to `INSERT` into locally.
-
-### Move 2 — the five storage primitives, walked
-
-**The session Map (session-scoped in-memory "tables").**
+You've built with `useState` — data lives in a React component and dies
+when the component unmounts. Now imagine that scaled up: **every tier in
+this stack is a `useState` at a different altitude**, with a different
+"when does it unmount" rule. That's the shape.
 
 ```
-  lib/state/insights.ts:14
-  ────────────────────────
-  const state = new Map<string, SessionFeed>();
+The persistence hierarchy — pattern skeleton
 
-  where SessionFeed = {
-    insights:       Map<insightId, Insight>       ← current briefing
-    investigations: Map<investigationId, ...>     ← per-anomaly deep dive
-    anomalies:      Map<insightId, Anomaly>       ← raw pre-derived form
+  client                                server
+  ──────                                ──────
+
+  ┌ localStorage ┐  ────browser────► ┌ signed cookies ┐
+  │  bi:mode     │                    │  bi_auth       │  ── AES-256-GCM
+  │  bi:mcp_config│                   │  bi_session    │
+  └──────────────┘                    └────────────────┘
+         │                                    │
+         │                                    │
+         ▼                                    ▼
+  ┌ sessionStorage ┐                  ┌ in-mem Map ────┐
+  │  bi:insight:*  │                  │  SessionFeed    │
+  │  bi:diag:*     │                  │  <sessionId,…>  │  ── warm-only
+  │  bi:inv:*      │                  └────────────────┘
+  └────────────────┘                           │
+                                                │
+                                                ▼
+                                       ┌ file system ──┐
+                                       │ .auth-cache   │  ── dev-only
+                                       │  .json        │
+                                       └───────────────┘
+                                                │
+                                                ▼
+                                       ┌ git-committed ┐
+                                       │ eval/         │
+                                       │  baseline.json│  ── durable
+                                       │  receipts/*   │
+                                       │ lib/state/    │
+                                       │  demo-*.json  │
+                                       └───────────────┘
+```
+
+Every arrow is a hop with a labeled seam. The pattern's kernel is: **the
+tier's scope determines its consistency model.** Client tiers are
+per-browser; server tiers are per-instance; cookie tiers are per-user;
+git tiers are per-deploy.
+
+### Move 2 — walk it, tier by tier
+
+Each sub-section is one tier. One diagram. One code anchor. The
+"what breaks if you take it away" test at the end.
+
+#### Tier 1 — localStorage (`bi:mode`, `bi:mcp_config`)
+
+Browser-owned key-value store. You've used it: `localStorage.setItem`.
+Here it holds **two** things, each doing a job a DB would do:
+
+```
+Layers-and-hops — the mode switch, from click to route
+
+┌─ UI layer ─────────────────┐
+│  page.tsx onClick          │
+└──────────────┬─────────────┘
+               │ hop 1: switchMode('live-mcp')
+               ▼
+┌─ localStorage ─────────────┐
+│  bi:mode → 'live-mcp'      │  ← Tier 1 write
+└──────────────┬─────────────┘
+               │ hop 2: setState → re-render
+               ▼
+┌─ useBriefingStream ────────┐
+│  fetch('/api/briefing      │
+│    ?mode=live-mcp')        │  ← the tier fans out to the network
+└────────────────────────────┘
+```
+
+`app/page.tsx:79` reads the persisted mode on mount. `app/page.tsx:108`
+writes it on toggle. `lib/mcp/config.ts:107` reads the MCP override.
+`lib/mcp/config.ts:134` writes it. Both wrap the call in
+`try/catch` — Safari private mode throws on `setItem`.
+
+```typescript
+// lib/mcp/config.ts:106-117
+export function readPersistedConfig(): McpConfigOverride | null {
+  if (typeof localStorage === 'undefined') return null;    // SSR-safe: no window on the server
+  try {
+    const raw = localStorage.getItem(BI_MCP_CONFIG_KEY);   // KV read by string key
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);                        // stored as JSON
+    if (!isMcpConfigOverride(parsed)) return null;         // validate before trusting
+    return normalizeConfig(parsed);
+  } catch {
+    return null;                                            // storage blocked → treat as unset
   }
-```
-
-The outer key is the session id from the `bi_session` cookie (`lib/mcp/session.ts:16-24`). Each session gets its own inner triple; the outer map is never cleared by request-scoped code. In DB terms: three "tables" per user, but only for as long as this Vercel instance stays warm. `putInsights` (`insights.ts:57-71`) does the equivalent of `DELETE FROM insights WHERE session_id = ?; INSERT ...` — replace-the-briefing, atomic only because the JS turn between `clear()` and the last `.set()` cannot yield.
-
-Anchored code, annotated:
-
-```ts
-// lib/state/insights.ts:57-71
-export function putInsights(sessionId: string, items: Insight[], rawAnomalies?: Anomaly[]): void {
-  const s = sessionState(sessionId);   // get-or-create the per-session "schema"
-  s.insights.clear();                  // wipe THIS session's rows only
-  s.anomalies.clear();                 //   (never touches other sessions)
-  items.forEach((i, idx) => {
-    s.insights.set(i.id, i);           // primary-key insert
-    if (rawAnomalies?.[idx]) s.anomalies.set(i.id, rawAnomalies[idx]);
-  });
 }
 ```
 
-The comment above it (`insights.ts:5-7`) names the bug this shape fixed: a plain module-level Map's `clear()` would wipe another user's feed mid-briefing on a warm serverless instance. The session-keying is the fix — a table per session, not one table shared.
+**What breaks if you drop it:** the user's chosen MCP server (or their
+custom bearer token, or the fact that they picked `live-mcp` over
+`live-synthetic`) is forgotten on every page load. The app still works
+— it just defaults every time.
 
-**The 60s TTL response cache (a per-warm-instance "materialized view").**
+#### Tier 2 — sessionStorage (per-tab caches)
 
-```
-  lib/data-source/bloomreach-data-source.ts:122
-  ─────────────────────────────────────────────
-  private cache = new Map<string, { result: unknown; expiresAt: number }>();
-
-  key = `${toolName}:${JSON.stringify(args)}`   ← exact-match hash lookup only
-  ttl = 60_000 ms (options.cacheTtlMs override) ← per-call, not per-key
-```
-
-This is the closest thing this repo has to an index. It's a hash table keyed by the tool name and its full argument object, so `get_project_overview({project_id: X})` on call 2 within 60s returns instantly. No range scan, no prefix match, no partial key — same args or nothing. Error results are deliberately not cached (`bloomreach-data-source.ts:179-181`) so a transient 429 doesn't poison the next 60 seconds of reads.
-
-**`bi_auth` — the encrypted-cookie durability layer.**
+Same API as localStorage; different lifespan. Dies on tab close. Used
+here as a **cross-page cache**: when the feed page fetches an insight,
+it stashes it under `bi:insight:<id>` (`useBriefingStream.ts:57`) so the
+investigate page can find it without hitting the server again.
 
 ```
-  lib/mcp/auth.ts:38-104
-  ──────────────────────
-  cookie name:   bi_auth
-  encryption:    AES-256-GCM with 12-byte IV, 16-byte tag
-  key derivation: sha256(AUTH_SECRET) → 32 bytes
-  max-age:       10 days (matches Bloomreach token lifetime)
-  scope:         httpOnly, secure, sameSite=none, path=/
+Sequence — feed writes, investigate reads (same tab, different route)
+
+  briefing route          feed page          sessionStorage        investigate page
+  ──────────────          ─────────          ──────────────        ────────────────
+   emit 'insight' ──────► setInsights
+                          stashInsights ───► setItem(bi:insight:<id>)
+                                              │
+                                              │ (tab still open)
+                                              │
+                                              ▼
+                                              ◄──── getItem(bi:insight:<id>)
+                                                    ← useInvestigation.ts:175
 ```
 
-Because Vercel gives you a fresh serverless instance between the OAuth `authorize` redirect and the callback, an in-memory store loses the PKCE verifier every time. The cookie is what makes the OAuth handshake work at all in production. `AsyncLocalStorage` (`auth.ts:47`) is the trick: seed a store from the cookie once at request start (`auth.ts:86-104`), let the OAuth SDK do its dozen synchronous reads/writes against the ALS-scoped store, flush back to the cookie once at request end. That flush pattern is how you get around Next's request-vs-response cookie split — read-after-set in the same request returns the OLD value unless you route both through your own in-memory shadow.
+`lib/hooks/useInvestigation.ts:175` reads the stash and passes it to
+`/api/agent?insight=<url-encoded-json>`. Why this exists: on Vercel, the
+briefing and the investigation can hit **different warm instances**, so
+Tier 3 (in-mem Map) is unreliable across a page navigation. Tier 2
+carries the data across the seam.
 
-**Committed JSON as "read replica" (deploy-time storage).**
+**What breaks if you drop it:** the investigate page has to look the
+insight up via server-side `getInsight(sessionId, id)` (Tier 3) — which
+misses on a cross-instance route. In that case the browser has to
+re-fetch the whole briefing, which takes seconds.
+
+#### Tier 3 — server in-memory Map (`SessionFeed`)
+
+The closest thing this repo has to a "table."
+
+```typescript
+// lib/state/insights.ts:8-14
+type SessionFeed = {
+  insights: Map<string, Insight>;                          // primary "insights" table
+  investigations: Map<string, Investigation>;              // primary "investigations" table
+  anomalies: Map<string, Anomaly>;                         // primary "anomalies" table
+};
+
+const state = new Map<string, SessionFeed>();              // partitioned by sessionId
+```
+
+The outer `Map<sessionId, SessionFeed>` is your **partition key** (the
+`sessionId` cookie). Inside, three sibling maps play the role of three
+tables. `insight.id` is the row key.
+
+The comment above this in the actual file names the exact reason it's
+partitioned:
+
+```typescript
+// lib/state/insights.ts:5-8
+// Session-scoped feed state. A single warm Vercel instance serves many users
+// concurrently, so module-level Maps would bleed between sessions — and
+// putInsights' clear() would wipe another user's feed mid-briefing. Each
+// session gets its own sub-feed; the outer map is never cleared by a request.
+```
+
+That comment IS the story of case B. In a real DB, `PRIMARY KEY
+(sessionId, insight_id)` would handle it. Here, a nested map does.
+
+**What breaks if you drop it:** the agent loop still works (it writes
+via `putInsights`, reads via `getInsight`), but every read after a
+process restart hits an empty map. Users see "insight not found" until
+they re-run the briefing.
+
+#### Tier 4 — server-signed cookies (`bi_auth`, `bi_session`)
+
+Two cookies, two jobs:
+
+  → **`bi_session`** — the sessionId UUID, per-user, HttpOnly. This is
+    the partition key for Tier 3. Created in `lib/mcp/session.ts:16-24`.
+
+  → **`bi_auth`** — AES-256-GCM encrypted OAuth state (client info,
+    tokens, PKCE verifier). This is the ONLY tier that survives a
+    Vercel redeploy AND rides between warm instances.
 
 ```
-  lib/state/demo-insights.json          665 lines  — one full briefing
-  lib/state/demo-investigations.json  3,487 lines  — 8+ investigations
-  public/demo/                                     — served static
+The bi_auth cookie — one row of a "durable_auth_state" table
+
+┌─ Client (browser) ─────────────────────────────────────────┐
+│  cookie: bi_auth = base64url(iv || tag || ciphertext)      │
+│  · HttpOnly (JS can't read)                                 │
+│  · SameSite=None (survives OAuth cross-site redirect)      │
+│  · Secure (HTTPS-only)                                      │
+│  · max-age = 10 days                                        │
+└────────────┬───────────────────────────────────────────────┘
+             │ hop: every request auto-includes bi_auth
+             ▼
+┌─ Service · withAuthCookies() ──────────────────────────────┐
+│  decryptStore(raw) using sha256(AUTH_SECRET) as AES key    │
+│  → Store (typed record shape)                              │
+│  → AsyncLocalStorage-scoped, per-request                   │
+│                                                             │
+│  fn() runs — many read/writes to the ALS store             │
+│                                                             │
+│  if ctx.dirty:                                              │
+│    encryptStore(ctx.store) → set cookie in the response    │
+└────────────────────────────────────────────────────────────┘
 ```
 
-`app/api/briefing/route.ts:78-149` reads `lib/state/demo-insights.json` when the URL has `?demo=cached` and replays it as an NDJSON stream at a "readable pace" (see the `PACE_MS` constant in the same file). This is the same pattern as a Postgres follower: pre-computed data, no primary hit, deliberately stale. The refresh policy is manual (`app/page.tsx` has a dev-only "capture as demo snapshot" button that runs the live agents and writes these files).
-
-**`eval/baseline.json` — a committed reference row.**
-
-```
-  eval/baseline.json:1-92
-  ───────────────────────
-  {
-    "runId":     "2026-07-03T04-08-28-644Z",
-    "builtAt":   "2026-07-03T05:29:44.727Z",
-    "caseCount": 10,
-    "diagnosis":       { perDimensionPassRate: {...}, verdictDistribution: {...} },
-    "recommendation":  { perDimensionPassRate: {...}, verdictDistribution: {...} }
+```typescript
+// lib/mcp/auth.ts:86-104
+export async function withAuthCookies<T>(fn: () => Promise<T>): Promise<T> {
+  if (process.env.NODE_ENV !== 'production') return fn();     // dev/test uses file/mem
+  const { cookies } = await import('next/headers');
+  const raw = (await cookies()).get(AUTH_COOKIE)?.value;
+  const ctx: RequestStore = { store: raw ? decryptStore(raw) : {}, dirty: false };
+  const result = await requestStore.run(ctx, fn);            // ALS carries ctx to every reader
+  if (ctx.dirty) {                                            // write-back once, at commit time
+    (await cookies()).set(AUTH_COOKIE, encryptStore(ctx.store), {
+      httpOnly: true, secure: true, sameSite: 'none',
+      path: '/', maxAge: AUTH_COOKIE_MAX_AGE,
+    });
   }
+  return result;
+}
 ```
 
-Read by `eval/gate.eval.ts:49-91` as `readFileSync(baselinePath, 'utf8')`, parsed as one row, compared field-by-field to a freshly-computed `candidate`. If any dimension in `perDimensionPassRate` drops by more than `GATE_MAX_REGRESSION` (default 0.10), the gate fails. That's a SELECT-then-compare against a committed row. The receipts in `eval/receipts/` (28 JSON files at time of writing) are the raw scored cases from which each baseline gets `computeBaseline(runId, receipts)` (`baseline.eval.ts:53`) aggregated — one row of raw data per (case × runId).
+**Read this like a database:** `withAuthCookies` is `BEGIN`; `ctx` is
+the transaction's private snapshot; every provider method reads/writes
+`ctx`; `if ctx.dirty: set cookie` is `COMMIT`. The AES-GCM tag is the
+row's checksum. `decryptStore` catches a bad tag and returns `{}` —
+that's your "corrupted row → treat as null."
 
-### Move 2 variant — the load-bearing skeleton (what breaks if you remove it)
+**What breaks if you drop it:** every OAuth flow completes… and then
+loses its tokens on the next request. The user re-authenticates on
+every page load. There is no durability path for OAuth in production
+without this cookie.
 
-The absolute minimum this "storage layer" needs to keep working:
+#### Tier 5 — file system (dev only)
 
-1. **The `Map<sessionId, ...>` outer key.** Remove the session id and put everything in a flat module-level Map, and `putInsights`' `clear()` wipes every user's feed on every briefing. This is the fix that already shipped; the code comment at `insights.ts:5-7` narrates it explicitly.
-2. **The 60s TTL response cache.** Remove it and every repeated `list_cloud_organizations` (the MCP bootstrap chain runs it on every call — see `~/.claude/projects/.../MEMORY.md`) hits Bloomreach's ~1 req/s rate limit and the whole briefing stalls. This is not a nice-to-have; it's what makes the app usable.
-3. **The `AsyncLocalStorage` wrapping around cookie reads.** Remove it and the OAuth SDK's read-then-set-then-read pattern reads the OLD cookie mid-request, which either sends the wrong PKCE verifier or wipes the tokens. This is the least intuitive of the three and the one an interviewer will poke at.
+`.auth-cache.json` at the repo root, gitignored. Written by
+`writeAll()` in `lib/mcp/auth.ts:137-141` when `PERSIST` is true
+(`NODE_ENV === 'development'`).
 
-Everything else — the eval receipts, the demo JSON, the `bi_session` cookie — is hardening, not skeleton.
+Why it exists: Next's dev server re-evaluates modules on hot-reload,
+which wipes the in-memory Map mid-OAuth-flow. The PKCE verifier and DCR
+client info have to survive between `connect` and `callback`. Dev
+persists to disk; test uses an isolated in-mem map; prod uses the
+cookie above.
+
+**What breaks if you drop it:** every dev hot-reload during OAuth
+kills the flow with `no PKCE code_verifier stored for this session`
+(the throw at `lib/mcp/auth.ts:215`).
+
+#### Tier 6 — git-committed
+
+Three artifacts here play three different DB roles:
+
+| File                            | Role                    | Refreshed by                |
+| ------------------------------- | ----------------------- | --------------------------- |
+| `eval/baseline.json`            | committed reference row | `npm run eval:baseline`     |
+| `eval/receipts/*.json`          | append-only judged runs | `npm run eval`              |
+| `lib/state/demo-insights.json`  | frozen read replica     | `/api/mcp/capture-demo`     |
+
+**`baseline.json`** is the row the CI regression gate compares
+candidate runs against. Look at the shape:
+
+```typescript
+// eval/baseline.json (excerpt)
+{
+  "runId": "2026-07-03T04-08-28-644Z",
+  "builtAt": "2026-07-03T05:29:44.727Z",
+  "caseCount": 10,
+  "diagnosis": {
+    "perDimensionPassRate": {
+      "root_cause_plausibility": 0.75,
+      "evidence_grounding": 0.5,
+      "scope_coherence": 0.75,
+      "actionable_next_step": 0
+    },
+    ...
+  }
+}
+```
+
+The gate at `eval/gate.eval.ts:74` reads this file, computes a
+candidate `baseline` from the latest receipts, and blocks if any
+`perDimensionPassRate` regresses by more than `GATE_MAX_REGRESSION`.
+
+**In DB terms:** `baseline.json` is a single row; the CI gate is a
+`SELECT` that compares two rows and fails on a threshold delta; the
+receipts folder is the audit log.
+
+**What breaks if you drop them:** the CI gate has nothing to compare
+against and every eval run passes silently; demo mode has no snapshot
+to replay, so a fresh visitor sees a spinner and no data.
 
 ### Move 3 — the principle
 
-**Choose your durability boundary and put everything on one side of it.** This repo's boundary is "the request." Every write dies when the request ends *unless* it lands in a cookie or in git. That's not "no persistence"; it's persistence with two very deliberate long-term homes (client cookie, source repo) and a disposable middle. When the read pattern is "warm-start-friendly + eventual truth" and the write pattern is "one user's briefing at a time," an actual database is dead weight. When the read pattern grows past that (analytics, cross-session queries, audit trails), the disposable middle stops being enough and you buy a database — but not before.
+**A database is not a place; it's a set of jobs.** Storage, indexing,
+consistency, durability, backup, recovery — every one of those exists
+somewhere. When there's no DB, you can see the jobs clearly because each
+one lives in a different tier with a different failure mode.
 
-## Primary diagram
+The moment you add Postgres, all six of these merge into "the database"
+and become opaque. You lose the ability to reason about individual
+guarantees — which is exactly what makes a real DB *easier* to use and
+*harder* to reason about at the same time.
+
+## Primary diagram — the whole persistence stack
 
 ```
-  The full storage picture, every arrow labelled
+The persistence hierarchy — one frame, all six tiers
 
-  ┌─ browser ─────────────────────────────────────────────────┐
-  │  sessionStorage       localStorage: bi:mode                │
-  └────────┬────────────────────┬──────────────────────────────┘
-           │ HTTP + cookies      │
-           │                     │
-  ┌────────▼──────────────┐   ┌──▼──────────────────────────────┐
-  │  bi_session (opaque)  │   │  bi_auth (AES-256-GCM)          │
-  │  session id (UUID)    │   │  OAuth tokens + PKCE verifier   │
-  │  session.ts:16-24     │   │  auth.ts:38-104                 │
-  └────────┬──────────────┘   └──┬──────────────────────────────┘
-           │                     │ decrypt into ALS
-           │                     │ auth.ts:86-104
-           ▼                     ▼
-  ┌─ Vercel serverless (warm instance) ────────────────────────┐
-  │                                                             │
-  │  session Map<sessionId, SessionFeed>                        │
-  │    insights.ts:14 — three inner Maps per session            │
-  │      ├── insights (rows)                                    │
-  │      ├── investigations (rows)                              │
-  │      └── anomalies (rows, pre-derived)                      │
-  │                                                             │
-  │  BloomreachDataSource.cache: Map<"tool:args", {result,exp}> │
-  │    bloomreach-data-source.ts:122 — 60s TTL                  │
-  │                                                             │
-  └──────────────────────────┬──────────────────────────────────┘
-                             │ callTool (MCP over HTTPS)
+  ┌─ CLIENT ─────────────────────────────────────────────────────┐
+  │                                                               │
+  │   Tier 1: localStorage                                        │
+  │   ┌──────────────────────────────┐                            │
+  │   │ bi:mode      · 'live-mcp'    │  ← per-browser, long-lived │
+  │   │ bi:mcp_config · JSON blob    │                            │
+  │   └──────────────────────────────┘                            │
+  │                                                               │
+  │   Tier 2: sessionStorage                                      │
+  │   ┌──────────────────────────────┐                            │
+  │   │ bi:insight:<id>              │  ← per-tab, dies on close  │
+  │   │ bi:diag:<id>                 │                            │
+  │   │ bi:inv:<step>:<id>           │                            │
+  │   └──────────────────────────────┘                            │
+  │                                                               │
+  └──────────────────────────┬───────────────────────────────────┘
+                             │ HTTPS
+                             │ (cookies auto-attach)
+  ┌─ SERVER ─────────────────▼───────────────────────────────────┐
+  │                                                               │
+  │   Tier 3: in-memory Map (per-warm-instance)                   │
+  │   ┌──────────────────────────────────────────────┐            │
+  │   │ Map<sessionId, {insights, investigations,    │            │
+  │   │                 anomalies}>                  │            │
+  │   └──────────────────────────────────────────────┘            │
+  │                    │                                          │
+  │                    │ partition key ← bi_session cookie        │
+  │                    ▼                                          │
+  │   Tier 4: signed cookies                                      │
+  │   ┌──────────────────────────────────────────────┐            │
+  │   │ bi_session  · UUID (HttpOnly, SameSite=None) │            │
+  │   │ bi_auth     · AES-256-GCM(store) 10d TTL     │  ← durable │
+  │   └──────────────────────────────────────────────┘            │
+  │                                                               │
+  │   Tier 5: .auth-cache.json (DEV ONLY)                         │
+  │   ┌──────────────────────────────────────────────┐            │
+  │   │ file at cwd, gitignored, JSON                │            │
+  │   └──────────────────────────────────────────────┘            │
+  │                                                               │
+  └──────────────────────────┬───────────────────────────────────┘
+                             │ git push
                              ▼
-  ┌─ Bloomreach loomi connect MCP ─────────────────────────────┐
-  │  execute_analytics_eql over the wobbly-ukulele workspace   │
-  │  the actual RDBMS lives here, we don't touch it            │
-  └────────────────────────────────────────────────────────────┘
-
-  ┌─ git (source of truth for deploy-time storage) ────────────┐
-  │  lib/state/demo-insights.json        ─┐                     │
-  │  lib/state/demo-investigations.json  ─┤ read replica         │
-  │  public/demo/*                       ─┘                     │
-  │  eval/baseline.json                     ← committed row      │
-  │  eval/receipts/*.json (28 rows)         ← per-run scores     │
-  │  eval/goldens/*.ts                      ← seed fixtures      │
-  └────────────────────────────────────────────────────────────┘
+  ┌─ Tier 6: git-committed (durable, versioned) ─────────────────┐
+  │                                                               │
+  │   eval/baseline.json           ← reference row for CI gate   │
+  │   eval/receipts/*.json         ← append-only judged runs     │
+  │   lib/state/demo-insights.json ← frozen read replica         │
+  │   lib/state/demo-investigations.json                          │
+  │                                                               │
+  │   backup: git tag study-pre-regen-2026-07-03-p2               │
+  │   rollback: git revert / git reset --hard <tag>               │
+  └───────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The "no DB" choice is not an oversight — it's a shape. Bloomreach is the database. This app is a *reader with reasoning*, not a system of record. The rows it produces (an Insight, an Investigation) are ephemeral analyst thinking, not customer data. If a user comes back tomorrow, running the briefing again is *the right answer* — the underlying event stream has moved.
+**Where does this pattern come from?** It comes from **shipping without
+a datastore**. Every startup engineer who wired up "just a JSON file for
+now" has invented some version of Tier 6. Every extension author with
+`chrome.storage` has invented Tier 1. Every ephemeral serverless
+function ever deployed has bumped into Tier 3's problem.
 
-Given that, the interesting mechanics all cluster around three questions:
+The interesting move in this repo is that all six tiers are being used
+**deliberately** — each with a job the others can't do. That's rarer.
+Most no-DB codebases pick one tier (usually localStorage) and try to
+force every job through it.
 
-1. **How do you keep two concurrent users' briefings apart with just `Map`s?** → per-session inner maps (`insights.ts:14`).
-2. **How do you keep OAuth alive across serverless instances with no session store?** → the encrypted cookie (`auth.ts:38-104`).
-3. **How do you demo without hitting the flaky alpha backend?** → committed JSON as a replica (`briefing/route.ts:78-149`).
+**When does this pattern stop working?** Three cases:
 
-The rest of this study guide walks each mechanism at DB depth: how a real engine solves it, and what the corresponding move looks like here.
+  → You need **cross-user reads**. Every tier here is per-user or
+    per-instance. A "top 10 insights across all users" query is
+    impossible without a real DB.
 
-Adjacent reading:
-- `study-runtime-systems` for why `putInsights` is atomic without a lock.
-- `study-distributed-systems` for the AsyncLocalStorage request-scoping pattern.
-- `study-data-modeling` for the *shape* of the rows this layer stores.
+  → You need **write coordination**. Concurrent writes to the same
+    row are undefined here — the last writer wins, silently. A real DB
+    gives you either a transaction or an error.
+
+  → You need **cross-instance state that ISN'T per-user**. The cookie
+    story only works because each user carries their own state. A
+    global counter that all users increment can't ride the cookie.
+
+At any of those three, you reach for Postgres. Until then, this stack
+is genuinely cheaper — no schema migrations, no ORM, no connection
+pool, no backup strategy that isn't "git."
 
 ## Interview defense
 
-**Q: "Where does state live in this app?"**
+**"Walk me through the persistence story for this app."**
 
-Model answer: "Three places, at three durability tiers. In-memory per warm serverless instance: a `Map<sessionId, SessionFeed>` at `lib/state/insights.ts:14` for the current briefing, and a 60s TTL response cache inside `BloomreachDataSource` at `lib/data-source/bloomreach-data-source.ts:122`. On the client for ten days: an encrypted `bi_auth` cookie holding OAuth tokens and the PKCE verifier, at `lib/mcp/auth.ts:38-104`. In git forever: `lib/state/demo-*.json` as a replayable snapshot, `eval/baseline.json` as the regression reference row. The load-bearing part is that the server owns *no durable state* — every long-lived byte is on the client or in the repo."
+Answer, in the order to say it: *"There is no database. Persistence is
+a six-tier hierarchy — localStorage and sessionStorage on the client,
+an in-memory Map on the server per warm instance, then signed cookies
+carrying encrypted OAuth state across instances, a dev-only file
+cache, and finally git as the most durable layer. Each tier does one
+job a database would do. The load-bearing seam is the cookie — it's the
+only tier that survives a redeploy AND rides between warm instances
+in production."*
 
-Diagram to sketch: the three-band durability diagram from the structure pass (in-memory / cookie / git), with the seam labelled.
+Then draw the primary diagram above. That's the whole story on one
+board.
 
-**Q: "You said the session Map's `clear()` is safe. Prove it."**
+**"What's the fsync equivalent in this system?"**
 
-Model answer: "`putInsights` at `insights.ts:57-71` runs synchronously — no `await` between the `clear()` calls and the final `.set()`. Node's event loop is single-threaded, so nothing else on this warm instance can observe an intermediate state; the JS turn is the atomic unit. Two concurrent HTTP requests to the same instance are two different turns — one runs to completion before the other starts its `clear()`. The bug that this fixed was cross-session contamination, not intra-session — that's what the session-keying is for. See the comment at `insights.ts:5-7`."
+Answer: *"There are two, at different scopes. For per-user OAuth state,
+it's the AES-GCM cookie write in `withAuthCookies` — one write-back per
+request at commit time, exactly like `COMMIT` flushes the WAL. For
+committed artifacts like `eval/baseline.json`, it's `git commit` — the
+commit hash is the LSN."*
 
-Anchor: `Map.set` doesn't await; the event loop is your lock.
+**"What breaks first under load?"**
 
-**Q: "Why a cookie for OAuth state instead of a Redis or Vercel KV?"**
+Answer: *"Tier 3, the in-memory Map, because it's per-warm-instance.
+Two concurrent briefings for the same user landing on different Vercel
+instances see two different Maps. sessionStorage carries the insight
+across the page navigation, but the anomaly-to-insight lookup on the
+investigate route silently misses. The fix would be either a real
+shared store, or shorter-lived state that lives in the cookie."*
 
-Model answer: "Cost, simplicity, and it works. The alpha Bloomreach server revokes tokens after minutes, so 'long-lived server-side session' has no operational value — refresh-and-reconnect is the recovery path anyway. Encrypting the state and putting it on the client with AES-256-GCM keeps the whole app stateless server-side. The trick that actually makes it work is the `AsyncLocalStorage` scoping at `auth.ts:47`: the OAuth SDK reads and writes the store many times per request, and Next's cookies API returns *stale* values within a request after a set. So we decrypt once at the top of the request into an ALS store, run everything against that, and re-encrypt-and-set once at the bottom (`auth.ts:86-104`). The cookie is the durability layer; the ALS is the consistency layer *within* a request."
-
-Anchor: request-scoped ALS wraps a cookie that survives 10 days on the client.
+The load-bearing skeleton part interviewers routinely forget:
+**AsyncLocalStorage-scoped commit** in `withAuthCookies`. Without it,
+the cookie gets set on every provider-method call and hits Next's
+request-vs-response split — you read the OLD value in the same
+request. Naming that seam signals you built the thing, not just read
+about it.
 
 ## See also
 
-- `02-records-pages-and-storage-layout.md` — how records physically live in the primitives we just named.
-- `03-btree-hash-and-secondary-indexes.md` — why the 60s cache is a hash-only index and what a B-tree would buy you.
-- `07-wal-durability-and-recovery.md` — why the cookie is the whole durability story.
-- `08-replication-and-read-consistency.md` — the demo snapshot as a read replica.
+  → `02-records-pages-and-storage-layout.md` — the row shape at each
+    tier
+  → `03-btree-hash-and-secondary-indexes.md` — how each tier's index
+    is built
+  → `07-wal-durability-and-recovery.md` — Tier 6 walked as WAL + backup
+  → `08-replication-and-read-consistency.md` — Tier 6's `demo-*.json`
+    as the frozen replica

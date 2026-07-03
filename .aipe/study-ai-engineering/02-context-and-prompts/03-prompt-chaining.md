@@ -1,216 +1,215 @@
-# 03 — Prompt chaining
+# Prompt chaining
 
-**Type:** Industry standard. Also called: pipeline of prompts, multi-stage LLM, sequential agents.
+## Subtitle
+
+Multi-stage LLM pipeline / sequential agent handoff — Industry standard.
 
 ## Zoom out, then zoom in
 
-The load-bearing pattern in this codebase's product logic. The diagnose → recommend flow is a chain: two stages, each with one job, connected by a typed handoff.
+The investigation flow in this codebase is a two-step prompt chain: **diagnostic agent** produces a `Diagnosis`, then **recommendation agent** takes that `Diagnosis` plus the original `Anomaly` and produces a `Recommendation[]`. Each step is its own agent with its own system prompt, its own tool set, its own model call loop. The output of step 1 becomes part of the input to step 2. The user sees them as two clicks — "investigate" then "see recommendations →" — but they're one chain.
 
 ```
-  Zoom out — the product's chain, in one frame
+  Zoom out — the two-step chain
 
-  ┌─ Product flow ────────────────────────────────────────────────────┐
-  │                                                                   │
-  │  Anomaly                                                          │
-  │     │                                                             │
-  │     ▼                                                             │
-  │  ┌─────────────────────────┐                                      │
-  │  │  DiagnosticAgent         │  one job: diagnose the cause         │
-  │  │  (Sonnet, ≤6 tool calls) │  produces Diagnosis                  │
-  │  └──────────┬──────────────┘                                      │
-  │             │  Diagnosis (structured)                              │
-  │             ▼                                                     │
-  │  ┌─────────────────────────┐                                      │
-  │  │  RecommendationAgent     │  one job: propose the action         │
-  │  │  (Sonnet, own tool loop) │  produces Recommendation[]           │
-  │  └──────────┬──────────────┘                                      │
-  │             │  Recommendation[]                                   │
-  │             ▼                                                     │
-  │        UI renders                                                 │
-  │                                                                   │
-  │  ★ THIS CONCEPT ★                                                 │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌─ Feed (anomaly card) ───────────────────────────────┐
+  │  user clicks investigate                             │
+  └───────────────────────┬──────────────────────────────┘
+                          │
+                          ▼
+  ┌─ Step 2 — Diagnostic ──────────────────────────────┐
+  │  DiagnosticAgent.investigate(anomaly)               │
+  │  → Diagnosis { conclusion, evidence,                │
+  │                hypothesesConsidered }               │
+  └───────────────────────┬──────────────────────────────┘
+                          │  handed off via
+                          │  route: ?step=recommend
+                          │  cache: getCachedInvestigation
+                          ▼
+  ┌─ Step 3 — Recommendation ★ ─────────────────────────┐ ← chain step 2
+  │  RecommendationAgent.propose(anomaly, diagnosis)     │
+  │  → Recommendation[] with steps + expected impact     │
+  └──────────────────────────────────────────────────────┘
 ```
 
-Zoom in. Each stage is a full agent (ReAct loop, tools, streaming trace). The handoff is a typed object (`Diagnosis`), not the raw trace. Both stages share one `BudgetTracker` so the ceiling counts total spend across both.
+Zoom in: the chain isolates concerns. Step 1's job is "what happened and why." Step 2's job is "what to do about it." Each step has one job.
 
 ## Structure pass
 
-**Layers:**
-- Outer: the product-facing chain (feed → investigate → recommend)
-- Middle: the two agents and their trace surfaces
-- Inner: each agent's own tool-use loop
-
-**Axis: what flows between stages?**
-- Between stages: the typed conclusion (`Diagnosis`), NOT the trace
-- Within a stage: raw messages array, tool_use, tool_result
-- To the UI: streamed `AgentEvent` NDJSON
-
-**Seam:** the `Diagnosis` object handed to `RecommendationAgent.propose(anomaly, diagnosis)`. Above: two independent agents. Below: shared budget, shared session id.
+- **Layers:** UI trigger → diagnostic → handoff → recommendation → UI render. Five bands.
+- **Axis: what each step owns.** Diagnostic owns *understanding*. Recommendation owns *action*. The handoff carries the diagnosis object across the seam.
+- **Seam:** the `Diagnosis` object. It's the contract between the two agents. Recommendation agent trusts it; diagnostic agent produces it against its rubric.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You've written a POST handler that calls a fetch, awaits it, then passes its parsed body to another fetch. Two sequential external calls, connected by a data handoff. Prompt chaining is the same, except each "call" is a full LLM agent with its own tool loop.
+Prompt chaining is the answer to "each LLM call should have one job." A single agent asked "diagnose this AND recommend actions" would do both worse than two agents each doing one. The chain lets you:
+
+- Use different tools for each step (diagnostic needs EQL queries; recommendation may not).
+- Score each step separately (the eval has two rubrics — one per step).
+- Cache the intermediate result (a re-render of step 3 doesn't re-run step 2).
 
 ```
-  Chain — sequential stages, typed handoff between
+  Chain vs monolith — the shape
 
-  ┌─── Stage 1 ────────┐          ┌─── Stage 2 ────────┐
-  │  DiagnosticAgent    │          │  RecommendationAgent│
-  │                     │          │                     │
-  │  input:  Anomaly    │          │  input:  Anomaly    │
-  │                     │          │          + Diagnosis│
-  │  tools:  MCP tools  │          │  tools:  MCP tools  │
-  │                     │          │                     │
-  │  output: Diagnosis  │──handoff─►│  output: Rec[]     │
-  └─────────────────────┘  (typed) └─────────────────────┘
-       ~50s p50                          ~51s p50
-       ~$0.03-0.05                       ~$0.04-0.06
+  Monolith (banned pattern):
+  ┌───────────────────────────────┐
+  │  One prompt: diagnose AND recommend │
+  │  → mixed reasoning, mixed rubric    │
+  │  → hard to score, hard to cache     │
+  └───────────────────────────────┘
 
-                    total ≈ 100-110s, ~$0.09
-                    (shared BudgetTracker)
+  Chain (this codebase):
+  ┌─────────────────┐    ┌──────────────────┐
+  │  Step 1:        │───▶│  Step 2:         │
+  │  Diagnose        │    │  Recommend       │
+  │  (own tools,     │    │  (own tools,     │
+  │   own rubric,    │    │   own rubric,    │
+  │   own model call)│    │   own model call)│
+  └─────────────────┘    └──────────────────┘
 ```
 
-### Move 2 — walk the mechanism
+### Move 2 — the step-by-step walkthrough
 
-**The handoff site.**
+**Step 1 — diagnostic.** `lib/agents/diagnostic.ts:47` — `DiagnosticAgent.investigate(anomaly)`:
 
-`eval/run.eval.ts:198-269` (also `app/api/agent/route.ts` for live). Two agent invocations, sequential, sharing state:
+- Input: an `Anomaly` from the monitoring scan (or from the feed's insight cache).
+- Tools: full MCP tool set — the agent picks what it needs.
+- Loop: 5–10 turns, alternating thought → EQL query → tool result → thought → ...
+- Output: `Diagnosis { conclusion, evidence[], hypothesesConsidered[], affectedCustomers? }`. Schema in `lib/mcp/types.ts:30-46`.
 
-```typescript
-// eval/run.eval.ts:189-269 (abbreviated)
-const budget = new BudgetTracker({ maxCostUsd: budgetLimitUsd });
+**The handoff.** The route (`app/api/agent/route.ts`) invokes step 1 or step 2 based on the `?step=diagnose|recommend` query param. When step 2 runs:
 
-// ─── diagnose ────────────────────────────────────
-const diagnosticAgent = new DiagnosticAgent(anthropic, dataSource, schema, allTools, sessionId);
-const diagnosis = await diagnosticAgent.investigate(anomaly, {
-  onToolResult: (tc) => diagnosisToolCalls.push({ ...tc }),
-  onCapabilityEvent: (ev) => diagnosisTrace.push(ev),
-  budget,                    // ← shared tracker, first phase
-});
+- It calls `getCachedInvestigation(sessionId, insightId)` in `lib/state/investigations.ts` — the diagnosis from step 1 is already cached.
+- If cache miss, it runs the combined chain (used only by the demo-snapshot capture path).
+- The recommendation agent receives both the `Anomaly` and the cached `Diagnosis`.
 
-// ─── recommend ───────────────────────────────────
-const recommendationAgent = new RecommendationAgent(anthropic, dataSource, schema, allTools, sessionId);
-const recommendations = await recommendationAgent.propose(
-  anomaly,
-  diagnosis,                 // ← the typed handoff
-  {
-    onToolResult: (tc) => recommendationToolCalls.push({ ...tc }),
-    onCapabilityEvent: (ev) => recommendationTrace.push(ev),
-    budget,                  // ← same tracker, continues accumulating
-  },
-);
+**Step 2 — recommendation.** `lib/agents/recommendation.ts:26` — `RecommendationAgent.propose(anomaly, diagnosis)`:
+
+- Input: original anomaly + step 1 diagnosis.
+- Tools: same MCP tool set — the recommendation agent may pull further data to size impact, but often doesn't.
+- Loop: 4–8 turns.
+- Output: `Recommendation[]` — each with `title`, `rationale`, `bloomreachFeature`, `steps[]`, `estimatedImpact`, `confidence`.
+
+**Why the caching matters.** The user might click "see recommendations →", then click back, then forward again. Without caching, each round trip re-runs step 1 (~50s). With caching, step 1 runs once per anomaly per session, and step 2 runs each time it's needed (still fresh — user may want a different rec set on a rerun).
+
+Diagram of one full chain execution:
+
 ```
+  Two-step chain — layers-and-hops
 
-**What's typed at the boundary.**
+  ┌─ UI feed ─────┐  hop 1: click investigate       ┌─ /api/agent ──┐
+  │ InsightCard   │ ──────────────────────────────► │ step=diagnose │
+  └───────────────┘  hop 4: diagnosis via NDJSON ◄─ └──────┬────────┘
+                                                     hop 2 │ investigate()
+                                                           ▼
+                                                    ┌─ DiagnosticAgent ┐
+                                                    │  5-10 turns      │
+                                                    │  emit reasoning, │
+                                                    │  tool_call events│
+                                                    └──────┬───────────┘
+                                                     hop 3 │ Diagnosis
+                                                           ▼
+                                                    saveInvestigation()
+                                                    (state/investigations.ts)
 
-The `Diagnosis` object (`lib/mcp/types.ts`) — `{conclusion, evidence[], hypothesesConsidered[], affectedCustomers?, confidence?}`. Not the diagnostic agent's trace, not its messages array, not its tool call history. Just the structured conclusion. The RecommendationAgent takes that conclusion + the original anomaly and starts its own loop with a fresh messages array.
-
-**Why the trace doesn't cross.**
-
-Because the recommendation agent's job is different: propose a lever + rationale + steps. It doesn't need to re-reason about the evidence — that work is done, encoded in the `Diagnosis.evidence` field. Passing the raw trace would balloon the recommendation agent's input context AND invite it to re-litigate the diagnosis instead of building on it.
-
-**Shared budget, split agents.**
-
-`BudgetTracker` is created once at the top of the investigation. Injected into BOTH agents' `AgentHooks.budget`. Every model turn in EITHER agent adds to the same running total. If diagnose eats up 90% of the budget, recommend gets checked against the remaining 10% before its first model turn. This is the `06-production-serving/02-llm-cost-optimization.md` mechanism at the chain level.
-
-**Two chains in one product.**
-
-There's a second chain in this codebase: monitoring → diagnostic → recommendation. Monitoring produces `Anomaly[]`; the user clicks one; diagnostic + recommendation run over the chosen anomaly. That's a chain with a human-in-the-loop step in the middle (the user's click).
+  ┌─ UI /recommend ┐ hop 5: click "see recs →"      ┌─ /api/agent ──┐
+  │ page.tsx      │ ──────────────────────────────► │ step=recommend│
+  └───────────────┘  hop 8: rec[] via NDJSON ◄───── └──────┬────────┘
+                                                     hop 6 │ propose(anomaly, cached diagnosis)
+                                                           ▼
+                                                    ┌─ RecommendationAgent┐
+                                                    │  4-8 turns          │
+                                                    └──────┬──────────────┘
+                                                     hop 7 │ Recommendation[]
+                                                           ▼
+                                                    stream back
+```
 
 ### Move 3 — the principle
 
-Chain when each stage has one job. Two agents, each with a narrow task, connected by a typed handoff — that's easier to debug, cheaper to iterate on (change one stage without retesting the other), and easier to evaluate (separate rubrics per stage). One monster agent doing "diagnose and recommend in one loop" would blur the failure modes and make it impossible to tell which part broke.
+If a task has two shaped-differently outputs, use two chains. The isolation buys you: separately scorable rubrics, separately cacheable steps, separately swappable models (recommendation could run on a smaller model if you validated the quality). The single-agent version couldn't offer any of that.
 
 ## Primary diagram
 
 ```
-  The diagnose → recommend chain — the load-bearing product flow
+  Two-step chain — full frame
 
-  ┌─ start ───────────────────────────────────────────────────────────┐
-  │  Anomaly (from monitoring or user selection)                      │
-  │  BudgetTracker created (default $2 ceiling)                       │
-  └─────────────────────────────┬─────────────────────────────────────┘
-                                │
-  ┌─ Stage 1: Diagnostic ───────▼─────────────────────────────────────┐
-  │                                                                   │
-  │  DiagnosticAgent.investigate(anomaly, { budget, hooks })           │
-  │      │                                                             │
-  │      ▼                                                             │
-  │  AptKit's DiagnosticInvestigationAgent runs its loop               │
-  │  ~5-10 model turns                                                 │
-  │  ≤6 tool calls (execute_analytics_eql etc.)                        │
-  │  budget accumulates: ~$0.03-0.05 spent                             │
-  │  streams: reasoning_step, tool_call_start, tool_call_end           │
-  │      │                                                             │
-  │      ▼                                                             │
-  │  returns: Diagnosis { conclusion, evidence[], hypotheses[] }       │
-  └─────────────────────────────┬─────────────────────────────────────┘
-                                │  typed handoff
-  ┌─ Stage 2: Recommendation ───▼─────────────────────────────────────┐
-  │                                                                   │
-  │  RecommendationAgent.propose(anomaly, diagnosis, { budget, hooks })│
-  │      │                                                             │
-  │      ▼                                                             │
-  │  AptKit's RecommendationAgent runs its own loop                    │
-  │  budget continues from where diagnose left off                     │
-  │  fresh messages array (not passed the diagnose trace)              │
-  │      │                                                             │
-  │      ▼                                                             │
-  │  returns: Recommendation[] { title, feature, steps[], impact }    │
-  └─────────────────────────────┬─────────────────────────────────────┘
-                                │
-                            UI renders
+  ┌─ Anomaly (from monitoring scan) ───────────────────────┐
+  │  { metric, scope, change, severity, evidence, impact }  │
+  └───────────────────────┬────────────────────────────────┘
+                          │
+                          ▼
+  ┌─ Step 1: DiagnosticAgent ──────────────────────────────┐
+  │                                                         │
+  │  system prompt: "you are a data analyst; find the       │
+  │                  root cause; cite evidence"             │
+  │  tools: full MCP tool set (EQL, segments, funnels)      │
+  │  loop: ReAct, 5-10 turns                                │
+  │                                                         │
+  │  → Diagnosis {                                          │
+  │      conclusion: "payment_failure_rate spike ...",      │
+  │      evidence: [...],                                   │
+  │      hypothesesConsidered: [...]                        │
+  │    }                                                    │
+  │                                                         │
+  │  scored by: eval/rubrics/diagnosis-quality.ts           │
+  │             (4 dims × 5 scale)                          │
+  └───────────────────────┬────────────────────────────────┘
+                          │  saveInvestigation()
+                          │  getCachedInvestigation() on rerun
+                          ▼
+  ┌─ Step 2: RecommendationAgent ──────────────────────────┐
+  │                                                         │
+  │  system prompt: "given this diagnosis, propose          │
+  │                  concrete Bloomreach actions"           │
+  │  tools: MCP tool set (used sparingly)                   │
+  │  loop: ReAct, 4-8 turns                                 │
+  │                                                         │
+  │  → Recommendation[] {                                   │
+  │      title, rationale, bloomreachFeature,               │
+  │      steps[], estimatedImpact, confidence               │
+  │    }                                                    │
+  │                                                         │
+  │  scored by: eval/rubrics/recommendation-quality.ts      │
+  │             (4 dims × 5 scale)                          │
+  │  ↑ this rubric's diagnosis_response dim (48% pass rate) │
+  │    catches the "pause A/B when root cause is payment"   │
+  │    failure that recurs in cases 01 + 08                 │
+  └────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-Alternative to chaining: one big agent that does both jobs in one loop. That's viable — GPT-4 or Sonnet can absolutely handle a "diagnose then recommend" prompt in a single agent invocation. The reasons this repo chains anyway:
+Prompt chaining is one of the oldest patterns in LLM engineering — it predates agents by a couple of years. The tradeoff versus a monolithic prompt: more latency (sequential calls), more cost (two full context loads), more complexity (state between steps), for the benefit of isolation and independent scoring.
 
-1. **Evaluability.** Two rubrics, one per stage (`diagnosis-quality.ts`, `recommendation-quality.ts`). If the whole thing were one agent, the rubric would have to score both jobs at once and it would be hard to say "the diagnosis was fine but the recommendation missed."
-2. **Streaming shape.** The product surfaces two distinct pages (investigate → recommend), each with its own status log. Two agents fit that shape naturally; one agent would need artificial phase markers.
-3. **Independent iteration.** Improving the recommendation prompt without retesting diagnose is cheaper. Chain lets you split ownership.
+The recommendation-fit failure (cases 01 + 08) is a *chain* failure, not a single-step failure. The diagnosis names payment_failure correctly (`root_cause_plausibility` pass rate 75%); the recommendation agent then proposes "pause the A/B experiment" instead of "escalate to payments." That's a step 2 problem the chain isolation lets you see cleanly — it wouldn't be visible in a monolithic prompt.
 
-Chaining is a common pattern in production LLM systems. Examples: RAG (retrieve → generate as a chain), question-decomposition (break question → solve sub-questions → synthesize), refinement (draft → critique → revise). All share the shape: multiple stages, typed handoff, each stage narrowly scoped.
+Related: **../05-evals-and-observability/02-eval-methods.md** (how the chain-per-step gets scored independently). **../04-agents-and-tool-use/01-agents-vs-chains.md** (chains vs agents — this codebase uses both: a chain of two agents).
 
 ## Project exercises
 
-### Exercise — swap the sequence for parallel diagnostics
+### B2.3 · Add a "verify" step to the chain
 
-- **Exercise ID:** C2.3-A · Case A (chain exercised; alt shape explores parallel).
-- **What to build:** on the feed page, when the user clicks an anomaly, run diagnose AND a shorter "quick recommendation" in parallel (against the same anomaly, both without the other's output). Compare quality vs the sequential chain in an eval. Under what conditions does parallelism buy speed without hurting quality?
-- **Why it earns its place:** shows you understand chaining is a design choice, not the only shape. Interviewer signal: "here's when I'd chain, here's when I'd parallelize, and here's how I measured the tradeoff."
-- **Files to touch:** `lib/agents/quick-recommendation.ts` (new; simpler prompt, no diagnosis input), `app/api/agent/route.ts` (parallel path), extend `eval/run.eval.ts` to run both shapes.
-- **Done when:** report shows time-to-first-recommendation and quality-vs-sequential across 5 golden cases.
-- **Estimated effort:** 1-2 days.
+- **Exercise ID:** B2.3
+- **What to build:** Insert a third step between diagnosis and recommendation: a cheap-model check that asks "does the diagnosis's primary root cause match what the recommendation is addressing?" If no, either regenerate the recommendation with an explicit note, or emit a warning event to the UI.
+- **Why it earns its place:** Directly targets the case-01+case-08 recommendation-fit failure. Interview payoff: "the eval showed a real failure; here's the chain-shaped fix I designed."
+- **Files to touch:** New `lib/agents/verify.ts` (Haiku-model verifier), `app/api/agent/route.ts` (insert between steps), new `eval/rubrics/chain-coherence.ts` (score the added step separately).
+- **Done when:** the verifier runs on all 10 baseline cases; when it flags a mismatch, either the rec is regenerated or a `chain_warning` NDJSON event fires; new receipt fields capture the verifier's decision.
+- **Estimated effort:** `1–2 days`.
 
 ## Interview defense
 
-**Q: Why chain diagnose and recommend instead of one big agent?**
+**Q: Why not have one agent do both steps?**
 
-Three reasons. First, evaluability — I have separate rubrics per stage, so I can measure "the diagnosis is good but the recommendation is off" without ambiguity. Second, streaming — the product has two pages (investigate + recommend); two agents map to that split naturally. Third, iteration — I can change the recommendation prompt without re-running diagnose evals. If it were one loop, every prompt change would invalidate the whole rubric surface.
+Three reasons. (1) You can't score them separately — the eval's diagnosis rubric and recommendation rubric are different dimensions; a single output would need a merged rubric. (2) You can't cache the diagnosis independently — a re-render of the recommendation page would re-run everything. (3) You can't swap models per step — diagnosis needs Sonnet's reasoning, recommendation might work on Haiku. Load-bearing: the chain gives you three independent knobs at the cost of one extra API round-trip.
 
-**Q: What's actually passed between stages?**
+**Q: The chain is where the eval failures live. Doesn't that argue against chaining?**
 
-The typed `Diagnosis` object — conclusion, evidence array, hypotheses considered. NOT the diagnostic agent's messages array or tool call trace. The recommendation agent starts with a fresh messages array; the diagnosis becomes context in its first user message. Passing the whole trace would balloon the recommendation input AND invite the model to re-litigate the diagnosis instead of building on it.
-
-```
-  Handoff shape
-
-  Diagnostic agent → [Diagnosis object] → Recommendation agent
-                        ↑
-                    just the conclusion, not the trace
-```
-
-**Q: How is cost tracked across the chain?**
-
-One `BudgetTracker` instance is created at the top of the investigation and passed as `AgentHooks.budget` to BOTH agents. Every model turn in either agent adds to the same accumulator. If diagnose burns through most of the ceiling, recommend gets checked against what's left before its first model turn. Shared state, not per-agent quotas.
+No — the eval failures live at the *seam* between the two steps. That's exactly where chaining gains you visibility. A monolithic prompt with the same failure would look like "the answer was wrong" with no way to say why. The chain lets you point at "step 1 got the root cause right; step 2 misconnected the action to the cause." That's the diagnostic power, not the failure signature.
 
 ## See also
 
-- `04-agents-and-tool-use/01-agents-vs-chains.md` — the shape distinction between an agent and a chain
-- `eval/run.eval.ts:198-269` — the two-stage handoff in the eval runner
-- `lib/agents/diagnostic.ts`, `lib/agents/recommendation.ts` — the two stages
-- `lib/agents/budget.ts` — the shared ceiling that spans both
+- [../04-agents-and-tool-use/01-agents-vs-chains.md](../04-agents-and-tool-use/01-agents-vs-chains.md) — chains of agents vs single agents.
+- [../05-evals-and-observability/02-eval-methods.md](../05-evals-and-observability/02-eval-methods.md) — how the chain is scored per step.
+- [01-context-window.md](01-context-window.md) — the fixed prefix each step of the chain rebuilds.

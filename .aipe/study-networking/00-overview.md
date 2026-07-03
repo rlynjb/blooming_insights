@@ -1,192 +1,108 @@
-# Networking overview — blooming_insights
+# study-networking — overview
 
-The through-line: **what actually happens on the wire, where can it fail,
-and which protocol semantics does the code rely on?** This repo answers that
-across three HTTPS surfaces — browser to Next routes, routes to Bloomreach,
-routes to Anthropic — with everything else (DNS, TLS handshakes, connection
-pooling) delegated to Node's default `fetch` and to the CDN/edge layer.
+The question this guide answers: **what actually happens on the wire in this repo, where can it fail, and which protocol semantics does the code rely on?**
 
-The whole system, one picture. Every horizontal line here is a boundary the
-code crosses; each one is where the interesting failure modes live.
+You're building a Next.js app that fans out to two upstream HTTPS surfaces per user turn — an MCP server (Bloomreach by default) and the Anthropic API — and streams NDJSON back to the browser over a long-lived response body. That's three wire surfaces, all HTTPS, no WebSockets, no gRPC. This guide walks each of them the way you'd walk a stack: shape first, then mechanics, then failure.
+
+## The wire in one picture
+
+Three hops, three protocols, three failure characters. Every user turn touches all three.
 
 ```
-  blooming_insights — the on-the-wire map
+  The wire — three surfaces, all HTTPS
 
-  ┌─ Client (browser) ──────────────────────────────────────────────┐
-  │  React 19 pages · useBriefingStream / useInvestigation           │
-  │  fetch() → ReadableStream → readNdjson (lib/streaming/ndjson.ts) │
-  └───────────────────────────────┬─────────────────────────────────┘
-                                  │  hop 1: HTTPS (Vercel edge → route)
-                                  │  GET /api/briefing / /api/agent
-                                  │  Cookie: bi_session; bi_auth
-                                  │  → NDJSON stream (chunked)
-  ┌─ Next routes (Node runtime) ──▼─────────────────────────────────┐
-  │  app/api/{briefing,agent,mcp/*}/route.ts                         │
-  │  maxDuration = 300 (Vercel Pro)                                  │
-  │  Content-Type: application/x-ndjson; Cache-Control: no-store     │
-  └────────────┬─────────────────────────────────────┬──────────────┘
-               │  hop 2: HTTPS                        │  hop 3: HTTPS
-               │  MCP over StreamableHTTP             │  api.anthropic.com
-               │  Bearer <OAuth token>                │  Bearer + cache_control
-               │  30s AbortSignal.timeout per call    │  system prefix
-               ▼                                      ▼
-  ┌─ Bloomreach loomi-mcp ──────┐      ┌─ Anthropic messages API ────┐
-  │ loomi-mcp-alpha.bloomreach   │      │ claude-sonnet-4-6 / haiku    │
-  │ .com/mcp (no trailing slash) │      │ ephemeral prompt cache       │
-  │ rate limit: 1 per 10 seconds │      │ cache_creation → cache_read  │
-  │ tokens revoked after ~min    │      │ (~90% discount on repeats)   │
-  └──────────────────────────────┘      └──────────────────────────────┘
+  ┌─ Browser (React) ────────────────────────────────────────────┐
+  │  useBriefingStream / useInvestigation                        │
+  │    fetch(url, { headers: { x-bi-mcp-config } })              │
+  │    → readNdjson(res.body, handle)                            │
+  └─────────────────────────┬────────────────────────────────────┘
+                            │  hop 1: HTTPS · NDJSON stream ·
+                            │  cookies (bi_session, bi_auth) ·
+                            │  optional x-bi-mcp-config header
+                            ▼
+  ┌─ Next.js route handler (Vercel Node runtime) ────────────────┐
+  │  app/api/{briefing,agent}/route.ts                           │
+  │    - decodes config header (fail-safe → env fallback)        │
+  │    - opens ReadableStream, writes NDJSON as agent progresses │
+  │    - fans out to two upstream HTTPS clients                  │
+  └────────────┬────────────────────────────────┬────────────────┘
+               │ hop 2                          │ hop 3
+               │ HTTPS · MCP JSON-RPC           │ HTTPS · Anthropic
+               │ Streamable HTTP transport      │ Messages API
+               │ Authorization: Bearer <tok>    │ x-api-key +
+               │ per-call AbortSignal(30s)      │ cache_control:
+               │                                │ ephemeral
+               ▼                                ▼
+  ┌─ MCP server (Bloomreach loomi) ─┐  ┌─ Anthropic API ─────────┐
+  │  loomi-mcp-alpha.bloomreach.com │  │  api.anthropic.com      │
+  │  (or MCP_URL override)          │  │                         │
+  └─────────────────────────────────┘  └─────────────────────────┘
 ```
 
-Three horizontal boundaries — each with a distinct failure surface, timeout
-budget, and retry policy. The rest of this guide walks each in turn.
+The route handler is the seam. Every network concern in this repo sits at that middle band: authentication, timeout, retry, cancellation, cache. The browser only sees HTTPS + NDJSON. The upstreams only see one bearer/API-key request at a time.
 
----
+## What earns a concept file
 
-## What's load-bearing (read these first)
+The spec fixes eight concepts, in this order. Each file uses the full `format.md` template — zoom-out, structure pass, how-it-works with real repo code, primary diagram, elaborate, interview defense, see also.
 
-The three mechanisms that carry the whole networking story:
+  1. `01-network-map.md`
+     the full on-the-wire path and every network boundary — the browser → route → (MCP, Anthropic) fan-out with header/cookie/token flow named at each hop
+  2. `02-dns-routing-and-addressing.md`
+     names, addresses, routing, proxies, edge layers, and origin resolution — MCP URL precedence chain, redirect URI derivation from `x-forwarded-host`, Vercel edge in front of the route
+  3. `03-tcp-udp-connections-and-sockets.md`
+     connections, sockets, transport choices, ordering, lifecycle — Node runtime fetch pooling, Streamable HTTP, per-request lifetime
+  4. `04-tls-and-trust-establishment.md`
+     encryption in transit, certificates, trust establishment, and termination points — Vercel edge TLS, upstream TLS, no client-side termination
+  5. `05-http-semantics-caching-and-cors.md`
+     methods, status codes, headers, caching, cookies, CORS, and browser policy — cookie flags (`SameSite=None`, `Secure`, `HttpOnly`), `Cache-Control: no-cache`, no CORS (same-origin), `cache_control: ephemeral` for Anthropic prompt caching, `x-bi-mcp-config` header
+  6. `06-websockets-sse-streaming-and-realtime.md`
+     long-lived connections, streams, realtime behavior, reconnect logic — NDJSON over `fetch` streaming response (not SSE, not WS), `readNdjson` kernel, `useReconnectPolicy` for revoked-token recovery
+  7. `07-timeouts-retries-pooling-and-backpressure.md`
+     timeouts, retries, jitter, connection pools, request collapse, and overload — 30s per-call MCP timeout via `AbortSignal.timeout`, 300s route budget, rate-limit retry ladder with parsed retry-after, 60s response cache
+  8. `08-networking-red-flags-audit.md`
+     ranked protocol and network-failure risks grounded in the repo
 
-  1. **The 300s / 30s / retry-ceiling composition** — `AbortSignal.timeout(30_000)`
-     at `lib/mcp/transport.ts:38` composed with the route-level `req.signal`
-     via `composeSignals` (`lib/mcp/transport.ts:173`), inside the 300s
-     Vercel Pro budget (`maxDuration = 300` at `app/api/agent/route.ts:22`
-     and `app/api/briefing/route.ts:19`). Whichever signal fires first cancels
-     the in-flight call. This is the load-bearing invariant — everything
-     else hangs on it. See **07-timeouts-retries-pooling-and-backpressure.md**.
+## Top-of-mind findings (verdict-first)
 
-  2. **NDJSON over `fetch` streams** (not SSE, not WebSocket) — one kernel
-     at `lib/streaming/ndjson.ts:17` consumed by every client hook
-     (`useBriefingStream`, `useInvestigation`, chat), produced by every
-     streaming route via `encodeEvent` at `lib/mcp/events.ts:15`. The choice
-     of NDJSON-over-fetch (over EventSource) is deliberate — it lets the
-     client cancel via the request signal instead of an EventSource-close
-     dance, and it works over the same authenticated `Cookie:` header path.
-     See **06-websockets-sse-streaming-and-realtime.md**.
+Read these before opening the concept files. The full walk lives in `08-networking-red-flags-audit.md`.
 
-  3. **OAuth 2.1 + PKCE + Dynamic Client Registration inside an encrypted
-     cookie** — the `bi_auth` cookie holds the OAuth state (client info,
-     PKCE verifier, tokens) AES-256-GCM-encrypted under `AUTH_SECRET`
-     (`lib/mcp/auth.ts:62-79`), scoped per session, seeded once and flushed
-     once per request via `AsyncLocalStorage`. `SameSite=None` + `Secure` is
-     required so the cross-site OAuth return from Bloomreach's IdP hits the
-     `/api/mcp/callback` route with the cookie still attached. See
-     **04-tls-and-trust-establishment.md** and **05-http-semantics-caching-and-cors.md**.
+  → **The 30s per-call MCP timeout is the strongest single defense you have.**
+     `lib/mcp/transport.ts:38, :131` composes `AbortSignal.timeout(30_000)` with the route's own cancel signal via `composeSignals` — whichever fires first cancels the in-flight MCP call. Without this, one stuck Bloomreach call would burn the entire 300s route budget on a single tool call. Naming this timeout — and saying "the retry ladder deliberately does NOT retry it because a retry would just risk another 30s wait inside the same route budget" (transport.ts:34-37) — is the load-bearing part of the timeouts story.
 
-## Ranked findings
+  → **The MCP URL is a preset, not an identity.** The precedence chain in `lib/mcp/connect.ts:38-48` is `override.url` (UI settings modal, per-request header) → `MCP_URL` env → `BLOOMREACH_MCP_URL` env (legacy) → hardcoded `loomi-mcp-alpha.bloomreach.com` default. Bloomreach is what's baked in as a working example; any HTTPS MCP endpoint plugs in via the header or env. Same story for auth: `oauth-bloomreach`, `bearer`, or `anonymous` are three swappable providers behind one `OAuthClientProvider` interface (`lib/mcp/auth-providers/index.ts:56`).
 
-The wire behavior in priority order. Full walks in
-**08-networking-red-flags-audit.md**.
+  → **NDJSON over fetch is the streaming choice — not SSE, not WebSockets.** The route opens a `ReadableStream<Uint8Array>` and writes one JSON object per newline; the browser reads `res.body` with `getReader()` and parses each line (`lib/streaming/ndjson.ts:17-64`). One kernel, four consumers (briefing, investigation, capture, chat). The consequence: reconnection is a full `fetch` retry, not a resumable stream. This is why `useReconnectPolicy` exists — a revoked Bloomreach token surfaces as an `error` NDJSON event, the hook matches the shape (`invalid_token|unauthor|forbidden|401|session expired|reconnect`), fires `POST /api/mcp/reset`, and reloads the page.
 
-  1. **Retry ladder budget arithmetic under a per-call 30s cap** — the
-     transport's 30s `TOOL_TIMEOUT_MS` bounds a single HTTP round-trip; the
-     `BloomreachDataSource` retry ladder can add up to `retryCeilingMs = 20_000`
-     wait × `maxRetries = 3` = 60s of *wall clock* on a single tool call
-     that keeps getting rate-limited. Under the 300s Pro budget this is
-     fine; on Hobby (60s) it would consume the entire budget on one
-     stuck tool. This is why `maxDuration = 300` at both routes.
-     Evidence: `lib/mcp/transport.ts:38`, `lib/data-source/bloomreach-data-source.ts:135-136,164-174`.
+  → **The custom header transport for per-request MCP config is fail-safe by design.** `lib/mcp/config.ts:87-100` decodes `x-bi-mcp-config` with a try/catch that returns `null` on any failure. A malformed base64 payload, a JSON parse error, an unknown auth type — all fall through to env-driven behavior instead of crashing the request. The route site (`app/api/agent/route.ts:165`) reads the header and passes the decoded override to `makeDataSource`. If nothing decodes, env wins — exactly what you want in production where the header is optional.
 
-  2. **Timeouts fail fast; only rate-limit results retry** — a `TimeoutError`
-     from `AbortSignal.timeout` throws `HTTP 0: timeout after 30000ms`
-     (`transport.ts:137`) and rides the transport failure path; the
-     retry ladder only fires on tool *results* whose `isError === true`
-     text matches `/rate limit|too many requests/i`
-     (`bloomreach-data-source.ts:51-55`). A hung origin (network partition)
-     fails once at 30s rather than four times at 30s. Deliberate — a retry
-     would just wait 30s more inside the same route budget.
+  → **Cookies carry two different trust levels across the same cross-site boundary.** `bi_session` (in `lib/mcp/session.ts`) is a random UUID that identifies the user's browser to the route. `bi_auth` (in `lib/mcp/auth.ts:48-104`) is an AES-256-GCM-encrypted store of OAuth tokens + PKCE state + DCR client info, keyed by `bi_session`. Both use `SameSite=None; Secure` in production so they survive the cross-site OAuth redirect. The encryption is what lets `bi_auth` sit in a browser cookie at all — Vercel's ephemeral functions can't share memory across the `/api/mcp/connect` → Bloomreach IdP → `/api/mcp/callback` round-trip, so the browser cookie is the only state both sides can see.
 
-  3. **Ephemeral prompt caching on the Anthropic hop** — a single
-     `cache_control: { type: 'ephemeral' }` block on the system prompt
-     (`lib/agents/aptkit-adapters.ts:87`) turns every subsequent ReAct-loop
-     iteration within 5 minutes into a `cache_read` at ~10% of normal
-     input cost. Baseline eval shows this live: `cache_creation_input_tokens: 3168`
-     on the first turn matched by `cache_read_input_tokens: 3168` on the
-     next.
+  → **Prompt caching rides an Anthropic-specific header cache marker.** `lib/agents/aptkit-adapters.ts:87` wraps the system prompt in `cache_control: { type: 'ephemeral' }`. First call is a cache_creation (~1.25× normal input cost); subsequent calls within ~5 min are cache_reads (~0.1×). Verified live: `cache_creation_input_tokens 3168` → `cache_read_input_tokens 3168` on the next call. This is a network optimization living inside the Anthropic protocol, not something Anthropic caches transparently — it's a first-class HTTP-level knob on the request payload.
 
-  4. **Cross-site OAuth cookie survival** — `bi_session` and `bi_auth`
-     both use `SameSite=None; Secure` in production
-     (`lib/mcp/session.ts:12`, `lib/mcp/auth.ts:98`). `SameSite=Lax` would
-     drop the cookie on the IdP-driven return to `/api/mcp/callback`, and
-     the callback would land with `no session` (there's a defensive
-     `!sid` check at `app/api/mcp/callback/route.ts:20`).
+  → **`x-forwarded-host` drives the OAuth redirect URI on Vercel.** `lib/mcp/connect.ts:57-70` derives the redirect from the actual request host in production (falls back to `APP_ORIGIN` locally). Without this, a preview-deployment URL would trigger an OAuth flow whose callback lands on the production alias — different origin, different cookie jar, the `bi_session` cookie doesn't come along and the callback sees "no session". This is a network-layer detail (the edge inserts `x-forwarded-host`) that fixes an identity-layer bug (cookie scope).
 
-  5. **Origin per-request redirect_uri** — production reads
-     `x-forwarded-host` from Next's request headers to derive
-     `${proto}://${host}/api/mcp/callback` (`lib/mcp/connect.ts:36-57`).
-     Without this, a preview-deploy URL's cookie would be dropped when the
-     callback lands on the production alias.
+## What is `not yet exercised`
 
-  6. **The trailing slash 307 problem** — `mcpUrl()` strips trailing
-     slashes off `BLOOMREACH_MCP_URL` explicitly (`lib/mcp/connect.ts:33`)
-     because the SDK's URL construction would otherwise produce
-     `.../mcp/` and eat a 307 redirect on every call. Small but
-     load-bearing.
+Named for honesty and for the shape it would take when it becomes relevant:
 
-  7. **Fetch-body redaction before logging** — `makeCapturingFetch` at
-     `transport.ts:103` records the body of any non-OK response so tool
-     errors surface the real server text, and `redactSecrets` at
-     `transport.ts:66` strips `Bearer …`, `access_token`,
-     `refresh_token`, `id_token`, `code_verifier` before storage — so a
-     token nested in an error envelope never reaches Vercel logs.
+  → **WebSockets / SSE.** Neither is used. The streaming surface is NDJSON over `fetch` response bodies. If a future feature needs server-push after the initial response finishes, SSE (`text/event-stream`) fits the same Vercel route shape. WebSockets would require moving off the standard Vercel Node runtime (they don't survive an ephemeral function's per-request lifecycle).
 
-  8. **No connection-pool or DNS controls in the app** — the app uses
-     the platform default `fetch` (Undici under Node, browser fetch on
-     the client). No `Agent`, no keepalive tuning, no DNS pinning, no
-     HTTP/2 push. This is fine for the current traffic shape (one user,
-     one MCP origin, one LLM origin) and would be the first thing to
-     revisit if the app ever fanned out to per-user workspaces at scale.
+  → **HTTP connection pooling / keep-alive control.** No explicit `httpAgent` config, no `keepalive: true` on `fetch`. Node 20's `undici` fetch pools connections per host automatically. On Vercel's ephemeral functions this pool is per-instance-lifetime, which is short — so pooling is a best-effort optimization, not a load-bearing mechanism here. Would become relevant on a long-running Node server hitting Bloomreach/Anthropic under sustained load.
+
+  → **DNS caching / SRV records / service discovery.** Origins are hardcoded HTTPS URLs; DNS is Vercel's / Node's default resolver. No SRV, no consul, no discovery layer.
+
+  → **Multi-region / edge routing.** Vercel's edge fronts the route but the route is a Node function, not an edge function. No `runtime: 'edge'` declared. No per-region routing logic. `x-forwarded-host` shows up because Vercel's edge terminates TLS and forwards to the function, not because there's regional logic in this code.
+
+  → **CORS.** All browser-to-route requests are same-origin. No `Access-Control-*` headers configured. Would become relevant if the API layer were split out of the Next.js app.
+
+  → **UDP / QUIC / HTTP/3.** Not exercised at the application layer. Whatever the Vercel edge negotiates with browsers is opaque to this code.
 
 ## Reading order
 
-  1. `01-network-map.md` — the full wire path across the three surfaces
-  2. `02-dns-routing-and-addressing.md` — origins, per-host redirect_uri, 307
-  3. `03-tcp-udp-connections-and-sockets.md` — where sockets are (Undici) and aren't
-  4. `04-tls-and-trust-establishment.md` — HTTPS termination + the encrypted cookie
-  5. `05-http-semantics-caching-and-cors.md` — methods, headers, cookies, prompt cache
-  6. `06-websockets-sse-streaming-and-realtime.md` — NDJSON over fetch, reconnect
-  7. `07-timeouts-retries-pooling-and-backpressure.md` — the composed budget
-  8. `08-networking-red-flags-audit.md` — ranked risks with evidence
+Start with `01-network-map.md` — the picture the rest of the guide hangs off. Then `05-http-semantics-caching-and-cors.md` (the layer most of the interesting mechanisms sit in for this repo) and `07-timeouts-retries-pooling-and-backpressure.md` (where the load-bearing 30s timeout lives). `06-websockets-sse-streaming-and-realtime.md` explains why NDJSON was the right call. End with `08-networking-red-flags-audit.md` — the ranked risks with evidence.
 
-## Not yet exercised
+## See also
 
-Deliberately absent from this repo — flagged so a reader doesn't hunt for
-them:
-
-  - **CDN, load balancer, geo-DNS** — Vercel's edge is present but not
-    configured; no route runs `edge` runtime, no CDN caching headers set
-    beyond `no-store` on streams.
-  - **DNS pinning, custom resolvers, IPv6 tuning** — platform default.
-  - **mTLS, certificate pinning, custom trust roots** — public HTTPS only.
-  - **WebSockets** — not exercised anywhere. The streaming surface is
-    NDJSON-over-fetch by design (see 06).
-  - **Server-Sent Events (`EventSource`)** — considered and rejected; a
-    line in `lib/mcp/types.ts` documents that streaming uses fetch +
-    ReadableStream, not EventSource.
-  - **UDP, HTTP/3, HTTP/2 push** — no code path uses them.
-  - **CORS** — the whole app is same-origin (Next app + its own routes),
-    so no `Access-Control-*` header is emitted anywhere. Adding a
-    third-party client would need CORS wired in.
-  - **Request coalescing / collapsing** — the 60s response cache at
-    `bloomreach-data-source.ts:186` collapses *cache hits* but there's no
-    in-flight singleflight/dedupe of concurrent identical requests.
-  - **Jitter on retries** — the retry ladder is deterministic
-    (parsed hint OR `retryDelayMs * 2**(retries-1)`, capped at
-    `retryCeilingMs`). Adding jitter is a one-line change if the app
-    ever fans out to multiple concurrent users hitting the same
-    `1 per 10 second` window.
-  - **Circuit breaker / half-open probes** — no state kept across
-    failures; the retry ladder is per-call.
-
-## Cross-links to adjacent guides
-
-  - **Trust boundaries at each hop** (whether encryption/auth is *safe*) —
-    see `.aipe/study-security/`.
-  - **Where each network boundary belongs in the architecture** (why
-    NDJSON here and not there) — see `.aipe/study-system-design/`,
-    especially the streaming pattern file.
-  - **What the wire behavior costs in wall-clock and cost** —
-    see `.aipe/study-performance-engineering/`.
-  - **How runtime signals cancel in-flight work** —
-    see `.aipe/study-runtime-systems/` for the AbortSignal composition
-    at the process level.
+  → `study-security` — same trust boundaries, different question ("is each hop safe?" rather than "what's on the wire?")
+  → `study-system-design` — same network fan-out, different question ("where should these boundaries live?" rather than "what protocol carries them?")
+  → `study-distributed-systems` — the coordination story that hangs off the wire

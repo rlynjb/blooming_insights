@@ -1,319 +1,272 @@
 # Memory, stack, heap, GC, and lifetimes
 
-*Memory model · Language-agnostic (with JS/V8 specifics)*
+**Industry:** memory model, garbage collection, allocation lifecycles · Language-agnostic
 
 ## Zoom out — where this concept lives
 
-Memory in this codebase is a story about *lifetimes*. Node's garbage collector handles the mechanics; the app's job is to hold references only for the right duration and let go on time. On a warm serverless instance, holding a reference too long is the shape of a leak.
+Every band on the runtime map has a heap that V8 owns and a GC that reclaims it when references go away. The memory pressure story in `blooming_insights` is quiet — small objects, short-lived requests, no big buffers — but the lifetime rules (what stays alive on a warm instance, what dies with a request, what dies with a tab) are load-bearing.
 
 ```
-Zoom out — memory lifetimes on the Vercel Node instance
+  Zoom out — where memory lives
 
-┌─ Process memory (V8 heap, one per instance) ──────────────────────┐
-│                                                                    │
-│  MODULE-SCOPE lifetime (dies only when the process dies)          │
-│  ┌────────────────────────────────────────────────────────────┐  │
-│  │ prompt strings          readFileSync at module top          │  │
-│  │ pricing table           lib/agents/pricing.ts               │  │
-│  │ compiled schemas        lib/mcp/schema.ts                   │  │
-│  │ regex patterns          lib/mcp/transport.ts:55-61          │  │
-│  └────────────────────────────────────────────────────────────┘  │
-│                                                                    │
-│  PROCESS-SCOPE STATE (accumulates until GC frees or process dies) │
-│  ┌────────────────────────────────────────────────────────────┐  │
-│  │ Map<sessionId, SessionFeed>    ← GROWS with active sessions │  │
-│  │ Map<insightId, AgentEvent[]>   ← GROWS with cached invs     │  │
-│  │ BloomreachDataSource cache     ← 60s TTL, self-expiring     │  │
-│  └────────────────────────────────────────────────────────────┘  │
-│                                                                    │
-│  REQUEST-SCOPE (freed when request ends + GC picks up)            │
-│  ┌────────────────────────────────────────────────────────────┐  │
-│  │ RequestStore ctx              ← released when fn() resolves │  │
-│  │ BudgetTracker                 ← released with investigation │  │
-│  │ CapabilityEvent[] (eval)      ← released at test end        │  │
-│  │ collected: AgentEvent[]       ← held while stream is open   │  │
-│  └────────────────────────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────────────────────┘
+  ┌─ Browser ──────────────────────────────────────────┐
+  │  V8 heap · React fiber tree · React state          │
+  │  DOM refs · fetch response bodies (streamed)       │
+  │  bounded by: the tab                               │
+  └───────────────────────┬────────────────────────────┘
+                          │
+  ┌─ Vercel serverless ──▼─────────────────────────────┐
+  │  ★ THIS CONCEPT ★                                   │
+  │  Node V8 heap · module-level Maps · ALS contexts   │
+  │  bounded by: Vercel's instance memory ceiling      │
+  └───────────────────────┬────────────────────────────┘
+                          │
+  ┌─ Upstream ──────────▼──────────────────────────────┐
+  │  their heap, their GC                              │
+  └────────────────────────────────────────────────────┘
 ```
 
-## Structure pass — one axis, three altitudes
+The concept: **automatic memory management with distinct object lifetimes per runtime tier**. Understanding where an allocation lives (request scope vs instance scope vs page scope) tells you when the GC will reclaim it — and where a leak would hide.
 
-Trace *"when does this memory get released?"* across the lifetime layers.
+## Structure pass — layers, axis, seams
+
+Pick one axis — **when does this allocation get freed?** — and trace it down.
 
 ```
-"When does this memory get released?" — one question, three answers
+  One axis (when does this get freed?) down the layers
 
-┌─ module ────────────────────────────────────┐
-│  → NEVER, until the process dies             │
-│    → OK for small stable data (prompts,      │
-│      regexes, pricing table)                 │
-└──────────────────────┬──────────────────────┘
-                       ▼
-┌─ process (with self-expiring TTL) ──────────┐
-│  → when the TTL passes AND the reference is  │
-│    dropped                                    │
-│    → BloomreachDataSource cache: 60s TTL     │
-└──────────────────────┬──────────────────────┘
-                       ▼
-┌─ request ────────────────────────────────────┐
-│  → when the request ends (all closures drop) │
-│    → the safe default; nothing accumulates    │
-└─────────────────────────────────────────────┘
+  ┌─ per-await stack frame ────────────────────────┐
+  │  local vars, arguments      → RELEASED when    │
+  │                               the async fn's    │
+  │                               continuation ends │
+  └────────────────────────────────────────────────┘
+      ↓
+  ┌─ per-request objects ──────────────────────────┐
+  │  ALS RequestStore, agent  → RELEASED when the  │
+  │  instances, trace arrays    ReadableStream      │
+  │                              closes             │
+  └────────────────────────────────────────────────┘
+      ↓
+  ┌─ per-instance objects ─────────────────────────┐
+  │  module-level Maps, cache → RELEASED when the  │
+  │  entries, SDK client       Vercel instance dies │
+  │                             (minutes to hours)  │
+  └────────────────────────────────────────────────┘
+      ↓
+  ┌─ per-tab objects (browser) ────────────────────┐
+  │  React state, localStorage → RELEASED when tab  │
+  │                              closes (or GC in   │
+  │                              a background tab)  │
+  └────────────────────────────────────────────────┘
+
+  the seam that matters: request boundary vs instance boundary
 ```
 
-The seam that matters: **module ↔ process.** Module-scope holds tiny stable data forever (fine); process-scope holds request-derived state (dangerous without a cap). Every process-scope `Map` in this codebase either has a TTL or is bounded by session count.
+**The load-bearing seam:** what dies with the request vs what survives the request. Every module-level `Map` in `lib/*` is a survival case — you're deliberately choosing "outlive this request." Every ALS context is a die-with-the-request case. Confusing them either leaks memory (Maps that grow forever) or loses data (state you needed on the next request).
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know how JS closures keep variables alive as long as the closure is reachable? That's the whole game. GC frees anything that no closure, no map, no promise chain still references. On a warm serverless instance, "reachable from a module-level Map" means "reachable forever until the process dies." So the risk is stashing request-derived data in a module-level Map that never gets cleared.
+You know how a React component's local state (`useState`) dies when the component unmounts? That's a lifetime scoped to a mount. V8's GC does the same for objects: as long as *something* holds a reference (a closure, a Map entry, a React fiber), the object stays alive. When the last reference drops, the object becomes garbage. The next GC pass reclaims it.
 
 ```
-The two shapes memory can take
+  Pattern — reachability determines lifetime
 
-  MODULE                          REQUEST-SCOPED
-  ──────                          ──────────────
+  ┌─ roots (always reachable) ─────────────────────┐
+  │  global object, module top-level vars,          │
+  │  the current call stack, live promises          │
+  └────────────┬───────────────────────────────────┘
+               │  refs to
+               ▼
+  ┌─ your objects ─────────────────────────────────┐
+  │  { user: {…}, trace: [{…}, {…}], client: {…} } │
+  │                                                 │
+  │  as long as SOMETHING traces back to a root,   │
+  │  the whole graph stays alive                    │
+  └────────────────────────────────────────────────┘
 
-  const REGEX = /foo/g            async function handler() {
-  const PRICING = {…}               const local = new Map()
-  const state = new Map()           await work()
-    ▲                               // local drops when handler
-    │                               // returns — GC frees it
-    │ REACHABLE FOREVER              }
-    │ from the module               ▲
-    │                               │ reachable only during the request
+  reclamation: unreachable subgraphs get GC'd
 ```
 
-The codebase pattern is: **stable data goes in module scope, request-derived data goes in request-scoped closures OR in module-level Maps with an explicit cleanup contract.**
+The subtlety in JS: closures capture references. A callback registered on an event target keeps its captured variables alive as long as the callback is registered. A promise's `.then` callback keeps captured variables alive until the promise resolves. Getting this wrong is exactly how JS "memory leaks" happen — closures holding onto too much, forgotten timers, undeleted Map entries.
 
-### Move 2 — the mechanisms
+### Move 2 — the pieces
 
-#### Module-scope: small, stable, one-shot
+#### The Node V8 heap on Vercel
 
-The module-scope allocations in this codebase are small and never grow:
+**Where it lives:** inside one Node process per warm Vercel instance. V8's default max heap is 4GB (`--max-old-space-size=4096`); Vercel's memory limit is configurable per function (default 1024MB on Pro). Whichever ceiling is lower wins.
 
-```
-Module-scope allocations, categorized
+**What survives one request:** everything at module top-level. That's:
 
-  PROMPTS          ~1-10 KB each, 4 files       legacy agents only
-  PRICING TABLE    ~2 KB                        lib/agents/pricing.ts
-  REGEX PATTERNS   ~200 bytes each              lib/mcp/transport.ts:55-61
-  ENV LOOKUP       primitive strings            various process.env reads
+- `const memStore = new Map<string, SessionAuthState>()` — `lib/mcp/auth.ts:36`. Test-only, but it *is* module-level.
+- `const requestStore = new AsyncLocalStorage<RequestStore>()` — `lib/mcp/auth.ts:47`. The ALS itself is module-level; the contexts it scopes are per-request.
+- `const state = new Map<string, SessionFeed>()` — `lib/state/insights.ts:14`. Grows one entry per session.
+- `const mem = new Map<string, AgentEvent[]>()` — `lib/state/investigations.ts:11`. Grows one entry per investigation.
+- `private cache = new Map<…>()` inside a DataSource instance — `lib/data-source/bloomreach-data-source.ts:122`. But the DataSource instance itself is per-request (constructed inside the route handler), so this cache dies with the request.
 
-  Total footprint: well under 100 KB
-  Growth over time: zero (all one-shot at module load)
-```
-
-Nothing in this list has a growth rate; they're all one-shot allocations at module load. Even on the busiest Vercel instance, module-scope memory stays flat.
-
-Real example — the token-redaction regex patterns:
-
-```ts
-// lib/mcp/transport.ts:55-61
-const TOKEN_PATTERNS: RegExp[] = [
-  /Bearer\s+[A-Za-z0-9._\-+/=]+/g,
-  /"access_token"\s*:\s*"[^"]+"/g,
-  /"refresh_token"\s*:\s*"[^"]+"/g,
-  /"id_token"\s*:\s*"[^"]+"/g,
-  /"code_verifier"\s*:\s*"[^"]+"/g,
-];
-```
-
-Five compiled regex objects, allocated once per process. Every subsequent `redactSecrets()` call reuses them — no re-compilation, no per-call allocation.
-
-#### Process-scope with TTL: the DataSource cache
+**What dies with the request:** the DataSource instance (and its 60s cache), the DiagnosticAgent / RecommendationAgent instances, the `collected: AgentEvent[]` array inside the ReadableStream's `start` (`app/api/agent/route.ts:191`), the ALS context. All of these are constructed inside the request handler; their references drop when the ReadableStream closes and the promise chain resolves.
 
 ```
-The 60s cache — self-expiring, bounded-in-expectation
+  Layers-and-hops — allocation lifetime inside one Vercel instance
 
-// lib/data-source/bloomreach-data-source.ts:122
-private cache = new Map<string, { result: unknown; expiresAt: number }>();
-
-// on set (line 186):
-this.cache.set(cacheKey, { result, expiresAt: now + ttl });
-
-// on read (lines 147-152):
-if (!options.skipCache) {
-  const cached = this.cache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) {
-    return { result: cached.result, durationMs: 0, fromCache: true };
-  }
-}
+  ┌─ Vercel instance (Node process, one heap) ───────────────────┐
+  │                                                              │
+  │  ┌─ module-level (survives requests) ──────────────────┐    │
+  │  │  memStore Map · requestStore · insights.ts state    │    │
+  │  │  investigations.ts mem · MCP SDK client (per session)│   │
+  │  │                                                      │    │
+  │  │  grows over instance lifetime                        │    │
+  │  │  dies with instance (minutes to hours)               │    │
+  │  └──────────────────────────────────────────────────────┘    │
+  │                        │                                     │
+  │                        │  holds refs into                    │
+  │                        ▼                                     │
+  │  ┌─ per-request (dies with request) ───────────────────┐    │
+  │  │  ALS RequestStore ctx · DataSource instance · agent │    │
+  │  │  collected AgentEvent[] · trace arrays               │    │
+  │  │                                                      │    │
+  │  │  root: the ReadableStream + the async chain          │    │
+  │  │  dropped when stream closes                          │    │
+  │  └──────────────────────────────────────────────────────┘    │
+  │                                                              │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-The subtle detail: **entries are never explicitly deleted.** Expired entries stay in the Map until they're overwritten by a new set with the same key, or the Map itself is dropped. On a busy instance with varied queries, the Map grows over the DataSource's lifetime.
+#### The MCP SDK client's per-session persistence
 
-Why this is OK here: `BloomreachDataSource` is constructed per request (`makeDataSource()` in `lib/data-source/index.ts`), then dropped at request end. The cache dies with it. There is no long-lived DataSource holding an unbounded expired-entry accumulation.
+`connectMcp` in `lib/mcp/connect.ts` reuses an MCP SDK Client per session — the session cookie's stability means we can hold onto the connection across requests within the same session. That Client instance sits in some session-keyed Map (or gets re-created per request depending on the auth path); either way, it's an object with a WebSocket-ish transport underneath, and closing it releases the connection. `dsResult.dispose` (`app/api/agent/route.ts:186`) is the cleanup handle called in the route's `finally`.
 
-If a future refactor moved the DataSource to module scope (for warm-instance connection reuse), this cache would leak — the codebase would need an explicit eviction pass.
+**Failure mode this design hedges against:** if the DataSource were held module-level *and* the session cookie rotated, you'd have a stale Client holding a dead connection, still referenced from the Map. The current design constructs the DataSource per request (via `makeDataSource`) and disposes on request end. The connection reuse, when it happens, is at a lower level (the MCP client's transport pool).
 
-#### Process-scope without TTL: session Maps
+#### The session-keyed Maps grow — but slowly, and get GC'd with the instance
 
-```
-Session Maps — grows with active sessions, never explicitly evicted
+Vercel keeps warm instances for a variable period (seconds to minutes idle, usually killed after ~15 min of no traffic). Every session that hits an instance during its lifetime adds one entry to `state` (in `insights.ts`) and one to `memStore` (in `auth.ts`, dev/test only). Nothing prunes these Maps — but nothing needs to, because the whole process dies before the Map gets big.
 
-// lib/state/insights.ts:14
-const state = new Map<string, SessionFeed>();     // ★ NEVER cleared by request code
+**When this becomes a real leak:** if the process ran for weeks (a long-running Node server, not serverless), the Maps would grow unbounded. There's no LRU eviction, no periodic sweep. The workload has never hit that shape in this repo's history, but it's worth naming as the failure mode.
 
-// lib/state/investigations.ts:11
-const mem = new Map<string, AgentEvent[]>();      // ★ NEVER cleared by request code
-```
+#### The browser heap and React state
 
-The isolation contract is *"only clear this session's sub-map, never the outer map"* (see `04-shared-state-races-and-synchronization.md`). That contract is what keeps concurrent sessions from stepping on each other — but it's also what makes the Map's growth unbounded in principle: every unique session id that ever hits the instance leaves a `SessionFeed` behind.
+**Where it lives:** the browser tab's V8 heap. React 19 holds the fiber tree; components hold state via `useState`. React garbage-collects state when the component unmounts.
 
-In practice:
-  → Session ids are UUIDv4 (`lib/mcp/session.ts:20`) — 128 bits of entropy, no reuse.
-  → Vercel warm instances live at most a few minutes to a few hours before recycling.
-  → Session cookies expire after 10 days but Vercel kills the instance long before then.
-
-So the practical footprint on any one instance is *"sessions active in the last few minutes,"* not *"all sessions ever."* Not a leak, but not defended by code either — it's defended by the platform's instance lifetime.
-
-The `_clear(sessionId?)` test hook at `lib/state/insights.ts:95-101` is the only explicit eviction path, and it's test-only.
-
-#### Request-scope: the safe default
-
-Anything created inside a route handler (or inside a `withAuthCookies(fn)` closure) drops when the handler returns:
+**What lives here per investigation page:** the `items: TraceItem[]` array in `useInvestigation` grows monotonically as agent events arrive. A typical investigation produces ~30-60 trace items. Each is small (a few hundred bytes). At the end of the run, the trace is JSON-stringified into `sessionStorage`:
 
 ```
-Request-scope allocations that go away for free
-
-  RequestStore ctx           declared in withAuthCookies      auth.ts:90
-  BudgetTracker              new BudgetTracker(...) in load    load.eval.ts:265
-                             route wiring for prod TBD
-  BloomreachDataSource       makeDataSource(mode, sid)         routes
-  collected: AgentEvent[]    inside stream closure             route.ts:186
-  encoder: TextEncoder       inside stream closure             route.ts:183
-  phases: Array<{phase,…}>   inside stream closure             route.ts:216
+  // lib/hooks/useInvestigation.ts:135-142 — the stash
+  sessionStorage.setItem(
+    stashKey(step, id),
+    JSON.stringify({ items: cItems, diagnosis: cDiag, recommendations: cRecs }),
+  );
 ```
 
-`collected` is the biggest allocation in the request lifetime — it holds every AgentEvent emitted during the investigation. For a typical run that's ~50 events × ~1KB truncated payload ≈ 50KB. Held until the stream closes; released when the handler function's closures unlink.
+**Where it dies:** when the user navigates away (React unmounts, the component's state goes), OR when the tab closes (`sessionStorage` cleared). `sessionStorage` has a per-origin quota (typically 5-10MB) — a runaway investigation with hundreds of trace items would eventually hit it. Today the traces are far under that.
 
-This is the codebase's default pattern and it's the right one: local allocations, released when the handler returns, GC handles the rest.
+**One subtle allocation pattern:** the `handle(e)` callback captures `cItems`, `cRecs`, `cDiag` in its closure. Those closure references keep the arrays alive as long as `handle` is registered on the NDJSON reader. When the stream ends, `readNdjson` resolves, `handle` drops out of scope, and the closure captures become collectible. Standard closure hygiene.
 
-#### Investigation-scope: `BudgetTracker` + `CapabilityEvent[]`
-
-Two accumulators live for the length of one investigation:
+#### The `startedRef` latch is a tiny bit of long-lived state
 
 ```
-BudgetTracker fields — three small numbers, growing linearly
-
-// lib/agents/budget.ts:42-44
-private inputTokens = 0;
-private outputTokens = 0;
-private turns = 0;
+  // lib/hooks/useInvestigation.ts:45 — one boolean per mount
+  const startedRef = useRef(false);
 ```
 
-Three primitives, updated ~10 times per investigation. Negligible footprint.
+`useRef` allocates one object per mount. Under React StrictMode dev, the component mounts, unmounts, remounts — the `startedRef` from the first mount gets GC'd, a fresh one is allocated on the remount. In production strict mode is off; there's one `startedRef` per real mount, dropped on unmount.
 
-```
-CapabilityEvent[] — growing array, capped by turns × ~2 events/turn
+#### No leaks worth naming today
 
-// eval/load.eval.ts:269, :281
-const diagnosisTrace: CapabilityEvent[] = [];
-const recommendationTrace: CapabilityEvent[] = [];
-
-// aptkit-adapters.ts:161 (per capability event):
-this.hooks.onCapabilityEvent?.(event);
-```
-
-Bounded by turns: a diagnostic run is typically 5–15 turns, each emitting a few events. Array of ~20-60 objects, each ~1KB. Released at test end.
+- No forgotten `setInterval` — the codebase doesn't use polling timers.
+- No unclosed event listeners on the browser — React 19's `useEffect` cleanup pattern is used correctly in the hooks (except the deliberate no-cleanup on the NDJSON fetch, which is a controlled choice explained in `useInvestigation.ts:34-38`).
+- No dangling promise chains — every async op the app starts is awaited or ends with a `.catch` that surfaces the error to state.
 
 ### Move 3 — the principle
 
-**Where you allocate is where you live.** Every allocation in this codebase lives exactly as long as its enclosing scope. Module-scope means forever; process-scope Map means "until you delete the key or the instance dies"; request closure means "until the handler returns." The bug shape to avoid is *"request-derived value stashed in a module-scope container that has no eviction policy."*
+Automatic GC does not mean automatic memory hygiene. Every module-level `Map`, every closure capture, every `useRef`, every `sessionStorage.setItem` is a lifetime decision you're making — sometimes explicitly, sometimes by accident. On serverless the process dying often saves you from the accidental ones; on long-running processes (your dev server, a full Node server) the same code would leak. Know which of your allocations survive one request, and why.
 
-The codebase's discipline: for anything derived from a request, either **give it a request-scoped closure** (default), or **key it by session with an explicit-clear-only-your-own contract** (session Maps), or **give it a TTL** (DataSource cache). Never module-scope unless the value is stable across all requests.
-
-## Primary diagram — memory by lifetime
+## Primary diagram
 
 ```
-Memory allocations across scopes
+  Memory lifetimes — every scope, every layer
 
-MODULE SCOPE — flat, small, forever
-┌──────────────────────────────────────────────────────────────┐
-│  prompts, regexes, pricing table                              │
-│  ~< 100 KB total, zero growth                                │
-└──────────────────────────────────────────────────────────────┘
+  ┌─ browser tab heap ───────────────────────────────────────────┐
+  │  React fiber tree · component state · fetch response bodies │
+  │  sessionStorage (bi:inv:*, bi:diag:*)                       │
+  │  localStorage (bi:mcp_config, bi:mode)                      │
+  │  dies with tab                                              │
+  └──────────────────────────────────────────────────────────────┘
 
-PROCESS SCOPE (with TTL) — self-expiring
-┌──────────────────────────────────────────────────────────────┐
-│  DataSource cache (60s TTL)                                   │
-│  · one instance per request, dies with the DataSource         │
-│  · if DataSource ever became long-lived → expired entries     │
-│    would need an eviction pass                                │
-└──────────────────────────────────────────────────────────────┘
+  ┌─ Vercel instance heap (Node 20, V8) ─────────────────────────┐
+  │                                                              │
+  │  ┌─ module-level survives requests ────────────────────┐    │
+  │  │                                                      │    │
+  │  │  insights.ts     Map<sid, SessionFeed>  (grows /sess)│    │
+  │  │  investigations  Map<invId, events>     (grows /inv) │    │
+  │  │  auth.ts         memStore (dev/test only)            │    │
+  │  │  auth.ts         requestStore (ALS instance)         │    │
+  │  │                                                      │    │
+  │  │  no LRU · nothing prunes · dies with process         │    │
+  │  └──────────────────────────────────────────────────────┘    │
+  │                                                              │
+  │  ┌─ per-request dies with request ─────────────────────┐    │
+  │  │                                                      │    │
+  │  │  ALS context · DataSource · Bloomreach 60s cache     │    │
+  │  │  DiagnosticAgent · RecommendationAgent · trace array │    │
+  │  │  ReadableStream + its collected AgentEvent[]         │    │
+  │  │                                                      │    │
+  │  │  released when stream closes + finally runs          │    │
+  │  └──────────────────────────────────────────────────────┘    │
+  │                                                              │
+  │  ┌─ per-async-frame dies at end of continuation ───────┐    │
+  │  │                                                      │    │
+  │  │  local vars, arguments, closure captures             │    │
+  │  │  V8 optimizes short-lived allocations aggressively   │    │
+  │  └──────────────────────────────────────────────────────┘    │
+  │                                                              │
+  └──────────────────────────────────────────────────────────────┘
 
-PROCESS SCOPE (session-keyed) — grows with active sessions
-┌──────────────────────────────────────────────────────────────┐
-│  Map<sessionId, SessionFeed>                                  │
-│  Map<insightId, AgentEvent[]>                                 │
-│  · bounded in practice by Vercel instance lifetime            │
-│  · NOT bounded by explicit eviction in code                   │
-│  · session ids are UUIDs → no key reuse                       │
-└──────────────────────────────────────────────────────────────┘
-
-REQUEST SCOPE — freed at handler end
-┌──────────────────────────────────────────────────────────────┐
-│  ALS RequestStore ctx        withAuthCookies closure          │
-│  BloomreachDataSource        per-request construction         │
-│  collected: AgentEvent[]     ~50 events × ~1 KB               │
-│  encoder, phases[]           local variables                  │
-└──────────────────────────────────────────────────────────────┘
-
-INVESTIGATION SCOPE — freed at end of investigation
-┌──────────────────────────────────────────────────────────────┐
-│  BudgetTracker               three ints + one const           │
-│  CapabilityEvent[] (eval)    ~20-60 events × ~1 KB            │
-└──────────────────────────────────────────────────────────────┘
-
-CALL SCOPE — freed when the promise settles
-┌──────────────────────────────────────────────────────────────┐
-│  AbortSignal + timeout       transient primitive              │
-│  temporary strings           tool args, results (truncated)   │
-└──────────────────────────────────────────────────────────────┘
+  hazards this design controls:
+    · no long-running Node server (Vercel kills the process periodically)
+    · no timers holding closures across requests (setInterval unused)
+    · session-keyed cleanup patterns (never state.clear())
+    · DataSource dispose() in route finally
+    · sessionStorage per-tab (per-origin quota ~5-10MB, we're well under)
 ```
 
-## Elaborate — why the codebase never tunes GC
+## Elaborate
 
-V8's garbage collector is generational — young allocations that die fast (request closures) get collected cheaply; long-lived objects (module state) get promoted to old space and collected less often. This model happens to fit this codebase perfectly: request-scoped allocations are exactly the "die young" shape V8 optimises for.
+V8's generational GC — young generation collected frequently, old generation less often — is well-suited to request-scoped allocations. Short-lived objects (the `collected` array, the trace items during a request) rarely survive to the old generation; they get reclaimed cheaply. Long-lived objects (the module-level Maps) sit in the old generation and only get scanned during full GC pauses.
 
-The codebase doesn't set `--max-old-space-size`, doesn't call `global.gc`, doesn't ship a heap-dump utility. It doesn't need to. Vercel's Node runtime gives ~1 GB per instance by default; typical steady-state usage is orders of magnitude smaller (session Maps + DataSource caches + module strings). The instance recycles before old-space fills.
+The failure mode for a Node backend is usually not "the heap is too big" but "the heap fragments" (V8 handles this reasonably) or "closures capture a huge object graph that stays alive too long" (this is the classic Node leak). The repo avoids both because:
 
-If the codebase grew a shape that broke this — say, a background job that accumulates large intermediate results between requests, or a WebSocket connection that holds long-lived per-connection buffers — GC tuning would matter. Neither exists.
+1. Every request is short-ish (< 300s).
+2. The heavy objects (agent state, tool results) die with the request.
+3. The only truly long-lived state is small (session ids, feed entries).
 
-The one gotcha: if `BloomreachDataSource` becomes a warm-instance singleton (a reasonable perf optimization), the 60s TTL cache would need eviction because expired-but-not-overwritten entries pile up forever. The fix would be either a periodic `for (const [k, v] of cache) if (v.expiresAt < now) cache.delete(k)` sweep or a size cap.
+For a deeper cut: the [Node.js docs on Diagnostics](https://nodejs.org/api/) point at `--inspect` + Chrome DevTools memory profiling. In the current codebase you'd almost never need it — the heap is small and quiet. If a workload change made investigations balloon (a 10MB tool result kept in memory for the full 300s route), you'd reach for the profiler.
+
+Read `06-filesystem-streams-and-resource-lifecycle.md` next — same theme but with I/O handles instead of pure memory objects. Then `07-backpressure-bounded-work-and-cancellation.md` for how BudgetTracker enforces work ceilings.
 
 ## Interview defense
 
-**Q: Show me a module-scope Map in this codebase. Why isn't it a leak?**
+**Q: What memory lives on a warm Vercel instance across requests?**
 
-`const state = new Map<string, SessionFeed>()` at `lib/state/insights.ts:14`. It grows with every unique session id that hits this instance. It's not a leak because:
+Four things, all in module-level Maps. The auth store (`lib/mcp/auth.ts` — `memStore` is dev/test, the ALS is the production path). The feed state (`lib/state/insights.ts` — `Map<sessionId, SessionFeed>`). The investigation cache (`lib/state/investigations.ts` — `Map<invId, AgentEvent[]>`). And the MCP SDK Client per session, when we reuse it. Everything else is per-request: the DataSource instance, the agent instances, the trace array, the ReadableStream. They all die when the route's `finally` runs and the ReadableStream closes.
 
-  1. Session ids are UUIDv4 (never reused).
-  2. Vercel warm instances live at most a few minutes to a few hours, then recycle. The Map dies with the instance.
-  3. On any live instance, "sessions active in the last few minutes" is the practical bound.
+*Diagram to sketch: one Vercel instance box with an inner "module-level" band (persists) and an outer "per-request" band (dies) — arrows showing the request boundary crossing.*
 
-It IS unbounded in principle — no explicit eviction, no LRU. If Vercel changed to hour-long warm instances and traffic spiked, we'd want an eviction pass. Today, instance lifetime is the defense.
+**Q: Could the session-keyed Maps leak memory over time?**
 
-Anchor: `lib/state/insights.ts:14` (the map), `:8-12` (the isolation comment), `lib/mcp/session.ts:20` (UUID generation).
+Not in practice, because Vercel kills instances every ~15 min of idle. The Map holds one entry per session that hit that instance, each entry is small (a handful of insights, maybe an investigation), and the whole process gets torn down periodically. If we ever moved to a long-running Node server, we'd need an LRU or a TTL — none of the Maps have those today. It's a known limitation named honestly, not a live bug.
 
-**Q: The DataSource has a 60s cache. Show me where an entry gets removed.**
+*Diagram to sketch: a Map growing over time with an axe labeled "instance kill" chopping it back to empty.*
 
-Nowhere explicitly. Look at `lib/data-source/bloomreach-data-source.ts:186` — entries get set. There's no `.delete()` on the cache. Expired entries sit in the Map until either overwritten by a new set with the same `name:JSON.stringify(args)` key, or the whole Map is dropped when the DataSource is dropped.
+**Q: The load-bearing part people forget about Node memory lifetimes?**
 
-This is safe because the DataSource is constructed per request (`makeDataSource()` in each route) and dropped at request end. The cache dies with it.
+That module-level allocations survive `import` — not just the first request. If you write `const cache = new Map()` at module top-level, that Map is created ONCE per Node process, and it stays alive for as long as the process does. On serverless that's usually fine (short lifetimes, small Maps). On a long-running server, the same code leaks unless you prune. The tell in this repo: comments in `lib/state/insights.ts:4-7` and `lib/mcp/auth.ts:26-33` explicitly name what survives and why — because getting this wrong at review time is easy.
 
-If we moved to a warm-instance DataSource singleton (a performance win — avoids re-authing MCP every request), this cache would need eviction. The fix would be a size cap or a sweep pass. Anchor: `lib/data-source/bloomreach-data-source.ts:122, :186`.
-
-**Q: What's the largest single allocation in a live request?**
-
-The `collected: AgentEvent[]` array inside the /api/agent stream closure at `app/api/agent/route.ts:186`. It holds every event emitted during an investigation — reasoning steps, tool calls, tool results (truncated to 4KB via `TRUNC = 4000`), the diagnosis, the recommendations, the `done` event. Typical: ~50 events × ~1 KB = ~50 KB. Held until the stream closes; then GC'd.
-
-The truncation is the load-bearing detail — without it, a multi-MB EQL response would pin memory for the request duration. Anchor: `app/api/agent/route.ts:97-101`.
+*Diagram to sketch: two timelines — "one request" ends after seconds, "one instance" spans thousands of requests over minutes; a Map lives on the second timeline.*
 
 ## See also
 
-  → `01-runtime-map.md` — the scope diagram this file elaborates on.
-  → `04-shared-state-races-and-synchronization.md` — why the module-scope Maps are session-keyed.
-  → `06-filesystem-streams-and-resource-lifecycle.md` — the `TextEncoder` allocations and the truncation pattern.
+- `04-shared-state-races-and-synchronization.md` — the *shape* of the module-level Maps
+- `06-filesystem-streams-and-resource-lifecycle.md` — I/O handles, streams, and their cleanup
+- `07-backpressure-bounded-work-and-cancellation.md` — how BudgetTracker keeps the trace array bounded

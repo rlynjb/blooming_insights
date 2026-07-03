@@ -1,333 +1,269 @@
 # 01 · Anatomy of a production prompt
 
-**Prompt sections / structured system prompt — Industry standard**
+**Industry name:** *anatomy of a system prompt* / *sections of a prompt* · Language-agnostic
 
-## Zoom out, then zoom in
+## Zoom out — where the prompt lives
 
-Every LLM call in this codebase ends up as one HTTP request to Anthropic, and the payload is a `system` string plus a `messages` array. That's it. All the discipline you're about to learn is discipline about what goes into those two fields — because the model doesn't care about your intent, only your bytes.
+Before you decompose it, put it on the map. A prompt is not one string. It's four sections stacked in a specific order, then a `messages[]` array of conversation, then (in the 2026 world) a `tools[]` array so the model can act.
 
 ```
-  Zoom out — where the anatomy sits in the stack
+  Zoom out — where the prompt lives in this system
 
-  ┌─ Route layer (Next.js) ─────────────────────────────────┐
-  │  /api/agent — NDJSON stream                             │
-  └────────────────────────┬────────────────────────────────┘
+  ┌─ UI layer ──────────────────────────────────────────────┐
+  │  Next.js page → fetch('/api/briefing')                   │
+  └────────────────────────┬─────────────────────────────────┘
                            │
-  ┌─ Agent layer (blooming wrappers) ───▼───────────────────┐
-  │  DiagnosticAgent · MonitoringAgent · RecommendationAgent │
-  └────────────────────────┬────────────────────────────────┘
-                           │
-  ┌─ AptKit reusable agent (@aptkit/core) ▼─────────────────┐
-  │  DiagnosticInvestigationAgent.investigate()             │
-  │      renderPromptTemplate(system, {schema, anomaly})    │
-  └────────────────────────┬────────────────────────────────┘
-                           │
-  ┌─ Provider adapter ─────▼────────────────────────────────┐
-  │  AnthropicModelProviderAdapter.complete()                │
-  │      → ★ this is where the prompt anatomy is assembled ★│ ← we are here
-  │      params.system = [{type:'text', text, cache_control}]│
-  │      params.messages = messages                          │
-  └────────────────────────┬────────────────────────────────┘
-                           │  HTTPS
-  ┌─ Provider ─────────────▼────────────────────────────────┐
-  │  Anthropic API (Sonnet 4.6)                             │
-  └─────────────────────────────────────────────────────────┘
+  ┌─ Service layer ────────▼─────────────────────────────────┐
+  │  briefing route → MonitoringAgent → DiagnosticAgent → …   │
+  └────────────────────────┬─────────────────────────────────┘
+                           │  agent.investigate(anomaly)
+  ┌─ Agent internals ──────▼─────────────────────────────────┐
+  │  ★ THIS BLOCK ★  system prompt assembled here             │ ← we are here
+  │    ├─ role / rules (static across investigations)          │
+  │    ├─ context injection (schema, categories, anomaly)      │
+  │    ├─ few-shot (if any)                                     │
+  │    └─ hard-rules / output shape                             │
+  │  then messages[]: [{ role:'user', content:'begin' }]        │
+  │  then tools[]: MCP tools passed at call time                │
+  └────────────────────────┬─────────────────────────────────┘
+                           │  Anthropic.messages.create()
+  ┌─ Provider ─────────────▼─────────────────────────────────┐
+  │  system + messages + tools cross the wire                 │
+  └───────────────────────────────────────────────────────────┘
 ```
 
-**Zoom in.** A production prompt has four sections, and mixing them is how prompts drift. Role (who the model is), rules/schema (what it must do), context (variable data for this call), and task (the user's immediate ask). Junior mode dumps all four into one system string with no boundaries. Senior mode names each section explicitly and knows which slot each byte lives in.
+## Zoom in — the four sections
 
-## Structure pass
+Every production prompt in this repo, whether it's the retired string prompts in `lib/agents/legacy-prompts/*.md` or the currently-active system prompts inside `@aptkit/core`, decomposes to the same four sections:
 
-Before walking the mechanics, three foundations.
+1. **Role + rules** (constant per call).
+2. **Context injection** (per-call — the schema, the anomaly, the categories).
+3. **Few-shot examples** (constant if present; skipped in most of this repo).
+4. **Output shape / hard rules** (constant per call).
 
-### Axes — the dimension we're tracing
+Then the `messages[]` starts with a first user turn kicking things off, and `tools[]` gives the model something to do besides talk. That's the whole anatomy.
 
-For anatomy, the axis is **cost per call**. Every section of a prompt has a different cost profile — some are stable across the whole session (system prompt, constant), some vary per call (context, per-anomaly), some vary per user turn (task, per-message). Trace this axis and the sections separate themselves.
+## Structure pass — layers, axis, seams
 
-### Seams — where the axis flips
+Before mechanics, read the skeleton. Trace one axis — *what changes per call vs what is constant* — down the layers.
 
-There are three seams inside a single Anthropic API call:
+- **Layer 1: the system prompt.** Constant across every model turn within one investigation. Reused across the ~10 ReAct-loop iterations DiagnosticInvestigationAgent makes.
+- **Layer 2: the messages[].** Grows every turn. Tool calls, tool results, model text — all appended here.
+- **Layer 3: the tools[].** Constant across the loop.
 
-- **system vs messages** — the boundary between "stable across the loop" (system) and "changes every turn" (messages).
-- **stable system prefix vs variable context** — inside the system string, the front is static and cacheable; the back has the anomaly / diagnosis injected fresh each call.
-- **model-visible vs adapter-visible** — the model sees the flat string; the adapter code wraps it in a cache-control block. That wrap is a load-bearing seam Anthropic reads and the model doesn't.
+**The axis:** which parts change per turn vs which are stable.
 
-### Layered decomposition
+- system prompt → stable across the loop (cache-eligible)
+- tools → stable across the loop (cache-eligible)
+- messages → grows every turn (never stable)
 
-Same question — "what varies here?" — asked at three altitudes:
+**The seam:** the boundary between "stable prefix" and "growing suffix." That's where prompt caching lives. `AnthropicModelProviderAdapter.complete()` sets one `cache_control: ephemeral` breakpoint on the system prompt, which covers both stable-prefix bands (system + tools) transparently. See `lib/agents/aptkit-adapters.ts:85-89`.
 
-```
-  "What varies here?" — held constant down the layers
-
-  ┌───────────────────────────────────────────┐
-  │ outer: session (a whole investigation)     │  role, rules, schema
-  │   → CONSTANT                               │  don't vary
-  └───────────────────────────────────────────┘
-      ┌─────────────────────────────────────┐
-      │ middle: one API call inside the loop │  system prefix stable
-      │   → PARTIAL                          │  context slot varies
-      └─────────────────────────────────────┘
-          ┌─────────────────────────────────┐
-          │ inner: one user turn             │  task varies per turn
-          │   → VARIABLE                     │  everything else stable
-          └─────────────────────────────────┘
-```
-
-The lesson: the four sections aren't co-equal. They live at different altitudes of variance, and prompt caching (see `04-token-budgeting.md`) works by exploiting exactly this hierarchy.
+Mechanics hang off this skeleton. The four sections belong to Layer 1. The context injected inside them (schema, anomaly) is the only per-call thing in the "stable prefix" that isn't stable — and that's a problem you'll see recur in the token-budgeting file.
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — the shape
 
-You know how a `fetch()` has a URL, headers, body, and query params — four distinct slots, each with its own semantics, and mixing them (putting the body content in the URL) is how you get bugs? A prompt has four analogous slots, each with its own semantics.
-
-```
-  Prompt anatomy — the four slots
-
-  ┌───────── system string ─────────┐    ┌─── messages array ───┐
-  │                                 │    │                      │
-  │  ┌─ role ────────────────────┐  │    │  ┌─ user turn ─────┐ │
-  │  │ "you are a diagnostic     │  │    │  │ "Run the anomaly│ │
-  │  │  investigation agent"     │  │    │  │  checklist…"    │ │
-  │  └───────────────────────────┘  │    │  └─────────────────┘ │
-  │                                 │    │                      │
-  │  ┌─ rules / schema ──────────┐  │    │  ┌─ tool_result ───┐ │
-  │  │ "Make at most 6 tool      │  │    │  │ {…tool JSON…}   │ │
-  │  │  calls. Return ONLY JSON  │  │    │  └─────────────────┘ │
-  │  │  in a fenced block…"      │  │    │                      │
-  │  └───────────────────────────┘  │    │  ┌─ assistant ─────┐ │
-  │                                 │    │  │ "I'll query…"   │ │
-  │  ┌─ context (interpolated) ──┐  │    │  └─────────────────┘ │
-  │  │ {schema}     ← workspace  │  │    │                      │
-  │  │ {anomaly}    ← case       │  │    └──────────────────────┘
-  │  └───────────────────────────┘  │
-  └─────────────────────────────────┘
-
-    stable across the ReAct loop         changes every model turn
-```
-
-Role, rules, context on one side of the seam. Task and its evolving turn history on the other. That's the whole anatomy.
-
-### Move 2 — the step-by-step walkthrough
-
-**The role slot — who the model is.**
-
-The first paragraph of every prompt in this codebase names the agent's identity. From `@aptkit/prompts/dist/src/diagnostic.js:1`:
-
-```js
-export const DIAGNOSTIC_PROMPT = `You are a diagnostic investigation agent for an analytics workspace.
-
-Your job is to investigate why one specific anomaly occurred. You generate 2-3 competing hypotheses, query the available tools to test them, and return the best-supported explanation with evidence. You do not propose remediation.
-```
-
-Two lines and you know the agent's job and its guardrail (does not propose remediation — that's the recommendation agent's job). The negation ("You do not propose remediation") is doing real work: it stops the model from bleeding into the recommendation agent's territory. If you remove it, the diagnosis starts to include "and here's what to do next," and now the recommendation agent is either redundant or contradicted.
+Think of a prompt the way you'd think of an HTTP request. You've built plenty of those: there's a URL (the fixed target), headers (metadata about the request), a body (the payload), and query params (the small variable inputs). A prompt is the same shape.
 
 ```
-  Role slot — what breaks if it's missing
+  Pattern — prompt anatomy as sections
 
-  ┌─────────────────────────────────────────┐
-  │  "You are a diagnostic ... agent."      │  identity
-  │  "You generate 2-3 hypotheses..."       │  method
-  │  "You do NOT propose remediation."      │  guardrail (negation)
-  └─────────────────────────────────────────┘
-        │
-        │  strip it → the agent bleeds into
-        │  recommendation territory. Downstream
-        │  agent gets confused input.
-        ▼
+  ┌─────────────────────────────────────────────┐
+  │ system prompt                                │
+  │  ┌────────────────────────────────────────┐ │
+  │  │ § 1  role + rules      (constant)      │ │
+  │  │ § 2  context injection (per-call)      │ │
+  │  │ § 3  few-shot examples (constant/none) │ │
+  │  │ § 4  output shape      (constant)      │ │
+  │  └────────────────────────────────────────┘ │
+  └─────────────────────────────────────────────┘
+  ┌─────────────────────────────────────────────┐
+  │ messages[]                                   │
+  │  [ user: "begin" ]                           │
+  │  [ assistant: text + tool_use ]              │
+  │  [ user: tool_result ]                       │
+  │  [ assistant: … loop … ]                     │
+  └─────────────────────────────────────────────┘
+  ┌─────────────────────────────────────────────┐
+  │ tools[]  (constant)                          │
+  └─────────────────────────────────────────────┘
 ```
 
-**The rules/schema slot — what the model must do.**
+Each § inside the system prompt has one job. Mixing jobs is how prompts drift. When the "role" section starts explaining output format, or the "context injection" section grows opinions about hypotheses, you've lost the decomposition and the next iteration will be harder than it needs to be.
 
-Hard rules and the output contract. Same file, lines 6-45:
+### Move 2 — walking the four sections
 
-```js
-Hard rules:
-- Make at most 6 tool calls, then conclude.
-- Use the tool catalog you receive at runtime; do not assume a tool exists.
-- Every evidence item must cite data you actually observed.
-...
-Return ONLY a JSON object in a \`\`\`json fenced block with this shape:
+#### § 1 — role + rules (constant)
+
+The section that names who the model is and the hard constraints on how it operates. In the retired string prompt at `lib/agents/legacy-prompts/monitoring.md:1-9`, this reads:
+
+```
+You are the monitoring agent in blooming insights, an AI analyst for an
+ecommerce workspace running on Bloomreach Engagement (EQL-shaped tools).
+
+## Role
+You run a fixed checklist of ecommerce anomaly categories (below) against
+this workspace. …
+```
+
+That's the *whole* role section. It doesn't do anything else. It names the entity, names its remit, and stops. In `@aptkit/core`, the same content lives inside the `AnomalyMonitoringAgent` class — you don't see the string in this repo anymore, but the shape is the same.
+
+```
+  Layers-and-hops — what happens when § 1 mixes jobs
+
+  ┌─ § 1 role ──────────┐
+  │ "you are the        │  ← belongs here
+  │  monitoring agent"  │
+  └──────────┬──────────┘
+             │
+  ┌─ § 4 output shape ──▼──────┐
+  │ "return JSON with these    │  ← belongs here
+  │  fields: …"                │
+  └────────────────────────────┘
+
+  when someone edits § 1 to say "you are the monitoring agent
+  and you should return JSON," they've stapled § 4 to § 1.
+  next iteration, the model returns JSON to the diagnostic
+  agent too, because the role now carries an output rule.
+  the parser breaks. two-week debug session begins.
+```
+
+The rule: § 1 says who the model is and what it does. That's it. Output shape lives in § 4.
+
+#### § 2 — context injection (per-call)
+
+The per-call variables. In the monitoring prompt, this is `{categories}`, `{project_id}`, and `{schema}` (see `lib/agents/legacy-prompts/monitoring.md:13-14` and `:101`). In the diagnostic prompt, add `{anomaly}` (see `lib/agents/legacy-prompts/diagnostic.md:15-17`). The values are computed in TypeScript before the string is assembled.
+
+In the active path, the context injection is done by `@aptkit/core` — you hand it `workspace: this.schema` and `categories: […]` and (for diagnose) `anomaly` at call time, and it templates them in. See `lib/agents/monitoring.ts:84-90` for the shape.
+
+The section that most often bloats. In this repo the fix is `schemaSummary()` — a compaction step that turns a 112KB schema into 20 events × 10 properties + top 30 customer properties. Full file walk in `04-token-budgeting.md`.
+
+#### § 3 — few-shot examples (constant, or absent)
+
+If the concept is well-shaped without them, skip. This repo doesn't lean on few-shot for the three agents; the rubric task in `eval/rubrics/diagnosis-quality.ts:18-22` is more constrained (a rubric definition, not a task-behavior prompt) and doesn't use few-shot either.
+
+The one place few-shot pays here is the output example blocks — the retired string prompts include a JSON template of the expected shape at `lib/agents/legacy-prompts/monitoring.md:72-85`. That's a shape example, not a task example. It's still a form of few-shot: it constrains output structure by showing it.
+
+Full walk in `08-few-shot.md`.
+
+#### § 4 — output shape / hard rules (constant)
+
+The most under-taught section. It's where you declare the JSON keys, what each field means, and what the parser will do if you deviate.
+
+Real example from `lib/agents/legacy-prompts/diagnostic.md:60-82`:
+
+```
+Return ONLY a JSON object (in a ```json fenced block) of exactly this shape:
+
+```json
 {
-  "conclusion": "string",
-  "evidence": ["string"],
-  "hypothesesConsidered": [ { "hypothesis": "string", "supported": true, ...
+  "conclusion": "string — the best-supported explanation, or an honest…",
+  "evidence": ["string — one piece of evidence per item, citing tool results"],
+  "hypothesesConsidered": [
+    { "hypothesis": "string — what you tested",
+      "supported": true,
+      "reasoning": "string — why the data supports or rules this out" }
+  ],
+  …
+}
 ```
 
-Two things live here: **behavioral rules** (tool call budget, honesty about tools, evidence traceability) and the **output schema shape**. Blooming validates the parse afterwards (`lib/mcp/validate.ts:29`, `isDiagnosis`), but the model gets the shape in-prompt so its default emission matches what the parser accepts.
+Two things this teaches the model:
 
-**The context slot — variable data for this call.**
+1. The wrapper: fenced ` ```json ` block. Consumed by `parseAgentJson()` in `lib/mcp/validate.ts:3-13`, which strips the fence before `JSON.parse`.
+2. The schema: exact keys, brief inline descriptions. The prompt teaches the shape by showing one.
 
-Template placeholders like `{schema}` and `{anomaly}` get filled at runtime by `renderPromptTemplate`. In this codebase, `schemaSummary(schema)` (`lib/agents/monitoring.ts:19-60`) produces the string that goes into `{schema}` — token-budgeted to 20 events × 10 properties + 30 customer properties, because the raw schema is ~112KB and would blow the context window.
+The active path uses tool-calling to enforce the shape structurally (the model can only emit tokens that match the tool's input schema). But the fenced-JSON-with-example approach still lives in the query prompt at `lib/agents/legacy-prompts/query.md:46-48`, because the query agent returns prose, not structured data.
 
-```
-  Layers-and-hops — how the anatomy is assembled
+**What breaks in § 4 if you're not careful.** The three common failures:
 
-  ┌─ template file ──────────────┐
-  │  @aptkit/prompts/            │  hop 1: prompt string with {vars}
-  │  diagnostic.js DIAGNOSTIC_   │──────────────────────────────►
-  │  PROMPT                      │
-  └──────────────────────────────┘
-
-  ┌─ variables ──────────────────┐
-  │  schemaSummary(workspace)    │  hop 2: rendered variables
-  │  JSON.stringify(anomaly)     │──────────────────────────────►
-  └──────────────────────────────┘
-                                          ┌─ renderPromptTemplate ─┐
-                                          │  substring replacement │
-                                          │  {schema} → schemaText  │
-                                          │  {anomaly} → JSON      │
-                                          └───────────┬────────────┘
-                                                      │  hop 3: assembled system
-                                                      ▼
-  ┌─ AnthropicModelProviderAdapter ──────────────────────────────┐
-  │  aptkit-adapters.ts:85-89                                    │
-  │  params.system = [{type:'text', text, cache_control:...}]    │
-  │  params.messages = [...user + tool_result turns...]          │
-  └──────────────────────────────────────────────────────────────┘
-                          │  hop 4: HTTPS to Anthropic
-                          ▼
-  ┌─ Anthropic API ──────────────────────────────────────────────┐
-  │  reads system as one flat string; reads messages as turns    │
-  └──────────────────────────────────────────────────────────────┘
-```
-
-**The task slot — the user turn.**
-
-Sits in `messages`, not `system`. In this codebase it's static per agent, injected at loop start. From `@aptkit/core`'s `AnomalyMonitoringAgent.scan()`:
-
-```js
-userPrompt: 'Run the anomaly checklist using the available tools. Return only the anomaly JSON array in a json fence, or [] if no meaningful anomaly is found.',
-```
-
-One line. That's the whole task. Everything about *what* to run is in the system prompt's checklist (`{categories}` interpolation from `formatCategoryChecklist()`). The user turn just says "go."
-
-Why? Because the system prompt is cached (see `AnthropicModelProviderAdapter.complete()` at `lib/agents/aptkit-adapters.ts:85-89` — the `cache_control: { type: 'ephemeral' }` breakpoint). Bytes in the user turn are *not* cached, so keeping the user turn tiny keeps every ReAct-loop iteration cheap.
+- **Instruction added to another section that contradicts § 4.** Someone adds "be concise" to § 1. The model complies by dropping the fenced ` ```json ` wrapper because it "wastes tokens." Parser breaks.
+- **§ 4 grows a new field without a matching validator update.** The prompt says "now emit `impactRealism`." The validator in `lib/mcp/validate.ts` doesn't check for it. First few runs look fine; the field silently varies; downstream code that assumed it exists crashes on a case where the model dropped it.
+- **Model courtesies.** The model wraps the JSON inside a markdown fence *plus* prepends "Here's the analysis:". The `parseAgentJson()` substring scan at `lib/mcp/validate.ts:7-12` catches this by searching for the first `[` or `{`. That fallback exists specifically because § 4 alone doesn't fully control the output; the parser has to be forgiving.
 
 ### Move 2 variant — the load-bearing skeleton
 
-The kernel of a production prompt anatomy is four sections, in this order:
+If you had to reconstruct this pattern from memory, what's the kernel? Four moving parts inside the system prompt:
 
-```
-  role → rules/schema → context → task
+1. **Role + rules.** Drop it and the model doesn't know what it is; it defaults to "helpful assistant" and starts hedging.
+2. **Context injection.** Drop it and the model has no data to reason over; it hallucinates the workspace or refuses.
+3. **Few-shot examples.** Drop them and shape drifts on edge cases. On simple tasks, missing this doesn't break anything.
+4. **Output shape.** Drop it and the model chooses a plausible shape per call. Parser breaks on run three.
 
-  (stable, session)    (stable, session)   (varies, per call)  (varies, per turn)
-```
-
-What breaks if you strip each:
-
-- **Strip role** — the model default-personifies as a generic assistant, ignores your specific method, and the output starts to feel like ChatGPT instead of a diagnostic analyst.
-- **Strip rules/schema** — output shape drifts. Sometimes JSON, sometimes prose. Your parser fails intermittently. This is the bug people file as "the LLM is unreliable" when it's actually "the prompt has no schema."
-- **Strip context** — the model tries to answer from priors ("what's typical for ecommerce"). It sounds plausible and is completely disconnected from your workspace.
-- **Strip task** — the model doesn't know when to stop. It rambles, asks clarifying questions, or invents a task.
-
-Hardening layered on top of the skeleton (not part of it): few-shot examples (see `08-few-shot.md`), forbidden-openings (see `13-forbidden-patterns.md`), CoT scaffolding (see `09-chain-of-thought.md`). All optional. The four sections are not.
+Everything else — the tool catalog, the workspace schema, the anomaly — is hardening for a specific job. The four sections above are the skeleton.
 
 ### Move 3 — the principle
 
-**Prompts are structured payloads, not blobs of text.** The reader sees prose; the model sees tokens; the seam between "stable" and "variable" is where cost, cacheability, and iteration all live. Treat every prompt as if it were a request body with named fields — because as far as your ability to iterate on it is concerned, it is.
+**One section, one job, named explicitly.** That's the whole rule. When a section starts doing two jobs, the prompt hasn't drifted yet — but the next edit will make it drift, because whoever edits it can't tell which job they're touching. The decomposition is a maintenance discipline, not a rendering choice. The model doesn't care whether your prompt is one paragraph or four sections; you and the next engineer will.
 
 ## Primary diagram
 
 ```
-  A production prompt — everything at once
+  Anatomy — the full recap
 
-  ┌───────────────── Anthropic API call ─────────────────┐
-  │                                                       │
-  │  params.system = [                                    │
-  │    { type: 'text',                                    │
-  │      text: renderPromptTemplate(                      │
-  │              DIAGNOSTIC_PROMPT,                       │
-  │              { schema, anomaly, project_id }          │
-  │            ),                                         │
-  │      cache_control: { type: 'ephemeral' } }           │
-  │  ]                                                    │
-  │      │                                                │
-  │      └─ contains, in order:                           │
-  │         ┌─ role ───────────────────────┐              │
-  │         │ "You are a diagnostic ...    │              │
-  │         │  You do NOT propose remed."  │              │
-  │         └──────────────────────────────┘              │
-  │         ┌─ rules ──────────────────────┐              │
-  │         │ "Make at most 6 tool calls…" │              │
-  │         │ "Return ONLY JSON in a fence"│              │
-  │         └──────────────────────────────┘              │
-  │         ┌─ schema (embedded example) ──┐              │
-  │         │ {"conclusion":"","evidence":…│              │
-  │         └──────────────────────────────┘              │
-  │         ┌─ context (interpolated) ─────┐              │
-  │         │ {schema} ← schemaSummary()   │  var         │
-  │         │ {anomaly} ← JSON.stringify() │  var         │
-  │         └──────────────────────────────┘              │
-  │                                                       │
-  │  params.messages = [                                  │
-  │    { role: 'user',                                    │
-  │      content: 'Run the anomaly checklist…' } ← task   │
-  │    ...tool_result and assistant turns as loop runs... │
-  │  ]                                                    │
-  └───────────────────────────────────────────────────────┘
-
-     system → stable prefix, cached          messages → varies per turn
+  ┌─ system prompt ─────────────────────────────────────────────┐
+  │                                                              │
+  │  § 1  role + rules                                           │
+  │       "you are the diagnostic agent. investigate WHY."       │
+  │                                                              │
+  │  § 2  context injection                                      │
+  │       {project_id}   ← per-call                              │
+  │       {anomaly}      ← per-call                              │
+  │       {schema}       ← per-call (compressed by schemaSummary)│
+  │                                                              │
+  │  § 3  few-shot examples                                       │
+  │       (absent for this agent; see 08-few-shot.md)             │
+  │                                                              │
+  │  § 4  output shape                                            │
+  │       "return ONLY a JSON object of exactly this shape…"      │
+  │       { conclusion, evidence, hypothesesConsidered, … }       │
+  │                                                              │
+  └──────────────────────────────────────────────────────────────┘
+  ┌─ messages[] ────────────────────────────────────────────────┐
+  │  [ user:  "investigate this anomaly" ]                       │
+  │  [ assistant: text + tool_use ]                              │
+  │  [ user:  tool_result ]                                      │
+  │  [ … ReAct loop … ]                                          │
+  │  [ assistant: final JSON ]                                   │
+  └──────────────────────────────────────────────────────────────┘
+  ┌─ tools[]  ────────────────────────────────────────────────── ┐
+  │  execute_analytics_eql · list_scenarios · …                  │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The four-section shape is the working consensus across Anthropic and OpenAI documentation, though neither vendor names it exactly this way. Anthropic's prompt engineering guide splits into "role, task, examples, output format." OpenAI's cookbook uses "system, few-shot, user." Both are the same four sections with different names for the boundaries. The names don't matter — what matters is that you can point at each section in your own prompt and say "this is the role" without hunting.
+The four-sections decomposition isn't in any spec — it's practitioner shorthand. Anthropic's prompt-engineering guide calls out most of these as separate techniques (role prompting, providing context, examples, output formatting) without ever saying "these are the four sections of a prompt." OpenAI's cookbook does something similar. Once you have shipped a few of these you notice the same four keep showing up, and naming them separately is how you keep them from bleeding into each other.
 
-The tradeoff nobody names: **more structure = more brittle to iterate on**. If you add a fifth section for "priority overrides" or "conditional rules," you now have five things to keep in sync. Four is the sweet spot most production prompts settle at. If you find yourself wanting a fifth, ask whether it belongs in the rules section instead.
-
-A word on XML tags. Anthropic's guide recommends wrapping sections in XML-like tags (`<role>`, `<rules>`, `<context>`). This codebase does not use XML tags — the sections are separated by markdown headings (`## Role`, `## Hard rules`) because the reader is a human first, model second. Both work. Pick one and stay consistent. Mixing markdown headings and XML tags is where prompts get unreadable.
-
-Related concepts:
-- **Prompts as code** (`03-prompts-as-code.md`) — once the anatomy is stable, treating the prompt as a versioned artifact is the next discipline.
-- **Token budgeting** (`04-token-budgeting.md`) — the context slot is where token discipline earns its keep.
-- **Prompt injection defenses** (`12-prompt-injection-defense.md`) — the seam between "the system says" and "the user says" is what injection attacks target.
+The reason this repo split its prompts into an aptkit-owned inner shape plus a blooming-owned outer context: the four sections partition cleanly. Aptkit owns § 1 and § 4 (role, rules, output shape). Blooming owns § 2 (the context — schema, categories, anomaly). § 3 stays absent for these agents. The split is possible *because* the sections are decomposed; if § 1 and § 4 were tangled, the split wouldn't be a package boundary, it'd be a mess.
 
 ## Interview defense
 
-**Q: Walk me through the sections of a production prompt. Why does the ordering matter?**
+**Q: How do you decompose a production system prompt?**
 
-Four sections: role, rules and schema, context, task. Role first because it primes the model's persona and constrains everything downstream. Rules and schema next because they set behavioral guardrails and the output shape — the model reads them before it reads any variable data. Context after, because it's the variable slot and its position matters for prefix caching — the stable stuff has to come *before* the variable stuff or you get zero cache hits. Task last, in the user message, because that's the "go" signal, and it's also where per-turn state (tool results, follow-up user turns) accumulates.
-
-```
-  Interview whiteboard sketch
-
-  system:  [ role ] → [ rules/schema ] → [ context vars ]
-                    ↑ stable prefix, cached
-                                        ↑ varies per call
-
-  messages: [ user "go" ] → [ tool_result ] → [ assistant ] → …
-                              ↑ evolves every ReAct turn
-```
-
-Anchor: `AnthropicModelProviderAdapter.complete()` at `lib/agents/aptkit-adapters.ts:59-121` — see the `cache_control` breakpoint on line 87.
-
-**Q: What's the load-bearing part people forget?**
-
-Negations in the role slot. "You do NOT propose remediation" in the diagnostic prompt (`@aptkit/prompts/dist/src/diagnostic.js:4`). Positive instructions constrain what the model does; negations stop it from bleeding into a neighboring agent's territory. Every multi-agent system I've shipped has needed at least one negation per agent role, and every one where I forgot led to bleed-through.
+Four sections. Role, context, few-shot, output shape. Role is constant and says who the model is. Context is per-call — the data you're reasoning over. Few-shot is examples of task behavior, often absent when the shape is well-constrained by the output schema. Output shape is the JSON structure the parser expects. The rule: one section, one job.
 
 ```
-  Negation as guardrail
-
-  agent A "you do X"        ┐
-                            │   without negations,
-  agent B "you do Y"        ┤   both agents start
-                            │   also doing Z
-  agent C "you do Z"        ┘
-
-  with "you do NOT do Y" in A's role:
-  A stays in its lane
+  system ──► [§1 role][§2 context][§3 shots?][§4 shape]
 ```
 
-**Q: Someone hands you a prompt as one giant blob. First thing you do?**
+Anchor: `lib/agents/legacy-prompts/diagnostic.md` — the retired string prompt in this repo is the cleanest reading of the decomposition.
 
-Highlight the four sections. If I can't find the role in the first paragraph, that's finding #1. If the rules and the schema are interleaved with prose that's context, that's finding #2. If the task is embedded in the system string instead of the user message, that's the reason it's not cacheable. The refactor is almost mechanical: extract to four named blocks, run the eval set, keep the diff if scores hold.
+**Q: What breaks when the sections tangle?**
 
-Anchor: `lib/agents/legacy-prompts/monitoring.md` is a good example of a well-structured version — the `## Role`, `## Hard rules`, `## Output` headings make each section addressable in code review.
+Someone adds "be concise" to § 1. The model interprets it as "drop the JSON fence wrapper" and starts emitting bare text. The parser at `lib/mcp/validate.ts:parseAgentJson` falls back to a substring scan and catches most cases, but you've now made the parser load-bearing to compensate for a prompt regression. That's the smell — when the parser starts working around the prompt, the sections aren't decomposed anymore.
+
+```
+  §1 "be concise"  ──► model reinterprets §4  ──► parser scrambles
+```
+
+Anchor: `lib/mcp/validate.ts:3-13` — the fallback substring scan exists exactly for this failure mode.
 
 ## See also
 
-- `02-structured-outputs.md` — the schema section in more depth.
-- `03-prompts-as-code.md` — versioning the anatomy.
-- `04-token-budgeting.md` — why the stable-before-variable ordering matters.
-- `12-prompt-injection-defense.md` — the section boundaries as security boundaries.
+- 02 · structured outputs — how § 4 becomes a tool schema instead of a prose declaration.
+- 03 · prompts as code — how these sections stay reviewable when the prompt is a file, not a runtime string.
+- 04 · token budgeting — how § 2 (the context injection) gets compressed so it fits.
+- 07 · output mode mismatch — what happens when § 4 says JSON in chain A and markdown in chain B.

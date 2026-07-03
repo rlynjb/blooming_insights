@@ -15,7 +15,7 @@ Real Bloomreach is the wrong test surface:
 - **Slow.** ~1 req/s is the throttle; a fault suite of 20+ cases would take minutes to run just from the rate limit.
 - **Not actually stressed.** Bloomreach's error surface is a fraction of what a production LLM app has to handle. Malformed JSON, half-written tool results, timeout mid-stream — those either happen rarely or don't happen at all in the alpha.
 
-The seam already exists (RFC-05: DataSource port with three prior adapters shipped). The question was whether fault injection is another adapter (a swap) or a decorator (a wrap). Wrap won, because the goal is to make the *real* stack fail in known ways — not to substitute a fake stack that fails.
+The seam already exists (RFC-05: DataSource port with prior adapters shipped through Olist and Synthetic). The question was whether fault injection is another adapter (a swap) or a decorator (a wrap). Wrap won, because the goal is to make the *real* stack fail in known ways — not to substitute a fake stack that fails.
 
 ---
 
@@ -72,7 +72,7 @@ The reason isn't luck; it's the shape of the loop. AptKit's ReAct loop packages 
 
 **What this buys:**
 - **A receipt, not a claim.** 9/3/0 is a specific number from a specific run. When a reviewer asks "how do you know graceful degradation works?", the answer is a runId with 9 injected faults and 3 clean conclusions.
-- **The seam paid for itself again.** Fault injection was the fourth use of the DataSource port (Olist add → Olist remove → Synthetic add → FaultInjecting). Each use is a receipt that the abstraction is real — a port people actually reuse is a healthy port.
+- **The seam paid for itself again.** Fault injection was the fourth use of the DataSource port (Olist add → Olist remove → Synthetic add → FaultInjecting), and Session B's `McpDataSource` + `AuthProvider` split made it five. Each use is a receipt that the abstraction is real — a port people actually reuse is a healthy port.
 - **Reproducible fault sequences.** With `seed`, the same fault pattern replays across CI runs. Fault-related regressions surface as different verdicts on the same fault trace — not as flaky noise.
 - **The graceful path is the ReAct path.** No special error-handling code path was written. The loop already knew what to do with `is_error: true` blocks. Fault injection uncovered a capability that was already there, just untested.
 

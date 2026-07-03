@@ -1,331 +1,257 @@
 # Processes, threads, and tasks
 
-*Execution model · Language-agnostic (JavaScript runtime specifics)*
+**Industry:** processes, threads, and cooperative tasks · Language-agnostic
 
 ## Zoom out — where this concept lives
 
-Before the mechanism, the question: *where does work actually run in this codebase?* The answer is compact — every server task runs on one Node event loop, every client task runs on one browser event loop, and nothing else exists.
+Every band on the runtime map has *one* JavaScript thread. That single-threaded rule is the assumption underneath every other concurrency choice in the repo — the ALS pattern, the module-level Maps, the spacing gate, all of them work because there is no preemption inside a JS event loop.
 
 ```
-Zoom out — the runtime's execution surface
+  Zoom out — one JS thread per band
 
-┌─ Browser event loop ──────────────────────────────────────────┐
-│  React reconciler, fetch handlers, ★ NDJSON reader ★           │
-│  ← we are here for the client work                             │
-└─────────────────────────────────────────────────────────────────┘
-                    ▲
-                    │ HTTPS (async, non-blocking)
-                    │
-┌─ Node event loop (Vercel serverless instance) ───────────────┐
-│  ★ every route handler, every agent loop, every MCP call ★    │
-│  ← we are here for all server work                             │
-│                                                                │
-│  What is NOT here:                                            │
-│  · worker_threads    — not used                                │
-│  · child_process     — not used                                │
-│  · cluster           — not used                                │
-│  · OS threads        — not used (Node doesn't expose them)     │
-└────────────────────────────────────────────────────────────────┘
+  ┌─ Browser ───────────────────────────────────┐
+  │  V8 · main thread · React runs here         │
+  │  ★ THIS CONCEPT ★                            │
+  └──────────────────────┬──────────────────────┘
+                         │  fetch (browser scheduler)
+  ┌─ Vercel serverless ─▼───────────────────────┐
+  │  Node 20 · one event loop per instance      │
+  │  ★ THIS CONCEPT ★                            │
+  └──────────────────────┬──────────────────────┘
+                         │  HTTPS
+  ┌─ Upstream ──────────▼───────────────────────┐
+  │  their process model, not ours              │
+  └─────────────────────────────────────────────┘
 ```
 
-Two loops, both single-threaded. The whole `study-runtime-systems` topic reduces to: how do you get useful work done on one loop without blocking it?
+The concept: **cooperative tasks scheduled on one thread**, not threads pinned to cores. Async functions yield at every `await`; the event loop picks the next one; nothing preempts you. The consequence: race conditions in the classical sense (two threads, one variable) don't exist. But *interleaving* still does — an `await` is a yield point where any other pending task can run before you resume.
 
-## Structure pass — one axis, three altitudes
+## Structure pass — layers, axis, seams
 
-Trace *control flow* down the stack. The answer changes at every altitude.
+Pick one axis — **who decides which task runs next** — and trace it across the layers.
 
 ```
-Who decides what runs next?  — one question, three answers
+  One axis (who schedules?) traced down the layers
 
-┌─ Node's libuv scheduler ──────────────────────────┐
-│  picks the next task from the microtask / macro    │
-│  task / I/O queues                                 │
-│    → the RUNTIME decides                           │
-└──────────────────┬─────────────────────────────────┘
-                   │
-                   ▼
-┌─ Async/await in your code ───────────────────────┐
-│  every `await` yields control back to the loop     │
-│    → the AWAITED value's readiness decides         │
-└──────────────────┬─────────────────────────────────┘
-                   │
-                   ▼
-┌─ The eval load harness ──────────────────────────┐
-│  N indices in a queue, K workers .shift() until    │
-│  the queue is empty                                │
-│    → the QUEUE decides (fair, first-come)          │
-└────────────────────────────────────────────────────┘
+  ┌─ your code ─────────────────────────────┐
+  │  await points          → YOU yield        │
+  └─────────────────────────────────────────┘
+      ↓ every await is a hand-off
+  ┌─ V8 event loop ────────────────────────┐
+  │  microtask + macrotask queues → the LOOP │
+  │                                          picks next task
+  └─────────────────────────────────────────┘
+      ↓
+  ┌─ OS scheduler ─────────────────────────┐
+  │  the process runs when the OS says so   │
+  │  (Vercel abstracts this away)           │
+  └─────────────────────────────────────────┘
+
+  seam that matters: the await. Below it, you have no control.
 ```
 
-The self-similar pattern here is powerful: the load harness's worker pool is a *tiny hand-rolled scheduler* built on top of the language's async primitives. Same shape as the underlying loop, one level up.
+**The seams:**
 
-The seams:
-
-  → **Sync ↔ async** — any function that returns a Promise gives control back to the loop on `await`. This is where CPU work "hides"; work between `await`s blocks the loop.
-  → **Loop-owned ↔ code-owned scheduling** — the load harness's queue is the one place in the codebase where user code owns "what runs next." Everywhere else, the runtime picks.
+- **Every `await` is a scheduling seam.** Between the `await` and its resolution, ANY other pending task can run. If your invariant depends on "no one else touched X between step 1 and step 2," you have to enforce it — the event loop doesn't.
+- **The process boundary is opaque.** You cannot spawn a worker thread and expect it to share memory with the main thread. In Node you could reach for `worker_threads` (structured-clone messaging, no shared memory except SharedArrayBuffer). The repo does not.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know how `setTimeout(fn, 0)` doesn't run `fn` immediately, but queues it? That's the loop. Every async operation in JS gets queued somewhere — microtasks (Promise resolutions), macrotasks (`setTimeout`, I/O completions) — and the loop picks the next one when the current stack empties.
+You know how a React component sees `setTimeout(fn, 0)` and thinks "run after everything else in this tick"? That's the event loop's macrotask queue. `Promise.resolve().then(fn)` schedules on the microtask queue, which drains between every macrotask. Every `async` function you write is just sugar over promises: each `await` is a `.then` — the function *stops*, the current task ends, and the loop picks up whatever's next.
 
 ```
-The event loop, in one picture
+  Pattern — the event loop's task queues
 
-  ┌──────────────────────────────────────────┐
-  │  call stack (synchronous work runs here) │
-  └────────────────────┬─────────────────────┘
-                       │  stack empty?
-                       ▼
-       ┌───────────────────────────────────┐
-       │  microtask queue                  │
-       │  (Promise .then, queueMicrotask)  │  ← drained fully before next macrotask
-       └────────────────────┬──────────────┘
-                            │  empty?
-                            ▼
-       ┌───────────────────────────────────┐
-       │  macrotask queue                  │
-       │  (setTimeout, I/O completions)    │  ← one at a time
-       └───────────────────────────────────┘
+  ┌── one tick ──────────────────────────────────────┐
+  │                                                  │
+  │  1. run macrotask (e.g. incoming HTTP request)   │
+  │     │                                            │
+  │     │  hits await                                │
+  │     ▼                                            │
+  │  2. drain microtask queue completely             │
+  │     (resolved promises, .then callbacks)         │
+  │     │                                            │
+  │     ▼                                            │
+  │  3. render / I/O poll                            │
+  │     │                                            │
+  │     ▼                                            │
+  │  4. pick next macrotask ── back to step 1        │
+  │                                                  │
+  └──────────────────────────────────────────────────┘
+
+  key rule: between any two lines of your code separated
+  by an await, the loop may have run other tasks
 ```
 
-Every `await` in your code yields to the loop between the "before" and "after" of the awaited expression. Multiple concurrent requests on one Vercel instance interleave freely — one request's `await dataSource.callTool(…)` gives another request's handler a chance to run.
+That's the model. Everything else — cooperative scheduling, no preemption, single-threaded execution — falls out of it.
 
-### Move 2 — the mechanisms in this codebase
+### Move 2 — walking the pieces
 
-#### Server-side: every handler is one async function
+#### The Node runtime (the serverless band)
 
-```
-Where server work runs — one Node process, many concurrent requests
+**What it is:** V8 embedded in Node 20. One main thread runs your JavaScript. Under the hood, `libuv` runs a thread pool for FS and DNS I/O (default 4 threads), but you never touch it directly — the results flow back to the main thread through the event loop.
 
-request A ─► handler A (async)
-                │
-                ├── await bootstrap(schema)      ┐
-                │                                │ each await
-                ├── await dataSource.listTools() │ yields to
-                │                                │ the loop —
-                ├── await agent.investigate(…)   │ other requests
-                │                                │ run in the gaps
-                └── send({type:'done'})           ┘
-                    controller.close()
+**What runs there:** everything under `app/api/*/route.ts`. Also everything under `lib/*` when imported by a route. The Anthropic SDK, the MCP SDK, `node:fs`, `node:crypto` — all of it on the same thread.
 
-request B ─► handler B (async)                    ← runs concurrently
-                │                                    with A on the same
-                └── await agent.propose(…)           event loop
-```
+**Where the boundary is:** `worker_threads` isn't imported anywhere in the repo. There's no CPU-heavy work that would justify it. The heaviest single operation is `JSON.parse` on a truncated (`TRUNC = 4000` bytes, `app/api/agent/route.ts:98`) MCP tool result, which is trivial.
 
-Every route handler in `app/api/*/route.ts` is an `async` function returning a `Response`. The handler body typically follows the pattern:
-
-  → set up per-request state (`getOrCreateSessionId`, `makeDataSource`)
-  → return a `new Response(new ReadableStream({ start(controller) { … } }))`
-  → inside `start`, the async work runs (agents, MCP calls, Anthropic calls)
-  → `send(event)` calls enqueue into the stream; every `await` yields to the loop
-
-No handler in this codebase spawns a worker, forks a process, or does CPU-heavy synchronous work that would block the loop. The heaviest sync work is `JSON.stringify` / `JSON.parse` on ~4KB truncated tool results (`app/api/briefing/route.ts:71-75`) — nothing to worry about.
-
-#### Client-side: React renders + the NDJSON reader loop
+**How you'd know it's single-threaded from the code:** the ALS pattern in `lib/mcp/auth.ts:47` only makes sense in a single-threaded context. If Node were multi-threaded, `AsyncLocalStorage` wouldn't give you per-request isolation — you'd need thread-local storage AND some cross-thread coordination.
 
 ```
-Where client work runs — one browser event loop
+  Node 20 in the serverless band
 
-┌─ React tree render ─┐   ┌─ readNdjson async loop ────────────────┐
-│  useState updates    │◄──│  while(true) {                          │
-│  useEffect fires     │   │    const {value, done} = await reader   │
-│  useRef reads        │   │    if (done) break;                     │
-└─────────────────────┘   │    buf += decoder.decode(value)         │
-                          │    for (line of lines) handle(line)      │  ← each handle
-                          │  }                                       │    calls setState
-                          └─────────────────────────────────────────┘    which schedules
-                                                                          a React render
+  ┌─ main thread (your JavaScript) ─────────────────┐
+  │                                                 │
+  │  route handler          async fn.await          │
+  │    │                       │                    │
+  │    │                       │  yields            │
+  │    ▼                       ▼                    │
+  │  event loop  ─────────►  next task              │
+  │                                                 │
+  └──────┬────────────────────────────┬─────────────┘
+         │  I/O request               │  crypto op
+         ▼                            ▼
+  ┌─ libuv thread pool ─────┐    ┌─ inline (main) ──┐
+  │  (4 default)            │    │  createHash /     │
+  │  disk I/O · DNS         │    │  AES-256-GCM run  │
+  │  results marshalled     │    │  synchronously    │
+  │  back to main thread    │    │  on main thread   │
+  └─────────────────────────┘    └───────────────────┘
 ```
 
-The kernel of client-side work is the NDJSON reader in `lib/streaming/ndjson.ts:17-64`. It's one async function looping on `reader.read()`, calling `handle(event)` for each parsed line. Every `handle` call typically calls a React `setState`, which enqueues a React render on the microtask/task queue. The browser interleaves reader progress with React renders naturally.
+Node's threading is real but hidden. You cannot use it to escape a CPU-bound loop on the main thread — it exists only for I/O.
 
-The optional `cancelOn` callback is polled *between reads*:
+#### The browser runtime
 
-```ts
-// lib/streaming/ndjson.ts:32-36
-while (true) {
-  if (opts?.cancelOn?.()) {
-    await reader.cancel();
-    return;
-  }
-  const { value, done } = await reader.read();
-```
+**What it is:** the same V8 (or Firefox's SpiderMonkey, or Safari's JavaScriptCore) embedded in a browser tab. One main thread per tab.
 
-`useBriefingStream` uses this to break out cleanly when the effect cleanup fires:
+**What runs there:** everything in `components/*`, `lib/hooks/*` (client hooks), and any `'use client'` module. React 19 rendering, event handlers, `useEffect` bodies, the NDJSON reader loop.
 
-```ts
-// lib/hooks/useBriefingStream.ts:130-153, :288
-const cancelledRef = useRef(false);
-// … inside useEffect:
-cancelledRef.current = false;
-// … in the async body:
-await readNdjson<BriefingEvent>(res.body, handle, { cancelOn: () => cancelledRef.current });
-// … in cleanup:
-return () => { cancelledRef.current = true; };
-```
+**Where the boundary is:** `Worker` isn't used in the repo. React 19's compiler emits main-thread code by default; server components (`app/page.tsx` when it doesn't have `'use client'`) run on the server, not on a worker.
 
-Note the deliberate asymmetry: `useBriefingStream` uses `cancelOn` to break out on unmount, but `useInvestigation` does *not* cancel on cleanup — see `lib/hooks/useInvestigation.ts:33-37` for the comment explaining why (StrictMode double-mount + started-guard was aborting the stream and leaving logs empty).
-
-#### The one place user code owns scheduling: the load harness
+**The specific single-threaded pattern that matters here:** the `startedRef` latch in `lib/hooks/useInvestigation.ts:45-50`:
 
 ```
-Semaphore-based worker pool — the standard JS-runtime concurrency primitive
-
-  ┌─ shared queue ─┐
-  │ [0,1,2,…,N-1]  │  ← all N task indices, dropped in at start
-  └────────┬───────┘
-           │  workers pull one at a time via .shift()
-           │
-  ┌────────┼────────┬────────┬────────┐
-  │        │        │        │        │
-  ▼        ▼        ▼        ▼        ▼
-worker 0  worker 1  worker 2  worker 3  worker K-1
-
-each worker:
-  while (queue.length > 0) {
-    const index = queue.shift()          // atomic on single loop
-    if (index == null) return
-    await runOneInvestigation(index)     // yields to the loop
-  }
-
-Promise.all(workers) → wait for all to drain the queue
+  // lib/hooks/useInvestigation.ts:45-50 — the mount latch
+  const startedRef = useRef(false);
+  useEffect(() => {
+    if (!id) return;
+    if (startedRef.current) return;  // ← run once per mount
+    startedRef.current = true;
+    // ...
+  });
 ```
 
-The load harness at `eval/load.eval.ts:171-211` is the one place in the codebase where user code owns "what runs next":
+Under React StrictMode (dev), the effect fires twice — mount, cleanup, remount. Without the latch, the fetch would start twice. The `useRef` is safe as a latch *because* JavaScript is single-threaded: no other task can read `startedRef.current` between the `if` check and the `startedRef.current = true` assignment. In a multi-threaded runtime you'd need a proper compare-and-swap.
 
-```ts
-// eval/load.eval.ts:171-211 — annotated
+#### Cooperative tasks — the shape of an async agent loop
 
-const indices = Array.from({ length: LOAD_N }, (_, i) => i);
-const queue = [...indices];                          // shared work queue
+The DiagnosticAgent + RecommendationAgent live entirely on the main thread. Their concurrency shape is a chain of awaits, not a thread pool. `app/api/agent/route.ts:283-289` runs them in sequence: diagnostic finishes, then recommendation starts. Nothing parallel. The BudgetTracker (`lib/agents/budget.ts:41`) is safe as a shared object because the two agents never run at the same time — no race, just handoff.
 
-async function worker(workerId: number): Promise<void> {
-  while (queue.length > 0) {                         // one worker pulls one task
-    const index = queue.shift();                     // .shift() is atomic on
-    if (index == null) return;                       //   the single loop —
-    //                                                  no lock needed
-    const golden = goldens[index % goldens.length];
-    try {
-      const inv = await runOneInvestigation(index, …);  // heavy async work
-      results.push(inv);                             //   yields many times
-    } catch (err) {                                  // errors don't stop
-      results.push({ …, error: msg });               //   other workers
-    }
-  }
-}
+```
+  Sequential agent chain — single thread, sequenced awaits
 
-const workers = Array.from({ length: LOAD_CONCURRENCY }, (_, i) => worker(i));
-await Promise.all(workers);                          // wait for queue drain
+  route handler
+    │
+    ▼
+  await bootstrap(signal)          ← MCP orchestrator, yields at each call
+    │
+    ▼
+  await dataSource.listTools()     ← yields
+    │
+    ▼
+  await diagnostic.investigate()   ← agent loop, many yields inside
+    │
+    ▼
+  await recommendationAgent.propose()  ← runs after diagnostic finishes
+    │
+    ▼
+  send('done')
+
+  the whole chain is one macrotask thread — no fork/join
 ```
 
-Why this shape (skeleton test — what breaks if you remove each part):
-
-  → Drop **the shared queue** and you have N tasks per worker with no way to balance load; a slow worker holds up the whole run.
-  → Drop **the `while (queue.length > 0)` loop** and each worker does one task; you're not pooling anything.
-  → Drop **the try/catch** and one failing investigation stops its worker; the concurrency drops.
-  → Drop **`Promise.all(workers)`** and the test returns before workers finish; the receipt is empty.
-
-The result: N investigations complete in `wall-clock ≈ N × per-investigation / K`, capped by `Math.max(600_000, ((LOAD_N * 300_000) / LOAD_CONCURRENCY) * 1.5)` (line 228). Real number from the codebase state: `LOAD_N=2, K=1 → 208s wall clock (≈104s per investigation)`.
-
-#### The one micro-primitive worth naming: `sleep`
-
-```ts
-// lib/data-source/bloomreach-data-source.ts:73-75
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
-}
-```
-
-This is the codebase's whole toolkit for "wait a bit." Used by the rate-limit retry ladder at `bloomreach-data-source.ts:172` and by the spacing gate at `:193`. The demo replay uses the same shape inline at `app/api/briefing/route.ts:103, :119`.
-
-Note what's NOT here: no `worker_threads.Worker`, no `child_process.spawn`, no `AbortController.abort()` on a background timer (the `AbortSignal.timeout` factory does that internally). Every `sleep` yields to the loop, other work runs while it waits.
+Contrast this with `eval/load.eval.ts:210` — `await Promise.all(workers)`. That's still one thread, but now K worker tasks are *interleaved* on the same event loop. Each worker awaits its next investigation; while it's waiting, another worker gets to run. The single-thread rule holds; the concurrency is *cooperative*.
 
 ### Move 3 — the principle
 
-**Concurrency is not parallelism, and this codebase never confuses them.** All server work is *concurrent* — many requests interleave on one event loop — but never *parallel* — nothing runs on two cores at once. The load harness's K workers are K concurrent async loops on the same event loop, sharing a queue; they don't run on K cores.
+Single-threaded execution is the underrated superpower of JavaScript runtimes. You lose parallelism (a CPU-bound task blocks *everything*), but you get a memory model that fits in your head: **no two lines of your code can execute simultaneously**. If line 1 reads a Map and line 2 writes it, no one interleaved between them — unless there's an `await` in between. That's the entire mental model. Every synchronization primitive in the repo (the ALS pattern, the `startedRef` latch, the shared BudgetTracker) works because of this rule.
 
-For an IO-bound workload like this (network calls to Anthropic and Bloomreach dominate), concurrency alone is enough — the CPU sits idle waiting for network responses anyway. If the workload were CPU-bound (heavy JSON parsing on multi-MB tool results, ML inference), the K-workers pattern would top out at one loop's worth of CPU, and you'd need `worker_threads`. It isn't, so you don't.
-
-## Primary diagram — the full execution surface
+## Primary diagram
 
 ```
-Everywhere work runs in blooming insights
+  Processes, threads, and tasks — the full picture
 
-BROWSER (one event loop per tab)
-┌──────────────────────────────────────────────────────────────┐
-│                                                               │
-│  React reconciler (owns render scheduling)                    │
-│                                                               │
-│  useEffect → fetch() → readNdjson loop                        │
-│                          │                                    │
-│                          ├─► handle(event) → setState → render│
-│                          └─► cancelOn poll → reader.cancel()  │
-│                                                                │
-└──────────────────────────────────────────────────────────────┘
-                            │  HTTPS
-                            ▼
-NODE PROCESS (one event loop per warm serverless instance)
-┌──────────────────────────────────────────────────────────────┐
-│                                                               │
-│  request A: route handler (async)                             │
-│    │                                                          │
-│    ├─ await bootstrap(signal)          ┐                      │
-│    ├─ await listTools(signal)          │  every await         │
-│    ├─ await agent.investigate({signal})│  yields to the loop  │
-│    ├─ send(event) → controller.enqueue │  other requests run  │
-│    └─ controller.close()               ┘                      │
-│                                                                │
-│  request B: route handler (async)  ← runs interleaved with A   │
-│                                                                │
-│  eval load harness (test env only):                           │
-│    K workers, one shared queue                                │
-│    Promise.all(workers)                                       │
-│                                                                │
-│  What's absent: worker_threads, child_process, cluster,       │
-│  OS threads. All work is single-loop concurrent.              │
-│                                                                │
-└──────────────────────────────────────────────────────────────┘
+  ┌─ Browser tab ────────────────────────────────────────────────┐
+  │  ONE main JS thread                                          │
+  │                                                              │
+  │  React render ── useEffect ── fetch() ── NDJSON reader loop  │
+  │       │              │           │              │            │
+  │       └── all interleaved on ONE event loop ────┘            │
+  │                                                              │
+  │  no workers used; the `startedRef` latch is safe             │
+  │  because nothing else can run between check and set          │
+  └──────────────────────────────────────────────────────────────┘
+
+  ┌─ Vercel instance (Node 20) ──────────────────────────────────┐
+  │  ONE main JS thread                                          │
+  │                                                              │
+  │  route handler         async agent loop                      │
+  │    │                        │                                │
+  │    │  ALS.run(ctx,          │  every await = yield           │
+  │    │           () => …)     │                                │
+  │    │  scopes the store      │  BudgetTracker checked         │
+  │    │  to this task chain    │  before each turn              │
+  │    │                        │                                │
+  │    └── all interleaved on ONE event loop ─┘                  │
+  │                                                              │
+  │  hidden: libuv 4-thread I/O pool (FS + DNS)                  │
+  │  no worker_threads; no cluster; no child_process             │
+  └──────────────────────────────────────────────────────────────┘
+
+  ┌─ vitest process (eval only) ─────────────────────────────────┐
+  │  ONE main JS thread                                          │
+  │                                                              │
+  │  worker pool pattern:                                        │
+  │  Array.from({length: K}, worker(i))                          │
+  │      │                                                       │
+  │      └── K "workers" are just K interleaved async tasks      │
+  │          on ONE thread — cooperative concurrency             │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-## Elaborate — why single-loop is enough here
+## Elaborate
 
-Node's event loop is what Ryan Dahl built the whole runtime around: assume every I/O is async, run one loop, and you get high concurrency without threads. For a workload where every request is dominated by "wait for a network response" — which is exactly what an agent app is — this model gets full CPU utilization on tiny CPU because the CPU sits idle 90% of the time anyway, waiting for Anthropic or Bloomreach to respond.
+The "one thread per event loop" model comes from Netscape's original JavaScript — it was designed as a scripting language for a browser, and browsers didn't want to expose threading to scripts. Node.js inherited that model because it wanted to reuse V8. Deno and Bun kept it for the same reason.
 
-The Achilles heel is CPU-bound work. If a request had to (say) run a large ML model locally, the event loop would freeze during the model call; other requests would stack up. That's when you reach for `worker_threads`. This codebase doesn't have that shape — inference is all remote (Claude), MCP tool calls are all remote (Bloomreach). So one loop suffices.
+The tradeoff is well-understood: you cannot escape a CPU-bound loop by throwing more cores at it. If you have work that genuinely needs parallel CPUs, you either move it to a worker (`worker_threads` in Node, `Worker` in the browser) or move it out of the JavaScript runtime entirely (a native addon, a separate service, a queue → worker fleet in a different language). None of these apply to `blooming_insights` today; the workload is I/O-bound (waiting on Bloomreach and Anthropic), and I/O is exactly what the event loop is good at.
+
+Read `03-event-loop-and-async-io.md` next — it walks how the queues actually drain and what "microtask starvation" looks like when it goes wrong. Then `04-shared-state-races-and-synchronization.md` shows how the single-threaded rule turns into a design pattern (ALS scoping).
 
 ## Interview defense
 
-**Q: You said "concurrent, not parallel" — draw the difference.**
+**Q: The repo runs on Vercel. How many threads does one request touch?**
 
-```
-Concurrent (this codebase)          Parallel (not used here)
+One. Vercel serverless functions are Node 20 processes — one main JavaScript thread. Under the hood libuv runs a 4-thread pool for disk and DNS I/O but you never see it — the results marshal back to the main thread through the event loop. The repo doesn't use `worker_threads` or child processes. Every route handler, every agent loop, every crypto op runs on the same thread. That's why the ALS pattern in `lib/mcp/auth.ts` is safe — one request = one async task chain = one ALS context.
 
-one event loop:                      two cores:
-  req A ─╮                             req A ──────►
-         ├─ interleaved                              (core 1)
-  req B ─╯                             req B ──────►
-                                                     (core 2)
-```
+*Diagram to sketch: a horizontal band labeled "main JS thread" with the route handler + agent + crypto stacked inside it, and a small "libuv thread pool" box below feeding I/O results in.*
 
-Concurrent means many tasks are *in progress* on one loop; each `await` gives another task a turn. Parallel means many tasks are *executing simultaneously* on multiple cores. Blooming insights is fully concurrent, never parallel — worker threads and child processes are absent from `lib/` and `app/`.
+**Q: If everything is single-threaded, how does the load harness run K workers concurrently?**
 
-Why it's enough: every heavy operation in the request path is IO (network calls to Claude and Bloomreach). The CPU is idle during the wait; other requests fill the idle time.
+Cooperative interleaving. In `eval/load.eval.ts` we spawn K "worker" async functions with `Promise.all` — they all live on the same event loop, but each one awaits its next investigation, and while it's waiting, another worker gets to run. There's no true parallelism. K=3 gives us ~3× throughput because the work is I/O-bound (waiting on Anthropic + MCP), and the event loop keeps three requests in flight at once. If the work were CPU-bound, K=3 wouldn't help — one busy loop would block everyone.
 
-**Q: Walk me through the load harness's worker pool. What breaks if I drop the shared queue?**
+*Diagram to sketch: three horizontal timelines labeled worker-0, worker-1, worker-2, each with alternating "waiting on network" and "processing" bars interleaved on a single thread bar underneath.*
 
-Six workers, one shared array of indices, each worker `.shift()`s and processes until the queue empties. `Promise.all(workers)` waits for the drain. Drop the shared queue → static assignment → a slow investigation blocks its worker; other workers finish early and idle instead of picking up the slack. The point of the shared queue is *work stealing without locks* — `.shift()` is atomic on the single event loop, so no synchronization primitive is needed.
+**Q: What's the load-bearing part everyone forgets about the JS event loop?**
 
-Anchor: `eval/load.eval.ts:171-211`.
+That every `await` is a scheduling seam. People remember "JavaScript is single-threaded" and conclude "no races" — and that's *almost* right. The trap: between the `await` and its resolution, ANY other pending task can run. So if you read a shared Map on line 1, do an `await` on line 2, and write the Map on line 3, someone else may have touched it in between. That's not a thread race, but it's the same class of bug. The fix in the repo is either ALS (per-request store, no shared write) or the shared `BudgetTracker` (sequential-only writers). Both dodge the interleaving problem, they don't solve it in general.
 
-**Q: If Anthropic ever added a local model, would this design still work?**
-
-No — local inference would be CPU-bound, and one heavy inference call would freeze the event loop for its duration, stalling every other request on the instance. The fix would be `worker_threads`: run inference in a worker, `postMessage` the result back. That's not on the roadmap; it's the shape of change that would break the "one loop is enough" property.
+*Diagram to sketch: a single thread timeline with a red gap labeled "await" between two of your lines, and an arrow from a second task threading through that gap.*
 
 ## See also
 
-  → `03-event-loop-and-async-io.md` — the queue mechanics and non-blocking I/O.
-  → `07-backpressure-bounded-work-and-cancellation.md` — the concurrency ceiling in the load harness, and how it composes with the route budget.
-  → `study-testing` — how the fault-injecting DataSource proves the concurrency behavior under load.
+- `03-event-loop-and-async-io.md` — the queues, the microtask/macrotask split, blocking hazards
+- `04-shared-state-races-and-synchronization.md` — the ALS pattern and why it works on one thread
+- `07-backpressure-bounded-work-and-cancellation.md` — the eval worker pool + cooperative concurrency

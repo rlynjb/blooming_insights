@@ -1,33 +1,28 @@
-# study-ai-engineering — index
+# AI engineering — study guide index
 
-Per-codebase AI engineering study guide for `blooming_insights` — a Next.js multi-agent AI analyst that runs the diagnose → decide loop over a Bloomreach Engagement workspace, built on `@aptkit/core@0.3.0` and streamed to the UI as NDJSON.
+Per-repo AI engineering study guide for **blooming_insights**. Follows the `study-ai-engineering.md` spec (v1.69.2) with the `format.md` per-concept file template.
 
-Start with `00-overview.md`. Then walk the sub-directories in order — each has its own README with a reading order.
+## Codebase shape
 
-## Sub-directories
+**LLM application engineering** — five agent classes wrapping `@aptkit/core` primitives, one DataSource port with a live MCP adapter and swappable auth, a 10-case eval harness with two rubrics and a regression gate. No classical ML in this repo.
 
-- `01-llm-foundations/` — the model as an IO function, tokens, sampling, structured outputs, streaming, cost, heuristic-before-LLM, provider abstraction, override locks.
-- `02-context-and-prompts/` — the finite context window, lost-in-the-middle, prompt chaining (the diagnose → recommend handoff is a chain).
-- `03-retrieval-and-rag/` — mostly "not exercised" for this repo. The agents query structured data, not text over vectors. Concept files present for shape completeness.
-- `04-agents-and-tool-use/` — the load-bearing sub-section. Agent-vs-chain, tool calling, ReAct, tool routing, agent memory, error recovery. AptKit owns the loop; this repo owns the adapter bridge.
-- `05-evals-and-observability/` — the tier-2 story. Eval sets, methods, LLM-as-judge biases, LLM observability. 10 goldens × 2 rubrics × 4 dims × 3 verdicts, per-case receipt, judge-error resilience, signal-class-aware gate.
-- `06-production-serving/` — prompt caching (live), cost optimization (Haiku for intent), prompt injection surface, rate limiting + backpressure (partial — inbound to the MCP server, not to the app), retry + circuit breaker (retry present, breaker not).
-- `07-system-design-templates/` — interview reframes: search-ranking (no), tech-support chatbot (partially — the ReAct loop is structurally similar).
-- `08-machine-learning/` — largely "not exercised." Files present per spec for shape recognition and Case B project exercises.
-- `09-ml-system-design-templates/` — interview reframes: recommender (no), anomaly detection (**partially — YES actually, the monitoring agent IS anomaly detection**), object detection (no).
+## Reading order
 
-## Two "features in this codebase" files at root
+1. [00-overview.md](00-overview.md) — the whole system in one picture.
+2. [01-llm-foundations/](01-llm-foundations/) — the interface-level model and the primitives every agent uses.
+3. [04-agents-and-tool-use/](04-agents-and-tool-use/) — where most of the codebase lives.
+4. [05-evals-and-observability/](05-evals-and-observability/) — the harness that keeps the agents honest.
+5. [02-context-and-prompts/](02-context-and-prompts/) — the context-window discipline behind the prompts.
+6. [03-retrieval-and-rag/](03-retrieval-and-rag/) — retrieval concepts as study material; the codebase does not yet exercise RAG.
+7. [06-production-serving/](06-production-serving/) — caching, cost, injection, rate limiting, retries.
+8. [07-system-design-templates/](07-system-design-templates/) — interview reframes (Search ranking, Tech support chatbot).
+9. [ai-features-in-this-codebase.md](ai-features-in-this-codebase.md) — the actual AI features the repo ships.
 
-- `ai-features-in-this-codebase.md` — per-feature table of every AI-touching thing in the repo: which agent, which prompt, which pattern, which files.
-- `ml-features-in-this-codebase.md` — the honest short list. This codebase has no trained ML.
+## Not included
 
-## What's real, what's stubbed
+- **08-machine-learning/** and **09-ml-system-design-templates/** — no trained model in this repo. Skipped per spec ("Concepts that don't apply to this codebase's shape at all … are skipped — no file generated").
+- **ml-features-in-this-codebase.md** — same reason.
 
-The overview (`00-overview.md`) has the current-state snapshot. Key numbers to anchor against, from the committed baseline run (`eval/baseline.json`, runId `2026-07-03T04-08-28-644Z`):
+## Per-sub-section index
 
-- 10 golden cases, 4 signal classes (has-signal, partial-signal, no-signal, positive)
-- Per-case cost: ~$0.09 agent-side (cached). Total 10-case run: $0.913 agent + ~$0.40 judge estimate = ~$1.30
-- Per-phase p50 latency: diagnose 50s · diagnosis-judge 38s · recommend 51s · rec-judge 90s · total 225s
-- Diagnosis dim pass rates: root_cause_plausibility 75% · evidence_grounding 50% · scope_coherence 75% · actionable_next_step 0%
-- Recommendation dim pass rates: diagnosis_response 48% · feature_choice_fit 62% · step_actionability 100% · impact_realism 43%
-- Session D pilot calibration (AI-vs-AI, 6 cases): verdict agreement 6/6 (100%) · exact-match dims 13/24 (54%) · within-1 dims 24/24 (100%)
+Each sub-section has its own `README.md` listing the concept files inside it, with anchors to the load-bearing files in the repo.

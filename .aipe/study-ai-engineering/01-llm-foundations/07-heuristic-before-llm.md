@@ -1,203 +1,195 @@
-# 07 — Heuristic-before-LLM
+# Heuristic before LLM
 
-**Type:** Industry standard. Also called: rule-then-model, tiered classification, cheap-path routing.
+## Subtitle
+
+Fast-path routing / two-stage classification — Industry standard.
 
 ## Zoom out, then zoom in
 
-The routing pattern that skips the expensive model when a cheap rule can decide. This repo exercises the SHAPE (a cheap cheap-model classifier that routes to an expensive one) but not the strictest version (regex-then-LLM).
+Not every user query needs the full agent loop. When a user types into the QueryBox, the codebase runs a **cheap classifier first** (Haiku 4.5, one shot, ~500 input tokens, $0.0005/call), then only calls the expensive agent path if the intent warrants it. The classifier is one layer above the agents; the *schema coverage gate* is another. Both are "heuristic before LLM" applied at different granularities.
 
 ```
-  Zoom out — the routing seam in this repo
+  Zoom out — two heuristic gates before expensive LLM work
 
-  ┌─ Query input (free-form user text) ───────────────────────────────┐
-  └─────────────────────────────┬─────────────────────────────────────┘
-                                │
-  ┌─ Intent classifier (Haiku 4.5, cheap) ─────────────────────────────┐
-  │  classifyIntent(anthropic, query, sessionId)                       │
-  │  ★ PARTIALLY THIS CONCEPT ★  — cheap-LLM, not regex                │
-  └────────────────┬──────────────────────────┬────────────────────────┘
-                   │                          │
-                   ▼                          ▼
-        ┌─────────────────┐        ┌─────────────────┐
-        │  Diagnostic     │        │  Query          │
-        │  agent (Sonnet) │        │  agent (Sonnet) │
-        │  expensive path │        │  expensive path │
-        └─────────────────┘        └─────────────────┘
+  ┌─ UI ────────────────────────────────────────────────┐
+  │  QueryBox                                            │
+  └───────────────────────┬──────────────────────────────┘
+                          │  free-form text
+                          ▼
+  ┌─ Route ────────────────────────────────────────────┐
+  │  Gate 1 (cheap):  classifyIntent (Haiku)            │ ← LLM but small
+  │  Gate 2 (rules):  runnableCategories(schema)        │ ← pure code
+  └───────────────────────┬──────────────────────────────┘
+                          │  only if intent + coverage pass
+                          ▼
+  ┌─ Agent (expensive) ────────────────────────────────┐
+  │  Sonnet 4.6, multi-turn, tool-using                 │
+  └────────────────────────────────────────────────────┘
 ```
 
-Zoom in. The full heuristic-before-LLM pattern has two tiers below the expensive model: a deterministic rule (regex, keyword match) that resolves obvious cases, THEN a cheap-LLM fallback for ambiguous ones, THEN the expensive LLM for the remaining hard cases. In this codebase we skip the first tier — go straight to a cheap LLM (Haiku) to classify intent, then route to the expensive agent. That's a partial version of the pattern; the Case B exercise below adds the missing tier.
+Zoom in: at every layer, the codebase asks "can we answer this with less?" before spending on more. The intent classifier is heuristic-before-LLM applied to *routing*. The coverage gate is applied to *tool selection*.
 
 ## Structure pass
 
-**Layers:**
-- Outer: reader input (free-form query)
-- Middle: intent classification (currently Haiku)
-- Inner: destination agent (Sonnet-powered)
-
-**Axis: cost per decision.**
-- Regex layer (missing): ~free, milliseconds
-- Haiku classify: ~$0.0001-0.0005, ~1s
-- Sonnet agent: ~$0.05, ~50-100s
-
-**Seam:** `classifyIntent` returns an `Intent`; the route handler switches on it. Above the seam, callers pass in free-form text; below, the destination-agent code takes over.
+- **Layers:** UI → route → cheap gate → expensive gate → agent. Five bands.
+- **Axis: cost per gate.** UI: free. Route: free. Cheap gate: $0.0005/call. Expensive agent: $0.09/call. Order matters — you gate cheapest-first.
+- **Seams:** `classifyIntent()` (LLM classifier) and `runnableCategories()` (pure function). Both filter; both are cheap-relative-to-the-agent.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You've written a route handler that checks `if (path.startsWith('/api/'))` before doing something heavier. Same shape: cheap check first, expensive work only when needed. The LLM is the "expensive work"; the check is what you can decide without asking it.
+The pattern has two shapes in this codebase.
+
+**Shape A — cheap LLM classifier.** For the QueryBox, the intent isn't obvious from surface form ("what happened to conversions last week" vs "recommend an experiment" vs "explain this chart"). A rules-based router would need N regex patterns and would drift. A cheap LLM classifier (Haiku, $0.0005) picks the right agent tier.
+
+**Shape B — pure-code coverage gate.** For the monitoring scan, some anomaly categories require tools or event streams the workspace doesn't have. Running the agent to discover it can't answer is wasteful. `runnableCategories()` in `lib/agents/categories.ts` filters *before* the agent runs.
 
 ```
-  Tiered classification — cheap deciders first
+  The pattern — two shapes of the same idea
 
-  input
+  Input
     │
     ▼
-  ┌────────────┐  match?   ┌─────────────┐
-  │ regex/rule │──────yes──►│ return direct│  ← ~0 cost
-  └─────┬──────┘            └─────────────┘
-        │ no
-        ▼
-  ┌────────────┐  confident? ┌────────────┐
-  │ cheap LLM  │───────yes──►│ return     │  ← ~$0.0001
-  │ (Haiku)    │             │            │
-  └─────┬──────┘             └────────────┘
-        │ unsure
-        ▼
-  ┌────────────┐
-  │ expensive  │  ~ $0.05
-  │ (Sonnet)   │
-  └────────────┘
+  ┌───────────────────────┐
+  │  cheap gate           │  free (rules) or nearly free (Haiku)
+  │  can we skip / route  │
+  │  the expensive path?  │
+  └───────────┬───────────┘
+              │
+       ┌──────┴──────┐
+       │             │
+       ▼ yes         ▼ no / needs it
+   short-circuit   expensive agent path
+   (return early)  (Sonnet, tools, loop)
 ```
 
-### Move 2 — walk the mechanism
+### Move 2 — the step-by-step walkthrough
 
-**What this repo has today.**
+**The intent classifier.** `lib/agents/intent.ts:19` — one function, `classifyIntent(anthropic, query, sessionId, signal)`. It calls into aptkit's `classifyAptKitIntent`, which uses Haiku 4.5, returns a `QueryIntent` label:
 
-The intent classifier at `lib/agents/intent.ts:21-38`. Anthropic Haiku 4.5 classifies a free-form query into an `Intent` before the request routes to the diagnostic or query agent.
-
-```typescript
-// lib/agents/intent.ts:21-38
+```ts
+// lib/agents/intent.ts:16
 const CLASSIFIER_MODEL = 'claude-haiku-4-5-20251001';
 
 export async function classifyIntent(
-  anthropic: Anthropic,
-  query: string,
-  sessionId?: string,
-  signal?: AbortSignal,
+  anthropic: Anthropic, query: string, sessionId?: string, signal?: AbortSignal,
 ): Promise<Intent> {
   return classifyAptKitIntent(
-    new AnthropicModelProviderAdapter(
-      anthropic,
-      'coordinator',
-      sessionId,
-      CLASSIFIER_MODEL,               // ← Haiku, not Sonnet
-      'agents/intent:classifyIntent',
-    ),
-    query,
-    { signal },
+    new AnthropicModelProviderAdapter(anthropic, 'coordinator', sessionId,
+      CLASSIFIER_MODEL, 'agents/intent:classifyIntent'),
+    query, { signal },
   );
 }
 ```
 
-The Haiku pass is ~5× cheaper than Sonnet on input, ~3× cheaper on output, and much faster (Haiku 4.5 is roughly 2-3× throughput of Sonnet). For a one-turn classification with a short prompt, that's ~$0.0001-0.0005 per call vs Sonnet's ~$0.001-0.005 per equivalent call.
+Two things to notice: (1) same `AnthropicModelProviderAdapter` as the expensive agents — the provider abstraction is uniform. (2) `parseIntent()` in `lib/agents/intent.ts:11` defaults to `'diagnostic'` when the model returns garbage; the default is the safest agent to reach for.
 
-**What the strictest pattern would add — a regex tier.**
+**The coverage gate.** `lib/agents/categories.ts:26-27` — `coverageFor()` and `runnableCategories()`:
 
-Many queries have obvious hints. A message like "why did conversion drop?" contains "why" and a metric name — high-confidence signal for the diagnostic route. A message like "how do I set up a scenario?" contains "how" + a Bloomreach feature — high-confidence signal for the query route. A regex/keyword tier could resolve maybe 40-70% of queries at zero LLM cost, leaving Haiku only for the ambiguous "the numbers look weird lately" cases.
+```ts
+// lib/agents/categories.ts (schemaCapabilities + runnableCategories from aptkit)
+// runnableCategories(schema): AnomalyCategory[] returns only categories
+// whose `requires` list is entirely present in the workspace's schemaCapabilities.
+```
 
-**Why we don't have that tier today.**
+Categories with `requires: ["purchase", "checkout"]` filter through only if the workspace exposes both events. This is pure code — a set intersection — running before the monitoring agent starts. It's exactly the "regex prefix" version of heuristic-before-LLM, applied to tool availability instead of user input.
 
-Honest answer: query volume is low (this is a demo app, not production traffic), so the Haiku cost is negligible. Adding the regex tier is Case B — a next-step exercise, not a current-state limitation. The pattern SHAPE (cheap-first, expensive-fallback) is exercised; the strictest form is not.
+**Where the fast-path win shows up.** In the monitoring briefing, roughly 3–5 of the 12 defined ecommerce categories get gated out for a partially-schema'd workspace. The agent doesn't waste tool calls looking for `payment_failure_rate` when the schema doesn't have `payment_failure` events.
 
-**The measured drift risk.**
+Execution trace of a query flowing through both gates:
 
-Heuristics rot. If we DID have a regex tier and the query patterns shifted (users adopt slang, new feature vocabulary), the regex would silently over-classify to one branch. Mitigation from the spec: log every heuristic-routed case, occasionally sample it through the LLM to detect drift. This codebase already logs every classification via `AnthropicModelProviderAdapter`'s per-call log — extending that to a heuristic tier would be trivial.
+```
+  Query flow — two gates
+
+  user types: "why did revenue drop last week"
+    │
+    ▼
+  classifyIntent → "diagnostic"   ← Haiku, ~200ms, $0.0005
+    │
+    ▼
+  route branch on intent:
+    · "diagnostic" → construct DiagnosticAgent
+    · "chat" → construct QueryAgent
+    · other → error path
+    │
+    ▼
+  DiagnosticAgent.investigate:
+    │
+    ▼
+  agent picks tools; runnableCategories already filtered
+  the schema down to what's answerable
+    │
+    ▼
+  ~10 Sonnet turns, ~$0.09
+```
 
 ### Move 3 — the principle
 
-Route by cost. Deterministic rules are ~free, cheap models are almost free, expensive models are the resource to conserve. Structure your classification tiers so each layer only sees inputs the layer above couldn't resolve. The failure mode of skipping tiers isn't wrong output — it's paying 10× more than you had to for the same decision.
+Route on cost gradient. Start with free rules. Move to cheap LLM classifiers only when rules don't suffice. Move to expensive agent loops only when the classifier says "yes, this needs it." The wrong order — running the expensive path first and short-circuiting later — is the default trap because it feels simpler.
 
 ## Primary diagram
 
-The routing pipeline this repo has, and the tier it's missing.
-
 ```
-  Current state (missing regex tier)
+  Heuristic-before-LLM in this codebase — full frame
 
-  free-form user query
-         │
-         ▼
-  ┌─────────────────────────┐
-  │ classifyIntent (Haiku)  │  every query hits this
-  │ ~$0.0001-$0.0005/call   │  ~1s
-  └─────────┬───────────────┘
-            │
-       ┌────┴────┐
-       ▼         ▼
-  Diagnostic   Query
-  agent        agent
-  (Sonnet)     (Sonnet)
-
-
-  Case B target (heuristic tier added)
-
-  free-form user query
-         │
-         ▼
-  ┌─────────────────────────┐
-  │ regex/keyword rules     │  ~40-70% resolved here
-  │ ~0 cost, ~1ms           │  logged for drift check
-  └─────┬───────────────────┘
-        │ ambiguous?
-        ▼
-  ┌─────────────────────────┐
-  │ classifyIntent (Haiku)  │  only ambiguous cases
-  └─────────┬───────────────┘
-            │
-            ▼
-       agent switch
+  ┌─ UI: QueryBox or briefing trigger ─────────────────────┐
+  │                                                        │
+  └──────────────────────┬─────────────────────────────────┘
+                         │
+                         ▼
+  ┌─ Gate 1 (route level) ─────────────────────────────────┐
+  │  QueryBox → classifyIntent()  ← Haiku, $0.0005          │
+  │    lib/agents/intent.ts:19                              │
+  │  Briefing → runnableCategories(schema)  ← pure code     │
+  │    lib/agents/categories.ts                             │
+  └──────────────────────┬─────────────────────────────────┘
+                         │  survivors of the gate
+                         ▼
+  ┌─ Gate 2 (per-agent) ───────────────────────────────────┐
+  │  DiagnosticAgent picks tools via filterToolSchemas()    │
+  │    lib/agents/tool-schemas.ts:9                         │
+  │  (filters MCP tools down to agent-relevant subset)      │
+  └──────────────────────┬─────────────────────────────────┘
+                         │
+                         ▼
+  ┌─ Expensive path ───────────────────────────────────────┐
+  │  Sonnet 4.6 multi-turn agent loop                       │
+  │  ~$0.09/case observed                                   │
+  └────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The strictest deployment of this pattern combines the regex tier with an ONLINE-DRIFT-CHECK — take 1-5% of heuristic-routed cases, ALSO run them through the LLM, compare. If the LLM disagrees on more than X% of samples, alert. This is anomaly detection on your router's decision distribution, and it prevents the failure mode where the regex silently mis-classifies a growing chunk of traffic while looking fine on the pass rate.
+The classic version of this pattern is a regex prefix check ("if the input starts with `/` treat it as a command"). This codebase runs a fancier variant because the input surface (free text) makes regex brittle. But the shape is the same: cheap gate → expensive path, with the option of the cheap gate short-circuiting.
 
-Related industry patterns: intent classification with a lightweight fine-tuned model (BERT-scale, not LLM); routing agents with tool calls where the tool is "classify_intent"; and the "cascading models" literature (small → medium → large, gated by confidence at each step). The heuristic-before-LLM pattern here is the simplest form of that cascade.
+Drift is the risk. When the input distribution shifts (users start asking things the classifier hasn't seen), the classifier's accuracy drops silently. Mitigations: log the classifier's outputs, occasionally spot-check against the agent's expensive answer, retrain / re-prompt on drift. This codebase doesn't yet log intent-classifier decisions (a gap).
+
+Related: **05-evals-and-observability/01-eval-set-types.md** (an intent-classifier golden set would catch drift). **04-agents-and-tool-use/04-tool-routing.md** (the tool-level version of this pattern).
 
 ## Project exercises
 
-### Exercise — add the regex tier
+### B1.7 · Log intent classifier decisions and add a golden set
 
-- **Exercise ID:** C1.7-B · Case B (pattern partially present; strictest tier missing).
-- **What to build:** a small `heuristicIntent(query: string): Intent | null` in `lib/agents/intent.ts` that returns a confident `Intent` when the query matches known patterns (contains a metric name + "why/dropped/spike" → diagnostic; contains "how/set up" + a bloomreachFeature name → query; else null). Wire it BEFORE `classifyIntent` in the route handler. Log every routed decision with `{decidedBy: 'heuristic' | 'llm', intent, query}`.
-- **Why it earns its place:** the strictest form of a routing pattern this repo already partially exercises. Interviewer signal: "I know the cheap path; here's how I extended it to cheaper, with logging so I can measure how often the cheap path actually decides."
-- **Files to touch:** `lib/agents/intent.ts` (add heuristic layer), `app/api/agent/route.ts` (call heuristic first), `__tests__/intent.test.ts` (test both tiers).
-- **Done when:** running the query endpoint against 10 canonical queries logs `decidedBy: 'heuristic'` on at least 7/10, and drops the Haiku classifier's call count proportionally.
-- **Estimated effort:** <1hr for a first cut; 1-4hr with tests and logging.
+- **Exercise ID:** B1.7
+- **What to build:** Wire `classifyIntent()` output into the receipts pipeline so every classifier call becomes a receipt row (`{query, predictedIntent, expensivePathTaken, actualDiagnosis?}`). Then curate 20 QueryBox-style queries with hand-labeled intents as a golden set.
+- **Why it earns its place:** Closes the "we can detect drift" loop. Right now the cheap gate is unmeasured; adding the receipt + golden pair makes it a real production surface.
+- **Files to touch:** `lib/agents/intent.ts` (log receipt row), `app/api/agent/route.ts` (thread the log), new `eval/intent-goldens/`, extend `eval/run.eval.ts` to score classifier accuracy.
+- **Done when:** the golden set runs alongside the existing 10-case eval; per-intent precision/recall show up in the report.
+- **Estimated effort:** `1–2 days`.
 
 ## Interview defense
 
-**Q: Why is the intent classifier a Haiku call and not a regex?**
+**Q: Why not just use the expensive agent for everything?**
 
-Because query volume is low and I haven't measured the Haiku cost as material. The pattern SHAPE — cheap-first, expensive-fallback — is exercised: I don't use Sonnet for intent classification, I use Haiku, which is ~5× cheaper on input. The strictest form would add a regex tier BEFORE Haiku for obvious queries. That's a next-step exercise. Both tiers use the same principle: don't pay for what a cheaper layer could decide.
+Cost. A diagnostic run at ~$0.09 × 10k invocations/month = $900/month; the same volume at Haiku-classifier + selective routing is ~$50/month for the classifier + $900 × (proportion that actually need it) for the agent. If half of QueryBox traffic is out-of-scope or trivially answerable ("what's the total customer count?" — no agent needed), the cheap gate saves half the agent cost. Load-bearing: measuring the routing hit rate so you know the savings are real.
 
-```
-  today:       [Haiku classify] → agent
-  strictest:   [regex] → [Haiku] → agent
-                 ~70% here, rest fall through
-```
+**Q: What happens when the Haiku classifier is wrong?**
 
-**Q: How would you know if a regex tier was over-classifying?**
-
-Sample. Take 1-5% of regex-routed queries, ALSO run them through Haiku, compare intents. If the disagreement rate on a rolling 100-sample window exceeds a threshold (say 10%), alert. That's drift detection on your router. The heuristic-before-LLM pattern's known failure mode is silent misrouting when input patterns shift — the shadow sample is the check.
-
-**Q: Where else does this pattern show up?**
-
-Any tiered classification: cheap-then-expensive is the same shape as CDN cache-then-origin, memoization-then-recompute, in-memory-cache-then-DB. LLM cost just makes the multiplier bigger — the difference between the cheap and expensive path is 10-100×, not 2-5×, so the incentive to tier is stronger.
+Two failure modes. (1) It says "diagnostic" when it should have said "chat" — the expensive agent runs, over-spends but gets an answer. Cost mistake, not a correctness mistake. (2) It says "chat" when it should have said "diagnostic" — the QueryAgent tries to answer without the full investigation tools, may return a shallow answer. Correctness mistake, worse. Mitigation: `parseIntent()` biases to `'diagnostic'` on unparseable output (`lib/agents/intent.ts:11`), and the intent-golden exercise (`B1.7`) would surface the confusion matrix.
 
 ## See also
 
-- `06-production-serving/02-llm-cost-optimization.md` — the Haiku/Sonnet cost split
-- `04-agents-and-tool-use/04-tool-routing.md` — a related routing decision inside an agent loop
-- `lib/agents/intent.ts` — the current cheap-LLM tier
+- [../04-agents-and-tool-use/04-tool-routing.md](../04-agents-and-tool-use/04-tool-routing.md) — the same idea at the tool level.
+- [../05-evals-and-observability/01-eval-set-types.md](../05-evals-and-observability/01-eval-set-types.md) — the golden-set pattern that would keep the classifier honest.
+- [06-token-economics.md](06-token-economics.md) — the numbers behind the "save 5×" claim.

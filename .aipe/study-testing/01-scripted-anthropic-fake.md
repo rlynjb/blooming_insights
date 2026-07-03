@@ -1,307 +1,400 @@
-# Scripted Anthropic fake
+# 01 — Scripted Anthropic Fake
 
-*Test double · Language-agnostic pattern · Deterministic side of the seam*
+**Industry name:** *scripted test double* over the LLM SDK boundary
+(a.k.a. *response queue fake*).
+**Type:** Language-agnostic pattern applied to a specific SDK.
+**Determinism side:** DETERMINISTIC — the fake replaces the
+probabilistic core with a scripted queue, so `test/agents/*.test.ts`
+becomes a pure input/output assertion suite. This is the load-bearing
+seam that makes the entire agent unit-test layer possible.
 
-The single technique that makes every agent-loop test in this repo
-possible. The Anthropic SDK is replaced at module load with a class whose
-`messages.create()` drains a shared queue of pre-scripted responses. Tests
-fill the queue in `beforeEach`; the agent loop runs against it as if it
-were the real network.
+═════════════════════════════════════════════════
+Zoom out — where this pattern sits
+═════════════════════════════════════════════════
 
-## Zoom out, then zoom in
+Every agent test file needs to answer the same question: *does
+`runAgentLoop` correctly stitch together turns of Anthropic responses
+into a final result, and does it correctly hand off tool calls to the
+MCP surface between turns?* The seam it swaps is the one place the
+system is non-deterministic — the LLM.
 
 ```
-  Zoom out — where the scripted Anthropic fake lives
+  Zoom out — the seam this pattern swaps
 
-  ┌─ Test file ──────────────────────────────────────────────────┐
-  │ vi.mock('@anthropic-ai/sdk', () => mockAnthropicModule())     │
-  │ (module-scope; hoisted before the route module loads)         │
-  └───────────────────────────┬──────────────────────────────────┘
+  ┌─ Agent layer (lib/agents/*) ────────────────────────────┐
+  │  runAgentLoop      DiagnosticAgent      RecommendationAgent│
+  │        │                 │                       │      │
+  │        └──── all call →  anthropic.messages.create       │
+  └───────────────────────────┬─────────────────────────────┘
                               │
-  ┌─ Route module ───────────▼──────────────────────────────────┐
-  │ const anthropic = new Anthropic({ apiKey: … })               │
-  │   ← this `new` hits ★ MockAnthropic ★                        │
-  │ await anthropic.messages.create({ … })                       │
-  │   ← this hits the scripted-queue drain                       │
-  └───────────────────────────┬──────────────────────────────────┘
+                    ┌─────────▼──────────┐
+                    │  ★ THIS SEAM ★     │  ← we swap it in tests
+                    │  Anthropic SDK      │
+                    └─────────┬──────────┘
                               │
-  ┌─ Shared queue (module state) ────────────────────────────────┐
-  │ anthropicQueue.shift() → returns next scripted message       │
-  │ anthropicCalls.push(params) → records what was asked         │
-  │ resetAnthropicQueue() in beforeEach clears both              │
-  └──────────────────────────────────────────────────────────────┘
+                     ┌────────▼────────┐
+                     │  Anthropic API   │  (real; skipped in test)
+                     └─────────────────┘
 ```
 
-The lump in the middle is what we're focused on: `MockAnthropic`, defined
-as an actual `class` (not a `vi.fn().mockImplementation(...)`) because
-vitest's spy wrapper isn't `new`-able unless the underlying function is
-declared as `function` or `class`. The route does `new Anthropic({apiKey})`
-inside the handler, so the mock has to be `new`-able.
+The tests never hit the API — they hand `runAgentLoop` a fake that
+looks like the SDK but reads from a scripted queue. The whole 261-test
+`npm test` runs offline in sub-seconds.
 
-## Structure pass
+═════════════════════════════════════════════════
+Structure pass — layers · axes · seams
+═════════════════════════════════════════════════
 
-- **Layers**: test file → module boundary (`vi.mock`) → route module → SDK
-  boundary (`new Anthropic()`) → mocked class → shared queue.
-- **Axis (control)**: who decides what the "model" says next? The test does
-  — it calls `setAnthropicResponses([...])` before the route runs, and the
-  route reads what the test wrote.
-- **Seam**: `new Anthropic(…)`. That single constructor call is the seam
-  where prod and test diverge. The scripted queue is what makes that
-  seam usable in an assertion.
+**Layers:**
+- test code (calls `runAgentLoop(...)` with a fake)
+- fake shim (`{ messages: { create } }` — a queue-drained function)
+- `runAgentLoop` (production; runs untouched)
+- MCP fake (`McpCaller` interface, pattern 02)
 
-## How it works
+**Axis held constant — control:** who decides what happens next in
+the agent loop?
+- outermost (test): test scripts the sequence
+- middle (`runAgentLoop`): the real production loop decides based
+  on `stop_reason` and content blocks
+- innermost (SDK fake): reads the next scripted response, throws
+  on exhaustion
 
-The pattern lives in two places: `test/api/_helpers.ts:24-136` as the
-canonical helper used by the two integration tests, and inline in each of
-`test/agents/{base,monitoring,diagnostic,recommendation,query}.test.ts`
-as a per-file `buildFakeAnthropic(responses)` (the five agent test files
-predate the helper — same pattern, five copies).
+**Seam:** the constructor of `runAgentLoop` — it takes `anthropic`
+as a parameter. That's the only injection point; everything above
+hangs off it.
 
-### Move 1 — the shape
+═════════════════════════════════════════════════
+How it works
+═════════════════════════════════════════════════
 
-You already know how to script a request/response round trip: `fetch`
-returns a `Promise<Response>`, you resolve it with a fixed body. Same idea
-here, but the "response" is a fully-formed `Anthropic.Messages.Message`
-object with `content` blocks (text or tool_use), a `stop_reason`, a
-`usage` block. The test pre-builds a *sequence* of these — the model's
-scripted turns — and the fake pops them one at a time.
+#### Move 1 — the mental model
+
+You know how in a UI test you can hand a component a scripted
+`fetch()` that returns `{ users: [...] }` on the first call and
+`{ error: 'boom' }` on the second? Same idea, but the "component"
+is `runAgentLoop` and the "fetch" is `anthropic.messages.create`.
+The fake is a queue-drained function: each call to `create()`
+pops the next scripted `Message` off a `responses[]` array. Two
+call sites → two scripted responses.
 
 ```
-  Scripted Anthropic — the shape of the queue
+  The scripted-queue kernel
 
-  test setup                    each `messages.create()` call
-  ──────────                    ──────────────────────────────
-   [ Msg 1 ]                     shift()  →  Msg 1  (turn 1: tool_use)
-   [ Msg 2 ]  ═══════════════▶   shift()  →  Msg 2  (turn 2: tool_use)
-   [ Msg 3 ]                     shift()  →  Msg 3  (turn 3: end_turn)
-                                 shift()  →  undefined → THROW
-                                             ("scripted queue exhausted")
+  test setup:      responses = [resp_turn1, resp_turn2]
+                       │
+                       ▼
+  runAgentLoop calls anthropic.messages.create(...)
+                       │
+                       ▼
+       fake pops responses[idx++]  → returns resp_turn1
+                       │
+              (real loop decides: tool_use → dispatch to MCP fake)
+                       │
+                       ▼
+  runAgentLoop calls anthropic.messages.create(...) again
+                       │
+                       ▼
+       fake pops responses[idx++]  → returns resp_turn2
+                       │
+                       ▼
+       end_turn        → loop returns final result
 ```
 
-The throw on exhaustion is deliberate — tests should fail loudly when the
-agent loop runs longer than scripted, not silently hang on `undefined`.
+The kernel has three parts. Drop any one and it breaks:
 
-### Move 2 — the moving parts
+- **the queue** — indexed by call count; without it the fake would
+  always return the same response and multi-turn tests couldn't work
+- **the throw-on-exhaustion** — `if (!resp) throw new Error(...)`;
+  without it, the fake returns `undefined` and the test fails 10
+  lines later with a cryptic error about `stop_reason` being
+  `undefined`. The throw fails at the *scripting* mistake, not the
+  downstream consequence
+- **the `caller: { type: 'direct' }` field on `tool_use` blocks** —
+  the SDK's TypeScript shape requires it; forgetting it makes
+  `content` fail a compile check inside `runAgentLoop`
 
-**The `vi.mock` call must be at module scope.** Vitest hoists `vi.mock` to
-the top of the file *before* any imports run, so by the time the route
-module does `import Anthropic from '@anthropic-ai/sdk'`, the mock is
-already installed. If you put `vi.mock` inside a `beforeAll`, it fires
-too late — the route has already imported the real SDK. The comment at
-`test/api/briefing.integration.test.ts:17-19` names this explicitly:
+#### Move 2 — the walkthrough
 
-```typescript
-// Mocks live at module scope so they're registered before the route module is
-// imported (vitest hoists `vi.mock`).
+**Building the fake — the factory.**
+
+The factory `buildFakeAnthropic(responses)` returns an object shaped
+like `{ messages: { create } }`. That's the entire SDK surface the
+agents touch — no `client.completions`, no `client.beta`, nothing
+else. Because the SDK is opaque to the tests, the fake is tiny.
+
 ```
+  Location: test/agents/base.test.ts:16-56
 
-**The mock must be a class, not a spy.** From `_helpers.ts:66-84`:
+  function buildFakeAnthropic(responses: FakeResponse[]) {
+    let idx = 0;
+    let count = 0;
 
-```typescript
-export function mockAnthropicModule(): { default: unknown } {
-  class MockAnthropic {
-    messages = {
-      create: async (params: Anthropic.Messages.MessageCreateParamsNonStreaming) => {
-        anthropicCalls.push(params);
-        const next = anthropicQueue.shift();
-        if (!next) throw new Error('mock anthropic: scripted queue exhausted');
-        return typeof next === 'function' ? next() : next;
-      },
-    };
+    const create = vi.fn(async () => {          // ← queue-drained
+      count++;                                    //   fn (per call)
+      const resp = responses[idx];
+      if (!resp) throw new Error(                 // ← fail loud on
+        `No scripted response at index ${idx}`    //   mismatch, don't
+      );                                          //   silently return
+      idx++;                                      //   undefined
+      return {
+        id: `msg_${idx}`,
+        type: 'message',
+        role: 'assistant',
+        model: AGENT_MODEL,
+        content: resp.content,                    // ← only these two
+        stop_reason: resp.stop_reason,            //   fields matter
+        usage: { input_tokens: 10, ... }
+      };
+    });
+
+    return { anthropic: { messages: { create } }, callCount };
   }
-  return { default: MockAnthropic };
-}
 ```
 
-The route does `new Anthropic({apiKey})`. If the mock were a plain
-function, `new` would throw `TypeError: X is not a constructor`. `class
-MockAnthropic` is both callable-with-`new` and lets us attach the
-`messages` field naturally.
+The `usage` field is real-shaped (matches the SDK's `Usage` type)
+because `runAgentLoop` logs it — but it's cosmetic. The two fields
+that drive the loop are `content` (the array of content blocks) and
+`stop_reason` (`'tool_use' | 'end_turn' | 'max_tokens' | ...`).
 
-Notice `anthropicCalls.push(params)` on line 3. Every call the route
-makes is recorded in a module-level array. Tests can assert on what was
-asked: which `tools` were sent, what the system prompt was, what
-`max_tokens` was set to. This is the observability half of the fake.
+**Content-block helpers — where the type discipline lives.**
 
-**Function entries are the error-injection hook.**
-`setAnthropicResponses([mockAnthropicResponse({...}), anthropicErrorResponse('boom')])`
-scripts a two-turn sequence where turn 2 throws. From `_helpers.ts:89-93`:
-
-```typescript
-export function anthropicErrorResponse(message: string): () => Anthropic.Messages.Message {
-  return () => {
-    throw new Error(message);
-  };
-}
-```
-
-The `typeof next === 'function' ? next() : next` line in the drain code
-means a function in the queue gets *called*, and if it throws, the throw
-propagates up through `runAgentLoop` into the route's catch block, which
-emits an `error` event on the NDJSON stream. That's how tests script a
-mid-stream SDK failure.
-
-**The queue is module state; `resetAnthropicQueue()` MUST run in
-`beforeEach`.** From `_helpers.ts:52-55`:
-
-```typescript
-export function resetAnthropicQueue(): void {
-  anthropicQueue.length = 0;
-  anthropicCalls.length = 0;
-}
-```
-
-Vitest resolves the mock factory once — the two module-level arrays are
-shared across every test in every file that mocks `@anthropic-ai/sdk`.
-Skip the reset and test 2 either sees leftover responses from test 1 or,
-worse, records assertions against calls from both. Every integration
-test file has this in its `beforeEach`. Skipping it is the exact silent
-failure the scripted-queue architecture is vulnerable to.
-
-**Building a response shape is enough work to earn a helper.** From
-`_helpers.ts:96-136`, `mockAnthropicResponse({text, toolUses, stop_reason,
-usage})` fills all 12 required fields on `Anthropic.Messages.Message`
-(model, id, container, stop_details, stop_sequence, usage cache fields,
-etc.). Without the helper every test would fill these by hand and drift.
-
-### Move 3 — the principle
-
-**Constructor injection at the SDK boundary is what makes this whole test
-strategy work.** `runAgentLoop(anthropic, mcp, …)` takes the SDK as a
-parameter. If it did `import { anthropic } from './anthropic-singleton'`
-or `new Anthropic()` inside itself, the test would be forced to
-`vi.mock` on domain code — and every test would then be testing the
-mock's behavior, not the loop's. The seam is inherited from the design.
-The scripted queue is what fills the seam.
-
-Two industry names for what this is: **module-boundary mocking** (the
-Jest/Vitest lineage) and **stateful test double** (the Meszaros
-xUnit-Test-Patterns lineage). Either term identifies the pattern in a
-one-second interview lookup.
-
-## Primary diagram
+Two 4-line helpers make the assertions readable and the types happy:
 
 ```
-  Scripted Anthropic fake — the whole shape
+  Location: test/agents/base.test.ts:58-70
 
-  ┌─ test/api/briefing.integration.test.ts ──────────────────────┐
-  │                                                              │
-  │ vi.mock('@anthropic-ai/sdk',                                 │
-  │   () => mockAnthropicModule())          ◄─── hoisted first   │
-  │                                                              │
-  │ beforeEach(() => {                                           │
-  │   resetAnthropicQueue()                                      │
-  │   setAnthropicResponses([                                    │
-  │     mockAnthropicResponse({ toolUses: [{name:'x',input:…}]}),│
-  │     mockAnthropicResponse({ text: '[{…anomalies…}]' }),      │
-  │   ])                                                         │
-  │ })                                                           │
-  │                                                              │
-  │ it('emits insights on happy path', async () => {             │
-  │   const res = await GET(makeRequest())                       │
-  │   const events = await collectEvents(res)                    │
-  │   expect(events).toContainEqual({ type: 'insight', … })      │
-  │   expect(getAnthropicCalls()).toHaveLength(2)                │
-  │ })                                                           │
-  └──────────────────┬───────────────────────────────────────────┘
-                     │
-  ┌─ test/api/_helpers.ts ────────────────────────────────────────┐
-  │  anthropicQueue: ScriptedResponse[]  (module state)           │
-  │  anthropicCalls: Params[]            (module state)           │
-  │                                                                │
-  │  class MockAnthropic { messages.create = async (params) => {   │
-  │    anthropicCalls.push(params)                                 │
-  │    const next = anthropicQueue.shift()                         │
-  │    if (!next) throw new Error('scripted queue exhausted')      │
-  │    return typeof next === 'function' ? next() : next           │
-  │  }}                                                            │
-  └──────────────────┬─────────────────────────────────────────────┘
-                     │  vi.mock returns { default: MockAnthropic }
-                     ▼
-  ┌─ app/api/briefing/route.ts (production code, unchanged) ──────┐
-  │  const anthropic = new Anthropic({ apiKey: … })  // ← Mock    │
-  │  const runResult = await runAgentLoop(anthropic, mcp, …)      │
-  │    // inside: await anthropic.messages.create({tools, msgs})   │
-  │    // ← drains the queue                                       │
-  └────────────────────────────────────────────────────────────────┘
+  function toolUseBlock(id, name, input) {
+    return {
+      type: 'tool_use', id, name, input,
+      caller: { type: 'direct' }             // ← SDK requires this
+    } as unknown as Anthropic.Messages.ContentBlock;
+  }
+
+  function textBlock(text) {
+    return { type: 'text', text, citations: null }
+      as unknown as Anthropic.Messages.ContentBlock;
+  }
 ```
 
-## Elaborate
+The double-cast (`as unknown as`) is deliberate. The SDK's
+`ContentBlock` union has 8+ shapes with private fields (`_type`,
+`caller`), and we don't want to hand-roll the entire discriminated
+union each time. The double-cast says "trust me, this is the shape."
+Tests that break the shape fail at runtime with an actionable
+`stop_reason: undefined` error, not a cryptic type error.
 
-The pattern is not unique to this repo; it's what Jest and Vitest were
-designed for. Where this repo goes further than the average codebase:
+**Consumer side — how a test drives it.**
 
-- **The recorded-call half.** Most module mocks just replace behavior.
-  This one also *records* every call in `anthropicCalls`, exposed via
-  `getAnthropicCalls()`. That's the observability seam — tests assert
-  on both what came out AND what went in. See the integration tests'
-  `expect(getAnthropicCalls().at(-1)?.system).toContain(...)` patterns.
-- **The error-injection hook via function-in-queue.** Most fakes handle
-  errors by having a separate `.mockRejectedValueOnce(...)` path. This
-  one puts the "throwing function" in the same queue as the "returning
-  message" values, so the temporal ordering of successes and failures
-  is a single flat list. Reads cleaner in test setup.
-- **The five agent test files' inline builders predate the helper.**
-  `test/agents/{base,monitoring,diagnostic,recommendation,query}.test.ts`
-  each have their own `function buildFakeAnthropic(responses)`. Same
-  pattern, five copies. Consolidation is a cleanup task, but the
-  duplication doesn't hide bugs — each file's builder is self-contained.
+The consumer pattern is: script exactly the turns you want, wire the
+fake into the loop, assert on both the loop's return value AND the
+`callCount`.
 
-Related standard terms worth naming for the interview:
-- **Test double** (Meszaros): the umbrella term for stubs, mocks, spies,
-  fakes. `MockAnthropic` is a **fake** in this taxonomy — it has working
-  behavior (drains a queue) rather than just recording calls.
-- **Module-boundary mocking**: `vi.mock('@anthropic-ai/sdk', …)` operates
-  at the ES module boundary. The route module gets the fake as its
-  default export.
-- **Response staging**: the queue-and-drain pattern where a test stages
-  the future responses before the code under test runs.
+```
+  Location: test/agents/base.test.ts:105-147
 
-## Interview defense
+  it('executes a tool then returns final text', async () => {
+    const { anthropic, callCount } = buildFakeAnthropic([
+      // Turn 1: model requests a tool
+      { content: [toolUseBlock('tu1', 'get_project_overview',
+                                { project_id: 'p' })],
+        stop_reason: 'tool_use' },
+      // Turn 2: model returns final text
+      { content: [textBlock('done: 5 customers')],
+        stop_reason: 'end_turn' },
+    ]);
 
-**Q: Why not just mock `messages.create` directly with `vi.fn()`?**
+    const mcp = buildFakeMcp(async () => ({           // ← pattern 02
+      isError: false, content: [],
+      structuredContent: { data: { total_customers: 5 } }
+    }));
 
-A: Because the route does `new Anthropic({apiKey})` — a `vi.fn()`
-mock isn't `new`-able. `class MockAnthropic` is. The `new` matters
-because it's how the route gets a fresh SDK instance per-request in
-production; the test has to match that shape or the mock doesn't
-apply.
+    const result = await runAgentLoop({
+      anthropic: anthropic as unknown as Anthropic,   // ← seam swap
+      dataSource: mcp,
+      agent: 'monitoring',
+      system: 'You are a monitoring agent.',
+      userPrompt: 'Check the project.',
+      toolSchemas: fakeToolSchemas,
+      onToolCall: vi.fn(),
+    });
 
-**Q: What's the failure mode if you forget `resetAnthropicQueue()`?**
+    expect(result.finalText).toContain('done');
+    expect(result.toolCalls).toHaveLength(1);
+    expect(callCount()).toBe(2);                       // ← both turns fired
+  });
+```
 
-A: The queue is module-level state — vitest resolves the factory
-once. If test 1 scripts 3 responses and consumes 2, test 2 starts
-with 1 leftover response. Test 2's assertions on `getAnthropicCalls()`
-count are also off by whatever test 1 pushed. It'd manifest as
-"tests pass in isolation but fail when run together" — the classic
-shared-state test smell. Every integration test file has
-`resetAnthropicQueue()` in `beforeEach` for this reason.
+The `callCount()` assertion is important. Without it, a test that
+scripts 3 turns but the loop only runs 2 would still pass — the
+assertions on `finalText` would look reasonable, but a real
+regression (loop bailed early) would slip through. Asserting `callCount`
+pins the exact turn count.
 
-**Q: When would you break this pattern and use MSW or a real HTTP
-mock instead?**
+**Load-bearing details every consumer of this pattern gets right:**
 
-A: When you need to test something below the SDK level — the
-retry-on-429 behavior of the SDK itself, HTTP timeouts, connection
-pooling. This repo doesn't test those because they belong to
-Anthropic. If you were testing a custom fetch layer that wraps the
-SDK, MSW at the network boundary would be the right seam. Above the
-SDK, module-level fake is faster and reads cleaner.
+- `stop_reason: 'tool_use'` on the tool-call turn (not `'end_turn'`) —
+  otherwise `runAgentLoop` would exit immediately without dispatching
+- `stop_reason: 'end_turn'` on the final text turn — otherwise the
+  loop would try another turn and pop `undefined` from an empty queue
+- Sequence of turns MATCHES the queue index — if a test scripts
+  [tool_use, tool_use, end_turn] but the model only fires 2 tool
+  calls, the last scripted response is never consumed and `callCount`
+  reveals the drift
 
-**Q: What's the load-bearing part someone would forget?**
+#### Move 2 variant — the load-bearing skeleton
 
-A: The `throw new Error('scripted queue exhausted')` on `shift() ===
-undefined`. Without it, the fake returns `undefined`, the route calls
-`.content` on undefined, and the test fails with `TypeError: Cannot
-read property 'content' of undefined` two frames deep in the loop.
-With the throw, the test fails immediately with "scripted queue
-exhausted" — you know instantly the loop ran longer than you
-scripted. It's a diagnostic aid, not just error handling.
+Kernel: **queue + index + throw-on-exhaustion.**
 
-## See also
+- Drop the queue → single response can't script multi-turn.
+- Drop the index → each call returns responses[0] forever; multi-turn tests break.
+- Drop the throw → mismatched scripts fail cryptically 20 lines later.
 
-- `02-injected-datasource-fake.md` — the *other* seam this test
-  strategy fills. Same shape (inject a fake) at a different boundary.
-- `04-signal-class-gated-eval.md` — the probabilistic side of the
-  seam. Same agents, real SDK, rubric verdict instead of equality.
-- `audit.md` lens 2 — where this pattern sits in the overall test
-  pyramid.
+Hardening on top: `callCount()` accessor (for the pin assertion),
+`usage` field (cosmetic), `vi.fn()` wrapping (so tests can also read
+`.mock.calls[i][0]` to assert on the *outgoing* request shape — see
+`base.test.ts:277-281`, which asserts that the second turn omits
+`tools` after the budget is spent).
+
+#### Move 3 — the principle
+
+When a system depends on a non-deterministic external service, make
+the seam constructor-injectable and put a scripted fake behind it.
+The fake becomes the entire correctness surface for the layer above;
+the real service is only exercised by a separate, cost-aware,
+non-deterministic harness. This split is what lets you test agent
+loops in sub-milliseconds and eval them at ~$0.15/case — the same
+production code runs against both.
+
+═════════════════════════════════════════════════
+Primary diagram
+═════════════════════════════════════════════════
+
+The recap: three actors, one seam, two suites.
+
+```
+  Full picture — the seam and both suites
+
+  ┌─ npm test  (test/agents/*.test.ts) ─────────────────────────┐
+  │                                                             │
+  │  test writes:            uses:                              │
+  │  responses = [           runAgentLoop({                     │
+  │    { content: [toolUse],   anthropic: FAKE  ────┐           │
+  │      stop_reason: '...' }, dataSource: FAKE ─┐  │           │
+  │    { content: [text],      toolSchemas: ...  │  │           │
+  │      stop_reason: '...' }, onToolCall: vi.fn() │           │
+  │  ]                       })                  │  │           │
+  │                                              │  │           │
+  │  asserts:                                    │  │           │
+  │  · finalText / toolCalls[i]                  ▼  ▼           │
+  │  · callCount() === scripted length      ┌────────────┐      │
+  │  · onToolCall fired N times             │ real       │      │
+  │                                         │ runAgentLoop│     │
+  │                                         │ + real      │      │
+  │                                         │ McpClient   │      │
+  │                                         └────────────┘      │
+  └─────────────────────────────────────────────────────────────┘
+                                                    │
+                                                    │  same code
+                                                    ▼
+  ┌─ npm run eval  (eval/run.eval.ts) ──────────────────────────┐
+  │                                                             │
+  │  runAgentLoop({                                             │
+  │    anthropic: REAL Anthropic client,                        │
+  │    dataSource: SyntheticDataSource,                         │
+  │    ...                                                       │
+  │  })                                                          │
+  │  → judged by RubricJudge → verdict stays out of npm test    │
+  │  → cross-link to study-ai-engineering                       │
+  └─────────────────────────────────────────────────────────────┘
+```
+
+═════════════════════════════════════════════════
+Elaborate
+═════════════════════════════════════════════════
+
+The pattern's ancestor is **fake HTTP servers for API clients** —
+you don't run the real API in tests, you hand your client a shim
+that returns pre-baked responses. The Anthropic version adds one
+twist: the responses aren't just body shapes, they're *sequences* —
+because agent loops make multiple calls per test. That's why the
+queue matters.
+
+The style is copy-pasted (deliberately) across three test files:
+`test/agents/base.test.ts`, `monitoring.test.ts`, `diagnostic.test.ts`,
+`recommendation.test.ts`, `query.test.ts`. The
+`buildFakeAnthropic()` helper is duplicated in each. A shared
+`test/helpers/anthropic-fake.ts` would DRY it up, but the current
+duplication is intentional — each file's fake tweaks the fields
+that matter for its assertions (some read `.mock.calls`, some don't;
+some need the `usage` field asserted on, some don't). The Session B/D
+additions (`auth-providers.test.ts`, `config.test.ts`) don't use
+this pattern because they don't cross the Anthropic seam — they test
+pure functions.
+
+The integration-test version (`test/api/_helpers.ts:mockAnthropicModule`)
+takes the same pattern and pushes it up one level: instead of
+constructing the fake in the test, it stubs the entire module at
+load time (`vi.mock('@anthropic-ai/sdk', ...)`), so the route's
+`new Anthropic(...)` inside its handler picks up the fake
+transparently. Same queue, wrapped in a class.
+
+Cross-link: `study-ai-engineering` covers the other half of the seam
+(the eval harness that runs against real Anthropic + judges the
+output). That side asks "did the model do a good job?" This side
+asks "did our code correctly handle whatever the model returned?"
+
+═════════════════════════════════════════════════
+Interview defense
+═════════════════════════════════════════════════
+
+**Q: How do you unit-test code that calls an LLM?**
+
+Answer: You make the LLM SDK constructor-injectable, then hand your
+code a scripted fake — an object shaped like the SDK but drained
+from a queue of pre-baked responses. Multi-turn agent loops need
+sequenced responses, so the queue advances on each `create()` call.
+The fake throws on queue exhaustion so a mis-scripted test fails at
+the source of the mistake, not 10 lines later.
+
+Anchor: `test/agents/base.test.ts:16-56` — `buildFakeAnthropic()`
+factory. Every agent unit test in this repo consumes it.
+
+Diagram sketch:
+
+```
+  test: [resp1, resp2] → fake.create() pops → real runAgentLoop
+                                              decides based on
+                                              stop_reason + content
+```
+
+**Q: What breaks if you don't throw on queue exhaustion?**
+
+Answer: Silent test failures with confusing errors. `runAgentLoop`
+reads `resp.content` and `resp.stop_reason`; if `resp` is `undefined`,
+it fails 5-10 lines deep in the loop with a TypeError about reading
+`stop_reason` of undefined. The user has no idea their script was
+wrong. Throwing at the point of exhaustion pins the actual mistake:
+"you scripted 2 responses but the loop needs 3."
+
+**Q: Why not use `jest.mock` / `vi.mock` for the whole SDK?**
+
+Answer: Because a hand-rolled fake gives you the per-call queue with
+zero magic — you can see the state (`idx`, `count`) and reason about
+it. Module-level mocks are the right choice at the *integration*
+boundary (the route's `new Anthropic(...)`), where the fake needs to
+survive across the module-import boundary — see
+`test/api/_helpers.ts:mockAnthropicModule`. At the unit level, the
+constructor-injection version is more transparent.
+
+═════════════════════════════════════════════════
+See also
+═════════════════════════════════════════════════
+
+- `02-scripted-mcp-caller-fake.md` — the sibling fake for the MCP
+  boundary; the two are always used together
+- `03-http-transport-mock-with-module-hoisting.md` — the same
+  pattern at the module level (integration tests)
+- `audit.md` lens 6 — how this pattern shipped the AI-feature seam
+  end-to-end
+- `study-ai-engineering` — the probabilistic half of the seam
+  (real Anthropic + judge)

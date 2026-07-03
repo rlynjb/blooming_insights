@@ -1,351 +1,525 @@
-# WAL, durability, and recovery
+# 07 · WAL, durability, and recovery
 
-*Durability + recovery / Language-agnostic*
+*Write-ahead logs, durability boundaries, backup, restore · Case B (git is the WAL)*
 
-## Zoom out, then zoom in
+## Zoom out — where this concept lives
 
-You know how Postgres flushes every commit to a write-ahead log before returning "success," so a crash mid-transaction can be replayed from the log? That's durability. This repo has no WAL, no fsync, no recovery loop. What it has is one AES-256-GCM encrypted cookie that survives on the client for ten days, some committed JSON in git, and a very deliberate policy of "the server owns no durable state." This file names each durability primitive and where the boundary sits.
+Durability is the promise that a committed write survives a crash. In
+a real DB, that promise is kept by the WAL — a write-ahead log
+flushed to disk before the actual data pages, so recovery can replay
+the log after a crash and reconstruct the state. This repo has no
+disk-based WAL, but it has three artifacts playing the same three
+roles: `eval/receipts/*.json` as the append-only log, `eval/baseline.json`
+as the committed reference, and `git tag` as the point-in-time
+snapshot.
 
 ```
-  Zoom out — where "durability" lives in this repo
+Zoom out — where durability would sit
 
-  ┌─ UI (browser) ────────────────────────────────────────────┐
-  │  bi_auth cookie (AES-256-GCM, 10 days, httpOnly)           │  ← the ONLY prod durability
-  │  bi_session cookie (opaque UUID, session)                  │
-  │  localStorage: bi:mode                                     │
-  │  sessionStorage: stashed Insight for click-through nav     │
-  └────────────────────────┬──────────────────────────────────┘
+┌─ commit event ────────────────────────────────────────┐
+│  "record this eval run's judgment"                    │
+└──────────────────────────┬────────────────────────────┘
                            │
-  ┌─ Service (Vercel warm instance) ▼─────────────────────────┐
-  │                                                            │
-  │  session Map, TTL cache, McpClient cache                   │
-  │  → ALL wiped on cold-start / redeploy                      │
-  │                                                            │
-  │  dev-only: .investigation-cache.json, .auth-cache.json     │
-  │  → gitignored, local filesystem only                       │
-  │                                                            │
-  └────────────────────────┬──────────────────────────────────┘
+┌─ ★ THIS CONCEPT ★ ──────▼────────────────────────────┐
+│  the durability boundary                              │
+│    · WAL: write log before data                       │
+│    · checkpoint: promote log to durable data pages    │
+│    · backup: point-in-time copy                       │
+│    · restore: replay from log OR reload from backup   │
+│                                                        │
+│  this repo's analogs:                                  │
+│    · eval/receipts/*.json  — the append-only log      │
+│    · eval/baseline.json    — the "checkpoint" row     │
+│    · git tag               — the point-in-time backup │
+│    · git revert            — the restore              │
+└──────────────────────────┬────────────────────────────┘
                            │
-  ┌─ git repository ────── ▼──────────────────────────────────┐
-  │  ★ lib/state/demo-*.json      committed snapshots           │  ← deploy-time durability
-  │  ★ eval/baseline.json         committed regression ref     │
-  │  ★ eval/receipts/*.json       committed per-run scores     │
-  │  ★ git tags (study-pre-regen-2026-07-03)  = "backup"       │
-  │                                                            │
-  └────────────────────────────────────────────────────────────┘
+┌─ storage ────────────────▼────────────────────────────┐
+│  file system + git                                    │
+└───────────────────────────────────────────────────────┘
 ```
 
-**Zoom in.** The server's serverless instances are *ephemeral by contract* — Vercel gives you no promise about their lifetime, no attached disk. So durability had to move somewhere else. Two places: the encrypted cookie on the client (for per-user state that has to survive a redeploy) and git (for state that has to survive the app's death). Everything else is a cache with extra steps.
+## Zoom in — the pattern
 
-## Structure pass
+**The pattern:** *append-only log + committed reference row + git
+backup.* Every eval run writes one file per case to `eval/receipts/`
+(the WAL). The `computeBaseline` function reads those files and
+produces a wide-row summary in `eval/baseline.json` (the checkpoint).
+`git commit` publishes both; `git tag` is the point-in-time snapshot;
+`git revert` is the restore.
 
-**Axis to hold constant: what survives a redeploy?**
+## Structure pass — one axis across the durability tiers
+
+**Axis: "what happens after a process death?"** (durability boundary)
 
 ```
-  "does this survive `vercel deploy`?" — traced across the state primitives
+Trace durability across the tiers, worst-case
 
-  ┌─ session Map<sessionId, SessionFeed> ─────────────────────┐
-  │  in-memory on the warm instance                            │  → NO. wiped every redeploy,
-  │  insights.ts:14                                            │    every cold-start.
-  └───────────────────────────────────────────────────────────┘
-      ┌─ BloomreachDataSource TTL cache ───────────────────────┐
-      │  in-memory on the warm instance                         │  → NO. wiped every redeploy.
-      │  bloomreach-data-source.ts:122                          │    (60s TTL anyway.)
-      └────────────────────────────────────────────────────────┘
-          ┌─ AsyncLocalStorage auth store ─────────────────────────┐
-          │  per-request only                                        │  → NO. dies at
-          │  auth.ts:47                                              │    request end.
-          └────────────────────────────────────────────────────────┘
-              ┌─ bi_auth cookie ───────────────────────────────────────┐
-              │  on the client, AES-256-GCM, 10-day max-age              │  → YES. redeploy
-              │  auth.ts:38-104                                          │    doesn't touch it.
-              └────────────────────────────────────────────────────────┘
-                  ┌─ committed JSON in git ─────────────────────────────────┐
-                  │  demo-*.json, baseline.json, receipts/*.json              │  → YES. survives
-                  │                                                            │    everything.
-                  └────────────────────────────────────────────────────────────┘
+  Tier                            Survives...           Recovery path
+  ────                            ────────────          ─────────────
+  in-memory Map                   nothing               empty on restart
+  ────                            ────────────          ─────────────
+  bi_auth cookie                  process death         browser re-sends
+                                  redeploy               on next request
+                                  10 days                (crypto-tag verified)
+  ────                            ────────────          ─────────────
+  .auth-cache.json (dev)          process death         fs.readFileSync
+                                  NOT rm                on start
+  ────                            ────────────          ─────────────
+  eval/receipts/*.json            everything up to      readdirSync
+                                  git commit             (permanent once
+                                                          committed)
+  ────                            ────────────          ─────────────
+  eval/baseline.json              everything up to      readFileSync
+                                  git commit             on every CI gate
+  ────                            ────────────          ─────────────
+  demo-insights.json              everything up to      readFileSync
+                                  git commit             on every demo mode
+  ────                            ────────────          ─────────────
+  git tag                         permanent             git checkout
+                                                          git reset --hard <tag>
 ```
 
-The seam that flips the axis is **the network boundary from server to client, plus the deploy-time boundary from repo to running app**. Nothing in the middle survives a redeploy. Two survivors: the client's cookie, and git.
+The seams that matter:
+
+  → **In-memory → cookie seam** — this is the ONLY durability tier
+    that carries per-user state across a redeploy. Everything
+    below dies with the process.
+
+  → **Working tree → git seam** — this is the boundary between
+    "in-progress changes" and "committed history." `eval/receipts/`
+    accumulates in the working tree during a run and gets committed
+    per PR; that's exactly the WAL-to-checkpoint pattern.
+
+  → **git HEAD → git tag seam** — HEAD moves; tags don't. The tag
+    `study-pre-regen-2026-07-03-p2` names today's pre-regen state
+    so a bad regeneration can `git reset --hard <tag>` back.
+
+The **most load-bearing move** is the git-commit boundary. Below it,
+you have working-tree files that could be lost on any error. Above
+it, you have permanent history the CI gate can rely on.
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — the pattern
 
-Standard shape of durability in a real database:
-
-```
-  standard WAL kernel
-
-  1. write intent to log (append-only, sequential)
-  2. fsync the log → durable on disk
-  3. apply change to the in-memory buffer
-  4. lazy checkpoint → flush buffer to data pages later
-  5. on crash: replay log from the last checkpoint
-
-  key property: (2) happens BEFORE returning "committed"
-```
-
-This repo's equivalent:
+You know a Redux time-travel debugger — every action produces a new
+state, the history is a list of states, "undo" means jumping back.
+The WAL pattern is that, plus a rule: **the log is written to disk
+BEFORE the state is updated.** That way, if the process dies mid-
+update, the log tells recovery exactly what to redo.
 
 ```
-  this-repo "durability" kernel
+WAL pattern — the kernel
 
-  in-memory Maps       ← no durability layer at all
-       │
-       │  (nothing to fsync)
-       │
-       ▼
-  bi_auth cookie       ← the "log" — writes are batched to the response cookie
-       │                  once per request via withAuthCookies flush
-       │
-       ▼
-  browser              ← the "durable disk" — the client holds it for 10 days
-       │
-       ▼
-  next request         ← the "recovery" — decrypt on read, seed ALS store
+  1. INTENT     application wants to commit a write
+  2. LOG        WAL entry appended to log file  ── fsync
+  3. APPLY      in-memory state updated
+  4. CHECKPOINT periodically flush apply-side to disk
+                → forget log entries older than checkpoint
 
-  git repo             ← the "backup" — committed JSON survives everything
+  what breaks if you skip step 2:
+    process death after apply, no log → recovery can't redo
+  what breaks if you never checkpoint:
+    log grows forever, recovery replays everything on start
 ```
 
-The load-bearing insight: **the cookie IS the WAL**. Every write to auth state is buffered in ALS during the request, then serialized-and-encrypted-and-set into the cookie at request end (`auth.ts:86-104`). The cookie makes it to the browser, becomes durable there. On the next request, `withAuthCookies` decrypts it into a fresh ALS store — that's the "recovery." The whole "log-then-apply" shape is there, just at the request granularity instead of the transaction granularity.
+Kernel of durable storage — three parts:
 
-### Move 2 — the primitives walked
+  1. **The append-only log.** Every write appends. Never mutate.
+     Missing → no way to recover from a crash mid-checkpoint.
+  2. **The checkpoint / materialized view.** Aggregates the log into
+     a compact readable shape. Missing → every reader has to replay
+     the entire log.
+  3. **The backup boundary.** A named snapshot you can roll back to.
+     Missing → you can only recover forward, never undo a bad state.
 
-**`bi_auth` — encrypted-cookie durability.**
+### Move 2 — walk the three artifacts
 
-```ts
-// lib/mcp/auth.ts:38-49
-const PERSIST = process.env.NODE_ENV === 'development';
-const CACHE_FILE = join(process.cwd(), '.auth-cache.json');
-const memStore = new Map<string, SessionAuthState>();
+Three artifacts, three roles.
 
-interface RequestStore { store: Store; dirty: boolean }
-const requestStore = new AsyncLocalStorage<RequestStore>();
-const AUTH_COOKIE = 'bi_auth';
-const AUTH_COOKIE_MAX_AGE = 60 * 60 * 24 * 10; // 10 days, matches token lifetime
+#### Artifact 1 — `eval/receipts/*.json` as the WAL
+
+Every eval run writes one file per case (per test signal) into
+`eval/receipts/`. The filename is the durability-carrying part:
+
+```
+Actual receipt filenames from the repo
+
+  01-conversion-drop-mobile-checkout-2026-07-03T02-12-17-099Z.json
+  01-conversion-drop-mobile-checkout-2026-07-03T02-47-24-392Z.json
+  01-conversion-drop-mobile-checkout-2026-07-03T04-08-28-644Z.json
+  02-fraud-payment-failure-credit-card-2026-07-03T02-47-24-392Z.json
+  ...
+
+  format: <caseId>-<runId>.json
+    caseId: 01..10 with a short slug
+    runId: ISO timestamp, ms precision, - as separator
+
+  properties:
+    - append-only (each run writes new files, never mutates old)
+    - unique-by-(caseId, runId) (physical isolation, no collisions)
+    - fully ordered by runId (sort by suffix = chronological)
+    - trivially replayable (readdir + parse + aggregate)
 ```
 
-Three backends selected by env:
-- **dev** → gitignored file `.auth-cache.json` (survives dev-server restarts).
-- **test** → in-memory `memStore` (isolated per test run).
-- **prod** → encrypted `bi_auth` cookie on the client.
+The `pickRunId` helper reads exactly this shape:
 
-The prod backend is the only one that matters for the durability story. AES-256-GCM (`auth.ts:62-79`) with a 12-byte random IV and 16-byte auth tag; the key is `sha256(AUTH_SECRET)`; a tampered or corrupt cookie decrypts to `{}` and the app treats it as "no auth" (`auth.ts:69-79`). The cookie carries the OAuth client info from Dynamic Client Registration, the tokens (access + refresh), and the PKCE `code_verifier` — everything a warm-instance-lost server needs to keep the OAuth flow alive across a serverless cold-start.
-
-The 10-day max-age matches Bloomreach's token lifetime — outliving that would just mean carrying dead tokens.
-
-**Cookie flush = commit.**
-
-```ts
-// lib/mcp/auth.ts:86-104
-export async function withAuthCookies<T>(fn: () => Promise<T>): Promise<T> {
-  if (process.env.NODE_ENV !== 'production') return fn();
-  const { cookies } = await import('next/headers');
-  const raw = (await cookies()).get(AUTH_COOKIE)?.value;
-  const ctx: RequestStore = { store: raw ? decryptStore(raw) : {}, dirty: false };
-  const result = await requestStore.run(ctx, fn);
-  if (ctx.dirty) {
-    (await cookies()).set(AUTH_COOKIE, encryptStore(ctx.store), {
-      httpOnly: true,
-      secure: true,
-      sameSite: 'none',
-      path: '/',
-      maxAge: AUTH_COOKIE_MAX_AGE,
-    });
+```typescript
+// eval/baseline.eval.ts:120-130
+function pickRunId(fromEnv: string | undefined): string {
+  if (fromEnv) return fromEnv;
+  const files = readdirSync(RECEIPTS_DIR).filter((f) => f.endsWith('.json'));
+  const runIds = new Set<string>();
+  for (const f of files) {
+    const m = f.match(/-(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d+Z)\.json$/);
+    if (m) runIds.add(m[1]);
   }
-  return result;
+  if (runIds.size === 0) throw new Error('No receipts found');
+  return [...runIds].sort().pop() as string;  // ← "latest LSN"
 }
 ```
 
-Line 91: BEGIN — decrypt-and-load. Line 92: run the request with ALS scoping. Line 93-102: COMMIT — if any write happened during the request (`ctx.dirty === true`), re-encrypt and set the cookie. The response header is the durability barrier — once the browser receives it, the write survives redeploy, cold-start, and this warm instance's death.
+**Read this like a WAL:**
 
-Notice what's *not* here: no fsync, no checkpoint, no partial-write recovery. The cookie is either fully written (browser stores it, next request sees it) or it isn't (network error mid-response, next request sees the pre-write value). Because the OAuth SDK is idempotent — it can redo the DCR, re-request the tokens — losing a write is recoverable by rerunning the handshake. This is the design's tolerance for "no true WAL."
+  → filename = `<segment>-<lsn>.json`, where `lsn` is the runId
+    timestamp
+  → `readdirSync` = "scan the log directory"
+  → `.sort().pop()` = "get the latest checkpoint / LSN"
+  → per-file `JSON.parse` = "decode log records"
 
-**In-memory state = zero durability by design.**
+**In DB terms:** this is a **segmented WAL**. Each segment (case) has
+its own file. Segments are named by case + LSN. The latest LSN is
+the highest-sorted timestamp. Recovery is trivial: readdir + parse.
 
-```ts
-// lib/state/insights.ts:14
-const state = new Map<string, SessionFeed>();
+**Boundary condition — no fsync guarantee.** `writeFileSync` in
+Node is buffered by the OS; a hard power loss between the syscall
+and the disk flush can lose the file. In practice CI is running in
+cloud instances with reliable storage, and the receipts get committed
+to git shortly after being written. If you cared, `fs.fsyncSync` on
+the fd would be the missing step.
 
-// lib/data-source/bloomreach-data-source.ts:122
-private cache = new Map<string, { result: unknown; expiresAt: number }>();
-```
+#### Artifact 2 — `eval/baseline.json` as the checkpoint / materialized view
 
-Both die on redeploy, both die on cold-start. This is *accepted*. The insight surface is not audit data — it's ephemeral analyst thinking, and re-running the briefing is the right recovery move. The 60s TTL cache is by definition a cache; losing it costs one round-trip's worth of latency. Neither of these needs to survive.
+The baseline is what `computeBaseline` produces from the receipts:
 
-The client-side fallback for insight PK lookups (`useInvestigation.ts` stashes the whole `Insight` into `sessionStorage`) is what makes "server has no state anymore" survivable at the UX layer — the user clicks a card, the client already has the row, the server rebuilds the anomaly from `?insight=` (see `resolveAnomaly` at `app/api/agent/route.ts:35-49`, third fallback branch).
-
-**`eval/baseline.json` — durability via commit-to-git.**
-
-```ts
-// eval/gate.eval.ts:52-61
-const label = process.env.BASELINE_LABEL ?? '';
-const baselineFile = label ? `baseline-${label}.json` : 'baseline.json';
-const baselinePath = resolve(EVAL_DIR, baselineFile);
-let baseline: Baseline;
-try {
-  baseline = JSON.parse(readFileSync(baselinePath, 'utf8')) as Baseline;
-} catch {
-  throw new Error(`Missing baseline at ${baselinePath}. Build one with:  npm run eval:baseline`);
+```typescript
+// eval/baseline.eval.ts:87-95
+export function computeBaseline(runId: string, receipts: Receipt[]): Baseline {
+  return {
+    runId,
+    builtAt: new Date().toISOString(),
+    caseCount: receipts.length,
+    diagnosis: aggregate(receipts.map((r) => [r.diagnosisJudgment])),
+    recommendation: aggregate(receipts.map((r) => r.recommendationJudgments.map((rj) => rj.judgment))),
+  };
 }
 ```
 
-The regression-gate's "reference row" is a committed JSON file. Durability is `git commit`. Recovery is `git checkout`. Backups are branches and tags. This is filesystem-as-committed-database at its most literal: a single JSON row whose durability guarantee is "as long as the git remote is intact."
-
-Same story for `eval/receipts/*.json` (28 rows today, one per case × runId) — each is a self-contained committed file. Losing one means losing that scored case; you re-run the eval to regenerate. `lib/state/demo-*.json` is the same shape — committed snapshots, regenerable via the dev-only "capture" button.
-
-**Git tags as backup/rollback.**
+This function reads N log records and produces one summary row.
+That's a **checkpoint operation** in the classical sense — it takes
+the accumulated log and boils it down to a compact representation
+that captures the state "as of the current runId."
 
 ```
-  git tags in this repo (partial):
-    study-pre-regen-2026-06-28
-    study-pre-regen-2026-07-03
-    rehearse-pre-regen-2026-06-28
-    study-rehearse-pre-regen-v1.69.2
+Sequence — checkpoint (baseline build) and gate (baseline compare)
+
+  eval runner                receipts/          baseline.json          CI gate
+  ───────────                ──────────         ──────────────         ───────
+  write receipt(case1)  ──► case1-run.json
+  write receipt(case2)  ──► case2-run.json                             
+  ...                       ...
+                            (10 files)
+
+  npm run eval:baseline
+     │
+     └─► readdir + parse + computeBaseline
+                        │
+                        └──────────────────►   { runId, builtAt,
+                                                 caseCount:10,
+                                                 diagnosis: {…},
+                                                 recommendation: {…} }
+
+  (committed to git)
+
+                                                                         npm run eval
+                                                                         (writes new
+                                                                          receipts)
+                                                                         │
+                                                                         │
+                                                                         npm run eval:gate
+                                                                         │
+                                                                         ┌──▼──┐
+                                                                         │ read│
+                                                                         │ base│
+                                                                         │line │
+                                                                         └──┬──┘
+                                                                            │ read new
+                                                                            │ receipts
+                                                                            │ computeBaseline
+                                                                            │ (candidate)
+                                                                            │
+                                                                            ▼
+                                                                         compare
+                                                                         → pass or block
 ```
 
-These are named restore points before large study/rehearse regenerations. `git checkout study-pre-regen-2026-07-03` is the human-scale equivalent of a PITR (point-in-time recovery). The retention policy is manual (tags don't garbage-collect), the granularity is coarse (one tag per major regen), and there's no automation — but it *works* and it's cheap.
+**Read this like a DB:** `computeBaseline` is a materialization
+function. `baseline.json` is a materialized view. The CI gate is a
+`SELECT` that compares two views. The materialization is manual
+(explicit `npm run eval:baseline`), not automatic — that's a
+deliberate choice, so you can refresh the reference row on your
+schedule rather than every run.
 
-**Dev-only file cache = local-filesystem durability.**
+**Boundary condition — the stale baseline.** If you regenerate
+`baseline.json` from a candidate that itself has regressed, you
+lock in the regression. The comment inside `baseline.eval.ts`
+doesn't call this out explicitly, but the naming (`BASELINE_LABEL=v2`
+support for multi-baseline workflow) hints at it. In DB terms this
+is "the checkpoint contains a wrong page; recovery replays into a
+wrong state." Rollback is `git revert` of the baseline.json commit.
 
-```ts
-// lib/state/investigations.ts:1-9
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-import type { AgentEvent } from '../mcp/events';
+#### Artifact 3 — `git tag` as the point-in-time backup
 
-const PERSIST = process.env.NODE_ENV === 'development';
-const CACHE_FILE = join(process.cwd(), '.investigation-cache.json');
-const DEMO_FILE = join(process.cwd(), 'lib/state/demo-investigations.json');
+The context reminded us that today's git tag is
+`study-pre-regen-2026-07-03-p2`. That's the durability boundary for
+this study itself: a snapshot of the working tree BEFORE the study-
+family regeneration.
+
+```
+Layers-and-hops — the backup / restore flow
+
+┌─ working tree ──────────────────────────┐
+│  .aipe/study-database-systems/*.md      │
+│  (about to be regenerated)              │
+└───────────────┬─────────────────────────┘
+                │ hop 1: git tag study-pre-regen-<date>
+                ▼
+┌─ git object store ──────────────────────┐
+│  refs/tags/study-pre-regen-2026-07-03-p2│
+│  → immutable pointer to commit SHA      │
+└───────────────┬─────────────────────────┘
+                │ hop 2: [regeneration runs]
+                │        [outputs bad? → rollback]
+                ▼
+┌─ working tree (bad state) ──────────────┐
+│  regenerated files, some off-spec        │
+└───────────────┬─────────────────────────┘
+                │ hop 3: git reset --hard study-pre-regen-2026-07-03-p2
+                ▼
+┌─ working tree (restored) ───────────────┐
+│  identical to the tag                    │
+└─────────────────────────────────────────┘
 ```
 
-`.investigation-cache.json` is written from the dev branch of `saveInvestigation` (`investigations.ts:30-41`). It's gitignored — a dev-machine convenience for iterating on investigations without re-running the agents. Production is stateless (Vercel filesystem is read-only, and `PERSIST` is false anyway).
+Every one of the four hops is a durability primitive in a real DB:
 
-### Move 2 variant — the load-bearing skeleton
+  → hop 1: `pg_basebackup` / `mysqldump` — create a point-in-time
+    backup
+  → hop 2: production runs — the "workload" that might corrupt the
+    checkpoint
+  → hop 3: `pg_restore` / `mysql < dump.sql` — restore from backup
 
-Minimum viable durability layer:
+**The load-bearing property:** git tags are immutable once created.
+Nobody can move `study-pre-regen-2026-07-03-p2` to a different SHA
+without a force-push AND a notification (git blocks tag moves by
+default). That's stronger than a filesystem backup — a filesystem
+backup can be silently overwritten; a git tag can't.
 
-1. **The bi_auth cookie itself.** Remove it (or drop `AUTH_SECRET`) and OAuth breaks the moment the warm instance turns over — the PKCE `code_verifier` from the `authorize` request is gone before the `callback` runs. This is the *only* production durability primitive that the app cannot function without.
-2. **The `ctx.dirty` gate.** Remove it and every request sets the cookie, whether or not it wrote — wastes response headers, slows every request slightly. Keep it.
-3. **The commit-to-git story for `eval/baseline.json`.** Remove it and the regression gate has no reference; every PR is either "no gate" or "run a fresh baseline every time" (which defeats the point).
+**In DB terms:** a git tag is a **read-only backup with content-
+addressable integrity checking**. The SHA IS the checksum; if any
+byte of any committed file changed, the SHA would be different.
+It's what a DB engineer would call a "cryptographically-verified
+snapshot."
 
-Everything else — the demo snapshot, the dev file cache, the git tags — is convenience or backup.
+### Move 2.5 — the WAL that isn't (the auth cookie)
+
+Here's a subtle one. The `bi_auth` cookie has some WAL-like
+properties but is missing the log part:
+
+```
+Comparison — cookie durability vs classical WAL
+
+  bi_auth cookie                        classical WAL
+  ─────────────                          ─────────────
+  one blob, latest state                 log of all writes
+  encrypted, self-tagged                 append-only
+  survives redeploy                      survives crash + recover
+  recovery: browser re-sends             recovery: replay log
+  backup: none                           backup: base + logs
+  rollback: none                         PITR: replay to a point
+```
+
+The cookie is a **state snapshot without a log**. That's why:
+
+  → You can't "recover to a state 5 minutes ago" — the old cookie is
+    gone, replaced by the current one.
+  → You can't audit the history of OAuth state changes — there is
+    no history, only the current.
+  → You can rotate `AUTH_SECRET` for security, but you can't roll
+    back a bad token save.
+
+This is a classic **CRDT-style latest-wins state** rather than a
+log-based state. It's fine because OAuth is inherently latest-wins
+(the newest token is the right one; the old ones are worthless), but
+it's important to name what's missing.
 
 ### Move 3 — the principle
 
-**Push durability to the layer that already has it.** This repo doesn't try to build a WAL over Vercel's stateless serverless — it *inherits* durability from the browser (cookie) and from git (commit). The result is an app with zero server-side persistent storage that still recovers from redeploys, cold-starts, and instance death. The tradeoff is real: you can't store anything the client can't hold, and you can't durably persist anything that has to change between deploys. Every state design decision downstream of that reads as the natural consequence: sessions are ephemeral, insights are re-generated, investigations are re-runnable, baselines are git rows.
+**Durability is a property of a specific tier, not of the system.**
+Every artifact in this repo has a durability answer, and the answer
+is different for each. The in-memory Map is durable for zero
+seconds. The cookie is durable for ten days OR one AUTH_SECRET
+rotation, whichever is first. The receipts are durable until you
+`git push --force`.
 
-## Primary diagram
+The reason engineers reach for a database for durability is that a
+DB gives you one integrated story: WAL for the log, checkpoints for
+the materialized state, backups for point-in-time recovery, all
+coordinated. Here you're building that same story out of files and
+git. It works — it's how a lot of small systems ship — but every
+piece is your responsibility, and losing any one piece breaks
+recovery.
+
+## Primary diagram — the durability stack
 
 ```
-  Durability, from a write to "safe past a redeploy"
+Durability in blooming_insights — from ephemeral to permanent
 
-  ┌─ per-request auth write ───────────────────────────────────┐
-  │                                                             │
-  │  request enters                                             │
-  │    │                                                        │
-  │    ▼                                                        │
-  │  withAuthCookies:                                           │
-  │    decrypt bi_auth   ─► ctx.store ─► requestStore.run(ctx)  │
-  │                                          │                  │
-  │                                          ▼                  │
-  │                                      OAuth SDK                │
-  │                                       many readState /       │
-  │                                       patchState calls        │
-  │                                       (all hit ctx.store)     │
-  │                                          │                    │
-  │                                          ▼                    │
-  │    if ctx.dirty: encrypt(ctx.store) ─► set bi_auth cookie    │
-  │    │                                     │                    │
-  │    │                                     ▼                    │
-  │    ▼                                Set-Cookie header          │
-  │  response leaves                    (COMMIT boundary)          │
-  │                                          │                    │
-  │                                          ▼                    │
-  │                                     browser stores it         │
-  │                                     for 10 days                │
-  │                                                                │
-  │  next request: decrypt ─► same round begins                    │
-  │                                                                │
-  │  lib/mcp/auth.ts:86-104                                        │
+  ┌── EPHEMERAL (dies with process) ─────────────────────────────┐
+  │  Map<sessionId, SessionFeed>                                  │
+  │    lifespan: warm instance                                    │
+  │    recovery: none, empty on restart                           │
   └───────────────────────────────────────────────────────────────┘
 
-  ┌─ deploy-time / eval durability (git) ──────────────────────┐
-  │                                                             │
-  │  npm run eval:baseline                                      │
-  │    → reads eval/receipts/*.json (28 rows)                   │
-  │    → aggregates via computeBaseline(runId, receipts)        │
-  │    → writes eval/baseline.json                              │
-  │    → committer commits it                                   │
-  │                                                             │
-  │  npm run eval:gate                                          │
-  │    → reads eval/baseline.json (durable "row")               │
-  │    → compares to candidate → passes/fails PR check          │
-  │                                                             │
-  │  eval/baseline.eval.ts:56-58                                │
-  │  eval/gate.eval.ts:53-91                                    │
-  │                                                             │
-  │  backup / rollback: git tags                                │
-  │    study-pre-regen-2026-07-03  ← human-scale PITR anchor    │
-  └────────────────────────────────────────────────────────────┘
+  ┌── PER-USER PORTABLE (10 days) ───────────────────────────────┐
+  │  bi_auth cookie                                                │
+  │    lifespan: 10d or AUTH_SECRET rotation                      │
+  │    tier:     browser cookie                                    │
+  │    tag:      AES-256-GCM auth tag verifies integrity           │
+  │    recovery: browser re-sends → decryptStore(raw)              │
+  └───────────────────────────────────────────────────────────────┘
 
-  ┌─ what doesn't survive (accepted losses) ───────────────────┐
-  │                                                             │
-  │  session Map<sessionId, SessionFeed> — wiped on redeploy    │
-  │    → recovery: user re-runs briefing (agent is idempotent)  │
-  │                                                             │
-  │  BloomreachDataSource cache — wiped on redeploy             │
-  │    → recovery: 60s of extra Bloomreach hits                 │
-  │                                                             │
-  │  in-flight requests — dropped mid-flight on redeploy        │
-  │    → recovery: client's auto-reconnect on `invalid_token`   │
-  │      (see app/page.tsx feed logic)                          │
-  │                                                             │
-  └────────────────────────────────────────────────────────────┘
+  ┌── DEV FILE (until rm) ───────────────────────────────────────┐
+  │  .auth-cache.json                                              │
+  │    lifespan: filesystem                                        │
+  │    tier:     gitignored file                                   │
+  │    recovery: readFileSync on start                             │
+  └───────────────────────────────────────────────────────────────┘
+
+  ┌── WAL (append-only, per-run) ────────────────────────────────┐
+  │  eval/receipts/<caseId>-<runId>.json                          │
+  │    lifespan: git working tree, then committed                 │
+  │    tier:     file system → git                                │
+  │    ordering: runId ISO timestamp = natural LSN                │
+  │    recovery: readdir + parse + aggregate                      │
+  └───────────────────────────────────────────────────────────────┘
+
+  ┌── CHECKPOINT (materialized view) ────────────────────────────┐
+  │  eval/baseline.json                                            │
+  │    lifespan: committed                                         │
+  │    tier:     git                                               │
+  │    role:     regression-gate reference row                     │
+  │    recovery: readFileSync on gate run                          │
+  └───────────────────────────────────────────────────────────────┘
+
+  ┌── FROZEN REPLICA (materialized view) ────────────────────────┐
+  │  lib/state/demo-insights.json                                  │
+  │  lib/state/demo-investigations.json                            │
+  │    lifespan: committed                                         │
+  │    tier:     git                                               │
+  │    role:     demo-mode read replay                             │
+  │    refresh:  /api/mcp/capture-demo (dev-only route)            │
+  └───────────────────────────────────────────────────────────────┘
+
+  ┌── POINT-IN-TIME BACKUP ──────────────────────────────────────┐
+  │  git tag study-pre-regen-2026-07-03-p2                        │
+  │    lifespan: permanent (until force-push)                     │
+  │    tier:     git object store                                 │
+  │    tag:      SHA is the checksum                              │
+  │    restore:  git reset --hard <tag>                           │
+  └───────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The interesting philosophical point: **"the WAL is on the client"** is a pattern local-first apps have been articulating for years. This repo is not local-first — it's a serverless web app talking to a remote SaaS — but it borrowed the exact same durability idea for the auth layer. Encrypt the state, ship it to the client, let the client be the durable disk. The tradeoff you accept is a bounded state size (cookies are limited, browsers cap them at ~4KB per; check the encrypted-store size stays under that) and a max-age you have to pick honestly.
+**Where does the "WAL as segmented files" pattern come from?**
+Postgres's WAL uses segmented files (16 MB each by default, named
+`000000010000000000000001` and up). LevelDB / RocksDB use "SST
+files" that follow the same pattern. Kafka is entirely a segmented
+log per partition. The instinct is universal: append is cheap,
+mutation is expensive, and segments make retention / archival
+trivial.
 
-The eval-layer story is a different kind of durability: *versioning by commit*. `eval/baseline.json` isn't just a persisted row — it's a row whose *edits are code-reviewed*. Every time a baseline changes, someone opens a PR to change it, and the change is auditable in git history. That's a stronger durability guarantee than most production databases give you (you can `SELECT * FROM audit_log`, but you can't `git blame` a Postgres row without extra tooling).
+**The `receipts/*` folder is one of the cleanest analogs of this
+pattern in a small codebase.** No mutation, no cleanup, no schema
+migrations. Each file is complete on its own; you can `rm` an old
+run's files without breaking anything (though the gate wouldn't
+have historical baselines).
 
-`study-system-design` owns the higher-level question of "which datastore was chosen" (answer: none for local state, Bloomreach for source-of-truth). Here the point is narrower: **the two durability primitives that DO exist are picked deliberately**, and they cover exactly the two failure modes the app can't ignore (OAuth surviving cold-start; eval baseline surviving PR review).
+**When would you replace this with SQLite?** When the append-only
+log grows past a few thousand files AND you start wanting queries
+like "what's the pass rate for case 3 over the last 20 runs." Right
+now the gate does one comparison (baseline vs candidate); a query
+across N runs would require N reads. SQLite would make it one
+`SELECT`. Nothing else changes about the pattern — the record shape
+and the LSN concept both survive the migration.
 
-### `not yet exercised`
-
-- **Write-ahead log (per-transaction append + fsync barrier).** No engine.
-- **Fsync / synchronous_commit / group commit.** No engine.
-- **Checkpoints and dirty-page flushing.** No engine.
-- **Backup automation (pg_dump, base backup + WAL archive).** Manual git tags only.
-- **Point-in-time recovery, PITR windows.** Coarse via `git checkout <tag>`.
-- **Replication as durability (log-shipping to standby).** See `08-replication-and-read-consistency.md`.
-- **Crash recovery replay from the log on startup.** Cookie decrypt on request-start is the analog, at request granularity.
+**The `capture-demo` route is a manual checkpoint operation.** It
+takes the current session's in-memory feed and writes it to
+`lib/state/demo-insights.json` (plus investigations). That IS a
+checkpoint — freezing the in-memory state to durable storage. But
+it's manual (you click a button in dev) and never automatic. In DB
+terms: no background checkpoint thread. That's fine for a "frozen
+demo replica" pattern; it would be broken for a production DB.
 
 ## Interview defense
 
-**Q: "How does this app persist data?"**
+**"How does this system handle a crash mid-write?"**
 
-Model answer: "Almost none of it, and that's deliberate. There are two durable primitives. One: the `bi_auth` cookie at `lib/mcp/auth.ts:38-104` — AES-256-GCM encrypted, 10-day max-age, holds OAuth client info + tokens + PKCE verifier. That survives redeploys because it's on the client. Everything the server needs to keep OAuth alive across a cold-start goes in this cookie. Two: committed JSON in git — `lib/state/demo-*.json` for demo replay, `eval/baseline.json` for regression-gate reference, `eval/receipts/*.json` for per-run scores. Those survive because they're in the repo. Between the two, the entire session Map, TTL cache, and MCP client cache are wiped on every redeploy — accepted, because the recovery move is 'user re-runs the briefing' and the agent is idempotent."
+Answer: *"It depends on the tier. The in-memory Map loses everything
+on process death — the redeploy IS the crash, and the next request
+starts fresh. The `bi_auth` cookie survives because it's on the
+browser side, so the client re-sends it on the next request and
+`decryptStore` verifies the AES-GCM tag before trusting it. The
+`eval/receipts/` folder is append-only per run, so a crash mid-run
+leaves a partial run in the working tree — the gate would either
+skip it or fail cleanly on a missing case. The git-committed
+artifacts are the only permanent tier."*
 
-Diagram to sketch: the "per-request auth write" flow — decrypt into ALS, mutate, dirty-check, encrypt-and-set on response.
+**"Where's the write-ahead log?"**
 
-**Q: "What's the WAL analog here?"**
+Answer: *"`eval/receipts/` is the closest analog. Each run writes
+one JSON file per case; the runId in the filename is the LSN. The
+`computeBaseline` function is the checkpoint operation — it reads
+all receipts for a runId and produces the materialized view in
+`eval/baseline.json`. The CI gate compares two materialized views.
+Recovery in this world is `readdirSync + parse`, which is trivial
+because the files are self-describing."*
 
-Model answer: "The cookie flush at the end of `withAuthCookies` in `auth.ts:86-104`. Standard WAL is 'append to log, fsync, then return commit.' Here it's 'buffer to ALS store during the request, encrypt into cookie on response.' The response's Set-Cookie header is the commit barrier. It's request-granular rather than transaction-granular, but the shape is identical: you don't return success until the durable layer has the write. And like a real WAL, if the response never reaches the client (network error), the write is lost — but the OAuth handshake is idempotent, so recovery is just 'redo the flow.' That's the design's acceptance for not having a true fsync."
+**"How would you roll back a bad regeneration?"**
 
-Anchor: cookie Set-Cookie header = commit barrier; response reaches client = "fsynced."
+Answer: *"`git reset --hard study-pre-regen-2026-07-03-p2`. The tag
+was created before the regeneration ran, so it points at the
+known-good tree. Git tags are immutable and content-addressable —
+the SHA is effectively the checksum — so this is stronger than a
+filesystem backup. There's no undo for a filesystem overwrite; there
+IS an undo for a git commit."*
 
-**Q: "How would you back up production data?"**
-
-Model answer: "There isn't any. Bloomreach owns the source of truth — customer data, event streams — and I don't back that up because I don't run it. My app's durable state is (1) `bi_auth` cookies on user browsers, which I can't back up and don't need to (they expire in 10 days and re-auth is fine), and (2) whatever's committed in the repo, which is backed up by the git remote. If I ever added server-side persistence — a Postgres for cross-session analytics, say — that's when I'd need backup automation. Right now the 'backup' is `git push origin main` plus tags like `study-pre-regen-2026-07-03` as human-scale restore points."
-
-Anchor: no server-side durable state → no backup needed. Backup = git remote + tags.
+The load-bearing skeleton part interviewers routinely forget:
+**the runId timestamp precision.** With millisecond precision plus
+the `-<random>` suffix pattern, two concurrent eval runs cannot
+collide on filenames. That's the "no two writers write the same
+segment" property that makes the WAL work without locking. Naming
+this signals you thought about the concurrency of the log itself.
 
 ## See also
 
-- `01-database-systems-map.md` — the full storage picture this file zooms in on.
-- `05-transactions-isolation-and-anomalies.md` — the atomicity story that pairs with cookie-as-commit.
-- `06-locks-mvcc-and-concurrency-control.md` — the AsyncLocalStorage pattern that makes the cookie-flush idempotent.
-- `08-replication-and-read-consistency.md` — how the demo snapshot acts as a read replica.
+  → `01-database-systems-map.md` — the six tiers each recovery
+    story sits in
+  → `05-transactions-isolation-and-anomalies.md` — atomicity as
+    the durability sibling
+  → `08-replication-and-read-consistency.md` — the demo snapshot
+    as a frozen replica
+  → `study-testing/` — how the eval gate consumes this durability
+    story

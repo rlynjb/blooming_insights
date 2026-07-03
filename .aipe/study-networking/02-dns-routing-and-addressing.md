@@ -1,319 +1,351 @@
-# DNS, routing, and addressing
+# 02 — DNS, routing, and addressing
 
-*Origin resolution (Industry standard)* — names, addresses, routing,
-proxies, edge layers, and how the code resolves *where to talk to*.
+## Subtitle
 
-## Zoom out — where this concept lives
+Origin resolution and request routing (Language-agnostic — how a URL becomes a socket, and how the app decides which URL to open).
 
-Before a byte hits the wire the code has to answer three questions:
-which origin, which path, which redirect URI. This repo answers them
-with three env vars and one clever `x-forwarded-host` read. The rest
-is defaults.
+## Zoom out, then zoom in
+
+Before any packet leaves, three questions get answered: which host do we open a connection to, whose DNS answers that name, and — for our own inbound requests — which origin was the browser actually talking to? For most Next.js apps this whole layer is invisible. In this repo it isn't, because the MCP URL is configurable per-request and the OAuth callback URL is derived from the actual inbound host (not a hardcoded env var). Two small pieces of routing logic; both load-bearing.
 
 ```
-  Zoom out — origin resolution across the three hops
+  Zoom out — where addressing sits
 
-  ┌─ Browser ────────────────────────────────────────────────────┐
-  │  window.location.origin (implicit — same-origin fetch)        │
-  └──────────────────────┬───────────────────────────────────────┘
-                         │
-  ┌─ Next route ─────────▼───────────────────────────────────────┐
-  │  ★ ORIGIN RESOLUTION LIVES HERE ★                             │
-  │  mcpUrl()          — BLOOMREACH_MCP_URL env, trailing / stripped │
-  │  redirectUri()     — x-forwarded-host (prod) / APP_ORIGIN (dev)  │
-  │  Anthropic SDK     — default api.anthropic.com                   │
-  └──────────────────────┬───────────────────────────────────────┘
-                         │
-                         ▼
-                    upstream origins
-                (loomi-mcp-alpha.bloomreach.com,
-                 api.anthropic.com)
+  ┌─ UI layer ─────────────────────────────────────────────────┐
+  │  fetch('/api/briefing?mode=live-mcp')                      │
+  │  (same-origin — no DNS lookup involved)                    │
+  └────────────────────────┬───────────────────────────────────┘
+                           │
+                           ▼
+  ┌─ Edge band (Vercel) ───────────────────────────────────────┐
+  │  routes browser → route function                           │
+  │  inserts x-forwarded-host, x-forwarded-proto               │
+  └────────────────────────┬───────────────────────────────────┘
+                           │
+                           ▼
+  ┌─ Service band (route) ─────────────────────────────────────┐
+  │  ★ THIS FILE ★                                             │  ← we are here
+  │   · mcpUrl(override) — pick which host to call             │
+  │   · redirectUri()    — figure out which host called us     │
+  └──────────┬──────────────────────────────┬──────────────────┘
+             │                              │
+             │ DNS lookup + TCP+TLS         │
+             ▼                              ▼
+  ┌─ Provider ─────────────────────┐  ┌─ Anthropic ────────────┐
+  │  MCP origin (Bloomreach preset)│  │  api.anthropic.com     │
+  └────────────────────────────────┘  └────────────────────────┘
 ```
 
-Three env vars pin the origins. One `x-forwarded-host` read makes
-preview-deploys work. That's the whole story.
+Zoom in — this file answers two questions. First, when the route decides to open an outbound HTTPS call, how does it pick the URL? Second, when the browser lands on the OAuth callback, how does the route figure out which origin it needs to redirect back to?
 
-## The structure pass
+## Structure pass
 
-The axis is **who decides which origin to hit at each layer**. Held
-constant across altitudes:
+**Layers:**
+- Client (browser)
+- Edge (Vercel — inserts routing headers)
+- Route (picks outbound URL, derives inbound origin)
+- Upstream (the URL we picked)
+
+**Axis — CONTROL (who decides which address to hit):**
 
 ```
-  Axis: "who decides the origin?"
+  "who decides the URL?" — traced down the stack
 
-  ┌─────────────────────────────────────────┐
-  │ browser fetch                            │  → CODE decides
-  │ /api/briefing                             │    (same-origin implicit)
-  └─────────────────────────────────────────┘
-      ┌─────────────────────────────────────┐
-      │ Next route                          │  → ENV decides
-      │ BLOOMREACH_MCP_URL, APP_ORIGIN      │    (config)
-      └─────────────────────────────────────┘
-          ┌─────────────────────────────────┐
-          │ OAuth callback redirect_uri     │  → REQUEST decides
-          │ derived from x-forwarded-host   │    (per-request)
-          └─────────────────────────────────┘
-              ┌──────────────────────────────┐
-              │ Anthropic hop                │  → SDK decides
-              │ default api.anthropic.com    │    (library default)
-              └──────────────────────────────┘
+  Client       → hardcoded relative paths ('/api/briefing')
+                 → CODE decides
+       seam #1: browser doesn't need DNS — same-origin
+  Edge         → routes to Vercel function by hostname
+                 → VERCEL config decides
+       seam #2: route sees x-forwarded-* headers
+  Route        → mcpUrl() precedence chain
+                 → OVERRIDE > ENV > DEFAULT decides
+  Route (OAuth)→ redirectUri() reads x-forwarded-host
+                 → REQUEST-HEADERS decide
+       seam #3: outbound TLS to picked origin
+  Upstream     → whichever URL won the precedence chain
+
+  control flips at every seam
 ```
 
-Four altitudes, four different owners. The seam that matters most is
-between "ENV decides" and "REQUEST decides" — the OAuth flow *can't*
-use a static config because the redirect URI has to match whichever
-Vercel host the user actually hit.
-
-**Seams**:
-
-  - **browser ↔ route** — same-origin, cookie flows naturally.
-  - **route ↔ Bloomreach** — cross-origin; the route is configured with
-    one origin per environment.
-  - **IdP ↔ callback route** — cross-site *return*; the redirect_uri
-    must be one that DCR pre-registered *and* the browser can reach with
-    its `bi_session` cookie attached.
-  - **route ↔ Anthropic** — cross-origin; SDK-owned, no local config.
+**Seams:**
+- Seam #1 — same-origin means no client-side DNS (browser reuses the connection to `<deployed-host>`).
+- Seam #2 — Vercel edge → route: the edge inserts `x-forwarded-host` so the route knows the real inbound origin.
+- Seam #3 — the outbound origin selection: the precedence chain decides which upstream to open.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You've configured API base URLs before (`NEXT_PUBLIC_API_URL` in a
-CRA/Vite app). This is the server-side version of that, plus a wrinkle:
-one of the URLs has to be *derived per request* because Vercel gives
-each deploy a different hostname and the OAuth redirect must land on
-the same one that set the cookie.
+Two lookup tables — one for outbound (route → MCP), one for inbound (route → OAuth callback):
 
 ```
-  The pattern — static config + one dynamic derivation
+  Two lookup tables sitting inside the route
 
-  ┌─ static env ──────────────────────────┐
-  │  BLOOMREACH_MCP_URL                    │
-  │  APP_ORIGIN                            │
-  │  ANTHROPIC_API_KEY                     │
-  └───────────────────────────────────────┘
+  outbound (which URL do we call?)
+  ─────────────────────────────────
+   override.url          ─┐
+   MCP_URL env            │
+   BLOOMREACH_MCP_URL env │  ← first match wins
+   'https://loomi-mcp-   │
+    alpha.bloomreach.com/mcp/' ┘
 
-  ┌─ per-request derivation ──────────────┐
-  │  x-forwarded-host                     │  ← the wrinkle
-  │  →  proto + host + '/api/mcp/callback' │
-  └───────────────────────────────────────┘
+  inbound (what origin called us?)
+  ─────────────────────────────────
+   x-forwarded-host      ─┐
+   host header            │  ← first match wins
+   APP_ORIGIN env         │
+   'http://localhost:3000' ┘
 ```
 
-### Move 2 — the origin decisions
+The pattern in both is the same: a precedence chain, first match wins, sane default at the bottom so a fresh clone works out of the box. That's the whole shape.
 
-#### The MCP origin
+### Move 2 — the walkthrough
 
-The Bloomreach MCP URL is env-configured with one non-obvious cleanup
-step. `lib/mcp/connect.ts:30-34`:
+#### The outbound URL precedence chain
+
+The MCP URL is picked once per request, inside `mcpUrl(override)`. The override comes from the per-request `x-bi-mcp-config` header (which came from the user's localStorage settings modal). If no override, fall through to `MCP_URL` env, then to the legacy `BLOOMREACH_MCP_URL` env, then to a hardcoded Bloomreach alpha URL as the sensible default.
+
+From `lib/mcp/connect.ts:38-48`:
 
 ```ts
-  function mcpUrl(): URL {
-    const raw =
-      process.env.BLOOMREACH_MCP_URL ?? 'https://loomi-mcp-alpha.bloomreach.com/mcp/';
-    return new URL(raw.replace(/\/+$/, ''));   // strip trailing slash(es) — avoids a 307
-  }
+function mcpUrl(override?: McpConfigOverride): URL {
+  // Precedence: override.url (from UI settings modal, per-request header) →
+  // MCP_URL env → BLOOMREACH_MCP_URL env (legacy) → Bloomreach alpha default.
+  // Unset env still yields a working example config out of the box.
+  const raw =
+    override?.url ??
+    process.env.MCP_URL ??
+    process.env.BLOOMREACH_MCP_URL ??
+    'https://loomi-mcp-alpha.bloomreach.com/mcp/';
+  return new URL(raw.replace(/\/+$/, '')); // strip trailing slash(es) — avoids a 307
+}
 ```
 
-The trailing-slash strip is load-bearing. Without it, the SDK
-constructs `https://loomi-mcp-alpha.bloomreach.com/mcp/` and the
-Bloomreach edge answers with a `307 Temporary Redirect` to
-`.../mcp` (no trailing slash) — one extra round-trip added to every
-single MCP call, plus a redirect that the SDK may not preserve the
-`Authorization` header across. Strip it once at construction, and
-every subsequent call skips the redirect.
+Two details worth naming:
 
-This is the kind of detail that only shows up when you're staring at a
-network waterfall and every span has a mysterious ~200ms 307 in front
-of it. The comment on that line is worth its weight in gold.
+**The trailing-slash strip.** `URL.toString()` on `new URL('https://x/mcp/')` and `new URL('https://x/mcp')` are different strings; Bloomreach's Streamable HTTP transport 307-redirects the trailing-slash form to the non-trailing form. A 307 on every MCP call would double the round-trip count on this hop. Stripping it in advance avoids that.
 
-#### The OAuth callback redirect URI
+**Bloomreach as a preset, not the identity.** The default at the bottom of the chain is a Bloomreach URL because a fresh clone needs to reach *something* HTTPS-shaped to demonstrate the flow. It's not baked-in — every other layer of the code (auth providers, tool schemas, retry ladder shapes) also works against arbitrary MCP servers. Set `MCP_URL=...` and you're pointing at a different server; the code doesn't notice.
 
-The interesting one. `lib/mcp/connect.ts:36-57`:
+```
+  Outbound URL — precedence chain
+
+  request → decodeConfigHeader(x-bi-mcp-config) → override|null
+                                                       │
+                                                       ▼
+                            ┌──────────────────────────────────┐
+                            │  mcpUrl(override) {              │
+                            │    return                        │
+                            │      override.url                │
+                            │      ?? process.env.MCP_URL      │
+                            │      ?? process.env.BLOOMREACH_  │
+                            │           MCP_URL                │
+                            │      ?? 'https://loomi-mcp-alpha │
+                            │          .bloomreach.com/mcp/';  │
+                            │  }                               │
+                            └──────────────────────────────────┘
+                                           │
+                                           ▼
+                    new URL(raw).replace(/\/+$/, '')
+                                           │
+                                           ▼
+                          transport opens connection here
+```
+
+#### The inbound origin — deriving the OAuth redirect URI
+
+This is the subtler routing decision, and the one that fails silently if you get it wrong. The OAuth flow needs a callback URL to hand to Bloomreach. If you hardcode it to `APP_ORIGIN`, then any request that lands on a preview deployment (`blooming-insights-git-branch-user.vercel.app`) initiates an OAuth flow whose callback lands on production (`APP_ORIGIN`). Different origin, different cookie jar, `bi_session` cookie doesn't come along — the callback route sees "no session" and 400s.
+
+The fix — derive the callback origin from the actual inbound request. Vercel's edge inserts `x-forwarded-host` and `x-forwarded-proto` when it hands the request to the route. From `lib/mcp/connect.ts:50-71`:
 
 ```ts
-  async function redirectUri(): Promise<string> {
-    // In production, derive the redirect from the ACTUAL request host so the OAuth
-    // callback returns to the same origin that set the session cookie…
-    if (process.env.NODE_ENV === 'production') {
-      try {
-        const { headers } = await import('next/headers');
-        const h = await headers();
-        const host = h.get('x-forwarded-host') ?? h.get('host');
-        if (host) {
-          const proto = h.get('x-forwarded-proto') ?? 'https';
-          return `${proto}://${host}/api/mcp/callback`;
-        }
-      } catch { /* not in a request scope — fall through to APP_ORIGIN */ }
+async function redirectUri(): Promise<string> {
+  // In production, derive the redirect from the ACTUAL request host so the OAuth
+  // callback returns to the same origin that set the session cookie — preview
+  // deployments and the production alias both work (DCR registers each host's
+  // redirect URI on the fly). Without this, opening a per-deploy URL while the
+  // callback goes to APP_ORIGIN drops the cookie → "no session". Locally we use
+  // APP_ORIGIN (http://localhost), since there's no forwarded host.
+  if (process.env.NODE_ENV === 'production') {
+    try {
+      const { headers } = await import('next/headers');
+      const h = await headers();
+      const host = h.get('x-forwarded-host') ?? h.get('host');
+      if (host) {
+        const proto = h.get('x-forwarded-proto') ?? 'https';
+        return `${proto}://${host}/api/mcp/callback`;
+      }
+    } catch {
+      /* not in a request scope — fall through to APP_ORIGIN */
     }
-    return `${process.env.APP_ORIGIN ?? 'http://localhost:3000'}/api/mcp/callback`;
   }
+  return `${process.env.APP_ORIGIN ?? 'http://localhost:3000'}/api/mcp/callback`;
+}
 ```
 
-Trace what happens without this. Suppose `APP_ORIGIN=https://blooming.app`
-but the user opened a preview deploy at
-`https://blooming-git-feature-xyz.vercel.app`:
+Read it as another precedence chain: `x-forwarded-host` → `host` → `APP_ORIGIN` → localhost default. Same pattern as `mcpUrl` — first match wins, sensible default at the bottom.
+
+The load-bearing detail: **DCR (Dynamic Client Registration) registers each host's redirect URI on the fly.** Bloomreach's OAuth server sees a request from a new preview deployment, registers that host's redirect URI in the client info, and issues tokens tied to that redirect URI. If the redirect URI in the callback doesn't match what was registered during connect, the token exchange fails. That's why deriving from the actual inbound host matters — the OAuth flow's two legs (`/connect` and `/callback`) have to agree on the redirect URI, and if you hardcode it, you're forcing every deployment onto the same origin.
 
 ```
-  Without x-forwarded-host — the cookie drops
+  Inbound origin — deriving the callback URL
 
-  1. user hits blooming-git-feature-xyz.vercel.app/           ← sets bi_session cookie for THIS host
-  2. clicks "connect Bloomreach"
-  3. server generates authorize URL with redirect_uri = https://blooming.app/api/mcp/callback
-  4. browser redirects to Bloomreach IdP
-  5. IdP redirects to https://blooming.app/api/mcp/callback   ← different host!
-  6. bi_session cookie was set for blooming-git-feature-xyz.vercel.app, NOT sent
-  7. callback lands with no session → 400 "no session"
+  browser ──HTTPS──► Vercel edge ──HTTP──► route function
+                          │                       │
+                          │ inserts:              │
+                          │   x-forwarded-host    │
+                          │   x-forwarded-proto   │
+                          ▼                       ▼
+                   ┌──────────────────────────────────┐
+                   │  redirectUri() {                 │
+                   │    const host =                  │
+                   │      h.get('x-forwarded-host')   │
+                   │      ?? h.get('host');           │
+                   │    return `${proto}://${host}    │
+                   │            /api/mcp/callback`;   │
+                   │  }                               │
+                   └──────────────────────────────────┘
+                          │
+                          ▼
+                   hand to Bloomreach OAuth server as
+                   the `redirect_uri` parameter
 ```
 
-With the header-based derivation, step 3 uses the preview host, step 5
-lands on the same preview host, step 6 sends the cookie, step 7 succeeds.
-DCR handles the fact that each host registers its own redirect_uri
-on the fly (each preview deploy runs its own Dynamic Client Registration
-with its own redirect_uri — the Bloomreach IdP accepts it).
+#### Client-side DNS — none
 
-Layers and hops for the OAuth roundtrip:
+The browser-side of this repo doesn't do explicit DNS lookups. All `fetch()` calls in the client hooks are relative paths (`/api/briefing`, `/api/mcp/reset`, etc.), so the browser reuses the connection to whatever origin loaded the page. The one exception is the OAuth authorize-URL redirect — when the route returns `{ needsAuth: true, authUrl: '<bloomreach-idp-url>' }`, the browser does `window.location.href = authUrl`, which is a top-level navigation. That's where the browser resolves Bloomreach's IdP hostname.
 
-```
-  OAuth callback — the cookie has to survive a cross-site round trip
+From `lib/hooks/useBriefingStream.ts:173-181`:
 
-  ┌─ Browser ─────────┐  hop 1: /api/briefing                    ┌─ Route ────────┐
-  │  bi_session=abc   │ ────────────────────────────────────────► │  connectMcp()  │
-  │                    │  hop 2: 401 needsAuth + authorize URL     │  no tokens →   │
-  │                    │ ◄──────────────────────────────────────── │  return authUrl│
-  └───┬──────────────┘                                            └────────────────┘
-      │  hop 3: 302 to authorize URL
-      ▼
-  ┌─ Bloomreach IdP ──────────────────────────────────────────────┐
-  │  user authenticates                                             │
-  └───┬────────────────────────────────────────────────────────────┘
-      │  hop 4: 302 to redirect_uri (SAME HOST as hop 1!)
-      │        Cookie: bi_session=abc   ← SameSite=None + Secure lets it ride
-      ▼
-  ┌─ Same Route — /api/mcp/callback ────────────────────────────────┐
-  │  readSessionId() → 'abc'                                         │
-  │  completeAuth('abc', code) → tokens saved to bi_auth cookie      │
-  │  302 to /                                                        │
-  └──────────────────────────────────────────────────────────────────┘
+```ts
+if (res.status === 401) {
+  const body = await readBody(res);
+  if (body?.needsAuth && body?.authUrl) {
+    window.location.href = body.authUrl as string;
+    return;
+  }
+  // ...
+}
 ```
 
-Two things had to be right for this to work:
-  - **redirect_uri = same host as the initial visit** (the
-    `x-forwarded-host` derivation)
-  - **cookies allow cross-site return** (`SameSite=None; Secure`;
-    see 05)
+That's the entire client-side DNS story: implicit, browser-managed, one lookup for the IdP origin during the OAuth handoff.
 
-Either wrong, the callback lands with no session.
+#### Node-side DNS — implicit through `fetch`
 
-#### The Anthropic origin
+The route uses Node's `undici`-backed global `fetch`. DNS resolution is delegated to `dns.lookup` (the OS resolver), cached briefly by Node's default resolver (usually seconds, not minutes). No explicit `dns.setServers`, no `dnscache`, no `/etc/hosts` munging. If Bloomreach's DNS goes down, the fetch would fail with `ENOTFOUND` and the `SdkTransport.callTool` catch would surface it as an HTTP error via the captured body path (`lib/mcp/transport.ts:105-118`).
 
-The SDK owns this. `new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })`
-at `briefing/route.ts:256` and `agent/route.ts:244` — no `baseURL`
-override anywhere in the repo. Default is `api.anthropic.com`. The SDK
-handles connection pooling, HTTP/2 (if the platform supports it), and
-retry — all opaque to the app.
-
-#### Vercel edge as an implicit hop
-
-There's an unnamed hop before the route in production: Vercel's edge
-network terminates TLS, adds `x-forwarded-*` headers, and forwards to
-the Node runtime. The code sees `x-forwarded-host` because Vercel puts
-it there. On a self-hosted deployment (bare Node), you'd read `host`
-directly (the fallback at `connect.ts:47`).
+No SRV records, no service discovery, no consul. Origins are hardcoded HTTPS URLs; that's the whole address book.
 
 ### Move 3 — the principle
 
-Static config for stable origins, per-request derivation for the one
-URL that has to match the browser's current host. This pattern shows
-up any time OAuth meets multi-environment deploys — the redirect URI
-is the single per-request value in an otherwise env-driven set.
+**When the address is a decision, put the decision in a precedence chain with a sane default at the bottom.** Both routing decisions in this repo use the same shape: user override wins, then env, then a hardcoded default that keeps the app runnable out of the box. The default isn't the identity — it's the sensible starting point. Making it a preset means shipping a fresh clone that works, while keeping every layer of the code (data source, auth provider, retry ladder) generic over the actual origin.
 
 ## Primary diagram
 
-The full origin-resolution recap:
-
 ```
-  Primary — how each origin is resolved
+  DNS & routing — the full picture
 
-  ┌─ Browser ────────────────────────────────────────────────────┐
-  │  same-origin: /api/briefing, /api/agent, /api/mcp/*           │
-  └───────────────────────────┬──────────────────────────────────┘
-                              │
-  ┌─ Next route ──────────────▼──────────────────────────────────┐
-  │                                                                │
-  │  hop 2 origin  ──► mcpUrl()                                    │
-  │                    reads BLOOMREACH_MCP_URL                     │
-  │                    strips trailing slash → avoids 307           │
-  │                                                                │
-  │  callback URI  ──► redirectUri()                               │
-  │                    prod: x-forwarded-host + x-forwarded-proto   │
-  │                    dev:  APP_ORIGIN                             │
-  │                                                                │
-  │  hop 3 origin  ──► Anthropic SDK default                       │
-  │                    api.anthropic.com                            │
-  │                                                                │
-  └──────────────────────────────────────────────────────────────┘
+  ┌─ Client band ──────────────────────────────────────────────┐
+  │  fetch('/api/briefing?…')          ← relative path,        │
+  │                                      no DNS involved       │
+  │                                                            │
+  │  window.location.href = authUrl    ← top-level nav,        │
+  │                                      browser DNS lookup    │
+  │                                      for Bloomreach IdP    │
+  └──────────────────────────────┬─────────────────────────────┘
+                                 │
+                                 ▼
+  ┌─ Edge band (Vercel) ───────────────────────────────────────┐
+  │  routes to Node function by deploy hostname                │
+  │  inserts:                                                  │
+  │    x-forwarded-host  = <actual inbound host>               │
+  │    x-forwarded-proto = 'https'                             │
+  │  TLS terminated here                                       │
+  └──────────────────────────────┬─────────────────────────────┘
+                                 │
+                                 ▼
+  ┌─ Service band (route function) ────────────────────────────┐
+  │                                                            │
+  │  OUTBOUND URL SELECTION                                    │
+  │  ────────────────────                                      │
+  │  mcpUrl(override):                                         │
+  │    override.url                                            │
+  │      ?? MCP_URL                                            │
+  │      ?? BLOOMREACH_MCP_URL                                 │
+  │      ?? 'https://loomi-mcp-alpha.bloomreach.com/mcp/'      │
+  │    → strip trailing slash                                  │
+  │    → new URL()                                             │
+  │                                                            │
+  │  INBOUND ORIGIN DERIVATION                                 │
+  │  ─────────────────────────                                 │
+  │  redirectUri() (prod only):                                │
+  │    h.get('x-forwarded-host') ?? h.get('host')              │
+  │      → build `${proto}://${host}/api/mcp/callback`         │
+  │    fallback: APP_ORIGIN                                    │
+  │                                                            │
+  │  Node's global fetch → OS dns.lookup                       │
+  │                          (cached briefly, no explicit      │
+  │                           override)                        │
+  └──────────┬─────────────────────────────┬───────────────────┘
+             │                             │
+             │ hop 2: HTTPS to picked MCP  │ hop 3: HTTPS to
+             │ origin (dynamic per request)│ api.anthropic.com
+             ▼                             │ (hardcoded in SDK)
+   ┌─ MCP server ──────────┐               ▼
+   │  Bloomreach loomi     │       ┌─ Anthropic API ───┐
+   │  (preset default) or  │       │  api.anthropic.com│
+   │  arbitrary HTTPS MCP  │       │  (SDK-managed URL)│
+   └───────────────────────┘       └───────────────────┘
 ```
 
 ## Elaborate
 
-Why is redirect_uri derivation not just `NEXT_PUBLIC_APP_URL`? Because
-Vercel gives every push a fresh preview hostname. You'd have to redeploy
-the env var for every preview, and even then the *production alias* and
-the *production deploy URL* are two different hostnames. `x-forwarded-host`
-is the only value that always names the host the browser is currently
-looking at.
+**Why precedence chains at all.** Any config value that might legitimately want to be overridden at three different layers (deploy-time env, request-time header, code default) needs a chain. The alternative — a single source of truth — either forces every user to fork the code (if the default is hardcoded) or breaks the "works out of the box" property (if the default is unset). Chains are the smallest thing that composes all three.
 
-Where DNS *would* matter but doesn't yet:
+**What DCR (Dynamic Client Registration) buys you.** RFC 7591 lets an OAuth client register itself with the authorization server at runtime, sending its metadata (including `redirect_uris`) and receiving back a `client_id`. Without DCR, every deployment would need to be pre-registered with Bloomreach — which means every preview URL needs a config change on Bloomreach's side. With DCR, the code registers on the fly and Bloomreach accepts the redirect URI it just registered. That's what makes the `x-forwarded-host` trick work — the code can register a preview deployment's callback URI right before requesting an auth code, and the exchange works because the URIs match.
 
-  - **DNS pinning** — if the app cached the resolved IP for an origin,
-    it'd survive DNS-level outages of one CDN pop. Not exercised.
-  - **Custom resolver** — you'd use `dns.resolve` in Node with a
-    specific resolver for privacy. Not exercised.
-  - **Geo-DNS** — Bloomreach and Anthropic handle this at their edge;
-    the app never sees the resolution decision.
+**On the client side, why relative paths matter.** Every browser `fetch('/api/…')` reuses the origin the page was loaded from, so if a user opens a preview deployment, the fetch calls stay on the preview deployment. The alternative — hardcoding `APP_ORIGIN` on the client — would send preview-deploy traffic to production, mixing cookies across origins. Relative paths are how you keep the browser and the callback on the same origin without any explicit routing logic.
 
-Where routing *would* matter but doesn't yet:
-
-  - **Per-region routing** — Vercel edge steers requests to nearest
-    region; no route runs `export const runtime = 'edge'`, so all
-    routes hit Node in a single region.
-  - **Load balancer** — no self-managed LB; Vercel handles it.
+**What's not exercised.** No SRV records, no service discovery, no CNAMEs pointing at internal LB names, no `dns.setServers`, no custom resolver. Origins are named hosts in code or config. Would become interesting if this app grew a per-region MCP tier, at which point service discovery (or a CNAME dance with region-affinity) would show up.
 
 ## Interview defense
 
-**Q: How does the OAuth callback know which URL to redirect to when
-the same code runs on production, preview, and localhost?**
+**Q: The OAuth callback works on your production alias but not on a preview deployment — walk me through what's happening.**
 
-  Verdict first: it derives the redirect URI from `x-forwarded-host`
-  per request, not from a static env var. That's the only way the
-  preview deploys and the production alias can both work with the same
-  code path.
+The callback URI has to match between the `/connect` leg (where you register with the IdP) and the `/callback` leg (where you exchange the code). If you hardcode `APP_ORIGIN` in the redirect, both legs use the production origin, but the browser landed on a preview deployment — so the `bi_session` cookie set on the preview host doesn't come along when the browser redirects to the production origin. Callback route sees "no session" and 400s.
+
+Fix: derive the redirect URI from `x-forwarded-host` in production (Vercel's edge inserts it). Then both legs agree on which origin they're using, DCR registers the preview host's URI on the fly, and the cookie stays scoped to the preview deployment.
 
 ```
-  answer sketch — three environments, one derivation
-
-  localhost         → APP_ORIGIN env  (no forwarded headers)
-  vercel preview    → x-forwarded-host = blooming-git-xyz.vercel.app
-  production        → x-forwarded-host = blooming.app
-
-  redirect_uri = ${proto}://${host}/api/mcp/callback
-  DCR registers whichever the current request presents
+  Without x-forwarded-host                With x-forwarded-host
+  ────────────────────────                ─────────────────────
+  browser on preview ─► /connect          browser on preview ─► /connect
+    redirect_uri = APP_ORIGIN               redirect_uri = preview host
+                                                     │
+  IdP redirects to APP_ORIGIN             IdP redirects to preview host
+    /callback ← different origin!           /callback ← same origin ✓
+    bi_session cookie missing               bi_session cookie present
+    → "no session"                          → completeAuth succeeds
 ```
 
-  Anchor: `lib/mcp/connect.ts:36-57`, `redirectUri()`.
+Anchor: `lib/mcp/connect.ts:57-70`.
 
-**Q: Why strip the trailing slash off the MCP URL?**
+**Q: If I set `MCP_URL=https://my-server/mcp` at deploy time, but the user has a persisted config with `url: 'https://other/mcp'` — which wins?**
 
-  Direct: the server answers `.../mcp/` with a `307 Temporary Redirect`
-  to `.../mcp`. If we left the slash in, every single MCP call would
-  cost one extra round-trip, and the SDK doesn't guarantee the `Authorization`
-  header survives redirects. One `.replace(/\/+$/, '')` at construction
-  time removes the whole class of problem.
+The user's persisted config, because it's per-request (rides the `x-bi-mcp-config` header) and the precedence chain in `mcpUrl` puts `override.url` first. If the user clears their persisted config (or never set one), the header is omitted, `decodeConfigHeader` returns `null`, `override.url` is undefined, and `MCP_URL` env wins.
 
-  Anchor: `lib/mcp/connect.ts:33`, `mcpUrl()`.
+The chain is: `override.url` → `MCP_URL` → `BLOOMREACH_MCP_URL` (legacy) → hardcoded default. First match wins.
+
+Anchor: `lib/mcp/connect.ts:38-48`.
+
+**Q: Where does DNS actually happen in this stack?**
+
+Three places, all implicit. The browser resolves the deploy hostname when the user first loads the page (and again for a top-level nav to the OAuth IdP). The route's outbound `fetch` calls resolve Bloomreach and `api.anthropic.com` through Node's `undici`, which uses the OS resolver (`dns.lookup`). Vercel's edge resolves internally when routing to the function.
+
+No explicit DNS caching, no service discovery, no CNAMEs pointing at internal LB names. All origins are hardcoded HTTPS URLs (or, for MCP, resolved by the precedence chain then handed to `new URL()` and to `fetch`).
 
 ## See also
 
-  - `01-network-map.md` — where these origins fit in the three-hop map
-  - `04-tls-and-trust-establishment.md` — the cookie that survives the callback
-  - `05-http-semantics-caching-and-cors.md` — SameSite=None; Secure details
+- `01-network-map.md` — the full topology; this file zooms into the addressing layer of that map
+- `05-http-semantics-caching-and-cors.md` — how the `x-forwarded-*` headers relate to cookie scoping
+- `04-tls-and-trust-establishment.md` — where TLS terminates on the inbound side (right at the edge, which is why `x-forwarded-proto` exists)

@@ -1,105 +1,144 @@
-# 08 — Query rewriting and HyDE
+# Query rewriting and HyDE
 
-**Type:** Industry standard. Also called: query expansion, hypothetical document embeddings.
+## Subtitle
+
+Query augmentation for retrieval / hypothetical document embeddings — Industry standard.
 
 ## Zoom out, then zoom in
 
-**Not exercised in this codebase.** User queries are usually short; docs are long. Rewriting closes the query-doc size gap.
+User queries are short and ambiguous ("fix the auth thing"). Documents are long and specific. The embedding-space distance between them is often larger than it should be. Two mitigations: **query rewriting** (LLM expands the query to something more retrievable) and **HyDE** (LLM writes a hypothetical answer, embeds that, retrieves docs close to it).
+
+```
+  Zoom out — where these live
+
+  ┌─ Query ─────────────────────────────────────────┐
+  │  "fix the auth thing" ← short, ambiguous         │
+  └──────────┬──────────────────────────────────────┘
+             │
+             ▼
+  ┌─ Rewrite OR HyDE ★ ─────────────────────────────┐ ← we are here
+  │  · rewrite: LLM expands to a fuller query        │
+  │  · HyDE:    LLM writes a hypothetical doc,       │
+  │             embed that instead                    │
+  └──────────┬──────────────────────────────────────┘
+             │
+             ▼
+  ┌─ Retrieval (embed + cosine or hybrid) ──────────┐
+  └─────────────────────────────────────────────────┘
+```
 
 ## Structure pass
 
-Axis: what does the query look like to the embedding model? Short and ambiguous is hard to match against long dense docs. Rewrite or hypothetical-doc-generation closes the gap.
+- **Layers:** raw query → augmentation LLM → retrieval → docs. Four bands.
+- **Axis: closeness in embedding space.** Raw query embeds far from doc embeddings; augmented query embeds closer.
+- **Seam:** the augmentation LLM call. It's a cheap Haiku-tier call that bridges the query/doc mismatch.
 
 ## How it works
 
-### Move 1
+### Move 1 — the mental model
 
-The query "fix auth thing" is short and vague. Docs about authentication debugging are long and specific. Embedding both maps them to different regions of vector space. Rewriting or HyDE bridges this.
+**Query rewrite.** Ask an LLM: "expand this query with related terms and specifics." Take the expanded text, embed *that*, retrieve.
+
+**HyDE.** Ask an LLM: "write a hypothetical answer to this query." Embed the hypothetical answer, retrieve docs whose embeddings are close to the hypothetical answer's embedding.
 
 ```
-  Two approaches
+  Two augmentation shapes — sketched
 
-  query rewriting: query → LLM → longer retrievable query
-    "fix auth thing" → "how to debug authentication token verification errors"
-    embed the rewritten query, retrieve.
+  raw:  "fix the auth thing"
 
-  HyDE (Hypothetical Document Embeddings):
-    query → LLM → hypothetical answer paragraph
-    embed the hypothetical, retrieve docs similar to it.
+  rewrite:
+    LLM → "how to debug authentication token verification errors"
+    embed rewrite, retrieve
+
+  HyDE:
+    LLM → "To debug auth, check the token signature against the JWT
+           secret in the env file. Common causes include expired
+           tokens, mismatched clock skew, and misconfigured issuers."
+    embed HyDE output, retrieve
 ```
 
-### Move 2
+HyDE wins when queries are short and answers are long — the answer embedding lands in the same region of the space as real answer docs.
 
-**Query rewriting.** Short LLM call: "expand this query into a longer, more retrievable form." Result: same intent, longer, more terms overlapping with docs.
+### Move 2 — the step-by-step walkthrough
 
-**HyDE.** LLM writes a hypothetical answer to the query. Embed that hypothetical, retrieve docs similar to it. The hypothetical is a "doc-shaped query" — closer to what real docs look like in embedding space.
+**Cost.** Every query pays for one extra LLM call (~$0.0005 on Haiku). At high query rate, the added cost adds up; at low query rate, it's noise.
 
-**Cost.** Both add an LLM call per query. That's ~$0.001-0.005 with Sonnet, or ~$0.0001-0.0005 with Haiku. Fine if retrieval quality is the bottleneck; wasteful if it isn't.
+**Where blooming would use rewrite.** The QueryBox — free-form user text like "why did revenue drop." Rewrite could add "conversion_rate purchase revenue period-over-period 90d" as retrievable EQL terms. But this only helps if there's a retrieval step to help; today there isn't.
 
-### Move 3
+**Where blooming would use HyDE.** Rare in this codebase's would-be shape. HyDE works when queries and docs have different vocabularies (user question vs internal doc); investigation memory has similarly-shaped input on both sides.
 
-Add when measured. If your recall@k drops on short queries but climbs on long queries, rewriting or HyDE gives you the long-query behavior on all queries.
+**Implementation shape.**
+
+```
+  rewriteQuery(rawQuery):
+    prompt = "Expand this analytics query with related metric names,
+              event types, and time-range terms. Return only the
+              expanded query."
+    return anthropic.messages.create(model=haiku, prompt=[rawQuery, ...])
+
+  hydeRetrieve(rawQuery, index, k=3):
+    hypotheticalAnswer = anthropic.messages.create(
+      model=haiku,
+      prompt="Write a paragraph that would answer this query: " + rawQuery
+    )
+    return index.search(embed(hypotheticalAnswer), k)
+```
+
+### Move 3 — the principle
+
+Query augmentation is worthwhile only when measured retrieval quality is poor. It's a Haiku-cost knob that trades a small per-query cost for measurable recall improvement. Add it after you can prove the baseline retrieval isn't good enough.
 
 ## Primary diagram
 
 ```
-  Query rewriting
+  Query augmentation — full frame
 
-  short user query
-        │
-        ▼
-    LLM rewrite (~$0.001)
-        │
-        ▼
-    longer, more retrievable query
-        │
-        ▼
-    embed → retrieve
+  ┌─ Raw query ────────────────────────────────────────┐
+  │  "why did mobile revenue drop"                      │
+  └────────┬───────────────────────────────────────────┘
+           │
+    ┌──────┴──────┐
+    ▼             ▼
+  rewrite path  HyDE path
 
-  HyDE
+  rewrite:                          HyDE:
+    → LLM rewrites w/ metric names   → LLM writes hypothetical answer
+    → embed rewrite                  → embed hypothetical
+    → retrieve                       → retrieve
 
-  short user query
-        │
-        ▼
-    LLM generate hypothetical answer (~$0.005)
-        │
-        ▼
-    "hypothetical" text
-        │
-        ▼
-    embed → retrieve docs similar to it
+  Both add: latency (one Haiku call, ~200ms), cost (~$0.0005).
+  Both earn: measurable recall improvement on ambiguous queries.
 ```
 
 ## Elaborate
 
-HyDE was published in 2022 (Gao et al.). It works because the embedding space's structure captures "what real docs look like" more than "what short user queries look like." The hypothetical mimics the shape of real docs and lands closer to real docs in the space.
+HyDE was proposed by Gao et al. 2022. Query rewriting predates it by decades in classical IR. Both patterns are cheap to implement and easy to measure — the key discipline is measuring before adding.
+
+Related: **05-dense-vs-sparse.md** (sparse doesn't need query augmentation — it works on token overlap directly), **11-rag.md** (where augmentation feeds).
 
 ## Project exercises
 
-### Exercise — query rewriting on the past-investigation RAG
+### B3.8 · Add query rewrite to the QueryBox path
 
-- **Exercise ID:** C2.11-B · Case B (RAG not exercised).
-- **What to build:** if the RAG stack from `01-04` is present, add a Haiku call that rewrites the current anomaly's description into a longer, more retrievable form BEFORE embedding it for the "similar past investigations" panel. Measure recall@3 with and without.
-- **Why it earns its place:** shows you know the query-doc size gap is a real problem. Interviewer signal: "I bridged the query-doc gap when recall was low on short queries."
-- **Files to touch:** `lib/rag/rewrite.ts` (new), `lib/rag/retrieve.ts` (chain).
-- **Done when:** report shows recall@3 with and without rewriting on 10 queries.
-- **Estimated effort:** 1-4hr.
+- **Exercise ID:** B3.8 (Case B — depends on retrieval landing)
+- **What to build:** Once retrieval lands (e.g., investigation memory per B3.1), add a Haiku rewrite step for QueryBox queries before retrieval. Compare hit@3 before and after on 30 hand-labeled queries.
+- **Why it earns its place:** Cheap, measurable augmentation. Interview payoff: "here's how I'd measure whether it earns its place."
+- **Files to touch:** `lib/agents/query.ts`, new `lib/agents/rewrite.ts` (Haiku-only helper).
+- **Done when:** the rewrite step is A/B-comparable via env flag; the eval reports hit@3 delta.
+- **Estimated effort:** `1–2 days`.
 
 ## Interview defense
 
-**Q: Rewriting vs HyDE?**
+**Q: Rewrite or HyDE — which would you pick?**
 
-Rewriting is safer — it's still a query, just longer. HyDE is more aggressive — it's a hypothetical answer, which can hallucinate and pull retrieval off-topic if the LLM guesses wrong. I'd default to rewriting and reach for HyDE only when rewriting doesn't move the needle.
+Depends on the mismatch shape. If queries and docs have similar vocabulary (they're both diagnoses), rewrite wins because it stays in the same shape. If queries are questions and docs are answers, HyDE wins because it transforms the query into the doc shape. Measure both if you can.
 
-**Q: Extra cost per query worth it?**
+**Q: What if the LLM rewrite invents wrong terms?**
 
-Depends on the miss rate. If recall@k is already 90%, no. If it's 60% because queries are short, yes — the extra ~$0.001 is trivial relative to a real recall win.
-
-**Q: Where does this fit relative to hybrid retrieval?**
-
-Orthogonal. Rewrite the query first, then hybrid-retrieve. Both moves target different failure modes (dense-only vs short-query).
+Real risk. If the rewrite adds terms that aren't in the corpus, retrieval fetches nothing or the wrong things. Mitigations: constrain the rewrite prompt with domain vocabulary ("only use terms from: [event names, metric names]"), or use the raw query as a fallback if the rewrite retrieves nothing.
 
 ## See also
 
-- `05-dense-vs-sparse.md` — the retrieval this feeds
-- `01-llm-foundations/07-heuristic-before-llm.md` — same "cheap LLM in front" pattern
+- [11-rag.md](11-rag.md) — the pipeline this feeds.
+- [07-reranking.md](07-reranking.md) — the sibling knob at the other end of the pipeline.
+- [05-dense-vs-sparse.md](05-dense-vs-sparse.md) — the sparse alternative that avoids augmentation altogether.

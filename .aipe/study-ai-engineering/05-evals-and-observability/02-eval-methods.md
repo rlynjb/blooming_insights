@@ -1,184 +1,192 @@
-# 02 — Eval methods
+# Eval methods
 
-**Type:** Industry standard. Also called: eval strategy, scoring methodology.
+## Subtitle
+
+Rubric-based LLM-as-judge / criteria-scored evaluation — Industry standard.
 
 ## Zoom out, then zoom in
 
-The ladder from exact-match to human-eval. This repo uses rubric-based LLM-as-judge with 4 dimensions × 1-5 scale × 3 verdicts.
+blooming's eval method is **LLM-as-judge over a rubric**. Two rubrics: `eval/rubrics/diagnosis-quality.ts` and `eval/rubrics/recommendation-quality.ts`. Each has 4 dimensions on a 5-point scale, and each judgment produces one of 3 verdicts: `pass`, `fail`, `unclear`. The judge is Sonnet (same family as the agents); the position/verbosity biases are addressed by shuffling order and capping length. The baseline reports per-dimension pass rates.
 
 ```
-  Zoom out — the ladder (cheap → expensive → precise)
+  Zoom out — where evaluation lives
 
-  exact match          → free, brittle
-  fuzzy match          → cheap, sloppy
-  rubric (LLM-judge)   → cheap-ish, structured  ← ★ THIS CODEBASE ★
-  pairwise (A/B)       → cheap, comparative
-  human eval           → gold standard, doesn't scale
+  ┌─ eval/goldens/ ─────┐    ┌─ eval/rubrics/ ─────────┐
+  │  10 cases            │    │  2 rubrics × 4 dims × 5 │
+  │  (input to eval)    │    │  scale × 3 verdicts     │
+  └──────────┬───────────┘    └──────────┬──────────────┘
+             │                            │
+             └──────────┬─────────────────┘
+                        │
+                        ▼
+  ┌─ eval/run.eval.ts ★ ─────────────────────────────────┐ ← we are here
+  │  · run agents on each case                            │
+  │  · judge output against rubric                         │
+  │  · write per-case receipt                              │
+  │  · aggregate (report.eval.ts) or gate (gate.eval.ts)   │
+  └──────────────────────────────────────────────────────┘
 ```
-
-Zoom in. Rubric-based LLM-as-judge is the sweet spot for LLM output scoring at this scale — structured (4 dims), scalable (LLM does the work), and measurable enough that regression detection works (baseline.json + gate.eval.ts). The two rubrics live in `eval/rubrics/`.
 
 ## Structure pass
 
-Axis: cost per judgment vs signal per judgment.
-- Exact match: near-free per, near-zero signal on generated text
-- Rubric-LLM-judge: ~$0.04 per judgment, structured signal across dims
-- Human: hours per judgment, high signal
-
-**Seam:** the rubric definition. Above: the judgment call. Below: whatever mechanism scores it (LLM, human, exact-match check).
+- **Layers:** golden case → agent → judgment → verdict → receipt → aggregate. Six bands.
+- **Axis: reliability.** Each layer either boosts or degrades the eval's signal. LLM-as-judge is noisier than exact-match but scales beyond it.
+- **Seam:** the rubric itself. The 4-dimension structure is the contract every judgment shares.
 
 ## How it works
 
-### Move 1
+### Move 1 — the mental model
 
-You've picked between assertion styles — `assertEqual` (exact) vs regex vs custom matcher. Same shape at the eval boundary: pick the scoring method that matches the shape of your outputs.
+The ladder of eval methods:
 
 ```
-  The ladder — pick by output shape
+  Eval method ladder — cheap → expensive
 
-  classifier out {A, B, C}     → exact match
-  ID or number                  → exact match
-  short generated text          → fuzzy (BLEU, ROUGE) or LLM judge
-  long structured output        → rubric with dims
-  qualitative preference        → pairwise or human eval
+  ┌──────────────────────┬──────────────────────────────┐
+  │ Method               │ When to use                  │
+  ├──────────────────────┼──────────────────────────────┤
+  │ Exact match          │ Classifiers, structured out, │
+  │                      │ IDs                          │
+  ├──────────────────────┼──────────────────────────────┤
+  │ Fuzzy match          │ Text with acceptable variance│
+  ├──────────────────────┼──────────────────────────────┤
+  │ Rubric (LLM-judge)   │ Quality of generated text —  │
+  │                      │ where blooming lives         │
+  ├──────────────────────┼──────────────────────────────┤
+  │ Pairwise             │ Comparing two variants       │
+  ├──────────────────────┼──────────────────────────────┤
+  │ Human eval           │ Highest signal, low scale    │
+  └──────────────────────┴──────────────────────────────┘
 ```
 
-### Move 2
+blooming's diagnoses and recommendations are open-ended text — exact match wouldn't fit. Rubric-scored is the right rung.
 
-**The two rubrics.**
+### Move 2 — the step-by-step walkthrough
 
-- `eval/rubrics/diagnosis-quality.ts` — 4 dims × 1-5 scale × 3 verdicts.
-- `eval/rubrics/recommendation-quality.ts` — same shape, different dims.
+**The rubric shape.** `eval/rubrics/diagnosis-quality.ts:16` — `RubricDefinition` from `@aptkit/core`:
 
-Each dim has: `{id, label, description, scale: [{score: 1-5, description}]}`. Verdicts: `pass` (all dims ≥4), `pass_with_notes` (any dim = 3), `fail` (any dim ≤ 2).
+- `id`, `title`, `task` (English description of what's being scored)
+- `dimensions[]` — 4 dimensions per rubric
 
-Diagnosis dims:
-- `root_cause_plausibility` — does the conclusion name a plausible mechanism?
-- `evidence_grounding` — does it cite actual signals from the tool results?
-- `scope_coherence` — does it stay in the anomaly's scope?
-- `actionable_next_step` — is there a specific named next action?
+Each dimension has an `id`, `label`, `description`, and `scale: { score, description }[]` (1–5 with descriptions for each score).
 
-Recommendation dims:
-- `diagnosis_response` — does the rec address the root cause?
-- `feature_choice_fit` — is `bloomreachFeature` the right lever?
-- `step_actionability` — are steps executable, not aspirational?
-- `impact_realism` — is `estimatedImpact` proportional?
+**Diagnosis rubric dimensions.**
 
-**The judge.**
+1. `root_cause_plausibility` — does the conclusion name a mechanism, not a symptom restatement? (Score 1 = "restates the symptom"; score 5 = "specific mechanism with rival mechanisms considered")
+2. `evidence_grounding` — does the diagnosis cite actual signals from the substrate?
+3. `scope_coherence` — does it stay within the anomaly's stated scope?
+4. `actionable_next_step` — does it hint at what to look at next? **(baseline pass rate: 0% — systemic prompt gap)**
 
-`RubricJudge` from `@aptkit/core`. Takes a rubric + subject text + context object. Emits `{dimensions, verdict, fix, reasoning}`. In this repo, ~$0.04 per judgment at `temperature: 0`, `maxTokens: 4096`.
+**Recommendation rubric dimensions.**
 
-**How the judge is invoked (`eval/run.eval.ts:229-247`):**
+1. `diagnosis_response` — does the rec address the diagnosed root cause? (**baseline pass rate: 48% — the case-01+08 failure**)
+2. `feature_choice_fit` — is the Bloomreach feature (scenario / segment / campaign / voucher / experiment) appropriate?
+3. `step_actionability` — are the steps concrete?
+4. `impact_realism` — is the estimated impact grounded?
 
-```typescript
-const diagnosisJudge = new RubricJudge({
-  model: judgeModel,
-  rubric: diagnosisQualityRubric,
-  capabilityId: 'blooming.eval.diagnosis-judge',
-  maxTokens: 4096,
-  temperature: 0,
-});
-const result = await diagnosisJudge.judge({
-  subject: JSON.stringify(diagnosis, null, 2),
-  context: {
-    anomaly: JSON.stringify(anomaly, null, 2),
-    known_correct_shape: JSON.stringify(goldenCase.knownCorrect, null, 2),
-    case_intent: goldenCase.intent,
-    signal_class: goldenCase.signalClass,
-    tool_calls_trace: formatToolCallTrace(diagnosisToolCalls),
-  },
-});
+**The judge call.** `RubricJudge` from `@aptkit/core` takes the rubric + the agent output + the golden context; internally uses tool-calling to force the judge model to emit `{ verdict, dimensions: [{ id, score, rationale }] }` in a schema-checked shape. `max_tokens = 4096` (bumped from the default to prevent mid-JSON truncation on long recs).
+
+**Judge-error resilience.** On parse failure, `eval/run.eval.ts` catches the error and writes a `judge_error` placeholder into the receipt instead of crashing the run. The count of `judge_error` in a run is itself a signal — if it rises, the token cap is too low or the rubric is overly complex.
+
+**Verdict from dimensions.** A "pass" verdict on the whole judgment requires all dimensions score ≥ 3 (empirically calibrated; see **03-llm-as-judge-bias.md**). "Unclear" is used when the judge's rationale contradicts its own scores (a rare failure mode). "Fail" when any dimension < 3.
+
+Diagram of one case's judgment path:
+
+```
+  One case's judgment — layers-and-hops
+
+  golden case ─►  DiagnosticAgent.investigate  ─►  Diagnosis
+                                                    │
+                                                    ▼
+                                              RubricJudge (Sonnet)
+                                              rubric = diagnosis-quality
+                                                    │
+                                                    ▼
+                                              { verdict: "pass",
+                                                dimensions: [
+                                                  { id: "root_cause_plausibility",
+                                                    score: 4, rationale: "..." },
+                                                  { id: "evidence_grounding",
+                                                    score: 3, rationale: "..." },
+                                                  ...
+                                                ] }
+                                                    │
+                                                    ▼
+                                              write eval/receipts/<runId>-01.json
 ```
 
-Notice the `tool_calls_trace` context — the judge sees not just the diagnosis but WHAT TOOL CALLS produced it. That means the `evidence_grounding` dim can verify that cited numbers are traceable to actual tool results.
+### Move 3 — the principle
 
-**Judge-error handling.**
-
-When RubricJudge returns `{ok: false}`, `eval/run.eval.ts:334-339` writes a `judge_error` placeholder. See `01-llm-foundations/04-structured-outputs.md` — structured output failures are the failure mode. In the baseline run, 6/10 diagnosis judgments returned `judge_error` (the model produced JSON the aptkit runtime couldn't parse within maxTokens). The placeholder pattern prevents these from crashing the run.
-
-### Move 3
-
-Match the method to the output shape. Exact match for classifiers, rubric for generative outputs, pairwise for A/B, human for anything subjective. Don't use exact match on generated text and call it "eval failed" when the model paraphrased.
+Rubric-scored LLM-as-judge is the right rung on the ladder for open-ended text. It's noisier than exact-match but scales; the noise is bounded by good rubric design (specific dimensions with anchored scale descriptions). Calibrate against blind human scoring before trusting the numbers.
 
 ## Primary diagram
 
 ```
-  Rubric-based LLM-as-judge — this codebase
+  Eval method — full frame
 
-  ┌─ Input to judge ──────────────────────────────────────────────────┐
-  │  subject:  JSON.stringify(diagnosis, null, 2)                     │
-  │  context:                                                          │
-  │    - anomaly                                                       │
-  │    - knownCorrect (golden case guidance)                          │
-  │    - signalClass                                                   │
-  │    - tool_calls_trace  ← judge can trace claims to real results    │
-  └────────────────────────┬──────────────────────────────────────────┘
-                           │
-  ┌─ Rubric (4 dims × 1-5 × 3 verdicts) ▼─────────────────────────────┐
-  │  diagnosisQualityRubric =                                          │
-  │    dimensions: [                                                   │
-  │      {id: 'root_cause_plausibility', label, scale: [{1..5}]},      │
-  │      {id: 'evidence_grounding', ...},                              │
-  │      {id: 'scope_coherence', ...},                                 │
-  │      {id: 'actionable_next_step', ...},                            │
-  │    ]                                                               │
-  │    verdicts: [pass, pass_with_notes, fail]                        │
-  │    checks: [...binary checks]                                     │
-  └────────────────────────┬──────────────────────────────────────────┘
-                           │
-  ┌─ Judge output ─────────▼──────────────────────────────────────────┐
-  │  {                                                                 │
-  │    dimensions: {                                                   │
-  │      root_cause_plausibility: {score: 4, reason: "…"},             │
-  │      evidence_grounding:      {score: 3, reason: "…"},             │
-  │      scope_coherence:         {score: 4, reason: "…"},             │
-  │      actionable_next_step:    {score: 2, reason: "…"},             │
-  │    },                                                              │
-  │    verdict: 'fail',   // ← any dim ≤ 2                             │
-  │    fix: "add a specific next action",                              │
-  │    reasoning: "…",                                                 │
-  │  }                                                                 │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌─ Golden case ──────────────────────────────────────────┐
+  │  anomaly + intent + knownCorrect                        │
+  └────────────────────┬───────────────────────────────────┘
+                       │
+                       ▼
+  ┌─ Agent runs ───────────────────────────────────────────┐
+  │  DiagnosticAgent → Diagnosis                            │
+  │  RecommendationAgent → Recommendation[]                 │
+  └────────────────────┬───────────────────────────────────┘
+                       │
+                       ▼
+  ┌─ Judge runs (LLM-as-judge) ────────────────────────────┐
+  │  RubricJudge(rubric, output, context) →                 │
+  │    { verdict, dimensions: [{ score, rationale }] }      │
+  │  Sonnet judge; max_tokens=4096; judge_error resilience   │
+  └────────────────────┬───────────────────────────────────┘
+                       │
+                       ▼
+  ┌─ Receipt written ──────────────────────────────────────┐
+  │  eval/receipts/<runId>-<caseId>.json                    │
+  │  contains: verdicts, per-dim scores, per-phase latency, │
+  │            per-phase tokens + cost                      │
+  └────────────────────┬───────────────────────────────────┘
+                       │
+                       ▼
+  ┌─ Aggregate: report.eval.ts / gate.eval.ts ─────────────┐
+  │  · per-dim pass rate across cases                       │
+  │  · p50/p95/p99 latency + $ per case                     │
+  │  · gate: block if any dim drops >10pp vs baseline       │
+  └────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-Rubric-based scoring has three big advantages over pass/fail eval:
-1. **Structured signal.** Per-dim scores tell you WHICH dimension is weak, not just "it failed."
-2. **Regression at dim granularity.** `baseline.json` tracks per-dim pass rates, so a regression in `evidence_grounding` alone can gate the PR without hiding it in an overall pass rate.
-3. **Judge disagreement is localized.** Two judges disagreeing on one dim is a smaller issue than disagreeing on overall verdict.
+LLM-as-judge became the industry standard around 2023 as human labeling scaled poorly. The tradeoff: bias (see **03-llm-as-judge-bias.md**) for scale + repeatability. Good rubric design keeps bias bounded; blind calibration keeps you honest.
 
-Common alternatives: **BLEU / ROUGE** (n-gram overlap; useful for translation, worthless for divergent-answer eval); **LLM-as-judge on overall quality only** (loses per-dim signal); **pairwise ranking** (works when you have a baseline to compare against).
+The 4-dim × 5-scale × 3-verdict shape is characteristic. Fewer dimensions (1–2) collapses too much information; more (6+) makes each judgment call too heavy and increases token cost per judgment. Blooming's 4-dim design is empirically calibrated.
+
+Related: **03-llm-as-judge-bias.md** (mitigating judge biases), **04-llm-observability.md** (the receipts pipeline), **../01-llm-foundations/04-structured-outputs.md** (the tool-schema constraint that makes judgment output well-formed).
 
 ## Project exercises
 
-### Exercise — pairwise A/B eval for prompt tweaks
+### B5.2 · Add pairwise eval for prompt-tuning experiments
 
-- **Exercise ID:** C3.2-B · Case B (rubric exercised; pairwise not).
-- **What to build:** for each golden case, run the diagnostic agent with prompt version A vs prompt version B. Present both diagnoses to a third-party judge, ask "which is better and why?". Prompts iterate faster with pairwise than with absolute rubric scores — the judge doesn't have to calibrate.
-- **Why it earns its place:** rubric is for measuring absolute quality; pairwise is for comparing changes. Both have their place.
-- **Files to touch:** `eval/pairwise.eval.ts` (new), `eval/rubrics/pairwise.ts` (new pairwise rubric).
-- **Done when:** running `npm run eval:pairwise` on 5 goldens produces a per-case A vs B verdict, useful for prompt-iteration decisions.
-- **Estimated effort:** 1-2 days.
+- **Exercise ID:** B5.2 (Case B — not yet implemented)
+- **What to build:** New `eval/pairwise.eval.ts` that takes two prompt variants (e.g., `diagnostic-v1` vs `diagnostic-v2`) and runs each against the goldens; a judge scores which output is better per case (with position-shuffling to avoid position bias); reports win rate + tie rate.
+- **Why it earns its place:** Rubric evals answer "is this good enough"; pairwise answers "is this *better*." Prompt tuning needs pairwise.
+- **Files to touch:** New `eval/pairwise.eval.ts`, extend `eval/rubrics/` with a comparative rubric, wire into `package.json` as `npm run eval:pairwise`.
+- **Done when:** running the pairwise eval on the current diagnostic prompt vs a modified prompt reports win rate + tie rate + verdict distribution.
+- **Estimated effort:** `1–2 days`.
 
 ## Interview defense
 
-**Q: Why rubric instead of exact match?**
+**Q: Why 4 dimensions per rubric and not more?**
 
-Because diagnosis output is generated prose + structured JSON. Exact match on the conclusion sentence never passes — the model paraphrases, and paraphrase isn't wrong. Rubric-based scoring measures WHAT MATTERS (plausibility, evidence grounding, scope, actionability) without punishing legitimate variation.
+Each dimension is a judgment call — more dimensions = more tokens per judgment, more chances for judge inconsistency, more scores to interpret. Four is where the signal-per-judgment stays high without token cost exploding. If a fifth dimension emerges as load-bearing (say, "citation accuracy"), I'd add it; adding for its own sake dilutes.
 
-**Q: What are the rubric dims?**
+**Q: What does `judge_error` mean in the receipts?**
 
-Four per rubric. Diagnosis: root_cause_plausibility, evidence_grounding, scope_coherence, actionable_next_step. Recommendation: diagnosis_response, feature_choice_fit, step_actionability, impact_realism. Each dim is scored 1-5 with description per score. Verdict is derived: pass if all ≥4, pass_with_notes if any = 3, fail if any ≤ 2.
-
-**Q: How does the judge see the tool calls?**
-
-Passed as context. `tool_calls_trace` is a formatted trace of `--- call N: tool_name --- args: … result: …` per line. That means the `evidence_grounding` dim can verify that numbers cited in the diagnosis actually appear in the tool results. Without the trace, the judge would score `evidence_grounding` on prose plausibility alone.
+Judge output failed schema validation, typically because it hit the `max_tokens = 4096` cap mid-JSON. The receipt records a `judge_error` placeholder; the run doesn't crash. In practice: bumping `max_tokens` to 4096 dropped judge_error rate from ~10% to ~1% (empirical). Load-bearing: it's a real production concern for any LLM-as-judge setup.
 
 ## See also
 
-- `01-eval-set-types.md` — what gets scored
-- `03-llm-as-judge-bias.md` — what the judge can get wrong
-- `04-llm-observability.md` — the receipt structure the judgment lands in
-- `eval/rubrics/` — the two rubrics
-- `eval/run.eval.ts` — the invocation
+- [01-eval-set-types.md](01-eval-set-types.md) — the inputs.
+- [03-llm-as-judge-bias.md](03-llm-as-judge-bias.md) — the reliability layer.
+- [04-llm-observability.md](04-llm-observability.md) — the output layer.

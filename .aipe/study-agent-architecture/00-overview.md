@@ -1,80 +1,117 @@
-# Agent architecture — overview
+# Overview — the whole agent system in one diagram
 
-**Shape:** multi-agent (deterministic supervisor + 5 workers).
-**Runtime:** `@aptkit/core@0.3.0` — Blooming adapters bridge Anthropic + MCP into AptKit's provider-neutral surface.
-**Anchor claim:** The control flow is **written in TypeScript**, not decided by a router LLM. What's autonomous is what happens *inside* each worker (an AptKit ReAct loop with a tool budget).
+*Type: system orientation*
 
-## The whole system in one picture
+## Zoom out — the whole system
 
-```
-  Zoom out — blooming_insights, at the agent-topology level
-
-  ┌─ UI (Next.js App Router) ─────────────────────────────────────┐
-  │  app/page.tsx (feed)                                          │
-  │  app/investigate/[id]/page.tsx (diagnose)                     │
-  │  app/investigate/[id]/recommend/page.tsx (recommend)          │
-  │  StatusLog ← ReasoningTrace ← NDJSON stream                   │
-  └───────────────────────────┬───────────────────────────────────┘
-                              │ fetch + ReadableStream reader
-  ┌─ Service (route.ts) ──────▼───────────────────────────────────┐
-  │  /api/briefing  → runs MonitoringAgent (fan-out over 10 cats) │
-  │  /api/agent     → deterministic supervisor: classify or       │
-  │                    diagnose → recommend                       │
-  │                                                               │
-  │  ★ THE SUPERVISOR IS CODE, NOT AN LLM ★                       │
-  └───────────────────────────┬───────────────────────────────────┘
-                              │
-  ┌─ Worker agents (lib/agents, thin wrappers over AptKit) ───────┐
-  │  MonitoringAgent · DiagnosticAgent · RecommendationAgent      │
-  │  QueryAgent · classifyIntent (Haiku router)                   │
-  │                                                               │
-  │  each = AptKit ReAct loop (step → tool → observe → repeat)    │
-  │  bounded by maxTurns=8, maxToolCalls=6                        │
-  └───────────────────────────┬───────────────────────────────────┘
-                              │ tool_use via BloomingToolRegistryAdapter
-  ┌─ Data source (lib/data-source) ───────────────────────────────┐
-  │  BloomreachDataSource (MCP over OAuth+PKCE)                   │
-  │  SyntheticDataSource (deterministic fake)                     │
-  │  FaultInjectingDataSource (decorator, offline chaos)          │
-  └───────────────────────────────────────────────────────────────┘
-```
-
-## The three shapes, and where this repo sits
-
-Workflow (chain) — engineer writes the steps in code. LLM fills slots but does not choose the next step.
-Single-agent — one ReAct loop with tools. Model decides which tool to call and when to stop.
-Multi-agent — many coordinating agents in a topology.
-
-**This repo is a hybrid, and that's the interesting bit:**
+The forest before any tree. Every box below is a real thing in this repo; every arrow is a real hop between them.
 
 ```
-  outer layer: deterministic pipeline (CODE picks the next agent)
-      ├─ classifyIntent (Haiku) → route to QueryAgent OR skip
-      ├─ MonitoringAgent (fan-out over runnable categories)
-      └─ DiagnosticAgent → RecommendationAgent (sequential)
+  blooming insights — end-to-end agent system
 
-  inner layer: each agent runs a single-agent ReAct loop
-      └─ AptKit runAgentLoop (step + execute + accumulate + terminate)
-
-  innermost: tools (execute_analytics_eql, list_scenarios, …)
+  ┌─ Browser (UI) ───────────────────────────────────────────────────────┐
+  │  app/page.tsx  →  useBriefingStream / useInvestigation               │
+  │  StatusLog (streams reasoning + tool calls)                          │
+  │  x-bi-mcp-config header (base64 JSON, per fetch)                     │
+  └────────────────────────────┬─────────────────────────────────────────┘
+                               │ NDJSON stream (AgentEvent)
+  ┌─ Next.js route (supervisor) ─────────────────────────────────────────┐
+  │  app/api/briefing/route.ts   →  MonitoringAgent                      │
+  │  app/api/agent/route.ts      →  classifyIntent (Haiku, coordinator)  │
+  │                                 → QueryAgent | Diagnostic → Recommend│
+  │  code-routed. NO supervisor LLM. Budget tracker + hooks per request. │
+  └────────────────────────────┬─────────────────────────────────────────┘
+                               │ agent constructs
+  ┌─ Agents (aptkit + adapter bridge) ───────────────────────────────────┐
+  │  MonitoringAgent · DiagnosticAgent · RecommendationAgent · QueryAgent│
+  │  aptkit ReAct loop  ←→  3 adapters:                                  │
+  │    AnthropicModelProviderAdapter   (SDK + ephemeral prompt cache)    │
+  │    BloomingToolRegistryAdapter     (DataSource + McpToolDef)         │
+  │    BloomingTraceSinkAdapter        (CapabilityEvent → AgentEvent)    │
+  └────────────────────────────┬─────────────────────────────────────────┘
+                               │ callTool / listTools
+  ┌─ DataSource seam ────────────────────────────────────────────────────┐
+  │  lib/data-source/types.ts (port)                                     │
+  │  ├─ BloomreachDataSource / McpDataSource (default preset)            │
+  │  ├─ SyntheticDataSource   (live-synthetic — default mode)            │
+  │  └─ FaultInjectingDataSource (decorator, offline harness)            │
+  └────────────────────────────┬─────────────────────────────────────────┘
+                               │ transport (over the wire)
+  ┌─ Provider (MCP) ─────────────────────────────────────────────────────┐
+  │  Bloomreach loomi connect  (default: OAuth 2.1 + PKCE + DCR)         │
+  │  OR bearer  OR anonymous   (swappable via makeAuthProvider)          │
+  └──────────────────────────────────────────────────────────────────────┘
 ```
 
-The **outer topology is chain-shaped** — the sequence diagnose → recommend is written in `app/api/agent/route.ts`, not decided by an LLM. The **inner loop is agent-shaped** — inside DiagnosticAgent, the model chooses which EQL queries to run and when to stop. This is the recommended production posture: predictable control flow at the top, autonomous loops only where the path genuinely can't be predicted.
+**What's at the top of the stack.** The browser holds a `useInvestigation` / `useBriefingStream` hook that opens a `fetch()` against `/api/agent` or `/api/briefing`, attaches a base64 `x-bi-mcp-config` header (so a visitor can point at their own MCP server via a settings modal), and consumes newline-delimited JSON as it arrives. Each NDJSON event is an `AgentEvent` — a reasoning step, a tool_call_start, a tool_call_end, an `insight`, a `diagnosis`, a `recommendation`. The `StatusLog` renders them in real time.
 
-## What this guide covers, by sub-section
+**What's at the bottom.** The Bloomreach loomi connect MCP server is the default, spoken over OAuth 2.1 + PKCE + Dynamic Client Registration. The MCP server is swappable: `MCP_AUTH_TYPE=bearer` or `anonymous` route through `makeAuthProvider({type, ...})`, and the settings modal can override the whole thing per request.
 
-- **`01-reasoning-patterns/`** — the loop-shape substrate every worker sits on. Chains-vs-agents boundary, the AptKit ReAct kernel, plan-and-execute (not used), reflexion (not used), ToT (not used), routing (used: `classifyIntent`).
-- **`02-agentic-retrieval/`** — none of it is exercised here. The diagnostic loop retrieves via EQL as a general tool, not as a semantic-retrieval loop. Covered honestly with "not yet implemented" + the refactor that would introduce it.
-- **`03-multi-agent-orchestration/`** — the load-bearing section. Coordinator-worker (deterministic supervisor is a variant), sequential pipeline (diagnose → recommend), parallel fan-out (partial — monitoring runs categories concurrently but not agents), swarm (rejected — Anthropic's finding), graph orchestration (not used), shared state (session + workspace schema), coordination failure modes (BudgetTracker, per-call timeouts, `is_error` graceful degradation).
-- **`04-agent-infrastructure/`** — context engineering (schemaSummary + AptKit context builder), agent memory (working only — no episodic/long-term), tool calling + MCP (the substrate), agent evaluation (`eval/` harness — currently live), guardrails and control (BudgetTracker + BudgetExceededError, iteration caps, no HITL).
-- **`05-production-serving/`** — cross-turn caching (Anthropic ephemeral cache on system prompt, live), fan-out backpressure (no explicit limiter; ~1 req/s MCP throttle bounds it), per-tool circuit breaking (not implemented; FaultInjectingDataSource proves the agent already degrades gracefully via `is_error`).
-- **`06-orchestration-system-design-templates/`** — the three generic templates (research assistant, agentic support, coding agent), each mapped to "does this repo look like this?"
-- **`agent-patterns-in-this-codebase.md`** — the table of patterns this repo actually uses, with control envelope per pattern.
+**What's in the middle.** That's what this guide teaches.
 
-## The one number to hold in your head
+## Zoom in — the three shapes, and which one this is
 
-Per-case cost: **~$0.09**. Per-phase p50: diagnose ~50s, recommend ~51s. The Anthropic ephemeral cache turns a 3168-token cache_creation into cache_read hits across every ReAct loop turn.
+Every agent codebase is one of three shapes. Read the table cold, then find yours.
 
-## Reading order
+```
+  ┌──────────────────┬──────────────────────────────────────────────┐
+  │ Shape            │ What the codebase exercises                  │
+  ├──────────────────┼──────────────────────────────────────────────┤
+  │ Workflow / chain │ Engineer writes the steps; LLM fills slots.  │
+  │                  │ NO autonomous loop.                          │
+  ├──────────────────┼──────────────────────────────────────────────┤
+  │ Single-agent     │ One ReAct loop with tools. Model picks next  │
+  │                  │ tool + when to stop.                         │
+  ├──────────────────┼──────────────────────────────────────────────┤
+  │ Multi-agent      │ Multiple agents in a topology. Work is split │
+  │                  │ across specialties; a coordination structure │
+  │                  │ decides who runs when.                       │
+  └──────────────────┴──────────────────────────────────────────────┘
+```
 
-A → B → C → D → E → F. Then `agent-patterns-in-this-codebase.md` for the summary. If you're new to multi-agent, spend the most time on C — it's the load-bearing new material.
+**This repo is multi-agent, code-routed.** Four specialist agents — monitoring, diagnostic, recommendation, query — each own one ReAct loop over MCP tools. Above them sits a supervisor. The supervisor is a Next.js route handler. There is no supervisor LLM.
+
+That distinction is load-bearing. Most multi-agent frameworks put an LLM in the boss seat (LangGraph's supervisor node, AutoGen's manager). This repo doesn't — a Haiku classifier picks intent, then the route decides the sequence in TypeScript. The tradeoff:
+
+```
+  Two ways to route in a multi-agent system
+
+  LLM-routed supervisor              Code-routed supervisor (this repo)
+  ┌───────────────────┐              ┌───────────────────┐
+  │   supervisor LLM  │              │   route handler   │
+  │  (Sonnet, ~$0.05  │              │  (TypeScript,     │
+  │   per decision)   │              │   $0, deterministic)│
+  └────┬──────────────┘              └────┬──────────────┘
+       │ chooses agent                    │ if step=diagnose → diag agent
+       ▼                                  │ if step=recommend → rec agent
+   worker agent                           ▼
+                                       worker agent
+
+  + adapts to novel decompositions      + $0 supervisor cost
+  + one prompt controls everything      + full request-flow debuggability
+  – unpredictable cost                  – every new route needs code
+  – hard to trace decisions             – ships with the codebase, not the model
+```
+
+For this product — three well-known stages (monitor → diagnose → recommend) with a clear "what changed → why → what to do" journey — code-routing is the correct pick. The decomposition is written into `app/api/agent/route.ts:230-310` and `app/api/briefing/route.ts`. The LLMs never see it, because they never need to.
+
+## What this guide covers
+
+Every SECTION below is calibrated to this shape:
+
+- **Section 01** covers the reasoning-pattern family every worker instantiates (ReAct, plan-and-execute, reflexion, etc.). The load-bearing file is the **agent loop skeleton** — the kernel every worker runs.
+- **Section 02** covers retrieval as a control loop. This repo does NOT do vector retrieval; it does *tool-driven retrieval* (agents pick which EQL query to run). The section covers the pattern family so the reader can defend "I chose not to use vector RAG because …".
+- **Section 03** is the load-bearing new material — nine files walking every multi-agent topology plus coordination failure modes.
+- **Section 04** covers the cross-cutting infrastructure (context engineering, memory, tools, evals, guardrails).
+- **Section 05** covers the three production-serving concerns that only show up once the unit of work is an autonomous loop: cross-turn caching, fan-out backpressure, per-tool circuit breaking.
+- **Section 06** reframes the codebase as three system-design interview templates.
+
+## The receipts that ship with this codebase
+
+Every claim below is anchored to a real artifact in the repo (paths and numbers used throughout the sub-section files):
+
+- **Prompt caching** (`lib/agents/aptkit-adapters.ts`): system prompt wrapped in `cache_control:'ephemeral'`. Live logs show cache_creation → cache_read pattern (3168-token hits).
+- **Budget ceiling** (`lib/agents/budget.ts`): `BudgetTracker` + `BudgetExceededError`, checked BEFORE each dispatch. Shared across diagnostic + recommendation.
+- **Fault-injecting decorator** (`lib/data-source/fault-injecting.ts`): 9 injected faults / 3 investigations / 0 failed — the tier-2 graceful-degradation receipt.
+- **Baseline** (runId `2026-07-03T04-08-28-644Z`): per-case ~$0.09; p50 diagnose 50s / recommend 51s / diag-judge 38s / rec-judge 90s.
+- **261 tests** (+38 vs prior regen).

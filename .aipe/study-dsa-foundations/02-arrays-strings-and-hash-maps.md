@@ -1,285 +1,342 @@
 # Arrays, strings, and hash maps
 
-Industry names: indexed sequences, strings, hash sets, hash maps, dictionaries. Type: Industry standard.
+*Indexed sequences · hash tables · sets · Industry standard*
 
-## Zoom out — the heavy chapter for this repo
+## Zoom out, then zoom in
 
-If Blooming Insights has a single DSA superpower, it's *"put it in a Map, then look it up."* Almost every service-layer file uses `Map` or `Set` — for cache, for session state, for tool coverage, for dedup, for schema filtering. This chapter walks the six load-bearing spots and teaches the vocabulary — hash function, collision, load factor, iteration order, prototype pollution — that separates "I used a Map" from "I picked Map for a reason."
-
-```
-  Where hash-keyed structures show up
-
-  ┌─ UI layer ──────────────────────────────────────┐
-  │  (no hash structures here — pure display)       │
-  └────────────────────┬────────────────────────────┘
-                       │
-  ┌─ Service layer ────▼────────────────────────────┐
-  │  Map<sessionId, SessionFeed>  (state/insights)  │  ← nested Maps
-  │  Set<string>  (tool-coverage cross-check)       │  ← membership
-  │  Set<string>  (filterToolSchemas)               │  ← allow-list
-  └────────────────────┬────────────────────────────┘
-                       │
-  ┌─ Transport layer ──▼────────────────────────────┐
-  │  Map<cacheKey, {result, expiresAt}>             │  ← the 60s cache
-  │  RegExp  (parseRetryAfterMs)                    │  ← string parse
-  └────────────────────┬────────────────────────────┘
-                       │
-  ┌─ Eval layer ───────▼────────────────────────────┐
-  │  Set<string>  (runId dedup from filenames)      │  ← extract-unique
-  └─────────────────────────────────────────────────┘
-```
-
-The interesting seam is the **service ↔ transport** boundary. Both sides use `Map`, but for different reasons: service Maps hold per-user session state (correctness); transport Maps hold time-bounded response cache (performance). Same primitive, different job. That's the axis worth tracing.
-
-## Structure pass — trace *state ownership* across layers
-
-Axis: **who owns this Map, and when does it get cleared?**
-
-- **Service Maps** (`lib/state/insights.ts:14`): outer Map keyed by sessionId; never cleared globally; inner Maps cleared *per session* on new briefing. Ownership = *user session*.
-- **Transport Map** (`lib/data-source/bloomreach-data-source.ts:122`): keyed by `${name}:${JSON.stringify(args)}`; entries expire after 60s; not cleared explicitly. Ownership = *transport instance* (per connection).
-- **Set-based membership** (`filterToolSchemas`, `crossCheckToolCoverage`): built and discarded within one function call. Ownership = *stack frame*.
-
-Seam: **between the transport Map (time-bounded) and the service Map (session-bounded).** The failure mode differs — a stale transport entry means an outdated tool result (recoverable); a bleeding service Map would leak one user's insights into another's feed (catastrophic). That's why `putInsights` at `lib/state/insights.ts:57` clears the inner Map, never the outer. Structure protects correctness.
-
-## How it works — six primitives, six real anchors
-
-### Move 1 — the mental model
-
-Hash maps are the workhorse. You already reach for them without thinking. What the chapter adds is *why* JavaScript gives you two collection types and when to pick which.
+If you cut this codebase in half and looked at what's in it, you'd find arrays and hash maps. Everything else is a decoration. The picture below shows every place a hash map (`Map` or `Set`) or an array-based operation is the load-bearing primitive.
 
 ```
-  The kernel: a hash map lookup
+  Zoom out — where arrays / maps / sets live in blooming_insights
 
-  key ──► [ hash fn ] ──► bucket index
-                              │
-                              ▼
-                         ┌──────────────┐
-                         │  bucket[k]   │  ← may hold multiple entries
-                         │  = value_1   │     if collision (chaining)
-                         │  = value_2   │
-                         └──────────────┘
-                              │
-                              ▼   equality check on stored keys
-                          value
-
-  what makes it O(1): hash spreads keys evenly across buckets,
-                       so bucket sizes stay tiny (load factor ~ 1)
-  what breaks it     : bad hash (all → same bucket) → linear scan
+  ┌─ UI layer ───────────────────────────────────────────────────┐
+  │  NDJSON reader: one string.split('\n'), one line per event   │
+  │  → array of parsed events, iterated once                     │
+  └─────────────────────────┬────────────────────────────────────┘
+                            │
+  ┌─ Agent / route layer ───▼────────────────────────────────────┐
+  │  ★ THIS CONCEPT LIVES HERE ★                                 │
+  │  · tool-schemas.ts: allowedTools = new Set<string>()         │
+  │  · categories-legacy.ts: new Set<string>() for dedup         │
+  │  · flatMap over response.content blocks                      │
+  │  · fault-injecting.ts: rate-check array walk                 │
+  └─────────────────────────┬────────────────────────────────────┘
+                            │
+  ┌─ Eval layer ────────────▼────────────────────────────────────┐
+  │  · report.eval.ts: new Set<runId>() to dedup receipts        │
+  │  · gate.eval.ts:  new Set(dims) for score-dimension check    │
+  │  · load.eval.ts:  Array<Investigation> as accumulator        │
+  └─────────────────────────┬────────────────────────────────────┘
+                            │
+  ┌─ Config / transport ────▼────────────────────────────────────┐
+  │  · config.ts: base64 round-trip on JSON string               │
+  │  · config.ts: isMcpConfigOverride — 3-field schema walk      │
+  │  · test/mcp/config.test.ts: Record<string,string> DOM shim   │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-Two things can go wrong: the hash function collides all keys (unlikely with V8's implementation), or you use *the wrong container* (plain `{}` for user-controlled keys — see the `__proto__` trap below).
+**Zoom in.** Three primitives, one after the other. Arrays are contiguous, index-addressable, ordered — `arr[i]` in O(1), any scan in O(n). Strings are arrays of characters (or code units, in JS's UTF-16 case) with a `.split()` and `.slice()` API. Hash maps (JS `Map`, `Set`, plain objects) are O(1) average lookup by key — the primitive behind every "have I seen this?" question in the codebase.
 
-### Move 2 — the six load-bearing spots
+## Structure pass
 
-**Map for session state (`Map<string, SessionFeed>`)** — `lib/state/insights.ts:14-19`.
+**Layers.** Two altitudes:
+  1. the *shape* of the container (array, set, map, string)
+  2. the *operation* performed on it (lookup, scan, dedupe, transform)
 
-Every warm Vercel instance can serve multiple users concurrently. Session state lives in module-level Maps keyed by sessionId, and the *inner* maps get cleared on new briefings — the *outer* map never does.
+**Axis: what's the cost of "does this contain X?"** Trace it down:
+  - array (unsorted) → O(n) linear scan
+  - array (sorted) → O(log n) binary search *(not exercised in this repo)*
+  - hash set → O(1) average
+  - string → `.includes()` is O(n × m) — Boyer-Moore or KMP inside V8
+
+**Seams.** The load-bearing seam is between *lookup by key* (hash map) and *iteration over items* (array). Every "is this in the allowed list?" check in the agent code is a set lookup; every "process each received event" is an array scan. Get the container right and the operation costs collapse.
+
+## How it works
+
+### Move 1 — arrays are contiguous slots; hash maps are computed slots
+
+You already know arrays: `[a, b, c]`, indexed by position. A hash map is the same idea but with the index *computed* from the key. You call `map.get("foo")`, the runtime hashes `"foo"` to an integer, and that integer picks the slot. Same O(1) access shape as an array — just addressed by content instead of position.
+
+```
+  Array vs hash map — how the slot gets chosen
+
+  ARRAY:  arr[3]           →  slot 3
+                              (position is the address)
+
+  MAP:    map.get("foo")   →  hash("foo") = 8391
+                           →  8391 mod capacity = slot 47
+                              (content is the address)
+```
+
+Collisions happen when two keys hash to the same slot. JS `Map` handles this with chaining (linked list per slot) — search inside a slot is O(1) amortized because the load factor is bounded. This is why hash-map lookup is *average* O(1), not worst-case: an adversarial input could pile every key into one slot.
+
+### Move 2 — the set-based dedup / membership primitive
+
+Every "have I seen this?" question in the repo uses a `Set`. Not an array with `.includes()`, not an object with property lookup — a `Set`, because it's the primitive that says "I only care about presence."
+
+```
+  Set membership — the "is X in the collection?" primitive
+
+  operation:      check          expected time
+  ────────────────────────────────────────────
+  set.has(x)      → true/false   O(1) average
+  set.add(x)      → mutation     O(1) amortized
+  set.delete(x)   → mutation     O(1) average
+
+  vs array.includes(x)           O(n) linear scan
+```
+
+The canonical use in this repo — enum-membership validation:
 
 ```ts
-// lib/state/insights.ts:14
-const state = new Map<string, SessionFeed>();
-
-// lib/state/insights.ts:57-70
-export function putInsights(sessionId: string, items: Insight[], rawAnomalies?: Anomaly[]): void {
-  const s = sessionState(sessionId);
-  s.insights.clear();     // clear ONLY this session
-  s.anomalies.clear();
-  items.forEach((i, idx) => {
-    s.insights.set(i.id, i);
-    if (rawAnomalies?.[idx]) s.anomalies.set(i.id, rawAnomalies[idx]);
-  });
-}
+// lib/mcp/config.ts:41-45 — the set as an enum membership check
+const VALID_AUTH_TYPES = new Set<McpAuthType>([
+  'oauth-bloomreach',
+  'bearer',
+  'anonymous',
+]);
+// later, inside isMcpConfigOverride:
+if (!VALID_AUTH_TYPES.has(v.authType as McpAuthType)) return false;
 ```
 
-Load-bearing part — **`s.insights.clear()` clears the inner map, never `state.clear()`**. Drop that discipline and one user's new briefing wipes every other user's feed on the same warm instance.
+Three elements — an array with `.includes()` would be fine here. The signal is the *shape of the code*: the set says "membership is the question I'm asking." When the enum grows to 30 auth types, the shape doesn't change; only the constant does.
 
-Why `Map` not `{}`? Three reasons that matter here:
-- **Prototype safety.** A user-controlled sessionId of `__proto__` on a plain object would let a caller write to `Object.prototype`. Not exploitable through this codebase, but the safe default is `Map`.
-- **Iteration order.** `Map` iterates in insertion order, guaranteed. Plain objects mix insertion order and numeric-key sort order.
-- **`.size` is O(1).** On a plain object you'd need `Object.keys(o).length` — O(n).
-
-**Map for a time-bounded cache** — `lib/data-source/bloomreach-data-source.ts:122, 144-152`.
-
-Every Bloomreach tool result gets cached for 60 seconds by `(name, args)`:
+The same primitive shows up for allowed-tool filtering:
 
 ```ts
-// lib/data-source/bloomreach-data-source.ts:122
-private cache = new Map<string, { result: unknown; expiresAt: number }>();
-
-// lib/data-source/bloomreach-data-source.ts:144-152
-const cacheKey = `${name}:${JSON.stringify(args)}`;
-const ttl = options.cacheTtlMs ?? 60_000;
-
-if (!options.skipCache) {
-  const cached = this.cache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) {
-    return { result: cached.result as T, durationMs: 0, fromCache: true };
-  }
-}
-```
-
-Load-bearing part — **`JSON.stringify(args)` in the cache key**. Object identity would give false negatives (`{a:1,b:2}` and `{a:1,b:2}` are different objects); JSON is the poor-man's structural equality. It's fragile — key order matters, so `{a:1,b:2}` and `{b:2,a:1}` cache separately, and functions/undefined don't serialize. Fine for this call site (args are simple JSON) but a landmine at scale.
-
-Not shown here but worth knowing: nothing evicts entries when they expire; the Map grows monotonically until the serverless instance dies. On a single warm instance running a full day, this is a **memory leak** — small (60s TTL means each unique key lives briefly) but real. See `.aipe/study-performance-engineering/` for the fix (LRU with size cap).
-
-**Set for allow-list filtering** — `lib/agents/tool-schemas.ts:13-15`.
-
-```ts
-// lib/agents/tool-schemas.ts:13-15
+// lib/agents/tool-schemas.ts:13 — set as an allowlist
 const set = new Set(allowed);
-return all
-  .filter((t) => set.has(t.name))
-  .map((t) => ({ name: t.name, description: t.description ?? '',
-                  input_schema: t.inputSchema as Anthropic.Messages.Tool['input_schema'] }));
+// then: allowedTools.has(toolName)
 ```
 
-Kernel: `new Set(allowed)` promotes an array to O(1) membership test, then `.filter` scans the tools with O(1) probes. Drop the Set and it degrades to `allowed.includes(t.name)` inside the filter — O(n·m) instead of O(n+m). Same picture as `01-complexity-and-cost-models.md`'s Move 2, told from the Set side.
-
-**Set for tool-name coverage** — `lib/mcp/tool-coverage.ts:39-41, 50-55`.
+And for dedup of runIds across receipts:
 
 ```ts
-// lib/mcp/tool-coverage.ts:39-41
-export function crossCheckToolCoverage(serverToolNames: string[]): ToolCoverageReport {
-  const server = new Set(serverToolNames);
-  const absent = (list: readonly string[]) => list.filter((n) => !server.has(n));
-
-  const missing = { monitoring: absent(monitoringTools), diagnostic: absent(diagnosticTools),
-                    recommendation: absent(recommendationTools), bootstrap: absent(bootstrapTools) };
-
-  const configured = new Set<string>([...monitoringTools, ...diagnosticTools,
-                                       ...recommendationTools, ...bootstrapTools]);
-  // ...
-}
-```
-
-Two Sets doing complementary work: `server` for "does the MCP server have this tool?" and `configured` for "does *any* agent list reference this server tool?" The two Sets meet at `unusedOnServer: serverToolNames.filter(n => !configured.has(n))`. Symmetric-difference-shaped, without needing to compute an actual symmetric difference.
-
-**Set for dedup** — `eval/report.eval.ts:204-207`.
-
-```ts
-// eval/report.eval.ts:203-210
-const files = readdirSync(RECEIPTS_DIR).filter((f) => f.endsWith('.json'));
+// eval/report.eval.ts:204 — set to collapse duplicates
 const runIds = new Set<string>();
 for (const f of files) {
   const m = f.match(/-(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d+Z)\.json$/);
   if (m) runIds.add(m[1]);
 }
-if (runIds.size === 0) throw new Error('No receipts found');
-return [...runIds].sort().pop() as string;
 ```
 
-The classic *extract-unique-from-corpus* pattern. Regex pulls a timestamp out of each filename, Set eats duplicates, `.sort().pop()` picks the newest. This is the exact shape you'd write for "find the unique users who did X" — swap filenames for events and it transfers unchanged.
+One line per unique runId, no matter how many files match. The set collapses N array entries into K unique keys in a single pass — O(N) time, O(K) space. The equivalent using an array + `.includes()` would be O(N²) — every add checks every previous entry.
 
-**Regex over strings** — `lib/data-source/bloomreach-data-source.ts:64-71`.
+### Move 2 — the structural type-guard as O(k) schema walk
+
+This is where hash-map thinking meets TypeScript's `unknown` boundary. `isMcpConfigOverride` walks a small object schema — check each field's type, look up enum members in a set — and returns a boolean:
 
 ```ts
-// lib/data-source/bloomreach-data-source.ts:64-71
-function parseRetryAfterMs(result: unknown): number | null {
-  const text = JSON.stringify((result as any)?.content ?? result);
-  const after = text.match(/retry[\s-]*after[^0-9]*(\d+)\s*second/i);
-  if (after) return parseInt(after[1], 10) * 1000;
-  const perWindow = text.match(/per\s*(\d+)\s*second/i);
-  if (perWindow) return parseInt(perWindow[1], 10) * 1000;
-  return null;
+// lib/mcp/config.ts:50-60 — O(field count) type guard
+export function isMcpConfigOverride(value: unknown): value is McpConfigOverride {
+  if (value === null || typeof value !== 'object') return false;
+  const v = value as Record<string, unknown>;                    // ← treat as hash map
+  if (v.url !== undefined && typeof v.url !== 'string') return false;
+  if (v.authType !== undefined) {
+    if (typeof v.authType !== 'string') return false;
+    if (!VALID_AUTH_TYPES.has(v.authType as McpAuthType)) return false;  // ← O(1) set check
+  }
+  if (v.bearerToken !== undefined && typeof v.bearerToken !== 'string') return false;
+  return true;
 }
 ```
 
-Two regexes with capture groups. This is the repo's clearest string-algorithm anchor — matching a pattern (`retry-after ~N second`) and extracting a numeric parameter. The interview transfer is *"parse an unstructured error string to a structured value"* — a standard shape.
+The type guard is O(3) — one check per known field. The `Record<string, unknown>` cast is the vocabulary move: "for the purposes of validation, this unknown is a hash map from string to unknown, and I'm going to look up specific keys." That's textbook structural typing at the runtime seam.
 
-Load-bearing part — **the `i` flag and the loose character-class `[^0-9]*`**. The upstream text is human-written and inconsistent; strict matching would break on the second variant.
+```
+  Type guard as hash-map walk — three lookups, one set check
+
+  input: unknown
+     │
+     ▼
+  is it an object? ──── no ───► false
+     │ yes
+     ▼
+  v.url        : string | undefined?    ← O(1) property lookup
+     │ ok
+     ▼
+  v.authType   : one of 3 valid enums?  ← O(1) set.has()
+     │ ok
+     ▼
+  v.bearerToken: string | undefined?    ← O(1) property lookup
+     │ ok
+     ▼
+  return true
+```
+
+The pattern generalizes: any "parse this JSON off the wire" boundary in a typed language looks like this. Zod, io-ts, ajv — all built on the same shape at scale. The hand-rolled version here is fine because the schema is three fields.
+
+### Move 2 — the base64 round-trip on the string primitive
+
+Strings are arrays of code units. Base64 is a fixed 4:3 expansion — three input bytes become four ASCII output characters, per a 64-symbol lookup table. O(n) time, O(n) space, no algorithm cleverness.
+
+```
+  Base64 — a table lookup encoded as a bit shift
+
+  input bytes:   [11010101]  [10101100]  [11100011]     ← 3 bytes = 24 bits
+                     │            │            │
+                     └────────────┴────────────┘
+                                  │
+              take 6 bits at a time (24 / 6 = 4 outputs)
+                                  │
+                                  ▼
+                   [110101] [011010] [110011] [100011]  ← 4 × 6-bit indices
+                       │        │        │        │
+                       ▼        ▼        ▼        ▼
+                       '1'      'a'      'z'      'j'    ← table lookup
+```
+
+The interesting part in this codebase isn't the algorithm — it's the *runtime detection* wrapper:
+
+```ts
+// lib/mcp/config.ts:77-82 — one function, two runtimes
+export function encodeConfigHeader(config: McpConfigOverride): string {
+  const json = JSON.stringify(normalizeConfig(config));
+  // btoa is available in browsers; Node has Buffer. Runtime detection.
+  if (typeof btoa === 'function') return btoa(json);
+  return Buffer.from(json, 'utf8').toString('base64');
+}
+```
+
+Same output, two APIs, one function. The DSA insight: base64 has a ~33% size overhead (4 bytes out per 3 in). Cookies feel large because of this — a 3KB payload becomes ~4KB on the wire.
+
+### Move 2 — the localStorage shim as hash-map-with-a-contract
+
+The test-side simulation of DOM `localStorage` is a plain JavaScript object with three methods stapled on. It exists because vitest runs in Node, where `localStorage` doesn't exist:
+
+```ts
+// test/mcp/config.test.ts:127-144 — hash map wearing a DOM interface
+let store: Record<string, string> = {};
+
+(globalThis as unknown as { localStorage: Storage }).localStorage = {
+  getItem: (k: string) => (k in store ? store[k] : null),
+  setItem: (k: string, v: string) => { store[k] = v; },
+  removeItem: (k: string) => { delete store[k]; },
+  clear: () => { store = {}; },
+  key: () => null,
+  length: 0,
+};
+```
+
+This is the Case-A hash-map application: not "look things up by key" as a raw primitive, but "conform to an interface the code under test expects, with a hash-map underneath." The `in` operator is O(1) property presence; the assignment is O(1). Behavior matches the DOM version *for the API surface the code exercises*. Anything more elaborate (a proper `Storage` implementation with quota checks, event dispatching, per-origin partitioning) would be over-engineering for a unit test.
+
+```
+  In-memory KV shim — hash map wearing a DOM contract
+
+  ┌─ Code under test ────────────────────┐
+  │  readPersistedConfig()               │
+  │  → localStorage.getItem(BI_MCP_KEY)  │  ← expects DOM Storage
+  └───────────────────┬──────────────────┘
+                      │
+  ┌─ Test seam ───────▼──────────────────┐
+  │  globalThis.localStorage = {         │
+  │    getItem: (k) => store[k] ?? null, │
+  │    setItem: (k, v) => store[k] = v,  │
+  │    removeItem: (k) => delete store[k]│
+  │  }                                   │
+  └───────────────────┬──────────────────┘
+                      │
+  ┌─ Underneath ──────▼──────────────────┐
+  │  Record<string, string> = {}         │  ← the hash map
+  │  O(1) get / set / delete             │
+  └──────────────────────────────────────┘
+```
 
 ### Move 3 — the principle
 
-*Membership tests and keyed lookups are the primitives you'll reach for hundreds of times a year.* Getting the container right (Map vs `{}`, Set vs array) is a code-shape decision that costs nothing at write time and saves you correctness bugs (prototype pollution, false-negative dedup) and O(n·m) surprises at read time. The muscle memory: **user-controlled keys → Map**, **membership test → Set**, **cache with expiry → Map + timestamp value**.
+**Reach for the hash map when the question is "presence."** Reach for the array when the question is "iteration." Almost every "I need a data structure here" moment in an application codebase is one of these two — the exotic structures earn their keep only when you have a specific access pattern that neither of them serves. In this repo, both primitives cover everything.
 
-## Primary diagram — the six anchors mapped
+## Primary diagram
+
+The whole surface: three uses of hash-map thinking (set membership, structural schema walk, KV shim) and one use of an array-based transform (base64).
 
 ```
-  Six hash-keyed structures across the layers
+  Arrays / strings / hash maps in blooming_insights — the whole surface
 
-  ┌─ Service layer ─────────────────────────────────────────┐
-  │                                                          │
-  │  state ── Map<sessionId, {                              │
-  │              insights:      Map<id, Insight>            │
-  │              investigations Map<id, Investigation>      │
-  │              anomalies:     Map<id, Anomaly>            │
-  │            }>                                            │
-  │                          ↑ session-owned, per-user clear │
-  │                                                          │
-  │  filterToolSchemas ── new Set(allowed) ── O(1) probe    │
-  │  crossCheckCoverage ── new Set(serverTools)             │
-  │                                                          │
-  └──────────────────────────┬──────────────────────────────┘
-                             │
-  ┌─ Transport layer ────────▼──────────────────────────────┐
-  │                                                          │
-  │  cache ── Map<`${name}:${json}`, {result, expiresAt}>   │
-  │                          ↑ time-owned, 60s TTL          │
-  │                                                          │
-  │  parseRetryAfterMs ── regex over error envelope         │
-  │                                                          │
-  └──────────────────────────┬──────────────────────────────┘
-                             │
-  ┌─ Eval layer ─────────────▼──────────────────────────────┐
-  │                                                          │
-  │  pickRunId ── new Set<string>() ── dedup filenames      │
-  │                                                          │
-  └──────────────────────────────────────────────────────────┘
+  ┌─ HASH-MAP AS SET (membership) ─────────────────────────────┐
+  │                                                             │
+  │  VALID_AUTH_TYPES.has(v.authType)     ← config.ts:56        │
+  │  allowedTools.has(toolName)           ← tool-schemas.ts:13  │
+  │  runIds.add(m[1])                     ← report.eval.ts:206  │
+  │                                                             │
+  │  → all O(1) average per op                                  │
+  └─────────────────────────────────────────────────────────────┘
+
+  ┌─ HASH-MAP AS SCHEMA (type guard) ──────────────────────────┐
+  │                                                             │
+  │  isMcpConfigOverride(v)               ← config.ts:50-60    │
+  │  Record<string, unknown> cast + 3 lookups + 1 set.has()     │
+  │                                                             │
+  │  → O(field count) = O(3)                                    │
+  └─────────────────────────────────────────────────────────────┘
+
+  ┌─ HASH-MAP AS TEST SHIM (interface conformance) ────────────┐
+  │                                                             │
+  │  Record<string, string> + { getItem, setItem, remove }      │
+  │                                       ← config.test.ts:127  │
+  │                                                             │
+  │  → O(1) per DOM Storage op                                  │
+  └─────────────────────────────────────────────────────────────┘
+
+  ┌─ ARRAY / STRING (transform) ───────────────────────────────┐
+  │                                                             │
+  │  btoa(json) / Buffer.from(json).toString('base64')          │
+  │                                       ← config.ts:77-82     │
+  │                                                             │
+  │  → O(n) in string length                                    │
+  └─────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-Hash tables were invented independently in ~1953 by Hans Peter Luhn at IBM. The load-factor / collision / chaining terminology comes from the compiler-writing tradition (symbol tables). Modern JavaScript's `Map` uses V8's internal hidden-class + SipHash implementation — it's *not* a linear-probing open-addressed table like Python's dict; the details matter if you ever hit degenerate cases.
+Hash tables were introduced by H. P. Luhn (IBM, 1953) with linear probing. The chaining variant (linked list per bucket) followed shortly after. The average-case O(1) guarantee needs a good hash function and a bounded load factor — production JS `Map` handles both, but a naive `Object` used as a map hits pathological cases (the "hash-collision DoS" bug that hit Node, Ruby, and PHP around 2011-2012 was exactly this).
 
-**Prototype pollution** — the reason `Map` exists — is real: CVE-2018-3721 (lodash.merge), CVE-2019-10744 (lodash.defaultsDeep). The lesson isn't "always use Map"; it's *"know which container's contract you need"*.
+TypeScript's structural typing has a specific shape at the runtime boundary: the compiler can't check that data off the wire actually has the type it's declared as, so you need a user-defined type guard (a function returning `value is T`) to promote `unknown` to the typed shape. This is the pattern `isMcpConfigOverride` implements. Libraries like Zod (`z.object(...).parse(x)`) automate the same pattern at scale, but the hand-rolled version is fine when the schema is small and there's exactly one caller.
 
-For strings, learn one thing beyond regex: **Rabin-Karp fingerprinting** (rolling hashes) and **suffix arrays**. Neither appears in this repo, but they show up in interview questions constantly and both build on the hash-map intuition — a hash reduces a variable-length key to a fixed-length probe.
+Base64 predates the web — MIME (RFC 2045, 1996) standardized it for email attachments. The `data:` URL scheme, JWTs, and any binary-in-JSON channel use it. The 33% overhead is fundamental to any encoding that squeezes 8-bit bytes into 6-bit ASCII (2^6 = 64 safe characters).
+
+Related reading: CLRS chapter 11 (hash tables), Sedgewick's "Algorithms" section 3.4 (hash tables, open addressing vs chaining). For string algorithms in general, Gusfield's "Algorithms on Strings, Trees, and Sequences" is the deeper text — mostly relevant when you need suffix arrays or Aho-Corasick, neither of which shows up here.
 
 ## Interview defense
 
-**Q: Why `Map` instead of a plain object in `lib/state/insights.ts`?**
+**Q: This codebase uses `Set` a lot. When would you *not* reach for a `Set`?**
 
-Answer: Three reasons. First, prototype safety — the sessionId is user-derived, and a plain object with key `__proto__` would let a caller mutate the prototype chain. Second, iteration order is guaranteed insertion-order for `Map`, whereas plain objects mix insertion and numeric-key sort order. Third, `.size` is O(1) instead of `Object.keys(o).length`'s O(n). None of them are performance sensitive here, but the safe default in TypeScript is `Map` for anything user-keyed.
-
-```
-  Why Map over {} for user-keyed state
-
-  Map:        set(k, v) O(1)  ·  clear() O(1)  ·  size O(1)  ·  no __proto__ trap
-  {}:         o[k] = v  O(1)  ·  keys().length O(n)  ·  __proto__ hazard
-```
-
-Anchor: `lib/state/insights.ts:14`.
-
-**Q: The cache Map at `lib/data-source/bloomreach-data-source.ts:122` — what breaks first at scale?**
-
-Answer: Memory. Nothing evicts entries when they expire, so the Map grows monotonically until the serverless instance dies. It's a slow leak — 60s TTLs mean each unique key contributes briefly — but at high uniqueness (random query params in cache key), memory grows unbounded. The fix is an LRU cap: cap size at N entries and evict on insert. That trades a bit of complexity for a hard memory ceiling.
+Three cases. First, when the collection is tiny and static — a set of 3 auth types could be an array with `.includes()` and no one would notice. The set signals intent ("membership is the question") more than it wins performance. Second, when you need ordering or iteration in insertion order without the set's guarantees — JS `Set` does preserve insertion order, but if you want indexed access (`arr[3]`), it's not the right shape. Third, when you need multiplicity — a `Set` collapses duplicates; `Array` or `Map<T, count>` keeps them.
 
 ```
-  cache growth: current vs bounded
+  When Set vs Array vs Map
 
-  current:   entries = ∫ writes(t) dt  →  grows forever, TTL is display-only
-  bounded:   entries ≤ N, evict LRU on insert  →  hard ceiling
+  Set     → "is X in the collection?" — presence only
+  Array   → "process each item" — iteration, indexed access
+  Map     → "look up value by key" — key/value pairs
 ```
 
-Anchor: `lib/data-source/bloomreach-data-source.ts:122,144-152`.
+**Anchor:** "Set is for membership; Array is for iteration; Map is for key-value. Wrong container = wrong access-cost."
 
-**Q: Talk through `filterToolSchemas` — what does the Set save you?**
+**Q: The `isMcpConfigOverride` type guard is hand-rolled. When would you swap for Zod?**
 
-Answer: The pattern is "given a list of items and a whitelist of allowed names, return the whitelisted items with their schemas mapped." Without the Set, you'd do `allowed.includes(t.name)` inside the filter — O(m) per tool, so O(n·m) total. Pre-computing the Set makes membership O(1), so total cost drops to O(n + m). At this repo's scale (40 tools, 8 allowed) the difference is invisible; the shape is what protects you at any future scale.
+When the schema grows past what a human can eyeball in one screen, or when errors need to be structured (Zod gives you an error tree pointing at which field failed and why). Three fields, one call site — hand-rolled is fine. Ten fields with nested objects and unions — Zod pays for itself in the error UX alone.
 
 ```
-  Set-then-scan cost
+  Type guard scale — where to swap
 
-  allowed.includes  :  O(m) × n tools  =  O(n·m)
-  new Set(allowed)  :  O(m) once
-  set.has  × n      :  O(1) × n        =  O(n)   ← total O(n + m)
+  1-5 fields, 1 call site       → hand-rolled type guard  ← current
+  5-15 fields, few call sites   → could go either way
+  nested / union types          → Zod (or ajv, io-ts)     ← future
+  spec-driven schemas           → Zod + JSON Schema export
 ```
 
-Anchor: `lib/agents/tool-schemas.ts:13-15`.
+**Anchor:** "Hand-rolled scales to about a dozen fields; past that, structured errors from Zod earn their keep."
+
+**Q: What breaks if you replace `Set` with plain `Object` in `VALID_AUTH_TYPES`?**
+
+The `has` check becomes `'authType' in obj`, which is O(1) but has the prototype-chain gotcha — `'toString' in {}` is `true`. You'd need `Object.hasOwn(obj, key)` to be safe. Plus the hash-collision DoS surface: a big attacker-controlled key set colliding to the same bucket used to hang V8 (`Map` has non-adversarial hash paths that mitigate this). For three static enum values it's a wash. For a big user-input-driven set it matters. The set is the honest primitive.
+
+**Anchor:** "`Set` avoids the prototype-chain trap and the hash-DoS surface — small readability + defensiveness win."
 
 ## See also
 
-- `01-complexity-and-cost-models.md` — the O(1)/O(n)/O(n·m) vocabulary this chapter cites.
-- `03-stacks-queues-deques-and-heaps.md` — the load harness's index-queue is another use of arrays as ordered containers.
-- `06-sorting-searching-and-selection.md` — `.sort().pop()` in `pickRunId`.
-- `.aipe/study-security/` — for the prototype-pollution class of bug in more depth.
+  → `01-complexity-and-cost-models.md` — where the O(1) claims here get their cost-model vocabulary
+  → `03-stacks-queues-deques-and-heaps.md` — the ordered-container family; sets and arrays live one level down
+  → `06-sorting-searching-and-selection.md` — where "sorted array" enters the picture (and doesn't in this repo)
+  → `study-testing` — the localStorage shim as a test-seam story

@@ -1,23 +1,20 @@
-# 01 — LLM foundations
+# 01 · LLM foundations
 
-The layer beneath everything else in this repo. Every agent, every eval, every cost line traces back to what an LLM is (a next-token predictor with an interface), how tokens shape context and cost, how sampling parameters change output shape, and how the boundary at the model — structured outputs, streaming, provider abstraction — determines what's easy or hard downstream.
+The interface-level model and the primitives every agent in this codebase uses. Nine concept files, each self-contained. Read in order the first time; jump around after.
 
-## Files (read in order)
+- [01-what-an-llm-is.md](01-what-an-llm-is.md) — the LLM as a function, not a database.
+- [02-tokenization.md](02-tokenization.md) — text → tokens → cost + context math.
+- [03-sampling-parameters.md](03-sampling-parameters.md) — temperature, top-p, top-k; when to pin to 0.
+- [04-structured-outputs.md](04-structured-outputs.md) — typed contracts at the LLM boundary; how `RubricJudge` and the agent tool schemas enforce shape.
+- [05-streaming.md](05-streaming.md) — NDJSON over `ReadableStream` for the UI; why not SSE.
+- [06-token-economics.md](06-token-economics.md) — the per-case cost ledger from a real eval receipt.
+- [07-heuristic-before-llm.md](07-heuristic-before-llm.md) — the intent classifier + categories gate as heuristic-before-LLM routing.
+- [08-provider-abstraction.md](08-provider-abstraction.md) — the `AnthropicModelProviderAdapter` and aptkit's `ModelProvider` port.
+- [09-user-override-locks.md](09-user-override-locks.md) — user override discipline; how the codebase's UI + config surface protects agent output.
 
-- `01-what-an-llm-is.md` — the IO model, before the architecture. Every bug story ends with "we thought the model was doing X."
-- `02-tokenization.md` — text becomes tokens. Context windows are sized in tokens. Cost is measured in tokens.
-- `03-sampling-parameters.md` — temperature, top-p, top-k. This codebase uses `temperature: 0` on the judge; agents use AptKit's defaults.
-- `04-structured-outputs.md` — the tool-call schema is the only output path (`Anomaly`, `Diagnosis`, `Recommendation`). No free-form JSON parsing.
-- `05-streaming.md` — NDJSON `AgentEvent` stream. First-token latency drops the perceived wait.
-- `06-token-economics.md` — the cost ledger. Per-case ~$0.09 (agent-side, cached). Per 10-case run ~$1.30.
-- `07-heuristic-before-llm.md` — partially exercised: intent uses Haiku (cheap-LLM) not heuristic regex. Case B project exercise.
-- `08-provider-abstraction.md` — the `ModelProvider` port from AptKit + `AnthropicModelProviderAdapter` in this repo. One swap point.
-- `09-user-override-locks.md` — not exercised. There are no user-editable fields the agent re-classifies. Case B project exercise.
+## The load-bearing files in this sub-section
 
-## Anchor shape
-
-LLM application engineering (primary shape). Every file here is directly exercised in `blooming_insights` except `07` (partial), `09` (not present).
-
-## Curriculum
-
-Phase 1 — concepts C1.1-C1.14.
+- `lib/agents/aptkit-adapters.ts` — the provider adapter, 260 LOC.
+- `lib/agents/pricing.ts` — Anthropic pricing helper (aptkit only knows OpenAI).
+- `lib/agents/intent.ts` — the Haiku classifier (heuristic layer above Sonnet).
+- `lib/mcp/events.ts` + `lib/mcp/types.ts` — the typed streaming contract.

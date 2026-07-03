@@ -1,91 +1,81 @@
-# Security — trust axis of blooming insights
+# study-security — blooming insights
 
-The only question: what can an attacker reach, and what happens when they do?
+The trust axis, walked in one file per boundary the repo actually enforces.
 
-This guide traces that question across every boundary in the repo — where untrusted input enters, who's allowed past, what's hidden vs exposed, and what the dependencies drag in. Every finding cites a real file and line range. When a control is load-bearing enough to earn a deep walk, it gets a numbered pattern file.
+## The through-line
 
----
+```
+  every input is hostile until proven otherwise.
+  every boundary either enforces a trust decision or leaks one.
+
+  trace the trust axis:
+     ↓
+     where does untrusted input enter?     (attack surface)
+     who is allowed past this boundary?    (authn / authz)
+     what's hidden, what's exposed?        (secrets / data)
+     what does the model let in?           (LLM/agent trust)
+```
+
+Every finding below ties to one of those beats: which boundary, which trust
+assumption, what breaks if it's wrong.
+
+## The trust map — three boundaries this repo enforces
+
+blooming insights sits between three parties that don't trust each other by
+default. The audit walks each one.
+
+```
+  Three trust boundaries — who talks to whom, and what crosses
+
+  ┌─ Browser (visitor's machine) ────────────────────────────┐
+  │  React UI · localStorage (bi:mode, bi:mcp_config)         │
+  │  ↑ NDJSON stream                    ↓ fetch()             │
+  └────────────────────────┬─────────────────────────────────┘
+                           │  boundary 1: browser ↔ routes
+                           │  cookies (bi_session, bi_auth), header
+                           │  (x-bi-mcp-config, base64-JSON)
+  ┌─ Next routes (blooming insights) ─▼──────────────────────┐
+  │  /api/agent · /api/briefing · /api/mcp/*                  │
+  │  auth store (ALS-scoped, cookie-backed in prod)           │
+  │  ↑ Anthropic response                ↓ tool calls         │
+  └───────────┬──────────────────────────┬───────────────────┘
+              │ boundary 2:              │ boundary 3:
+              │ routes ↔ Anthropic API   │ routes ↔ MCP server
+              │ HTTPS + API key          │ HTTPS + Bearer / OAuth
+              ▼                          ▼
+       ┌─ Anthropic ─┐         ┌─ MCP server (user-chosen URL) ─┐
+       │  claude-*   │         │  Bloomreach loomi alpha OR any │
+       └─────────────┘         │  URL the visitor pasted        │
+                               └────────────────────────────────┘
+```
 
 ## Reading order
 
-Start at the top, stop when the map is enough.
+Start with `audit.md` for the eight-lens sweep. Pattern files walk the controls
+the audit finds worth a deep read.
 
 ```
-  ┌─ Orient ────────────────────────────────────────────────┐
-  │  00-overview.md    the trust map + the three highest    │
-  │                    risks + a one-line verdict per lens  │
-  └──────────────────────────────┬──────────────────────────┘
-                                 │
-  ┌─ Full audit ─────────────────▼──────────────────────────┐
-  │  audit.md          8 lenses walked over the real repo   │
-  │                    with file:line grounding             │
-  └──────────────────────────────┬──────────────────────────┘
-                                 │
-  ┌─ Deep walks on load-bearing controls ────────────────────┐
-  │  01-encrypted-cookie-auth-store.md                       │
-  │  02-oauth-pkce-with-dcr.md                               │
-  │  03-read-only-tool-allowlist.md                          │
-  │  04-model-output-type-guards.md                          │
-  │  05-budget-ceiling-defense.md                            │
-  │  06-log-secret-redaction.md                              │
-  └──────────────────────────────────────────────────────────┘
+  audit.md                                     the 8-lens sweep · start here
+    ├─ 01-encrypted-auth-cookie.md             AES-256-GCM + ALS store · cookie
+    ├─ 02-oauth-pkce-dcr-boundary.md           OAuth 2.1 + PKCE + DCR at MCP hop
+    ├─ 03-user-chosen-mcp-url-boundary.md      new trust surface · UI-picked URL
+    ├─ 04-server-side-config-validation.md     header decode + isMcpConfigOverride
+    ├─ 05-model-output-validation.md           parseAgentJson + type guards
+    └─ 06-secret-redaction-in-errors.md        redactSecrets before logs/UI
 ```
 
----
+## Cross-links
 
-## The trust axis at a glance
+- `study-system-design/README.md` — architecture and request flow (adjacent axis).
+- `study-software-design/README.md` — interfaces + complexity (adjacent axis).
+- `study-testing/README.md` — how the controls above are proven (adjacent axis).
+- `rehearse-interview-defense/README.md` — the security answers you rehearse
+  when someone asks "what's the auth story?"
 
-Three trust boundaries in this repo. The Bloomreach loomi connect server is the only third party the agents reach; the Anthropic API is the model provider (fully server-side, key never touches the browser); the browser is where the analyst sits.
+## Honest scope
 
-```
-  Trace the trust axis across three hops
-
-  ┌─ Browser (untrusted) ──────────────────────────┐
-  │  React app, QueryBox, sessionStorage insights   │
-  │  can send: any JSON in ?insight= / ?diagnosis=  │
-  └──────────────────────┬─────────────────────────┘
-                         │  hop 1: HTTP request
-                         │  → sid cookie (httpOnly)
-                         │  → bi_auth cookie (AES-256-GCM)
-                         ▼
-  ┌─ Next.js server (trusted core) ────────────────┐
-  │  app/api/{briefing,agent,mcp/*}                 │
-  │  ALS-scoped RequestStore, type-guarded output   │
-  │  ★ every trust decision lives here ★            │
-  └──────┬──────────────────────────┬───────────────┘
-         │                          │
-         │ hop 2a: HTTPS + Bearer  │ hop 2b: HTTPS + API key
-         ▼                          ▼
-  ┌─ Bloomreach MCP ──────┐   ┌─ Anthropic API ────┐
-  │  OAuth 2.1 / PKCE      │   │  claude-sonnet-4-6  │
-  │  data provider         │   │  model provider     │
-  │  (semi-trusted)        │   │  (semi-trusted:     │
-  │                        │   │   its output       │
-  │                        │   │   is UNTRUSTED)    │
-  └────────────────────────┘   └─────────────────────┘
-```
-
-**The one that carries the weight:** hop 2b's return direction. Anthropic is a trusted counterparty for the request but its response is untrusted input crossing back into your system. `parseAgentJson` + the `isAnomalyArray` / `isDiagnosis` / `isRecommendationArray` type guards in `lib/mcp/validate.ts` are the seam that keeps model output from flowing straight to the UI.
-
----
-
-## Where to look for what
-
-| Question | File |
-|---|---|
-| What are the highest risks right now? | `00-overview.md` |
-| Does this repo do X? (any lens) | `audit.md` |
-| How does the encrypted cookie actually work? | `01-encrypted-cookie-auth-store.md` |
-| How does OAuth flow across the redirect? | `02-oauth-pkce-with-dcr.md` |
-| Why can the client only call some tools? | `03-read-only-tool-allowlist.md` |
-| Where is model output validated? | `04-model-output-type-guards.md` |
-| What stops a runaway agent from burning $$? | `05-budget-ceiling-defense.md` |
-| Where do we scrub tokens from logs? | `06-log-secret-redaction.md` |
-
----
-
-## Cross-links to sibling guides
-
-- **`study-system-design`** — architecture, request flow, streaming NDJSON contract. Non-security-shaped concerns about how the pieces fit together.
-- **`study-data-modeling`** — the `Insight` / `Anomaly` / `Diagnosis` / `Recommendation` types. Security says who's allowed to read/write them; data modeling says what they look like.
-- **`study-software-design`** — deep modules, layering, information hiding. Security is a lens *through* the design, not the design itself.
+- **No database → no SQLi, no row-level auth.** Every "storage" finding is
+  really about in-memory maps or cookie-scoped state. Called out per-lens.
+- **No multi-tenant authz.** The app is single-user-per-cookie. Session
+  isolation, not tenant isolation, is what the audit checks.
+- **No CSP / no rate limit at the edge.** Both flagged in the audit.

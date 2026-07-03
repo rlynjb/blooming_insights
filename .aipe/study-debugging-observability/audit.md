@@ -1,321 +1,487 @@
-# Audit — the 8 lenses, applied
+# audit.md — Pass 1
 
-One `##` section per lens. Each names what the codebase actually does
-(with `file:line`) or emits `not yet exercised` honestly. Cross-links
-into the Pass-2 pattern files for the deep walks.
+The 8-lens debugging + observability audit, walked against the code
+that's actually here. Each lens gets one `##` section grounded in
+`file:line`. Lenses that don't apply are named `not yet exercised`
+honestly. Cross-links point at Pass-2 pattern files.
 
-## 1. observability-map — the evidence map
-
-The system has three concentric evidence rings. Read them out from
-the browser and each ring exposes strictly more than the last.
-
-```
-  The three rings of evidence
-
-  ┌─ Ring 1 · live browser view ─────────────────────────────┐
-  │  ReasoningTrace + ToolCallBlock rendering the NDJSON      │
-  │  stream from /api/briefing or /api/agent                  │
-  │  gone the moment the tab closes                          │
-  └──────────────────────────────────────────────────────────┘
-                        ▲
-                        │ same events, one-shot
-                        │
-  ┌─ Ring 2 · in-process state ──────────────────────────────┐
-  │  saveInvestigation() → in-memory Map + dev-only JSON      │
-  │  file (.investigation-cache.json)                        │
-  │  route.ts:305 (COMBINED runs only)                       │
-  └──────────────────────────────────────────────────────────┘
-                        ▲
-                        │ synthetic-substrate only
-                        │
-  ┌─ Ring 3 · durable receipts on disk ──────────────────────┐
-  │  eval/receipts/<case>-<runId>.json — the debuggable       │
-  │  ledger; anomaly + diagnosis + judgment + tool trace     │
-  │  + usage + cost + budget                                 │
-  └──────────────────────────────────────────────────────────┘
-```
-
-**Ring 1 — the wire.** `AgentEvent` (`lib/mcp/events.ts:5-14`) is the
-8-variant discriminated union: `reasoning_step` / `tool_call_start` /
-`tool_call_end` / `insight` / `diagnosis` / `recommendation` / `done` /
-`error`. Producers use `encodeEvent(e)` (`events.ts:17`), consumers use
-`readNdjson` (`lib/streaming/ndjson.ts` — the 64-LOC kernel). This
-carries everything the UI has to show. → deep walk in
-`01-ndjson-live-trace.md`.
-
-**Ring 2 — server-side one-shot memory.** `lib/state/investigations.ts`
-holds combined `diagnose+recommend` runs in a per-session in-memory
-map, backed by a gitignored JSON file only in dev
-(`investigations.ts:7`). The split-step runs are held only on the
-client via `sessionStorage`, so they die with the tab.
-
-**Ring 3 — the receipts.** `eval/receipts/<case>-<runId>.json` is the
-only surface that survives across sessions with *provenance*:
-anomaly (input), diagnosis (agent output), diagnosisJudgment (judge
-output), tool-call trace, per-agent usage row, per-agent cost, and a
-budget snapshot. Sample receipt: 424 lines /
-`09-engagement-drop-email-campaign-2026-07-03T04-08-28-644Z.json`. →
-deep walk in `03-capability-trace-receipts.md`.
-
-## 2. reproduction-and-evidence
-
-**Repro is genuinely cheap here — three modes.**
-
-  → **`?demo=cached`** — plays back the committed snapshot
-    (`lib/state/demo-insights.json`) as NDJSON, delay-throttled to
-    140ms per event (`briefing/route.ts:25`, `agent/route.ts:104`). No
-    auth, no API cost, deterministic. This is the reliable presentation
-    path AND the reliable "make the UI render this exact scenario" tool.
-
-  → **`SyntheticDataSource`** — an in-process fake data source that
-    both `eval/run.eval.ts` and `eval/load.eval.ts` bind to. Any bug
-    triggered by the golden cases is reproducible without touching
-    Bloomreach, and the schema is fixed
-    (`syntheticWorkspaceSchema`).
-
-  → **`FaultInjectingDataSource`** — a decorator with configurable
-    per-call rates for `timeout / rate_limit / server_error /
-    malformed_json` (`lib/data-source/fault-injecting.ts:31-39`).
-    Deterministic when you set `FAULT_SEED` (`fault-injecting.ts:41`),
-    fully non-deterministic otherwise. This is how you exercise the
-    "Bloomreach 429'd mid-scan" path locally. → deep walk in
-    `05-fault-injecting-load-harness.md`.
-
-Hypotheses get tested by writing a golden case (`eval/goldens/`) with
-an expected-shape rubric, running the eval, and reading the judgment
-verdict + rationale off the receipt. This is closer to a science
-notebook than an ad-hoc `console.log`.
-
-## 3. structured-logs-and-correlation
-
-Server-side logs are `console.log(JSON.stringify(...))` in
-five load-bearing sites — all shipping structured records to Vercel's
-log pipeline via stdout scraping.
-
-| Site | Shape | Purpose |
-|---|---|---|
-| `app/api/briefing/route.ts:317-323` | `{ route, sessionId, mode, totalMs, phases[], aborted }` | one summary per request |
-| `app/api/agent/route.ts:331-337` | same shape | one summary per request (agent) |
-| `lib/agents/aptkit-adapters.ts:97-101` | `{ site, sessionId, usage }` | per model turn |
-| `lib/agents/base-legacy.ts:135`, `256` | `{ site, sessionId, usage }`, `{ site, ... }` | legacy — same shape |
-| `lib/agents/intent-legacy.ts:36` | `{ site, sessionId, usage }` | legacy classifier |
-
-The shape is **deliberately shared** across the two streaming routes
-so a single Vercel filter (`route = "/api/briefing"` OR `phases.phase
-= "monitoring_scan"`) reads across both — the comment at
-`briefing/route.ts:316-319` names this explicitly. → deep walk in
-`02-per-phase-request-summary.md`.
-
-**Correlation ID.** There is one: `sessionId` — the value of the
-`bi_session` cookie (`lib/mcp/session.ts:16-24`). It's stamped on
-every log line at every site listed above. There's **no request ID
-separate from the session**, so two concurrent requests from the same
-browser tab share a correlation key — this is acceptable at the
-current scale (one user, alpha demo) but starts to hurt once you have
-multiple parallel requests per session.
-
-**Redaction.** `redactSecrets` (`lib/mcp/transport.ts:66-76`) strips
-Bearer headers and OAuth token JSON fields before they hit a log.
-Applied at every server-side `console.error` call site (via
-`formatError(e)` → `redactSecrets(...)`). The redaction is only for
-OAuth-shaped secrets; there is no PII redaction for Bloomreach
-customer data flowing through EQL results.
-
-## 4. metrics-slis-slos-and-alerts
-
-**not yet exercised** as a live metrics pipeline. No Prometheus, no
-Datadog, no OpenTelemetry metrics.
-
-What DOES exist is metrics computed on demand from the receipts:
-
-- `eval/report.eval.ts:78-96` — p50/p95/p99/max/mean per phase
-  (investigate / diag-judge / recommend / rec-judge / total).
-- `eval/report.eval.ts:130-141` — per-tool-call latency distribution.
-- `eval/baseline.eval.ts` — per-dimension pass rates + verdict
-  distributions across all cases in a run.
-
-These are **eval-time SLIs** — computed after a run finishes, printed
-to stderr. There is no threshold, no page, no alert. The closest thing
-to an SLO is the regression gate in `eval/gate.eval.ts` — see lens 7.
-
-**When this starts to matter.** As soon as blooming insights sees
-sustained production traffic, "p95 total request latency" becomes a
-number someone wants to look at *between* runs, not just when
-Rein re-runs `npm run eval:report`. That's when you'd wire OTel
-metrics or ship the per-phase log lines into a real time-series DB.
-
-## 5. traces-and-request-lifecycles
-
-**Per-request tracing exists as the phase log,** at approximately
-"5 spans per request" granularity:
-
-Briefing route phases (`briefing/route.ts:221-281`):
-- `schema_bootstrap` → `coverage_gate` → `list_tools` → `monitoring_scan`
-
-Agent route phases (`agent/route.ts:236-295`, conditional on flow):
-- `schema_bootstrap` → `list_tools` → then EITHER `intent_classify` +
-  `query_answer` (free-form query) OR `diagnostic_investigate` +
-  `recommendation_propose` (investigation)
-
-Each phase records via `recordPhase(name, startedTs)` (`route.ts:217`)
-into a per-request array, and the array ships as `phases[]` in the
-final summary log. The comment at `briefing/route.ts:200-202` names
-the design: **the finally block always fires, so we get the phase log
-even when a phase throws**, and can see how much of the 300s budget
-was burned before the failure.
-
-**Deeper drill-down happens inside the aptkit trace sink.**
-`BloomingTraceSinkAdapter.emit()` (`lib/agents/aptkit-adapters.ts:143-
-174`) receives every `CapabilityEvent` from aptkit — including
-`model_usage` events with per-turn cache_creation / cache_read token
-counts. The `onCapabilityEvent` hook forwards this to any caller that
-wants it (the eval runner does). → deep walk in
-`03-capability-trace-receipts.md`.
-
-**What's NOT here:** no OpenTelemetry span IDs, no parent/child span
-relationships, no distributed context propagation. The whole stack is
-one Node process; the phase log is the trace.
-
-## 6. state-snapshots-and-debugging-boundaries
-
-Three snapshot surfaces the debugger reaches for.
-
-**Snapshot A · in-flight NDJSON.** Pipe the stream to a file:
-
-```
-curl -s 'http://localhost:3000/api/briefing?mode=live-synthetic' > trace.ndjson
-```
-
-Each line is a self-describing `AgentEvent`. Everything the UI would
-have shown is reproducible from the file via `readNdjson`.
-
-**Snapshot B · the receipt.** Written by
-`eval/run.eval.ts:305-321`. Contains not just the outputs but the
-**full aptkit trace** the outputs were derived from (`diagnosisTrace`
-+ `recommendationTrace` are held in memory during the run and
-summarized into the `usage` row on write). If a diagnosis is wrong,
-you have every model turn's token count and every tool call's args +
-result truncated to 4000 chars (`run.eval.ts:96` — `trunc()`) — enough
-to diagnose "the agent hallucinated a fact" vs "the tool returned bad
-data."
-
-**Snapshot C · captured HTTP error body.** `makeCapturingFetch`
-(`lib/mcp/transport.ts:103-118`) records the body of any non-2xx
-Bloomreach response into an `HttpErrorHolder`, so when the MCP SDK
-throws its generic `Unauthorized`, the transport can rethrow with the
-**real server body** attached (`transport.ts:139-143`). Without this,
-alpha-server errors would surface as generic "Unauthorized" with no
-clue what happened.
-
-## 7. incident-analysis-and-prevention
-
-**The prevention loop the repo actually runs:**
-
-```
-  golden case exercises a hypothesis
-        │
-        ▼
-  eval/run.eval.ts writes a per-case receipt
-        │
-        ▼
-  eval/baseline.eval.ts summarizes N receipts into
-    per-dimension pass rates + verdict distribution
-        │
-        ▼
-  committed to eval/baseline.json
-        │
-        ▼
-  next run: eval/gate.eval.ts compares candidate vs
-    baseline; blocks if any dimension regresses > 10pp
-```
-
-The gate is at `eval/gate.eval.ts:47-93`. Threshold default
-`GATE_MAX_REGRESSION=0.10` (10 percentage points), configurable per
-run. → deep walk in `04-baseline-and-regression-gate.md`.
-
-**Incidents observed in the current baseline (2026-07-03T04-08-28-644Z):**
-
-- `rec-judge` p99 outlier at case 09 (`819598ms total`,
-  `675185ms recommendationJudge` — see the sample receipt). The judge
-  retried multiple times on that case. The report surfaces this via
-  the p99 latency vs mean latency gap (`report.eval.ts:96`).
-- Judge-error verdicts appear in the baseline distribution:
-  `judge_error: 6` on diagnosis and `judge_error: 9` on
-  recommendation (`eval/baseline.json` — verdictDistribution). The
-  runner writes them as receipts (never throws) via
-  `buildJudgmentPlaceholder` (`run.eval.ts:87-99`) so they're
-  surfaced as a distinct outcome rather than lost. This is the
-  **"the observability captured what the judge model can't handle"**
-  case.
-
-**Runbooks.** Not yet exercised as a `docs/runbooks/` folder. The
-known alpha-server incident (revoked-token every ~5 min) is handled
-inline by `lib/hooks/useReconnectPolicy.ts:33-45` — the fix is coded
-into the client, not documented as a procedure.
-
-## 8. debugging-observability-red-flags-audit
-
-Ranked by consequence.
-
-**Red flag 1 — no correlation ID separate from the session.** Two
-concurrent requests from the same tab share a `sessionId` in the log
-line. This is fine at the alpha scale; the day someone opens two
-investigation tabs it becomes real work to disentangle their phase
-logs. **Fix cost:** low (add a `req.headers.get('x-request-id') ??
-crypto.randomUUID()` per handler, thread through the send helpers,
-stamp on both routes' summary log — one afternoon).
-
-**Red flag 2 — client-side trace is transient, split runs never reach
-the receipt path.** `saveInvestigation` (`agent/route.ts:305`) only
-fires on the combined run (`step == null`). The individual
-diagnose/recommend runs from the browser flow live in
-`sessionStorage` and die with the tab. A user reporting "the
-diagnosis was wrong" cannot hand you a receipt unless they were on
-the capture path. **Fix cost:** medium — writing per-step receipts
-that align with the eval receipt shape.
-
-**Red flag 3 — `console.log` is the only production ship path.**
-Vercel scrapes stdout, but there's no structured shipping, no PII
-redaction beyond OAuth tokens, no per-tenant fields. **Fix cost:**
-medium if you retrofit pino + a shipper; high if you add OTel.
-**When it matters:** the moment any real customer's data flows
-through the logs.
-
-**Red flag 4 — the p50/p95/p99 numbers depend on the reader running
-the report.** No automatic run, no dashboard, no alert. The
-"observability" is fully pull-based, not push. **Fix cost:** low if
-you just cron `npm run eval:report > report.txt` in CI; higher if
-you want a real dashboard.
-
-**Red flag 5 — cache-tier tokens under-counted.** `pricing.ts:6-13`
-documents this: `estimateAnthropicCost` uses only `inputTokens` and
-`outputTokens`. `cache_read_input_tokens` are excluded from the input
-count in aptkit's `model_usage` shape, so the report reads a **cost
-upper bound**. Fine for a budget ceiling (conservative is the right
-direction) but misleading if someone reads the receipt as a source of
-truth for "what did this cost."
-
-**Red flag 6 — judge_error is a real outcome, not a rare one.** The
-committed baseline has 6/40 diagnosis judgments and 9/60
-recommendation judgments as `judge_error`. That's ~15% of the signal
-being unusable — the observability surfaces this honestly (it's in
-`verdictDistribution`) but the fix belongs to prompt engineering, not
-this guide.
-
-**Red flag 7 — no PII redaction on Bloomreach EQL results.**
-`redactSecrets` strips OAuth tokens (`transport.ts:66-76`) but the
-tool-call results ship into `console.log(JSON.stringify({site, usage,
-...}))` and into eval receipts unredacted. Customer emails,
-customer IDs, and purchase details flow through unchanged.
-**When it matters:** the moment a receipt for a real customer's data
-ends up in a bug report or a public repo.
+The load-bearing story up front: **the observability pile is small on
+purpose — one wire, one summary log, one hook, and receipts on disk.**
+Every mechanism is one specific piece of evidence for one specific
+question. Nothing is a generic "let's log this in case."
 
 ---
 
-Cross-refs to the discovered patterns:
+## 1. observability-map
 
-- `01-ndjson-live-trace.md` — lenses 1, 3, 5, 6
-- `02-per-phase-request-summary.md` — lenses 3, 4, 5
-- `03-capability-trace-receipts.md` — lenses 1, 5, 6, 7
-- `04-baseline-and-regression-gate.md` — lenses 4, 7
-- `05-fault-injecting-load-harness.md` — lenses 2, 6
+**Three live surfaces plus two receipt classes; nothing outside them.**
+
+The evidence map, exhaustive:
+
+- **Live NDJSON stream** — `lib/mcp/events.ts:4-12` defines an
+  8-variant discriminated union (`AgentEvent`). Produced by
+  `/api/agent` (`app/api/agent/route.ts:194`) and `/api/briefing`
+  (`app/api/briefing/route.ts:198`) through a shared `send()`
+  closure. Consumed by the browser via `readNdjson`
+  (`lib/streaming/ndjson.ts:17-64`) which then dispatches to the
+  investigation hook (`lib/hooks/useInvestigation.ts:99-153`).
+  → see `01-ndjson-agent-event-wire.md`
+- **Per-phase summary console log** — one JSON line per request in
+  the route's `finally` block: `app/api/agent/route.ts:336-343` and
+  `app/api/briefing/route.ts:322-329`. Shared shape between routes so
+  a single Vercel filter reads both.
+  → see `03-per-phase-timing-log.md`
+- **Anthropic per-call usage log** — one JSON line per model turn from
+  `AnthropicModelProviderAdapter.complete()` at
+  `lib/agents/aptkit-adapters.ts:97-101`. Shape:
+  `{ site, sessionId, usage: response.usage }`. The `usage` field
+  carries Anthropic's own `cache_creation_input_tokens` +
+  `cache_read_input_tokens` — the evidence that prompt caching is
+  actually landing on the wire.
+- **Dev-only cache file** — `lib/state/investigations.ts:7-46` writes
+  `.investigation-cache.json` in `NODE_ENV=development` only; the
+  serverless FS is read-only in production. This is not intended as
+  an observability surface, but it is the fastest way to grab a
+  full trace of a dev run for post-hoc diagnosis.
+- **Per-case receipts on disk** — `eval/receipts/<caseId>-<runId>.json`
+  written by `eval/run.eval.ts:341-398`. Full case: anomaly, tool
+  calls (both agents), diagnosis, recommendations, judge verdicts,
+  usage + cost per phase, budget snapshot. Latest baseline runId:
+  `2026-07-03T04-08-28-644Z`, ten cases.
+- **Load receipt** — `eval/load-receipts/load-<runId>.json` written
+  by `eval/load.eval.ts:219-220`. p50/p95/p99 for each of investigate
+  / recommend / total across N investigations; per-fault-kind counts
+  when fault injection is on.
+- **Baseline + gate** — `eval/baseline.json` (committed) plus
+  `eval/gate-<runId>.json` (per-run) drive the regression check
+  (`eval/gate.eval.ts:112-148`).
+
+What's on this map is what exists. There is no metrics endpoint, no
+Prometheus scrape, no OTLP exporter, no separate `/health` route,
+and no separate debug logger — the four `console.error` / `console.log`
+call sites plus the four eval receipt classes are the entire pile.
+
+## 2. reproduction-and-evidence
+
+**Reproduction is receipt-driven; the receipt is both the input and
+the verdict.**
+
+Every eval run mints a `sharedRunId` in `beforeAll`
+(`eval/run.eval.ts:168`) and every case receipt embeds it in the
+filename (`<caseId>-<runId>.json`) plus the receipt body's `runId`
+field. That's the reproduction handle: give someone a runId and they
+can pull the whole case pile off disk, load it in `report.eval.ts`
+(`eval/report.eval.ts:62-69`) and get the same p50/p95/p99 table you
+saw. No re-running the agent — the evidence is the run.
+
+For live incidents the reproduction path is:
+
+1. Grab the `sessionId` from the browser (network tab) or the
+   Vercel log filter.
+2. Filter the log by that sessionId — you get every model turn
+   (`aptkit-adapters.ts:97`) plus the one summary line
+   (`route.ts:336`).
+3. Cross-reference the `phases[]` array to know which phase burned
+   time. If a phase field is missing, the throw happened *before*
+   that `recordPhase` call.
+
+Controlled experiments are what the fault-injecting DataSource is
+for (`lib/data-source/fault-injecting.ts:65-`). Set
+`FAULT_TIMEOUT=0.1 FAULT_RATE_LIMIT=0.05 FAULT_SEED=42
+npm run eval:load` and the load run replays a deterministic
+failure sequence — the receipt records `faultTotals` so you can
+prove the graceful-degradation path fires the number of times you
+told it to.
+
+Hypothesis testing lives in the golden cases themselves
+(`eval/goldens/index.ts` re-exports 10 case files). Each case has a
+`knownCorrect` shape and a `signalClass`
+(`has-signal` / `partial-signal` / `no-signal` / `positive`); the
+judge rubric scores against these on 4 dimensions per phase. The
+verdict distribution *is* the hypothesis test.
+
+## 3. structured-logs-and-correlation
+
+**Two structured log shapes, one correlation ID by convention.**
+
+Every log line the repo emits is `JSON.stringify`-shaped, never a
+plain string. Two shapes matter:
+
+- **Per model-turn** — `lib/agents/aptkit-adapters.ts:97-101`:
+  `{ site: 'agents/<name>:aptkit-model', sessionId, usage }`.
+  `usage` is Anthropic's raw usage envelope, including
+  `cache_creation_input_tokens` and `cache_read_input_tokens` when
+  caching is active. This is the wire-level evidence that caching
+  is landing — grep for `cache_read_input_tokens` in the log stream
+  and every non-first turn in an investigation should have a
+  non-zero value.
+- **Per-request summary** — `app/api/agent/route.ts:336-343` and
+  `app/api/briefing/route.ts:322-329`:
+  `{ route, sessionId, mode, totalMs, phases, aborted }`. One line
+  per request, in the `finally` so it fires even on throw. The
+  shape is deliberately identical between routes so a single
+  Vercel filter (e.g. `phases.phase = "schema_bootstrap"`) reads
+  across both.
+
+Correlation:
+
+- **`sessionId`** is `lib/mcp/session.ts:16-24`, minted as a
+  `crypto.randomUUID()` on first request and set as an httpOnly
+  cookie (`bi_session`). It appears in the per-turn log, the
+  summary log, and every eval receipt (`eval/run.eval.ts:183`,
+  `eval/load.eval.ts:264`). This is the one ID that ties a live
+  session to its logs.
+- **`runId`** correlates all receipts belonging to one eval run.
+- **`caseId`** correlates a receipt back to its golden case
+  definition in `eval/goldens/`.
+
+There is no trace ID / span ID / distributed trace context — the
+browser → route → MCP hop is not stitched. The `sessionId` is the
+stand-in.
+
+Redaction:
+
+- `lib/mcp/transport.ts:66-76` (`redactSecrets`) walks a fixed set
+  of `TOKEN_PATTERNS` (Bearer, `access_token`, `refresh_token`,
+  `id_token`, `code_verifier`) and replaces the token value with
+  `[redacted]` while preserving the surrounding JSON key.
+- Called by every error-path `console.error` in the routes:
+  `app/api/agent/route.ts:174`, `:317`, `:330`;
+  `app/api/briefing/route.ts:179`, `:303`, `:316`; plus the four
+  MCP proxy routes. This is enforced at the *log-string
+  construction site*, not by a downstream sink — so a token in
+  `err.cause.cause` doesn't survive the `formatError` walk
+  (`transport.ts:82-97`) and reach Vercel.
+  → see `06-log-redaction-and-error-chain.md`
+
+## 4. metrics-slis-slos-and-alerts
+
+**Not yet exercised as continuous signals; measured on-demand via
+eval receipts.**
+
+The repo has no continuously-emitted metrics: no `/metrics`
+endpoint, no OTLP exporter, no StatsD, no Prometheus client, no
+CloudWatch custom metrics. Nothing pages anyone; nothing
+auto-alerts.
+
+The signal that would populate an SLI *does* exist — it's just
+computed on-demand from receipts:
+
+- **Latency SLI** — computed by `eval/report.eval.ts:90-96` from
+  the `durationMs` field on every receipt. Current numbers
+  (runId `2026-07-03T04-08-28-644Z`): p50 diagnose 50s,
+  d-judge 38s, recommend 51s, r-judge 90s, total 225s.
+- **Cost SLI** — `eval/report.eval.ts:104-131` sums per-case
+  `usage.costUsd` from receipts; current run total is
+  $0.913 agent-side across 10 cases.
+- **Quality SLI** — per-dimension pass rate over judge verdicts,
+  four dimensions per phase, computed by
+  `eval/baseline.eval.ts` and cached in `eval/baseline.json`.
+- **Load / concurrency SLI** — populated by
+  `eval/load.eval.ts:335-385` into `load-<runId>.json`; fault
+  totals per kind when fault injection is on.
+
+When continuous export becomes real, the seam is clear: every
+receipt is already a proto-metric with `runId` + `caseId` as
+labels; a nightly job could `curl` them into any TSDB without
+touching the runner.
+
+Alerting: no threshold, no notification. The regression gate
+(`eval/gate.eval.ts:135`) is the closest thing — a *deploy-time*
+alert that fires as a non-zero CI exit code if any judge dimension
+regresses by more than 10pp against baseline.
+→ see `07-regression-gate-and-baseline.md`
+
+## 5. traces-and-request-lifecycles
+
+**Two lifecycles, both fully instrumented; no cross-hop tracing.**
+
+The two request lifecycles:
+
+- **Live investigation** — `GET /api/agent?insightId=…&step=diagnose`
+  or `&step=recommend`. Ten wall-clock phases named by
+  `recordPhase`:
+  `schema_bootstrap`, `list_tools`, `intent_classify`,
+  `query_answer`, `diagnostic_investigate`,
+  `recommendation_propose`. All in `app/api/agent/route.ts:222-300`.
+- **Live briefing** — `GET /api/briefing`. Four phases named by
+  `recordPhase`: `schema_bootstrap`, `coverage_gate`, `list_tools`,
+  `monitoring_scan`. All in `app/api/briefing/route.ts:210-286`.
+
+Each phase is a wall-clock delta stashed into a local `phases[]`
+array; the summary log emits the whole array in the `finally`
+block. The phase log is per-*request*, not per-tool-call — the
+tool-call level lives on the NDJSON wire as
+`tool_call_start` / `tool_call_end` events with `durationMs`.
+
+Causal chain, per investigation:
+
+```
+  browser useInvestigation  (lib/hooks/useInvestigation.ts:47)
+       │  fetch(/api/agent?...)
+       ▼
+  route.GET  (app/api/agent/route.ts:111)
+       │  makeDataSource(mode, sid, override)
+       ▼
+  DataSource  (bloomreach or synthetic; lib/data-source/)
+       │
+       ▼
+  DiagnosticAgent.investigate  (lib/agents/diagnostic.ts:46)
+       │  wraps AptKit primitive
+       ▼
+  AptKit agent loop  (@aptkit/core)
+       │  onCapabilityEvent for every step
+       ▼
+  BloomingTraceSinkAdapter.emit  (lib/agents/aptkit-adapters.ts:157)
+       │  fans out to hooks
+       ▼
+  route.send(AgentEvent)  (app/api/agent/route.ts:192)
+       ▼
+  NDJSON wire  →  browser dispatch
+```
+
+The AptKit → Blooming seam is `BloomingTraceSinkAdapter`
+(`lib/agents/aptkit-adapters.ts:149-184`). Every AptKit
+`CapabilityEvent` fans out three ways: to `onCapabilityEvent` (raw,
+for evals), to Blooming's internal per-type routing (text →
+`onText`, tool → `onToolCall` / `onToolResult`), which then feeds
+`send()` in the route → NDJSON on the wire. One event, three
+consumers, one adapter.
+→ see `04-capability-trace-fanout.md`
+
+Cross-hop tracing: none. The browser → route hop is a plain
+`fetch`; no `traceparent` header. The route → MCP hop is a plain
+MCP SDK client call; no trace context propagation. The correlation
+ID (`sessionId`) is set by the server on cookie mint and read on
+subsequent calls, but nothing wires it into the model or MCP
+request as a header.
+
+## 6. state-snapshots-and-debugging-boundaries
+
+**State snapshots are receipts; before/after is baseline vs
+candidate.**
+
+State inspection points:
+
+- **Investigation cache file** — `.investigation-cache.json` in
+  dev, written by `saveInvestigation`
+  (`lib/state/investigations.ts:30-41`). This is a full replay-able
+  event stream keyed by `insightId`; the `/api/agent` route reads
+  from it first (`route.ts:127`) if `?live=1` is not set. Cache-first
+  replay is *itself* a debugging tool — a bad prod investigation can
+  be exported from the cache file and re-inspected offline.
+- **Session's in-memory insights** — `lib/state/insights.ts` (not
+  fully read here) holds per-session insights + anomalies; scoped to
+  the `sessionId` cookie so concurrent sessions can't collide.
+- **Demo snapshot** — `lib/state/demo-investigations.json` +
+  `lib/state/demo-insights.json` are committed fallback state; the
+  cache-first read at `route.ts:127` picks these up when the in-mem
+  and dev-file paths miss.
+- **Eval receipts** — the definitive state snapshot for post-hoc
+  analysis. Each receipt contains the full anomaly, every tool
+  call's args and result (truncated to 4000 chars, `route.ts:98-102`
+  and `run.eval.ts:145-147`), the diagnosis, the recommendations, and
+  the judge verdicts.
+
+Debugging boundaries — where the seam supports intercept /
+substitute:
+
+- **`DataSource` port** (`lib/data-source/types.ts`, implementations
+  in `bloomreach-data-source.ts`, `synthetic-data-source.ts`,
+  `mcp-data-source.ts`). Swap it in the factory and the same agent
+  code runs against fake data. This is what the evals do — the
+  goldens run against `SyntheticDataSource` so no OAuth is needed
+  and every run is deterministic.
+- **`FaultInjectingDataSource`** (`lib/data-source/fault-injecting.ts`)
+  wraps *any* DataSource and forces the four failure modes
+  (`timeout`, `rate_limit`, `server_error`, `malformed_json`) at
+  configurable per-kind rates. Seeded PRNG makes runs
+  reproducible. This is the controlled-experiment surface — force
+  a fault, observe the retry ladder, observe the graceful
+  degradation, count the faults in the receipt.
+- **`onCapabilityEvent`** on `AgentHooks` — captures every raw
+  AptKit event without touching agent internals. This is what
+  makes token + cost math possible offline: the receipt captures
+  every event, the report replays the events through
+  `summarizeUsage` + `estimateCost`.
+
+Before/after: the receipt shape + `runId` lets you compare any two
+runs. `eval/gate.eval.ts:112-148` does exactly this at the
+per-dimension pass-rate level; a person can do it at the per-case
+receipt level with `diff <(jq . baseline-01-…) <(jq . candidate-01-…)`.
+
+## 7. incident-analysis-and-prevention
+
+**The 300s budget breach is the one modeled incident; guarded by
+the budget tracker + traced by the phase log.**
+
+The named production incident this repo has actually been designed
+around is the 300s Vercel Pro route budget:
+
+- **Signal** — the summary log fires in the `finally` block, so a
+  route that hit the 300s cap still emits its `phases[]`. The last
+  entry in `phases[]` names the phase that burned the budget.
+  `aborted: req.signal.aborted` disambiguates client cancel from
+  server timeout.
+- **Guard** — `BudgetTracker` (`lib/agents/budget.ts:41-77`) is
+  created per investigation and shared across
+  `DiagnosticAgent` + `RecommendationAgent`. Every model turn calls
+  `AnthropicModelProviderAdapter.complete()`
+  (`aptkit-adapters.ts:59-66`) which checks `budget.exceeded()`
+  BEFORE dispatching. On breach it throws `BudgetExceededError`;
+  the route catches it (implicit — falls through the generic error
+  path at `route.ts:308-321`) and emits a graceful NDJSON `error`
+  event.
+- **Cost-side prevention** — Phase-3 prompt caching in
+  `aptkit-adapters.ts:85-89`: the system prompt is wrapped in an
+  `ephemeral` cache breakpoint on every `complete()` call. First
+  call is `cache_creation` (~1.25× normal), every subsequent call
+  within 5 min is `cache_read` (~0.1×). For a ~10-turn diagnostic
+  run this is a ~80% reduction on the system-prompt input token
+  cost. Landing verified via the per-turn log's
+  `cache_read_input_tokens` field.
+- **Retry-side prevention** — the MCP transport's per-call
+  `AbortSignal.timeout(30_000)` (`lib/mcp/transport.ts:38`) bounds
+  any single tool call to 30s. Composed with the client's
+  `req.signal` via `composeSignals`
+  (`transport.ts:173-189`) so whichever fires first cancels the
+  call. This prevents one stuck MCP call from monopolizing the
+  route's 300s.
+
+The fault-injection surface (see lens 6) is the regression guard
+for the retry-and-degrade paths. The regression gate is the
+quality regression guard.
+
+Runbooks / post-mortems: not yet exercised. There is no
+`RUNBOOK.md`, no `POSTMORTEMS/` directory, no incident template.
+The eval receipt structure is what a post-mortem *would* attach
+if there were one — full case reproduction on disk.
+
+## 8. debugging-observability-red-flags-audit
+
+The ranked blind spots, worst first. Each is real — no invented
+finding to fill the section.
+
+### R1. `console` is the only sink
+
+Rank: highest, because it's the ceiling on how much observability
+scales without work. Every log line ends up in either the browser
+devtools or Vercel's log stream. Grep works fine for one incident;
+it doesn't work for "did the p95 shift over the last 100 requests"
+without pulling everything into a spreadsheet.
+
+- Evidence: every log call site in the repo is `console.log` or
+  `console.error`. Grep across `lib/` and `app/`:
+  `lib/agents/aptkit-adapters.ts:97`, `app/api/agent/route.ts:336`,
+  `app/api/briefing/route.ts:322` — plus the six error-path
+  `console.error`s wrapped in `redactSecrets(formatError(…))`.
+- Consequence: metrics-shaped questions ("what fraction of
+  briefings hit the 30s MCP timeout in the last hour?") don't have
+  an answer without ad-hoc log-parsing.
+- Move: the fix isn't a logger library; the fix is an aggregation
+  seam. A `logStructured(shape)` shim that today wraps
+  `console.log` but tomorrow can also `fetch` to an OTLP HTTP
+  endpoint. Cheap now, cheaper before there's a second sink.
+
+### R2. No trace-ID propagation across hops
+
+Rank: high, because the only correlation ID today is `sessionId`,
+which is *per-user*, not *per-request*. A user with two open tabs
+firing two briefings gets two log streams tagged the same way.
+
+- Evidence: no `traceparent` / `traceId` in any header threading
+  in `app/api/*/route.ts`; no request-scoped context passed into
+  the agent classes.
+- Consequence: interleaved logs from two concurrent requests
+  can't be untangled without timestamps + heuristics.
+- Move: mint a `requestId = crypto.randomUUID()` at the top of
+  each route, thread it into every `console.log` payload, and
+  into the `send()` closure so it also lands on the NDJSON wire.
+  One field, ~5 lines per route, fully additive.
+
+### R3. Client-side error visibility is a black hole
+
+Rank: high. The browser side of the observability map is
+`readNdjson` → dispatch. If the ndjson parser or the dispatch
+handler throws, the error stays in the browser console. Nothing
+reports it back.
+
+- Evidence: `lib/hooks/useInvestigation.ts:206-208` catches the
+  outer async error and calls `setError`, but there's no browser
+  → server "please log this" round-trip. The `readNdjson`
+  malformed-line handler
+  (`lib/streaming/ndjson.ts:47-49`) defaults to silent skip.
+- Consequence: a subtle producer bug (e.g. an `unknown` result
+  that doesn't round-trip through JSON cleanly) surfaces as
+  "the trace item stopped updating" with no server-side signal.
+- Move: pass `onMalformed` to `readNdjson` and post the failing
+  line to a `POST /api/log-malformed` route. Also fire a
+  `window.addEventListener('error'|'unhandledrejection', …)` in
+  the app shell that pings the same route.
+
+### R4. Prompt-caching evidence lives only in logs
+
+Rank: medium. The `cache_read_input_tokens` on the per-turn log
+is the sole live evidence that caching is landing. The receipts
+capture `inputTokens` + `outputTokens` but *not* the cache split
+(comment at `aptkit-adapters.ts:103-106` explicitly names this —
+aptkit's `model_usage` event doesn't expose the cache fields).
+
+- Evidence: `budget.ts:29-34` (`BudgetSnapshot`) has no cache
+  tokens; `report.eval.ts` prints totals but not cache hit rate;
+  receipt shape at `run.eval.ts:341-395` has no cache field.
+- Consequence: cache regressions are invisible in receipts.
+  Someone edits a system prompt and blows the cache; the token
+  totals go up but no dimension in the baseline says
+  "cache hit rate dropped."
+- Move: capture `response.usage.cache_read_input_tokens` +
+  `cache_creation_input_tokens` in the adapter's usage log
+  (already emitted) but *also* pipe them into a
+  `CacheStatsCollector` alongside the `BudgetTracker`, snapshot
+  it into the receipt, and add a `cache_hit_rate` line to the
+  report.
+
+### R5. No `/health` or `/ready` endpoint
+
+Rank: medium-low. No probe route means Vercel and any external
+uptime monitor can only measure end-to-end briefing latency as a
+proxy for health. If MCP auth is broken but briefings still 200
+via the cached demo path, health is silently green.
+
+- Evidence: `find app/api -name route.ts` — no `health/` or
+  `ready/`.
+- Consequence: outages that only affect the *fresh* path stay
+  invisible until someone tries to run a fresh investigation.
+- Move: `GET /api/health` returns `{ ok, checks: { mcp: 'ok' |
+  'auth-required' | 'timeout', anthropic: 'ok' | 'no-key' } }`
+  after non-destructive probes. Sub-second budget.
+
+### R6. Dev cache file has no rotation
+
+Rank: low. `.investigation-cache.json` grows unbounded per
+insightId key. Not a runtime problem (dev only) but eventually a
+grep-slowdown / disk problem.
+
+- Evidence: `lib/state/investigations.ts:32-37` always
+  `readJson` → merge → `writeFileSync`. No TTL, no eviction.
+- Consequence: a dev machine that runs a lot of investigations
+  ends up with a fat cache file. Then git tries to include it
+  (`.gitignore` catches it; verified) but the cache read gets
+  slow.
+- Move: cap at N most-recent insightIds, or add a
+  `npm run cache:clear` script.
+
+### R7. Log volume per investigation is high, unbounded
+
+Rank: low. Every model turn emits a JSON line
+(`aptkit-adapters.ts:97`); a diagnostic run is ~10 turns, a full
+investigation (diagnose + recommend) is ~20. At load N=20 that's
+~400 lines per load run. Fine today; a problem at real
+concurrency.
+
+- Evidence: no sampling in the per-turn log; no log-level flag
+  gating it.
+- Consequence: at 100 concurrent investigations the log stream is
+  ~2000 lines/min just from the model-usage logs.
+- Move: a debug-flag gate (`process.env.LOG_MODEL_USAGE`) or
+  head-sampling (1-in-N per session).

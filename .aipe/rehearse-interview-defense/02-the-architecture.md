@@ -15,10 +15,16 @@ This is the whiteboard walk. Every hop labeled, every band named, every seam mar
 
   ┌─ Browser (React 19) ─────────────────────────────────────────────┐
   │                                                                  │
-  │  app/page.tsx (461 LOC)                                          │
+  │  app/page.tsx                                                    │
   │  ├─ useBriefing()          → GET /api/briefing (NDJSON)           │
-  │  ├─ useLiveMode()          → live vs demo toggle (localStorage)   │
+  │  ├─ useLiveMode()          → 3 modes (default: `live-synthetic`)  │
+  │  │                           demo · live-synthetic · live-mcp     │
   │  └─ useInvestigation()     → POST /api/agent (NDJSON)             │
+  │                                                                  │
+  │  McpConfigModal (components/settings/McpConfigModal.tsx)         │
+  │    ← only visible when mode = `live-mcp`                         │
+  │    ← writes McpConfigOverride to localStorage[bi:mcp_config]     │
+  │    ← "only enter MCP URLs you trust" warning surfaced inline     │
   │                                                                  │
   │  StatusLog + ReasoningTrace  ← streams agent thinking to UI      │
   │  readNdjson kernel (64 LOC) ← ONE kernel, 4 streaming consumers   │
@@ -26,12 +32,18 @@ This is the whiteboard walk. Every hop labeled, every band named, every seam mar
   └────────────────────────────┬─────────────────────────────────────┘
                                │  hop 1: fetch() + ReadableStream
                                │  Content-Type: application/x-ndjson
+                               │  header: x-bi-mcp-config (base64 JSON)
                                ▼
   ┌─ Route layer (Next.js 16 App Router · edge=off) ─────────────────┐
   │                                                                  │
   │  /api/briefing   → runs monitoringAgent, streams Insight[]       │
   │  /api/agent      → step=diagnose | recommend | null (combined)   │
   │  /api/mcp/*      → OAuth callbacks, tool coverage, capture        │
+  │                                                                  │
+  │  decodeConfigHeader(x-bi-mcp-config)                             │
+  │    → validated McpConfigOverride | null (fail-safe: null, not    │
+  │      throw, on malformed input → falls through to env)           │
+  │    → passed to makeDataSource(mode, override)                    │
   │                                                                  │
   │  lib/state/insights.ts                                           │
   │    session-keyed Map<sessionId, SessionFeed>                     │
@@ -67,22 +79,27 @@ This is the whiteboard walk. Every hop labeled, every band named, every seam mar
   │                                                                  │
   └────────────────────────────┬─────────────────────────────────────┘
                                │  hop 3: DataSource port (71 LOC)
-                               │  → the seam. 4 uses, 0 caller changes.
+                               │  → the seam. 5 uses, 0 caller changes.
                                ▼
   ┌─ Provider layer ─────────────────────────────────────────────────┐
   │                                                                  │
   │   ┌─────────────────────┐                                        │
-  │   │ Bloomreach          │   → live path                          │
-  │   │ DataSource          │                                        │
+  │   │ McpDataSource       │   → live-mcp path (generic)            │
+  │   │ (alias re-export of │      Bloomreach is the DEFAULT preset, │
+  │   │  BloomreachDataSrc) │      not the codebase identity         │
   │   └──────────┬──────────┘                                        │
   │              │  hop 4: MCP over StreamableHTTP                   │
-  │              │  OAuth PKCE + Dynamic Client Registration         │
+  │              │  AuthProvider strategy (3 OAuthClientProviders):  │
+  │              │    · BloomreachAuthProvider (OAuth PKCE + DCR)    │
+  │              │    · BearerAuthProvider     (static token)        │
+  │              │    · AnonymousAuthProvider  (no auth)             │
   │              ▼                                                   │
-  │   loomi-connect MCP server ──▶ Bloomreach Engagement             │
+  │   ANY MCP server ──▶ target workspace                            │
+  │   (default preset: loomi-connect ──▶ Bloomreach Engagement)      │
   │                                                                  │
   │   ┌─────────────────────┐                                        │
-  │   │ Synthetic           │   → offline eval / capture path        │
-  │   │ DataSource          │                                        │
+  │   │ Synthetic           │   → default UX (live-synthetic)        │
+  │   │ DataSource          │      + offline eval / capture path     │
   │   └─────────────────────┘                                        │
   │                                                                  │
   │   ┌─────────────────────┐                                        │
@@ -129,17 +146,17 @@ The strong answer walks the four bands in order, names the two off-to-the-side s
 
 > *"I'll draw it in four bands — browser, routes, agents, providers — plus two scaffolds off to the side.*
 >
-> *[Draw browser band] Top band is the browser. React 19, Next.js 16. `app/page.tsx` is 461 lines, extracted into three hooks — `useBriefing`, `useLiveMode`, `useInvestigation`. The panel that streams the agents' reasoning is `StatusLog` wrapping `ReasoningTrace`. All the streaming surfaces — the briefing, the diagnose step, the recommend step, and the free-form query — consume one shared kernel called `readNdjson`, which is 64 lines of code. Four consumers, one kernel. That's the strongest deduplication receipt on the frontend.*
+> *[Draw browser band] Top band is the browser. React 19, Next.js 16. `app/page.tsx` is extracted into three hooks — `useBriefing`, `useLiveMode`, `useInvestigation`. The default mode is `live-synthetic` — real agents against local fake data, no OAuth required — with `demo` and `live-mcp` as the other two. When the user picks `live-mcp`, a settings modal appears — `McpConfigModal` — that lets them plug in their own MCP server URL, auth type, and bearer token. The panel that streams the agents' reasoning is `StatusLog` wrapping `ReasoningTrace`. All the streaming surfaces — the briefing, the diagnose step, the recommend step, and the free-form query — consume one shared kernel called `readNdjson`, which is 64 lines of code. Four consumers, one kernel. That's the strongest deduplication receipt on the frontend.*
 >
-> *[Draw route band] Second band is the Next.js route layer. Two main routes — `/api/briefing` for the monitoring pass, and `/api/agent` for the diagnostic and recommendation steps. The `maxDuration` is 300 seconds because Vercel's Pro tier maxes there, and I have a 300-second route budget composed with 30-second per-call timeouts at `lib/mcp/transport.ts`. Session state lives in a `Map<sessionId, SessionFeed>` — session-keyed, not id-keyed, which I'll come back to when we talk about the concurrent-user bug.*
+> *[Draw route band] Second band is the Next.js route layer. Two main routes — `/api/briefing` for the monitoring pass, and `/api/agent` for the diagnostic and recommendation steps. On every request, the route decodes an `x-bi-mcp-config` header — that's the transport for the settings-modal override — validates it with `isMcpConfigOverride`, and passes it into `makeDataSource`. If the header is malformed, `decodeConfigHeader` returns `null` rather than throwing, and the route falls through to env defaults. The `maxDuration` is 300 seconds because Vercel's Pro tier maxes there, and I have a 300-second route budget composed with 30-second per-call timeouts at `lib/mcp/transport.ts`. Session state lives in a `Map<sessionId, SessionFeed>` — session-keyed, not id-keyed, which I'll come back to when we talk about the concurrent-user bug.*
 >
 > *[Draw agent band] Third band is the agent layer. Five agents on top of `@aptkit/core@0.3.0` — monitoring, diagnostic, query, recommendation, and a Haiku classifier called `classifyIntent`. The Haiku classifier is the deterministic supervisor — a small model routing to a big model. AptKit is my agent primitive; I wrapped it in about 263 lines of adapter code — three classes: `AnthropicModelProviderAdapter`, `BloomingToolRegistryAdapter`, `BloomingTraceSinkAdapter`. The legacy pre-AptKit loop is still in the repo at `*-legacy.ts` as a rollback receipt.*
 >
-> *[Draw provider band] Fourth band is providers. The critical piece is a 71-line port called `DataSource`. I've used it four different ways — the real Bloomreach adapter, a Synthetic adapter for offline eval, and a `FaultInjectingDataSource` decorator that wraps any of them and injects failures at configurable rates. Four uses, zero caller-side changes. That's the strongest seam receipt in the whole system.*
+> *[Draw provider band] Fourth band is providers. The critical piece is a 71-line port called `DataSource`. I've used it five different ways — `McpDataSource` (that's the generic MCP client; it's a rename via re-export of `BloomreachDataSource`, so Bloomreach is now the default preset, not the codebase identity), `SyntheticDataSource` for the default UX and for offline eval, and a `FaultInjectingDataSource` decorator that wraps any of them and injects failures at configurable rates. Five uses, zero caller-side changes. Behind `McpDataSource` is a second seam — three `OAuthClientProvider` implementations selected by strategy: `BloomreachAuthProvider` for OAuth PKCE + DCR, `BearerAuthProvider` for a static token, and `AnonymousAuthProvider` for no-auth servers. That's the strongest seam receipt in the whole system.*
 >
 > *[Draw scaffolds] Off to the side, two scaffolds. The eval flywheel — 10 goldens, 2 rubrics with 4 dimensions each, a baseline committed to the repo, and a gate that blocks if any dimension regresses more than 10 percentage points. And CI on GitHub Actions — typecheck, tests, build, on every push."*
 
-That's the walkthrough. Roughly 90 seconds if you're drawing at a natural pace. You've named 12 real files and given three concrete receipts (readNdjson 64 LOC / 4 consumers, AptKit adapters 263 LOC, DataSource 71 LOC / 4 uses). No hedging. No filler.
+That's the walkthrough. Roughly 90 seconds if you're drawing at a natural pace. You've named 12 real files and given three concrete receipts (readNdjson 64 LOC / 4 consumers, AptKit adapters 263 LOC, DataSource 71 LOC / 5 uses). No hedging. No filler.
 
 ┌─────────────────────────┬─────────────────────────┐
 │ WEAK ANSWER             │ STRONG ANSWER           │
@@ -155,7 +172,10 @@ That's the walkthrough. Roughly 90 seconds if you're drawing at a natural pace. 
 │ UI. Oh, and I have some │ code. The provider band │
 │ evals."                 │ is behind a 71-line     │
 │                         │ DataSource port with    │
-│                         │ four uses. The eval     │
+│                         │ five uses — including a │
+│                         │ swappable MCP client    │
+│                         │ behind three auth       │
+│                         │ providers. The eval     │
 │                         │ flywheel and CI gate    │
 │                         │ sit off to the side."   │
 ├─────────────────────────┼─────────────────────────┤
@@ -210,7 +230,9 @@ Here's the request flow — the diagnose step, end to end:
                                                     │
                                                     │  DataSource.callTool()
                                                     ▼
-                                              BloomreachDataSource
+                                              McpDataSource (Bloomreach preset)
+                                              → AuthProvider strategy picks
+                                                OAuth-PKCE|Bearer|Anonymous
                                               → MCP call over StreamableHTTP
                                               → 30s per-call timeout
                                               → response envelope: structuredContent
@@ -241,7 +263,7 @@ Say it out loud:
 
 > *"When a user clicks an InsightCard, `useInvestigation.start` posts to `/api/agent` with the insight ID and step equals 'diagnose'. The route validates the session, reads the Insight from the session-keyed feed map, checks the BudgetTracker to make sure we're under the per-investigation ceiling, and starts the agent.*
 >
-> *AptKit runs the loop. Each tick, the model streams tokens back — either text, or a `tool_use` block. On a `tool_use`, AptKit routes through `BloomingToolRegistryAdapter` down to the `DataSource` port, which the running configuration wires to `BloomreachDataSource`. That calls MCP over StreamableHTTP with a 30-second per-call timeout. The MCP server proxies to Bloomreach. Result comes back as a `tool_result` block. The trace sink emits an NDJSON event to the response stream — reasoning step, tool call start, tool call end.*
+> *AptKit runs the loop. Each tick, the model streams tokens back — either text, or a `tool_use` block. On a `tool_use`, AptKit routes through `BloomingToolRegistryAdapter` down to the `DataSource` port. In `live-mcp` mode that resolves to `McpDataSource` — the generic MCP client — with whichever `OAuthClientProvider` the AuthProvider factory picked (Bloomreach OAuth by default, or Bearer / Anonymous if the user set an override in the settings modal). That calls MCP over StreamableHTTP with a 30-second per-call timeout. The MCP server proxies to the target workspace. Result comes back as a `tool_result` block. The trace sink emits an NDJSON event to the response stream — reasoning step, tool call start, tool call end.*
 >
 > *The browser reads the NDJSON via the shared `readNdjson` kernel and paints each event into `StatusLog`. When the agent produces its final `Diagnosis`, that streams as a `diagnosis` event and the browser stashes it in `sessionStorage`, so the recommend step (step 3) hydrates instantly when the user clicks through."*
 
@@ -271,10 +293,13 @@ Once you land the architecture walk, the interviewer will pick one branch to dri
   │
   ├─► "How does the DataSource abstraction pay off?"
   │      They're testing whether you know why it's there.
-  │      Answer: "Four uses, zero caller-side changes. Bloomreach,
-  │      Synthetic for offline eval, FaultInjecting as a decorator
-  │      on either. The eval flywheel wouldn't exist without it —
-  │      goldens run against Synthetic, no MCP round-trips."
+  │      Answer: "Five uses, zero caller-side changes.
+  │      McpDataSource (Bloomreach as default preset, swappable to
+  │      any MCP server via the settings modal), Synthetic for
+  │      offline eval and as the default UX, and FaultInjecting as
+  │      a decorator on either. The eval flywheel wouldn't exist
+  │      without it — goldens run against Synthetic, no MCP
+  │      round-trips."
   │
   └─► "What's the AptKit adapter layer doing?"
          They're testing whether you understand what you're
@@ -340,15 +365,15 @@ The band structure would stay. The DataSource port would stay. The AptKit bounda
 
   ## The one-page summary
 
-**Core claim.** blooming insights is a four-band system with two off-to-the-side scaffolds. Browser (React 19, one shared 64-LOC NDJSON kernel). Route (Next.js 16, session-keyed feed map). Agent (5 agents on @aptkit/core, ~263 LOC of adapters). Provider (DataSource port, 4 uses, 0 caller changes). Off to the side: eval flywheel + CI gate.
+**Core claim.** blooming insights is a four-band system with two off-to-the-side scaffolds. Browser (React 19, one shared 64-LOC NDJSON kernel, settings modal for `live-mcp`, default UX is `live-synthetic`). Route (Next.js 16, session-keyed feed map, per-request McpConfigOverride header). Agent (5 agents on @aptkit/core, ~263 LOC of adapters). Provider (DataSource port, 5 uses, 0 caller changes; McpDataSource is generic with Bloomreach as the default preset; three OAuthClientProvider strategies behind it). Off to the side: eval flywheel + CI gate.
 
 **The questions covered.**
 
   → "Walk me through the architecture." → four bands + two scaffolds + three receipts (64/263/71 LOC).
-  → "Walk me through one request." → browser → route → agent tick → DataSource → MCP → back through the stream to StatusLog.
+  → "Walk me through one request." → browser → route (decodes McpConfigOverride) → agent tick → DataSource → McpDataSource (Bloomreach preset by default) → back through the stream to StatusLog.
   → "How does NDJSON work?" → server writes to ReadableStream, client reads via `readNdjson.ts` kernel, buffering handles partial lines.
   → "Why session-keyed?" → concurrent-user wipe fix (Chapter 6).
-  → "Why the DataSource abstraction?" → four uses, zero caller changes; the eval flywheel depends on it.
+  → "Why the DataSource abstraction?" → five uses, zero caller changes; the eval flywheel depends on it; the swappable MCP client is the fifth use.
 
 **The pull quote.**
 

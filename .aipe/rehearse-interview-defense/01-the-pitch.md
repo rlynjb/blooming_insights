@@ -177,7 +177,7 @@ Say this:
 >
 > *[Problem] A marketer on Bloomreach normally has to notice a metric moved, hunt for the cause, and figure out which Bloomreach feature to reach for. blooming insights does that end-to-end — monitoring detects the anomaly, a diagnostic agent forms and tests hypotheses against the actual event data, and a recommendation agent proposes a concrete Bloomreach action.*
 >
-> *[Shape] It's five agents on top of AptKit as the agent primitive, wrapped in about 260 lines of adapter code that keep AptKit at arm's length. The frontend is Next.js 16 with a shared NDJSON streaming kernel — 64 lines of code, four different streaming surfaces consume it. And there's a DataSource port — a 71-line interface that's been used four different ways with zero caller-side changes. That's the strongest architectural receipt in the whole system.*
+> *[Shape] It's five agents on top of AptKit as the agent primitive, wrapped in about 260 lines of adapter code that keep AptKit at arm's length. The frontend is Next.js 16 with a shared NDJSON streaming kernel — 64 lines of code, four different streaming surfaces consume it. And there's a DataSource port — a 71-line interface that's been used five different ways with zero caller-side changes, including a swappable MCP server behind three auth-provider strategies. Bloomreach is the default preset, not the identity of the codebase. That's the strongest architectural receipt in the whole system.*
 >
 > *[Differentiator] The thing that separates it from every other agent app is that the agents' reasoning streams to the UI as a first-class surface — not a hidden trace, a real panel next to the answer.*
 >
@@ -286,7 +286,7 @@ If you were pitching this project a year from now with more time, you'd cut the 
 
   → 10 seconds: *"An AI analyst for a Bloomreach ecommerce workspace that shows its work — it streams the agents' reasoning as a first-class UI surface."*
   → 30 seconds: setup + mechanism + receipt. Add the three-stage loop (what changed / why / what to do) and one receipt (eval-gated in CI).
-  → 90 seconds: hook + problem + shape + differentiator + receipt + honest thing. Add the architecture markers (5 agents on AptKit, 71-line DataSource port with 4 uses) and volunteer the actionable_next_step 0% baseline as the honest limitation.
+  → 90 seconds: hook + problem + shape + differentiator + receipt + honest thing. Add the architecture markers (5 agents on AptKit, 71-line DataSource port with 5 uses including a swappable MCP server, Bloomreach as default preset) and volunteer the actionable_next_step 0% baseline as the honest limitation.
 
 **The pull quotes.**
 

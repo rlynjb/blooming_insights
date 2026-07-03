@@ -1,381 +1,272 @@
-# The audit — 8 lenses through this codebase
+# Audit — 8 lenses across blooming insights
 
-Walks the AOSD design lenses against the current repo. Each lens
-names findings with `file:line`. When a finding is significant
-enough to have its own deep walk, this file cross-links to the
-pattern file (`01-` through `06-`) instead of restating it.
+The 8 AOSD lenses walked against the current repo. Each lens names the AOSD red flag(s) that fire it, cites real paths + line ranges, ranks the findings, and (when the finding earned a Pass 2 file) cross-links to the deep walk.
 
-The lens order is diagnostic → structural → readability →
-capstone. Complexity first (where does it hurt?), depth and
-hiding next (how do we bury it?), layering and pull-down after
-(who should own the decision?), errors and readability last
-(when the shape is right, is the surface honest?). Red flags at
-the end as the actionable index.
+Order matters: complexity first (the diagnostic overview), then the primitives (deep-vs-shallow → info hiding → layers → pull-down → errors → readability), then the red-flag capstone as the actionable index.
+
+## Verdict up front
+
+The two rank-ordered findings for the whole audit:
+
+1. **Deep-module wins outnumber leaks 3-to-1** — the port + adapter + decorator + preset + factory in `lib/data-source/` (5 files, ~1100 LOC total), the strategy-pattern auth providers in `lib/mcp/auth-providers/` (3 flows behind one 10-method interface), and the NDJSON kernel in `lib/streaming/ndjson.ts` (64 LOC that replaces 4 hand-rolled parse loops) are all textbook AOSD moves. The seam has shipped **5 uses without a caller-surface change** — the tier-2 receipt.
+
+2. **The #1 fix is not a bug** — it's the 9 files (~1000 LOC) in `lib/agents/*-legacy.ts`. Preserved as a migration rollback receipt; imported now by only 2 test files. Time to remove; the AptKit-backed replacements are load-bearing and the tests can port to them.
 
 ---
 
 ## 1. complexity-in-this-codebase
 
-The diagnostic overview. Three symptoms to locate: amplified
-change (one edit touches many files), high cognitive load (the
-module nobody wants to touch), unknown-unknowns (surprises
-hiding behind an interface).
+The diagnostic overview. Three symptoms to locate: change amplification (one edit touches many files), cognitive load spikes (the module nobody wants to touch), and unknown unknowns (surprising behavior hiding behind a normal-looking name).
 
-**Three highest-complexity hotspots today, ranked:**
+**Change amplification — where a single edit ripples:**
 
-1. **`lib/agents/*-legacy.ts` — 9 files, ~1000 LOC of frozen
-   duplication.** Every one is a shadow of its non-legacy sibling:
-   `base-legacy.ts` (270) shadows `base.ts` (14 — the aptkit
-   bridge), `monitoring-legacy.ts` (138) shadows `monitoring.ts`
-   (116), etc. The legacy chain runs a hand-rolled ReAct loop; the
-   non-legacy chain delegates to aptkit through the three-class
-   adapter bundle (see `02-aptkit-bridge.md`). Only two test files
-   (`test/agents/base.test.ts`, `test/agents/synthesis-instruction.test.ts`)
-   still import from them, and they import from `base-legacy.ts`
-   only. **Symptom: cognitive load.** A reader arriving at
-   `lib/agents/` sees the same agent named twice and has to work
-   out which one is live. **Fix: delete the seven unreferenced
-   files; keep `base-legacy.ts` only if the two tests can't be
-   rewritten against the live path this week.**
+- `lib/mcp/types.ts` (141 LOC) — the shared data-model file. Adding a field to `Insight`, `Anomaly`, `Diagnosis`, or `Recommendation` cascades into the UI (`components/feed/*`, `components/investigation/*`), the demo snapshots (`lib/state/demo-*.json`), the validators (`lib/mcp/validate.ts`), the NDJSON contract (`lib/mcp/events.ts`), and the agents. This is a *centralized* shared vocabulary — the cost is real but the alternative (each layer defining its own shape) is worse. Optional-field discipline (`context.md`: "new fields stay optional so older snapshots still validate") is the mitigation.
 
-2. **`app/page.tsx` — 461 LOC.** Down from a heavier version (the
-   `useBriefingStream`, `useDemoCapture`, `useReconnectPolicy`
-   hooks were extracted — see `lib/hooks/`). What's left is
-   *layout code*: header + mode toggle + two-column shell + the
-   coverage-grid section + the query-box section. Individually
-   each block is fine; together it's still a long file with three
-   concerns interleaved. **Symptom: amplified change.** A
-   header-copy edit and a stepper-status edit sit in the same
-   file. **Fix: extract `<FeedHeader />`, `<FeedModeToggle />`,
-   and `<FeedLayout />` — the concerns are already visible in the
-   comments.**
+- `app/api/briefing/route.ts` (341 LOC) — the route that runs monitoring and emits the NDJSON. Every new event type, every new dispatch case, every schema addition passes through here. Reasonable given the streaming discipline, but the length is the largest procedural file after the legacy agent loop.
 
-3. **`lib/data-source/synthetic-data-source.ts` — 516 LOC.** By far
-   the longest single file in `lib/data-source/`. It's a fixture
-   generator that produces plausible EQL responses for the agents
-   to reason over — a lot of it is data tables (event catalogues,
-   segment shapes, plausible customer counts). Reads dense but
-   the split between "shape of a synthetic response" and "the
-   generator that emits it" isn't visible from the file layout.
-   **Symptom: unknown-unknowns.** Editing a synthetic response
-   shape risks silently breaking a golden case. **Fix: split
-   `synthetic-fixtures.ts` (the data) from
-   `synthetic-data-source.ts` (the adapter).**
+**Cognitive-load hotspot — the module you'd hesitate to touch:**
 
-The number that ties them together: three files carry ~2000 LOC.
-Cut the legacy chain and you're back under a healthy total.
+- `lib/agents/aptkit-adapters.ts` (260 LOC) — three classes in one file (`AnthropicModelProviderAdapter`, `BloomingToolRegistryAdapter`, `BloomingTraceSinkAdapter`). Two-directional shape mapping (Anthropic ↔ AptKit ↔ Blooming) plus budget tracking, prompt caching, and trace-event fan-out. The right decision (single directory of "here be the adapter bridge"), but the load is real. → see `01-port-adapter-decorator-preset-factory.md` for why this is deep, not shallow.
+
+**Unknown-unknown — surprising behavior behind a normal name:**
+
+- `lib/mcp/auth.ts` (259 LOC) still exports `BloomreachAuthProvider`, but the honest new home is `lib/mcp/auth-providers/bloomreach.ts`, which just re-exports it. A newcomer opening `auth-providers/` sees three siblings (bloomreach, bearer, anonymous) and reasonably assumes the class lives in `bloomreach.ts` — it doesn't. Deliberate (the class was designed to live in `auth-providers/` from the start; the re-export is the plan's non-disruptive path) but worth naming.
+
+**Ranked hotspots (highest complexity first):**
+
+1. `lib/agents/aptkit-adapters.ts` — three-class bridge, two-way mapping, plus budget + caching
+2. `app/api/briefing/route.ts` — the largest procedural route (341 LOC) and the NDJSON entry point
+3. `lib/data-source/synthetic-data-source.ts` — 516 LOC of deterministic fake data; long, but the length is *data* not logic
+
+---
 
 ## 2. deep-vs-shallow-modules
 
-Modules ranked by depth — functionality relative to interface
-size. Deep = big body, small surface; shallow = surface nearly as
-complex as the body (classitis).
+Depth = functionality ÷ interface size. Big body behind a small interface is deep (good); interface as wide as the body is shallow (classitis).
 
-**Deepest module — the standout example.**
-`DataSource` (`lib/data-source/types.ts` — 71 LOC total, of which
-the interface is `callTool` + `listTools`, two methods, ~15 LOC of
-signature). Under that interface sits **~740 LOC of adapter work**:
-`BloomreachDataSource` (214), `SyntheticDataSource` (516),
-`FaultInjectingDataSource` (167 — see `03-fault-injecting-decorator.md`).
-The client (the agents) only ever holds a `DataSource` reference;
-they don't know which adapter they're calling. This is the deepest
-module in the repo and the seam has now shipped in four live uses
-(Olist add, Olist remove, Synthetic add, FaultInjecting wrap). Deep
-walk: `01-datasource-port.md`.
+**Red flag: shallow module / classitis.**
 
-**Shallowest module — the worst offender.**
-`lib/agents/base.ts` — 14 LOC. Exports one constant (`AGENT_MODEL`)
-and one type alias (`McpCaller`). Nothing else. Its interface is
-100% of its body. This is textbook classitis — a module that
-exists to be named. Compare against `base-legacy.ts` (270 LOC of
-the hand-rolled ReAct loop it *used* to hold). **The rename was
-correct** — the ReAct loop moved into aptkit — but what's left
-should be inlined into the two files that import it (`aptkit-adapters.ts`,
-`monitoring.ts`, `diagnostic.ts`, `recommendation.ts`) or merged
-with `aptkit-adapters.ts` as a single `agents/base` module. The
-14-line file is one grep step nobody needs to take.
+**Deepest module in the repo (the win):**
 
-**Runner-up shallow module.** `lib/agents/pricing.ts` — 61 LOC — is
-borderline. It exports one function (`estimateAnthropicCost`) that
-is short. But its purpose is genuinely narrow (fill the aptkit
-gap for Anthropic pricing) and it's called from three sites
-(`budget.ts`, `eval/run.eval.ts`, `eval/load.eval.ts`). This is
-*narrow* not *shallow* — the interface is one function because the
-job is one function. Keep as-is.
+`lib/data-source/types.ts` — the **port** (`DataSource` interface). 71 LOC of interface plus doc comments; 2 methods (`callTool`, `listTools`). Behind that surface: OAuth 2.1 + PKCE + DCR session persistence, ~1 req/s rate limiting, 60s response cache, rate-limit retry ladder with parsed penalty windows, AbortSignal composition, McpToolError tagging. All hidden. The agents hold a `DataSource`, never a concrete adapter. → see `01-port-adapter-decorator-preset-factory.md` for the full walk.
+
+Runner-up: `lib/mcp/auth-providers/index.ts:56` — `makeAuthProvider({type, sessionId, redirectUri, bearerToken})`. 10 lines of switch statement pick one of three wildly different auth flows (OAuth PKCE DCR, static bearer, no-op) and return them typed as one interface. Consumer (`connectMcp` at `lib/mcp/connect.ts:82-140`) doesn't know which fired. → see `02-auth-strategy-injection.md`.
+
+Runner-up 2: `lib/streaming/ndjson.ts:17-64` — `readNdjson(body, onEvent, opts)`. 4-argument signature; behind it the whole "fetch → reader → TextDecoder → split → parse → dispatch" loop, plus trailing-buffer flush, malformed-line skip, and mid-stream cancel poll. Four call sites (feed, capture, investigation hook, chat) share it. → see `01-port-adapter-decorator-preset-factory.md` (the pulled-down kernel).
+
+**Shallowest module — the top offender:**
+
+`lib/agents/*-legacy.ts` — 9 files, ~1000 LOC total, imported by only 2 test files (`test/agents/base.test.ts`, `test/agents/synthesis-instruction.test.ts`) plus each other. Each `*-legacy.ts` is a thin wrapper around `runAgentLoop` from `base-legacy.ts` — the AptKit migration replaced these with `lib/agents/monitoring.ts` (116 LOC), `diagnostic.ts` (67 LOC), `recommendation.ts` (47 LOC), `query.ts` (34 LOC). The parallel exists deliberately: it's the rollback receipt for the AptKit migration. But nothing in `app/` reaches for them anymore.
+
+**Verdict:** the legacy files are neither shallow nor deep — they're **frozen**. They were once the deep modules; they've been superseded. The fix isn't refactoring; it's deletion. The 2 test files that still import them either port to the AptKit-backed classes or become archival evidence. **Do this next.**
+
+**Second-tier shallow module:**
+
+`lib/mcp/session.ts` (29 LOC) — a `sessionCookie()` helper. Small. Not classitis, just genuinely small — the shape is honest. Not a finding.
+
+**Ranked:**
+
+1. `lib/agents/*-legacy.ts` × 9 files (~1000 LOC) — frozen shallow parallel. **Remove.**
+2. Nothing else fires the shallow-module red flag. The rest of the repo either uses depth well or is honestly small.
+
+---
 
 ## 3. information-hiding-and-leakage
 
-Facts that live in two modules and force them to change together.
-Config that exposes internals. Temporal decomposition where every
-step of a process gets its own file.
+Look for decisions that leak — a fact known in two modules that forces them to change together; temporal decomposition; config that exposes internals.
 
-**Best-hidden decision.**
-"Which vendor SDK is the Anthropic-shaped one" lives entirely
-inside `lib/agents/aptkit-adapters.ts` (263 LOC). The three adapter
-classes — `AnthropicModelProviderAdapter`, `BloomingToolRegistryAdapter`,
-`BloomingTraceSinkAdapter` — plus their private converter functions
-(`toAnthropicMessage`, `toAnthropicTool`, `toModelContentBlock`, etc.)
-sit in one file. Every one of `monitoring.ts` / `diagnostic.ts` /
-`recommendation.ts` imports the three adapter classes as a bundle
-and never sees the anthropic SDK or the aptkit type surface
-directly. That fence is what lets the Bloomreach-side code type-check
-without pulling `@anthropic-ai/sdk` types into every agent file.
-Deep walk: `02-aptkit-bridge.md`.
+**Red flag: information leakage; same knowledge edited twice.**
 
-**Leaked fact — same knowledge, edited in two places.**
-The Anthropic model name `'claude-sonnet-4-6'` appears in five
-files: `lib/agents/base.ts:5` (`AGENT_MODEL`), `lib/agents/budget.ts:47`
-(the `BudgetTracker` constructor default), `eval/run.eval.ts:219`
-(the `estimateCost` fallback in the diagnosis-cost branch),
-`eval/run.eval.ts:273` (same, recommendation branch),
-`eval/load.eval.ts:299` and `:302` (both cost estimates). If
-you upgrade to a new Sonnet SKU, all five must move together.
-**Fix: `BudgetTracker` and the eval cost-estimator should read
-`AGENT_MODEL` from `base.ts`, not hardcode it.** The default in
-`BudgetTracker`'s constructor is where the leak started — it names
-the model to compute a cost, but the cost is about "whatever model
-the agents actually run." Depend on the constant.
+**Deliberate hiding wins (praise as finding):**
 
-**Second leak — the `ToolResult` open shape.**
-`lib/data-source/types.ts:32` — `ToolResult` declares `[key: string]:
-unknown` on the interface to let `structuredContent` ride through
-the seam without appearing in the type. This is the escape hatch
-that makes `unwrap<T>(result)` in `lib/mcp/schema.ts` work. But the
-interface doesn't say that — a reader has to trace to `unwrap()`
-to learn why the type is open. **Fix: name `structuredContent` on
-the `ToolResult` interface explicitly, as `structuredContent?:
-unknown`, and drop the open index signature.** The one field that
-actually rides through gets named; the type stops promising
-anything to callers.
+- `lib/mcp/config.ts` (146 LOC) — the client's localStorage is invisible to the server; the server's env is invisible to the client; only the base64-encoded header carries what's needed. The precedence chain (UI override → env → hardcoded default) is documented in `resolveConfig` and implemented in `mcpUrl()` at `lib/mcp/connect.ts:38-48`. Neither side of the boundary needs to know how the other picked its default. → see `04-client-server-contract-module.md`.
 
-**Third leak — the `pricing.ts` regex list.**
-`lib/agents/pricing.ts:26-33` — the Anthropic pricing table has
-three model families. If Anthropic prices change or a new family
-ships, both the table here and any hardcoded model in `base.ts`
-must be edited. Not urgent, but the same knowledge (model
-identity) is expressed as a regex here and a literal there.
+- `lib/data-source/mcp-data-source.ts` (27 LOC) — the class body is *not* in this file. It's a pure re-export from `bloomreach-data-source.ts`. The "how it's spelled today" (McpDataSource) is separated from "where the code lives" (the historical name). → see `03-rename-via-reexport.md`.
+
+- `lib/mcp/auth-providers/bloomreach.ts` (16 LOC) — also a re-export. Same pattern.
+
+**Actual leakage (small):**
+
+- The Bloomreach 10-second penalty window appears in **two** places: `lib/data-source/bloomreach-data-source.ts:135` (`retryDelayMs: opts.retryDelayMs ?? 10_000`) and `lib/mcp/connect.ts:120-125` (the connect-time defaults override it back to 10_000). If Bloomreach changes its rate limit, both files need editing. Small, but a real seam.
+
+- `AGENT_MODEL = 'claude-sonnet-4-6'` in **both** `lib/agents/base.ts:7` and `lib/agents/base-legacy.ts:10`. Same reason as (1) above — until the legacy files are removed, model-string edits happen twice.
+
+**Ranked (worst first):**
+
+1. Duplicated `AGENT_MODEL` and duplicated agent loop shape across the legacy tree (subsumed by the deletion fix in lens 2 — no separate action needed).
+2. Bloomreach penalty window in two places. **Fix later:** one exported constant.
+3. Everything else honors the hiding discipline. The client/server config split (`lib/mcp/config.ts`) is a textbook win.
+
+---
 
 ## 4. layers-and-abstractions
 
-Pass-through methods and pass-through variables. Layers that don't
-earn their place — a call chain where a wrapper just forwards.
+Find pass-through methods, pass-through variables, and adjacent layers offering the same abstraction — a layer not earning its place.
 
-**Genuine pass-through: `RecommendationAgent.propose`.**
-`lib/agents/recommendation.ts:26-46` — the class wraps `AptKitRecommendationAgent`
-and its `propose()` method forwards to `agent.propose(anomaly,
-diagnosis, { signal })`. The wrapper does five things: builds the
-model adapter, builds the tool registry, builds the trace sink,
-builds the aptkit agent, and calls its `propose`. The header
-comment on line 16 names this honestly ("Compatibility wrapper:
-Blooming keeps this constructor while AptKit owns the reusable
-agent"). Same shape in `lib/agents/diagnostic.ts:37-63`.
+**Red flag: pass-through method/variable.**
 
-**Is this a pass-through worth removing?** No — but recognize why.
-The wrapper does one load-bearing job: it converts aptkit's
-`DiagnosticDiagnosis` type back to Blooming's `Diagnosis` type
-(`toBloomingDiagnosis` on line 65), which today happens to be an
-identity function. The conversion function exists so that when
-aptkit's shape drifts from ours, there's already a seam to
-insert the mapping into. **This is speculative future-hardening**
-by AOSD standards, which normally recommends against it — but in
-this specific case the two adapters and the trace-sink bundle
-argue that the API-shape drift is likely enough to justify the
-seam. Live with it; annotate why.
+**Layers that earn their place:**
 
-**No pass-through variables.** The hooks bag (`AgentHooks`) is
-threaded from route handler → agent method → adapter → trace sink,
-but every layer *reads* from it (`hooks.budget`, `hooks.signal`,
-`hooks.onCapabilityEvent`), so no field is a bare forward.
+The layer chain for a live agent call is:
+
+```
+  agents        (MonitoringAgent, DiagnosticAgent, ...)
+      │
+      ▼
+  AptKit adapters   (BloomingToolRegistryAdapter)
+      │
+      ▼
+  DataSource port   (types.ts — 2 methods)
+      │
+      ▼
+  DataSource adapter   (BloomreachDataSource — cache + rate-limit + retry)
+      │
+      ▼
+  McpTransport         (SdkTransport)
+      │
+      ▼
+  MCP SDK Client
+```
+
+Every layer adds something. `AptKit adapters` maps shapes (Anthropic ↔ AptKit ↔ Blooming trace events). The `DataSource` port narrows the surface. The adapter adds cache + rate-limit + retry + AbortSignal + typed errors. `SdkTransport` isolates the SDK's raw calls behind the `McpTransport` interface (which is what the `HttpErrorHolder` capturing-fetch attaches to). Nothing is straight forwarding.
+
+**Small pass-through — the honest finding:**
+
+`lib/agents/aptkit-adapters.ts:143-145` — `BloomingToolRegistryAdapter.callTool` calls `this.dataSource.callTool(name, args, options)` and returns `{result, durationMs}`. Almost a pass-through — it drops `fromCache` because AptKit's `ToolRegistry` interface doesn't carry it. The drop is deliberate (upstream trace hooks pick up `fromCache` from `BloomingTraceSinkAdapter`) but it's the closest thing to a pass-through in the repo. Not worth changing; the alternative (thread `fromCache` through AptKit's foreign interface) would violate its abstraction.
+
+**Ranked:**
+
+1. No pure pass-through layers fire the red flag in this repo.
+2. The one near-miss (adapter-registry `callTool`) is honest.
+
+---
 
 ## 5. pull-complexity-downward
 
-Knobs the module has enough information to decide itself but
-pushes up to callers.
+Find knobs pushed up to callers that the module had enough information to decide itself.
 
-**Best example of complexity pulled down.** The NDJSON reader
-(`lib/streaming/ndjson.ts` — 64 LOC). Three callers used to run
-the same fetch → reader → TextDecoder → buffer → split('\n') →
-JSON.parse → dispatch shape inline: `useBriefingStream.ts`,
-`useDemoCapture.ts`, `useInvestigation.ts`. Every one had to know
-about the trailing-buffer flush, the malformed-line skip, and the
-cancel-between-reads polling. The kernel owns all three concerns
-now; callers pass a `body` stream, an `onEvent` handler, and
-optionally a `cancelOn` predicate. Deep walk: `06-ndjson-kernel.md`.
+**Red flag: avoidable config exposed to users.**
 
-**Knob still exposed that could be owned.** `AnthropicModelProviderAdapter`
-takes six constructor params: `anthropic, agent, sessionId, model,
-logSite, budget`. Two of them (`model`, `logSite`) have defaults
-that the two agent call sites always accept. The call sites
-pass `undefined, undefined, hooks.budget` positionally
-(`lib/agents/diagnostic.ts:52-54`, `lib/agents/recommendation.ts:36-38`).
-**Fix: convert to a named-options object.** `new AnthropicModelProviderAdapter({
-anthropic, agent, sessionId, budget: hooks.budget })` reads
-straight. The two undefined positional args are a red flag by
-themselves.
+**Praise as finding — knobs pulled down correctly:**
 
-**One knob that's correctly pulled down.** `BudgetTracker`'s
-`exceeded()` method reads the limits from the tracker itself; the
-adapter (`aptkit-adapters.ts:64`) only asks "did you exceed?" and
-throws if yes. The adapter never sees the limit values. The
-tracker owns both accumulation and the ceiling check — the
-adapter is a pass-through to the tracker, not the other way around.
+- `readNdjson` in `lib/streaming/ndjson.ts` takes 3 arguments (`body`, `onEvent`, `opts` for cancel + malformed-line callback). It does *not* expose the buffer strategy, the chunk size, the decoder settings — the caller couldn't do anything useful with them anyway. 4 call sites, none forced to know the parse loop.
+
+- `BloomreachDataSource` in `lib/data-source/bloomreach-data-source.ts` owns `minIntervalMs` (~1 req/s spacing), `retryDelayMs` (10s penalty window), `retryCeilingMs` (20s cap), `maxRetries` (3). The consumer sets them once at `connectMcp` (`lib/mcp/connect.ts:120-125`) with defaults that reflect Bloomreach's observed behavior; agents that only need `callTool` never see any of them.
+
+**Knobs still up at the caller (real finding):**
+
+- `CallToolOptions.skipCache` and `CallToolOptions.cacheTtlMs` in `lib/data-source/bloomreach-data-source.ts:22-26`. The 4 MCP routes (`/api/mcp/{call,tools,tools/check,capture}`) rely on `skipCache` to force fresh reads for the capture path. The knob is unavoidable — the module can't tell "the debug tool wants uncached" from "any other caller." Reasonable.
+
+- The `sessionId` argument threaded through `makeDataSource` → `connectMcp` → `BloomreachAuthProvider`. It's request-scoped state; the module can't pull it down because there's no per-process session. Also unavoidable.
+
+**Ranked:**
+
+1. No red-flag knobs currently pushed up. The two remaining caller-visible knobs (`skipCache`, `sessionId`) are load-bearing.
+
+---
 
 ## 6. errors-and-special-cases
 
-Where exception handling is scattered across call sites, and
-where a different definition would erase a class of special cases
-altogether.
+Find exception handling scattered across call sites and special cases a different definition would erase.
 
-**Special case defined out.** `readNdjson` (`lib/streaming/ndjson.ts:52-60`)
-handles the "producer forgot the trailing newline" case by
-flushing the buffer at end-of-stream. Every caller *could* have
-handled that itself, badly. The kernel absorbs it once and every
-caller inherits the correct shape.
+**Red flag: try/except everywhere; special-case sprawl.**
 
-**Well-defined error class.** `BudgetExceededError`
-(`lib/agents/budget.ts:85-95`) carries the snapshot and the limit
-as fields, so the route handler can emit a graceful NDJSON `error`
-event without reconstructing the state. The class documents its
-own emission path in the constructor comment. This is the
-right shape.
+**Errors defined out (praise):**
 
-**Error handling that's still scattered — the fault injector.**
-`FaultInjectingDataSource` fires four failure modes
-(`fault-injecting.ts:112-155`): three throw, one returns a
-malformed envelope. Each fire method is short but the shape isn't
-uniform — a reader has to check whether each mode throws or
-returns. **This is deliberate** — the whole point is that agents
-handle both throw and malformed-envelope paths, and the injector
-exercises both. But it's worth naming in the type: today, `roll <
-threshold` returns `Promise<DataSourceCallResult>` from three of
-the four branches by throwing, and one branch by returning. The
-signature doesn't tell you that. **Fix (minor): document the
-"three throw + one return" shape at the top of the file.**
+- `McpToolError` in `lib/data-source/bloomreach-data-source.ts:101-110` — one typed error carrying `toolName + detail`. Route handlers catch one class instead of parsing generic `Error.message`. The transport failure path (401 Unauthorized) and the `isError: true` tool result path both end up here.
 
-**No scattered try/except.** The only two `catch` blocks in
-`lib/` are in `ndjson.ts` (the malformed-line handler) and
-`app/page.tsx` (the `localStorage.getItem` guard). Both are
-one-line silent-swallow catches with a clear comment. This is
-clean.
+- Rate-limit *retries* are not error-handling — they're normal control flow inside `BloomreachDataSource.callTool` at `lib/data-source/bloomreach-data-source.ts:163-174`. The consumer sees success or `McpToolError`; the retry loop is invisible. Textbook error-definition-eliminates-special-cases.
 
-## 7. readability
+- `readNdjson` swallows malformed lines by default and surfaces them through the optional `onMalformed` callback (`lib/streaming/ndjson.ts:47`). The consumer chooses whether to care; the kernel doesn't grow a strict/lenient mode flag.
 
-Names, comments, consistency, obviousness. Four facets, ranked
-list per facet.
+**Special-case sprawl (small):**
 
-### names
+- Auth flow errors: `BloomreachAuthProvider` captures `lastAuthorizeUrl` and `connectMcp` at `lib/mcp/connect.ts:127-139` reaches back for it inside the catch. The `provider instanceof BloomreachAuthProvider` guard is the special case — bearer and anonymous providers throw if they end up in the OAuth flow (which is the correct behavior). Deliberate; the alternative is to lift `lastAuthorizeUrl` to the base interface, but only one provider has one, so that would be shallow-module bait.
 
-Strong. The port is `DataSource`, adapters end in `-DataSource`,
-the aptkit bridge classes end in `-Adapter`, the trace sink is
-`BloomingTraceSinkAdapter`. When names get long they get precise:
-`AnthropicModelProviderAdapter` is nine syllables and reads exactly
-what it does.
+- Fault-injection errors in `lib/data-source/fault-injecting.ts:118-146` — 4 fireX() private methods, one per fault kind. Could be a switch. As-is, each fault owns its shape (timeout error message, HTTP 429 with `.status`, HTTP 500, malformed-json ToolResult). The four are genuinely different; the sprawl is honest.
 
-Worst names:
-- `hooks` (`lib/agents/diagnostic.ts:46`, everywhere) — the AgentHooks
-  bag is called `hooks`. This is fine until you realise there are
-  React hooks in the same repo. **Fix: `agentHooks` at the call
-  site, `hooks` inside the type is fine.**
-- `McpCaller` (`lib/agents/base.ts`) — this is the client-facing
-  type of the `DataSource` port's tool-call surface. The name says
-  "an MCP caller" but the seam has been renamed to `DataSource`
-  and this alias hasn't followed. **Fix: rename to `ToolCaller`
-  or drop and use `DataSource` directly.**
+**Ranked:**
 
-### comments
+1. No scattered try/catch fires the red flag. The `McpToolError + retry ladder + malformed-line callback` design is a textbook error-definition win.
 
-Strong. Every load-bearing file (`types.ts`, `fault-injecting.ts`,
-`budget.ts`, `pricing.ts`, `ndjson.ts`, `aptkit-adapters.ts`)
-opens with a purpose comment that names what the file exists to
-solve. `pricing.ts:1-14` is a good example — it says which gap
-this fills, what the upstream shape is (`estimateCost` returns
-undefined for anthropic), and what caveats matter (cache-tier
-pricing not included).
+---
 
-Missing interface comment worth adding:
-- `DataSource` itself (`types.ts:63`) has an inline JSDoc line but
-  no comment explaining *when a caller would want to swap
-  adapters* — the seam's story. The existing header says "Currently
-  `BloomreachDataSource` is the only implementation — an Olist
-  (SQL-backed) adapter previously lived behind this seam and was
-  removed," which is history but not motivation. **Fix: add one
-  paragraph on the interface itself: "Callers hold this type, not
-  a concrete adapter. Adapters live in `bloomreach-data-source.ts`,
-  `synthetic-data-source.ts`, `fault-injecting.ts` (decorator)."**
+## 7. readability (names · comments · consistency · obviousness)
 
-Comment that restates the code — not many. `app/page.tsx` has one
-weak comment (`// re-runs the briefing fetch below` at :94) that
-adds nothing. Cleanest interface-comment in the repo:
-`aptkit-adapters.ts:76-88` on the cache-control decision.
+Four facets in one lens. Each red flag counted separately.
 
-### consistency
+### Names
 
-Two hooks-bag shapes coexist:
-1. `MonitorHooks` (`lib/agents/monitoring.ts:66-71`) — 4 fields.
-2. `AgentHooks` (`lib/agents/diagnostic.ts:16-35`) — 5 fields.
+**Precision wins:** `readNdjson`, `BloomreachDataSource`, `McpConfigOverride`, `FaultInjectingDataSource`, `bootstrapSchema`, `McpToolError` — each name predicts its body. No `Manager`, `Helper`, `Utils`, or `Handler` classes.
 
-`AgentHooks` has `onCapabilityEvent` and `budget`; `MonitorHooks`
-doesn't. `RecommendationAgent` imports `AgentHooks` from
-`diagnostic.ts` rather than defining its own. **Fix: rename
-`AgentHooks` to `InvestigationHooks` (since it's used by
-diagnostic + recommendation) or fold `MonitorHooks` into `AgentHooks`.**
-Two type names for the same job is the classic red flag.
+**Legacy name still doing work:** `BloomreachDataSource` is now the *class name* but not the *layer name* — the interface is `DataSource`, the alias is `McpDataSource`, but the file that exports the concrete class is still `bloomreach-data-source.ts`. The class is generic (works against any MCP server); "Bloomreach" is the historical first user. Deliberate (the plan's non-disruptive naming path — see `mcp-data-source.ts` header comment) but a real reader trip-wire.
 
-Second consistency issue: five different filename shapes under
-`lib/agents/`:
-- `monitoring.ts` / `monitoring-legacy.ts` (no dashes vs one)
-- `aptkit-adapters.ts` (dashes)
-- `tool-schemas.ts` (dashes)
-- `base.ts` / `base-legacy.ts`
+**Small vagueness:** `parseAgentJson` in `lib/agents/legacy-validate.ts` — "agent" is vague when 4 agents produce differently-shaped output. The paired `isAnomalyArray` / `isDiagnosis` / `isRecommendationArray` guards clarify it, but the parse function name doesn't stand alone. Subsumed by the legacy deletion.
 
-The `-legacy` suffix is the problem — it reads as if legacy files
-are first-class members of the module tree. **Fix: move them to
-`lib/agents/_legacy/` or delete.**
+**Verdict:** naming is above average. The one legacy naming friction (`BloomreachDataSource` class in `mcp-data-source.ts`-aliased directory) is explained in-file, so a reader who opens the code finds the explanation. Not a fix.
 
-### obviousness
+### Comments
 
-The "huh?" spot: `AnthropicModelProviderAdapter` positional args.
-Call site: `new AnthropicModelProviderAdapter(this.anthropic,
-'diagnostic', this.sessionId, undefined, undefined, hooks.budget)`
-(`diagnostic.ts:48-55`). Two `undefined`s in a row is the code
-telling you the interface is wrong. Named options would erase
-the surprise.
+**Comments that carry what code can't:** almost every file in `lib/data-source/`, `lib/mcp/`, and `lib/streaming/` opens with a header block that explains *why* the shape is what it is — trade-offs, history, budget implications. Example: `lib/data-source/bloomreach-data-source.ts:1-14` (header explaining the Bloomreach adapter's history and why it's identical to what it was pre-rename). Example: `lib/streaming/ndjson.ts:1-13` (why the trailing-buffer flush exists). Example: `lib/data-source/fault-injecting.ts:11-16` (**the 5-uses receipt** — the file that names the seam-uses count as the tier-2 story).
 
-Second surprise: `hooks.budget` is optional (`AgentHooks.budget`
-has `?:`), but when set, it's a *shared instance* across
-`DiagnosticAgent.investigate` and `RecommendationAgent.propose`
-in the same investigation. `eval/run.eval.ts:212,267` shares one
-`budget` between two agent calls to accumulate the total. The
-sharing isn't visible from the type — it's just that the caller
-holds a reference. **Fix: name the shared-instance contract in the
-type comment.**
+**Missing interface comment (one):** the exported `readNdjson` has a one-line JSDoc; adequate. `makeAuthProvider` at `lib/mcp/auth-providers/index.ts:56` has none — the switch is self-explanatory, but a one-line JSDoc summarizing "picks a provider by discriminant" would help.
+
+**Comments that restate the code:** none found in the audit sample.
+
+**Verdict:** the comment density is high on the load-bearing files (interfaces, kernels, decorators) and correctly low on the leaf data-shape files. The 5-uses receipt comment in `fault-injecting.ts:11-16` is the load-bearing example — it's the sentence a reader takes with them.
+
+### Consistency
+
+**Two-conventions-for-one-job (one, small):** the DataSource result envelope uses camelCase (`{result, durationMs, fromCache}`); the raw NDJSON events also use camelCase; the McpConfigOverride fields (`authType`, `bearerToken`) match. Consistent.
+
+The one shape swing: `Insight | Anomaly | Diagnosis | Recommendation` all use camelCase field names, but `evidence[].tool` uses lowercase because it's the MCP tool name (external). That's not inconsistency; it's a real boundary.
+
+**Verdict:** consistent. No red flag.
+
+### Obviousness
+
+**The "huh?" spots:**
+
+- `lib/mcp/auth.ts` still exporting `BloomreachAuthProvider` while `lib/mcp/auth-providers/bloomreach.ts` re-exports it. If you open `auth-providers/` first, the file with the class body isn't in the folder. See lens 1's unknown-unknown finding.
+
+- `lib/agents/base.ts` (14 LOC) is tiny; it defines only `AGENT_MODEL` and `McpCaller`. A newcomer expecting the agent loop here finds it in `base-legacy.ts`. Also subsumed by the legacy deletion.
+
+**Verdict:** two "huh?" spots, both subsumed by the deletion of the legacy tree. Not new fixes.
+
+### Ranked (per facet, worst first):
+
+- Names: `BloomreachDataSource` class in `mcp-data-source.ts`-aliased directory. Explained in-file.
+- Comments: missing one-line JSDoc on `makeAuthProvider`. Trivial.
+- Consistency: no finding.
+- Obviousness: `lib/agents/base.ts` (14 LOC) vs `base-legacy.ts` (270 LOC). Subsumed.
+
+---
 
 ## 8. red-flags-audit
 
-Ousterhout's red flags as a review checklist, marked against this
-repo. `fires` / `doesn't` / `N/A`, with location + one-line fix
-where it fires. Sorted by severity.
+Ousterhout's red flags as a checklist. Each marked against this repo: **fires** / **doesn't** / **N/A**. Sorted by severity for THIS repo.
 
-| Red flag                       | Status  | Location + fix                                                                                   |
-|:-------------------------------|:--------|:--------------------------------------------------------------------------------------------------|
-| Shallow module (classitis)     | fires   | `lib/agents/base.ts` — 14 LOC, one constant + one type. Inline or merge into `aptkit-adapters.ts`. |
-| Duplicated modules             | fires   | `lib/agents/*-legacy.ts` — 9 files, only 2 test imports remain. Delete 7; migrate the 2 tests.     |
-| Information leakage            | fires   | `'claude-sonnet-4-6'` in 5 sites. Read `AGENT_MODEL` from `base.ts` in `budget.ts` + evals.        |
-| Avoidable config exposed       | fires   | `AnthropicModelProviderAdapter` 6-positional-arg constructor. Convert to named options.            |
-| Vague name                     | fires   | `McpCaller` (should be `ToolCaller` or drop); `hooks` at call sites (should be `agentHooks`).      |
-| Two conventions for one job    | fires   | `MonitorHooks` (4 fields) vs `AgentHooks` (5 fields) — fold or rename.                             |
-| Interface leakage              | fires   | `ToolResult.[key: string]: unknown` (`types.ts:32`) hides the `structuredContent` escape hatch.    |
-| Comment restates code          | fires   | `app/page.tsx:94` — "re-runs the briefing fetch below". Delete.                                    |
-| Pass-through method            | fires but justified | `RecommendationAgent.propose` (`recommendation.ts:26-46`) — kept as drift-buffer against aptkit shape changes. Annotate. |
-| Special-case sprawl            | doesn't | Errors are defined-out (readNdjson buffer flush; `BudgetExceededError`).                          |
-| Try/except everywhere          | doesn't | Two catches in `lib/`; both narrow and commented.                                                  |
-| Untyped generic                | doesn't | `DataSource.result` is `unknown` by choice (unwrap at call site).                                  |
-| Hidden control flow            | doesn't | Every async path threads `signal`; no orphaned promises.                                          |
-| Same knowledge edited twice — dates | doesn't | No date/timestamp literals repeated across files.                                                 |
-| Temporal decomposition         | doesn't | Files are organized by concept (agent / data-source / mcp), not by step of a process.             |
-| Deep interface hides too little | doesn't | `DataSource` is 2 methods; adapters are 200+ LOC each. Depth ratio ~1:100.                        |
+| # | red flag | verdict | evidence + one-line fix |
+|---|----------|---------|-------------------------|
+| 1 | **Shallow module (classitis)** | **fires** | `lib/agents/*-legacy.ts` × 9 files, imported by 2 test files. **Fix:** port the 2 tests to the AptKit-backed classes, then delete the legacy tree. |
+| 2 | **Information leakage (repeated knowledge)** | **fires (small)** | Bloomreach 10s window in `bloomreach-data-source.ts:135` + `connect.ts:120`. **Fix:** one exported `BLOOMREACH_PENALTY_MS` constant. |
+| 3 | **Temporal decomposition** | doesn't | No module structured "step 1 / step 2 / step 3." The agent loop is inside AptKit, not the repo's problem. |
+| 4 | **Overexposure (avoidable knobs pushed up)** | doesn't | The exposed knobs (`skipCache`, `sessionId`) are load-bearing; the caller has information the module cannot infer. |
+| 5 | **Pass-through method/variable** | doesn't | The one near-miss (`BloomingToolRegistryAdapter.callTool`) is deliberate (AptKit's `ToolRegistry` interface doesn't carry `fromCache`). |
+| 6 | **Pass-through decoration** | doesn't | `FaultInjectingDataSource` adds real behavior (fault injection); it's a real decorator, not a wrapper for its own sake. |
+| 7 | **Repeated code** | doesn't | The NDJSON parse loop that used to appear 4 times is now one kernel (`lib/streaming/ndjson.ts`). |
+| 8 | **Special-case sprawl** | doesn't | `McpToolError` + the retry ladder + `readNdjson`'s malformed-callback erase what would otherwise be scattered try/catch. |
+| 9 | **Conjoined methods (must be called in sequence)** | doesn't | `makeDataSource → bootstrap → callTool` is a sequence, but each stage returns a self-sufficient object. Not conjoined; layered. |
+| 10 | **Comments restating code** | doesn't | Comment density is high but load-bearing (headers explain history and trade-offs, not what the code says). |
+| 11 | **Vague names** | doesn't | No `Manager`, `Helper`, `Utils`, `Handler` classes. `parseAgentJson` is the vaguest name; subsumed by legacy deletion. |
+| 12 | **Untyped generic containers** | doesn't | `ToolResult` and `DataSourceCallResult` type `result` as `unknown` on purpose (the MCP envelope carries adapter-specific `structuredContent`); call sites cast via `unwrap<T>()`. Honest, not lazy. |
 
-**Highest-severity fires, in order:** duplicated modules (legacy),
-shallow `base.ts`, model-name leak, positional-arg constructor.
-The first two are the highest-leverage cleanup in the repo —
-delete-only work, no behavior change.
+**Severity-ordered top 3 fixes for THIS repo:**
+
+1. **Delete the legacy tree.** `lib/agents/*-legacy.ts` (9 files). Port 2 test files to AptKit-backed classes. **Effort: 2-4 hours.** **Payoff:** ~1000 LOC gone, one obviousness landmine gone, one duplicated `AGENT_MODEL` constant gone. Highest ROI in the repo.
+
+2. **Extract `BLOOMREACH_PENALTY_MS`.** One `export const` in a shared module (e.g. `lib/data-source/bloomreach-defaults.ts`). Import from `bloomreach-data-source.ts` and `connect.ts`. **Effort: 15 min.** **Payoff:** zero drift risk on the retry-window constant.
+
+3. **One-line JSDoc on `makeAuthProvider`.** Trivial. **Effort: 2 min.** **Payoff:** the reader who opens `auth-providers/index.ts` sees "picks a provider by discriminant" without reading the switch first.
+
+Nothing else fires with enough severity to spend a PR on. The rest of the audit is praise, honest small findings, and the pattern files below.

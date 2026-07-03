@@ -1,162 +1,153 @@
-# 03 — Sampling parameters
+# Sampling parameters
 
-**Type:** Industry standard. Also called: temperature, top-p (nucleus sampling), top-k.
+## Subtitle
+
+Temperature, top-p, top-k — Industry standard.
 
 ## Zoom out, then zoom in
 
-Sampling controls the shape of the model's next-token distribution and, downstream, whether output is repeatable or creative.
+This codebase doesn't set temperature explicitly anywhere. That's a deliberate choice: the adapter uses Anthropic's defaults, and the agents rely on the model's default sampling to be "sensible." Look at `lib/agents/aptkit-adapters.ts:57` — the `MessageCreateParams` object contains `model`, `max_tokens`, `messages`, and `tools`. No `temperature`, no `top_p`, no `top_k`.
+
+That's fine — until it isn't. Understanding what those knobs do, and when the codebase should reach for them, is the concept.
 
 ```
-  Zoom out — where sampling lives in the request
+  Zoom out — where sampling parameters could go
 
-  ┌─ Agent layer ─────────────────────────────────────────────────────┐
-  │  AnthropicModelProviderAdapter.complete(request)                   │
-  │  · request.temperature ← ★ THIS CONCEPT ★                          │
-  │  · request.messages, request.tools                                 │
-  └─────────────────────────────┬─────────────────────────────────────┘
-                                │
-  ┌─ Anthropic SDK ─────────────▼─────────────────────────────────────┐
-  │  messages.create({temperature, top_p?, top_k?, ...})               │
-  │  passes through to model server                                    │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌─ Agent code ─────────────────────────────────────────┐
+  │  agent builds ModelRequest                            │
+  └───────────────────────┬──────────────────────────────┘
+                          ▼
+  ┌─ AnthropicModelProviderAdapter.complete() ★ ────────┐ ← we are here
+  │  today: { model, max_tokens, messages, tools }       │
+  │  tomorrow: could add { temperature, top_p }          │
+  └───────────────────────┬──────────────────────────────┘
+                          ▼
+                     Anthropic model
 ```
 
-Zoom in. Two places in this codebase set temperature explicitly. Everywhere else, AptKit picks the default. That's a deliberate design — the agents rely on Anthropic's tuned defaults for tool-use reasoning; the judge overrides to 0 for reproducibility.
+Zoom in: the sampler sits between the raw next-token distribution and the emitted token. Changing sampling doesn't change the model; it changes which token the model picks from a distribution it already produced.
 
 ## Structure pass
 
-**Layers:**
-- Outer: reader-visible behavior (reproducibility, creativity)
-- Middle: `request.temperature` in the ModelRequest
-- Inner: the model server's sampling algorithm
-
-**Axis: reproducibility.**
-- `temperature: 0` → same input → same output (near-deterministic). Judge picks this.
-- `temperature: 0.7` (Anthropic's typical default) → variation across runs, natural-sounding output. Agents use the default.
-
-**Seam:** `AnthropicModelProviderAdapter.complete()`. Everything higher (AptKit, agents) speaks in `ModelRequest`; everything lower (SDK, HTTP) speaks in Anthropic-specific param names. The adapter maps.
+- **Layers:** distribution → sampler → chosen token. Three bands, all inside the model.
+- **Axis: determinism.** At temperature 0, sampling is deterministic — same prompt, same output every time. At higher temperatures, sampling is stochastic — same prompt, different outputs.
+- **Seam:** the sampler itself. Above it, the model is fixed. Below it, the emitted tokens depend on the sampler's settings.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-The model produces a probability distribution over its ~200K-token vocabulary for the next token. Sampling picks one. Temperature reshapes the distribution before picking — low temperature = sharpen (pick the most likely), high = flatten (allow the tail).
+The model produces a probability distribution over the vocabulary. The sampler picks one token from that distribution. Three knobs control how:
 
 ```
-  Temperature reshapes the next-token distribution
+  Sampling knobs — what each one does to the distribution
 
-  T = 0     ▓                     ← pick argmax; deterministic
-            ▓
-            ▓        _   _   _
-           argmax
+  raw distribution:
+    "checkout"  ██████ 0.35
+    "cart"      ████   0.22
+    "payment"   ███    0.15
+    "session"   ██     0.10
+    ...(long tail)
 
-  T = 0.7  ▓ ▓                    ← natural spread; some variation
-           ▓ ▓ ▓
-           ▓ ▓ ▓ ▓ _ _
-           top    tail
+  temperature=0:  always pick "checkout"        ← deterministic
+  temperature=1:  sample from full distribution ← default-ish
+  temperature=2:  boost the tail — take risks   ← creative
 
-  T = 1.5  ▓ ▓ ▓ ▓                ← wild; the tail wins often
-           ▓ ▓ ▓ ▓ ▓
-           ▓ ▓ ▓ ▓ ▓ ▓ ▓
+  top_p=0.9:      keep tokens until sum≥0.9, sample from those
+                  (drops the "long tail")
+
+  top_k=40:       keep only 40 most-likely tokens
+                  (hard cap on candidate set)
 ```
 
-Top-p (nucleus sampling) is a cap: keep the smallest set of tokens whose probabilities sum to `p`, then sample from that set. Top-k: keep the top `k` tokens by probability, sample from those. Anthropic's SDK supports both; this repo uses neither explicitly.
+### Move 2 — the step-by-step walkthrough
 
-### Move 2 — walk the mechanism
+**temperature.** Scales the logits before softmax. `T=0` collapses to argmax (pick the highest-probability token). `T=1` uses the raw distribution. `T>1` flattens the distribution so lower-probability tokens are more likely.
 
-**Where temperature is set — two places.**
+**top_p (nucleus sampling).** Keep tokens until their cumulative probability hits `p`, then sample from that set. Adapts automatically — when the model is confident (one dominant token), the nucleus is small; when it's uncertain (many candidates), the nucleus is larger.
 
-1. **The judge, at 0.** In `eval/run.eval.ts:236` and `:283`, both `RubricJudge` instances pass `temperature: 0`. This is deliberate: a judge that disagrees with itself across runs on the same input is useless for regression measurement.
+**top_k.** Keep only the `k` most-likely tokens. Cruder than top_p; harder cap.
 
-```typescript
-// eval/run.eval.ts:229-237
-const diagnosisJudge = new RubricJudge({
-  model: judgeModel,
-  rubric: diagnosisQualityRubric,
-  capabilityId: 'blooming.eval.diagnosis-judge',
-  maxTokens: 4096,
-  temperature: 0,          // ← reproducibility
-});
+**How this codebase currently uses them.** It doesn't set any of them. Anthropic's default temperature is roughly 1.0 for `messages.create()`. That's why the eval harness sees slight variation between runs of the same case — the diagnostic agent's exact wording varies turn to turn.
+
+**Where the codebase *should* set temperature=0.** The intent classifier. `lib/agents/intent.ts:19` calls `classifyAptKitIntent()` — a single-shot classification into a fixed label set. Non-determinism here is pure noise. A future add: pass `temperature: 0` through the adapter for classifier calls. Aptkit's `ModelRequest` shape supports it (`request.temperature` is optional); the adapter just needs to plumb it through.
+
+Diagram of the current state vs the future state:
+
+```
+  Comparison — current vs recommended
+
+  ┌─ Current ──────────────────────────┬─ Recommended ─────────────────────┐
+  │ every call uses default temp (~1)  │ agents keep default temp           │
+  │                                    │ intent classifier uses temp=0      │
+  │ intent varies run-to-run           │ intent is deterministic            │
+  │ eval verdicts vary slightly across │ eval verdicts vary only on the     │
+  │ reruns of the same case            │ agent's non-determinism, not the   │
+  │                                    │ classifier's                       │
+  └────────────────────────────────────┴────────────────────────────────────┘
 ```
 
-2. **The agents, at the default.** No temperature is passed anywhere in `MonitoringAgent`, `DiagnosticAgent`, `RecommendationAgent`, or `QueryAgent`. The `ModelRequest` field is unset; AptKit doesn't override; Anthropic's server uses its default (currently ~0.7 for tool-use models). This is the right call for reasoning under tool-use — deterministic tool-use loops tend to get stuck in a groove.
-
-**Why NOT temperature: 0 on the agents.**
-
-You'd think reproducibility would help evals. It doesn't, and here's why: the ReAct loop's decisions branch heavily on tool_result values. If the SyntheticDataSource returns the same numbers (it does — it's a fixture), a `temperature: 0` agent would take the exact same path every time and eval variance would look artificially clean. Anthropic's default temperature gives you natural variance in the trace WITHOUT changing the overall verdict — which is closer to how the agent behaves on live data.
+**Where the codebase *should not* set temperature=0.** The agents themselves. Diagnostic + recommendation both benefit from occasional exploration — if the model gets stuck on a wrong hypothesis, a tiny bit of temperature gives it a chance to consider alternatives. Temperature 0 on a multi-turn agent tends to loop.
 
 ### Move 3 — the principle
 
-Pick temperature based on what you're measuring, not on a general aesthetic. Deterministic where you need reproducibility (judges, tests, classifiers). Default where you need natural reasoning variety (agent loops, generation). Don't set top-p and top-k unless you've measured they help — extra dials, extra ways to be wrong.
+Temperature=0 is the right default for anything you want reproducible — classifiers, structured output extractors, gate decisions. Temperature≈1 is the right default for anything multi-turn or generative — agents, chat, writing. The knob you almost never need to touch is `top_k`; nucleus sampling (`top_p`) is a better default when you need to constrain diversity.
 
 ## Primary diagram
 
-Where temperature is set in this repo and what depends on it.
-
 ```
-  Temperature settings in blooming_insights
+  Sampling in the request/response flow — one frame
 
-  ┌─ Agents (reasoning; run against live/synthetic data) ─────────────┐
-  │   temperature: (unset → Anthropic default ~0.7)                    │
-  │   MonitoringAgent · DiagnosticAgent · RecommendationAgent ·        │
-  │   QueryAgent · intent classifier                                    │
-  └────────────────────────────────────────────────────────────────────┘
-
-  ┌─ Judges (rubric scoring; must be reproducible) ───────────────────┐
-  │   temperature: 0                                                    │
-  │   RubricJudge (diagnosis rubric)                                    │
-  │   RubricJudge (recommendation rubric)                               │
-  │   → eval/run.eval.ts:236, :283                                     │
-  └────────────────────────────────────────────────────────────────────┘
-
-  Session D calibration mixed judges (Sonnet at 0 vs Haiku at 0)
-    · 6/6 verdict agreement · 13/24 exact match dims · 24/24 within-1
-  → eval/calibration/agreement-*.json
+  ┌─ your code ────────────────────────────────────────┐
+  │  ModelRequest {                                     │
+  │    messages, tools, maxTokens,                      │
+  │    temperature?,   ← MISSING in this codebase      │
+  │    topP?           ← MISSING in this codebase      │
+  │  }                                                  │
+  └──────────────────────┬──────────────────────────────┘
+                         │
+                         ▼
+  ┌─ Anthropic ─────────────────────────────────────────┐
+  │  model → raw next-token distribution                 │
+  │        → sampler (uses temperature / topP)           │
+  │        → emitted token                               │
+  └──────────────────────┬──────────────────────────────┘
+                         │
+                         ▼
+                     next token
 ```
 
 ## Elaborate
 
-The "temperature = 0 is deterministic" claim has a caveat: at exactly 0, Anthropic uses argmax sampling, but tie-breaking on identical logits can still produce different tokens on different backend replicas. In practice on Sonnet 4.6 with real prompts this happens vanishingly rarely, but "deterministic" is really "near-deterministic given a fixed backend build."
+The names come from the physics analogy: at high "temperature," a probability distribution flattens (all outcomes roughly equal); at low temperature, it sharpens (one dominant outcome). It's an analogy that has stuck.
 
-Top-p and top-k are worth understanding even if you don't set them:
-- **top-p = 0.9** (nucleus sampling): keep the smallest cluster of tokens totalling 90% probability. Adapts — high-confidence turns get few tokens in the cluster, uncertain turns get many.
-- **top-k = 40**: keep only the top 40 by probability. Hard cap regardless of distribution shape.
+Provider defaults matter: OpenAI's default temperature is 1.0; Anthropic's is roughly 1.0 too; some open-source stacks default to 0.7. If you swap providers via the port, verify the default before assuming "no temperature" means the same thing.
 
-Combined with temperature they can compose (temperature reshapes, top-p/top-k truncate). Most production agents at this scale don't bother.
+Related: **04-structured-outputs.md** (where `temperature=0` and structured outputs work together to produce reliable typed responses), **08-provider-abstraction.md** (where the `ModelRequest.temperature` field would flow through if you added it).
 
 ## Project exercises
 
-### Exercise — measure judge stability under retry
+### B1.3 · Plumb temperature through the ModelRequest
 
-- **Exercise ID:** C1.3-A · Case A (concept exercised).
-- **What to build:** modify `eval/run.eval.ts` to run each `RubricJudge.judge()` call TWICE with the same input, log both `dimensions.*.score` sets to the receipt, compute per-dim stability rate across the double-judged set. Confirms that `temperature: 0` gives near-deterministic judging in practice, or reveals it doesn't.
-- **Why it earns its place:** turns a design claim ("temperature 0 is reproducible") into a measured claim ("score stability across double-run: X%"). Interviewer signal: "I didn't trust that temperature 0 was actually reproducible — here's the measurement."
-- **Files to touch:** `eval/run.eval.ts`, add a receipt field `diagnosisJudgmentSecondRun` and `recommendationJudgmentsSecondRun`, add a small aggregator in `afterAll`.
-- **Done when:** running the 10-case eval prints a "judge stability" section with per-dim exact-match rate across the double-judged runs.
-- **Estimated effort:** 1-4hr.
+- **Exercise ID:** B1.3
+- **What to build:** Add explicit `temperature: 0` to the intent classifier's model call, keeping default temperature everywhere else. Add a test that verifies the same intent query produces the same output over 5 back-to-back calls.
+- **Why it earns its place:** Small, low-risk, and the eval-noise reduction is measurable. Interview payoff: "here's a specific place I found where the default was wrong and here's the fix."
+- **Files to touch:** `lib/agents/aptkit-adapters.ts` (plumb `request.temperature` into `params`), `lib/agents/intent.ts` (pass temperature=0 via aptkit's classifier options), `test/agents/intent.test.ts` (determinism test).
+- **Done when:** the classifier test passes 5/5 with identical output; the eval receipts stop showing intent-classification variance.
+- **Estimated effort:** `1–4hr`.
 
 ## Interview defense
 
-**Q: What temperature do you run the agents at?**
+**Q: Your codebase doesn't set temperature anywhere. Is that a bug?**
 
-Anthropic's default (~0.7). I don't override it on the agents. The reasoning is: temperature 0 tempts you into believing your evals are stable when actually you've just flattened the natural variance of the loop. The judge runs at 0 because reproducibility on a rubric matters more than variety. Agents run at the default because the ReAct loop's real behavior on live data has some randomness in it, and I want the eval to see that.
+Not for the agents — Anthropic's default is fine for multi-turn tool-using loops that benefit from occasional exploration. It *is* a gap for the intent classifier: single-shot classification into a fixed label set, where non-determinism is pure noise. The fix is a two-line plumb-through in the adapter — see `B1.3`. The load-bearing part: knowing which class of task cares about determinism and which doesn't.
 
-```
-  agents at default T → real-world variance
-  judge at T=0        → stable scoring
-  = eval measures signal, not judge noise
-```
+**Q: Why not just use temperature=0 everywhere?**
 
-**Q: When would you set top-p or top-k?**
-
-Rarely. If I saw the model repeatedly falling into the same wrong groove on a specific class of prompt — always picking the same doomed tool call, always phrasing rejection the same wrong way — I'd try top-p around 0.9 to loosen the tail before I'd go up on temperature. Neither is in this codebase today because I haven't hit that failure pattern.
-
-**Q: What does "temperature 0 is not fully deterministic" mean in practice?**
-
-Anthropic argmaxes at T=0, but ties on identical logits break unpredictably across replicas. In this repo on Sonnet 4.6 I've never seen the judge score two rounds differently on the same input, but I'd never claim "guaranteed identical" — I'd say "reproducible in practice."
+Multi-turn agents at temperature 0 tend to loop. If the model picks a wrong tool at turn 1 and the reasoning path leading to that tool is the highest-probability path at temperature 0, the model will pick it again at turn 2, and again at turn 3, until `max_iterations` catches it. Small temperature gives the model an escape hatch. The alternative is more expensive: detect the loop in code and inject a "try a different tool" observation (see **04-agents-and-tool-use/06-error-recovery.md**).
 
 ## See also
 
-- `04-structured-outputs.md` — schema-constrained outputs cap variance more than temperature does
-- `05-evals-and-observability/03-llm-as-judge-bias.md` — biases the judge carries at any temperature
-- `eval/run.eval.ts` — the two `temperature: 0` sites
+- [04-structured-outputs.md](04-structured-outputs.md) — pairing temperature=0 with schema-constrained output.
+- [../04-agents-and-tool-use/06-error-recovery.md](../04-agents-and-tool-use/06-error-recovery.md) — the loop-detection pattern for when temperature isn't enough.
+- [08-provider-abstraction.md](08-provider-abstraction.md) — how the `ModelRequest` port would carry temperature across providers.

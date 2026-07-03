@@ -1,135 +1,147 @@
-# 03 — Chunking strategies
+# Chunking strategies
 
-**Type:** Industry standard. Also called: text splitting, document segmentation.
+## Subtitle
+
+Document splitting for retrieval / chunk-as-unit — Industry standard.
 
 ## Zoom out, then zoom in
 
-**Not exercised in this codebase.** If RAG were added, the natural chunk unit for this repo would be one whole `Diagnosis.conclusion` (short prose paragraph) or one `hypothesisConsidered` entry — semantic units, not arbitrary token windows.
+If blooming grows past-investigation memory (see **01-embeddings.md**'s exercise), each investigation record is already a natural chunk — it has a bounded shape (`anomaly + diagnosis`) and doesn't need splitting. The chunking question is a non-question for this corpus. For a different candidate corpus — product catalog descriptions, docs — chunking would matter.
+
+This file covers chunking as a concept because the codebase would need it if the ecommerce workspace's *catalog* were indexed for retrieval (~10k+ product descriptions).
 
 ```
-  Zoom out — chunking would happen before embedding
+  Zoom out — where chunking would live
 
-  ┌─ Would-be RAG pipeline ───────────────────────────────────────────┐
-  │  raw text (past investigations)                                   │
-  │     │                                                             │
-  │     ▼  ★ CHUNKING ★                                                │
-  │  chunk 1: "Conclusion: payment processor timeout on mobile SP…"   │
-  │  chunk 2: "Hypothesis 1: UX regression — supported: false…"       │
-  │     │                                                             │
-  │     ▼  embed each chunk                                           │
-  │  vectors ──► store                                                 │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌─ Would-be corpus (catalog descriptions, ~10k rows) ─┐
+  │  each ~200-1000 tokens                               │
+  └───────────────────────┬──────────────────────────────┘
+                          │  chunk() ← we are here
+                          ▼
+  ┌─ Chunks (one embedding per chunk) ★ ────────────────┐
+  │  target: 200-500 tokens each                         │
+  └──────────────────────────────────────────────────────┘
 ```
-
-Zoom in. Chunk size and boundary choice determine retrieval quality — too small = missing context, too large = diluted relevance. In this codebase's would-be RAG, the natural chunk is a structural unit from the `Diagnosis` schema, not fixed-token windows.
 
 ## Structure pass
 
-**Layers:**
-- Outer: retrieval quality (does the right chunk come back?)
-- Middle: chunk size + boundary discipline
-- Inner: text-splitter mechanics (fixed / sentence / structural)
-
-**Axis: coherence per chunk.**
-- Fixed windows: cheap but boundaries land mid-sentence (poor coherence)
-- Sentence windows: better boundaries, sometimes too small
-- Structural (per Diagnosis field, per markdown heading): highest coherence
-
-**Seam:** the chunker function — text in, chunks out. Above: the corpus. Below: the embedding call.
+- **Layers:** raw document → chunk boundaries → chunks → embeddings. Four bands.
+- **Axis: coherence.** A chunk should be self-contained enough that its embedding represents its content correctly.
+- **Seam:** the boundary decision. Fixed-size, sentence-window, and structural each pick the seam differently.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You've written a `.split('\n')` on a big string and had a bug because it split inside a code block. Chunking is that class of decision at scale — where to cut has semantic consequences.
+Three strategies:
 
 ```
   Three chunking shapes
 
-  ┌─ Fixed-size ──────────┐   ┌─ Sentence-window ─┐  ┌─ Structural ──┐
-  │  every N tokens      │   │  split on . ! ?    │  │  per heading  │
-  │  boundaries: dumb    │   │  boundaries: clean │  │  per field    │
-  │  coherence: variable │   │  coherence: prose  │  │  coherence:   │
-  │                      │   │                    │  │    highest   │
-  └──────────────────────┘   └────────────────────┘  └───────────────┘
+  Fixed-size (N tokens):
+  ┌────────────┬────────────┬────────────┐
+  │ tokens 1-N │ tokens N-2N│ tokens 2N-3N│
+  └────────────┴────────────┴────────────┘
+  simple; boundaries may split sentences
+
+  Sentence-window (N sentences per chunk):
+  ┌────────────┬────────────┬────────────┐
+  │ 4 sentences│ 4 sentences│ 4 sentences│
+  └────────────┴────────────┴────────────┘
+  clean boundaries; may vary in token count
+
+  Structural (heading/section/JSON path):
+  ┌────────────┬────────────┬────────────┐
+  │ heading 1  │ heading 2  │ heading 3  │
+  │  + body    │  + body    │  + body    │
+  └────────────┴────────────┴────────────┘
+  highest coherence; requires parsing
 ```
 
-### Move 2 — walk the mechanism (as it would apply)
+### Move 2 — the step-by-step walkthrough
 
-**Fixed-size chunking (200-500 tokens).**
-Baseline. Split every N tokens. Sometimes with overlap (last 50 tokens of chunk N repeat as first 50 of chunk N+1) to avoid cutting a key phrase in half. Simple. Boundaries can land mid-sentence, mid-word. Fine for large homogeneous corpora; poor for structured data.
+**For catalog descriptions.** Structural. Each product is one chunk — `{id, name, description, category, price}` serialized to text. No splitting needed; each product is already a coherent unit under ~500 tokens.
 
-**Sentence-window chunking.**
-Split on sentence boundaries, then group K sentences per chunk. Cleaner boundaries. Better for prose (news articles, docs). Loses on data with paragraph-level cohesion (e.g. a diagnosis conclusion is one sentence — chunking within is nonsensical).
+**For long documents (support docs, runbooks).** Sentence-window with overlap. Common values: 5 sentences per chunk, 1 sentence overlap. Overlap ensures context spanning chunk boundaries isn't lost.
 
-**Structural chunking (the right fit for this repo).**
-Use the document's structure. For markdown, one chunk per section under an H2. For JSON like `Diagnosis`, one chunk per hypothesis, one for the conclusion, one for evidence. Coherence is high — every chunk is a self-contained semantic unit — but you need a structural parser per format.
+**For code.** Structural — chunk by function or class. Cross-references are then resolved at retrieval time by fetching adjacent chunks.
 
-**What would fit this codebase.**
-`Diagnosis` is already structured. Chunk it as:
-- Chunk 1: `conclusion` (~200 tokens)
-- Chunk 2-4: each `hypothesesConsidered[i]` entry (~150 tokens each)
-- Chunk 5: `evidence` summary (~500 tokens)
+**Where the chunker would live.** If blooming added catalog retrieval, one file — `lib/mcp/catalog-index.ts` — with a `buildIndex(catalog: Catalog[])` function that produces `{id, chunkText, embedding}` rows. No chunker needed for the initial implementation; each catalog row *is* a chunk.
 
-Retrieval could pull "the conclusion of a similar past diagnosis" separately from "a hypothesis that was ruled out in a similar past diagnosis." Two useful retrieval targets.
+Pseudocode of a would-be catalog indexer:
+
+```
+  buildCatalogIndex(catalog):
+    rows = []
+    for product in catalog:
+      text = product.name + " · " + product.description
+           + " · category: " + product.category
+      vec = embed(text)
+      rows.push({ id: product.id, text, vec })
+    return rows
+  // no splitting; each product is one chunk
+```
 
 ### Move 3 — the principle
 
-Chunk at the document's natural seams. If the document has structure (markdown headings, JSON fields, code function boundaries), use it. Fixed-size is the fallback when nothing else is available. Small semantic chunks beat large fixed-size chunks on retrieval quality every time.
+The chunk is the unit of retrieval. A chunk too small lacks context ("2.5%" without knowing what metric); a chunk too large dilutes relevance (a chunk that mentions 10 topics fires on queries about any one of them). Structural boundaries when they exist; sentence-window with overlap otherwise; fixed-size only when the input has no discoverable structure.
 
 ## Primary diagram
 
 ```
-  Structural chunking of a Diagnosis (proposed shape)
+  Chunking — full frame
 
-  {
-    conclusion: "…",           ← chunk 1 (200 tokens)
-    hypothesesConsidered: [
-      {hypothesis: A, ...},    ← chunk 2 (150 tokens)
-      {hypothesis: B, ...},    ← chunk 3 (150 tokens)
-      {hypothesis: C, ...},    ← chunk 4 (150 tokens)
-    ],
-    evidence: [...],           ← chunk 5 (500 tokens)
-  }
-
-  each chunk: self-contained semantic unit
-  cross-chunk retrieval: "find similar hypotheses" independent of
-  "find similar conclusions"
+  ┌─ Source doc ───────────────────────────────────────┐
+  │  raw text / JSON / structured document              │
+  └───────────────────────┬────────────────────────────┘
+                          │
+                          ▼
+  ┌─ Strategy pick ────────────────────────────────────┐
+  │  structural if doc has heading/section tree         │
+  │  sentence-window if long prose                      │
+  │  fixed-size only as fallback                        │
+  └───────────────────────┬────────────────────────────┘
+                          │
+                          ▼
+  ┌─ Chunks ───────────────────────────────────────────┐
+  │  target 200-500 tokens; each self-contained         │
+  │  optional overlap to preserve context               │
+  └───────────────────────┬────────────────────────────┘
+                          │
+                          ▼
+  ┌─ Embed each chunk → index ─────────────────────────┐
+  └────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-For long unstructured text (books, transcripts), state-of-the-art chunkers use small LMs to find semantic boundaries — a huggingface `SemanticChunker` or LangChain's `RecursiveCharacterTextSplitter` with markdown-aware fallbacks. That's overkill for this codebase's shape.
+Chunking is the most-tuned part of any RAG stack. Common failures: chunks that split a step-by-step instruction across the boundary (fixed-size on procedural text), chunks that include headers with the wrong body (structural on poorly-nested markdown), chunks so big they retrieve for every query (over-inclusive).
 
-For code corpora, chunking on function or class boundaries is standard. GitHub Copilot's retrieval uses AST-based chunking. Not applicable here — no code corpus.
+Related: **11-rag.md** (chunks feed retrieval), **07-reranking.md** (recovering when the chunk boundary was wrong).
 
 ## Project exercises
 
-### Exercise — structural chunking of Diagnosis objects
+### B3.3 · Add catalog retrieval as a specialized tool
 
-- **Exercise ID:** C2.6-B · Case B (RAG not exercised).
-- **What to build:** if `01-embeddings.md`'s Case B is taken, chunk each stored diagnosis as `{conclusion, per-hypothesis, evidence}` rather than concatenating to one blob. Store `{investigationId, chunkKind, text, vector}`.
-- **Why it earns its place:** proves you chunk at semantic seams, not by naive token windows. Interviewer signal: "I chunked by the schema's structure, not by tokens."
-- **Files to touch:** `lib/rag/chunk.ts` (new), `lib/rag/embed.ts` (call chunker before embedding).
-- **Done when:** running the embed step on 10 diagnoses produces ~50 chunks (5 per diagnosis) with distinct `chunkKind` fields.
-- **Estimated effort:** <1hr on top of the embed exercise.
+- **Exercise ID:** B3.3 (Case B — not yet implemented)
+- **What to build:** New MCP tool `retrieve_catalog(query)` that embeds the query, returns top-5 matching product descriptions. Chunker: one product = one chunk. Index in memory for the demo workspace, sqlite-vec in prod.
+- **Why it earns its place:** Turns "catalog is 10k rows" from a context-window problem into a retrieval problem. Directly reduces token cost on catalog-related recommendations.
+- **Files to touch:** New `lib/mcp/catalog-index.ts`, extend `lib/agents/tool-schemas.ts` to register the new tool, extend `lib/agents/monitoring.ts` and recommendation prompt.
+- **Done when:** for a workspace with 10k+ catalog items, a "which category drove the drop" question triggers retrieval instead of dumping the catalog into context; receipt shows tokens saved.
+- **Estimated effort:** `1–2 days`.
 
 ## Interview defense
 
-**Q: What chunk size do you use?**
+**Q: How would you chunk investigation memory?**
 
-Depends on the corpus's structure. For structured data (JSON schemas, markdown with headings), I chunk on the natural boundary — one chunk per section or field. For unstructured prose, 200-500 tokens with sentence-aware splitting. Fixed-size token windows are the last resort.
+I wouldn't. Each investigation is already a bounded record with a fixed schema. The chunk is the whole investigation record; no splitting needed. Load-bearing: recognize when the corpus already has natural chunks and don't invent a chunker just to have one.
 
-**Q: Why not just embed the whole document as one chunk?**
+**Q: What about very long documents?**
 
-Because retrieval works on cosine similarity between the query and each chunk vector. If the whole doc is one chunk, you get one relevance score for a doc that might contain 10 semantically different sections. Chunking lets retrieval find the relevant SECTION, not just the relevant doc.
-
-**Q: Overlap?**
-
-Fixed-size chunking often uses 10-20% overlap to avoid cutting key phrases in half. Structural chunking usually skips overlap — the boundaries are already semantic. This codebase's would-be corpus is structured, so overlap doesn't add value.
+Sentence-window with 5 sentences per chunk, 1 sentence overlap. Overlap catches cross-boundary references. If the document has structural markers (markdown headings), prefer structural — the coherence per chunk is markedly higher.
 
 ## See also
 
-- `01-embeddings.md` — what each chunk becomes
-- `04-vector-databases.md` — where the chunks live
-- `07-reranking.md` — the two-stage retrieval that lets you use small chunks
+- [11-rag.md](11-rag.md) — the pipeline chunks feed.
+- [01-embeddings.md](01-embeddings.md) — what each chunk becomes.
+- [07-reranking.md](07-reranking.md) — the fix when chunk boundaries mismatch the query.

@@ -1,276 +1,316 @@
 # Stacks, queues, deques, and heaps
 
-Industry names: LIFO stack, FIFO queue, double-ended queue, priority queue / binary heap. Type: Industry standard.
+*Ordering disciplines · priority queues · Industry standard*
 
-## Zoom out — one live queue, zero heaps
+## Zoom out, then zoom in
 
-There's exactly one place in this repo where a queue is load-bearing: the load-eval worker pool at `eval/load.eval.ts:171-211`. That's the anchor for this whole chapter. Stacks, deques, and heaps are all `not yet exercised` — but one of them (a binary heap for top-K selection) would be the right upgrade for `monitoring-legacy.ts:136`, so we'll teach the primitive against that as a "what would fit."
-
-```
-  Where ordering disciplines show up
-
-  ┌─ Service layer ─────────────────────────────────┐
-  │  monitoring: sort + slice(10) as pseudo-heap    │  ← where a heap would fit
-  │  (not yet exercised: real priority queue)       │
-  └────────────────────┬────────────────────────────┘
-                       │
-  ┌─ Eval layer ───────▼────────────────────────────┐
-  │  load harness: index queue + K workers          │  ← the live queue
-  │  ★ THIS IS THE LOAD-BEARING SPOT ★              │
-  └─────────────────────────────────────────────────┘
-
-  not yet exercised: LIFO stack (agent loop is not a stack)
-  not yet exercised: deque (no double-ended access)
-  not yet exercised: binary heap / priority queue
-```
-
-## Structure pass — trace *ordering discipline* across the container types
-
-Axis: **what does this container promise about pull order?**
-
-- **Stack** (LIFO): last in, first out. Answer: "the most recent thing."
-- **Queue** (FIFO): first in, first out. Answer: "the oldest waiting thing."
-- **Deque**: both ends. Answer: "either end, your choice."
-- **Priority queue / heap**: highest priority first. Answer: "whichever thing scored highest."
-
-The seam is the answer to the question "what should come out next?" That's the axis every ordered container disagrees about. If you can name which discipline you need, you've picked the container.
-
-In this repo, only FIFO is used — and even that with the caveat that `queue.shift()` on an Array is O(n), not the O(1) a real queue would give you.
-
-## How it works — the worker pool + the missing heap
-
-### Move 1 — the queue kernel
-
-You already know the shape from a coffee line: things arrive at the back, get served from the front, and the counter doesn't care what any customer wants until it's their turn.
+Ordering disciplines are just rules for "which item do I pick next?" LIFO (stack — newest first). FIFO (queue — oldest first). Priority (heap — most-important first). This codebase reaches for exactly one of these as a load-bearing move — a FIFO queue for the load harness — and misses one obvious opportunity for a heap. The picture:
 
 ```
-  FIFO queue kernel
+  Zoom out — where ordering disciplines live in blooming_insights
 
-     enqueue ──►  [ a │ b │ c │ d ]  ──► dequeue
-                   ↑                  ↑
-                   tail (add here)    head (remove here)
-
-  what makes it a queue: adding at one end, removing at the other
-  what breaks it       : mid-container access (that's a list, not a queue)
+  ┌─ UI layer ───────────────────────────────────────────────────┐
+  │  (nothing here — React handles its own scheduling)           │
+  └─────────────────────────┬────────────────────────────────────┘
+                            │
+  ┌─ Route + agent layer ───▼────────────────────────────────────┐
+  │  · monitoring-legacy.ts:136 — sort + slice(10)               │
+  │    ★ HEAP-SHAPED PROBLEM, SOLVED WITH SORT ★                 │
+  │  · aptkit's internal message queue (opaque to this code)     │
+  └─────────────────────────┬────────────────────────────────────┘
+                            │
+  ┌─ Eval / load layer ─────▼────────────────────────────────────┐
+  │  ★ THIS CONCEPT LIVES HERE ★                                 │
+  │  · load.eval.ts:169-211 — FIFO index queue + K workers       │
+  │    (hand-rolled semaphore, no library)                       │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-The load-bearing invariant: **workers pulling from the queue are guaranteed to see each item exactly once, without coordinating with each other.** In a multi-threaded runtime you'd need a lock. In JavaScript, the single-threaded event loop is the lock — `queue.shift()` is atomic because nothing else can run until it returns.
+**Zoom in.** Every ordering discipline is a container with a *policy*. The container is usually an array (or a heap-backed array); the policy is what makes it a stack vs a queue vs a heap. Get the policy right and the "which item next?" question collapses to one call.
 
-### Move 2 — the load harness (worker pool)
+## Structure pass
 
-**Semaphore-style concurrency with an index queue** — `eval/load.eval.ts:171-211`.
+**Layers.** Two altitudes:
+  1. the *interface* (push/pop, enqueue/dequeue, insert/peek-max)
+  2. the *implementation* (array, linked list, heap-backed array)
 
-The load harness runs N investigations at concurrency K. The idea: build a queue of indices, spawn K worker functions, let each worker pull-and-process until the queue is empty. Errors in one worker don't stop the others.
+**Axis: what's the cost of `pop`?** Trace it down:
+  - stack (LIFO array push/pop) → O(1) both
+  - queue (FIFO with `Array.shift()`) → O(1) push, O(n) shift *(what the load harness uses)*
+  - deque (both ends O(1)) → needs a circular buffer or linked list *(not exercised here)*
+  - min-heap (priority queue) → O(log n) insert, O(log n) extract-min *(you built this in reincodes; this repo hasn't used it yet)*
+
+**Seams.** The load-bearing seam is between *whatever pop policy* and *the underlying container's cost*. `Array.shift()` is O(n) even though it feels like O(1) — that shift is fine when the queue is small, expensive when it isn't. Naming that gap is the interview signal.
+
+## How it works
+
+### Move 1 — the policies, in one picture
+
+You know these from work. A stack is a stack of plates — last one on is the first one off. A queue is a checkout line — first come, first served. A heap is triage — most severe patient first regardless of arrival time. Same *container*, different *ordering rule*.
 
 ```
-  Worker-pool pattern (K=3, N=8)
+  Ordering disciplines — same container, different rule
 
-  queue:  [0, 1, 2, 3, 4, 5, 6, 7]        ← shared index queue
+  STACK (LIFO):        QUEUE (FIFO):       PRIORITY QUEUE:
+                                            (min-heap here)
+    push │  pop        enqueue    dequeue    insert   extract-min
+      │   ▲              │            ▲         │           ▲
+      ▼   │              ▼            │         ▼           │
+    ┌───────┐         ┌───────────────┐      ┌───────────────┐
+    │ C ← top│        │ A B C D E → out│     │  1  ← min     │
+    │ B     │        │                │      │  3   5        │
+    │ A     │        └───────────────┘      │  7  8  9  6   │
+    └───────┘           head       tail      └───────────────┘
+    O(1)/O(1)           O(1)/O(1)*            O(log n) / O(log n)
 
-  workers:  ┌─ w0 ─┐   ┌─ w1 ─┐   ┌─ w2 ─┐
-            │ pull │   │ pull │   │ pull │   ← each pulls one at a time
-            └──┬───┘   └──┬───┘   └──┬───┘
-               │          │          │
-              [0]        [1]        [2]     ← concurrent (network-bound)
-               │          │          │
-              done       done       done
-               │          │          │
-               ▼          ▼          ▼
-              [3]        [4]        [5]     ← next pulls
-               │          │          │
-              done       fails      done    ← w1's failure doesn't stop w0/w2
-               │                     │
-               ▼                     ▼
-              [6]                   [7]
-               │                     │
-              done                  done
-
-  termination: every worker loop exits when queue.length === 0
+  * O(1) if implemented as a circular buffer or linked list; O(n)
+    shift if the naive Array.shift() is used (this repo's harness)
 ```
 
-Real code, side by side:
+The heap's shape matters here — it's a *nearly-complete binary tree* stored as an array where `parent(i) = (i-1)/2`, `leftChild(i) = 2i+1`. That layout is what makes `heapifyUp` and `heapifyDown` cache-friendly and lets extract-min be O(log n). You built this in `reincodes/BinaryHeap.ts` — the primitive is already in your head.
+
+### Move 2 — the FIFO load-harness queue (the actual load-bearing use)
+
+This is the one place ordering discipline is load-bearing in the repo. The pattern: LOAD_N tasks, K concurrent workers, one shared FIFO queue of indices. Workers pull until the queue is empty.
+
+```
+  Semaphore-based concurrency — K workers, one shared FIFO
+
+  queue: [0, 1, 2, 3, 4, ..., N-1]        ← index generator
+
+    worker 0 ───► shift() → 0 ───► runOneInvestigation(0)
+    worker 1 ───► shift() → 1 ───► runOneInvestigation(1)  ← in flight
+    worker 2 ───► shift() → 2 ───► runOneInvestigation(2)  ← in flight
+    (worker 0 finishes)
+    worker 0 ───► shift() → 3 ───► runOneInvestigation(3)  ← picks up
+    ...
+    queue empty → all workers return → Promise.all resolves
+```
+
+The code — the whole primitive fits in ~40 lines:
 
 ```ts
-// eval/load.eval.ts:171-211
+// eval/load.eval.ts:169-211 — hand-rolled semaphore
+// Semaphore-based concurrency. queue is an index generator; workers
+// pull from it until it's exhausted. Errors don't stop other workers.
 const indices = Array.from({ length: LOAD_N }, (_, i) => i);
-const queue = [...indices];                       // ← the FIFO queue
+const queue = [...indices];                              // ← FIFO buffer
 
 async function worker(workerId: number): Promise<void> {
-  while (queue.length > 0) {                      // ← loop until empty
-    const index = queue.shift();                  // ← dequeue (O(n) — see note)
-    if (index == null) return;                    // ← guard: another worker won the race
+  while (queue.length > 0) {                             // ← policy check
+    const index = queue.shift();                         // ← O(n) shift (small n, fine)
+    if (index == null) return;
     const caseIdx = index % goldens.length;
     const golden = goldens[caseIdx];
     const started = performance.now();
     try {
-      const inv = await runOneInvestigation(...);  // ← the network-bound work
-      results.push(inv);
+      const inv = await runOneInvestigation(index, golden.caseId, golden.signalClass, golden, workerId);
+      results.push(inv);                                 // ← unordered accumulator
+      // ...
     } catch (err) {
-      // ← per-item try/catch: failures don't stop other workers
-      results.push({ index, ...errorShape });
+      // ...error path also pushes a synthetic Investigation
     }
   }
 }
 
 const workers = Array.from({ length: LOAD_CONCURRENCY }, (_, i) => worker(i));
-await Promise.all(workers);                       // ← wait for all K to drain the queue
+await Promise.all(workers);                              // ← wait for all K to drain
 ```
 
-**Load-bearing parts, by what breaks if you remove them:**
+Three load-bearing parts, each of which breaks something specific if you remove it:
 
-1. **`while (queue.length > 0)` loop.** Drop it and each worker processes exactly one item then exits — total throughput = K items, not N.
-2. **`queue.shift()` returning `undefined` on empty.** With the `if (index == null) return;` guard, this handles the case where two workers both saw `queue.length > 0` but the other one shifted first. Without it, one worker would try to process `undefined`.
-3. **The per-item `try/catch`.** Without it, one thrown error would reject the worker's promise, and while `Promise.all` would fail-fast, the other running workers would keep going — but any *later* items in the queue would never be picked up because the failed worker never returns to its loop.
+  **1. The shared queue.** Without it, each worker would need its own slice of indices — the fastest worker would finish first and idle while slower workers grind through their slices. The shared queue is what makes "K workers, work-stealing on completion" work. Remove it and you get *static partitioning*, which is the wrong shape when task duration varies.
 
-**The single-threaded event loop is the lock.** This works without a mutex because JavaScript can't interleave synchronous code. `queue.shift()` runs to completion before any other JS runs. The moment you `await`, other workers get a turn — but they can't corrupt each other's local state, only the shared queue, and the queue is only touched at synchronous shift/length points.
+  **2. The `while (queue.length > 0)` loop with `shift()` inside.** Without this the worker would only handle one task and terminate. The while loop is what makes it a *worker* rather than a *one-shot*. The subtle correctness bit: `queue.length > 0` check + `queue.shift()` isn't atomic in most languages, but *is* atomic here because JS's event loop runs each `await`-free block to completion. Port this to Go or Rust and you'd need a mutex.
 
-**The O(n) shift trap.** `Array.prototype.shift()` on a JS array is O(n) — it re-indexes every remaining element. At N=20, K=3, that's fine. At N=100_000 it isn't; you'd want a real queue (linked list, or head-pointer + never-shrink array). Flag it and move on:
+  **3. The `Promise.all(workers)`.** Without it, the outer scope would return before any worker finished — you'd write receipts for zero completed investigations. `Promise.all` is the barrier that says "everybody has to be done."
 
-```
-  Cost of dequeue
+**Optional hardening (not part of the skeleton):** the try/catch around `runOneInvestigation` — a worker that hits an error doesn't stop other workers. Removing it turns one failed investigation into a whole-run failure. Worth having, but conceptually separate from the ordering discipline.
 
-  Array.shift()      O(n)   ← current, fine at N ≤ ~10k
-  linked-list shift  O(1)
-  ring buffer        O(1)   ← preferred at scale
-```
+### Move 2 — the heap-shaped problem this repo solves with sort (the missed opportunity)
 
-### Move 2 (continued) — where a heap would fit
-
-**`not yet exercised`: binary heap / priority queue.**
-
-The load-bearing example the repo *doesn't* build is a top-K selection. Look at `lib/agents/monitoring-legacy.ts:136`:
+This is the interview-worth signal for this file. `monitoring-legacy.ts:136` needs the 10 most-severe anomalies out of an array. The current code sorts the whole thing:
 
 ```ts
-// lib/agents/monitoring-legacy.ts:136
+// lib/agents/monitoring-legacy.ts:136 — sort + slice(10)
 return [...parsed].sort((a, b) => SEV_RANK[b.severity] - SEV_RANK[a.severity]).slice(0, 10);
 ```
 
-Sort everything, take the first 10. Cost: O(n log n). At n=50 that's ~280 ops. If the anomaly count ever grew (imagine n=50_000), sort would still cost ~780_000 ops — but a real top-K would be O(n log 10) ≈ 170_000 ops. Order of magnitude.
-
-Kernel of a binary heap (max-heap, for "highest severity first"):
+That's O(n log n) time, O(n) space. For the current use — one LLM turn's worth of anomalies, always small — it's fine. If `parsed` had hundreds or thousands of entries, a min-heap of size 10 would be the honest answer:
 
 ```
-  Binary heap — a complete binary tree stored as an array
+  Top-K with a size-K min-heap — the "keep the K best so far" pattern
 
-       [ 9 ]                         array: [9, 7, 8, 3, 6, 5, 4]
-       /   \                          index:  0  1  2  3  4  5  6
-     [7]   [8]
-     / \   / \                       parent(i)  = floor((i-1)/2)
-   [3][6][5][4]                      leftChild  = 2i + 1
-                                     rightChild = 2i + 2
+  heap capacity: K = 10  (keep 10 largest severity)
 
-  invariant: every parent ≥ its children (max-heap)
+  for each item in the array:
+    if heap.size < K:
+      heap.insert(item)                    ← O(log K) fill phase
+    else if item.severity > heap.peekMin().severity:
+      heap.extractMin()                    ← O(log K) — evict smallest kept
+      heap.insert(item)                    ← O(log K) — add newcomer
+    else:
+      skip                                 ← item can't be top K
+                                             (heap.peekMin() is O(1))
 
-  push(x):  append x at the end; "sift up" — swap with parent while larger
-            → O(log n)
-
-  pop():    take root; move last element to root; "sift down" — swap with
-            larger child while smaller → O(log n)
-
-  peek():   read root → O(1)
+  result: heap now holds the top 10, in any order.
+  total time: O(n × log K) = O(n × log 10) = O(n)
+  total space: O(K) = O(10)
 ```
 
-Pseudocode for top-K with a min-heap of size K (the canonical form — hold the K largest by maintaining a min-heap and pushing/popping):
+Trace it — say 20 items, keep top 3:
 
 ```
-  topK(items, K):
-    heap = empty min-heap
-    for item in items:                       // O(n)
-      if heap.size < K:
-        heap.push(item)                       // O(log K)
-      else if item > heap.peek():
-        heap.pop()                            // O(log K)
-        heap.push(item)                       // O(log K)
-    return heap.toSortedArray()               // O(K log K)
+  Execution trace — keep top 3 by severity
 
-  total: O(n log K + K log K)  =  O(n log K)
+  input severities: [5, 2, 8, 1, 7, 3, 9, 4, 6, ...]
+
+  step  action                          heap (min at top)
+  ────────────────────────────────────────────────────
+   1    insert 5                        [5]
+   2    insert 2                        [2, 5]
+   3    insert 8                        [2, 5, 8]        ← full
+   4    1 < min(2)? no → skip           [2, 5, 8]
+   5    7 > min(2)? yes → evict 2       [5, 7, 8]
+   6    3 > min(5)? no → skip           [5, 7, 8]
+   7    9 > min(5)? yes → evict 5       [7, 8, 9]
+   8    4 > min(7)? no → skip           [7, 8, 9]
+   9    6 > min(7)? no → skip           [7, 8, 9]        ← final
 ```
 
-Contrast: current sort-and-slice is `O(n log n)`. At K=10 fixed and large n, top-K wins hard. The repo doesn't yet need this, but flag it for future maintainers if n ever grows.
+You already have the primitive:
+
+```ts
+// reincodes/PriorityQueue.ts (your own code)
+// heap-backed with updatePriority — enqueue / dequeue / value→index lookup
+```
+
+Swap is:
+
+```ts
+// what the top-K would look like with your PriorityQueue
+const topK = new MinPriorityQueue<Anomaly>((a) => SEV_RANK[a.severity]);
+for (const item of parsed) {
+  if (topK.size < 10) topK.enqueue(item);
+  else if (SEV_RANK[item.severity] > topK.peek()!.priority) {
+    topK.dequeue();
+    topK.enqueue(item);
+  }
+}
+return topK.toArray();  // any order; caller sorts if display order matters
+```
+
+Why isn't this in the repo? Because `parsed` is always tiny. The signal for the interview is: "I looked at this, I picked sort because n is small, and here's the exact swap when n grows." That's the shape of the answer for every "why didn't you use the fancy data structure?" question in a senior interview.
 
 ### Move 3 — the principle
 
-Ordering discipline is a contract, not a container. Ask "what should come out next?" — the answer picks the primitive. FIFO for fair scheduling (load harness), LIFO for depth-first backtracking (not present), priority order for top-K under budget (the missing heap). The load-bearing skill is not knowing how heaps work — it's recognizing "top-K under a budget" as the shape when it walks past you.
+**Ordering discipline is a policy, not a container.** The container is almost always an array (or a heap-backed array). The interesting choice is the *rule* by which you pick the next item. FIFO for fair scheduling. LIFO for backtracking / undo. Priority for triage. Match the rule to the problem and the code writes itself; mismatch and you'll end up sort-slicing on a hot path.
 
-## Primary diagram — ordering disciplines and where they live
+## Primary diagram
+
+The whole story: one queue that's load-bearing in the harness, one heap-shaped problem the repo solves with sort today, one primitive you've already built in `reincodes` that would win when the shape flips.
 
 ```
-  Four containers, one axis: "what comes out next?"
+  Ordering disciplines in blooming_insights — where they live and where they should
 
-  ┌─ Stack (LIFO) ──────────────┐   NOT YET EXERCISED
-  │  push → [a][b][c]           │   would fit: DFS, backtracking
-  │  pop  ← last-in             │   ("agent loop" is NOT a stack —
-  └─────────────────────────────┘    it's a linear iteration)
+  ┌─ FIFO QUEUE (load harness) ────────────────────────────────┐
+  │                                                             │
+  │  eval/load.eval.ts:169-211                                  │
+  │  · shared index array + K workers pulling shift()           │
+  │  · Array.shift() is O(n) but n stays small — fine           │
+  │  · hand-rolled semaphore, no library                        │
+  │                                                             │
+  │  interview signal: "I own the concurrency primitive"        │
+  └─────────────────────────────────────────────────────────────┘
 
-  ┌─ Queue (FIFO) ──────────────┐   LIVE: load harness
-  │  [a][b][c] ← enqueue at end │
-  │  dequeue front → a          │   file: eval/load.eval.ts:171-211
-  │                             │   cost: O(n) shift on Array
-  └─────────────────────────────┘   fix at scale: linked list / ring buffer
+  ┌─ HEAP-SHAPED PROBLEM (currently sort) ─────────────────────┐
+  │                                                             │
+  │  lib/agents/monitoring-legacy.ts:136                        │
+  │  · sort + slice(10) — O(n log n) on a small n               │
+  │  · size-10 min-heap → O(n log 10) = O(n) when n grows       │
+  │                                                             │
+  │  interview signal: "the swap is one file (reincodes)        │
+  │  away — I built the PriorityQueue, I know when to reach     │
+  │  for it and when not to."                                   │
+  └─────────────────────────────────────────────────────────────┘
 
-  ┌─ Deque ─────────────────────┐   NOT YET EXERCISED
-  │  add/remove either end      │   would fit: sliding window
-  └─────────────────────────────┘
-
-  ┌─ Heap / priority queue ─────┐   NOT YET EXERCISED
-  │  root = highest priority    │   would fit: top-K severity anomalies
-  │  O(log n) push, O(log n) pop│   (currently sort-and-slice at
-  │  O(1) peek                  │    monitoring-legacy.ts:136)
-  └─────────────────────────────┘
+  ┌─ NOT YET EXERCISED ────────────────────────────────────────┐
+  │                                                             │
+  │  · deque (both ends O(1))                                   │
+  │  · double-ended priority queue                              │
+  │  · monotonic queue / stack (sliding-window max)             │
+  │                                                             │
+  │  none of these show up in this repo yet                     │
+  └─────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The worker-pool pattern shows up under many names — **thread pool** (Java), **executor** (Rust), **goroutine pool** (Go). In JavaScript it looks minimal because the runtime does the scheduling for you: no locks, no threads, just an event loop and a shared array. The tradeoff is that the pool is bounded by *your* concurrency limit, not the CPU's — you're managing outbound network calls, not compute parallelism.
+Heaps come from Williams (1964) with heapsort. The array-backed complete-binary-tree layout is the trick — parents at `(i-1)/2`, children at `2i+1` and `2i+2`. No pointers, cache-friendly, `sift-up` and `sift-down` are just index arithmetic. The Fibonacci heap (Fredman & Tarjan, 1984) buys you O(1) amortized `decreaseKey` for algorithms like Dijkstra and Prim, but the constants are big enough that a binary heap wins in practice for most sizes — the one in `reincodes` is exactly the right implementation.
 
-Binary heaps were invented by J.W.J. Williams in 1964 for heapsort. The array-as-implicit-tree trick (parent at `(i-1)/2`) is the elegant part — you get O(log n) push/pop without any pointers. For interviews, learn **heapify in O(n)** (build a heap from an unsorted array by sift-down from the middle inward — subtler than the O(n log n) push-each-one approach). And know **Fibonacci heaps** exist even if you'll never implement one — they get O(1) amortized push and are the reason Dijkstra's algorithm is O(E + V log V) instead of O(E log V).
+Deques (`std::deque` in C++, `collections.deque` in Python) are typically a doubly-linked list of blocks, giving O(1) push/pop at both ends *and* random access. JS doesn't have a built-in deque — every "queue" in a JS codebase is either an array (with O(n) `shift`) or a hand-rolled linked list. `Array` with a head cursor (never actually shift, just increment an index) gets you O(1) enqueue/dequeue at the cost of memory that grows until you compact.
 
-The deque story that isn't in this codebase but is a classic interview shape: **sliding window maximum in O(n) with a monotonic deque.** Worth practicing.
+The "shared work queue with K workers" pattern is the shape of every worker pool: `worker_threads` in Node, `ThreadPoolExecutor` in Python, goroutines with a channel in Go, `tokio::spawn` with an `mpsc` channel in Rust. Same skeleton, different concurrency primitives. The load harness reaches for none of them because JS's single-threaded event loop makes the naive version correct.
+
+The top-K pattern is a classic. Introselect / quickselect gets you O(n) *expected* time without a heap, but the constants are ugly and the code is fragile. Size-K heap is O(n log K), which is effectively O(n) for small K and much simpler to write correctly. Facebook's `select-k-out-of-n` benchmarks in the mid-2010s settled on heap for K < 100 and quickselect for K ≥ 100.
+
+Related reading: CLRS chapters 6 (heapsort + priority queues), 10 (elementary data structures), Sedgewick chapter 2.4 (priority queues). For the concurrency angle, "The Art of Multiprocessor Programming" (Herlihy & Shavit) is the deeper text.
 
 ## Interview defense
 
-**Q: Walk me through the load harness's concurrency model.**
+**Q: The load harness uses `Array.shift()`, which is O(n). Why is that fine here?**
 
-Answer: It's a semaphore-style worker pool over a shared FIFO index queue. Build `queue = [0, 1, ... N-1]`, spawn K worker functions, each worker loops `while (queue.length > 0)` and pulls with `queue.shift()`. Wrap the work in per-item try/catch so one investigation's failure doesn't stop the others. `Promise.all(workers)` waits for all K workers to drain the queue.
-
-The single-threaded event loop is the lock — `queue.shift()` runs atomically because JavaScript can't interleave synchronous code. The `if (index == null) return;` guard handles the race where two workers both saw `queue.length > 0` but only one won the shift.
+Two reasons. First, N stays small — LOAD_N defaults to 20, tops out around 100-200 in practice. O(n) shifts on a 200-element array are hundreds of nanoseconds, dwarfed by the milliseconds per investigation. Second, the alternative — a head-index cursor that never shifts — trades one perf annoyance for a memory-lifetime one (the array keeps growing until you compact). Not worth the complexity at this scale. If N crossed 10,000 tasks in one run, I'd swap for a head cursor or a real deque.
 
 ```
-  Worker pool — atomicity from the event loop
+  Cost math — why shift() is fine
 
-  worker 0:  check length → shift → await work ─────────►
-  worker 1:  check length → shift → await work ───►
-  worker 2:  check length → shift → await work ─────►
-
-  ← synchronous check-and-shift never interleaves
-  ← the moment you await, other workers get a turn
+  N = 200 tasks
+  average shift depth: N/2 = 100 element moves
+  cost per move: ~1 ns
+  total: 200 tasks × 100 ns = 20 μs of shift work
+  compared to: 200 × 10s investigation time = 2000 seconds
+  → shift cost is 10^-8 of total work — invisible
 ```
 
-Anchor: `eval/load.eval.ts:171-211`.
+**Anchor:** "`Array.shift()` is O(n) but n stays tiny — visible in a benchmark, invisible in this workload."
 
-**Q: What's the cost of `queue.shift()` here, and when does it matter?**
+**Q: `monitoring-legacy.ts:136` does sort-and-slice-10. When would you swap for a heap?**
 
-Answer: O(n). `Array.prototype.shift()` re-indexes every remaining element. At the current N=20 with K=3, that's ~200 element moves total over the whole run — invisible. At N=100_000 it'd be quadratic total work, ~5 billion moves. The fix at scale is a real queue: a linked list gives O(1) shift, or a ring buffer with head/tail pointers.
-
-Anchor: `eval/load.eval.ts:176`.
-
-**Q: Where in this repo would a binary heap fit better than what's there today?**
-
-Answer: `lib/agents/monitoring-legacy.ts:136` does `sort + slice(10)` for top-severity anomalies — O(n log n). A min-heap of size K would give O(n log K), which is asymptotically better once K stays fixed at 10 and n grows. Today n is `~50` so the difference is invisible; if the anomaly count ever grew to thousands, swapping to a bounded heap would be the right move. The kernel is push-if-heap.size<K, else if item > heap.peek() pop-and-push.
+When `parsed` reliably exceeds ~50 items. Below that, sort is faster in practice — Timsort's constants beat the heap's, and the code is one line. Above that, the O(n log n) vs O(n log 10) = O(n) gap opens up. The right answer isn't "always use a heap for top-K" — it's "know when N flips the tradeoff." I've implemented the min-heap and priority queue from scratch in `reincodes/BinaryHeap.ts` and `PriorityQueue.ts`, so I could make the swap with confidence when the workload demands it — right now it doesn't.
 
 ```
-  Top-K by heap
+  Sort vs heap for top-K — the flip point
 
-  n items ──► heap of size K (K << n) ──► K largest
-       O(log K) per push/pop, O(n log K) total
-       vs. sort's O(n log n)
+  N=10       sort wins (constants)
+  N=50       tie
+  N=1000     heap wins (n log n / n → 10× less work)
+  N=1M       heap wins big
 ```
 
-Anchor: `lib/agents/monitoring-legacy.ts:136`.
+**Anchor:** "Sort wins for small n; heap wins past ~50-100; I've built the primitive so the swap is a one-line change when N crosses over."
+
+**Q: If two workers race on `queue.shift()`, don't you get a bug?**
+
+Not in JavaScript. The event loop runs each synchronous block to completion — a worker's `queue.length > 0` check and its immediately-following `queue.shift()` happen atomically because there's no `await` between them. No other worker can touch the queue until the current one hits an await. Port this pattern to Go or Rust and you'd need a mutex around both operations, or a channel that serializes access. The interview signal: "this is safe *because of the runtime model*, not because of the data structure — I know the difference."
+
+```
+  Why JS makes this safe — the atomic block
+
+  worker code:
+    while (queue.length > 0) {   ← check
+      const index = queue.shift();  ← modify
+      ...
+      await something();          ← ONLY here does another
+                                    worker get a chance to run
+    }
+```
+
+**Anchor:** "Safe here because JS runs the check-then-modify as one event-loop turn; in a real-threaded language this would need a lock."
 
 ## See also
 
-- `02-arrays-strings-and-hash-maps.md` — the results Array that receives worker output.
-- `06-sorting-searching-and-selection.md` — the sort-and-slice that a heap would replace.
-- `.aipe/study-runtime-systems/` — the event-loop as implicit lock.
-- `.aipe/study-distributed-systems/` — worker pools generalize to real distributed queues.
+  → `01-complexity-and-cost-models.md` — the O(n log n) vs O(n log K) math the top-K story rests on
+  → `04-trees-tries-and-balanced-indexes.md` — where the binary heap's tree shape gets its full treatment
+  → `06-sorting-searching-and-selection.md` — the sort at the other end of the top-K tradeoff
+  → `study-runtime-systems` — where the event-loop atomicity story lives in full

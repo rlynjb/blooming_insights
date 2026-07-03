@@ -1,32 +1,60 @@
-# study-performance-engineering — blooming insights
+# study-performance-engineering
 
-Applied audit of what's measurably slow or expensive in this repo, why, and which change would improve it without moving the bottleneck.
+Applied performance-engineering audit of this repo — measurement and
+optimization of what the code actually does. Grounded in real files,
+real receipts, real budgets. No invented scale, no aspirational numbers.
 
-## Reading order
+Two passes, standard for audit-style generators:
 
-1. `00-overview.md` — the map. Ranked findings, the one weight-bearing distinction (spacing-compliance vs backpressure), and where each pattern file lives.
-2. `audit.md` — Pass 1. The 8-lens walk with `file:line` grounding. Every lens either names what's there or emits `not yet exercised`.
-3. Pattern files — Pass 2. One per significant mechanism this repo exercises:
-   - `01-prompt-caching.md` — ephemeral cache breakpoint on the system prompt; ~80% reduction on prefix input cost across a ReAct loop.
-   - `02-per-investigation-budget-ceiling.md` — check-before-dispatch token/cost ceiling per investigation.
-   - `03-observability-report.md` — receipts on disk + a report that emits p50/p95/p99 latency + tokens/cost.
-   - `04-load-harness-with-fault-injection.md` — semaphore-based concurrency harness; a decorator that injects timeouts/429s/500s/malformed JSON.
-   - `05-rate-limit-spacing-and-retry-ladder.md` — `minIntervalMs = 1100` proactive spacing + parsed-window retry ladder on 429s. This is rate-limit compliance, not backpressure.
-   - `06-response-cache-and-demo-replay.md` — the 60s response cache and the demo-snapshot NDJSON replay path.
+```
+  Pass 1 — the 8-lens audit         audit.md
+  Pass 2 — the discovered patterns  01-…  02-…  03-…  …
+```
 
-## Neighbors — cross-links
+## Read order
 
-- `study-runtime-systems` — the execution model: `AbortSignal.timeout` composition, the ReAct loop's per-turn shape, cancellation propagation.
-- `study-system-design` — the architecture-scale tradeoffs: the `DataSource` seam, DIY vs Vercel Pro's 300s cap, the demo vs live split.
+  1. `00-overview.md` — the repo-grounded map, ranked findings,
+     what's measured vs `not yet exercised`.
+  2. `audit.md` — the 8-lens walk. Each lens either names what the
+     repo does with `file:line` grounding or emits `not yet exercised`.
+  3. Pattern files (`01-` through `07-`) — one per load-bearing perf
+     mechanism the repo actually exercises. Read in numeric order or
+     jump straight to the one you're debugging.
 
-Findings that belong to those neighbors are cross-linked from `audit.md`, not restated here.
+## Pattern files
 
-## What this repo does NOT exercise (yet)
+- `01-route-budget-and-timeout-composition.md` — how the 300s route
+  budget, 30s per-tool timeout, and `AbortSignal` composition together
+  bound a single investigation.
+- `02-spacing-gate-and-retry-ladder.md` — the ~1.1s proactive spacing
+  gate vs the parsed retry-after ladder. The load-bearing distinction:
+  spacing is a scheduler; the retry ladder is backpressure.
+- `03-prompt-caching-ephemeral-breakpoint.md` — `cache_control:
+  ephemeral` on the system prompt; validated live with
+  `cache_read_input_tokens` hits in the receipts.
+- `04-response-cache-ttl.md` — the 60s per-`(name, args)` map cache
+  inside the Bloomreach adapter; write-through on `skipCache`.
+- `05-budget-ceiling-check-before-dispatch.md` — the `BudgetTracker`
+  gate that throws BEFORE the next Anthropic call, not after.
+- `06-load-harness-semaphore-concurrency.md` — the fixed-K worker
+  pool that drives the load eval. Fault-injection is layered as a
+  decorator on the DataSource — the agent doesn't know.
+- `07-fault-injecting-decorator.md` — offline degradation exercise
+  via a DataSource decorator. Shows the agent surviving 9 faults
+  across 3 investigations with 0 failures.
 
-- Multi-region deployment / horizontal scale
-- Persistent queues (Kafka, Redis Streams) — no work queue exists; investigations run inside the request
-- Client-side rendering budget or bundle-size optimization — the UI is dark-mode-only Tailwind v4 with no perceptible startup-cost work
-- Database indexes / query plans — there is no database
-- CPU profiling of hot loops — the hot path is model + MCP calls, not local compute
+## Cross-links to neighbor generators
 
-These lenses emit `not yet exercised` in `audit.md` with an honest note about when they'd become relevant.
+  → **`study-runtime-systems`** owns the execution mechanism:
+     event loop, async/await, `AbortSignal` composition semantics,
+     how `setTimeout` interacts with backpressure. This guide MEASURES;
+     runtime-systems EXPLAINS.
+  → **`study-system-design`** owns the architectural tradeoffs:
+     why the ~1.1s spacing gate exists (Bloomreach per-user global
+     rate limit), why the 60s response cache is per-instance
+     (Vercel memory model), why the load harness runs offline.
+     This guide grounds those choices in numbers; system-design
+     defends them at the whiteboard.
+
+If a finding belongs to a neighbor, this guide cross-links rather than
+re-teaches. That partition is what keeps each generator sharp.

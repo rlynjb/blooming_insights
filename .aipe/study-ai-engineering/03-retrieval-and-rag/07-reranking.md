@@ -1,95 +1,144 @@
-# 07 — Reranking with a cross-encoder
+# Reranking with a cross-encoder
 
-**Type:** Industry standard. Also called: cross-encoder rerank, two-stage retrieval.
+## Subtitle
+
+Two-stage retrieval / cross-encoder rerank — Industry standard.
 
 ## Zoom out, then zoom in
 
-**Not exercised in this codebase.** Reranking sits after retrieval and improves top-k precision at the cost of latency.
+Retrieval (dense, sparse, or hybrid) is fast but coarse — it uses independent embeddings for query and doc, then measures distance. A **cross-encoder** takes the query and one candidate doc together as input and outputs a relevance score using full attention across both. Slow but accurate. Two-stage retrieval uses the cheap retriever to narrow to ~50 candidates, then the cross-encoder to polish to top 3–5.
+
+```
+  Zoom out — two-stage retrieval
+
+  ┌─ Query ──────────────────────────────────────────┐
+  └──────────────────┬───────────────────────────────┘
+                     ▼
+  ┌─ Stage 1: bi-encoder (embed) retrieve ───────────┐
+  │  fast, top-50 candidates                          │
+  └──────────────────┬───────────────────────────────┘
+                     │  50 candidates
+                     ▼
+  ┌─ Stage 2: cross-encoder rerank ★ ────────────────┐ ← we are here
+  │  slow, top-5 polished ranking                     │
+  └──────────────────┬───────────────────────────────┘
+                     ▼
+                  final top-5
+```
 
 ## Structure pass
 
-Axis: quality-vs-latency tradeoff. Bi-encoder retrieval is fast but coarse. Cross-encoder rerank is slow but precise. Two-stage combines them.
+- **Layers:** query → stage 1 (fast) → stage 2 (slow) → results. Three bands.
+- **Axis: latency vs precision.** Stage 1 is fast and coarse. Stage 2 is slow and precise. Order matters: coarse-first cuts the expensive stage's input size.
+- **Seam:** the boundary between retrieval and reranking. Retrieval returns 50; rerank returns 5.
 
 ## How it works
 
-### Move 1
+### Move 1 — the mental model
 
-You've paginated a DB query — fetch a bigger candidate set cheaply, then filter the top-k precisely. Same shape here.
+Bi-encoder: `embed(query)` and `embed(doc)` separately, compare with cosine. Cheap because embeddings are precomputed.
+
+Cross-encoder: `score(query, doc)` in one pass with attention across both. Expensive because there's no precomputation — every (query, doc) pair is a fresh call.
 
 ```
-  Query
-    │
-    ▼
-  bi-encoder retrieve → top-50 candidates (~1-10ms)
-    │
-    ▼
-  cross-encoder rerank → top-5 precise         (~50-500ms)
+  Bi-encoder vs cross-encoder — the shape
+
+  Bi-encoder (retrieval):
+    embed(query) ──►  q_vec
+    embed(doc)   ──►  d_vec  (precomputed)
+    score = cosine(q_vec, d_vec)                ← one lookup
+
+  Cross-encoder (rerank):
+    score = model(query, doc)                   ← one full call per (q, d)
+    → slow but precise
 ```
 
-### Move 2
+### Move 2 — the step-by-step walkthrough
 
-**Bi-encoder.** Query embedding + doc embeddings, cosine. Fast because query is embedded once, docs are pre-embedded. Coarse because each doc's embedding is independent of the query.
+**Where reranking pays for itself.** When the top-50 from stage 1 has the right answer in it, but not at rank 1. Example: a paraphrase-heavy query where the correct doc lands at rank 8 in dense retrieval. Cross-encoder rerank pushes it to rank 1 in ~90% of such cases.
 
-**Cross-encoder.** A small model that takes query + doc as a joint input, outputs a relevance score. Attends jointly to both. Much more precise. Slow because the model has to run PER query-doc pair.
+**Where reranking doesn't help.** When stage 1 already puts the right answer at rank 1 (measure this first!) or when stage 1 doesn't retrieve the right doc at all — reranking can't rescue a doc that wasn't in the candidate set.
 
-**Why two stages.** Cross-encoding all N docs is expensive. Cross-encoding just the top-50 from the bi-encoder is affordable and captures most of the precision win.
+**Model choice.** `cross-encoder/ms-marco-MiniLM-L-6-v2` from sentence-transformers is a common default — small, runs on CPU, accurate enough. Cohere Rerank v3 is the hosted equivalent.
 
-**When it earns its place.** When retrieval quality is measurably bad — hit@k below your target on a held-out eval set. Add rerank; measure the improvement; keep it if the improvement is meaningful. Don't add speculatively.
+**For blooming.** No reranking today because no retrieval. If retrieval landed, the decision would be measurement-driven: measure hit@k before rerank; add rerank only if the gap is significant.
 
-### Move 3
+Pseudocode:
 
-Two-stage retrieval is the boring right pattern. Skip stage 2 when stage 1 is precise enough; skip stage 1 when the corpus is small enough to cross-encode entirely. In between (the common case), do both.
+```
+  twoStageRetrieve(query, k=5):
+    // stage 1 — fast, coarse
+    candidates = hybridRetrieve(query, N=50)
+    // stage 2 — slow, precise
+    scored = candidates.map(doc => ({
+      doc,
+      score: crossEncoder.score(query, doc.text)
+    }))
+    scored.sort(by score desc)
+    return scored.slice(0, k)
+```
+
+### Move 3 — the principle
+
+Reranking is a quality-vs-latency knob. It earns its place when measurement shows stage 1 is retrieving the right docs but not ranking them well. Add it late, add it when you can prove the win.
 
 ## Primary diagram
 
 ```
-  Two-stage retrieval
+  Two-stage retrieval — full frame
 
-  ┌──────────────────────────────┐
-  │ Stage 1: bi-encoder retrieve │  fast, coarse, top-50
-  │  (cosine similarity)         │
-  └──────────────┬───────────────┘
-                 │  50 candidates
-                 ▼
-  ┌──────────────────────────────┐
-  │ Stage 2: cross-encoder rerank│  slow, precise, top-5
-  │  (query + doc joint attention)│
-  └──────────────┬───────────────┘
-                 │
-                 ▼
-            Top 5 ranked
+  ┌─ Query ────────────────────────────────────────────┐
+  └──────────────────┬─────────────────────────────────┘
+                     │
+                     ▼
+  ┌─ Stage 1: bi-encoder / hybrid ─────────────────────┐
+  │  embed + cosine (dense) + BM25 (sparse) + RRF      │
+  │  → top-50 candidates                                │
+  │  latency: 10-50ms                                   │
+  └──────────────────┬─────────────────────────────────┘
+                     │
+                     ▼
+  ┌─ Stage 2: cross-encoder ★ ─────────────────────────┐
+  │  model(query, doc) per candidate                    │
+  │  → top-5 polished                                   │
+  │  latency: 50 candidates × ~10ms each = ~500ms       │
+  └──────────────────┬─────────────────────────────────┘
+                     │
+                     ▼
+                 final top-5
 ```
 
 ## Elaborate
 
-Cross-encoders like `cross-encoder/ms-marco-MiniLM-L-6-v2` (Hugging Face) run in ~10ms per pair on CPU. Cohere and Voyage sell hosted rerank endpoints (Cohere Rerank v3 is the popular one). Both APIs take query + doc list, return relevance-scored ranking.
+The bi-encoder / cross-encoder split is standard in modern IR (from BERT-era through modern retrievers). The name "cross-encoder" refers to encoding query and doc *together*, letting attention span both — which is why it's more accurate and why it can't be precomputed.
+
+For very large corpora (100k+), a third stage sometimes appears: a small LLM used as a judge on the top-5 output, producing a final ranking with reasoning. Extra latency; used only in high-value search paths.
+
+Related: **06-hybrid-retrieval-rrf.md** (stage 1's fusion), **11-rag.md** (where the final top-5 feeds).
 
 ## Project exercises
 
-### Exercise — Cohere Rerank on the fused top-20
+### B3.7 · Measure hit@k before considering rerank
 
-- **Exercise ID:** C2.10-B · Case B (RAG not exercised).
-- **What to build:** if `06-hybrid-retrieval-rrf.md`'s hybrid retrieval is present, add a Cohere Rerank pass on the top-20 from RRF. Measure hit@5 vs no-rerank on a held-out set.
-- **Why it earns its place:** shows you know rerank is a measurement decision, not a habit. Interviewer signal: "I added rerank because hit@5 was below target; here's the before/after."
-- **Files to touch:** `lib/rag/rerank.ts` (new), `lib/rag/retrieve.ts` (chain after RRF).
-- **Done when:** report shows hit@5 with and without rerank on a held-out set of 10 query-doc pairs.
-- **Estimated effort:** 1-2 days.
+- **Exercise ID:** B3.7 (Case B — not yet implemented)
+- **What to build:** Once the would-be investigation-memory index (`B3.1/B3.4`) is live, hand-label 30 anomaly queries with their intended top-3 investigations. Measure hit@1 and hit@3 for the retrieval-only pipeline. Only add reranking if hit@3 < 80%.
+- **Why it earns its place:** Discipline over reflex. Interview payoff: "here's how I'd decide whether reranking is worth adding" — measurement-first.
+- **Files to touch:** New `eval/retrieval-goldens/`, new `eval/retrieval.eval.ts`.
+- **Done when:** the eval prints hit@1 / hit@3 / MRR for the retrieval path; the number is committed as a baseline.
+- **Estimated effort:** `1–2 days`.
 
 ## Interview defense
 
-**Q: Do you always add rerank?**
+**Q: Should you always rerank?**
 
-No. Only when I've measured that retrieval quality is below target. Rerank adds ~100ms of latency; on a corpus where hit@5 is already 90%, that's a bad trade. On one where hit@5 is 60%, rerank often pushes it to 80% and the latency is worth it.
+No. Rerank when measurement shows stage 1 retrieves the right doc but ranks it wrong. If stage 1 already puts it at rank 1, reranking is wasted latency. If stage 1 doesn't retrieve it at all, rerank can't fix that — improve retrieval first.
 
-**Q: Why not skip bi-encoder and cross-encode everything?**
+**Q: Why not just use the cross-encoder for everything?**
 
-Cost. Cross-encoding 1M docs per query would be seconds of compute per query. Bi-encoder → top-50 → cross-encode is what makes the joint expressiveness affordable.
-
-**Q: Hosted rerank vs local?**
-
-Local models (Hugging Face cross-encoders) are 10-30ms/pair on CPU, free to run. Hosted rerank (Cohere, Voyage) is often ~50-200ms + network + fees, but stronger models on hard tasks. For a small production app, start local.
+Latency and cost. Cross-encoder scores are ~10ms per pair; scoring a 10k-corpus for one query = 100 seconds. Bi-encoder retrieval narrows to 50 candidates; the cross-encoder then runs on those. Two-stage keeps the expensive model's input bounded.
 
 ## See also
 
-- `05-dense-vs-sparse.md` — stage 1 candidates
-- `06-hybrid-retrieval-rrf.md` — fused stage 1 input
+- [06-hybrid-retrieval-rrf.md](06-hybrid-retrieval-rrf.md) — the stage 1 fusion.
+- [11-rag.md](11-rag.md) — the pipeline both stages live in.
+- [../02-context-and-prompts/02-lost-in-the-middle.md](../02-context-and-prompts/02-lost-in-the-middle.md) — where reranking places the top-1 at prime attention position.

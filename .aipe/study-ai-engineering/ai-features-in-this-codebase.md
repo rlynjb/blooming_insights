@@ -1,119 +1,110 @@
 # AI features in this codebase
 
-Every AI-touching thing in `blooming_insights`, with which pattern it uses and where it lives. The runtime is `@aptkit/core@0.3.0` (the ReAct loop, the tool-registry contract, the trace sink); the Blooming code owns the adapter bridge, the prompts (retired to `legacy-prompts/`; active prompts live inside AptKit), the tools (via MCP or synthetic), and the surrounding evals/observability.
+Every LLM-powered surface in blooming_insights, mapped to the pattern it uses and the file it lives in.
 
-## The features, at a glance
+## The feature table
+
+Six AI features. Five agents plus one classifier — all live over the same DataSource port, all traced through the same `AgentHooks.onCapabilityEvent` sink.
 
 ```
-┌────────────────────────┬─────────────────┬────────────────────────────────────┐
-│ Feature                │ Pattern          │ Anchor (file / class)              │
-├────────────────────────┼─────────────────┼────────────────────────────────────┤
-│ Monitoring anomaly scan│ Single-agent    │ MonitoringAgent → AptKit's         │
-│                        │ tool-use loop   │ AnomalyMonitoringAgent             │
-│                        │                 │ lib/agents/monitoring.ts           │
-├────────────────────────┼─────────────────┼────────────────────────────────────┤
-│ Diagnostic investigation│Single-agent    │ DiagnosticAgent → AptKit's         │
-│                        │ tool-use loop   │ DiagnosticInvestigationAgent       │
-│                        │ (≤6 tool calls) │ lib/agents/diagnostic.ts           │
-├────────────────────────┼─────────────────┼────────────────────────────────────┤
-│ Recommendation gen.    │ Single-agent    │ RecommendationAgent → AptKit's     │
-│                        │ tool-use loop   │ RecommendationAgent                │
-│                        │                 │ lib/agents/recommendation.ts       │
-├────────────────────────┼─────────────────┼────────────────────────────────────┤
-│ Diagnose → recommend   │ Prompt chain    │ eval/run.eval.ts:198-269           │
-│ pipeline               │ (2-stage)       │ app/api/agent/route.ts             │
-├────────────────────────┼─────────────────┼────────────────────────────────────┤
-│ Free-form query        │ Single-agent    │ QueryAgent (AptKit)                │
-│                        │ tool-use loop   │ lib/agents/query.ts                │
-├────────────────────────┼─────────────────┼────────────────────────────────────┤
-│ Intent classification  │ Heuristic +     │ classifyIntent, haiku-4-5          │
-│                        │ cheap-LLM       │ lib/agents/intent.ts               │
-├────────────────────────┼─────────────────┼────────────────────────────────────┤
-│ Diagnosis-quality judge│ LLM-as-judge    │ RubricJudge (AptKit)               │
-│                        │ (rubric)        │ eval/rubrics/diagnosis-quality.ts  │
-├────────────────────────┼─────────────────┼────────────────────────────────────┤
-│ Recommendation-quality │ LLM-as-judge    │ RubricJudge (AptKit)               │
-│ judge                  │ (rubric)        │ eval/rubrics/recommendation-       │
-│                        │                 │ quality.ts                         │
-└────────────────────────┴─────────────────┴────────────────────────────────────┘
+  ┌─────────────────────┬───────────────────┬────────────────────────────────┐
+  │ Feature             │ Pattern           │ Where it lives                 │
+  ├─────────────────────┼───────────────────┼────────────────────────────────┤
+  │ Monitoring scan     │ ReAct agent loop  │ lib/agents/monitoring.ts       │
+  │ (anomaly detection) │  + tool routing   │ + @aptkit/core                 │
+  │                     │  (categories gate)│                                │
+  ├─────────────────────┼───────────────────┼────────────────────────────────┤
+  │ Diagnostic          │ ReAct agent loop  │ lib/agents/diagnostic.ts       │
+  │ investigation       │  + prompt chain 1 │ + @aptkit/core                 │
+  ├─────────────────────┼───────────────────┼────────────────────────────────┤
+  │ Recommendation      │ ReAct agent loop  │ lib/agents/recommendation.ts   │
+  │ proposal            │  + prompt chain 2 │ + @aptkit/core                 │
+  │                     │  (in from step 1) │                                │
+  ├─────────────────────┼───────────────────┼────────────────────────────────┤
+  │ Free-form query     │ ReAct agent loop  │ lib/agents/query.ts            │
+  │ (QueryBox)          │  + intent-routed  │ + @aptkit/core                 │
+  ├─────────────────────┼───────────────────┼────────────────────────────────┤
+  │ Intent classifier   │ Single-chain,     │ lib/agents/intent.ts           │
+  │                     │  cheap model      │ (Haiku 4.5)                    │
+  ├─────────────────────┼───────────────────┼────────────────────────────────┤
+  │ LLM-as-judge        │ Single-chain      │ eval/rubrics/*.ts              │
+  │ (offline eval)      │  rubric scoring   │ (@aptkit/core RubricJudge)     │
+  └─────────────────────┴───────────────────┴────────────────────────────────┘
 ```
 
-## Per-feature detail
+Model choice: all agents run `claude-sonnet-4-6`. Intent classifier runs `claude-haiku-4-5-20251001`. Judge runs whatever `RUBRIC_JUDGE_MODEL` env resolves to — Sonnet by default.
 
-The template each row fills: **Inputs · Outputs · Model + provider · Approx. cost per call · Failure modes · Eval set (size, where stored).**
+## Per-feature spec
 
-### Monitoring anomaly scan
+### Monitoring scan
 
-- **Inputs (typed):** `WorkspaceSchema` (project id, event catalog, customer properties, catalogs, totals) + `AnomalyCategory[]` (the fixed checklist of ecommerce anomaly categories from `@aptkit/core`'s `ECOMMERCE_ANOMALY_CATEGORIES`, wrapped in Blooming's `AnomalyCategory` shape via `lib/agents/categories.ts`).
-- **Outputs (typed):** `Anomaly[]` — each has `{metric, scope[], change{value,direction,baseline}, severity, evidence[], impact?, history?, category?}`. Contract lives in `lib/mcp/types.ts`.
-- **Model + provider:** Anthropic `claude-sonnet-4-6` via `AnthropicModelProviderAdapter` (`lib/agents/aptkit-adapters.ts`).
-- **Approx. cost per call:** monitoring is ~1 model turn per anomaly-worth of tool calls; a full briefing is ~4-5 turns × ~1-2K input / ~500 output tokens each. Estimated cost per briefing: ~$0.02-0.05 uncached, ~$0.005-0.015 with prompt caching.
-- **Failure modes observed:** rate limit against the alpha Bloomreach MCP server (~1 req/s), token revocation mid-scan (auto-reconnect on the UI). No hallucination-of-numbers reported at eval time — the ecommerce-category checklist keeps the agent from inventing metrics.
-- **Eval set:** monitoring itself is not gated by the harness in `eval/run.eval.ts` (which evaluates `diagnose + recommend` against synthetic anomalies). Monitoring surfaces are exercised end-to-end via the committed demo snapshot (`lib/state/demo-*.json`).
+- **Inputs:** `WorkspaceSchema` (project shape) + `AnomalyCategory[]` (which categories the schema can support, decided by `runnableCategories()` in `lib/agents/categories.ts:24`).
+- **Outputs:** typed `Anomaly[]` — each anomaly has `metric`, `scope[]`, `change {value, direction, baseline}`, `severity`, `evidence[]`, and optional `impact`. Schema: `lib/mcp/types.ts:9-28`.
+- **Model + provider:** Anthropic Sonnet 4.6 via `lib/agents/aptkit-adapters.ts` → `AnthropicModelProviderAdapter`.
+- **Approx tokens per call:** ~12k input (schema summary + system prompt + tool defs) · ~1.5k output per turn · 3–7 turns per scan.
+- **Failure modes observed:** overreach into scopes the schema can't support (handled by the coverage gate in `lib/agents/categories.ts`), rate limit collision at ~1 req/s (handled by `BloomreachDataSource` retry ladder).
+- **Eval set:** ~none live — the monitoring output is upstream of the eval; anomalies are held constant across cases via `eval/goldens/*.ts`.
 
 ### Diagnostic investigation
 
-- **Inputs (typed):** one `Anomaly` (from monitoring) + `WorkspaceSchema` + full MCP tool catalog.
-- **Outputs (typed):** `Diagnosis` = `{conclusion, evidence[], hypothesesConsidered[{hypothesis, supported, reasoning}], affectedCustomers?, confidence?}`. Contract lives in `lib/mcp/types.ts`.
-- **Model + provider:** Anthropic `claude-sonnet-4-6` via `AnthropicModelProviderAdapter`.
-- **Approx. cost per call:** eval-measured at ~$0.03-0.05 per diagnosis (cached, from receipts in `eval/receipts/`). Median ~10 model turns, ~50s p50 wall time.
-- **Failure modes observed:** the biggest one in the committed baseline is `actionable_next_step` at 0% pass rate (dim 4 of the diagnosis rubric) — the agent's conclusions rarely include a specific named next step with a tool/query. `evidence_grounding` at 50% is the next largest — agent sometimes states conclusions that trace back only weakly to the tool results.
-- **Eval set:** 10 goldens (has-signal / partial-signal / no-signal / positive) in `eval/goldens/`, rubric in `eval/rubrics/diagnosis-quality.ts`. Committed baseline: `eval/baseline.json` (runId `2026-07-03T04-08-28-644Z`).
+- **Inputs:** one `Anomaly` + `WorkspaceSchema` + full MCP tool list.
+- **Outputs:** typed `Diagnosis` — `conclusion`, `evidence[]`, `hypothesesConsidered[]` (with `supported: boolean`), optional `affectedCustomers`. Schema: `lib/mcp/types.ts:30-46`.
+- **Model + provider:** Sonnet 4.6.
+- **Approx tokens per call:** ~15k input · ~2k output per turn · 5–10 turns per investigation. With prompt caching (`lib/agents/aptkit-adapters.ts:75-98`), input tokens after turn 1 drop ~80%.
+- **Failure modes observed:** eval receipt shows `actionable_next_step` scores 0% — the agent's prompt never asks it to propose actions, so the diagnosis is a plausible root cause with no "what to do about it." Prompt gap, not a model gap.
+- **Eval set:** 10 goldens (`eval/goldens/01–10-*.ts`); baseline `eval/baseline.json` runId `2026-07-03T04-08-28-644Z`.
 
-### Recommendation generation
+### Recommendation proposal
 
-- **Inputs (typed):** `Anomaly` + `Diagnosis` + `WorkspaceSchema` + full MCP tool catalog. Note: RecommendationAgent receives the diagnosis and can call tools to enrich (segment sizes, campaign lists) before proposing.
-- **Outputs (typed):** `Recommendation[]` — each has `{id, title, rationale, bloomreachFeature: scenario|segment|campaign|voucher|experiment, steps[], estimatedImpact, confidence}`.
-- **Model + provider:** Anthropic `claude-sonnet-4-6` via `AnthropicModelProviderAdapter`.
-- **Approx. cost per call:** ~$0.04-0.06 per recommendation set. Median p50 wall time 51s.
-- **Failure modes observed:** in the baseline — `impact_realism` at 43% pass rate is the lowest. Rec impact estimates are frequently disproportionate to the anomaly magnitude or missing the linking assumption. `diagnosis_response` at 48% — recs sometimes address a symptom instead of the diagnosed root cause. `step_actionability` at 100% is the strong one (steps are specific enough to execute).
-- **Eval set:** same 10 goldens as diagnosis; rubric in `eval/rubrics/recommendation-quality.ts`.
+- **Inputs:** one `Anomaly` + the `Diagnosis` from step 2 + `WorkspaceSchema` + tool list.
+- **Outputs:** `Recommendation[]` — each `{title, rationale, bloomreachFeature, steps[], estimatedImpact, confidence}`. Schema: `lib/mcp/types.ts:48-63`.
+- **Model + provider:** Sonnet 4.6.
+- **Approx tokens per call:** ~18k input · ~3k output per turn · 4–8 turns. Prompt caching same as diagnostic.
+- **Failure modes observed:** cases 01 + 08 both propose "pause the A/B experiment" when the primary root cause is a payment processor — a recommendation-fit failure the `diagnosis_response` rubric catches (scores 2, fails). Overall `diagnosis_response` pass rate: 48%.
+- **Eval set:** same 10 goldens, judged by the `recommendation-quality` rubric (`eval/rubrics/recommendation-quality.ts`).
 
-### The diagnose → recommend chain
+### Free-form query
 
-- **Pattern:** prompt chain — output of diagnostic agent (a `Diagnosis`) becomes input to recommendation agent, along with the original anomaly. Two sequential agent invocations, each with its own tool-use loop, sharing an investigation's `BudgetTracker`.
-- **Where it lives:** the eval runner walks it explicitly (`eval/run.eval.ts:198-269`); the route handler at `app/api/agent/route.ts` walks it stage-by-stage based on the `step=diagnose|recommend|null` param.
-- **Why chain not one big agent:** each stage has one job (diagnose the cause, propose the action) — the failures are isolated, the trace surfaces are separable, and either stage can be swapped independently. The recommendation stage receives the diagnosis's structured conclusion as context, not the diagnostic agent's whole tool-call trace.
-- **Cost:** ~$0.09/case total in the committed baseline (agent-side, cached).
+- **Inputs:** raw user text + a `QueryIntent` (from the intent classifier) + tool list.
+- **Outputs:** natural-language answer string.
+- **Model + provider:** Sonnet 4.6.
+- **Approx tokens per call:** varies widely (~5k–20k input, 500–2k output).
+- **Failure modes observed:** none formally evaluated; the eval harness does not include a query rubric.
+- **Eval set:** none currently — a `query-quality` rubric would be a next add.
 
-### Free-form query (natural-language Q&A)
+### Intent classifier
 
-- **Pattern:** single-agent tool-use loop with a broader tool set than diagnostic.
-- **Inputs:** a free-form text query + `WorkspaceSchema` + full MCP tool catalog.
-- **Outputs:** streamed text response with cited tool calls.
-- **Model:** Anthropic `claude-sonnet-4-6`.
-- **Where it lives:** `lib/agents/query.ts` (thin wrapper) → `@aptkit/core`'s `QueryAgent`. Surfaced via `QueryBox` (bottom of feed).
-- **Live only.** In demo mode the `QueryBox` is shown but inert.
+- **Inputs:** raw query text.
+- **Outputs:** `QueryIntent` — one of the aptkit-defined intent tags.
+- **Model + provider:** Haiku 4.5 (`claude-haiku-4-5-20251001`) via `lib/agents/intent.ts:16`.
+- **Approx tokens per call:** ~500 input · ~50 output. Costs ~$0.0005 per call.
+- **Failure modes observed:** `parseIntent()` defaults to `'diagnostic'` when the model returns something unparseable (`lib/agents/intent.ts:11`).
+- **Eval set:** none — intent labels are internal routing, not user-facing.
 
-### Intent classification (query router)
+### LLM-as-judge (offline)
 
-- **Pattern:** heuristic-before-LLM (spec's "heuristic-before-LLM" concept, though today it's LLM-only using a cheaper model — Haiku).
-- **Inputs:** raw user query string.
-- **Outputs:** `Intent` (currently one of `'diagnostic'` etc., re-exported from `@aptkit/core`'s `QueryIntent`).
-- **Model + provider:** Anthropic `claude-haiku-4-5-20251001` — deliberately the cheap fast model, since intent classification is one turn and doesn't need Sonnet's reasoning depth.
-- **Approx. cost per call:** ~$0.0001-0.0005 per classify.
-- **Where it lives:** `lib/agents/intent.ts` (thin adapter around AptKit's `classifyIntent`).
+- **Inputs:** rubric definition + agent output.
+- **Outputs:** `RubricJudgment` — per-dimension score (1–5) + overall verdict (`pass` / `fail` / `unclear`) + rationale.
+- **Model + provider:** typically Sonnet 4.6.
+- **Approx tokens per call:** ~4k input · ~1k output. `max_tokens = 4096`. Judge-error resilience: on parse failure the receipt records a `judge_error` placeholder instead of crashing the run.
+- **Failure modes observed:** occasional token cap hit on the recommendation rubric (long output list); mitigated by the `max_tokens = 4096` bump and the placeholder fallback.
+- **Eval set:** blind calibration protocol (Session D pilot) — verdict 6/6 agreement, exact 13/24 (54%), within-1 24/24 (100%).
 
-### Diagnosis-quality LLM-as-judge
+## The connective tissue
 
-- **Pattern:** LLM-as-judge with a rubric (4 dimensions × 1-5 scale × 3 verdicts).
-- **Inputs:** the diagnosis JSON to score + context (the anomaly, the golden case's `knownCorrect` notes, the tool-call trace, the signal class).
-- **Outputs:** `{dimensions: {dim → {score, reason}}, verdict, fix, reasoning}`.
-- **Model:** Anthropic `claude-sonnet-4-6` — same model as the agent-under-test. Known self-preference bias risk (see `05-evals-and-observability/03-llm-as-judge-bias.md`). Session D pilot ran a Haiku judge for calibration.
-- **Approx. cost per call:** ~$0.04 per judgment (maxTokens=4096, no cache — each case has different context).
-- **Failure modes:** in the baseline, the diagnosis judge had 6/10 `judge_error` verdicts (model failed to produce parseable structured output within budget). Placeholder-verdict handling in `eval/run.eval.ts:82-108` prevents these from crashing the run.
+All six features share:
 
-### Recommendation-quality LLM-as-judge
+- **The `DataSource` port** (`lib/data-source/types.ts:64-73`) — no agent knows whether it's talking to MCP, Synthetic, or a FaultInjecting decorator. Five uses of the seam, zero caller-surface change.
+- **The `AgentHooks` shape** (`lib/agents/diagnostic.ts:17-36`) — one hook interface flows through every agent. `onCapabilityEvent` feeds the observability report; `budget` feeds the pre-dispatch ceiling gate; `signal` propagates cancellation.
+- **The prompt-caching cache breakpoint** (`lib/agents/aptkit-adapters.ts:75-98`) — one cache_control marker in the adapter; every agent benefits. Live measurement: `cache_read_input_tokens = 3168` on a real receipt (turn 2+ of a diagnostic run).
+- **The `AnthropicModelProviderAdapter`** — one Anthropic SDK client wrapped once, used by every agent through aptkit's `ModelProvider` port. Swappable to any other provider without touching agents.
 
-Same shape as the diagnosis judge, different rubric. Scores each recommendation independently (baseline had 30 total judgments across 10 cases; 9 were `judge_error`).
+## Curriculum concept mapping
 
-## The DataSource seam (not a feature but load-bearing)
+Roughly, in Phase order:
 
-The seam that makes swapping between live Bloomreach, synthetic evals, and fault-injected load tests possible without any agent code changing. `BloomreachDataSource` (live MCP), `SyntheticDataSource` (deterministic in-memory), `FaultInjectingDataSource` (offline decorator). All conform to `DataSource` in `lib/data-source/types.ts`. See `04-agents-and-tool-use/02-tool-calling.md` for the walkthrough.
-
-## What's NOT in this table
-
-- No RAG feature. No embeddings, no vector store.
-- No trained model. Every "reasoning" step is an LLM call.
-- No semantic cache. Prompt caching (Anthropic ephemeral) IS live; semantic caching is not.
-- No fine-tuned model. Base Sonnet 4.6 out of the box.
+- **Phase 1** (LLM foundations): intent classifier, prompt caching, provider abstraction, token economics → sub-section 01.
+- **Phase 2** (context + prompts): the diagnose → recommend chain → sub-section 02.
+- **Phase 4** (agents): every ReAct agent → sub-section 04.
+- **Phase 3** (evals): the harness → sub-section 05.
+- **Phase 5** (production): rate limiting, retry, budget, injection defenses → sub-section 06.

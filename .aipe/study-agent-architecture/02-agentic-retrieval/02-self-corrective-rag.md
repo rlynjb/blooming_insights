@@ -1,146 +1,143 @@
 # Self-corrective RAG
 
-_Industry standard._
+*Industry names: self-corrective RAG / CRAG · Language-agnostic*
 
-## Zoom out, then zoom in
-
-Add a relevance grader between retrieval and generation, with a fallback path. **Not implemented.** No retrieval to grade. Covered for pattern-recognition and to name the shape that would arrive if RAG got introduced.
+## Zoom out
 
 ```
-  Zoom out — where the grader would sit
+  Zoom out — a grader between retrieval and generation
 
-  ┌─ Retrieval tool ─────────────────────────────────────────┐
-  │  retrieve(query, k=5) → chunks[]                          │
-  └───────────────────────┬──────────────────────────────────┘
-                          │
-  ┌─ Grader (NOT PRESENT) ▼──────────────────────────────────┐
-  │  chunk[i] → relevant? grounded?                           │
-  │  drop irrelevant · fall back if all irrelevant           │
-  └───────────────────────┬──────────────────────────────────┘
-                          ▼
-                     generate answer
+  ┌─ agentic RAG ────────────────────────────────┐
+  │  retrieve → generate                          │
+  │             (or loop)                         │
+  └───────────────┬──────────────────────────────┘
+                  ▼
+  ┌─ ★ self-corrective RAG ★ ────────────────────┐ ← we are here
+  │  retrieve → grade → generate | fall back      │
+  │  the grader is the gate that catches the gap  │
+  └──────────────────────────────────────────────┘
 ```
 
-Zoom in: this file's job is to name the distinction between "retrieval success" (chunk came back) and "answer success" (chunk was actually relevant). The grader catches the gap.
+## Zoom in
+
+Retrieval success (a chunk came back) is not answer success (the chunk is relevant and the answer is grounded in it). Self-corrective RAG adds a **relevance grader** between retrieval and generation, with a fallback path when the retrieval fails the grade. Not currently used inline in this repo; the closest thing is the diagnostic agent's own hypothesis-refinement step.
 
 ## Structure pass
 
-**Layers:** retrieve · grade (per chunk) · fallback (all irrelevant) · generate.
-**Axis:** *what does relevant mean here?*
-**Seam:** the grader's decision — cheap deterministic (BM25 score threshold?) or LLM (does this chunk address the query?).
+Layers: **retriever** — **grader** — **either generator (pass) or fallback (fail)**.
 
-```
-  Retrieval success vs answer success
+Axis to hold constant: **what happens on a bad retrieval?**
 
-  chunk came back  ────────►  answer is grounded in it?
-                                        │
-                              ┌─────────┴─────────┐
-                              ▼                   ▼
-                            YES                  NO
-                        generate           the grader would
-                        (as usual)         drop this chunk
-```
+The failure mode this pattern fixes is silent: retrieval "worked" (got results), but the results aren't relevant, so the generation hallucinates on top of them. Without the grader, you never notice.
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — the shape
 
-You've built a fetch with a validation step before — `const res = await fetch(url); if (!isValid(res)) fallback();`. Self-corrective RAG is the same: retrieve first, validate the results, fallback to a different retrieval strategy if validation fails.
+You've written a `fetch → validate → use OR error-recover` chain before. Self-corrective RAG is that shape where "validate" is a model call scoring relevance, and "error-recover" is a query rewrite, wider search, or escalation to a different source.
 
 ```
-  Pattern: self-corrective RAG
+  Self-corrective RAG — the grader is a gate
 
-  retrieve top-k ─────►  grade each chunk
-                              │
-                     ┌────────┴────────┐
-                     ▼ relevant        ▼ not relevant
-                 keep + generate    fallback:
-                                      - rewrite query
-                                      - widen search (k=20)
-                                      - route to different source
-                                      - escalate to human
+  retrieve → ┌─────────────────────────┐
+             │ grade each chunk/result: │
+             │ relevant? grounded?      │
+             └──────────┬──────────────┘
+              ┌──────────┴──────────┐
+              ▼ relevant            ▼ not relevant
+          generate            fall back:
+                              rewrite query / widen
+                              search / escalate
 ```
 
-### Move 2 — the walkthrough
+### Move 2 — the mechanics, and where it would fit here
 
-**In this codebase — not implemented.** No retrieval, no grading.
+**The grader is an LLM call.** The classic implementation uses a small model with a prompt like "Is this chunk relevant to the query? Answer yes/no with a confidence." Cheap (a few hundred tokens), fast (small model). The confidence lets you set a threshold — high-confidence pass generates, low-confidence pass or high-confidence fail triggers fallback.
 
-**The closest analogous check.** `diagnosticInvestigationToolPolicy` in `node_modules/@aptkit/.../diagnostic-agent.js:8-23` is a tool *allowlist* — a static gate on which tools can even be called. That's more like input validation than a grader on the output. The output-side equivalent doesn't exist here.
+**Not-yet-implemented in this repo.** No inline grader today. The gap this would close in the diagnostic agent: when `execute_analytics_eql` returns a shape the model didn't expect (schema drift, sparse data, empty result set), the model tries to reason over it anyway. A grader would say "this EQL result doesn't answer the sub-question" and force a refinement.
 
-**Where it would land.** If Blooming added `retrieve_similar_investigations` as a tool, the grader would be a post-retrieval Haiku call:
+**Where it would go.** Between the tool call and the state update in `lib/agents/aptkit-adapters.ts` — the `BloomingToolRegistryAdapter.executeToolCall()` hook. You'd add:
 
-Hypothetical:
-```ts
-// hypothetical
-async function retrieveWithGrader(query: string): Promise<Chunk[]> {
-  const chunks = await vectorStore.search(query, { k: 5 });
-  const graded = await Promise.all(chunks.map(chunk =>
-    grader.grade(query, chunk)   // Haiku: {relevant: bool, reason: string}
-  ));
-  const relevant = chunks.filter((_, i) => graded[i].relevant);
-  if (relevant.length === 0) {
-    // fallback: rewrite query and retry, or route to web search
-    const rewritten = await queryRewriter.rewrite(query);
-    return vectorStore.search(rewritten, { k: 10 });
-  }
-  return relevant;
-}
+```
+  Where the grader would fit — in the tool result path
+
+  agent picks EQL          ← current
+       │
+       ▼
+  DataSource.callTool      ← current
+       │
+       ▼
+  ┌──── grader (new) ──────────────┐
+  │  Haiku: "does this result       │
+  │  answer the sub-question?"      │
+  └──────┬──────────────────────────┘
+   pass  │ fail
+         ▼
+  fallback: rewrite EQL,
+  widen scope, or emit
+  "insufficient data" note
 ```
 
-Line-by-line: `vectorStore.search` returns top-k by embedding similarity — same as static RAG. `grader.grade` is where the pattern diverges — a per-chunk relevance call that catches the "high similarity, low relevance" case (paraphrase matches, wrong intent, stale content). On zero-relevant, the fallback rewrites the query. This is *one* of many fallback shapes (see also: escalate, widen k, route to a different source).
+**Cost of adding this.** Every tool result gets a grader call — for a 4-turn diagnostic that's +4 model calls, roughly +$0.02 per case. In exchange, silent-hallucination-on-bad-retrieval becomes recoverable. Whether it's worth adding depends on how often the current diagnostic agent produces confident conclusions from weak evidence — a metric worth measuring.
 
-**Why grading is load-bearing.** Retrieval scores rank *similarity*, not *answer utility*. A chunk with 0.87 cosine similarity to the query may still not answer it — think "how do I reset my password?" retrieving a chunk about password *policies*. The grader is the check that catches that gap.
+**Contrast with reflexion.** Reflexion (`01-reasoning-patterns/05-reflexion-self-critique.md`) is a critic on the final output; self-corrective RAG is a critic on each intermediate retrieval. Complementary, not overlapping. The self-corrective grader catches "we're building a wrong conclusion on bad data" *before* the model commits; reflexion catches "the final answer looks wrong" *after* it commits.
 
-**The failure mode this pattern exposes.** LLM graders are noisy. A cheap grader (Haiku) is fine at "is this chunk topically related" but bad at "does this chunk *contain* the answer." A high-precision grader is Sonnet-level cost, at which point the grader cost approaches the generator cost — you're paying twice for one answer. Mitigation: use the grader as a *filter, not a scorer* — binary keep/drop, not weighted rank.
+**The failure mode this teaches.** Retrieval success is not answer success. The chunk came back; the chunk is off-topic; the model dutifully answers using the off-topic chunk. Without the grader, this is silent. The grader turns it into an observation the model can act on.
 
 ### Move 3 — the principle
 
-Retrieval success is not answer success. The grader is the gate between them. Adopt it when your one-shot RAG measurably fails on "topically related but not answering" chunks — that's the specific failure mode the grader fixes. If your failure is "wrong topic entirely," a better embedding is cheaper. Match the pattern to the failure.
+The gap between "retrieval returned something" and "the something is relevant" is the source of most RAG hallucinations. A grader closes the gap at the cost of one extra small-model call per retrieval. When the stakes justify grounded answers, this is the cheapest fix.
 
 ## Primary diagram
 
 ```
-  Recap — the four-branch shape of self-corrective RAG
+  Self-corrective RAG — the full loop with fallback paths
 
-  query
-    │
-    ▼
-  retrieve top-k
-    │
-    ▼
-  grade each ─────────► relevant chunks
-    │                        │
-    │ all irrelevant         ▼
-    ▼                    generate
-  fallback:              (as static RAG)
-    - rewrite query
-    - widen k
-    - route to different source
-    - escalate to human
+  ┌─ retrieve ──────────────────────────────────┐
+  │  vector store, SQL, or (in this repo) EQL   │
+  └────────────────────┬────────────────────────┘
+                       │ chunks / rows
+                       ▼
+  ┌─ grader (new) ──────────────────────────────┐
+  │  small model, prompt: "relevant? grounded?" │
+  │  → { relevant: bool, confidence: 0-1 }      │
+  └────────────────────┬────────────────────────┘
+                       │
+        ┌──────────────┴──────────────┐
+        ▼ relevant                    ▼ not relevant
+   ┌──────────┐              ┌─────────────────────┐
+   │ generate │              │ fallback:            │
+   └──────────┘              │  1. rewrite query    │
+                             │  2. widen search     │
+                             │  3. try alt source   │
+                             │  4. emit "insufficient│
+                             │     data" note        │
+                             └─────────────────────┘
 ```
 
 ## Elaborate
 
-Self-corrective RAG (also called CRAG) was named in Yan et al. 2024. Its main claim: the grader catches the failure that plain RAG can't detect until the generator produces a hallucination. In practice teams reach for it when they see "retrieval succeeded but answer is wrong" in their eval traces — the diagnostic marker that grading would help.
+Self-corrective RAG (CRAG — Corrective Retrieval-Augmented Generation) was named by Yan et al. (2024) — the paper's contribution was formalizing the grader + fallback as a first-class step, not a hidden retry inside retrieval. LangGraph ships a reference implementation as `Corrective-RAG`.
 
-Adjacent shapes: **reranking** is a graded ranking (not just keep/drop); **hybrid retrieval + rerank** is the production standard for high-stakes RAG. See `study-ai-engineering.md` for the mechanics of both.
+The related pattern is **Self-RAG** (Asai et al., 2023) — a fine-tuned model that emits "reflection tokens" indicating whether to retrieve, whether the retrieval is relevant, and whether the generated answer is supported. Same intuition (grade before trust), different mechanism (baked into the model vs a separate call).
 
 ## Interview defense
 
-**Q: Does this codebase grade retrieval relevance?**
-A: No — there's no retrieval to grade. The DiagnosticAgent's tools are analytical (EQL, list scenarios, etc.), not retrievers. What exists that's analogous is a static tool *allowlist* at the input side, not a post-retrieval grader on the output side. If the product added a playbook corpus, self-corrective RAG would be the shape I'd introduce — a Haiku grader between retrieval and the diagnostic loop, with a fallback that rewrites the query on zero-relevant.
+**Q: How do you catch bad retrievals?**
 
-Diagram: the four-branch shape from the recap.
-Anchor: hypothetical, references the actual tool-policy allowlist for the closest existing pattern.
+Not with an inline grader today. My diagnostic loop relies on the model's own next-turn reasoning to catch it — if turn 1's EQL returned weird data, the model's turn 2 reasoning usually says "that didn't answer the question, let me try …". That works most of the time because the model can see the raw result.
 
-**Q: Why not use the LLM as the grader in every case?**
-A: Cost and noise. A cheap grader (Haiku per chunk) is fine at "topically related" but poor at "actually answers the question." A high-precision grader is Sonnet-level cost, which means you're paying generator cost twice. The production trick is to keep the grader binary (keep/drop, not scored) and cheap — use it as a filter, not a ranker. If you need ranking, you want a real reranker (cross-encoder), not an LLM.
+Where I'd add a self-corrective grader: if I noticed the model producing confident conclusions from weak evidence. A cheap Haiku call between the tool result and the state update — "does this EQL result answer the sub-question?" — with a low-confidence fallback to query rewrite. Estimated cost: +$0.02 per diagnostic case. I'd add it after measuring how often silent-bad-retrieval fires — no point paying the tax if it's rare.
 
-Diagram: cost vs precision quadrant for grader model choice.
-Anchor: general reasoning; refers to `study-ai-engineering.md`.
+*Anchor visual:* the grader-in-the-tool-result-path diagram above.
+
+**Q: What's the failure mode this fixes?**
+
+Silent hallucination on off-topic retrieval. Vector store returns chunks that came up top-K but aren't actually about the question; the model uses them anyway; the answer is confidently wrong. Static RAG has no defense — the grader is the only one that catches it.
 
 ## See also
 
-- `01-agentic-rag.md` — the loop this pattern lives inside.
-- `03-retrieval-routing.md` — the routing tier above retrieval.
-- Cross-reference: `.aipe/study-ai-engineering/03-retrieval-and-rag/` for the retrieval mechanics.
+- **`01-agentic-rag.md`** — the base pattern this refines.
+- **`03-retrieval-routing.md`** — the fallback often *is* routing to a different source.
+- **`01-reasoning-patterns/05-reflexion-self-critique.md`** — critic on final output; complementary to this file's critic on intermediate retrieval.
+- **`.aipe/study-ai-engineering/03-retrieval-and-rag/`** — RAG mechanics.

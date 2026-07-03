@@ -1,250 +1,220 @@
 # Runtime map
 
-*Runtime topology · Project-specific*
+**Industry:** the runtime map (execution-context inventory) · Language-agnostic
 
 ## Zoom out — where this concept lives
 
-Before you can reason about a bug or a cost blowout, you need to see the whole thing on one page. The runtime map is that page — it names the process boundaries, where state lives inside each one, and which resources cross each boundary.
+Every concept file in this guide hangs off one picture: the three bands where code in `blooming_insights` actually runs, and the boundaries between them. This file draws the picture; the other seven files walk one aspect of it at a time.
 
 ```
-Zoom out — the three bands and where state lives
+  Zoom out — the runtime map
 
-┌─ Browser (one page per user) ─────────────────────────────────────┐
-│  ★ React tree                                                     │
-│  ★ useRef latches, sessionStorage stashes, localStorage mode      │
-│  fetch()  →  ReadableStream reader  →  handle(event)              │
-└─────────────────────┬─────────────────────────────────────────────┘
-                      │ HTTPS (one request per stream)
-                      │ req.signal fires on unmount / tab close
-┌─ Vercel serverless (Node process) ▼───────────────────────────────┐
-│  ★ THIS IS WHERE ALL SERVER RUNTIME LIVES ★  ← we are here        │
-│                                                                    │
-│  process-scoped (module load, warm reuse):                        │
-│  · in-memory Map<sessionId, SessionFeed>  lib/state/insights.ts   │
-│  · in-memory Map<insightId, AgentEvent[]> lib/state/investigations│
-│  · prompt strings read at module load     (legacy agents)         │
-│  · pricing table                          lib/agents/pricing.ts   │
-│                                                                    │
-│  request-scoped (per HTTP request):                               │
-│  · AsyncLocalStorage RequestStore         lib/mcp/auth.ts:47      │
-│  · ReadableStream body                    routes                  │
-│  · BudgetTracker instance                 lib/agents/budget.ts    │
-│  · BloomreachDataSource instance          per makeDataSource()    │
-│                                                                    │
-│  call-scoped (per MCP or Anthropic call):                         │
-│  · AbortSignal.timeout(30_000)            lib/mcp/transport.ts:38 │
-│  · retry ladder waitMs                    bloomreach-data-source  │
-└─────────────────────┬─────────────────────────────────────────────┘
-                      │ HTTPS (per-user rate-limited; ~1 req/s)
-┌─ Providers (external) ▼───────────────────────────────────────────┐
-│  Anthropic API · Bloomreach loomi connect MCP server              │
-└───────────────────────────────────────────────────────────────────┘
+  ┌─ Browser (V8, one JS thread) ────────────────────────────┐
+  │  React 19 · useInvestigation · McpConfigModal            │
+  │  localStorage · sessionStorage · fetch()                 │
+  └───────────────────────┬──────────────────────────────────┘
+                          │  hop 1: HTTPS request + NDJSON
+  ┌─ Vercel serverless (Node 20, one warm process) ─▼────────┐
+  │  ★ THIS FILE'S FOCUS ★                                   │
+  │  app/api/*/route.ts · ALS · in-memory Map<sessionId,…>   │
+  │  bounded by maxDuration = 300                            │
+  └───────────────────────┬──────────────────────────────────┘
+                          │  hop 2: HTTPS (Bearer / OAuth)
+  ┌─ Upstream (not our runtime) ──────────▼──────────────────┐
+  │  Bloomreach MCP server · Anthropic API                   │
+  │  we own our rate-limit policy, not their scheduling      │
+  └──────────────────────────────────────────────────────────┘
+
+  fourth CONTEXT (not a production tier): vitest process for evals
 ```
 
-There are exactly three bands. Not four. There is no worker process, no child process, no OS thread the app manages. A `grep -r "worker_threads\|child_process"` across `lib/` and `app/` returns zero hits. This is important: every runtime primitive you meet in the rest of this guide is a *single-threaded-event-loop* primitive, not a threading one.
+You're looking at the whole system. Every mechanism in the following files is either "how work moves within one band" or "what has to survive a hop between bands."
 
-## The structure pass — control, state, failure
+## Structure pass — layers, axis, seams
 
-Three axes, held constant across the three bands. Read one column at a time; the answer flips at every boundary.
+The map has three layers. Pick one axis — **who owns state** — and trace it across all three.
 
 ```
-The three-band structure — same axes, three answers each
+  One axis (who owns state?) traced down the layers
 
-axis          browser              node process            provider
-────          ─────────────        ────────────            ────────
+  ┌─ Browser ────────────────────────────────┐
+  │  React state + localStorage + session-   │  → the CLIENT owns
+  │  Storage. Survives reloads (localStorage │    persistent config
+  │  only), tab-only (sessionStorage)        │
+  └──────────────────────────────────────────┘
+       ↓ hop crosses a trust boundary
+  ┌─ Vercel serverless ──────────────────────┐
+  │  ALS-scoped Map + module-level Map<sid,…>│  → the INSTANCE owns
+  │  wiped when the instance dies            │    per-request state
+  │  encrypted cookie survives instance death│    (ephemeral)
+  └──────────────────────────────────────────┘
+       ↓ hop crosses a network boundary
+  ┌─ Upstream ───────────────────────────────┐
+  │  Bloomreach owns OAuth tokens + workspace│  → the PROVIDER owns
+  │  data. Anthropic owns model context.     │    the source of truth
+  └──────────────────────────────────────────┘
 
-control       React scheduler +    single event loop       their scheduler,
-              microtask queue      + microtask queue       we don't see it
-
-state         useState, useRef,    Map<sessionId, …>,      opaque; each call
-              sessionStorage,      ALS RequestStore,       is stateless from
-              localStorage         BudgetTracker(instance) our side
-
-failure       error boundary,      try / catch / finally   HTTP status +
-              readNdjson's         + `send({type:'error'})`  isError envelope
-              onMalformed hook     on NDJSON wire          (MCP result)
-
-lifecycle     mount → unmount      request → response      per-call
-              (StrictMode: mount   (finally block always
-              → unmount → mount)   fires, even on abort)
+  the answer flips at each layer — that's the lesson
 ```
 
-The seams that carry a load are the boundaries where an axis-answer flips:
+**Two seams matter more than the others:**
 
-  → **Browser ↔ Node — the control axis flips.** The browser owns "when to start a request"; the Node process owns "when to finish it." The signal that binds them is `req.signal` — the browser can cancel; the node handler observes and unwinds. See `useInvestigation.ts:38-49` (the client side) and `route.ts:215, :226` (`req.signal.throwIfAborted()` between phases).
+- **The browser → server seam.** State that must survive a page reload lives in `localStorage` or an encrypted cookie. State that must survive one browsing session lives in `sessionStorage`. State that dies with the tab is fine as React state. The choice is load-bearing — the MCP config modal writes to `localStorage`; the diagnosis handoff between step 2 and step 3 uses `sessionStorage`. See `04-shared-state-races-and-synchronization.md`.
 
-  → **Node ↔ Provider — the failure axis flips.** Inside the Node band, failures are `throw`s and rejections. At the provider boundary they become HTTP status codes and MCP `isError` envelopes. `BloomreachDataSource.callTool` translates both directions: HTTP errors → `McpToolError` with tagged tool name; `isError: true` results → rate-limit retry OR pass-through.
+- **The Vercel instance → next Vercel instance seam.** Warm instances live for minutes; ephemeral ones die after one request. Module-level `Map`s look persistent but aren't: the *next* request may hit a *different* instance. The design compensates by encoding the anomaly into the URL as a `?insight=…` query param — see `app/api/agent/route.ts:36-46`. That's a *deliberate* choice to sidestep shared state entirely.
 
-  → **Request ↔ Call — the state axis flips.** Above the transport call, state is a `BudgetTracker` instance shared across turns. Below it, state is a per-call `AbortSignal` and a per-call retry counter. The transport is where the "long-lived accumulator" meets the "call-scoped ceiling."
-
-Everything in this guide hangs on those three seams.
-
-## How it works — the map, mechanism by mechanism
+## How it works
 
 ### Move 1 — the mental model
 
-A Vercel serverless deployment isn't magic: it's one Node process, cold-started when needed, kept warm briefly, killed when idle. Every module-level `const`, every `new Map()`, every top-level `readFileSync` runs once per instance and persists until the process dies.
+A runtime map is just an inventory: for each piece of code, name the process it runs in, the thread inside that process, and the boundary that separates it from the next piece. In a full-fat backend the inventory might be dozens of rows (a web tier, a queue, a worker fleet, a cron scheduler, a search index, a cache). In `blooming_insights` it's three, and one of them (upstream) isn't ours.
 
 ```
-One instance, many requests
+  Pattern — runtime inventory row
 
-instance boots (cold start)
-   │
-   │  module load: prompts read, Maps created, pricing table freezes
-   ▼
-request A ──►  handler runs  ──► response  ──► instance stays warm
-   │              │                │
-   │              └─ reads         └─ writes to same Maps
-request B ──►    handler runs  ──► response
-   │              │
-   │              └─ ★ sees A's Maps ★  ← this is why session-keying matters
-   ▼
-… some time passes …
-   │
-   ▼
-instance killed (Vercel decides)
-   │
-   ▼
-request C ──►  COLD START ──►  new instance, empty Maps
+  ┌── row ──────────────────────────────────────────────┐
+  │  where     the process / band                       │
+  │  what      the JS event loop / worker / no-op       │
+  │  who owns  state, cache, resources                  │
+  │  budget    time · memory · money per unit of work   │
+  │  bounded   how it stops (timeout · signal · kill)   │
+  └─────────────────────────────────────────────────────┘
+
+  fill in three rows: browser · vercel · upstream
 ```
 
-The critical property: warm reuse. On a warm instance, session Maps carry state between requests. That's a feature (you don't re-connect the MCP client on every call) and a hazard (state that isn't scoped by session bleeds between users).
+Once you have those three rows, every question about performance, safety, or debuggability lands somewhere on the map.
 
-### Move 2 — the three bands, one at a time
+### Move 2 — walking each band
 
 #### The browser band
 
-The browser hosts one React tree per open tab. State lives in three places, at three lifetimes:
+**What runs:** React 19 components under `app/` and `components/`. The `useInvestigation` hook (`lib/hooks/useInvestigation.ts:39`) drives a live investigation stream — it kicks off a `fetch()` in a `useEffect`, then reads the NDJSON body chunk-by-chunk via `readNdjson`.
 
-  → **`useState` / `useRef`** — component-scoped. Wipes on unmount.
-  → **`sessionStorage`** — tab-scoped. Survives navigation within the tab, dies on tab close. Used to stash the insight (`bi:insight:${id}`), the diagnosis handoff (`bi:diag:${id}`), and the completed investigation trace (`bi:inv:${step}:${id}`) — see `lib/hooks/useInvestigation.ts:19-20`.
-  → **`localStorage`** — origin-scoped. Persists across tab close. Used only for the demo/live mode flag (`bi:mode`) — see `lib/hooks/useInvestigation.ts:158`.
+**Thread model:** one JavaScript thread. Not two, not four — the same event loop as any V8 embedding. Any long-running synchronous work here freezes rendering. The repo does nothing synchronous that would matter (no big JSON.parse of megabyte payloads in the hot path; the NDJSON reader parses one line at a time).
 
-The critical browser primitive is the `useRef` latch in `useInvestigation.ts:44`:
+**State ownership:** three tiers.
 
-```ts
-// lib/hooks/useInvestigation.ts:44-49
-const startedRef = useRef(false);
+- `localStorage` — persists across reloads. Holds `bi:mcp_config` (the config modal, `lib/mcp/config.ts:34`) and `bi:mode` (feed live mode, `lib/hooks/useInvestigation.ts:159`). SSR-unsafe by definition, so every helper guards with `typeof localStorage === 'undefined'` (`lib/mcp/config.ts:107`).
+- `sessionStorage` — tab-scoped. Holds `bi:inv:<step>:<id>` (per-step trace stash) and `bi:diag:<id>` (diagnosis handoff between step 2 and step 3). See `lib/hooks/useInvestigation.ts:20-21`.
+- React state — dies with the component. Trace items, complete flag, error.
 
-useEffect(() => {
-  if (!id) return;
-  if (startedRef.current) return; // run once per mount (survives StrictMode)
-  startedRef.current = true;
-```
+**Bounded by:** the browser tab. There is no timeout ceiling — an in-flight NDJSON stream can run for the full 300s Vercel budget. On unmount the stream is deliberately NOT cancelled; see `lib/hooks/useInvestigation.ts:34-38` for the StrictMode-safe pattern.
 
-React 19 dev mode double-mounts every effect. Without the ref latch, every investigation would fire twice. With it, the second mount observes the ref is already `true` and bails. The comment at line 46 is load-bearing: `run once per mount (survives StrictMode)`.
+#### The Vercel serverless band
 
-#### The Node process band
+**What runs:** every file under `app/api/*/route.ts`. `app/api/agent/route.ts` is the load-bearing one — it runs the investigation stream. `app/api/briefing/route.ts` runs the initial monitoring sweep. Both set `export const maxDuration = 300` (`app/api/agent/route.ts:23`, `app/api/briefing/route.ts:20`).
 
-This is where all server runtime lives. Cross-cutting mechanisms:
+**Thread model:** one Node process per warm instance, one V8 event loop inside it. Vercel keeps instances warm for concurrent requests — module-level state (`memStore` in `auth.ts:36`, the `Map<sessionId, SessionFeed>` in `insights.ts:14`) survives across requests to that instance.
 
-  → **`AsyncLocalStorage` (`node:async_hooks`)** — `lib/mcp/auth.ts:47`. Seeds a `RequestStore` from the auth cookie once at request start, flushes back once at request end. Each request gets its own ALS context; concurrent requests on one instance never share state.
+**State ownership:** three sub-tiers.
 
-  → **`ReadableStream<Uint8Array>`** — `app/api/briefing/route.ts:99, :191`, `app/api/agent/route.ts:129, :184`. Web Streams API, not Node's `stream` module. The route returns a stream; Vercel keeps the connection open until `controller.close()`.
+- **Request-scoped, ALS-backed.** `withAuthCookies` (`lib/mcp/auth.ts:86`) seeds an `AsyncLocalStorage`-scoped store from the encrypted cookie once at the start of a request and flushes it back at the end. Every provider read/write inside hits the ALS store. Each request gets its own ALS context, so two concurrent requests on one instance never share auth state.
+- **Instance-scoped, module-level `Map`.** `lib/state/insights.ts:14` — `Map<sessionId, SessionFeed>`. Each session's feed is a sub-`Map`. Wiped when Vercel kills the instance.
+- **Cross-instance, encrypted cookie.** `bi_auth` (AES-256-GCM under `AUTH_SECRET`) is the only state that survives the boundary. It carries OAuth tokens, DCR client info, and PKCE verifier — the fields the OAuth callback needs when it lands on a *different* instance.
 
-  → **Session-keyed `Map`** — `lib/state/insights.ts:14`. Outer map keyed by session id. Only the caller's sub-map is cleared on write; the outer map is never cleared by request code.
+**Bounded by:** `maxDuration = 300` seconds on the route. Vercel kills the invocation at 300s regardless. The 30s per-call MCP timeout in `transport.ts:38` is a *sub-budget* inside that — one stuck upstream call can't burn the whole budget.
 
-  → **`BudgetTracker` instance** — `lib/agents/budget.ts:41-77`. Instance created per investigation; passed via `AgentHooks.budget` to both `DiagnosticAgent.investigate()` and `RecommendationAgent.propose()`. Same instance across the two agents in one investigation.
+#### The upstream band (not our runtime)
 
-#### The provider band
+**What runs:** Bloomreach's MCP server and Anthropic's Claude API. We don't own the runtime, the scheduling, or the resource model.
 
-Two providers, both stateless from our side:
+**What we own:** our **client-side policy** against them. The BloomreachDataSource holds a 60s response cache (`lib/data-source/bloomreach-data-source.ts:122`), a ~1 req/s spacing gate (`:123, :191-200`), and a retry ladder that honors the server's stated penalty window. The rate-limit retry logic caps a single call at up to 20s of retry wait (`retryCeilingMs`, `:127`).
 
-  → **Anthropic API** — `claude-sonnet-4-6` for agents, `claude-haiku-4-5-20251001` for intent classification. Called through the `@anthropic-ai/sdk` client. Every call is independent from Anthropic's perspective; state lives in the *messages array* the client sends.
+**Bounded by:** whatever the upstream promises. Bloomreach's stated retry hint is ~10s; our fallback base matches. Anthropic's per-model rate limits are the other implicit bound — the BudgetTracker (`lib/agents/budget.ts:41`) enforces our cost ceiling, not theirs.
 
-  → **Bloomreach loomi connect MCP server** — the OAuth-authenticated MCP server. Per-user rate-limited (~1 req/s); tokens revoked after minutes. `BloomreachDataSource` (`lib/data-source/bloomreach-data-source.ts`) is the adapter that speaks to it.
+#### The eval context (fourth band, but not a production tier)
+
+**What runs:** vitest processes for `eval/*.eval.ts`. Same Node 20 runtime as the serverless band, but the wall-clock budget is *lifted* — `eval/load.eval.ts` runs for 28+ minutes at N=20 K=3.
+
+**Why call it out:** the eval harness is the only place in the repo with explicit bounded parallelism — the worker-pool pattern in `eval/load.eval.ts:171-211`. That mechanism doesn't exist in production because the production shape (one user, one instance, one investigation) doesn't need it.
 
 ### Move 3 — the principle
 
-**Runtime state has a lifetime, and the lifetime is what the scope is for.** Every piece of state in this codebase is deliberately scoped to a lifetime: module (Maps that survive requests), request (ALS), investigation (BudgetTracker), or call (AbortSignal). When the lifetimes are named right, the concurrency questions get easy — you never have to ask "who else sees this?" because the scope answers.
+A runtime map is worth writing down for the same reason a build-vs-runtime dependency graph is worth writing down: it makes the ambient assumptions visible. The moment you can name "this state lives on the instance, that state lives in the cookie, this state lives on the browser," a whole class of bugs (auth-token leak between users, feed wipes another user's data, browser state that doesn't survive reload) stops being surprising. You either designed against them or you didn't.
 
-The mistake the codebase avoids: process-scoped state that should be request-scoped. That mistake is how `putInsights` would wipe another user's feed on a warm instance if the map weren't keyed by session (`lib/state/insights.ts:14, :62-71`). The scope is the fix.
-
-## Primary diagram — the full map
+## Primary diagram — the runtime map, whole
 
 ```
-Runtime map — three bands, state at every scope
+  Runtime map — every band, every hop, every boundary
 
-┌─ Browser ─────────────────────────────────────────────────────────┐
-│                                                                    │
-│  ┌─ Page (React tree) ────────────────────────────────────┐       │
-│  │ useState  useRef(latch)  sessionStorage  localStorage  │       │
-│  └────────────────────┬───────────────────────────────────┘       │
-│                       │ fetch()                                   │
-│                       │ req.signal fires on unmount                │
-└───────────────────────┼───────────────────────────────────────────┘
-                        │
-                        ▼   HTTPS
-┌─ Vercel serverless — ONE Node process per warm instance ──────────┐
-│                                                                    │
-│  Route handler:                                                   │
-│  · maxDuration = 300                                              │
-│  · try { … } finally { console.log(phases) }                      │
-│  · ReadableStream body                                            │
-│                                                                    │
-│  ┌─ process scope ────────────────────────────────────────┐       │
-│  │ Map<sessionId, SessionFeed>       lib/state/insights.ts│       │
-│  │ Map<insightId, AgentEvent[]>      lib/state/invs.ts    │       │
-│  │ prompt strings (legacy agents)                          │       │
-│  └────────────────────────────────────────────────────────┘       │
-│                                                                    │
-│  ┌─ request scope (ALS + local) ──────────────────────────┐       │
-│  │ RequestStore { store, dirty }     lib/mcp/auth.ts:46    │       │
-│  │ BudgetTracker                     lib/agents/budget.ts  │       │
-│  │ BloomreachDataSource              lib/data-source/…     │       │
-│  │ CapabilityEvent[] (eval only)     eval/load.eval.ts     │       │
-│  └────────────────────────────────────────────────────────┘       │
-│                                                                    │
-│  ┌─ call scope (per MCP / Anthropic call) ────────────────┐       │
-│  │ AbortSignal.timeout(30_000)       lib/mcp/transport.ts  │       │
-│  │ composeSignals(client, timeout)                          │       │
-│  │ retry counter (up to maxRetries=3)                       │       │
-│  └────────────────────────────────────────────────────────┘       │
-│                                                                    │
-└───────────────────────┬───────────────────────────────────────────┘
-                        │
-                        ▼   HTTPS (rate-limited ~1 req/s per user)
-┌─ Providers ───────────────────────────────────────────────────────┐
-│  Anthropic (stateless)                                            │
-│  Bloomreach MCP (session-owned; tokens rot ~minutes)              │
-└───────────────────────────────────────────────────────────────────┘
+  ┌─ Browser (V8, single JS thread) ─────────────────────────────┐
+  │                                                              │
+  │  React components ── useInvestigation ── fetch() ── ndjson   │
+  │                        (started-ref latch)                    │
+  │                                                              │
+  │  state:  localStorage (bi:mcp_config, bi:mode)               │
+  │          sessionStorage (bi:inv:<step>:<id>, bi:diag:<id>)   │
+  │          React state (ephemeral)                             │
+  │  bounded by: the tab                                         │
+  └────────────────────────────┬─────────────────────────────────┘
+                               │  HTTPS + custom header
+                               │  x-bi-mcp-config: <base64 JSON>
+                               │  cookie: bi_session, bi_auth
+                               ▼
+  ┌─ Vercel serverless (Node 20, one warm process) ──────────────┐
+  │                                                              │
+  │  app/api/agent/route.ts   maxDuration = 300                  │
+  │  app/api/briefing/route.ts                                   │
+  │                                                              │
+  │  per-request:  AsyncLocalStorage<RequestStore>               │
+  │                 └─ seeded from bi_auth, flushed at end       │
+  │                                                              │
+  │  per-instance: Map<sessionId, SessionFeed> (lib/state/…)     │
+  │                 └─ dies when Vercel kills the instance       │
+  │                                                              │
+  │  bounded by:   route maxDuration (300s)                      │
+  │                per-call MCP timeout (30s)                    │
+  │                per-investigation BudgetTracker (USD)         │
+  └────────────────────────────┬─────────────────────────────────┘
+                               │  HTTPS + Bearer / OAuth PKCE
+                               │  spacing gate: ~1 req/s
+                               ▼
+  ┌─ Upstream (not our runtime) ─────────────────────────────────┐
+  │                                                              │
+  │  Bloomreach MCP  (list_cloud_organizations → …)              │
+  │  Anthropic API   (claude-sonnet-4-6)                         │
+  │                                                              │
+  │  bounded by:  their rate limits + our BudgetTracker          │
+  └──────────────────────────────────────────────────────────────┘
+
+  fourth CONTEXT — not a production tier:
+  ┌─ vitest process (long-lived Node) ───────────────────────────┐
+  │  eval/load.eval.ts — semaphore-based K workers, no wall clock│
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-## Elaborate — why the three-band framing lands
+## Elaborate
 
-The three-band framing comes from serverless deployment reality: you write code that runs on a Node process, but the platform owns the process lifecycle. You don't `fork()`, you don't manage threads, you don't tune GC. What you own is the code that runs *inside* one process, and the protocol between that process and the client / the providers.
+Runtime maps come out of the systems-programming tradition — the same instinct that draws process diagrams before writing any code. The reason the exercise still matters in a serverless-first architecture is that "serverless" hides the runtime by design. You don't allocate processes; Vercel does. You don't schedule threads; V8 does. You don't reserve memory; the platform kills you if you overshoot.
 
-This shifts the runtime questions from *"how do I schedule work across cores"* to *"how do I bound work inside one event loop, how do I share resources across concurrent requests on one warm instance, and how do I compose the cancellation signals so nothing outlasts its purpose."* Every mechanism in this guide is a variation on those three questions.
+The consequence: the runtime decisions you *do* make (ALS for scoping, module `Map`s for per-instance cache, encrypted cookies for cross-instance state, per-call timeouts for upstream calls) become the *only* runtime knobs you have. Missing one of them isn't hidden by defaults — it shows up as a bug you can point at.
 
-If the codebase later grew a background job (e.g., a scheduled monitoring scan), it would add a fourth band — the cron trigger — and the runtime questions would shift again (durable state? job retries?). It has not, so this guide teaches three bands.
+For a next step: the file `04-shared-state-races-and-synchronization.md` walks the ALS pattern in detail (why it exists, what it prevents). The file `07-backpressure-bounded-work-and-cancellation.md` walks the 300s budget + AbortSignal composition. Read those two next — everything else is a specialization of what happens inside one of these bands.
 
 ## Interview defense
 
-**Q: How many processes does blooming insights run?**
+**Q: What runtime does `blooming_insights` run on?**
 
-Three bands, but only one that the app manages: the Node process on Vercel. The browser is a client, not a process the app owns; the Anthropic and Bloomreach APIs are external services. Everything server-side happens inside one Node process per warm serverless instance. No worker threads, no child processes.
+Three bands, actually — browser V8, Vercel serverless (Node 20), and upstream providers we don't own. The interesting one is the middle band: it's *one Node process per warm Vercel instance*, one V8 event loop inside that, and module-level state survives across requests to the same instance but not across instances. That's why `lib/mcp/auth.ts` uses `AsyncLocalStorage` to scope OAuth state per request — two concurrent requests on one instance would otherwise share the same token store.
 
-Anchor: `grep -r "worker_threads\|child_process" lib/ app/` returns zero hits.
+*Diagram to sketch: the three horizontal bands with the AsyncLocalStorage box inside the middle band, one context per request.*
 
-**Q: Where does state live in a warm serverless instance?**
+**Q: How does state cross a Vercel instance boundary?**
 
-Three scopes, three lifetimes:
+By design, three ways only. First, an encrypted `bi_auth` cookie (AES-256-GCM under `AUTH_SECRET`) — that's how OAuth tokens survive from the `connect` request on instance-A to the `callback` request on instance-B. Second, URL query params — the feed hands the anomaly to the investigation page as `?insight=…` so the target route doesn't depend on a shared `Map`. Third, `localStorage` on the client, which persists across reloads and is sent back as a custom header (`x-bi-mcp-config`). Nothing else survives an instance death.
 
-  → Process scope — module-level `Map`s (`lib/state/insights.ts:14`), prompt strings read at module load (legacy agents), the pricing table. Persists across every request on this instance until the process dies.
+*Diagram to sketch: two Vercel instance boxes side by side with three arrows between them — cookie, URL param, custom header — and an X through anything else.*
 
-  → Request scope — `AsyncLocalStorage` for the auth cookie store (`lib/mcp/auth.ts:47`), per-request `BudgetTracker`, per-request `BloomreachDataSource`. Dies when the response ends.
+**Q: Why not use Redis for shared state?**
 
-  → Call scope — `AbortSignal.timeout(30_000)` on each MCP call. Dies when the call resolves or aborts.
+Because the workload doesn't need it. One user per browser session hitting one route at a time; the concurrency ceiling per session is ~1 in-flight request. Redis is warranted when you need cross-instance shared state that has to be consistent (a rate limiter that spans all users, a cache with cross-user hit rates, a job queue). None of those apply here. The BudgetTracker is per-investigation, the rate limit is per-user (via the ALS-scoped session), and there's no job queue. Adding Redis now would be infrastructure without a workload to justify it.
 
-The failure mode this prevents: process-scoped state that should be session-scoped. `putInsights` clears one session's insights — if the outer map weren't keyed by session, it would wipe another user's feed mid-briefing on a warm instance.
-
-**Q: What's the maximum wall-clock a single request can hold?**
-
-`maxDuration = 300s` on `/api/briefing` and `/api/agent` (Vercel Pro's cap). Below that, `TOOL_TIMEOUT_MS = 30_000` per MCP call means one hung call costs 30s, not 300s. Below that, `retryCeilingMs = 20_000` bounds any single retry wait. Bounded work is enforced at every level of the stack.
+*Diagram to sketch: a decision tree — "shared state needed?" → no → arrow down to the current design; yes → arrow across to Redis.*
 
 ## See also
 
-  → `02-processes-threads-and-tasks.md` — the answer to "where does work run" per band.
-  → `04-shared-state-races-and-synchronization.md` — the mechanisms behind each scope in the map.
-  → `07-backpressure-bounded-work-and-cancellation.md` — how the ceilings compose.
-  → `study-system-design` (`.aipe/study-system-design/`) — the DataSource seam and the deployment shape from a system-design lens.
+- `02-processes-threads-and-tasks.md` — the "one JS thread per band" claim, made concrete
+- `04-shared-state-races-and-synchronization.md` — the ALS pattern in detail
+- `07-backpressure-bounded-work-and-cancellation.md` — how the 300s budget composes with the 30s per-call timeout
+- `.aipe/study-system-design/` — the WHERE (which component owns which responsibility), complementing this file's HOW

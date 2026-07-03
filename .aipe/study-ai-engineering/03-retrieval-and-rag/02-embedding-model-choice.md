@@ -1,145 +1,147 @@
-# 02 — Embedding model choice
+# Embedding model choice
 
-**Type:** Industry standard. Also called: embedding provider selection, embedding decision matrix.
+## Subtitle
+
+Model selection tree / one-way decision — Industry standard.
 
 ## Zoom out, then zoom in
 
-**Not exercised in this codebase.** If RAG were added, picking an embedding model would be a one-way decision — swap later means re-embedding the entire corpus.
+If blooming ever ships retrieval, the embedding-model choice is the highest-blast-radius decision in that layer. Every stored vector is coupled to the model that produced it — switching models means re-embedding every row in the index. Bounded corpus (say 10k investigations, ~$0.05 to re-embed with a hosted model), still not free.
 
 ```
-  Zoom out — where this decision would land
+  Zoom out — where the choice bites
 
-  ┌─ RAG add (proposed) ──────────────────────────────────────────────┐
-  │                                                                   │
-  │  past diagnoses ─embed─► vectors ─cosine─► retrieval               │
-  │                    │                                              │
-  │                    │  ★ CHOOSE THIS ★                              │
-  │                    │  (locked once picked)                        │
-  │                    ▼                                              │
-  │            OpenAI / Cohere / Voyage / local ST                    │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌─ ingest ──────────────────────────┐
+  │  text ─► embed(v1) ─► store vec   │
+  └────────────────┬───────────────────┘
+                   │
+  ┌─ query ─────── ▼ ──────────────────┐
+  │  text ─► embed(v1) ─► compare      │
+  │                    ↑                │
+  │  MUST match ingest model exactly    │
+  └────────────────────────────────────┘
+
+  Switch models → re-embed EVERYTHING (one-way)
 ```
 
-Zoom in. The choice is a decision tree: English vs multilingual, hosted vs local, general vs domain-specific, cost sensitivity. For this codebase (a solo demo, English-only text, low volume), OpenAI `text-embedding-3-small` is the default answer — cheap, hosted, high-quality for English.
+Zoom in: pick deliberately. The wrong choice is expensive to reverse.
 
 ## Structure pass
 
-**Layers:**
-- Outer: product need (language, privacy, corpus type)
-- Middle: model catalog (OpenAI, Cohere, local ST, Voyage)
-- Inner: per-model attributes (dimensions, cost, latency, license)
-
-**Axis: cost of switching.**
-- Small corpus (< 100K docs): re-embed is cheap; low switching cost
-- Large corpus: re-embed is expensive; high switching cost
-
-**Seam:** the embedding client — the call site that turns text into vectors. Above: the corpus and retrieval. Below: whichever vendor's SDK.
+- **Layers:** use case → model family → provider → dimension → cost. Five bands.
+- **Axis: cost per vector.** Text-embedding-3-small: ~$0.02/M tokens. Voyage-3: ~$0.06/M. On-device sentence-transformers: free after model download.
+- **Seam:** the embedding function call. Once chosen, it's cemented into the corpus's stored vectors.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You've picked a database (Postgres vs MySQL vs SQLite) and had to live with the choice. Same shape here — schema of the vector, dimensions, similarity metric all tied to the model.
+Decision tree by use case:
 
 ```
-  Decision tree — what to embed with
+  Embedding model choice — the decision tree
 
-  what's the use case?
+  Use case?
     │
-    ├── English, general, hosted OK
-    │   → text-embedding-3-small (OpenAI)
+    ├── English, general purpose, low-cost, hosted
+    │   → text-embedding-3-small (OpenAI, 1536 dims, $0.02/M)
     │
-    ├── Multilingual or domain
-    │   → embed-v3 (Cohere), BGE, multilingual MiniLM
+    ├── Multilingual or high-recall required
+    │   → cohere embed-v3 · voyage-3 · BGE-large
     │
-    ├── Privacy-critical, on-device
-    │   → sentence-transformers (local)
+    ├── Code / structured text
+    │   → voyage-code-2 · text-embedding-3-large
     │
-    └── Code, technical text
-        → text-embedding-3-large (OpenAI), Voyage code-2
+    └── Privacy-critical, on-device
+        → sentence-transformers (all-MiniLM, ~90 MB, free)
 ```
 
-### Move 2 — walk the mechanism
+### Move 2 — the step-by-step walkthrough
 
-**The main options (as of 2026).**
+**For blooming's would-be use cases.** English business text (diagnoses, EQL queries), small corpus (~10k rows realistic), latency-tolerant (embedding runs on save, not on interactive path). `text-embedding-3-small` is the right default: cheap, well-behaved, 1536 dims easy to index.
 
-- **OpenAI `text-embedding-3-small`** (1536-dim, $0.02/MTok): the pragmatic default. Fast, cheap, high quality for English. Used broadly in production.
-- **OpenAI `text-embedding-3-large`** (3072-dim, $0.13/MTok): higher quality on hard retrieval tasks (code, technical text). 6× the cost of small.
-- **Cohere `embed-v3` (multilingual)**: strong on non-English. ~$0.10/MTok.
-- **Voyage `voyage-large-2` / `voyage-code-2`**: strong on domain-specific, particularly code. Similar cost to OpenAI large.
-- **`sentence-transformers` (local)**: free, runs on CPU/GPU on your infra. Smaller and slower than hosted, but private.
+**When you'd upgrade.** If retrieval quality is poor and you can measure it (with a hit@k eval on a held-out set), upgrade to `text-embedding-3-large` (3072 dims, ~$0.13/M) or `voyage-3` (~$0.06/M, slightly better on English quality benchmarks). Don't upgrade without evidence — the cost and re-embed pain don't repay themselves.
 
-**Cost math for this codebase (hypothetical corpus).**
+**When you'd go on-device.** If you decide investigations should never leave the deploy environment (a compliance concern that doesn't yet apply to blooming), `all-MiniLM-L6-v2` at 384 dims runs comfortably on Node.js and costs nothing after download. Quality is markedly worse than hosted, but adequate for coarse similarity.
 
-If we embedded every past investigation's `conclusion` (~200 tokens each) and there are 10K investigations, that's 2M tokens. At OpenAI small pricing ($0.02/MTok), that's $0.04 total. Even a full re-embed is under $0.10. Switching cost is essentially free at this scale.
+Diagram of the family tradeoffs:
 
-At real scale (100K, 1M docs) it grows — but embedding is still cheap relative to LLM inference.
+```
+  Model families — the tradeoff space
 
-**Why the decision matters more than the cost implies.**
-
-Switching mid-flight requires re-embedding EVERYTHING. Not just cost — coordination. You either:
-- Snapshot the corpus, embed with new model, swap the index (downtime or dual-serve)
-- Version each doc with `embedding_version`, backfill lazily (complexity)
-
-Both are fine at 10K docs; both are hard at 100M.
+  ┌──────────────────┬───────┬─────────┬────────────────┐
+  │ family           │ dims  │ cost/M  │ where it wins  │
+  ├──────────────────┼───────┼─────────┼────────────────┤
+  │ text-emb-3-small │ 1536  │ $0.02   │ default        │
+  │ text-emb-3-large │ 3072  │ $0.13   │ quality upgrade│
+  │ voyage-3         │ 1024  │ $0.06   │ English recall │
+  │ cohere-embed-v3  │ 1024  │ $0.10   │ multilingual   │
+  │ sentence-t local │ 384   │ free    │ on-device      │
+  └──────────────────┴───────┴─────────┴────────────────┘
+```
 
 ### Move 3 — the principle
 
-Pick once, commit. The scale where embedding is "just re-run it" ends fast. Prefer a model with a clear roadmap (OpenAI's `text-embedding-3` family is a stable line) over the flavor of the month. For this codebase's shape (small English text), OpenAI small is the boring right answer.
+Pick the cheapest family whose quality you've measured to be adequate. Never upgrade on faith — measure hit@k before and after. Because switching is one-way, treat the choice like a database engine choice, not a library pick.
 
 ## Primary diagram
 
 ```
-  What the decision would look like for this codebase
+  Embedding model choice — full frame
 
-  need: past-diagnosis similarity retrieval
-    │
-    ├── language:      English (Bloomreach data, agent text)
-    ├── volume:         low (< 10K past diagnoses in any horizon)
-    ├── privacy:        moderate (data is Bloomreach's)
-    ├── domain:         general prose + numbers, some technical
-    │
-    ▼
-  pick: OpenAI text-embedding-3-small
-    · $0.02/MTok — trivial at this volume
-    · 1536-dim — fine for cosine similarity
-    · hosted — no infra to manage
-    · stable family — future OpenAI updates are drop-in
+  ┌─ Requirements ────────────────────────────────────┐
+  │  language (English? multi?), latency, privacy,    │
+  │  budget, corpus size                              │
+  └───────────────────┬──────────────────────────────┘
+                      │
+                      ▼
+  ┌─ Family shortlist ────────────────────────────────┐
+  │  · hosted general → text-embedding-3-small         │
+  │  · hosted quality → voyage-3 / text-embedding-3-lg │
+  │  · on-device      → sentence-transformers          │
+  └───────────────────┬──────────────────────────────┘
+                      │
+                      ▼
+  ┌─ Measurement ─────────────────────────────────────┐
+  │  hit@k on 100 hand-labeled queries                 │
+  │  vs 50 hand-labeled negatives                      │
+  └───────────────────┬──────────────────────────────┘
+                      │
+                      ▼
+  ┌─ Commit ──────────────────────────────────────────┐
+  │  cement the choice; re-embed only on measured need │
+  └───────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-Embedding models diverge fast. Between 2022 and 2026 the frontier moved from OpenAI's `text-embedding-ada-002` (1536-dim, mid-quality) through Cohere, BGE, Voyage, then OpenAI's v3 family, with Voyage and Cohere competing on specific verticals. The move to smaller-and-cheaper `text-embedding-3-small` was a genuine step up on cost-per-quality. Expect another step-up cycle in 2027.
+Embedding models rotate every 6–12 months. text-embedding-ada-002 was the OpenAI default for two years; 3-small/large replaced it in 2024. Voyage, Cohere, and BGE turn over models on a similar cadence. Pick a family with the strongest year-over-year track record for stability.
 
-Fine-tuned embedding models are a separate discipline. If you had 100K+ labeled query-document pairs and retrieval quality was the bottleneck, you could fine-tune an embedding model on your own data. That's a real project — not applicable here.
+Related: **01-embeddings.md** (what the vectors are), **09-stale-embeddings.md** (what to do when the model upgrades).
 
 ## Project exercises
 
-### Exercise — commit to `text-embedding-3-small` for the RAG add
+### B3.2 · Set the embedding model constant
 
-- **Exercise ID:** C2.5-B · Case B (RAG not exercised).
-- **What to build:** if `01-embeddings.md`'s Case B is picked, use OpenAI `text-embedding-3-small`. Document the choice in a small `docs/rag-decisions.md` with the tradeoff (why not multilingual, why not local).
-- **Why it earns its place:** shows you know the decision is a one-way door. Interviewer signal: "I picked with the exit in mind."
-- **Files to touch:** `lib/rag/embed.ts` (fixed model constant), `docs/rag-decisions.md` (new).
-- **Done when:** the model is hard-coded in one place; the decision doc lists the alternatives considered.
-- **Estimated effort:** <1hr for the decision + doc; 1-4hr including the initial embed.
+- **Exercise ID:** B3.2 (Case B — not yet implemented)
+- **What to build:** As part of the investigation-memory retrofit (B3.1), commit a `EMBEDDING_MODEL = 'text-embedding-3-small'` constant to `lib/state/investigation-index.ts` and document the choice in a comment. The comment names the alternatives considered and cites hit@k measurement thresholds for when to upgrade.
+- **Why it earns its place:** Turns "pick a model" into "pick a model and defend it with numbers." Interview payoff: "I know which one and I know why."
+- **Files to touch:** `lib/state/investigation-index.ts` (constant + doc comment), `docs/embedding-model.md` (measurement protocol).
+- **Done when:** the constant is committed with the ADR-style comment; the measurement protocol names the golden set + hit@k threshold that would trigger an upgrade.
+- **Estimated effort:** `<1hr`.
 
 ## Interview defense
 
-**Q: Why OpenAI small over large?**
+**Q: If you had to pick today for blooming, which model?**
 
-For this corpus: 10× cost, ~5-10% quality gain on hard cases, no obvious wins on English prose. Small is the default; go to large only if you measure a real recall gap. I wouldn't guess at that up front.
+`text-embedding-3-small`. Reasons: English-only corpus, low cost, 1536 dims easy to index in sqlite-vec, and I don't have evidence yet that quality is inadequate. If I measured hit@k on a golden set and saw < 60% top-3 recall, I'd move to voyage-3 or text-embedding-3-large and re-embed the corpus (bounded pain at 10k rows).
 
-**Q: What about local (sentence-transformers)?**
+**Q: Why not just use whatever is cheapest?**
 
-If Bloomreach's data privacy required on-device, local wins. In this codebase the data already leaves the user's device (goes to Bloomreach's servers, goes to Anthropic's servers), so local embedding doesn't buy privacy — it just adds ops burden.
-
-**Q: What breaks if you swap embedding models?**
-
-Every stored vector is worthless. You either re-embed the whole corpus (may be expensive at scale) or dual-serve (write vectors for both models until the migration completes). Neither is hard at 10K docs; both are real at 100M docs. That's why picking is a one-way decision above a certain scale.
+Cost is a factor, not the factor. If the quality is 30% worse for 5× cheaper, retrieval will surface the wrong neighbors and the augmentation is worse than no retrieval. Measure quality first; optimize cost second.
 
 ## See also
 
-- `01-embeddings.md` — the primitive being committed to
-- `04-vector-databases.md` — where the vectors land
-- `09-stale-embeddings.md` — the ongoing maintenance surface
+- [01-embeddings.md](01-embeddings.md) — the primitive this chooses among.
+- [09-stale-embeddings.md](09-stale-embeddings.md) — dealing with model upgrades.
+- [11-rag.md](11-rag.md) — where the choice's quality gets measured.

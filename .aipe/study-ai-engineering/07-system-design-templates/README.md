@@ -1,12 +1,12 @@
-# 07 — System design templates (interview reframes)
+# 07 · System design templates (interview reframes)
 
-Two AI interview templates. Not concept files — interview prompts this codebase either exemplifies or could be refactored to exemplify. Uses the fixed 9-bullet template (per spec).
+Two interview reframes that use the fixed 9-bullet shape defined in the spec:
 
-## Files
+- [01-search-ranking.md](01-search-ranking.md) — "Design a search ranking system." Blooming's shape maps `partially`; the retrieval sub-section names the refactor path.
+- [02-tech-support-chatbot.md](02-tech-support-chatbot.md) — "Design a tech support chatbot." Blooming maps `no` (wrong domain); the file names what a repurposing would look like as an interview thought experiment.
 
-- `01-search-ranking.md` — "Design a search ranking system." Applies to this codebase: **no**. This codebase doesn't do search; the ReAct loop over structured MCP tools is a different shape. How-to-make-it-apply named.
-- `02-tech-support-chatbot.md` — "Design a tech support chatbot." Applies to this codebase: **partially**. The ReAct agent + structured output pattern maps directly to a chatbot's request-response with escalation. The workspace-analyst framing isn't a chatbot but the mechanisms are structurally similar.
+These files do NOT use the per-concept format template. They use the 9-bullet shape from the spec:
 
-## Curriculum
+- The prompt · Standard architecture · Data model · Key components · Scale concerns · Eval framing · Common failure modes · Applies to this codebase · How to make it apply
 
-Phase 5 — concepts C5.10 (Search ranking), C5.14 (Tech support chatbot).
+Every template is generated for every guide even when the codebase doesn't exemplify it. The "Applies" bullet is honest; the "How to make it apply" names the concrete refactor.

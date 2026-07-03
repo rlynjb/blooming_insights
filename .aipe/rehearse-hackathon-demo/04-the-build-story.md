@@ -59,14 +59,23 @@ You do not tour every phase. You name the arc, spotlight one, and get out. The r
   └──────────┬────────────┘
              │
              ▼
-  ┌── Phase 5 ────────────┐
-  │ portfolio hardening    │
-  │ end-to-end             │  ★ THIS IS THE CHAPTER
-  │                        │  shipped, measured, gated,
-  │  eval/ + eval:report    │  demoable via one command.
-  │  + eval:load +          │  see Chapter 06 for the
-  │  eval:gate              │  L5 story on this phase.
-  └────────────────────────┘
+  ┌── Phase 5 ──────────────┐
+  │ portfolio hardening      │  ★ THIS IS THE CHAPTER
+  │ end-to-end               │
+  │                          │  shipped, measured, gated,
+  │  Sessions A–D:           │  demoable via one command.
+  │   A prompt caching live  │
+  │   B env-driven MCP url   │  A: cuts input tokens on
+  │   C fault + gate + CI    │     repeated turns
+  │   D per-request UI       │  B: MCP_URL env instead
+  │     override (settings)  │     of hard-coded
+  │                          │  C: budget cap, 9/3/0
+  │  eval/ + eval:report     │     fault receipt, CI gate
+  │  + eval:load + eval:gate │     at >10pp
+  │                          │  D: settings modal +
+  │                          │     x-bi-mcp-config header
+  │                          │     — live swap on stage
+  └──────────────────────────┘
 ```
 
   ## The verbatim script — 45 seconds
@@ -102,9 +111,12 @@ You do not tour every phase. You name the arc, spotlight one, and get out. The r
                                        what makes the fault
                                        injection receipt honest."
   ────────────────────────            ──────────────────────────
-  hand to Chapter 05                  "the whole eval flywheel,
-                                       the baseline, the gate, the
-                                       fault harness — shipped,
+  hand to Chapter 05                  "prompt caching, the budget
+                                       cap, the fault harness at
+                                       9/3/0, the regression gate
+                                       wired into CI, and the
+                                       swappable MCP config you
+                                       just watched — all shipped,
                                        measured, and demoable in
                                        one command."
   ────────────────────────            ──────────────────────────
@@ -118,9 +130,9 @@ You do not tour every phase. You name the arc, spotlight one, and get out. The r
 
   If a judge asks in Q&A "what was the actual hard part," this is the answer you rehearse. It's already in Chapter 06 too, but the seed goes here.
 
-  The seam is easy to build. It is hard to *prove*. Anyone can define an interface and one adapter. What made this seam load-bearing is that it has three uses — and each use is independently receipt-backed. The Bloomreach adapter runs in `live-bloomreach` and hits real OAuth. The synthetic adapter runs in `live-synthetic` and drives the demo. The decorator runs in `eval:load` and produces the "9 faults / 3 investigations / 0 failures" receipt. Each use is a different failure mode; each proved the seam carries the contract.
+  The seam is easy to build. It is hard to *prove*. Anyone can define an interface and one adapter. What made this seam load-bearing is that it has **five independent uses** — each receipt-backed. The MCP adapter runs in `live-mcp` and hits real OAuth (Bloomreach), or a bearer token, or anonymous — three auth strategies over the same port. The synthetic adapter runs as the default at page load (`live-synthetic`) and drives the demo. The decorator runs in `eval:load` and produces the "9 faults / 3 investigations / 0 failures" receipt. And Session D's settings-modal override lets a visitor swap the URL live via the `x-bi-mcp-config` base64 header — no rebuild, no fork. Each use is a different failure mode; each proved the seam carries the contract.
 
-  ┃ "Anyone can define an interface. Three uses is what makes it load-bearing."
+  ┃ "Anyone can define an interface. Five uses is what makes it load-bearing."
 
   If you have to cut the hard-part line for time, drop it — but keep the "shipped, measured, demoable" line above. That one is the closer for this chapter.
 
@@ -207,8 +219,8 @@ You do not tour every phase. You name the arc, spotlight one, and get out. The r
   │    8:00  flash the diagram                                │
   │    8:05  "five phases got me here."                       │
   │    8:10  spotlight P1 (hand-rolled loop) + P2 (seam)      │
-  │    8:20  P3 retired + rebuilt in P5                       │
-  │    8:30  hard part: "three uses is what makes it          │
+  │    8:20  P3 retired + rebuilt in P5 (Sessions A–D)        │
+  │    8:30  hard part: "five uses is what makes it           │
   │           load-bearing"                                    │
   │    8:40  "shipped, measured, and demoable in one command" │
   │           → hand to Chapter 05                             │

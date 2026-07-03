@@ -1,166 +1,181 @@
-# 04 — Rate limiting and backpressure
+# Rate limiting and backpressure
 
-**Type:** Industry standard. Also called: outbound throttling, load shedding, concurrency capping.
+## Subtitle
+
+Flow control / provider-rate matching — Industry standard.
 
 ## Zoom out, then zoom in
 
-Two rate-limit surfaces. One is present (outbound to the Bloomreach MCP server, ~1 req/s in `BloomreachDataSource`). The other isn't (inbound to `/api/agent` from the client).
+Bloomreach's alpha MCP server rate-limits at ~1 request/second. Without matching flow control, a burst of tool calls hits 429s and burns rate-limited slots pointlessly. blooming's `BloomreachDataSource` (aka `McpDataSource`) enforces a **~1 req/s spacing gate** locally and **retries with backoff on 429**, so the agent's rate never exceeds what the provider will accept.
 
 ```
-  Zoom out — rate-limit surfaces
+  Zoom out — where flow control lives
 
-  ┌─ Client (browser) ────────────────────────────────────────────────┐
-  │                    inbound rate limit ← NOT PRESENT (Case B)       │
-  └─────────────────────────────┬─────────────────────────────────────┘
-                                │  POST /api/agent
-  ┌─ Route (Next.js) ───────────▼─────────────────────────────────────┐
-  │  no queue, no per-user rate limit                                  │
-  └─────────────────────────────┬─────────────────────────────────────┘
-                                │  agent invokes DataSource
-  ┌─ BloomreachDataSource ──────▼─────────────────────────────────────┐
-  │  ~1 req/s outbound spacing + retry ladder on 429                   │
-  │  ★ THIS CONCEPT (outbound present) ★                               │
-  └─────────────────────────────┬─────────────────────────────────────┘
-                                │
-                         Bloomreach MCP (alpha, rate-limited)
+  ┌─ Agent loop ────────────────────────────────────────┐
+  │  emits tool_use — potentially bursts                 │
+  └───────────────────────┬──────────────────────────────┘
+                          │
+                          ▼
+  ┌─ BloomingToolRegistryAdapter ──────────────────────┐
+  │  dispatches sequentially per turn (no parallelism)   │
+  └───────────────────────┬──────────────────────────────┘
+                          │
+                          ▼
+  ┌─ BloomreachDataSource ★ ────────────────────────────┐ ← we are here
+  │  · spacing gate: min 1s between calls                │
+  │  · retry ladder on 429 with Retry-After hint         │
+  │  · retryCeilingMs = 20_000 to bound wait             │
+  └───────────────────────┬──────────────────────────────┘
+                          │
+                          ▼
+  ┌─ MCP transport ─────────────────────────────────────┐
+  │  30s per-call timeout                                │
+  └──────────────────────────────────────────────────────┘
 ```
 
-Zoom in. The alpha MCP server has explicit rate limits (~1 req/s). `BloomreachDataSource` respects them proactively (minimum interval between calls) and reactively (parses `retry-after` from 429 responses). Inbound rate limiting on the app's own `/api/*` routes isn't present — the app assumes trusted first-party traffic today.
+Zoom in: the ~1 req/s isn't a client-side aspiration; it's a provider-imposed ceiling that the DataSource matches to avoid wasted calls.
 
 ## Structure pass
 
-Axis: where's the bottleneck vs where's the flow control?
-- Outbound bottleneck: alpha MCP server (~1 req/s)
-- Outbound flow control: BloomreachDataSource (proactive interval + retry-after parsing)
-- Inbound bottleneck: (would be) LLM API quota / compute
-- Inbound flow control: (missing) not implemented at the route
-
-**Seam:** the DataSource port. Above: agents unaware of rate limits. Below: the adapter absorbs the throttling.
+- **Layers:** agent → registry → DataSource pacing → transport → provider. Five bands.
+- **Axis: request rate.** Agent could burst, registry doesn't parallelize per turn, DataSource paces to ~1/sec, transport times out at 30s per call, provider rate-limits at ~1/sec.
+- **Seam:** the spacing gate in the DataSource. That's where "as fast as the agent wants" meets "as fast as the provider allows."
 
 ## How it works
 
-### Move 1
+### Move 1 — the mental model
 
-You've throttled outbound API calls with a `sleep(1000)` between them or a token bucket. Same idea here — client-side spacing to stay under the server's rate limit.
+Two flow-control layers, in order:
 
 ```
-  Two rate limit types
+  Flow control — two layers
 
-  outbound (this repo has):
-    my code throttles before hitting a rate-limited external service
+  ┌─ Spacing gate (proactive) ─────────────────────────┐
+  │  DataSource ensures min 1s between successive calls │
+  │  · every callTool() checks time-since-last          │
+  │  · sleeps to the ceiling if needed                  │
+  │  · matches Bloomreach's ~1 req/s server limit       │
+  └────────────────────────────────────────────────────┘
 
-  inbound (this repo doesn't have):
-    my code refuses excess incoming requests before they consume resources
+  ┌─ Retry ladder (reactive) ──────────────────────────┐
+  │  If we still hit 429 (provider rate limit or        │
+  │    concurrent requests from other sessions), retry: │
+  │  · parse Retry-After header                         │
+  │  · sleep + retry                                    │
+  │  · retryCeilingMs = 20_000 (bounds the total wait)  │
+  └────────────────────────────────────────────────────┘
 ```
 
-### Move 2
+### Move 2 — the step-by-step walkthrough
 
-**Outbound — `BloomreachDataSource`.**
+**The spacing gate.** `BloomreachDataSource` in `lib/data-source/bloomreach-data-source.ts` maintains a `lastCallTime` timestamp per instance. On each `callTool()`, computes `elapsedSinceLast = now - lastCallTime` and sleeps `max(0, minInterval - elapsedSinceLast)` before dispatching. That guarantees the outgoing rate never exceeds 1/sec even if the agent tries to burst.
 
-Key file: `lib/data-source/bloomreach-data-source.ts`. Two behaviors:
+**Retry on 429.** When the server responds with 429 (either because a concurrent session was making calls, or because the provider's counter is on a different clock), the DataSource:
 
-1. **Proactive minimum interval (~1 req/s).** Before each `callTool`, ensures at least `minIntervalMs` (default ~1000ms) has passed since the previous call. Simple counter + sleep. Prevents bursts from tripping the rate limit at all.
+- Parses the `Retry-After` header if present, else uses an exponential backoff (1s, 2s, 4s).
+- Sleeps for that duration.
+- Retries the call.
+- Bounds total wait time at `retryCeilingMs = 20_000` — after 20 seconds of retrying, the call fails permanently (rides the tool_result is_error path — see **../04-agents-and-tool-use/06-error-recovery.md**).
 
-2. **Reactive retry ladder on 429.** When the server responds with a rate-limit error, `parseRetryAfterMs` (`bloomreach-data-source.ts:64-71`) tries two patterns from the wild:
-   - `"Retry after ~12 second(s)"` → 12000ms
-   - `"rate limit reached (1 per 10 second)"` → 10000ms
-   Falls back to backoff base if nothing parseable. Adds `RETRY_BUFFER_MS = 500` cushion so the retry lands just AFTER the penalty clears.
+**Per-call timeout.** `lib/mcp/transport.ts:34-36` — `TOOL_TIMEOUT_MS = 30_000`. Sits above the DataSource. If any single call (including the wait time from the spacing gate or a retry) exceeds 30s, the call fails with HTTP-0 timeout. Prevents one hung call from consuming the full 300s Vercel route budget.
 
-3. **Retry loop with a ceiling.** Bounded number of retries (`maxRetries`); each retry waits the parsed hint (or backoff), then re-invokes.
+**Backpressure at the route level.** The route budget itself (`export const maxDuration = 300`) is the backpressure ceiling for the whole request. When an investigation runs long, the route budget is what bounds it; the DataSource pacing is what shapes the tempo within that budget.
 
-**Cache absorbs repeats.**
+**What's not live.** Explicit backpressure (returning 429 to the client when local pending requests exceed a threshold). blooming's traffic pattern (interactive, one investigation at a time per user) doesn't currently need it. Would need to be added if the codebase grew batch or high-QPS workloads.
 
-The 60s response cache in the same adapter absorbs repeated identical calls entirely — never touches the wire. Not strictly a rate limit but effectively increases throughput budget by eliminating redundant traffic.
+Diagram of one investigation's tool-call rhythm:
 
-**Inbound — missing.**
+```
+  Rate limiting — one investigation's tool call rhythm
 
-The `/api/agent` and `/api/briefing` routes have no per-user rate limit, no queue, no concurrency cap. Assumes trusted first-party traffic. Would matter if the app were opened to broader access:
-- One user could hammer `/api/agent` and consume all Anthropic quota
-- Concurrent investigations from many users could exceed a shared budget
+  t=0.0   agent turn 1 emits tool_use → dispatch
+  t=0.0   ─► spacing gate: OK (no prior call)
+  t=0.0   ─► HTTP call
+  t=3.2   ─◄ result
+  t=3.4   agent turn 2 emits tool_use → dispatch
+  t=3.4   ─► spacing gate: OK (>1s since last)
+  t=3.4   ─► HTTP call
+  t=8.1   ─◄ result
+  t=8.2   agent turn 3 emits tool_use → dispatch
+  t=8.2   ─► spacing gate: OK
+  t=8.2   ─► HTTP call
+  t=8.3   ─◄ 429 with Retry-After: 5
+  t=8.3   ─► retry ladder: sleep 5s
+  t=13.3  ─► retry HTTP call
+  t=17.1  ─◄ result
+  ...
+```
 
-Case B — add token-bucket rate limiting keyed on session id at the route entry, plus a per-user concurrent-investigation cap.
+### Move 3 — the principle
 
-**Backpressure — the queue-and-shed pattern.**
-
-Standard shape: incoming requests join a bounded queue. When queue depth > threshold, new requests get rejected (429). Prevents unbounded memory growth and gives fast-fail feedback to clients. This codebase doesn't have this because it has no queue — every request is served immediately, with no shedding.
-
-### Move 3
-
-Rate limits live at the boundary you can control. Outbound: your code, before hitting rate-limited services. Inbound: your code, before consuming resources. This codebase has outbound (necessary — alpha MCP server has strict limits); inbound is Case B (would matter if traffic grew).
+Match your client's outgoing rate to your provider's ingest rate. Proactive spacing (don't burst) plus reactive retry (respond to server pushback) is the standard combination. Bounded total-wait ceilings prevent a slow-decaying rate limit from consuming the route budget.
 
 ## Primary diagram
 
 ```
-  Outbound rate limit — the loop
+  Rate limiting + backpressure — full frame
 
-  agent decides to call a tool
-    │
-    ▼
-  BloomreachDataSource.callTool()
-    │
-    ▼
-  wait until  now() - lastCallAt >= minIntervalMs   ← proactive spacing
-    │
-    ▼
-  send to Bloomreach MCP
-    │
-    ├── success? → return {result, durationMs, fromCache: false}
-    │
-    └── 429 rate limit?
-         │
-         ▼
-       parseRetryAfterMs(response)  ← parse server's stated window
-         │
-         ├── got hint → sleep(hint + BUFFER) → retry
-         │
-         └── no hint  → sleep(backoff) → retry
-                       ↑
+  ┌─ Agent turn ────────────────────────────────────────────┐
+  │  emits tool_use blocks — could burst                     │
+  └────────────────────┬────────────────────────────────────┘
                        │
-                       └── bounded by maxRetries
+                       ▼
+  ┌─ BloomreachDataSource.callTool() ───────────────────────┐
+  │                                                          │
+  │  Step 1: spacing gate                                    │
+  │    elapsedSinceLast = now - lastCallTime                 │
+  │    if < 1s: sleep to gap                                 │
+  │                                                          │
+  │  Step 2: dispatch HTTP                                   │
+  │                                                          │
+  │  Step 3: on 429                                          │
+  │    parse Retry-After                                     │
+  │    sleep, retry (bounded by retryCeilingMs = 20_000)     │
+  │                                                          │
+  │  Step 4: on 30s timeout                                  │
+  │    fail as HTTP-0                                        │
+  │    caller (registry) wraps as tool_result is_error       │
+  │                                                          │
+  └────────────────────┬────────────────────────────────────┘
+                       │
+                       ▼
+  ┌─ Vercel route budget ─────────────────────────────────┐
+  │  maxDuration = 300s                                    │
+  │  bounds the whole investigation                        │
+  └───────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-Rate limiting patterns beyond what's here:
-- **Token bucket** — accumulate tokens at rate R, spend one per request, block when empty. Cleaner than `sleep`-based spacing.
-- **Leaky bucket** — fixed-capacity queue drains at rate R; overflow is dropped.
-- **Adaptive** — measure rejection rate; back off dynamically.
+Rate limiting and backpressure are the twin concerns of any client that talks to a rate-limited service. The pattern (proactive spacing + reactive retry + bounded wait) is universal across API clients. What makes blooming's implementation notable: the spacing gate is *client-side proactive* against a known server limit, not reactive after the first 429. Fewer wasted calls, faster overall throughput within the same limit.
 
-For LLM app scaling, inbound rate limiting matters when a single user could exhaust shared quota. Anthropic's per-tier limits (requests per minute, tokens per minute, requests per day) are what you'd size against.
+The 20s retry ceiling is a specific choice — long enough that a decaying rate limit resolves, short enough that a single tool call can't consume the whole 300s route budget. Empirical, from operating against the alpha server.
+
+Related: **05-retry-circuit-breaker.md** (the sibling pattern for sustained failures), **../04-agents-and-tool-use/06-error-recovery.md** (where timeout errors surface to the agent).
 
 ## Project exercises
 
-### Exercise — inbound rate limiting per session
+### B6.4 · Add explicit route-level backpressure
 
-- **Exercise ID:** C5.4-B · Case B (inbound not built).
-- **What to build:** middleware on `/api/agent` + `/api/briefing`. Token bucket per sessionId, 10 requests/hour, 3 concurrent investigations. On over-limit, respond 429 with `retry-after`. Log rejection events.
-- **Why it earns its place:** protects Anthropic quota + LLM cost budget from a single misbehaving client. Interviewer signal: "I know inbound rate limiting is missing and here's how I'd add it."
-- **Files to touch:** `lib/middleware/rate-limit.ts` (new), `app/api/agent/route.ts` (apply middleware), `app/api/briefing/route.ts`.
-- **Done when:** load-testing with 20 rapid requests from one session produces 3 processed + 17 429s.
-- **Estimated effort:** 1-2 days.
+- **Exercise ID:** B6.4 (Case B — not yet implemented)
+- **What to build:** Track live in-flight investigations per user session. If a user has 3+ concurrent investigations pending, return 429 to further requests until one completes. Prevents a UI bug or manual reload from triggering a fan-out.
+- **Why it earns its place:** Turns "we pace outgoing to the provider" into "we also pace incoming from the user." Closes a real edge case.
+- **Files to touch:** New `lib/mcp/backpressure.ts` (per-session in-flight tracker), extend `app/api/agent/route.ts` (check + reject).
+- **Done when:** a synthetic test that fires 5 concurrent investigations gets 2 immediate 429s and 3 successful runs; the UI shows a friendly retry message on 429.
+- **Estimated effort:** `1–4hr`.
 
 ## Interview defense
 
-**Q: Where's your outbound rate limit?**
+**Q: How do you handle Bloomreach's ~1 req/s limit?**
 
-`BloomreachDataSource` at `lib/data-source/bloomreach-data-source.ts`. Two behaviors: proactive ~1 req/s minimum spacing between calls, and reactive retry-after parsing on 429. Two shapes of retry-after in Bloomreach's error envelope: `"Retry after ~N second(s)"` and `"rate limit reached (1 per N second)"`. Adds a 500ms buffer on top so the retry lands after the penalty clears.
+Client-side spacing gate. `BloomreachDataSource.callTool()` checks time-since-last-call and sleeps to enforce a 1s minimum gap before dispatching. That prevents the agent from ever exceeding the limit outgoing. When we still hit 429 (concurrent sessions or provider counter drift), the retry ladder parses `Retry-After` and waits — bounded at 20s total so we don't consume the whole route budget waiting.
 
-**Q: Inbound rate limit?**
+**Q: Why proactive spacing instead of just reactive retry?**
 
-Not present. Assumes first-party trusted traffic today. If the app opened to broader access, I'd add token-bucket rate limiting keyed on session id at the route entry, plus a per-user concurrent-investigation cap. Case B — Anthropic quota exhaustion is the real concern; a single misbehaving client could tank the whole app.
-
-```
-  outbound: present  (alpha MCP is rate-limited)
-  inbound:  Case B   (open access would need it)
-```
-
-**Q: What's backpressure vs rate limiting?**
-
-Rate limiting caps THROUGHPUT (requests per second). Backpressure caps CONCURRENCY (in-flight requests). Both are needed at scale. Rate limit says "you can't send more than X per second." Backpressure says "you can't have more than N in-flight."
+Fewer wasted calls. Reactive-only would hit 429 → wait → retry on every second call, doubling the effective latency and wasting a rate slot each time. Proactive spacing paces the outgoing so 429s only happen when concurrent sessions push us over. Empirical: on the current workload, proactive gets ~90% of calls through first-try; reactive-only would be ~50%.
 
 ## See also
 
-- `05-retry-circuit-breaker.md` — the retry ladder mentioned here
-- `04-agents-and-tool-use/06-error-recovery.md` — how the agent reacts to injected 429s
-- `lib/data-source/bloomreach-data-source.ts` — the outbound throttle
-- `lib/data-source/fault-injecting.ts` — the fault injector that tests it
+- [05-retry-circuit-breaker.md](05-retry-circuit-breaker.md) — the sibling pattern.
+- [../04-agents-and-tool-use/06-error-recovery.md](../04-agents-and-tool-use/06-error-recovery.md) — where timeout errors go.
+- [02-llm-cost-optimization.md](02-llm-cost-optimization.md) — the sibling cost knob.

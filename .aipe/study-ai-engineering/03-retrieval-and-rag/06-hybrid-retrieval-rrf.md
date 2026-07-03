@@ -1,93 +1,155 @@
-# 06 — Hybrid retrieval with RRF
+# Hybrid retrieval with RRF
 
-**Type:** Industry standard. Also called: Reciprocal Rank Fusion.
+## Subtitle
+
+Reciprocal Rank Fusion / rank-based merge — Industry standard.
 
 ## Zoom out, then zoom in
 
-**Not exercised in this codebase.** RRF combines dense + sparse results without needing to normalize scores between them.
+RRF is the merge step that combines dense and sparse retrieval outputs into one ranked list without needing calibrated scores. Each method votes by rank; documents that rank well in either method float to the top; documents ranked well in both dominate.
+
+```
+  Zoom out — where RRF fits
+
+  ┌─ Dense retrieval ──┐    ┌─ Sparse retrieval ──┐
+  └────────┬───────────┘    └──────────┬──────────┘
+           │                           │
+           └───────────┬───────────────┘
+                       │
+                       ▼
+  ┌─ ★ RRF fusion ★ ────────────────────────────────┐ ← we are here
+  │  score(doc) = Σ 1 / (k + rank_in_method)          │
+  └──────────────────────────────────────────────────┘
+                       │
+                       ▼
+                    merged top-k
+```
 
 ## Structure pass
 
-Axis: how do you merge two ranked lists with incompatible score scales? Answer: rank-based fusion; each list "votes" by position.
+- **Layers:** two ranked lists → RRF score per doc → merged ranking. Three bands.
+- **Axis: contribution.** Each method contributes rank, not score. That normalizes across methods that have incomparable score scales.
+- **Seam:** the RRF formula. Simple; robust; no calibration needed.
 
 ## How it works
 
-### Move 1
+### Move 1 — the mental model
 
-You have two ranked lists (dense top-k, sparse top-k). Their scores aren't on the same scale (cosine is [-1, 1]; BM25 is unbounded). You need a way to merge that's robust to that. RRF is that way.
+Each document's RRF score is the sum, over methods that ranked it, of `1 / (k + rank)`. `k` is a constant (typically 60). Higher ranks in either method contribute more; appearing in both methods stacks the score.
 
 ```
-  RRF — vote by rank, not by score
+  RRF — the math (k=60)
 
-  score(doc) = sum over lists of  1 / (k + rank_in_list)
-  (k is a constant, typically 60)
+  doc7 ranked #1 in dense, #1 in sparse
+  → RRF = 1/(60+1) + 1/(60+1) = 0.0328
 
-  a doc ranked #1 in one list and #3 in another beats
-  a doc ranked #1 in one list but absent from the other.
+  doc3 ranked #1 in dense only
+  → RRF = 1/(60+1) + 0 = 0.0164
+
+  doc5 ranked #2 in sparse only
+  → RRF = 0 + 1/(60+2) = 0.0161
+
+  ordering: doc7 (0.0328) > doc3 (0.0164) > doc5 (0.0161)
 ```
 
-### Move 2
+### Move 2 — the step-by-step walkthrough
 
-Formula: `score(doc) = Σ 1/(k + rank_i)` where `rank_i` is the doc's rank in list i (or ∞ if absent), and `k` is a smoothing constant (60 is Cormack et al.'s default from the 2009 paper).
+**Why RRF beats score-normalization.** Dense returns cosine similarities in `[-1, 1]`. BM25 returns unbounded positive scores whose magnitude depends on corpus stats. Normalizing to a common scale (min-max, z-score) requires per-corpus tuning and drifts as the corpus changes. RRF sidesteps this — it uses only rank order, not score magnitude.
 
-**Why rank not raw score.** Because a cosine of 0.85 and a BM25 of 15.3 aren't comparable. Ranks are. Doc that shows up in the top of BOTH lists wins the fusion.
+**Why `k=60`.** Empirical; the original RRF paper (Cormack, Clarke, Buettcher 2009) tested a range and `k=60` performs well across corpora. Not a magic number; a robust default.
 
-**Why k = 60.** Damps the influence of a single list's top item, so a doc that's #1 in list A and #10 in list B still has a chance. Higher k = more egalitarian, lower k = more winner-take-all. 60 is empirically robust across corpora.
+**Implementation.** ~20 lines of code:
 
-### Move 3
+```
+  rrfMerge(rankings, k=60, topK=3):
+    scores = Map<docId, number>
+    for ranking in rankings:                    // dense list, sparse list
+      for (rank, doc) in enumerate(ranking):
+        scores[doc.id] += 1 / (k + rank + 1)   // rank 0-indexed
+    sorted = scores entries sorted by score desc
+    return sorted.slice(0, topK)
+```
 
-RRF is the boring right default for hybrid retrieval. Score normalization (min-max, z-score) is fragile across queries; rank fusion isn't.
+Diagram of the merge:
+
+```
+  RRF merge — one query
+
+  dense list:  [doc3, doc7, doc1, doc4, doc9]
+  sparse list: [doc7, doc2, doc5, doc3, doc8]
+
+  RRF scores (k=60):
+    doc3: 1/61 (dense#1) + 1/64 (sparse#4) = 0.0320
+    doc7: 1/62 (dense#2) + 1/61 (sparse#1) = 0.0325
+    doc1: 1/63 (dense#3)                   = 0.0159
+    doc2:                  1/62 (sparse#2) = 0.0161
+    doc5:                  1/63 (sparse#3) = 0.0159
+    ...
+
+  merged: doc7 > doc3 > doc1 ≈ doc2 ≈ doc5 ...
+```
+
+### Move 3 — the principle
+
+Fusion by rank order is more robust than fusion by score. It requires no calibration, adapts across methods that have incomparable scales, and rewards documents that any strong method vouches for while giving priority to documents both methods agree on.
 
 ## Primary diagram
 
 ```
-  RRF worked example
+  Hybrid retrieval with RRF — full frame
 
-  Dense top:  [D3, D7, D1, D9]
-  Sparse top: [D7, D2, D5, D3]
-
-  scores (k=60):
-    D3: 1/(60+1) + 1/(60+4) = 0.0164 + 0.0156 = 0.032
-    D7: 1/(60+2) + 1/(60+1) = 0.0161 + 0.0164 = 0.033
-    D1: 1/(60+3)             = 0.0159
-    D9: 1/(60+4)             = 0.0156
-    D2: 1/(60+2)             = 0.0161
-    D5: 1/(60+3)             = 0.0159
-
-  Fused ranking: [D7, D3, D2, D1, D5, D9]
-  (D7 wins — in top-2 of both lists)
+  ┌─ Query ───────────────────────────────────────────┐
+  │  "why did mobile revenue drop last week"           │
+  └────────┬──────────────────────────────────────────┘
+           │
+           ├──────────────────────────┐
+           ▼                          ▼
+  ┌─ Dense retriever ─┐    ┌─ Sparse retriever ─┐
+  │  embed + cosine   │    │  BM25              │
+  │  top-N=10         │    │  top-N=10          │
+  └────────┬──────────┘    └────────┬───────────┘
+           │                        │
+           └──────────┬─────────────┘
+                      │
+                      ▼
+  ┌─ RRF fusion ──────────────────────────────────────┐
+  │  score = Σ 1/(k + rank), k=60                      │
+  │  sort desc, take top-K=3                           │
+  └────────┬──────────────────────────────────────────┘
+           │
+           ▼
+       top-3 for LLM prompt
 ```
 
 ## Elaborate
 
-RRF assumes both lists are ranking the same underlying corpus. If dense searches over one index and sparse over another, that's fine — as long as the docs are the same set of things.
+RRF is used inside many production RAG systems (LlamaIndex, LangChain, Weaviate) as the default fusion when both dense and sparse are configured. Alternative fusion methods (learned rank fusion, weighted sum) can outperform RRF with per-corpus tuning but require training data.
+
+Related: **05-dense-vs-sparse.md** (the two inputs), **07-reranking.md** (a further-quality pass on the RRF output).
 
 ## Project exercises
 
-### Exercise — implement RRF fusion
+### B3.6 · Add RRF merge to the would-be EQL library
 
-- **Exercise ID:** C2.9-B · Case B (RAG not exercised).
-- **What to build:** `fuseRRF(lists: string[][], k = 60): string[]` in `lib/rag/rrf.ts`. Takes N ranked lists of doc ids, returns fused ranking.
-- **Why it earns its place:** the standard fusion primitive. Interviewer signal: "I fuse without normalizing scores; here's why RRF beats score-based fusion."
-- **Files to touch:** `lib/rag/rrf.ts` (new), `lib/rag/retrieve.ts` (call fusion).
-- **Done when:** unit test verifies the worked example above.
-- **Estimated effort:** <1hr.
+- **Exercise ID:** B3.6 (Case B — not yet implemented)
+- **What to build:** After `B3.5` adds sparse retrieval, add RRF fusion so the EQL library returns a merged top-3 rather than dense-only.
+- **Why it earns its place:** ~20 LOC change with measurable quality improvement on mixed lexical/semantic queries. Interview payoff: naming the formula and the k=60 default.
+- **Files to touch:** `lib/eql/library.ts` (add `rrfMerge()`), `test/eql/library.test.ts` (add fusion tests with known rankings).
+- **Done when:** unit test verifies the merged ordering against hand-computed RRF scores; the library exports a `hybridSearch(query, k)` function.
+- **Estimated effort:** `<1hr` after `B3.5` is done.
 
 ## Interview defense
 
-**Q: Why RRF over score normalization?**
+**Q: Why RRF and not weighted sum?**
 
-Score normalization is fragile. Cosine 0.85 might be top-1 in one query and top-100 in another; min-max normalization doesn't fix that. Ranks are stable — top-1 is always top-1 regardless of what the query is. RRF trades rank-precision (loses the numeric spread) for cross-list robustness.
+Weighted sum requires calibrated scores or a hand-tuned weight per method — which drifts as the corpus grows. RRF uses only ranks, so it's stable across corpora and doesn't need retuning. The load-bearing part: the formula is `1/(k + rank)`, k=60 is a robust default from the original paper, and both methods contribute additively so documents in both rise.
 
-**Q: What does k control?**
+**Q: What's k for?**
 
-Smoothing. Higher k = flatter contribution per rank; a doc's rank matters less. Lower k = top ranks dominate. 60 is the "just works" value from Cormack et al.'s original paper; production systems rarely tune it.
-
-**Q: What if a doc is only in one list?**
-
-Its score is just `1/(k + rank)` from that single list. It can still rank in the fused output, but a doc in BOTH lists (even at middling rank in each) tends to beat it. That's the whole point — the fusion rewards agreement.
+A smoothing constant. Small k gives sharp differences between rank 1 and 2; large k flattens them. k=60 was empirically chosen for good behavior across corpus sizes. You can tune it if measurement shows the merge is over- or under-favoring top-1 hits.
 
 ## See also
 
-- `05-dense-vs-sparse.md` — the two lists this fuses
-- `07-reranking.md` — the next stage that can polish the fused top
+- [05-dense-vs-sparse.md](05-dense-vs-sparse.md) — the two inputs.
+- [07-reranking.md](07-reranking.md) — the quality pass after RRF.
+- [11-rag.md](11-rag.md) — the full pipeline.

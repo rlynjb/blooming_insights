@@ -1,61 +1,137 @@
-# Overview — the performance map of blooming insights
+# 00 · Overview — perf-shape of this repo
 
-You built an AI analyst that runs on Vercel Pro (300s route ceiling), talks to an alpha MCP server that rate-limits at ~1 req/s and revokes tokens after minutes, and streams a multi-agent ReAct loop to the browser as NDJSON. In the last two weeks you added prompt caching, a per-investigation budget ceiling, an observability report, a load harness, and a fault-injection decorator. This map tells you where the load-bearing bytes go and how the new machinery earns its keep.
+The whole system in one frame, with the perf mechanisms marked.
 
-## The one distinction that carries the file
+```
+  Zoom out — where perf is decided
 
-**Rate-limit compliance is not backpressure.** The `minIntervalMs = 1100` proactive spacing in `lib/mcp/connect.ts:97` and the 10-second retry ladder in `lib/data-source/bloomreach-data-source.ts:135` exist because Bloomreach's alpha server states its window (`1 per 10 second`) and returns 429 if you cross it. Nothing is queuing calls to protect a slow consumer, no queue depth is being watched, no work is being shed. It's a client-side gate to stay inside a server-stated quota. This distinction is load-bearing enough that the audit calls it out under two lenses (io-network-and-database-bottlenecks and caching-batching-and-backpressure) and pattern `05-rate-limit-spacing-and-retry-ladder.md` opens with it.
+  ┌─ UI (Next.js RSC + client hooks) ──────────────────────────┐
+  │  investigate page → useInvestigation → readNdjson           │
+  │      · header override: persistedConfigHeader()            │
+  │      · one AbortController per mount (React StrictMode-safe)│
+  └────────────────────────────────┬───────────────────────────┘
+                                   │  HTTPS · NDJSON stream
+  ┌─ Serverless route (Vercel node runtime) ─────────────────────┐
+  │  /api/agent · maxDuration = 300s  ← ROUTE BUDGET             │
+  │      · phase timings recorded per request                    │
+  │      · BudgetTracker (~$2/investigation) checks BEFORE       │
+  │        every Anthropic call                                  │
+  │      · prompt cache: system prompt wrapped ephemeral         │
+  └────────────────────┬──────────────────────┬──────────────────┘
+                       │                      │
+                       │ model turns          │ tool calls
+                       ▼                      ▼
+              ┌─ Anthropic API ──┐   ┌─ DataSource (port) ────────┐
+              │ Sonnet 4.6       │   │  Bloomreach adapter        │
+              │ · cache_creation │   │   · 60s response cache     │
+              │   1.25× input    │   │   · ~1.1s spacing gate     │
+              │ · cache_read     │   │   · retry ladder (10s/20s) │
+              │   0.1× input     │   │   · 30s per-call timeout   │
+              └──────────────────┘   └────────────────────────────┘
+                                        │
+                                        ▼ live-synthetic swap
+                                     ┌─ SyntheticDataSource ──────┐
+                                     │  in-process fake, 0ms     │
+                                     │  used by load eval        │
+                                     └────────────────────────────┘
+```
 
-## Ranked findings — what to fix first
+## Ranked findings
 
-Ordered by consequence to the ~$1.30 / 10-case eval run + the 300s route budget.
+The load-bearing perf mechanisms, ordered by consequence.
 
-### 1. Prompt caching earns the biggest win — the numbers prove it
+  1. **Route budget composition** (`app/api/agent/route.ts:23`
+     `maxDuration = 300`) — the outer bound. Every mechanism below
+     exists to fit within it. See `01-route-budget-and-timeout-composition.md`.
 
-The ReAct loop reuses the same system prompt across every turn (3–15 turns per agent). Adding a single `cache_control: { type: 'ephemeral' }` breakpoint at `lib/agents/aptkit-adapters.ts:87` turned the first call into a cache_creation and every subsequent call within 5 min into a cache_read at ~10% the input cost. Live logs prove it: `cache_creation_input_tokens 3168` on the first call matches `cache_read_input_tokens 3168` on the next. **Pattern file:** `01-prompt-caching.md`.
+  2. **Spacing gate vs retry ladder** (`lib/mcp/connect.ts:121`
+     `minIntervalMs: 1100`; `bloomreach-data-source.ts:163-174`
+     retry loop) — the load-bearing distinction of the whole repo:
+     the spacing gate is a *scheduler* (proactive `sleep`), the retry
+     ladder is *backpressure* (reactive on 429). Confusing them is
+     the perf trap. See `02-spacing-gate-and-retry-ladder.md`.
 
-### 2. The 300s route budget is the ceiling that must not tear
+  3. **Prompt caching** (`lib/agents/aptkit-adapters.ts:85-89`
+     `cache_control: { type: 'ephemeral' }`) — validated live in
+     receipts: `cache_read_input_tokens 3168` on the second turn.
+     Roughly 80% off system-prompt cost across a ~10-turn ReAct loop.
+     See `03-prompt-caching-ephemeral-breakpoint.md`.
 
-`app/api/agent/route.ts:22` and `app/api/briefing/route.ts:19` both set `maxDuration = 300`. The baseline run (10 cases, runId `2026-07-03T04-08-28-644Z`) shows per-phase p50 latency of **diagnose 50s · d-judge 38s · recommend 51s · r-judge 90s · total 225s**. Total under budget, but the r-judge outlier at case 09 hit 675s — five to nine times normal. That's inside a single case in the eval, not a route call, so the route survives, but it names the mechanism: model retries on a bad response can stack. `lib/mcp/transport.ts:38` caps a single MCP call at `TOOL_TIMEOUT_MS = 30_000` so a hung Bloomreach connection can't burn the whole route. **Audit lens:** latency-throughput-and-tail-behavior.
+  4. **Response cache TTL** (`lib/data-source/bloomreach-data-source.ts:145`
+     `ttl = options.cacheTtlMs ?? 60_000`) — per-`(name, args)` map,
+     absorbs repeats within a single investigation. Not shared across
+     Vercel instances. See `04-response-cache-ttl.md`.
 
-### 3. Budget ceiling is check-before-dispatch, not a soft target
+  5. **Budget ceiling** (`lib/agents/budget.ts` + adapter check at
+     `aptkit-adapters.ts:64-66`) — throws BEFORE dispatch, not after.
+     A runaway loop cannot burn additional cost past the ceiling.
+     See `05-budget-ceiling-check-before-dispatch.md`.
 
-`lib/agents/budget.ts` builds a `BudgetTracker` per investigation. Each model turn calls `budget.exceeded()` BEFORE dispatching to Anthropic (`lib/agents/aptkit-adapters.ts:64`). Throws `BudgetExceededError` if the ceiling has been hit. A runaway ReAct loop can't burn additional cost after the ceiling is crossed. Default is $2.00 (`BUDGET_MAX_USD` env), vs the observed ~$0.09/case — this is an escape valve, not a normal-path constraint. **Pattern file:** `02-per-investigation-budget-ceiling.md`.
+  6. **Load harness with semaphore concurrency** (`eval/load.eval.ts:170-211`
+     fixed-K worker pool) — bounded parallel workers pull from a
+     shared queue. Smoke: `N=2, K=1` → 208s wall clock, $0.156.
+     See `06-load-harness-semaphore-concurrency.md`.
 
-### 4. Fault injection proves the agents reason around failures
+  7. **Fault-injecting decorator** (`lib/data-source/fault-injecting.ts`)
+     — wraps the DataSource so a fraction of calls fail in known ways
+     without touching the agent. Run: `FAULT_TIMEOUT=0.2
+     FAULT_MALFORMED_JSON=0.2 N=3` → 9 faults, 0 failures.
+     See `07-fault-injecting-decorator.md`.
 
-`lib/data-source/fault-injecting.ts` is a decorator over any `DataSource`. Configurable per-error probabilities for timeout / rate_limit / server_error / malformed_json. The load smoke with `FAULT_TIMEOUT=0.2, FAULT_MALFORMED_JSON=0.2, N=3` injected **9 faults across 3 investigations → 0 investigation failures**. AptKit's ReAct loop presents each fault as a `tool_result` block with `is_error: true`; the model reasons around it and tries a different query. That's the graceful-degradation surface tier-2 promises. **Pattern file:** `04-load-harness-with-fault-injection.md`.
+## Real numbers — baseline runId 2026-07-03T04-08-28-644Z, 10 cases
 
-### 5. Response cache — TTL 60s per (tool_name, args)
+Per-phase p50 wall-clock latency:
 
-`lib/data-source/bloomreach-data-source.ts:145` caches every successful tool call for 60 seconds keyed on `${name}:${JSON.stringify(args)}`. Error results are not cached (line 179). The cache is per-`BloomreachDataSource` instance, so per-request in production. It absorbs the "same EQL query fired twice" pattern that shows up when the agent's ReAct loop re-derives a metric. **Pattern file:** `06-response-cache-and-demo-replay.md`.
+```
+  phase                     p50
+  ─────────────────         ─────
+  diagnostic_investigate    ~50s
+  diagnosisJudge            ~38s
+  recommendation_propose    ~51s
+  recommendationJudge       ~90s
+  total (per case)          ~225s
+```
 
-### 6. The demo replay is the reliability lever, not a perf trick
+Per-case cost avg ~$0.09 agent-side. Full run: $0.913 agent + ~$0.40
+judge ≈ ~$1.30 total for 10 cases. One rec-judge outlier: case 09
+at 675s. That's the tail — a p50 of ~90s and a max of 675s is the
+distribution to name in interviews, not just the p50.
 
-`?demo=cached` in `app/api/briefing/route.ts:86` serves committed snapshots (`lib/state/demo-*.json`) as NDJSON with a 180ms delay per event. Wall clock 0s for the model. This is presentation-reliability first — the alpha MCP server revokes tokens after minutes — but it also side-steps every performance risk in the live path. Named for what it is.
+Load smoke (`LOAD_N=2 LOAD_CONCURRENCY=1`, no faults): 208s wall
+clock, ~104s per investigation, $0.156. Load with faults
+(`FAULT_TIMEOUT=0.2 FAULT_MALFORMED_JSON=0.2 N=3`): 9 injected
+faults, 0 investigation failures.
 
-## Real numbers you should hold
+## `not yet exercised`
 
-**Baseline (runId `2026-07-03T04-08-28-644Z`, 10 cases, sequential):**
+Honestly named so `audit.md` doesn't manufacture findings:
 
-| Phase           | p50   | p95   | p99   |
-| :-------------- | :---- | :---- | :---- |
-| diagnose        | 50s   |       |       |
-| diagnosis-judge | 38s   |       |       |
-| recommend       | 51s   |       |       |
-| rec-judge       | 90s   |       | 675s  |
-| total           | 225s  |       |       |
+  → **No client-side bundle profiling.** The client is a Next.js RSC
+    surface with modest interactivity (feed, investigate). No Lighthouse
+    baseline, no bundle-size budget, no Core Web Vitals capture.
+  → **No CPU or memory profiling.** No flamegraphs, no heap snapshots,
+    no allocation tracking. The hot path is I/O-bound (network to
+    Anthropic + MCP), not CPU-bound, which is why it hasn't come up.
+  → **No production observability.** Phase timings go to
+    `console.log` for Vercel to pick up; there is no APM, no metrics
+    pipeline, no SLO dashboard. See `audit.md` §2.
+  → **No horizontal-scale load test.** The load harness runs one
+    process, semaphore-bounded. There's no multi-region fanout, no
+    coordinated load, no queue-depth measurement across replicas.
+    See `audit.md` §3.
+  → **No cross-instance cache.** The 60s response cache is a
+    per-process `Map`. Vercel serverless memory is not shared, so on
+    a cold start the cache is empty by construction. Named honestly
+    rather than pretending it's a distributed cache.
 
-Per-case cost avg **~$0.09 agent-side**. Total 10-case: **$0.913 agent + ~$0.40 judge ≈ $1.30**.
+## Cross-links
 
-**Load smoke (LOAD_N=2, K=1, no faults):** wall clock 208s (~104s/investigation). Cost $0.156. Judges add ~50% latency vs the load path (which skips them).
-
-**Load with faults (`FAULT_TIMEOUT=0.2`, `FAULT_MALFORMED_JSON=0.2`, N=3):** 9 injected faults, 0 investigation failures.
-
-**Cache validation live:** `cache_creation_input_tokens 3168` on the first call, matching `cache_read_input_tokens 3168` on the very next call within the same session.
-
-## What earns a pattern file (and what doesn't)
-
-The general rule from `me.md`: a pattern has a name, passes the load-bearing test, passes the recognition test. For performance specifically, the load-bearing test asks — if I stripped this out, what measurable capability would the system lose? Real answers name a number.
-
-Six patterns earn files here. Everything else is a lens finding in `audit.md`. The lenses that find nothing (rendering-client-and-mobile-performance, cpu-memory-and-allocation) emit `not yet exercised` with an honest note.
+  → `study-runtime-systems` — the execution model (event loop,
+    `AbortSignal` composition, `setTimeout` as backpressure). This
+    guide MEASURES the resulting latency; runtime-systems EXPLAINS
+    why an async gap is spent the way it is.
+  → `study-system-design` — the architectural tradeoffs. Why the
+    ~1.1s gate exists at all (Bloomreach's per-user global rate
+    limit); why the load harness runs offline (avoid burning the
+    ~1 req/s live budget); why per-instance caches are correct-enough
+    for portfolio traffic.

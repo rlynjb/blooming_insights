@@ -1,260 +1,304 @@
-# Data modeling red-flags audit
+# 07 — Data-modeling red flags · audit
 
-**Industry term:** Data-modeling smell catalog · **Type:** Consolidated capstone checklist, applied verbatim to blooming_insights.
+**Consolidated checklist · this codebase · verdict + severity + fix**
 
-## Zoom out, then zoom in
+## Zoom out — where this file sits
 
-**Zoom out — the audit at a glance.** This is the capstone. Each red flag from the topic spec, marked FIRES / N/A / CLEAN against this repo with a one-line rationale and a link to the concept file that walks it in depth. If a red flag is N/A, it's because the substrate doesn't exist (no DB → no missing-index red flag in the classical sense).
-
-```
-  The red-flag scorecard — where blooming_insights lands
-
-  ┌─ FIRES ────────────────────────────────────────────────────────┐
-  │  · same fact stored twice (2 instances — walked in file 02)    │
-  │  · query pattern with no supporting index                       │
-  │    (eval aggregation over receipts/ — walked in file 03)        │
-  │  · invariant enforced only in app code                          │
-  │    (clear-then-set, demo-capture atomicity — walked in file 04) │
-  └────────────────────────────────────────────────────────────────┘
-
-  ┌─ CLEAN ────────────────────────────────────────────────────────┐
-  │  · destructive migration with no rollback (no migrations)      │
-  │  · column drop with no backfill (no columns, no drops)          │
-  │  · schema fighting the access pattern (request/demo paths OK)   │
-  └────────────────────────────────────────────────────────────────┘
-
-  ┌─ N/A — substrate doesn't exist ────────────────────────────────┐
-  │  · no discernible model / everything in one JSON blob           │
-  │    (there IS a discernible model — it's in TypeScript, not SQL) │
-  │  · multi-write op without transaction: FIRES for the two cases  │
-  │    that exist (see 04) — but the general "SQL transaction"      │
-  │    version is N/A because there's no SQL                        │
-  │  · N+1 query in ORM: N/A (no ORM)                               │
-  └────────────────────────────────────────────────────────────────┘
-```
-
-**Zoom in — the pattern.** Read this file top-to-bottom as the audit summary. Each finding names its severity, its home file, and the constructive next move.
-
-## Structure pass
-
-### One axis: severity (impact × likelihood)
+The other six files walked concepts. This one is the *audit*: the standard data-modeling red-flag checklist marked against this specific repo. Every row is a claim about *this* codebase, ranked worst-first, with a fix path.
 
 ```
-  Severity axis — cost today × likelihood of firing tomorrow
+  Zoom out — the audit's shape
 
-  cost today │ cost tomorrow
-  ───────────┼───────────────
-   zero      │    low       →  keep an eye, don't act
-   zero      │    high      →  refactor before shipping the change that fires it
-   low       │    low       →  accept as debt
-   low       │    high      →  fix in the next sprint
-   high      │    any       →  fix now
+  ┌─ Findings ranked worst-first ───────────────────────────┐
+  │                                                          │
+  │  ┌── HIGH severity ──┐                                   │
+  │  │  latent bugs;      │  → shape drift, missing invariant │
+  │  │  fix soon          │    enforcers, silent corruption   │
+  │  └────────────────────┘                                   │
+  │                                                          │
+  │  ┌── MEDIUM severity ┐                                   │
+  │  │  works today,      │  → policy gaps, unscripted       │
+  │  │  breaks on         │    regenerations, growth cliffs  │
+  │  │  destructive       │                                   │
+  │  │  change or scale   │                                   │
+  │  └────────────────────┘                                   │
+  │                                                          │
+  │  ┌── LOW severity ────┐                                   │
+  │  │  worth naming, not │  → conventions, opportunities to │
+  │  │  worth fixing yet  │    tighten later                  │
+  │  └────────────────────┘                                   │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-Every finding below carries a "severity today" and a "severity if X changes."
+## The checklist
 
-### Seams — where red flags cluster
+Each red flag is stated as it would appear in a generic data-modeling audit, then marked against this repo.
 
-Two seams collect most of the flags:
+### 1. **Same fact stored in two places, editable independently**  — HIGH · fixable
 
-- **The `anomalyToInsight` seam** (`lib/state/insights.ts:25`) — the enrichment splice is where denormalization enters, and it's where the missing "recompute on evidence change" contract lives.
-- **The `eval/` aggregation seam** (`eval/baseline.eval.ts`, `gate.eval.ts`, `report.eval.ts`) — three copies of the same directory-scan pattern, no shared abstraction, no indexed store.
+**Generic form:** the same fact is declared/edited in more than one place, with no mechanism keeping the copies in sync. The DB analog: two columns holding the same value, updatable independently.
 
-Everything else is either clean or "the substrate doesn't exist so the question doesn't apply."
-
-## How it works
-
-### Move 1 — the mental model
-
-Read the checklist the way you'd read a linter's output: each entry names a *specific pattern* to look for in your code, a *specific consequence* if it's present, and a *specific fix* if you decide to address it. Not every red flag needs to be fixed — some are acceptable debt for the current scale — but every red flag deserves to be *named*. Blind spots are more dangerous than known debt.
+**In this repo:** yes — `Diagnosis` and `Investigation.diagnosis`.
 
 ```
-  How to read a red-flag entry
-
-     ┌──────────────────────────────────────────────┐
-     │ NAME OF THE RED FLAG                         │
-     │  ─────────────────────────                   │
-     │  where it fires · file:line                  │
-     │  severity today · severity tomorrow          │
-     │  what breaks (concrete)                      │
-     │  fix (constructive)                          │
-     │  cross-ref to the concept file that walks it │
-     └──────────────────────────────────────────────┘
+  lib/mcp/types.ts:94-104          lib/mcp/types.ts:132-141
+  ────────────────                  ────────────────
+  interface Diagnosis {              interface Investigation {
+    conclusion: string;                insightId: string;
+    evidence: string[];                reasoning: ReasoningStep[];
+    hypothesesConsidered:              diagnosis: {
+      { hypothesis, supported,           conclusion: string;
+        reasoning }[];                   evidence: string[];
+    ...                                  hypothesesConsidered: string[];
+  }                                                    ↑ DIFFERENT SHAPE
+                                       };
+                                       recommendations: Recommendation[];
+                                     }
 ```
 
-### Move 2 — the checklist, one entry at a time
+Same conceptual entity, same file, two shapes. `hypothesesConsidered` is `{hypothesis, supported, reasoning}[]` in one and `string[]` in the other. Nothing enforces they stay in sync.
 
-#### RF1 · Same fact editable in two places — FIRES
+**Fix:** replace `Investigation.diagnosis: {...inline...}` with `Investigation.diagnosis: Diagnosis`. One-line change, single source of truth thereafter. TypeScript will complain at any call site that assumed the old shape — you fix those in the same PR.
 
-**Where:** `lib/mcp/types.ts:58` (type comment explicitly names it as "denormalized from Diagnosis.affectedCustomers.count"); `lib/state/insights.ts:25-45` (the derived-field splice in `anomalyToInsight`).
+**Cost:** ~30 minutes; 1 line changed + ~5 call sites updated.
 
-**Severity today:** low. Pipeline is one-shot; anomalies aren't mutated after enrichment.
-**Severity tomorrow:** medium-high. The moment any edit path is added (re-scope a diagnosis, refresh evidence), the copies silently disagree.
+---
 
-**What breaks:** `Insight.affectedCustomers` renders the count from the first diagnosis; a re-run diagnosis with a different count doesn't update the card. `Insight.revenueImpact` etc. derive from evidence at construction; if evidence gets enriched mid-flight, the derived field is stale.
+### 2. **Multi-write operation with no transaction wrapping it** — CONDITIONAL · currently safe
 
-**Fix:** delete the derived fields from `Insight`; derive at render time (a `.map()` inside the component) or via a memoized selector. Cost is negligible — display-time only.
+**Generic form:** an operation writes multiple pieces of state that must land together or not at all, without an atomicity mechanism. The DB analog: two `INSERT`s outside a `BEGIN`/`COMMIT`.
 
-→ Full walkthrough: `02-normalization-and-duplication.md`.
+**In this repo:** currently safe by accident of runtime. `putInsights` writes to `insights` and `anomalies` maps in one synchronous function. Because the runtime is single-threaded, no reader can observe the intermediate state.
 
-#### RF2 · Frequent query with no supporting index — FIRES
+**When it becomes a real red flag:** the moment an `await` is introduced anywhere between `s.insights.clear()` and the final `.set()` (file 04 walks this). Also, if the maps ever move to a shared-memory worker or a persistence layer, the atomicity guarantee vaporizes.
 
-**Where:** `eval/baseline.eval.ts:44-51`, `eval/gate.eval.ts:64-72`, `eval/report.eval.ts:62-70`. Three copies of `readdirSync + filter-by-suffix + JSON.parse × N`.
+**Fix path (preventive):** wrap `putInsights` with a comment naming the "no `await` allowed here" invariant, and consider extracting a `synchronousSectionOnly` marker/type if the codebase grows more of these. Not urgent.
 
-**Severity today:** low. 10 files per run × a few runs = milliseconds per aggregation.
-**Severity tomorrow:** high at 200 cases per run or when cross-run trending arrives (no answer without full scan).
+**Cost:** ~5 minutes for the comment; nothing else needed today.
 
-**What breaks:** every gate/baseline/report run does two full directory listings (one to pick the runId, one to filter). Every cross-run question — "which cases regressed in the last month?" — has no answer short of parsing every file.
+---
 
-**Fix:** two-step. **Step 1 (cheap):** factor a `eval/receipts.ts` module with `listRunIds()` and `readRun(runId)`; three call sites collapse to one abstraction. **Step 2 (bigger, only when the query pattern demands):** SQLite table `run_dimensions(runId, caseId, dimension, score, verdict)` + index on `(dimension, verdict)`. Keep receipts as blobs for full replay; extract the aggregation surface into rows.
+### 3. **A migration policy that only handles additive changes** — MEDIUM · known, bounded
 
-→ Full walkthrough: `03-indexing-vs-query-patterns.md`.
+**Generic form:** the schema evolves, but the migration strategy handles only "add optional field." Renames, retypes, deletions have no defined path. The DB analog: no `ALTER TABLE` scripts, only `ADD COLUMN`.
 
-#### RF3 · Multi-write operation with no transaction — FIRES (two instances)
+**In this repo:** yes. Every field added to `Insight`, `Anomaly`, `Recommendation`, `Diagnosis` since day one has been optional (`?`), which handles the additive case for all committed JSONs (demo seeds, receipts, baseline). There's no `schemaVersion` field anywhere, no `migrate()` at the read boundary, no script that regenerates the demo seeds when a shape changes.
 
-**Where:**
-1. `lib/state/insights.ts:57-71` — `putInsights` does `.clear()` + `.clear()` + `forEach.set` in sequence, no swap.
-2. Demo-capture path — writes `lib/state/demo-insights.json` **and** `lib/state/demo-investigations.json` sequentially; no atomic-rename dance.
+**Concrete failure case:** rename `Insight.headline` → `Insight.title`. Every hand-committed `demo-insights.json` entry now silently reads as "no title." Nothing catches this at build time.
 
-**Severity today:** near-zero. Case 1 is safe because Node's event loop doesn't preempt inside a sync function and the current loop body doesn't await. Case 2 is safe because dev workflow is capture → git diff → commit, so bad writes get caught by human review.
+**Fix:** file 05's Phase B — read-side migration with `schemaVersion` + `migrate()` per persisted shape. See that file for the full walkthrough.
 
-**Severity tomorrow:** case 1 becomes real the moment anyone adds an `await` inside the forEach (which the shape doesn't forbid). Case 2 becomes real the moment the capture becomes automated / CI-triggered.
+**Cost:** ~2-3 hours for the first pass (add `schemaVersion: '1'` to every persisted shape + build the `migrate()` scaffolding); every future destructive change adds one case (~15 minutes).
 
-**What breaks:** case 1 — a concurrent `listInsights` in the race window returns `[]`. Case 2 — first file succeeds, second fails, committed demo is inconsistent (insight ids reference nonexistent investigations).
+---
 
-**Fix:** case 1 — build the new maps locally, swap references atomically. Case 2 — write to temp files, then rename in a specific order (or collapse to one file).
+### 4. **No stable identifier for an entity that will eventually need to survive a session** — MEDIUM · latent
 
-→ Full walkthrough: `04-transactions-and-integrity.md`.
+**Generic form:** an entity's primary key is a per-session UUID or a random ID that means nothing outside the session. The DB analog: using auto-increment IDs as user-facing references, then later needing to reassign them across environments.
 
-#### RF4 · Invariant enforced only in app code (not the store) — FIRES (by construction)
+**In this repo:** yes. `Insight.id = crypto.randomUUID()` (`lib/state/insights.ts:26`). Meaningful only within one session's `Map<sessionId, SessionFeed>`. The moment you want:
+  → to share an investigation link across sessions,
+  → to favorite an insight and see it re-favor'd on Tuesday,
+  → to keep a history of past briefings,
+  → to deep-link into an investigation from an email,
 
-**Where:** everywhere, because the store *is* app code. There's no DB layer that could enforce constraints. `lib/mcp/validate.ts:17-57` is the entire integrity layer for LLM-produced content; `BudgetTracker` is the entire integrity layer for cost.
+...the session-UUID doesn't survive.
 
-**Severity today:** low. The validators are correct and run at every trust boundary. Budget is enforced before every model turn.
-**Severity tomorrow:** low, *as long as* new trust boundaries also add validators. The risk is a future contributor adding a route handler that skips validation and injects unchecked LLM output into state.
+**Fix:** add a `stableInsightKey: string` derived from `hash(metric + scope + baseline)` alongside the existing `id`. Old code paths keep using `id`; new persistence uses `stableInsightKey`. Non-invasive.
 
-**What breaks if a validator is skipped:** malformed anomalies flow into the state Map, then throw at some downstream deref with no useful stack.
+**Cost:** ~1 hour; the derivation is deterministic, no migration needed for existing sessions (they die with the instance anyway).
 
-**Fix:** none needed for the current shape — this red flag *"invariant enforced in app code"* fires by construction in a no-DB architecture and is the intended design. Address only if you introduce a durable store; then move constraints (uniqueness, FK, check constraints) into the store where the enforcement is stronger.
+---
 
-→ Full walkthrough: `04-transactions-and-integrity.md`.
+### 5. **A frequent query with no supporting "index"** — LOW · latent scan cost
 
-#### RF5 · Destructive migration with no rollback — CLEAN
+**Generic form:** a hot-path read walks a linear collection. The DB analog: `SELECT ... WHERE unindexed_column = ?`.
 
-**Where:** N/A. There are no migrations; the schema evolves by adding optional fields (`?`) to TypeScript interfaces. Every change is additive-only.
-
-**Severity today:** zero.
-**Severity tomorrow:** low — the discipline is enforced by convention + the 144-test suite that reads the committed demo. A breaking change would require touching every persisted snapshot; the review pressure would catch it.
-
-**What breaks:** nothing yet. The trap to watch: the day someone tries to *narrow* a union type (drop the string case from `EstimatedImpact`), it silently invalidates every legacy snapshot. → tracked in `05-migrations-and-evolution.md`.
-
-**Fix:** no fix; keep the additive-optional discipline. If schema evolution ever becomes a hot path (frequent shape changes across many stores), introduce a Zod-style schema library so migrations become explicit versioned artifacts.
-
-#### RF6 · Column drop with no backfill — CLEAN
-
-**Where:** N/A (no columns, no drops).
-
-→ See `05-migrations-and-evolution.md` for the equivalent case in this repo: *renaming* a required field.
-
-#### RF7 · Relational schema fighting a document-shaped access pattern (or vice versa) — CLEAN (deliberate)
-
-**Where:** N/A. There's no relational schema. The document-shaped access pattern is matched with document-shaped storage (JSON files). The KV access pattern is matched with a Map.
-
-**Severity today:** zero. Store shape matches access shape on every path.
-**Severity tomorrow:** medium at eval-aggregation growth — `06-access-patterns-and-storage-choice.md` names the trigger.
-
-→ Full walkthrough: `06-access-patterns-and-storage-choice.md`.
-
-#### RF8 · No discernible data model / one giant JSON blob — CLEAN
-
-**Where:** N/A. The model is well-articulated in `lib/mcp/types.ts` (7 core interfaces) + `eval/goldens/types.ts` (4 eval interfaces) with a single canonical file per concern. This isn't the "unknown blob" anti-pattern — the shapes are typed, imported everywhere, and validated at boundaries.
-
-**Severity today:** zero.
-**Severity tomorrow:** zero, provided new persisted concerns get their own interface rather than being stuffed into an existing one.
-
-→ Full walkthrough: `01-the-data-model-and-its-shape.md`.
-
-#### RF9 · N+1 query in ORM code — N/A
-
-No ORM, no query, no N+1.
-
-The closest analog: **N+1 file reads** in the eval aggregation loop. The `readdirSync + parse × N` pattern reads N files to answer one question. This is called out under RF2 rather than as a separate flag; the fix (materialized view or a real store) is the same.
-
-#### Move 2 variant — the load-bearing skeleton of "a red-flags audit that stays useful"
-
-Three parts. If any is missing, the audit degrades from tool to decoration.
-
-1. **Named findings, not vague smells.** "This might be a problem" isn't a finding. "`Insight.affectedCustomers` is denormalized from `Diagnosis.affectedCustomers.count`, breaks the moment either is re-computed independently" is a finding. Every entry above cites a specific file:line.
-
-2. **Severity split: today vs tomorrow.** A red flag with severity=low today can be worth fixing if severity tomorrow is high. Reversing the pair (high today, low tomorrow) usually means "the thing that would have fired already did, once, and now everyone is careful" — accept as debt. Every entry above gives both.
-
-3. **Constructive move, not just critique.** Every entry names the fix. RF1's fix is "derive at render time." RF2's fix is a two-step `eval/receipts.ts` + SQLite. If a red flag has no fix, it's either N/A or the design is deliberately paying the cost — say so explicitly (RF4 CLEAN by construction, RF7 CLEAN deliberately).
-
-### Move 3 — the principle
-
-**A red-flags audit is only useful if you also do the un-flagging.** Every finding needs a decision: fix now, fix next, or accept as debt with the tradeoff named. Blooming_insights lands in a genuinely reasonable place — three flags fire, all at low severity today, all with concrete moves for when severity rises. The two that would be worth acting on soon are (RF2) the missing `eval/receipts.ts` abstraction (the fix is a factoring, not a store change) and (RF3) the demo-capture atomicity (a one-time write-then-rename fix). The rest are debt worth naming and accepting.
-
-## Primary diagram
-
-The whole audit in one frame.
+**In this repo:** two O(F) scans, both cold-path:
 
 ```
-  blooming_insights — red-flag capstone
+  file                                     scan                                cost today
+  ────                                     ────                                ────────────
 
-  ┌─ act soon (today's low + tomorrow's high) ──────────────────┐
-  │                                                              │
-  │  RF1  denormalization on Insight     → derive at render      │
-  │       (02-normalization-and-duplication.md)                  │
-  │                                                              │
-  │  RF2  eval scan × 3 sites            → factor eval/receipts  │
-  │       (03-indexing-vs-query-patterns.md)                     │
-  │                                                              │
-  │  RF3  demo-capture atomicity         → write-then-rename     │
-  │       (04-transactions-and-integrity.md)                     │
-  └─────────────────────────────────────────────────────────────┘
+  lib/state/investigations.ts:15-20        readJson() re-parses whole file     O(dev cache
+   (getCachedInvestigation fallback)        every call                          size)
+                                                                                dev-only
 
-  ┌─ accept as debt (low both today and tomorrow) ──────────────┐
-  │                                                              │
-  │  RF3(a)  putInsights clear-then-set  → safe until an await   │
-  │          is added inside the forEach                         │
-  │                                                              │
-  │  RF4  integrity in app code          → intended for no-DB    │
-  │                                                              │
-  └─────────────────────────────────────────────────────────────┘
-
-  ┌─ clean or N/A ──────────────────────────────────────────────┐
-  │                                                              │
-  │  RF5  destructive migration          → no migrations         │
-  │  RF6  column drop w/o backfill       → no columns            │
-  │  RF7  schema vs access mismatch      → matches by design     │
-  │  RF8  no discernible model           → well-typed model      │
-  │  RF9  N+1 in ORM                     → no ORM                │
-  │                                                              │
-  └─────────────────────────────────────────────────────────────┘
+  eval/baseline.eval.ts:44-46              readdirSync + filter(endsWith)      O(28 files)
+   (baseline receipt collection)            for a runId                         negligible
 ```
 
-## Elaborate
+Both are cold-path. Neither is a bug today. Both would be real costs at 10× scale.
 
-The three "act soon" findings share a shape: **an abstraction that isn't there yet.** RF1 needs a "compute at read" abstraction (a selector or a hook). RF2 needs an "eval receipts" module abstraction. RF3(demo-capture) needs a write-then-rename abstraction. None of these require introducing a store, a library, or a framework — they're all local refactorings that harden the shape without adding a dependency. That's the sweet spot: high leverage, low commit cost.
+**Fix:**
+  → dev cache: memoize the parsed JSON keyed on file mtime (see file 03).
+  → receipt collection: partition receipts into `eval/receipts/{runId}/` subdirs, or move to SQLite (`eval/receipts.sqlite`).
 
-The "accept as debt" entries are also worth reading as a check on discipline. RF3(a) is safe because Node's synchronous execution model *happens to* protect the code. That's not a data-modeling contract — it's a runtime happenstance. If you ever want the code to be safe *by contract*, the immutable-swap fix is a two-line change. Whether to do it now is a question about the team's tolerance for latent bugs vs the value of "we shipped that fix and it stays fixed forever."
+**Cost:** the dev cache fix is ~15 minutes; the receipts partition is ~1 hour but not needed until `eval/receipts/` has 500+ files.
+
+---
+
+### 6. **N+1 query pattern in app code** — NOT PRESENT
+
+**Generic form:** app code issues one query per row in a loop instead of one query returning all rows.
+
+**In this repo:** no. The MCP data layer batches naturally (one tool call returns whole datasets), agents iterate over in-memory arrays without re-fetching, and the feed render pulls the whole feed in one go. This isn't an accident — the design decision to make the whole SessionFeed one document (file 06) forecloses this class of bug.
+
+**Verdict:** clean.
+
+---
+
+### 7. **A destructive migration with no rollback plan** — NOT APPLICABLE YET
+
+**Generic form:** a schema change removes a column or drops data with no way to reverse it.
+
+**In this repo:** no committed schema has ever been dropped. The whole migration story is additive (see red flag 3). When destructive changes come, they'll need rollback plans — file 05's Phase B `migrate()` design implicitly supports rollback (versions can be walked backward if the migration functions are invertible).
+
+**Verdict:** not exercised yet; the framework to support it is a next-step.
+
+---
+
+### 8. **An invariant enforced only in app code that the "DB" doesn't guard** — MIXED
+
+**Generic form:** an invariant lives in app code with no enforcement close to the storage. The DB analog: an application checks "email is unique" but no `UNIQUE` constraint exists on the column — a race lets duplicates in.
+
+**In this repo:** partially, and the partial coverage is the story. The strong cases:
+  → `isMcpConfigOverride` guards the wire boundary rigorously (`lib/mcp/config.ts:50-60`).
+  → `makeAuthProvider` throws on cross-field violations (`lib/mcp/auth-providers/index.ts:56-76`).
+  → `withAuthCookies` + AES-256-GCM enforce cookie integrity + request scoping.
+
+The weak case:
+  → **no shape guard on `Insight` at any read boundary.** The demo seeds could be corrupted (rename a field, break a type) and nothing would catch it at load — a bad `Insight` would just render weirdly in the UI.
+
+**Fix:** add `isInsight()` type guard next to the interface declaration, mirror the pattern from `isMcpConfigOverride`. Use it at every "reads-a-committed-JSON" boundary (`demo-insights.json`, `demo-investigations.json`, any migrated eval receipts).
+
+**Cost:** ~30 minutes per top-level type (Insight, Anomaly, Diagnosis, Recommendation, Investigation). Maybe 2 hours total. Best paid for at the same time as the `schemaVersion` work (red flag 3).
+
+---
+
+### 9. **A wire format with weak validation** — NOT PRESENT
+
+**Generic form:** the app accepts network inputs without validating them, trusting the sender.
+
+**In this repo:** no. The MCP config wire format has three failure modes covered (see file 04):
+  → missing header → `null` → env fallback.
+  → malformed base64 / JSON → `null` → env fallback.
+  → invalid shape → type guard rejects → `null` → env fallback.
+
+All three are tested at `test/mcp/config.test.ts`.
+
+**Verdict:** clean — model for what other boundaries should do.
+
+---
+
+### 10. **Denormalization without a "single writer" invariant** — NOT PRESENT
+
+**Generic form:** a denormalized field can be updated from multiple write paths, allowing the denormalized copy to drift from its source.
+
+**In this repo:** no. Every denormalized field on `Insight` (`evidence`, `impact`, `history`, `affectedCustomers`, `category`) is written exactly once — inside `anomalyToInsight()` — and never mutated afterward. `putInsights` clears and rebuilds; nothing else writes.
+
+**Verdict:** clean — the write-atomicity discipline (file 02, file 04) enforces the invariant by structure.
+
+---
+
+### 11. **A "big blob" JSON that's grown without a rotation strategy** — LOW · watch
+
+**Generic form:** a collection of files grows indefinitely with no expiry, no rotation, no compaction.
+
+**In this repo:** the `eval/receipts/` directory has 28 files committed today. Every baseline run adds 10 more (one per golden case). There's no rotation strategy, no `eval/receipts/archive/`, no note on how many to keep.
+
+At current pace (~2-3 baseline runs per week during active dev, ~0 during idle), this is fine for a year. At 500+ receipts, the O(F) scans in `baseline.eval.ts` and `report.eval.ts` start to feel it, and git blob storage begins to bloat.
+
+**Fix:** either partition into `eval/receipts/{runId}/*.json` (git-friendly, index by directory), or keep only the last N runs and archive the rest (loses history — worse). Best move: **partition + keep everything**, since git handles the storage cheaply.
+
+**Cost:** ~30 minutes; the aggregator and load-shape scripts need updated readdir walks.
+
+---
+
+### 12. **A schema that assumes something the storage can't guarantee** — LOW · noted
+
+**Generic form:** the schema treats a field as if the storage layer enforces some property (uniqueness, foreign-key integrity, ordering) that it actually doesn't.
+
+**In this repo:** the `Anomaly` map is keyed by the parallel `Insight.id`, with no explicit "there's exactly one anomaly per insight" declaration. The invariant holds because `putInsights` writes both together, but the *shape* doesn't say it. If a maintainer later did `s.anomalies.set(someOtherId, ...)` from a different code path, the invariant would break silently.
+
+**Fix:** a comment on `SessionFeed` explaining the parallel-map invariant, or (better) collapsing anomalies into `Insight.rawAnomaly?: Anomaly` so the parallel structure is impossible to violate.
+
+**Cost:** the comment is 5 minutes; the structural collapse is 1 hour and requires care because the anomaly is intentionally kept separate for the agent-loop path (which doesn't want the denormalized `Insight` fields).
+
+---
+
+## Summary — the audit at a glance
+
+```
+  Ranked-worst-first — the audit's ledger
+
+  ─────────────────────────────────────────────────────────────────────
+  #    finding                                  severity   effort  fix
+  ─────────────────────────────────────────────────────────────────────
+  1    Diagnosis vs Investigation.diagnosis     HIGH       ~30m    file 02
+       shape drift                                                  file 04
+                                                                    fix
+  3    no schemaVersion + migrate() policy       MEDIUM     ~2-3h   file 05
+                                                                    Phase B
+  4    Insight.id is session-UUID; no             MEDIUM     ~1h    file 06
+       stable key for cross-session survival                        Q3
+  5a   dev cache reparses whole file per call    LOW        ~15m    file 03
+       (getCachedInvestigation)                                     memoize
+  5b   O(F) receipt-dir scans in baseline/       LOW        ~1h     file 03
+       load — cliff at ~500 files                                   partition
+  8    no isInsight() guard on read boundaries   LOW-MED    ~2h     add type
+                                                                    guards
+  11   eval/receipts/ growing without rotation   LOW        ~30m    partition
+                                                                    by runId
+  12   parallel-map invariant undocumented       LOW        5m       comment
+       (anomalies vs insights)
+  ─────────────────────────────────────────────────────────────────────
+
+  clean rows (no red flag firing):
+  · N+1 queries (file 06 shape forecloses)
+  · wire-format validation (isMcpConfigOverride is the model)
+  · denormalization without single-writer (write-atomicity holds it)
+  · destructive migration rollback (nothing destructive yet)
+```
+
+## The one-line verdict
+
+**The data modeling is stronger than it looks for a no-DB app**, with two real risks (`Diagnosis` shape drift, no `schemaVersion`) and one latent architectural inflection (no stable identifier). The wire-boundary validation (`isMcpConfigOverride`) and the session-scoped Map keying are exemplary — those are the patterns to extend to the read boundaries that don't have them yet.
+
+The single most valuable next PR: **file 02's `Diagnosis` fix**, 30 minutes, permanently removes a class of latent bug. The single most valuable *strategic* next step: **file 05's `schemaVersion` scaffolding**, 2-3 hours, buys forward capacity for every destructive schema change from that point on.
 
 ## Interview defense
 
-**Q: "Walk me through your data-modeling audit findings, worst to best."**
-Answer: "Three fire, five are clean or N/A. Worst: RF1 — `Insight` denormalizes derived fields from `Anomaly.evidence` and copies `Diagnosis.affectedCustomers.count`. Zero cost today because the pipeline is one-shot; medium-high cost the moment any edit path is added. Second: RF2 — `readdirSync + filter + parse × N` appears three times in the eval subsystem. First fix is factoring `eval/receipts.ts`, no store needed; second fix is SQLite once cross-run trending becomes a query. Third: RF3 — two multi-write operations without atomicity (in-memory clear-then-set, demo two-file capture). Both safe today by convention, both need a swap-or-rename fix. Clean cases: no destructive migrations, well-typed model, store shape matches access on request and demo paths. N/A: no ORM, no SQL." Draw the severity-split diagram.
+### Q1 — "give me the worst data-modeling issue in this repo, and how you'd fix it."
 
-**Q: "What's the one you'd fix first if you had a day?"**
-Answer: "RF2's first move — factor `eval/receipts.ts` with `listRunIds()` and `readRun(runId)`. Three call sites collapse to one abstraction. Doesn't need a store; just removes duplication and gives us a seam to swap in a database later. Under two hours to ship." Anchor: `eval/baseline.eval.ts:44-51`, `eval/gate.eval.ts:64-72`, `eval/report.eval.ts:62-70`.
+> The `Diagnosis` shape drift. Same conceptual entity — the diagnostic agent's output — declared twice in the same file. `Diagnosis` (lib/mcp/types.ts:94-104) has `hypothesesConsidered: {hypothesis, supported, reasoning}[]`. `Investigation.diagnosis` (types.ts:132-141) has `hypothesesConsidered: string[]`. Nothing enforces they stay in sync.
+>
+> The fix is one line: replace `Investigation.diagnosis: {...inline...}` with `Investigation.diagnosis: Diagnosis`. TypeScript then flags every call site that assumed the old inline shape — I'd update those in the same PR. Thirty minutes of work, permanent removal of a whole class of latent shape-drift bug.
 
-**Q: "What would you leave alone?"**
-Answer: "RF4 — invariants in app code — is by design in a no-DB system. `lib/mcp/validate.ts` is 60 lines and handles every trust boundary. `BudgetTracker.exceeded()` guards cost before every model turn. Both are enforced at exactly the right seams; moving them to a store would only matter if a store existed. And RF5 through RF9 are honestly N/A — you shouldn't invent problems the substrate doesn't have." Anchor: `lib/agents/budget.ts:71-76` for the model of a good app-side invariant.
+Anchor: "same file, same entity, two shapes, no enforcer."
+
+### Q2 — "what's your migration strategy, and where does it break?"
+
+> Optional-fields-only, forward-only. Every new field on my top-level types is `?`, so old committed JSONs — demo seeds, eval receipts, baseline — still validate against the current types. Adding a field is safe; renaming or retyping isn't.
+>
+> Where it breaks: destructive changes. Rename `Insight.headline` → `Insight.title` and my demo seeds silently render blank titles. There's no `schemaVersion` field to switch on, no `migrate()` at any read boundary. That's the biggest strategic debt.
+>
+> The fix path is defined but not built: read-side migration with `schemaVersion` + `migrate(fromVer, data)`. About 2-3 hours to scaffold, then every future destructive change adds one 15-minute case. The reason it's not built yet: no destructive change has been *needed* yet, and YAGNI applies to migration infrastructure until it doesn't.
+
+Anchor: "forward-only today; read-side migration when destructive comes."
+
+### Q3 — "what's the cleanest pattern in this codebase, and what makes it clean?"
+
+> The wire-format validation for `McpConfigOverride`. Three failure modes covered (missing header, malformed base64/JSON, invalid shape), all falling back safely to env defaults, all tested. Cross-field invariants pushed one layer down to `makeAuthProvider` where they're enforced with throws. Empty-string normalization in a separate pass so partial overrides work without clobbering env.
+>
+> What makes it clean: **four layers, four failure modes, no layer trusted with the whole invariant.** The UI can be bypassed (curl); the type guard can be fooled by valid-but-nonsense values; the factory catches missing required fields for a given discriminant; the tests prove all four paths. That's the defense-in-depth pattern I'd extend to the *other* read boundaries — the demo seeds, the eval receipts — that currently have no guards at all.
+
+Anchor: "the MCP config path is the model; the read boundaries for committed JSON aren't there yet."
 
 ## See also
 
-- `00-overview.md` — the summary card that got you here.
-- `02-normalization-and-duplication.md` — RF1 walkthrough.
-- `03-indexing-vs-query-patterns.md` — RF2 walkthrough.
-- `04-transactions-and-integrity.md` — RF3 and RF4 walkthrough.
-- `05-migrations-and-evolution.md` — why RF5 / RF6 are clean.
-- `06-access-patterns-and-storage-choice.md` — why RF7 is clean and where it would flip.
+- `01-the-data-model-and-its-shape.md` — the ERD that named every entity this audit touches.
+- `02-normalization-and-duplication.md` — walks the specific `Diagnosis` shape drift.
+- `04-transactions-and-integrity.md` — the wire-validation pattern this audit calls exemplary.
+- `05-migrations-and-evolution.md` — the `schemaVersion` fix path for red flag 3.
+- `06-access-patterns-and-storage-choice.md` — the "when to add a DB" line this audit's stable-key finding depends on.

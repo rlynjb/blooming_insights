@@ -1,141 +1,177 @@
 # When NOT to go multi-agent
 
-_Industry standard._
+*Industry name: single-agent-first / the escalation gate · Language-agnostic*
 
-## Zoom out, then zoom in
-
-The single most important multi-agent decision is whether to be multi-agent at all. This file comes first in the sub-section by design. The default answer is *no* — stay single-agent — and this file names the specific conditions under which the answer flips.
+## Zoom out
 
 ```
-  Zoom out — the gate before every multi-agent decision
+  Zoom out — the gate before every SECTION C topology
 
-  ┌─ Business need ────────────────────────────────────────────┐
-  │  "We need the agent to do X"                               │
-  └────────────────────────────┬───────────────────────────────┘
-                               ▼
-  ┌─ Escalation gate ──────────────────────────────────────────┐
-  │  1. Build a single-agent (ReAct) baseline                  │
-  │  2. Measure: success rate, tool-call accuracy, latency, $ │
-  │  3. Identify SPECIFIC failure single-agent cannot fix     │
-  │  4. Is failure genuinely decomposable into specialties?    │
-  │       ┌────────────────┴──────────────────┐                 │
-  │       ▼ no                                 ▼ yes            │
-  │  stay single-agent               escalate to SPECIFIC       │
-  │  fix prompt / tools / retrieval  topology addressing it     │
-  └────────────────────────────────────────────────────────────┘
+  ┌─ single-agent (ReAct) baseline ──────────────┐
+  │  is it hitting a specific ceiling?           │
+  └─────────────────┬────────────────────────────┘
+                    ▼
+  ┌─ ★ THE GATE ★ ────────────────────────────────┐ ← we are here
+  │  Is the failure genuinely decomposable        │
+  │  into independent specialties?                │
+  └─────────────────┬────────────────────────────┘
+       yes ─────────┴─────── no
+       ▼                     ▼
+   escalate to           stay single-agent
+   a specific            (fix prompt / tools /
+   topology              retrieval instead)
 ```
 
-Zoom in: this repo passed the gate. There are 5 agents. The senior-grade answer is naming *why* they're separate agents, not why "multi-agent is better."
+## Zoom in
+
+The single most important multi-agent decision is whether to be multi-agent at all. Multi-agent adds roughly **2-5x coordination overhead** and a much larger debugging surface. The quality gain is often modest unless the problem genuinely splits into specialties. This file is here to earn you the senior-grade answer: "I considered multi-agent and chose not to, because the failure wasn't decomposable."
 
 ## Structure pass
 
-**Layers:** single-agent baseline · measurement · failure identification · decomposability check · topology selection.
-**Axis:** *is the failure genuinely decomposable into specialties, or is it a single-agent that needs better prompting?*
-**Seam:** the decomposability check. This is where most teams flip too early and pay 2-5x coordination tax for no quality lift.
+Layers: **baseline** (single-agent ReAct) — **measurement** (concrete failure modes) — **decomposability test** — **topology pick**.
 
-```
-  The coordination tax — what multi-agent costs
+Axis to hold constant: **what specific failure does escalation fix?**
 
-  Single-agent:                Multi-agent:
-  1 model call per turn        N model calls per turn (per agent)
-  1 context window             N contexts to route
-  1 debugging surface          N agents + inter-agent messages
-  Cost baseline                2-5x coordination overhead
-  Latency baseline             adds handoff + synthesis time
-```
+If you can't name one, you're paying 2-5x overhead for nothing. That's the whole gate.
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — the shape
 
-You've refactored a monolithic React component into smaller ones before. Sometimes it clarifies (each has one job); sometimes it fragments (now you're passing 12 props between them). Multi-agent has the same trap — decomposition helps when the pieces genuinely differ, and hurts when they don't. The senior move is naming the concrete quality gain and comparing it to the 2-5x cost, not decomposing for aesthetics.
+You've resisted refactoring a working component because "it's fine as-is." Same instinct here. The premature-multi-agent instinct is the same as the premature-abstraction instinct: it feels sophisticated, adds surface area, and rarely improves outcomes on the current problem.
 
 ```
-  Pattern: the decomposability test
+  The escalation gate — four steps, in order
 
-  Does the task split into pieces that:
-    (a) need different tool sets?
-    (b) need different context/prompts?
-    (c) have measurably different failure modes?
-
-  All three → multi-agent probably wins
-  Two of three → maybe; measure
-  One or none → single-agent with better prompt shaping
+  ┌───────────────────────────────────────────────┐
+  │ 1. Build a single-agent (ReAct) baseline      │
+  │ 2. Measure: success rate, tool-call accuracy, │
+  │    latency, cost                              │
+  │ 3. Identify the SPECIFIC failure single-agent │
+  │    cannot fix                                 │
+  │ 4. Is that failure genuinely decomposable     │
+  │    into independent specialties?              │
+  │       │                                        │
+  │       ├─ no  → stay single-agent, fix the      │
+  │       │        prompt / tools / retrieval      │
+  │       └─ yes → escalate to the SPECIFIC        │
+  │                topology that addresses it      │
+  └───────────────────────────────────────────────┘
 ```
 
-### Move 2 — the walkthrough
+### Move 2 — how the gate reads against this repo's decisions
 
-**Why blooming_insights passes the gate.** The three-agent-split (Monitoring, Diagnostic, Recommendation) meets all three criteria:
+**This repo IS multi-agent, but not the way most people mean.** The four workers (Monitoring, Diagnostic, Recommendation, Query) are specialized agents — that's multi-agent by construction. But the supervisor is *code*, not an LLM. So the decisions the gate would test are:
 
-- **(a) Different tool sets.** Monitoring uses ~10 category-scan tools (EQL variants tuned for anomaly detection). Diagnostic uses the 11-tool investigation allowlist (evidence gathering). Recommendation uses a different subset (list_scenarios, list_experiments — action-shape tools). Different lists, no overlap in intent. See `node_modules/@aptkit/.../diagnostic-agent.js:8-23` for the diagnostic policy; the equivalent lists exist for monitoring and recommendation in the AptKit packages.
+1. Was decomposing "the analyst" into four agents worth the coordination cost? — **Yes.** Each specialty has a different job (find anomalies vs form hypotheses vs propose actions vs answer free-form). Prompts are different, tool selection preferences are different, output shapes are different. This is decomposable in the load-bearing sense.
 
-- **(b) Different context/prompts.** Monitoring's prompt is "scan for anomalies against these 10 categories." Diagnostic's is "given this anomaly, investigate the cause." Recommendation's is "given this diagnosis, propose Bloomreach actions." A single-agent prompt that covered all three would be huge, context-bloat prone, and would confuse the model about which mode it was in.
+2. Would adding an LLM supervisor on top be worth it? — **No.** The supervisor sequence is three well-known stages (monitor → diagnose → recommend). A Sonnet-based supervisor decision would cost ~$0.05 per hop, add ~2-3s latency, and buy nothing — the sequence is stable across every anomaly type. The correct decision is **code-routed multi-agent**: specialists at the worker layer, deterministic sequencing at the supervisor layer.
 
-- **(c) Different failure modes.** Monitoring fails on schema-gate errors (which categories can run against this workspace?). Diagnostic fails on inconclusive evidence. Recommendation fails on inappropriate feature choice (recommending a Scenario when a Segment would fit better). Different failures, different fixes.
+3. Would adding a second worker per specialty (fan-out) buy quality? — **Not yet measured.** The diagnostic path could parallelize hypothesis testing (three hypotheses in parallel, three EQLs, merge findings). That's a real escalation candidate. The current diagnostic p50 is 50s; parallel would target ~20s. Deferred until the latency budget matters.
 
-**What DOESN'T pass the gate — and would collapse back to single-agent.** Imagine splitting Diagnostic into "Hypothesizer" and "Evidence-Gatherer" agents. Both would use the same 11 tools, run against the same workspace context, and fail the same way (bad EQL syntax). The split would be aesthetic (nice separation!) and cost 2x — no measurable win. This split was considered and rejected during the AptKit migration.
+**The cost concretized.**
 
-**Coordinator/Query is a router, not a fourth worker.** `classifyIntent` picks between diagnostic-shaped and exploratory-shaped queries but doesn't have its own worker loop with tools — it hands off to `QueryAgent` after routing. Calling it a "coordinator agent" would inflate the count without earning it. See `01-reasoning-patterns/07-routing.md`.
+```
+  What "2-5x coordination overhead" actually means
 
-**The cost, made concrete.** A single-agent "do everything" prompt would probably cost ~$0.05/investigation (one model, one prompt, one loop). The three-agent split runs at ~$0.09/investigation (diagnose ~$0.045 + recommend ~$0.045). The 80% cost premium buys: clean prompts, three UI phases, isolated failure handling, per-agent evaluation. In production I traded 80% cost for a system I can actually reason about and iterate on independently per agent.
+  Single-agent (ReAct):        1 model call per turn
+                               state = one message history
+                               debugging = one loop trace
+
+  Multi-agent w/ LLM sup:      1 supervisor call + N worker calls per hop
+                               state = supervisor's view + N worker views
+                               debugging = supervisor decisions +
+                                           each worker's loop
+                               cost:  ~2-3x tokens
+                               debug: ~5x surface area
+                                      (you now debug a conversation
+                                       between agents, not one loop)
+
+  Multi-agent code-routed:     0 supervisor cost (deterministic)
+                               N worker calls per hop
+                               state = per-worker views, route ties them
+                               debugging = per-worker + route sequence
+                               cost:  ~1-1.5x vs one big ReAct agent
+                                      (specialization can save tokens
+                                       per worker)
+                               debug: ~2x surface area
+```
+
+Code-routed is the sweet spot when the sequence is stable. LLM-routed is worth it when the sequence itself needs to adapt — which is rarer than teams initially think.
+
+**The failures that ARE decomposable (rare escalations).**
+
+- **Specialists with genuinely different tools.** A code agent (reads files, runs tests) and a review agent (runs linters, checks style) — different tool sets, different prompts, different success criteria. Worth splitting.
+- **Parallel independent subtasks.** A research question with three independent sub-sources — worth fan-out.
+- **Producer-critic asymmetry.** Output quality is uneven and a critic from a different model family catches errors — worth debate/verifier.
+
+**The failures that are NOT decomposable.**
+
+- **"The agent gets confused."** Fix the prompt or the tools; don't add another agent.
+- **"The agent forgets."** Fix context engineering (SECTION D); don't add memory-manager-agents.
+- **"The agent picks the wrong tool."** Reduce tool count, sharpen tool descriptions, add a pre-router; don't add a tool-picker-agent above it.
 
 ### Move 3 — the principle
 
-Multi-agent adds 2-5x coordination cost. That cost has to buy something concrete: different tools, different prompts, different failure modes, or all three. If it buys nothing but "cleaner architecture," you're building the wrong thing. The senior-grade answer to "why multi-agent" is not "we needed more agents" — it's "here's the specific decomposition the problem forced, and here's the measured quality lift over single-agent."
+Multi-agent is not "more sophisticated single-agent." It's a different architecture with real coordination cost. The senior-grade posture is to reach for it only when a specific single-agent failure names itself and the failure genuinely splits into specialties. Naming when you *didn't* escalate is a stronger signal than always escalating.
 
 ## Primary diagram
 
 ```
-  Recap — the escalation gate applied to this repo
+  The escalation gate — decision tree
 
-  Task: "notice, diagnose, recommend"
-    │
-    ▼
-  Would single-agent work?
-    │
-    ▼
-  Single-agent baseline attempted (legacy files: base-legacy.ts, etc.)
-    │
-    ▼
-  Failure identified: prompt bloat + context confusion
-  when one prompt covered notice+diagnose+recommend
-    │
-    ▼
-  Decomposable? YES:
-    - monitor: 10 category tools, "scan" prompt
-    - diagnose: 11 evidence tools, "investigate" prompt
-    - recommend: action-shape tools, "propose" prompt
-  Different tools, different prompts, different failures.
-    │
-    ▼
-  → Escalate to 3-agent supervisor-worker (chain-shape)
-  → Cost: +80% per investigation (~$0.09 vs ~$0.05 baseline)
-  → Buys: cleaner iteration, three UI phases, per-agent evals
+  ┌──────────────────────────────────────────────────────┐
+  │                                                       │
+  │  Have you shipped ReAct baseline?    ── no ──► ship it│
+  │             │ yes                                     │
+  │             ▼                                         │
+  │  Have you measured its ceiling?      ── no ──► measure│
+  │             │ yes                                     │
+  │             ▼                                         │
+  │  Can you name the specific failure? ── no ──► not     │
+  │             │ yes                              ready  │
+  │             ▼                                         │
+  │  Is it genuinely decomposable       ── no ──► fix     │
+  │  into specialties?                             prompt/│
+  │             │ yes                              tools/ │
+  │             ▼                                  retriev│
+  │  Pick the SPECIFIC topology that                      │
+  │  addresses that failure:                              │
+  │    → supervisor-worker (specialties)                  │
+  │    → pipeline (sequential stages)                     │
+  │    → fan-out (independent parallel)                   │
+  │    → debate (quality gate)                            │
+  │    → graph (needs human-in-loop / branching)          │
+  └──────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-Anthropic's "Building Effective Agents" (2024) is the source for the "don't reach for multi-agent before single-agent hits its ceiling" rule. The specific failure the paper warns about: teams that adopt multi-agent for aesthetic reasons ("microservices for agents!") and end up debugging inter-agent conversations for weeks. The paper's recommended posture is exactly what this repo does — deterministic supervisor + task-specialist workers.
+The "single-agent-first" rule crystallized around 2024 as teams reported the same pattern: they'd built impressive multi-agent demos, deployed them, and watched cost balloon and reliability drop compared to a well-tuned single agent. Anthropic's "Building Effective Agents" essay (Dec 2024), the OpenAI Cookbook's agent guide, and CrewAI's own documentation now all lead with the same escalation rule.
 
-The historical shape here: legacy `lib/agents/base-legacy.ts` was a hand-written single-agent loop that tried to cover everything. Splitting it during the AptKit migration wasn't aesthetic — it was because the single prompt had grown to 400+ lines and the model was frequently confused about which phase it was in. The split fixed the confusion by narrowing each agent's job.
+The counter-example — when multi-agent *is* the right start — is systems where the sub-tasks are so different that combining them into one agent means combining incompatible tool sets or contradictory prompt goals. A codebase-editing agent + a customer-support agent are that different. Diagnostic + recommendation for the same workspace are not — they share tools, share the workspace context, and only differ in the output they produce. Splitting them is warranted (different final structured outputs) but doesn't need an LLM supervisor above them; a code sequence is enough.
 
 ## Interview defense
 
-**Q: Why is this a multi-agent system instead of a single-agent one?**
-A: Three concrete reasons: different tool sets per phase (Monitoring's category-scan tools, Diagnostic's evidence-gathering allowlist, Recommendation's action-shape tools), different prompts (scan vs investigate vs propose), and different failure modes (schema-gate errors vs inconclusive evidence vs inappropriate feature). All three criteria — tools, prompts, failures — are genuinely distinct. Single-agent with one 400-line prompt was the previous shape and the model got confused about which mode it was in. The 3-agent split costs 80% more per investigation and buys cleaner iteration + per-agent evals.
+**Q: Why isn't your supervisor an LLM?**
 
-Diagram: the three-criteria decomposability test.
-Anchor: `node_modules/@aptkit/.../diagnostic-agent.js:8-23` (the tool policy split) + `lib/agents/base-legacy.ts` for the earlier monolithic shape.
+Because the supervisor sequence is stable. Three stages — monitor, diagnose, recommend — with well-known transitions between them (feed → investigate step 2 → step 3). A Sonnet-based supervisor would cost ~$0.05 per hop, add ~2-3s latency, and buy nothing on this decomposition. Code-routed with LLM specialists at the worker layer is the sweet spot.
 
-**Q: When would you collapse back to single-agent?**
-A: If the phases stopped being distinct — same tools, same context, same failures. In practice that never happens once you've split; more common is *further* splitting when a phase itself grows too big. The trigger is measured, not aesthetic: I'd collapse if I could ship the same behavior with one prompt and no measurable regression in eval. If not, the split is earned.
+Where I'd add an LLM supervisor: if the sequence itself started needing to adapt — e.g., some anomalies need diagnose → re-monitor → diagnose loops before recommendation. Right now the sequence is stable, so LLM routing is premature.
 
-Diagram: the reverse gate — "phases collapsing back to one".
-Anchor: general reasoning; refers to the eval infra in `04-agent-infrastructure/04-agent-evaluation.md`.
+*Anchor visual:* the escalation gate diagram above.
+
+**Q: What single-agent failure would push you to multi-agent-with-LLM-supervisor?**
+
+Sequence unpredictability. If the "what to do next" itself depended on the LLM's read of the situation — not just "what tool" but "which whole stage" — then an LLM supervisor earns its cost. For this product, the three stages are what the user chose to see (the ProcessStepper is UI-visible), so the sequence can't change dynamically anyway. The design constrains the shape.
+
+**Q: How do you know when a failure is "decomposable"?**
+
+Different tool sets, different success criteria, or different output shapes. If two hypothetical agents would share the same tools and prompts and just have slightly different framings, they're not decomposable — you have one agent with an inconsistent prompt. If they have genuinely different jobs (analyze data vs propose Bloomreach features), they're decomposable.
 
 ## See also
 
-- `02-supervisor-worker.md` — the topology this repo uses once it passes the gate.
-- `03-sequential-pipeline.md` — the diagnose→recommend chain shape.
-- `09-coordination-failure-modes.md` — the 2-5x cost, made concrete with specific failures.
-- `06-orchestration-system-design-templates/` — the three templates as buildable targets.
+- **`02-supervisor-worker.md`** — the topology this repo picked once the gate cleared.
+- **`03-sequential-pipeline.md`** — the sub-shape between diagnostic and recommendation.
+- **`09-coordination-failure-modes.md`** — the specific failures that make up the 2-5x cost.
+- **`01-reasoning-patterns/03-react.md`** — the baseline you build before this gate applies.

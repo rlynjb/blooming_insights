@@ -1,330 +1,466 @@
-# Replication and read consistency
+# 08 · Replication and read consistency
 
-*Replication / Language-agnostic*
+*Replicas, lag, failover, stale reads · Case B (the frozen replica)*
 
-## Zoom out, then zoom in
+## Zoom out — where this concept lives
 
-You know how a Postgres primary streams its WAL to one or more replicas, apps can send read-only queries to a follower for scale, and you have to think about *lag* — the follower might return "yesterday's" data — that's replication. This repo has no streaming replication, no primary/follower topology, no read-your-writes protocol. What it has is one *pre-captured JSON snapshot* that serves reads on the demo path, and a bank of *committed eval receipts* that serve as historical rows. Both are frozen replicas. This file names the pattern each plays, and the freshness bounds each accepts.
-
-```
-  Zoom out — where "read replicas" live in this repo
-
-  ┌─ UI (browser) ────────────────────────────────────────────┐
-  │  the feed page: reads live OR replays committed snapshot   │
-  │    ?demo=cached  →  reads /lib/state/demo-insights.json    │
-  │    (default live) →  reads the agent output stream          │
-  │  toggle persisted in localStorage `bi:mode`                │
-  └────────────────────────┬──────────────────────────────────┘
-                           │
-  ┌─ Service (Vercel) ─────▼──────────────────────────────────┐
-  │                                                            │
-  │  briefing route: two branches                              │
-  │    demo branch  →  readFileSync(DEMO_FILE) → NDJSON replay │  ← this file's scope
-  │    live branch  →  runs the monitoring agent               │
-  │                                                            │
-  │  agent route: two branches                                 │
-  │    cache hit    →  getCachedInvestigation → replay         │
-  │    cache miss   →  live agent run                          │
-  │                                                            │
-  └────────────────────────┬──────────────────────────────────┘
-                           │
-  ┌─ Bloomreach ▼─────────────────────────────────────────────┐
-  │  the primary. always live. every read is a network call.  │
-  └────────────────────────────────────────────────────────────┘
-
-  ┌─ git (frozen replicas) ────────────────────────────────────┐
-  │  lib/state/demo-insights.json           the feed replica    │
-  │  lib/state/demo-investigations.json     the drill-down replica│
-  │  eval/baseline.json                     the reference "row"  │
-  │  eval/receipts/*.json                   historical eval rows │
-  └────────────────────────────────────────────────────────────┘
-```
-
-**Zoom in.** The demo snapshot is a real replica pattern — pre-computed, deliberately stale, faster to read, no auth. The refresh policy is *manual*, not streaming. That's the trade you make when your presentation reliability matters more than freshness.
-
-## Structure pass
-
-**Axis to hold constant: how stale is this read allowed to be?**
+Replication is what happens when you have more than one copy of your
+data — a primary and one or more replicas. The classical questions
+are: what does the replica see, how stale is it, what happens on
+primary failure. This repo has NO live replication (only one Vercel
+deployment, one Bloomreach account, one everything). It DOES have a
+frozen replica — `lib/state/demo-insights.json` — that plays exactly
+the role a stale read replica plays.
 
 ```
-  "how fresh must this read be?" — traced across the read paths
+Zoom out — where replication would sit
 
-  ┌─ live briefing (?demo=live) ───────────────────────────────┐
-  │  agent runs, hits Bloomreach at query time                  │  → fresh (as of the
-  │  app/api/briefing/route.ts:151+                             │    execute_analytics_eql call)
-  └────────────────────────────────────────────────────────────┘
-      ┌─ live briefing + 60s cache ─────────────────────────────────┐
-      │  same tool + args within 60s → cached result                 │  → up to 60s stale
-      │  bloomreach-data-source.ts:144-152                           │
-      └─────────────────────────────────────────────────────────────┘
-          ┌─ demo replay (?demo=cached) ────────────────────────────────┐
-          │  readFileSync(lib/state/demo-insights.json)                   │  → stale until
-          │  app/api/briefing/route.ts:78-149                             │    someone re-captures
-          └──────────────────────────────────────────────────────────────┘
-              ┌─ cached investigation replay ───────────────────────────────┐
-              │  getCachedInvestigation → mem, then dev file, then demo file │  → stale by design
-              │  lib/state/investigations.ts:22-28                            │    (idempotent replay)
-              └──────────────────────────────────────────────────────────────┘
-                  ┌─ eval baseline read ────────────────────────────────────────┐
-                  │  readFileSync(eval/baseline.json)                             │  → stale by intent
-                  │  eval/gate.eval.ts:53-58                                      │    (frozen reference)
-                  └──────────────────────────────────────────────────────────────┘
+┌─ primary write ──────────────────────────────────────┐
+│  briefing agent → putInsights → SessionFeed         │
+└────────────────────────┬─────────────────────────────┘
+                         │
+┌─ ★ THIS CONCEPT ★ ────▼─────────────────────────────┐
+│  the replication story                               │
+│    · primary: SessionFeed in memory                  │
+│    · replica: demo-insights.json in git              │
+│    · replication event: /api/mcp/capture-demo        │
+│    · lag: time since last capture (manual)          │
+│    · failover: `?demo=cached` URL flag              │
+└────────────────────────┬─────────────────────────────┘
+                         │
+┌─ reads ────────────────▼─────────────────────────────┐
+│  live: through the agent loop                        │
+│  demo: static file read of the frozen replica        │
+└──────────────────────────────────────────────────────┘
 ```
 
-The seam that flips the axis is **the "how does this replica get updated" question**. The 60s cache updates on its own (TTL expiry + next real call). The demo snapshot updates only when a dev runs the capture flow. The baseline updates only when a PR changes it. As you go down the list, the write frequency drops from "seconds" to "months."
+## Zoom in — the pattern
+
+**The pattern:** *manually-refreshed frozen read replica.* A committed
+JSON snapshot serves the "read-only demo" traffic; the primary
+(live agent + MCP) serves the interactive traffic. The refresh is
+manual — a dev clicks a button to capture the current session's
+feed into the file, then commits it. Lag is measured in "days since
+last capture," not seconds.
+
+## Structure pass — one axis across primary and replica
+
+**Axis: "what does each source promise about freshness?"** (staleness)
+
+```
+Trace freshness across the read sources
+
+  Source                          Freshness                     Consistency
+  ──────                          ─────────                     ───────────
+  live SessionFeed                as-of latest putInsights       within a session,
+                                  in this warm instance          strong
+  ──────                          ─────────                     ───────────
+  60s response cache              up to 60s stale                bounded staleness
+                                  (per cacheKey)                 within a process
+  ──────                          ─────────                     ───────────
+  bi_auth cookie                  as-of the last commit         strongly consistent
+                                  (per request)                  per user
+  ──────                          ─────────                     ───────────
+  demo-insights.json              as-of last capture             strongly consistent
+                                  (typically weeks)              — but very stale
+  ──────                          ─────────                     ───────────
+  eval/baseline.json              as-of last baseline build      strongly consistent
+                                  (per CI cadence)               within CI
+```
+
+The seams that matter:
+
+  → **Live-vs-demo seam** — the `mode` selector in the client
+    (`bi:mode`) picks which source serves the reads. Same page,
+    different data source.
+
+  → **Same-instance vs cross-instance seam** — within one warm
+    Vercel instance, the SessionFeed is strongly consistent.
+    Across instances, it's inconsistent (each has its own Map). The
+    browser (sessionStorage + cookie) carries state across this seam.
+
+  → **Capture-time vs commit-time seam** — the demo replica is
+    written by `writeFileSync` (immediately durable in the working
+    tree), then committed to git separately. There's a window where
+    the file is on disk but not yet in git; a redeploy in that
+    window loses the capture.
+
+The **most load-bearing property** is that the demo replica has **no
+lag metric**. Nobody in the codebase checks how old the file is; the
+demo mode happily replays whatever is committed, regardless of
+whether the workspace has drifted since capture.
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — the pattern
 
-Standard replication kernel:
-
-```
-  standard primary → follower replication
-
-  primary                            follower
-  ───────                            ────────
-  write X                            (lags)
-    │
-    ▼
-  append to WAL
-    │
-    ▼
-  ship WAL entry over the wire ──►  apply WAL entry
-    │                                 │
-    ▼                                 ▼
-  return commit                     "now up to LSN N"
-
-  reader on follower may see version N-k (lag = k)
-```
-
-This repo's shape (Case B: no engine, but the pattern is there):
+You've built with a CDN. The primary is your origin server; the CDN
+is a stale-tolerant replica that serves cached responses. The origin
+is authoritative; the CDN is fast and slightly behind. That's the
+shape here — except the "CDN" is a JSON file in git, and the "cache
+TTL" is however often a dev runs the capture button.
 
 ```
-  this-repo pattern — snapshot as replica, manual "replication"
+Frozen-replica pattern — kernel
 
-  live path (source of truth)      snapshot (frozen replica)
-  ────────────────────────         ──────────────────────────
-  agent hits Bloomreach            lib/state/demo-*.json
-    │                                  │
-    ▼                                  ▼
-  produces Insights + trace        served by /api/briefing?demo=cached
-    │                                  │
-    ▼                                  ▼
-  dev clicks "capture snapshot"    replay at PACE_MS = pretty pace
-    │
-    ▼
-  writes lib/state/demo-*.json
-    │
-    ▼
-  dev commits the file             ← this IS the replication step
+  primary (live agent)                    frozen replica (demo-insights.json)
+  ────────────────────                    ────────────────────────────────────
+  writes                                   NEVER writes
+  reads (agent needs latest)               reads (demo page needs
+                                             SOMETHING to display)
+
+     ── capture-demo route ──────────────►
+        (dev-only, one-shot, manual)
+
+  the interesting properties:
+    · the replica is a static file (no daemon replicates for you)
+    · the "sync" is a manual button click
+    · the replica can drift arbitrarily far behind
+    · reads from the replica never fall back to the primary
 ```
 
-The load-bearing insight: **the "replication lag" is however long since the last capture-and-commit**. That's minutes when a dev is actively iterating, hours between commits, indefinitely on a stable snapshot that isn't due for refresh. Same phenomenon as a lagging Postgres follower, just at a coarser cadence.
+Kernel of frozen-replica reads — three parts:
 
-### Move 2 — the primitives walked
+  1. **The replica artifact.** A file or blob that captures a
+     point-in-time snapshot. Missing → nothing to serve.
+  2. **The read-routing decision.** Some flag says "use the replica,
+     not the primary." Missing → readers always hit the (slow /
+     unavailable) primary.
+  3. **The refresh mechanism.** Some way to update the replica when
+     it's too stale. **Missing → the replica ages until it's wrong;
+     nothing warns you.** This is the exact hazard this repo has.
 
-**The demo snapshot as read replica.**
+### Move 2 — walk the three moving parts
 
-```ts
-// app/api/briefing/route.ts:78-96 (abridged)
-const demo = req.nextUrl.searchParams.get('demo') === 'cached';
+Three parts to walk: the capture (write to the replica), the routing
+(mode selector), and the read (demo mode's static serve).
 
-if (demo) {
-  let snapshot: DemoSnapshot | null = null;
-  try {
-    snapshot = JSON.parse(readFileSync(DEMO_FILE, 'utf8')) as DemoSnapshot;
-  } catch {
-    snapshot = null;
-  }
-  if (snapshot) {
-    const snap = snapshot;
-    // NDJSON replay from the snapshot, paced at PACE_MS
-    ...
-```
+#### Part 1 — the capture (writing to the frozen replica)
 
-Server-side: read the whole JSON file, stream it back as NDJSON at a "readable" pace so the demo doesn't just flash the answer. `DEMO_FILE` points at `lib/state/demo-insights.json` (`briefing/route.ts` header constants). This is the same read pattern a Postgres follower serves — no primary hit, pre-computed, deliberately stale.
+The `/api/mcp/capture-demo` route is the "replication event" for this
+system. It reads the current in-memory feed and writes it to a
+committed JSON file:
 
-The client toggles between live and demo via `localStorage` `bi:mode` (see `app/page.tsx`). Default is `demo`, which is a design choice: presentation reliability > freshness, because the alpha Bloomreach server revokes tokens after minutes and rate-limits hard.
+```typescript
+// app/api/mcp/capture-demo/route.ts:34-58 (abbreviated)
+// Writes lib/state/demo-insights.json + demo-investigations.json.
+// Dev-only route. Manual trigger via the "capture demo" button on the feed page.
 
-**The investigation cache = a layered replica chain.**
+writeFileSync(
+  join(process.cwd(), 'lib/state/demo-insights.json'),
+  JSON.stringify(payload, null, 2),
+);
 
-```ts
-// lib/state/investigations.ts:22-28
-export function getCachedInvestigation(insightId: string): AgentEvent[] | null {
-  if (mem.has(insightId)) return mem.get(insightId)!;                 // (1) warm-instance mem
-  const fromFile = PERSIST ? readJson(CACHE_FILE)[insightId] : undefined; // (2) dev file
-  if (fromFile) return fromFile;
-  const fromDemo = readJson(DEMO_FILE)[insightId];                    // (3) committed demo
-  return fromDemo ?? null;
+// Investigations only get written when the cache exists
+if (haveInvestigationCache) {
+  writeFileSync(
+    join(process.cwd(), 'lib/state/demo-investigations.json'),
+    JSON.stringify(invPayload, null, 2),
+  );
 }
 ```
 
-Three tiers of freshness, checked in order:
-1. **In-memory (this warm instance)** — the freshest replica. Populated by any live agent run that finished on this instance.
-2. **`.investigation-cache.json` (dev only)** — the file that survives dev-server restarts. Same freshness as the last dev run.
-3. **`demo-investigations.json` (committed)** — the coldest tier. Only refreshed when a dev commits.
-
-Read-through: the first hit wins. Miss → live agent run (see `app/api/agent/route.ts:107-130`). This is a *cache hierarchy* with clearly different lag characteristics per tier, and the code walks them in the order that maximizes freshness.
-
-**The 60s TTL cache = a within-warm-instance replica.**
-
-```ts
-// lib/data-source/bloomreach-data-source.ts:144-187
-if (!options.skipCache) {
-  const cached = this.cache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) {
-    return { result: cached.result as T, durationMs: 0, fromCache: true };
-  }
-}
-...
-this.cache.set(cacheKey, { result, expiresAt: now + ttl });
-```
-
-In DB terms this is a *result cache* — every `(tool, args)` gets its own replica of the last-seen result, expiring in 60 seconds. Consistency is *bounded staleness*: no reader sees data older than 60s. When a stale entry is read (impossible today because of TTL, but conceptually), the cost is one round-trip's latency to refresh.
-
-The refresh policy is *lazy expiration*: the entry sits there past 60s until someone reads it and forces a re-fetch. Errors are excluded (`bloomreach-data-source.ts:179-181`) so a transient rate-limit never gets replicated for 60 seconds — that would be a *poisoned replica*.
-
-**`eval/baseline.json` = the pinned reference replica.**
-
-```ts
-// eval/gate.eval.ts:53-58
-const baselinePath = resolve(EVAL_DIR, baselineFile);
-let baseline: Baseline;
-try {
-  baseline = JSON.parse(readFileSync(baselinePath, 'utf8')) as Baseline;
-} catch {
-  throw new Error(`Missing baseline at ${baselinePath}. ...`);
-}
-```
-
-The baseline is a *frozen reference* — the row every candidate run gets compared to. In DB terms it's a materialized view over an older set of receipts, pinned indefinitely until someone rebuilds it (`npm run eval:baseline` at `eval/baseline.eval.ts:41-65`). Refresh policy: manual, code-reviewed, git-committed. Lag: whatever the age of `builtAt` in the file (`2026-07-03T05:29:44.727Z` at time of writing).
-
-The receipts themselves (`eval/receipts/*.json`, 28 rows) are the *append-only log* the baseline is materialized from. When you run `npm run eval:baseline`, it's essentially:
+Read this as a **replication event.** The primary (in-memory
+SessionFeed) is captured; the replica (JSON file) is updated
+atomically via `writeFileSync`; the caller commits the file to git.
+Once committed, the replica is durable across redeploys.
 
 ```
-  SELECT
-    computeBaseline(receipts)
-  FROM
-    receipts
-  WHERE
-    runId = :latestOrSpecified
+Sequence — one manual replication event
+
+  dev clicks "capture demo"
+      │
+      ▼
+  fetch('/api/mcp/capture-demo', { method: 'POST' })
+      │
+      ▼
+  route reads session's SessionFeed
+      │
+      ▼
+  writeFileSync(demo-insights.json, JSON.stringify(feed))
+      │
+      ▼
+  return {ok: true, files: […]}
+      │
+      ▼
+  dev: git add + git commit + git push
+      │
+      ▼
+  next deploy: replica is in the bundled repo
 ```
 
-...and the result is written to `eval/baseline.json`. That's a snapshot of a snapshot. `eval/baseline.eval.ts:42-65` is the "job" that materializes it.
+**Boundary condition — the write-but-not-commit window.** Between
+`writeFileSync` and `git commit`, the file is only in the dev's
+working tree. A crash / cleanup / branch-switch loses the capture.
+There is no atomicity between the fs write and the git commit; a
+committed replica is only durable AFTER `git push`.
 
-### Move 2 variant — the load-bearing skeleton
+**In DB terms:** this is **manual, non-atomic replication with no
+lag tracking.** In production DBs, replication lag is measured in
+milliseconds and monitored; here it's measured in "weeks since
+someone hit the button" and monitored by nobody.
 
-Minimum viable "replica" story:
+#### Part 2 — the routing decision (`bi:mode` picks the source)
 
-1. **The `lib/state/demo-*.json` files.** Remove them and the default `?demo=cached` path fails — the app loses its no-auth demo mode and every visitor has to run the full OAuth handshake to see anything.
-2. **The read-through cascade in `getCachedInvestigation`.** Remove tiers and either warm-instance freshness (tier 1) or committed replay (tier 3) becomes lost — the "step 3 hydrates instantly on back-nav" UX depends on tier 1; the demo path depends on tier 3.
-3. **`eval/baseline.json` as a pinned reference.** Remove it and the regression gate has nothing to compare against; every PR is either "no gate" or "compute a fresh baseline" (which regresses to noise).
+The client's mode selector routes reads to either the primary or the
+replica:
 
-Rest is nice-to-have.
+```typescript
+// app/page.tsx:79-96 (mode resolution on mount)
+const saved = localStorage.getItem('bi:mode');
+if (saved === 'demo') setMode('demo');
+else if (saved === 'live-mcp') setMode('live-mcp');
+else if (saved === 'live-synthetic') setMode('live-synthetic');
+```
+
+```
+Comparison — three modes, three data sources
+
+  demo                           live-mcp                       live-synthetic
+  ────                           ────────                       ──────────────
+  reads: static JSON file        reads: MCP tool calls          reads: SyntheticDataSource
+                                        (Bloomreach or            (in-process
+                                         env-configured server)    deterministic)
+  writes: NONE                   writes: putInsights            writes: putInsights
+  freshness: last capture        freshness: real-time           freshness: real-time
+                                                                  (deterministic)
+  role: reliability path         role: production               role: fresh-visitor UX
+        + regression evidence
+```
+
+The `demo` mode is the interesting one for this concept. Look at the
+comment in `app/page.tsx:60-62`:
+
+```typescript
+// demo replays the cached snapshot — still reachable via
+// ?demo=cached URL param or by manually setting `bi:mode=demo` in
+// localStorage (kept as a reliability path / dev tool / regression evidence),
+// but no longer in the mode toggle.
+```
+
+**"Reliability path"** is exactly the language a DB engineer uses for
+a read replica used during a primary outage. If the live MCP server
+is down or the OAuth flow fails, hitting `?demo=cached` gives you a
+guaranteed-working page. The reads are stale, but they render.
+
+#### Part 3 — the read (demo mode's static serve)
+
+Reads in demo mode bypass the agent loop entirely:
+
+```typescript
+// app/api/briefing/route.ts:22 (referenced pattern)
+const DEMO_FILE = join(process.cwd(), 'lib/state/demo-insights.json');
+// ... route reads DEMO_FILE and streams the pre-captured insights
+```
+
+```
+Layers-and-hops — a demo-mode read
+
+┌─ UI · page.tsx ─────────────────────┐
+│  mode = 'demo'                       │
+│  useBriefingStream('demo', ready)    │
+└────────────────┬────────────────────┘
+                 │ hop 1: GET /api/briefing?mode=demo
+                 ▼
+┌─ Route handler · briefing ──────────┐
+│  reads lib/state/demo-insights.json  │
+│  parses → replays as NDJSON events   │
+│  NEVER touches the agent loop        │
+└────────────────┬────────────────────┘
+                 │ hop 2: NDJSON stream
+                 ▼
+┌─ Client · useBriefingStream ────────┐
+│  receives {type:'insight', …}       │
+│  renders identically to live mode    │
+└─────────────────────────────────────┘
+```
+
+**In DB terms:** the demo route is a **direct read from the frozen
+replica**. It never falls back to the primary. If the file is stale,
+the render is stale. If the file is missing, the demo fails (there's
+no "read primary as fallback" behavior).
+
+**Boundary condition — the schema mismatch.** If the Insight type
+shape drifts (a new required field is added, an existing field is
+renamed), old demo captures become undecodable. There's no
+migration layer between the captured JSON and the current TypeScript
+type. In a real DB this would be schema versioning; here it's
+"someone remembers to re-capture."
+
+### Move 2.5 — the read-consistency levels, mapped
+
+DB systems name their read-consistency levels precisely. Map this
+repo's read paths onto that vocabulary:
+
+```
+Read consistency levels — where each source falls
+
+  Level                    Example DB                Repo analog
+  ─────                    ──────────                ───────────
+  Strong (per-key)         Postgres single-row       withAuthCookies
+                                                       (per-request cookie)
+  ─────                    ──────────                ───────────
+  Snapshot                 Postgres READ COMMITTED   SessionFeed within one
+                                                       warm instance
+  ─────                    ──────────                ───────────
+  Bounded staleness        Redis w/ TTL              60s response cache
+                             (60s TTL)                 in BloomreachDataSource
+  ─────                    ──────────                ───────────
+  Eventual                 Postgres async replica    demo-insights.json
+                                                       (with unbounded lag)
+  ─────                    ──────────                ───────────
+  Prehistoric              A tape backup             demo-insights.json
+                             from 2019                 if never re-captured
+```
+
+The demo replica sits between "eventual" and "prehistoric" depending
+on how long since the last capture. Without a lag metric, you can't
+tell which one you're in.
 
 ### Move 3 — the principle
 
-**Pick your replica's refresh cadence to match the read's freshness requirement, and be honest about the lag.** Real streaming replication chases zero lag; here we accept "hours" (the demo snapshot), "60 seconds" (the TTL cache), or "indefinite" (the baseline). Each choice is defensible when the *read* doesn't need better. The presentation demo doesn't need real numbers; the eval gate doesn't need this week's baseline. When the read pattern's freshness requirement tightens (real customer analytics dashboard, cross-session query surface), the manual-refresh model breaks and you need streaming replication for real.
+**A replica's usefulness is bounded by its lag.** A 100 ms replica
+is a read scaling tool; a 100 second replica is a reliability tool;
+a 100 day replica is a demo artifact. The lag determines the use
+case. In this repo the demo replica is used for the last two — a
+reliability path when the primary is down, and a stable artifact
+for regression evidence — and both use cases tolerate high lag.
 
-## Primary diagram
+The moment you'd need a low-lag replica here is if the demo mode
+ever had to reflect the CURRENT workspace's data — e.g., "show the
+last 24 hours of anomalies." Then you'd need automated capture on a
+schedule, lag tracking, and possibly fallback-to-primary reads. None
+of that exists today, which is a deliberate scoping decision.
+
+## Primary diagram — the primary + replica map
 
 ```
-  Every replica and its refresh policy
+Replication story in blooming_insights — primary, replica, and routing
 
-  ┌─ tier 1: in-memory result cache (per warm instance) ────────┐
-  │                                                              │
-  │  BloomreachDataSource.cache: Map<key, {result, expiresAt}>   │
-  │    refresh: lazy on TTL expiry (60s)                         │
-  │    lag: 0–60s                                                │
-  │    lib/data-source/bloomreach-data-source.ts:122, 144-187    │
-  │                                                              │
-  └──────────────────────────────────────────────────────────────┘
+  ┌── PRIMARY (live path) ───────────────────────────────────────┐
+  │                                                                │
+  │   agent loop → putInsights →                                   │
+  │      SessionFeed  (in-memory, per-warm-instance)               │
+  │                                                                 │
+  │   reads: getInsight / listInsights                              │
+  │   consistency: strong within a warm instance                   │
+  │   durability: 0 (dies with process)                            │
+  │                                                                 │
+  └────────────────────┬───────────────────────────────────────────┘
+                       │
+                       │ manual capture:
+                       │  /api/mcp/capture-demo
+                       │  (dev-only, POST)
+                       ▼
+  ┌── REPLICA (frozen, committed) ───────────────────────────────┐
+  │                                                                │
+  │   lib/state/demo-insights.json                                 │
+  │   lib/state/demo-investigations.json                           │
+  │                                                                 │
+  │   writes: manual only, via capture-demo                        │
+  │   reads:  GET /api/briefing?mode=demo                          │
+  │   consistency: strong (immutable file)                         │
+  │   durability: forever (once committed)                         │
+  │   lag: unbounded (last capture ← now)                          │
+  │                                                                 │
+  └────────────────────────────────────────────────────────────────┘
 
-  ┌─ tier 2: in-memory investigation cache (per warm instance) ┐
-  │                                                              │
-  │  investigations.ts mem: Map<insightId, AgentEvent[]>          │
-  │    refresh: written by live agent runs                       │
-  │    lag: 0 (this instance's own writes)                       │
-  │    lib/state/investigations.ts:11, 22-41                     │
-  │                                                              │
-  └──────────────────────────────────────────────────────────────┘
+  ┌── READ ROUTING ──────────────────────────────────────────────┐
+  │                                                                │
+  │   localStorage bi:mode                                          │
+  │                                                                 │
+  │   'live-synthetic' → SyntheticDataSource (in-process)          │
+  │   'live-mcp'       → live agent loop (primary)                 │
+  │   'demo'           → demo-insights.json (frozen replica)       │
+  │                                                                 │
+  │   route: /api/briefing?mode=... reads the flag once at start   │
+  │   never falls back between modes                                │
+  └────────────────────────────────────────────────────────────────┘
 
-  ┌─ tier 3: dev-only file cache ──────────────────────────────┐
-  │                                                              │
-  │  .investigation-cache.json (gitignored)                      │
-  │    refresh: dev routes write on cache miss                   │
-  │    lag: dev-machine freshness                                │
-  │    lib/state/investigations.ts:30-41                         │
-  │                                                              │
-  └──────────────────────────────────────────────────────────────┘
-
-  ┌─ tier 4: committed demo snapshot (production replica) ─────┐
-  │                                                              │
-  │  lib/state/demo-insights.json                                │
-  │  lib/state/demo-investigations.json                          │
-  │    refresh: manual, dev clicks "capture" then commits        │
-  │    lag: since last commit                                    │
-  │    served by /api/briefing?demo=cached                       │
-  │    app/api/briefing/route.ts:78-149                          │
-  │                                                              │
-  └──────────────────────────────────────────────────────────────┘
-
-  ┌─ tier 5: committed eval reference ─────────────────────────┐
-  │                                                              │
-  │  eval/baseline.json — the pinned regression reference        │
-  │    refresh: `npm run eval:baseline` writes it; commit it     │
-  │    lag: since last rebuild                                   │
-  │    eval/baseline.eval.ts:42-65                               │
-  │    eval/gate.eval.ts:53-91                                   │
-  │                                                              │
-  │  eval/receipts/*.json — the append-only "log" it's built from│
-  │    28 rows, one per (case × runId)                           │
-  │                                                              │
-  └──────────────────────────────────────────────────────────────┘
+  ┌── FAILURE MODES ─────────────────────────────────────────────┐
+  │                                                                │
+  │   primary down (MCP unreachable)                               │
+  │     → live-mcp: error banner, reconnect policy fires          │
+  │     → user manually switches to ?demo=cached (reliability     │
+  │       path)                                                   │
+  │                                                                 │
+  │   replica stale (drift)                                        │
+  │     → NOTHING FLAGS IT — the demo renders happily              │
+  │     → this is the top-3 red flag in this study                │
+  │                                                                 │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The interesting thing about the demo snapshot pattern is that it inverts the usual "eventual consistency" tradeoff. In a normal replica, the primary is the truth and the replica lags. Here the *replica is deliberately more stable than the primary* — the primary (Bloomreach alpha) is unreliable (rate-limited, token-revoking), so the replica (`lib/state/demo-*.json`) is what you show to a viewer who has to see the app work *right now*. The primary is only reached for updates. That's a pattern you see in local-first apps and in developer-preview demos, but rarely in the replication literature — the replica isn't a scale device, it's a *reliability device*.
+**Where does the "frozen replica for demo" pattern come from?** From
+every developer who ever shipped a "static demo" of a live product.
+Notion has a demo workspace; Linear has a demo issue tracker; Figma
+has a demo file. The pattern is "capture the primary at a
+representative moment, commit it, and route demo traffic there." The
+tradeoff is always the same: freshness for reliability.
 
-The eval baseline is a different flavor: an *analytical replica* in the classic sense. Receipts are the row-level log; the baseline is the aggregated view; the gate is the query against the view. If receipts count grew (100 cases × 100 runs = 10,000 rows), you might introduce a per-runId subdirectory (a filesystem "index" — see `03-btree-hash-and-secondary-indexes.md`'s "not yet exercised" list). Today it's fine.
+**Why this repo went with a JSON file instead of a proper replica.**
+Because the demo mode's job is regression evidence, not real-time
+mirroring. The captured JSON is checked into git, gets diffed on
+every PR, and provides a stable reference for "does the app still
+render insights correctly." A live replica would give you neither of
+those properties.
 
-`study-system-design` owns "why did you pick this architecture"; here we own the mechanics of "how does the replica stay coherent enough to be useful." The demo snapshot's "just recapture and commit" refresh loop is the honest answer.
-
-### `not yet exercised`
-
-- **Streaming replication / logical decoding (Postgres, Debezium).** No engine, no log to ship.
-- **Leader / follower topology.** N/A — the "primary" is Bloomreach (managed).
-- **Failover / promotion / split-brain resolution.** N/A.
-- **Quorum reads / writes (Dynamo-style N/R/W).** No cluster.
-- **Read-your-writes consistency guarantees.** The client-side `sessionStorage` stash is a per-user RYW hack (client holds its own writes), not a server-side guarantee.
-- **Monotonic reads / bounded staleness protocols.** No versioning to compare against.
-- **Multi-region replication, geo-replication lag budgets.** No multi-region setup.
+**When would you upgrade to real replication?** If you wanted the
+demo mode to reflect "this week's anomalies" rather than "the
+anomalies as of the last capture," you'd need scheduled captures.
+Once you have scheduled captures, you're a step away from
+event-driven captures (capture every time putInsights runs), and at
+that point you have real replication. But the effort is only worth
+it if the demo mode's job changes.
 
 ## Interview defense
 
-**Q: "How do you handle read replicas here?"**
+**"Does this system have replication?"**
 
-Model answer: "Two real replica patterns, both frozen rather than streaming. The demo snapshot at `lib/state/demo-insights.json` and `demo-investigations.json` is a *reliability replica* — pre-captured, no auth needed, served by `/api/briefing?demo=cached` at `app/api/briefing/route.ts:78-149`. Its refresh policy is 'a dev clicks capture, commits the file' — deliberate, not automated, because presentation reliability matters more than freshness given the alpha backend's unreliability. The eval baseline at `eval/baseline.json` is an *analytical replica* — one aggregated row materialized from the `eval/receipts/*.json` row log via `computeBaseline(runId, receipts)` at `eval/baseline.eval.ts`. It's the pinned reference the regression gate compares candidates against. Refresh is `npm run eval:baseline` + git commit; the lag is 'since last rebuild.' Neither is real streaming replication, but both are the same pattern — a stale copy that serves reads faster than the primary."
+Answer: *"Yes and no. There's no live-replicated database, but there
+IS a frozen read replica — `lib/state/demo-insights.json` — that
+gets captured manually from a live session via `/api/mcp/capture-demo`
+and committed to git. When the client's mode is `demo`, the briefing
+route reads from the JSON file instead of running the agent loop.
+It's used as a reliability path when the live MCP is down, as
+regression evidence in git diffs, and as a stable demo artifact."*
 
-Diagram to sketch: the five-tier replica stack from tier 1 (in-mem TTL cache) to tier 5 (committed eval receipts).
+**"What's the lag on this replica?"**
 
-**Q: "What's the freshness story on the 60s TTL cache?"**
+Answer: *"Unbounded and untracked. That's a red flag I'd fix in
+production. The capture is a manual dev-only button click, and
+there's no metric anywhere for 'time since last capture.' The demo
+mode will happily replay a 6-month-old snapshot with no warning.
+In a real DB this would be an alerting failure — replication lag
+above threshold triggers a page. Here nobody notices until a demo
+user reports seeing stale data."*
 
-Model answer: "Bounded staleness of 60 seconds per (tool, args). Reader-facing: any tool call within 60s of an earlier identical call sees the earlier result — `lib/data-source/bloomreach-data-source.ts:144-152`. The cache is per warm instance, so two Vercel instances have independent caches; a call cached on instance A won't help a reader on instance B. Poisoning is prevented by not caching errors — `bloomreach-data-source.ts:179-181` — so a transient rate-limit doesn't lock in a 'fail for 60 seconds' state. If freshness needs to be tighter (say, 5 seconds), you drop the TTL; if looser, you raise it. Today 60s is picked to absorb the bootstrap chain — every request replays `list_cloud_organizations` and `list_projects`, and caching those saves 2 real calls per request against a ~1 req/s limit."
+**"How does the client route reads to the replica?"**
 
-Anchor: bounded staleness = TTL; errors excluded so no poisoning.
+Answer: *"Through the `bi:mode` localStorage flag, resolved on
+mount in `app/page.tsx`. Values are `demo`, `live-mcp`, and
+`live-synthetic`. The chosen mode gets passed through the URL as
+`?mode=` to `/api/briefing`, and the route handler picks the data
+source. There's no automatic failover between modes — if the live
+mode errors, the user has to explicitly switch to demo via
+`?demo=cached` or by editing localStorage."*
 
-**Q: "How would you scale if the workload grew?"**
-
-Model answer: "The replicas as they stand don't scale — they're presentation devices, not throughput devices. If read load grew past what one Vercel warm instance can serve, I'd promote the 60s cache to a shared tier (Vercel KV, Redis) so instances share hits, and I'd let the demo snapshot stay committed since it's a static file the CDN already caches. If cross-user analytical reads showed up (search across all users' insights, historical trending), that's the moment I'd introduce a real database — Postgres with a follower for reads — because the manual-refresh snapshot model breaks the moment freshness needs to be tighter than 'when a dev remembers to re-capture.' Not before."
-
-Anchor: current replicas are reliability/presentation, not scale; introduce real replication when read-freshness requirements tighten.
+The load-bearing skeleton part interviewers routinely forget:
+**the demo mode has no fallback to primary.** In real replication,
+a replica read that fails often falls back to the primary. Here it
+doesn't — a missing or corrupt `demo-insights.json` produces an
+error, not a degraded read. Naming this signals you thought about
+what "read consistency in the presence of failure" actually means.
 
 ## See also
 
-- `01-database-systems-map.md` — where these replicas fit in the whole storage picture.
-- `04-query-planning-and-execution.md` — how the cache acts as plan-reuse.
-- `07-wal-durability-and-recovery.md` — the other side of "committed JSON in git" as durability.
-- `study-system-design` — the higher-level "why this architecture" question.
+  → `01-database-systems-map.md` — Tier 6 (git-committed) as the
+    replica's storage tier
+  → `07-wal-durability-and-recovery.md` — capture as a checkpoint
+    operation
+  → `09-database-systems-red-flags-audit.md` — the stale-replica
+    hazard as a ranked finding
+  → `study-distributed-systems/` — the same seam viewed as
+    "consistency across replicas"

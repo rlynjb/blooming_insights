@@ -1,479 +1,473 @@
-# HTTP semantics, caching, and CORS
+# 05 — HTTP semantics, caching, cookies, and CORS
 
-*HTTP protocol behavior (Industry standard)* — methods, status codes,
-headers, cookies, caching, browser same-origin policy, and the
-provider-side prompt caching that rides on the Anthropic hop.
+## Subtitle
 
-## Zoom out — where this concept lives
+HTTP-layer conventions (Industry standard — the headers, cookies, methods, status codes, and cache semantics that carry the app's contracts).
 
-The routes touch every HTTP concern that matters here: method choice
-(GET streams, POST mutations), status codes (401 with a `needsAuth`
-JSON envelope before committing to a stream), cache control
-(`no-store, no-transform` on NDJSON so no intermediate buffers), cookies
-(three kinds with different `SameSite`), and the one provider-side
-caching optimization — Anthropic's ephemeral prompt cache — that turns
-a 90% saving from a single `cache_control` block.
+## Zoom out, then zoom in
+
+Most of the interesting decisions in this repo's network layer live in HTTP-level conventions — not TCP, not TLS, not application logic. Cookie flags decide whether the OAuth handshake even completes. `Cache-Control: no-cache` decides whether an intermediary buffers your NDJSON stream (which would kill the whole streaming experience). A custom `x-bi-mcp-config` header decides whether the user's own MCP server plugs in per-request or the deploy-time env wins. Prompt caching rides an inline `cache_control` field in the Anthropic API payload. Every one of these is a header or a cookie doing load-bearing work.
 
 ```
-  Zoom out — HTTP-layer concerns and where they live
+  Zoom out — where HTTP semantics live
 
-  ┌─ Browser ─────────────────────────────────────────────────────┐
-  │  fetch() with implicit Cookie: bi_session; bi_auth              │
-  │  reads Content-Type to pick NDJSON vs JSON branch                │
-  └───────────────────────┬───────────────────────────────────────┘
-                          │  hop 1: GET /api/{briefing,agent}?…
-                          │         POST /api/mcp/{reset,call,capture}
-                          ▼
-  ┌─ Next routes (Node) ──────────────────────────────────────────┐
-  │  ★ HTTP SEMANTICS LIVE HERE ★                                  │
-  │  method routing (route.ts GET/POST exports)                    │
-  │  401 needsAuth JSON envelope before stream commit               │
-  │  Content-Type: application/x-ndjson                             │
-  │  Cache-Control: no-store, no-transform                          │
-  │  Set-Cookie: bi_session, bi_auth with SameSite=None + Secure    │
-  └───┬───────────────────────────────────────────┬───────────────┘
-      │  hop 2: JSON-RPC over HTTPS                │  hop 3: HTTPS + prompt cache
-      ▼                                            ▼
-  ┌─ Bloomreach ──────┐                     ┌─ Anthropic ────────┐
-  │ Authorization:    │                     │ Authorization:      │
-  │ Bearer <token>    │                     │ Bearer <key>        │
-  │                   │                     │ system prefix       │
-  │                   │                     │ cache_control:      │
-  │                   │                     │   ephemeral         │
-  └───────────────────┘                     └─────────────────────┘
+  ┌─ UI layer ─────────────────────────────────────────────────┐
+  │  fetch() sets: x-bi-mcp-config (optional)                  │
+  │  browser auto-sends: bi_session + bi_auth cookies          │
+  └────────────────────────┬───────────────────────────────────┘
+                           │
+                           ▼
+  ┌─ Service layer (routes) ───────────────────────────────────┐
+  │  ★ THIS FILE ★                                             │  ← we are here
+  │   response headers:                                        │
+  │     Content-Type: application/x-ndjson                     │
+  │     Cache-Control: no-cache, no-transform                  │
+  │   cookies set:                                             │
+  │     bi_session (SameSite=None; Secure; HttpOnly)           │
+  │     bi_auth    (SameSite=None; Secure; HttpOnly; encrypted)│
+  │   custom headers read:                                     │
+  │     x-bi-mcp-config (base64-encoded JSON)                  │
+  └──────────┬──────────────────────────────┬──────────────────┘
+             │ hop 2                        │ hop 3
+             ▼                              ▼
+  ┌─ MCP server ──────────────────┐  ┌─ Anthropic ────────────┐
+  │  Authorization: Bearer <tok>  │  │  x-api-key + cache_    │
+  │  Content-Type: application/json│  │  control: ephemeral   │
+  └───────────────────────────────┘  └────────────────────────┘
 ```
 
-Same-origin app; no CORS in play. Cookies do the heavy lifting for
-identity and cross-site OAuth return. NDJSON is the streaming payload.
+Zoom in — this file walks the HTTP layer: cookies (three of them, each with a different flag story), the custom header transport for MCP config, the streaming Content-Type, the prompt-caching field, and why there's no CORS anywhere.
 
-## The structure pass
+## Structure pass
 
-The axis: **who caches what**. HTTP has many caching layers; this repo
-uses exactly two.
+**Layers:**
+- Client (browser reads cookies, sends fetch)
+- Route (sets response headers, reads request headers, sets cookies)
+- Upstream MCP (reads bearer, returns JSON)
+- Upstream Anthropic (reads API key, respects cache_control marker)
+
+**Axis — TRUST + LIFECYCLE (which cookie flag does what work?):**
 
 ```
-  Axis: "at each hop, does anything cache the response?"
+  "who reads this cookie/header, and how long?" — traced
 
-  ┌─────────────────────────────────────────┐
-  │ browser → route                          │  → NO CACHE
-  │ Cache-Control: no-store, no-transform    │    (streaming: caching
-  │                                          │    would break reveal)
-  └─────────────────────────────────────────┘
-      ┌──────────────────────────────────────┐
-      │ route → Bloomreach                   │  → APP CACHE
-      │ 60s in-memory response cache          │    (BloomreachDataSource
-      │ per (name+args)                        │    cache Map)
-      └──────────────────────────────────────┘
-          ┌──────────────────────────────────┐
-          │ route → Anthropic                │  → PROVIDER CACHE
-          │ ephemeral prompt cache            │    (Anthropic's server-side,
-          │ 5-min TTL on system prefix        │    5-min TTL, driven by
-          │                                   │    cache_control header)
-          └──────────────────────────────────┘
-              ┌──────────────────────────────┐
-              │ Vercel edge / CDN            │  → BYPASSED
-              │ (would cache if allowed)     │    (no-store, no-transform
-              │                              │    passes through)
-              └──────────────────────────────┘
+  bi_session      HttpOnly=true    → server-only, not JS
+                  SameSite=None    → survives cross-site OAuth return
+                  Secure=true      → HTTPS-only
+                  no maxAge        → session cookie
+                                     (lives until browser closes)
+
+  bi_auth         same three flags → server-only, cross-site, HTTPS
+                  maxAge=10 days   → matches OAuth token lifetime
+                  AES-256-GCM      → encrypted content
+
+  x-bi-mcp-config request-only     → not persisted server-side
+                  base64(JSON)     → travels ASCII-safe
+                  optional         → omitted when localStorage empty
+
+  each has a different lifecycle + trust story
 ```
 
-Two effective caching layers, each at a different altitude, each with a
-different TTL and eviction policy. That's the whole caching story.
+**Seams:**
+- Seam #1 — the `SameSite=None` boundary: without it the cookies don't survive the OAuth cross-site return.
+- Seam #2 — the `x-bi-mcp-config` header vs env config: header wins per-request, env is the fallback.
+- Seam #3 — `Cache-Control: no-cache` on the response body: prevents intermediary buffering that would kill streaming.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You've set `Cache-Control` headers on API responses before. This repo
-uses two extremes: aggressive `no-store, no-transform` on the streaming
-routes (you *don't* want an intermediate proxy to buffer a stream),
-and app-level in-memory caching everywhere the response is small and
-stable enough to reuse. And there's one third caching layer that lives
-entirely on the LLM provider — Anthropic's server caches the system
-prompt prefix if you tag it with a `cache_control` breakpoint.
+Think of HTTP semantics as **the conventions this codebase leans on to do work that would otherwise need custom protocol machinery.** Cookies for session state. Custom headers for per-request overrides. Content-Type for stream vs JSON dispatching. Cache-Control for keeping the streaming pipe unbuffered. Every one is a standard HTTP-layer knob repurposed for a specific concrete need.
 
 ```
-  The pattern — three caches at three altitudes
+  HTTP knobs used by this repo
 
-  no-store on the stream ─┐
-                          │
-  60s app cache on tools ─┼──►  each layer has its own TTL and scope
-                          │
-  5-min provider cache ───┘
-  on Anthropic prefix
+  request from browser:
+    Method:          GET                 (read-only routes)
+                     POST                (mutations: /reset, /callback code exchange)
+    Cookies:         bi_session, bi_auth
+    Custom header:   x-bi-mcp-config     (base64-encoded JSON, optional)
+    Body:            none on GET
+
+  response from route:
+    Status:          200 (stream / snapshot)
+                     401 (auth needed — { needsAuth, authUrl })
+                     500 (env misconfig, transport error)
+                     404 (anomaly not found)
+    Content-Type:    application/x-ndjson (streaming)
+                     application/json     (snapshot / errors)
+    Cache-Control:   no-cache, no-transform (streaming)
+                     no-store, no-transform (demo snapshot)
+    Set-Cookie:      bi_session (on first visit)
+                     bi_auth    (after OAuth completes)
 ```
 
-### Move 2 — the HTTP surface, one concern at a time
+### Move 2 — the walkthrough
 
-#### Methods — GET for streams, POST for mutations
+#### Cookies — three flags doing three different jobs
 
-The routes divide by method:
+The two cookies in this codebase carry cross-site auth state. Both share three flags: `HttpOnly`, `Secure`, `SameSite=None` (in production). Each flag does different work:
 
-  - `GET /api/briefing` — the streaming monitoring scan (`app/api/briefing/route.ts:77`)
-  - `GET /api/agent` — the streaming investigation / query (`app/api/agent/route.ts:110`)
-  - `GET /api/mcp/callback` — OAuth callback (`app/api/mcp/callback/route.ts:5`)
-  - `POST /api/mcp/reset` — auth teardown
+- **`HttpOnly=true`** — JavaScript can't read the cookie. XSS can't exfiltrate the OAuth tokens by reading `document.cookie`. Load-bearing for the token-storage story.
+- **`Secure=true`** — cookie only transmitted over HTTPS. Matches the TLS story from file 04.
+- **`SameSite=None`** — cookie DOES cross site boundaries. Load-bearing for OAuth: the flow leaves for Bloomreach's IdP and comes back; without `SameSite=None`, the browser drops the cookie on the return leg. With it, cookie survives the round-trip.
 
-`GET` for the streams matters — the browser (and any intermediate) can
-cache GET responses under the right headers, but never POST. The
-`no-store` header opts out of caching. GET also lets the URL carry all
-state, which is why `?mode=live-bloomreach&insight=…&step=diagnose`
-works as a full state carrier.
-
-#### Status codes — 401 with a JSON envelope
-
-The interesting decision: return `401` *before* committing to a stream,
-with a JSON body the client can parse (`briefing/route.ts:180-182`):
+From `lib/mcp/session.ts:10-14`:
 
 ```ts
-  if (!dsResult.ok) {
-    return NextResponse.json({ needsAuth: true, authUrl: dsResult.authUrl }, { status: 401 });
-  }
+function sessionCookieOpts() {
+  return process.env.NODE_ENV === 'production'
+    ? { httpOnly: true, secure: true, sameSite: 'none' as const, path: '/' }
+    : { httpOnly: true, sameSite: 'lax' as const, path: '/' };
+}
 ```
 
-Then commit to the stream only after auth is confirmed. This matters
-because you can't cleanly signal "please redirect for auth" *inside* an
-NDJSON stream — the client can't do a full-page navigation while
-consuming a stream, and if the client tries, the browser may not
-attach the fresh cookies. Returning 401 before the stream lets the
-client redirect fully.
-
-Client picks it up (`useBriefingStream.ts:162-171`):
+And `lib/mcp/auth.ts:93-102`:
 
 ```ts
-  if (res.status === 401) {
-    const body = await readBody(res);
-    if (body?.needsAuth && body?.authUrl) {
-      window.location.href = body.authUrl as string;
-      return;
-    }
-    setErrorMessage('authentication required');
-    setStatus('error');
-    return;
-  }
+(await cookies()).set(AUTH_COOKIE, encryptStore(ctx.store), {
+  httpOnly: true,
+  secure: true,
+  // SameSite=None so the PKCE verifier + client info survive the cross-site
+  // OAuth return from the IdP to /api/mcp/callback (matches bi_session).
+  sameSite: 'none',
+  path: '/',
+  maxAge: AUTH_COOKIE_MAX_AGE,
+});
 ```
 
-The client checks *before* it starts reading the body stream, so no
-partial NDJSON is consumed.
+The comment names the exact reason for `SameSite=None`: the PKCE verifier saved during `/api/mcp/connect` has to survive the cross-site round-trip through Bloomreach's IdP so `/api/mcp/callback` can read it and exchange the auth code.
 
-#### Content-Type — the branch discriminator
+**Dev vs prod flag divergence.** In development, `Secure` is dropped (localhost HTTP wouldn't send `Secure` cookies) and `SameSite` falls back to `Lax` (no cross-site OAuth flow to survive locally). Two flag sets, one call site — the environment picks.
 
-`application/x-ndjson; charset=utf-8` on the live path
-(`briefing/route.ts:148`), `application/json` on the demo snapshot path
-(implicit via `NextResponse.json`). The client sniffs and branches
-(`useBriefingStream.ts:185-199`):
+**The `maxAge` story.** `bi_session` has no `maxAge` — it's a session cookie, lives until the browser closes. `bi_auth` has `maxAge: 60 * 60 * 24 * 10` (10 days) to match the OAuth token lifetime. Longer would mean holding stale tokens; shorter would mean re-authenticating more often.
+
+```
+  Cookie flag comparison
+
+                   bi_session          bi_auth
+                   ──────────          ───────
+  HttpOnly         yes                 yes
+  Secure           prod: yes           prod: yes
+                   dev:  no            dev:  no
+  SameSite         prod: none          prod: none
+                   dev:  lax           dev:  lax
+  maxAge           unset (session)     10 days
+  content          UUID (plaintext)    AES-256-GCM ciphertext
+                   = user session id   = { clientInformation,
+                                         tokens, codeVerifier, state }
+```
+
+#### The custom `x-bi-mcp-config` header transport
+
+This is the swappable-MCP surface's client → server transport. The user picks an MCP server URL and auth in the settings modal; that JSON gets base64-encoded and rides a custom header on every subsequent fetch.
+
+Client side, `lib/mcp/config.ts:77-82`:
 
 ```ts
-  const ct = res.headers.get('content-type') ?? '';
-  // Demo / snapshot path: plain JSON, no live stream.
-  if (!ct.includes('ndjson') || !res.body) {
-    const body = await readBody(res);
-    // …consume as one JSON object…
-    return;
-  }
-  // Live path: NDJSON stream…
-  await readNdjson<BriefingEvent>(res.body, handle, ...);
+export function encodeConfigHeader(config: McpConfigOverride): string {
+  const json = JSON.stringify(normalizeConfig(config));
+  // btoa is available in browsers; Node has Buffer. Runtime detection.
+  if (typeof btoa === 'function') return btoa(json);
+  return Buffer.from(json, 'utf8').toString('base64');
+}
 ```
 
-One field, two response shapes, one client that gracefully handles
-either. If the route ever falls back to plain JSON (e.g. the demo
-snapshot file is malformed and the route serves a JSON error), the
-client still functions.
-
-#### Cache-Control — deliberate no-caching on streams
-
-Both streaming routes emit `Cache-Control: no-store, no-transform`
-(`briefing/route.ts:149, 333`; `agent/route.ts:107`). Why both directives?
-
-  - `no-store` — the response must not be cached. Full stop.
-  - `no-transform` — the response must not be transformed. Critically,
-    this stops intermediaries from *buffering* the stream and
-    re-delivering it as one payload. A proxy that decompresses, buffers,
-    and re-emits chunks kills the progressive reveal.
-
-Without `no-transform`, a helpful intermediary could turn a
-streaming NDJSON response into a single 30s wait followed by 15 events
-delivered at once. `no-transform` is the tell that this is a stream.
-
-#### Cookies — three cookies, three roles
-
-The full cookie inventory:
-
-```
-  cookie inventory in this repo
-
-  ┌──────────────┬──────────────────────────────────────────────────┐
-  │ name         │ role, options                                     │
-  ├──────────────┼──────────────────────────────────────────────────┤
-  │ bi_session   │ session id (UUID)                                 │
-  │              │ httpOnly, SameSite=none, Secure (prod)            │
-  │              │ SameSite=lax (dev, no Secure)                     │
-  │              │ set on first request; long-lived                  │
-  ├──────────────┼──────────────────────────────────────────────────┤
-  │ bi_auth      │ AES-256-GCM ciphertext of OAuth state per session │
-  │              │ httpOnly, SameSite=none, Secure                    │
-  │              │ maxAge = 10 days                                   │
-  │              │ prod only (dev uses .auth-cache.json file)         │
-  ├──────────────┼──────────────────────────────────────────────────┤
-  │ bi:reconnecting │ localStorage flag (not a cookie),               │
-  │  bi:mode        │ but shape-adjacent — the client-side one-shot   │
-  │                 │ guards and mode persistence                      │
-  └──────────────┴──────────────────────────────────────────────────┘
-```
-
-The `SameSite=none` decision is documented in
-`session.ts:6-9`:
-
-> SameSite=Lax can drop the cookie on that return in some browsers/flows,
-> so use SameSite=None + Secure on HTTPS. Locally (http://localhost)
-> Secure cookies aren't sent, so fall back to Lax without Secure.
-
-The dev fallback to Lax is a *dev-only concession*, because `Secure`
-requires HTTPS and localhost is HTTP. The tradeoff is that in dev, the
-cookie may drop on cross-site returns — but you'd rarely test the OAuth
-flow that way in dev anyway.
-
-#### CORS — deliberately absent
-
-Grep for `Access-Control` across the repo: zero hits. The whole app is
-same-origin (Next app + its own routes), so CORS never fires. The
-`no-store` and `Content-Type` headers do the heavy lifting for the
-browser's behavior; CORS wouldn't add anything.
-
-**When it becomes relevant**: if a third-party app ever consumed
-`/api/briefing` directly, CORS headers would need to be emitted, and
-the cookie-based auth would need to be reworked (`SameSite=None`
-cookies from a third-party origin have their own rules).
-
-### The provider cache — Anthropic's ephemeral prefix
-
-The one provider-side caching mechanism this repo actively uses.
-Full walk at `lib/agents/aptkit-adapters.ts:74-89`:
+Server side, `lib/mcp/config.ts:87-100`:
 
 ```ts
-    // Phase-3 prompt caching. The system prompt is stable across every call
-    // within an investigation (all ~5-15 ReAct-loop iterations reuse it) and
-    // is the largest fixed prefix in the payload. Wrapping it in an ephemeral
-    // cache breakpoint makes the first call a cache_creation (~1.25× normal
-    // input cost) and every subsequent call within 5 min a cache_read
-    // (~0.1× normal). For a diagnostic run's ~10 model turns this is roughly
-    // an 80% reduction on the system-prompt token cost.
-    //
-    // Tools are also stable across the loop but the Anthropic API caches
-    // tools transparently when the SAME breakpoint is set on the system
-    // prompt — so this one addition covers both prefixes.
-    if (request.system) {
-      params.system = [
-        { type: 'text', text: request.system, cache_control: { type: 'ephemeral' } },
-      ];
-    }
+export function decodeConfigHeader(header: string | null | undefined): McpConfigOverride | null {
+  if (!header) return null;
+  try {
+    const json =
+      typeof atob === 'function'
+        ? atob(header)
+        : Buffer.from(header, 'base64').toString('utf8');
+    const parsed = JSON.parse(json);
+    if (!isMcpConfigOverride(parsed)) return null;
+    return normalizeConfig(parsed);
+  } catch {
+    return null;
+  }
+}
 ```
 
-Layers and hops for the caching cycle:
+Two load-bearing details:
 
-```
-  Ephemeral prompt cache — first call vs subsequent
+**Base64 encoding.** HTTP header values are ASCII-only by protocol. Base64 lets a future non-ASCII field (unicode URLs, non-Latin bearer tokens) travel safely. Overhead is ~33%, which for a small config object (<200 bytes) is negligible.
 
-  Call #1 (cache miss)
-  ┌─ Route ────────────────────────────────┐
-  │  anthropic.messages.create({           │
-  │    system: [{ text, cache_control:     │
-  │              { type: 'ephemeral' } }]  │
-  │    …                                    │
-  │  })                                     │
-  └────────────┬───────────────────────────┘
-               │  HTTPS
-               ▼
-  ┌─ Anthropic API ────────────────────────┐
-  │  reads breakpoint → hashes prefix       │
-  │  stores prefix in ephemeral cache       │
-  │  response.usage.cache_creation_input   │
-  │    _tokens: 3168                        │
-  │  charges ~1.25× normal for the prefix   │
-  └────────────────────────────────────────┘
+**Fail-safe decode.** The whole function is inside a try/catch that returns `null` on any failure — malformed base64, JSON parse error, unknown auth type, wrong field types. The call site (`app/api/agent/route.ts:165`) simply passes the result to `makeDataSource`, which treats `null` as "use env config." A broken header does NOT crash the request; it degrades to env defaults.
 
-  Call #2 within 5 minutes (cache hit)
-  ┌─ Route ────────────────────────────────┐
-  │  anthropic.messages.create({           │
-  │    system: [{ text: SAME, cache_control:│
-  │              { type: 'ephemeral' } }]  │
-  │    …                                    │
-  │  })                                     │
-  └────────────┬───────────────────────────┘
-               │  HTTPS
-               ▼
-  ┌─ Anthropic API ────────────────────────┐
-  │  matches hash → skip prefix processing  │
-  │  response.usage.cache_read_input        │
-  │    _tokens: 3168                        │
-  │  charges ~0.1× normal for the prefix    │
-  └────────────────────────────────────────┘
-```
-
-Baseline verification live: `cache_creation_input_tokens: 3168` on the
-first call, matched by `cache_read_input_tokens: 3168` on the next.
-The prefix hash matches exactly. Every call to `complete()` inside a
-ReAct loop that runs within 5 minutes hits the cache. For a diagnostic
-investigation (~10 model turns), that's a ~90% reduction on the system
-prompt's token cost.
-
-**The gotcha**: cache lookup is by prefix hash. If any byte of the
-system prompt changes, the cache misses. This is why the system
-prompt is loaded from a static `.md` file (`lib/agents/prompts/`) and
-never templated with dynamic values — stability of the prefix bytes is
-what makes the cache hit.
-
-### The app-level tool cache
-
-The middle caching layer. `BloomreachDataSource.callTool` maintains a
-60s in-memory Map keyed by `${name}:${JSON.stringify(args)}`
-(`bloomreach-data-source.ts:139-151, 179-187`):
+The header is only attached when the user has persisted a config. From `lib/hooks/useBriefingStream.ts:164-169`:
 
 ```ts
-  const cacheKey = `${name}:${JSON.stringify(args)}`;
-  const ttl = options.cacheTtlMs ?? 60_000;
-
-  if (!options.skipCache) {
-    const cached = this.cache.get(cacheKey);
-    if (cached && cached.expiresAt > Date.now()) {
-      return { result: cached.result as T, durationMs: 0, fromCache: true };
-    }
-  }
-  // …
-  // Don't cache error results — they should not poison the cache.
-  if ((result as any)?.isError === true) {
-    return { result: result as T, durationMs, fromCache: false };
-  }
-  this.cache.set(cacheKey, { result, expiresAt: now + ttl });
+// UI settings modal (Session D) persists MCP config in localStorage;
+// send it as a header so the route can override env-driven defaults.
+// Unset → header omitted → env-driven behavior preserved.
+const mcpHeader = persistedConfigHeader();
+const res = await fetch(url, {
+  headers: mcpHeader ? { [BI_MCP_CONFIG_HEADER]: mcpHeader } : undefined,
+});
 ```
 
-Three deliberate choices:
-  1. **Errors never cache** — an `isError: true` result skips the
-     `this.cache.set(...)` line. Without this, a transient 429 would
-     poison the cache for 60s.
-  2. **Per-process, in-memory** — Vercel spins up new instances at
-     will; a cache hit only works within one instance's lifetime. This
-     is fine — the cache exists to absorb repeat calls *within one
-     briefing*, not across users or requests.
-  3. **`skipCache` still refreshes** — even if you set `skipCache: true`,
-     the fresh result *is* written back to the cache (write-through).
-     Used by the `/debug` "force fresh" path.
+`persistedConfigHeader()` returns `null` when localStorage is empty — the ternary omits the header entirely. This keeps the default request shape identical to pre-Session-D behavior.
+
+```
+  x-bi-mcp-config — client to server transport
+
+  ┌─ browser ──────────────────────────────────────────┐
+  │  localStorage['bi:mcp_config']                     │
+  │    = '{"url":"https://my/mcp","authType":"bearer"}'│
+  │                                                    │
+  │  persistedConfigHeader() {                         │
+  │    read localStorage → parse → validate            │
+  │    → JSON.stringify → btoa(...)                    │
+  │    → 'eyJ1cmwiOiJodHRwczovL215L21jcCIsIm...'       │
+  │  }                                                 │
+  └───────────────────┬────────────────────────────────┘
+                      │  fetch(url, {
+                      │    headers: {
+                      │      'x-bi-mcp-config': '<base64>'
+                      │    }
+                      │  })
+                      ▼
+  ┌─ route ────────────────────────────────────────────┐
+  │  decodeConfigHeader(req.headers.get(...)) {        │
+  │    try {                                           │
+  │      atob → JSON.parse → validate                  │
+  │      return normalized config                      │
+  │    } catch {                                       │
+  │      return null  ← FAIL-SAFE                       │
+  │    }                                               │
+  │  }                                                 │
+  │                                                    │
+  │  makeDataSource(mode, sid, override_or_null);      │
+  │  // null → env-driven behavior; not-null → override│
+  └────────────────────────────────────────────────────┘
+```
+
+#### Response Content-Type dispatching
+
+The route can return either NDJSON (live stream) or JSON (snapshot / error). The client dispatches on the response's `Content-Type` header. From `lib/hooks/useBriefingStream.ts:196-210`:
+
+```ts
+const ct = res.headers.get('content-type') ?? '';
+
+// Demo / snapshot path: plain JSON, no live stream.
+if (!ct.includes('ndjson') || !res.body) {
+  const body = await readBody(res);
+  const data = body as unknown as BriefingResponse;
+  // ...
+  return;
+}
+
+// Live path: NDJSON stream — surface monitoring's real status as it runs.
+```
+
+The dispatch is `ct.includes('ndjson')` — matches `application/x-ndjson; charset=utf-8`. Anything else (including a truncated response with no `Content-Type`) falls through to the JSON path, which reads the body defensively via `readBody(res)`:
+
+```ts
+async function readBody(res: Response): Promise<Record<string, unknown>> {
+  const text = await res.text();
+  if (!text) return {};
+  try {
+    return JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    return { __raw: text };
+  }
+}
+```
+
+Empty body → `{}`. Non-JSON body → `{ __raw: text }`. Never throws. This is defensive HTTP handling: a 500 with an HTML body from Vercel's edge doesn't crash the client — it surfaces the raw HTML as the error message.
+
+#### `Cache-Control: no-cache, no-transform` — keeping the stream unbuffered
+
+The NDJSON response uses this pair of directives. `no-cache` tells any intermediary that a cached response should not be reused without revalidation. `no-transform` tells any intermediary NOT to gzip-encode or otherwise modify the response body mid-flight. From `app/api/agent/route.ts:106-109`:
+
+```ts
+const NDJSON_HEADERS = {
+  'Content-Type': 'application/x-ndjson; charset=utf-8',
+  'Cache-Control': 'no-cache, no-transform',
+};
+```
+
+**Why `no-transform` is load-bearing.** If a proxy gzip-encoded the response body, it might buffer bytes until it had enough to compress a full block — potentially seconds or KBs at a time. The stream would land in the browser in bursts instead of a smooth flow. `no-transform` forbids that. For NDJSON specifically, where the JSON-per-line boundary is meaningful and buffering to a block boundary could split lines mid-parse, this is critical.
+
+**Why `no-cache` matters.** An intermediary caching this response could serve a stale run to another user or reuse it after the events are irrelevant. Streams shouldn't be cached.
+
+Demo mode uses stricter directives — `no-store, no-transform` — because a cached demo snapshot has no purpose (the file is on disk; caching is pointless).
+
+#### Prompt caching — `cache_control: { type: 'ephemeral' }`
+
+This isn't an HTTP header, it's a field inside the Anthropic API's JSON request body. But it's a network-layer caching decision — telling the server "please cache this prefix so subsequent requests can skip re-processing it." From `lib/agents/aptkit-adapters.ts:85-89`:
+
+```ts
+if (request.system) {
+  params.system = [
+    { type: 'text', text: request.system, cache_control: { type: 'ephemeral' } },
+  ];
+}
+```
+
+The system prompt (which is stable across ~5-15 iterations of the ReAct loop within one investigation) gets wrapped in an ephemeral cache breakpoint. First call is a cache_creation (~1.25× normal input cost). Subsequent calls within ~5 min are cache_reads (~0.1× normal input cost). Verified live: `cache_creation_input_tokens 3168` → `cache_read_input_tokens 3168` on the next call.
+
+This is a first-class HTTP-layer optimization living in the request payload. Not something Anthropic caches transparently — the client has to opt in per request.
+
+#### No CORS anywhere
+
+All browser → route calls are same-origin. The React app is served by the same Next.js deployment that hosts the API routes. So the browser never sends an `Origin` header the server needs to check against, never issues an OPTIONS preflight, never sees `Access-Control-*` response headers.
+
+Grep confirms: no `Access-Control-*` strings anywhere in `lib/` or `app/`. This is `not yet exercised` — it becomes relevant if the API layer splits out of the Next.js app.
+
+#### Status codes — the four the app returns
+
+- `200` — success. Either a JSON body (snapshot / query result) or a streaming NDJSON body.
+- `401` — auth needed. Response body is `{ needsAuth: true, authUrl: '<bloomreach-idp>' }`. Client redirects to `authUrl`.
+- `404` — anomaly not found (only for `/api/agent?insightId=...`).
+- `500` — setup error. Response body is `{ error: '...' }`.
+
+From `app/api/agent/route.ts:180`:
+
+```ts
+if (!dsResult.ok) return NextResponse.json({ needsAuth: true, authUrl: dsResult.authUrl }, { status: 401 });
+```
+
+The 401 pattern is worth naming: it's a normal HTTP status code carrying a redirect URL in the body, NOT a `Location` header. This is because the browser doesn't automatically follow redirects on `fetch()` responses in this flow — the client (`useBriefingStream`) reads the JSON body and calls `window.location.href = body.authUrl` as a top-level navigation. That's the only way the OAuth flow's browser context (cookies, referer) gets propagated correctly.
 
 ### Move 3 — the principle
 
-Each cache lives at the altitude that owns its TTL and eviction. The
-browser cache is opted out because streams can't be cached. The
-provider cache is opted in via one header because the provider is best
-positioned to hash the prefix. The app cache lives in the app because
-it needs to know when a result is an error and skip caching.
+**HTTP is the substrate everyone speaks; use its conventions instead of inventing new ones.** Every load-bearing decision in this layer — the `SameSite=None` for OAuth survival, the `no-cache, no-transform` for stream integrity, the base64 for header safety, the `Content-Type` dispatch — is a standard HTTP concept applied to a specific concrete need. The custom `x-bi-mcp-config` header is the one place the app steps outside standard headers, and even there the payload is base64-encoded JSON, not a bespoke wire format. Building on HTTP's conventions is cheaper than inventing parallel machinery.
 
 ## Primary diagram
 
 ```
-  Primary — HTTP semantics across the wire
+  HTTP-layer semantics — every header/cookie/status doing work
 
-  ┌─ Browser ────────────────────────────────────────────────────┐
-  │  GET /api/briefing                                             │
-  │  Cookie: bi_session; bi_auth                                   │
-  └───────────────────────┬──────────────────────────────────────┘
-                          │
-  ┌─ Route ──────────────▼───────────────────────────────────────┐
-  │  auth check → return 401 needsAuth JSON if unauth              │
-  │  ELSE stream:                                                  │
-  │    Content-Type: application/x-ndjson                          │
-  │    Cache-Control: no-store, no-transform                       │
-  │    Set-Cookie: bi_auth (refreshed if dirty)                    │
-  │                                                                │
-  │    ┌─ 60s in-memory app cache (BloomreachDataSource) ─────┐   │
-  │    │  key: name:JSON.stringify(args)                       │   │
-  │    │  no cache on isError                                  │   │
-  │    └───────────────────────────────────────────────────────┘   │
-  └───┬───────────────────────────────────────┬───────────────────┘
-      │                                       │
-      ▼                                       ▼
-  ┌─ Bloomreach ──────────────┐    ┌─ Anthropic ──────────────────┐
-  │  Authorization: Bearer     │    │  Authorization: Bearer        │
-  │  … MCP JSON-RPC payload    │    │  system: [{ …, cache_control: │
-  │                            │    │    { type: 'ephemeral' } }]   │
-  │                            │    │  → 5-min prefix cache          │
-  │                            │    │    cache_creation_input_tokens │
-  │                            │    │    cache_read_input_tokens     │
-  └────────────────────────────┘    └───────────────────────────────┘
+  ┌─ Request from browser ─────────────────────────────────────┐
+  │                                                            │
+  │  Method:  GET (read routes) / POST (mutations)             │
+  │  URL:     /api/briefing?mode=live-mcp                      │
+  │                                                            │
+  │  Headers (browser auto):                                   │
+  │    Cookie: bi_session=<uuid>;                              │
+  │            bi_auth=<AES-GCM-ciphertext>                    │
+  │                                                            │
+  │  Headers (app):                                            │
+  │    x-bi-mcp-config: <base64(JSON)> (optional)              │
+  │                                                            │
+  └────────────────────────┬───────────────────────────────────┘
+                           ▼
+  ┌─ Route processing ─────────────────────────────────────────┐
+  │                                                            │
+  │  decodeConfigHeader(req.headers.get(...))                  │
+  │    → override or null (fail-safe)                          │
+  │                                                            │
+  │  withAuthCookies() — decrypt bi_auth, run inside ALS       │
+  │                                                            │
+  │  makeDataSource(mode, sid, override) → open MCP + Anthropic│
+  │                                                            │
+  │  Response is one of two shapes:                            │
+  │    stream: new ReadableStream + NDJSON_HEADERS             │
+  │    error:  NextResponse.json(body, { status })             │
+  │                                                            │
+  └────────────────────────┬───────────────────────────────────┘
+                           ▼
+  ┌─ Response to browser ──────────────────────────────────────┐
+  │                                                            │
+  │  Status: 200 / 401 / 404 / 500                             │
+  │                                                            │
+  │  Headers:                                                  │
+  │    Content-Type: application/x-ndjson; charset=utf-8       │
+  │                  application/json (fallback)               │
+  │    Cache-Control: no-cache, no-transform (stream)          │
+  │                   no-store, no-transform (demo)            │
+  │    Set-Cookie: bi_session=<uuid>; HttpOnly; Secure;        │
+  │                 SameSite=None; Path=/                      │
+  │    Set-Cookie: bi_auth=<AES-GCM>; HttpOnly; Secure;         │
+  │                 SameSite=None; Path=/; Max-Age=864000      │
+  │                                                            │
+  │  Body:                                                     │
+  │    stream: {event}\n{event}\n... (writer keeps writing)    │
+  │    error:  { needsAuth, authUrl } for 401                  │
+  │            { error } for 500                               │
+  │                                                            │
+  └────────────────────────────────────────────────────────────┘
+
+  Upstream calls (from route, on separate hops):
+    hop 2 (MCP):
+      Authorization: Bearer <token>
+      Content-Type:  application/json (JSON-RPC body)
+    hop 3 (Anthropic):
+      x-api-key:            <ANTHROPIC_API_KEY>
+      anthropic-version:    2023-06-01
+      Content-Type:         application/json
+      body includes:        system: [{ ..., cache_control: { type: 'ephemeral' } }]
 ```
 
 ## Elaborate
 
-**Why NDJSON over `text/event-stream` (SSE)?** SSE requires
-`Content-Type: text/event-stream` and follows an `event: X\ndata: Y\n\n`
-framing. NDJSON is simpler: one JSON per line, no framing rules, no
-`retry:` field, no auto-reconnect built into the client (which we
-actively don't want here — the reconnect policy is app-owned via
-`useReconnectPolicy`). NDJSON also composes with `AbortController`
-naturally; SSE via `EventSource` has less clean cancellation semantics.
+**Why not `SameSite=Lax` for the session cookie?** `Lax` blocks cross-site cookie transmission on all methods except top-level GET navigations. The OAuth return IS a top-level GET navigation (Bloomreach's IdP does a browser-level redirect back to `/api/mcp/callback`), so `Lax` *would* work for that case. The rationale for `None` is broader: any future cross-site scenario (embedding, popup OAuth, etc.) would need `None` anyway, and there's no downside on a cookie that's already `Secure` + `HttpOnly` + carries only a random UUID. Consistency with `bi_auth` (which absolutely needs `None`) is the tiebreaker.
 
-**Why not `Cache-Control: private, max-age=0` instead of `no-store`?**
-`private, max-age=0` still allows caching (browser MAY cache with
-revalidation). `no-store` says *don't even hold this*. For a stream,
-that's the right choice.
+**Why the 401 body pattern instead of a redirect header.** Browsers auto-follow `Location` redirects on `fetch()` by default, but the redirect target (Bloomreach's IdP) would then be fetched *from* the fetch context — CORS would block it, cookies would drop. Returning the URL in the body and letting client code do `window.location.href = authUrl` triggers a top-level navigation, which is what OAuth flows need.
 
-**Why not use HTTP/2 push for the LLM responses?** Not exercised — the
-Anthropic SDK handles transport, and there's no push semantics in
-Claude's messages API anyway. LLMs don't push; they respond.
+**What prompt caching is doing to the network story.** The `cache_control: ephemeral` marker changes the request payload but not the transport. The upstream server ingests the request, checks its cache for the marked prefix, either counts it as a creation or reads it from cache, and includes the counts in the response's `usage` field. From the client's perspective, only the token counts differ — the wire shape is unchanged. This is the load-bearing detail: prompt caching is a semantic marker on the wire, not a new protocol.
+
+**What's not exercised.** CORS (same-origin app). Preflight OPTIONS handling. `Access-Control-Allow-Credentials`. `Vary` header for cache correctness. `ETag` / `If-None-Match` conditional requests. `Content-Encoding: gzip` on responses (Vercel handles this transparently at the edge for non-streaming responses; streaming responses opt out via `no-transform`).
+
+**Two cookies where one might do.** The split between `bi_session` (identity) and `bi_auth` (auth material) is intentional. If they were one cookie, rotating auth would require re-issuing the identity. Splitting them lets the app treat identity as durable and auth material as ephemeral — refresh tokens, re-auth on expiry, all without a new session id.
 
 ## Interview defense
 
-**Q: How does the client know whether to render a live stream or a
-static snapshot?**
+**Q: Walk me through the cookie flags on `bi_auth` and why each one is set.**
 
-  Direct: the route returns `Content-Type: application/x-ndjson` for
-  the live path and `application/json` for the demo path. The client
-  reads the header on the first response and branches. No route flag,
-  no query param check — just the standard HTTP semantic.
+Four flags:
 
 ```
-  answer sketch — one field discriminates the branch
+  HttpOnly: true          → JS can't read; XSS can't steal tokens
+  Secure:   true          → HTTPS-only in transit
+  SameSite: none          → cookie SURVIVES cross-site OAuth return
+                            (without this, dropped by browser on return)
+  maxAge:   10 days       → matches OAuth token lifetime
+```
 
-  if (ct.includes('ndjson') && res.body) {
-    await readNdjson(res.body, handle);  // stream
-  } else {
-    const body = await readBody(res);
-    setInsights(body.insights);           // snapshot
+Plus AES-256-GCM encryption of the value itself (key derived from `SHA-256(process.env.AUTH_SECRET)`) — because the cookie is stored at rest on the browser's disk, and TLS-in-transit doesn't cover at-rest.
+
+The load-bearing one is `SameSite: none`. Without it, the flow leaves for Bloomreach's IdP, comes back to `/api/mcp/callback`, and the browser drops the cookie on the return leg — the callback route sees "no session" and 400s. `SameSite=Lax` might work for the return leg specifically (top-level GET), but consistency with the broader cross-site story tipped it to `None`.
+
+Anchor: `lib/mcp/auth.ts:93-102`.
+
+**Q: A user's `x-bi-mcp-config` header is malformed — how does the app respond?**
+
+Fail-safe fallthrough. `decodeConfigHeader` catches any error (base64 decode failure, JSON parse error, unknown auth type, wrong field types) and returns `null`. The route site passes `null` to `makeDataSource`, which treats it as "use env config" — the same code path as a request that never sent the header.
+
+The malformed header does NOT crash the request. It degrades to env-driven behavior transparently. This is intentional: a portfolio visitor who breaks their localStorage config still gets a working experience against the deploy's default MCP.
+
+```ts
+// lib/mcp/config.ts:87-100
+export function decodeConfigHeader(header: string | null | undefined): McpConfigOverride | null {
+  if (!header) return null;
+  try {
+    // ... decode + parse + validate ...
+    return normalizeConfig(parsed);
+  } catch {
+    return null;  // fail-safe: any error → env-driven
   }
+}
 ```
 
-  Anchor: `lib/hooks/useBriefingStream.ts:185-199`.
+Anchor: `lib/mcp/config.ts:87-100`.
 
-**Q: Why 401 before the stream and not an `error` event inside the
-stream?**
+**Q: Why `no-cache, no-transform` on the streaming response?**
 
-  Direct: because the auth-error path needs to trigger a *full-page
-  navigation* to the IdP for the OAuth dance. You can't cleanly do
-  that from inside a consuming stream — the browser may not attach
-  fresh cookies to the navigation, and any partial NDJSON parsed
-  before the error is wasted work. Returning 401 with `needsAuth:
-  true` before committing to the stream lets the client `window.location.href
-  = authUrl` and start the OAuth flow with a clean slate.
+Both directives protect the streaming semantics from intermediary interference. `no-cache` prevents any proxy or CDN from caching the response and serving a stale run to another user. `no-transform` prevents any intermediary from re-encoding the body — critically, gzip-encoding it, which would buffer bytes to compressible block boundaries and destroy the smooth event-by-event flow.
 
-  Anchor: `app/api/briefing/route.ts:180-182`,
-  `lib/hooks/useBriefingStream.ts:162-171`.
+For NDJSON specifically, where the `\n` boundary is meaningful and the client parses one line at a time, an intermediary buffering bytes to a block boundary could split lines mid-parse. `no-transform` forbids that.
 
-**Q: What's the effective cost of one investigation with prompt
-caching on?**
-
-  Direct: baseline (Runid `2026-07-03T04-08-28-644Z`) shows
-  `cache_creation_input_tokens: 3168` on the first call, matched by
-  `cache_read_input_tokens: 3168` on the next. Cache-read tokens are
-  billed at ~10% of normal input. Across a ~10-turn ReAct loop, that's
-  ~90% savings on the system-prompt prefix. First call absorbs the
-  ~1.25× "creation" premium; every subsequent call within 5 minutes
-  wins. Net: roughly halves the LLM cost per investigation.
-
-  Anchor: `lib/agents/aptkit-adapters.ts:85-89`.
+Anchor: `app/api/agent/route.ts:106-109`.
 
 ## See also
 
-  - `06-websockets-sse-streaming-and-realtime.md` — the NDJSON choice
-    against SSE and WebSocket
-  - `07-timeouts-retries-pooling-and-backpressure.md` — how retries
-    interact with the 60s app cache
-  - `.aipe/study-security/` — SameSite=None as a threat-model tradeoff
+- `06-websockets-sse-streaming-and-realtime.md` — the streaming semantics that `no-cache, no-transform` protects
+- `04-tls-and-trust-establishment.md` — the `Secure` cookie flag and its TLS story
+- `02-dns-routing-and-addressing.md` — how `x-forwarded-*` headers relate to the origin/cookie story
+- `study-security` — the same cookie flags seen from "is this safe?" rather than "what does each flag do?"

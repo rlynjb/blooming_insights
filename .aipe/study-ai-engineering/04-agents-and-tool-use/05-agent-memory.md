@@ -1,174 +1,157 @@
-# 05 — Agent memory
+# Agent memory
 
-**Type:** Industry standard. Also called: conversation memory, short-term vs long-term memory.
+## Subtitle
+
+Short-term (in-context) + long-term (retrieved) memory — Industry standard.
 
 ## Zoom out, then zoom in
 
-Two layers of memory in this codebase. Short-term (the messages array within one investigation). Long-term (session storage, demo snapshots — human-scale persistence, not RAG retrieval).
+blooming's agents have **short-term memory** — the accumulated messages in the current agent loop — and no long-term memory. Once an investigation finishes, its diagnosis is saved (`lib/state/investigations.ts`) but the *next* investigation doesn't retrieve it. That's a live limitation and a named future feature (see the retrieval sub-section).
 
 ```
-  Zoom out — memory layers
+  Zoom out — two memory layers
 
-  ┌─ Short-term (in-context, this turn) ──────────────────────────────┐
-  │  messages array — grows across the ReAct loop                     │
-  │  disappears when the investigation ends                            │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌─ Short-term (in-context) ─── LIVE ────────────────────┐
+  │  messages array grows turn-by-turn                     │
+  │  disappears when agent loop terminates                 │
+  │  bounded by context window (200k for Sonnet 4.6)       │
+  └────────────────────────────────────────────────────────┘
 
-  ┌─ Long-term (persisted, across investigations) ────────────────────┐
-  │  sessionStorage (per browser tab) — useInvestigation hook stash    │
-  │  demo snapshot (committed lib/state/demo-*.json)                   │
-  │  NOT retrieved by the agent — accessible only via UI               │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌─ Long-term (retrieved) ─── NOT LIVE ──────────────────┐
+  │  would retrieve past investigations from an index      │
+  │  see 03-retrieval-and-rag/B3.11 for the shipped-feature│
+  │  exercise                                              │
+  └────────────────────────────────────────────────────────┘
 ```
 
-Zoom in. Short-term memory is standard — every LLM app has it (the messages array). Long-term memory in this codebase is HUMAN-facing (the user navigates back to a completed investigation) but NOT AGENT-facing (the diagnostic agent doesn't retrieve past investigations at runtime). The RAG-shaped long-term memory would be Case B (see `03-retrieval-and-rag/11-rag.md`).
+Zoom in: the two-layer split is the standard shape. Short-term is what fits in the current context; long-term is what you retrieve from persistent storage per-turn.
 
 ## Structure pass
 
-**Layers:**
-- Outer: what the AGENT can access at runtime
-- Middle: what the APP persists across sessions
-- Inner: what the UI shows the user
-
-**Axis: who accesses this memory?**
-- Short-term messages array: the model (during the loop)
-- Session storage: the UI (navigation, refresh)
-- Demo snapshot: the UI + capture tooling (committed as source of truth for demo mode)
-- (missing) Long-term retrieved memory: would be agent-accessible via RAG
-
-**Seam:** the boundary between "in the loop's messages" and "on disk." The agent only sees what's in messages. Everything else is UI persistence.
+- **Layers:** current turn messages → agent's message accumulator → context window → (would-be) long-term retrieval. Four bands.
+- **Axis: durability.** Short-term dies with the loop; long-term persists across sessions.
+- **Seam:** the retrieval step. Not built yet in blooming; would sit between "compose system prompt" and "call model."
 
 ## How it works
 
-### Move 1
+### Move 1 — the mental model
 
-You've distinguished between "state in a React component" (short-term, dies with the component) and "state in localStorage" (long-term, survives reload). Same shape for agent memory: what's in the messages array is short-term (dies with the loop); what's in sessionStorage / demo snapshot is long-term (survives the investigation).
+Short-term memory in an agent is the growing message list. Every model turn, the messages get one longer — the model's response and the tool results feed back in.
 
 ```
-  Two memory layers
+  Short-term memory — how it grows
 
-  ┌─ Short-term ──────────────────────────────────────┐
-  │  the messages array — everything the model sees    │
-  │  dies at loop end                                  │
-  └───────────────────────────────────────────────────┘
-
-  ┌─ Long-term (this codebase — not retrieved) ───────┐
-  │  sessionStorage per-tab   (useInvestigation)       │
-  │  demo snapshot on disk    (lib/state/demo-*.json)  │
-  │  UI hydrates from these; agent does NOT            │
-  └───────────────────────────────────────────────────┘
+  turn 1:  [user]                                            (1 msg)
+  turn 2:  [user, assistant, user (tool_result)]             (3 msgs)
+  turn 3:  [user, asst, user (tool_result), asst, user (tr)] (5 msgs)
+  ...
+  turn N: bounded by the 200k-token context window
 ```
 
-### Move 2
+Long-term memory is different: at each turn, you retrieve `k` relevant items from a persistent store (past investigations, past decisions, past conversations) and inject them into the system prompt or as few-shot examples.
 
-**Short-term: the messages array.**
+### Move 2 — the step-by-step walkthrough
 
-Every model turn re-sends the whole history. That's the entire "memory" during the loop. See `02-context-and-prompts/01-context-window.md` for the mechanics. Dies at investigation end — the diagnostic agent's next invocation on a different anomaly starts fresh.
+**Short-term in blooming — what it captures.** Every tool call's args and results, every model turn's text, every observation. By turn 10 of a diagnostic, the agent's short-term memory is a running record of what's been tried and what came back. That's why aptkit's loop doesn't re-run identical EQL queries — the memory is right there, the model sees it.
 
-**Long-term type 1: sessionStorage.**
+**Where short-term breaks.** At the context ceiling. If a single investigation runs so long that messages accumulate past ~150k tokens, the oldest messages start getting pushed out or the model starts losing attention on mid-context content (see **../02-context-and-prompts/02-lost-in-the-middle.md**). Blooming's observed run lengths (5–10 turns, 20–40k tokens) are far from that ceiling.
 
-`lib/hooks/useInvestigation.ts` (per project context) stashes the diagnosis + recommendations in `sessionStorage`. Purpose: the user can navigate back to step 2 or forward to step 3 without re-running the agent. Survives StrictMode double-mount. Dies when the tab closes.
+**Long-term — the design blueprint.** Once past-investigation memory (see `03-retrieval-and-rag/11-rag.md` exercise `B3.11`) lands, the shape is:
 
-**Long-term type 2: the demo snapshot.**
+- On investigation complete, embed `anomaly + diagnosis` and store in the index.
+- On new investigation start, embed the incoming anomaly, retrieve top-3 past investigations from the index, inject as few-shot into the system prompt.
 
-`lib/state/demo-insights.json` and `lib/state/demo-investigations.json`. Committed. Captured once locally via the dev-only capture button; replayed by `?demo=cached`. Instant, no auth, no live agents. This is the "reliable presentation path" — same NDJSON events the live path emits, replayed from disk.
+That's RAG applied to the memory problem. The retrieval step is stateless per-invocation; the storage step happens once per completed investigation.
 
-**Why no retrieved long-term memory (RAG-shaped) today.**
+```
+  Short-term (live) vs long-term (planned)
 
-Two reasons: (1) volume of past investigations is low; (2) the diagnostic agent has strong tool-call grounding to CURRENT DATA, so retrieving prior reasoning is additive not necessary. See `03-retrieval-and-rag/11-rag.md` for the shape it would take if added.
+  ┌─ SHORT-TERM (live) ───────────────────────────────────┐
+  │  messages: [system, user, assistant, user (tool_res),  │
+  │              assistant, user (tool_res), ...]          │
+  │  visible to every model turn                            │
+  │  dies at loop end                                       │
+  └────────────────────────────────────────────────────────┘
 
-**The retrieval question, if it were added.**
+  ┌─ LONG-TERM (not built) ───────────────────────────────┐
+  │  persistent index of past investigations               │
+  │  retrieved per invocation, injected as few-shot         │
+  │  survives across sessions                              │
+  │  see B3.11                                              │
+  └────────────────────────────────────────────────────────┘
+```
 
-Would look like: on `DiagnosticAgent.investigate(anomaly)`, first embed the anomaly, retrieve top-3 similar past diagnoses from a vector store, prepend their conclusions to the initial user message as "context from similar past cases." Same ReAct loop; enriched initial context. Case B exercise below.
+**Session memory in QueryAgent.** `lib/agents/query.ts` runs a similar short-term memory for a single query — the free-form conversation may span multiple turns but is bounded to one HTTP round-trip. There's no chat-history-across-sessions today.
 
-### Move 3
+### Move 3 — the principle
 
-Short-term memory is unavoidable — it IS the messages array. Long-term memory is a design decision: what's worth persisting, who accesses it (UI or agent), how it's retrieved (direct lookup or similarity). This codebase persists for UI navigation but not for agent access. That's a shape, not a limitation.
+Short-term memory is free (it's just the messages array); long-term memory has a cost (embedding, storage, retrieval per invocation). Add long-term only when the per-invocation cost is justified by the value of remembering across sessions.
 
 ## Primary diagram
 
 ```
-  Memory layers in this codebase
+  Agent memory in blooming — full frame
 
-  ┌─ Loop-scoped (short-term) ────────────────────────────────────────┐
-  │                                                                   │
-  │  messages array                                                   │
-  │    [system, user(anomaly), asst, user(tool_result), asst, ...]    │
-  │    grows across ~5-10 turns                                       │
-  │    dies at DiagnosticAgent.investigate() return                    │
-  │                                                                   │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌─ Turn 1 ─────────────────────────────────────────────┐
+  │  messages: [ system, user "diagnose X" ]              │
+  └───────────────────────┬──────────────────────────────┘
+                          │  after model turn
+                          ▼
+  ┌─ Turn 2 ─────────────────────────────────────────────┐
+  │  messages: [ system, user, assistant, user (tool_res)]│
+  └───────────────────────┬──────────────────────────────┘
+                          │  ... grows ...
+                          ▼
+  ┌─ Turn N ─────────────────────────────────────────────┐
+  │  messages: [ ... ~40k tokens accumulated ... ]        │
+  └───────────────────────┬──────────────────────────────┘
+                          │  final turn: submit_diagnosis
+                          ▼
+  ┌─ Loop terminates ────────────────────────────────────┐
+  │  short-term memory discarded                          │
+  │  diagnosis saved to lib/state/investigations.ts       │
+  │  (NOT re-embedded / not indexed)                      │
+  └──────────────────────────────────────────────────────┘
 
-  ┌─ Browser-tab-scoped (medium-term) ────────────────────────────────┐
-  │                                                                   │
-  │  sessionStorage (useInvestigation hook)                            │
-  │    stashes {trace, diagnosis, recommendations} keyed by insight id │
-  │    survives navigation between step 2 and step 3                   │
-  │    dies at tab close                                               │
-  │                                                                   │
-  └───────────────────────────────────────────────────────────────────┘
-
-  ┌─ Repo-scoped (permanent, committed) ──────────────────────────────┐
-  │                                                                   │
-  │  lib/state/demo-insights.json                                     │
-  │  lib/state/demo-investigations.json                               │
-  │    committed snapshots; replay engine                             │
-  │    used by ?demo=cached for auth-free demo path                   │
-  │                                                                   │
-  └───────────────────────────────────────────────────────────────────┘
-
-  ┌─ (missing) Agent-retrievable long-term memory ────────────────────┐
-  │                                                                   │
-  │  Vector store over past diagnoses (Case B)                        │
-  │  Agent-side retrieval on each new investigation                    │
-  │  Would let agent "remember" similar past cases                    │
-  │                                                                   │
-  └───────────────────────────────────────────────────────────────────┘
+  Future (B3.11):
+  ┌─ Long-term memory ───────────────────────────────────┐
+  │  on save: embed(anomaly + diagnosis) → index          │
+  │  on new investigation: retrieve top-3 similar         │
+  │  → inject as few-shot in system prompt                │
+  └──────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The industry pattern for agent long-term memory:
-- **Episodic memory** — full conversation logs, retrieved by similarity to current query.
-- **Semantic memory** — extracted facts / claims / preferences, indexed and retrieved.
-- **Working memory** — the current loop's messages array (short-term).
+The two-layer memory model is standard — short-term as "what fits in context" and long-term as "what you retrieve." The distinction matters for design: short-term is where sub-second-latency reasoning happens; long-term is where you accept 10–100ms retrieval latency in exchange for knowledge that couldn't fit in-context.
 
-Modern agent frameworks (LangGraph, CrewAI) bake all three in as first-class concepts. AptKit today ships working memory (the messages array) and lets the caller layer episodic / semantic on top. This codebase uses only working memory + UI persistence; no retrieved memory of any shape.
+Chat-style memory (persistent conversation across sessions) is a specialized long-term form — retrieve prior turns of *this user*'s conversation, inject into system prompt. blooming's QueryBox doesn't do this yet; the sessions modal in the UI is per-session only.
+
+Related: **03-react-pattern.md** (short-term is embedded in the loop), **../03-retrieval-and-rag/11-rag.md** (long-term is RAG), **../03-retrieval-and-rag/12-graphrag.md** (a specialized long-term shape).
 
 ## Project exercises
 
-### Exercise — retrieved episodic memory over past investigations
+### B4.5 · Ship investigation-memory long-term retrieval
 
-- **Exercise ID:** C4.5-B · Case B (short-term exercised; long-term retrieval not).
-- **What to build:** if the RAG stack from `03-retrieval-and-rag/*` is present, wire the diagnostic agent to retrieve top-3 similar past diagnoses at the start of each investigation and prepend them to the initial user message.
-- **Why it earns its place:** turns the codebase's long-term memory from UI-persistence into agent-accessible. Interviewer signal: "my agents can remember; here's the retrieval that enables it."
-- **Files to touch:** `lib/agents/diagnostic.ts` (accept optional retrieved context), `lib/rag/retrieve.ts` (call before invoke), `eval/run.eval.ts` (measure quality with vs without).
-- **Done when:** enabling retrieved memory shows measurable per-dim quality change on the 10-case eval.
-- **Estimated effort:** 1 week (assumes RAG stack from earlier exercises is built).
+- **Exercise ID:** B4.5 (Case B — depends on B3.11 aggregate exercise)
+- **What to build:** The concrete "long-term memory for agents" feature. On investigation save: embed `anomaly + diagnosis`, store in `.investigation-index.json`. On new investigation: retrieve top-3, inject as few-shot in the diagnostic agent's system prompt. Aggregates B3.1 through B3.10 into an agent-facing feature.
+- **Why it earns its place:** Turns "we have short-term memory" into "we have two-layer memory." Directly measurable via baseline rerun — does the `root_cause_plausibility` pass rate improve when the agent has prior investigations to reference?
+- **Files to touch:** All files in the `03-retrieval-and-rag/` sub-section's B3.11 aggregate.
+- **Done when:** the diagnostic agent's system prompt includes retrieved past-investigation context on runs where the index has ≥3 relevant entries; the baseline rerun shows measurable impact.
+- **Estimated effort:** `≥1 week`.
 
 ## Interview defense
 
-**Q: What memory do the agents have?**
+**Q: Why doesn't blooming have long-term memory yet?**
 
-Only the current investigation's messages array — short-term, in-context. When an investigation ends, the messages array is discarded. Long-term persistence in this repo is UI-side (sessionStorage for navigation, committed demo snapshots for the demo path); the agents don't retrieve from it.
+Corpus. Long-term memory needs a corpus of past investigations to retrieve from. The codebase writes investigations to state but doesn't accumulate cross-session yet. Adding memory before the corpus is scaffolding for a load that doesn't exist. Load-bearing: I know exactly what to build (`B4.5`) and I know when to build it (after enough investigations accumulate that retrieval would return non-trivial matches).
 
-```
-  short-term:  messages array (dies at loop end)
-  medium-term: sessionStorage (dies at tab close)
-  long-term:   demo snapshot (committed, UI-only)
-  retrieved:   (missing — Case B RAG add)
-```
+**Q: What about short-term memory within a single agent?**
 
-**Q: What would agent-side long-term memory look like?**
-
-RAG over past diagnoses. Embed each conclusion; on new investigation, retrieve top-3 similar past cases; prepend to initial user message. Would let the agent apply prior reasoning. Not built today because past-investigation volume is low and the tool-call grounding already gives the agent strong current-data access.
-
-**Q: Why the sessionStorage stash?**
-
-Because the two-page product flow (investigate step 2 → step 3) needs to survive navigation without re-running the ~225s agent chain. Stashing lets step 3 hydrate instantly with the diagnosis from step 2. Not a "memory" the agent uses — it's a UX cache.
+That's live. The `messages` array grows turn-by-turn inside the aptkit loop; the model sees the whole thing every turn. Bounded by the 200k context window, but blooming's investigations use 20–40k, so there's 5× headroom. Where it would break: if a tool result exploded to 100kB, one call could blow the window. Mitigation named in `B2.1` — bound tool_result size.
 
 ## See also
 
-- `02-context-and-prompts/01-context-window.md` — the mechanics of short-term memory
-- `03-retrieval-and-rag/11-rag.md` — what agent-side long-term memory would look like
-- `lib/hooks/useInvestigation.ts` — the medium-term stash
+- [03-react-pattern.md](03-react-pattern.md) — where short-term memory feeds every turn.
+- [../03-retrieval-and-rag/11-rag.md](../03-retrieval-and-rag/11-rag.md) — the shape long-term memory would take.
+- [../02-context-and-prompts/01-context-window.md](../02-context-and-prompts/01-context-window.md) — the ceiling short-term memory competes for.

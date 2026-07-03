@@ -1,325 +1,305 @@
-# TCP/UDP, connections, and sockets
+# 03 — TCP/UDP, connections, and sockets
 
-*Transport-layer connections (Industry standard)* — the connections and
-sockets underneath the HTTP calls in this repo. Almost all of it is
-delegated to the platform; the code touches sockets nowhere directly.
+## Subtitle
 
-## Zoom out — where this concept lives
+Transport-layer connections and lifecycle (Language-agnostic — the sockets behind the HTTP calls, and how long each one lives).
 
-Every network call in this repo goes through `fetch` — either the
-browser's `fetch` on the client, or Node's built-in `fetch` (backed by
-Undici) inside the routes. Undici manages a connection pool, keeps
-sockets warm with HTTP keepalive, and reuses them across requests.
-None of that shows up in the app code — but understanding what Undici
-does under the hood is what lets you reason about long-lived stream
-lifetimes and the 30s per-call timeout.
+## Zoom out, then zoom in
+
+Every one of the three HTTPS hops in the network map is a TCP connection under the hood (no UDP anywhere in this codebase's application layer). What's interesting isn't that TCP carries the requests — that's true of any HTTPS app — it's the **lifecycle** of the connections. The inbound one is long-lived (kept open for the whole NDJSON stream, up to 300 seconds). The two outbound ones are short-lived per call and pooled by Node's fetch. Different lifecycle stories on either side of the same route function.
 
 ```
-  Zoom out — where sockets live in this repo
+  Zoom out — connection lifecycles across the layers
 
-  ┌─ Client (browser fetch) ────────────────────────────────────┐
-  │  browser's HTTP stack manages sockets                        │
-  │  HTTP/1.1 keepalive or HTTP/2 multiplexed (browser choice)   │
-  └───────────────────────┬──────────────────────────────────────┘
-                          │  TCP + TLS to Vercel edge
-                          ▼
-  ┌─ Vercel edge (TLS terminated) ──────────────────────────────┐
-  │  Vercel handles keepalive to Node runtime                    │
-  └───────────────────────┬──────────────────────────────────────┘
-                          │
-  ┌─ Node runtime (route handler) ──────────────────────────────┐
-  │  ★ SOCKETS LIVE HERE (in Undici's pool) ★                    │
-  │  fetch() → Undici Agent (default: keepalive on, pool sized)  │
-  │  no custom Agent; no custom Dispatcher                       │
-  └───┬───────────────────────────────────────────────┬──────────┘
-      │  TCP+TLS to loomi-mcp-alpha.bloomreach.com    │  TCP+TLS to api.anthropic.com
-      ▼                                                ▼
-  ┌─ Bloomreach ────┐                          ┌─ Anthropic ────┐
-  │  MCP over HTTPS │                          │  HTTPS         │
-  └─────────────────┘                          └────────────────┘
+  ┌─ UI layer ─────────────────────────────────────────────────┐
+  │  browser fetch() — TCP conn held open for the response     │
+  │  body (streaming), reused by the browser's HTTP/2 pool     │
+  │  for subsequent same-origin calls                          │
+  └────────────────────────┬───────────────────────────────────┘
+                           │  hop 1: LONG-LIVED
+                           │  connection open ~5–120s
+                           ▼
+  ┌─ Service band (route) ─────────────────────────────────────┐
+  │  ★ THIS FILE ★                                             │  ← we are here
+  │  the multiplexer — holds one inbound socket open while     │
+  │  opening/closing many outbound ones                        │
+  └──────────┬──────────────────────────────┬──────────────────┘
+             │ hop 2: SHORT-LIVED, POOLED   │ hop 3: SHORT-LIVED, POOLED
+             │ per tool call, ~200ms-30s    │ per model turn, ~2-10s
+             ▼                              ▼
+  ┌─ MCP server ──────────────────┐  ┌─ Anthropic API ────────┐
+  │  each callTool = one HTTPS    │  │  each messages.create  │
+  │  request; ideally reuses TCP  │  │  = one HTTPS request;  │
+  │  conn from the last call      │  │  same reuse story      │
+  └───────────────────────────────┘  └────────────────────────┘
 ```
 
-The app owns nothing at the socket layer — no `new Agent(…)`, no
-`net.Socket`, no `dgram`. The platform's defaults carry the whole
-weight. That's a design choice, and it's the right one at this
-traffic volume.
+Zoom in — this file walks the lifecycle. When does each socket open? When does it close? What's holding it open in between? Where does that lifecycle constrain what the app can do?
 
-## The structure pass
+## Structure pass
 
-Two seams that matter, one axis: **connection lifetime — how long does
-the underlying TCP+TLS connection live?**
+**Layers:**
+- Browser TCP pool (HTTP/2 to same-origin)
+- Vercel edge socket to the function invocation
+- Node function's outbound `undici` connection pool
+- Two upstream TCP endpoints (MCP origin, Anthropic API)
+
+**Axis — LIFECYCLE (when does this connection exist?):**
 
 ```
-  Axis: "how long does one TCP+TLS connection last?"
+  "how long does this socket live?" — traced down the stack
 
-  ┌─────────────────────────────────────────┐
-  │ browser → route                          │  → per fetch, but
-  │ NDJSON response (chunked)                │    lives for the whole
-  │                                          │    300s stream lifetime
-  └─────────────────────────────────────────┘
-      ┌──────────────────────────────────────┐
-      │ route → Bloomreach                   │  → Undici keepalive,
-      │ many short JSON-RPC calls            │    connection reused
-      │                                       │    across ~15 tool calls
-      └──────────────────────────────────────┘
-          ┌──────────────────────────────────┐
-          │ route → Anthropic                │  → Undici keepalive,
-          │ many short LLM calls              │    connection reused
-          │                                   │    across ReAct turns
-          └──────────────────────────────────┘
+  browser ─► route          → OPEN for whole response body
+                              (up to 300s NDJSON stream)
+       seam #1: request/response is one TCP conversation
+  route ─► MCP              → OPEN per tool call
+                              (~30ms-30s), pooled per host
+       seam #2: pool decides "reuse or open new"
+  route ─► Anthropic        → OPEN per model turn
+                              (~2-10s), pooled per host
+       seam #3: TLS handshake amortized by keep-alive
+
+  the answer flips at each seam:
+    one long-lived, N short-lived
 ```
 
-The seam that matters: the *browser-to-route* connection is
-long-lived (streaming for potentially 5 minutes), while every
-*route-to-upstream* connection is short-lived but pooled and reused.
+**Seams:**
+- Seam #1 — the inbound socket stays open for the whole stream body. Closing early = "stream aborted" on the browser side.
+- Seam #2/3 — the outbound sockets get pooled by `undici`. Reused across calls within an instance's lifetime; each new TLS handshake costs ~50-100ms.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know that `fetch('/api')` behind the scenes opens a TCP connection,
-does a TLS handshake, sends the HTTP request, reads the response. What
-you might not know: on a modern platform (browser, Node with Undici,
-Chromium), the connection *stays open* after the response for reuse.
-The next `fetch` to the same origin skips the TCP handshake, skips the
-TLS handshake, and starts sending immediately.
+Think of the route function as a **valve** with one large-diameter pipe on the input side (the browser's long-lived stream) and two smaller pipes it opens on demand for each internal request (the pooled outbound fetches). The valve stays open until the response body closes; the two smaller pipes open and close many times during that window.
 
 ```
-  The pattern — one physical connection, many logical requests
+  The valve — one inbound pipe, N outbound bursts
 
-  time ─►
+              inbound (browser fetch)
+                       │
+              ═════════════════════════
+              ║   route function      ║
+              ║  ┌─────────────────┐  ║   outbound MCP call
+              ║  │   ReadableStream ─╫──►  ─ open ─ close
+              ║  │   controller     │  ║   outbound Anthropic call
+              ║  │   .enqueue(byte) ─╫──►  ─ open ─ close
+              ║  └─────────────────┘  ║   MCP call again (pool reuses)
+              ═════════════════════════   ─ open ─ close
+                       │
+              (open until stream close)
 
-  connection open ─┐
-                    │  fetch #1 request bytes
-                    │  fetch #1 response bytes
-                    │              gap ~50ms (Undici keepalive)
-                    │  fetch #2 request bytes         ← same connection
-                    │  fetch #2 response bytes
-                    │              gap ~1100ms (1 req/s spacing)
-                    │  fetch #3 request bytes         ← still same connection
-                    │  fetch #3 response bytes
-                    │              …
-                    │  (connection eventually closed by idle timeout
-                    │   on server side, or process exit on client)
+  inbound: one TCP connection, held open the whole time
+  outbound: many short TCP conversations, pooled per host
 ```
 
-For blooming_insights this means the ~15 tool calls in one investigation
-open exactly *one* TCP+TLS handshake to Bloomreach and *one* to Anthropic,
-then reuse. That's a big win — TLS handshake alone is ~100-300ms per
-attempt.
+### Move 2 — the walkthrough
 
-### Move 2 — where sockets show up (and don't)
+#### Hop 1 (down) — the browser's request TCP
 
-#### The route-to-upstream connections
+The browser opens one TCP connection to the deploy origin (or reuses an HTTP/2 stream on an existing one) when the user's `fetch('/api/briefing')` fires. Nothing special — standard `fetch` over HTTPS. The interesting part is what happens next.
 
-Node 18+ ships `fetch` as a global backed by Undici. The default
-`Dispatcher` maintains a connection pool with:
-  - HTTP/1.1 keepalive on by default
-  - ~10 sockets per origin (Undici default)
-  - idle timeout ~4s (so a Bloomreach call every ~1.1s reuses)
-  - automatic HTTP/2 negotiation via ALPN if the server offers it
+#### Hop 1 (up) — the response body stays open
 
-The app doesn't override any of this. There's no `import { Agent } from 'undici'`
-anywhere in `lib/`. That's fine — one user, one MCP origin, one LLM
-origin, one route at a time.
-
-**What that means concretely**: the 300s stream from the browser hosts
-a Node request context that makes ~15 outbound fetches. All of them
-share one Undici pool per origin. The `1.1s` proactive spacing in
-`BloomreachDataSource.liveCall` at `lib/data-source/bloomreach-data-source.ts:190-198`:
+The route returns a `Response` whose body is a `ReadableStream<Uint8Array>`. From `app/api/agent/route.ts:189-192`:
 
 ```ts
-  private async liveCall(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
-    const elapsed = Date.now() - this.lastCallAt;
-    if (elapsed < this.minIntervalMs) {
-      await new Promise((r) => setTimeout(r, this.minIntervalMs - elapsed));
+const encoder = new TextEncoder();
+const stream = new ReadableStream<Uint8Array>({
+  async start(controller) {
+    // ...
+  },
+});
+```
+
+That stream stays open — the socket stays open — until `controller.close()` fires. Which is why the socket lives up to 300 seconds:
+
+```ts
+// app/api/agent/route.ts:23
+// 300s = Vercel Pro's max. A live investigation (diagnostic → recommendation)
+// runs ~100-115s under the ~1 req/s MCP limit; 60s (Hobby) cannot fit it.
+export const maxDuration = 300;
+```
+
+The consequence: **one open socket, potentially for five minutes.** During that window, the browser's `readNdjson` is reading one chunk at a time. If the browser closes early (user navigates away), the socket closes and `req.signal.aborted` becomes true — which the route observes:
+
+```ts
+// app/api/agent/route.ts:134-136 (inside the cached-replay loop)
+// Client cancelled mid-replay — break out so we don't keep enqueuing
+// bytes into an already-closed reader.
+if (req.signal.aborted) break;
+```
+
+For the live path, the abort signal is composed with the transport's per-call timeout so any in-flight MCP call cancels immediately (see file 07). That's the load-bearing lifecycle detail: **the inbound socket's close event propagates all the way down to the outbound socket's abort.**
+
+#### Hop 2 and hop 3 — pooled outbound sockets
+
+Node's global `fetch` (backed by `undici` on Node 20+) pools TCP connections per origin automatically. When `dataSource.callTool` or `anthropic.messages.create` runs, `undici` checks its pool for an idle connection to the target host. If one's available, it reuses it (skipping TCP handshake + TLS handshake, saving ~50-100ms). If not, it opens a new one.
+
+No `httpAgent` is configured in this repo. No `keepalive: true` flag on the individual fetch calls. Grep confirms:
+
+```
+grep "httpAgent|keep-alive|keepalive" — no matches in lib/ or app/
+```
+
+The pool is Node-runtime-default. On Vercel's ephemeral functions, that pool's lifetime is the function invocation's lifetime — which can be a few seconds to a few minutes. The consequence: **each cold function invocation pays one TCP+TLS handshake per upstream host on its first call.** Subsequent calls within the same invocation reuse.
+
+For a live investigation with ~5-15 MCP tool calls in the ReAct loop, only the first call takes the handshake hit. The rest ride the pool.
+
+```
+  Outbound pool — per-host TCP reuse
+
+  first MCP call:
+    open TCP → TLS handshake → HTTP request → response
+    (socket returned to pool, not closed)
+
+  second MCP call:
+    pool.acquire() → use pooled socket → HTTP request → response
+    (no handshake!)
+
+  ... N-1 more times ...
+
+  function invocation ends → pool discarded → all sockets close
+
+  first Anthropic call:
+    same pattern, different host → different pool entry
+```
+
+#### Neither client uses HTTP/2 to upstreams explicitly
+
+`undici` speaks HTTP/1.1 by default. If Bloomreach's server negotiates HTTP/2 during ALPN, `undici` would fall back to HTTP/1.1 (it doesn't currently support H2 as a client without `undici.Client` H2 flag). Anthropic's SDK uses its own transport but effectively HTTP/1.1 as well. No multiplexing across streams.
+
+The practical implication: **each concurrent outbound call needs its own socket.** If a route were to fire 5 MCP calls in parallel, `undici` would either open 5 sockets or serialize them onto fewer. For this repo the ReAct loop is sequential inside a single agent — one MCP call at a time — so pool size doesn't hit its ceiling in practice.
+
+#### Zero UDP anywhere
+
+QUIC (which is UDP-based) isn't used at the application layer. DNS resolution goes through the OS resolver, which likely uses UDP under the hood — but that's below the app's abstraction level. No custom UDP sockets, no QUIC transports, no realtime UDP-based protocols.
+
+#### The 30-second per-call ceiling as a socket lifecycle constraint
+
+The transport composes a 30-second `AbortSignal.timeout` with the route-level cancel signal. From `lib/mcp/transport.ts:38, :131-137`:
+
+```ts
+const TOOL_TIMEOUT_MS = 30_000;
+// ...
+async callTool(name: string, args: Record<string, unknown>, opts?: CallToolOpts): Promise<unknown> {
+  if (this.httpErrors) this.httpErrors.last = null;
+  const signal = composeSignals(opts?.signal, AbortSignal.timeout(TOOL_TIMEOUT_MS));
+  try {
+    return await this.client.callTool({ name, arguments: args }, undefined, { signal });
+  } catch (err) {
+    // Timeout path — distinct `HTTP 0:` tag so callers can recognize it.
+    if (isTimeoutError(err)) {
+      throw new Error(`HTTP 0: timeout after ${TOOL_TIMEOUT_MS}ms`, { cause: err });
     }
-    // …
-    const result = await this.transport.callTool(name, args, { signal });
+    // ...
+  }
+}
 ```
 
-is *application-level* spacing to respect Bloomreach's global 1-req-per-second
-rate limit — it has nothing to do with the underlying TCP connection.
-The Undici pool doesn't care about the wait; the socket stays open
-during the sleep.
-
-#### The browser-to-route stream
-
-The interesting one. The route returns a `ReadableStream` inside a
-`Response` (`app/api/briefing/route.ts:191-336`), so from the browser's
-perspective this is one `fetch` that never fully completes until the
-route emits `done`. Under HTTP/1.1 that's one dedicated socket for the
-duration; under HTTP/2 it's one stream ID over a multiplexed connection.
-
-Cancellation matters here. When the effect unmounts:
-
-```ts
-  return () => {
-    cancelledRef.current = true;   // useBriefingStream.ts:298
-  };
-```
-
-The `readNdjson` loop polls `cancelOn()` between reads and calls
-`reader.cancel()` (`lib/streaming/ndjson.ts:33-36`). That closes the
-underlying HTTP/1 socket or HTTP/2 stream, and the browser fires
-`AbortError` back into the route via `req.signal`. The route's
-`throwIfAborted()` guards then abort in-flight upstream calls.
-
-Here's the whole cancellation chain across the socket layer:
-
-```
-  Cancellation path — from user tab close to socket release
-
-  User closes tab
-        │
-        │  browser fires
-        │  navigator.sendBeacon-style teardown OR
-        │  effect cleanup runs on route change
-        ▼
-  ┌─ Browser ───────────────────────────────────────────────┐
-  │  cancelledRef.current = true                             │
-  │  readNdjson polls, sees cancel, calls reader.cancel()    │
-  │  → HTTP/1 socket closed OR HTTP/2 stream RST_STREAM     │
-  └─────────────┬───────────────────────────────────────────┘
-                │  TCP FIN or HTTP/2 reset
-                ▼
-  ┌─ Route ─────────────────────────────────────────────────┐
-  │  req.signal fires (AbortError)                           │
-  │  throwIfAborted() at next check                          │
-  │  in-flight callTool signal (composed) → aborts           │
-  └─────────────┬───────────────────────────────────────────┘
-                │  cancel propagates via AbortSignal
-                ▼
-  ┌─ Undici pool ───────────────────────────────────────────┐
-  │  in-flight upstream request cancelled                    │
-  │  socket returned to pool (or destroyed if mid-transfer)  │
-  └──────────────────────────────────────────────────────────┘
-```
-
-The route logs `aborted: req.signal.aborted` in the finally summary
-(`briefing/route.ts:323`) so an operator can see cancellation events
-in the Vercel log stream.
-
-#### UDP — not exercised
-
-No `dgram`, no `datagram`, no QUIC-level code. HTTP/3 (QUIC over UDP)
-would be handled entirely by the platform stack if the browser and
-upstream negotiate it, but the app doesn't see it.
-
-#### Raw TCP — not exercised
-
-No `net.Socket` anywhere in `lib/`. No `net.createConnection`. All
-network access is via `fetch`.
+When that signal fires, `undici` aborts the fetch, which closes the underlying TCP socket. **Socket-level cancellation is how the app enforces "no single call takes more than 30s."** Without the abort, the socket would sit there waiting for the server's response until Node's default socket timeout (~2 minutes) or the route's 300s budget ran out — both of which are worse.
 
 ### Move 3 — the principle
 
-Trust the platform's socket layer until you have a specific reason not
-to. Undici's defaults handle keepalive, pooling, and idle timeout
-correctly for the workload here. You'd revisit only when:
-  - **You need a specific keepalive interval** to prevent an
-    intermediate NAT/firewall from dropping idle connections.
-  - **You need per-user connection isolation** (e.g. a multi-tenant
-    proxy where each tenant needs their own pool).
-  - **You need a specific TLS session ticket policy** for perf.
-
-None of those apply at this repo's scale.
+**Lifecycle is what makes networks visible.** For a same-origin `fetch` call that resolves in 50ms, the socket lifecycle is invisible — it opens, gets used, gets pooled or closed, all under the hood. When one socket is held open for 5 minutes and the other side of the same function is opening/closing sockets at the rate of the ReAct loop, lifecycle stops being invisible. The route function is where those two lifecycles meet, which is why every timeout, cancel, and pool decision in this repo happens right there.
 
 ## Primary diagram
 
 ```
-  Primary — the socket picture
+  Connection lifecycle — all three hops laid out over time
 
-  ┌─ Browser ────────────────────────────────────────────────────┐
-  │  one long-lived fetch (up to 300s) → one HTTP stream         │
-  │  reader.cancel() → RST_STREAM or FIN                          │
-  └───────────────────────┬──────────────────────────────────────┘
-                          │  one TCP+TLS conn (or HTTP/2 stream)
-                          ▼
-  ┌─ Vercel edge (TLS terminated) ──────────────────────────────┐
-  │  reverse proxy → Node runtime                                │
-  └───────────────────────┬──────────────────────────────────────┘
-                          │  local/loopback
-                          ▼
-  ┌─ Node runtime (Undici pool) ────────────────────────────────┐
-  │                                                                │
-  │  origin: loomi-mcp-alpha.bloomreach.com                       │
-  │  ┌──────────────────────────┐                                 │
-  │  │ socket 1 (keepalive)     │  ← reused for ~15 tool calls    │
-  │  └──────────────────────────┘                                 │
-  │                                                                │
-  │  origin: api.anthropic.com                                    │
-  │  ┌──────────────────────────┐                                 │
-  │  │ socket 1 (keepalive)     │  ← reused for ReAct turns       │
-  │  └──────────────────────────┘                                 │
-  │                                                                │
-  │  No custom Agent, Dispatcher, or Pool — Undici defaults       │
-  └──────────────────────────────────────────────────────────────┘
+  time ───────────────────────────────────────────────────────►
+
+  ┌─ hop 1 (browser → route) ─────────────────────────────────┐
+  │                                                            │
+  │  browser TCP conn ═══════════════════════════════════════  │
+  │                    ▲                                     ▲ │
+  │              fetch() opens                controller.close│
+  │              (or reuses HTTP/2)          browser reader end│
+  │                                                            │
+  │  ~0-300s open (up to maxDuration)                          │
+  └────────────────────────────────────────────────────────────┘
+
+  ┌─ hop 2 (route → MCP), pooled outbound ────────────────────┐
+  │                                                            │
+  │  MCP conn ─── ─── ─── ─── ─── ─── ─── ─── ─── ─── (closed)│
+  │             │   │   │   │   │   │   │   │   │             │
+  │           call 1│ call 2│ call 3│ call 4│                  │
+  │                 │       │       │       │                  │
+  │  each interval: pool acquire → HTTP req → response → return│
+  │  first call pays TCP+TLS handshake; rest reuse             │
+  │  each call bounded by AbortSignal.timeout(30_000)          │
+  └────────────────────────────────────────────────────────────┘
+
+  ┌─ hop 3 (route → Anthropic), separate pool ────────────────┐
+  │                                                            │
+  │  Anthropic conn ─── ─── ─── ─── ─── ─── (closed at fn end)│
+  │                  │   │   │   │   │                         │
+  │              turn 1 turn 2 turn 3 turn 4                  │
+  │                                                            │
+  │  interleaved with hop 2 calls in the ReAct loop            │
+  │  same pool-per-host story, different host                  │
+  └────────────────────────────────────────────────────────────┘
+
+  when hop 1 aborts (browser closes tab):
+    req.signal.aborted = true
+    → composeSignals fires
+    → in-flight hop 2/3 fetches abort
+    → their TCP sockets close
+    → route function exits early
 ```
 
 ## Elaborate
 
-The interesting decision here is *not* to touch sockets. In a system
-where every millisecond mattered you'd tune keepalive, pre-warm the
-pool at cold start, maybe pin an HTTP/2 connection. Here, the largest
-network cost per request is:
+**Why pool per host, not per app.** TLS handshakes are expensive (RTT-bound, ~50-100ms). Pooling amortizes them across calls to the same origin. Two origins → two pools. If you added a third upstream (a database HTTP API, say), you'd get a third pool entry, but the pooling is otherwise transparent — you don't configure it.
 
-  - Anthropic latency: ~2-5s per LLM turn (dominated by model compute)
-  - Bloomreach latency: ~200-500ms per tool call + rate-limit waits
+**Why the inbound socket is different.** The response body is a *stream*, not a request/response transaction. HTTP/1.1's `Transfer-Encoding: chunked` (or HTTP/2's DATA frames) keep the socket open until the server sends the terminating chunk (empty chunk + CRLF for HTTP/1.1). Vercel's edge doesn't buffer `application/x-ndjson` bodies, so chunks reach the browser as fast as the route writes them. The socket lives as long as the stream does.
 
-The socket handshake savings (~200ms for TLS 1.3, once, on the first
-call) are noise against those. Not worth engineering.
+**What's not exercised.** WebSockets (would need a different upgrade handshake and a socket lifetime that outlives request/response). Long-polling (which would require multiple short-lived connections; NDJSON is strictly better for this shape). Custom `undici.Agent` with configured pool size, keep-alive settings, or HTTP/2. Explicit socket-level timeouts (Node's `socket.setTimeout` — everything happens at the `AbortSignal` layer instead).
 
-The one place it *would* matter: if the Vercel Node runtime cold-starts
-mid-briefing. A cold start opens fresh sockets to both origins; the
-first tool call absorbs the TLS handshake. Not measurable in the
-current baseline (`2026-07-03T04-08-28-644Z`), but a knob to consider
-if you saw a bimodal latency distribution on the first call.
+**On Vercel's ephemeral function lifetime.** The pool is per-invocation, but Vercel keeps warm instances around between invocations — so a subsequent invocation *might* hit the same instance and reuse its pool. Best-effort optimization, not a load-bearing property. If you were running this on a long-lived Node server, the pool would persist across all requests to that server; on Vercel it doesn't.
+
+**The `HTTP 0:` timeout tag.** The transport wraps the timeout error with a distinct message shape — `HTTP 0: timeout after 30000ms` — so callers can pattern-match on it. `HTTP 0` because there was no HTTP response at all; the socket was cancelled before the server responded. See `08-networking-red-flags-audit.md` for how this shows up in the fault-injection surface.
 
 ## Interview defense
 
-**Q: How does the app manage connection pooling to Bloomreach?**
+**Q: How long does one socket live in this app?**
 
-  Verdict first: it doesn't — Undici does, and the defaults are right
-  for this workload.
+Depends which socket. The inbound socket (browser → route) lives for the entire NDJSON stream, up to 300 seconds. The outbound sockets (route → MCP, route → Anthropic) are per-call — they open when a fetch fires, get pooled after the response completes, get discarded when the function invocation ends. Individual calls are bounded by a 30-second `AbortSignal.timeout` composed with the route-level cancel signal, so no single outbound call can hold a socket open longer than that.
 
 ```
-  answer sketch — one pool per origin, warm across the briefing
+  timeline of one 100-second investigation:
 
-  briefing route lifetime (~50-100s)
-      │
-      ├─ callTool #1  → Undici opens socket #1 to bloomreach
-      │  200ms TLS handshake included
-      │
-      ├─ 1.1s spacing (app-level, socket stays open)
-      │
-      ├─ callTool #2  → REUSES socket #1
-      │  no TLS handshake
-      │
-      ├─ callTool #15 → still socket #1
-      │
-      └─ route returns → socket idle in pool
-                        idle timeout ~4s → Undici closes
+  inbound socket:  ═════════════════════════════════════════════
+                   0s                                        100s
+  outbound (MCP):    ─── ── ─── ─ ─── ── ─── ─── ─── ── ─── ──
+                     each ~200ms-30s, pooled per host
+  outbound (Anth):     ─── ─── ─── ─── ─── ─── ─── ───
+                       each ~2-10s, pooled per host
 ```
 
-  Anchor: `lib/data-source/bloomreach-data-source.ts:190-205` (the
-  1.1s spacing sits *on top of* Undici's pool, which handles the
-  socket reuse transparently).
+Anchor: `app/api/agent/route.ts:23` (maxDuration), `lib/mcp/transport.ts:38` (TOOL_TIMEOUT_MS).
 
-**Q: What happens to the underlying TCP connection when the browser
-tab closes mid-stream?**
+**Q: How does the app handle a browser closing the tab mid-investigation?**
 
-  Direct: browser closes the stream, the socket (HTTP/1) or stream
-  (HTTP/2) sends RST/FIN, Node's `req.signal` fires `AbortError`, the
-  route's next `throwIfAborted()` throws, and any in-flight upstream
-  `callTool` has its own composed signal aborted, which cancels the
-  Undici request and returns the socket to the pool (or destroys it if
-  it was mid-transfer).
+`req.signal` fires. That signal is composed with the transport's per-call timeout via `composeSignals` in `lib/mcp/transport.ts:131-133`, so any in-flight MCP call aborts. `undici` cancels the fetch, the underlying TCP socket closes, and the route's `try/catch` catches the AbortError:
 
-  Anchor: `useBriefingStream.ts:298`, `lib/streaming/ndjson.ts:33-36`,
-  `briefing/route.ts:215,248,259,283,290`.
+```ts
+if (e instanceof DOMException && e.name === 'AbortError') {
+  return;
+}
+```
+
+The route exits without emitting an error event (no consumer to read it), the finally block runs the dispose + logs the phase timings, and the function invocation ends. All three sockets close.
+
+Anchor: `app/api/agent/route.ts:313-315`.
+
+**Q: What's the load-bearing socket-lifecycle detail people miss when they build this shape?**
+
+Composing the abort signal into the transport. Without composition, aborting the inbound socket doesn't propagate to the outbound sockets — they keep running until their own timeout fires, burning route budget and cost. The `composeSignals` call in `lib/mcp/transport.ts:131` is what wires "browser closed the tab" to "MCP call cancels now." One line, but the socket lifecycle wouldn't join up without it.
 
 ## See also
 
-  - `01-network-map.md` — the three hops these sockets carry
-  - `04-tls-and-trust-establishment.md` — the TLS handshake we skip on reuse
-  - `07-timeouts-retries-pooling-and-backpressure.md` — the timeouts that ride on top
+- `01-network-map.md` — the topology this lifecycle sits inside
+- `07-timeouts-retries-pooling-and-backpressure.md` — the 30s timeout as the load-bearing lifecycle constraint
+- `06-websockets-sse-streaming-and-realtime.md` — why the inbound socket has a different lifecycle than the outbound ones

@@ -1,359 +1,297 @@
 # 10 · Self-critique and self-consistency
 
-**Self-critique / LLM-as-judge / self-consistency / verify-then-emit — Industry standard**
+**Industry name:** *self-critique* / *self-consistency* / *LLM-as-judge* · Industry standard
 
-## Zoom out, then zoom in
+## Zoom out — critique as a separate chain
 
-A model critiquing its own output has the same blind spots that produced the output. That's the honest headline. The technique still works — under specific conditions — because critique and generation are different modes and the model does catch a class of errors on critique that it missed on generation. In this codebase, self-critique is realized as **LLM-as-judge** (see `05-eval-driven-iteration.md`) — a *different* prompt (the RubricJudge) scores the diagnostic agent's output against a rubric. Not the same LLM turn critiquing itself; a *secondary* LLM call with different context, different task, and different scoring criteria. That's the shape that earns tokens.
-
-```
-  Zoom out — where self-critique sits
-
-  ┌─ Generation ────────────────────────────────────────────┐
-  │  DiagnosticAgent produces Diagnosis                     │
-  │  Same LLM, same context, same call                      │
-  └────────────────────────┬────────────────────────────────┘
-                           │
-  ┌─ ★ CRITIQUE STAGE ★ ────▼───────────────────────────────┐
-  │  RubricJudge scores the Diagnosis                       │  ← we are here
-  │  DIFFERENT prompt, DIFFERENT context (rubric-shaped),   │
-  │  same underlying model, temperature 0                   │
-  │  outputs: dimensions{}, verdict, fix                    │
-  └────────────────────────┬────────────────────────────────┘
-                           │
-  ┌─ Consumer ─────────────▼────────────────────────────────┐
-  │  eval receipt writes judgment alongside diagnosis        │
-  │  regression gate: has-signal + partial-signal must not   │
-  │  verdict as fail                                         │
-  └─────────────────────────────────────────────────────────┘
-```
-
-**Zoom in.** Self-critique has three common shapes: (1) **same-turn critique** — "produce an answer, then critique it, then revise" in one long generation. Cheap but blind. (2) **secondary-call critique** — a different LLM call reads the output and scores it. This is what's in production. (3) **self-consistency** — run the same prompt N times, majority-vote the answer. Expensive but catches the "one weird sample" case. This codebase uses shape (2) as LLM-as-judge in the eval pipeline. Shape (1) is not used in the agent loop itself — production diagnoses don't get re-verified before shipping to the UI.
-
-## Structure pass
-
-### Axes — the dimension we're tracing
-
-**What is the critique blind to?** A model critiquing its own output tends to be blind to *the same blind spots* that produced the output — because it reads the output the same way. A rubric-anchored critique with different context (like `tool_calls_trace`) can catch different things because the *context* forces different attention. Trace this axis and you find where self-critique earns tokens and where it's ceremony.
-
-### Seams — where critique catches vs misses
-
-Three seams:
-
-- **Same-turn vs secondary-call** — same-turn critique is generation continuing under the same context; secondary-call critique is a fresh generation with a different prompt shape. The secondary call has the option to see things (rubric criteria, tool traces) the generating call never had.
-- **Rubric-anchored vs free-form** — rubric-anchored critique scores against named dimensions; free-form critique produces "here are three things I could improve" prose. Rubric-anchored is parseable and gates decisions; free-form is a dashboard read.
-- **Judge-of-answer vs self-consistency** — judge-of-answer scores one output. Self-consistency runs N outputs and votes. Different failure modes; different costs.
-
-### Layered decomposition
-
-"What does the critique see that generation missed?" — traced down:
+Self-critique in this codebase isn't the classic "ask the same model to critique its own output" pattern. It's the *stronger* version: a distinct judge chain with its own rubric, its own context (including the tool trace), and its own scoring. Same shape as self-critique, structurally cleaner.
 
 ```
-  "What does critique catch?" — same question, three altitudes
+  Zoom out — critique as a second chain
 
-  ┌────────────────────────────────────────────────┐
-  │ outer: format bugs (JSON malformed, wrong fields│  → validators already
-  │        missing)                                 │    catch these
-  └────────────────────────────────────────────────┘
-      ┌────────────────────────────────────────────┐
-      │ middle: content bugs (invented numbers,     │  → critique catches
-      │         out-of-scope claims)                │    when it has the
-      │                                             │    tool_calls_trace
-      └────────────────────────────────────────────┘
-          ┌────────────────────────────────────────┐
-          │ inner: reasoning bugs (wrong root       │  → critique often
-          │        cause given the evidence)        │    misses because
-          │                                          │    critique-mode has
-          │                                          │    same priors
-          └────────────────────────────────────────┘
+  ┌─ Producing chain ─────────────────────────────────┐
+  │  DiagnosticAgent.investigate(anomaly)              │
+  │    → diagnosis (JSON with hypotheses + evidence)   │
+  └─────────────────┬─────────────────────────────────┘
+                    │
+                    │  produced artifact
+                    ▼
+  ┌─ Critiquing chain (RubricJudge) ─────────────────┐
+  │  input:  the diagnosis                            │
+  │          + anomaly                                │
+  │          + known_correct_shape                    │
+  │          + case_intent                            │
+  │          + signal_class                           │
+  │          + tool_calls_trace  ← ★ load-bearing ★  │
+  │  scores: 4 dimensions × 1-5 scale                 │
+  │  verdict: pass / pass_with_notes / fail           │
+  │  fix:     one-line remediation string             │
+  └────────────────────────────────────────────────────┘
 ```
 
-The middle layer is where LLM-as-judge is most useful. The inner layer — deep reasoning bugs — is where self-critique tends to be blind, because critique-mode brings the same priors that generation brought.
+## Zoom in — three related patterns, one used here
+
+Three flavors that all get called "self-critique" in the literature:
+
+1. **Classic self-critique** — same model, same session, second turn asks "critique your previous answer." Cheap, biased.
+2. **Self-consistency** — run the same prompt N times, take the majority vote. Expensive, more reliable.
+3. **Judge-as-secondary-prompt** — a distinct chain with its own rubric and context. Higher fidelity, requires infrastructure.
+
+This codebase uses #3 (the RubricJudge pattern from concept 05) for the eval harness. It doesn't use #1 or #2 on the production hot path.
+
+## Structure pass — layers, axis, seams
+
+Trace one axis: *how independent is the critic from the producer*.
+
+- **Layer 1 — producer (DiagnosticAgent).** Uses `claude-sonnet-4-6`, sees the anomaly + workspace schema + tools.
+- **Layer 2 — critic (RubricJudge).** Uses `claude-sonnet-4-6` (same model family, deliberate for cost consistency; could be swapped). Sees the diagnosis + a *different* context set (rubric, known-correct-shape, case-intent, tool trace).
+
+**The seam:** the different context set. That's what makes the critic *independent* enough to be useful. Same model, different eyes. The critic isn't asked "was your answer good" (self-critique with all its bias); it's given a rubric and a ground-truth reference and asked to score.
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — the shape
 
-You know how a code review by the *same engineer* who wrote the code catches typos but misses the wrong-abstraction bug — because you read your own code with the assumptions you had when writing it? Self-critique is that. A *different reviewer* (or the same person after a day of distance) catches more. LLM-as-judge is engineering that distance: a fresh prompt shape, different task framing, sometimes different context, so the "same model" comes at the output cold.
+You've done code review. Not "I review my own PR" — "someone else, with fresh eyes, reads my PR against a checklist." The reviewer has:
+
+- **The artifact** (your PR).
+- **A reference frame** (the style guide, the design doc, the acceptance criteria).
+- **Independence from producing it** (they didn't write the code).
+
+The RubricJudge is the code-review analog for LLM outputs. Same three pieces: the artifact (diagnosis), the reference frame (rubric + known-correct-shape), the independence (fresh conversation, different context, no memory of the producing chain's ReAct loop).
 
 ```
-  Same-turn critique vs secondary-call critique
+  Pattern — critique as second-pass review
 
-  same-turn (weak):                       secondary-call (this codebase):
+  producer          artifact         critic
+  ┌──────────┐     ┌──────────┐    ┌──────────────┐
+  │ chain A  │ ──► │ diagnosis│──► │ RubricJudge  │
+  │ (agent)  │     │  JSON    │    │  scores it   │
+  └──────────┘     └──────────┘    └──────┬───────┘
+                                          │
+                                          ▼
+                                    ┌──────────────┐
+                                    │ judgment     │
+                                    │  · dimensions│
+                                    │  · verdict   │
+                                    │  · fix       │
+                                    └──────────────┘
 
-  ┌── one LLM call ───────────────┐        ┌── generation call ──┐   ┌── critique call ──┐
-  │  "Produce a diagnosis, then    │        │  agent context      │   │  judge context     │
-  │   critique it, then revise."  │        │  (anomaly, tools,   │──▶│  (subject +       │
-  │                                │        │   loop history)     │   │   rubric +         │
-  │  same context, same priors    │        │                     │   │   tool_calls_trace)│
-  └────────────────────────────────┘        └─────────────────────┘   └────────────────────┘
-
-  reads own output as author              reads output as reviewer,
-  catches: format bugs                    catches: shape + grounding
-  misses: reasoning bugs                  catches: reasoning bugs
-                                          (with tool_calls_trace)
+  the "same eyes review the same code" pattern:
+  producer is blind to its own biases.
+  critic is blind to the reasoning path that led here.
+  both blindnesses cover different bugs.
 ```
 
-### Move 2 — the step-by-step walkthrough
+### Move 2 — walking the mechanism
 
-**Step 1 — the secondary call has a different prompt shape.**
+#### The RubricJudge invocation
 
-`@aptkit/core/node_modules/@aptkit/evals/dist/src/rubric-judge.js:61-77`:
+`eval/run.eval.ts:229-247`:
 
-```js
-return [
-    `You are a rubric judge for: ${rubric.title}.`,
-    rubric.task,
-    '',
-    'Score the subject against the rubric. Score meaning and evidence, not style preferences unless the rubric asks for style.',
-    'Never rewrite the subject. Return one highest-leverage fix, not a list.',
-    '',
-    'Rubric dimensions:',
-    dimensions,
-    '',
-    'Allowed verdicts:',
-    verdicts,
-    checks.trimEnd(),
-    ...
-    'Output JSON only. No prose. No markdown fences. Use exactly this shape:',
-    JSON.stringify(outputShape),
-].filter(Boolean).join('\n');
 ```
-
-The judge prompt is not "here's a diagnosis, is it good?" — it's a *rubric-shaped* prompt that names dimensions, scales, verdicts, and a specific output structure. The task framing is "you are a rubric judge," not "review this diagnosis." That reframing pushes the model into critique-mode with specific criteria, not generation-mode with continuation instincts.
-
-**Step 2 — the context makes critique grounded rather than vibes-based.**
-
-`eval/run.eval.ts:238-247`:
-
-```ts
+const diagnosisJudge = new RubricJudge({
+  model: judgeModel,
+  rubric: diagnosisQualityRubric,
+  capabilityId: 'blooming.eval.diagnosis-judge',
+  maxTokens: 4096,
+  temperature: 0,
+});
 const diagnosisJudgmentResult = await diagnosisJudge.judge({
   subject: JSON.stringify(diagnosis, null, 2),
   context: {
-    anomaly: JSON.stringify(goldenCase.anomaly, null, 2),
+    anomaly:            JSON.stringify(goldenCase.anomaly, null, 2),
     known_correct_shape: JSON.stringify(goldenCase.knownCorrect, null, 2),
-    case_intent: goldenCase.intent,
-    signal_class: goldenCase.signalClass,
-    tool_calls_trace: formatToolCallTrace(diagnosisToolCalls),
+    case_intent:        goldenCase.intent,
+    signal_class:       goldenCase.signalClass,
+    tool_calls_trace:   formatToolCallTrace(diagnosisToolCalls),
   },
 });
 ```
 
-The context is what makes this critique valuable and not ceremony. Without `tool_calls_trace`, the judge is asked "is this a good diagnosis?" — it can only score in the abstract. With `tool_calls_trace`, the judge can verify "did the diagnosis cite a number that came from an actual tool result, or did it invent one?" — grounded critique. This is the specific reason self-critique tends to be blind to reasoning bugs unless you deliberately supply the context the original generation had *plus* something the original didn't have.
+Four moving parts:
+
+- **`rubric`** — a `RubricDefinition` (concept 05). Dimensions, scale, verdicts, checks. Structured, versioned (`id: 'blooming-diagnosis-quality-v1'`).
+- **`subject`** — the diagnosis under review, serialized JSON.
+- **`context`** — the five fields that give the judge independence. `known_correct_shape` is the ground-truth reference; `tool_calls_trace` is what makes the judge able to detect confabulation.
+- **`maxTokens: 4096`** — bumped from 2048 because the no-signal case reasoning was longer and truncating. Real production tuning, not premature optimization.
+
+`temperature: 0` — the judge is nondeterministic even at 0 (Anthropic doesn't guarantee determinism), but 0 is the closest we get. Variance across runs is real (concept 05 notes the same case scoring `root_cause_plausibility` 4 or 5 depending on the run).
+
+#### Why this is stronger than classic self-critique
+
+Classic self-critique looks like this:
 
 ```
-  Critique context — what makes it grounded
+   turn 1  USER: "diagnose this anomaly"
+           MODEL: [diagnosis]
 
-  ┌── original generation saw ────────────────────────┐
-  │  anomaly, tool results (during loop), schema      │
-  │  BUT NOT: the rubric, the known-correct shape     │
-  └────────────────────────┬──────────────────────────┘
-                           │
-  ┌── critique sees ───────▼──────────────────────────┐
-  │  anomaly (same)                                    │
-  │  tool_calls_trace (same, but as one artifact)      │
-  │  known_correct_shape (NEW — generation didn't have)│
-  │  rubric dimensions (NEW — generation didn't have)  │
-  │  signal_class (NEW — generation didn't have)       │
-  └────────────────────────────────────────────────────┘
-
-  the NEW context is what lets critique catch what generation missed
+   turn 2  USER: "was that correct? critique it."
+           MODEL: [critique — sees its own reasoning in context]
 ```
 
-**Step 3 — the outputs are structured, not free-form.**
+Two failures:
 
-The judge returns:
+1. **Bias.** The model sees its own reasoning path from turn 1. It rationalizes rather than reviews. "Yes, my reasoning was sound because..." — the critique is a defense, not an audit.
 
-```json
-{
-  "dimensions": {
-    "root_cause_plausibility": { "score": 4, "reason": "…" },
-    "evidence_grounding":       { "score": 5, "reason": "…" },
-    ...
-  },
-  "checks": { "cites at least one number from the tool results": true, ... },
-  "verdict": "pass",
-  "fix": "The one highest-leverage improvement…",
-  "reasoning": "…"
-}
-```
+2. **No ground truth.** The critique has no reference frame beyond the model's own priors. If the model's confabulation is convincing, its critique will be too.
 
-Structured critique is the difference between "this is a dashboard read" and "this gates a decision." The eval harness reads `verdict`, gates on `pass|pass_with_notes|fail`, and aggregates `dimensions` across cases. A free-form critique ("here are some thoughts on the diagnosis…") can't gate anything.
+RubricJudge sidesteps both:
 
-**Step 4 — the specific bug that self-critique catches in this codebase.**
+- **Fresh conversation.** The judge doesn't see the producing chain's messages. No rationalization loop.
+- **Ground-truth reference.** `known_correct_shape` is human-authored per case. The judge grades against that, not against the model's own opinion of correctness.
+- **Real evidence via `tool_calls_trace`.** The judge sees the actual tool calls the producer made and the actual results. It can cross-check every claim in the diagnosis against real data.
 
-Look at the `evidence_grounding` dimension in `eval/rubrics/diagnosis-quality.ts:41-55`:
+Receipt `05-no-signal-retention-subscribers-2026-07-03T02-12-17-099Z.json` is the case study. The DiagnosticAgent confidently reasoned about "31.2% payment failure rise, 4,820 high-risk customers, 18.4% conversion drop" — plausible-looking numbers. If we'd asked the same model to self-critique, it likely would have defended its reasoning. RubricJudge, seeing the tool trace, wrote:
 
-```ts
-{
-  id: 'evidence_grounding',
-  label: 'Evidence grounding',
-  description: 'Does the diagnosis cite the actual signals the substrate exposed? Bonus if it names the co-occurring signals (e.g. the payment_failure spike alongside the conversion drop). Penalty for invented numbers or claims not derivable from the tool results.',
-  scale: [
-    { score: 1, description: 'Numbers or claims that contradict the evidence.' },
-    { score: 2, description: 'Vague evidence references; no specific numbers cited.' },
-    { score: 3, description: 'Cites at least one specific number from the evidence.' },
-    { score: 4, description: 'Cites multiple specific signals; notes at least one co-occurring signal.' },
-    { score: 5, description: 'Cites the primary and co-occurring signals; every claim is traceable to a tool result.' },
-  ],
-},
-```
+> "these numbers originate from tools that do not exist in the workspace or returned synthetic data unrelated to subscription/billing events. The known_correct_shape explicitly flags inventing subscriber counts, churn rates, and MRR numbers as a failure mode. Every cited number is either invented or from a tool whose output is synthetic noise..."
 
-Score 1 explicitly says "numbers or claims that contradict the evidence." This is the confabulation bug — the model invents a plausible-sounding number that isn't in the tool results. Same-turn self-critique tends to miss this because the same generative priors that invented the number will accept it as plausible on re-read. Secondary-call critique WITH the tool_calls_trace catches it — because the judge is asked "is this number in the trace?" and the trace is right there to check.
+That finding is impossible for classic self-critique. The tool trace + known-correct-shape are what enable it.
+
+#### Self-consistency — what it would look like here
+
+Self-consistency: run the same prompt N times, take the majority vote. Not in this repo, but worth understanding.
+
+For the diagnostic agent, self-consistency would be:
 
 ```
-  Confabulation — what critique catches when it has the trace
-
-  generation:   "payment failures rose 31.2%" (real)
-                "payment failures rose 45%"   (invented — sounds right)
-
-  same-turn critique:   both look plausible; skims accept both
-  secondary + trace:    checks 31.2% against trace → found
-                        checks 45% against trace → NOT found → flag
-                        evidence_grounding score drops to 1
+   for i in 1..5:
+     diagnosis_i = agent.investigate(anomaly)   // ← 5 independent runs
+   final_diagnosis = majority_vote(diagnoses[])  // ← consensus
 ```
 
-**Step 5 — where self-consistency lives (and doesn't).**
+Cost: 5× tokens. Reliability: higher, because random model variance averages out.
 
-Self-consistency is running the same prompt N times and voting. This codebase does not use it for the main agent output — the diagnostic agent runs once per anomaly, and its output ships. There is a related pattern in the eval infrastructure: the calibration slice at `eval/compute-agreement.eval.ts` and `eval/calibration/` measures judge-vs-human agreement, and if agreement is low the whole judge-as-signal argument collapses. That's a *different* discipline — measuring the reliability of the judge — but it borrows the self-consistency idea (multiple observations of the same case, do they agree?).
-
-Where I'd reach for real self-consistency: high-stakes classification where wrong is costly (say, content moderation) and the cost of running the classifier 3-5 times and voting is small. Not for the diagnostic loop, which is already ~50 seconds per case and would triple in cost for marginal reliability gain.
-
-**Step 6 — the diminishing returns problem.**
-
-A model critiquing its own output has the same blind spots that produced the output. If the diagnostic agent's priors say "payment processor issue" is the most likely cause for any conversion drop, its self-critique also says "payment processor issue" is the most likely cause. The critique will happily *confirm* the primary hypothesis and miss that the actual cause was something else the model's priors don't emphasize. The fix is not "critique harder" — it's *changing the context* (rubric criteria that force different attention, tool_calls_trace that grounds claims) so the critique-mode reads the output through a different lens.
+For the RubricJudge, self-consistency would be:
 
 ```
-  The blind-spot problem — why "critique harder" doesn't help
+   for i in 1..3:
+     judgment_i = judge.judge({ subject: diagnosis, context })
+   final_verdict = majority_vote(judgments[].verdict)
+```
 
-  generation priors:  "conversion drop → payment"
-  critique priors:    "conversion drop → payment"    ← same priors
-  self-critique:      "payment hypothesis looks fine"
-                                              → same conclusion.
+Cost: 3× judge tokens. Reliability: higher on the borderline cases (concept 05's judgment-stability variance — same anomaly scoring `root_cause_plausibility` 4 or 5 across runs would collapse to a single median score).
 
-  fix: change the CONTEXT of the critique
-       supply rubric that scores "rival mechanisms considered"
-       supply tool_calls_trace so grounding is verifiable
-       the priors don't change, but the attention does
+This codebase doesn't run self-consistency in the eval — 15-40 minute run × N would be prohibitive. If a specific dimension's variance became loud enough to hide signal, we'd invest.
+
+#### The diminishing-returns problem
+
+A model critiquing its own output has the same blind spots that produced the output. Self-critique catches obvious errors (formatting, missed steps) but misses systematic ones (the confabulation the model finds plausible).
+
+The RubricJudge sidesteps this partly — separate conversation, ground-truth context — but *not fully*. The judge is still an LLM with the same fundamental biases. On subtle judgment calls ("is this hypothesis actually plausible?"), the judge can be wrong in the same direction as the producer. This is why:
+
+- The rubric is multi-dimensional (four dimensions × 5-point scale). Even if the judge is wrong on one dimension, aggregate scores are more stable.
+- Human calibration on a subset is important — pull 10 judgments, have a human score them, check judge-vs-human agreement.
+- Judge model is versioned separately (`capabilityId: 'blooming.eval.diagnosis-judge'`) so you can track its own drift.
+
+The Hamel Husain framing: LLM-as-judge is useful for *directional* signal, not for *ground truth*. You'd never say "the judge said pass, therefore this is production-ready." You'd say "the judge said pass on 8/10 cases and fail on 2, so let me look at the 2." The judge is a filter, not an oracle.
+
+```
+  Flow — where LLM-as-judge sits in the eval chain
+
+  agent output ──► RubricJudge ──► judgment ──► human triage
+                       │                            │
+                       │                            └── high-confidence fail:
+                       │                                 fix the prompt
+                       │
+                       └── high-confidence pass: skip human review
+                           borderline: flag for human review
 ```
 
 ### Move 2 variant — the load-bearing skeleton
 
-The kernel of production self-critique is three moves:
+Kernel of self-critique done right:
 
-```
-  secondary call (not same-turn) → rubric-shaped prompt → grounded context (with trace)
-```
+1. **Distinct conversation from the producer.** Drop this and the critic rationalizes rather than reviews.
+2. **Ground-truth reference in the context.** Drop this and the critic grades on model priors.
+3. **Real evidence available to the critic** (tool trace here). Drop this and the critic can't detect confabulation.
+4. **Structured judgment output.** Drop this and you can't aggregate across cases.
 
-What breaks if you skip each:
-
-- **Skip "secondary call"** — same-turn critique reads the output with the same priors. Catches typos, misses reasoning bugs.
-- **Skip "rubric-shaped prompt"** — free-form critique produces prose. Not parseable, not gate-able, ends up as dashboard read.
-- **Skip "grounded context"** — the judge scores in the abstract. Can say "reads plausible" but can't verify "cites a real number."
-
-Hardening layered on top: self-consistency across judge runs (run the judge N times, look at variance), human-vs-judge calibration (`eval/compute-agreement.eval.ts`), rubric evolution (add dimensions as new failure modes surface).
+Hardening on top: self-consistency (majority vote), calibration slices (judge-vs-human), judge-model rotation, per-dimension trend tracking. None of that is the skeleton.
 
 ### Move 3 — the principle
 
-**Critique is only as good as the context you give it.** A model reading its own output with the same context that produced it will make the same mistakes. A model reading with rubric criteria that force different attention, and with a trace that anchors grounding, can catch what generation missed. The trick isn't running critique — it's engineering the context so critique reads through a different lens.
+**Independence is what makes critique useful — and it's what classic self-critique lacks.** The RubricJudge is stronger than classic self-critique specifically because it does *not* share memory with the producer. Same model. Different eyes. Different context. Different job. That structural independence is what lets it catch confabulation the producer can't see in its own output.
 
 ## Primary diagram
 
 ```
-  Self-critique in this codebase — the two calls
+  Self-critique — the full recap
 
-  ┌── generation call ──────────────────────────────────────┐
-  │  DiagnosticAgent.investigate(anomaly)                    │
-  │  model: Sonnet 4.6                                       │
-  │  system: diagnostic prompt (role, rules, schema)          │
-  │  context: schema, anomaly                                │
-  │  tools: analytics tools (allowlist)                       │
-  │  output: Diagnosis JSON                                   │
-  └────────────────────────┬────────────────────────────────┘
-                           │  (subject)
-  ┌── critique call ───────▼────────────────────────────────┐
-  │  RubricJudge.judge({ subject, context })                 │
-  │  model: Sonnet 4.6 (same underlying model,               │
-  │         DIFFERENT prompt shape, temperature 0)           │
-  │  system: buildRubricJudgeSystemPrompt(rubric)             │
-  │  context: anomaly + known_correct_shape + case_intent    │
-  │           + signal_class + tool_calls_trace              │
-  │  tools: NONE                                              │
-  │  output: { dimensions, verdict, fix, checks }             │
-  └────────────────────────┬────────────────────────────────┘
-                           │
-  ┌── consumer ────────────▼────────────────────────────────┐
-  │  eval receipt: writes both diagnosis AND judgment        │
-  │  regression gate: fail on has-signal + partial-signal    │
-  │                   verdicts of `fail`                     │
-  │  per-dimension pass rate: aggregated in afterAll         │
-  └─────────────────────────────────────────────────────────┘
+  ┌─ Classic self-critique (NOT used here) ────────────────────┐
+  │  turn 1  produce                                            │
+  │  turn 2  same model, same session: "was that correct?"      │
+  │  weaknesses: rationalization loop, no ground truth          │
+  └─────────────────────────────────────────────────────────────┘
+
+  ┌─ Self-consistency (NOT used here) ─────────────────────────┐
+  │  run same prompt N times                                    │
+  │  majority vote across outputs                               │
+  │  weaknesses: 2-5× cost per case                             │
+  └─────────────────────────────────────────────────────────────┘
+
+  ┌─ Judge-as-secondary-prompt (★ used here ★) ────────────────┐
+  │  producer: DiagnosticAgent                                  │
+  │      ↓                                                       │
+  │  artifact: diagnosis (JSON)                                  │
+  │      ↓                                                       │
+  │  critic: RubricJudge                                         │
+  │    · fresh conversation (no rationalization)                 │
+  │    · rubric + known_correct_shape (ground truth)             │
+  │    · tool_calls_trace (real evidence)                        │
+  │      ↓                                                       │
+  │  output: dimensions + verdict + fix                          │
+  │                                                              │
+  │  captured in eval/receipts/<case>-<runId>.json               │
+  └─────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-Self-consistency was named by Wang et al. 2022 ("Self-Consistency Improves Chain of Thought Reasoning") — the specific technique of sampling multiple reasoning paths and taking the majority vote. It was a real improvement on math and logic benchmarks at the time. Modern models have absorbed enough of this that per-sample variance on well-shaped tasks is low, and running the loop N times often produces the same output N times. The residue: self-consistency is worth reaching for on tasks with high per-sample variance (edge cases, ambiguous inputs), not for stable tasks.
+The RubricJudge pattern is where LLM-as-judge as a discipline landed after two years of iteration. Early self-critique work (Reflexion, Self-Refine papers, 2023) established the technique. Practitioner community (Hamel Husain most vocally) refined it: fresh conversation, ground truth, structured rubric, human calibration on a subset. This codebase implements the practitioner-community version.
 
-LLM-as-judge as a discipline came out of the Anthropic and OpenAI eval teams around 2023-2024. Hamel Husain's writing is the canonical practitioner-side reference — the specific point that "your LLM eval is only as good as the context you give the judge" is his, and it's why this codebase's judge context includes `tool_calls_trace` (which is the specific bit Hamel would call out as load-bearing).
+The cost math on when self-critique / self-consistency is worth it:
 
-Two failure modes I've watched:
+- **Self-consistency at N=3.** Triples the producer cost. Worth it when the base output has high variance and you have no eval to catch regressions. In this repo, evals catch regressions, so self-consistency isn't worth 3× cost on the hot path.
 
-- **The "judge model is the generator model" bug.** Team uses GPT-4 to generate and GPT-4 to judge. Judge scores everything at 4.5 because it reads its own reasoning style as good. Fix: use a different model for judging, or use rubric-shaped prompts that force different attention. This codebase uses the same underlying model (Sonnet 4.6) but a different prompt shape and different context — that's the mitigation.
-- **The "critique that never fails" bug.** The judge scores every output as `pass` because the rubric levels are too fuzzy ("score 3 = adequate," "score 4 = good"). Fix: anchor scale levels with specific behavior descriptions (as this codebase does — "score 1 = restates the symptom, score 5 = rival mechanisms considered"). Concrete anchors force discrimination.
+- **Judge-as-secondary-prompt.** Adds one critic call per producer call. Roughly 2× the cost of the producer alone (judge is smaller, but not much). Worth it because the judgment feeds back into the eval score, which is how you iterate on prompts.
 
-Related concepts:
-- **Eval-driven iteration** (`05-eval-driven-iteration.md`) — the full loop that LLM-as-judge sits inside.
-- **Chain-of-thought** (`09-chain-of-thought.md`) — the reasoning that critique reads.
-- **Structured outputs** (`02-structured-outputs.md`) — the judge itself uses structured output.
+- **Both together.** 5-6× cost. Only worth it for safety-critical outputs (medical, legal, content moderation). This repo doesn't cross that bar.
+
+The specific line where LLM-as-judge stops being useful: when the judge's variance approaches the producer's variance. If your judge disagrees with itself 40% of the time on borderline cases, it's not filtering — it's adding noise. This codebase's eval `afterAll` prints per-dimension score distributions specifically so you can see whether the judge is behaving as a filter or as noise. When the distribution is bi-modal (lots of 4s and 5s, few 3s), the judge is filtering. When it's uniform (equal spread across 1-5), the judge is noise.
+
+The interaction with concept 05 (eval-driven iteration): RubricJudge is the mechanism inside the eval harness. Every case's `diagnosisJudgment` in the receipt is a RubricJudge output. The eval discipline (goldens + rubric + receipts) *depends* on RubricJudge working; if the judge were unreliable, the entire eval-driven-iteration story collapses. So investing in judge quality (rubric refinement, calibration, context tuning) has outsized leverage.
+
+The related pattern from other codebases in Rein's portfolio: `AdvntrCue` has a similar critic-like layer for RAG relevance scoring — the retrieved chunks are scored against the query before being included in the final generation. Different domain, same shape — independent critic, structured score, downstream code uses the score to filter.
 
 ## Interview defense
 
-**Q: Does this codebase run self-critique on production diagnoses before shipping to the UI?**
+**Q: How does this codebase implement self-critique?**
 
-No, and the reason is honest. Self-critique costs a second LLM call per output — roughly doubling per-case latency and cost. The eval pipeline runs the judge on every golden case, so regressions in critique-visible qualities (grounding, scope, plausibility) surface at eval time and gate deploys. Production diagnoses ship un-critiqued because the eval discipline is the check. If a specific class of production failure started showing up that evals miss, the answer might be adding a lightweight in-line critique for that class — but it would be shaped around the specific failure, not a blanket "critique everything."
-
-```
-  Where critique runs in this codebase
-
-  eval loop:         diagnostic → judge (LLM-as-judge)
-                                    scores against rubric
-                                    gates on has-signal / partial-signal
-
-  production loop:   diagnostic → UI (NO critique)
-                                    trust the eval discipline
-                                    saves latency + cost
-```
-
-Anchor: `eval/run.eval.ts:229-247` for the judge invocation in eval.
-
-**Q: The judge scores every case as `pass_with_notes`. What's wrong?**
-
-The rubric's scale levels aren't specific enough, so the judge can't discriminate. If score 3 means "adequate" and score 4 means "good," those are vibes — the judge picks 3 or 4 by feel. The fix is anchoring scale levels with specific behavior descriptions. This codebase does it right at `eval/rubrics/diagnosis-quality.ts:29-38`: score 1 = "restates the symptom," score 5 = "rival mechanisms are considered." The judge has to check specific things to pick a score. Second thing to check: the escape-hatch distinct-score-count check at `eval/run.eval.ts:516-523` — if a dimension shows only one distinct score across all cases, the substrate is too homogeneous and the judge isn't discriminating even with a good rubric.
+Not classic self-critique — a stronger variant. The RubricJudge at `eval/run.eval.ts:229-247` is a distinct chain with its own rubric, its own context, and its own scoring. It grades diagnoses on 4 dimensions × 5-point scale using ground-truth `known_correct_shape` from each golden case plus the real `tool_calls_trace` from the producing chain. Fresh conversation from the producer, different context, structured output. This is stronger than "ask the same model to critique its answer" because there's no rationalization loop — the critic can't defend the producer's reasoning because it never saw the reasoning path, only the artifact.
 
 ```
-  Vague rubric vs specific rubric
-
-  vague:                              specific:
-   score 3 = adequate                   score 3 = plausible mechanism,
-   score 4 = good                                weakly evidenced
-   score 5 = excellent                  score 4 = specific mechanism,
-                                                evidence supports it
-                                       score 5 = specific mechanism +
-                                                evidence supports +
-                                                rival mechanisms considered
-
-  judge: picks by feel                 judge: verifies each level explicitly
-   → clusters at 3-4                    → uses full 1-5 range
+   classic:  same model + same session → rationalization
+   this:     same model + fresh session + rubric + ground truth
+                                          → independent audit
 ```
 
-**Q: What's the load-bearing part people forget?**
+Anchor: `eval/run.eval.ts:229-247`, `eval/rubrics/diagnosis-quality.ts`.
 
-The tool_calls_trace in the judge context. Everyone builds a rubric with a "cites evidence" dimension. Nobody remembers to pass the tool results into the judge. So the judge scores "did this diagnosis cite evidence?" in the abstract — it looks at the diagnosis's evidence field and says "yes, there are three bullet points, seems evidenced." What it can't do without the trace is verify "the number cited in evidence[0] actually came from the third tool call, not the model's priors." The trace is what turns "reads plausible" into "verifiably grounded." Every self-critique setup I've built without the trace was easier to game than any I've built with one.
+**Q: What makes the judge able to catch confabulation the producer can't?**
 
-Anchor: `tool_calls_trace` field at `eval/run.eval.ts:246` and its truncation in `formatToolCallTrace` at `eval/run.eval.ts:132-152`.
+Two things. One, the `known_correct_shape` field — human-authored notes per golden case that explicitly flag failure modes (e.g. "inventing subscriber counts is a fail"). The judge grades against that, not against the model's own priors. Two, the `tool_calls_trace` — the actual tool calls the producer made and their real results. The judge can cross-reference every number cited in the diagnosis against a real tool result. Without the trace, a plausible-sounding invented number scores well; with the trace, the judge writes "this number is not in any tool result." Receipt `05-no-signal-retention-subscribers` is the canonical example — 4,820 confabulated "high-risk customers" caught by trace cross-reference.
+
+```
+  producer  ──► diagnosis with "4,820 customers"
+  judge     ──► reads tool_calls_trace ──► "no tool returned that number" ──► score 1
+```
+
+Anchor: `eval/run.eval.ts:238-247` (judge context), `eval/receipts/05-no-signal-retention-subscribers-*.json` (the found confabulation).
 
 ## See also
 
-- `05-eval-driven-iteration.md` — LLM-as-judge is the eval loop's critique layer.
-- `09-chain-of-thought.md` — the reasoning the critique reads.
-- `11-meta-prompting.md` — the judge system prompt is built from data (`buildRubricJudgeSystemPrompt`).
+- 05 · eval-driven iteration — the RubricJudge is the mechanism inside the eval harness.
+- 09 · chain-of-thought — the structured `hypothesesConsidered` reasoning is what the judge grades on.
+- 02 · structured outputs — the judgment itself is a structured output (dimensions, verdict, fix).
+- 06 · single-purpose chains — the judge is another single-purpose chain with a scoped job.

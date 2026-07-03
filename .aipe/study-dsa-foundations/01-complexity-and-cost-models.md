@@ -1,231 +1,222 @@
 # Complexity and cost models
 
-Industry names: Big-O notation, asymptotic analysis, amortized analysis, streaming vs batch. Type: Industry standard.
+*Big-O notation · amortized analysis · streaming vs batch · Language-agnostic*
 
-## Zoom out — cost models across the layers
+## Zoom out, then zoom in
 
-You already know cost when you write it out loud: "this loop runs once per user, that one runs once per session." Big-O is just that thought in a portable notation. What matters for *this* repo is picking the right cost model — batch vs streaming, worst-case vs amortized — because the wrong model hides real bugs.
-
-```
-  Where cost decisions live in Blooming Insights
-
-  ┌─ UI layer ─────────────────────────────────────┐
-  │  React feed  ·  n = insights per session (~10) │  → O(n) fine
-  └────────────────────┬───────────────────────────┘
-                       │
-  ┌─ Service layer ────▼───────────────────────────┐
-  │  Agent loop  ·  n = model turns (~5-20)         │
-  │  BudgetTracker.add()  ★ streaming ★             │  ← O(1) per turn
-  │  filterToolSchemas    n = tools (~40)           │  → O(n·m) fine
-  └────────────────────┬───────────────────────────┘
-                       │
-  ┌─ Transport layer ──▼───────────────────────────┐
-  │  cache Map lookup  ·  O(1) amortized            │
-  │  rate-limit retry  ·  ≤3 attempts (bounded)     │
-  └────────────────────┬───────────────────────────┘
-                       │
-  ┌─ Eval layer ───────▼───────────────────────────┐
-  │  percentiles()  ·  n = tool calls per run       │  ★ batch — O(n log n)
-  │  worker pool    ·  N = 20, K = 3                │  → O(N/K) wall
-  └────────────────────────────────────────────────┘
-```
-
-Only two of these are load-bearing decisions: `BudgetTracker.add()` (streaming — must stay O(1) because it fires once per model turn) and `percentiles()` (batch — allowed to be O(n log n) because it runs *once* at the end).
-
-## Structure pass — the axis is cost
-
-Layers: **UI**, **service**, **transport**, **eval**. Trace one axis — **cost per unit of work** — across all four.
-
-- **UI**: cost = one React render per state change. n is tiny (`~10` insights). No optimization needed.
-- **Service**: cost = tokens + wall time per model turn. The dominant cost isn't algorithmic; it's the API call. Local algorithms just can't be worse than the API round-trip.
-- **Transport**: cost = HTTP round-trip + rate-limit wait (~10s per retry). Local work is invisible next to network cost.
-- **Eval**: cost = the metric itself — we *measure* p50/p95/p99 here. This is where Big-O finally matters.
-
-The seam flips at **service → transport**: cost changes from "CPU time per turn" to "wall-clock waiting on the network." A different cost model applies on each side. Same axis, different answer. Learn to spot which side you're on.
-
-## How it works — three cost models the repo uses
-
-### Move 1 — the mental model
-
-Cost analysis is a magnifying glass at three focal lengths:
+Every other file in this guide asks "what does this cost?" — which is a question you can only answer once you've agreed on a cost *model*. Complexity notation is that agreement: a compact way to say "as `n` grows, what does the work do?" The picture below is where that question gets asked in this codebase.
 
 ```
-  Three focal lengths for cost — same operation, different answer
+  Zoom out — where cost gets counted in blooming_insights
 
-  ┌─ zoom in: per operation ─────────────────────────┐
-  │  BudgetTracker.add()  →  3 additions + 1 counter │  → O(1)
-  └───────────────────────┬──────────────────────────┘
-                          │  aggregate across turns
-  ┌─ zoom mid: per request ─▼────────────────────────┐
-  │  agent loop  →  add() × T turns                  │  → O(T)
-  └───────────────────────┬──────────────────────────┘
-                          │  aggregate across load run
-  ┌─ zoom out: per run ────▼─────────────────────────┐
-  │  percentiles()  →  sort(all call durations)      │  → O(N log N)
-  └──────────────────────────────────────────────────┘
-
-  same code path, three cost stories — pick the right one for the question
+  ┌─ UI layer ───────────────────────────────────────────────────┐
+  │  React hooks, NDJSON reader — one line at a time, O(1) per   │
+  │  line; total O(response length)                              │
+  └─────────────────────────┬────────────────────────────────────┘
+                            │
+  ┌─ Route + agent layer ───▼────────────────────────────────────┐
+  │  ★ THIS IS WHERE THE MODELS MATTER ★                         │
+  │  · budget accumulator — O(1) per turn (streaming)            │
+  │  · fault-injector CDF walk — O(k) rates per call             │
+  │  · monitoring top-K — O(n log n) sort + slice                │
+  └─────────────────────────┬────────────────────────────────────┘
+                            │
+  ┌─ Eval layer ────────────▼────────────────────────────────────┐
+  │  · percentile via full sort — O(n log n) receipts            │
+  │  · load-harness queue — O(1) shift/push, O(n) total          │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-The bug: reasoning about `add()` at the wrong focal length. It looks free (O(1)), but multiplied across `T` turns per request and `N` requests per run, that's `O(N·T)` allocations if you get the wrong data structure inside.
+The middle band is where the "what does this cost as n grows" question actually decides code shape. The UI is bounded by the response size; the eval layer is bounded by the receipt count (tens to hundreds). The agent layer runs per user turn — that's the one place a wrong cost model would blow up the whole system.
 
-### Move 2 — the three models you'll reach for
+**Zoom in.** Complexity notation names the *growth* — the rate at which time or space climbs when input doubles. Amortized analysis names the *average* across a sequence of operations, hiding the occasional expensive one. Streaming vs batch names *when* you pay — one-shot for the whole input, or piece by piece as data arrives. Get all three vocabularies straight before opening the concept files that use them.
 
-**Worst-case Big-O** — the ceiling. What's the slowest this can get on adversarial input?
+## Structure pass
 
-You use it when the input is bounded or trusted. Example: `filterToolSchemas` at `lib/agents/tool-schemas.ts:13-15` scans all tools once per allowed name.
+**Layers.** Cost lives at three altitudes:
+  1. per-operation cost (`add()` is O(1))
+  2. per-request cost (an investigation makes M model turns × O(1))
+  3. per-run cost (an eval loops N cases × M turns)
+
+**Axis: what changes as `n` grows?** Hold that question constant down the stack:
+  - per-operation → `n` is the *input size* of one call
+  - per-request → `n` is the *turn count* per investigation
+  - per-run → `n` is the *case count* in the eval
+
+**Seam: where the model flips.** The load-bearing seam is between *streaming* and *batch*. Streaming ops (budget accumulator) never allocate `n` slots — space is O(1). Batch ops (percentile sort) hold all `n` items in memory. That flip is where "does this scale?" gets answered.
+
+## How it works
+
+### Move 1 — big-O is a growth rate, not a stopwatch
+
+You already know this from work: `.map()` over a 10-element array is instant; over a 10-million-element array it isn't. What changed isn't the operation — it's `n`. Big-O drops constants and lower-order terms so the *shape* of that growth is visible without benchmarking.
 
 ```
-  Worst-case walk: filterToolSchemas(all=40 tools, allowed=8 names)
+  Growth-rate shapes — how work climbs as n doubles
 
-  step 1:  set  = new Set(allowed)         // O(m)          allowed = 8
-  step 2:  for each t in all:               // O(n) loop     all = 40
-  step 3:      set.has(t.name)             // O(1) per check
-  step 4:  return matches                   // 8 rows
-
-  total:   O(n + m)  →  40 + 8  →  48 ops per bootstrap
+  n:       1     2     4     8    16    32    64
+  ────────────────────────────────────────────────
+  O(1)     1     1     1     1     1     1     1    ← constant
+  O(log n) 0     1     2     3     4     5     6    ← doubles = +1 step
+  O(n)     1     2     4     8    16    32    64    ← doubles = doubles
+  O(n log n)     2     8    24    64   160   384    ← sort's shape
+  O(n²)    1     4    16    64   256  1024  4096    ← nested loop
+  O(2^n)   2     4    16   256 65536 ...            ← unusable past small n
 ```
 
-Real code, side by side:
+Read across a row: as `n` doubles, does the work stay flat, add one step, double, more than double? The answer names the class. Everything else — hidden constants, cache effects, GC pauses — hides inside the shape.
+
+### Move 2 — the streaming vs batch flip
+
+The single most useful move in this file: an operation that looks batch (`sort()`, `filter()`, `reduce()`) becomes streaming the moment you swap the *return* for an *update to a fixed-size accumulator*.
+
+**Case A: batch (allocates n slots).**
+
+```
+  Batch pattern — hold everything, then compute
+
+  input:  [t1, t2, t3, …, tN]     ← full array in memory
+             │
+             ▼
+       ┌───────────┐
+       │ operation │  reads all N items
+       └─────┬─────┘  writes 1 result
+             ▼
+          result
+```
+
+Percentile via sort in `eval/report.eval.ts:161-179` is batch: `[...arr].sort(…)` holds every duration in memory, then indexes. Fine when N is 20-100 receipts. Blows up at millions.
+
+**Case B: streaming (fixed-size state).**
+
+```
+  Streaming pattern — collapse each item into state, drop it
+
+  input:  t1 → t2 → t3 → … → tN     ← one at a time
+          │    │    │         │
+          ▼    ▼    ▼         ▼
+       ┌──────────────────────────┐
+       │ state (fixed size)       │  ← same size regardless of N
+       └────────────┬─────────────┘
+                    ▼
+                 result
+```
+
+`BudgetTracker.add()` in `lib/agents/budget.ts:51-55` is streaming: three integers, updated in place, never grows. `snapshot()` reads the state, doesn't re-scan history.
+
+Load-bearing code, side by side with the pattern:
 
 ```ts
-// lib/agents/tool-schemas.ts:13-15
-const set = new Set(allowed);              // O(m) build
-return all
-  .filter((t) => set.has(t.name))          // O(n) scan, O(1) probe
-  .map((t) => ({ name: t.name, ... }));    // O(k) map over matches
-```
+// lib/agents/budget.ts:41-55 — streaming O(1) accumulator
+export class BudgetTracker {
+  private inputTokens = 0;      // ← fixed-size state, three ints
+  private outputTokens = 0;
+  private turns = 0;
 
-Load-bearing part — **`new Set(allowed)` before the filter**. If you skipped the Set and did `allowed.includes(t.name)` inside `.filter`, cost jumps from `O(n+m)` to `O(n·m)`. On this repo's scale (`n=40, m=8`) the difference is 48 vs 320 ops — invisible. On any larger tool catalog the shape of the code is what protects you.
-
-**Amortized cost** — the average across many operations, even when one is slow.
-
-You use it for data structures where most operations are cheap but occasional operations are expensive (dynamic array resize, hash table rehash, Bloom cache eviction). The load-bearing example in this repo is the `Map`-backed cache at `lib/data-source/bloomreach-data-source.ts:122`:
-
-```
-  Amortized read: cache.get(key)
-
-  hot path:                       O(1) hash + eq                    [99% of calls]
-  cold miss:  callTool + net      O(net) ≈ 200-2000ms                [1% of calls]
-
-  amortized read cost = 0.99 · O(1) + 0.01 · O(net) ≈ O(1) if hit rate stays high
-```
-
-The word *amortized* means "we count the rare expensive operation but spread it across the many cheap ones." The cache is only worth it when hit rate is high enough that amortization wins — that's the design contract, not just a nice-to-have.
-
-**Streaming vs batch** — the biggest cost decision in the repo.
-
-Batch: hold all the data, then compute. Streaming: update state as each item arrives, hold nothing extra.
-
-`BudgetTracker.add()` at `lib/agents/budget.ts:51-55` is the streaming case:
-
-```ts
-// lib/agents/budget.ts:51
-add(usage: { inputTokens: number; outputTokens: number }): void {
-  this.inputTokens += usage.inputTokens;      // O(1)
-  this.outputTokens += usage.outputTokens;    // O(1)
-  this.turns += 1;                            // O(1)
+  add(usage: { inputTokens: number; outputTokens: number }): void {
+    this.inputTokens += usage.inputTokens;   // ← O(1) per model turn
+    this.outputTokens += usage.outputTokens; //   no allocation
+    this.turns += 1;
+  }
+  // ...
 }
 ```
 
-Three integer adds. Total state: three numbers. Whether the agent runs 3 turns or 300, this method's cost is constant. That's what streaming buys you: memory usage decoupled from input size.
+The trick: `add()` is called every time an Anthropic response comes back — potentially dozens of times per investigation. If this had to keep an array of `{ inputTokens, outputTokens }` per turn and sum on read, the exceeded() check would be O(turns) every call — an O(n²) hot path. Making the accumulator streaming makes the whole ceiling-check machinery O(1).
 
-`percentiles()` at `eval/report.eval.ts:161-179` is the batch case:
+### Move 2 — amortized analysis: the average across a sequence
 
-```ts
-// eval/report.eval.ts:169-171
-const sorted = [...arr].sort((a, b) => a - b);          // O(n log n) time, O(n) space
-const pct = (p: number) => sorted[Math.min(sorted.length - 1,
-                                           Math.floor((p / 100) * sorted.length))];
-const mean = Math.round(sorted.reduce((s, n) => s + n, 0) / sorted.length);
+Big-O of a *single* operation can lie about the *sequence*. A `push()` into a dynamic array is O(1) most of the time and O(n) on the rare copy-to-a-bigger-buffer. Amortized analysis smooths this: divide the worst-case cost of a big operation across the many cheap ones that follow, and each push averages out to O(1).
+
+```
+  Amortized cost — smoothing the spike across the run
+
+  op:      1  2  3  4  5  6  7  8  9 …
+  cost:    1  1  1  1  4  1  1  1  1     ← op 5 was the resize (copy 4)
+                       ▲
+                       └── amortized: total cost / n ops = ~1.4 → O(1)
 ```
 
-Full copy, full sort, index lookup. This is fine because it runs once at the end of a load run over `~1000` tool-call durations. If you tried to compute p95 streaming (as each call arrives), you'd reach for a t-digest or reservoir sampling — a whole different algorithm.
-
-**The rule of thumb:** if the operation runs *inside a hot loop*, it must be O(1) streaming. If it runs *once at the end*, O(n log n) batch is fine. The bug is confusing which one you're writing.
+Where this matters in the repo: `queue.push(...)` and `queue.shift()` in `eval/load.eval.ts:171-176`. `Array.shift()` in JS is *technically* O(n) because it re-indexes the remaining elements. Load-harness runs are small (LOAD_N up to a couple hundred), so nobody noticed. If the queue held millions of tasks, you'd swap for an index cursor or a real deque — the honest answer under interview pressure.
 
 ### Move 3 — the principle
 
-Big-O is not a lecture-hall abstraction; it's the question *"what happens when the input gets 10× bigger?"* asked at three altitudes: per operation, per request, per run. Pick the wrong altitude and you'll optimize what doesn't matter or ignore what does. Every complexity choice in this repo is answering that question at one of those three altitudes — no more, no less.
+**Pick the model to match the pressure.** For a static array of receipts you'll iterate a few times: O(n log n) sort is honest. For an accumulator that fires per model turn inside a long-running investigation: O(1) streaming is load-bearing. The interview signal isn't quoting Big-O — it's saying "here's what n is, here's how fast it grows in this codebase, here's the model I picked and here's the class of change that would flip the model."
 
-## Primary diagram — cost model chosen per layer
+## Primary diagram
+
+The whole story: the batch/stream flip is where the class of scaling changes, and it's chosen by whether the operation returns a value or updates a fixed-size state.
 
 ```
-  The three cost models mapped to the four layers
+  Complexity-model decision — the flip that matters
 
-  ┌─ UI layer ──────────────────────────────────────┐
-  │  n small → any model works, don't optimize      │
-  └────────────────────┬────────────────────────────┘
-                       │  seam: local cpu → cost
-  ┌─ Service layer ────▼────────────────────────────┐
-  │  BudgetTracker.add()   ★ STREAMING ★  O(1)/turn │
-  │  filterToolSchemas     WORST-CASE     O(n+m)    │
-  └────────────────────┬────────────────────────────┘
-                       │  seam: local cpu → network
-  ┌─ Transport ────────▼────────────────────────────┐
-  │  cache.get()           AMORTIZED      O(1) avg  │
-  │  retry ladder          BOUNDED WORST  ≤3 × 10s  │
-  └────────────────────┬────────────────────────────┘
-                       │  seam: streaming → batch
-  ┌─ Eval ─────────────▼────────────────────────────┐
-  │  percentiles()         BATCH          O(n log n)│
-  │  worker pool wall      BOUNDED WORST  O(N/K)    │
-  └─────────────────────────────────────────────────┘
+           ┌─ input size known & bounded? ─────┐
+           │                                    │
+       yes ▼                                no  ▼
+     ┌────────────────┐                ┌────────────────┐
+     │ BATCH is fine  │                │ STREAMING wins │
+     │                │                │                │
+     │ sort + index   │                │ accumulator    │
+     │ full-array ops │                │ fixed state    │
+     │ O(n log n) OK  │                │ O(1) per item  │
+     └────────────────┘                └────────────────┘
+       report.eval.ts                    budget.ts
+       :161 percentiles                  :51 add()
+       (N ≤ hundreds)                    (per model turn)
 ```
 
 ## Elaborate
 
-Big-O comes from Bachmann (1894) via Knuth's *The Art of Computer Programming*, but the useful modern shape — worst-case vs amortized vs expected — was formalized by Robert Tarjan in the 1980s (splay trees, union-find). The streaming/batch distinction became load-bearing with big-data systems (MapReduce, Storm, Flink) — the insight that memory usage is a first-class cost, not just runtime.
+Big-O comes from Bachmann (1894) and Landau (1909) as an *asymptotic* notation — it describes limits, not concrete times. Knuth popularized it for algorithm analysis in the 1970s. The important thing to internalize: it's a *tool for choosing between shapes*, not a benchmark. Two O(n log n) sorts can differ 10× in wall-clock — one is cache-friendly, one is a mess of pointer-chasing. Big-O tells you the shape; profiling tells you the constant.
 
-If you want the streaming quantile story, read **Ted Dunning's t-digest** paper and Facebook's HyperLogLog — the algorithms that let you compute p99 over a billion events without holding a billion floats. Those are what would replace `percentiles()` if the eval harness ever needed to scale to millions of tool calls.
+Amortized analysis comes from Tarjan's "potential method" (1985) — a way to give sequences of operations honest complexity by lending cheap ops future budget for expensive ones. Dynamic array growth (JS `Array`, Python `list`, C++ `vector`) is the canonical example.
 
-For amortized analysis, read the classic **union-find with path compression** (Tarjan): individual operations look linear in the worst case but amortized cost is inverse-Ackermann — effectively O(1). Same shape as the cache-hit story here, just formalized.
+Streaming algorithms have their own literature — Munro-Paterson for streaming quantiles (1980), Flajolet-Martin for streaming cardinality (1985), Morris for streaming approximate count (1978). All share the same shape: fixed-size state, one pass, approximate answers with tight bounds. The `BudgetTracker` is an exact-answer streaming accumulator because it only tracks sums; the moment you'd want p95 across turns, you'd need one of those approximate sketches.
+
+Related reading: CLRS chapter 17 (amortized), Skiena chapter 1 (Big-O), Aggarwal & Vitter (1988) for I/O-model complexity — a totally different cost model where disk-page reads are the unit, not comparisons.
 
 ## Interview defense
 
-**Q: What's the time complexity of `filterToolSchemas`?**
+**Q: This codebase mostly uses O(1) hash maps and O(n) linear scans. What's the interesting cost-model story?**
 
-Answer: O(n + m) where n = total tools and m = allowed names. Build the Set in O(m), scan tools in O(n) with O(1) membership test per tool. If you skipped the Set and did an array `.includes` inside the filter, it'd degrade to O(n·m).
-
-```
-  filterToolSchemas cost
-
-  Set build   :  ● ● ● ●   O(m)
-  scan+probe  :  ▪ ▪ ▪ ▪ ▪ ▪ ▪ ▪ ▪ ▪ ▪ ▪   O(n)   each ▪ = one O(1) probe
-  total       :  O(n + m)
-```
-
-Anchor: `lib/agents/tool-schemas.ts:13-15`.
-
-**Q: Why is `BudgetTracker.add()` O(1) — and why does it matter?**
-
-Answer: Three integer additions and a counter. It matters because it's called once per model turn inside the agent loop; if it were O(t) where t is prior turns, cumulative cost across a T-turn conversation would be O(T²). Streaming state — three counters, no arrays — is what keeps it linear-total.
+The streaming-vs-batch flip in `budget.ts` vs `report.eval.ts`. Both track running numbers across a sequence. The budget tracker is streaming — three integer accumulators, O(1) per model turn — because it's called *inside the hot path* of an investigation, potentially hundreds of times. The percentile report is batch — full sort, O(n log n) — because it runs *once at the end* over a fixed array of receipts. The insight is choosing the model based on where in the system the operation lives, not on the operation itself. If `add()` had to hold every turn's usage and re-sum, the ceiling check would be O(n) per turn — O(n²) across the investigation.
 
 ```
-  Streaming vs batch for the budget
+  The flip — same "track a sequence" problem, two models
 
-  streaming (current):  add() O(1) × T turns   →  O(T) total
-  batch (hypothetical): store usage[], sum on read
-                        each read O(T) × R reads  →  O(T·R) total
+  budget.ts (hot path)              report.eval.ts (once-per-run)
+  ────────────────────              ─────────────────────────────
+  streaming O(1)/turn               batch O(n log n) once
+  fixed-size state                  full array in memory
+  no revisit of past turns          reads all receipts, sorts, indexes
 ```
 
-Anchor: `lib/agents/budget.ts:51-55`.
+**Anchor:** "The model is chosen by where the operation lives, not what it does — hot path gets streaming, end-of-run gets batch."
 
-**Q: When is O(n log n) fine and when is it a bug?**
+**Q: What's O(n log n) actually doing in `sort`?**
 
-Answer: Fine when it runs once, at the end, over a bounded batch — like `percentiles()` at `eval/report.eval.ts:161` running over the whole receipt set after the load run finishes. It's a bug when the same sort runs *inside* a request path once per event — that turns a 5ms operation into a 5000ms one at n=10k. The tell is whether you're computing over accumulated state (batch) or per-event state (streaming).
+Comparison-based sort's lower bound is `log₂(n!) ≈ n log n` comparisons — you can't beat it without exploiting structure (radix sort's O(n) needs digit-count assumptions). JS's `Array.prototype.sort` is Timsort in V8 (adaptive merge sort) — O(n) on nearly-sorted data, O(n log n) worst case. In `report.eval.ts` the durations are unsorted, so it's the worst-case shape.
 
 ```
-  Sort-when: batch vs hot-path
+  Why sort can't beat n log n (comparison-based)
 
-  BATCH   :   agent loop done ──► sort receipts ──► print p95      // once
-  HOT-PATH:   per event ──► sort history ──► pick threshold        // ✗ bug shape
+  n items → n! possible orderings
+  each comparison halves the possibility space
+  need ⌈log₂(n!)⌉ ≈ n log n comparisons
+  → any comparison sort has this lower bound
 ```
 
-Anchor: `eval/report.eval.ts:161`, contrast with `BudgetTracker.add()` at `lib/agents/budget.ts:51`.
+**Anchor:** "Comparison sort's floor is log(n!) — no algorithm beats it without exploiting structure like digit-count."
+
+**Q: When would you actually replace one of these with a fancier data structure?**
+
+The one place in this repo I'd swap today: `monitoring-legacy.ts:136`'s sort-and-slice-10. It's currently O(n log n) over a small array — the array is small enough that the swap doesn't matter. If a future feature has the agent produce hundreds of anomaly candidates and pick the top 10, a size-10 min-heap gets it to O(n log 10) = O(n). I've built the PriorityQueue in `reincodes` — the swap is one class import, not a research project.
+
+**Anchor:** "The heap swap is one file away — I've built the primitive; the question is when n gets big enough to justify it."
 
 ## See also
 
-- `02-arrays-strings-and-hash-maps.md` — the Set/Map primitives whose costs this file cites.
-- `06-sorting-searching-and-selection.md` — the `percentiles()` sort, expanded.
-- `.aipe/study-performance-engineering/` — how these theoretical costs turn into real p95 latency.
+  → `02-arrays-strings-and-hash-maps.md` — the primitives most of this repo's O(1) and O(n) claims sit on top of
+  → `03-stacks-queues-deques-and-heaps.md` — where the heap-vs-sort tradeoff for top-K gets its full treatment
+  → `06-sorting-searching-and-selection.md` — where the O(n log n) sort meets the O(log n) binary-search gap
+  → `study-performance-engineering` — same cost primitives, different question ("what does this actually take on the box?")

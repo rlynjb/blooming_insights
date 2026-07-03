@@ -1,298 +1,353 @@
-# Migrations and evolution
+# 05 — Migrations and evolution
 
-**Industry term:** Backward-compatible schema evolution / additive-optional migration · **Type:** Industry-standard concept, applied here to TypeScript types + committed JSON snapshots (no DDL, no migration tool).
+**Schema evolution · Case B (no DB, but data DOES persist across commits) · forward-only, optional-fields discipline**
 
-## Zoom out, then zoom in
+## Zoom out — where this concept lives
 
-**Zoom out — where "migrations" happen.** blooming_insights has no `/migrations` directory, no schema versioning tool, no `ALTER TABLE`. Its persisted data is TypeScript-typed JSON. When the shape changes, the migration story is: **add optional fields to the interface, keep old snapshots valid, let the UI degrade gracefully when a field is absent.**
-
-```
-  "migrations" in blooming_insights — where a shape change ripples
-
-  ┌─ single source of type ─────────────────────────────────────┐
-  │  lib/mcp/types.ts    (Insight, Anomaly, Diagnosis, ...)     │
-  │  eval/goldens/types.ts    (GoldenCase, SignalClass)         │
-  └────────────────────────┬────────────────────────────────────┘
-                           │  add optional field
-                           ▼
-  ┌─ producers ─────────────────────────────────────────────────┐
-  │  agents emit new field  · new code populates it              │
-  │  old code / older run    · new field is undefined            │
-  └────────────────────────┬────────────────────────────────────┘
-                           │
-  ┌─ persisted data ────────▼───────────────────────────────────┐
-  │  ★ THIS CONCEPT'S PROOF ★                                   │
-  │  · demo-insights.json / demo-investigations.json (committed)│
-  │  · eval/receipts/*.json (varies across run generations)     │
-  │  · eval/baseline.json (committed reference)                 │
-  └────────────────────────┬────────────────────────────────────┘
-                           │
-  ┌─ consumers ─────────────▼───────────────────────────────────┐
-  │  UI reads Insight — falls back when optional field absent    │
-  │  eval/gate.eval.ts reads baseline — tolerates missing dims  │
-  │  eval/report.eval.ts reads Receipt.usage (optional!)         │
-  └─────────────────────────────────────────────────────────────┘
-```
-
-**Zoom in — the pattern.** The migration discipline is *"never make an old snapshot invalid."* Concretely: new fields are added as `?` (optional); no fields are ever renamed or removed; literal-union types get their new member appended, not their old one replaced. Every "capability signal" on the `Receipt` (`usage?`, `budget?`, `faultTotals?`) is a version marker in disguise — its presence tells the reader "this receipt was produced by a version of the code that had this observability layer wired."
-
-## Structure pass
-
-### Layers of evolution
+Migrations are the change-amplification symptom made physical: code is cheap to change, a schema with live data in it is not. In a database this shows up as `ALTER TABLE` scripts. Here, there's no `ALTER TABLE`, but there is *committed data on disk* — `eval/baseline.json`, `eval/receipts/*.json`, `lib/state/demo-insights.json`, `public/demo/*.json` — that has to survive shape changes.
 
 ```
-  Types of shape change — from cheapest to most disruptive
+  Zoom out — where "live data" survives commits in this repo
 
-  ┌─ Additive-optional (routine, safe) ──────────────────────────┐
-  │  add `newField?: T` — old snapshots stay valid                │
-  │  · Insight.revenueImpact, .aov, .funnel, .history, .category  │
-  │  · Diagnosis.confidence, .timeSeries                          │
-  │  · Recommendation.effort, .timeToSetUpMinutes, ...            │
-  │  · Receipt.usage, .budget, .faultTotals (capability markers)  │
-  └────────────────────────┬─────────────────────────────────────┘
-                           │
-  ┌─ Additive-required (needs a backfill or a default) ──────────┐
-  │  add `newField: T` — old snapshots would be INVALID           │
-  │  · not used in this repo (would break older run receipts)     │
-  └────────────────────────┬─────────────────────────────────────┘
-                           │
-  ┌─ Widening (add a variant to a union) ────────────────────────┐
-  │  add member to literal union — safe if consumers handle DU   │
-  │  · CategoryId currently 10 members; adding an 11th is safe    │
-  │    IF every switch/if-chain on CategoryId is exhaustive       │
-  └────────────────────────┬─────────────────────────────────────┘
-                           │
-  ┌─ Narrowing (change a required field's shape) ────────────────┐
-  │  breaking — old snapshots don't match, no backfill possible   │
-  │  · Recommendation.estimatedImpact went string → union of      │
-  │    string | { range, rangeUsd?, assumption } — handled by     │
-  │    keeping BOTH shapes valid (see validate.ts:46-48)          │
-  └──────────────────────────────────────────────────────────────┘
+  ┌─ ephemeral tiers (no migration needed) ─────────────┐
+  │  tier 1: localStorage (per-browser, resets fine)     │
+  │  tier 2: in-memory Map (dies with instance)          │
+  │  tier 3: bi_auth cookie (10-day expiry catches you)  │
+  │  tier 4: dev-only files (gitignored, throw away)     │
+  └──────────────────────────────────────────────────────┘
+
+  ┌─ durable tier (migrations LIVE here) ────────────────┐
+  │  tier 5: git-committed JSON                          │
+  │    ★ THIS FILE ★ — how do shape changes here NOT     │
+  │    break the running app?                            │
+  │                                                       │
+  │  eval/baseline.json           (regression reference)  │
+  │  eval/receipts/*.json         (28 files, historical) │
+  │  lib/state/demo-insights.json (demo mode seed)       │
+  │  lib/state/demo-investigations.json                  │
+  │  public/demo/*.json           (baked golden fixtures)│
+  │  eval/goldens/*.ts            (TypeScript, but data) │
+  │  eval/calibration/*.json      (worksheet + agreement)│
+  └──────────────────────────────────────────────────────┘
 ```
 
-### One axis: **can the old shape still be read?**
+The question this file answers: **when I change an entity's shape, what breaks on disk — and how do I un-break it?**
 
-Trace it across every persisted store:
+## The structure pass — layers, one axis, seams
+
+Hold one axis: **is this shape change safe against the on-disk data?**
 
 ```
-  "can I still read data written by yesterday's code?" — the discipline
+  Axis: "does changing this field break the committed JSON?"
 
-  demo snapshots     → yes, always. Older committed JSON must render
-                       identically. Optional-field-as-migration keeps this.
+  ┌── change type ───────────────────────────────────────────┐
+  │                                                          │
+  │  ADDING an optional field to Insight                     │
+  │    → old committed JSONs lack it → validator says OK      │
+  │    → new code reads it as undefined → renders fallback    │
+  │    ✓ FORWARD-COMPATIBLE                                   │
+  │                                                          │
+  │  ADDING a required field to Insight                      │
+  │    → old committed JSONs lack it → validator would fail  │
+  │    → but this repo has no validator on Insight! → runtime │
+  │      crash when new code assumes the field exists         │
+  │    ✗ NOT FORWARD-COMPATIBLE                               │
+  │                                                          │
+  │  RENAMING a field on Insight                             │
+  │    → old key still on disk under old name                │
+  │    → new code reads the old name and gets undefined      │
+  │    ✗ NOT FORWARD-COMPATIBLE                               │
+  │                                                          │
+  │  CHANGING a field's TYPE                                 │
+  │    → history: number[] → history: {ts, val}[]            │
+  │    → new code loops assuming objects, gets numbers       │
+  │    ✗ NOT FORWARD-COMPATIBLE                               │
+  │                                                          │
+  └──────────────────────────────────────────────────────────┘
 
-  eval receipts      → yes. `Receipt.usage?` present in Phase-2+ runs,
-                       absent in pre-Phase-2. `Receipt.budget?` similar
-                       (Phase-3). Readers `usage?.diagnose` gracefully.
-
-  eval baseline      → yes. baseline.json has one committed shape;
-                       when new dimensions are added to a rubric,
-                       gate.eval.ts uses `?? 0` for missing dims
-                       (`b.perDimensionPassRate[dim] ?? 0`).
-
-  live in-memory     → not persistent — the question doesn't apply.
+  seam: the git commit boundary. Changes to types.ts commit
+        instantly; changes to committed JSONs require a separate
+        commit (or a regenerate step). The two can drift.
 ```
 
-### Seams — where evolution enters
-
-- **`lib/mcp/types.ts` first-add of `?`** — every time a new optional field is added, the *existence* of previously written data forces the shape to stay backward-compatible. This is a real schema-evolution seam, just enforced by convention (and by 144 tests that read the committed demo).
-- **`lib/mcp/validate.ts:46-48` — the `impactOk` check.** This is where a *widening* migration was handled — `estimatedImpact` used to be a string, now it's a string-or-object union, and both pass validation.
+The whole discipline in this codebase is **stay in the ✓ row.** Almost every field added since day one has been optional. That's not a strategy for the ✗ rows — it's *lucky-additive*, and the moment a destructive change is needed, there's no migration story ready.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-If you've ever added a nullable column to a Postgres table, you already know this trick. Adding `newColumn INT NULL` doesn't break existing rows (they get NULL) and doesn't break existing SELECTs (they don't mention the column). New writers can populate it; new readers can use it; nothing else changes. The migration is *forward-only* and *cheap*.
+You know this from evolving a REST API: adding an optional response field is safe (old clients ignore it, new clients use it); renaming a field breaks old clients (they look for the old name, get nothing); changing a field's type breaks new clients (they parse the old value wrong). Same three cases here, but the "clients" are:
 
-blooming_insights runs the same play with TypeScript optional fields:
+  (a) the running app code (which imports from `lib/mcp/types.ts`),
+  (b) the committed JSONs on disk (which are frozen at whatever shape they were committed at), and
+  (c) the eval subsystem (which reads receipts across runs and expects the same shape).
 
 ```
-  Additive-optional migration — the pattern
+  The pattern — three "clients" of the schema, three ways to drift
 
-     types.ts:
-     ┌─────────────────────────────┐
-     │ interface Insight {         │
-     │   ...existing fields        │
-     │   newField?: NewType;   ◄── added, marked optional
-     │ }                           │
-     └─────────────────────────────┘
-              │
-              ▼
-     producers:
-        old code:  doesn't set newField → undefined       ← still valid
-        new code:  sets newField        → populated       ← works
-
-     consumers:
-        old code:  doesn't read newField                  ← unaffected
-        new code:  reads insight.newField (may be undef)  ← handle fallback
+    change            (a) app code           (b) committed JSONs   (c) eval subsystem
+    ──────            ───────────────         ───────────────────   ─────────────────
+    add optional      compiles, runtime OK   ignores new field     ignores new field
+    add required      compiles, RUNTIME      fails to validate     fails to load
+                      CRASH                  (if there's a         historical receipts
+                                              validator)
+    rename field      compiles, reads old    old name still on     old receipts have
+                      as undefined           disk, new name         old name; new
+                                              missing               receipts have new
+    change type       compiles, PARSES       old value has old     type mismatch
+                      OLD VALUE WRONG        type                   across runs
 ```
 
-Zero coordination cost across producers. The catch is *conservation of typing*: the field is optional forever, so every consumer that reads it must handle `undefined`. The type system enforces that — you can't dereference `insight.newField.someProperty` without narrowing.
+The load-bearing discipline: **every new field on `Insight`, `Anomaly`, `Recommendation`, `Diagnosis` is declared with `?`.** That handles case (a). It does *nothing* for the other two.
 
-### Move 2 — three migrations, walked
+### Move 2 — the current state, and where it breaks
 
-Each is a real change that shipped in the current shape of this repo.
+Walk each durable artifact one at a time.
 
-#### Migration A — `Insight` gained business-owner enrichments
+#### Artifact 1 — `lib/state/demo-insights.json` (the demo-mode seed)
 
-**File:** `lib/mcp/types.ts` (lines 55-62)
+**Shape drift risk:** an `Insight` field is renamed or changes type.
 
-```typescript
-// ── business-owner enrichments (Tier 1). All optional + derived from the
-//    existing evidence, so older snapshots still validate and render. ──
-revenueImpact?: { lostUsd: number; expectedUsd: number; currency: 'USD' };
-aov?: { current: number; prior: number };
-funnel?: { view: number; cart: number; checkout: number; purchase: number };
-affectedCustomers?: number;
-history?: number[];
-downstreamReady?: { diagnosis: boolean; recommendations: number };
-category?: CategoryId;
+**Current state:** the file was seeded when `Insight` had ~10 fields; it's since grown to ~15 optional ones. Because every added field was optional, the seed still validates against the current type — old fields are present, new fields are absent, TS is happy.
+
+**What would break:**
+  → Rename `Insight.headline` → `Insight.title`. New code reads `.title`, gets `undefined`. Every demo-mode insight card renders blank.
+  → Change `Insight.history: number[]` → `Insight.history: {ts, val}[]`. New code loops `.value` on numbers, silently NaN.
+
+**Current mitigation:** none. If you make either change, you re-generate the seed by hand (there's no script that regenerates it from the current agent) or edit the JSON by hand.
+
+**The fix, when it becomes real:** a `scripts/bake-demo-*.ts` (there's already `scripts/bake-demo-coverage.ts` for related coverage data) that runs the current agent, captures the output, and writes the seed. Then a schema change means: change the type, re-run the bake, commit both.
+
+#### Artifact 2 — `eval/receipts/*.json` (28 committed receipts)
+
+**Shape drift risk:** `Receipt`'s fields grow or shrink; historical receipts become unreadable to the aggregator.
+
+**Current state:** the receipt shape is defined *implicitly* — there's no exported `Receipt` type, only the local `type Receipt = {...}` in `baseline.eval.ts:26-39` for the aggregator's needs. The receipt writer (`run.eval.ts`) writes whatever the current run produces.
+
+That's a real modeling weakness: **the receipt is a big denormalized blob with no canonical shape declaration.** When the receipt grows a new field (say, `budgetSnapshot` was added mid-week 4), old receipts don't have it. The aggregator reads with `.?` and defaults, but there's no test that catches "the field was renamed, all old receipts are silently missing."
+
+**What would break:**
+  → Rename `receipt.diagnosisJudgment` → `receipt.diagJudgment`. The aggregator's `r.diagnosisJudgment` becomes undefined; `baseline.json` regenerates with empty verdict distribution. Nobody notices unless they eyeball the numbers.
+  → Add `receipt.retryCount` as a required field for the aggregator. Old receipts crash the aggregate.
+
+**Current mitigation:** the aggregator's `Receipt` type is *narrow* (`baseline.eval.ts:26-39` picks only the fields it needs). That accidentally forward-shields it — the wide receipt could grow and the narrow aggregator stays happy.
+
+**The fix, when it becomes real:** move `Receipt` to a `eval/types.ts` alongside `GoldenCase`. Version it: `receipt.schemaVersion: '1' | '2'`. The aggregator switches on version.
+
+#### Artifact 3 — `eval/baseline.json` (the regression reference)
+
+**Shape:** aggregate-only. `runId`, `builtAt`, `caseCount`, `diagnosis: DimensionAggregate`, `recommendation: DimensionAggregate`.
+
+**Shape drift risk:** the aggregator's dimension names change. Regression gate compares aggregates by name; a rename = a false regression.
+
+**Current state:** committed at run `2026-07-03T04-08-28-644Z`. The gate reads it (`eval/gate.eval.ts`), reads a candidate run's aggregate, compares dimension-by-dimension.
+
+```
+  The regression-gate loop — where baseline shape matters
+
+  ┌── committed: eval/baseline.json ────────────────┐
+  │  perDimensionPassRate: {                         │
+  │    root_cause_plausibility: 0.75,                │
+  │    evidence_grounding: 0.5,                      │
+  │    scope_coherence: 0.75,                        │
+  │    actionable_next_step: 0                       │
+  │  }                                                │
+  └───────────────────────┬──────────────────────────┘
+                          │  gate.eval.ts loads both
+                          ▼
+  ┌── candidate: computed from a fresh run ──────────┐
+  │  perDimensionPassRate: {                         │
+  │    root_cause_plausibility: 0.80,   ← +5%        │
+  │    evidence_grounding: 0.5,                       │
+  │    scope_coherence: 0.75,                         │
+  │    actionable_next_step: 0.10       ← +10%       │
+  │  }                                                │
+  └───────────────────────┬──────────────────────────┘
+                          ▼
+                       compare per-dim → verdict
+
+  the DRIFT case: baseline uses "actionable_next_step"; a rubric
+  rev renames it to "next_step_actionability". Gate sees the old
+  key as missing → false "regression" of 100% on that dim.
 ```
 
-The comment on line 54-55 is the migration doc: *"All optional + derived from the existing evidence, so older snapshots still validate and render."* This is the pattern applied verbatim:
+**What would break:**
+  → Rename a rubric dimension. The baseline has the old name; candidate has the new. Gate reports the old dim as regressed-to-nothing, the new dim as improved-from-nothing.
 
-- old committed `demo-insights.json` (any version) has no `revenueImpact` → the type still validates because the field is `?`.
-- `deriveInsightFields` at `lib/insights/derive.ts:27-38` populates `revenueImpact` when it can (revenue metrics with a `current`/`prior` in evidence and a `down` direction); returns empty otherwise. New code that calls it on old anomalies works fine.
-- UI consumers that read `insight.revenueImpact` must handle `undefined` — TypeScript enforces this.
+**Current mitigation:** none. A rubric change requires deliberately re-baselining (`RUN_BASELINE=1 npm run eval:baseline`) and committing the new baseline.
 
-**What breaks if a field is added *without* the `?`:** every existing committed snapshot fails validation on startup; the demo mode is broken until every JSON file is manually backfilled or edited. This is the DB migration equivalent of `ALTER TABLE ADD COLUMN NOT NULL` without a default — the classic downtime-inducing move.
+**The fix, when it becomes real:** a `baseline.rubricVersion` field on both the baseline and each receipt. The gate refuses to compare across mismatched versions and emits a "REBASELINE REQUIRED" message.
 
-#### Migration B — `estimatedImpact` widened from string to union
+#### Artifact 4 — `Investigation.diagnosis` shape drift (in-flight, will bite when destructive)
 
-**File:** `lib/mcp/types.ts` (lines 108-110) + `lib/mcp/validate.ts` (lines 46-48)
+Already flagged in file 02 and file 04. The relevant migration risk: the two shapes `Diagnosis` and `Investigation.diagnosis` will diverge, and the demo `demo-investigations.json` seed was written against one of them. Whichever one gets updated (say, `Diagnosis.hypothesesConsidered` gets a fourth field), the demo seed will validate against the older sibling type but *not* against the newer one.
 
-The type is now a union — string (legacy) OR a richer shape:
+There's no explicit test that "the demo seed matches the current type." That's the migration test that doesn't exist yet.
 
-```typescript
-// types.ts:108-110
-export type EstimatedImpact =
-  | string
-  | { range: string; rangeUsd?: { low: number; high: number }; assumption: string };
+### Move 2.5 — current state vs future state
+
+**Current state (Phase A):**
+  → Every added field is optional. TypeScript is happy across all committed JSONs.
+  → No `schemaVersion` anywhere.
+  → No migration scripts. Regeneration is manual.
+  → Two shape-drift risks live (Diagnosis vs Investigation.diagnosis, demo seeds).
+  → 28 committed receipts, all from one week, all under implicit "receipt shape" contract.
+
+**Future state (Phase B), the version where migrations become real:**
+
+```
+  Phase A (today)                        Phase B (when needed)
+  ─────────────                          ─────────────────────
+
+  Insight (types.ts):                    Insight (types.ts):
+    id: string                             schemaVersion: '2'   ← NEW
+    headline: string                       id: string
+    ... 15 optional fields ...             title: string        ← RENAMED
+                                            ... etc ...
+
+  demo-insights.json:                    demo-insights.json:
+    { insights: [{ headline: ... }] }      { schemaVersion: '2',
+                                            insights: [{ title: ... }] }
+
+  read path (server):                    read path (server):
+    JSON.parse(file)                      readInsightSeed(file):
+    → shape assumed                        parsed = JSON.parse(file)
+                                           switch (parsed.schemaVersion):
+                                             '1': migrateV1toV2(parsed)
+                                             '2': parsed
+                                             else: throw
 ```
 
-The validator accepts both:
+The migration point is *at the read boundary*, not in a separate step. That's the "read-side migration" pattern: instead of walking all files and rewriting them (dangerous, can't roll back), you version the shape and add a case in the reader for each historical version. Old files stay untouched. If you ever need to compact, you re-run the reader and re-write everything at the current version.
 
-```typescript
-// validate.ts:46-48
-const impactOk =
-  typeof x.estimatedImpact === 'string' ||
-  (!!x.estimatedImpact && typeof x.estimatedImpact === 'object' && typeof x.estimatedImpact.range === 'string');
-```
+Cost of moving to Phase B: adding `schemaVersion: '1'` to every committed JSON today (a search/replace). Adding a `migrateInsight` function with one case. From there, every future destructive change is a `'2' → '3'` case, and old receipts still load.
 
-And the read path handles both — `impactRange` at `lib/insights/derive.ts:4-6`:
-
-```typescript
-export function impactRange(e: EstimatedImpact): string {
-  return typeof e === 'string' ? e : e.range;
-}
-```
-
-This is a **narrowing-to-widening migration**: the shape got richer, but the old shape stays valid forever. Three consequences:
-
-1. The validator accepts both, so every recommendation from every era passes.
-2. Reads use a type guard (`typeof e === 'string'`) to fork on the shape.
-3. The type is now stuck as a union — you can't "clean up" by dropping the string variant without invalidating old committed snapshots.
-
-**What breaks if you drop the string variant:** every committed demo-investigation from before the widening fails validation, and every old test fixture breaks. In practice, this migration is one-way — the string case becomes permanent tech debt.
-
-#### Migration C — `Receipt.usage` and `Receipt.budget` as capability signals
-
-**File:** the anonymous receipt shape in `eval/run.eval.ts:341-395` + reader at `eval/report.eval.ts:39-44`
-
-```typescript
-// report.eval.ts:39-44 — the reader's declared shape
-usage?: {
-  diagnose?: UsageRow;
-  recommend?: UsageRow;
-};
-```
-
-The `?` on both levels is doing work: `usage?` means "this receipt might be from before Phase-2 (no usage observability)"; `diagnose?` means "even if usage is present, one of the two agent phases might have failed to report." The reader (`eval/report.eval.ts`) checks for presence at every level:
-
-```typescript
-// paraphrased read pattern from report.eval.ts
-const u = receipt.usage?.diagnose;
-if (u) {
-  // safely dereference u.inputTokens, u.costUsd, ...
-}
-```
-
-This is the **capability-signal pattern**: an optional field's *presence* tells the reader which era of the code produced this record. It's a version marker without a version number.
-
-**Three signals like this in the receipt:**
-- `usage?` — Phase-2 (observability wiring).
-- `budget?` — Phase-3 (per-investigation ceiling).
-- `faultTotals?` on load receipts — fault-injection era.
-
-**What breaks if you make one of these required:** every receipt from before that phase fails validation. Regression gate breaks. Old baseline can't be read. This is why they stay optional.
-
-#### Move 2 variant — the load-bearing skeleton of "safe schema evolution"
-
-Three rules. Each one, if broken, forces a re-write of every persisted snapshot.
-
-1. **Never remove or rename a field.** Old snapshots have the old name; removing it makes them invalid. Renaming is remove-plus-add — same problem.
-
-2. **Add new fields as optional first.** If you need required-ness later, add optional, backfill every existing store, *then* change the type. Blooming_insights doesn't currently do the second step — everything stays optional forever, which is the honest cost of not having a migration tool.
-
-3. **Widen unions instead of narrowing.** Add a variant to `Severity` (add "urgent" as a new member)? Safe. Remove one? Breaking — old snapshots referencing the removed member fail. Same for `BloomreachFeature`, `CategoryId`, `SignalClass`.
-
-Drop rule 1 and you get "why doesn't the demo load?" bugs on git pull. Drop rule 2 and your CI breaks on every add. Drop rule 3 and older evaluation runs stop parsing.
+**What the migration to Phase B doesn't have to change:** the wire format, the in-memory `Map`, the cookie encryption. All of those are ephemeral tiers where the shape drift dies with the instance/cookie. Migrations only matter for tier 5.
 
 ### Move 3 — the principle
 
-**When the schema evolves without a tool, the type file *is* the migration log — read its git history.** Every diff that adds a `?:` is a forward-compatible migration; every diff that changes a required field's type is a breaking change that better be backed by a backfill of every store. blooming_insights lives at the "additive-only" discipline: it never makes an old snapshot invalid, which means it never needs a migration tool. The tradeoff is the optional-field accumulation — the shape gets slowly polluted with fields that are optional-forever. That's the debt you pay to avoid the migration tool. The rule you take home: **schema evolution is a discipline before it's a tool; the tool just enforces the discipline at scale.** Below the "scale" threshold, additive-optional-only + honest type comments is enough.
+The principle: **for every persisted shape, know your migration policy — even if the policy is "regenerate by hand."** The three honest policies:
 
-## Primary diagram
+  1. **Optional-fields-only, forward-only.** Every new field is `?`. No renames, no type changes, no removals. Cheap; works until it doesn't. This is the current policy.
+  2. **Read-side migration with schema versions.** Version everything, migrate at the read boundary. Costs a `schemaVersion` field + a `migrate()` per shape. Handles destructive changes safely.
+  3. **Rewrite everything on change.** Regenerate all committed JSONs from the current agent every time the shape changes. Works if regeneration is scripted; a horror if it's manual.
 
-The whole migration story in one frame — every persisted store, every evolution rule, every capability signal.
+Policy 1 is where this repo is. Policy 2 is where it should move the moment a destructive change ships. Policy 3 is where the demo seeds effectively are (regenerate-by-hand), which is why they're a modeling weakness.
+
+## Primary diagram — the migration surface, ranked
 
 ```
-  blooming_insights — schema evolution recap
+  Every committed shape in this repo — migration risk, ranked
 
-  ┌─ persisted stores (must stay readable) ─────────────────────┐
-  │  · demo-insights.json                                        │
-  │  · demo-investigations.json                                  │
-  │  · eval/goldens/*.ts   (source, not persisted, but committed)│
-  │  · eval/baseline.json                                        │
-  │  · eval/receipts/*.json (per run — see capability signals)   │
-  └────────────────────────┬────────────────────────────────────┘
-                           │
-  ┌─ evolution discipline (enforced by convention + TS) ────────┐
-  │                                                              │
-  │  add new field  →  mark `?`  →  handle undefined at reader   │
-  │  widen union    →  keep old variant  →  fork on typeof/tag   │
-  │  never rename   ·  never remove  ·  never narrow             │
-  └────────────────────────┬────────────────────────────────────┘
-                           │
-  ┌─ capability signals in Receipt (era markers) ───────────────┐
-  │                                                              │
-  │  usage?      Phase-2  (per-agent token+cost observability)   │
-  │  budget?     Phase-3  (per-investigation ceiling)            │
-  │  faultTotals? load-only (fault-injection era)                │
-  │                                                              │
-  │  reader: `receipt.usage?.diagnose?.inputTokens ?? 0`         │
-  │  presence = "this era was wired"                             │
-  └─────────────────────────────────────────────────────────────┘
+  ────────────────────────────────────────────────────────────────────────
+  artifact                          risk         current    fix path
+                                                 policy
+  ────────────────────────────────────────────────────────────────────────
+  lib/state/demo-*.json             MEDIUM       manual     scripts/bake-*
+    (demo mode seeds)                            regen                 +
+                                                             schemaVersion
+
+  eval/receipts/*.json              MEDIUM       narrow-    move Receipt
+    (28 files, cross-run             (aggregator  shield    to eval/types.ts
+     comparison used)                 accident)               + version field
+
+  eval/baseline.json                LOW-MEDIUM   rubric     baseline.
+    (regression gate reference)                  version    rubricVersion +
+                                                 lives in   gate refuses to
+                                                 rubric     compare across
+
+  eval/goldens/*.ts                 LOW         optional-  compile checks
+    (TypeScript, compile-checked)                only       most drift for
+                                                            us
+
+  public/demo/*.json                LOW         bake       already scripted
+    (coverage baked fixture)                    script      via
+                                                            scripts/bake-
+                                                            demo-coverage.ts
+
+  eval/calibration/*.json           LOW         manual     versioned per-run
+    (worksheet + agreement)                     regen       already; safe
+  ────────────────────────────────────────────────────────────────────────
+
+  Legend:
+    MEDIUM = destructive change here will silently break something
+    LOW    = destructive change will fail loud, or the pattern is scripted
 ```
 
 ## Elaborate
 
-The additive-optional pattern is Protobuf's default discipline (`optional` is the semantic; every new field is safe to add). Avro is stricter — schemas must be explicitly compatible in one of a few enumerated ways. JSON without a schema tool is the loosest form of all: nothing enforces compatibility except convention + test coverage. blooming_insights lands where a Next.js app of this size naturally does — TypeScript types as the schema, the 144-test suite as the "does the migration still parse?" enforcer, git history of `types.ts` as the migration log.
+Where the pattern comes from: read-side migration is Fowler's *Schemaless Data Migration* pattern from the NoSQL literature — it's what MongoDB, Couchbase, and the "no migrations" school of database use in place of `ALTER TABLE`. The core idea: **store the version alongside the data, migrate at the read boundary, never touch the write side until compaction time.** This lets you deploy the migration code and the schema change in the same commit, with no lockstep between "code deploy" and "data migration ran successfully."
 
-The capability-signal pattern (optional field = era marker) is the same shape as **feature flags in configuration** — presence signals "this environment has the feature." Similar shape, same reading discipline. When the feature is fully rolled out, the flag becomes redundant but often stays as forever-optional debt. Same for the receipts here — Phase-2 is universal, but `usage?` stays optional because the pre-Phase-2 receipts exist.
+The reason this codebase is *close* to that pattern without formalizing it: TypeScript's `?` gives you a subset of it (the additive case). What's missing is the version discriminator that lets you handle non-additive changes. That's a ~50-line addition that pays off the first time you rename or retype a field.
+
+The reason not to add it *today*: it costs 3 files and 30 minutes; the payoff is zero until the first destructive change. YAGNI applies. The reason to *know it exists*: when the destructive change comes, you don't want to invent this at that moment — you want to have decided it in advance and cut the change in one PR.
+
+Related reading: Martin Fowler on *Evolutionary Database Design* — the same principles ported to a schemaless world. Also worth: the Rails ActiveRecord community's decade of learning that "always add a `NOT NULL default` in migrations" — which is the same lesson as "always mark new fields optional in TypeScript."
 
 ## Interview defense
 
-**Q: "How do you migrate the schema in this system?"**
-Answer: "There's no migration tool — no `/migrations` directory, no DDL. What we have instead is a discipline: every new field on a persisted shape is optional. The type comment on `Insight` at `lib/mcp/types.ts:54-55` states this literally: 'all optional + derived from the existing evidence, so older snapshots still validate and render.' Consumers of an optional field handle `undefined` — TypeScript enforces that. The type file `lib/mcp/types.ts` is effectively the migration log; its git history is the change record." Draw the additive-optional-migration diagram.
+### Q1 — "you have committed JSON on disk. What's your migration story?"
 
-**Q: "Show me a real migration that shipped."**
-Answer: "`Recommendation.estimatedImpact` used to be a plain string. It got widened to `string | { range, rangeUsd?, assumption }`. Both variants are still valid — the validator at `lib/mcp/validate.ts:46-48` checks either shape, and readers fork on `typeof e === 'string'` at `lib/insights/derive.ts:4-6`. Old snapshots keep working. The cost is that the string variant is now permanent — you can't clean it up without breaking older committed data." Anchor: the type at `lib/mcp/types.ts:108-110`.
+> Optional-fields-only, forward-only. Every new field on `Insight`, `Anomaly`, `Recommendation` is declared with `?`, so old committed JSONs — the demo seeds, the eval receipts, the baseline — still validate against the current types. Adding a field is safe; renaming or retyping isn't.
+>
+> That's fine for where I am (hackathon-scale, ~40 committed data files, all under my control). It's *not* a strategy for destructive changes. When those come, the move is read-side migration: add a `schemaVersion` field to each persisted shape, add a `migrate(oldVer, data) → currentVer` at the read boundary, keep the historical migrations forever. Then a rename is a version bump, not a lockstep code-plus-data migration.
 
-**Q: "What's the risk of this approach?"**
-Answer: "Two. First, optional-field creep — every new field is optional forever, which slowly pollutes the shape and makes 'is this required?' impossible to read from the type. Second, no automatic backfill — if you ever decide a new field *should* be required, you have to write a migration script by hand and touch every persisted store. Right now the surface is small enough that neither is painful. At 10x the shape surface, or when the eval receipt count grows past a few hundred runs, either a schema library like Zod or an actual migration tool starts to earn its keep." Anchor: the capability-signal fields in the `Receipt` shape from `eval/run.eval.ts:341-395`.
+```
+  the ladder of migration policies
+
+  today:   optional-fields-only              works until destructive
+  next:    schemaVersion + read-side migrate  handles all changes
+  never:   rewrite all files on change        breaks the moment you
+                                               forget one
+```
+
+Anchor: "today = forward-only; when destructive, add schemaVersion at the read boundary."
+
+### Q2 — "what's the specific migration risk you're carrying today?"
+
+> Two, both in file 02's shape-drift finding. First: `Diagnosis` and `Investigation.diagnosis` are two shapes for the same conceptual entity in the same file. If someone edits one, the other doesn't follow, and the demo `demo-investigations.json` seed will silently validate against the older sibling type. Nothing catches that.
+>
+> Second: the eval receipts have no exported `Receipt` type. The aggregator declares a *narrow* type locally, which accidentally forward-shields it against added fields, but a rename in the receipt shape would silently make the baseline aggregate empty on that dimension. Nobody would notice unless they eyeball the numbers.
+>
+> Both are latent, not live. The fix for both is the same: version + type-check at the read boundary.
+
+Anchor: "two live shape-drift risks, both fixable with a `schemaVersion` + `migrate` pair."
+
+### Q3 — "walk me through renaming `Insight.headline` to `Insight.title`."
+
+> Today, one PR:
+>
+>   1. Rename in `lib/mcp/types.ts:41`.
+>   2. Find-replace `headline` → `title` across the codebase (~50 sites: components, tests, agent prompts).
+>   3. Regenerate `demo-insights.json` — this is the trap. There's no script; it's a hand-edit or "run the app, screenshot, copy JSON." I'd have to add a `scripts/bake-demo-insights.ts` for this to be safe.
+>   4. Regenerate golden receipts — `eval/goldens/*.ts` use `Anomaly` not `Insight`, so no change here.
+>   5. Regenerate `eval/baseline.json` — only if the rename touches a rubric dimension name. `headline` → `title` doesn't, so baseline is fine.
+>
+> That's uncomfortable — step 3 is the risky one, and it doesn't scale. Under Phase B (read-side migration), same rename becomes:
+>
+>   1. Bump `schemaVersion` on `Insight` from `'1'` to `'2'`.
+>   2. Rename in types.
+>   3. Add `migrateInsightV1toV2` that maps `.headline` → `.title`.
+>   4. Nothing else. Demo seeds and old receipts continue to load because the read boundary migrates them lazily.
+>
+> That's the migration-cost delta: today's rename touches ~50 sites AND requires regenerating a seed I don't have a script for; Phase B's rename touches 3 sites and skips regeneration entirely.
+
+```
+  today's rename cost vs Phase B's rename cost
+
+  today:                          Phase B:
+  ──────                          ────────
+  1 type rename                   1 type rename
+  ~50 call sites                  1 migrate() case
+  1 seed regen (no script!) ←  1 schemaVersion bump
+  ~200 lines of diff              ~10 lines of diff
+```
+
+Anchor: "the read-side-migration pattern turns a 50-site change into a 3-site change."
 
 ## See also
 
-- `01-the-data-model-and-its-shape.md` — the shapes being evolved.
-- `04-transactions-and-integrity.md` — the runtime validators that make the additive-optional discipline safe.
-- `07-data-modeling-red-flags-audit.md` — the "no destructive migrations" entry on the consolidated checklist.
+- `02-normalization-and-duplication.md` — the shape drift between `Diagnosis` and `Investigation.diagnosis` is the specific migration hazard.
+- `04-transactions-and-integrity.md` — the type guards this file assumes at the read boundary.
+- `06-access-patterns-and-storage-choice.md` — why "commit JSON, migrate on read" is even viable at this scale.
+- `07-data-modeling-red-flags-audit.md` — the "no `schemaVersion` anywhere" red flag is marked here.

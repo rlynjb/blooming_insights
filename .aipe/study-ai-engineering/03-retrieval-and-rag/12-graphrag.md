@@ -1,108 +1,159 @@
-# 12 — GraphRAG
+# GraphRAG
 
-**Type:** Industry standard. Also called: entity-relation retrieval, knowledge-graph RAG.
+## Subtitle
+
+Graph-traversal retrieval / entity-relationship augmented generation — Industry standard.
 
 ## Zoom out, then zoom in
 
-**Not exercised in this codebase.** GraphRAG extracts entities + relations from a corpus and traverses them at query time instead of / alongside vector similarity.
+GraphRAG extracts entities and relationships from the corpus upfront, then retrieves by traversing the graph from query-mentioned entities. Where plain RAG asks "what's semantically close?", GraphRAG asks "what's structurally related?"
+
+```
+  Zoom out — the two RAG shapes
+
+  Plain RAG:
+    query → embed → nearest neighbors → augment
+
+  GraphRAG:
+    query → extract entities → traverse graph → collect chunks → augment
+```
 
 ## Structure pass
 
-Axis: how do you retrieve when relevant docs don't share vocabulary with the query but ARE structurally related?
-- Vector RAG: fails — no term overlap, embedding may or may not bridge.
-- GraphRAG: succeeds — walks the entity graph explicitly.
+- **Layers:** entities → relationships → subgraph → chunks. Four bands.
+- **Axis: relatedness shape.** Semantic (embeddings) vs structural (graph traversal). Different signal.
+- **Seam:** the entity-extraction step. Upfront cost; enables the whole traversal downstream.
 
 ## How it works
 
-### Move 1
+### Move 1 — the mental model
 
-User asks "what did I decide about auth in the design meetings about session management?" Vector RAG embeds the query, finds top-k semantically similar chunks. If no chunk mentions "auth" AND "session management" AND "design meetings" together, retrieval may miss the right doc.
-
-GraphRAG walks entities: [auth] → related_to → [session_management] → discussed_in → [design_meeting_3] → contains → [chunks]. The traversal finds the right meeting even when text similarity fails.
+You know how graph traversal works from BFS/DFS on adjacency lists — you have `Graph.ts` in reincodes and you've walked one many times. GraphRAG is the same primitive applied to a corpus: extract nodes (entities) and edges (relations) once, then traverse at query time.
 
 ```
-  Entities + relations extracted upfront
+  GraphRAG — the shape
 
-  [auth] ──relates_to──► [session management]
-     │
-     └──discussed_in──► [design meeting #3]
-                             │
-                             └──contains──► [chunks 12, 13, 14]
+  Upfront (once per corpus):
+    docs → LLM extracts entities + relations
+           → { entities: [E1, E2, ...],
+               relations: [(E1, discussed_in, D1), ...] }
+           store as graph
 
-  query traverses graph: find entities, walk to chunks, retrieve.
+  At query time:
+    "what did I decide about auth in the sessions meetings"
+       │
+       ▼
+    parse: entities = [auth, sessions, meetings]
+       │
+       ▼
+    traverse: find nodes near auth ∩ near sessions
+       │
+       ▼
+    collect chunks attached to those nodes
+       │
+       ▼
+    augment prompt with those chunks
 ```
 
-### Move 2
+### Move 2 — the step-by-step walkthrough
 
-**Extraction.** Run an LLM over each doc once, extract `{entity, entity, relation}` triples. Store in a graph DB (Neo4j, Kùzu) or a table.
+**When GraphRAG beats plain RAG.** When relevant docs don't share vocabulary with the query but *are* structurally related. Example: a query about "the auth flow" needs docs tagged with "session management" — different words, related concept. Plain RAG (embedding-only) may miss the connection; GraphRAG follows the `auth ─relates_to→ session_management` edge.
 
-**Retrieval.** Match query to entities. Walk the graph N hops from those entities. Return chunks associated with visited nodes.
+**When plain RAG is enough.** Most cases. GraphRAG has a hefty upfront cost (LLM-extract entities from the whole corpus) and a maintenance cost (re-extract on doc changes). Unless the corpus has strong relational structure worth exploiting, plain RAG wins on complexity budget.
 
-**Combined with vector RAG.** Best of both — graph retrieval finds structurally-related docs; vector retrieval catches paraphrases within them.
+**For blooming.** Overkill for the near-term. Investigation memory is a flat set of records with no rich cross-record relationships. If the codebase grew a "root-cause taxonomy" — a graph of cause → symptom → mitigation nodes accumulated over time — GraphRAG would earn its place. Today, not there.
 
-**Cost.** Extraction is a big up-front LLM cost (one call per doc, ~$0.005-0.02 each). At 10K docs, that's $50-200 one-time.
+**Implementation shape.**
 
-**When it beats vector RAG.** Corpora with strong entity structure (meeting notes, project docs, org wikis, code) where the query names an entity or relation rather than a topic. Vector RAG handles topics; GraphRAG handles connections.
+- One-time: run an entity+relation extractor on the corpus. Store nodes + edges in any graph store (Neo4j, in-memory `Map<node, Set<edge>>`, sqlite with a relations table).
+- Per-query: use an LLM (or NER model) to parse query entities. Traverse the graph N hops. Collect chunks attached to visited nodes. Rank chunks (RRF over frequency-of-visit + optional relevance score).
 
-### Move 3
+Pseudocode:
 
-GraphRAG shines when the corpus has entity structure and queries traverse it. For text-similarity queries, vector RAG is simpler. Hybrid (both) works when both are cheap enough to run.
+```
+  buildGraph(corpus):
+    for doc in corpus:
+      extracted = LLM.extract(doc, schema={entities, relations})
+      graph.addEntities(extracted.entities)
+      graph.addRelations(extracted.relations)
+      graph.attachChunk(extracted.entities[0], doc.chunk)
+
+  queryGraph(query, k=3):
+    queryEntities = LLM.parseEntities(query)
+    visited = BFS(graph, queryEntities, maxHops=2)
+    chunks = visited.flatMap(node => graph.chunksFor(node))
+    return rankByFrequency(chunks).slice(0, k)
+```
+
+### Move 3 — the principle
+
+Structural retrieval catches relationships semantic retrieval misses — at the cost of an expensive extraction step. Only earn the cost when the corpus's structure is load-bearing for the queries you actually run.
 
 ## Primary diagram
 
 ```
-  GraphRAG flow
+  GraphRAG — full frame
 
-  ┌─ Ingestion (one-time) ────────────────────────────────────────────┐
-  │  for each doc:                                                    │
-  │    LLM extract entities + relations → {entity, entity, relation}  │
-  │    store in graph DB                                              │
-  └───────────────────────────────────────────────────────────────────┘
-
-  ┌─ Query time ──────────────────────────────────────────────────────┐
-  │  query text                                                       │
-  │    │                                                              │
-  │    ▼ named-entity extract                                          │
-  │  entity ids                                                       │
-  │    │                                                              │
-  │    ▼ graph traversal                                              │
-  │  visited nodes                                                    │
-  │    │                                                              │
-  │    ▼ pull chunks associated with visited nodes                    │
-  │  retrieved chunks                                                 │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌─ Corpus (docs) ─────────────────────────────────────┐
+  │  investigations, past diagnoses, EQL queries, ...    │
+  └──────────────────┬──────────────────────────────────┘
+                     │  one-time
+                     ▼
+  ┌─ Entity + relation extraction (LLM) ────────────────┐
+  │  { entities, relations, chunk_attachments }          │
+  └──────────────────┬──────────────────────────────────┘
+                     ▼
+  ┌─ Graph store ───────────────────────────────────────┐
+  │  nodes = entities                                    │
+  │  edges = relations                                   │
+  │  each node has attached chunks                       │
+  └──────────────────┬──────────────────────────────────┘
+                     │  at query time
+                     ▼
+  ┌─ Query parse → entities ────────────────────────────┐
+  └──────────────────┬──────────────────────────────────┘
+                     ▼
+  ┌─ BFS from query entities (maxHops=2) ───────────────┐
+  └──────────────────┬──────────────────────────────────┘
+                     ▼
+  ┌─ Collect + rank chunks ─────────────────────────────┐
+  └──────────────────┬──────────────────────────────────┘
+                     ▼
+  ┌─ Augment prompt (like plain RAG) ───────────────────┐
+  └─────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-GraphRAG was popularized by Microsoft's 2024 paper of the same name. The core idea (entity extraction + graph traversal) is older — it's the retrieval side of question-answering over knowledge bases. The 2024 GraphRAG paper's contribution was scaling the extraction using LLMs and combining hierarchical community summaries with the entity graph.
+GraphRAG (as a named pattern) was popularized by Microsoft Research (2024) and integrated into LangChain and LlamaIndex. Simpler forms — knowledge graphs powering search — predate the term by two decades (Google Knowledge Graph, 2012).
+
+The upfront cost is real. Extracting entities from a 10k-doc corpus with a Sonnet-tier LLM at ~$0.05/doc = $500. Cheaper models (Haiku, gpt-4o-mini) drop it to ~$50 with quality tradeoff. Blooming's would-be corpus at 10k rows would be ~$50 to build the graph — bounded, but not free.
+
+Related: **11-rag.md** (the plain-RAG baseline), **01-embeddings.md** (still used inside GraphRAG for chunk-attachment similarity).
 
 ## Project exercises
 
-### Exercise — small GraphRAG over agent tool traces
+### B3.12 · Build a root-cause taxonomy graph (thought experiment)
 
-- **Exercise ID:** C2.15-B · Case B (RAG not exercised).
-- **What to build:** across past investigations, extract entities `{metric, scope, category, tool}` and relations `{caused_by, co_occurred_with, resolved_by}`. Build a small graph (~few hundred nodes). At query time, extract entities from the incoming anomaly, walk 2 hops, pull chunks.
-- **Why it earns its place:** the entity structure IS present (metric-scope-category-tool graph). GraphRAG could add real value for the "similar past" retrieval that vector RAG might miss.
-- **Files to touch:** `lib/rag/graph.ts` (new), `lib/rag/retrieve.ts` (add graph traversal branch).
-- **Done when:** given an anomaly, the traversal surfaces 3 past investigations with matching entity graph paths, not just semantic similarity.
-- **Estimated effort:** 1 week.
+- **Exercise ID:** B3.12 (Case B — hypothetical stretch)
+- **What to build:** As a design exercise (not necessarily to ship): sketch the entity extraction over blooming's 10 golden cases. Extract entities like `payment_processor`, `checkout_step`, `mobile_segment`, and relations like `payment_processor causes payment_failure`. Compare against what plain RAG would retrieve.
+- **Why it earns its place:** Even as an unshipped exercise, it teaches you when the structural signal beats the semantic one. Interview payoff: "here's the analysis I did to decide GraphRAG wasn't worth it for this codebase (and here's when it would be)."
+- **Files to touch:** `docs/graphrag-analysis.md` (or a discussion doc). No production code.
+- **Done when:** the analysis names 3 queries where GraphRAG would retrieve differently than plain RAG on the 10-golden corpus, and quantifies whether the difference would improve or degrade the eval.
+- **Estimated effort:** `1–4hr`.
 
 ## Interview defense
 
-**Q: GraphRAG vs vector RAG?**
+**Q: Would you build GraphRAG for blooming?**
 
-Vector RAG on topics; GraphRAG on connections. Query "how do we handle auth" is a topic — vector RAG shines. Query "which decisions link session management to auth" is a connection — GraphRAG shines. Real production often uses both, gated by query shape.
+Not today. The corpus doesn't have the relational density that GraphRAG's upfront cost pays for — 10 golden cases with mostly-independent anomalies. Where GraphRAG earns its place: corpora with strong entity structure — support docs where products/features/errors interconnect, or knowledge bases like a root-cause taxonomy. The load-bearing part: recognize the shape mismatch.
 
-**Q: What's the up-front cost?**
+**Q: When would you switch to GraphRAG from plain RAG?**
 
-Extraction — one LLM call per doc to pull entities and relations. At 10K docs and Sonnet-cost, that's $50-100 one-time. Ongoing cost is just the incremental extraction on new docs.
-
-**Q: When wouldn't you use it?**
-
-When your corpus is homogeneous prose with weak entity structure (news articles, blog posts). The graph would be trivial and vector RAG would do just as well at a fraction of the setup cost.
+Two signals. (1) plain-RAG hit@3 is below threshold and the misses share a pattern (queries that need related-not-similar chunks). (2) the corpus has a clear entity graph that's cheap to extract. Absent either, plain RAG is enough.
 
 ## See also
 
-- `11-rag.md` — the umbrella
-- `04-agents-and-tool-use/05-agent-memory.md` — agent memory has a graph-shaped variant too
+- [11-rag.md](11-rag.md) — the plain-RAG baseline.
+- [01-embeddings.md](01-embeddings.md) — the sibling primitive.
+- [../04-agents-and-tool-use/05-agent-memory.md](../04-agents-and-tool-use/05-agent-memory.md) — where memory-shaped retrieval matters.

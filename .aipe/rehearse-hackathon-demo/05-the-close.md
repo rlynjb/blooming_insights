@@ -53,7 +53,9 @@ Three beats: **what's next** (clearly framed as future — never demoed as if it
 
   → **A blind human calibration pass** on the eval flywheel — Chapter 06 has the full answer, but the seed goes here. You already have the worksheet; the pass is 30-60 minutes of a human rater going through blind. That gives you the interview-defensible number.
 
-  → **The next mode** — `live-bloomreach` with fresh tokens. The synthetic path is the demo path because it's reliable; the Bloomreach path is the production path, and it's already built. What ships next is a smoother OAuth reconnect flow when the alpha server revokes tokens.
+  → **A smoother OAuth reconnect** for `live-mcp` mode. The synthetic path is the demo path because it's reliable. The MCP path is the production path — already built, with three auth strategies (Bloomreach OAuth, bearer, anonymous) and a live-swap settings modal already shipped. What ships next is a cleaner reconnect flow when the alpha Bloomreach server revokes tokens mid-session.
+
+  What is **not** on this list because it already shipped: swappable MCP servers, the eval flywheel, prompt caching, the regression gate, the fault harness. Do not accidentally promise a capability the room just watched work.
 
 ```
   SHOW (on screen)                    SAY (out loud)
@@ -63,9 +65,12 @@ Three beats: **what's next** (clearly framed as future — never demoed as if it
   from the money shot)                 pass on the eval to give me
                                        an interview-defensible
                                        number. and a smoother OAuth
-                                       reconnect when the alpha
-                                       server revokes tokens mid-
-                                       session."
+                                       reconnect for live-mcp when
+                                       the alpha bloomreach server
+                                       revokes tokens mid-session.
+                                       swappable MCP is already
+                                       shipped — you just watched
+                                       it."
   ────────────────────────            ──────────────────────────
 ```
 
@@ -194,8 +199,9 @@ Three beats: **what's next** (clearly framed as future — never demoed as if it
   │    8:45  back to browser feed page                        │
   │    8:45  "what's next — two things"                       │
   │           → blind calibration pass on the eval            │
-  │           → smoother OAuth reconnect for                  │
-  │             live-bloomreach                                │
+  │           → smoother OAuth reconnect for live-mcp         │
+  │             (swappable MCP already shipped — do NOT       │
+  │             list as future)                               │
   │    9:00  the ask: "one conversation. if you run           │
   │           analytics on a Bloomreach workspace, find       │
   │           me after."                                      │

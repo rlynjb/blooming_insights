@@ -1,264 +1,352 @@
-# Access patterns and storage choice
+# 06 — Access patterns and storage choice
 
-**Industry term:** Access-pattern-driven store selection · document vs relational vs KV · **Type:** Industry-standard concept, applied here to a repo whose deliberate choice is *no persistent store at all* (except JSON files and in-memory Maps).
+**Storage-shape/access-shape fit · the seam to system-design · why "no database" was actually right**
 
-## Zoom out, then zoom in
+## Zoom out — where this concept lives
 
-**Zoom out — where the storage-choice question lands.** In an app that reaches for Postgres, you're picking between relational vs document vs KV vs event log. blooming_insights doesn't reach for any of those — the storage layer is a `Map`, a set of JSON files, and (indirectly, through Bloomreach MCP) the analyst's event stream. The interesting question isn't "which database?" — it's "does *no database* actually match the access pattern?"
-
-```
-  Storage-choice question — where each read/write lands
-
-  ┌─ Request path (hot) ────────────────────────────────────────┐
-  │  writes: 1 briefing per session       (few Insights)         │
-  │  reads:  1 feed load + 1 card open   (get by id)             │
-  │  → access pattern: write-once, read-many-within-session      │
-  │  → store: in-memory Map<sid, {Map, Map, Map}>                │
-  └────────────────────────┬────────────────────────────────────┘
-                           │
-  ┌─ Demo path (warm) ──────▼───────────────────────────────────┐
-  │  writes: rare (dev-only capture)                             │
-  │  reads:  on every demo mode render                           │
-  │  → access pattern: read-mostly, single-file snapshot          │
-  │  → store: committed JSON file (lib/state/demo-*.json)        │
-  └────────────────────────┬────────────────────────────────────┘
-                           │
-  ┌─ Eval path (cold, batch) ▼──────────────────────────────────┐
-  │  writes: 1 receipt per (case, run) = N per run               │
-  │  reads:  aggregate ALL receipts of a run per invocation      │
-  │  → access pattern: append-only log with occasional roll-up  │
-  │  → store: file-per-record directory (eval/receipts/)        │
-  └─────────────────────────────────────────────────────────────┘
-```
-
-**Zoom in — the pattern.** Three access patterns, three stores, and — importantly — three matches. This concept sits at the seam between data modeling (this guide) and system design (`study-system-design/`): choosing *which* store is architecture; matching the store *shape* to the access pattern is data modeling. This file covers the second half.
-
-## Structure pass
-
-### Layers of storage choice
+Every other concept file here has taken "no DB" as given and worked around it. This one asks the harder question: **was that the right call?** And if so, when does it stop being right?
 
 ```
-  Store selection — the tree
+  Zoom out — the seam to system-design
 
-     "how often do I write?"
-        ├── once per request → in-memory (RAM is the store)
-        │       ├── read-by-id only        → Map<id, T>
-        │       └── partition by session   → Map<sid, Map<id, T>>  ← this
-        │
-     "how often do I read?"
-        ├── continuously (demo)  → single-file snapshot
-        │       └── committed → JSON blob, versioned in git
-        │
-     "how many records will accumulate?"
-        ├── few, immutable       → one file per record          ← eval receipts
-        │       └── query pattern? → scan all + parse (see file 03)
-        │
-        ├── many, mutable        → real database
-        │       └── not exercised in blooming_insights today
-        │
-        └── many, immutable log  → append-only file / event store
-                └── not exercised today (would be the next step
-                    if receipt volume grew)
+  ┌─ Storage layer (the choice) ─────────────────────────┐
+  │                                                       │
+  │  Option A: no DB — tier ladder + in-memory Map        │
+  │            ★ WHAT THIS REPO CHOSE ★                   │
+  │                                                       │
+  │  Option B: Postgres + Drizzle (AdvntrCue's choice)    │
+  │  Option C: SQLite local + Supabase mirror (buffr's)   │
+  │  Option D: GitHub-as-backend (dryrun's choice)        │
+  │  Option E: pgvector + Postgres (for a RAG layer)      │
+  │                                                       │
+  └───────────────────────────────────────────────────────┘
+                     ▲
+                     │  the seam:
+                     │  "which datastore?" → system-design
+                     │  "does its shape fit the reads?" → data-modeling (here)
+                     ▼
+  ┌─ Access shape (the driver) ─────────────────────────┐
+  │                                                       │
+  │  Read: per-session hot feed (the briefing)            │
+  │  Read: per-insight investigate deep-dive              │
+  │  Read: cross-session aggregates? ← NO                 │
+  │  Read: user-scoped history? ← NO                      │
+  │  Read: full-text search? ← NO                         │
+  │  Write: replace-whole-feed atomically                 │
+  │  Write: append tool-call events during agent loop     │
+  │                                                       │
+  └───────────────────────────────────────────────────────┘
 ```
 
-### One axis: **does the store shape match the access shape?**
+The question: **given the access shape above, does Option A (no DB) match it — and where does that match break?**
 
-Match check per path:
+## The structure pass — layers, one axis, seams
 
-- **Request path:** access is `(sid, id)` → `Insight`; store is `Map<sid, Map<id, Insight>>`. **Match.** Every read is O(1).
-- **Demo path:** access is "the whole snapshot at once"; store is one file. **Match.** One `readFile + parse` per load.
-- **Eval path:** access is *sometimes* `(runId, caseId)` → one receipt (match — filename encodes both), but *usually* "aggregate all receipts of a run" (mismatch — filename filter + N parses). **Partial match.**
+Hold one axis: **what's the natural lookup key for this read?**
 
-### Seams — where store shape flips
+```
+  Axis: "what identifier do I have when I read this fact?"
 
-- **The RAM-to-disk seam.** In-memory `Map` for request state; JSON files for anything that must survive a process. Above the seam: fast, ephemeral. Below: slower, durable. There's nothing in the middle — no SQLite, no Redis. That's the deliberate design.
-- **The single-file-vs-file-per-record seam.** Demo state is one file; eval receipts are N files. Above: whole-snapshot access; below: individual-record access with occasional roll-up. The moment aggregation becomes frequent, the file-per-record shape starts to hurt.
+  ┌── read shape ─────────────────┬── natural key ─────────┐
+  │                               │                        │
+  │  daily briefing               │  sessionId             │
+  │  (home page render)           │                        │
+  ├───────────────────────────────┼────────────────────────┤
+  │  investigate a specific       │  sessionId + insightId │
+  │  insight                       │                        │
+  ├───────────────────────────────┼────────────────────────┤
+  │  ask a follow-up query        │  sessionId + query     │
+  │  (natural-language)           │  string                │
+  ├───────────────────────────────┼────────────────────────┤
+  │  reset demo mode              │  sessionId             │
+  ├───────────────────────────────┼────────────────────────┤
+  │  eval: read receipts for a    │  runId (filename)      │
+  │  run                          │                        │
+  ├───────────────────────────────┼────────────────────────┤
+  │  ── NOT PRESENT ──            │                        │
+  │  see all my past briefings    │  userId + dateRange    │
+  │  favorite an insight          │  userId + insightKey   │
+  │  full-text search insights    │  query string          │
+  │  compare workspaces           │  workspaceId × N       │
+  └───────────────────────────────┴────────────────────────┘
+
+  seam: every "present" read is scoped to sessionId. Every
+        "not present" read wants a userId or a query index.
+        The DB decision hinges on which side of this seam
+        the app crosses.
+```
+
+Every existing read is scoped to `sessionId`. Every hypothetical read that would demand a DB is scoped to *something else* — a user id, a query string, a workspace. **That's the whole story: as long as the access shape is session-scoped, the tier ladder is enough.** Cross the seam into user-scoped or query-scoped reads, and the tier ladder runs out.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-The right way to think about storage choice: **the shape of your query is a demand, the shape of your store is a supply. Match them or you pay the mismatch tax on every read.** A Postgres row is great for point lookups by primary key and terrible for "give me the last N events in order" (unless you add an index that makes it good). A Kafka log is great for "give me events from offset X" and terrible for "find the event where user_id = 42" (unless you add a projection that makes it good).
+You know this from the shape-matches-store rule anyone who has picked between Postgres and Redis has felt: **you don't pick the store first, you pick the store to fit the shape.** Redis is right if you're storing "the value for a key" and reading it back by key. Postgres is right if you're joining tables. A document store is right if you're storing "the whole aggregate" and reading it whole.
+
+This app's shape: **whole aggregates, keyed by session, read back whole.** That's a document-store shape. And the tier-2 `Map<sessionId, SessionFeed>` is *literally* a document store — one document per session, the whole SessionFeed as the value, get-by-session-id as the read.
 
 ```
-  Access-pattern-to-store matching — the demand and supply
+  The pattern — access shape drives the store shape
 
-     access-shape (demand)                      store-shape (supply)
-     ────────────────────                       ────────────────────
-     "point lookup by known id"     ────►       Map / KV / indexed table
-     "the whole thing right now"    ────►       single file / snapshot
-     "range in insertion order"     ────►       array / log / sequence
-     "match on a field's value"     ────►       secondary index / query
-     "join across records"          ────►       relational + FKs
-     "aggregate by group"           ────►       roll-up table / mat view
+    "how do I read this?"          natural store           natural analog
+    ─────────────────────           ───────────────         ─────────────
+    by primary key, whole           document store          Map<pk, doc>
+    by predicate, filtered          relational              SELECT ... WHERE
+    by similarity, ranked           vector store            embed + kNN
+    by full-text, ranked            search engine           inverted index
+    by timestamp range              time-series             time-partitioned
 
-     mismatch tax:
-       scan when you should have looked up
-       parse when you should have queried
-       join in app code when you should have joined in the store
+  this repo: 100% "by primary key (sessionId), whole"
+             → Map<sessionId, SessionFeed> is the RIGHT shape
+             → adding Postgres would just re-implement Map with more latency
 ```
 
-For blooming_insights, each of the three paths has a demand and a supply — the question is whether they line up.
+The verdict: **for the current access shape, an in-memory `Map` is the correct store.** Adding Postgres would be adding a network hop to a get-by-key that's already O(1) in the process. That's not conservatism — that's shape-fit.
 
-### Move 2 — the three paths, walked
+### Move 2 — the specific access patterns, one by one
 
-#### Path A — the request path (perfect match)
+#### Access pattern 1 — the daily briefing (home feed)
 
-**Access pattern:** During a briefing, the monitoring agent produces a handful of `Insight`s. The route handler puts them into state under the session id. The UI then reads them: first as a list (the feed page), then by id (the investigate page). Reads outnumber writes by ~5x per session.
+**Read:** `listInsights(sessionId)` → render feed. Fires once per home-page load.
 
-**Store:** `Map<sessionId, { insights: Map<id, Insight>, ... }>` at `lib/state/insights.ts:14`.
+**Write:** `putInsights(sessionId, items)` — replace whole feed atomically, ~5-10 items.
 
-Walk the match:
+**Store shape:** `Map<sessionId, SessionFeed>` with `insights: Map<id, Insight>`.
 
-- Write shape: `putInsights(sid, items)` at line 57 — one function call, N inserts (typically 3-8). O(N).
-- Read-by-id shape: `getInsight(sid, id)` at line 73 — two Map hits. O(1).
-- Read-list shape: `listInsights(sid)` at line 81 — one session hit + O(k) values spread.
+**Match:** yes. The read is "give me all insights for this session"; the store gives it in O(N) where N is small (5-10). The write is "replace the whole feed"; the store supports it with `.clear()` + set. No index needed, no query planner, no marshalling cost.
 
-Every access primitive the app uses has an O(1) or O(k) implementation in the Map-of-Maps. **The store shape is the access shape.**
+**When it stops matching:** the moment a user has *multiple* briefings across time and wants to see the archive. Today's map has *one current briefing* per session, replaced on each new run. History becomes: `Map<(userId, date), SessionFeed>` — which is still a document-store shape, but keyed by (user, date), which means an auth layer and a real user identity, which means a DB.
+
+#### Access pattern 2 — the investigate deep-dive
+
+**Read:** `getInsight(sessionId, id)` → hydrate the insight. Then `getCachedInvestigation(id)` → hydrate the reasoning trace. Streams new agent events via SSE if not cached.
+
+**Write:** `putInvestigation(sessionId, inv)` after the agent completes. Also `saveInvestigation(insightId, events)` to the fallback tier for dev-mode persistence.
+
+**Store shape:** in-memory `Map<insightId, Investigation>` + a three-source fallback chain (see file 01).
+
+**Match:** yes. The read is "give me the investigation for this insight ID"; the store gives it in O(1). The three-source chain (in-memory → dev file → committed demo) covers the three failure modes: cold start, dev restart, demo-mode fallback.
+
+**When it stops matching:** users want to *share* an investigation link. The URL today is `/investigate/{insightId}`, and the insight ID is a session-scoped UUID — meaningless to another user. Sharing requires a *durable* insight ID that survives session boundaries, which is exactly the modeling change file 02 walked in the "favorites" interview answer.
+
+#### Access pattern 3 — the natural-language query
+
+**Read + write:** the query box at the bottom of every screen accepts free-form questions, dispatches to the agent loop, and streams events back. No storage happens; the results render inline and vanish on refresh.
+
+**Store shape:** none. The result lives in component state, never persisted.
+
+**Match:** yes, by omission — the design says "queries don't persist," so there's nothing to store. That's a modeling call, not a technical one: the team decided ephemeral queries were fine, and the store shape follows.
+
+**When it stops matching:** a "query history" or "save this query" feature. Then queries need a durable identity + a store — another tier-6 use case.
+
+#### Access pattern 4 — the auth boundary (bi_auth cookie)
+
+**Read + write:** every MCP-touching request decrypts the cookie into an ALS context, mutates, re-encrypts on flush.
+
+**Store shape:** `Record<sessionId, SessionAuthState>` serialized into one cookie.
+
+**Match:** *scaled to one entry per browser*, yes. The cookie carries only the current session's OAuth state. It's shaped as a `Record` for future-proofing (multi-session-per-browser), but effectively used as a single-entry map.
+
+**When it stops matching:** cross-device auth. A user logs in on desktop, wants to see their briefings on mobile. Cookies are per-browser; you can't share `bi_auth`. That forces a real durable auth store — an auth DB, keyed by user, with per-device sessions.
+
+#### Access pattern 5 — the eval subsystem
+
+**Read shape:** two dominant queries — "all receipts for runId X" (aggregator) and "all receipts for caseId Y" (load-shape review). Both O(F) over the receipts dir. Plus "the current baseline" (single file read).
+
+**Write shape:** append-only. New receipts written per case per run; never mutated.
+
+**Store shape:** filesystem, with filename patterns as the index.
+
+**Match:** yes at hackathon scale (28 receipts total). See file 03 for the O(F) scan analysis. The write pattern (append, never mutate) is exactly what filesystems + git are best at.
+
+**When it stops matching:** ~1,000+ receipts. Filesystem `readdir` starts costing real time; git blobs start bloating. The natural next tier is SQLite over `eval/receipts.sqlite` — same append-only pattern, real indexes, git-friendly with a rebuild step. Not needed today.
+
+### Move 2.5 — comparison with Rein's other system-design portfolio
+
+The five system shapes in Rein's portfolio pick the storage-access match differently. Worth ranking them side-by-side, because this app's "no DB" call is only defensible if the shape of *its* domain matches.
 
 ```
-  Request-path match — access primitives ↔ store operations
+  Access-shape → storage-choice, across five projects
 
-     UI wants                          Map<sid, {Map}> gives
-     ─────────                         ─────────────────────
-     "the feed for this session"   →   state.get(sid).insights.values()
-     "one card by id"              →   state.get(sid).insights.get(id)
-     "put the fresh briefing"      →   .clear() then .set() × N
-     "delete stale sessions"       →   NOT DONE — sessions accumulate
-                                       until process restarts
+  project        primary access shape           storage picked
+  ──────────    ─────────────────────           ──────────────
+
+  dryrun        review card by (deckId, cardId)  GitHub JSON files
+                write on review                   ← lookup by path,
+                spaced-repetition schedule        no relational shape
+                (per-card)
+
+  buffr         "give me my vlogs, whole"        SQLite (canonical) +
+                offline-first, single-user        Supabase (opt mirror)
+                                                  ← document + mirror
+
+  contrl        real-time frame → landmarks      no storage in hot path
+                per-frame, no persistence         ← latency budget
+                                                    forbids I/O
+
+  AdvntrCue     RAG: embed → kNN → context       pgvector + Postgres
+                per-session chat history          ← relational + vector,
+                                                    colocated
+
+  blooming      "give me this session's briefing" Map<sess, feed> +
+  insights      whole, read-and-render            git-committed JSON
+                                                  ← document, ephemeral
+
+  the pattern: EACH project's storage matches ITS access shape.
+               No project is "just use Postgres by default."
 ```
 
-The last item is the visible cost: **there's no eviction.** Long-lived processes accumulate session Maps forever. Vercel functions cycle every few hours so this is capped in practice, but on a truly long-running server, this would leak. → cross-link to `study-system-design/` for the cold-start / warm-instance implications.
-
-#### Path B — the demo path (perfect match, different shape)
-
-**Access pattern:** Demo mode reads the entire pre-computed briefing + investigations, once, on page load. Writes happen only during a dev-only "capture this as the demo snapshot" flow (referenced in AGENTS.md).
-
-**Store:** two committed JSON files — `lib/state/demo-insights.json` (~665 lines) and `lib/state/demo-investigations.json` (~3487 lines).
-
-Walk the match:
-
-- Write shape: rare, dev-only, whole-file replacement. Serialization cost doesn't matter.
-- Read shape: on demo page load, `readFileSync + JSON.parse` for both files. At ~80KB total, that's a few milliseconds — well under any user-perceptible threshold.
-- Query shape: none. The reader wants "the whole snapshot," and that's what's stored.
-
-**The mismatch cost is zero.** This is the correct call. If you tried to store this in Postgres — 10 rows for insights, some for investigations, joins for the trace — the read-time cost would be higher (network + parse) and the deploy-time story would be more complex (migrations, seed data, environment parity). Committed JSON is a genuinely better shape for "the demo is our reliable presentation path."
-
-**One subtle cost:** the demo snapshot is committed, so it moves through code review. If you regenerate it and get an inconsistent write (see `04-transactions-and-integrity.md`), a reviewer catches it in the diff. That's the operational-safeguard version of atomicity — it works for this workflow, it wouldn't work for a live-write path.
-
-#### Path C — the eval path (partial mismatch — the interesting case)
-
-**Access pattern:** *During* a run — each case produces one receipt, written independently. *After* a run — every aggregation (baseline, gate, report) reads all receipts for a runId, sums per-dimension pass rates, prints or writes the summary.
-
-**Store:** file-per-record in `eval/receipts/`, filename encodes `(caseId, runId)`.
-
-Walk the match:
-
-- **Write shape (during run):** each case writes one file. Perfect independence — parallelizable, no shared state, no coordination. Match.
-- **Read shape "one specific receipt":** filename encodes the key. `readFileSync(resolve(RECEIPTS_DIR, `${caseId}-${runId}.json`))` is O(1). Match.
-- **Read shape "all receipts for a runId":** `readdirSync + filter-by-suffix + parse × N`. Match at 10 files; mismatch at 200; disaster at 2000.
-- **Read shape "aggregate scores across every run":** no support. You'd have to walk every file, parse every one, extract just the dimension scores. This is the pure mismatch case.
-
-```
-  Eval-path store vs. queries — where the shape fits and where it doesn't
-
-     query                             cost with file-per-record layout
-     ─────                             ────────────────────────────────
-     one specific receipt         →    O(1)  filename lookup            ✓
-     all receipts for a runId     →    O(all_files) directory scan +
-                                       O(k) parses                       ✓ at 10, ✗ at 200
-     "which cases regressed?"     →    O(all_files) scan +
-                                       full parse of every hit           ✗
-     "trend a dimension over runs"→    O(all_files) scan +
-                                       full parse of every hit           ✗
-
-     ═══════════════════════════════════════════════════════════════
-     the mitigation that exists: eval/baseline.json
-     ───────────────────────────────────────────────────────────────
-     one committed pre-aggregated summary → gate reads in O(1)
-     (this is a materialized view — see file 03)
-```
-
-**What breaks the match at scale:** the second and third queries. Every gate run does two `readdirSync` calls (one to discover latest runId, one to filter for it), plus N parses. At 10 cases × 5 recent runs = 50 files, ~100ms. At 200 cases × 30 runs = 6000 files, several seconds *just to read the directory*, before any parse cost.
-
-**The right store when that mismatch bites:** SQLite locally, Postgres if the eval subsystem becomes a shared service. A single table `runs(runId, caseId, dimension, score, verdict)` with indexes on `(runId)` and `(dimension, verdict)` makes every aggregation an indexed lookup. The migration is: keep receipts as blobs for full replay, but *also* extract the aggregation surface into a table. That's a genuine dual-storage pattern, and it's the natural next step.
-
-#### Move 2 variant — the load-bearing skeleton of "store matches access"
-
-Three parts. Drop any one and the mismatch tax starts to hurt.
-
-1. **The access primitives are enumerated.** For each store, name every read and write pattern the app actually uses. If you skip this, you can't check the match — you're guessing.
-
-2. **Each primitive maps to a single store operation.** `getInsight` maps to two Map hits. `readRun(runId)` — the abstraction that *should* exist in `eval/` — currently doesn't; every caller reimplements the scan. That's a smell (see file 03 too).
-
-3. **The mapping's cost class is named.** O(1) for point lookups, O(k) for list-in-session, O(N) for whole-directory scans. When you can name the class, you can predict where the store breaks.
-
-Drop part 1 and you have vague "I think this is fast enough." Drop part 2 and the abstraction leaks into every caller. Drop part 3 and you're surprised when performance falls off a cliff at some scale you didn't plan for.
+Where blooming insights fits: **ephemeral document store with git-committed durable seeds.** That's a valid shape when the domain doesn't demand user-scoped durability. The moment it does, blooming moves toward the AdvntrCue shape (Postgres + colocated auxiliary indexes) rather than the buffr shape (local-first with mirror), because there's no local device to be authoritative.
 
 ### Move 3 — the principle
 
-**"Do you need a database?" is the wrong first question. "What's the shape of every read and write?" is the right one.** Once you've enumerated the access pattern, the store choice is usually forced: point lookup by known id in a small dataset per user? A Map. Immutable log of events? A file-per-record directory. Range query by a value you don't own? An indexed table. Blooming_insights got its request path exactly right (Map matches perfectly), got its demo path exactly right (JSON matches perfectly), and got its eval path *half-right* — the write shape matches (file-per-record works for independent case runs), the read shape doesn't (aggregation is a filesystem scan). The rule you take home: **the right time to introduce a database is when your access pattern gains a query the current store can only answer by scanning.** Not before, not after.
+The principle: **choose storage by matching the shape you read, not the shape you write.** Writes are usually easier to accommodate; reads dominate cost and design. If every read is "get whole aggregate by ID," you want a document store — and an in-memory `Map` is the fastest document store there is. If reads want joins or aggregates, you want relational. If reads want similarity, you want vector. Never the reverse.
 
-## Primary diagram
+The load-bearing consequence for this codebase: **as long as reads stay session-scoped, no DB is the correct call.** The tier ladder answers every read pattern currently in the app. Adding Postgres today would give up latency (a network hop where there was `Map.get`) with nothing to show for it.
 
-Every store, every access pattern, side by side — showing where the match holds and where the mismatch tax will eventually hit.
+The line where that flips is precise: the first read whose natural key isn't `sessionId`. Favorites, per-user history, cross-workspace comparisons, full-text search — all of these need a durable identifier that survives the session. That's when the tier ladder runs out and DB shopping starts.
+
+## Primary diagram — the access-shape/storage-shape fit map
 
 ```
-  blooming_insights — access patterns and store shape
+  Every access pattern in this repo — matched to its store, and where it breaks
 
-  ┌─ REQUEST PATH ──────────────────────────────────────────────┐
-  │                                                              │
-  │  access:  write-once, read-many-within-session               │
-  │  store:   Map<sid, Map<id, T>>                               │
-  │  match:   ✓ every primitive O(1) or O(k)                     │
-  │  cost:    memory leak on very long-lived process (uncapped)  │
-  │                                                              │
-  └─────────────────────────────────────────────────────────────┘
+  ─────────────────────────────────────────────────────────────────────────────
+  access pattern                    natural key         store          fit
+  ─────────────────────────────────────────────────────────────────────────────
+  daily briefing (feed render)      sessionId           Map<sess,      ✓
+                                                         SessionFeed>
 
-  ┌─ DEMO PATH ─────────────────────────────────────────────────┐
-  │                                                              │
-  │  access:  read whole snapshot on page load                   │
-  │  store:   single committed JSON file (per concept)           │
-  │  match:   ✓ read = whole file = one parse                    │
-  │  cost:    write atomicity across two files (see file 04)     │
-  │                                                              │
-  └─────────────────────────────────────────────────────────────┘
+  investigate deep-dive             sessionId +         nested Map     ✓
+                                     insightId          + 3-source
+                                                         fallback
 
-  ┌─ EVAL PATH ─────────────────────────────────────────────────┐
-  │                                                              │
-  │  access:  file-per-case-per-run + occasional aggregation     │
-  │  store:   flat directory of ~35KB JSON files                 │
-  │  match:   ✓ write (independent) · ✓ point-lookup             │
-  │           ~ per-runId scan (OK today, ✗ at 10x scale)        │
-  │           ✗ cross-run aggregation (no support)               │
-  │  mitigation: baseline.json (materialized view for the gate)  │
-  │  next step: SQLite when aggregation becomes frequent         │
-  │                                                              │
-  └─────────────────────────────────────────────────────────────┘
+  natural-language query            (ephemeral)         — no store —   ✓
+                                                                       (by design)
+
+  MCP OAuth state                   sessionId           bi_auth        ✓
+                                                         encrypted
+                                                         cookie
+
+  eval receipts by runId            runId               filename       ✓
+                                                         pattern         (small F)
+
+  eval baseline reference           (singleton)         one file       ✓
+
+  ─── the seam ────────────────────────────────────────────────────────────
+  BELOW: hypothetical, would demand tier 6 (a real DB)
+  ─────────────────────────────────────────────────────────────────────────
+
+  favorites list                    userId +            — needs DB —   ✗
+                                     stableInsightKey
+
+  briefing history                  userId + date       — needs DB —   ✗
+
+  shared investigation link         durable insightId   — needs DB —   ✗
+
+  cross-workspace comparison        workspaceId × N     — needs DB —   ✗
+
+  full-text insight search          query string        — needs        ✗
+                                                         search index —
+  ─────────────────────────────────────────────────────────────────────────
+
+  the rule: every ✓ has sessionId in the key.
+             every ✗ needs a durable identifier the session doesn't provide.
 ```
 
 ## Elaborate
 
-The "match the store to the access" discipline is old — it's the pattern behind CQRS (write model separate from read model), materialized views (pre-shape the answer for a specific query), and secondary indexes (add a store shape to answer a query the primary shape can't). Blooming_insights runs the tiniest form of this: `baseline.json` is a hand-built materialized view over the receipts directory, tailored to exactly one query (the gate's per-dimension diff).
+Where the pattern comes from: this is *bounded contexts* from Domain-Driven Design applied at the storage layer. The bounded context here is "one session's exploration of one workspace's daily anomalies." Everything inside that context is naturally aggregated per session, per day. Everything outside — user history, cross-user comparison, permanent bookmarks — is a *different* context, and DDD would tell you it deserves its own store, not to be crammed into this one.
 
-The eval-path partial mismatch is a real preview of the "when do I introduce a database?" moment. The trigger to watch for: **the second time you write `readdirSync + filter + parse × N` for a new question.** The first time is fine — it's a one-off. The second time you're building the same abstraction twice, and the answer is either factor out the read (`eval/receipts.ts`) or move to a real store. Right now the pattern is written three times (`baseline`, `gate`, `report`) — that's already over the threshold; the abstraction is overdue even before the store question.
+The reason "no DB" often gets picked wrong: teams reach for Postgres before they've named the access shape, because Postgres is the "safe default." For a session-scoped ephemeral shape, Postgres is *not* safer — it's slower and more complex, and it obscures the fact that the domain didn't need it. Naming the access shape first prevents that.
 
-Cross-link: the *which* database question ("Postgres vs SQLite vs Redis") is architectural — that belongs to `study-system-design/`. This file's contribution is the *shape* argument: the access pattern tells you whether you need a database at all, and when, and which shape (relational, document, KV) matches. The vendor choice comes after.
+The reason not to lean too hard on this: the domain grows. What's ephemeral in v1 gets promoted to durable in v3 when a customer says "I want to see last week's briefings." At that point the correct move isn't to lift-and-shift the `Map` into a DB — it's to *add* a durable tier for the promoted concepts, keeping the ephemeral tier for the reads that stay session-scoped. Two-tier reads: the DB for archive, the `Map` for current. That's the natural evolution.
+
+Related reading: DHH's "one person framework" writing on why Basecamp resists SQL joins for read paths — same shape-fit argument. Also: Fielding's REST dissertation on caching semantics — the tier ladder here is basically Fielding's cacheability semantics stretched across five stores.
 
 ## Interview defense
 
-**Q: "Why is there no database in this system?"**
-Answer: "Because the access pattern doesn't need one. The request path is write-once-per-session, read-many-within-that-session — a two-level Map matches perfectly (session partition + entity id, both O(1)). The demo path is 'read the whole snapshot on load' — one committed JSON file matches perfectly. The eval path writes independently per case, which files-per-record match; the aggregation-across-runs read is where a store *would* help, and today we mitigate with `eval/baseline.json` as a materialized view for the regression gate. If cross-run trending becomes a feature, SQLite is the smallest next step." Draw the three-path diagram.
+### Q1 — "you don't have a database. Isn't that a hackathon shortcut?"
 
-**Q: "When would you introduce a database?"**
-Answer: "The trigger is the eval subsystem specifically. When any question emerges that can't be answered without scanning every receipt — 'trend evidence_grounding scores over the last month,' 'find every case where the gate blocked,' 'compare judge-error rates across model versions' — the file layout hits its wall. That's the moment for SQLite: one table `run_dimensions(runId, caseId, dimension, score, verdict)`, index on `(dimension, verdict)`, and every aggregation is O(log N)." Anchor: `eval/baseline.eval.ts:44-51` for the scan; `eval/baseline.json` for the current materialized-view workaround.
+> It could be, but it's not — it's a shape-fit choice. Every read in this app is scoped to a session ID: the daily briefing, the investigate deep-dive, the OAuth state, the query results. None of them join, none of them aggregate across users, none of them survive the session. That access shape *is* a document store — `key → whole aggregate → read whole`. An in-memory `Map<sessionId, SessionFeed>` is a document store; adding Postgres would just re-implement that with a network hop.
+>
+> The line where "no DB" would stop being right is precise: **the first read whose natural key isn't `sessionId`.** Favorites, per-user history, shared investigation links, cross-workspace compares — all of these want a durable identifier the session doesn't provide. That's when I'd introduce a real DB, and I know exactly what shape it would take: user-scoped tables, with stable `insightKey` = `hash(metric + scope + baseline)` so anomalies re-firing on Tuesday link back to Monday's favorite.
 
-**Q: "Any current pattern that already smells like a missing store?"**
-Answer: "Yes — the `readdirSync + filter-by-suffix + parse × N` block appears three times: `baseline.eval.ts`, `gate.eval.ts`, `report.eval.ts`. Three copies of the same scan is a strong signal the abstraction is missing. First move: factor `eval/receipts.ts` with `listRunIds()` and `readRun(runId)`. Second move (if aggregation frequency grows): back it with SQLite." Draw the three-copies pattern → one-abstraction move.
+```
+  the sessionId seam
+
+  every current read:           every future read that'd break:
+  ─────────────────             ──────────────────────────────
+  by sessionId                  by userId
+  by sessionId + insightId      by durable insightKey
+  by sessionId + query          by query index
+
+  → the tier ladder holds because sessionId is enough.
+    it stops holding on the first read that needs more.
+```
+
+Anchor: "no DB while sessionId is the natural key; DB the moment it isn't."
+
+### Q2 — "if the demo works, why didn't you 'just add Supabase' like buffr does?"
+
+> Buffr's shape is different. Buffr has a canonical local store (SQLite on-device) and Supabase is an *opt-in* mirror for cross-device sync. That's a local-first shape — the device is authoritative, the cloud is a copy. It works because buffr's user has one device, one identity, and wants their data available on other devices they own.
+>
+> Blooming Insights doesn't have a local-first story. It runs entirely in a browser tab against serverless functions. There's no device to be authoritative on. If I added Supabase, it wouldn't be "mirror the local store" — it would be "*become* the store," which changes the whole architecture: I'd need user auth (currently only workspace-scoped OAuth), a schema, migrations, RLS policies. That's a real database rollout, and the domain doesn't ask for it *yet*.
+>
+> When it does ask — the moment favorites or history land — I'd pick Postgres, not Supabase (RLS is nice for tenant isolation but I've already got that via session scoping), and I'd colocate any future vector search (RAG on past insights) in the same instance the way AdvntrCue does. Same reasoning: shape drives store, not defaults.
+
+Anchor: "buffr's local-first shape doesn't map onto this domain; when a DB comes, it's Postgres for the same reasons AdvntrCue picked it."
+
+### Q3 — "walk me through the promotion from 'ephemeral' to 'durable' for the favorites feature."
+
+> Three moves:
+>
+> First, give `Insight` a **stable key** that isn't a session-scoped UUID. `stableInsightKey = hash(metric + scope + baseline)`. That means when Tuesday's briefing re-detects Monday's anomaly, they share a key — favorites persist across the session boundary. This is a modeling change, not a storage one; it goes in `lib/mcp/types.ts` alongside the existing `id`.
+>
+> Second, introduce a **tier 6 — a durable DB**. Postgres, single instance, colocated on Vercel. Two tables:
+>
+> ```
+>   users {
+>     id           uuid       primary key
+>     workspaceId  string     (from OAuth)
+>     createdAt    timestamptz
+>   }
+>
+>   favorites {
+>     userId      uuid       references users
+>     insightKey  string     -- stable, not session UUID
+>     createdAt   timestamptz
+>     unique (userId, insightKey)
+>   }
+> ```
+>
+> Third, **wire it into the existing read path** without disturbing the session-scoped Map. On feed render, look up the user's favorites; join in memory by comparing each rendered `insight.stableInsightKey` against the favorite set. That keeps the hot-path `Map<sessionId, SessionFeed>` untouched — the favorites read is a *separate* small query that runs in parallel.
+>
+> The whole change: 1 field on `Insight`, 2 tables in a new tier, 1 auth boundary (user identity via existing OAuth), 1 in-memory join. It doesn't disturb any current shape — the tier ladder gains a new rung.
+
+```
+  the promotion — three moves, ranked
+
+  1. modeling:    add stableInsightKey to Insight
+                    (survives session boundary)
+  2. storage:     introduce tier 6 (Postgres)
+                    users + favorites tables
+  3. read wiring: parallel favorites lookup on feed render,
+                    join in memory by stableInsightKey
+
+  what does NOT change:
+  · Map<sessionId, SessionFeed> — still the hot-path feed store
+  · bi_auth cookie discipline    — still the request-scoped state
+  · eval subsystem              — still filesystem-committed
+  · demo mode                    — still tier-5 seeded
+```
+
+Anchor: "add a rung, don't rewrite the ladder."
 
 ## See also
 
-- `01-the-data-model-and-its-shape.md` — the shapes being stored.
-- `03-indexing-vs-query-patterns.md` — the concrete cost of the eval-path scan.
-- `07-data-modeling-red-flags-audit.md` — the "no persistent store" and "shape fights access" entries.
-- `study-system-design/` — the *which* datastore question sits there (architecture), separate from *whether the shape fits* (here).
+- `01-the-data-model-and-its-shape.md` — the tier ladder this file's storage choice sits inside.
+- `03-indexing-vs-query-patterns.md` — the O(1) `Map` access this file justifies.
+- `05-migrations-and-evolution.md` — why "no DB" is compatible with real committed data, if you version it.
+- `07-data-modeling-red-flags-audit.md` — the "durable identifier missing" red flag is marked here.

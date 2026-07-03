@@ -53,6 +53,13 @@ The what-AI-did / what-I-did split. Left column is decisions AI shaped; right is
   │    AI proposed the initial types.ts; I evaluated against my   │
   │    portfolio's port-adapter experience, accepted, extended.   │
   │                                                               │
+  │  → Swappable MCP client (McpDataSource + 3 AuthProviders)     │
+  │    AI proposed the config-override transport (header +        │
+  │    localStorage + settings modal); I evaluated against the    │
+  │    existing DataSource seam, accepted, shipped as the 5th     │
+  │    use of the same port. Deliberate reframing: Bloomreach is  │
+  │    the default preset, not the codebase identity.             │
+  │                                                               │
   └───────────────────────────────────────────────────────────────┘
 
   ┌─ DEFAULTED-TO decisions (AI's default; not deeply evaluated) ─┐
@@ -77,7 +84,7 @@ The what-AI-did / what-I-did split. Left column is decisions AI shaped; right is
   └───────────────────────────────────────────────────────────────┘
 ```
 
-Three modes. Six deliberate. Three evaluated-and-accepted. Four defaulted-to. Every important decision fits into one of these three buckets, and the boundaries between them are honest. That's the map you defend from.
+Three modes. Six deliberate. Four evaluated-and-accepted. Four defaulted-to. Every important decision fits into one of these three buckets, and the boundaries between them are honest. That's the map you defend from.
 
   ## The five treated questions
 
@@ -99,7 +106,7 @@ Say this:
 >
 > *There are three modes I'd distinguish. First: decisions I made deliberately — I read the docs, evaluated alternatives, made the call. Prompt caching config, NDJSON versus SSE, the fault-injection design, budget check-before-dispatch. Six of those.*
 >
-> *Second: decisions where AI made a suggestion and I evaluated and accepted it. AptKit migration is the biggest one — AI suggested it, I read the API surface, compared to LangGraph and Mastra, evaluated the boundary shape, accepted, and kept the legacy loop as a rollback receipt.*
+> *Second: decisions where AI made a suggestion and I evaluated and accepted it. AptKit migration is the biggest one — AI suggested it, I read the API surface, compared to LangGraph and Mastra, evaluated the boundary shape, accepted, and kept the legacy loop as a rollback receipt. The swappable MCP client is another — AI proposed the config-override transport, I evaluated it against the DataSource seam I'd already built, accepted, and the fifth use of the port shipped in a day.*
 >
 > *Third: decisions where I defaulted to what AI proposed without deeply evaluating alternatives. OAuth PKCE plus Dynamic Client Registration is the canonical one. It works, I can defend it against the MCP spec, but I did not evaluate whether a different auth flow would have been better. That's honest. The trigger to revisit it would be an auth-specific security review.*
 >
@@ -117,7 +124,7 @@ Say this:
 │ It helped speed things  │ deliberate,             │
 │ up, but I understand    │ evaluated-and-accepted, │
 │ everything in the       │ and defaulted-to.       │
-│ codebase."              │ Six deliberate, three   │
+│ codebase."              │ Six deliberate, four    │
 │                         │ evaluated, four         │
 │                         │ defaulted. OAuth PKCE + │
 │                         │ DCR is the canonical    │
@@ -354,7 +361,7 @@ The defaulted-to list itself is the honest map. Nothing to change about the list
 
   ## The one-page summary
 
-**Core claim.** The 2026 baseline is that everyone used AI. The senior signal is naming three decision modes explicitly: deliberate, evaluated-and-accepted, and defaulted-to. Six deliberate, three evaluated, four defaulted. OAuth PKCE + DCR is the canonical defaulted-to example. Trigger to revisit: security review.
+**Core claim.** The 2026 baseline is that everyone used AI. The senior signal is naming three decision modes explicitly: deliberate, evaluated-and-accepted, and defaulted-to. Six deliberate, four evaluated, four defaulted. OAuth PKCE + DCR is the canonical defaulted-to example. Trigger to revisit: security review.
 
 **The questions covered.**
 

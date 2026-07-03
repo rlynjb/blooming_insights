@@ -1,159 +1,174 @@
-# 02 — Lost-in-the-middle
+# Lost in the middle
 
-**Type:** Industry standard. Also called: attention drop-off, positional bias, middle-of-context penalty.
+## Subtitle
+
+Positional attention degradation / long-context recall failure — Industry standard.
 
 ## Zoom out, then zoom in
 
-The empirical pattern that models attend strongest to the start and end of the context window. Not directly measured in this codebase but shapes how tool_result content is structured.
+Empirically, LLMs attend strongly to the start and end of long contexts and weakly to the middle. This isn't a bug in your prompt; it's a property of how transformers were trained. If the answer to the user's question is buried in the middle of 40k tokens of tool results, the model may miss it even though "the answer is in the context."
+
+In this codebase the risk shows up when the diagnostic agent accumulates many tool results and then has to reason across all of them. Each tool result is a `user`-role message with a `tool_result` block; by turn 8, the model is reading 5–8 of them, and the ones from turns 3–5 are in the middle of the accumulated context.
 
 ```
-  Zoom out — where positional bias would show up
+  Zoom out — where mid-context attention risk lives
 
-  ┌─ messages array (grows across the loop) ──────────────────────────┐
-  │  [system]        ← START ─── attended strongly                    │
-  │  [user: anomaly]                                                  │
-  │  [asst: thought] ← MIDDLE ── attended less                        │
-  │  [user: tool_result]                                              │
-  │  ...many turns...                                                 │
-  │  [asst: latest thought]                                           │
-  │  [user: latest tool_result]  ← END ── attended strongly           │
-  │                                                                   │
-  │  ★ THIS CONCEPT ★                                                 │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌─ System prompt (start — well-attended) ───────────────┐
+  └───────────────────────┬───────────────────────────────┘
+                          │
+  ┌─ Schema, tools (start — well-attended) ──────────────┐
+  └───────────────────────┬───────────────────────────────┘
+                          │
+  ┌─ Early turns (near start — well-attended) ───────────┐
+  │  turns 1-2 tool results                               │
+  └───────────────────────┬───────────────────────────────┘
+                          │
+  ┌─ ★ MIDDLE ★ (attention degrades) ────────────────────┐ ← risk zone
+  │  turns 3-6 tool results                               │
+  └───────────────────────┬───────────────────────────────┘
+                          │
+  ┌─ Late turns (near end — well-attended) ──────────────┐
+  │  turns 7-9 tool results + current question            │
+  └───────────────────────┬───────────────────────────────┘
+                          │
+                          ▼
+                    model response
 ```
 
-Zoom in. Empirical result from research on Claude, GPT-4, and open models: attention weight is highest at the very beginning (system prompt, opening context) and at the very end (recent turns). Middle-of-context content is more likely to be ignored or misremembered. In this repo, the pattern is present in theory but our messages arrays are small enough (~35K peak) that we don't measurably hit it.
+Zoom in: this is why "just add more context" is not the fix for retrieval quality.
 
 ## Structure pass
 
-**Layers:**
-- Outer: reader observation (agent forgets something from turn 3)
-- Middle: model's attention weights
-- Inner: transformer attention mechanics
-
-**Axis: model attention by position.**
-- Start (system, first user): strong attention
-- Middle (turns 3-6 of a 10-turn loop): weak attention
-- End (latest turns): strong attention
-
-**Seam:** the messages array ordering. What goes first and last is what the model attends to; the middle is where lossy compression happens implicitly.
+- **Layers:** early context → middle context → late context → response. One dimension, three regions.
+- **Axis: attention strength.** Empirically U-shaped — high at edges, low in the middle. Not a knob you can tune; a property of the model's training.
+- **Seam:** where in the message list a fact sits determines whether the model uses it. Not a code seam — a positional one.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-Think of a phone number someone tells you. First three digits and last four — easy. The middle two? You forget them and have to ask again. Same shape. Attention over a long context isn't uniform; middle content is systematically discounted.
+Imagine reading a 300-page technical book with the answer to your question on page 150. You'd remember the intro clearly; you'd remember the conclusion clearly; you'd hazily remember pages 30 and 270. Page 150 might not surface unless you re-read it. Transformer attention behaves the same way at long context lengths.
+
+The failure isn't binary. A model given a mid-context fact often *does* find it — the attention is degraded, not zero. But the failure rate is higher there, and the failure mode is silent: the model produces a fluent but wrong answer.
 
 ```
-  Attention weight by position (empirical, generalized)
+  Empirical attention pattern — cartoon
 
-  weight
-    │
-    │▓                              ▓
-    │▓▓                           ▓▓▓
-    │▓▓▓                        ▓▓▓
-    │▓▓▓                       ▓▓▓
-    │▓▓▓▓                     ▓▓▓▓
-    │▓▓▓▓▓                   ▓▓▓▓▓
-    │▓▓▓▓▓▓                 ▓▓▓▓▓▓
-    │▓▓▓▓▓▓▓__▓_▓__▓_▓_▓___▓▓▓▓▓▓▓
-    └──────────────────────────────►
-      start        middle        end
-                position in context
+  attention
+  strength
+     │
+     │ █████                                    █████
+     │ █████                                    █████
+     │ █████ ████                          ████ █████
+     │ █████ ████ ███                  ███ ████ █████
+     │ █████ ████ ███ ██          ██ ███ ████ █████
+     │ █████ ████ ███ ██ █ █ █ █ █ █ ██ ███ ████ █████
+     └─────────────────────────────────────────────► position
+       start          middle             end
+
+       edges get read;
+       middle gets skimmed
 ```
 
-Origin of the "middle" penalty: transformer attention is bidirectional (each token attends to all others), but decoder-only autoregressive models are trained on next-token prediction, which biases them toward recent context (needed for generation) AND toward opening context (often instructions). The middle gets neither training signal strongly.
+### Move 2 — the step-by-step walkthrough
 
-### Move 2 — walk the mechanism
+**Where it shows up in this codebase.** Long diagnostic runs — the ones that fire 8+ tool calls before submitting a diagnosis. By turn 8, the assistant messages + tool results from turns 3–5 are mid-context. If the *root cause signal* is in one of those mid-context tool results, the model may reach a diagnosis that doesn't fully cite it.
 
-**Where this WOULD hurt in this codebase.**
+**Concrete example — golden case 08.** From the eval receipts, cases 01 and 08 both showed "the primary root cause is payment processor" as the intended diagnosis. The scan evidence carries `payment_failure_rate rose 31.2%` — that's the load-bearing signal. If the agent fires 5–6 EQL queries chasing checkout UX, session drop, and other hypotheses before circling back to payment, the payment_failure evidence from turn 2 is now in the middle of a 20k-token context. Attention degradation is one reason the model produces "pause the A/B experiment" as a rec instead of "escalate to payments" — the wrong mid-context evidence gets weighted.
 
-If a diagnostic investigation ran 20+ tool calls (it doesn't; capped at 6), the earliest tool_result blocks would sit in the middle of the messages array by turn 15. The model might weight the freshest 2-3 tool_results heavily and effectively ignore the early ones — even though early evidence might be critical to the diagnosis.
+**Mitigations available in this codebase.**
 
-**Why we don't measurably hit it.**
+1. **Bound each tool result.** A shorter mid-context block is more likely to be read fully. See `B2.1` in **01-context-window.md**.
+2. **Summarize as the agent goes.** Have the agent explicitly emit a `reasoning_step` that restates its current best hypothesis at each turn — pushing the current-best summary into the *end* region where attention is highest. Not implemented.
+3. **Reorder messages before final diagnosis.** Before the model's final answer turn, inject a synthesized summary of "the most relevant evidence so far" at the end. Not implemented.
+4. **Retrieval + reranking.** For a RAG setup (this codebase doesn't have one yet — see sub-section 03), retrieve top-k relevant chunks *ranked to put the most relevant at the ends*.
 
-Two design choices keep this codebase away from the failure mode:
+Diagram of the risk zone:
 
-1. **The 6-tool-call budget.** With at most 6 tool calls, the messages array stays short (~35K peak). Everything is close enough to the "end" that positional bias barely matters.
-2. **Schema-constrained conclusion.** The agent's final output is a `Diagnosis` object with `evidence` array — the model has to explicitly cite what supports each hypothesis. That forces it to REFER to what's in the tool_results, which brings the referenced content back into the model's active attention rather than relying on positional recall.
+```
+  Position vs attention — one 10-turn diagnostic
 
-**What we'd do differently at higher tool-call counts.**
-
-Two mitigations from the research:
-- **Summarize old turns.** After N turns, replace the earliest tool_result blocks with a running summary of "what we've learned so far." Trades detail for position — the summary lives at the start (strong attention) instead of the middle (weak).
-- **Move the question to the end.** Restate the anomaly / goal in the LATEST user message, not just the first one. The model attends to the end; restating the question there anchors the reasoning.
-
-Neither is implemented today because we haven't measured the failure mode. Case B exercise would be adding the summarization.
+  position (token offset)  ← attention (subjective)
+  ──────────────────────────────────────────────
+  0-15k     fixed prefix          █████ high
+  15-18k    turn 1 (user + asst)  █████ high
+  18-22k    turn 2 (+ tool_res)   ████  medium-high
+  22-27k    turn 3-4              ██    LOW ← lost-in-middle zone
+  27-32k    turn 5-6              ██    LOW ←
+  32-38k    turn 7-8              ████  medium-high
+  38-42k    turn 9 (asst final)   █████ high
+```
 
 ### Move 3 — the principle
 
-Position in the messages array is a proxy for model attention. Put load-bearing information at the start (system prompt, the question) or at the end (fresh tool_result, restated goal). Don't bury the key finding in the middle of a long loop and expect the model to remember it. When you can't avoid it, summarize.
+Context size is not the same as recall. The model attends unevenly across the context; long contexts amplify the effect. The engineering discipline: put important facts at the ends when you have a choice; keep the middle dense-but-brief; measure whether long-context runs degrade quality (they usually do).
 
 ## Primary diagram
 
 ```
-  What "middle" looks like in this repo (turn 10 of a diagnostic)
+  Lost in the middle — full frame
 
-  ┌─ messages array (~35K tokens) ────────────────────────────────────┐
-  │                                                                   │
-  │  system         ▓▓▓ 2-3K     [START — strong attention]            │
-  │  tools          ▓▓  1-2K                                           │
-  │  user: anomaly  ▓   0.5K                                           │
-  │  ─────                                                            │
-  │  asst turn 2    ▓   0.3K                                           │
-  │  tool_result 2  ▓▓  1.2K     [MIDDLE — weak attention]             │
-  │  asst turn 3    ▓   0.3K                                           │
-  │  tool_result 3  ▓▓  1.8K     ↓                                     │
-  │  asst turn 4    ▓   0.4K     ↓ risk zone if history                │
-  │  tool_result 4  ▓▓  1.5K     ↓ grew much longer                   │
-  │  asst turn 5    ▓   0.3K                                           │
-  │  tool_result 5  ▓▓  1.9K                                           │
-  │  asst turn 6    ▓   0.4K                                           │
-  │  tool_result 6  ▓▓▓ 2.1K                                           │
-  │  ─────                                                            │
-  │  asst turn 7    ▓   0.4K     [END — strong attention]              │
-  │  final result   ▓   0.5K                                           │
-  │                                                                   │
-  │  Because history is short (~35K vs 200K limit), everything         │
-  │  is "close enough" to start/end. No measured misattention today.   │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌────────────────────────────────────────────────────────┐
+  │  START region (high attention)                         │
+  │  · system prompt · tools · schema                       │
+  │  · turn 1 tool results (still near start)              │
+  └────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+  ┌────────────────────────────────────────────────────────┐
+  │  MIDDLE region (degraded attention) ← failure zone     │
+  │  · turns 3-6: tool results from the exploration phase   │
+  │    of a diagnostic run                                  │
+  │  · this is where the primary-cause evidence often ends  │
+  │    up buried on runs that took many hypotheses to reach │
+  │    the answer                                           │
+  └────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+  ┌────────────────────────────────────────────────────────┐
+  │  END region (high attention)                            │
+  │  · latest tool result · current question                │
+  │  · assistant's next turn (the diagnosis)                │
+  └────────────────────────────────────────────────────────┘
+
+  Mitigations:
+    · bound each tool result (see B2.1)
+    · summarize-as-you-go (reasoning_step restates hypothesis)
+    · reorder-before-final (inject summary at end)
+    · retrieve+rerank (put top matches at ends)
 ```
 
 ## Elaborate
 
-The finding comes from "Lost in the Middle: How Language Models Use Long Contexts" (Liu et al., 2023) which measured attention accuracy on multi-document QA at varying gold-position depth. Consistent finding across models: U-shaped accuracy curve, with a valley in the middle third of context.
+The phrase and empirical measurement come from Liu et al. 2023 ("Lost in the Middle: How Language Models Use Long Contexts"). The pattern replicates across model families — GPT-4, Claude, open-source models. Newer long-context models (100k+, 1M+) have partially mitigated the effect through training changes, but it hasn't gone away.
 
-The problem gets worse with longer contexts. At 200K, the middle-attention degradation is measurable in benchmarks. At 30K, it's within noise. This codebase runs at the low end of that range, which is why we don't see it as a practical issue.
+The mitigations that generalize: (1) put load-bearing facts at the ends, (2) keep the middle dense, (3) use retrieval-and-rerank to select which facts get into context in the first place. The mitigation that doesn't help: bigger context. Bigger context makes the middle longer, not the attention better.
 
-Related failure modes: **needle in a haystack** (finding one specific fact in a long context — modern models do well on this at the ends, poorly in the middle); **long-context recall degradation** (attending to details from earlier in the conversation).
+Related: **../03-retrieval-and-rag/07-reranking.md** (the reranking pattern that puts most-relevant chunks at prime attention positions). **../01-llm-foundations/06-token-economics.md** (bigger contexts also cost more).
 
 ## Project exercises
 
-### Exercise — running summary for long investigations
+### B2.2 · Summarize-as-you-go: force the diagnostic agent to restate its best hypothesis each turn
 
-- **Exercise ID:** C2.2-B · Case B (concept not exercised; would matter if tool-call cap were raised).
-- **What to build:** when the tool-call count > 4, insert a "summary of findings so far" as an assistant message BEFORE the growing tool_result history. Model summarizes what earlier tool_results showed; each summary replaces the raw earlier turns in the messages array, keeping recent turns in full detail.
-- **Why it earns its place:** proves you know the failure mode and have a mitigation. Interviewer signal: "for longer loops I'd summarize old turns to keep the anchor at the start instead of letting it drift into the middle."
-- **Files to touch:** `lib/agents/aptkit-adapters.ts` (or a wrapper), a small summarization helper that intercepts the messages array before `complete()`.
-- **Done when:** running an artificially-extended diagnostic (raise cap to 12) shows the messages array has summaries instead of raw early turns; a test proves the summary preserves the key finding.
-- **Estimated effort:** 1-2 days.
+- **Exercise ID:** B2.2
+- **What to build:** Modify the diagnostic agent's system prompt to require a "current best hypothesis: ..." line in every reasoning_step. This puts the running summary at the end of the context every turn, where attention is highest.
+- **Why it earns its place:** Directly targets the lost-in-the-middle mode the recommendation-fit eval failure (cases 01, 08) is likely a symptom of. Measurable: rerun the baseline, check if `diagnosis_response` pass rate improves.
+- **Files to touch:** aptkit's diagnostic system prompt (external) — since this codebase wraps aptkit, contribute the change to aptkit or add a `systemPromptAddendum` config option; extend `lib/agents/diagnostic.ts` to pass it.
+- **Done when:** the reasoning_step trace shows the "current best hypothesis" line, and rerunning the baseline shows either a stable or improved recommendation-quality pass rate.
+- **Estimated effort:** `1–2 days`.
 
 ## Interview defense
 
-**Q: Does lost-in-the-middle affect this codebase?**
+**Q: You've observed cases 01 and 08 failing with the "pause the A/B experiment" recommendation. Is lost-in-the-middle the cause?**
 
-Not measurably at today's usage. The 6-tool-call cap keeps the messages array around 35K peak; everything is close enough to the start or end that positional bias is within noise. If we raised the cap to 15-20 tool calls, the risk would show up — turn 3's tool_result would sit in the "middle" of a 100K+ context and the model might weight it low.
+Suspected, not proven. The primary root cause is a payment_failure signal that gets discovered on turn 2 but doesn't stay in the front of context by turn 10. That's the mid-context risk zone. Proof would require a targeted eval — run the same case with a message reorder that keeps payment_failure at the end, compare recommendation quality. The load-bearing part of the answer: I can point at the specific eval failure and the specific structural reason, and I can design the experiment that would confirm or refute.
 
-**Q: What would you do at higher tool-call counts?**
+**Q: Wouldn't just using a smaller model help?**
 
-Summarize old turns. After turn N, replace the earliest tool_results with a running summary of "what we've learned so far." That trades detail for position — the summary sits at the start (strong attention) instead of raw content sitting in the middle (weak attention). Trade-off: some detail is compressed away, so the summarization prompt has to preserve what's diagnostically important.
-
-**Q: How would you MEASURE if it was happening?**
-
-Adversarial eval. Craft a case where the diagnosis-critical evidence appears in turn 2's tool_result, then extend the loop with irrelevant follow-up tools that push turn 2's evidence into the middle. Judge whether the diagnosis still cites turn 2's finding. If the citation rate drops as the loop gets longer, that's lost-in-the-middle. Not in the current harness — a candidate case for Adversarial set expansion (`05-evals-and-observability/01-eval-set-types.md`).
+Sometimes — smaller models have less context to lose things in, so the effect is smaller. But smaller models are worse at multi-turn reasoning overall, so you'd trade one failure mode for another. The right lever is context management (bound tool results, summarize as you go, retrieve+rerank), not model choice.
 
 ## See also
 
-- `01-context-window.md` — the container this pattern lives in
-- `05-evals-and-observability/01-eval-set-types.md` — adversarial set could probe this
-- `04-agents-and-tool-use/06-error-recovery.md` — the 6-call cap that keeps us safe
+- [01-context-window.md](01-context-window.md) — the container this attention pattern applies to.
+- [../03-retrieval-and-rag/07-reranking.md](../03-retrieval-and-rag/07-reranking.md) — the RAG-side mitigation.
+- [../05-evals-and-observability/02-eval-methods.md](../05-evals-and-observability/02-eval-methods.md) — how to design the eval that proves or refutes this cause.

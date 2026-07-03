@@ -1,192 +1,184 @@
 # Agent memory tiers
 
-_Industry standard._
+*Industry names: agent memory tiers / short-term-vs-long-term memory · Industry standard*
 
-## Zoom out, then zoom in
-
-Memory as a dedicated component, separate from the context window. Working (in-context), episodic (recent runs), long-term (persistent knowledge). This repo has *working memory only* — the context of the current investigation. There's no episodic memory of prior runs, no long-term store of user preferences or facts. This file names why that's the right call for the current product surface, and what adopting each tier would require.
+## Zoom out
 
 ```
-  Zoom out — what tiers exist in this repo
+  Zoom out — memory as a component, not just "big context window"
 
-  ┌─ Working memory (in-context) ─── ★ THIS IS ALL BLOOMING HAS ──┐
-  │  Current investigation's window: system prompt +               │
-  │  Anomaly + Diagnosis + tool trace                              │
-  │  Lifetime: one HTTP request; gone when the loop ends           │
-  └────────────────────────────────────────────────────────────────┘
-  ┌─ Episodic (recent sessions) ────── NOT IMPLEMENTED ────────────┐
-  │  Would store: "user investigated X yesterday, concluded Y"      │
-  │  Would be retrieved on relevant new investigations              │
-  └────────────────────────────────────────────────────────────────┘
-  ┌─ Long-term (persistent knowledge) ── NOT IMPLEMENTED ──────────┐
-  │  Would store: durable facts, preferences, prior conclusions     │
-  │  Would be a vector DB, semantic search on new tasks             │
-  └────────────────────────────────────────────────────────────────┘
+  ┌─ context engineering (superset) ──────────────┐
+  │  ★ MEMORY TIERS ★                              │ ← we are here
+  │    working (in-context)                        │
+  │    episodic (recent sessions)                  │
+  │    long-term (persistent knowledge)            │
+  └───────────────────────────────────────────────┘
 ```
 
-Zoom in: the strongest signal in this codebase is what's deliberately absent. Blooming has "no database" as a design principle (see `.aipe/project/context.md`). Session state lives in in-memory `Map<sessionId, SessionFeed>`; investigations live in `sessionStorage` in the browser. That's fine for working memory — it's per-request, per-user, ephemeral. It doesn't extend to episodic or long-term.
+## Zoom in
+
+Memory is a dedicated component, separate from the context window. Three tiers: **working** (the current task's context — lives in the window), **episodic** (summaries of past runs, retrieved by relevance), **long-term** (durable facts, decisions, preferences, stored in a vector DB or graph). This repo uses working memory only; episodic and long-term are not yet implemented. Cross-refs `.aipe/study-ai-engineering/`'s agent-memory file for the two-layer split; this file extends to three tiers plus the cross-session retrieval problem.
 
 ## Structure pass
 
-**Layers:** working (in-context) · episodic (recent, retrievable) · long-term (persistent, vector-indexed).
-**Axis:** *how long does this memory need to survive, and who queries it?*
-**Seam:** the boundary between context-window memory and store-backed memory. Working memory lives IN the prompt; episodic and long-term live OUTSIDE and get retrieved into it.
+Layers: **working** (fastest, smallest, transient) — **episodic** (medium, session-scoped summaries) — **long-term** (slowest, largest, durable).
+
+Axis to hold constant: **what happens when the task ends?**
 
 ```
-  The tier boundaries — lifetime + query pattern
+  What survives task end — the axis that flips per tier
 
-  Tier          Lifetime          Storage             Query pattern
-  ────────────  ───────────────   ────────────────    ──────────────
-  Working       one request       context window      inline (whole thing)
-  Episodic      hours to days     serialized log      retrieve by relevance
-  Long-term     unbounded          vector DB / graph   semantic search
+  Working memory:    gone (window discarded)
+  Episodic memory:   summary persists per session
+  Long-term memory:  durable across all sessions
 ```
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — the shape
 
-You've written a React app with three shapes of state: component state (lives with the component, gone on unmount), `sessionStorage` (survives navigation within the tab), a backing database (survives everything). Agent memory tiers are the same instinct, at the agent layer. Working memory = component state. Episodic = `sessionStorage`. Long-term = backing store. Blooming has all three at the app layer, but only the *first* at the agent layer.
-
-```
-  Pattern: three-tier agent memory
-
-  ┌─ Working ───────────────────────────────────┐
-  │  in-context — same window as the LLM sees   │
-  └─────────────────────────────────────────────┘
-  ┌─ Episodic ──────────────────────────────────┐
-  │  outside window — retrieved on demand        │
-  │  scoped to recent, filtered by relevance    │
-  └─────────────────────────────────────────────┘
-  ┌─ Long-term ─────────────────────────────────┐
-  │  outside window — retrieved on demand        │
-  │  unbounded, semantic search                  │
-  └─────────────────────────────────────────────┘
-```
-
-### Move 2 — the walkthrough
-
-**Working memory — what IS here.** The current investigation's context lives in the LLM's window and in the process. Two implementations back it:
-
-- **Model side.** The prompt carries system prompt + anomaly + tool trace. AptKit's agent loop accumulates the trace turn by turn.
-- **Process side.** `lib/state/insights.ts:14` — `const state = new Map<string, SessionFeed>()` — a per-session sub-map holding the current briefing's insights, investigations, and anomalies. Scoped to sessionId so it survives across HTTP requests within a session, but bounded to in-memory (dies with the Vercel instance).
-
-```ts
-// lib/state/insights.ts:14-23 — session-scoped working memory
-const state = new Map<string, SessionFeed>();
-
-function sessionState(sessionId: string): SessionFeed {
-  let s = state.get(sessionId);
-  if (!s) {
-    s = { insights: new Map(), investigations: new Map(), anomalies: new Map() };
-    state.set(sessionId, s);
-  }
-  return s;
-}
-```
-
-Line-by-line:
-
-- **`Map<string, SessionFeed>`** — outer key is sessionId (from cookie). This is the multi-tenant scope key; without it, one user's feed would clobber another's on a warm instance.
-- **`SessionFeed` holds Insight/Investigation/Anomaly**. These are the artifacts an agent produces; retaining them means a follow-up request in the same session can look up "the insight I clicked" by id.
-- **Purely in-memory.** Dies with the process. On a Vercel cold start, everything is empty. That's fine — the demo path serves committed snapshots, the live path re-fetches from Bloomreach.
-
-**Episodic memory — NOT here, and here's what adopting would require.** An episodic layer would store recent investigations serialized, so a follow-up query ("show me the drops I investigated last week") could retrieve them. What would need to change:
-
-- **Persistence.** In-memory `Map` → a database or an object store. Currently blooming has "no database" as a design principle. Adopting episodic would break that.
-- **Retrieval.** By relevance to the current task — usually embedding-based similarity. That means an embedding pipeline and a vector index.
-- **Retrieval trigger.** A tool-shaped entry point ("recall_prior_investigation") the agent can call, so retrieval is a control-loop decision, not a blanket inject.
-
-The trigger to adopt this would be a product surface that spans investigations — e.g. "compare this drop to the drop from last month" or "did we already recommend this Bloomreach feature and did it work?" Neither is a current product goal.
-
-**Long-term memory — NOT here, same reasoning.** A long-term layer would store durable facts: user preferences ("this analyst always cares about the checkout funnel"), verified prior conclusions ("we ran Scenario X in March, it lifted conversion 4%"), or workspace-specific patterns ("this workspace's mobile traffic peaks Sundays"). Adopting would need:
-
-- **A vector DB** (Pinecone, pgvector, an embedded store).
-- **A write pipeline** — decide when a fact is durable enough to persist. Blooming would probably want a human confirm step, not automatic ingestion.
-- **A retrieval loop.** Same as episodic — semantic search on a tool call, not blanket injection.
-
-The reason blooming doesn't have long-term today: every investigation is fresh. The product's value proposition is "an analyst that shows its work" for one moment in time. Cross-investigation learning is a natural next feature, but it's a next feature, not a v1 requirement.
-
-**Why "no long-term" is defensible for now.** Bloomreach itself is the source of truth for durable data (customer profiles, events, catalog). Blooming's job is *reasoning* over that data. If a fact is durable, it belongs in Bloomreach's data model, not in a side-channel memory. If a fact is derived (a prior recommendation's effectiveness), it could live in an episodic tier — but only if the product surface asks for it.
+You've reasoned about storage tiers before — CPU cache vs RAM vs disk. Same instinct. Working memory is the register, episodic is RAM, long-term is disk. Each tier trades speed for capacity + durability.
 
 ```
-  Layers-and-hops — the tiers, currently and hypothetically
+  Three tiers — capacity, cost, durability trade
 
-  ┌─ Working memory (LIVE) ────────────────────────────────────┐
-  │  system prompt + anomaly + tool trace (in LLM window)      │
-  │  SessionFeed Map (per-session, in-process)                 │
-  └────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-  ┌─ Episodic (NOT LIVE) ──────────────────────────────────────┐
-  │  Would need: durable store, embedding pipeline, tool entry │
-  │  Would enable: "what did I investigate yesterday?"          │
-  └────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-  ┌─ Long-term (NOT LIVE) ─────────────────────────────────────┐
-  │  Would need: vector DB + write policy + semantic retrieval │
-  │  Would enable: prior-recommendation reuse, user preferences│
-  └────────────────────────────────────────────────────────────┘
+  ┌─ Working (in-context) ─────────────────────────┐
+  │  The current task's context. Lives in the      │
+  │  window. Gone when the run ends.               │
+  │  ~50k tokens, cost = per-turn input tokens     │
+  └────────────────────────────────────────────────┘
+  ┌─ Episodic (recent sessions) ───────────────────┐
+  │  Summaries of past runs/conversations.          │
+  │  Retrieved by relevance to the current task.    │
+  │  ~KB per session, cost = one summary call +    │
+  │  one retrieval per session                      │
+  └────────────────────────────────────────────────┘
+  ┌─ Long-term (persistent knowledge) ─────────────┐
+  │  Durable facts, decisions, preferences. Stored │
+  │  in a vector DB / graph. Unbounded.             │
+  │  MB-GB, cost = embed + store + retrieve         │
+  └────────────────────────────────────────────────┘
 ```
+
+### Move 2 — what this repo has today, and what would come next
+
+**Today: working memory only.**
+
+Each agent run has one context — the aptkit `ModelMessage[]` accumulated across turns of the ReAct loop. When the run ends (Diagnosis emitted, budget exhausted, or cancelled), the context is discarded. Nothing survives between investigations.
+
+That's a deliberate scope decision. The product's unit of work is one investigation — start with an anomaly, end with recommendations. Cross-investigation state ("what did we conclude last week about the same metric?") isn't in the current product design.
+
+The one thing that DOES cross investigation boundaries: the **committed demo snapshot** (`lib/state/demo-insights.json`). But that's not agent memory — it's a captured trajectory replayed for the demo/reliability path. Different concern.
+
+**Where episodic memory would fit.** A useful escalation would be "the diagnostic agent recognizes it's investigating the same anomaly for the third time this week and short-circuits." Requires:
+
+```
+  Episodic memory — the hypothetical addition
+
+  ┌── new: EpisodicStore ────────────────────────┐
+  │  On investigation done, emit summary:         │
+  │    {                                          │
+  │      timestamp,                               │
+  │      anomaly: { metric, scope, change },      │
+  │      diagnosis: { conclusion, evidence },     │
+  │      recommendations: [...],                  │
+  │      outcome: 'applied' | 'ignored' | null    │
+  │    }                                          │
+  │  Store in Postgres or KV                      │
+  └───────────────┬───────────────────────────────┘
+                  │
+                  ▼
+  On new investigation start:
+    - retrieve top-K similar past investigations
+    - prepend "Prior investigation of this metric: ..."
+      to the DiagnosticAgent's context
+```
+
+Would need a durable store (this repo has none today — no database), an embedding model for similarity, and a retrieval step. The pattern is essentially agentic RAG (`02-agentic-retrieval/01-agentic-rag.md`) over an internal history.
+
+**Where long-term memory would fit.** Longer-term facts about the workspace: "This workspace's revenue drops on the third Friday every month due to a known payment provider maintenance window." Not something a single investigation would learn — something that persists across many.
+
+Long-term memory is where the "retrieval problem" gets sharp: the memory only works if the *right thing* is retrieved at the *right time*. That's RAG inside the agent. Cross-refs `.aipe/study-ai-engineering/`'s memory file for the two-layer split; the three-tier model here adds the intermediate episodic layer.
+
+**The reason NOT to add these tiers preemptively.**
+
+- **Cost.** Every episodic/long-term retrieval is another turn of the loop, another tool call, more tokens. If the current investigation doesn't need cross-session context to be good, adding memory is complexity + cost with no quality gain.
+- **Poison risk.** Bad memory poisons future retrievals. A misclassified past diagnosis gets retrieved as "similar to this one" and biases the current run. Requires memory hygiene: confidence tracking, staleness, retrieval quality checks.
+- **Product-shape mismatch.** The user's mental model is "one anomaly, one investigation." Silently pulling in past investigations changes what the answer means — and if the user can't see what past context was used, trust drops.
+
+**When memory would be worth it.** When cross-investigation patterns are load-bearing to the answer quality — e.g., a workspace with strong seasonality where each investigation should reference prior similar ones. Not there yet.
+
+### Move 2.5 — the bridge to storage layering
+
+The three-tier memory model maps to a storage-layering discipline the reader has already built in other projects: canonical local + retrieved context. Working memory is the "current view"; episodic is "recent local state"; long-term is "durable canonical." Same instinct at higher altitude. The load-bearing part is deciding which tier a given piece of information should live in — trying to store everything in long-term makes retrieval slower; storing everything in working blows the window. Tier assignment is the actual design work.
 
 ### Move 3 — the principle
 
-Memory tiers are earned, not adopted preemptively. Working memory is required — every agent has it by definition. Episodic and long-term are product features that need a specific reason to exist: "the user needs to reference something across sessions." Without that reason, they add complexity (retrieval, embeddings, storage) for no user-facing gain. Blooming has zero cross-investigation retrieval requirements today, so the tiers stop at working. When the product needs "compare this drop to last month's drop," episodic earns its keep. Until then, deferring is the right call.
+Memory tiers separate speed from durability. Working memory is fast and transient; long-term is durable and slow. Episodic is the middle. The retrieval problem is the load-bearing one — long-term memory only works if the *right thing* is retrieved at the *right time*. That's why cross-session memory is really "RAG inside the agent" — same mechanics as any other retrieval, applied to the agent's own history.
 
 ## Primary diagram
 
 ```
-  Recap — memory in this repo
+  Memory tiers — what this repo has and what's next
 
-  ┌─ Working memory (only tier that exists) ────────────────────┐
-  │                                                             │
-  │  In LLM window:                                             │
-  │   - system prompt (cached)                                  │
-  │   - Anomaly (current investigation input)                   │
-  │   - Diagnosis (Stage B input, if step 3)                    │
-  │   - tool_use ↔ tool_result trace (grows per turn)            │
-  │                                                             │
-  │  In process (SessionFeed Map):                              │
-  │   - insights: Map<id, Insight>                               │
-  │   - investigations: Map<id, Investigation>                   │
-  │   - anomalies: Map<id, Anomaly>                              │
-  │  Lifetime: warm Vercel instance; per-session scope           │
-  └─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-  ┌─ Episodic + Long-term (deferred) ───────────────────────────┐
-  │  Trigger to adopt: cross-investigation product surface       │
-  │  Cost: durable store, embeddings, retrieval loop             │
-  └─────────────────────────────────────────────────────────────┘
+  ┌─ Working memory (SHIPPED) ────────────────────────────┐
+  │  aptkit ModelMessage[] per agent per run              │
+  │  ~50k tokens                                          │
+  │  gone when run ends                                    │
+  │  cost: per-turn input tokens                           │
+  └────────────────────────────────────────────────────────┘
+
+  ┌─ Episodic memory (not yet) ───────────────────────────┐
+  │  would be: EpisodicStore                              │
+  │    schema: { anomaly, diagnosis, recommendations,     │
+  │              timestamp, outcome }                     │
+  │    retrieval: embed anomaly, top-K similar past runs  │
+  │    injection: prepend "Prior similar: ..." to context │
+  │  cost: summary call + retrieval + embed               │
+  │  when: cross-investigation patterns matter            │
+  └────────────────────────────────────────────────────────┘
+
+  ┌─ Long-term memory (not yet) ──────────────────────────┐
+  │  would be: durable workspace facts                    │
+  │    "revenue dips 3rd Friday due to payment window"    │
+  │    "TX customers churn on price sensitivity"          │
+  │  store: vector DB / graph                              │
+  │  retrieval: RAG over the fact store                    │
+  │  cost: embed + store + retrieve + memory hygiene       │
+  │  when: workspace-level patterns are load-bearing       │
+  └────────────────────────────────────────────────────────┘
+
+  The retrieval problem is the load-bearing one —
+  long-term only works if the right thing is retrieved
+  at the right time. That's RAG inside the agent.
 ```
 
 ## Elaborate
 
-The design instinct behind blooming's "working memory only" is the same one behind "no database": defer state until the product forces it. Every stateful component adds a storage decision, a schema migration, a consistency question. If the product doesn't need that state, adding it is pure debt.
+The tiered-memory model for LLM agents crystallized around 2024. MemGPT (Packer et al., 2023) introduced hierarchical memory as a first-class concept; ChatGPT's "memory" feature (2024) productionized long-term memory for a consumer product; frameworks like LangChain's `Memory` and LlamaIndex's `Memory` interfaces standardized the API surface.
 
-The failure mode this defers, honestly: no cross-session learning. If a user investigates the same checkout drop weekly, blooming re-derives every conclusion from scratch. That's wasteful token spend on repeat problems. An episodic layer would cut that — retrieve last week's diagnosis, tell the model "this is likely the same issue, verify quickly." Estimated saving: 30-50% on repeated investigations. Not adopted because the product hasn't seen that use pattern yet.
-
-The other failure mode: no user personalization. Blooming can't learn "this analyst prefers segment recommendations over scenario recommendations." Every investigation starts cold. A long-term memory layer would fix that. Not adopted because the current interface doesn't ask for it — recommendations are all shown; the analyst picks.
-
-The cross-reference to `study-ai-engineering`'s agent-memory file covers the two-layer short/long split; this file extends it to the three-tier model and names why blooming stops at tier one.
+The frontier is **learned memory hygiene** — memory that self-cleans (staleness detection, confidence decay, conflict resolution when new observations contradict stored facts). This is where the memory problem becomes agent-shaped — the agent itself has to reason about what to remember, forget, and retrieve. See Reflexion (Shinn et al., 2023) for the earliest production of "agent maintaining its own memory."
 
 ## Interview defense
 
-**Q: What memory tiers does this system have, and where does it stop?**
-A: Working memory only. In-LLM: system prompt + Anomaly + tool trace, all in the current window. In-process: a `Map<sessionId, SessionFeed>` in `lib/state/insights.ts` that holds the current session's insights, investigations, and anomalies — per-session scoped so users don't collide on a warm Vercel instance, purely in-memory so it dies with the process. No episodic tier (recent-session recall), no long-term tier (durable facts). Both would be natural next features, but neither has a current product surface asking for them. The design principle is "defer state until the product forces it" — same reason blooming has no database.
+**Q: Do you have long-term memory?**
 
-Diagram: the three-tier picture with only the working tier lit up.
-Anchor: `lib/state/insights.ts:14-23`.
+Not yet. Today the repo has working memory only — aptkit's `ModelMessage[]` per agent per run, discarded when the run ends. Deliberate scope choice: the product's unit of work is one investigation. Cross-investigation state isn't in the current design.
 
-**Q: When would you add long-term memory, and what would you use for it?**
-A: The trigger would be a product surface that spans investigations — "compare this drop to last month's" or "did we already recommend this feature and did it work?" Adopting means three moving parts: a durable store (pgvector inside a Postgres, probably; blooming has no database today so this is a real infra decision), an embedding pipeline for semantic retrieval, and a tool-shaped retrieval entry point (`recall_prior_investigation`) so the agent's control loop decides when to look back — not blanket inject. The write side needs a policy — I'd want a human confirmation step before facts become durable, not automatic ingestion. That last part matters: automatic ingestion of every conclusion means bad conclusions become "learned" facts, which is the classic RAG-poisoning failure.
+Where I'd add it: episodic first, if I noticed the diagnostic agent redoing the same investigation for a recurring anomaly. The pattern would be an EpisodicStore (Postgres), embed the current anomaly, retrieve top-K similar past investigations, prepend them to context. Long-term (workspace facts) only makes sense after episodic proves useful.
 
-Diagram: the three-tier picture with adoption arrows on episodic → long-term.
-Anchor: general; refers to `.aipe/study-ai-engineering/` for RAG mechanics.
+The reason I don't have it: cost + poison risk. Every retrieval is another turn; bad memory poisons future runs. Adding memory before the product needs it is complexity for no gain.
+
+*Anchor visual:* the three-tier diagram above.
+
+**Q: What's the hardest part of long-term memory?**
+
+Retrieval. Storing is trivial (write to a vector DB). Retrieving the *right* fact at the *right* moment is the whole problem — same as any RAG system, just applied to the agent's own history instead of external documents. That's why "agent memory" is really "agentic RAG over an internal store" — the mechanics are the same.
+
+The second-hardest part is memory hygiene — staleness, confidence decay, conflict resolution when observations contradict stored facts. A stored fact "Texas customers churn on price sensitivity" that becomes obsolete needs to be flagged, not silently retrieved into a new investigation.
 
 ## See also
 
-- `01-context-engineering.md` — how the working tier gets curated.
-- `03-multi-agent-orchestration/08-shared-state-and-message-passing.md` — the shared-vs-message split that would extend to episodic if adopted.
-- Cross-reference: `.aipe/study-ai-engineering/`'s agent-memory file for the two-layer short/long split.
+- **`01-context-engineering.md`** — memory is one source context engineering pulls from.
+- **`02-agentic-retrieval/01-agentic-rag.md`** — memory retrieval IS agentic RAG.
+- **`.aipe/study-ai-engineering/`** agent-memory file — the two-layer short/long split.

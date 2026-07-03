@@ -1,258 +1,311 @@
 # Trees, tries, and balanced indexes
 
-Industry names: rooted tree, binary tree, trie / prefix tree, AVL / red-black tree, B-tree. Type: Industry standard.
+*Hierarchical structures · prefix indexes · self-balancing trees · Industry standard*
 
-## Zoom out — the honest verdict: `not yet exercised`
+## Zoom out, then zoom in
 
-This is a service-and-transport codebase built around linear scans of small collections (40 tools, 10 anomalies, 20 investigations). Nothing here needs a balanced tree; nothing here needs a trie. The one *shape* that resembles a tree walk is the error-cause chain in `formatError()` at `lib/mcp/transport.ts:82-97` — but that's a degenerate tree (every node has degree 1), bounded at depth 5, and walked with a while loop, not recursion.
-
-```
-  Trees in this codebase — the honest map
-
-  ┌─ Service layer ─────────────────────────────────┐
-  │  (no trees)                                     │
-  └─────────────────────────────────────────────────┘
-
-  ┌─ Transport layer ───────────────────────────────┐
-  │  formatError: walk error.cause chain            │  ← degenerate tree
-  │  (depth ≤ 5, degree 1 → basically a list)       │
-  └─────────────────────────────────────────────────┘
-
-  not yet exercised:  binary search tree
-  not yet exercised:  AVL / red-black balanced tree
-  not yet exercised:  trie / prefix tree
-  not yet exercised:  B-tree / B+tree (would be the storage engine)
-  not yet exercised:  segment tree / Fenwick tree
-```
-
-That's not a criticism — the domain doesn't call for them yet. The chapter's job is to teach the primitives so the reader recognizes when a tree *would* land, and to name the one repo spot that's tree-shaped.
-
-## Structure pass — trees are the "hierarchy" axis
-
-Axis: **do children have an intrinsic order, and does structure need to stay balanced?**
-
-- **Rooted tree**: hierarchy with no key ordering. Filesystem directories, DOM. Balance doesn't matter.
-- **Binary search tree**: keys ordered left < parent < right; O(log n) if balanced, O(n) if not.
-- **Balanced BST (AVL, red-black)**: guaranteed balance through rotation; O(log n) worst-case for all ops.
-- **Trie**: keys are sequences (strings); depth = key length; branching = alphabet size.
-- **B-tree**: high-branching factor, shallow depth; the disk-friendly variant that databases use.
-
-The seam between these is *the invariant that must hold on every insert*. Different invariants demand different rebalancing work. Understanding which invariant applies is more than half the vocabulary.
-
-## How it works — the one anchor + the missing primitives
-
-### Move 1 — the tree kernel
-
-A tree is a set of nodes where each has zero or one parent and any number of children, no cycles. You already know the shape from filesystems.
+This is a Case-B file: the repo doesn't exercise trees, tries, or balanced indexes in any load-bearing way. Naming that up front is the point. But you *have* built these primitives — `reincodes/BinarySearchTree.ts`, `Tree.ts`, `BinaryHeap.ts` — and interviews still ask about them, so this file teaches the primitives from first principles and anchors to your own implementations.
 
 ```
-  Tree kernel — root, edges, leaves
+  Zoom out — where trees don't (yet) live in blooming_insights
 
-              [ root ]
-             /    │    \
-        [ a ]   [ b ]   [ c ]
-        /   \             │
-     [ d ] [ e ]         [ f ]
-                          │
-                        [ leaf ]
+  ┌─ UI layer ───────────────────────────────────────────────────┐
+  │  React's virtual DOM is a tree, but that's framework         │
+  │  internals — you don't own or walk it directly               │
+  └─────────────────────────┬────────────────────────────────────┘
+                            │
+  ┌─ Agent / route layer ───▼────────────────────────────────────┐
+  │  Agent conversations are a *linear* sequence — no branching, │
+  │  no tree of alternative reasoning paths                      │
+  └─────────────────────────┬────────────────────────────────────┘
+                            │
+  ┌─ Storage / config ──────▼────────────────────────────────────┐
+  │  No database, no ordered index, no in-memory sorted map      │
+  │  All state is flat: JSON files, Set<string>, Record<K,V>     │
+  └──────────────────────────────────────────────────────────────┘
 
-  what makes it a tree: exactly one path from root to any node
-  what breaks it       : a back-edge → cycle → no longer a tree
+  ┌─ Where trees LIVE, in your other codebase ──────────────────┐
+  │                                                              │
+  │  reincodes/BinarySearchTree.ts                               │
+  │    · insert / search / delete (rec + iter)                   │
+  │    · pre / in / post-order traversals                        │
+  │    · successor / predecessor                                 │
+  │                                                              │
+  │  reincodes/Tree.ts                                           │
+  │    · general n-ary tree                                      │
+  │    · pre / post traversal via generators                     │
+  │    · used in recursion call-stack visualizers                │
+  │                                                              │
+  │  reincodes/BinaryHeap.ts                                     │
+  │    · nearly-complete binary tree stored as an array          │
+  │    · heapifyUp / heapifyDown                                 │
+  │                                                              │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-The mechanics that matter for every tree:
-- **Traversal order** (pre-order, in-order, post-order) determines what the algorithm sees when.
-- **Depth vs breadth** (DFS vs BFS) picks a stack vs a queue.
-- **Balance** (or lack of it) turns O(log n) operations into O(n).
+**Zoom in.** A tree is any hierarchy — each node has zero or more children, one parent (or zero, at the root). Trees show up whenever "contains" is the load-bearing question: file systems, DOMs, ASTs, category hierarchies. Tries specialize trees for prefix lookups; balanced trees (AVL, red-black, B-trees) enforce a height invariant so operations stay O(log n). None of these are load-bearing in blooming_insights *today* — but the primitives are worth knowing cold.
 
-### Move 2 — the one repo anchor
+## Structure pass
 
-**`formatError` — bounded traversal of a degenerate tree** — `lib/mcp/transport.ts:82-97`.
+**Layers.** Two altitudes:
+  1. the *shape* (binary vs n-ary, ordered vs unordered, balanced vs not)
+  2. the *operation* the shape enables (search, insert, prefix match, range query)
 
-Errors in Node have a `cause` property; a wrapper error's cause is the error underneath. `formatError` walks that chain to assemble a single log-line, redacting nested tokens along the way. It's structurally a tree walk, but every node has exactly one child (or zero), so it degenerates to a list — and even then, walked with a bounded loop, not recursion.
+**Axis: how does the tree stay useful as it grows?** Trace it down:
+  - unbalanced BST → O(log n) average, O(n) worst-case (a sorted-input insert makes it a linked list)
+  - balanced BST (AVL, red-black) → O(log n) guaranteed
+  - B-tree → O(log_B n) with B-way branching, tuned for disk pages
+  - trie → O(key length), independent of tree size
+
+**Seams.** The load-bearing seam is between *sortedness* and *balance*. A BST that stays balanced gives you sorted iteration + O(log n) operations. Lose either and you either lose the ordering (hash-map) or lose the guarantee (linked list masquerading as a tree). This is why databases reach for B-trees, not naive BSTs — the invariant survives adversarial insert orders.
+
+## How it works
+
+### Move 1 — a tree is a linked structure with a "parent pointer" you can't take back
+
+You already know a linked list: each node points to `next`. A binary tree is that shape with two `next` pointers — `left` and `right`. An n-ary tree just has an array of children. Everything else about trees is what you *do with* the pointers.
 
 ```
-  The cause chain — a tree with degree 1
+  A binary tree — the shape
 
-  error A "callTool failed"
-     │  .cause
-     ▼
-  error B "HTTP 401"
-     │  .cause
-     ▼
-  error C "invalid token …tk_abc…"
-     │  .cause
-     ▼
-    null
-
-  formatError walks top → bottom, joins with "caused by:",
-  stops at depth 5 or when .cause is null
+              (10)                 ← root
+             /    \
+           (5)    (15)             ← level 1
+           / \    /  \
+         (3) (7)(12)(20)           ← level 2
 ```
 
-Real code:
+For a *binary search tree*, the invariant is: for every node, everything in the left subtree is smaller, everything in the right subtree is larger. That's what makes `search(x)` an O(log n) descent instead of an O(n) scan — every comparison eliminates half the remaining tree.
+
+For a *heap*, the invariant is: every parent ≤ every child (min-heap) or ≥ (max-heap). No left/right ordering — a heap is looser than a BST. This is why the heap can pack into an array (see file 03) but the BST can't.
+
+### Move 2 — traversals: three ways to walk a tree
+
+You built these in `reincodes/BinarySearchTree.ts`. The three orders are named by *when the node itself gets visited* relative to its children:
+
+```
+  Traversal orders — same tree, three walks
+
+  Tree:              (10)
+                    /    \
+                  (5)   (15)
+                  / \    / \
+                (3)(7)(12)(20)
+
+  Pre-order:   10 → 5 → 3 → 7 → 15 → 12 → 20
+               (visit node, then left, then right)
+               → serialize a tree, DFS with visit-first
+
+  In-order:    3 → 5 → 7 → 10 → 12 → 15 → 20
+               (left, node, right)
+               → BST in-order = sorted output — the killer app
+
+  Post-order:  3 → 7 → 5 → 12 → 20 → 15 → 10
+               (left, right, node)
+               → free a tree, evaluate an expression tree
+```
+
+The pseudocode for all three fits on one screen:
+
+```
+  function traverse(node, order):
+    if node is null: return
+    if order == pre:  visit(node)
+    traverse(node.left,  order)
+    if order == in:   visit(node)
+    traverse(node.right, order)
+    if order == post: visit(node)
+```
+
+**What breaks if you drop the null check?** The recursion never terminates at a leaf — you'd try to descend into `null.left` and crash. The base case is the load-bearing part.
+
+**What breaks if you swap `left` and `right`?** Nothing structural — you get the mirror-image traversal. In-order on a BST would give you *reverse-sorted* output. Same algorithm, symmetric shape.
+
+Your own code (line ranges from memory of your reincodes DSA portfolio):
 
 ```ts
-// lib/mcp/transport.ts:82-97
-export function formatError(e: unknown): string {
-  const parts: string[] = [];
-  let cur: unknown = e;
-  let depth = 0;
-  while (cur && depth < 5) {                     // ← bounded traversal
-    if (cur instanceof Error) {
-      parts.push(cur.stack ?? cur.message);
-      cur = (cur as { cause?: unknown }).cause;   // ← descend one child
-    } else {
-      parts.push(String(cur));
-      cur = null;                                 // ← terminate on non-Error
-    }
-    depth++;
+// reincodes/BinarySearchTree.ts — the shape you already own
+class BinarySearchTree<T> {
+  root: TreeNode<T> | null = null;
+  insert(value: T): void { /* ... */ }
+  search(value: T): TreeNode<T> | null { /* ... */ }
+  delete(value: T): void { /* handles 0, 1, 2 children */ }
+  preOrder():  T[] { /* recursive */ }
+  inOrder():   T[] { /* recursive — sorted for BST */ }
+  postOrder(): T[] { /* recursive */ }
+  successor(node: TreeNode<T>): TreeNode<T> | null {
+    // if right subtree exists, return leftmost of right
+    // otherwise climb until we're a left child
   }
-  return parts.join('\n  caused by: ');
 }
 ```
 
-**Load-bearing parts:**
+The tricky operation is `delete` — three cases (leaf, one child, two children) and the two-child case needs the successor. That's the code that separates "I read a chapter" from "I built one."
 
-1. **`depth < 5` cap.** The one part you *always* forget on a recursive traversal. Without it, a circularly-linked `cause` (rare but possible) would infinite-loop. This is exactly the same protection a graph BFS's `visited` set gives you, in the degenerate case where "visited" collapses to a depth counter.
-2. **`cur instanceof Error` branch.** The tree's leaves aren't always `Error` — someone could throw a plain object or string. Handle it, terminate.
-3. **`parts.join('\n  caused by: ')`.** This is the in-order projection: walk root-first, join with a separator. The output preserves cause order.
+### Move 2 — balance: why a naive BST breaks
 
-**Why written iteratively, not recursively?** Two reasons. First, recursion in JS has a call-stack limit around 10k frames — with a depth cap of 5, iterative is still safer as a habit. Second, the iterative shape makes the depth cap obvious; a recursive version with a depth parameter is easier to mis-write. See `07-recursion-backtracking-and-dynamic-programming.md` for when recursion is the better choice.
-
-### Move 2 (continued) — where the missing primitives would land
-
-**`not yet exercised`: a trie for tool-schema lookup.**
-
-Today, `filterToolSchemas` at `lib/agents/tool-schemas.ts:13-15` uses `Set.has(t.name)` — O(1) per name, O(n) total to scan all tools. At 40 tools this is invisible.
-
-If the tool catalog ever grew to thousands *and* names shared common prefixes (e.g. `bloomreach.customer.get`, `bloomreach.customer.list`, `bloomreach.customer.update`), a trie would let you route by prefix and prune whole subtrees at once. Kernel:
+Insert `1, 2, 3, 4, 5` into an empty BST *in that order*. Every new node goes right. You end up with:
 
 ```
-  Trie — one node per prefix character
+  Insertion order matters — degenerate BST
 
-  root
-   │
-   ├─ 'b' ── 'l' ── 'o' ── 'o' ── ... ── "bloomreach.customer.get"
-   │                              └── ... "bloomreach.customer.list"
-   │                              └── ... "bloomreach.customer.update"
-   │
-   └─ 'e' ── 'v' ── 'a' ── 'l' ── ... "eval.run"
+  insert 1: (1)
+  insert 2: (1) - (2)
+  insert 3: (1) - (2) - (3)
+  ...
+  insert 5: (1) - (2) - (3) - (4) - (5)
+             ↑
+             this is a linked list wearing a BST hat
+             search(5) is O(n), not O(log n)
 ```
 
-Trie ops:
-- `insert(word)`: walk from root, create nodes for each character; O(|word|).
-- `search(word)`: walk from root; O(|word|); returns true only at terminal marker.
-- `startsWith(prefix)`: walk from root; return the subtree; O(|prefix|).
+That's the whole reason balanced BSTs exist. AVL trees (Adelson-Velsky & Landis, 1962) rebalance after every insert via *rotations*. Red-black trees (Bayer, 1972 → CLRS chapter 13) do the same with a color invariant that's easier to maintain. B-trees (Bayer & McCreight, 1970) generalize to B-way branching for disk-page-sized nodes.
 
-For membership tests, a hash set wins (O(1) vs O(|word|)). Tries win when the *prefix operations* matter — autocomplete, longest-common-prefix, dictionary compression.
+You *don't* have these implementations in `reincodes` — this is a genuine curriculum gap. The interview signal: "I've built the unbalanced BST from scratch; I know the balancing algorithms conceptually; I haven't implemented an AVL rotation with confidence yet — that's a two-week focused study." That's an honest answer.
 
-**`not yet exercised`: a balanced BST for percentile queries.**
+### Move 2 — tries: prefix lookups in O(key length)
 
-`percentiles()` at `eval/report.eval.ts:161` sorts the whole array every time. If percentiles were computed streaming — added one value at a time and queried repeatedly — an **order-statistic tree** (red-black BST with subtree counts) would give O(log n) insert and O(log n) k-th-largest.
+A trie is a tree where each edge is one character, and each root-to-node path spells out a prefix. It's the primitive behind autocomplete, spell-check, and IP-routing tables.
 
-That's not built here, and probably shouldn't be — the eval runs batch. But it's the answer to "how would you compute running percentiles at scale?" if you got asked.
+```
+  Trie — one edge per character, prefix lookup in O(key length)
+
+               (root)
+              /   |   \
+             a    c    t
+             |    |    |
+            (n) (a)   (o)
+             |    |    |
+            (d) (t)*  (o)*
+             |
+            (*)        * = terminal (a complete word ends here)
+
+  words stored: "and", "cat", "too"
+  search("cat"): 3 hops = O(len("cat"))
+  search("catapult"): 3 hops, then t.next is null → not found
+```
+
+The killer property: search cost is independent of *how many* words are in the trie — only the length of the query matters. A dictionary of 100,000 words and a dictionary of 10 words both search "cat" in 3 hops.
+
+Not exercised in this repo. Would become relevant if you built an autocomplete over event property names — pulling every property matching a `page_` prefix from a hundred thousand events would be the exact shape a trie handles well.
+
+### Move 2 — B-trees: the shape databases actually use
+
+Every relational database's primary key index is a B-tree (or a B+ tree). The shape: nodes hold B keys (not one), have B+1 children, and stay balanced by splitting when full. B is chosen so a node fits in one disk page (typically B ≈ 100-1000).
+
+```
+  B-tree — B-way branching, tuned for disk pages
+
+              [ 10, 30, 60 ]
+             /     |     |    \
+     [1,3,5,7] [11,15,25] [31,40] [70,80,90]
+
+  each node is one page read
+  height stays ~log_B(n) — for n=1B and B=100, height = 5
+  → 5 page reads to find any key, no matter how big the tree
+```
+
+Why databases use this: disk I/O dominates. Reading one page (~4-16 KB) to check 100 keys is way faster than 100 separate page reads to check one key each. The B-tree's whole design is "pack as much as possible into one page and stay balanced."
+
+Not exercised in this repo — there's no persistent database. Would become relevant if you added Postgres or SQLite as a receipt store. `reincodes` doesn't have B-tree either — this is an interview-only primitive to know conceptually.
 
 ### Move 3 — the principle
 
-Trees earn their place when the *hierarchy* is intrinsic to the data or when the *log-depth* buys you a query you can't get from a hash map — ordered lookups, range queries, prefix matches. This codebase doesn't have any of those needs at its current scale. The reader's job is to recognize the shape when it arrives (or when it should).
+**Trees exist to make "contains" and "range" cheap in sorted order.** Every tree variant is a different tradeoff on that theme: unbalanced BST for the raw idea, AVL/red-black for the guarantee, B-tree for the disk-locality, trie for the prefix-lookup, heap for the priority. In this repo none of these earn their keep yet — a Set covers "contains" without ordering, and no data structure needs sorted-order iteration. Know the shapes; know when to reach for them; don't manufacture a use case in code that doesn't need one.
 
-## Primary diagram — the tree family, mapped to fits
+## Primary diagram
+
+The whole family — arrayed by the invariant each maintains — and where each one lives in your work.
 
 ```
-  Tree family — what each one solves, and where it would fit here
+  Trees / tries / balanced indexes — the family map
 
-  ┌─ Rooted tree ────────────────────────────┐   fits: filesystem, DOM
-  │  parent → children, no cycles            │   NOT PRESENT
-  └──────────────────────────────────────────┘
-
-  ┌─ Degenerate list-tree ───────────────────┐   fits: error.cause chain
-  │  each node has degree ≤ 1                │   LIVE at lib/mcp/transport.ts:82
-  └──────────────────────────────────────────┘
-
-  ┌─ Binary search tree ─────────────────────┐   fits: ordered set with
-  │  left < parent < right                   │        range queries
-  └──────────────────────────────────────────┘   NOT PRESENT
-
-  ┌─ Balanced BST (AVL, red-black) ──────────┐   fits: order-statistic
-  │  rotation keeps depth ≤ 2·log₂(n)        │        percentiles
-  └──────────────────────────────────────────┘   NOT PRESENT — would replace
-                                                  percentiles() at scale
-
-  ┌─ Trie / prefix tree ─────────────────────┐   fits: tool-name routing
-  │  depth = key length, branch = alphabet   │        (only worth it at
-  └──────────────────────────────────────────┘        thousands of names)
-                                                  NOT PRESENT
-
-  ┌─ B-tree / B+tree ────────────────────────┐   fits: disk indexes
-  │  high branching factor, shallow depth    │   NOT PRESENT — the database
-  │                                          │        is Bloomreach's problem
-  └──────────────────────────────────────────┘
+  ┌─ SHAPE ──────────────┬─ INVARIANT ──────────┬─ WHERE ────────────┐
+  │                       │                        │                     │
+  │  binary tree          │  each node ≤ 2 kids    │  no repo use        │
+  │                       │                        │                     │
+  │  BST                  │  left < node < right   │  reincodes/         │
+  │                       │                        │  BinarySearchTree.ts│
+  │                       │                        │                     │
+  │  balanced BST         │  BST + height          │  not built yet      │
+  │  (AVL, red-black)     │  invariant             │  ← curriculum gap   │
+  │                       │                        │                     │
+  │  B-tree               │  B-way branching,      │  DBs use it;        │
+  │                       │  fits in disk page     │  not in your code   │
+  │                       │                        │                     │
+  │  trie                 │  one edge per          │  not built yet      │
+  │                       │  character             │  ← curriculum gap   │
+  │                       │                        │                     │
+  │  heap                 │  parent ≤ children     │  reincodes/         │
+  │                       │  (nearly-complete)     │  BinaryHeap.ts      │
+  │                       │                        │                     │
+  │  n-ary tree           │  arbitrary children    │  reincodes/Tree.ts  │
+  └───────────────────────┴────────────────────────┴─────────────────────┘
 ```
 
 ## Elaborate
 
-Trees are the reader's home turf per `me.md` — you've built binary search trees before. What might be less familiar is the **rotation** trick that makes AVL and red-black trees work: after an insert unbalances the tree, one or two local pointer-swaps restore the invariant without touching the rest. Practicing rotations by hand once is worth the hour — you'll never forget the shape.
+Binary search trees date to Windley (1960). The self-balancing family started with AVL (1962), continued with red-black (1972), splay trees (Sleator & Tarjan, 1985), and treaps (Aragon & Seidel, 1989). Each trades a different complexity axis: AVL is strictly balanced (better search, more rotations on insert), red-black is loosely balanced (fewer rotations, slightly deeper), splay trees have great amortized bounds but terrible worst-case per-op, treaps randomize the balance so no input order breaks them.
 
-For interview prep, the tree topics that pay: **serialize/deserialize a binary tree** (Google favorite), **lowest common ancestor** (Meta), **kth-smallest in a BST** (in-order traversal + counter, extends naturally to order-statistic trees).
+B-trees (Bayer & McCreight, 1970) and B+ trees are the shape of every production database index — Postgres, MySQL InnoDB, SQLite, MongoDB, all use B-tree variants. The `+` variant keeps all data in leaves and links them in a list, so range scans are efficient. LSM-trees (Log-Structured Merge, O'Neil et al., 1996) are the alternative — used by Cassandra, RocksDB, LevelDB, HBase — trading read cost for write throughput. Every "SSTable" story in a database book is LSM-tree.
 
-The trie question that always comes up: **word search II** on LeetCode — walk a 2D grid, match against a set of words, prune by prefix. It's a trie + DFS + backtracking mash-up that ties this chapter to `07-recursion-backtracking-and-dynamic-programming.md`.
+Tries got their name from "reTRIEval" (Fredkin, 1960). Compressed variants (radix tree, Patricia trie) are what routing tables use to look up IP prefixes; a `/24` prefix match happens in O(24) hops through a Patricia trie regardless of the full routing-table size. The modern high-performance variant is the Adaptive Radix Tree (ART, 2013), used in newer in-memory databases like DuckDB.
 
-B-trees are the reason your database's index is fast. If you want to *see* one, sqlite's `.dump` prints the shape of its B+tree. Every leaf is an index page.
+Related reading: CLRS chapters 12 (BSTs), 13 (red-black trees), 18 (B-trees). Sedgewick chapter 3 (search trees, tries). "Database Internals" by Petrov is the practical text on B-trees and LSM in production systems.
 
 ## Interview defense
 
-**Q: There's no tree in this repo — but there is a chain walk. Talk about it.**
+**Q: Why doesn't this codebase use any trees?**
 
-Answer: `formatError` at `lib/mcp/transport.ts:82-97` walks an error's `cause` chain top-down, capped at depth 5, joining messages with "caused by:". It's structurally a tree walk, but every node has degree 1, so it degenerates to a list — and it's written iteratively with a while loop, not recursively.
-
-The load-bearing part is the depth cap. A circular cause reference (rare but possible) would infinite-loop without it. That's the same protection a BFS's `visited` set gives you on a real graph — in the degenerate case, "visited" collapses to a depth counter.
+Because the only questions it asks are "is X in this set?" and "give me each item in an unsorted list." Sets and arrays cover both without the constants a tree brings. Trees earn their keep when you need *ordered* iteration, *range* queries, or *prefix* lookups — none of those show up. The moment you add a receipt browser with "show me all receipts between date A and date B," a sorted map (B-tree in a real DB, an ordered array with binary search in memory) starts pulling weight.
 
 ```
-  Bounded traversal — depth counter as "visited" in a degenerate tree
+  When trees vs when hash
 
-  depth = 0    error A
-                  │  .cause
-  depth = 1    error B
-                  │
-   ...
-  depth = 5    STOP  ← safety cap; never rely on the graph being finite
+  hash set / map    → membership, key/value lookup, unordered
+  binary tree       → ordered iteration, range queries
+  trie              → prefix lookup, autocomplete
+  heap              → next-highest / next-lowest priority
+  B-tree            → all of the above, but on disk pages
 ```
 
-Anchor: `lib/mcp/transport.ts:82-97`.
+**Anchor:** "Trees earn their keep for ordered / range / prefix questions — this repo asks membership questions, so Set covers it."
 
-**Q: Where would you reach for a trie in this codebase?**
+**Q: You've built a BST — walk me through delete.**
 
-Answer: I wouldn't today. Tool-name lookup is `Set.has(name)` — O(1) — and there are 40 tools. A trie would be premature. If the catalog grew to thousands of names *and* callers wanted prefix operations (autocomplete, group-by-namespace), then a trie earns its keep because `startsWith(prefix)` returns a whole subtree in O(|prefix|) instead of O(n) filter.
-
-```
-  Set vs Trie — when the trie earns its place
-
-  Set:    membership only, O(1)                        ← current fit
-  Trie:   prefix ops, O(|prefix|) subtree return       ← would need
-                                                          "list tools starting with X"
-```
-
-Anchor: `lib/agents/tool-schemas.ts:13`.
-
-**Q: If you wanted running percentiles instead of batch, what would you build?**
-
-Answer: An order-statistic tree — a red-black BST where each node stores the size of its subtree. Insert is O(log n); k-th-largest is O(log n) by walking down and choosing left or right based on subtree counts. That replaces the current sort-then-index at `eval/report.eval.ts:161-179`, which is O(n log n) per query, batch-only.
-
-For very large streams, the practical answer is a **t-digest** — you give up exact percentiles for a compact sketch that answers p99 in constant memory. That's what production observability stacks (Datadog, Prometheus) actually use.
+Three cases. Node has no children: unlink it from its parent, done. Node has one child: replace the node with its child. Node has two children: find the *in-order successor* (leftmost node of the right subtree), copy its value into the node being deleted, then delete the successor (which now has at most one child, so it recurses into a simpler case). The successor is guaranteed to have no left child — that's why it's the leftmost — so the recursive delete terminates.
 
 ```
-  Percentile strategies
+  BST delete — three cases
 
-  batch sort + index  :  O(n log n)      ← current (report.eval.ts:161)
-  order-statistic BST :  O(log n) insert, O(log n) query   ← streaming, exact
-  t-digest             :  O(1) memory, approximate         ← streaming, at scale
+  case 1: leaf              case 2: one child          case 3: two children
+    (5)                       (5)                        (5)
+   /   \                     /   \                      /   \
+  (3)  (7) ← delete         (3)  (7) ← delete         (3)  (7) ← delete
+                                   \                       /  \
+                                   (8)                    (6)  (8)
+
+  → parent.right = null    → parent.right = (8)     → copy (6) into (7)
+                                                       → delete (6) [now case 1]
 ```
 
-Anchor: `eval/report.eval.ts:161`.
+**Anchor:** "Two-child delete = copy in-order successor's value, then delete the successor (which reduces to case 1 or 2)."
+
+**Q: Why is a red-black tree preferred over AVL in most libraries?**
+
+Red-black trees allow slightly more imbalance — the height ratio between longest and shortest path can be up to 2×, vs AVL's 1.5×. That looser invariant means fewer rotations per insert or delete on average. The trade is slightly deeper trees, so lookups are marginally slower, but the overall throughput on insert-heavy workloads is better. That's why C++ `std::map`, Java's `TreeMap`, Linux kernel schedulers, and a lot of language runtimes reach for red-black. Honest gap: I've read the algorithm but not implemented one from scratch — the rotation cases are the fiddly part, and knowing them cold is a specific study session away.
+
+**Anchor:** "Red-black relaxes the balance invariant → fewer rotations on writes → better throughput on write-heavy workloads. Slightly deeper reads."
+
+**Q: When would you reach for a trie in an app?**
+
+Any autocomplete over a bounded key alphabet. IP-routing tables. Spell-check with edit-distance search (a trie of the dictionary makes candidate generation dramatically faster than a linear scan). In frontend, they show up in libraries like `route-recognizer` for URL routing — matching `/users/:id/posts/:pid` against a request path is a trie walk. Not in this codebase, but if you added property-name autocomplete for the event-schema UI, a trie of property names would give you O(length) lookup no matter how many properties existed.
+
+**Anchor:** "Trie earns its keep the moment 'give me everything with this prefix' shows up as a hot path."
 
 ## See also
 
-- `03-stacks-queues-deques-and-heaps.md` — a binary heap *is* a tree (stored as an array).
-- `05-graphs-and-traversals.md` — trees are the special case of graphs without cycles.
-- `07-recursion-backtracking-and-dynamic-programming.md` — recursive tree traversal, which this repo doesn't do.
-- `.aipe/study-database-systems/` — B-trees as the storage engine's backbone.
+  → `03-stacks-queues-deques-and-heaps.md` — the heap is a tree; the array-backed representation lives there
+  → `05-graphs-and-traversals.md` — trees are graphs with one root and no cycles; DFS on a tree is what these traversals actually are
+  → `06-sorting-searching-and-selection.md` — the O(log n) shape that BSTs and binary search share
+  → `08-dsa-foundations-practice-map.md` — the ranked plan says which of these to practice first (AVL rotations)

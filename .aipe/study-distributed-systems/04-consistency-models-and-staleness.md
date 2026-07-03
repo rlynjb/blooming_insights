@@ -1,480 +1,326 @@
-# consistency-models-and-staleness
+# Consistency Models and Staleness
 
-*Session-scoped state · Warm-instance locality · Read-your-writes escape hatch · Industry standard*
+*Industry name: bounded staleness · read-through cache · Type: Industry standard*
 
 ## Zoom out — where this concept lives
 
-The interesting consistency questions in this repo aren't about a database
-you own (you don't own one). They're about the client, the warm Vercel
-instance, the sessionStorage escape hatch, and how "what the user sees"
-lines up with "what the server just did." The load-bearing thing to
-recognize: **the client's sessionStorage is a more durable store than the
-server's in-memory Map**, and the app knows this.
+Consistency asks a question with teeth: when I read, what am I *allowed* to see? Strong consistency says "always the latest write." Eventual says "eventually the latest, but not right now." Bounded staleness sits in between: "up to N seconds old, no worse."
 
 ```
-  Zoom out — where state lives in this app
+  Zoom out — the consistency surface in this repo
 
-  ┌─ Client layer ────────────────────────────────────────────────┐
-  │  sessionStorage — per-tab investigation cache                 │
-  │  localStorage    — mode toggle (bi:mode)                      │
-  │  ★ SURVIVES WARM-INSTANCE CYCLING ★                           │ ← we are here
-  └─────────────────────────┬─────────────────────────────────────┘
+  ┌─ Client band ──────────────────────────────────────────┐
+  │  browser · reads whatever the SSE stream sends          │
+  │            no consistency guarantees below              │
+  └─────────────────────────┬──────────────────────────────┘
                             │
-  ┌─ Service layer ─────────▼─────────────────────────────────────┐
-  │  Map<sessionId, SessionFeed> — insights, anomalies            │
-  │  Map<insightId, AgentEvent[]> — investigation trace           │
-  │  BloomreachDataSource.cache — per-instance 60s cache          │
-  │  ALL LIVE INSIDE ONE WARM INSTANCE                            │
-  │  scope: instance lifetime (minutes to hours)                  │
-  └─────────────────────────┬─────────────────────────────────────┘
+  ┌─ Server band ───────────▼──────────────────────────────┐
+  │                                                         │
+  │  ★ THIS FILE: what "consistent" means for shared state ★│
+  │                                                         │
+  │  · 60s response cache (per Vercel instance)             │
+  │  · in-mem investigations cache (per Vercel instance)    │
+  │  · auth cookie (per browser session, encrypted)         │
+  │                                                         │
+  └─────────────────────────┬──────────────────────────────┘
                             │
-  ┌─ Provider layer ──────────────────────────────────────────────┐
-  │  Bloomreach — the actual source of truth for workspace data   │
-  │  Anthropic — stateless to us                                  │
-  └────────────────────────────────────────────────────────────────┘
+                            ▼
+                    ┌──────────┐
+                    │MCP server│  ← the truth we cache from
+                    └──────────┘
 ```
 
-Everything server-side is per-warm-instance. The client is the durable
-anchor.
+There is no cross-node consistency in this repo — no replicas, no eventual convergence protocol, no quorum reads. What there is: **bounded staleness at 60 s** (the response cache), and **per-instance state that gets no consistency guarantees at all** (the investigation cache). Naming that plainly is the whole file.
+
+## Zoom in — narrow to the concept
+
+The one applied consistency question in this codebase is: "what does the model see when it reads via the cache?" Answer: **the most recent successful non-error response within the last 60 seconds, per Vercel instance.** That's bounded staleness, not strong consistency. Everything else — the investigations Map, the demo snapshot — is opportunistic and per-instance.
 
 ## Structure pass
 
-### Layers of consistency
+### Layers
+
+- **Browser** — has no shared state to be consistent about. Reads the stream once.
+- **Vercel function instance** — the 60 s response cache, the in-memory investigations Map.
+- **Shared, cross-instance** — the encrypted auth cookie (browser-owned), the demo JSON snapshot (git-committed, effectively read-only).
+- **External** — the MCP server's own consistency (out of scope; different guide).
+
+### One axis held constant — "what's the guaranteed freshness?"
 
 ```
-  Four questions, held constant across layers:
-  "when a write happens here, when does a read see it?"
+  Axis: freshness bound at each layer
 
-  ┌───────────────────────────────────────────────┐
-  │ client (browser)                               │
-  │   write: sessionStorage.setItem(...)           │
-  │   read:  sessionStorage.getItem(...)           │
-  │   consistency: strong (same tab, same domain)  │  synchronous
-  └───────────────────────────────────────────────┘
-      ┌───────────────────────────────────────────────┐
-      │ warm Vercel instance                          │
-      │   write: state.set(sid, feed)                 │
-      │   read:  state.get(sid)                       │
-      │   consistency: strong within instance,         │  sticky is best-effort
-      │                NONE across instances           │
-      └───────────────────────────────────────────────┘
-          ┌───────────────────────────────────────────┐
-          │ Bloomreach                                 │
-          │   write: none (we don't write)             │
-          │   read:  execute_analytics_eql             │
-          │   consistency: whatever their engine        │  (out of scope)
-          │                offers                       │
-          └───────────────────────────────────────────┘
+  browser                → whatever it displays now
+                           reload → fresh stream from server
+                           freshness = "as of this stream"
+
+  Vercel instance A      → cache hit: up to 60s old
+                           cache miss: fresh (server round-trip)
+
+  Vercel instance B      → cache is EMPTY on cold start
+                           first call: always fresh
+
+  auth cookie            → 10-day TTL (AUTH_COOKIE_MAX_AGE)
+                           any instance can decrypt any cookie
+                           cross-instance = consistent by construction
+
+  demo snapshot          → git-committed, changes only on deploy
+                           strong per-deploy, no runtime updates
+
+  MCP server truth       → whatever the tenant's real system says
+                           we don't reason about its internal consistency
 ```
 
-The answer at the middle layer is the interesting one: **strong within an
-instance, nothing across.** That's the constraint the client-side
-sessionStorage exists to work around.
-
-### One axis — "how does state survive a warm-instance cycle?"
-
-Trace it:
-
-```
-  Vercel warm instance cycles: what survives, what doesn't?
-
-  before:          instance A serves user X → putInsights → Map has data
-  cycle:           instance A gets evicted / redeployed / cold-drained
-  after:           instance B serves user X → getInsight returns null
-
-  what survives?
-    ✗ in-memory Map<sid, SessionFeed>       (lost)
-    ✗ BloomreachDataSource.cache Map        (lost)
-    ✗ dev file .investigation-cache.json    (dev only)
-    ✓ committed lib/state/demo-*.json       (demo mode only)
-    ✓ encrypted bi_auth cookie              (client-owned)
-    ✓ bi_session cookie                     (client-owned)
-    ✓ sessionStorage per-tab data           (client-owned)
-    ✓ localStorage bi:mode                  (client-owned)
-```
-
-The pattern: **client-owned survives, server-owned doesn't.** Which is
-why the `useInvestigation` hook exists — the app builds around this
-constraint rather than fighting it.
+The interesting flip: **instance A vs instance B** for the response cache. Same key, same 60 s TTL, but they don't share. That's per-instance bounded staleness with zero convergence between instances.
 
 ### Seams
 
-- **The session-id seam** — `getOrCreateSessionId()` at
-  `lib/mcp/session.ts:16` gives every browser a stable id via the
-  `bi_session` cookie. This seam is what lets the server-side Map be
-  "per-session" instead of "shared across users on the same instance."
-  Load-bearing for isolation.
-
-- **The client-cache-first seam** — the `/api/agent` route at
-  `app/api/agent/route.ts:125-142` checks the on-disk cache
-  (`getCachedInvestigation`) BEFORE any live work. This is the seam
-  where "the answer might already exist" is honored, saving the whole
-  agent invocation. In production the disk cache is empty (serverless
-  FS), so this path only fires for the committed demo snapshot.
-
-- **The `sessionStorage → ?insight= param` seam** — the client stashes
-  the whole Insight object in sessionStorage on card click, then hands
-  it forward as `?insight=<JSON>` on the investigate route. The server
-  reads it via `resolveAnomaly` at `app/api/agent/route.ts:35-45`. This
-  seam is the app's read-your-writes escape hatch — see the next block.
+- **Cache read seam** (`bloomreach-data-source.ts:147`): if hit AND not expired, return cached. Otherwise round-trip. This is the staleness bound.
+- **Cross-instance seam**: doesn't exist for the response cache or the investigations Map. Only the auth cookie crosses instances, and it crosses via the browser (round-trip through the client).
 
 ## How it works
 
-### Move 1 — the mental model: strong within an instance, sessionStorage across
+### Move 1 — the mental model
 
-You know how a React component's local `useState` lives only as long as
-that component is mounted? A Vercel warm instance's in-memory Map is the
-same idea, at a bigger scale — it lives only as long as the instance is
-warm. Whatever needs to survive longer has to move to a store the
-INSTANCE doesn't own.
+You've written a memoized HTTP fetch with a TTL — that's exactly this pattern. The distributed-systems angle: since Vercel autoscales, "the cache" isn't one cache. It's N caches, one per instance, each independently 60 s stale.
 
 ```
-  The pattern — client is the durable store, server is the cache
+  The pattern — per-instance bounded staleness
 
-     ┌─ client ─────────────────────┐
-     │  sessionStorage (per-tab)    │  ← DURABLE for a browsing session
-     │  localStorage   (per-domain) │  ← DURABLE across sessions
-     │  cookies        (per-domain) │  ← DURABLE, sent with each request
-     └──────────────┬───────────────┘
-                    │
-                    │  bi_session cookie (session id)
-                    │  ?insight=<JSON> (per-request payload)
-                    ▼
-     ┌─ warm instance ──────────────┐
-     │  Map<sid, SessionFeed>        │  ← EPHEMERAL, per-instance
-     │  BloomreachDataSource.cache   │  ← EPHEMERAL, per-instance, 60s TTL
-     └──────────────┬───────────────┘
-                    │
-                    ▼
-     ┌─ Bloomreach ─────────────────┐
-     │  source of truth              │  ← DURABLE but expensive to read
-     └───────────────────────────────┘
+    request 1              request 2              request 3
+        │                      │                      │
+        ▼                      ▼                      ▼
+  ┌──────────┐          ┌──────────┐          ┌──────────┐
+  │Instance A│          │Instance A│          │Instance B│
+  │ (cache X)│          │ (cache X)│          │ (cache ∅)│
+  └────┬─────┘          └────┬─────┘          └────┬─────┘
+       │                     │                     │
+   fresh fetch          cache hit                fresh fetch
+   populate X             (< 60s)               populate X'
+       │                     │                     │
+       ▼                     ▼                     ▼
+    server               (no server)             server
+
+  A and B never share. Each has its own X.
+  Bounded staleness AT EACH INSTANCE. Not across.
 ```
 
-The consistency picture is: **each layer trades durability for latency**.
-Client is durable but slow to read into the server (requires a request).
-Server cache is fast but ephemeral. Bloomreach is durable but rate-limited
-and expensive.
+The kernel: **cache with TTL bounds staleness in one place; scale-out multiplies the number of places.** If you want cross-instance freshness, you need external state (Redis, KV, cookie). This repo doesn't reach for that yet.
 
-### Move 2 — walk the mechanism
+### Move 2 — the walkthrough
 
-#### Session isolation — the outer Map is never cleared
+#### The response cache — bounded staleness at 60 s
 
-`lib/state/insights.ts:14` — `state = new Map<string, SessionFeed>()`.
-The outer map keyed by session id. `putInsights` clears only the
-caller's sub-map, never the outer map:
+The read is guarded by expiry:
 
-```typescript
-// lib/state/insights.ts:57-71
-export function putInsights(sessionId: string, items: Insight[], rawAnomalies?: Anomaly[]): void {
-  // Replace the previous briefing for THIS session — each run IS the current
-  // feed, not an addition. Without clearing, a warm serverless instance (or a
-  // long-running dev server) accumulates stale insights from earlier runs, so
-  // the feed shows yesterday's anomalies alongside today's. Investigations are
-  // keyed separately and untouched here. Only this session's sub-maps are
-  // cleared — never the outer map, never another session's feed.
-  const s = sessionState(sessionId);
-  s.insights.clear();
-  s.anomalies.clear();
-  items.forEach((i, idx) => {
-    s.insights.set(i.id, i);
-    if (rawAnomalies?.[idx]) s.anomalies.set(i.id, rawAnomalies[idx]);
-  });
-}
-```
-
-Bridge from what you know: this is the same shape as multi-tenant
-isolation in a shared React context — you key by tenant id, and the
-"clear my data" operation only clears the tenant's slice.
-
-**Load-bearing part: the two `.clear()` calls are on
-`s.insights` and `s.anomalies`, NOT on `state`.** If the code cleared
-`state` instead of `s.insights`, a `putInsights` on one session would
-wipe every other session's feed mid-briefing. In the shared warm
-instance model, that's a cross-tenant data leak by another name — one
-user's briefing wipes another user's feed. The comment at `:63-66`
-names this exact hazard.
-
-#### The 60s cache is per-instance (staleness across instances is fine)
-
-`BloomreachDataSource.cache` at `bloomreach-data-source.ts:122` is a
-per-instance `Map`. Two warm instances serving the same session-id
-each have their own copy. This is a "strong within instance, no
-guarantee across" consistency model, and it's fine because:
-
-- **60s TTL bounds the staleness** — even the most stale entry expires
-  within a minute
-- **Reads don't cross instances mid-request** — one request opens one
-  stream, lives on one instance
-- **The tools are read-only** — a stale answer is just an older number,
-  not a wrong write
-
-The consistency contract is "eventually consistent across instances,
-bounded by 60s." Which is exactly what you'd want for read-only data
-that's expensive to fetch.
-
-#### The client-side sessionStorage escape hatch — read-your-writes
-
-This is the piece that makes the whole story work. The user clicks
-an insight card on the feed, then navigates to the investigate page.
-The insight has to survive that navigation, and the warm instance's
-in-memory Map might not.
-
-Look at how the card handoff works:
-
-```
-  sessionStorage as the read-your-writes hop
-
-  feed page:
-    click insightCard
-    ────────────────►  sessionStorage.setItem(`bi:insight:${id}`, JSON.stringify(insight))
-    router.push(`/investigate/${id}?insight=<encoded>`)
-
-  investigate page:
-    reads ?insight= param OR sessionStorage
-    ────────────────────►  fetch('/api/agent?insightId=X&insight=<JSON>')
-
-  server (route.ts:35-45):
-    resolveAnomaly:
-      1. try parse insightParam → use it if valid    ← THE ESCAPE HATCH
-      2. fall back to state.get(sid, id)              ← instance-local
-      3. fall back to committed demo snapshot         ← only in demo
-```
-
-The `insight` query param IS the client's answer to "I just wrote this
-insight; you might not remember it." The server prefers the parameter
-because it's the only source that survives Vercel's per-instance
-memory (comment at `app/api/agent/route.ts:35-38`).
-
-**Load-bearing part: the ORDER of the fallbacks in `resolveAnomaly`.**
-Client-provided wins. In-memory second. Committed snapshot last. If
-you flipped this order, a stale in-memory entry would win over the
-fresh one the client just sent — same class of bug as reading from a
-stale replica when the client just wrote to the leader.
-
-#### The two-step investigate flow — client-side handoff, not server-side
-
-Related pattern. The investigate page runs in two steps:
-
-```
-  Step 2 → Step 3 handoff
-
-  investigate/[id]/page.tsx (step 2)         investigate/[id]/recommend/page.tsx (step 3)
-      │                                          │
-      │ runs DiagnosticAgent                     │ runs RecommendationAgent
-      │ produces `diagnosis`                     │ needs `diagnosis` as input
-      │                                          │
-      └── stash diagnosis in sessionStorage ─────┘
-          via useInvestigation hook               (server passes ?diagnosis=<JSON>)
-```
-
-The diagnosis goes through the client, not the server. The server has
-no cross-request memory of what step 2 produced. Same reason as
-insights: the client is the durable anchor.
-
-Server-side proof:
-
-```typescript
-// app/api/agent/route.ts:267-272 (excerpt)
-if (step === 'recommend') {
-  // STEP 3: the diagnosis was handed over from step 2.
-  diagnosis = parseDiagnosis(diagnosisParam);
-  if (!diagnosis) {
-    throw new Error('no diagnosis was handed over — open the diagnosis step first');
+```ts
+// lib/data-source/bloomreach-data-source.ts:147
+if (!options.skipCache) {
+  const cached = this.cache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return { result: cached.result as T, durationMs: 0, fromCache: true };
   }
 }
 ```
 
-`parseDiagnosis(diagnosisParam)` reads the client's handoff. If the
-handoff is missing, the server can't reconstruct — hard error.
+`expiresAt > Date.now()` is the entire staleness contract. If the entry hasn't expired, the cached value is served regardless of how many times the underlying data has changed on the MCP server. That's a **read-your-writes-within-instance** guarantee for the model — if the same investigation writes tool_result X, then asks for the same tool_call, it sees X.
 
-### The skeleton — what "consistency" reduces to
+**Failure mode this hides**: the model can't see writes from *another* instance's calls. Not a problem because there's nothing coordinated — but if two instances processed the same investigation concurrently (impossible today; the browser only opens one stream), they'd diverge.
 
-Isolate the kernel. The pattern is: "client owns durable state, server
-owns ephemeral cache, requests carry state forward through query params
-and sessionStorage."
+```
+  Staleness bound at read time
 
-What breaks without each part:
+  now = T
+  entry.expiresAt = T + 45s   → return cached  (bounded 45s stale)
+  entry.expiresAt = T - 5s    → miss, refetch  (staleness bound reset)
+```
 
-- **Drop the client-forward handoff (`?insight=`, `?diagnosis=`)** — a
-  warm instance cycle mid-investigation breaks step 2 → step 3. The
-  user clicks "see recommendations" and gets "no diagnosis was handed
-  over." Breaks the entire two-step flow.
-- **Drop session isolation (outer Map keyed by sid)** — every warm
-  instance's Map holds one user's data at a time, or worse, mixes
-  users. Cross-tenant leak.
-- **Drop the `isError` guard on the 60s cache** — a transient error
-  gets cached; every read within 60s returns the error. Recovery
-  takes 60s. (Same finding as file 03 — the mechanism serves both
-  delivery and consistency.)
-- **Drop the fallback order in `resolveAnomaly`** — the server prefers
-  stale in-memory data over what the client just wrote. Classic
-  stale-replica bug pattern.
+#### The investigations Map — no consistency guarantee
 
-### Optional hardening layered on top
+`lib/state/investigations.ts:11` — top-level `mem` Map. Written in `saveInvestigation`, read in `getCachedInvestigation`. Purely opportunistic:
 
-- **The auth cookie's 10-day `maxAge`** at `lib/mcp/auth.ts:49` — bounds
-  how long an encrypted-cookie auth store outlives an instance cycle.
-  Tokens expire in minutes on the alpha, but the cookie carrying them
-  lives longer, so the app can prompt for re-auth without losing the
-  full session.
-- **`throwIfAborted()` sprinkled throughout the routes** — every phase
-  boundary in `/api/briefing` and `/api/agent` checks `req.signal`
-  before doing work. If the client navigated away, the server doesn't
-  keep computing values that no reader wants. Bounds staleness of the
-  ABORTED case.
-- **`useInvestigation` deliberately survives StrictMode double-mount**
-  — the hook does NOT cancel the in-flight fetch on cleanup, which is
-  intentional (comment cited in `.aipe/project/context.md`). React 19
-  StrictMode mounts twice; cancelling on the first cleanup would abort
-  a valid in-flight investigation and force a redo.
+```ts
+// lib/state/investigations.ts:22
+export function getCachedInvestigation(insightId: string): AgentEvent[] | null {
+  if (mem.has(insightId)) return mem.get(insightId)!;
+  const fromFile = PERSIST ? readJson(CACHE_FILE)[insightId] : undefined;
+  if (fromFile) return fromFile;
+  const fromDemo = readJson(DEMO_FILE)[insightId];
+  return fromDemo ?? null;
+}
+```
+
+Three-tier read: in-memory Map (this instance) → dev file (this dev machine) → git-committed demo snapshot. In production only the first and third tiers exist (Vercel FS is read-only). No convergence. No cross-instance sharing.
+
+**This is opportunistic replay, not consistency**. If instance A ran the investigation and cached it, only instance A can replay it. Instance B on a subsequent request would recompute from scratch (or serve the demo snapshot if the insight matches one).
+
+#### The auth cookie — the exception
+
+The one piece of "distributed state" done right. `lib/mcp/auth.ts:86` `withAuthCookies`:
+
+```ts
+// lib/mcp/auth.ts:86
+export async function withAuthCookies<T>(fn: () => Promise<T>): Promise<T> {
+  if (process.env.NODE_ENV !== 'production') return fn();
+  const raw = (await cookies()).get(AUTH_COOKIE)?.value;
+  const ctx: RequestStore = { store: raw ? decryptStore(raw) : {}, dirty: false };
+  const result = await requestStore.run(ctx, fn);
+  if (ctx.dirty) {
+    (await cookies()).set(AUTH_COOKIE, encryptStore(ctx.store), {…});
+  }
+  return result;
+}
+```
+
+Any Vercel instance can decrypt any cookie because the cookie is encrypted under `AUTH_SECRET` (shared across all instances via env var). **This achieves strong consistency across instances by construction**: the state lives in the browser, and the crypto key is shared. No coordination protocol needed.
+
+```
+  Auth cookie — strong consistency by construction
+
+  Browser
+    ↑↓ cookie (AES-256-GCM under AUTH_SECRET)
+  ┌─────────────┬─────────────┐
+  │ Instance A  │ Instance B  │
+  │ decrypt(k)  │ decrypt(k)  │  same key, same view
+  │ mutate      │ mutate      │  writes race, but each
+  │ encrypt(k)  │ encrypt(k)  │  request is a single-writer
+  └─────────────┴─────────────┘  read-modify-write on ITS cookie
+                                 (not a shared row)
+```
+
+The race that could exist — two tabs updating the auth store concurrently — doesn't matter because each browser holds ONE cookie. Cross-tab, whoever writes last wins. Since the only writes are OAuth token refreshes (rare, minutes apart), that's fine.
+
+#### The AsyncLocalStorage read-through — request isolation
+
+Inside a single request, the auth store operates on a snapshot. `lib/mcp/auth.ts:47`:
+
+```ts
+const requestStore = new AsyncLocalStorage<RequestStore>();
+```
+
+The upstream comment explains why: "To avoid Next's request-vs-response cookie split (a read *after* a set in the same request returns the OLD value), we never touch the cookie per provider-method call. `withAuthCookies` seeds an AsyncLocalStorage-scoped store from the cookie ONCE at the start of the request and flushes it back ONCE at the end."
+
+**This is a read-your-writes guarantee within a request**: any read after a write in the same request sees the new value. Achieved by keeping the in-flight state in ALS instead of round-tripping through Next's cookie API.
+
+```
+  ALS-scoped store — read-your-writes within one request
+
+  request start
+    │
+    │ decrypt cookie → seed store
+    │
+    ├─ provider.saveTokens(t)     → store.tokens = t; dirty=true
+    ├─ provider.tokens()          → store.tokens (sees the write)
+    ├─ provider.saveClientInfo(i) → store.clientInfo = i; dirty=true
+    │
+    │ if dirty → encrypt store → set cookie
+  request end
+```
+
+### Move 2.5 — current state vs future state
+
+```
+  Phase A (now):                    Phase B (if scale demands):
+  ──────────────                    ─────────────────────────
+
+  · response cache PER instance     · shared cache in Redis / KV
+    60s TTL, no sharing               (Vercel KV, Upstash)
+                                    · cross-instance dedup
+  · investigations Map PER instance · shared investigations store
+    opportunistic replay              (durable, queryable)
+
+  · auth cookie shared              · unchanged; already right
+    (cross-instance, encrypted)     · maybe a KV lookup for session
+                                      auth if cookies grow
+
+  when B becomes worth it:
+    · Bloomreach 429s dominate → shared cache cuts requests
+    · users demand history → shared investigations enable it
+    · multi-tab investigations → shared state avoids divergence
+```
+
+The takeaway: **most of what's per-instance today wouldn't need to change if users stayed single-tab, single-investigation.** The consistency story only becomes a limitation when the product grows.
 
 ### Move 3 — the principle
 
-**When the server can't remember, teach the client to remind it.** In
-a stateless-runtime architecture (Vercel serverless, AWS Lambda, Cloud
-Run), server memory is the least durable store in the whole system. The
-practical consistency model isn't "eventually consistent" — it's "the
-client owns the durable copy, the server is a cache, and every
-request carries the state forward that the server can't guarantee will
-still be there next request." Recognize this shape and design UI state
-around it; fight it and you'll write cache invalidation code
-indefinitely.
+**Bounded staleness is a real consistency model, not "we didn't bother."** Naming your staleness bound (60 s here) is a design decision with tradeoffs: freshness vs load on the upstream. A cache without a stated bound is a bug waiting to be called; a 60 s TTL is a legible contract. The two questions to ask when you write a cache: "how stale is 'stale enough'?" and "who bounds the staleness?" This repo's answer: 60 s, at the McpDataSource layer.
 
-## Primary diagram — the consistency picture in one frame
+## Primary diagram
+
+The staleness story, one frame:
 
 ```
-  Consistency + durability, one frame
+  Consistency + staleness bounds — the whole picture
 
-  ┌─ Client (browser) — DURABLE ─────────────────────────────────────────┐
-  │                                                                       │
-  │   sessionStorage `bi:insight:${id}`   → survives page nav in-tab      │
-  │   sessionStorage `bi:investigation:${id}` → survives step 2 → step 3  │
-  │   localStorage    `bi:mode`           → survives close/reopen         │
-  │   cookies         `bi_session`, `bi_auth` → sent with each request    │
-  │                                                                       │
-  └───────┬───────────────────────────────────────────────────────────────┘
-          │
-          │  request carries:
-          │    - bi_session cookie (session id)
-          │    - ?insight=<JSON>   (client's copy of the write)
-          │    - ?diagnosis=<JSON> (step 2's output for step 3)
-          ▼
-  ┌─ Warm instance — EPHEMERAL ──────────────────────────────────────────┐
-  │                                                                       │
-  │   state: Map<sessionId, SessionFeed>                                  │
-  │       ├─ insights: Map<insightId, Insight>                            │
-  │       ├─ investigations: Map<insightId, Investigation>                │
-  │       └─ anomalies: Map<insightId, Anomaly>                           │
-  │       (lib/state/insights.ts:8-14 — keyed by session, isolated)       │
-  │                                                                       │
-  │   BloomreachDataSource.cache: Map<`${name}:${args}`, cachedResult>    │
-  │       (bloomreach-data-source.ts:122 — 60s TTL, no cross-instance)    │
-  │                                                                       │
-  │   resolveAnomaly fallback order:                                      │
-  │     ①  client-provided ?insight=  (survives instance cycle)           │
-  │     ②  state.get(sid, id)         (this instance's memory)            │
-  │     ③  committed demo snapshot    (demo mode only)                    │
-  │                                                                       │
-  └───────┬───────────────────────────────────────────────────────────────┘
-          │  hop B (rate-limited)
-          ▼
-  ┌─ Bloomreach — source of truth ─────────────────────────────────────┐
-  │  authoritative workspace data                                      │
-  └────────────────────────────────────────────────────────────────────┘
+  ┌─ Browser ──────────────────────────────────────────────┐
+  │  state: cookies (bi_session, bi_auth),                  │
+  │         localStorage[bi:mcp_config]                     │
+  │  consistency: single-writer per browser; strong within  │
+  └─────────────────────────┬──────────────────────────────┘
+                            │
+  ┌─ Vercel instance A ─────▼──────────────────────────────┐
+  │  ┌ 60s response cache ─┐   ┌─ investigations Map ────┐ │
+  │  │ bounded staleness   │   │ opportunistic replay    │ │
+  │  │ 60s TTL             │   │ per-instance only       │ │
+  │  │ no-cache-on-error   │   │ no cross-instance share │ │
+  │  └─────────────────────┘   └─────────────────────────┘ │
+  │  ┌ ALS auth store ────┐                                │
+  │  │ read-your-writes   │                                │
+  │  │ within one request │                                │
+  │  └────────────────────┘                                │
+  └────────────────────────────────────────────────────────┘
+  ┌─ Vercel instance B (independent) ──────────────────────┐
+  │  same shape, EMPTY caches on cold start                 │
+  │  independent staleness bound (also 60s, own clock)      │
+  └─────────────────────────┬──────────────────────────────┘
+                            │
+  ┌─ Auth cookie (cross-instance, browser-durable) ─────────┐
+  │  encrypted under AUTH_SECRET                            │
+  │  strong consistency by construction                     │
+  └─────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The pattern you're seeing here — "durable client + ephemeral server +
-request-carries-state" — is the same shape as:
+Formal consistency models: linearizable > sequential > causal > eventual. Bounded staleness is a variant of eventual with a staleness ceiling — Cosmos DB and Cloudant use it as a first-class read tier. Read-your-writes is a *session guarantee*, not a system-wide consistency model, and it's what ALS gives you within one request.
 
-- **JWT-based auth** — every request carries the token; the server never
-  remembers you between requests. Same trade: instance-agnostic, no
-  shared store required.
-- **URL-as-state SPAs** — the URL carries the app state (filters,
-  selection, page); reload restores it. Same trade: bookmarkable,
-  shareable, but the URL gets long.
-- **React Server Components with client-provided context** — the RSC
-  runs stateless; the client feeds context forward with each render.
+**Cache invalidation** — the second-hard-problem-in-CS story — is delegated here to the TTL. No pub/sub invalidation, no version stamps, no LRU eviction (only TTL). That's fine because:
 
-Where this pattern breaks in a larger system:
+- One writer per cache: the model, feeding through McpDataSource.
+- Read-only underlying data: a 60 s stale read of `list_projects` is still correct enough to reason about.
+- Bounded absolute lifetime: 60 s is the whole TTL; explicit `skipCache` overrides for the `/debug` "force fresh" path.
 
-- **When the state is too big to fit in a query param or a cookie** —
-  encrypted cookies max out at ~4KB in practice (browser limits are
-  larger but headers get expensive). This app's insight/diagnosis
-  objects fit; a full investigation trace does not (it's stashed in
-  sessionStorage, not the URL).
-- **When multiple tabs need to share state** — sessionStorage is
-  per-tab. If a user opens two tabs to the same insight, each runs
-  its own investigation. The system doesn't dedup across tabs.
-- **When you need read-your-writes across users** — this system is
-  strictly per-user; two users on one instance can't see each other's
-  insights (by design). If you had shared workspace state (team
-  view), the client-side stash wouldn't help — you'd need a real
-  shared store.
+**The auth cookie's crypto is what makes distributed state cheap here.** Every alternative — shared Redis session, JWT with backend validation, cookie-keyed KV lookup — trades a round-trip for stronger guarantees. AES-256-GCM under a shared secret gives you "any instance can act on any request" without any round-trip. See `lib/mcp/auth.ts:62` for the encryption; `lib/mcp/auth.ts:38-46` for the comment on why this choice.
 
-The `useInvestigation` hook's decision to NOT cancel the in-flight
-fetch on StrictMode cleanup (`.aipe/project/context.md` line 84) is a
-consistency call: better to complete the write to the server than to
-abort it and possibly restart cold. That's a "prefer completing an
-in-flight write to starting a fresh one" rule — a small but real
-distributed-systems principle.
+Related: `study-database-systems` walks the cookie's storage-level story (why AES-GCM, why SameSite=None for the OAuth return). `study-security` walks the trust boundary. This file only cares that "any instance can read any cookie" is a strong-consistency property achieved without coordination.
 
 ## Interview defense
 
-### Q: "How does state stay consistent across the browser and the server?"
+**Q: "What's your cache's consistency model?"**
 
-Sketch this:
+A: Bounded staleness at 60 s, per Vercel instance. Cache key is `${name}:${JSON.stringify(args)}`; entries expire at `now + 60_000`. A read that finds a fresh entry serves it; otherwise the retry ladder runs. No cross-instance sharing — instance A's cache and instance B's cache are independent.
 
 ```
-     client (durable)          server (ephemeral)
-     ────────────────          ──────────────────
-     sessionStorage ──────────► ?insight=<JSON>
-     sessionStorage ──────────► ?diagnosis=<JSON>
-     bi_session cookie ───────► Map<sid, SessionFeed>
-                                (this instance only)
+   inst A cache: [X, 45s left]  →  read X → hit
+   inst B cache: [empty]        →  read X → fresh fetch, populate
+
+   → same X, different instances, different freshness
 ```
 
-"The client is the durable store; the server is a cache. Every request
-carries the state forward that the server can't guarantee will be
-there — the insight object rides `?insight=<JSON>` from the feed to
-the investigate route, the diagnosis rides `?diagnosis=<JSON>` from
-step 2 to step 3. Server-side memory is a per-warm-instance Map keyed
-by session id — strong within an instance, no guarantee across.
-`resolveAnomaly` prefers the client-provided payload over the
-in-memory copy, which is the read-your-writes escape hatch. This is
-because a Vercel warm instance cycle mid-investigation would otherwise
-lose the state."
+**Load-bearing gotcha**: on Vercel's autoscaling model, "the cache is warm" is a per-instance assumption. First request to a new instance is always a cache miss, so the retry ladder has to hold every time. The cache is opportunistic; correctness lives in the ladder.
 
-Anchors: `app/api/agent/route.ts:35-58` (resolveAnomaly),
-`lib/state/insights.ts:57-71` (session isolation),
-`lib/hooks/useInvestigation.ts` (the client-side stash).
+**Q: "How does the auth cookie stay consistent across instances?"**
 
-### Q: "What breaks if the outer Map key isn't the session id?"
+A: Cryptographic construction. Every Vercel instance has `AUTH_SECRET` in its env; they all derive the same AES-256-GCM key. Any instance can decrypt any cookie the app has ever set. The state lives in the browser; the instances are stateless. No coordination protocol, no shared session store.
 
-"Cross-tenant leak. If the outer key were something shared across users
-(a global feed key), one user's `putInsights` would `.clear()` and
-overwrite everyone else's data. The comment at `lib/state/insights.ts:8`
-names this exact hazard — a single warm instance serves many users
-concurrently. The session-id partition is what keeps user A's briefing
-from wiping user B's feed mid-request."
+**Anchor**: `lib/mcp/auth.ts:62` (aesKey) and `lib/mcp/auth.ts:86` (withAuthCookies — ALS-scoped read-through).
 
-### Q: "What's the consistency model of the 60s response cache?"
+**Q: "When would you need to move to a shared cache?"**
 
-"Per-instance strong, cross-instance eventually consistent bounded by
-60s. Two warm instances serving the same session-id each have their
-own cache Map, so one instance can serve a stale answer for up to 60s
-after another instance saw a fresh one. Which is fine: the tools are
-read-only, staleness manifests as an older number, not a wrong write.
-If we needed cross-instance consistency, we'd use Vercel KV or
-Upstash — standard escape hatch. Don't need it yet."
+A: When Bloomreach 429s dominate the latency budget. Right now the cache is per-instance and the retry ladder covers the 429 case. If load grew such that instances were being scaled aggressively and each cold instance was triggering fresh 10 s retry waits, a shared cache (Vercel KV, Upstash) would cut those. Until then, the 60 s per-instance TTL is doing enough.
 
 ## See also
 
-- 03-idempotency-deduplication-and-delivery-semantics.md — the cache
-  from the delivery-semantics angle
-- 07-clocks-coordination-and-leadership.md — the OAuth cookie survives
-  instance cycles for the same reason sessionStorage does
-- 09-distributed-systems-red-flags-audit.md — the "no shared cache"
-  risk ranking
+- `03-idempotency-deduplication-and-delivery-semantics.md` — the cache's dedup role.
+- `01-distributed-system-map.md` — where the shared state actually crosses instances (only the cookie).
+- `09-distributed-systems-red-flags-audit.md` — the per-instance cache is the top-of-list risk.

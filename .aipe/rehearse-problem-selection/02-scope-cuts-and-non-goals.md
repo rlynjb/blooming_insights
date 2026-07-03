@@ -53,9 +53,9 @@ These are the cuts that held. Each one has a specific "what breaks if you re-add
 
 None of those are goals. The DB would carry weight it doesn't need to carry.
 
-**What re-adding it would cost.** ORM choice, migration file discipline, connection pooling in a serverless env (Vercel), auth-per-user (currently the OAuth is per-machine, per-session), a whole new class of bugs (leaked connections, migration drift), and — most damning — it would make the demo/live toggle harder, because the committed demo snapshot would have to sync to the DB rather than being read as plain JSON.
+**What re-adding it would cost.** ORM choice, migration file discipline, connection pooling in a serverless env (Vercel), auth-per-user (currently the OAuth is per-machine, per-session), a whole new class of bugs (leaked connections, migration drift), and — most damning — it would make the `live-synthetic` / `demo` mode gradient harder, because the committed `demo` snapshot would have to sync to the DB rather than being read as plain JSON.
 
-**The receipt.** Committed demo snapshots at `lib/state/demo-insights.json`, `lib/state/demo-investigations.json`. Zero DB code in the repo. The 24-test / 221-passing test suite runs without any DB fixture.
+**The receipt.** Committed demo snapshots at `lib/state/demo-insights.json`, `lib/state/demo-investigations.json`. Zero DB code in the repo. The 261-test suite runs without any DB fixture.
 
 ### No LLM supervisor — deterministic route code
 
@@ -136,11 +136,11 @@ This is the pile the review room actually cares about. Anyone can cut features. 
 
 **What un-cutting it looked like — receipt-backed:**
 
-- **FaultInjectingDataSource decorator.** Wraps a real DataSource and injects failures at the port boundary. Third offline use of the DataSource seam (after SyntheticDataSource for demo mode). Zero caller-surface changes — the agents don't know they're talking to an injected-failure adapter vs a real one.
+- **FaultInjectingDataSource decorator.** Wraps a real DataSource and injects failures at the port boundary. Fourth shipped use of the DataSource seam (after Olist add, Olist remove, Synthetic add). Zero caller-surface changes — the agents don't know they're talking to an injected-failure adapter vs a real one.
 - **9 injected faults across 3 investigations.** Timeouts, malformed responses, transient errors.
 - **0 failed.** Every injection was recovered by the loop's existing retry + rate-limit logic in `lib/mcp/client.ts`.
 
-**The interview line.** *"Fault tolerance was aspirational at v1. Once the DataSource seam matured, I added a FaultInjectingDataSource decorator — the third offline use of that seam. 9 faults injected across 3 investigations, 0 failed. That's a real drill, not a claim."*
+**The interview line.** *"Fault tolerance was aspirational at v1. Once the DataSource seam matured, I added a FaultInjectingDataSource decorator — the fourth shipped use of that seam. 9 faults injected across 3 investigations, 0 failed. That's a real drill, not a claim."*
 
 ## Pile 3 — kept cut on purpose
 

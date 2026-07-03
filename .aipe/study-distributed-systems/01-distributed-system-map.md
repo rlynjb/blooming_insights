@@ -1,391 +1,293 @@
-# distributed-system-map
+# Distributed System Map
 
-*Coordination map · Industry standard*
+*Industry name: coordination map / topology diagram · Type: Language-agnostic*
 
 ## Zoom out — where this concept lives
 
-You're about to look at your only distributed hop. Everything else in the
-codebase is in-process or same-machine. The Bloomreach MCP server is the
-single external system this app coordinates with, and every partial-failure
-mechanism you have exists to defend that boundary.
+Every distributed-systems audit opens with a picture: what participants exist, which arrows carry messages, who owns what state, and where the trust boundaries are. Without that picture, the rest of the vocabulary — timeouts, retries, quorums, sagas — has nothing to attach to. Here's the whole system, one frame:
 
 ```
-  Zoom out — the whole system as layers
+  Blooming insights coordination map — three bands, one hop out
 
-  ┌─ Client layer (browser) ──────────────────────────────────────┐
-  │  React 19 / Next 16 app router                                │
-  │  fetch() + ReadableStream reader                              │
-  │  sessionStorage (per-tab investigation cache)                 │
-  └───────────────────────────┬───────────────────────────────────┘
-                              │  hop A — same-origin HTTPS
-  ┌─ Service layer (Vercel Node runtime) ▼───────────────────────┐
-  │  app/api/briefing/route.ts   maxDuration=300                  │
-  │  app/api/agent/route.ts      maxDuration=300                  │
-  │  lib/agents/*   (AptKit agent loop)                           │
-  │  lib/data-source/*   (DataSource seam ★ THIS IS THE MAP ★)    │ ← we are here
-  │  lib/mcp/*   (transport, auth, connect)                       │
-  └───────┬─────────────────────────────────────────┬─────────────┘
-          │  hop C — Anthropic HTTPS                │  hop B — Bloomreach HTTPS
-  ┌─ Provider ▼──────────┐                ┌─ Provider ▼───────────────┐
-  │  api.anthropic.com   │                │  loomi-mcp-alpha          │
-  │  claude-sonnet-4-6   │                │  MCP over StreamableHTTP  │
-  │  claude-haiku-4-5    │                │  OAuth PKCE + DCR         │
-  │  stateless to us     │                │  ~1 req/s per user        │
-  └──────────────────────┘                │  revokes tokens: minutes  │
-                                          └───────────────────────────┘
+  ┌─ Client band (browser) ────────────────────────────────┐
+  │  Next.js UI  ·  SSE reader  ·  localStorage             │
+  │  state owned: bi:mcp_config, bi:mode, sessionStorage    │
+  └───────────────────────┬────────────────────────────────┘
+                          │  HTTPS · SSE / NDJSON
+                          │  headers: x-bi-mcp-config, bi_session cookie
+  ┌─ Server band (Vercel function, ephemeral) ─────────────┐
+  │  ★ THIS BAND CROSSES THE DISTRIBUTED SEAM ★             │
+  │  app/api/agent · app/api/mcp/*  (maxDuration=300)       │
+  │  state owned: 60s response cache (per instance)         │
+  │                encrypted auth cookie (per session)      │
+  │                in-mem investigations (per instance)     │
+  │                per-request AsyncLocalStorage auth store │
+  └───────────────────────┬────────────────────────────────┘
+                          │  HTTPS · streamable-http MCP
+                          │  auth: OAuth 2.1 / Bearer / none
+  ┌─ External band ───────▼────────────────────────────────┐
+  │  MCP server  (one URL per request)                     │
+  │  state owned: whatever the tool exposes                │
+  │  default preset: Bloomreach loomi                      │
+  │  parallel path: Anthropic API (not shown; own hop)     │
+  └────────────────────────────────────────────────────────┘
 ```
 
-The map you build here is the one every other file in this guide points
-back to. Three hops (A, B, C), two boundaries where partial failure is real
-(B and C, and B is where the interesting one lives), one place where all the
-coordination logic actually is (the service layer).
+This is the concept. Notice what's NOT here: no replicas, no partitions, no message broker, no leader, no gossip protocol, no service mesh. Everything sits on one axis — the HTTPS hop from the Vercel function to the MCP server.
+
+## Zoom in — narrow to the concept
+
+The coordination map answers one question: "when someone says the system fails, which participant and which arrow are they talking about?" You can't reason about a failure until you can point to the arrow it fires on. In this repo the vocabulary is small: `client → server` and `server → MCP server`. That's it. The audit files that follow can be precise because the map is small.
 
 ## Structure pass
 
+The map has three layers, one axis worth tracing across all of them, and two seams that carry contracts. Reading the skeleton in that order tells you where the mechanics belong.
+
 ### Layers
 
-Four bands, top to bottom, in the diagram above:
+- **Client** — browser, Next.js UI, `localStorage`. Chooses which MCP server to talk to (see `lib/mcp/config.ts:34`).
+- **Server** — Vercel function, `app/api/agent/route.ts`. Owns the agent loop and the DataSource port.
+- **External** — MCP server (default: Bloomreach), plus Anthropic on a separate hop.
 
-- **Client** — the browser. Owns the NDJSON stream reader, the mode toggle
-  (`bi:mode` in localStorage), the per-tab sessionStorage escape hatch.
-- **Service (Vercel Node)** — the two long routes (`/api/briefing` and
-  `/api/agent`) plus the four short MCP routes. Every long-running
-  coordination decision happens here.
-- **Provider — Bloomreach** — the interesting external system.
-  Rate-limited, alpha-quality, revokes tokens on you.
-- **Provider — Anthropic** — the model API. Well-behaved, but paid by the
-  token, so cost management is coordination too.
-
-### One axis — trace it: "who owns the state that survives this hop failing?"
-
-Not control flow. Not who-decides. STATE — because the interesting story is
-which sides can lose what and how the system reconstructs it.
+### One axis held constant — "who owns the state?"
 
 ```
-  One axis, held constant across every layer:
-  "who owns the state that survives this hop failing?"
+  Axis: state ownership, traced across the three layers
 
-  ┌───────────────────────────────────────────────┐
-  │ Client (browser)                               │
-  │   owns: sessionStorage (per-tab investigation) │  ← survives page refresh
-  │   owns: localStorage (bi:mode)                 │  ← survives close/reopen
-  └───────────────────────────────────────────────┘
-      ┌───────────────────────────────────────────────┐
-      │ Service (Vercel warm instance)                │
-      │   owns: in-memory Map<sid, SessionFeed>       │  ← survives NOTHING
-      │        (lib/state/insights.ts:14)              │    beyond one warm
-      │   owns: BloomreachDataSource cache (60s)      │    instance's lifetime
-      │        (bloomreach-data-source.ts:122)        │
-      └───────────────────────────────────────────────┘
-          ┌───────────────────────────────────────────┐
-          │ Provider — Bloomreach                      │
-          │   owns: OAuth tokens + PKCE state         │  ← owned by them; we
-          │   owns: rate-limit window (per user)      │    remember our copy
-          └───────────────────────────────────────────┘
-              ┌────────────────────────────────────────┐
-              │ Provider — Anthropic                    │
-              │   owns: nothing about us               │  ← every request is
-              │        (stateless model calls)         │    self-contained
-              └────────────────────────────────────────┘
+  client        →  UI settings (bi:mcp_config),
+                    bi_session cookie value
+                    → survives navigation, is durable per browser
+
+  server        →  60s response cache (per instance),
+                    in-mem investigations (per instance),
+                    encrypted auth cookie (per request)
+                    → durable per instance, ephemeral across scale-out
+
+  external      →  whatever the tool exposes (Bloomreach event log,
+                    project metadata) — this repo doesn't own it
+                    → durable per tenant, unmanaged by us
+
+  the answer flips at every layer — three different owners,
+  three different durability profiles
 ```
 
-The answer flips at every layer. That's the load-bearing insight: the
-**client is the most durable state store in this system**. sessionStorage
-outlives the Vercel warm instance's in-memory Map. That's why
-`useInvestigation` stashes the investigation trace in sessionStorage before
-navigating to the recommend page — the alternative is "run it again on a
-cold instance and hope."
+The interesting flip is between "durable per browser" (client) and "durable per instance, ephemeral across scale-out" (server). That flip is where most of the risk lives — a browser expects state to survive, and a Vercel function can't promise that.
 
-### Seams — where the axis flips
+### Seams — where the axis-answer flips
 
-Three seams matter:
+- **The HTTPS boundary between client and server.** State ownership flips from "browser durable" to "instance ephemeral." That's why the auth cookie exists: it moves durable state back into the browser so any Vercel instance can decrypt it. See `lib/mcp/auth.ts:86` `withAuthCookies` — one read at request start, one write at request end, AsyncLocalStorage in between.
 
-- **`req.signal` / route handler seam** (hop A) — where "client owns"
-  becomes "service owns." A closed tab flips `req.signal.aborted = true`,
-  and every layer below reads it via `composeSignals` and stops work. This
-  is where the client's "I've moved on" propagates to Bloomreach and
-  Anthropic.
+- **The DataSource port** (`lib/data-source/types.ts:63`). State ownership flips from "server code" to "external service." This is the seam where the retry ladder, the spacing gate, the 30 s timeout, and the fault injector all attach. Same interface, different failure profile on either side.
 
-- **`DataSource` interface** (between service and hop B) — the abstract
-  seam every agent talks to. Owns the retry ladder, the spacing gate, the
-  60s cache, the malformed-JSON injection. Two production adapters
-  (`BloomreachDataSource`, `SyntheticDataSource`) and one decorator
-  (`FaultInjectingDataSource`) all satisfy it. **This is the seam that
-  makes fault injection possible offline.**
-
-- **OAuth `authProvider` seam** (between hop B transport and the auth
-  store) — where "we own the tokens" meets "we don't own the runtime the
-  tokens live in." `BloomreachAuthProvider` at `lib/mcp/auth.ts:160`
-  implements the SDK's `OAuthClientProvider`; the store beneath it is
-  either a cookie (prod), a file (dev), or a Map (test). The seam lets the
-  MCP SDK stay ignorant of Vercel's runtime.
+The MCP server URL is *data* now (Session B/C), not part of the codebase identity. Bloomreach is one preset; a different URL means a different tenant, but the same DataSource contract.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know how a `fetch()` from the browser has one hop (browser → origin)? Add
-two more, one to Bloomreach and one to Anthropic, and treat them as
-**independent failure domains** — each can be slow, wrong, or unavailable
-without the other going down. The map is a picture of those three hops
-plus the boundaries where state ownership flips.
+Think of the coordination map as a graph where **nodes are participants** and **edges are RPCs that can fail independently**. You've built one of these before — every `fetch()` you've written is an edge, and every server that handles it is a node. Same primitive; just draw it out.
 
 ```
-  The pattern — three hops, two failure domains, one shared cancel signal
+  The pattern: nodes + directed edges + failure independence
 
-    Client                Service               Providers (2)
-    ──────                ───────               ────────────
-      │                     │                        ▲     ▲
-      │ hop A               │                        │ B   │ C
-      │  ─── fetch() ─────► │  ─── MCP ────────────► │     │
-      │                     │  ─── Anthropic ────────────► │
-      │                     │                        │     │
-      │  ◄── NDJSON ─────── │                        │     │
-      │                     │                        │     │
-      │ req.signal ◄──── composed ──── hop B timeout │     │
-      │                                              │     │
-      └──── close tab / abort ── fires all downstream signals
+     ●────────────►●
+     browser       Vercel function
+                       │
+                       ▼
+                    ●────────►●
+                    MCP        Anthropic
+                    server     API
 
-    Failure domain B (Bloomreach) is the interesting one.
-    Failure domain C (Anthropic) is quieter.
-    Cancel travels TOP DOWN; failure travels BOTTOM UP; each is independent.
+  every arrow can fail without the others firing —
+  independence is the property that makes it distributed
 ```
 
-### Move 2 — walk the mechanism
+The kernel is **failure independence**: any arrow can drop or delay without the others noticing. If the arrows fired together (one process, one call stack) it wouldn't be distributed — it'd be one system. The instant an arrow can fail on its own, coordination starts.
 
-#### The Client → Service hop (hop A)
+### Move 2 — the walkthrough
 
-Same-origin HTTPS. The client opens a `fetch()`, the route returns a
-`ReadableStream` with `Content-Type: application/x-ndjson`, and the
-client parses newline-delimited JSON. No SSE, no WebSocket — just a
-long-lived HTTP response.
+Walk the map one participant at a time, top to bottom, naming what each one owns.
 
-```typescript
-// app/api/briefing/route.ts:332-335 — the wire contract
-return new Response(stream, {
-  headers: {
-    'content-type': 'application/x-ndjson; charset=utf-8',
-    'cache-control': 'no-store, no-transform',
-  },
-});
-```
+#### The client (browser)
 
-`no-store, no-transform` matters: any intermediary that buffers or transforms
-NDJSON will destroy the "streaming reasoning" UX. Vercel's edge respects it.
+The browser holds durable state that the server can't. Two pieces matter:
 
-The important boundary here: **`req.signal` is the client's kill switch.**
-Close the tab, and it flips. Every downstream layer reads it — either
-directly (`req.signal.throwIfAborted()` at
-`app/api/briefing/route.ts:215, 248, 259, 283`) or via signal composition.
+- `bi_session` cookie — set by `getOrCreateSessionId()` in `lib/mcp/session.ts:16`. It's the identity that keys the auth store (`lib/mcp/auth.ts:12` `SessionAuthState`).
+- `localStorage[bi:mcp_config]` — the UI settings override. Read by `readPersistedConfig()` (`lib/mcp/config.ts:106`) and encoded into a base64 header on every fetch (`persistedConfigHeader()` at line 142).
 
-#### The Service → Bloomreach hop (hop B)
-
-The interesting one. `BloomreachDataSource` at
-`lib/data-source/bloomreach-data-source.ts:121` wraps a connected MCP SDK
-transport and adds four coordination behaviors on top of the wire:
+Nothing in the client "coordinates" with the server — it just supplies inputs and reads the stream. But the client is the ONLY participant that stably holds state across Vercel scale-out. That matters when the auth cookie backend is the encrypted cookie (see the seam below).
 
 ```
-  hop B, layered — one call, four defenses
+  Client → server hop
 
-  agent.callTool('execute_analytics_eql', { eql: ... }, { signal })
-                          │
-                          ▼
-  ┌─ BloomreachDataSource.callTool ─────────────────────┐
-  │  1. cache check  (60s, keyed name+args)             │  ← dedup
-  │  2. spacing gate  (sleep to hit minIntervalMs=1100) │  ← rate-limit avoid
-  │  3. liveCall via SdkTransport                        │
-  │       │                                              │
-  │       ▼                                              │
-  │  ┌─ SdkTransport.callTool (lib/mcp/transport.ts:129)│
-  │  │  composeSignals(opts.signal, timeout(30_000))    │  ← 30s ceiling
-  │  │  client.callTool({ name, arguments: args })      │
-  │  │  catch → HTTP 0 (timeout) or HTTP N (server)     │  ← error shaping
-  │  └──────────────────────────────────────────────────┘
-  │                                                      │
-  │  4. isRateLimited(result) check                     │  ← retry ladder
-  │     while retries < 3 { parseRetryAfterMs → sleep →  │
-  │        retry, cap at retryCeilingMs=20_000 }         │
-  │  5. don't cache on isError                          │  ← poison-guard
-  └─────────────────────────────────────────────────────┘
-                          │
-                          ▼
-  { result, durationMs, fromCache }
+  ┌─ Browser ───────┐     hop: HTTPS GET /api/agent
+  │  fetch(         │ ────────────────────────────►
+  │   '/api/agent', │     headers:
+  │   { headers: {  │       x-bi-mcp-config: <base64>
+  │     'x-bi-mcp-  │       cookie: bi_session=<uuid>, bi_auth=<enc>
+  │      config':.. │
+  │   }})           │     body: NDJSON stream (SSE-shaped)
+  └─────────────────┘ ◄────────────────────────────
 ```
 
-Every layer in that stack was added because Bloomreach's alpha behaved a
-specific way. `minIntervalMs=1100` because the alpha 429s at 1 req/s.
-`retryDelayMs=10_000` fallback because the alpha states its penalty as "1
-per 10 second" in error text. The 30s ceiling because a hung MCP call on
-the alpha would burn the entire 300s route budget on one stuck call.
+#### The server (Vercel function)
 
-The load-bearing code sits at `lib/mcp/connect.ts:96-101`:
+The entry point is `app/api/agent/route.ts`. Two properties dominate:
 
-```typescript
-return {
-  ok: true,
-  mcp: new BloomreachDataSource(new SdkTransport(client, httpErrors), {
-    minIntervalMs: 1100,
-    retryDelayMs: 10_000,
-    retryCeilingMs: 20_000,
-    maxRetries: 3,
-  }),
-};
+- **Ephemeral**. `maxDuration = 300` (line 23). Each request lives at most 300 s in a single instance. Scale-out means any request can hit any instance.
+- **Composed AbortSignals**. `req.signal` is threaded down through `bootstrap → listTools → agent.investigate → dataSource.callTool → transport.callTool`. See the receive path at `route.ts:231` `req.signal.throwIfAborted()`. Every layer respects the cancel.
+
+The instance-local state is the interesting part. **The 60 s response cache** (`lib/data-source/bloomreach-data-source.ts:122`) is a `Map` on the class instance — one instance per active tenant, per function process. On scale-out the cache is empty. **The investigations cache** (`lib/state/investigations.ts:11`) is a top-level `Map` — same story. The route handler treats these as opportunistic hits, not correctness guarantees.
+
+The trust boundary sits at the function's public HTTPS surface. Anything client-supplied — the `x-bi-mcp-config` header, `?insight=` param — is validated with a fail-safe (`isMcpConfigOverride`, `decodeConfigHeader` returns null on garbage; the resolveAnomaly path silently falls back). See `lib/mcp/config.ts:87`:
+
+```ts
+// lib/mcp/config.ts:87
+export function decodeConfigHeader(header: string | null | undefined): McpConfigOverride | null {
+  if (!header) return null;
+  try {
+    const json = /* atob or Buffer */;
+    const parsed = JSON.parse(json);
+    if (!isMcpConfigOverride(parsed)) return null;  // ← type-guard rejects bad shape
+    return normalizeConfig(parsed);
+  } catch {
+    return null;                                     // ← never throws; falls through to env
+  }
+}
 ```
 
-Those four numbers ARE the coordination contract with Bloomreach.
+The comment upstream (`config.ts:87`) is explicit: "do not throw — a bad header shouldn't crash the request; fall through to env instead." That's a coordination decision: a malformed client input never crosses into the server's state.
 
-#### The Service → Anthropic hop (hop C)
+#### The external band
 
-Comparatively quiet. `AnthropicModelProviderAdapter.complete` at
-`lib/agents/aptkit-adapters.ts:59` calls `anthropic.messages.create` with a
-composed signal, and the Anthropic SDK does its own retry-on-5xx internally.
-The only coordination logic YOU add is:
+**The MCP server is the only true distributed participant.** It runs somewhere else, on someone else's schedule, with someone else's failure modes. The default preset is Bloomreach's loomi endpoint (`lib/mcp/connect.ts:47` `'https://loomi-mcp-alpha.bloomreach.com/mcp/'`). Any URL works; Session B/C made this a per-request value.
 
-- **prompt caching** (`aptkit-adapters.ts:85-89`) — the system prompt has
-  `cache_control: { type: 'ephemeral' }` set, so within a 5-minute window
-  the ~10 model turns of one investigation reuse the same prefix and pay
-  ~0.1× on the input tokens
-- **budget tracking** (`aptkit-adapters.ts:63-66`) — before every
-  `complete()`, check `BudgetTracker` and throw `BudgetExceededError` if
-  the ceiling has been hit; the route catches this and emits a graceful
-  `{type:"error"}` on the NDJSON
+Three auth flows are supported behind one interface (`OAuthClientProvider`):
 
-Anthropic is stateless to us. Cost is the only thing that leaks across
-requests.
+```
+  Auth strategy per-server — same interface, different flow
 
-#### The fault-injection decorator (a fourth "hop" that isn't a hop)
+  ┌─ oauth-bloomreach ────┐   3-legged OAuth 2.1 + PKCE + DCR
+  │  BloomreachAuthProv.  │   state persisted per session
+  │  redirectToAuth() →   │   PKCE verifier + client info survive
+  │  finishAuth(code)     │   the connect→callback split
+  └───────────────────────┘
 
-`lib/data-source/fault-injecting.ts` is `DataSource`-shaped and wraps any
-concrete adapter. Fault checks fire in severity order — `timeout` first,
-then `rate_limit`, then `server_error`, then `malformed_json`
-(`fault-injecting.ts:85-100`). The seed makes the fault sequence
-reproducible via xorshift32 (`:157-166`).
+  ┌─ bearer ──────────────┐   1-hop: attach Authorization: Bearer <t>
+  │  BearerAuthProvider   │   token from env or per-request UI override
+  └───────────────────────┘
 
-The point of the decorator: **you can now exercise hop B's failure paths
-without hop B**. `eval/load.eval.ts:246-260` wraps a `SyntheticDataSource`
-with `FaultInjectingDataSource` when any `FAULT_*` rate is > 0, and the
-same agents that would run against Bloomreach run against the
-fault-injected synthetic. Week 4B smoke: 9 faults injected, 0
-investigations failed
-(`eval/load-receipts/load-2026-07-03T05-21-12-237Z.json`).
+  ┌─ anonymous ───────────┐   no auth header at all
+  │  AnonymousAuthProvider│
+  └───────────────────────┘
+
+  makeAuthProvider(cfg) picks based on env + UI override
+  → lib/mcp/auth-providers/index.ts:56
+```
+
+The routing is coordination-style: an incoming request carries a `x-bi-mcp-config` header, the server merges it with env defaults, `makeAuthProvider` picks the concrete implementation, and the transport is built. Nothing in the agent loop cares which auth strategy is on the wire.
+
+**Anthropic is a separate hop.** From the agent's perspective it's a fetch to `api.anthropic.com`. It has its own failure modes (rate limits, cache hits/misses via `cache_control: { type: 'ephemeral' }` on the system prompt — `aptkit-adapters.ts:87`), but it's outside this repo's coordination map because we never wrap it in retry/timeout/spacing logic. Anthropic's SDK owns those.
+
+#### The DataSource port — the seam the map hangs off
+
+The whole map is legible because the coordination surface is *one interface*, and every adapter fits behind it:
+
+```ts
+// lib/data-source/types.ts:63
+export interface DataSource {
+  callTool(name, args, opts?): Promise<DataSourceCallResult>;
+  listTools(opts?): Promise<unknown>;
+}
+```
+
+Three adapters implement it: `McpDataSource` (aliased `BloomreachDataSource`), `SyntheticDataSource`, and `FaultInjectingDataSource` (a decorator). The agent loop only ever sees `DataSource`. Every distributed concern — timeout, retry, cache — sits inside the McpDataSource adapter; the agent doesn't know.
+
+This is the seam that makes fault injection possible (Phase-4). The decorator wraps *any* DataSource, forces failures at configured rates, and the agent loop doesn't need to change to observe the faults. See `lib/data-source/fault-injecting.ts:65` `FaultInjectingDataSource` — same interface, different behavior.
 
 ### Move 3 — the principle
 
-**Draw the map before you draw the mechanism.** Every distributed-systems
-lesson in this repo hangs off a hop in the diagram above. The reason the
-one-page overview is a picture and not a paragraph is that once you can
-point at the picture, the mechanism at each hop stops being surprising.
-The corollary: if you find yourself explaining a partial-failure
-mechanism and you can't point at the hop it defends, either the mechanism
-is defensive noise or your map is wrong.
+**A coordination map is only useful if it's honest about what's actually distributed and what isn't.** This repo's map is small: one hop out, one authenticated session, one shared cache scoped to one instance. Drawing three layers with impressive arrows would misrepresent it. Naming that the MCP server is the single distributed participant makes the retry ladder, the fault injector, and the AbortSignal composition read as exactly what they are — the surface area where correctness under partial failure has to hold.
 
-## Primary diagram — the whole system, one frame
+## Primary diagram
+
+The whole map, every arrow labelled:
 
 ```
-  Full coordination map — recap
+  Blooming insights — the coordination map, one frame
 
-  ┌─ Client (browser) ────────────────────────────────────────────────────────┐
-  │  page.tsx / investigate/*.tsx                                             │
-  │  fetch('/api/{briefing,agent}?mode=live-bloomreach')                      │
-  │  ReadableStream reader → NDJSON parse → UI updates                        │
-  │  sessionStorage (per-tab), localStorage (mode)                            │
-  └───────────────────────────────┬───────────────────────────────────────────┘
-                                  │  hop A: HTTPS same-origin, NDJSON out
-                                  │         req.signal ← close tab / abort
-  ┌─ Service (Vercel Node) ▼─────────────────────────────────────────────────┐
-  │                                                                          │
-  │   app/api/briefing/route.ts    │    app/api/agent/route.ts                │
-  │   MonitoringAgent              │    DiagnosticAgent → RecommendationAgent │
-  │           │                    │           │                             │
-  │           └── AptKit agent loop (runs the model + tool calls) ──┐        │
-  │                                                                 │        │
-  │           ┌── DataSource seam (lib/data-source/types.ts) ◄──────┘        │
-  │           │                                                              │
-  │   ┌───────▼───────────┐   ┌────────────────┐   ┌────────────────────┐    │
-  │   │ Bloomreach        │   │ Synthetic      │   │ FaultInjecting     │    │
-  │   │ DataSource        │   │ DataSource     │   │ DataSource         │    │
-  │   │ (live prod)       │   │ (offline eval) │   │ (decorator ★ NEW)  │    │
-  │   └─────────┬─────────┘   └────────────────┘   └────────────────────┘    │
-  │             │                                                            │
-  │   ┌─ SdkTransport (lib/mcp/transport.ts:123) ─┐                          │
-  │   │  composeSignals(req.signal, timeout=30s)  │                          │
-  │   └─────────┬─────────────────────────────────┘                          │
-  │             │                                                            │
-  │   ┌─ OAuthClientProvider (BloomreachAuthProvider) ┐                      │
-  │   │  cookie / file / Map (env-dependent)           │                      │
-  │   └───────────────────────────────────────────────┘                      │
-  └─────────────┼──────────────────────────────────────────┬─────────────────┘
-                │  hop B: Bloomreach HTTPS                 │  hop C: Anthropic HTTPS
-                │  StreamableHTTP MCP transport            │  api.anthropic.com
-                │  OAuth PKCE + DCR                        │  claude-sonnet-4-6
-                ▼                                          ▼
-       ┌─ Provider (loomi) ┐                    ┌─ Provider (Anthropic) ┐
-       │ ~1 req/s per user │                    │ SDK-side retry on 5xx │
-       │ tokens expire ~m  │                    │ prompt cache 5min TTL │
-       │ EQL execution     │                    │ paid per token        │
-       └───────────────────┘                    └───────────────────────┘
+  ┌─ Client band ──────────────────────────────────────────┐
+  │  Browser                                                │
+  │  ├─ bi_session cookie          (persistent, per-browser)│
+  │  └─ localStorage[bi:mcp_config](persistent, per-browser)│
+  └──────────┬─────────────────────────────────────────────┘
+             │  hop 1: HTTPS  (SSE / NDJSON body)
+             │  headers: x-bi-mcp-config (base64 JSON),
+             │           cookie: bi_session, bi_auth (AES-256-GCM)
+             ▼
+  ┌─ Server band (Vercel function) ────────────────────────┐
+  │  app/api/agent/route.ts  (maxDuration=300)              │
+  │  ├─ 60s response cache          (per instance)          │
+  │  ├─ investigations Map          (per instance)          │
+  │  └─ AsyncLocalStorage auth store(per request)           │
+  │  ┌─ DataSource port ──────────────────────────────┐     │
+  │  │  chosen by mode + config override:             │     │
+  │  │    live-mcp     → McpDataSource                │     │
+  │  │    live-synth   → SyntheticDataSource          │     │
+  │  │    tests/load   → FaultInjectingDataSource     │     │
+  │  └────────────┬───────────────────────────────────┘     │
+  └───────────────┼────────────────────────────────────────┘
+                  │  hop 2: HTTPS  (streamable-http MCP)
+                  │  auth: Bearer <token> · OR · OAuth cookie
+                  │  timeout: AbortSignal.timeout(30_000)
+                  ▼
+  ┌─ External band ────────────────────────────────────────┐
+  │  MCP server (URL is per-request data)                   │
+  │  default preset: Bloomreach loomi-mcp-alpha             │
+  │  the only true distributed participant                  │
+  └────────────────────────────────────────────────────────┘
+
+  parallel hop (not on the coordination map, own SDK owns retries):
+  ┌───────────────────────────┐
+  │  Anthropic API            │
+  │  cache_control: ephemeral │  ← 80% input token cost cut
+  └───────────────────────────┘
 ```
 
 ## Elaborate
 
-The map above is the shape you inherit when you build "one long-running
-route that streams reasoning while talking to two external systems." It's
-a specific archetype. Other codebases in this shape:
+The map matters most when someone reports "the system is slow." The right first question is "which arrow?" — and that only works if you drew the arrows first.
 
-- ChatGPT-style app: one route, one external LLM, one same-origin stream
-- Vercel AI SDK example: same shape, sometimes with a vector DB as a
-  third hop
-- **This app** adds a rate-limited, session-authenticated external tool
-  server on hop B — which is what makes it distributed-systems-interesting
+For this repo, the coordination map stays small because the product is a *single-tenant investigation tool*: one user, one browser, one MCP tenant, one investigation at a time. The map would grow if the product moved to background jobs (adds a queue arrow), multi-user persistence (adds a shared database arrow), or a multi-region deploy (adds replica arrows). See `05-replication-partitioning-and-quorums.md` and `08-sagas-outbox-and-cross-boundary-workflows.md` for what those additions would demand.
 
-Where this pattern breaks: as soon as you add persistent state you own
-(a database, a queue, a job runner), the map grows a fourth layer and
-the interesting questions shift from "how do I survive hop B failing"
-to "how does the database survive me failing." That layer is
-`not yet exercised` here.
+The historical arc is worth naming: an Olist SQL-backed data source used to live behind this same seam, and was retired when Synthetic proved sufficient for offline demos. **That's the seam paying off** — retiring an entire adapter didn't change the agent loop. The map got simpler by one node.
 
 ## Interview defense
 
-### Q: "Walk me through the system as a distributed-systems problem."
+**Q: "What's the coordination surface of this system?"**
 
-Model answer, one diagram sketched while you speak:
+A: One hop out. The Vercel function talks to an MCP server over HTTPS; that's the only participant that can fail independently of the app. Anthropic is a separate fetch but its SDK owns the retry policy, so we treat it as a leaf, not a coordinated peer.
 
 ```
-  three hops, one interesting boundary
-
-  browser ── HTTPS ──► vercel ──── MCP HTTPS ────► bloomreach (rate-limited)
-                        │
-                        └──── Anthropic HTTPS ───► claude
+   Browser ──► Vercel fn ──► MCP server
+                    │
+                    └──────► Anthropic (leaf)
 ```
 
-"Three hops. Client → Vercel is same-origin, streams NDJSON back. Vercel →
-Anthropic is quiet — SDK handles retries, we add prompt caching and budget
-tracking. Vercel → Bloomreach is the interesting one: rate-limited at
-~1 req/s, alpha server revokes tokens after minutes, occasionally times
-out. Everything in `lib/data-source/bloomreach-data-source.ts` exists to
-defend that one boundary — spacing gate, retry ladder, 30s ceiling, no
-cache on error. The DataSource interface lets us swap in a synthetic
-adapter for eval and wrap either with `FaultInjectingDataSource` to
-exercise those defenses offline."
+**Q: "Where does state live and who owns it?"**
 
-### Q: "What's the load-bearing part everyone forgets?"
+A: Three owners. Browser owns `bi_session` and `localStorage[bi:mcp_config]` — persistent across navigation. Server owns the 60 s response cache and in-memory investigations Map — durable per Vercel *instance*, gone on scale-out. External owns the tool data.
 
-The one-line answer:
+**Load-bearing gotcha**: on Vercel's autoscaling model, the server-owned cache is effectively empty on the first request to a new instance. Any "we already have that data" story has to be per-instance. The correctness path is the retry ladder + spacing gate, not the cache — the cache is opportunistic.
 
-> **The DataSource seam.** Not the retries, not the timeout — the interface
-> at `lib/data-source/types.ts:63`. Without it, `FaultInjectingDataSource`
-> can't wrap `SyntheticDataSource`, and the whole "prove graceful
-> degradation offline" story doesn't work. The seam is what turned a
-> Bloomreach-only adapter into a testable distributed system.
+**Q: "What flips at each seam?"**
 
-Anchor: `lib/data-source/types.ts:63-71` (the interface),
-`lib/data-source/fault-injecting.ts:59` (the decorator that proves it).
+A: **Client → server** flips *state durability* (browser persistent → instance ephemeral). That flip is why the encrypted auth cookie exists — it moves durable state back to the browser so any Vercel instance can decrypt it (`lib/mcp/auth.ts:86`).
+
+**Server → external** flips *failure ownership*. Inside the function, we control failure. Past the DataSource port, the MCP server owns its own failure profile — 429 windows, timeouts, malformed responses — and the McpDataSource adapter has to translate all of that into a shape the agent loop can reason about.
 
 ## See also
 
-- 02-partial-failure-timeouts-and-retries.md — the mechanisms at hop B
-- 04-consistency-models-and-staleness.md — the client-owns-state axis
-- 07-clocks-coordination-and-leadership.md — the OAuth-across-instances
-  problem
-- `../study-system-design/audit.md` — architectural framing without the
-  distributed-systems lens
+- `02-partial-failure-timeouts-and-retries.md` — what the arrow-crossing correctness actually is.
+- `04-consistency-models-and-staleness.md` — how the instance-local cache behaves.
+- `09-distributed-systems-red-flags-audit.md` — where this map's small size hides real risks.

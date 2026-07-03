@@ -1,149 +1,168 @@
 # Agentic RAG
 
-_Industry standard._
+*Industry name: agentic RAG · Language-agnostic*
 
-## Zoom out, then zoom in
-
-The difference between static RAG (retrieve top-k, generate) and agentic RAG (loop: query, retrieve, evaluate, re-retrieve, generate). **Not implemented in blooming_insights.** This file covers the shape and names the refactor that would introduce it.
+## Zoom out
 
 ```
-  Zoom out — where agentic RAG would sit if adopted
+  Zoom out — retrieval as a loop, not a step
 
-  ┌─ Worker agent ─────────────────────────────────────────────┐
-  │  Currently: DiagnosticAgent runs execute_analytics_eql     │
-  │  (analytical tool call — not semantic retrieval)           │
-  │                                                            │
-  │  With agentic RAG (hypothetical):                          │
-  │  DiagnosticAgent + retrieve_playbook + retrieve_incident   │
-  │  tools that hit a vector store over past investigations    │
-  └────────────────────────────────────────────────────────────┘
+  ┌─ static RAG (one shot) ─────────────────────┐
+  │  query → retrieve → stuff → generate         │
+  └─────────────────────────────────────────────┘
+              ↓ escalation
+  ┌─ ★ AGENTIC RAG (a loop) ★ ──────────────────┐ ← we are here
+  │  agent decides when/what to retrieve         │
+  │  evaluates result, re-retrieves if needed    │
+  └─────────────────────────────────────────────┘
 ```
 
-Zoom in: agentic RAG is *ReAct whose primary tool is retrieval.* Same kernel from `01-reasoning-patterns/02-agent-loop-skeleton.md`, different tool policy.
+## Zoom in
+
+Static RAG is one call: embed the query, pull top-K chunks, stuff into the prompt, generate. Agentic RAG is a loop: the agent decides *what* to retrieve, *whether* the result is good enough, and *whether* to try again with a refined query. It's ReAct whose primary tool happens to be retrieval.
+
+In this repo the "retrieval tool" isn't a vector store — it's `execute_analytics_eql`. Same pattern, different substrate. The mechanics of vector retrieval live in `.aipe/study-ai-engineering/03-retrieval-and-rag/`; this file covers the control-loop shift.
 
 ## Structure pass
 
-**Layers:** query decomposition · per-source retrieval · relevance evaluation · re-retrieval loop · generation.
-**Axis:** *when does the loop decide it has enough evidence?*
-**Seam:** the evaluator — deterministic (chunk count?) or LLM (is this enough to answer?).
+Layers: **query decomposition** — **per-sub-query retrieval** — **evaluation** — **re-retrieval or generate**.
+
+Axis to hold constant: **who decides which retrieval to run?**
 
 ```
-  Static RAG vs agentic RAG — what's added
+  Who decides retrieval — static vs agentic
 
-  Static RAG:
-   query → retrieve top-k → stuff → generate
-   (single pass, no evaluation)
-
-  Agentic RAG:
-   query → decompose → retrieve → evaluate → sufficient?
-                                             │      │
-                                             │ no   │ yes
-                                             ▼      ▼
-                                          re-retrieve  generate
-                                          (cap iterations)
+  static RAG:  code decides (one-shot embed + ANN + top-K)
+  agentic RAG: agent decides (which sub-query, which source,
+                              whether to retry, when to stop)
 ```
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — the shape
 
-You've built a paginated search UI before — user types a query, results come back, user refines and searches again. Agentic RAG is that same loop, with the *model* playing the user role: it queries, reads results, refines, re-queries. Cap the loop so it doesn't spiral.
+You've written a `while (result.length < threshold) { widen(); retry(); }` before. Agentic RAG is that shape where "widen" and "retry" are model-chosen refinements to the query, not code-written rules.
 
 ```
-  Pattern: agentic RAG (retrieval as a control loop)
+  Agentic RAG — a loop over retrieval
 
-  ┌───────────────────────────────────────────┐
-  │  decompose query into sub-questions       │
-  └────────────────┬──────────────────────────┘
-                   ▼
-  ┌───────────────────────────────────────────┐
-  │  retrieve for each (route to right source)│
-  └────────────────┬──────────────────────────┘
-                   ▼
-  ┌───────────────────────────────────────────┐
-  │  evaluate: is this enough to answer?      │
-  └──────┬──────────────────────┬─────────────┘
-         ▼ no                   ▼ yes
-     re-retrieve            generate answer
-     (refine query)
-         │
-         └──── loop (cap iterations)
+  ┌───────────────────────────────────────────────┐
+  │  decompose query into sub-questions            │
+  └────────────────────┬──────────────────────────┘
+                       ▼
+  ┌───────────────────────────────────────────────┐
+  │  retrieve for each (route to the right source)│
+  └────────────────────┬──────────────────────────┘
+                       ▼
+  ┌───────────────────────────────────────────────┐
+  │  evaluate: is this enough to answer?          │
+  └──────────┬─────────────────────┬──────────────┘
+             ▼ no                  ▼ yes
+        re-retrieve            generate answer
+        (refine query)
+             │
+             └──── loop (cap iterations)
 ```
 
-### Move 2 — the walkthrough
+### Move 2 — how it maps to tool-driven retrieval
 
-**In this codebase — not implemented.** No vector store exists. Nothing to retrieve semantically from. Blooming's investigative loop *does* run a ReAct-shaped loop, but every tool is analytical (EQL, list_scenarios, list_experiments), not semantic-retrieval-shaped.
+**The reframe for this repo.** All agentic RAG is agentic AI; not all agentic AI does retrieval. In this repo, "retrieval" means "run an EQL query against the workspace data" — every EQL is a form of retrieval (pulling rows the agent then reasons over). The loop is identical to vector agentic RAG:
 
-**The closest existing shape.** The DiagnosticAgent's tool policy (`node_modules/@aptkit/.../diagnostic-agent.js:8-23`) allows 11 tools, but they're all "run this deterministic query against Bloomreach state." The model does pick which to run based on prior observations — that's the *control loop*, which IS the agentic part — but the tools themselves aren't retrievers.
+```
+  Agentic RAG in this repo — tool-driven, not vector-driven
 
-**Where agentic RAG would land.** Suppose Blooming grew to include a corpus of past investigation writeups ("here's how we handled a similar checkout drop in Q3 2025"). Then the shape would be:
-
-Hypothetical:
-```ts
-// hypothetical additions to DiagnosticAgent's tool policy
-const RETRIEVAL_TOOLS = [
-  'retrieve_similar_investigations',  // vector search over past writeups
-  'retrieve_playbook',                 // vector search over incident playbooks
-];
-
-// In the loop, the model would interleave:
-//   - retrieve tool (get context)
-//   - analytical tool (test hypothesis against current data)
-//   - another retrieve (get more context based on findings)
-//   - generate diagnosis grounded in both
+  input: Anomaly ("USA purchase_revenue · -38.4%")
+    │
+    ▼
+  ┌───────────────────────────────────────────────┐
+  │  decompose: what sub-questions do I need?     │
+  │  1. Is this concentrated in a specific state? │
+  │  2. Is it concentrated in a product category? │
+  │  3. Is it concentrated in a customer segment? │
+  └────────────────────┬──────────────────────────┘
+                       ▼
+  ┌───────────────────────────────────────────────┐
+  │  for each sub-question:                       │
+  │    → execute_analytics_eql(…)                 │
+  │  observe results                              │
+  └────────────────────┬──────────────────────────┘
+                       ▼
+  ┌───────────────────────────────────────────────┐
+  │  evaluate: enough to conclude?                │
+  │  (aptkit's decision, prompt-shaped)           │
+  └──────────┬─────────────────────┬──────────────┘
+             ▼ no                  ▼ yes
+        refine query          emit Diagnosis
+        (different EQL,       (final structured
+        different group-by)   output)
 ```
 
-Line-by-line: the additions are tool-policy changes. The loop *shape* is unchanged — same `runAgentLoop`, same maxTurns=8. What changes is the model's evaluation of "do I have enough evidence" — it now considers both current data (EQL results) AND past context (retrieved playbook chunks).
+**Where the loop lives in code.** Same place as ReAct: `lib/agents/diagnostic.ts` → aptkit's `DiagnosticInvestigationAgent`. The agent doesn't distinguish between "retrieval tools" and "action tools" — they're all just tools. That's actually the point: agentic RAG in a tool-calling agent is just ReAct where the tool happens to be a retrieval endpoint.
 
-**The tradeoff, made concrete.** Static RAG (one-shot retrieve + generate) at ~$0.005 per query. Agentic RAG loop at 3-5 tool calls: ~$0.015-0.025 (3-5x cost, 2-5x latency). Only worth it when one-shot retrieval measurably fails on multi-step queries. For a workspace-analysis product, the loop over EQL already IS the multi-step loop — adding another loop around a doc corpus would need a clear measured win.
+**The tradeoff vs static RAG.** Steep — roughly **3-10x token cost** and **2-5x latency** over one-shot retrieval. Every re-retrieval is another turn (model call + tool call). Use the loop only when one-shot retrieval measurably fails on multi-step or cross-source queries.
+
+For this repo, "one-shot retrieval" isn't an option — the diagnostic task is inherently multi-step (form hypothesis, test, re-hypothesize). So the loop is the baseline, not the escalation. But if you were building a Q&A over documentation, you'd start with static RAG and escalate to agentic only when queries needed decomposition or cross-source synthesis.
+
+**The termination guard, again.** The loop needs the same budget exit as any agent loop (`01-reasoning-patterns/02-agent-loop-skeleton.md`) — nothing guarantees the model will decide "enough evidence" if the data is weird. Every agentic RAG loop in production carries a max-iterations cap; in this repo it's aptkit's iteration cap plus the `BudgetTracker`.
 
 ### Move 3 — the principle
 
-Not all agentic AI does retrieval, but all agentic RAG is agentic AI. The escalation from static to agentic is a threshold decision: measure one-shot retrieval failing on multi-hop questions FIRST; adopt the loop only when the failure is real. In this codebase there's no retrieval at all, so the question is moot — the diagnostic loop over analytical tools IS the agentic pattern here.
+Retrieval-as-a-loop is not a new class of pattern; it's the agent kernel with a retrieval tool. What earns "agentic RAG" a name is the *deliberate decomposition* — the model decides which sub-question to answer with which retrieval, then decides when the accumulated evidence is enough. Vector store or SQL query, the shape is the same.
 
 ## Primary diagram
 
 ```
-  Recap — agentic RAG as a specialization of the ReAct kernel
+  Agentic RAG — the loop, and how this repo instantiates it
 
-  ┌─ ReAct kernel (see 01-reasoning-patterns/02) ────────────┐
-  │  step → tool → observe → repeat                          │
-  └───────────────┬──────────────────────────────────────────┘
-                  │  when tools are RETRIEVERS:
-                  ▼
-  ┌─ Agentic RAG specialization ─────────────────────────────┐
-  │  step (decompose query)                                  │
-  │  tool = retrieve(query_i, source)                        │
-  │  observe (chunks came back)                              │
-  │  evaluate (enough?)  ─┐                                  │
-  │       │ no             │                                 │
-  │       ▼                ▼                                 │
-  │   refine + loop     generate grounded answer             │
-  └──────────────────────────────────────────────────────────┘
+  ┌─ Agent (ReAct with retrieval-shaped tools) ─────────────────┐
+  │                                                              │
+  │  turn 1: decompose query mentally                            │
+  │          → execute_analytics_eql (sub-query 1)               │
+  │          ← result (rows)                                     │
+  │                                                              │
+  │  turn 2: read result, form next hypothesis                   │
+  │          → execute_analytics_eql (sub-query 2, refined)      │
+  │          ← result (rows)                                     │
+  │                                                              │
+  │  turn 3: enough evidence?                                    │
+  │          → yes: emit final Diagnosis (structured output)     │
+  │          → no:  refine query, → execute_analytics_eql        │
+  │                                                              │
+  │  guards: iteration cap + BudgetTracker.exceeded()            │
+  │                                                              │
+  └──────────────────────────────────────────────────────────────┘
+
+  Substrate difference from vector agentic RAG:
+    vector version: retrieval = embed + ANN + top-K chunks
+    this repo:      retrieval = EQL query returning rows
+    Loop shape:     identical.
 ```
 
 ## Elaborate
 
-The pattern came from LangChain's "self-querying retriever" and the "corrective RAG" papers (Yan et al. 2024). Production shape looks like: primary tool is `retrieve(query, source)`; secondary tool is `search_web(query)` for freshness; the loop evaluates chunks and re-retrieves.
+The term "agentic RAG" came into use around late 2023 as teams noticed that static top-K retrieval hit a ceiling on multi-hop questions (HotpotQA, MuSiQue). LangGraph's `Adaptive RAG` and LlamaIndex's `Sub Question Query Engine` were early productions of the pattern.
 
-Anchor for the reader coming from AdvntrCue: that project ran classic RAG over pgvector — one-shot retrieve top-k, stuff, generate. That's the static shape. Agentic RAG would add the loop *around* it — retrieve k=5, evaluate, if not enough refine the query, retrieve again. The AdvntrCue-scale question was whether the loop's coordination cost was worth the reliability lift; the answer depends on the failure rate of single-hop retrieval on your queries.
+The interesting frontier now is **agentic RAG with multiple retrieval sources** — routing per sub-question to vector DB vs SQL DB vs web search vs a proprietary API (see `03-retrieval-routing.md`). The multi-source case is where the pattern earns its complexity budget: one retrieval loop that spans heterogeneous knowledge sources is genuinely hard to build as a chain, and the agent decomposition pays for itself.
 
 ## Interview defense
 
-**Q: Does blooming_insights use agentic RAG?**
-A: No. It runs an agentic loop, but over analytical tools (EQL queries against Bloomreach state), not over a retrieval corpus. There's no vector store. If the product grew to include a playbook corpus or a past-investigation memory, I'd add retrieval tools to the DiagnosticAgent's policy and the same `runAgentLoop` kernel becomes agentic RAG for free — that's the point of the tool-agnostic loop.
+**Q: Do you do agentic RAG?**
 
-Diagram: the ReAct kernel with "tool = retrieve" callout.
-Anchor: `lib/agents/diagnostic.ts` (current) + hypothetical tool policy addition.
+Yes — but tool-driven, not vector-driven. Every EQL query the diagnostic agent runs is a retrieval step; the agent decomposes the anomaly into sub-hypotheses, runs an EQL per hypothesis, evaluates whether the accumulated evidence supports a conclusion, and either re-queries with a refined EQL or emits the final Diagnosis. Same loop shape as vector agentic RAG, different retrieval endpoint.
 
-**Q: When does one-shot RAG become insufficient?**
-A: When queries are multi-hop or cross-source. Multi-hop: "which product category drove the revenue drop, and which acquisition channel brought those customers in?" — that's a two-retrieve dependency; one-shot can't do it. Cross-source: "compare this quarter's playbook to what we did last quarter" — needs multiple retrievals against different stores. Measure with a golden set of hard queries; if one-shot fails >20% on those, the loop earns its keep.
+The reason there's no vector store: the workspace data is inherently structured (customer events, revenue, segments) and EQL is the right query language for it. A vector store would only make sense if I were retrieving over unstructured Bloomreach documentation — that's a possible future extension, not a current need.
 
-Diagram: one-shot vs loop — decision fork on "hops needed to answer".
-Anchor: general reasoning; refers to `study-ai-engineering` for one-shot mechanics.
+*Anchor visual:* the retrieve-observe-refine loop above.
+
+**Q: When wouldn't you use agentic RAG?**
+
+When one-shot retrieval works. If the queries are single-hop and the top-K static retrieval gets the answer 90%+ of the time, the 3-10x cost of the loop buys nothing. Agentic RAG is warranted specifically when multi-step or cross-source retrieval is measurably better than static.
+
+For this repo, the diagnostic task is inherently multi-step, so the loop is the baseline. But for a documentation Q&A, I'd start static and escalate.
 
 ## See also
 
-- `01-reasoning-patterns/02-agent-loop-skeleton.md` — the kernel this pattern instantiates.
-- `03-retrieval-routing.md` — the routing tier over multiple sources.
-- Cross-reference: `.aipe/study-ai-engineering/03-retrieval-and-rag/` for static RAG mechanics.
+- **`02-self-corrective-rag.md`** — the retrieval loop with a relevance grader inline.
+- **`03-retrieval-routing.md`** — routing to the right source before retrieval.
+- **`01-reasoning-patterns/03-react.md`** — the base pattern this instantiates.
+- **`.aipe/study-ai-engineering/03-retrieval-and-rag/`** — vector retrieval mechanics (embeddings, chunking, ANN).

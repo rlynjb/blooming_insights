@@ -1,93 +1,129 @@
-# 05 — Dense vs sparse retrieval
+# Dense vs sparse retrieval
 
-**Type:** Industry standard. Also called: semantic vs lexical retrieval, embedding search vs BM25.
+## Subtitle
+
+Semantic (embedding) vs lexical (BM25) matching — Industry standard.
 
 ## Zoom out, then zoom in
 
-**Not exercised in this codebase.** Both retrieval styles would need building; hybrid (combine both) is the strong default.
+Two retrieval families, different failure modes. Dense (embedding + cosine) catches paraphrases; sparse (BM25 over tokens) catches exact terms. Neither is strictly better; production systems use both.
 
 ```
-  Dense (embeddings)      Sparse (BM25 / keyword)
-  · captures paraphrase    · captures exact terms
-  · misses rare tokens     · misses paraphrase
-  ─── hybrid combines both ──
+  Zoom out — two retrieval families
+
+  ┌─ Query ─────────────────────────────────────────────┐
+  │  "how do I fix the auth bug"                        │
+  └──────────┬──────────────────────────┬──────────────┘
+             │                          │
+             ▼                          ▼
+  ┌─ Dense (embed + cosine) ─┐   ┌─ Sparse (BM25) ────┐
+  │  paraphrase-tolerant     │   │  exact-term-precise│
+  │  → "login broken"        │   │  → "CVE-2024-1234" │
+  └──────────────────────────┘   └────────────────────┘
 ```
 
 ## Structure pass
 
-Axis: what's the retrieval match on? Dense = semantic direction. Sparse = term frequency × inverse doc frequency. Hybrid = both, fused.
+- **Layers:** query → dense path AND sparse path → merged results. Two parallel bands.
+- **Axis: match type.** Dense: semantic. Sparse: lexical. Different failure modes; different wins.
+- **Seam:** the ranking merge (see **06-hybrid-retrieval-rrf.md**).
 
 ## How it works
 
-### Move 1
+### Move 1 — the mental model
 
-Dense embedding search finds "similar meaning." Sparse (BM25) finds "shared rare terms." Each has failure modes the other covers.
+Dense: embed query, embed corpus, cosine similarity. Recall is high for paraphrases; precision degrades on rare or exact terms.
+
+Sparse: BM25 over tokenized text. Precision is high on exact-term matches; misses paraphrases entirely.
 
 ```
-  Query: "how to fix the auth bug"
+  Dense vs sparse — the shape
 
-  Dense: finds  "login broken", "session errors"       ← paraphrase win
-  Sparse: finds "auth", "bug"                          ← exact-term win
-  Hybrid: finds both, ranks combined                   ← default
+  Dense pipeline:
+    query ─► embed ─► cosine vs corpus ─► top-k
+
+  Sparse pipeline:
+    query ─► tokenize ─► BM25 (term freq × inverse doc freq) ─► top-k
+
+  Hybrid: run both, fuse the rankings (RRF)
 ```
 
-### Move 2
+### Move 2 — the step-by-step walkthrough
 
-**Dense retrieval.** Embed the query, cosine-search over stored vectors, return top-k. Strengths: catches paraphrases ("cart abandonment" retrieves "shoppers not completing checkout"). Weakness: struggles on rare tokens, IDs, code snippets that weren't well-represented in the embedding model's training.
+**Dense — where paraphrase wins.** Query "conversion dropped last week" against a diagnosis embedded as "checkout completion decline over trailing 7d." Different words, similar meaning; embeddings put them nearby. BM25 would miss entirely.
 
-**Sparse retrieval (BM25).** Term-based. `score = idf(term) × (tf × (k+1)) / (tf + k × (1 - b + b × dl/avgdl))`. Standard IR algorithm. Strengths: exact-term matches, product IDs, error codes. Weakness: paraphrase fails ("issue" won't find "problem").
+**Sparse — where exact terms win.** Query "SKU-4293" (an exact product identifier) against a catalog. Embeddings might return nearby SKUs by semantic proximity (which is *wrong* for an ID); BM25 returns exactly that SKU or nothing. Similarly: dates, error codes, product names, versions.
 
-**Hybrid = both, fused with RRF (see next file).**
+**Where blooming's would-be corpus needs both.** Investigation memory: dense wins because the same anomaly type has many paraphrase-shaped variants across sessions. EQL query library: sparse wins because EQL literals (event names, property names, functions) are lexical — the model should retrieve queries with matching event names.
 
-For this codebase's would-be corpus (past diagnoses), the query would often be another anomaly's text — paraphrase-heavy but sometimes containing specific metric names ("conversion_rate"). Hybrid would be the right default.
+**Implementation notes.** BM25 is a small function: term frequency × inverse doc frequency, tunable with `k1` (~1.5) and `b` (~0.75) constants. `@node-rs/bm25` or similar libraries make this a two-line integration. No new infrastructure needed.
 
-### Move 3
+Pseudocode of a hybrid retrieval for investigation memory:
 
-Dense wins on semantic, sparse wins on lexical. Real production retrieval uses both. Skipping sparse because embeddings feel "smarter" leaves easy recall on the floor.
+```
+  hybridRetrieveDiagnoses(query, k=3):
+    denseHits  = denseIndex.search(embed(query), k=10)
+    sparseHits = bm25Index.search(tokenize(query), k=10)
+    return rrfMerge(denseHits, sparseHits, k=3)   // see file 06
+```
+
+### Move 3 — the principle
+
+Use both when the corpus has both semantic and lexical structure. When it doesn't (pure code, pure IDs), sparse alone; when it doesn't (pure prose with no proper nouns), dense alone. Hybrid is the default when in doubt.
 
 ## Primary diagram
 
 ```
-  Query
-    │
-    ├── dense embedding ─cosine─► [doc7, doc3, doc1]
-    │                                       (semantic top)
-    └── sparse (BM25) ─── term ────► [doc7, doc2, doc5]
-                                            (lexical top)
+  Dense + sparse — full frame
 
-           merge with RRF (next file) → final ranking
+  ┌─ Query ─────────────────────────────────────────────┐
+  │  "why did mobile revenue drop"                       │
+  └──────────┬──────────────────────────┬───────────────┘
+             │                          │
+             ▼                          ▼
+  ┌─ DENSE PATH ────────────┐  ┌─ SPARSE PATH ──────────┐
+  │  embed(query) → vec      │  │  tokenize(query)       │
+  │  cosine vs corpus vecs   │  │  BM25 vs corpus tokens │
+  │  → [doc3, doc7, doc1]    │  │  → [doc7, doc5, doc2]  │
+  └──────────┬──────────────┘  └──────────┬─────────────┘
+             │                            │
+             └──────────┬─────────────────┘
+                        │
+                        ▼
+  ┌─ RRF fusion (see 06-hybrid-retrieval-rrf.md) ───────┐
+  │  merges rankings by reciprocal rank                  │
+  └─────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-Modern practical retrieval uses hybrid + optional rerank. The "sparse is dead, embeddings replace it" claim from ~2020 didn't survive contact with production — BM25 keeps catching things embeddings miss. Elasticsearch and Postgres both support hybrid natively.
+BM25 (Robertson & Zaragoza, 2009) is a strong baseline that predates transformers by a decade. It still wins on exact-match tasks. The lesson: newer isn't better for every failure mode; understand what your query mix looks like before picking a single family.
+
+Related: **06-hybrid-retrieval-rrf.md** (how to merge), **11-rag.md** (where hybrid retrieval feeds).
 
 ## Project exercises
 
-### Exercise — hybrid retrieval over past diagnoses
+### B3.5 · Add sparse retrieval to the would-be EQL library
 
-- **Exercise ID:** C2.8-B · Case B (RAG not exercised).
-- **What to build:** if the RAG stack from `01-04` is present, add a BM25 index alongside the vector store. Retrieve top-20 from each, fuse with RRF (see `06-hybrid-retrieval-rrf.md`).
-- **Why it earns its place:** proves you know hybrid is the default. Interviewer signal: "I don't rely on embeddings alone."
-- **Files to touch:** `lib/rag/bm25.ts` (new), `lib/rag/retrieve.ts` (hybrid entry point).
-- **Done when:** retrieval on a query with a rare metric name returns docs BM25 alone would find, and paraphrase queries return docs dense alone would find.
-- **Estimated effort:** 1-2 days.
+- **Exercise ID:** B3.5 (Case B — not yet implemented)
+- **What to build:** As part of the EQL query library retrofit (see sub-section README), add BM25 over the EQL text as a second retrieval path. Merge with dense via RRF.
+- **Why it earns its place:** EQL identifiers are lexical (`event.purchase.total_price` is a token that matters exactly); dense-only retrieval would miss exact matches. Interview payoff: understanding retrieval-family failure modes.
+- **Files to touch:** New `lib/eql/library.ts`, add `@node-rs/bm25` dep or equivalent tiny implementation.
+- **Done when:** for a query matching an exact EQL literal, sparse retrieves the right query at rank 1; dense-only would rank it 3-5.
+- **Estimated effort:** `1–2 days`.
 
 ## Interview defense
 
-**Q: Dense only vs hybrid?**
+**Q: When would you not use dense retrieval?**
 
-Hybrid unless you've measured that sparse adds zero recall on your corpus. Skipping sparse because embeddings feel smarter costs you exact-term recall. BM25 is 40+ years old and still catches things state-of-the-art embeddings miss.
+Corpora dominated by exact-match tokens: code, EQL, SKUs, error codes. Embeddings degrade on rare/uncommon tokens — the model was never trained to distinguish `SKU-4293` from `SKU-4294`, so they end up nearby in vector space. BM25 sees them as distinct tokens and ranks correctly. Load-bearing: knowing when the corpus's structure argues against embeddings.
 
-**Q: Why does BM25 work?**
+**Q: Why not just always do hybrid?**
 
-Because term frequency × inverse doc frequency captures a real signal: rare terms that appear often in one doc are strong evidence of that doc's topic. It's a hand-crafted feature that transformer-learned features don't consistently reproduce.
-
-**Q: When is dense enough alone?**
-
-Corpora where every query is a well-formed sentence and every doc is prose. Legal briefs, research papers. When your queries have identifiers, error codes, product SKUs, snippets of code — hybrid is a clear win.
+Extra latency and complexity. If measurement shows dense-only is good enough (say, top-3 recall > 90%), running BM25 in parallel is wasted work. Hybrid is the fallback when either alone is insufficient — and you measure to know which case you're in.
 
 ## See also
 
-- `06-hybrid-retrieval-rrf.md` — the fusion algorithm
-- `01-embeddings.md` — the dense side
+- [06-hybrid-retrieval-rrf.md](06-hybrid-retrieval-rrf.md) — the fusion.
+- [11-rag.md](11-rag.md) — the pipeline both live in.
+- [../05-evals-and-observability/01-eval-set-types.md](../05-evals-and-observability/01-eval-set-types.md) — how to measure retrieval quality.

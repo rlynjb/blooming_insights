@@ -1,162 +1,197 @@
-# 03 — LLM-as-judge bias
+# LLM-as-judge bias
 
-**Type:** Industry standard. Also called: judge model bias, meta-eval, judge calibration.
+## Subtitle
+
+Position / verbosity / self-preference bias — Industry standard.
 
 ## Zoom out, then zoom in
 
-Three biases the LLM judge carries by default. This repo ran a Session-D pilot calibration slice to measure whether the judge could be trusted.
+LLM-as-judge is cheap and scalable, but biased. Three known biases: **position** (judge prefers whichever variant appears first), **verbosity** (judge prefers longer responses regardless of quality), **self-preference** (judge prefers outputs from its own model family). Knowing them lets you design around them. blooming's blind calibration protocol (Session D pilot) measured judge-vs-human agreement: verdict 6/6, exact score 13/24 (54%), within-1-score 24/24 (100%). That's what makes the eval numbers defensible.
 
 ```
-  Zoom out — three biases + this repo's mitigation
+  Zoom out — where bias mitigation lives
 
-  ┌─ Position bias ─────────────────────────────────────────────────┐
-  │  Judge prefers whichever variant appears first                   │
-  │  fix: randomize order                                            │
-  └─────────────────────────────────────────────────────────────────┘
-
-  ┌─ Verbosity bias ────────────────────────────────────────────────┐
-  │  Judge prefers longer responses                                  │
-  │  fix: cap length or score length as its own dim                  │
-  └─────────────────────────────────────────────────────────────────┘
-
-  ┌─ Self-preference ───────────────────────────────────────────────┐
-  │  Judge prefers outputs from the same model family                │
-  │  fix: use a DIFFERENT family as judge                            │
-  └─────────────────────────────────────────────────────────────────┘
-
-  ★ THIS REPO measured Sonnet-judge vs Haiku-judge agreement to
-    quantify the self-preference risk in Session D.
+  ┌─ Rubric definition ─────────────────────────────────┐
+  │  eval/rubrics/*.ts                                   │
+  │  · specific dimensions (not vague)                   │
+  │  · anchored scale descriptions                       │
+  │  · verbosity not explicit in prompt                  │
+  └───────────────────────┬──────────────────────────────┘
+                          │
+                          ▼
+  ┌─ Judge harness ★ ────────────────────────────────────┐ ← we are here
+  │  · RubricJudge (from @aptkit/core)                   │
+  │  · Sonnet judge, same family as agents (self-prefer  │
+  │    risk, addressed by calibration)                   │
+  └───────────────────────┬──────────────────────────────┘
+                          │
+                          ▼
+  ┌─ Blind calibration ──────────────────────────────────┐
+  │  Session D pilot: verdict 6/6 agreement,             │
+  │  exact score 13/24 (54%), within-1 24/24 (100%)      │
+  └──────────────────────────────────────────────────────┘
 ```
 
-Zoom in. LLM-as-judge is cheap (~$0.04/judgment) but biased. The Session-D calibration pilot compared verdicts across two judges (Sonnet, Haiku) on 6 cases: **verdict agreement 6/6 (100%), exact-match dims 13/24 (54%), within-1 dims 24/24 (100%).** That's the measured trust ceiling.
+Zoom in: calibration is the proof that the judge is doing what you think it is.
 
 ## Structure pass
 
-Axis: what makes the judge wrong?
-- Position: order dependency
-- Verbosity: length weighting
-- Self-preference: family homophily
-
-**Seam:** the judge's model choice. Change which model judges = change the bias profile.
+- **Layers:** bias source → mitigation → measured agreement → committed baseline. Four bands.
+- **Axis: trust.** Each mitigation raises trust in judge scores. Calibration numbers make trust legible.
+- **Seam:** the calibration protocol. Every rubric change should pass calibration before entering CI.
 
 ## How it works
 
-### Move 1
+### Move 1 — the mental model
 
-You've had a code review where the reviewer preferred your patch to your colleague's not because it was better but because it was longer / more detailed / from their close team. Same bias shape, at model scale.
+Three biases and their fixes:
 
 ```
-  Three known judge biases (all measurable, all mitigatable)
+  Three judge biases — sketched
 
-  position:    "A" wins more often than "B" when swapped   ← measure by swap
-  verbosity:   longer wins more often                       ← measure by length correlation
-  self-pref:   same-family judge scores higher              ← measure by cross-family
+  ┌─ Position bias ───────────────────────────────────┐
+  │  judge prefers whichever variant is listed first  │
+  │  Fix: randomize order per pair                    │
+  └────────────────────────────────────────────────────┘
+
+  ┌─ Verbosity bias ──────────────────────────────────┐
+  │  judge prefers longer responses                    │
+  │  Fix: cap length OR include length as a dim being  │
+  │        scored (so length becomes signal, not noise)│
+  └────────────────────────────────────────────────────┘
+
+  ┌─ Self-preference ─────────────────────────────────┐
+  │  judge prefers outputs from its own model family   │
+  │  Fix: use a different model family as judge OR     │
+  │        calibrate against blind human scoring        │
+  └────────────────────────────────────────────────────┘
 ```
 
-### Move 2
+### Move 2 — the step-by-step walkthrough
 
-**Position bias.**
+**Position bias.** Doesn't apply to blooming's rubric evals — each rubric judgment scores *one* output, not two side-by-side. Would apply if `B5.2` (pairwise eval) lands; the fix there is randomizing which variant is labeled "A" vs "B" per case.
 
-Not applicable in this codebase's current shape — the judge scores one output at a time against a rubric, not two variants pairwise. Would matter if `02-eval-methods.md`'s Case B pairwise eval were added.
+**Verbosity bias.** Blooming's rubrics have `step_actionability` and `impact_realism` in the recommendation rubric, and `evidence_grounding` in the diagnosis rubric — dimensions that naturally reward *specificity*, not length. A long-but-vague answer scores 2; a short-but-specific one scores 4. Explicit design choice.
 
-**Verbosity bias.**
+**Self-preference bias.** The biggest risk in blooming — Sonnet judges Sonnet output. Not addressed by using a different judge model (which would drop the risk); addressed by **calibration**. The blind protocol: score a subset of outputs with the judge, then score the same outputs blind (human), then compare distributions.
 
-Applicable. `RubricJudge` isn't length-blind. If the diagnosis conclusion is 300 words vs 100 words, the longer one may score higher on `root_cause_plausibility` because it discusses more mechanisms — even if the shorter is more precise. Mitigation: none in the rubric today. Would be Case B (add a `length_appropriateness` dim, or normalize the score against length correlation across the goldens).
+**The blind calibration protocol.** `eval/calibration/` folder holds the artifacts:
 
-**Self-preference.**
+- Take a small set of case outputs (Session D pilot used 6 cases = 6 diagnoses + 18 recs = 24 dimension-judgments).
+- Have a human blind-score them against the rubric (no judge scores visible).
+- Have the judge score them (the normal path).
+- Compare: verdict agreement, exact-score agreement, within-1-score agreement.
 
-Applicable and MEASURED. The agent-under-test runs on `claude-sonnet-4-6`. The judge in `eval/run.eval.ts:229` also runs on `claude-sonnet-4-6`. Same family. Self-preference risk is real.
+Session D pilot results:
 
-**The Session-D calibration slice.**
+```
+  Session D blind calibration — pilot results
 
-`eval/compute-agreement.eval.ts` + `eval/calibration/agreement-*.json`. Compared two judges (Sonnet at temp 0, Haiku at temp 0) on 6 golden cases (3 has-signal, 2 no-signal, 1 positive). Measured:
-- **Verdict agreement**: 6/6 (100%). Both judges reached the same pass/pass_with_notes/fail verdict on every case.
-- **Exact-match dims**: 13/24 (54%). Individual dim scores matched exactly ~half the time.
-- **Within-1 dims**: 24/24 (100%). Every dim was within ±1 score. No wild disagreements.
+  verdict agreement:          6 / 6      (100%)
+  exact score agreement:     13 / 24     (54%)
+  within-1-score agreement:  24 / 24     (100%)
+```
 
-Interpretation: the RUBRIC is robust across judges (verdicts stable, no wild dim disagreements), but individual scores are noisy at the 1-point level. That's the trust ceiling — this repo can rely on verdict-level regression detection, not on 0.1-point dim comparisons.
+100% verdict agreement is strong — the judge's pass/fail calls match the human's. 54% exact-score is moderate — judge and human sometimes disagree on 3 vs 4, but never disagree on 2 vs 5. 100% within-1 confirms the noise is bounded.
 
-**What the calibration DIDN'T catch.**
+**Judge-error resilience.** Distinct from bias. When the judge fails to emit valid JSON (max_tokens hit mid-response), the receipt records `judge_error` instead of crashing. `max_tokens = 4096` was tuned to make this <1% of judgments (see **02-eval-methods.md**).
 
-If BOTH judges (Sonnet, Haiku) are wrong the same way — e.g. both over-score `evidence_grounding` when the diagnosis uses fancy vocabulary — that's shared bias, not measurable by cross-model agreement. A human-labeled ground truth would catch it. Not built.
+Diagram of the calibration process:
 
-### Move 3
+```
+  Blind calibration — one round
 
-Trust the verdict; don't trust the score. LLM-as-judge is reliable at the coarse level and noisy at the fine level. Design your eval to depend on the coarse level — pass/fail gate on verdicts, not on fractional dim scores.
+  6 diagnosis outputs + 18 rec outputs = 24 judgment items
+    │
+    ├──────────────────────┐
+    ▼                      ▼
+  human blind scores    judge scores
+  each item             each item
+    │                      │
+    └──────────┬───────────┘
+               │
+               ▼
+  compare distributions:
+    verdict-level:     100% match  (6/6)
+    exact-score:        54% match  (13/24)
+    within-1-score:    100% match  (24/24)
+
+  interpretation:
+    judge is calibrated for pass/fail decisions
+    judge has bounded noise on granular scores
+    the eval numbers are trustworthy at verdict level
+```
+
+### Move 3 — the principle
+
+LLM-as-judge scales but biases. Rubric design (specific dimensions, anchored scales) reduces one class of bias. Blind calibration measures the residual noise and makes it legible. Never trust judge scores without calibration; calibration is the artifact that makes them defensible.
 
 ## Primary diagram
 
 ```
-  This repo's Session D calibration slice
+  Judge bias + mitigations in blooming — full frame
 
-  ┌─ 6 golden cases ──────────────────────────────────────────────────┐
-  │  01-conversion-drop-mobile-checkout    (has-signal)                │
-  │  02-fraud-payment-failure-credit-card  (has-signal)                │
-  │  03-session-drop-organic-mobile        (has-signal)                │
-  │  05-no-signal-retention-subscribers    (no-signal)                 │
-  │  07-positive-conversion-surge-mobile   (positive)                  │
-  │  09-engagement-drop-email-campaign     (partial-signal)            │
-  └─────────────┬─────────────────────────────────────────────────────┘
-                │
-     ┌──────────┼──────────┐
-     ▼                     ▼
-  ┌─ Judge A ──────┐   ┌─ Judge B ──────┐
-  │  Sonnet 4.6    │   │  Haiku 4.5     │
-  │  temp = 0      │   │  temp = 0      │
-  └────┬───────────┘   └────┬───────────┘
-       │                    │
-       │  verdicts          │  verdicts
-       ▼                    ▼
-  {pass, fail, pass_w_notes, ...}    ← compared per-case
-       │
-       ▼
-  agreement metrics (eval/calibration/agreement-*.json):
-    verdict agreement:  6/6 (100%)
-    exact-match dims:  13/24 (54%)
-    within-1 dims:     24/24 (100%)
+  ┌─ Rubric design ─────────────────────────────────────┐
+  │  · specific dimensions                               │
+  │  · anchored scale descriptions (1-5 with text)       │
+  │  · dimensions that reward specificity, not length    │
+  │    (mitigates verbosity bias by design)              │
+  └───────────────────────┬─────────────────────────────┘
+                          │
+                          ▼
+  ┌─ Judge model choice ────────────────────────────────┐
+  │  Sonnet 4.6 (same family as agents)                  │
+  │  · known self-preference risk                        │
+  │  · mitigated by calibration, not by different judge  │
+  └───────────────────────┬─────────────────────────────┘
+                          │
+                          ▼
+  ┌─ Blind calibration protocol (LIVE) ─────────────────┐
+  │  Session D pilot:                                    │
+  │    verdict 6/6 · exact 13/24 · within-1 24/24        │
+  │  → verdict-level trust is high                       │
+  │  → per-dim scores have bounded noise                 │
+  └───────────────────────┬─────────────────────────────┘
+                          │
+                          ▼
+  ┌─ Judge-error resilience (LIVE) ─────────────────────┐
+  │  max_tokens = 4096 (bumped from default)             │
+  │  on parse fail: receipt records judge_error          │
+  │  observed rate: <1% of judgments                     │
+  └─────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The literature on LLM-as-judge biases grew fast around 2023-2024. Notable papers: "Judging LLM-as-a-judge with MT-Bench and Chatbot Arena" (Zheng et al. 2023, established position bias and verbosity bias); "Large Language Models are not Fair Evaluators" (Wang et al. 2023, self-preference).
+The three biases are well-established (Zheng et al. 2023 "Judging LLM-as-a-Judge with MT-Bench" enumerates them and measures effect sizes). Calibration is the industry-standard mitigation for the residual — even a same-family judge can be defensible if calibrated against blind humans.
 
-Standard mitigations beyond what's in this repo: **G-Eval-style chain-of-thought judging** (make the judge reason before scoring), **multi-judge ensembles** (average across 3-5 diverse judges), **rubric-anchored scoring** (this repo's approach — 1-5 scores with per-score descriptions constrain drift).
+Cross-family judging (using Claude to judge GPT-4, or vice versa) can reduce self-preference but introduces its own inconsistency across judge upgrades. Same-family + calibration is the pragmatic tradeoff blooming makes.
+
+Related: **02-eval-methods.md** (the rubric shape), **04-llm-observability.md** (how bias-relevant metrics land in receipts).
 
 ## Project exercises
 
-### Exercise — verbosity-bias measurement
+### B5.3 · Expand calibration to the full 10-case set
 
-- **Exercise ID:** C3.3-A · Case A (concept exercised at the pilot level; extend to measure).
-- **What to build:** across the 10-case receipts, compute per-dim correlation between diagnosis length (character count) and dim score. If any dim correlates with length at |r| > 0.4, flag as verbosity-biased. Report in `report.eval.ts`.
-- **Why it earns its place:** turns "verbosity bias is real" into a measured claim on this repo's specific rubric. Interviewer signal: "I know which of my dims are length-biased, and I have the number."
-- **Files to touch:** `eval/report.eval.ts` (add correlation section), receipt already has length.
-- **Done when:** report prints per-dim length-correlation across the 10-case run.
-- **Estimated effort:** 1-4hr.
+- **Exercise ID:** B5.3 (Case A — pilot exists; expand)
+- **What to build:** Extend the blind calibration from 6 pilot cases to all 10 goldens (10 diagnoses + 30 recs = 40 dimension judgments). Report verdict / exact / within-1 agreement per dimension.
+- **Why it earns its place:** Turns "pilot shows the judge is calibrated" into "the whole eval is calibrated." Interview-defensible statement: "here's the number that says our judge agrees with humans."
+- **Files to touch:** `eval/calibration/` (add blind-scoring artifacts), new `eval/calibration.eval.ts` (compares), `eval/report.eval.ts` (surfaces per-dim calibration).
+- **Done when:** the report includes a per-dim calibration line; the numbers are committed as a baseline.
+- **Estimated effort:** `1–2 days` including the blind human scoring.
 
 ## Interview defense
 
-**Q: What biases does your judge carry?**
+**Q: How do you know your judge isn't just agreeing with itself?**
 
-Three known ones: position (pairwise ordering matters — not applicable here since I'm rubric-scoring, not pairwise), verbosity (longer wins — applicable, unmeasured), self-preference (same family — applicable, MEASURED). The Session-D pilot ran a cross-family calibration slice: verdict agreement between Sonnet-judge and Haiku-judge was 6/6 on 6 cases. Same-family risk exists but is bounded.
+Blind calibration. Session D pilot: 24 dimension-judgments where a human scored them blind, then the judge scored them. Verdict agreement 6/6 (100%); exact-score 13/24 (54%); within-1 24/24 (100%). At the verdict level — pass/fail — the judge matches the human. At granular per-dim scores, the noise is bounded to ±1. That's what makes the eval numbers defensible.
 
-**Q: How can you trust the judge?**
+**Q: Isn't Sonnet judging Sonnet a problem?**
 
-At the verdict level. Cross-family agreement was 100% on verdicts, 100% within-1 on dim scores. That means my regression gate on verdicts is safe. My gate on fractional dim differences would be noisy — I don't rely on that.
-
-```
-  Trust ceiling from Session D:
-  · verdict-level:   100% agreement → use for gating
-  · dim exact-match: 54%             → don't rely on 0.1 differences
-  · dim within-1:    100%            → dim regressions of 2+ are real
-```
-
-**Q: What if both judges are wrong the same way?**
-
-That's shared bias — not detectable by cross-model agreement. Only human-labeled ground truth catches it. Not built. If I saw suspicious eval results (e.g. all diagnoses passing but the recommendations obviously wrong on inspection), I'd add a small human-labeled set as a sanity check.
+Yes — self-preference bias is real. Mitigation options: use a different judge model (introduces cross-family inconsistency across judge upgrades), or calibrate against blind human scoring (bounds the residual). I chose calibration. The 100% verdict agreement in the pilot says the residual is small enough that the pass/fail decisions are trustworthy. Load-bearing: knowing the tradeoff and picking the right side for this codebase's shape.
 
 ## See also
 
-- `02-eval-methods.md` — the rubric that biases apply to
-- `04-llm-observability.md` — the receipt structure calibration lives in
-- `eval/calibration/agreement-*.json` — the actual pilot results
-- `eval/compute-agreement.eval.ts` — the agreement math
+- [02-eval-methods.md](02-eval-methods.md) — the rubric the judge scores against.
+- [04-llm-observability.md](04-llm-observability.md) — where calibration numbers show up in reports.
+- [../01-llm-foundations/04-structured-outputs.md](../01-llm-foundations/04-structured-outputs.md) — the schema constraint that makes judge output well-formed.

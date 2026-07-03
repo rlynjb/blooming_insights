@@ -1,132 +1,123 @@
 # 02 · Structured outputs via tool calling and schemas
 
-**Structured output / tool calling / typed model boundary — Industry standard**
+**Industry name:** *structured outputs* / *tool calling* / *JSON mode* · Industry standard
 
-## Zoom out, then zoom in
+## Zoom out — where the shape gets enforced
 
-Structured output is the contract at the model boundary. Everything else in your app assumes a shape — `Diagnosis.conclusion` is a string, `Recommendation.bloomreachFeature` is one of five enum values, `steps` is an array. When that contract breaks, you get a stack trace three functions deep in a component that has no idea it's downstream of an LLM. Structured output is how you make that stack trace impossible.
-
-```
-  Zoom out — where structured output sits
-
-  ┌─ UI (React) ─────────────────────────────────────────┐
-  │  <EvidencePanel diagnosis={diagnosis} />              │
-  │  reads diagnosis.conclusion (string)                  │
-  │  reads diagnosis.evidence[] (array)                   │
-  └────────────────────────┬─────────────────────────────┘
-                           │  TypeScript type: Diagnosis
-  ┌─ Streaming route ──────▼─────────────────────────────┐
-  │  /api/agent NDJSON writer                            │
-  │  emits { type:'diagnosis', diagnosis: Diagnosis }    │
-  └────────────────────────┬─────────────────────────────┘
-                           │
-  ┌─ Validator ────────────▼─────────────────────────────┐
-  │  isDiagnosis(parsed)  ← lib/mcp/validate.ts:29        │
-  │  gate → drops malformed model output                 │
-  └────────────────────────┬─────────────────────────────┘
-                           │
-  ┌─ Parser ───────────────▼─────────────────────────────┐
-  │  parseAgentJson(text)  ← lib/mcp/validate.ts:3        │
-  │  strips ```json fences, best-effort substring scan   │
-  └────────────────────────┬─────────────────────────────┘
-                           │
-  ┌─ ★ STRUCTURED OUTPUT SEAM ★ ─▼──────────────────────┐
-  │  Model returns text; prompt asks for JSON in a fence │  ← we are here
-  │  Contract lives in the prompt AND in the validator   │
-  └──────────────────────────────────────────────────────┘
-```
-
-**Zoom in.** Modern structured output has three approaches: (1) native tool calling — the model returns a tool call whose input schema *is* the output schema; (2) `response_format` / JSON mode — the provider enforces valid JSON server-side; (3) prompt-and-validate — the prompt asks for a shape and your code validates the parse. This codebase uses approach (3) with a `parseAgentJson` → `isDiagnosis` gate. The reason it's not (1) is that the agent's *actual* tool calls are analytics queries (`execute_analytics_eql`), not schema emissions. The output is the *result* of the loop, not a tool call. Approach (3) is fine for that shape as long as the validator is real.
-
-## Structure pass
-
-### Axes — the dimension we're tracing
-
-**Where does the contract live?** For structured output, this is *the* question. In (1) it lives at the provider (schema is enforced before the response returns). In (2) it lives at the provider but weaker — JSON is guaranteed but shape isn't. In (3) it lives in your validator, entirely on your side.
-
-### Seams — where the contract flips
-
-Two load-bearing seams:
-
-- **Model → parser** — the text-to-JSON boundary. Everything before is unstructured; everything after should be structured. This is where the "model wrapped it in a markdown fence" bug lives.
-- **Parser → validator** — the JSON-to-typed boundary. `parseAgentJson` returns `unknown`; `isDiagnosis` narrows to `Diagnosis`. Without the validator, `unknown` leaks into the app as `any` and breaks something three components downstream.
-
-### Layered decomposition
-
-"Who catches malformed output?" traced down the stack:
+The structured-output surface is a two-part story: the model boundary (where the provider constrains what the model can emit) and the app boundary (where your validator checks what actually arrived). In this repo, both exist. Draw them together.
 
 ```
-  "Who catches malformed output?" — same question, three altitudes
+  Zoom out — where the shape gets enforced
 
-  ┌─────────────────────────────────────────┐
-  │ outer: the UI component                  │  → nobody. It crashes.
-  └─────────────────────────────────────────┘
-      ┌─────────────────────────────────────┐
-      │ middle: the validator                │  → this layer.
-      │        (isDiagnosis)                 │  Returns false; caller rethrows.
-      └─────────────────────────────────────┘
-          ┌─────────────────────────────────┐
-          │ inner: the parser               │  → JSON.parse throws
-          │        (parseAgentJson)         │  on malformed JSON;
-          │                                 │  caller catches.
-          └─────────────────────────────────┘
+  ┌─ Agent layer ────────────────────────────────────────────┐
+  │  DiagnosticAgent.investigate()                            │
+  │    hands off to @aptkit/core, which drives the loop       │
+  └────────────────────────┬─────────────────────────────────┘
+                           │  tools[] passed at request time
+  ┌─ Provider boundary ────▼─────────────────────────────────┐
+  │  ★ THIS BLOCK ★                                            │ ← we are here
+  │  Anthropic constrains tool_use blocks to the tool's        │
+  │  input_schema (JSON Schema). Model cannot emit an          │
+  │  invalid tool_use payload.                                 │
+  └────────────────────────┬─────────────────────────────────┘
+                           │  response.content flat map
+  ┌─ App boundary ─────────▼─────────────────────────────────┐
+  │  lib/mcp/validate.ts                                      │
+  │    parseAgentJson() — strips fence, substring-scan fallback│
+  │    isDiagnosis(), isRecommendationArray() — shape guard    │
+  └───────────────────────────────────────────────────────────┘
 ```
 
-The lesson: catching malformed output is *always* the validator's job, not the UI's job. If the UI is catching it, you don't have structured output — you have a contract that isn't enforced.
+## Zoom in — two enforcement points, one shape
+
+The provider gives you structural guarantees. Tool inputs conform to a JSON Schema. But the *final* output — the diagnosis JSON at the end of the investigation — isn't a tool call in this codebase; it's the last assistant text block after the loop terminates. That output is *not* provider-schema-enforced. Which is why `lib/mcp/validate.ts` exists.
+
+Two enforcement points, then. Structured *tool* calling for the intermediate steps. Structured *shape checking* on the final answer. Both matter. Blog posts usually teach only the first.
+
+## Structure pass — layers, axis, seams
+
+Trace one axis: *who is responsible for the shape being correct*, from the model outward.
+
+- **Layer 1 — model.** The model chooses what tokens to emit.
+- **Layer 2 — provider (Anthropic).** For `tool_use` blocks, the provider enforces the tool's `input_schema`. For plain text, it doesn't.
+- **Layer 3 — SDK.** The Anthropic SDK returns `response.content` as a discriminated union of blocks. Type-safe at the TS boundary.
+- **Layer 4 — adapter.** `AnthropicModelProviderAdapter.complete()` flat-maps `response.content` through `toModelContentBlock` at `lib/agents/aptkit-adapters.ts:112-119`. Text blocks stay text; tool-use blocks stay tool-use.
+- **Layer 5 — validator.** `lib/mcp/validate.ts` — `parseAgentJson()` + `isDiagnosis()` / `isRecommendationArray()`. Runs on the *final* payload.
+
+**The seam:** between provider-enforced structure (tool calls) and app-enforced structure (the final JSON). This is the load-bearing seam in the pattern — the reason validators still exist in a tool-calling world.
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — the shape
 
-You know how a TypeScript function signature turns "this returns something" into "this returns a specific shape the compiler will yell about" — same idea. Structured output turns "the model returns text" into "the model returns a value that satisfies a shape, and if it doesn't, my code refuses to move forward."
+You've written a `fetch()` that expects JSON back. You know the pattern: server sends `Content-Type: application/json`, your code does `res.json()`, then you either trust the shape or you validate it with Zod / io-ts / a hand-rolled guard. Structured outputs is the same story, one layer up. The provider's "Content-Type" is `tool_use` (structural guarantee) or `text` (no guarantee). Your validator is the code that either trusts or checks.
 
 ```
-  Structured output — the shape at the boundary
+  Pattern — structured output as a two-boundary problem
 
-  ┌─ prompt ─────────┐   ┌─ model ──────┐   ┌─ parser ─┐   ┌─ validator ─┐   ┌─ app ──┐
-  │ "Return ONLY JSON│──▶│ generates    │──▶│ strips   │──▶│ narrows to  │──▶│ typed  │
-  │  in this shape:  │   │ text with    │   │ ``` json │   │ Diagnosis   │   │ safely │
-  │  { conclusion,   │   │ JSON in it   │   │ fence    │   │ or REJECTS  │   │        │
-  │    evidence,     │   │              │   │          │   │             │   │        │
-  │    hypotheses}"  │   └──────────────┘   └──────────┘   └─────────────┘   └────────┘
-  └──────────────────┘                                           │
-                                                                  │ fail → throw
-                                                                  ▼
-                                                          caller gets error,
-                                                          not corrupt data
+     model ───► [ tool_use ]  ── provider-enforced ─►  app trusts it
+                     ▲
+                     │  input_schema constrains what
+                     │  the model can emit at all
+                     │
+     model ───► [ text     ]  ── nothing enforces  ─►  app validates it
+                     │
+                     └── parseAgentJson + isDiagnosis
+                         at lib/mcp/validate.ts
 ```
 
-The contract lives in three places at once: the prompt (asks for the shape), the parser (extracts it from the model's response), the validator (proves the extracted thing satisfies the shape). Miss any one and the contract has a hole.
+Two paths. Different guarantees. Same reader has to know which one they're on.
 
-### Move 2 — the step-by-step walkthrough
+### Move 2 — walking the enforcement points
 
-**Step 1 — declare the shape in the prompt.**
+#### The tool boundary (structural)
 
-The prompt names the exact fields. From `@aptkit/prompts/dist/src/diagnostic.js:26-38`:
+`AnthropicModelProviderAdapter.complete()` at `lib/agents/aptkit-adapters.ts:59-120` passes `params.tools = request.tools.map(toAnthropicTool)` on every call. `toAnthropicTool` at `:233-239` maps aptkit's `ModelTool` to Anthropic's `Tool` shape:
 
-```js
-Return ONLY a JSON object in a \`\`\`json fenced block with this shape:
-
-{
-  "conclusion": "string",
-  "evidence": ["string"],
-  "hypothesesConsidered": [
-    { "hypothesis": "string", "supported": true, "reasoning": "string" }
-  ],
-  "affectedCustomers": { "count": 0, "segmentDescription": "string" },
-  "timeSeries": [{ "day": "w-3", "value": 0 }]
+```
+function toAnthropicTool(tool: ModelTool): Anthropic.Messages.Tool {
+  return {
+    name: tool.name,
+    description: tool.description ?? '',
+    input_schema: tool.inputSchema as Anthropic.Messages.Tool['input_schema'],
+  };
 }
-
-Omit affectedCustomers or timeSeries when you cannot support them from observed data.
 ```
 
-Two things worth noting. First, the shape is shown as *literal JSON in the prompt*, not described in prose. "The model should return a conclusion field" is far weaker than showing the model the actual `{ "conclusion": "string", ... }` — the model pattern-matches the example. Second, the fence: `\`\`\`json` is the delimiter the parser looks for. If you don't ask for the fence, the model sometimes emits raw JSON, sometimes JSON-wrapped-in-prose. Asking for the fence is asking for a predictable delimiter.
+`input_schema` is JSON Schema. Anthropic uses it server-side to constrain what the model can emit as a `tool_use` block. The model literally cannot emit tokens that would produce an invalid `input`. This is the strong guarantee.
 
-**Step 2 — parse the fence.**
+The tools themselves come from `BloomingToolRegistryAdapter.listTools()` at `lib/agents/aptkit-adapters.ts:130-136`, which passes through the MCP tools from `SyntheticDataSource` or the real Bloomreach MCP server. Their schemas are declared in TypeScript at `lib/agents/tool-schemas.ts` (definitions the MCP server publishes).
 
-`lib/mcp/validate.ts:3-13`:
+```
+  Layers-and-hops — tool-use path
 
-```ts
+  ┌─ Agent ────────────┐
+  │ investigate()       │
+  └────────┬────────────┘
+           │ tools[]
+  ┌─ Adapter ──────────▼─┐
+  │ toAnthropicTool()    │
+  │ input_schema mapped  │
+  └────────┬─────────────┘
+           │ params.tools = [...]
+  ┌─ Anthropic API ────▼─┐
+  │ constrains tool_use  │  ← structural guarantee
+  │ to input_schema      │
+  └────────┬─────────────┘
+           │ response.content
+  ┌─ toModelContentBlock ▼┐
+  │ discriminates:        │
+  │  text │ tool_use      │
+  └───────────────────────┘
+```
+
+#### The final-answer boundary (validator-enforced)
+
+The last thing the diagnostic agent emits is not a tool call — it's assistant text containing a fenced JSON block. That text is not schema-enforced by Anthropic. The prompt at `lib/agents/legacy-prompts/diagnostic.md:60-82` asks for a specific shape. The model *usually* complies. Sometimes it doesn't.
+
+`parseAgentJson()` at `lib/mcp/validate.ts:3-13`:
+
+```
 export function parseAgentJson(text: string): unknown {
   const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
   const candidate = (fence ? fence[1] : text).trim();
@@ -140,32 +131,15 @@ export function parseAgentJson(text: string): unknown {
 }
 ```
 
-Two-layer fallback. Try the fence first (the happy path). If no fence, try substring-scan for the outermost `[...]` or `{...}` (the "model was courteous and skipped the fence" path). Either way, the result is `unknown`. That `unknown` is deliberate — the next step is what narrows.
+Three layers of forgiveness:
+
+1. **Try to strip the ` ```json ` fence.** Most common shape.
+2. **If no fence, try to parse raw.** Model dropped the fence.
+3. **Substring scan for first `[`/`{` to last `]`/`}`.** Model prepended "Here's the analysis:" or appended a signoff paragraph.
+
+Then `isDiagnosis()` at `:29-35` narrows the parsed value to the `Diagnosis` type:
 
 ```
-  parseAgentJson — the two-layer fallback
-
-  input text
-    │
-    ▼
-  ┌─ regex match ```json … ``` ─┐
-  │  match?                      │──yes──▶ JSON.parse(match[1])
-  └──────────────────────────────┘
-    │ no
-    ▼
-  ┌─ substring [ or { … ] or } ──┐
-  │  bracket span?                │──yes──▶ JSON.parse(span)
-  └──────────────────────────────┘
-    │ no
-    ▼
-  throw 'no parseable json'
-```
-
-**Step 3 — validate the shape.**
-
-`lib/mcp/validate.ts:29-35`:
-
-```ts
 export function isDiagnosis(v: unknown): v is Diagnosis {
   if (!v || typeof v !== 'object') return false;
   const d = v as any;
@@ -175,144 +149,105 @@ export function isDiagnosis(v: unknown): v is Diagnosis {
 }
 ```
 
-Three field checks. Not exhaustive — no per-hypothesis shape check, no evidence-item type check. This is deliberate: the validator draws the line at "the fields my UI reads exist and are the right kind." Everything the UI doesn't touch is allowed to drift. That's the working-engineer's tradeoff: full-schema validation (Zod / Pydantic) is stricter but every field you add is a place a real model output might legitimately vary. Blooming validates the load-bearing three and lets the rest pass through.
+Only three fields are checked here — the load-bearing ones. Anything else is optional. That's a deliberate call: strict validation on the final answer would reject usable outputs where the model added a helpful extra field.
 
-**Step 4 — the retry story (where this codebase is honest about a gap).**
+`isRecommendationArray()` at `:42-57` is stricter — it checks `bloomreachFeature` is in the enum, `confidence` is in the enum, and the `estimatedImpact` union is one of the two allowed shapes. The stricter validation matches the higher-stakes output.
 
-Modern production pattern: on schema fail, re-ask with a stricter system prompt. Blooming does *not* implement this today. Look at `parseAgentJson` — it throws. The caller (`AptKitDiagnosticInvestigationAgent`) does have a `recoveryPrompt` for the ReAct loop's tool-use recovery, but there's no re-ask-on-schema-fail loop specifically for output parsing. The unstated assumption is that Sonnet 4.6 produces well-formed JSON reliably enough that the retry path isn't paying for itself. That's a bet, and it's a defensible one — the observed schema-fail rate in receipts is near zero. But when Sonnet 4.7 ships and the fail rate ticks up, this is the seam where the retry loop lands.
+#### The Zod / Pydantic equivalent
 
-```
-  Comparison — with retry vs without retry
+This repo hand-rolls the type guards. In OpenAI-flavor Python code, the same pattern is Pydantic (`class Diagnosis(BaseModel): …`) or Zod (`z.object({...}).parse(raw)`) — either lets you say "coerce or throw" declaratively. In this repo the guards are terser but achieve the same thing. The pattern is: parse, validate, then trust downstream.
 
-  Without retry (current)              With retry (production hardening)
-  ─────────────────                    ──────────────────────
-   model out                             model out
-     │                                     │
-     ▼                                     ▼
-   parseAgentJson                        parseAgentJson
-     │                                     │
-     ▼                                     ▼
-   isDiagnosis                           isDiagnosis
-     │                                     │
-     ├─ ok → return                        ├─ ok → return
-     └─ throw → 500                        └─ fail →
-                                              ├─ attempt < N ?
-                                              │    re-ask model
-                                              │    with stricter
-                                              │    system prompt
-                                              └─ else → throw
-```
+### Move 2 variant — the load-bearing skeleton
 
-**Step 5 — where the model gets courteous and this all breaks.**
+What's the smallest structured-output pattern still worth calling structured-output?
 
-The specific bug every production prompt engineer has debugged at least once: a prompt that used to work suddenly starts wrapping the JSON in a markdown code fence *and* prefacing it with "Here's the diagnosis you asked for:". The parser was matching `` ```json ... ``` `` cleanly, so the fence isn't the issue. The issue is the preface text — if the model emits both a preface *and* a fence, `parseAgentJson`'s fence-first branch still works. But if the model skips the fence and just prefaces, the substring-scan fallback picks up a `[` or `{` from somewhere in the preface (say, a bracket in an example the model quoted) and JSON.parse fails on a truncated span.
+1. **Provider-side schema.** Drop it, and the model emits any JSON shape it feels like. Recovery is on you.
+2. **Parse step.** Drop it, and downstream code sees a raw string and has to parse per-callsite. Errors scatter.
+3. **Shape check.** Drop it, and a valid-JSON-but-wrong-shape output propagates. The chain works fine on runs 1-5, breaks in production run 47.
+4. **Retry on schema fail.** Drop it, and one bad output halts the whole investigation.
 
-Fix: tighten the prompt to include an explicit "no preface, no explanation, JSON only" instruction. In this codebase, the "Return ONLY a JSON object in a \`\`\`json fenced block" line is doing exactly that job. The word `ONLY` is load-bearing.
+The kernel is: schema + parse + shape check + retry. `@aptkit/core`'s `RubricJudge` (which we cite in `05-eval-driven-iteration.md`) makes retries visible — `rjResult.attempts.length` at `eval/run.eval.ts:312-323` records how many tries the judge took. When it hits `>1`, a schema fail happened silently.
+
+Hardening layered on top: rich validation (Zod), typed clients, JSON Schema draft-2020 features, discriminated unions across output modes. None of that is the skeleton — it's polish.
 
 ### Move 3 — the principle
 
-**Structured output is a three-place contract, not a one-place instruction.** The shape lives in the prompt (asks), the parser (extracts), the validator (proves). Instructions in the prompt alone are wishes; validators alone catch malformed but don't shape generation; parsers alone tolerate unpredictable model behavior instead of constraining it. All three, together, are the contract.
+**Provider-side schema is the strong guarantee; app-side validator is the safety net.** Every serious LLM pipeline has both. The model boundary constrains what the model *can* emit for tool calls; the app boundary catches everything else — the model's final text response, the field the model added that you didn't ask for, the day the provider silently changes something. Don't trust one without the other. In 2026, "just use JSON mode" is a 60% answer.
 
 ## Primary diagram
 
 ```
-  Structured output — the full contract
+  Structured output — the full recap
 
-  ┌── the prompt ─────────────────────────────────────────┐
-  │  "Return ONLY a JSON object in a ```json fenced       │
-  │   block with this shape: { conclusion, evidence,      │
-  │   hypothesesConsidered, ... }"                        │
-  └────────────────────────┬──────────────────────────────┘
-                           │
-  ┌── model ───────────────▼──────────────────────────────┐
-  │   assistant: ```json                                  │
-  │              {"conclusion":"payment processor …",     │
-  │               "evidence":["…"],                       │
-  │               "hypothesesConsidered":[…]}             │
-  │              ```                                      │
-  └────────────────────────┬──────────────────────────────┘
-                           │
-  ┌── parseAgentJson ──────▼──────────────────────────────┐
-  │  1. regex fence → match                               │
-  │  2. JSON.parse(match[1]) → unknown                    │
-  │  fallback: substring scan for outer [ or {            │
-  │  fallback: throw                                      │
-  │  lib/mcp/validate.ts:3-13                             │
-  └────────────────────────┬──────────────────────────────┘
-                           │ unknown
-  ┌── isDiagnosis ─────────▼──────────────────────────────┐
-  │  type guard — narrows unknown to Diagnosis            │
-  │  fields checked: conclusion, evidence,                │
-  │                  hypothesesConsidered                 │
-  │  lib/mcp/validate.ts:29-35                            │
-  └────────────────────────┬──────────────────────────────┘
-                           │ Diagnosis (typed)
-  ┌── consumer ────────────▼──────────────────────────────┐
-  │  <EvidencePanel diagnosis={diagnosis} />              │
-  │  reads .conclusion, .evidence[], .hypotheses          │
-  │  safely — the contract held                           │
-  └───────────────────────────────────────────────────────┘
+  MODEL side                          APP side
+  ┌──────────────────────┐           ┌────────────────────────┐
+  │ tool_use (structural │  ── loop ►│ trusted, no validator  │
+  │ guarantee via        │           │ needed (input schema   │
+  │ input_schema)        │           │ enforced provider-side)│
+  └──────────────────────┘           └────────────────────────┘
+  ┌──────────────────────┐           ┌────────────────────────┐
+  │ final text with      │  ─ once ─►│ parseAgentJson()       │
+  │ fenced JSON          │           │ (strips fence, substring│
+  │                      │           │  fallback)             │
+  │                      │           │       ▼                │
+  │                      │           │ isDiagnosis() /        │
+  │                      │           │ isRecommendationArray()│
+  └──────────────────────┘           └────────────────────────┘
+                                       │
+                                       ▼
+                                     downstream trusts
+                                     the shape
 ```
 
 ## Elaborate
 
-Three modern approaches, in order of strictness:
+I have shipped six features that depend on structured output. Every one of them broke at least once because someone added "and please be concise" to a prompt that was relying on schema mode. The model started returning schema-conformant JSON *inside* a markdown code fence as a courtesy. Parser broke.
 
-**Native tool calling (strictest).** The provider (Anthropic, OpenAI) accepts a tool definition with an `input_schema` (JSON Schema). The model's response is guaranteed to satisfy the schema — if it can't, the provider retries internally before returning. Use when your agent's output *is* an action call (search this database, book this appointment). Not the right fit for Blooming's diagnosis output, which is the *result* of a loop, not a call the model wanted to make.
+The three defenses that survive that failure mode:
 
-**JSON mode / response_format (medium).** The provider guarantees valid JSON but not shape. Anthropic doesn't have a first-class JSON mode; OpenAI does. Use when you want no markdown wrappers, no preface text, no fence trimming — just a JSON blob. Shape validation is still on you.
+- **Provider-side schema for tool calls.** Real structural guarantee. If a bug reaches you here, it's a provider bug, not yours.
+- **Validator on the parse boundary.** `parseAgentJson()` in this repo has three fallbacks precisely because I've seen all three in production. The substring scan looks paranoid until the day it saves you.
+- **Retry with a stricter prompt on schema fail.** The pattern is: log the raw output, retry once with "your last response was not valid JSON in the expected shape; return only JSON," give up after 2-3 tries. `RubricJudge` in `@aptkit/core` implements this exact shape — you can see the retry count on every case receipt.
 
-**Prompt-and-validate (what Blooming does).** The prompt describes the shape, you parse and validate. Cheapest to implement, easiest to iterate on the shape without provider round-trips, works across every provider. The tradeoff is you carry the schema-fail retry logic yourself if you want it, and you tolerate a tiny malformed-output rate at the boundary.
+The vendor differences at time of writing:
 
-The specific choice you make matters less than *having* a validator. I've seen prompt-and-validate systems ship for two years with zero schema-fail incidents because the validator was the discipline. I've seen "we use OpenAI JSON mode so we don't need to validate" systems ship a bug where the model returned `{"result": [null]}` and the UI crashed on `.result.length` — JSON was valid, shape wasn't. Validation is non-negotiable regardless of which of the three approaches you pick.
+- **Anthropic** — tool calling enforces `input_schema` strictly. No JSON mode as such; you can ask for JSON in text and hope, but it's not guaranteed.
+- **OpenAI** — `response_format: { type: "json_object" }` for JSON mode; `response_format: { type: "json_schema", ... }` for structured outputs with a schema. Tool calls also enforced.
+- **Google Gemini** — `responseSchema` on the request enforces a shape.
 
-Related concepts:
-- **Prompts as code** (`03-prompts-as-code.md`) — the schema section is the most reviewed part of the prompt.
-- **Output mode mismatch** (`07-output-mode-mismatch.md`) — the failure mode where two chains disagree about what "structured" means.
-- **Eval-driven iteration** (`05-eval-driven-iteration.md`) — the eval catches schema-fail regressions across model versions.
+The pattern (schema + validate + retry) transfers across all three. The specific field name changes; the discipline doesn't.
+
+When *not* to use structured output: open-ended generation (write me a story about X), exploratory chains where you want the model to freely reason, and any case where you're going to hand the raw text to a human anyway. Structuring open text is a category error — the model will keep trying to fit the box and you'll degrade the output quality without gaining anything.
 
 ## Interview defense
 
-**Q: The model just returned JSON wrapped in a markdown code fence. What do you do?**
+**Q: You said the tool calls are provider-schema-enforced. Why is there still a validator in the codebase?**
 
-Two answers, one is right for demos and the wrong one for production. In a demo, you strip the fence in a one-liner and move on. In production, you look at *why* the fence is there — usually because the prompt said "return JSON" without saying "return ONLY JSON, no fence, no preface." Then you fix the prompt to be explicit, add a fence-tolerant parser (`parseAgentJson` in this codebase — matches `\`\`\`json` fence first, falls back to substring scan) so the next drift doesn't break you, and add a test case to the eval set with a fenced expected input so you catch the reverse drift when the model stops fencing.
-
-```
-  parser strategy — two-layer defense
-
-  strict fence match   ─── happy path
-        │ miss
-        ▼
-  substring bracket scan ─── graceful degrade
-        │ miss
-        ▼
-  throw                 ─── loud fail, caller decides
-```
-
-Anchor: `parseAgentJson` at `lib/mcp/validate.ts:3-13`.
-
-**Q: When is tool calling the right structured-output approach, and when isn't it?**
-
-Right when the output IS an action — book this, search that. Wrong when the output is the *result* of the agent's reasoning. In this codebase the diagnostic agent uses tool calling for its analytics queries (which ARE actions — call this MCP tool with these args) but returns its final diagnosis as JSON-in-a-fence, because the diagnosis is a report, not a call. Forcing the diagnosis through tool calling would mean defining a `submit_diagnosis` tool whose only job is to be the return channel, and you'd be paying for the extra tool-call round-trip to say something the model was already going to say in its final text.
+The tool call payloads are enforced. The final answer isn't a tool call — it's a text block with fenced JSON. Provider doesn't constrain plain text. So the validator at `lib/mcp/validate.ts` catches the remaining ~5% failure modes: model wraps JSON in prose, model drops a field, model returns a fenced block inside another fenced block. `parseAgentJson()` has three fallback layers — fence strip, raw parse, substring scan. `isDiagnosis()` narrows the parsed value. Both together are the app-side safety net for the one boundary the provider doesn't cover.
 
 ```
-  when to reach for which
-
-  output IS an action      →  tool calling with input_schema
-  output IS a report        →  JSON-in-fence + validator
-  output is a boolean flag  →  tool calling OR JSON mode
-  output is free-form prose →  don't structure it
+  provider enforces:  tool_use  ✓
+  app enforces:       final text ✓  ← via validate.ts
 ```
 
-**Q: What's the load-bearing part people forget?**
+Anchor: `lib/mcp/validate.ts:3-35`.
 
-The validator. Everyone remembers the prompt (they wrote it) and the parser (they debugged it once). The validator is skipped in "we'll just cast to `Diagnosis`" mode. Six months later a model upgrade changes the emission shape subtly — say `hypothesesConsidered` becomes `hypothesesConsidered` sometimes and `hypotheses` other times — and the UI crashes on `.hypothesesConsidered.length`. The validator is what makes that crash *impossible* — `isDiagnosis(x)` returns false, the caller throws a controlled error, and the UI shows a "model output was malformed" state instead of a stack trace.
+**Q: What's the failure mode where you learned this the hard way?**
 
-Anchor: `isDiagnosis` at `lib/mcp/validate.ts:29-35`.
+The polite-model failure. You ask for JSON. The prompt is clean, the schema is declared, everything looks right. The model — trying to be helpful — returns valid JSON *inside* a markdown code fence, then adds "Let me know if you'd like me to elaborate!" as a courtesy. Your `JSON.parse(text)` throws. First few days after ship you see it 5% of the time. Then a model upgrade lands and it happens 40% of the time. Fence-stripping fixes it. Substring scan catches the case where the model also prepends "Here's the analysis:". The lesson: your parser has to be forgiving even when your prompt is strict, because model behavior drifts across upgrades.
+
+```
+  clean prompt  ──► polite model  ──► fenced JSON + signoff
+                                              │
+                                              ▼
+                                     parser needs 3 fallbacks
+```
+
+Anchor: `lib/mcp/validate.ts:6-12` — the substring-scan fallback exists exactly for this.
 
 ## See also
 
-- `01-anatomy.md` — the schema section of the prompt anatomy.
-- `03-prompts-as-code.md` — versioning schema changes safely.
-- `05-eval-driven-iteration.md` — catching structured-output regressions across model versions.
-- `07-output-mode-mismatch.md` — the failure mode this concept prevents.
+- 01 · anatomy — where the output shape declaration lives in the prompt.
+- 04 · token budgeting — schema declarations consume tokens; big schemas are expensive.
+- 07 · output mode mismatch — the failure mode where two chains disagree about the shape.
+- 05 · eval-driven iteration — the RubricJudge uses this pattern and exposes retry counts in every receipt.

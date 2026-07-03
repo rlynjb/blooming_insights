@@ -1,653 +1,533 @@
-# Audit — the 7-lens walk
+# audit — the 7-lens walk
 
-Every finding cites a real file with line range. Verdicts are ranked
-worst-first inside each lens. State which side of the determinism seam a
-finding is on. Cross-link to the Pass 2 pattern files (`01-…` through
-`06-…`) for deep walks; the audit stays a lens-by-lens read.
+Pass 1 of the study. One `##` section per lens. Findings anchored to
+`file:line`. When a lens finds a technique that's load-bearing enough
+to earn a dedicated pattern file, the lens cross-links there instead of
+restating the deep walk.
 
-Suite state at time of audit:
-- `test/**/*.test.ts`: 24 files, **221 passing tests** (verified via
-  `wc -l` and `grep -cE "^\s*(it|test)\("`).
-- `eval/**/*.eval.ts`: 7 files. `run.eval.ts` runs 10 goldens. Latest
-  baseline runId `2026-07-03T04-08-28-644Z` (see `eval/baseline.json`).
-- CI (`.github/workflows/ci.yml`): typecheck + `npm test` + `next build`.
-  Lint deliberately omitted (28 pre-existing errors, separate cleanup).
-  Evals are NOT wired into CI push/PR — a manual `npm run eval` +
-  `npm run eval:gate` step (deliberate: cost + non-determinism).
+═════════════════════════════════════════════════
+Lens 1 — what is tested and what isn't
+═════════════════════════════════════════════════
 
----
+The coverage MAP, not the number. Which critical paths have tests,
+which don't.
 
-## 1. what-is-tested-and-what-isnt
+### What IS tested (well)
 
-**The coverage map — risk-ranked, not percentage-ranked.**
+- **The MCP client's cache + rate-limit ladder** —
+  `lib/mcp/client.ts` gets 14 tests
+  (`test/mcp/client.test.ts:14-198`) covering the cache miss/hit
+  contract, TTL expiry (fake timers), per-name+args keying, rate-limit
+  retry with parsed retry-after windows, `McpToolError` wrapping.
+  This is the highest-stakes surface in the repo — every agent tool
+  call routes through it, the alpha server rate-limits at ~1 req/s,
+  and the retry ladder decides whether the demo works. It's the
+  best-tested single module.
 
-### What has tests (worth reading top-down)
+- **Auth + session** — `lib/mcp/auth.ts` (14 tests) +
+  `lib/mcp/auth-providers/*` (17 tests, Session B additions) covers
+  the OAuth provider surface, CSRF state one-time-use
+  (`auth.test.ts:99-108`), AES-256-GCM cookie round-trip
+  (`auth.test.ts:124-134`), and provider-factory validation for the
+  three new auth types (`auth-providers.test.ts`).
 
-- **`lib/agents/base.ts` (the shared `runAgentLoop`)** — 8 test cases in
-  `test/agents/base.test.ts:105-345` covering: tool execution then final
-  text, no-tools direct return, tool error captured and loop continues,
-  `maxTurns` bailout with empty finalText, `maxToolCalls` forced-final-turn
-  synthesis instruction, `onText` per-turn callback, `onToolResult` after
-  execution, and byte-identity of the synthesis instruction (`
-  synthesisInstruction` only appended on the forced-final turn). This is
-  the most load-bearing surface in the codebase and the test file walks
-  every control-flow edge.
+- **Schema parsing against real fixtures** —
+  `test/fixtures/*.json` holds 8 captured MCP payloads
+  (`get_event_schema.json`, `get_customer_property_schema.json`,
+  `list_catalogs.json`, `get_project_overview.json`, …). The
+  `parseWorkspaceSchema` tests
+  (`test/mcp/schema.test.ts:62-297`) run the actual wire format
+  through the parser — this is fixture-anchored contract testing.
+  See `05-fixture-anchored-schema-tests.md`.
 
-- **Per-agent scripting**: `test/agents/monitoring.test.ts` (10+ cases),
-  `diagnostic.test.ts` (10+), `recommendation.test.ts` (10+),
-  `query.test.ts` (10+), `intent.test.ts`. Each agent's loop is walked with
-  a scripted Anthropic fake and asserts on: tool-call args, JSON parse of
-  final output, hypotheses coverage, error handling. → deep walk in
-  `01-scripted-anthropic-fake.md`.
+- **Agent loops** — `runAgentLoop` gets 8 tests
+  (`test/agents/base.test.ts:101-384`) covering tool-use → text
+  handoff, `maxTurns` budget, `maxToolCalls` synthesis flip, and
+  error recovery. Every specialized agent
+  (`monitoring/diagnostic/recommendation/query/intent`) has its own
+  file with 3–10 tests, all built on the same scripted-Anthropic
+  fake. See `01-scripted-anthropic-fake.md`.
 
-- **`lib/mcp/client.ts` — cache + rate-limit + retry**: `test/mcp/client.test.ts:14-198`
-  covers cache-hit, cache-miss, `skipCache`, TTL expiry with
-  `vi.useFakeTimers()`, per-call rate-limit floor (`minIntervalMs`),
-  error-result not cached, retry after rate-limited response, parsed
-  retry-after window (`(1 per 10 second)`, `Retry after ~7 seconds`), max
-  retries then give up, transport-throw wrapped as `McpToolError` with the
-  tool name in the message. Every load-bearing branch of the retry ladder
-  is asserted.
+- **Route integration** — `briefing.integration.test.ts` (7 tests) +
+  `agent.integration.test.ts` (10 tests) hit the routes end-to-end
+  with the full mock stack (Anthropic + MCP + session + connect).
+  Happy path, demo replay, 401, `listTools` failure, Anthropic 529,
+  cancellation, phase-timing log — all covered
+  (`briefing.integration.test.ts:115-407`).
 
-- **`lib/mcp/auth.ts` — OAuth + cookie crypto**: `test/mcp/auth.test.ts`
-  covers round-trip tokens/verifier, session isolation between two ids,
-  DCR client metadata shape (`public-client`, `openid profile email` scope),
-  `hasTokens`/`clearAuth`, and (with `vi.stubEnv('AUTH_SECRET', …)`) the
-  AES-256-GCM cookie round-trip.
+- **NDJSON codec** — `test/streaming/ndjson.test.ts` covers the 5
+  cases that matter: multi-event chunk, split line, trailing buffer,
+  malformed line, and `cancelOn` short-circuit
+  (`ndjson.test.ts:17-98`). Test uses the SAME `readNdjson` kernel
+  the production UI hooks use.
 
-- **`lib/mcp/transport.ts` — fetch capture + error enrichment**:
-  `test/mcp/transport.test.ts` covers `makeCapturingFetch` recording a 401
-  body without consuming the original response, non-OK responses recorded,
-  OK responses not recorded, and `SdkTransport` attaching the captured body
-  to a thrown tool error's message.
+- **New config module** — `lib/mcp/config.ts` (23 tests, Session D)
+  covers the encode/decode round-trip, three distinct fail-safe
+  fall-through paths (malformed base64 / invalid JSON / invalid
+  shape), and localStorage read-through with an in-memory shim
+  (`config.test.ts`). See `06-fail-safe-decode-contract-tests.md`.
 
-- **`lib/mcp/schema.ts` — bootstrap parsing against real fixtures**:
-  `test/mcp/schema.test.ts:1-297`. Loads 4 captured JSON files from
-  `test/fixtures/` (real MCP responses), calls `unwrap` and
-  `parseWorkspaceSchema` against them, and asserts on shape:
-  `structuredContent` preferred, `content[0].text` fallback, events sorted
-  by count descending, no duplicate names, etc. → deep walk in
-  `03-captured-fixture-schema-tests.md`.
+### What is NOT tested
 
-- **`lib/mcp/validate.ts` — agent output shape guards**:
-  `test/mcp/validate.test.ts:1-120`. `parseAgentJson` (fenced ```json,
-  bare, embedded), `isAnomalyArray`, `isDiagnosis`, `isRecommendationArray`
-  — accept/reject positive+negative, including the rich `estimatedImpact`
-  object shape.
+- **`components/**/*.tsx`** — 20 `.tsx` files, zero tests. Includes
+  `InsightCard`, `EvidencePanel`, `RecommendationCard`, `StatusLog`,
+  `ToolCallBlock`, `ProcessStepper`, `SeverityBadge`, `AgentBadge`,
+  the settings modal, the QueryBox, the SkelentonCard family. The
+  derive-field logic that feeds them IS unit-tested
+  (`test/insights/derive.test.ts`), so the pipe's inputs are
+  correct; nothing checks the render. **This is the largest
+  untested surface in the repo.** See gap #2 in `00-overview.md`.
 
-- **API integration tests (route level, mocked at the SDK/transport/session
-  seams)**: `test/api/briefing.integration.test.ts` (~400 lines, 7 cases),
-  `test/api/agent.integration.test.ts` (~565 lines, 5+ phases). These
-  drive the actual Next `NextRequest` through the handler and consume the
-  NDJSON stream via the production `readNdjson` kernel — no shortcut
-  parsers. → shape lives in the `mockAnthropicModule` +
-  `makeMockTransport` helpers at `test/api/_helpers.ts:1-425`.
+- **Client hooks** — `lib/hooks/{useInvestigation,
+  useBriefingStream, useReconnectPolicy, useDemoCapture}.ts`. Zero
+  tests. The load-bearing invariant "survives StrictMode by NOT
+  cancelling in-flight fetch on cleanup" lives in a comment
+  (`useInvestigation.ts`), not a test. See gap #1.
 
-- **`test/api/mcp-call-allowlist.test.ts`** — a contract pin test on the
-  `/api/mcp/call` allowlist guard: an allowlisted tool reaches
-  `conn.mcp.callTool` (no 403), an unsanctioned name (e.g. `whoami`)
-  returns 403, a non-string name returns 403. Named "contract pin" in the
-  file header — the test's whole job is to make removing a tool name
-  from the allowlist a compile-time forcing function.
+- **Markdown export** — `lib/export/investigationMarkdown.ts`. Zero
+  tests. Pure function; trivially snapshot-testable; broken export
+  is a broken demo. See gap #3.
 
-- **`lib/data-source/synthetic-data-source.ts`** — `test/data-source/synthetic-data-source.test.ts`
-  covers `listTools()` returning Bloomreach-shaped tool defs,
-  `bootstrapSchema` parsing the synthetic payloads into a `WorkspaceSchema`,
-  and `execute_analytics_eql` returning MCP-shaped envelopes. →
-  `02-injected-datasource-fake.md`.
+- **The `mcp-data-source.ts` layer beyond its interface** — the
+  fault-injecting decorator (`lib/data-source/fault-injecting.ts`)
+  has documented behavior but no unit test. Its four failure modes
+  ARE exercised through the load harness (`eval/load.eval.ts`), but
+  as an integration property — the decorator's isolated logic
+  (per-error probabilities, xorshift32 seed, callback firing) has
+  no unit test.
 
-- **`lib/state/insights.ts` + `investigations.ts`** — session-scoped state
-  maps. `insights.test.ts` explicitly tests cross-session isolation (the
-  bug the refactor fixed), plus the intentional-drop contract on
-  `insightToAnomaly` (evidence, impact, history, category all dropped).
+- **Design docs' example code** — `lib/design/**` exists as
+  written-down decisions, not runnable code; correct that it has no
+  tests.
 
-- **`lib/streaming/ndjson.ts`** — `test/streaming/ndjson.test.ts:1-98`.
-  Multi-line chunk emits one event per line, line split across two reads
-  reassembles, trailing buffer (no terminal newline) flushed at end,
-  malformed line silently skipped and reported via `onMalformed`, cancel
-  cleanly stops the reader.
+**Red flag check:** is the most important / most complex code the
+least tested? **Partial no.** The MCP client (most complex
+control-flow: cache + rate-limit + retry-after parsing + exponential
+backoff) is the best-tested. The client hooks (highest user impact:
+every page depends on them) are the least tested. Net: the
+server-side risk is well-covered; the client-side risk is not.
 
-- **`lib/insights/derive.ts`** — pure derivation (revenue impact, diagnosis
-  confidence rules, impact range/assumption). 8 cases in
-  `test/insights/derive.test.ts`.
-
-- **`lib/mcp/events.ts` codec** — `test/mcp/events.test.ts:1-81` round-trips
-  every `AgentEvent` variant, asserts `encodeEvent` ends with `\n` and
-  never contains an interior newline (this last is the pin that keeps
-  NDJSON safe).
-
-- **`lib/mcp/tool-coverage.ts`** — `test/mcp/tool-coverage.test.ts:1-83`.
-  Cross-checks what the server exposes vs what the agents are configured
-  to call; `bootstrapTools` byte-equality to the `resolveProject +
-  bootstrapSchema` code path (an anchor test — if either drifts, this
-  fires).
-
-- **`lib/agents/categories.ts`** — `test/agents/categories.test.ts` walks
-  the coverage table (full / limited / unavailable) against a real-world
-  event set ("wobbly-ukulele"). Domain-specific but the pattern
-  (capability introspection against a workspace) is well-tested.
-
-- **`lib/agents/base-legacy.ts` `buildSynthesisInstruction`** —
-  `test/agents/synthesis-instruction.test.ts` pins the assembled string
-  byte-for-byte against the pre-lift inline version for each of the four
-  agents. Explicit contract-pin test named as such.
-
-### What does NOT have tests (real risk)
-
-- **`lib/hooks/useInvestigation.ts`** — the client hook that consumes
-  `/api/agent`'s NDJSON stream. **No tests.** This is gap #1 in
-  `00-overview.md`. Deterministic-side finding — the hook has a scripted
-  producer available (any of the test/_helpers.ts patterns work), and
-  its behavior *is* exact-assertion-friendly (given event sequence → final
-  state).
-- **`lib/hooks/useBriefingStream.ts`** — same shape gap. Consumes
-  `/api/briefing`'s NDJSON. Auto-reconnect on `invalid_token` — an
-  important recovery path — is untested.
-- **`lib/hooks/useReconnectPolicy.ts`** — extracted from `app/page.tsx`
-  precisely because it deserved a seam. The seam exists; no tests bind to
-  it yet.
-- **`components/**/*.tsx`** — no component tests. All 19 tsx components
-  under `components/` are exercised only in dev/prod. Low-medium risk
-  for most (`SeverityBadge`, `Skeleton`, `AgentBadge` are near-trivial);
-  medium risk for `EvidencePanel`, `RecommendationCard`, `ReasoningTrace`
-  which have real conditional logic.
-- **`lib/mcp/session.ts`** — no direct unit test. Every integration test
-  mocks it, so the real implementation runs untested. Gap #2 in
-  `00-overview.md`.
-- **`lib/mcp/connect.ts`** — no direct unit test. Exercised indirectly by
-  the API integration tests, but the `redirect_uri` host-based branching
-  logic itself has no assertions.
-- **`lib/export/investigationMarkdown.ts`** — no tests. Low-frequency use
-  (user clicks "export ↓"), low risk.
-- **`app/**/page.tsx` server components** — no tests. Thin shells; risk
-  scales with how much logic each page does, and these are mostly
-  data-fetch-and-render.
-
-**Red flag: is the most important / most complex code the least tested?**
-No — the load-bearing agent loops, the MCP transport ladder, and the
-schema-parser boundary all have dense coverage. **But** the
-`useInvestigation` hook IS complex (StrictMode-survival, sessionStorage
-rehydrate, per-step trace filtering) and completely untested. Not the
-worst version of this red flag, but not clean either.
-
----
-
-## 2. test-design-and-levels
-
-**Pyramid as-built vs the pyramid as-recommended.**
+═════════════════════════════════════════════════
+Lens 2 — test design and levels (the pyramid as-built)
+═════════════════════════════════════════════════
 
 ### The shape
 
 ```
-                          Evals (probabilistic)
-                             ▲
-                             │  10 goldens · rubric-judged
-                             │  eval/run.eval.ts
-                             │  ~$0.09/case · ~15-40min/run
-                             │
-                     Integration (deterministic)
-                             ▲
-                             │  3 files, ~1400 lines
-                             │  test/api/*.integration.test.ts
-                             │  Mocks at 4 seams:
-                             │    Anthropic SDK · DataSource · session · NDJSON
-                             │
-                             Unit (deterministic)
-                             ▲
-                             │  20+ files, ~200 tests
-                             │  Pure logic + scripted agent loops
-                             │  All fakes injected — no vi.mock on domain code
+  The pyramid as-built
+
+  ────────────  e2e / browser         0 tests   (none)
+    ────────    integration          19 tests   (test/api/*)
+   ──────────   unit                242 tests   (everything else)
 ```
 
-**This is the pyramid shape you want**: broad base of fast unit tests,
-narrow middle of route-level integration tests hitting real handlers, and
-a tiny load-bearing top layer of AI evals. No browser/e2e layer.
+Standard, healthy shape. 90%+ of assertions run in sub-second unit
+tests; a narrow band of integration tests wires the routes through
+the full mock stack; no browser layer.
 
-### The seams the integration tests mock
+### Where the seams live
 
-`test/api/_helpers.ts:24-425` documents four surfaces:
+**Fakes, not mocks** — the repo consistently reaches for scripted
+fakes over `vi.fn().mockReturnValue(...)` at the load-bearing seams:
 
-1. **Anthropic SDK** — module-scope `vi.mock('@anthropic-ai/sdk', () => mockAnthropicModule())`
-   installs a real `class MockAnthropic` (needs to be `new`-able because
-   the route does `new Anthropic({ apiKey })`). Tests fill a shared
-   scripted queue via `setAnthropicResponses(...)` in `beforeEach`. The
-   queue is shared module state — `resetAnthropicQueue()` MUST run
-   between tests. → `01-scripted-anthropic-fake.md`.
-2. **DataSource** — a fake `DataSource` (matches port surface: `callTool` +
-   `listTools`) driven by a scenario enum (`'ok' | 'list-tools-fail' |
-   'tool-call-fail' | 'timeout'`). Returns MCP-shaped envelopes with
-   `{ structuredContent: {…} }`. → `02-injected-datasource-fake.md`.
-3. **Session/auth** — `vi.mock('../../lib/mcp/session', …)` stubs
-   `getOrCreateSessionId` + `readSessionId`; `vi.mock('../../lib/mcp/connect', …)`
-   stubs `connectMcp`.
-4. **NDJSON consumer** — `collectEvents(response)` reuses the production
-   `readNdjson` kernel. No shortcut parser — if the parser breaks, this
-   consumer breaks with it, which is the correct behavior.
+- **Anthropic SDK** — a scripted-response queue that's shared
+  module state between `_helpers.ts` and every integration test
+  (`test/api/_helpers.ts:47-93`). Each test fills the queue with
+  the exact sequence of turns the SDK would return; the fake throws
+  on exhaustion so mismatches fail loudly. See
+  `01-scripted-anthropic-fake.md`.
 
-**Why this is good**: the mocks live at the *outer* boundary of the app
-(SDK, transport, session), not inside domain code. Tests exercise the real
-`runAgentLoop`, real `bootstrapSchema`, real `deriveInsightFields`. The
-mocks don't hide bugs in the code under test.
+- **MCP caller** — `McpCaller` is an interface (`{ callTool(name,
+  args) → { result, durationMs, fromCache } }`), so unit tests
+  hand-roll a fake for the specific tool sequence the test needs
+  (`test/agents/diagnostic.test.ts:103-109`). The integration
+  tests upgrade this to a per-tool switch table in
+  `makeBootstrapCallTool` (`_helpers.ts:169-220`). See
+  `02-scripted-mcp-caller-fake.md`.
 
-### The unit tests
+- **HTTP transport** — `test/mcp/transport.test.ts` uses
+  `vi.stubGlobal('fetch', …)` to swap out the real `fetch` for the
+  20-line duration of a test, then `vi.unstubAllGlobals()` in
+  `afterEach` (`transport.test.ts:11-13`). See
+  `03-http-transport-mock-with-module-hoisting.md`.
 
-**Pure logic**: `derive.test.ts`, `validate.test.ts`, `tool-coverage.test.ts`,
-`schema.test.ts`, `events.test.ts`, `ndjson.test.ts`, `insights.test.ts`,
-`investigations.test.ts`, `synthesis-instruction.test.ts`,
-`categories.test.ts`. No mocks needed; inputs and outputs are values.
+- **Session + connect** — mocked at module load in
+  `_helpers.ts` (`briefing.integration.test.ts:51-59`). Each test
+  reassigns `currentMcp` / `currentConn` / `currentSessionId`;
+  the mock factory reads these at call-time so tests don't need
+  to re-mock per case.
 
-**Agent loops**: `base.test.ts`, `monitoring.test.ts`, `diagnostic.test.ts`,
-`recommendation.test.ts`, `query.test.ts`. Each builds a `buildFakeAnthropic`
-inline (same pattern in every file — the test files predate the shared
-`mockAnthropicModule` helper, which is why five files repeat almost
-identical builder functions). Each test scripts a specific model
-response sequence and asserts on: tool-use args, final JSON output,
-callback invocations, control-flow branches.
+### Where the balance is off
 
-**Red flag check — heavy mocking that tests the mock, not the code?**
-Not firing. The mocks are at the SDK boundary; the agent loop itself
-runs. If the agent loop parses `tool_use` blocks wrong, tests fail. If
-the loop's `maxTurns` guard is off-by-one, tests fail. Real code runs
-under test.
+**One inverted-pyramid smell (contained):** the integration tests
+in `test/api/` do a *lot* of work per test — 17 total tests but each
+one drains a full NDJSON stream, exercises 8-10 mocked surfaces,
+and asserts on 5-15 events. When they fail, the failure surface is
+wide (which mock did I break? Anthropic? MCP? session?). The
+`_helpers.ts` file has ~425 lines of scaffolding to make this
+tolerable — extensive comments explain the reality-vs-plan deltas
+uncovered during Phase 3 (`agent.integration.test.ts:7-25`). This
+is a fine tradeoff for a repo of this shape (streaming NDJSON
+routes are the product), but it means the integration tests are
+NOT cheap to add to — a new route or a new stream-shape needs
+another 30-line arrange block.
 
-**Red flag check — inverted pyramid?** Not firing. Almost all tests are
-sub-second unit tests. The three integration test files are the middle;
-they run in the same `vitest run` and finish in seconds.
+**No over-mocked unit tests** — the agent unit tests script the
+Anthropic + MCP boundary and let `runAgentLoop`'s real code do the
+work between them. That's the right level. There's no case here of
+a unit test that stubs the code under test.
 
-### The eval subsystem sits *outside* the pyramid
+**No missing integration coverage at a critical seam** — the two
+routes that carry the product both have integration tests. `/api/mcp/*`
+routes are utility (start OAuth, callback, tools list) — the
+allowlist that gates them is unit-tested
+(`test/api/mcp-call-allowlist.test.ts`), and the flow itself is
+covered indirectly through the auth tests.
 
-`eval/**/*.eval.ts` are **excluded from `npm test`** by design — the
-default `vitest.config.ts` `include` pattern only picks `test/**/*.test.ts`.
-The eval runner is `vitest.eval.config.ts` with a 5-minute per-test
-timeout. This partition IS the seam.
+═════════════════════════════════════════════════
+Lens 3 — tests as design pressure
+═════════════════════════════════════════════════
 
-The eval subsystem itself uses vitest as its runner but ships six distinct
-tools:
-- `run.eval.ts` — 10 goldens through both agents + rubric judge
-- `baseline.eval.ts` — build the committed pass-rate table
-- `gate.eval.ts` — compare a candidate run to the baseline
-- `load.eval.ts` — N × K semaphore concurrency, no judges
-- `generate-worksheet.eval.ts` + `compute-agreement.eval.ts` — calibration
-- `report.eval.ts` — human-readable summary
+Where code was hard to test *because* the design was tangled — and
+where testable code proves the design was clean.
 
-Each is `describe.skipIf(!shouldRun)`-guarded on a distinct env var
-(`RUN_LOAD`, `RUN_BASELINE`, etc.), which is how one config runs six
-different tools with per-package.json script.
+### The clean seams — tests are easy because design is clean
 
----
+- **`runAgentLoop` takes its `anthropic` as a parameter**
+  (`lib/agents/base.ts` signature). No `new Anthropic(…)` inside
+  the loop. Test files hand it a scripted fake in ~40 lines
+  (`base.test.ts:16-56`). This is the deep-vs-shallow module
+  test: the module has one clean seam (constructor injection), the
+  test file consumes it in one line. Cross-link:
+  `study-software-design`'s deep-modules discussion.
 
-## 3. tests-as-design-pressure
+- **`McpClient` takes its `transport` as a parameter**
+  (`lib/mcp/client.ts` constructor). Every rate-limit + retry test
+  hands it a hand-rolled 4-line transport
+  (`client.test.ts:5-12`). Zero elaborate setup — the seam is at
+  the type boundary.
 
-**Where code is testable *because* the design allowed it. Where it isn't
-because the design didn't.**
+- **`DataSource` is an interface** — the same code that runs
+  against Bloomreach in prod runs against `SyntheticDataSource` in
+  the eval harness and against `FaultInjectingDataSource` in the
+  load harness. The seam has now shipped in five uses without a
+  caller-surface change (`fault-injecting.ts:11-16` documents
+  this). Cross-link: `study-system-design`'s
+  provider-abstraction pattern.
 
-### The tests you can write because the design earned them
+- **`readNdjson` takes the `ReadableStream` as a parameter** —
+  works against a real `Response.body` in prod and against a
+  hand-rolled `ReadableStream` in the tests
+  (`ndjson.test.ts:5-13`). The `collectEvents` helper
+  (`_helpers.ts:384-389`) is 4 lines *because* the production
+  kernel is a pure function of a stream.
 
-- **`runAgentLoop(anthropic, mcp, …)`** takes both dependencies as
-  parameters. That single decision is what makes every agent test
-  possible — you build a `buildFakeAnthropic([…scripted responses])` and
-  a `buildFakeMcp((name, args) => result)`, pass them in, and the loop
-  runs against the fakes exactly as it runs against the real SDK. If
-  either were a module-level `new Anthropic()` or a top-level import
-  reaching for a singleton, the test file would be forced to use
-  `vi.mock` on domain code, and every test would be testing the mock.
+### The seams that DO show design pressure (mild)
 
-- **`DataSource` as a port**: `BloomreachDataSource`, `SyntheticDataSource`,
-  and `FaultInjectingDataSource` all implement the same `DataSource`
-  interface (`lib/data-source/types.ts`). The eval harness uses
-  `SyntheticDataSource` (no network), unit tests use inline fake
-  `DataSource` objects, load tests wrap either in `FaultInjectingDataSource`.
-  Three real implementations of the same port, and swapping them requires
-  zero downstream changes. → `02-injected-datasource-fake.md`.
+- **The route handlers do their own bootstrap.** `/api/briefing`
+  reads `sessionId → connectMcp → bootstrapSchema → coverage gate →
+  listTools → monitoring scan → NDJSON stream`, all inside one
+  `start(controller)` closure. Testing this needs 5 module-level
+  `vi.mock` calls (`briefing.integration.test.ts:38-87`). Not
+  broken — it works — but each new stream event or phase means the
+  test file's arrange block grows too. If a second route wanted the
+  same pipeline, the mocks would have to duplicate. The seam that
+  *would* fix this is a `runBriefing(deps): AsyncIterable<AgentEvent>`
+  helper injected into the route — the route would shrink to
+  `for await (const e of runBriefing(deps)) controller.enqueue(...)`
+  and the test would drop the 5 mocks. Design finding, cross-link
+  to `study-software-design`.
 
-- **Pure functions**: `deriveInsightFields`, `parseAgentJson`, `isDiagnosis`,
-  `unwrap`, `parseWorkspaceSchema`, `encodeEvent`, `decodeEvent`,
-  `readNdjson`. Every one of these has tests because they're pure — value
-  in, value out, no environment. The test files are short and dense.
+- **In-memory session-keyed maps** — `lib/state/insights.ts` +
+  `investigations.ts` hold state as top-level `Map`s. Test files
+  need explicit `_clear()` / `_clearInvestigationCache()` calls in
+  `beforeEach` (`briefing.integration.test.ts:99`,
+  `agent.integration.test.ts:98`). Every test that forgets these
+  becomes order-dependent. The clean-slate helpers are named with
+  `_` prefixes to signal "test-only," which is honest — but a
+  factory that constructs a fresh state map per request would take
+  the pressure off entirely. Mild finding.
 
-### The tests you can't write because the design didn't allow it
+### Untestable code as a design smell — check
 
-- **`useInvestigation.ts`** — starts a fetch inside a `useEffect`, reads
-  and writes `sessionStorage`, deliberately doesn't cancel on cleanup to
-  survive StrictMode's double-invoke. Testing this needs a seam that
-  isn't there: a way to intercept the fetch call. Options are
-  `vi.stubGlobal('fetch', …)` (works but every test is fragile to fetch
-  boundaries), extracting the stream-consumption into a pure function
-  taking a `ReadableStream` (the right fix — this is the deep-modules
-  finding), or writing a component-integration test with
-  `@testing-library/react` + MSW (the heavyweight fix). **This is a
-  design-pressure finding**: the hook is hard to test because its two
-  side effects (fetch, sessionStorage) share a scope with its logic.
-  Cross-link to `study-software-design` for the deep-vs-shallow module
-  angle — the pure stream-consumption function is the deeper module the
-  hook currently swallows.
+- **Client hooks with implicit React scheduler dependencies** —
+  `useInvestigation.ts` documents the StrictMode double-mount
+  handling in a comment because there's no test asserting the
+  behavior. This isn't hard to test (jsdom + a scripted
+  `ReadableStream` gets you there), but the fact that the invariant
+  is *communicated as a comment, not a test* is a red flag: any
+  refactor that "cleans up" the effect could silently break the
+  demo path.
 
-- **`app/page.tsx`** — same problem, one level up. It hosts the
-  `useBriefingStream` hook and the demo/live toggle. Test surface is a
-  full React tree render.
+Cross-link summary: hard-to-test surfaces in this repo are mostly
+mild (the routes' bootstrap size, the map-based state); the deep
+modules that are easy to test dominate.
 
-### Not a design-pressure finding but worth noting
+═════════════════════════════════════════════════
+Lens 4 — determinism, isolation, and flakiness
+═════════════════════════════════════════════════
 
-- **Auth store `AsyncLocalStorage`** is a real module-level singleton in
-  prod (`_authCookieCrypto`). Tests reset it with `_clearAuthStore()` in
-  `beforeEach` — that reset export is a test-only escape hatch that
-  crossed a boundary. It's the pragmatic call, but it's the sort of
-  thing that hides accidental cross-test coupling if `beforeEach`
-  is skipped. No case of that in the current suite.
+Tests that depend on time, network, ordering, or shared state.
 
----
+### What's controlled
 
-## 4. determinism-isolation-and-flakiness
+- **Time is faked when it matters** — every rate-limit,
+  retry-after, and cache-TTL test uses `vi.useFakeTimers()` +
+  `vi.advanceTimersByTimeAsync(N)` inside the test and
+  `vi.useRealTimers()` at the end (`client.test.ts:49-58`,
+  `client.test.ts:60-78`, `client.test.ts:111-140`). No test
+  waits on real `setTimeout` for its assertions. See
+  `04-fake-timer-time-travel-for-rate-limits.md`.
 
-**Tests that pass or fail on rerun for reasons you can't control train
-people to ignore red. I couldn't find any in this suite.**
+- **Env is scoped** — `AUTH_SECRET` is set via
+  `vi.stubEnv('AUTH_SECRET', 'test-secret-please-ignore')` in
+  `beforeEach` and released via `vi.unstubAllEnvs()` in `afterEach`
+  (`auth.test.ts:117-122`). Direct `process.env.X = ...` mutation
+  was retired after it caused cross-file flakiness in parallel
+  workers (comment `auth.test.ts:114-116`). The auth-providers
+  tests re-use the same pattern (`auth-providers.test.ts:70-102`).
 
-### Time — controlled
+- **Insight/investigation state is cleared** — every integration
+  test opens with `clearInsights()` +
+  `_clearInvestigationCache()` + `_resetSchemaCache()`
+  (`briefing.integration.test.ts:94-99`,
+  `agent.integration.test.ts:beforeEach`). The `_resetSchemaCache()`
+  comment (`briefing.integration.test.ts:95`) documents why: the
+  cache would silently skip bootstrap on the second test and drift
+  the mock-call assertions.
 
-Every timing test uses `vi.useFakeTimers()` and reverts with
-`vi.useRealTimers()` inside the test. See:
+- **The Anthropic queue is drained** — `resetAnthropicQueue()`
+  fires in `beforeEach` and the mock throws on exhausted queue
+  (`_helpers.ts:73-74`). Test order can't reorder responses; each
+  test declares its own script.
 
-- `test/mcp/client.test.ts:49-77` (TTL expiry, rate-limit)
-- `test/mcp/client.test.ts:111-167` (parsed retry-after windows)
+### What's not controlled
 
-No `setTimeout(..., 100)` and then `await sleep(200)` — every wait is on a
-timer the test drives.
+- **The eval harness is intentionally non-deterministic** — that's
+  the whole point of an eval (`eval/README.md:20-26`,
+  `vitest.eval.config.ts:1-32`). It's excluded from `npm test` by
+  file-pattern (`vitest.config.ts:12`), which is the right seam.
+  Cross-link to `study-ai-engineering`.
 
-### Network — none in `npm test`
+- **The demo replay in `briefing.integration.test.ts:172-195`
+  reads real files** (`lib/state/demo-insights.json`) and paces
+  emissions at 140ms — the test bumps its timeout to 15s to
+  accommodate. If the demo snapshot changed in a way that reshuffled
+  events (e.g. new insight class added), this test would need
+  updating. Deliberate coupling; documented.
 
-Zero. Every mention of `fetch` is either `vi.stubGlobal('fetch', …)` (see
-`test/mcp/transport.test.ts:19-25`) or a helper that returns a fake
-Response. The Anthropic SDK is mocked at module level. The MCP
-transport is mocked. The session cookie store is mocked. No test in
-`npm test` opens a socket.
+### Flakiness sources — none found
 
-### Ordering — no dependencies
+I checked for the obvious patterns:
+- No `Date.now()` assertions without fake timers.
+- No `Math.random()` inside assertions (only in test-mock helper for id
+  generation, `_helpers.ts:109` — cosmetic, not asserted on).
+- No `sleep(N)` waits.
+- No shared file-system state between tests.
+- No unstubbed globals surviving across files (`afterEach` on the
+  transport tests, `_helpers.ts` resets on the integration tests).
 
-Every test file resets state in `beforeEach`:
+If any test has ever flaked in CI, it's not because of a pattern
+the code shows.
 
-- `test/api/briefing.integration.test.ts` and `agent.integration.test.ts`
-  both call `resetAnthropicQueue()`, `_resetSchemaCache()`, `_clear` on the
-  insights map, and — in the agent case — `_clearInvestigationCache()`.
-  The comment in `agent.integration.test.ts:130-146` documents this
-  explicitly: without the schema-cache reset, the second test would skip
-  the bootstrap `callTool` path and every mock-call assertion would
-  drift.
-- `test/mcp/auth.test.ts:16-19` calls `_clearAuthStore()`.
-- `test/mcp/transport.test.ts:11-13` uses `afterEach(() => vi.unstubAllGlobals())`.
-- Every scripted-Anthropic file resets `idx = 0` when a new response set
-  is installed (implicit — new closure per test).
+═════════════════════════════════════════════════
+Lens 5 — edge cases and error paths
+═════════════════════════════════════════════════
 
-### Env vars — isolated
+The happy path is usually tested. Boundary values, empty/null,
+error branches — the rest.
 
-`test/mcp/auth.test.ts` uses `vi.stubEnv('AUTH_SECRET', 'test-secret-please-ignore')`
-inside individual tests. `process.env.ANTHROPIC_API_KEY = 'test-key'` is
-set in `beforeEach` of the integration files. No test mutates a shared
-env without a beforeEach fence.
+### What's covered
 
-### Shared mutable state — surfaced via reset-only exports
+- **Every JSON validator has both accept and reject cases** —
+  `test/mcp/validate.test.ts` walks `isAnomalyArray`, `isDiagnosis`,
+  `isRecommendationArray` with a well-formed input, an empty input,
+  a null / string / non-array input, a missing-field input, and each
+  enum-boundary violation (`validate.test.ts:22-120`). This is
+  systematic — no "happy-path-only" validator.
 
-`_clearAuthStore()`, `_clear()` on insights, `_clearInvestigationCache()`,
-`_resetSchemaCache()`, `_authCookieCrypto` — every escape hatch is
-prefixed `_` and used in `beforeEach`. This is the right shape: the
-production code doesn't expose these, but the test hook is right there.
+- **Every fail-safe decoder has null-return tests** —
+  `decodeConfigHeader` returns null for 5 distinct malformed
+  inputs: missing, empty, malformed base64, non-JSON base64, valid
+  base64 with invalid shape (`config.test.ts:97-121`). The
+  discipline is: bad input → null, never throw. See
+  `06-fail-safe-decode-contract-tests.md`.
 
-### Fixture data — captured once, checked in
+- **The MCP client's error branches are tested** — transport
+  throws → wrapped as `McpToolError`
+  (`client.test.ts:178-197`); error result → not cached
+  (`client.test.ts:89-99`); rate-limit → retried with parsed
+  window (`client.test.ts:111-140`); max retries → returns error
+  (`client.test.ts:169-176`).
 
-`test/fixtures/*.json` are real MCP responses captured from wobbly-ukulele
-and committed to the repo. They don't change between runs. If the
-Bloomreach server changes shape, you re-capture and re-commit — the
-capture is deliberate, not automatic. → `03-captured-fixture-schema-tests.md`.
+- **The routes' error branches are integration-tested** —
+  `/api/briefing` covers 401 unauthed
+  (`briefing.integration.test.ts:203-222`), `listTools` throws
+  (`briefing.integration.test.ts:230-265`), Anthropic 529
+  (`briefing.integration.test.ts:275-300`). `/api/agent` covers
+  404 insight-not-found + cached-investigation short-circuit +
+  unauthed (see `agent.integration.test.ts` first ~10 tests).
 
-### Real numbers — no flake sources found
+- **Cancellation** — the newest test
+  (`briefing.integration.test.ts:312-345`) verifies pre-abort
+  cancellation drops through to the finally without emitting
+  `done` or `error`, and that the phase log records
+  `aborted: true`.
 
-I searched for common flake triggers: `Math.random`, `Date.now()`,
-`new Date()`, unsealed timers, real network calls, unresetted module
-state. None fired against `test/**/*.test.ts`.
+### Where the boundary coverage thins
 
-**Verdict on this lens: clean.** If a test in this suite goes red, it's
-because the code changed, not because the moon phase did.
+- **The intent classifier has 7 tests but they're all string-in
+  → intent-out** (`test/agents/intent.test.ts`). No coverage of what
+  happens when the classifier's Anthropic call throws (does it
+  fall through to a default? Does it propagate?). Small gap.
 
-### The eval side is another story
+- **The `parseAgentJson` extractor is tested for happy shapes
+  (fenced json, bare json, embedded in prose, no-json throws)**
+  (`validate.test.ts:5-19`), but not for the boundary where the
+  extractor finds valid JSON that isn't a JSON *object* (e.g. a
+  bare number, a string literal). Downstream `isDiagnosis` /
+  `isAnomalyArray` would reject those, so it's not a real
+  correctness gap — but it means the extractor's error signaling
+  is under-specified.
 
-`eval/run.eval.ts` runs against real Anthropic and IS non-deterministic
-by nature — that's the whole point of the rubric-based approach. The
-determinism there comes from a different mechanism: signal-class-gated
-assertions (`has-signal` / `partial-signal` must not fail, everything
-else measured) and a committed baseline (`eval/baseline.json`) that a
-regression gate compares against. → `04-signal-class-gated-eval.md` and
-`05-rubric-baseline-and-regression-gate.md`.
+- **Property-based testing is not used anywhere.** Every test
+  writes explicit fixtures. For validators + parsers, a
+  fast-check pass would catch a class of shape drift that the
+  current explicit cases don't. Not a bug, a missed technique.
 
----
+═════════════════════════════════════════════════
+Lens 6 — testing AI features
+═════════════════════════════════════════════════
 
-## 5. edge-cases-and-error-paths
+The determinism seam in practice: how the repo wraps a
+non-deterministic core in a deterministic harness.
 
-**The happy path is usually tested. What about the boundaries?**
+### The seam is shipped end-to-end
 
-### What's well-covered
-
-- **Rate limit ladder** (`test/mcp/client.test.ts:101-176`): retry-after
-  parse from three different message shapes (`(1 per 10 second)`,
-  `Retry after ~7 seconds`, no window falls back to base delay), max
-  retries then give up, tool-throw wrapped as `McpToolError`.
-- **Malformed JSON in NDJSON** (`test/streaming/ndjson.test.ts:49-60`):
-  malformed line reported via `onMalformed` callback, subsequent lines
-  still emit.
-- **Empty transports return `{ tools: [] }`** (`test/mcp/client.test.ts:80-87`).
-- **Error results not cached** (`test/mcp/client.test.ts:89-99`) —
-  correctness-critical: a cached error would poison the workspace for
-  the whole session.
-- **Judge-error placeholder** (`eval/run.eval.ts:101-108`,
-  `run.eval.ts:314-326`): when RubricJudge can't produce structured
-  output after retries, the receipt gets a `'judge_error'` verdict
-  instead of throwing, so the summary aggregation sees complete data.
-- **Signal-class-aware gate** (`eval/run.eval.ts:406-424`): a fail on a
-  `no-signal` case is a measured data point, not a test failure.
-- **Cross-session isolation** (`test/state/insights.test.ts:53-80`): the
-  bug this refactor fixed — two sessions writing concurrently must not
-  overwrite each other's feed state. Test names the bug shape.
-- **Intentional-drop contract** (`test/state/insights.test.ts:110-130`):
-  the round-trip `insight → anomaly` drops `evidence`, `impact`, `history`,
-  `category`. Five separate `it()` cases pin each drop, so the next
-  person adding a field to `Anomaly` has a forcing function.
-- **Diagnosis fallback on parse failure** (`test/api/agent.integration.test.ts`
-  header comment 5): the diagnostic flow returns
-  `{ conclusion: 'Insufficient data…' }` when the model output doesn't
-  parse. Recommendation returns `[]`. Both shapes verified.
-- **Cancellation on `readNdjson`** (`test/streaming/ndjson.test.ts:62-97`):
-  `cancelOn: () => cancel` flips to true after the first event; the
-  reader must call `cancel()` before the second read.
-
-### What's not covered — worth naming
-
-- **`useInvestigation` reconnect-on-`invalid_token`**: gap #1. The whole
-  auth-recovery UX depends on this. Untested.
-- **Empty MCP tool list at bootstrap**: `filterToolSchemas(allTools,
-  monitoringAllowlist)` when the server returned zero tools. Only lightly
-  covered — the "server missing a bootstrap tool" case is asserted in
-  `test/mcp/tool-coverage.test.ts:52-57`, but the downstream `listTools()
-  === { tools: [] }` path through the agent loop isn't specifically
-  exercised.
-- **Concurrent `putInsights` calls for the same session** — is there a
-  race window? The test file has cross-session isolation but not
-  intra-session concurrency (in-memory map, so probably fine, but not
-  asserted).
-- **`FaultInjectingDataSource` deterministic sequence with a fixed seed**
-  — `lib/data-source/fault-injecting.ts` documents that
-  `FAULT_SEED` makes the fault pattern reproducible, but I don't see
-  a unit test in `test/data-source/` that pins this. The load harness
-  uses it, but that's an eval, not a deterministic test. → this is a
-  small `test/data-source/fault-injecting.test.ts` waiting to be
-  written.
-
-### Red flag — zero tests on error branches?
-
-Not firing. Error branches are well-represented, especially in the MCP
-ladder. What's *under*-represented is the empty-collection edge (empty
-array of tools, empty array of insights, empty diagnosis with a well-
-shaped fallback). Small gap, low impact.
-
----
-
-## 6. testing-ai-features — the seam in practice
-
-**This is the strongest section of the audit. The determinism seam here
-isn't rhetoric — it's an architected surface.**
-
-### The seam, drawn
+This repo has the AI-feature seam more cleanly than most — it's
+the single strongest test-design pattern in the codebase.
 
 ```
-   Deterministic harness                    Probabilistic core
-   ─────────────────────                    ──────────────────
+  How this repo tests an AI feature
 
-   test/agents/monitoring.test.ts           eval/run.eval.ts
-     buildFakeAnthropic([...scripted])        real Anthropic client
-     buildFakeMcp((name, args) => result)     SyntheticDataSource
-     scripted tool_use blocks                 RubricJudge scores
-     assertions: exact equality               assertions: verdict != fail
-                                              per signal class
-        │                                        │
-        └────────────── same runAgentLoop ──────┘
-                        same DataSource port
-                        same JSON parse
-                        same schema
+  ┌─ deterministic harness (test/agents/*.test.ts) ────────────┐
+  │  · scripted Anthropic fake (queue of scripted responses)   │
+  │  · scripted MCP fake (per-tool switch)                     │
+  │  · assert on: parse output, tool sequence, hook fires,     │
+  │              JSON validation, fallback shape               │
+  └───────────────────────────┬────────────────────────────────┘
+                              │  wraps
+  ┌─ non-deterministic core (lib/agents/*.ts) ─────────────────┐
+  │  · runAgentLoop → real Anthropic + real MCP                │
+  │  · in TESTS: swapped for the fakes above                   │
+  │  · in EVAL: run for real, judged by rubric                 │
+  └───────────────────────────┬────────────────────────────────┘
+                              │  handoff to
+  ┌─ probabilistic eval (eval/*.eval.ts) ──────────────────────┐
+  │  · 10 goldens, real Anthropic, RubricJudge                 │
+  │  · assert on: verdict != 'fail' for gated cases, per-dim   │
+  │              pass rates, baseline gate                     │
+  │  · study-ai-engineering territory                          │
+  └────────────────────────────────────────────────────────────┘
 ```
 
-The Anthropic SDK is the only piece that flips. Everything else — the
-tool schemas, the JSON parser, the diagnosis shape validator, the
-`DataSource`, the workspace schema — is identical between the
-deterministic tests and the probabilistic evals. That's why an
-eval-caught regression in `actionable_next_step` doesn't need a unit
-test to reproduce; the offending code path is the *same* path both
-harnesses drive.
+- **Prompt assembly, tool dispatch, output parsing** — the three
+  parts of an LLM feature that ARE deterministic — all have tests.
+  `runAgentLoop` (dispatch) has 8 tests. `parseAgentJson` /
+  `isDiagnosis` / `isRecommendationArray` (output parsing) have
+  ~25 tests. Prompt assembly is exercised via
+  `schemaSummary(fixtureSchema)` and the same fixture is used in
+  every monitoring/diagnostic test — so prompt-shape changes surface
+  in the test file as diffs.
 
-### What the deterministic side pins
+- **Fallback behavior on unparseable model output** — 
+  `DiagnosticAgent.investigate` returns a "fallback diagnosis"
+  when JSON extraction fails (`diagnostic.test.ts:227-268`), and
+  the tests explicitly assert `conclusion.match(/Insufficient/i)`
+  + empty evidence + empty hypotheses. This is the exact shape
+  the UI's `EvidencePanel` renders when the model gave up —
+  contract-tested here.
 
-- **Tool-use dispatch**: every agent's scripted test asserts on the
-  `tool_use` block's `name` and `input` — the exact call the model would
-  make. If a prompt change causes the model to call `execute_analytics`
-  instead of `execute_analytics_eql`, the eval fails but the unit test
-  can pin the fake-model script that must be preserved to keep the tool
-  routing correct.
-- **JSON parse**: `parseAgentJson` handles fenced ```json blocks,
-  unlabelled ``` blocks, bare JSON, JSON embedded in prose. Five test
-  cases in `test/mcp/validate.test.ts:4-20`.
-- **Shape validation**: `isDiagnosis`, `isAnomalyArray`,
-  `isRecommendationArray` — the type guards. Rejects null, non-object,
-  missing fields, bad enum values, non-array where array expected.
-- **Synthesis-instruction byte identity**: `test/agents/synthesis-instruction.test.ts`
-  pins the exact string appended when `maxToolCalls` is reached, for each
-  agent. This is a *contract pin* — a rename or reshape of the closer
-  string ("Do not say you need more queries.") must be deliberate.
-- **`maxTurns` bailout**: `test/agents/base.test.ts` verifies the loop
-  stops after `maxTurns` and returns `finalText: ''` without looping
-  forever. The most important safety property of the agent loop, tested.
+- **Dedicated-synthesis salvage** — when the loop ends with
+  rambling prose instead of JSON, the agent makes a second
+  tool-less synthesis call. Tested with a scripted 2-response
+  queue: rambling first, valid JSON second
+  (`diagnostic.test.ts:273-292`).
 
-### What the probabilistic side pins
+- **Signal-class-aware eval gate** — the eval harness only fails
+  on `has-signal` / `partial-signal` cases (real anomalies where
+  the agent should conclude something); `no-signal` / `positive`
+  cases are measured, not gated (`run.eval.ts:407-424`). This is
+  the correct discipline: gate on correctness, measure on
+  calibration.
 
-- **10 goldens across 4 signal classes**: has-signal (5), partial-signal
-  (2), no-signal (3), positive (1). No-signal cases explicitly test
-  hallucination resistance — `eval/goldens/05-no-signal-retention-subscribers.ts`
-  presents an anomaly about subscription MRR against a substrate that
-  has *no* subscription data, and the correct-response-shape doc says
-  the agent should refuse rather than confabulate. → `04-signal-class-gated-eval.md`.
-- **4-dimensional rubric per artifact**: `eval/rubrics/diagnosis-quality.ts`
-  scores 1-5 on `root_cause_plausibility`, `evidence_grounding`,
-  `scope_coherence`, `actionable_next_step`. Judge is Claude Sonnet 4.6
-  with `temperature: 0` and `maxTokens: 4096`.
-- **Judge-error resilience**: if RubricJudge's structured-output parse
-  fails after retries, the receipt gets a synthetic `'judge_error'`
-  verdict and the case doesn't drop out of the summary.
-- **Committed baseline + regression gate**: `eval/baseline.json` is the
-  per-dimension pass-rate reference; `eval/gate.eval.ts` blocks if any
-  dimension regresses by more than `GATE_MAX_REGRESSION` (default 10pp).
-  Signal-gated: `has-signal` and `partial-signal` MUST not fail; the
-  rest are measured. → `05-rubric-baseline-and-regression-gate.md`.
-- **Blind calibration**: `eval/calibration/generate-worksheet.eval.ts`
-  emits a null-filled worksheet, human labels blind, then
-  `compute-agreement.eval.ts` measures verdict agreement + exact-match
-  dimensions + within-1 dimensions. A `labelerMode: 'pilot-ai-vs-ai'`
-  vs `'human'` tag makes the pilot number honest about what it measures.
-  Latest pilot: 6/6 verdict, 13/24 exact-match, 24/24 within-1.
-- **Load harness**: `eval/load.eval.ts` runs N investigations at
-  concurrency K via a semaphore-based worker pool, no judges, emits
-  distribution stats (p50/p95/p99 per phase) and per-investigation
-  cost. When `FAULT_TIMEOUT`, `FAULT_RATE_LIMIT`, etc. env vars are set,
-  it wraps the DataSource with `FaultInjectingDataSource` — the same
-  path that hits the retry ladder in prod. → `06-fault-injection-decorator.md`.
+- **Judge-error placeholder** — when the judge model fails to
+  produce parseable structured output (parse error after retries),
+  the receipt records `verdict: 'judge_error'` instead of throwing
+  (`run.eval.ts:97-108`). This keeps the aggregation code honest —
+  a run with 2 judge errors doesn't disappear from the summary
+  block.
 
-### The bootstrapping problem this design solves
+The AI-feature seam finding is: **`test/agents/*.test.ts` is
+`study-testing`'s territory, `eval/*.eval.ts` is
+`study-ai-engineering`'s territory, and the split is clean at the
+config level** (`vitest.config.ts` includes only `test/**`;
+`vitest.eval.config.ts` includes only `eval/**`; the two never
+cross-run).
 
-Testing an AI feature has an obvious chicken-and-egg: the model output
-is non-deterministic, so you can't assert on exact strings, but the
-model output flows through code that *is* deterministic (parse, validate,
-dispatch, route). This repo solves it by putting the seam **at the SDK
-level, not inside the agent loop**. `runAgentLoop` takes an `Anthropic`
-instance as a parameter. Tests pass a scripted fake; evals pass the real
-SDK. The 90% of the code that isn't the model call gets covered by unit
-tests; the 10% that is the model call gets covered by rubric evals; the
-join happens at exactly one seam.
+═════════════════════════════════════════════════
+Lens 7 — testing red flags audit (capstone)
+═════════════════════════════════════════════════
 
-**Red flag — LLM feature with no test at the boundary?** Not firing.
-Every boundary (prompt assembly → tool_use dispatch → JSON parse →
-shape validation) has deterministic tests. The `synthesis-instruction`
-contract pin is the most extreme version — pinning the exact string
-that gets appended on the forced-final turn.
+The consolidated checklist. What's firing in this repo?
 
----
+```
+  Red flag                                              Firing?
+  ─────────────────────────────────────────────────────────────
+  most important / most complex code least tested       PARTIAL
+    → server-side densely tested; client hooks /
+      components not tested. Lens 1 finding.
+  heavy mocking that tests the mock, not the code        NO
+    → fakes are at the seam (Anthropic + MCP + fetch),
+      real code runs between them.
+  inverted pyramid (all e2e, slow, flaky)                NO
+    → 242 unit / 19 integration / 0 browser.
+  tests that pass/fail on rerun with no change           NO
+    → fake timers + stubEnv + explicit resets; no
+      shared file-system state.
+  tests that must run in a specific order                NO
+    → _clear() helpers in beforeEach; queue drained.
+  zero tests on error/exception branches                 NO
+    → every validator has reject cases; routes' error
+      branches integration-tested; fail-safe decoders
+      have null-return tests.
+  test that needs elaborate setup to reach the code      MILD
+    → integration tests wire 5 mocks × 30-line
+      arrange each. Not broken; scale ceiling visible.
+  LLM feature with no test at the boundary               NO
+    → prompt assembly, dispatch, output parsing all
+      deterministically tested. Lens 6 finding.
+  test uses real network / real time                     NO
+    → npm test has no network calls; eval harness
+      isolated by config.
+  flaky test suppressed with retry: N                    NO
+    → no vitest retry config; no it.skip except one
+      documented cancellation placeholder (retired).
+  a test file with no assertions                         NO
+  a test that asserts on itself (tautological)           NO
+```
 
-## 7. testing-red-flags-audit — capstone checklist
+### The three red flags that ARE firing (in priority order)
 
-Ranked from firing hardest to not firing.
+1. **`components/**/*.tsx` untested** (partial red flag under
+   "most important code least tested"). See gap #2.
+2. **`lib/hooks/use*.ts` untested** (same lens; the
+   StrictMode-double-mount comment is not a substitute for a
+   test). See gap #1.
+3. **Integration-test arrange blocks approaching a scale
+   ceiling** (mild). Adding a third streaming route would tax the
+   existing helper file. Design finding as much as testing
+   finding — cross-link to `study-software-design`'s deep-module
+   audit.
 
-- **Firing (2):**
-  - **Client hooks + components entirely untested.** `useInvestigation`,
-    `useBriefingStream`, `useReconnectPolicy` — no tests. All the tsx
-    components — no tests. See gap #1 in `00-overview.md`.
-  - **Legacy path tested, production path not.** `test/agents/base.test.ts:4`
-    and `test/agents/synthesis-instruction.test.ts:12` both import from
-    `../../lib/agents/base-legacy`. The production route uses
-    `lib/agents/base`. Either the two are identical (in which case
-    swap the imports) or they're not (in which case the tests are
-    pinning the wrong thing). This is gap #3 in `00-overview.md`.
-
-- **Not firing:**
-  - **Heavy mocking that tests the mock, not the code.** Mocks live at
-    the SDK/transport/session boundary, not inside domain code.
-  - **Inverted pyramid.** No e2e, three integration tests, dozens of
-    unit tests. Correct shape.
-  - **Test that passes/fails on rerun with no code change.** No source
-    of non-determinism found in `test/**/*.test.ts`.
-  - **Tests that must run in a specific order.** Every file resets
-    state in `beforeEach`. Vitest runs files in parallel by default; no
-    intra-file order dependencies observed.
-  - **Zero tests on error branches.** Error branches are dense — see
-    lens 5.
-  - **A test that needs elaborate setup to reach the code.**
-    Integration tests need module-level `vi.mock` + `beforeEach`
-    reset, but the setup is factored into `test/api/_helpers.ts` and
-    reused. Unit tests need almost nothing.
-  - **Prompt assembly, tool dispatch, output parsing untested.** All
-    three are tested at the deterministic boundary; the rubric evals
-    catch the model side.
-  - **Global mutable state that tests don't reset.** Every module with
-    state exports a `_clear*` reset used in `beforeEach`.
-  - **Time-dependent test using real setTimeout.** All timing goes
-    through `vi.useFakeTimers()`.
-  - **Fixture data that drifts.** Fixtures are captured once and
-    committed. Re-capture is deliberate.
-
----
-
-## Cross-links out of this audit
-
-- **Deep-vs-shallow modules and hard-to-test as a design smell** —
-  cross-link to `study-software-design`. The `useInvestigation` hook and
-  `app/page.tsx` are the concrete anchors. The hook mixes stream
-  consumption (pure), sessionStorage rehydration (impure but easy to
-  substitute), and React lifecycle glue (hard to test). Splitting them
-  is a design finding, not a testing finding.
-- **Eval subsystem internals** — cross-link to `study-ai-engineering`.
-  The rubric definitions, the `@aptkit/core` LLM-as-judge mechanics, the
-  calibration protocol design — all belong there. This audit only names
-  the deterministic wrapper: how the goldens are loaded, how the
-  baseline is written, how the regression gate compares two runs.
+Everything else on the checklist is clear.

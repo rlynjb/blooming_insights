@@ -1,315 +1,501 @@
-# Transactions, isolation, and anomalies
+# 05 · Transactions, isolation, and anomalies
 
-*ACID + isolation levels / Language-agnostic*
+*Atomicity, isolation levels, and the anomalies you inherit for free · Case B*
 
-## Zoom out, then zoom in
+## Zoom out — where this concept lives
 
-You know how in Postgres you write `BEGIN; UPDATE ...; UPDATE ...; COMMIT;` and if the second `UPDATE` fails everything rolls back — that's atomicity. You know how `READ COMMITTED` sees committed rows only, while `REPEATABLE READ` sees the same snapshot for the whole txn — that's isolation. This repo has none of the machinery. It has one atomic unit — *the JavaScript event-loop turn* — and one isolation boundary — *the sessionId*. This file walks the standard model, then names which anomalies are impossible here, which are possible, and which the repo silently ignores.
+Transactions are the DB feature that lets you say "these writes are
+one unit." Isolation levels are the DB knob that says "these reads see
+a consistent snapshot despite concurrent writers." This repo has
+**neither** — no BEGIN/COMMIT, no isolation level, no per-row versioning.
+Every write is `map.set()`; every read is `map.get()`. That means every
+classical concurrency anomaly is available to you for free, and you
+have to reason about them explicitly.
 
 ```
-  Zoom out — where "atomicity" and "isolation" live
+Zoom out — where transactions would sit in a normal app
 
-  ┌─ UI (browser) ─────────────────────────────────────────────┐
-  │  a card click → sessionStorage stash → nav to investigate   │
-  │  (client-side state; single reader)                         │
-  └────────────────────────┬───────────────────────────────────┘
-                           │  HTTP + bi_session cookie
-  ┌─ Service (Vercel warm instance) ▼──────────────────────────┐
-  │                                                             │
-  │  ★ session Map<sessionId, SessionFeed>     insights.ts:14   │ ← this file's scope
-  │  ★ AsyncLocalStorage-scoped auth store     auth.ts:47       │
-  │  ★ 60s TTL response cache                  bloomreach-…:122 │
-  │                                                             │
-  │  atomic unit:   one synchronous JS turn                     │
-  │  isolation:     sessionId (outer Map key) +                 │
-  │                 request-scoped ALS (auth store)             │
-  │                                                             │
-  └────────────────────────┬───────────────────────────────────┘
+┌─ business logic ──────────────────────────────────────┐
+│  save briefing:                                        │
+│    put insights[]                                      │
+│    put investigations[]                                │
+│    stamp coverage report                               │
+│  ↑ in a DB this would be ONE transaction               │
+└──────────────────────────┬────────────────────────────┘
                            │
-  ┌─ Provider (Bloomreach) ▼──────────────────────────────────┐
-  │  their txns / isolation are opaque; we never see them      │
-  └────────────────────────────────────────────────────────────┘
+┌─ ★ THIS CONCEPT ★ ──────▼────────────────────────────┐
+│  atomicity      — all-or-none writes                  │
+│  isolation      — reads see a consistent snapshot     │
+│  durability     — commits survive crashes             │
+│  consistency    — invariants hold across the writes   │
+│                                                        │
+│  this repo has:                                        │
+│    · no atomicity (writes are per-.set())            │
+│    · no isolation (reads race with writers)          │
+│    · one durability tier (cookie)                    │
+│    · consistency enforced ONLY by comments            │
+└──────────────────────────┬────────────────────────────┘
+                           │
+┌─ storage ────────────────▼────────────────────────────┐
+│  Map, cookie, git                                     │
+└───────────────────────────────────────────────────────┘
 ```
 
-**Zoom in.** The reason there's no `BEGIN/COMMIT` here is that the writes are so tiny — replacing one session's feed, updating one auth cookie — that Node's event loop already gives you the atomicity you'd need. But that means the isolation levels you *have* are two: "one JS turn" and "one request scope." Anything wider needs a real DB.
+## Zoom in — the pattern
 
-## Structure pass
+**The pattern:** *no transactions, one intentional "commit boundary"
+per request.* The only place in the codebase that looks like a
+transaction is `withAuthCookies` in `lib/mcp/auth.ts` — it BEGINs an
+AsyncLocalStorage-scoped store, lets the request do many writes, and
+COMMITs by flushing the cookie once. Everywhere else, writes commit
+one at a time and races are possible.
 
-**Axis to hold constant: what's the atomic unit — how much can fail together?**
+## Structure pass — one axis across the writes
+
+**Axis: "at what point is a write visible to another reader?"**
+(visibility / commit boundary)
 
 ```
-  "how much can fail as one unit?" — traced across the layers
+Trace write-visibility across the write sites
 
-  ┌─ synchronous JS statements ─────────────────────────────┐
-  │  the JS turn is atomic — no other code can interleave   │  → atomic unit = turn
-  │  between `s.insights.clear()` and `s.insights.set(...)` │
-  └─────────────────────────────────────────────────────────┘
-      ┌─ across an `await` ─────────────────────────────────────┐
-      │  event loop resumes other pending work; state you       │  → atomic unit ends
-      │  read before the await may be stale after               │    at every await
-      └────────────────────────────────────────────────────────┘
-          ┌─ across the request boundary ─────────────────────────┐
-          │  the ALS-scoped auth store flushes to the cookie once │  → atomic unit =
-          │  at the end of the request (auth.ts:86-104)           │    the whole request
-          └───────────────────────────────────────────────────────┘
-              ┌─ across MCP tool calls ─────────────────────────────┐
-              │  no cross-tool atomicity. Each callTool is its own    │  → no atomic unit
-              │  attempt. Retries on rate-limit are not "the same     │    beyond one call
-              │  transaction," they're new attempts.                  │
-              └───────────────────────────────────────────────────────┘
+  Write site                    Commit boundary                Race window?
+  ─────────────                 ─────────────────              ────────────
+  putInsights (feed)            per .set() (no commit at all)   YES
+  putInvestigation              per .set() (no commit at all)   YES
+  withAuthCookies (auth)        one cookie.set() at end          NO (per-req)
+  writePersistedConfig          per localStorage.setItem()       cross-tab race
+  eval receipts write           per writeFileSync                between runs
+  demo snapshot write           per writeFileSync                per capture
 ```
 
-Two visible atomic units: the JS turn (for local `Map` writes) and the request (for the auth cookie). The seam that flips the axis is **every `await`**. That's the interesting one, because you can accidentally hold "old" state across it if you cache values in locals — see the auth-cookie discussion below.
+The seams that matter:
+
+  → **The `putInsights` seam** — the outer Map is not cleared, but
+    the inner sub-map is unconditionally `.clear()`-ed at the top of
+    the function. That's the biggest anomaly surface in the codebase:
+    a concurrent second briefing wipes the first mid-flight. This is
+    the exact case that a DB transaction would eliminate.
+
+  → **The `withAuthCookies` seam** — this is the ONE place that
+    behaves like a transaction. Everything inside `requestStore.run`
+    reads/writes a private snapshot; the commit happens exactly once
+    at the end via `cookies().set`. That discipline is the reason
+    OAuth flows work at all.
+
+  → **The `eval/receipts` seam** — writes are per-case, in filename
+    order, isolated between runs because runId is in the filename.
+    No two runs touch the same file. That's a **naming-convention
+    transaction**: isolation by physical path, not by lock.
+
+The **most load-bearing move** is the AsyncLocalStorage-scoped
+transaction in `withAuthCookies`. That's the only place the codebase
+enforces a commit boundary. Everywhere else, invariants ride on
+comments and prayer.
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — the pattern
 
-The classic anomaly taxonomy, minus SQL:
-
-```
-  the four canonical anomalies
-
-  dirty read      → txn A reads txn B's uncommitted write, B rolls back
-  non-repeatable  → same query in txn A returns different rows on re-read
-  phantom read    → same range query returns different row COUNT on re-read
-  lost update     → txn A reads X, txn B reads X, both write X+1, one wins
-  write skew      → both txns pass a check, both write, invariant broken
-```
-
-Standard isolation levels are what you buy against each:
+You know a `useEffect` cleanup function that runs before the next
+effect fires. That "start-do-end" shape — set up context, do work,
+tear down — is exactly what a database transaction is. `BEGIN` sets
+up, `COMMIT` tears down and publishes.
 
 ```
-  isolation levels — what they prevent
+Transaction — pattern skeleton
 
-  READ UNCOMMITTED   → prevents nothing (rare in production)
-  READ COMMITTED     → prevents dirty reads
-  REPEATABLE READ    → also prevents non-repeatable + phantom (in MVCC engines)
-  SERIALIZABLE       → prevents all anomalies, including write skew
+  BEGIN
+    ┌─────────────────────────┐
+    │ private snapshot        │
+    │ of the store            │
+    │                         │
+    │ writes go HERE          │
+    │ reads go HERE (isolated │
+    │ from other txns)        │
+    └───────────┬─────────────┘
+                │
+                ▼
+  COMMIT
+    ┌─────────────────────────┐
+    │ atomic publish          │
+    │ to the shared store     │
+    └─────────────────────────┘
+
+  What breaks if there is no BEGIN/COMMIT:
+    - a reader in the middle sees partial writes
+    - two writers racing produce interleaved results
+    - a crash mid-work leaves the store half-updated
 ```
 
-This repo runs at what you might call "session-scoped serializable" — the sessionId partitions every dataset so cross-session anomalies don't exist. Within a session there is exactly one write path per key, so intra-session write skew doesn't exist either. What you *can* still hit are the anomalies that come from `await` — read-then-await-then-write patterns where the "then" hides a state change.
+The kernel is three parts:
 
-The kernel:
+  1. **The private snapshot** (aka the "workspace") — what the
+     transaction reads/writes. Isolated from other in-flight txns.
+  2. **The commit** — the atomic publish to the shared store.
+  3. **The abort** — the "throw away the workspace, don't publish"
+     path. **What breaks without abort:** every error leaks partial
+     state into the shared store. In this repo, most write paths
+     have no abort concept at all.
 
-```
-  what's atomic here — the JS-turn rule
+### Move 2 — walk the three write sites
 
-  turn N-1:    other request running
-             ─────────────────────── ← turn ends
-  turn N:      putInsights(sid, items) {
-                  s.insights.clear()          ┐
-                  s.anomalies.clear()         │  ONE atomic block:
-                  for each item:              │  no other code
-                     s.insights.set(id, i)    │  can observe an
-                     s.anomalies.set(id, a)   │  intermediate state.
-               }                              ┘
-             ─────────────────────── ← turn ends
-  turn N+1:    next microtask, next request, next tool result...
-```
+Three concrete write sites in the code, three different stories.
 
-Every synchronous block bracketed by turn boundaries IS a transaction. The line `s.insights.clear()` cannot possibly interleave with another handler's `s.insights.set(...)` because Node's event loop doesn't multitask synchronous code. That's the whole guarantee, and it's real.
+#### Site 1 — `putInsights` (the race)
 
-### Move 2 — the primitives walked
+The most anomaly-rich write site in the repo:
 
-**`putInsights` — the replace-the-briefing atomic write.**
-
-```ts
+```typescript
 // lib/state/insights.ts:57-71
 export function putInsights(sessionId: string, items: Insight[], rawAnomalies?: Anomaly[]): void {
-  const s = sessionState(sessionId);       // (1) get-or-create session's row group
-  s.insights.clear();                      // (2) wipe this session's insights
-  s.anomalies.clear();                     // (3) wipe this session's anomalies
-  items.forEach((i, idx) => {              // (4) re-populate — synchronously
-    s.insights.set(i.id, i);
+  // Replace the previous briefing for THIS session — each run IS the current
+  // feed, not an addition. Without clearing, a warm serverless instance (or a
+  // long-running dev server) accumulates stale insights from earlier runs, so
+  // the feed shows yesterday's anomalies alongside today's. Investigations are
+  // keyed separately and untouched here. Only this session's sub-maps are
+  // cleared — never the outer map, never another session's feed.
+  const s = sessionState(sessionId);
+  s.insights.clear();                                   // ← wipe
+  s.anomalies.clear();                                  // ← wipe
+  items.forEach((i, idx) => {
+    s.insights.set(i.id, i);                            // ← per-.set() write
     if (rawAnomalies?.[idx]) s.anomalies.set(i.id, rawAnomalies[idx]);
   });
 }
 ```
 
-The four steps run in one turn. Between (2) and (4), the session has an empty feed — but no other code on this warm instance can observe that empty state because the whole function is `void`, no `await`, no yield. In DB terms this is `DELETE FROM insights WHERE session_id = ?; INSERT ... FROM values(...)` wrapped in `BEGIN/COMMIT`, and the isolation comes free from the runtime.
+Read the shape: `.clear()` → loop `.set()`. In DB terms this is
+`DELETE FROM ... WHERE sessionId = ?; INSERT ...` — two statements,
+no wrapping transaction. If any reader lands between the `.clear()`
+and the last `.set()`, they see either **an empty feed** or a
+**partial feed**. Both are wrong.
 
-The bug this shape *fixed* is documented in the header comment at `insights.ts:5-7`:
+```
+Sequence — the race window (two concurrent briefings, same session)
 
-> A single warm Vercel instance serves many users concurrently, so module-level Maps would bleed between sessions — and putInsights' clear() would wipe another user's feed mid-briefing.
-
-Pre-fix: one flat `Map<insightId, Insight>` at module scope. `putInsights` for user B calls `clear()`, wiping user A's simultaneous briefing. That's the equivalent of a `TRUNCATE TABLE insights` in every session's transaction. The fix — session-keying the outer Map — is the "isolation level" this code chose.
-
-**`saveInvestigation` — write-through to two backing stores.**
-
-```ts
-// lib/state/investigations.ts:30-41
-export function saveInvestigation(insightId: string, events: AgentEvent[]): void {
-  mem.set(insightId, events);              // (1) write to in-memory
-  if (PERSIST) {
-    const all = readJson(CACHE_FILE);      // (2) read the file
-    all[insightId] = events;               // (3) mutate the object
-    try {
-      writeFileSync(CACHE_FILE, JSON.stringify(all));  // (4) rewrite the file
-    } catch { /* best effort */ }
-  }
-}
+  briefing A                    inner state             briefing B
+  ──────────                    ───────────             ──────────
+  clear()      ──────────►     [empty]
+  set(A1)      ──────────►     [A1]
+  set(A2)      ──────────►     [A1, A2]
+                                                        clear()  ── wipes A!
+                                                        set(B1)
+  set(A3)      ──────────►     [B1, A3]      ← INTERLEAVED
+                                                        set(B2)
+                                [B1, A3, B2]
+  ──── reader lands here ──►   [B1, A3, B2]  ← ANOMALY
 ```
 
-This is dev-only (`PERSIST = NODE_ENV === 'development'`). Read-modify-write on a JSON file. It's *not* atomic across (2)-(4) with respect to other concurrent writes to the same file — if two dev routes both saved investigations at the same instant, one could clobber the other's write between the readJson and the writeFileSync. In practice: one dev server, one user, doesn't matter. In production: this whole branch is dead code (`PERSIST` is false), and there's no shared filesystem to race on anyway.
+**In DB terms:** this is a **dirty write** on the "insights" table.
+Two concurrent updates to the same session key with no wrapping
+transaction. A real DB would either serialize them (repeatable-read
+isolation) or reject one (serializable). Here neither happens.
 
-That's the honest characterization: **the write skew here is real, and the mitigation is "there's only one writer, dev-only."**
+**Why the code accepts this:** because the caller pattern is "one
+active user, one briefing at a time." The odds of a real user
+triggering two overlapping briefings for the same session are low.
+But **the code doesn't enforce that**; the human pattern does.
 
-**AsyncLocalStorage-scoped auth store — request-atomic cookie flush.**
+**What would fix it:**
 
-```ts
+  → *Optimistic*: version-tag each briefing, only commit `.set()`s
+    that match the version at start. Second briefing sees a
+    mismatch and aborts.
+
+  → *Pessimistic*: a lock per sessionId. Second briefing waits
+    until the first completes.
+
+  → *MVCC*: never clear; add a `briefingId` to each insight; reads
+    filter by the latest briefingId. This is the "immutable
+    append-only" style.
+
+The comment above `putInsights` names the reason for the clear (avoid
+accumulating stale insights across runs). It does not name the race.
+That's the finding to flag.
+
+#### Site 2 — `withAuthCookies` (the one transaction)
+
+Now the counter-example — a real, working transaction pattern:
+
+```typescript
 // lib/mcp/auth.ts:86-104
 export async function withAuthCookies<T>(fn: () => Promise<T>): Promise<T> {
   if (process.env.NODE_ENV !== 'production') return fn();
   const { cookies } = await import('next/headers');
   const raw = (await cookies()).get(AUTH_COOKIE)?.value;
-  const ctx: RequestStore = { store: raw ? decryptStore(raw) : {}, dirty: false };
-  const result = await requestStore.run(ctx, fn);
-  if (ctx.dirty) {
+  const ctx: RequestStore = { store: raw ? decryptStore(raw) : {}, dirty: false };  // BEGIN
+  const result = await requestStore.run(ctx, fn);        // do work in ALS scope
+  if (ctx.dirty) {                                        // COMMIT (if any write happened)
     (await cookies()).set(AUTH_COOKIE, encryptStore(ctx.store), {
-      httpOnly: true, secure: true, sameSite: 'none', path: '/',
-      maxAge: AUTH_COOKIE_MAX_AGE,
+      httpOnly: true, secure: true, sameSite: 'none',
+      path: '/', maxAge: AUTH_COOKIE_MAX_AGE,
     });
   }
   return result;
 }
 ```
 
-This is the closest thing to a real transaction in the repo:
+Trace it as a transaction:
 
-1. **BEGIN** — decrypt the cookie into `ctx.store`, seed AsyncLocalStorage.
-2. Every `readState`/`patchState` call inside `fn()` reads from and writes to `ctx.store`, not the cookie directly (see `readAll`/`writeAll` at `auth.ts:113-142`).
-3. **COMMIT** — if any write happened (`ctx.dirty`), re-encrypt and `set` the cookie once.
+  1. **BEGIN**: decrypt the cookie, build `ctx = { store, dirty }`,
+     enter the ALS scope.
+  2. **Work**: `fn()` runs. Every provider method inside reads/writes
+     `ctx.store` via `readAll()` / `writeAll()` (which detect the
+     ALS scope and use it).
+  3. **COMMIT**: after `fn()` returns, if `ctx.dirty`, re-encrypt
+     the whole store and set the cookie. That's the atomic publish.
 
-That's snapshot isolation at the request granularity: within the request, the auth state is a consistent snapshot; between requests, the new snapshot only becomes visible after the response commits the cookie. The specific bug this defended against is described in the comments at `auth.ts:41-46`:
+Look at the writer side:
 
-> To avoid Next's request-vs-response cookie split (a read *after* a set in the same request returns the OLD value)...
-
-That's a *non-repeatable read within one request*. Without the ALS shim you'd `patchState({ tokens: T })` then immediately `readState()` and get the OLD value — the write went to the response cookie, the read comes from the request cookie. The ALS store is the "we buffer both in the same place until commit" trick.
-
-**MCP retry loop is NOT a transaction.**
-
-```ts
-// lib/data-source/bloomreach-data-source.ts:163-175
-let retries = 0;
-while (isRateLimited(result) && retries < this.maxRetries) {
-  retries++;
-  const hintMs = parseRetryAfterMs(result);
-  const backoffMs = this.retryDelayMs * 2 ** (retries - 1);
-  const waitMs = Math.min(hintMs != null ? hintMs + RETRY_BUFFER_MS : backoffMs, this.retryCeilingMs);
-  await sleep(waitMs);
-  result = await this.liveCall(name, args, options.signal);
+```typescript
+// lib/mcp/auth.ts:125-142
+function writeAll(store: Store): void {
+  const ctx = requestStore.getStore();
+  if (ctx) {
+    ctx.store = store;
+    ctx.dirty = true;                          // mark for commit at request end
+    return;                                     // no cookie touched here
+  }
+  // ... fallthrough to memStore or file
 }
 ```
 
-Each retry is a fresh call. There is no cross-call atomicity — if the first attempt executed a side effect and only the response was rate-limited (unlikely for read-only EQL, but possible for mutating tools), the retry double-executes. This is why *every tool used by this repo is read-only*. The design accepts "no atomicity across the retry" by *never mutating* through MCP.
+**Each provider-method write updates the ALS-scoped store and sets
+`dirty = true`. NO COOKIE IS WRITTEN INSIDE `fn()`.** All writes
+accumulate in the private snapshot; only the outer `withAuthCookies`
+publishes.
 
-### Move 2 variant — the load-bearing skeleton
+Why this discipline exists — the comment names it:
 
-What's the smallest atomicity story this repo needs?
+```typescript
+// lib/mcp/auth.ts:39-45
+// To avoid Next's request-vs-response cookie split (a read *after* a set in the
+// same request returns the OLD value), we never touch the cookie per
+// provider-method call. `withAuthCookies` seeds an AsyncLocalStorage-scoped store
+// from the cookie ONCE at the start of the request and flushes it back ONCE at
+// the end; the provider's many synchronous read/write calls hit that store in
+// between. Each request gets its own ALS context, so concurrent requests on one
+// instance never share state.
+```
 
-1. **The JS-turn atomicity of `putInsights`.** Add an `await` inside the loop and cross-session bleed comes back through the front door — one user's briefing could be half-written when the next user's request starts a new turn.
-2. **The sessionId in the outer Map key.** Remove it and every isolation guarantee collapses to "one user total."
-3. **The ALS store in `withAuthCookies`.** Remove it and the OAuth handshake sees stale token state within the callback request.
+That comment IS the isolation guarantee. **Each request has its own
+ALS context → concurrent requests on one Vercel instance never share
+state.** In DB terms, this is **snapshot isolation** at the request
+level: each request sees a consistent snapshot of the store as of
+its start, and only its own writes are visible to itself until
+commit.
 
-The rest — file-write best-effort in `saveInvestigation`, retry backoff — is hardening.
+**In DB terms:** `withAuthCookies` is a *serialized transaction per
+request*. The commit is atomic (one cookie set). The isolation is
+strong (no other request sees your ALS-scoped writes). The abort is
+implicit — if `fn()` throws, `ctx.dirty` may or may not be set, but
+you can wrap in `try/finally` if you want stricter abort semantics.
+
+**What breaks without this discipline:** the AGENT would set a
+cookie per provider-method call and hit Next's cookie split — reads
+after writes in the same request return the OLD value. That was the
+original bug this pattern fixes. Naming Next's request-vs-response
+cookie split is the interview signal here.
+
+#### Site 3 — `eval/receipts/*.json` (isolation by naming)
+
+The eval receipt writes are the third pattern: **no in-process
+concurrency at all, isolation enforced by the file name.**
+
+Each receipt file is named `<caseId>-<runId>.json`. Two concurrent
+eval runs have different `runId`s (they're timestamps down to the
+millisecond) → different filenames → no conflict.
+
+```
+Comparison — three isolation strategies in this codebase
+
+  putInsights                withAuthCookies              eval receipts
+  ─────────────              ────────────────             ─────────────
+  no isolation               per-request snapshot         per-run filename
+  (dirty-write race)         (via AsyncLocalStorage)      (physical isolation)
+
+  reader sees:               reader sees:                 reader sees:
+    interleaved              atomic post-commit           complete file only
+    partial state            or nothing new               (fs.writeFileSync is
+                                                          synchronous)
+
+  fixes needed:              works as designed            works as designed
+    lock, version,           for OAuth writes             for eval runs
+    or MVCC
+```
+
+In DB terms, the eval receipts pattern is like **partitioning by runId
+and appending only** — each run gets its own physical file, and the
+`readdirSync` in the gate is the "scan the partition" operation.
+
+### Move 2.5 — the anomalies you get for free
+
+Every classical anomaly is available in this codebase. Here's each
+one, with the site that exposes it:
+
+```
+Anomaly matrix — where each classical anomaly lives in this repo
+
+  Anomaly            Where it happens                       Fix if you cared
+  ────────           ─────────────────                      ────────────────
+  Dirty read         listInsights during putInsights        wrap in txn
+                     — sees post-clear, pre-set state
+  ────────           ─────────────────                      ────────────────
+  Dirty write        two putInsights, same session          lock or version
+  ────────           ─────────────────                      ────────────────
+  Lost update        two setMode() in different tabs        cross-tab msg
+                     race on localStorage bi:mode
+  ────────           ─────────────────                      ────────────────
+  Non-repeatable     listInsights called twice in a         snapshot iso
+     read            handler with a putInsights in between
+  ────────           ─────────────────                      ────────────────
+  Phantom read       add new insight between two listInsights snapshot iso
+  ────────           ─────────────────                      ────────────────
+  Write skew         not yet exercised — no cross-row       serializable iso
+                     invariants in this codebase
+```
+
+Most of these are **theoretical in practice** because the human
+usage pattern (one user, one session, one briefing at a time) doesn't
+exercise the race. That's the honest framing — the code accepts the
+anomalies because the workload doesn't trigger them.
 
 ### Move 3 — the principle
 
-**Pick your atomic unit consciously and don't cross it.** In this repo the units are the JS turn (for Map writes) and the request (for the auth cookie). Every write is designed to fit inside one unit. When you're tempted to add an `await` between a `clear()` and a `set()`, or a `readState()` and a `patchState()`, that's the moment you've silently downgraded your isolation level. Real databases hide this behind `BEGIN/COMMIT`; here it's on you to see it.
+**A transaction is a shape you draw around code, not a feature you
+turn on.** When there's no DB, you draw it yourself with
+AsyncLocalStorage, mutexes, versioning, or naming conventions. When
+there IS a DB, `BEGIN` / `COMMIT` is the shape.
 
-## Primary diagram
+The reason `withAuthCookies` reads like a transaction and
+`putInsights` reads like a race is that ONE of them consciously
+drew the shape and the other didn't. The concept of "transaction"
+survives the absence of a database — it just becomes your job to
+enforce it.
+
+## Primary diagram — the two shapes side by side
 
 ```
-  Atomicity + isolation, the whole picture
+The transaction question in blooming_insights — one shape, one no-shape
 
-  ┌─ turn atomicity (in-memory writes) ────────────────────────┐
-  │                                                             │
-  │  event loop turn:                                           │
-  │    putInsights(sid, items) {                                │
-  │        s.insights.clear();          ┐                       │
-  │        s.anomalies.clear();         │  ← this whole block   │
-  │        for i in items:              │    is atomic — no     │
-  │           s.insights.set(...);      │    interleave possible │
-  │           s.anomalies.set(...);     │                       │
-  │    }                                ┘                       │
-  │                                                             │
-  │    lib/state/insights.ts:57-71                              │
-  └─────────────────────────────────────────────────────────────┘
+  ┌── SHAPE (withAuthCookies) ────────────────────────────────────┐
+  │                                                                │
+  │   BEGIN                                                        │
+  │     ctx = { store: decrypt(cookie), dirty: false }            │
+  │     enter AsyncLocalStorage scope                              │
+  │                                                                │
+  │       ┌────────────────────────────────────────────┐          │
+  │       │ fn() runs                                   │          │
+  │       │                                             │          │
+  │       │  provider.saveTokens(t)  ─► ctx.store.tokens = t     │
+  │       │                              ctx.dirty = true         │
+  │       │  provider.saveClientInformation(ci) ─► ctx.store... │
+  │       │                                        ctx.dirty=true │
+  │       └────────────────────────────────────────────┘          │
+  │                                                                │
+  │   COMMIT                                                       │
+  │     if ctx.dirty:                                              │
+  │       cookies().set(AUTH_COOKIE, encrypt(ctx.store), {…})     │
+  │     leave ALS scope                                            │
+  │                                                                │
+  │   isolation: PER-REQUEST snapshot                              │
+  │   atomicity: one cookie write publishes N logical writes       │
+  └────────────────────────────────────────────────────────────────┘
 
-  ┌─ session isolation (per-user "database") ──────────────────┐
-  │                                                             │
-  │  state = Map<sessionId, SessionFeed>                        │
-  │                                                             │
-  │    session A               session B                        │
-  │      insights:                insights:                     │
-  │        {A1,A2,A3}               {B1,B2}                     │
-  │                                                             │
-  │    putInsights(A, [...]) NEVER touches B's inner Maps       │
-  │                                                             │
-  │    lib/state/insights.ts:14, 25-71                          │
-  └─────────────────────────────────────────────────────────────┘
-
-  ┌─ request isolation (auth cookie) ──────────────────────────┐
-  │                                                             │
-  │  request N:                                                 │
-  │    BEGIN   → decrypt cookie → ALS ctx.store                 │
-  │    fn() runs; many readState / patchState calls hit ctx     │
-  │    COMMIT  → if dirty, re-encrypt + set cookie              │
-  │                                                             │
-  │  request N+1: sees the freshly-set cookie                   │
-  │                                                             │
-  │    lib/mcp/auth.ts:86-104                                   │
-  └─────────────────────────────────────────────────────────────┘
+  ┌── NO-SHAPE (putInsights) ─────────────────────────────────────┐
+  │                                                                │
+  │   ┌── caller enters ──┐                                        │
+  │   │                    │                                        │
+  │   ▼                    │                                        │
+  │   sessionState(sid).insights.clear()                            │
+  │   sessionState(sid).anomalies.clear()                           │
+  │                                                                 │
+  │       ← reader can land HERE, see empty feed                    │
+  │                                                                 │
+  │   for each insight:                                             │
+  │     s.insights.set(id, insight)                                 │
+  │     s.anomalies.set(id, anomaly)                                │
+  │                                                                 │
+  │       ← reader can land HERE, see PARTIAL feed                  │
+  │                                                                 │
+  │   return                                                        │
+  │                                                                 │
+  │   isolation: NONE                                               │
+  │   atomicity: NONE                                               │
+  │   remedy:    caller pattern (one briefing at a time)            │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The interesting philosophical point: **this repo has serializable isolation for free, but only because the concurrency pattern is degenerate.** Each session has exactly one writer per request; each request runs on one warm-instance turn at a time. Node's event loop enforces "one turn at a time" and the sessionId enforces "one user's data at a time." You could argue the repo is *always* running at SERIALIZABLE — every read-write is a single-turn operation, so the entire history serializes trivially into "turn 1 by user A, turn 2 by user B, ..." with no conflict.
+**Where does the "transaction as a shape" idea come from?** From
+every system that had to invent transactions before a DB. Filesystems
+have `rename()` as an atomic commit. Redis has `MULTI` / `EXEC` as a
+pipeline transaction. Git has the commit as a snapshot transaction
+(the working tree is the private workspace; `git commit` is COMMIT;
+`git reset` is ABORT). The instinct is universal because concurrent
+writers show up in every system that has more than one writer.
 
-That falls apart the instant you introduce:
-- A shared mutable resource across sessions (e.g. a global rate-limiter's token bucket).
-- A multi-turn operation that has to span `await` (e.g. "load X, compute, save X" over the same key).
-- A shared filesystem in production (Vercel doesn't give you one; this is why the dev-file backend at `investigations.ts:30-41` isn't used in prod).
+**Isolation levels are the ONLY reason a DB is hard to reason
+about.** ACID transactions in a single-writer world are trivial. The
+complexity comes from letting multiple writers proceed AT THE SAME
+TIME and defining what each one sees of the others. This repo skips
+that complexity by having one writer per session — the same reason
+SQLite is popular for embedded apps.
 
-For now, none of those exist, so the "no isolation machinery" answer is defensible. Concrete anomaly the repo is exposed to today:
-
-- **Non-repeatable read across `await` in `withAuthCookies`** — solved via the ALS store.
-- **Lost update on `.investigation-cache.json` in dev** — accepted; single-writer environment.
-- **Write skew across sessions** — impossible by shape (sessions don't share keys).
-- **Phantom reads in `listInsights`** — impossible; the "range" is one session's inner Map, no other writer.
-
-### `not yet exercised`
-
-- **`BEGIN/COMMIT`, savepoints, distributed 2PC.** No engine.
-- **Explicit isolation-level configuration.** No engine.
-- **MVCC snapshot / undo log.** No engine.
-- **Deadlock detection.** No locks that could deadlock.
-- **Serializable snapshot isolation (SSI) conflict tracking.** No.
+**When would you add real transactions here?** When you gain any of
+three things: a cross-user query (aggregating across sessions),
+concurrent writers to the same session (e.g., a shared team
+briefing), or a durability boundary that isn't the cookie (e.g.,
+"keep this briefing across redeploys"). All three point at Postgres.
 
 ## Interview defense
 
-**Q: "How does this app avoid two users' briefings clobbering each other?"**
+**"How does this app handle concurrent writes?"**
 
-Model answer: "Two mechanisms, layered. The outer key of the state Map is the sessionId — `lib/state/insights.ts:14`, `Map<sessionId, SessionFeed>`. Each session has its own inner Maps for insights, anomalies, and investigations, so `clear()`-then-repopulate touches only that session's data. That's the isolation boundary. The atomicity boundary is the JS turn: `putInsights` at `insights.ts:57-71` is fully synchronous — no `await` between the clears and the sets. Node's single-threaded event loop cannot interleave two of those, so a concurrent handler either sees the full old feed or the full new feed, never a half-written one. Together: session-scoped, turn-atomic writes. In DB terms it's serializable, but only because the shape is degenerate — one writer per session per turn."
+Answer: *"It mostly doesn't — and that's a deliberate choice. There's
+exactly one transaction-shaped code path, `withAuthCookies` in
+`lib/mcp/auth.ts`, which uses AsyncLocalStorage to isolate an OAuth
+store per request and commit it as a single cookie write at the end.
+Everywhere else — the briefing feed, the investigations, the
+localStorage config — writes are per-`.set()` with no isolation, and
+the code relies on the human usage pattern (one active briefing at a
+time per session) to avoid races."*
 
-Diagram to sketch: the "turn atomicity + session isolation" primary diagram, top and middle boxes.
+**"What's the worst race in the codebase?"**
 
-**Q: "Where can a race still happen?"**
+Answer: *"`putInsights` in `lib/state/insights.ts:57`. It clears the
+session's inner Maps, then loops `.set()`s. A concurrent reader can
+land in the clear-then-set window and see either an empty feed or a
+partially-written feed. The fix would be either a per-session lock,
+an optimistic version tag on the briefing, or an append-only
+briefing-id shape that never mutates old entries."*
 
-Model answer: "Two places. First: `saveInvestigation` in `lib/state/investigations.ts:30-41` does a read-modify-write on `.investigation-cache.json` in dev. Two simultaneous writes could lose one. Mitigation is 'it's dev-only, one developer, one process' — production doesn't run this branch (`PERSIST` gates it). Second, and more interesting: any future code that spans an `await` between a read and a write of the same session key. `putInsights` today is safe because it's synchronous end-to-end; adding `await` inside would break that guarantee silently. The `withAuthCookies` pattern at `auth.ts:86-104` is the model to copy — it buffers writes into an ALS-scoped store and flushes once at the request boundary, which is how you get 'request-atomic' when a single turn isn't enough."
+**"How does OAuth avoid this problem?"**
 
-Anchor: sync writes = turn-atomic; async writes need ALS-style buffering to stay atomic.
+Answer: *"AsyncLocalStorage. `withAuthCookies` runs the request
+handler inside an ALS scope with a `ctx = { store, dirty }` object.
+Every provider-method write updates `ctx.store` and marks `dirty =
+true` — NO COOKIE is touched during the request. When the handler
+returns, if `dirty` is set, ONE cookie write publishes all
+accumulated writes atomically. This exists specifically because
+Next's cookies API has a request-vs-response split: a read after a
+set in the same request returns the OLD value. Deferring the commit
+to end-of-request avoids that."*
 
-**Q: "What isolation level would you say this runs at?"**
-
-Model answer: "Effectively SERIALIZABLE, and it's a lucky consequence of the shape rather than a configuration. The sessionId key means no two txns ever touch the same rows. The JS-turn atomicity means any single txn is indivisible from the outside. Together you get the strongest isolation level for free. The moment the shape changes — a global shared resource, a cross-session query surface, a multi-turn write — you'd want to move to something real. Until then, calling it 'SERIALIZABLE by construction' is honest."
-
-Anchor: SERIALIZABLE by construction — session key + JS turn = no interleave possible.
+The load-bearing skeleton part interviewers routinely forget: **the
+`ctx.dirty` flag.** Without it, every request writes the cookie
+even when nothing changed, which is wasted bandwidth AND resets the
+10-day max-age unnecessarily. The `dirty` flag is what makes the
+cookie write conditional — same reason a DB skips COMMIT-time WAL
+writes when nothing dirty happened.
 
 ## See also
 
-- `01-database-systems-map.md` — the state topology this file zooms in on.
-- `06-locks-mvcc-and-concurrency-control.md` — why no locks are needed given the atomicity story here.
-- `07-wal-durability-and-recovery.md` — what happens to "committed" state on warm-instance death.
-- `study-runtime-systems` — the event-loop mechanics that make the JS-turn atomicity real.
+  → `01-database-systems-map.md` — the six tiers each write lands in
+  → `06-locks-mvcc-and-concurrency-control.md` — the AsyncLocalStorage
+    pattern as "per-request MVCC"
+  → `07-wal-durability-and-recovery.md` — the cookie commit as the
+    fsync boundary
+  → `study-distributed-systems/` — the same concerns raised again
+    with warm-instance boundaries

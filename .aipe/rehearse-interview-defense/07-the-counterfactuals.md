@@ -4,7 +4,7 @@
 
 The senior-engineer move is to volunteer what you'd reconsider before being asked. Most candidates wait for the interviewer to ask "what would you do differently?" and treat the question defensively. Senior candidates use the reflection question as a hook to demonstrate they own the whole system — not just what shipped, but what could have shipped differently.
 
-But there's a trap. If you fabricate regrets to sound self-aware, you signal the opposite. "I really regret not writing more tests" from someone who wrote 221 passing tests reads as performative. The correct posture is a bounded list of *real* things you'd reconsider, each with the *trigger* that would cause you to actually make the change — and a bounded list of things you would NOT change, with receipts.
+But there's a trap. If you fabricate regrets to sound self-aware, you signal the opposite. "I really regret not writing more tests" from someone who wrote 261 passing tests reads as performative. The correct posture is a bounded list of *real* things you'd reconsider, each with the *trigger* that would cause you to actually make the change — and a bounded list of things you would NOT change, with receipts.
 
 This chapter walks the four decisions you'd reconsider (with triggers) and the four you would keep (with receipts). Both lists are load-bearing. The reconsider list shows self-awareness; the would-not list shows conviction. Volunteer both.
 
@@ -43,17 +43,22 @@ The counterfactuals matrix. Each decision on the left; what you'd reconsider on 
   NDJSON + readNdjson kernel  │ 4 streaming surfaces
                               │ consume one 64-LOC kernel
                               │
-  DataSource seam + adapters  │ 4 uses, 0 caller changes
+  DataSource seam + adapters  │ 5 uses, 0 caller changes
+                              │ (including swappable MCP)
                               │
   AptKit primitive boundary   │ Legacy loop preserved as
                               │ rollback receipt
                               │
   Portfolio hardening seq.    │ 6 phases, all shipped,
-                              │ every claim receipt-backed
+                              │ COMPLETE, receipt-backed
+                              │
+  Swappable MCP client        │ Bloomreach as default
+  (generalize instead of        │ preset; 5th use of the
+   hardcode Bloomreach)         │ same DataSource port
                               │
 ```
 
-Four decisions to reconsider. Four decisions to keep. Every reconsideration has a trigger; every keep has a receipt. This is what the reflection round should look like.
+Four decisions to reconsider. Five decisions to keep. Every reconsideration has a trigger; every keep has a receipt. This is what the reflection round should look like.
 
   ## The reconsider list — four things you'd revisit
 
@@ -201,9 +206,9 @@ The senior move is not just naming reconsiderations. It's holding ground on deci
 
 > *"NDJSON over Server-Sent Events was the right call. Four different streaming surfaces in the codebase — `/api/briefing`, `/api/agent` for diagnose, `/api/agent` for recommend, `/api/agent` for the free-form query — all consume one 64-line kernel called `readNdjson`. Four surfaces, one kernel, one framing. SSE would have added a second framing layer and broken POST support on `/api/agent`. That decision stands."*
 
-  ### 2. DataSource seam + adapters — receipt: 4 uses, 0 caller changes
+  ### 2. DataSource seam + adapters — receipt: 5 uses, 0 caller changes
 
-> *"The DataSource port is 71 lines. It's shipped in four uses — Bloomreach, Synthetic for offline eval, FaultInjecting decorator, and one demo adapter I added and removed. Every use of that port required zero changes to caller code. That's the strongest architectural receipt in the whole system. I'd design it the same way again."*
+> *"The DataSource port is 71 lines. It's shipped in five uses — McpDataSource (generic; Bloomreach is the default preset), Synthetic for offline eval and the default UX, FaultInjecting decorator, one demo adapter I added and removed, and the swappable-MCP path that turned the codebase from Bloomreach-specific into MCP-generic. Every use of that port required zero changes to caller code. That's the strongest architectural receipt in the whole system. I'd design it the same way again."*
 
   ### 3. AptKit primitive boundary — receipt: legacy loop preserved
 
@@ -211,7 +216,40 @@ The senior move is not just naming reconsiderations. It's holding ground on deci
 
   ### 4. Portfolio hardening sequence — receipt: 6 phases, all shipped
 
-> *"The six-phase hardening plan — eval, observability, cost, load and fault, regression gate, CI — shipped in that exact order because each phase depended on the one before it. You can't run a regression gate without a baseline. You can't have a baseline without an eval. You can't measure cost without observability. That sequence is not accidental. I'd sequence it identically again."*
+> *"The six-phase hardening plan — eval, observability, cost, load and fault, regression gate, CI — shipped in that exact order because each phase depended on the one before it. You can't run a regression gate without a baseline. You can't have a baseline without an eval. You can't measure cost without observability. That sequence is not accidental. I'd sequence it identically again. All four hardening weeks are shipped and the plan is complete."*
+
+  ### 5. Swappable MCP client — receipt: 5th use of the same port
+
+> *"Generalizing the MCP client — turning `BloomreachDataSource` into `McpDataSource` behind three `OAuthClientProvider` strategies — was one day of work because the seam was already there. That decision reframed the whole project: Bloomreach is the default preset, not the codebase identity. If a reviewer looked at this repo and only saw 'Bloomreach app,' they'd read a narrower story than the code tells. I'd generalize again. The abstraction-pressure receipt — same 71-line port, five uses, zero caller-surface changes — is what makes this defensible instead of speculative."*
+
+  ### The one counterfactual worth naming — what if I hadn't generalized the MCP client?
+
+This is the honest tradeoff. Volunteer it alongside the reconsider list; it's not a regret, but it's the counterfactual an interviewer will find if they push.
+
+┌─────────────────────────────────────────────────┐
+│ THEY ASK                                        │
+│   "What if you hadn't generalized the MCP        │
+│   client? Would the project be worse?"          │
+│                                                 │
+│ WHAT THEY'RE TESTING                            │
+│   Do you have honest counterfactuals for the    │
+│   decisions you'd keep? Or do you defend them   │
+│   with only benefits, no tradeoffs?             │
+└─────────────────────────────────────────────────┘
+
+Say this:
+
+> *"Honest counterfactual. If I hadn't generalized, the pitch guide would be shorter — the project is easier to explain as 'a Bloomreach analyst' than 'an MCP-generic analyst with Bloomreach as the default preset.' That's a real cost. Every interview minute I spend explaining the preset framing is a minute I'm not spending on the reasoning UI or the fault-injection receipt.*
+>
+> *The abstraction-pressure receipt also drops. Without the fifth use, the DataSource port ships in four uses instead of five. Four is still a strong receipt. Five is stronger because it's the one that came from a genuine reframing, not a testing tool.*
+>
+> *And the demo loses a beat. Right now I can flip between `demo`, `live-synthetic`, and `live-mcp` on stage — three modes, one code path. Without generalization, live-mcp is Bloomreach only; the settings modal doesn't exist; the swap story doesn't exist.*
+>
+> *So the tradeoff is real: shorter pitch and simpler mental model, versus a stronger seam receipt and a live-swap demo. I picked the latter and I'd pick it again — but I want to name the cost out loud. That's the difference between defending a decision and rationalizing one."*
+
+┃ "Not a regret, but an honest tradeoff. Shorter
+┃  pitch versus stronger seam receipt. I picked
+┃  the stronger receipt."
 
   ## The follow-up decision tree
 
@@ -306,7 +344,7 @@ What you'd change about the actual project: the four items on the reconsider lis
 
   ## The one-page summary
 
-**Core claim.** Four decisions to reconsider, each with a real trigger. Four decisions to keep, each with a receipt. Both lists volunteered before being asked.
+**Core claim.** Four decisions to reconsider, each with a real trigger. Five decisions to keep, each with a receipt. One honest counterfactual (what if I hadn't generalized the MCP client?) named alongside the keep list. All three lists volunteered before being asked.
 
 **The four reconsiderations.**
 
@@ -315,12 +353,17 @@ What you'd change about the actual project: the four items on the reconsider lis
   → Blind calibration → trigger: 30-60 min of human labeling. Fix: swap Session D pilot data for real labeled data.
   → Real load run → trigger: $2.50 in API spend + 2 hours. Fix: LOAD_N=30, LOAD_K=5.
 
-**The four would-not-change decisions.**
+**The five would-not-change decisions.**
 
   → NDJSON + readNdjson kernel → 4 streaming surfaces, one 64-LOC kernel.
-  → DataSource seam + adapters → 4 uses, 0 caller changes.
+  → DataSource seam + adapters → 5 uses, 0 caller changes (including swappable MCP).
   → AptKit primitive boundary → legacy loop preserved as rollback receipt.
-  → Portfolio hardening sequence → 6 phases, all shipped, receipt-backed.
+  → Portfolio hardening sequence → 6 phases, all shipped, COMPLETE, receipt-backed.
+  → Swappable MCP client → 1 day of work on an existing seam; Bloomreach as default preset, not identity.
+
+**The counterfactual.**
+
+  → What if I hadn't generalized the MCP client? Shorter pitch, simpler mental model — but abstraction-pressure receipt drops from 5 uses to 4, and the live-swap demo beat disappears. Not a regret. An honest tradeoff.
 
 **The pull quotes.**
 

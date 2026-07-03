@@ -1,539 +1,349 @@
-# queues-streams-ordering-and-backpressure
+# Queues, Streams, Ordering, and Backpressure
 
-*Client-side rate limiting · Streaming NDJSON · Backpressure · Concurrency semaphore · Industry standard*
+*Industry name: server-sent events · NDJSON stream · cancellation-based backpressure · Type: Industry standard*
 
 ## Zoom out — where this concept lives
 
-There are two flow-control mechanisms in this repo, and both are
-in-process. The proactive spacing gate on `BloomreachDataSource` is
-client-side rate limiting against the alpha server. The NDJSON
-`ReadableStream` in the routes is your outbound flow-control primitive
-for the browser. And the load harness has a semaphore-based concurrency
-limiter for eval runs. Everything else — real message queues, pub/sub,
-event streams, consumer groups — is `not yet exercised`.
+No message broker in this repo — no Kafka, no SQS, no Redis Streams. The one streaming surface is **the response stream from the Vercel function back to the browser**, framed as NDJSON events over an SSE-style keep-alive. Backpressure is one-way: the browser cancels; the server aborts. That's the whole story.
 
 ```
-  Zoom out — flow-control primitives, service-layer only
+  Zoom out — the one streaming surface
 
-  ┌─ Client layer ─────────────────────────────────────────┐
-  │  fetch() reader consumes NDJSON at its own pace        │
-  │  → backpressure via HTTP-level flow control            │
-  └────────────────────────┬───────────────────────────────┘
-                           │
-  ┌─ Service layer ────────▼───────────────────────────────┐
-  │  ★ THREE FLOW-CONTROL MECHANISMS ★                     │ ← we are here
-  │                                                        │
-  │  1. NDJSON ReadableStream out to browser (outbound)    │
-  │  2. minIntervalMs=1100 spacing gate (outbound to MCP)  │
-  │  3. LOAD_CONCURRENCY semaphore (eval harness only)     │
-  │                                                        │
-  │  no inbound queue — every request is a fresh call      │
-  │  no message queue between service and providers        │
-  └────────────────────────┬───────────────────────────────┘
-                           │
-  ┌─ Provider layer ────────────────────────────────────────┐
-  │  Bloomreach — rate-limits per user, no queue offered    │
-  │  Anthropic  — no queue at our layer                     │
-  └────────────────────────────────────────────────────────┘
+  ┌─ Browser ──────────────────────────────────────────────┐
+  │  fetch('/api/agent') → response.body reader             │
+  │  cancels via AbortController on unmount / navigate     │
+  └──────────────┬────────────────────▲────────────────────┘
+                 │  NDJSON stream     │  req.signal
+                 │  (agent events)    │  (aborts)
+                 ▼                    │
+  ┌─ Server ─────────────────────────┴───────────────────┐
+  │  ReadableStream<Uint8Array> in route.ts               │
+  │  each agent event → JSON line → controller.enqueue    │
+  │                                                       │
+  │  ★ THIS FILE: the stream, its ordering, its cancel ★   │
+  └───────────────────────────────────────────────────────┘
 ```
+
+Everything else — messages between agents, tool calls, results — happens **inside a single function invocation** as ordinary function calls. Ordering is program order. There are no queues to worry about.
+
+## Zoom in — narrow to the concept
+
+The streaming surface answers three questions:
+
+1. **What framing?** — NDJSON (JSON objects delimited by `\n`), served with `Content-Type: application/x-ndjson`.
+2. **What ordering?** — strict program order from the server's `send(...)` calls. No reordering.
+3. **What backpressure?** — cancellation-only. The browser aborts; the server sees `req.signal.aborted` and unwinds.
+
+Everything else — retries, throttling, dropped messages — is out of scope for this file. This is a *streaming response over one request*, not a durable queue.
 
 ## Structure pass
 
-### Layers of "who paces the work?"
+### Layers
+
+- **Route** (`app/api/agent/route.ts`) — owns the `ReadableStream<Uint8Array>` and enqueues encoded events.
+- **Event encoder** (`lib/mcp/events.ts`) — `encodeEvent(e)` renders a `AgentEvent` as a `\n`-terminated JSON line.
+- **Client fetch** — the browser reads the body incrementally via a `Response.body.getReader()` loop.
+- **Cancellation path** — `req.signal` is a `AbortSignal` that fires when the browser cancels or the connection drops.
+
+### One axis held constant — "what happens when the reader stops reading?"
 
 ```
-  "who decides how fast work happens at each layer?"
+  Axis: backpressure at each layer
 
-  ┌───────────────────────────────────────────────┐
-  │ browser reader                                 │
-  │   paces via: HTTP-level backpressure           │  reader pulls;
-  │              (fetch stream reader)              │  writer waits when
-  │                                                │  buffer is full
-  └───────────────────────────────────────────────┘
-      ┌───────────────────────────────────────────────┐
-      │ NDJSON writer (route handler)                 │
-      │   paces via: awaiting controller.enqueue      │  yields when
-      │              between events                    │  buffer is full;
-      │                                                │  REPLAY_DELAY_MS in
-      │                                                │  demo mode                │
-      └───────────────────────────────────────────────┘
-          ┌───────────────────────────────────────────┐
-          │ BloomreachDataSource                       │
-          │   paces via: minIntervalMs=1100 sleep     │  proactive;
-          │              retry ladder wait             │  reactive;
-          │                                            │  client-side rate limit
-          └───────────────────────────────────────────┘
-              ┌───────────────────────────────────────┐
-              │ eval load harness                      │
-              │   paces via: LOAD_CONCURRENCY workers │  semaphore-of-N
-              │              (queue.shift() until      │  pattern
-              │              exhausted)                │
-              └───────────────────────────────────────┘
+  browser        → reader.cancel() → server sees req.signal.aborted
+                    OR: page unloads → connection drops → signal aborts
+
+  route          → controller.enqueue() keeps queueing until
+                    the ReadableStream is closed or errors
+                    (Vercel's platform may block if buffers fill,
+                     but this happens rarely at NDJSON sizes)
+
+  agent loop     → checks req.signal.throwIfAborted() at phase
+                    boundaries → clean unwind + finally block
+
+  MCP call       → composeSignals(routeSig, timeout(30s)) →
+                    in-flight fetch cancelled immediately
 ```
 
-The pacing question has a different answer at every layer. That's fine
-— each layer has a different bottleneck. The load-bearing insight: the
-spacing gate is CLIENT-SIDE rate limiting, which is a specific kind of
-backpressure ("I know you'll 429 me if I go too fast, so I'll go slower
-than the ceiling").
-
-### One axis — "what happens when the consumer is slow?"
-
-```
-  "when the downstream can't keep up, what happens?"
-
-  ┌───────────────────────────────────────────────┐
-  │ browser reads NDJSON slowly                    │
-  │   → HTTP flow control: writer awaits           │  correct backpressure
-  │     controller.enqueue; whole stream slows     │  via TCP
-  └───────────────────────────────────────────────┘
-      ┌───────────────────────────────────────────────┐
-      │ Bloomreach can only take 1 req/s              │
-      │   → spacing gate sleeps before each call      │  proactive; PLUS
-      │   → retry ladder waits after 429              │  reactive
-      └───────────────────────────────────────────────┘
-          ┌───────────────────────────────────────────┐
-          │ Anthropic rate-limits                     │
-          │   → SDK-side retry (opaque to us)         │  handled by
-          │                                            │  Anthropic SDK
-          └───────────────────────────────────────────┘
-              ┌───────────────────────────────────────┐
-              │ eval load harness: K workers only     │
-              │   → other work waits in queue          │  bounded concurrency
-              └───────────────────────────────────────┘
-```
-
-Every layer has a different backpressure mechanism, and each is
-correctly-sized for its bottleneck. The consumer-slow story is what
-distinguishes real backpressure ("wait, don't drop") from queue overflow
-("buffer full, drop"). This repo does WAIT, never DROP.
+The answer flips at every layer. **Backpressure is transmitted upstream by aborting the AbortSignal, not by pausing the write side.** That's the design.
 
 ### Seams
 
-- **`controller.enqueue(...)` seam** — every NDJSON write in the routes
-  goes through this. `ReadableStream` is the flow-control primitive.
-  A reader that reads slowly causes the controller's buffer to fill,
-  and `enqueue` blocks the writer until the reader catches up. This is
-  the TCP-level backpressure surfaced as a JavaScript primitive.
-
-- **`this.lastCallAt` seam** in `BloomreachDataSource` — the mutable
-  timestamp that IS the spacing gate's state. Every liveCall reads and
-  writes it (`bloomreach-data-source.ts:191, 197, 200`). Correctness
-  hinges on writing it in BOTH the success and error branches — see
-  file 02 band 1.
-
-- **The load harness's `queue.shift()`** at `eval/load.eval.ts:176-207`
-  — the shared queue array is the semaphore. Workers pull from it
-  until it's empty; when they can't shift anymore, they exit. Bounded
-  concurrency without locks (single-threaded JS makes the shift-and-
-  check pattern atomic).
+- **Encode seam** (`lib/mcp/events.ts`): `encodeEvent(e)` returns a string; the route encodes it to bytes. The stream never sees objects.
+- **Enqueue seam** (`route.ts:194`): `controller.enqueue(encoder.encode(...))`. Once a byte's in, it's committed.
+- **Cancel seam** (`route.ts:231, 242, 253, ...`): every phase boundary checks `req.signal.throwIfAborted()`.
 
 ## How it works
 
-### Move 1 — the mental model: three primitives, one repo
+### Move 1 — the mental model
 
-You know how `pipe()` in shell pauses the writer when the reader can't
-keep up? Same primitive across the three flow-control mechanisms here:
+You've written an SSE stream before: `Content-Type: text/event-stream`, server writes lines, browser reads with `EventSource`. This is close, but framed as NDJSON — one JSON object per line, delimiter is a bare `\n`. The reader isn't `EventSource`; it's a `TextDecoder` over `response.body.getReader()`.
 
 ```
-  Three flow-control primitives in this repo
+  The pattern — one-writer streaming with cancel-driven backpressure
 
-  1. NDJSON stream OUT to browser
-     writer ──enqueue─► buffer ──read─► reader
-                       (bounded)
-     when reader is slow, buffer fills, writer awaits
-
-  2. Spacing gate BEFORE Bloomreach call
-     caller ──callTool─► BloomreachDataSource
-                              │
-                              ▼
-                         if (elapsed < 1100) sleep
-                              │
-                              ▼
-                         transport.callTool
-     client-side rate limiter: known-slow-consumer, slow yourself down
-
-  3. Load harness worker semaphore
-     [ index 0, index 1, ... , index N-1 ]  ← shared queue
-                    ▲
-             ┌──────┼──────┐
-             │      │      │
-         worker 0 worker 1 worker K-1     ← K workers pull until empty
-     bounded concurrency at K without locks (JS single-thread makes
-     queue.shift() atomic)
+  server                                       browser
+    │                                             │
+    │ ── phase X starts                           │
+    │ send({type:'reasoning_step', …})            │
+    │──────── JSON line + \n ─────────────────►   │
+    │                                             │ decode + parse
+    │                                             │ dispatch to UI
+    │                                             │
+    │ send({type:'tool_call_start', …})           │
+    │──────── JSON line + \n ─────────────────►   │
+    │                                             │ … user clicks "cancel"
+    │                                             │ controller.abort()
+    │                                             │ ── fetch aborts
+    │ req.signal.aborted = true                   │
+    │                                             │
+    │ next req.signal.throwIfAborted() → throws   │
+    │ finally: record phase, close stream         │
 ```
 
-Different primitives, same idea: **prevent the writer from overrunning
-the reader**. Each is at the right layer for its bottleneck.
+The kernel: **enqueue-per-event, cancel-signal-per-phase, no shared queue**. If you strip the cancel-signal you get an SSE that keeps burning function time even after the user leaves. If you strip the phase-boundary check you get a graceless unwind — the model keeps calling Anthropic in the background.
 
-### Move 2 — walk the mechanism
+### Move 2 — the walkthrough
 
-#### The proactive spacing gate — client-side rate limiting
+#### The NDJSON framing — one line per event
 
-Section 02 walked this from the partial-failure angle. Here it's
-recast as backpressure: **the client (this app) throttles itself
-because it knows the server would otherwise 429 it.**
+`lib/mcp/events.ts` exports `encodeEvent(e)`. The route uses it verbatim:
 
-```typescript
-// lib/data-source/bloomreach-data-source.ts:190-201
-private async liveCall(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
-  const elapsed = Date.now() - this.lastCallAt;
-  if (elapsed < this.minIntervalMs) {
-    await new Promise((r) => setTimeout(r, this.minIntervalMs - elapsed));
-  }
-  try {
-    const result = await this.transport.callTool(name, args, { signal });
-    this.lastCallAt = Date.now();
-    return result;
-  } catch (err) {
-    this.lastCallAt = Date.now();
-    throw new McpToolError(name, errorDetail(err), { cause: err });
-  }
-}
-```
-
-Bridge: this is the same shape as a token-bucket rate limiter with
-bucket size = 1 and refill rate = 1 per 1100ms. Or equivalently, a
-leaky bucket of the same size. The mechanism is one line of arithmetic;
-the discipline is remembering to reset `lastCallAt` on both branches
-(happy and error).
-
-**Load-bearing part: the sleep is per-DataSource-instance.** Each
-warm instance's `BloomreachDataSource` has its own `lastCallAt`. If two
-warm instances serve the same user concurrently (rare but possible),
-they can EACH send a call at t=0 without one blocking the other —
-they're independent rate limiters. This is why band 3 (the retry
-ladder) exists as the reactive backstop: proactive rate limiting is
-best-effort when it's per-instance; the retry ladder catches what
-leaked through.
-
-#### The NDJSON stream — TCP flow control surfaced as JS
-
-Both long routes wrap their work in a `ReadableStream` and emit events
-as they come:
-
-```typescript
-// app/api/agent/route.ts:184-190 (excerpt)
-const encoder = new TextEncoder();
-const stream = new ReadableStream<Uint8Array>({
-  async start(controller) {
-    const collected: AgentEvent[] = [];
-    const send = (e: AgentEvent) => {
-      collected.push(e);
-      controller.enqueue(encoder.encode(encodeEvent(e)));
-    };
-```
-
-The `controller.enqueue(...)` is where flow control happens. The
-platform gives you an internal buffer; when it fills, `enqueue`
-doesn't throw — it yields. If the browser is a slow reader (say, the
-user is on a bad connection), the writer pauses. When the browser
-catches up, the writer resumes.
-
-Bridge: this is exactly the same primitive as Node's
-`writable.write()` returning `false` to signal backpressure. Or the
-Fetch `Response.body` on the server side of edge functions. The
-`ReadableStream` interface is the flow-control primitive; each
-`.enqueue` is one write into the flow-controlled buffer.
-
-**Two demo-mode-only tweaks are interesting:**
-
-```typescript
-// app/api/briefing/route.ts:24-26
-// Pause between replayed demo events, so the snapshot reveals at a readable
-// pace instead of all at once (matches the agent route's investigation replay).
-const REPLAY_DELAY_MS = 140;
-```
-
-The demo path is deterministically paced — a `setTimeout(140ms)`
-between events (`app/api/briefing/route.ts:102-104, 119`). This
-turns the demo into a "reveal on human-readable timescale" not "flush
-all events at once." That's not backpressure; that's UX-shaped pacing.
-Named for what it is.
-
-#### The abort signal is the "stop paying" backpressure
-
-If the reader closes early (user navigates away), `req.signal.aborted`
-flips. The route reads it at every phase boundary:
-
-```typescript
-// app/api/agent/route.ts:130-138 (excerpt, replay path)
-for (const e of events) {
-  // Client cancelled mid-replay — break out so we don't keep enqueuing
-  // bytes into an already-closed reader.
-  if (req.signal.aborted) break;
+```ts
+// app/api/agent/route.ts:192
+const send = (e: AgentEvent) => {
+  collected.push(e);
   controller.enqueue(encoder.encode(encodeEvent(e)));
-  await new Promise((r) => setTimeout(r, REPLAY_DELAY_MS));
-}
+};
 ```
 
-And more importantly for live paths, at
-`app/api/agent/route.ts:226, 237, 248, 274, 290`:
+The `collected.push(e)` is the interesting sidecar: after the stream finishes, `saveInvestigation(insightId, collected)` writes the full event log to the in-memory cache (`route.ts:307`). That's how replay works — the same events that streamed to the browser are the ones a later request replays.
 
-```typescript
+```
+  Framing — one JSON object per newline
+
+  {"type":"reasoning_step","step":{…}}\n
+  {"type":"tool_call_start","toolName":"list_projects",…}\n
+  {"type":"tool_call_end","toolName":"list_projects",…}\n
+  {"type":"reasoning_step","step":{…}}\n
+  {"type":"diagnosis","diagnosis":{…}}\n
+  {"type":"recommendation","recommendation":{…}}\n
+  {"type":"done"}\n
+```
+
+**Content-Type**: `application/x-ndjson; charset=utf-8` (`route.ts:107`). No SSE `data:` prefix, no `event:` marker — just newline-delimited JSON. That's why the browser can't use `EventSource`; it needs a manual reader loop.
+
+#### The ordering — program order, no reordering
+
+Every `send(e)` call is synchronous with respect to the enqueue. The route runs `send` in the natural order of the agent loop:
+
+```
+  Ordering — strict program order from ONE writer
+
+  route.ts flow:
+    1. send(reasoning_step: 'reading the workspace schema…')
+    2. schema = await bootstrap(req.signal)
+    3. send(reasoning_step: 'interpreting your question…')
+    4. classifyIntent(...)
+    5. QueryAgent.answer(...) → hooks fire send(...) per turn
+       - each tool_call_start → send(...)
+       - each tool_call_end → send(...)
+       - each text step → send(...)
+    6. send(recommendation: r) (one per rec)
+    7. send({type:'done'})
+```
+
+There's only **one writer per stream**. No concurrent enqueue, no interleaving. Ordering is the program's execution order. That's the whole guarantee — simple because the concurrency budget is one.
+
+**Failure mode this avoids**: parallel agents writing to the same stream would need explicit sequencing. This repo runs agents sequentially inside one request, so the question doesn't arise.
+
+#### Cancellation — the one backpressure signal
+
+`req.signal` (an `AbortSignal` from `NextRequest`) is the single backpressure channel. Two ways it fires:
+
+1. **Explicit browser cancel** — user clicks a cancel button (currently: navigating away, page unload).
+2. **Connection drop** — browser tab closes, network drops, Vercel's edge detects the disconnect.
+
+Both surface as `req.signal.aborted === true`. Every phase boundary checks it:
+
+```ts
+// app/api/agent/route.ts:231, 242, 253, 271, 279, 292, ...
 req.signal.throwIfAborted();
 ```
 
-Bridge: this is the same idea as checking `AbortController.signal.aborted`
-in a long-running loop — the check is cheap; the abort is meaningful.
-The load-bearing insight: **aborting the reader propagates all the way
-down through `composeSignals` to the MCP transport and to Anthropic**
-(see file 02, band 2). The client's "stop" is one hop away from every
-outbound call.
+If the signal has fired, `throwIfAborted()` throws an `AbortError`, which unwinds the stream's `start(controller)` async function, hits the outer `catch`, records the phase, and closes cleanly.
 
-#### The eval load harness — bounded concurrency without a queue system
+```
+  Cancellation flow
 
-`eval/load.eval.ts:171-211` runs N investigations at concurrency K
-using nothing but an array and K worker functions:
-
-```typescript
-// eval/load.eval.ts:171-208 (excerpt)
-const indices = Array.from({ length: LOAD_N }, (_, i) => i);
-const queue = [...indices];
-
-async function worker(workerId: number): Promise<void> {
-  while (queue.length > 0) {
-    const index = queue.shift();
-    if (index == null) return;
-    // ... run one investigation
-  }
-}
-
-const workers = Array.from({ length: LOAD_CONCURRENCY }, (_, i) => worker(i));
-await Promise.all(workers);
+  browser: reader.cancel() or unload
+       │
+       ▼
+  fetch(): AbortController fires
+       │
+       ▼
+  server: req.signal.aborted = true
+       │
+  ┌────┴────────────────────────────────┐
+  │                                     │
+  ▼                                     ▼
+  route.ts phase boundary               MCP call in flight
+  throwIfAborted() throws               composeSignals fires abort
+  → route unwinds cleanly               → SDK cancels HTTP request
+  → controller.close()                  → route sees AbortError
+                                        → same unwind path
 ```
 
-Bridge: this is the "semaphore of N" pattern implemented via a shared
-queue. In multi-threaded languages this needs a lock; in
-single-threaded JS, `queue.shift()` returns atomically without a
-race. The K workers pull from the same array until it's empty, and
-`Promise.all` waits for all of them.
+The composed signal propagation is what makes this fast. Without `composeSignals(req.signal, timeout(30s))` in the transport, an in-flight MCP call would keep running until the 30 s timeout even though the browser has already left. With it, the fetch aborts within tens of milliseconds of the cancel.
 
-**Load-bearing part: `queue.shift()` returns `undefined` when the queue
-is empty**, which the worker treats as "I'm done" (`if (index == null)
-return`). Without that guard, the worker would loop-check
-`queue.length > 0` on every iteration, race with other workers, and
-occasionally re-enter the loop after the check but before the shift.
-In JS the race isn't a real hazard (single-threaded), but the pattern
-is defensive and correct as an idiom.
+#### The finally block — clean shutdown with phase telemetry
 
-This is how you get bounded concurrency for `LOAD_N=50 LOAD_CONCURRENCY=5`
-without introducing a real queue library. The tradeoff: no dead-letter
-queue, no visibility beyond the worker's own console.log, no retry.
-For a load harness that's fine — the point is to measure, not to
-guarantee delivery.
+Even on cancel, the route logs phase durations. `route.ts` structure (paraphrasing):
 
-#### What's absent: message queues, event streams, consumer groups
+```ts
+try {
+  // ... phase 1: bootstrap
+  req.signal.throwIfAborted();
+  const t_schema = performance.now();
+  const schema = await bootstrap(req.signal);
+  recordPhase('schema_bootstrap', t_schema);
 
-Zero. There is no Kafka, no Redis Streams, no BullMQ, no Cloud Tasks,
-no Bloomreach webhook consumer. Every request enters the system via
-an HTTP handler and exits via an HTTP response. Ordering is
-per-request-in-the-agent-loop, which is trivially sequential (one
-model turn at a time, one tool call at a time within a turn).
+  // ... phase 2: list tools
+  // ... phase 3: agent loops
+} catch (e) {
+  // client cancelled → AbortError → log and unwind
+} finally {
+  // record total phases, always emit summary to console
+  console.log(JSON.stringify({ site: 'agents/route', phases, ... }));
+}
+```
 
-When any of this becomes load-bearing:
+The `finally` is what makes this observable under cancellation — you still see how far the investigation got before the user bailed. That's the debugging story for streams that die mid-flight.
 
-- **Bloomreach webhook receiver** — if we started listening to real-time
-  events from Bloomreach, we'd need a durable queue on our side to
-  absorb bursts and dedup. Redis Streams or Vercel KV pub/sub.
-- **Background reconciliation** — if we grew persistent state and it
-  needed periodic sync, we'd need a job queue and a worker. BullMQ or
-  Vercel Cron.
-- **Multi-user shared workspace** — fan-out to N users when one user
-  triggers a briefing. Would need a pub/sub or fanout queue.
+#### Replay — same encoder, no live agent
 
-Named honestly in file 09.
+The demo path (`route.ts:126`) replays a cached event list at 180 ms per line:
 
-### The skeleton — what backpressure reduces to
+```ts
+// app/api/agent/route.ts:104, 130
+const REPLAY_DELAY_MS = 180;
+// ...
+const stream = new ReadableStream<Uint8Array>({
+  async start(controller) {
+    for (const e of events) {
+      if (req.signal.aborted) break;
+      controller.enqueue(encoder.encode(encodeEvent(e)));
+      await new Promise((r) => setTimeout(r, REPLAY_DELAY_MS));
+    }
+    controller.close();
+  },
+});
+```
 
-Isolate the kernel: **whichever consumer is slowest paces the whole
-chain, and every layer either waits or is designed to wait.**
-
-What breaks without each part:
-
-- **Drop the spacing gate** — every call goes at maximum speed, ~99% of
-  them get 429s, the retry ladder fires on every call, latency
-  triples. Bloomreach's rate-limit budget is burned by us instead of
-  saved.
-- **Drop the NDJSON writer's implicit flow control** (say, by pushing
-  into an unbounded array instead of `controller.enqueue`) — a slow
-  reader causes unbounded memory growth in the writer's process.
-  Vercel eventually kills the function.
-- **Drop the load harness's semaphore** — N investigations start at
-  once, all hit Anthropic and Bloomreach simultaneously, latencies
-  spike, budget explodes. Or: if the underlying providers deny the
-  burst, you learn nothing about steady-state behavior.
-- **Drop `req.signal.throwIfAborted()`** — closed tabs continue burning
-  work server-side. Cost, cost, cost.
-
-### Optional hardening layered on top
-
-- **`REPLAY_DELAY_MS` for demo paths** — deterministic 140-180ms
-  between demo events (`agent/route.ts:103`, `briefing/route.ts:25`).
-  Not backpressure; UX pacing. Named as such.
-- **`AptKit prompt caching`** at `aptkit-adapters.ts:85-89` — reduces
-  input tokens on repeated model calls in one investigation, which
-  reduces Anthropic API cost but ALSO reduces the effective load per
-  turn. Not primary flow control; secondary effect.
-- **Vercel's `maxDuration = 300`** on both routes — the hard ceiling.
-  A single request can't exceed 300s regardless of what's happening
-  inside. Fail-safe backstop.
+The **cancel loop is the same**: `if (req.signal.aborted) break`. Same NDJSON framing, same event types, same client reader. Only the source differs — a stored array instead of a live agent. That interchangeability is the payoff of framing events as data.
 
 ### Move 3 — the principle
 
-**Backpressure IS the coordination primitive between mismatched
-speeds.** When one side is 1 req/s and the other is 100 req/s, the
-1 req/s side wins — either by design (spacing gate slows the fast
-side) or by force (429s force the slow-down reactively). The mature
-version does both, at the right layers: proactive when you can
-predict the ceiling, reactive when you can't. This repo does both,
-and each mechanism is at the right layer. That's the shape of a
-system that has actually met partial failure, not a system built
-around what a distributed-systems textbook says you need.
+**Cancellation-based backpressure is the right shape for one-shot streams.** Traditional backpressure (a slow reader pauses a producer) matters for durable streams where lost data is unacceptable. For a one-shot investigation stream, the right question is: "is anyone still listening?" If yes, keep streaming; if no, tear down. That's what `req.signal` + `throwIfAborted()` at phase boundaries + `composeSignals` in the transport achieve. The producer never blocks — it just checks whether anyone cares.
 
-## Primary diagram — the flow-control picture
+## Primary diagram
+
+The whole streaming picture, one frame:
 
 ```
-  Backpressure + flow control in one frame
+  The streaming surface, one frame
 
-  ┌─ Client (browser reader) ───────────────────────────────────────────┐
-  │                                                                      │
-  │   fetch(url).body.getReader()                                        │
-  │       reads NDJSON at browser-controlled pace                        │
-  │       ← HTTP flow control pauses the server if reader falls behind   │
-  │                                                                      │
-  └──────────────────────────┬──────────────────────────────────────────┘
-                             │
-                             ▼
-  ┌─ Route handler stream ──────────────────────────────────────────────┐
-  │                                                                      │
-  │   ReadableStream<Uint8Array>                                         │
-  │       controller.enqueue(...)  ← writer awaits when buffer is full   │
-  │       REPLAY_DELAY_MS 140-180ms in demo paths only                   │
-  │                                                                      │
-  │       req.signal.throwIfAborted() at each phase boundary            │
-  │       (reader closes → whole downstream chain stops)                │
-  │                                                                      │
-  └──────────────────────────┬──────────────────────────────────────────┘
-                             │
-                             ▼
-  ┌─ Agent loop (AptKit runtime) ───────────────────────────────────────┐
-  │                                                                      │
-  │   loop iteration → model turn → optional tool calls → next iter     │
-  │       sequential; no parallel tool dispatch                          │
-  │                                                                      │
-  └──────────────────────────┬──────────────────────────────────────────┘
-                             │
-                             ▼
-  ┌─ BloomreachDataSource ──────────────────────────────────────────────┐
-  │                                                                      │
-  │   Band 0: cache check                                                │
-  │   Band 1: spacing gate ──────► sleep(1100 - elapsed)                 │  ← proactive
-  │   Band 2: transport call ────► composeSignals(req.signal, 30_000)    │
-  │   Band 3: retry ladder ──────► sleep(hint + 500ms), max 3x           │  ← reactive
-  │   isError guard: no cache write                                      │
-  │                                                                      │
-  └──────────────────────────┬──────────────────────────────────────────┘
-                             │  hop B (rate-limited)
-                             ▼
-  ┌─ Bloomreach ────────────────────────────────────────────────────────┐
-  │  ~1 req/s per user; 429 with stated window on overrun               │
-  └─────────────────────────────────────────────────────────────────────┘
-
-  What's NOT here:
-    ✗ inbound message queue
-    ✗ pub/sub / event streams
-    ✗ consumer groups
-    ✗ dead-letter queue
-    ✗ ordered event log
+  ┌─ Browser ──────────────────────────────────────────────┐
+  │  const res = await fetch('/api/agent?…')                │
+  │  const reader = res.body.getReader()                    │
+  │  const decoder = new TextDecoder()                      │
+  │                                                         │
+  │  while (true) {                                         │
+  │    const {done, value} = await reader.read()            │
+  │    if (done) break                                      │
+  │    // decode bytes, split on \n, parse each JSON line   │
+  │    for (const line of lines) dispatch(JSON.parse(line)) │
+  │  }                                                      │
+  │                                                         │
+  │  cancel: controller.abort() → reader errors             │
+  └─────────────────────┬───────────▲──────────────────────┘
+                        │           │
+                   NDJSON body    req.signal
+                        │           │
+  ┌─────────────────────▼───────────┴──────────────────────┐
+  │  app/api/agent/route.ts (Vercel function)              │
+  │                                                         │
+  │  const stream = new ReadableStream({                    │
+  │    async start(controller) {                            │
+  │      const send = (e) => controller.enqueue(            │
+  │        encoder.encode(encodeEvent(e))                   │
+  │      )                                                  │
+  │                                                         │
+  │      try {                                              │
+  │        req.signal.throwIfAborted() // phase boundary    │
+  │        ...bootstrap...                                  │
+  │        req.signal.throwIfAborted()                      │
+  │        ...listTools...                                  │
+  │        req.signal.throwIfAborted()                      │
+  │        ...diagnostic.investigate(hooks)                 │
+  │           hooks fire send(...) per event                │
+  │        req.signal.throwIfAborted()                      │
+  │        ...recommend.propose(hooks)                      │
+  │        send({type:'done'})                              │
+  │      } catch (e) {                                      │
+  │        if (isAbort) unwind cleanly                      │
+  │      } finally {                                        │
+  │        record phase durations                           │
+  │        controller.close()                               │
+  │      }                                                  │
+  │    }                                                    │
+  │  })                                                     │
+  │                                                         │
+  │  return new Response(stream, {                          │
+  │    headers: {                                           │
+  │      'Content-Type': 'application/x-ndjson; charset=utf8│
+  │      'Cache-Control': 'no-cache, no-transform',         │
+  │    }                                                    │
+  │  })                                                     │
+  └─────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The three-primitive story (stream, spacing gate, semaphore) is a
-common shape in the "one long route + one rate-limited external system"
-architecture. Where you'd see the same shape:
+**NDJSON vs SSE**: SSE (Server-Sent Events) has `EventSource` in browsers — automatic reconnect, `data:` framing, `event:` types. NDJSON has none of that — you roll the reader yourself. Why NDJSON here? Because the reader needs full control: this repo's stream is per-investigation (no reconnect makes sense; if you disconnected mid-way, you'd start a new investigation), and the event types are richer than SSE's flat `event:` scheme. NDJSON stays a JSON object per line, which is directly typed as `AgentEvent`.
 
-- **Vercel AI SDK apps** — same NDJSON stream shape; usually a token
-  bucket for the LLM API
-- **RAG chatbots** — often a semaphore around vector-search + LLM to
-  bound cost per request
-- **Streaming data-processing** — Node streams' built-in backpressure
-  is the same primitive as the ReadableStream flow control here
+**No message broker** — this repo doesn't have queues (Kafka, SQS, Redis Streams), and the reason is the request-scoped model. Everything happens inside one HTTP request's lifetime; there's no work to hand off to background workers, no eventual-processing story. When the product grows a background job (scheduled monitoring, batch briefing generation), that's when a queue becomes the right shape — and the vocabulary this file names (ordering, delivery semantics, dedup keys, backpressure via consumer lag) becomes load-bearing.
 
-Where a real queue system becomes necessary:
-
-- **When you can't afford to lose a message** — persistent queue with
-  durability (Kafka, Redis Streams with persistence, SQS)
-- **When consumers are separate processes** — the in-process shift-and-
-  check pattern only works within one Node process; cross-process
-  needs a shared queue
-- **When ordering matters across users** — global ordering requires
-  a single-writer log; the natural fit is an event log with partitions
-  by user id
-
-None of these are here. The audit call is honest — if the product
-grew a "listen to Bloomreach webhooks" feature or a "reconcile every
-customer's history nightly" feature, all three would be needed.
+**Compare to the load harness's semaphore**: `eval/load.eval.ts:171` runs N investigations at concurrency K using a shift-from-shared-array semaphore. That's the closest thing to a work queue in the repo — but it's process-local, not durable, and it exists only during a test run. See the header of `eval/load.eval.ts` for the design.
 
 ## Interview defense
 
-### Q: "How do you handle backpressure in this app?"
+**Q: "How does your response stream work?"**
 
-Sketch this:
+A: NDJSON over a `ReadableStream<Uint8Array>`. Each `AgentEvent` (reasoning step, tool call start/end, diagnosis, recommendation, done) is JSON-encoded, newline-delimited, and enqueued into the stream controller. The browser reads it with `response.body.getReader()` + `TextDecoder`, splits on `\n`, and dispatches each line as a typed event.
 
 ```
-     3 primitives, one repo
-
-     NDJSON stream out ──► TCP flow control (writer awaits reader)
-     spacing gate       ──► client-side rate limit (proactive)
-     load-harness sema  ──► bounded concurrency K
+   server sends:                       browser reads:
+   {reasoning_step: ...}\n             → dispatch(reasoning_step)
+   {tool_call_start: ...}\n            → dispatch(tool_call_start)
+   {tool_call_end: ...}\n              → dispatch(tool_call_end)
+   {done}\n                            → close reader
 ```
 
-"Three primitives at three layers. Outbound to the browser, an NDJSON
-ReadableStream — `controller.enqueue` yields when the buffer is full,
-so a slow reader pauses the whole chain. Outbound to Bloomreach, a
-proactive spacing gate at `minIntervalMs=1100` — we know their ceiling
-is ~1 req/s, so we throttle ourselves before they 429 us. And in the
-eval load harness, a semaphore-of-K via a shared queue and K workers
-that shift until it's empty. Each primitive is at the right layer for
-its bottleneck. No queues, no pub/sub — every request enters via HTTP
-and exits via HTTP."
+**Q: "How do you handle a client that leaves mid-stream?"**
 
-Anchors: `bloomreach-data-source.ts:190-201` (spacing gate),
-`app/api/agent/route.ts:184-190` (ReadableStream), `eval/load.eval.ts:171-208`
-(load harness).
+A: `req.signal` fires. Every phase boundary calls `throwIfAborted()`, which throws an `AbortError` that unwinds the async `start(controller)` function. The `finally` block still records phase durations to the log. Composed signals in the transport (`composeSignals(req.signal, AbortSignal.timeout(30_000))`) cancel any in-flight MCP call within milliseconds of the browser disconnect — so we don't burn function time on a call whose result no one will read.
 
-### Q: "What's the difference between proactive and reactive backpressure?"
+**Anchor**: `app/api/agent/route.ts:231` and `lib/mcp/transport.ts:131`.
 
-"Proactive is 'I know the ceiling, slow myself down before they
-enforce it' — the spacing gate. Reactive is 'they told me to stop,
-I stop and wait it out' — the retry ladder's parsed-hint wait. Both
-exist because they defend different failure modes. Proactive prevents
-429s in the common case. Reactive absorbs 429s when proactive isn't
-enough (say, two warm instances share the alpha's rate-limit budget)."
+**Q: "Do you have queues or backpressure?"**
 
-### Q: "When would you introduce a real message queue?"
+A: No queue. Backpressure is one-way, cancellation-based. There's one writer per stream (the route handler) and one reader (the browser), and the ordering is strict program order. If the reader stops reading, the writer sees the AbortSignal fire and tears down. No separate broker, no dead-letter queue, no dedup table — the stream lives and dies within one HTTP request.
 
-"Three cases:
-
-- if we started listening to Bloomreach webhooks (durable inbound
-  events, need to absorb bursts and dedup)
-- if we grew background reconciliation (job queue + worker; BullMQ
-  or Vercel Cron)
-- if we grew multi-user shared workspaces (fan-out from one trigger
-  to N users; pub/sub)
-
-Nothing today needs it. The current shape — one user, one request,
-one investigation, one long stream — doesn't have the failure modes a
-queue defends against. Introducing one now would be complexity for
-its own sake."
+**Load-bearing gotcha**: the stream is per-request. Any state that needs to survive the request lives elsewhere — in-memory (per instance, lost on cold start), in the demo JSON (deploy-time only), in the cookie (browser-durable, crypto-shared). See file 04 for the consistency story.
 
 ## See also
 
-- 02-partial-failure-timeouts-and-retries.md — the spacing gate as
-  proactive rate limiting; the retry ladder as reactive
-- 05-replication-partitioning-and-quorums.md — no queues means no
-  ordered log, no partition keys for messages
-- 09-distributed-systems-red-flags-audit.md — when queues become
-  load-bearing
+- `02-partial-failure-timeouts-and-retries.md` — where `composeSignals` connects cancellation to the MCP call.
+- `01-distributed-system-map.md` — the stream is one of the two arrows in the map.
+- `04-consistency-models-and-staleness.md` — what state survives past the stream ending.

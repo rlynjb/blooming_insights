@@ -40,9 +40,9 @@ This book is the choreography. Six chapters, one per beat of the slot, plus this
 
   Two things about that timeline. The money shot lands inside the first third — you never bury it. And the demo has a floor: the room has to see the agent actually reason. Everything else is a ceiling and cuts before the demo does.
 
-  ## The demo path — `bi:mode = live-synthetic`
+  ## The demo path — `bi:mode = live-synthetic` (default at page load)
 
-  You have three modes. `demo` replays a committed snapshot (fastest, but the room sees a canned result). `live-bloomreach` runs against the real MCP server (rate-limited, tokens revoke after minutes, wifi-dependent). `live-synthetic` is the one you rehearse and the one you present: real Claude, real agent reasoning, in-process deterministic ecommerce data, no creds, no upstream dependency.
+  You have three modes. `demo` replays a committed snapshot (fastest, but the room sees a canned result). `live-mcp` runs against any HTTPS MCP server — Bloomreach by default (rate-limited, tokens revoke after minutes, wifi-dependent), or a bearer/anonymous alternate via the ⚙ settings modal. `live-synthetic` is the one you rehearse and the one you present: real Claude, real agent reasoning, in-process deterministic ecommerce data, no creds, no upstream dependency. **It is now the default at page load** — the toggle sits correctly before you touch anything.
 
   This is the demo path because it is honest and reliable at once. The fake is the data, not the agent behavior. When a judge asks "isn't synthetic just fake data," Chapter 06 has the verbatim answer.
 
@@ -160,6 +160,6 @@ This book is the choreography. Six chapters, one per beat of the slot, plus this
 
   → The money shot lands by 2:30. Cut opening prose before you delay it.
 
-  → The demo path is `live-synthetic`. Not `demo`, not `live-bloomreach`. If the terminal has creds cached and it's tempting to switch to `live-bloomreach` because "the real thing is more impressive," resist — token revocation on the alpha MCP server has killed a demo before, and it will kill this one.
+  → The demo path is `live-synthetic` (the default). Not `demo`, not `live-mcp`. If the terminal has creds cached and it's tempting to switch to `live-mcp` because "the real Bloomreach thing is more impressive," resist — token revocation on the alpha MCP server has killed a demo before, and it will kill this one. The one exception is the optional Beat 3.5 in Chapter 02 (the settings-modal swap), which is a scripted 30-second detour, not the main line.
 
   → The eval flywheel is shipped, not aspirational. Every time you mention `eval:report`, `eval:gate`, or `eval:load`, you can point at `eval/baseline.json` in the repo and at a receipt in `eval/receipts/`. Never say "we plan to add" — you already did.

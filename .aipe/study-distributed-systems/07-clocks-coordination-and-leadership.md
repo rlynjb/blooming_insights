@@ -1,531 +1,288 @@
-# clocks-coordination-and-leadership
+# Clocks, Coordination, and Leadership
 
-*Session across ephemeral instances · Encrypted-cookie state · OAuth PKCE + DCR · Industry standard*
+*Industry name: monotonic vs wall-clock time · leases · leader election · Type: Industry standard*
 
 ## Zoom out — where this concept lives
 
-The interesting coordination problem in this repo is not "elect a leader"
-or "keep clocks in sync." It's: **how does OAuth state survive when the
-connect request and the callback request may land on different Vercel
-instances?** The answer — encrypted httpOnly cookies as the state
-store — is a specific solution to a specific stateless-runtime problem,
-and it's one of the more subtle pieces of the codebase.
+Distributed leadership — leases, election, split-brain, quorum-based coordination — is **not yet exercised** in this repo. What IS exercised: local monotonic time (`Date.now()`, `performance.now()`) used to bound waits, TTLs, and phase timings. Naming that clearly matters more than pretending otherwise.
 
 ```
-  Zoom out — where "coordination" lives
+  Zoom out — where clocks appear (and where they don't)
 
-  ┌─ Client (browser) ───────────────────────────────────┐
-  │  bi_session cookie (session id)                      │
-  │  bi_auth cookie (AES-256-GCM encrypted store)        │
-  │  ★ THE CROSS-INSTANCE COORDINATION HAPPENS HERE ★    │ ← we are here
-  └────────────────────────┬─────────────────────────────┘
-                           │
-  ┌─ Service layer ───────▼──────────────────────────────┐
-  │  BloomreachAuthProvider (OAuthClientProvider impl)   │
-  │  withAuthCookies → AsyncLocalStorage-scoped Store    │
-  │  read once at request start; write once at end       │
-  └────────────────────────┬─────────────────────────────┘
-                           │  hop B — OAuth authorize / callback / token
-                           ▼
-  ┌─ Provider ─────────────────────────────────────────────┐
-  │  Bloomreach IdP — issues tokens on code exchange      │
-  │  Tokens expire in minutes on the alpha                │
-  └───────────────────────────────────────────────────────┘
+  ┌─ Client band ──────────────────────────────────────────┐
+  │  browser clock (untrusted; not used for coordination)   │
+  └────────────────────────────────────────────────────────┘
+
+  ┌─ Server band ──────────────────────────────────────────┐
+  │  Date.now() → cache TTL, spacing gate, cookie MaxAge   │
+  │  performance.now() → phase durations, load latency     │
+  │  ★ THIS FILE: what these clocks bound, what they don't ★│
+  │                                                         │
+  │  NO leader, NO lease, NO election, NO coordination      │
+  │  between Vercel instances                              │
+  └────────────────────────────────────────────────────────┘
+
+  ┌─ External band ────────────────────────────────────────┐
+  │  MCP server's clock (opaque to us)                      │
+  │  Anthropic's clock (opaque to us)                       │
+  └────────────────────────────────────────────────────────┘
 ```
 
-Nothing in this repo elects a leader. Nothing has a term. Nothing uses
-distributed time. What DOES exist: state that has to survive across
-stateless-runtime instances, and the mechanism that makes it possible.
+## Zoom in — narrow to the concept
+
+Three clock uses matter here:
+
+1. **`Date.now()` for wall-clock TTL** — the 60 s response cache, the 10-day auth cookie MaxAge. Wall clock is fine because both bounds are approximate.
+2. **`Date.now()` for the spacing gate** — measures elapsed time within one instance to space calls at ≥ 1.1 s apart.
+3. **`performance.now()` for phase durations** — the route logs each phase's wall-clock time.
+
+None of these coordinate across nodes. That's the honest answer. Distributed leadership becomes relevant the moment there's shared mutable state, and this repo doesn't have any yet.
 
 ## Structure pass
 
-### Layers of "who holds this state, when?"
+### Layers — where clocks appear
+
+- **McpDataSource** — `this.lastCallAt = Date.now()` for the spacing gate.
+- **McpDataSource cache** — `expiresAt: now + ttl` for the 60 s TTL.
+- **route.ts** — `performance.now()` for phase durations.
+- **auth cookie** — `maxAge: AUTH_COOKIE_MAX_AGE` (10 days) — browser enforces expiry.
+- **fault injector** — `Math.random()` or seeded xorshift32 (`fault-injecting.ts:167`) — not a clock, but named here because it's the only randomness source in the coordination story.
+
+### One axis held constant — "does this clock coordinate across nodes?"
 
 ```
-  "who holds the OAuth state at each moment in the flow?"
+  Axis: does this clock cross an instance boundary?
 
-  ┌───────────────────────────────────────────────┐
-  │ before /connect                                │
-  │   client:   session cookie (id only, no auth)  │
-  │   server:   nothing                            │
-  │   provider: unaware                            │
-  └───────────────────────────────────────────────┘
-      ┌───────────────────────────────────────────────┐
-      │ during /connect                               │
-      │   client:   session cookie                    │
-      │   server:   PKCE code_verifier + DCR client   │
-      │             info in ALS-scoped Store          │
-      │   provider: about to receive redirect         │
-      └───────────────────────────────────────────────┘
-          ┌───────────────────────────────────────────┐
-          │ after /connect (response flushed)         │
-          │   client:   session + bi_auth cookie      │
-          │             (encrypted store, incl PKCE)  │
-          │   server:   nothing (instance can die)    │  ← the crucial hop
-          │   provider: showing authorize page        │
-          └───────────────────────────────────────────┘
-              ┌───────────────────────────────────────┐
-              │ during /callback (may be DIFFERENT   │
-              │                    instance)          │
-              │   client:   session + bi_auth cookie │
-              │   server:   reads bi_auth → decrypt → │
-              │             ALS-scoped Store restored │
-              │   provider: sending code back         │
-              └───────────────────────────────────────┘
-                  ┌───────────────────────────────────┐
-                  │ after /callback                    │
-                  │   client:   session + bi_auth      │
-                  │             (now with tokens)      │
-                  │   server:   flushed to bi_auth     │
-                  │   provider: authenticated          │
-                  └───────────────────────────────────┘
+  Date.now() in spacing gate      →  NO. per-instance elapsed only.
+  Date.now() in cache expiresAt   →  NO. per-instance TTL.
+  performance.now() phase timing  →  NO. logged locally only.
+  auth cookie MaxAge (10 days)    →  YES, sort of. Browser enforces;
+                                     server just checks decryption.
+  MCP server response times       →  YES, but opaque. We just retry.
 ```
 
-The interesting row is the third one: **after `/connect` returns,
-the server holds NOTHING**. Everything the SDK needs to complete the
-OAuth flow is in the client's cookie. That's what allows the callback
-to land on a different instance and still work.
-
-### One axis — "which state survives an instance cycle?"
-
-```
-  "does this state survive its instance being evicted?"
-
-  ┌───────────────────────────────────────────────┐
-  │ SDK's OAuthClientProvider methods              │
-  │   PKCE code_verifier                           │  ✓ via cookie
-  │   DCR clientInformation                        │  ✓ via cookie
-  │   tokens (access/refresh)                      │  ✓ via cookie
-  │   state (CSRF param)                           │  ✓ via cookie
-  │                                                │  (all in the store)
-  └───────────────────────────────────────────────┘
-      ┌───────────────────────────────────────────────┐
-      │ our per-request async context                 │
-      │   requestStore AsyncLocalStorage              │  ✗ dies with request
-      │   BloomreachAuthProvider instance             │  ✗ dies with request
-      │   ephemeral in-memory Map (dev/test)          │  ✗ (or lives as
-      │                                                │      long as node)
-      └───────────────────────────────────────────────┘
-```
-
-The SDK's state fields ALL survive because they live in the cookie
-after each request flushes. The transient stuff (ALS, provider
-instance) doesn't need to survive — the next request rebuilds them
-from the cookie.
+Only one clock crosses a node boundary — the browser's MaxAge enforcement on the auth cookie. And even that's an "expiration hint," not a distributed clock. There is no `HLC`, `NTP-corrected`, `TrueTime`-style clock in this repo.
 
 ### Seams
 
-- **`OAuthClientProvider` interface** — implemented by
-  `BloomreachAuthProvider` at `lib/mcp/auth.ts:160`. The SDK calls
-  `codeVerifier()`, `saveTokens()`, `clientInformation()`, etc.,
-  without knowing WHERE the store lives. The seam lets the store be
-  a cookie in prod and a file in dev without the SDK caring.
-
-- **`withAuthCookies` wrapper** at `lib/mcp/auth.ts:86-104` — read
-  once from the cookie, run the closure, write once at the end. This
-  is the seam between "per-call reads/writes on the provider" and
-  "one cookie read + one cookie write per request." Critical because
-  Next's request/response cookie split means a read AFTER a set in the
-  same request returns the OLD value.
-
-- **The `ctx.dirty` flag** at `lib/mcp/auth.ts:127` — only writes the
-  cookie back on `withAuthCookies`'s finally IF something changed.
-  Prevents overwriting the cookie on every request even when the auth
-  state is unchanged.
+No coordination seams because there's no coordination. If leadership ever entered this codebase, the seam would be at the DataSource layer — one Vercel instance would need to claim exclusive rights to some resource. That doesn't happen today.
 
 ## How it works
 
-### Move 1 — the mental model: the cookie IS the shared store
+### Move 1 — the mental model
 
-You know how session cookies work — the server sets a cookie, the
-browser sends it back, the server reads it. Same thing here, but the
-"session" is the OAuth state and the "server" might be a different
-Vercel instance each request. The cookie IS the shared store between
-instances.
+You've written `setTimeout(fn, 1000)`. That's a clock use. You've written `if (Date.now() > entry.expiresAt) { entry = null; }`. That's a clock use too. **A clock isn't distributed unless two nodes read the same time and act on it together.** This repo has clocks; it doesn't have distributed clocks.
 
 ```
-  The pattern — cookie as cross-instance state
+  The pattern — one instance, one clock, no coordination
 
-     browser
-        │  bi_auth = encrypt({ PKCE verifier, DCR info, tokens, state })
-        │
-        ▼
-     any Vercel instance:
-        1. read bi_auth from request
-        2. decrypt → ALS-scoped Store
-        3. run request logic (provider reads/writes hit the Store)
-        4. if Store.dirty: re-encrypt → set bi_auth in response
-        │
-        ▼
-     browser (updated cookie)
-        │
-        ▼
-     next request → any Vercel instance (maybe different one)
-        (same procedure)
+  instance A     time flows: t=0  →  t=1s  →  t=2s  →  …
+                     ↓          ↓        ↓
+                spacing gate  cache TTL   phase log
+                (own clock,  (own TTL,   (own timer,
+                 no share)    no share)   no share)
+
+  instance B     time flows: independently. never compared.
 ```
 
-Bridge: this is exactly the shape of JWT-based auth — every request
-carries the credential, the server never remembers you between
-requests. Difference: here the cookie holds MUTABLE state (tokens
-that get refreshed, PKCE verifiers that get consumed), so writes
-back to the cookie are required, not optional.
+If leadership were needed, the pattern would be different: one instance holds a lease with a TTL, other instances see the lease in shared state and wait. That's `etcd`, `Zookeeper`, or Consul. Not here.
 
-### Move 2 — walk the mechanism
+### Move 2 — the walkthrough
 
-#### Environment-forked storage
+#### The spacing gate's clock
 
-`lib/mcp/auth.ts` picks a storage backend by environment:
+`bloomreach-data-source.ts:190`:
 
-```typescript
-// lib/mcp/auth.ts:30-36
-// Storage backend, keyed by our app session id. Three backends, selected by env:
-//   • development → a gitignored file (.auth-cache.json).
-//   • test → in-memory Map (isolated per run; `_clearAuthStore` resets it).
-//   • production (Vercel) → an encrypted httpOnly cookie
-```
-
-Three implementations behind one `readAll` / `writeAll` seam
-(`auth.ts:113-142`):
-
-```typescript
-// lib/mcp/auth.ts:113-124 (excerpt)
-function readAll(): Store {
-  const ctx = requestStore.getStore();
-  if (ctx) return ctx.store; // production: ALS-scoped, cookie-backed
-  if (!PERSIST) return Object.fromEntries(memStore); // test: isolated in-memory
-  try {
-    if (existsSync(CACHE_FILE)) return JSON.parse(readFileSync(CACHE_FILE, 'utf8')) as Store;
-  } catch {
-    /* corrupt/unreadable cache — treat as empty */
+```ts
+private async liveCall(name, args, signal?): Promise<unknown> {
+  const elapsed = Date.now() - this.lastCallAt;
+  if (elapsed < this.minIntervalMs) {
+    await new Promise((r) => setTimeout(r, this.minIntervalMs - elapsed));
   }
-  return {};
+  // ...
+  this.lastCallAt = Date.now();
+  // ...
 }
 ```
 
-The provider (`BloomreachAuthProvider`, `auth.ts:160-218`) doesn't know
-which backend it's using. The SDK doesn't know one exists. The seam
-holds.
+Uses `Date.now()` (wall clock). Two properties:
 
-**Why the split at all?** Each environment has different constraints:
+- **Per-instance.** Each Vercel function instance has its own `lastCallAt`. Instance A calling at t=0 doesn't tell instance B not to call at t=100ms.
+- **Wall clock jumps are irrelevant.** If NTP corrects the clock backward by 500 ms mid-call, `elapsed` could go negative, but the check `if (elapsed < this.minIntervalMs)` still triggers a wait. The spacing bound holds regardless.
 
-- **dev** — Next hot-reloads modules; an in-memory Map wouldn't survive
-  the module rebuild that happens during a PKCE flow. File persistence
-  survives the reload.
-- **test** — needs isolation between test runs. In-memory Map with a
-  reset helper (`_clearAuthStore` at `auth.ts:250`).
-- **prod** — instances are ephemeral. Any single-instance store is
-  wrong. The cookie is the only cross-instance option.
+**Why not `performance.now()` here?** Because `lastCallAt` needs to survive across `async` boundaries, and `performance.now()` doesn't add anything for a millisecond-precision bound. `Date.now()` is idiomatic.
 
-#### AES-256-GCM for cookie encryption
+**Failure mode this doesn't defend against**: two Vercel instances hitting Bloomreach at the same instant. Each spaces its own calls at 1.1 s, but the aggregate rate exceeds 1 req/s. That's the case the retry ladder catches. See file 02.
 
-Cookies are client-visible if not encrypted. Tokens in a cleartext
-cookie would be readable by anyone with dev-tools access. Solution:
-encrypt the whole store under a server-side key derived from
-`AUTH_SECRET`:
+#### The cache TTL's clock
 
-```typescript
-// lib/mcp/auth.ts:51-79
-function aesKey(): Buffer {
-  const secret = process.env.AUTH_SECRET;
-  if (!secret) {
-    throw new Error(
-      'AUTH_SECRET is required in production to encrypt the auth cookie. ' +
-        'Set it in your Vercel project environment variables.',
-    );
-  }
-  return createHash('sha256').update(secret).digest(); // 32 bytes → AES-256
-}
+`bloomreach-data-source.ts:186`:
 
-function encryptStore(store: Store): string {
-  const iv = randomBytes(12);
-  const cipher = createCipheriv('aes-256-gcm', aesKey(), iv);
-  const enc = Buffer.concat([cipher.update(JSON.stringify(store), 'utf8'), cipher.final()]);
-  return Buffer.concat([iv, cipher.getAuthTag(), enc]).toString('base64url');
-}
-
-function decryptStore(token: string): Store {
-  try {
-    const buf = Buffer.from(token, 'base64url');
-    const decipher = createDecipheriv('aes-256-gcm', aesKey(), buf.subarray(0, 12));
-    decipher.setAuthTag(buf.subarray(12, 28));
-    const plain = Buffer.concat([decipher.update(buf.subarray(28)), decipher.final()]).toString('utf8');
-    return JSON.parse(plain) as Store;
-  } catch {
-    return {}; // tampered, rotated-secret, or corrupt cookie → treat as no auth
-  }
+```ts
+this.cache.set(cacheKey, { result, expiresAt: now + ttl });
+// ... later:
+if (cached && cached.expiresAt > Date.now()) {
+  return { result: cached.result as T, durationMs: 0, fromCache: true };
 }
 ```
 
-Cross-link: `../study-security/` teaches the auth-cookie crypto in
-detail. What matters here is that the decrypt returns `{}` on
-tampering — so a corrupted cookie falls back to "no auth" gracefully,
-triggering a fresh OAuth flow rather than a hard error.
+Same wall clock. Same per-instance scope. Wall-clock skew doesn't matter because the ceiling is per-instance — no other node ever reads `entry.expiresAt`.
 
-#### AsyncLocalStorage seals the per-request context
+#### The auth cookie's MaxAge — the one cross-instance clock
 
-Next's request/response cookie split is a real problem:
+`lib/mcp/auth.ts:49`:
 
-```
-  // lib/mcp/auth.ts:39-46 (paraphrased from comment)
-  To avoid Next's request-vs-response cookie split (a read *after* a set in the
-  same request returns the OLD value), we never touch the cookie per
-  provider-method call. `withAuthCookies` seeds an ALS-scoped store from the
-  cookie ONCE at the start of the request and flushes it back ONCE at the end;
-  the provider's many synchronous read/write calls hit that store in between.
+```ts
+const AUTH_COOKIE_MAX_AGE = 60 * 60 * 24 * 10; // 10 days
 ```
 
-Without ALS, the provider's `saveTokens()` → `tokens()` sequence would
-save to the response cookie, then read from the request cookie, and
-read stale data. With ALS, both operations hit the same in-memory
-Store for the duration of the request:
+Set as a cookie attribute: `maxAge: AUTH_COOKIE_MAX_AGE`. The browser enforces expiry. The server never checks it directly — it only tries to decrypt whatever the browser sends. So the "clock" here is:
 
-```typescript
-// lib/mcp/auth.ts:86-104
-export async function withAuthCookies<T>(fn: () => Promise<T>): Promise<T> {
-  if (process.env.NODE_ENV !== 'production') return fn();
-  const { cookies } = await import('next/headers');
-  const raw = (await cookies()).get(AUTH_COOKIE)?.value;
-  const ctx: RequestStore = { store: raw ? decryptStore(raw) : {}, dirty: false };
-  const result = await requestStore.run(ctx, fn);
-  if (ctx.dirty) {
-    (await cookies()).set(AUTH_COOKIE, encryptStore(ctx.store), {
-      httpOnly: true,
-      secure: true,
-      sameSite: 'none',  // survives cross-site OAuth return
-      path: '/',
-      maxAge: AUTH_COOKIE_MAX_AGE,
-    });
-  }
-  return result;
+- **Browser's clock** — decides when to delete the cookie.
+- **`AUTH_SECRET`** — decides whether the decrypted content is valid at all.
+
+This is a soft expiry: a browser with a wrong clock could keep the cookie longer than 10 days, but the OAuth tokens inside would already be expired (Bloomreach enforces its own token lifetimes). The MaxAge is a hygiene bound, not a security bound.
+
+```
+  Auth cookie MaxAge — soft expiry
+
+  browser clock                server clock
+       │                            │
+       │  cookie set at t=0         │
+       │  MaxAge = 10 days          │
+       │                            │
+       │  browser deletes at t=10d  │
+       │  IF its clock is right     │
+       │                            │
+       │  server gets cookie at any │  server just decrypts
+       │  time within that window   │  → if valid, use
+                                    │  → if expired token inside,
+                                    │    OAuth flow re-runs
+```
+
+#### `performance.now()` for phase durations
+
+`route.ts:220`:
+
+```ts
+const t0 = performance.now();
+const phases: Array<{ phase: string; durationMs: number }> = [];
+const recordPhase = (phase: string, started: number) => {
+  phases.push({ phase, durationMs: Math.round(performance.now() - started) });
+};
+```
+
+Monotonic clock. Used purely for observability (Vercel logs). No coordination. No TTL. No decision hinges on this timer other than "how long did phase X take?" which is what monotonic time is for.
+
+#### The fault injector's PRNG — deterministic when seeded
+
+`fault-injecting.ts:167`:
+
+```ts
+private random(): number {
+  if (this.options.seed == null) return Math.random();
+  let s = this.prngState;
+  s ^= s << 13;
+  s ^= s >>> 17;
+  s ^= s << 5;
+  this.prngState = s;
+  return (Math.abs(s) % 1_000_000) / 1_000_000;
 }
 ```
 
-**Load-bearing part: `requestStore.run(ctx, fn)` at `:91`.** ALS
-propagates through every awaited promise inside `fn`. So even
-if the SDK internally does 5 async hops between `saveTokens` and
-`tokens`, they all resolve `requestStore.getStore()` to the same
-`ctx`. Without ALS, you'd need to pass the context explicitly through
-every layer, which is not possible when the SDK owns the middle.
+Not a clock, but named here because it's the closest thing to a coordination decision the repo makes. When `FAULT_SEED` is set, the fault sequence is deterministic and reproducible across runs. That's crucial for regression tests — chaos testing that isn't reproducible isn't testing, it's dice-rolling.
 
-**Also load-bearing: `sameSite: 'none'`.** The OAuth flow crosses
-sites — we redirect to Bloomreach's IdP, and Bloomreach redirects back
-to `/api/mcp/callback`. `SameSite=Lax` would drop the cookie on the
-cross-site return in some browsers, and the callback would arrive
-without the PKCE verifier. `SameSite=None` (with `Secure`) preserves
-it across the round trip.
-
-#### Cookie shape survives without a session id in the SDK's mind
-
-The store is keyed by our app's session id (from `bi_session`).
-Multiple sessions can coexist in one cookie in principle, but the
-current design is one-session-per-user, so one entry per store.
-
-The redirect_uri handling at `lib/mcp/connect.ts:36-57` deserves a
-mention: production derives it from `x-forwarded-host`, so preview
-deploys and the production alias each get their own registered
-redirect URI. This solves a specific coordination problem: if
-`APP_ORIGIN` were static, the OAuth callback would try to return to
-the wrong origin on preview deploys, dropping the session cookie
-(different domain).
-
-#### What's absent: leader election, distributed clocks, term-based coordination
-
-Nothing here. There is no "one process must be the leader at a time"
-role. There is no "wait until wall-clock time X" logic. There is no
-term counter, no version vector, no vector clock.
-
-When any of this becomes load-bearing:
-
-- **Background job scheduler** — if we ran scheduled reconciliation
-  (say, "every day at 3am, refresh all users' briefings"), we'd need
-  a leader so multiple Vercel instances don't run the same job.
-  Standard fix: Vercel Cron (they elect the leader for you) or
-  Postgres SKIP LOCKED / Redis SETNX as poor-man's leader election.
-
-- **Distributed locking** — no shared resource requires coordinated
-  access today. The moment we add a shared persistent state (say, a
-  shared cache write path), we'd need a lock. Standard fix: Redis
-  SETNX with TTL, or Vercel KV atomic operations.
-
-- **Time-based ordering across nodes** — nothing here compares
-  timestamps across instances. Timestamps are used ONLY within one
-  request (e.g. `Date.now() - this.lastCallAt`), never compared
-  across instances.
-
-### The skeleton — what "coordination" reduces to here
-
-Isolate the kernel. The pattern is: "state that must survive
-stateless-runtime cycling lives in the client's cookie; the server
-holds it only for the duration of one request via ALS."
-
-What breaks without each part:
-
-- **Drop the encrypted cookie backend** — dev/test would still work
-  (their backends survive short lifetimes); prod would fail at
-  `/callback` because the instance that gets the callback doesn't
-  hold the PKCE verifier. The OAuth flow can't complete.
-- **Drop ALS** — the provider's `saveTokens()` → `tokens()` reads
-  stale data because the response-cookie write is invisible to a
-  request-cookie read. Silent staleness.
-- **Drop `sameSite: 'none'`** — the cross-site OAuth return drops the
-  cookie in some browsers; callback arrives without the PKCE
-  verifier. Same failure mode as dropping the cookie backend.
-- **Drop the graceful decrypt fallback (`return {};` on error)** — a
-  rotated `AUTH_SECRET` or a tampered cookie throws mid-request
-  instead of falling back to "no auth." Users see errors instead of
-  a re-auth prompt.
-
-### Optional hardening layered on top
-
-- **10-day cookie `maxAge`** (`auth.ts:49`) — bounds cookie durability.
-  Tokens expire in minutes on the alpha, but the cookie carrying them
-  lives long enough to hold the DCR client-info registration across
-  many token refreshes.
-- **`SameSite=None` + `Secure`** — required by browsers for cross-site
-  cookies. Documented at `auth.ts:97-98`.
-- **`consumeState` CSRF check** (`auth.ts:230-235`) — implemented but
-  NOT wired in, per the comment. The SDK calls `state()` multiple
-  times per flow, which broke a naive re-validation. Kept for a
-  future shared-store implementation.
+Load harness seeds each investigation from `(base + index)` so runs are deterministic yet unique per investigation. That's not coordination between nodes; it's coordination between test invocations.
 
 ### Move 3 — the principle
 
-**In a stateless-runtime system, "coordination" reduces to "state that
-must outlive the process, and where it lives instead."** The
-distributed-systems machinery you'd need on your own servers (Redis
-for leader election, distributed locks, term counters) is unnecessary
-here because the coordination surface is smaller than it looks: one
-user's OAuth state across a small handful of ephemeral instances. The
-cookie is the correct tool at the correct scale. The lesson: pick
-coordination mechanisms by the size of the coordination problem, not
-by the size of the distributed-systems textbook.
+**Local monotonic time is enough when no state crosses instances.** The moment two nodes share mutable state that a timer bounds — a lease, a lock, a coordinated retry — you need distributed time (HLCs, TrueTime, or a coordinator). This repo doesn't need any of that, and pretending it does would misrepresent what's here. The `Date.now()` uses in the spacing gate and cache are local timers; the auth cookie MaxAge is a hygiene bound. That's the whole clock story until the app grows shared mutable state.
 
-## Primary diagram — the OAuth-across-instances picture
+## Primary diagram
+
+Every clock use, one frame:
 
 ```
-  OAuth PKCE + DCR across Vercel's ephemeral instances
+  Every clock in the repo — where it appears, what it bounds
 
-  ┌─ Browser (durable state anchor) ────────────────────────────────────┐
-  │                                                                      │
-  │   bi_session cookie:  <uuid>                                         │
-  │   bi_auth cookie:     AES-256-GCM(iv || tag || ciphertext), sameSite │
-  │                       encrypts { clientInfo, codeVerifier, state,    │
-  │                                  tokens }                            │
-  │                                                                      │
-  └──────────────────────────┬──────────────────────────────────────────┘
-                             │
-                             │  every request carries both cookies
-                             ▼
-  ┌─ Any Vercel instance ────────────────────────────────────────────────┐
-  │                                                                       │
-  │   withAuthCookies(async () => {                                       │
-  │     1. read bi_auth ←── decrypt ── requestStore ALS ctx               │
-  │     2. run provider logic:                                            │
-  │        - provider.codeVerifier() → ctx.store[sid].codeVerifier        │
-  │        - provider.saveTokens(t)  → ctx.store[sid].tokens = t          │
-  │                                    ctx.dirty = true                   │
-  │     3. if ctx.dirty:                                                  │
-  │        encrypt(ctx.store) → set bi_auth on response                   │
-  │   })                                                                  │
-  │                                                                       │
-  │   NEVER touches the cookie per-provider-call (Next req/resp split)    │
-  │                                                                       │
-  └───────────────────────────────────────────────────────────────────────┘
+  ┌─ McpDataSource ────────────────────────────────────────┐
+  │  this.lastCallAt = Date.now()                           │
+  │    → spacing gate: sleep if elapsed < minIntervalMs     │
+  │    → per-instance, wall clock                           │
+  │                                                         │
+  │  entry.expiresAt = Date.now() + ttl                     │
+  │    → cache TTL check on next read                       │
+  │    → per-instance, wall clock                           │
+  └────────────────────────────────────────────────────────┘
 
-  Instance A serves /connect  →  writes bi_auth (with PKCE + DCR info)
-  Instance B serves /callback →  reads bi_auth (has PKCE + DCR info)
-                              →  writes bi_auth (now with tokens)
-  Instance C serves /mcp/call →  reads bi_auth (has tokens; refreshes as needed)
+  ┌─ SdkTransport ─────────────────────────────────────────┐
+  │  AbortSignal.timeout(30_000)                            │
+  │    → per-call timeout                                   │
+  │    → composes with route signal                         │
+  │    → node's internal timer (monotonic-ish)              │
+  └────────────────────────────────────────────────────────┘
 
-  All three instances share NOTHING but the cookie.
+  ┌─ route.ts (per request) ───────────────────────────────┐
+  │  performance.now() for phase durations                  │
+  │    → logged in finally block, always                    │
+  │    → monotonic, per instance                            │
+  └────────────────────────────────────────────────────────┘
+
+  ┌─ auth cookie ──────────────────────────────────────────┐
+  │  maxAge: 60 * 60 * 24 * 10  (10 days)                   │
+  │    → browser enforces expiry                            │
+  │    → cross-instance IN THE SENSE that any instance can  │
+  │      still decrypt a cookie the browser hasn't deleted  │
+  │    → soft expiry (server never checks the MaxAge)       │
+  └────────────────────────────────────────────────────────┘
+
+  ┌─ FaultInjectingDataSource ─────────────────────────────┐
+  │  xorshift32(seed) — deterministic when seeded           │
+  │    → reproducible fault sequences for regression tests  │
+  │    → NOT a clock; a coordination substitute for tests   │
+  └────────────────────────────────────────────────────────┘
+
+  ★ NO LEADER, NO LEASE, NO CROSS-NODE CLOCK ★
 ```
 
 ## Elaborate
 
-The "encrypted stateful cookie" pattern is the canonical answer to
-"how do I do stateful things on a stateless-runtime platform?" Same
-shape shows up in:
+The literature has three families of distributed clocks:
 
-- **iron-session** (Node) — encrypted-cookie session library, exactly
-  this shape
-- **Rails' encrypted session cookie** — same idea, browsers hold the
-  server's state
-- **Vercel's own session helpers** — same primitive
+1. **Physical clocks** — NTP-synchronized wall time. Correct-ish, but subject to drift and skew.
+2. **Logical clocks** — Lamport timestamps, vector clocks. Order events causally without wall time.
+3. **Hybrid** — HLCs (Hybrid Logical Clocks), Google's TrueTime. Combine physical + logical for bounded-uncertainty ordering.
 
-Where this pattern breaks:
+None of these appear here. If the app grew a scheduled monitoring job that ran every N minutes across multiple instances, a leader election would keep two instances from running the same job — that's `etcd`-style leadership with lease TTLs. Not needed today.
 
-- **Cookie size limits (~4KB in practice)** — headers get expensive
-  past this. Rich state means moving to a shared store (KV, Redis).
-- **State that must be readable by multiple users** — cookies are
-  per-user by construction. Shared state needs a shared store.
-- **Cryptographic key rotation** — if `AUTH_SECRET` rotates, all
-  existing cookies become undecryptable. The graceful fallback
-  (`return {};` on decrypt error) means users just re-auth, but
-  every session ends simultaneously. Real production would want
-  multi-key support with a rotation window.
+**Leases and split-brain**: a lease is a lock with a TTL. If the leaseholder dies without releasing, the lease expires and another instance can claim it. Split-brain is when two instances *both* think they hold the lease — usually because a clock skew or a network partition confuses the coordinator. Zookeeper, etcd, Consul all solve this with quorum-based coordination. Again, not here.
 
-The Bloomreach alpha's aggressive token expiry (minutes) is
-independently interesting: it forces the app to build a re-auth path
-as a first-class UI feature (the "reconnect" button on auth errors).
-This isn't a coordination problem — it's a resilience-to-expiry
-problem — but they compose. The cookie survives long enough to hold
-the DCR client info; the tokens inside it churn on refresh.
+**Where this becomes relevant**: the first background job. Say the app grew a nightly monitoring task that ran across all users. If two Vercel cron triggers fired at once (rare, but possible), a lease-based coordinator would ensure only one ran. That's the moment leader-election vocabulary earns its complexity.
 
 ## Interview defense
 
-### Q: "How does OAuth state survive across Vercel instances?"
+**Q: "Where does time show up in your system?"**
 
-Sketch this:
+A: Three places. `Date.now()` bounds the 60 s response cache and the ~1.1 s spacing gate — both per-instance, wall-clock. `performance.now()` measures phase durations for observability. `AbortSignal.timeout(30_000)` in the transport bounds a single MCP call. None of these coordinate across nodes.
 
 ```
-  browser                any instance
-     │                       │
-     │  bi_auth (encrypted) │
-     ├───────────────────────►
-     │                       ├─ read → decrypt → ALS store
-     │                       ├─ run provider methods (in-memory)
-     │                       ├─ write → encrypt → set cookie
-     │◄──────────────────────┤
-     │  bi_auth (updated)    │
+   spacing gate     Date.now()       per-instance
+   cache TTL        Date.now()       per-instance
+   phase durations  performance.now()per-instance, monotonic
+   per-call timeout AbortSignal      per-instance timer
+   cookie MaxAge    browser          soft; browser enforces
 ```
 
-"An encrypted httpOnly cookie called `bi_auth` holds the full OAuth
-state — PKCE code_verifier, DCR client info, tokens. AES-256-GCM
-under a secret in `AUTH_SECRET`. `withAuthCookies` at
-`lib/mcp/auth.ts:86` reads it once at request start, seeds an
-AsyncLocalStorage-scoped Store, runs the request logic (which
-includes many synchronous provider method calls), and writes it back
-once at the end if anything changed. The ALS is critical because
-Next's request/response cookie split makes read-after-write within
-one request return stale data — the ALS keeps everything in one
-in-memory store for the request's lifetime. `SameSite=None` +
-`Secure` because the OAuth flow crosses sites."
+**Q: "Do you have any distributed time?"**
 
-Anchors: `lib/mcp/auth.ts:47-104` (withAuthCookies, encryption),
-`lib/mcp/auth.ts:160-218` (BloomreachAuthProvider).
+A: No. There's no leader election, no lease, no coordinator. The auth cookie MaxAge is the closest thing — any Vercel instance can decrypt a cookie the browser still holds — but that's a soft hygiene bound, not a coordinated clock. If the app grew shared mutable state, that's when I'd reach for HLCs or a coordinator like etcd.
 
-### Q: "Do you have leader election?"
+**Q: "How would you add background jobs safely?"**
 
-"No. Nothing here has a role that must be a singleton. The moment we
-grew a scheduled job (nightly reconciliation, say), we'd need leader
-election so multiple Vercel instances don't run the same job. Standard
-move at that point: Vercel Cron does the leader election for us. Or
-Postgres SKIP LOCKED / Redis SETNX if we owned the scheduler."
-
-### Q: "What's the load-bearing part everyone forgets?"
-
-"`AsyncLocalStorage.run`. Without it, Next's request/response cookie
-split silently returns stale data on `provider.tokens()` reads that
-follow a `provider.saveTokens()` in the same request. The bug wouldn't
-throw; it would look like the tokens didn't persist. The ALS is what
-turns 'many provider calls per request' into 'one cookie read + one
-cookie write per request.'"
+A: The moment I need a scheduled job that runs across users, I'd add a distributed lease. Vercel Cron plus a Redis-backed lease (or a Postgres `SELECT FOR UPDATE` lock with a TTL) — one worker claims the lease with a bounded expiry, does the work, releases. If the worker dies mid-flight, the lease expires and another worker picks it up. That's the shape leader election takes at the small scale I'd need first.
 
 ## See also
 
-- 04-consistency-models-and-staleness.md — the sessionStorage escape
-  hatch is the client-side analog to what the auth cookie does for
-  auth state
-- `../study-security/audit.md` — the AES-256-GCM crypto in more detail
-- 09-distributed-systems-red-flags-audit.md — token revocation on the
-  alpha as a ranked risk
+- `02-partial-failure-timeouts-and-retries.md` — where `AbortSignal.timeout` composes with `req.signal`.
+- `04-consistency-models-and-staleness.md` — where `Date.now()` bounds cache staleness.
+- `05-replication-partitioning-and-quorums.md` — the shared-state precondition for coordination.

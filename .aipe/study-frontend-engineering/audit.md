@@ -1,250 +1,244 @@
-# audit — frontend engineering (blooming insights)
+# audit — frontend engineering, 8 lenses
 
-Pass 1. Walks the 8-lens frontend inventory against the current codebase, one `##` per lens, `file:line` grounded. `not yet exercised` is honest.
+Pass 1. Walk the codebase against the 8-lens inventory. Every applied claim grounded in a `file:line`. Cross-links to Pass 2 pattern files where a lens finding has a dedicated deep walk.
 
-## rendering-and-reactivity
+Reader posture: senior frontend engineer. No definitions of `useState` or "what a hook is." Straight to what THIS repo does.
 
-**Client-side SPA over the App Router. No SSR, no SSG, no RSC on any UI page.** Every page opens `'use client';` on line 1:
+## 1. rendering-and-reactivity
 
-- `app/page.tsx:1`
-- `app/investigate/[id]/page.tsx:1`
-- `app/investigate/[id]/recommend/page.tsx:1`
+**Rendering mode.** Next.js 16 App Router (`next: 16.2.6`, `react: 19.2.4` per `package.json:22-24`). The app is single-page-app-shaped despite the router — `app/page.tsx:1` opens with `'use client'`, `app/investigate/[id]/page.tsx:1` opens the same, and no `page.tsx` in the tree renders anything server-side beyond `layout.tsx` (which is presentational font wiring — `app/layout.tsx:14-27`). No `<Suspense>` at the route level, no `loading.tsx` files, no server components consuming the stream data. Route handlers under `app/api/*/route.ts` stream NDJSON; the client tree consumes the streams via `fetch()`.
 
-The only server-rendered thing is `app/layout.tsx` — the `<html lang="en" className="dark">` shell with `next/font/google` variables (`Syne`, `Inter`, `JetBrains_Mono`). Once `HomePage()` mounts, everything is React 19 concurrent reconciliation over `useState` — no `useReducer`, no `useTransition`, no `useDeferredValue`, no `useSyncExternalStore`, no Suspense boundary anywhere in the app tree.
+**Reconciliation model.** React 19 virtual-DOM, no compiler pragmas, no `use client`-only optimizations flipped on in `next.config.ts:1-7` (config is empty). Reconciliation runs on every setState from the stream dispatcher — each NDJSON event that mutates state (`setInsights`, `setCoverage`, `setTraceItems` at `lib/hooks/useBriefingStream.ts:220-273`) triggers a render pass. Not batched via `flushSync` or `startTransition`; the default React 19 automatic batching handles concurrent setState calls in the same microtask.
 
-Reconciliation model: React 19 virtual-DOM diffing, sync mode. `next.config.ts:1-6` is empty (`{}`) — no `experimental.reactCompiler`, so React Compiler is off. `reactStrictMode` defaults on (documented in the project context), and the code is written to survive it: `useInvestigation.ts:44` and `StreamingResponse.tsx:20` each use a `startedRef` guard to avoid double-fetching under the dev-only mount → cleanup → re-mount cycle.
+**Scheduling.** No `useTransition`, no `useDeferredValue`, no `useOptimistic` anywhere in the repo (grep returns zero hits across `app`, `components`, `lib`). Streaming updates hit the reconciler as they arrive; on a fast stream this can be dozens of `setState` calls per second (each NDJSON event → one setState) — deliberately un-throttled so the "shows its work" trace stays live.
 
-**Where work actually happens:** the four `useEffect`s in the app root (`page.tsx:68` — persisted mode; `useBriefingStream.ts:132` — briefing fetch; `useInvestigation.ts:46` — investigation fetch; `useDemoCapture.ts:91` — dev capture) each fire after mount. All server data arrives via `fetch()` inside the effect body. No route loaders, no `getServerSideProps` (Pages Router only), no App Router `Suspense boundary + streaming server component` pattern.
+**When work actually happens.** Client hydration on page mount; every subsequent update is a client-side setState. No `useEffect` runs work at commit that could be moved to render or vice versa — the streaming effect starts on mount and cleans up on `mode` / `ready` change (`lib/hooks/useBriefingStream.ts:137-311`).
 
-Cross-link: the async NDJSON reader's yielding behavior and how `await reader.read()` interacts with the microtask queue → `study-runtime-systems`. React 19's concurrent-scheduling primitives (`useTransition`, priority lanes) are `not yet exercised` here.
+**Cross-link.** The event loop and how React schedules work belongs to `study-runtime-systems`. This lens names what the repo does; not why the loop is shaped that way.
 
-## state-architecture
+## 2. state-architecture
 
-**No global store. Six state seams**, in order of scope:
+Every piece of state has one owner. The rule the repo enforces without stating: no global store, no `useContext` provider tree, no Redux / Zustand / Jotai. Grep finds zero `createContext` calls. Not "we thought about it and rejected it" — the shape is small enough that a store would be premature.
 
-1. **local component state** (`useState`) — the common case. `HomePage`'s `mode`, `ready`, `activeQuery` (`page.tsx:47,62,63`); the streaming hooks' entire result shape (`useBriefingStream.ts:108-120`, `useInvestigation.ts:39-44`); the reconnect policy's `reconnecting` flag (`useReconnectPolicy.ts:69`).
+**Owners, from longest-lived to shortest.**
 
-2. **`localStorage`** — one key: `bi:mode`, persisted at `page.tsx:89`, read at `page.tsx:73`. Legacy migration inline (`live`, `live-sql` → `live-bloomreach`). No JSON schema, one string value.
+  - **Browser storage — survives reload.**
+    - `localStorage['bi:mode']` (`app/page.tsx:79-82`) — the demo/live-synthetic/live-mcp toggle. Legacy values `'live'`, `'live-sql'`, `'live-bloomreach'` rewrite in-place to `'live-mcp'` on read (`app/page.tsx:83-96`).
+    - `localStorage['bi:mcp_config']` (`lib/mcp/config.ts:34`, key exported so the modal at `components/settings/McpConfigModal.tsx:5-9` reads/writes through helper functions, not the raw key). The MCP override object — url, authType, optional bearer.
+    - `sessionStorage['bi:insight:<id>']` (`lib/hooks/useBriefingStream.ts:54-61`) — feed writes each insight so the investigate page can hydrate on cross-page navigation without a server round-trip.
+    - `sessionStorage['bi:inv:<step>:<id>']` (`lib/hooks/useInvestigation.ts:20`) — investigation results, so back-nav and StrictMode double-mount hydrate instantly.
+    - `sessionStorage['bi:diag:<id>']` (`lib/hooks/useInvestigation.ts:21`) — diagnosis handed from step 2 to step 3.
 
-3. **`sessionStorage`** — five keys, each single-writer:
-   - `bi:insight:<id>` — the feed stashes each anomaly (`useBriefingStream.ts:53-60`) so the investigation page can hand it to `/api/agent`. Load-bearing because on Vercel serverless the feed request and the investigation request can hit different instances (server-side in-memory lookup is unreliable).
-   - `bi:inv:diagnose:<id>` / `bi:inv:recommend:<id>` — each step's completed result, stashed at `useInvestigation.ts:134` on the `done` event. Re-visits and back-nav hydrate instantly from these.
-   - `bi:diag:<id>` — the diagnosis handed from step 2 to step 3 (`useInvestigation.ts:139`).
-   - `bi:reconnecting` — one-shot guard preventing the auto-reconnect from looping (`useReconnectPolicy.ts:35`).
+  - **useState in the streaming hook — dies with the effect.**
+    - `useBriefingStream` (`lib/hooks/useBriefingStream.ts:113-125`) owns 9 pieces: `status`, `insights`, `workspace`, `errorMessage`, `demoSuffix`, `stepStatus`, `queryCount`, `traceItems`, `coverage`.
+    - `useInvestigation` (`lib/hooks/useInvestigation.ts:40-45`) owns 5: `items`, `diagnosis`, `recommendations`, `complete`, `error`.
 
-4. **URL / route state** — `useParams<{ id: string }>()` at `investigate/[id]/page.tsx:34`. The insight ID is the source of truth for which anomaly is being investigated. Query parameters (`?q=`, `?demo=cached`, `?mode=`) drive the API routes.
+  - **useState in the page — UI-only, no cross-effect sharing.**
+    - `activeQuery`, `settingsOpen`, `mode`, `ready` (`app/page.tsx:48-69`). `mode` mirrors localStorage but ISN'T authoritative — the LS write happens on toggle (`app/page.tsx:107-109`), state follows.
 
-5. **derived state** — the stepper's `state` values are derived from the fetch status inside `page.tsx:20-24` and `investigate/[id]/page.tsx:46-47`. `CoverageGrid`'s counts (`checked | monitored | firing | skipped`) are derived from the coverage array (`CoverageGrid.tsx:70-73`). No memoization — recomputed each render, cheap because the arrays are small.
+**Derived state.** Computed in-render, not stashed: `isDemo` (`app/page.tsx:70`), `forcedDemo` (`:67`), coverage counts (`components/feed/CoverageGrid.tsx:70-73`). No `useMemo` for these — cheap enough to recompute per render.
 
-6. **server-carried state** — the demo snapshot at `lib/state/demo-*.json` is committed. `/api/briefing?demo=cached` serves it as plain JSON; `useBriefingStream.ts:187-198` branches on `content-type` and takes the non-streaming path when the response is a snapshot.
+**Form state.** The MCP config modal at `components/settings/McpConfigModal.tsx:35-38` uses four `useState` fields (url, authType, bearerToken, initialized) — plain controlled inputs, no form library. Validation is one-line: `save-disabled` when `authType === 'bearer' && !bearerToken.trim()` (`:277`, `:59`).
 
-**Not yet exercised:** no `useReducer`, no Context Provider tree, no form-state library, no `URLSearchParams`-driven router state (the query params are read on the server side only). Cross-link: system-level state ownership → `study-system-design`.
+**Server state → client state.** The seam is `readNdjson` (`lib/streaming/ndjson.ts:17`). The hook that owns the fetch owns the derived client state — there's no `react-query` / `swr` / route loader involved. See `01-ndjson-stream-reader-hook.md`.
 
-## component-architecture
+**Cross-link.** Where state "should" live at the system level (server vs client, cache vs source of truth) → `study-system-design`. This lens names where the state currently lives.
 
-**~20 components, mostly presentational, one custom-hook layer under `lib/hooks/`.** Composition is straightforward — `children` prop is used implicitly (`layout.tsx`, `page.tsx` wrappers), but there are no slot patterns, no render-prop components, no headless UI, no compound components, no factory components.
+## 3. component-architecture
 
-Component sizes tell the story (LOC counts):
+**Composition patterns exercised.**
 
-| Component | LOC | Notes |
-|---|---:|---|
-| `InsightCard.tsx` | 495 | Largest. Presentational with derived-content helpers (`whyItMatters`, `scopeExplain`, `fmtUsd`, `fmtPct`) inline. Renders `SeverityBadge` and `Sparkline` children. |
-| `CoverageGrid.tsx` | 319 | Three tile variants (pending / ghost / live) inline. Icons via `lucide-react` in a `Record<CategoryId, LucideIcon>` map. |
-| `EvidencePanel.tsx` | 290 | Skeleton + real branches; embeds `<details>` disclosure for hypotheses. |
-| `StreamingResponse.tsx` | 253 | Client component, owns its own NDJSON fetch. |
-| `RecommendationCard.tsx` | 241 | Presentational. |
-| `ProcessStepper.tsx` | 138 | Layout-heavy, `role="group"` (line 74), state-derived styling. |
-| `ToolCallBlock.tsx` | 129 | Expandable JSON viewer for tool results. |
-| `TraceContent.tsx` | 122 | Markdown-lite renderer for agent step content. |
-| `ReasoningTrace.tsx` | 108 | Loops over `TraceItem[]`, dispatches to `AgentBadge` / `ToolCallBlock`. |
-| `GapChart.tsx` | 103 | Inline SVG chart, `role="img"` at line 49. |
-| `QueryBox.tsx` | 92 | Currently hidden behind `SHOW_QUERY_BOX = false` (`page.tsx:16`). |
-| `AgentPipeline.tsx` | 93 | |
-| `InvestigationSubject.tsx` | 89 | Banner above `EvidencePanel`. |
-| `StatusLog.tsx` | 86 | Sticky sidebar wrapper around `ReasoningTrace`. |
+  - **Presentation-only visual atoms.** `components/shared/Skeleton.tsx` (18 LOC), `components/shared/AgentBadge.tsx`, `components/feed/SeverityBadge.tsx`. Named for what they render, no state, take props, return JSX. Textbook presentational components.
 
-**Container-vs-presentational boundary:** the three page components (`app/page.tsx`, `investigate/[id]/page.tsx`, `investigate/[id]/recommend/page.tsx`) are the containers — they call hooks and pass results to presentational components. The extracted hooks (`useBriefingStream`, `useInvestigation`, `useDemoCapture`, `useReconnectPolicy`) *are* the container logic pulled out of `page.tsx` — hence `page.tsx` shrunk from a larger monolith to 461 LOC by moving the effect bodies into named hooks.
+  - **Compound-ish stepper.** `components/shared/ProcessStepper.tsx` (139 LOC) takes three named props (`monitoring`, `diagnostic`, `recommendation`), each a `StepInput` (`state | sub? | href?`). The page hands three sibling inputs; the stepper renders three sibling steps with a shared badge/label/sub layout. Not a headless "compound component" API with children slots — it's a prop-driven fixed-three-slot pattern. Simpler than it looks and correct for a fixed pipeline.
 
-**Where composition earns its keep:** `StatusLog` wrapping `ReasoningTrace` is the reuse — the same "how this was gathered / figured out" sidebar renders on all three pages with different `title` / `countLabel` / `emptyMessage` props (`StatusLog.tsx:28-34`). Same trace items shape (`TraceItem[]`, defined at `ReasoningTrace.tsx:6-24`), three different framings.
+  - **Fixed-slot container-with-inputs.** `components/feed/CoverageGrid.tsx` (319 LOC) takes `coverage`, `insights`, `loading`, walks a fixed `CATEGORIES` list from `lib/agents/categories`, and renders one tile per category — even the "not yet reported" ones as pending skeletons (`:74`, `settling`). Container-with-inputs, not container-with-children.
 
-**Where it doesn't:** `InsightCard.tsx` at 495 LOC is doing three jobs (severity + headline, comparison bars, why-it-matters copy) as one deep component. It reads well because the derived-content helpers are named — but a `deriveInsightCopy(insight)` module extraction would earn its place if a second surface ever needed the same "why this metric matters" text (that's speculative; today it's called once).
+  - **Presentational trace.** `components/investigation/ReasoningTrace.tsx` (108 LOC) takes `items: TraceItem[]`, dispatches on `item.kind === 'step' | 'tool'`, renders each accordingly. Sub-parts (`AgentBadge`, `TraceContent`, `ToolCallBlock`) split by concern.
 
-Cross-link: module depth → `study-software-design` (the `readNdjson` function is the textbook deep-module example — one shallow interface, all the parsing complexity contained).
+  - **New modal, imperative-open pattern.** `components/settings/McpConfigModal.tsx:34` takes `{ open, onClose, onSaved? }`. The parent owns `settingsOpen` (`app/page.tsx:49`); the modal returns `null` when `!open` (`:50`). Not a `<Dialog>` from a headless-UI library — a hand-rolled `role="dialog" aria-modal="true"` container. See `03-settings-modal-with-localstorage-persistence.md`.
 
-## data-fetching-and-cache
+**Boundary placement discipline.** Business logic sits in `lib/hooks/*` (313 LOC `useBriefingStream`, 213 LOC `useInvestigation`, 146 LOC `useDemoCapture`, 123 LOC `useReconnectPolicy`). Components stay lean and consume the hook output. The page (`app/page.tsx`, ~517 LOC) is the composition root — it wires hooks to components. This is textbook and worth naming: **the page is a wiring file, not a logic file.**
 
-**No fetch library.** No react-query, no SWR, no route loader. Every data fetch is a bare `fetch()` inside a `useEffect`, four times:
+**Abstraction earning its place.** `readNdjson` (64 LOC) is the strongest earn — it removed ~250 LOC of drift across four consumers. See `01-ndjson-stream-reader-hook.md`. `useReconnectPolicy` extracted the revoked-token dance the alpha Bloomreach server forces. `useBriefingStream` is close to load-bearing size (325 LOC) but it does exactly one job — this is the streaming-consumer bloat, not an accidental god-hook.
 
-- `useBriefingStream.ts:158` — `GET /api/briefing?demo=cached | ?mode=live-bloomreach | ?mode=live-synthetic`
-- `useInvestigation.ts:180` — `GET /api/agent?insightId=...&step=diagnose|recommend`
-- `StreamingResponse.tsx:92` — `GET /api/agent?q=<query>`
-- `useDemoCapture.ts:59` — `POST /api/mcp/capture-demo`
+**Container-vs-presentational.** Not enforced as a rule; observed in practice. Hooks contain, components present. No mixed component that both fetches and renders decorative markup.
 
-**Cache strategy: none client-side, sessionStorage-as-memo on the investigation results.** The hook hydrates from `sessionStorage.getItem(stashKey(step, id))` at `useInvestigation.ts:53` before firing the fetch — the back button and step-3 → step-2 nav feel instant because the completed trace is stashed at `useInvestigation.ts:134` on the `done` event.
+**Cross-link.** Deep-modules-vs-shallow, information hiding, complexity → `study-software-design`. This lens names the composition patterns; the deep-vs-shallow judgment lives there.
 
-The demo path is the other cache: `?demo=cached` serves the committed snapshot as plain JSON. `useBriefingStream.ts:187-198` branches on `content-type: application/x-ndjson`; if it's plain JSON it drains synchronously.
+## 4. data-fetching-and-cache
 
-**Server-side cache** lives in `McpClient` (`~1 req/s rate limit + result cache with `{result, durationMs, fromCache}` shape) — that's outside the frontend seam; see `study-system-design`.
+**How server state crosses into client state.** Every fetch happens inside a hook `useEffect` — no route loaders (Next.js 16 App Router doesn't have `loader` files anyway), no `Server Components fetching for the client tree`, no `use()` on promises. The pattern is uniform:
 
-**Optimistic mutations:** `not yet exercised`. There are no client-initiated mutations. Everything is read-only from the frontend's perspective; the "capture demo" button is dev-only and a full re-fetch after each POST.
+  1. `useEffect` on mount / dep-change → run the fetch.
+  2. `fetch('/api/…', { headers: mcpHeader ? { [BI_MCP_CONFIG_HEADER]: mcpHeader } : undefined })` (`lib/hooks/useBriefingStream.ts:167-169`, `lib/hooks/useInvestigation.ts:189-191`).
+  3. Check status → auth-redirect on 401 + `body.needsAuth` + `body.authUrl` (`useBriefingStream.ts:173-181`, mirrored in `useInvestigation.ts:192-198`).
+  4. `readNdjson(res.body, handle, { cancelOn })` — one kernel, four consumers.
+  5. `handle(event)` dispatches on `event.type` → `setState`. See `01-ndjson-stream-reader-hook.md`.
 
-**Error and retry:** per-call. `useBriefingStream.ts:172-183` reads the response body defensively (`readBody` at line 63-72 handles empty / HTML / 500 without throwing on `.json()`). Retry is not implemented in the hook — the auto-reconnect policy handles the auth-shaped error case only (`useReconnectPolicy.ts:33`). Any other transient failure surfaces the error to the UI and stays there until the user reloads.
+**Query library.** None. No react-query, swr, tanstack-query, or Apollo. Zero dependencies of that shape in `package.json:22-30`.
 
-Cross-link: wire semantics (keep-alive, HTTP/2 stream multiplexing, why not SSE) → `study-networking`. Cache-as-architecture (server-side rate-limit cache) → `study-system-design`.
+**Route loaders.** Not applicable — Next.js 16 App Router doesn't use route loaders the way Remix does; data lives in server components or in client hook effects. This repo picks client hook effects.
 
-## routing-and-navigation
+**Streaming pattern.** NDJSON (application/x-ndjson) over `fetch()`, not SSE (`EventSource`) and not WebSocket. Frame-per-line, JSON.parse per frame, dispatch per event. See `01-ndjson-stream-reader-hook.md` for the kernel; wire-format semantics belong to `study-networking`.
 
-**File-based, App Router, three UI routes plus API routes.** Route tree:
+**Mutations + optimistic updates.** Only mutation is the MCP-config write from the modal (`components/settings/McpConfigModal.tsx:52-63`, calls `writePersistedConfig` from `lib/mcp/config.ts:121-138`). It's client-only (`localStorage`) — no server mutation, no rollback needed. The modal calls `window.location.reload()` after save (`app/page.tsx:263-264`) to make the new header take effect on the next fetch. Simplest state model; costs one page refresh; buys correctness without a state-invalidation graph.
+
+**Cache invalidation strategy.** Not a cache-heavy app. `sessionStorage` hydrates instant-visible state on re-mount (`useInvestigation.ts:52-64`) — the reload is the invalidation trigger for MCP config, and the `bi:mode` toggle rebuilds the fetch URL (`useBriefingStream.ts:143`) which re-triggers the effect.
+
+**Error and retry behavior.**
+  - HTTP 401 → check `body.needsAuth + body.authUrl` → redirect. No retry.
+  - HTTP not-ok → surface `body.error || body.__raw || http <status>` (`useBriefingStream.ts:184-193`). No retry.
+  - NDJSON `type: 'error'` event → callback `onAuthError` gets first shot; if it returns true (auth-shaped, reconnect fired), bail; otherwise `setStatus('error')` (`useBriefingStream.ts:285-295`).
+  - Revoked-token reconnect belongs to `useReconnectPolicy` — one-shot guard + reset + reload (see the hook at `lib/hooks/useReconnectPolicy.ts`).
+  - Malformed NDJSON line → `readNdjson`'s `onMalformed` callback (default: silent skip, `lib/streaming/ndjson.ts:24-25`, `:47-49`).
+
+**Cross-link.** Wire semantics, HTTP framing, streaming transport rules → `study-networking`. Cache-as-architecture, source-of-truth boundaries → `study-system-design`. This lens is the client-side data-plumbing layer only.
+
+## 5. routing-and-navigation
+
+**Route structure.** File-based via App Router:
 
 ```
   app/
-   ├─ page.tsx                         → /
-   ├─ layout.tsx                       → root shell
-   ├─ investigate/
-   │   └─ [id]/
-   │       ├─ page.tsx                 → /investigate/:id
-   │       └─ recommend/
-   │           └─ page.tsx             → /investigate/:id/recommend
-   ├─ debug/
-   │   └─ page.tsx                     → /debug
-   └─ api/                             → server routes (not UI)
+    layout.tsx                          root layout, fonts + dark class
+    page.tsx                            home / feed  ('use client')
+    globals.css                         design tokens
+    api/
+      briefing/route.ts                 GET → NDJSON briefing stream
+      agent/route.ts                    GET → NDJSON agent stream
+      mcp/*                             REST for MCP auth/config
+    investigate/[id]/
+      page.tsx                          diagnose step  ('use client')
+      recommend/…                       recommend step
+    debug/                              dev-only pages
 ```
 
-**Navigation:** `next/link` throughout (`Link` from `next/link` in `ProcessStepper.tsx:2`, `InsightCard.tsx`, `CoverageGrid.tsx:3`, `investigate/[id]/page.tsx:3`). No programmatic `router.push` in the UI layer — every navigation is a `<Link>` in the JSX.
+**Code-splitting at the route boundary.** Whatever Next.js gives for free — nothing configured. No dynamic `import()` used deliberately in the app tree (`grep -r "dynamic(" app components lib` returns nothing frontend-side).
 
-**Dynamic segments:** `useParams<{ id: string }>()` at `investigate/[id]/page.tsx:34` reads the anomaly ID. Passed to `useInvestigation(id, 'diagnose')` which uses it as both the `sessionStorage` cache key and the `/api/agent?insightId=<id>` parameter.
+**Navigation lifecycle.** `next/link` used in `components/shared/ProcessStepper.tsx:2, 127` to jump between the three pipeline steps when `href` is set. No `router.push` calls that I can see used for the main flow. No `<Suspense>` boundaries defined at route entry — a hard fetch fires on mount, the loading skeleton renders in the same tree.
 
-**Code-splitting at the route boundary:** implicit via Next.js — each route is a separate bundle. No explicit `dynamic()` imports for lazy loading, no route-level `loading.tsx` or `error.tsx` files (checked: no matches).
+**Prefetch / transitions.** `next/link` default prefetch is in use (not opted out). No `useTransition` around navigation — the loading state is streamed data, not a transition.
 
-**Prefetch:** Next.js `<Link>` default behavior (prefetch on viewport). Not customized.
+**Guards / redirects / loaders.** Guarding lives at the API layer, not the route: `app/api/briefing/route.ts` and `app/api/agent/route.ts` return `401 + needsAuth + authUrl` on missing auth; the client hooks translate that to `window.location.href = authUrl` (`lib/hooks/useBriefingStream.ts:175-178`, `lib/hooks/useInvestigation.ts:193-197`). No client-side auth guard.
 
-**Guards / redirects / loaders:** `not yet exercised` for UI routes. The API routes handle auth (401 with `needsAuth: true, authUrl`), and the hooks redirect via `window.location.href = body.authUrl` on that response (`useBriefingStream.ts:164-166`, `useInvestigation.ts:181-186`, `StreamingResponse.tsx:94-99`). That's the closest thing to a route guard — client-side, per-fetch.
+**Scroll restoration.** Default browser + Next.js behavior. Not configured.
 
-**Scroll restoration:** default Next.js behavior; not customized.
+**Deep-linking.** `?demo=cached` URL param reaches the demo path even with the mode toggle hiding demo (`app/page.tsx:187-192` and `lib/hooks/useBriefingStream.ts:143`). Dynamic segment `investigate/[id]` carries the insight id.
 
-**Deep-linking:** every route is deep-linkable. The insight ID in the URL is the source of truth — `useInvestigation` reads it, hydrates from sessionStorage if present, else fires the fetch. A user landing directly on `/investigate/anom-123/recommend` with no stashed diagnosis will get an empty handoff (`useInvestigation.ts:73-84`) — the recommendation agent runs against the insight ID alone, without the step-2 diagnosis. Not a bug (the API supports it) but a subtle degradation the deep-link path exercises.
+Small routing surface, deliberately simple.
 
-## styling-and-design-system
+## 6. styling-and-design-system
 
-**Tailwind v4 (CSS-first) + CSS custom-property design tokens + inline `style` for everything specific.** No CSS-in-JS library, no CSS Modules, no styled-components.
+**CSS architecture.** Two systems, deliberately layered:
 
-**Design tokens** at `app/globals.css:3-15` — 12 tokens, one theme (dark only):
+  1. **CSS custom properties (design tokens) — `app/globals.css:3-14`**. Named accents, background band, text tiers, borders. Every component reads these via inline `style={{ color: 'var(--text-primary)' }}` — this is the load-bearing move for theming. Grep finds ~200+ references to `var(--…)` across components.
+  2. **Tailwind v4 utility classes** — `@import "tailwindcss"` at `app/globals.css:1`, `@theme inline` block at `:17-23` binding tokens to Tailwind's color scale. Used sparingly for layout primitives: `className="min-h-screen px-6 py-10 mx-auto w-full max-w-5xl"` (`app/page.tsx:141`).
 
-```
-  --bg-base       #0f1923       --accent-teal    #00d9a3
-  --bg-surface    #1a2332       --accent-coral   #fb7185
-  --bg-elevated   #243040       --accent-amber   #fbbf24
-  --border        #2d3a4d       --accent-purple  #a78bfa
-  --text-primary    #e8edf2
-  --text-secondary  #8b9bb0
-  --text-tertiary   #5a6878
-```
+**Not CSS Modules; not CSS-in-JS.** No `.module.css`, no styled-components, no emotion. Inline `style={{}}` for everything a token drives; Tailwind for layout scaffolding. This is the specific mix worth naming: **tokens through inline style, spacing through Tailwind**. It's not conventional and it works because the token set is small (14 variables) and the app is small.
 
-Consumed via `var(--token)` in inline `style` throughout — e.g. `page.tsx:130`, `StatusLog.tsx:41-46`, `ProcessStepper.tsx:60-63`. The `@theme inline { --color-background: var(--bg-base); ... }` block at `globals.css:17-23` bridges Tailwind's color system to the same tokens.
+**Design tokens.**
+  - Background band: `--bg-base` `--bg-surface` `--bg-elevated` `--border`.
+  - Text tiers: `--text-primary` `--text-secondary` `--text-tertiary`.
+  - Accents: `--accent-teal` (success/action), `--accent-coral` (error/critical), `--accent-amber` (warning/hypothesis), `--accent-purple`.
+  - Type: `--font-display` (Syne), `--font-body` (Inter), `--font-mono` (JetBrains Mono) wired at `app/layout.tsx:2-7`.
 
-**Fonts** loaded server-side via `next/font/google` in `app/layout.tsx:2-7` — three families (`Syne` display, `Inter` body, `JetBrains_Mono`) exposed as CSS variables. Consumed the same way: `fontFamily: 'var(--font-mono), monospace'` on nearly every mono style block.
+Semantic naming (`--accent-teal` is used everywhere "action" is meant) — one color, one meaning. Themes could be added by swapping the `:root` block; not yet exercised — the app is dark-only via `<html lang="en" className="dark">` at `app/layout.tsx:20`.
 
-**Theming:** `not yet exercised` — the `dark` class on `<html>` (`layout.tsx:22`) is fixed. No light mode, no user preference toggle. The project context explicitly says "dark mode only."
+**Theming (dark mode, brand).** Dark-only. `not yet exercised` for light-mode or theme switching.
 
-**Responsive strategy:** Tailwind breakpoint utilities on the layout containers — `grid grid-cols-1 lg:grid-cols-3` and `lg:col-span-2` on the two-column split (`page.tsx:270-272`, `investigate/[id]/page.tsx:145-147`). No container queries, no fluid type, no per-component breakpoint logic. Width is capped at `max-w-5xl` on every page (project context).
+**Responsive strategy.** Tailwind breakpoints. `className="grid grid-cols-1 lg:grid-cols-3"` (`app/page.tsx:326`) is the load-bearing responsive rule — feed becomes single-column below `lg`, two-column feed + sidebar trace above. Grep for `lg:`/`md:`/`sm:` shows a handful of usages, no container queries. No fluid type; type sizes are fixed rem values via inline style.
 
-**Animation:** three keyframes in `globals.css`:
-- `bi-fade-up` (line 32) — item entry animation, honored by `prefers-reduced-motion` at line 42
-- `bi-indeterminate` (line 46) — the progress bar under `StatusLog` when scanning
-- `bi-dot` (line 69) — three-dot loading indicator
+**Animation system.** Two CSS keyframes (`bi-fade-up` referenced at `components/feed/CoverageGrid.tsx:77`, `components/investigation/ReasoningTrace.tsx:66, 94`) plus Tailwind's `animate-pulse` on active state badges (`components/shared/ProcessStepper.tsx:109`, `components/feed/CoverageGrid.tsx:98`). No motion library.
 
-`prefers-reduced-motion` is honored for `bi-progress` and `bi-dots` at `globals.css:77-79`. Good hygiene.
+**How the design system scales.** As-is — inline `style` per component reads tokens. Scales linearly with usage sites, no worse. If the app grew to 100+ components a token-resolver hook or a class-name mapping would earn its place; at current scale, direct token reads are fine.
 
-**Design system scaling:** the token set holds up for the current 20-ish components because most surfaces are grayscale (`--text-*`, `--bg-*`) with accents (`--accent-*`) reserved for severity signals. The system does NOT scale to a second theme without pulling the color tokens out of `:root` and behind a theme selector. That's a foreseeable refactor when light mode arrives, not a red flag today.
+## 7. browser-platform-and-build
 
-Cross-link: FCP / LCP measurement, bundle-size numbers → `study-performance-engineering`. Design-system depth (what makes tokens "compose") → `study-software-design`.
+**Web APIs the repo actually touches.**
+  - **`localStorage`** — `bi:mode` (`app/page.tsx:79-92, :108`), `bi:mcp_config` via `lib/mcp/config.ts:106-138`. Try/catch around every read/write for private-browsing / blocked storage.
+  - **`sessionStorage`** — `bi:insight:<id>` (`lib/hooks/useBriefingStream.ts:54-61`), `bi:inv:*` and `bi:diag:*` (`lib/hooks/useInvestigation.ts:20-21, 53-64, 135-142`).
+  - **`fetch` + `ReadableStream` + `getReader` + `TextDecoder`** — the whole NDJSON pipeline, canonical implementation at `lib/streaming/ndjson.ts:28-64`.
+  - **`crypto.randomUUID()`** — used for on-the-fly trace item ids in the streaming dispatchers (`lib/hooks/useBriefingStream.ts:233, 245`, `lib/hooks/useInvestigation.ts:115`). Web-Crypto, standard modern-browser API.
+  - **`window.location.href`** for the OAuth redirect and reload after config save (`useBriefingStream.ts:177`, `app/page.tsx:264`).
+  - **`btoa` / `atob`** for base64-encoding the MCP config header (`lib/mcp/config.ts:80-93`). Runtime-detected — falls back to Buffer for Node.
 
-## browser-platform-and-build
+**Not touched.** `not yet exercised` for `EventSource`, `WebSocket`, `IndexedDB`, `MediaRecorder`, `Web Workers`, `Service Workers`, `Cache` API, `File System Access`, `Notifications`, `Permissions`, `Web Share`, `Web Speech`, `Intersection Observer`, `Resize Observer`. This is a streaming-fetch app; the wire format is NDJSON over HTTP and everything else stays out of the way.
 
-**Web APIs actually used:**
+**Bundler.** Next.js 16 default — Turbopack for dev, Webpack for prod build (unless a flag says otherwise; `next.config.ts` is empty at `:1-7`). Not configured — reader takes Next.js defaults on trust.
 
-| API | Where | Purpose |
-|---|---|---|
-| `fetch` | four hooks + `StreamingResponse` | primary data seam |
-| `ReadableStream` + `getReader` + `TextDecoder` | `lib/streaming/ndjson.ts:31-33` | NDJSON parse loop |
-| `localStorage` | `page.tsx:73,89` | `bi:mode` persistence |
-| `sessionStorage` | 5 keys across `useBriefingStream`, `useInvestigation`, `useReconnectPolicy` | cross-page state carry |
-| `crypto.randomUUID()` | `useBriefingStream.ts:222`, `useInvestigation.ts:114`, `StreamingResponse.tsx:54` | trace item IDs |
-| `window.location.href` | reconnect + auth-redirect paths | full-page navigation |
-| `window.alert` | `useDemoCapture.ts:99,134,136` | dev-only capture status |
-| `Blob` + `URL.createObjectURL` | markdown export (`lib/export/investigationMarkdown.ts`, per project context) | file download |
+**Code splitting, tree shaking, polyfills, sourcemaps.** All Next.js defaults. Not configured or overridden.
 
-**Not touched:** `WebSocket`, `EventSource`, `IndexedDB`, `Cache API`, `ServiceWorker`, `MediaRecorder`, `Notification`, `WebWorker`, `WebRTC`, `File System Access`, `WebAuthn`, `MessageChannel`. The frontend is HTTP-request-and-stream shaped — no persistent connection, no offline story, no background sync.
+**Cross-link.** Bundle-size and FCP / LCP *measurement* → `study-performance-engineering`. This lens names *which* APIs are reached for; the measurement layer names how big / how fast.
 
-**Bundler:** Next.js 16's default (Turbopack in dev, Webpack for production build). `next.config.ts` is empty — no `experimental` flags, no custom webpack config, no `transpilePackages` list.
+## 8. frontend-red-flags-audit
 
-**Code-splitting:** implicit route splitting via Next.js. No explicit dynamic imports.
+Ranked by user-visible consequence. Each grounded in evidence.
 
-**Tree shaking:** relies on Next.js defaults. `lucide-react` icons imported by name (`CoverageGrid.tsx:6-16`) — tree-shakes to only the icons used (10 of them, matching the 10 coverage categories).
+### R1 (top) — streaming trace has no `aria-live`; assistive tech gets nothing during a briefing
 
-**Sourcemaps / polyfills:** Next.js defaults; not customized.
+**Evidence.** `components/investigation/ReasoningTrace.tsx:52-63` — the container is a plain `<div>` with `flex-direction: column`. Grep for `aria-live` across `app`, `components`, `lib` returns zero hits. The sticky sidebar at `app/page.tsx:443-508` mounts this component and streams up to dozens of new `TraceItem`s during a live briefing.
 
-**Font loading:** `display: 'swap'` set at `layout.tsx:5-7` — text renders immediately in fallback fonts, no invisible-text FOIT.
+**User-visible consequence.** A screen-reader user gets no announcement that new tool calls or reasoning steps appeared. The entire "shows its work" pitch — the whole reason for the streaming sidebar — is silent to them. The visible UI updates every ~200ms during a live run; the accessibility tree gets one snapshot at mount.
 
-Cross-link: bundle-size measurement (numbers) → `study-performance-engineering`. Why NDJSON over `EventSource` / WebSocket → `study-networking`.
+**Fix, one line each.** On `ReasoningTrace`'s outer container: `role="log"` + `aria-live="polite"` + `aria-relevant="additions"`. Optionally `aria-atomic="false"` (default anyway). Polite so it doesn't preempt other announcements.
 
-## frontend-red-flags-audit
+### R2 — MCP bearer token in `localStorage` is under-protected relative to the OAuth cookie
 
-Ranked by user-visible consequence. Each anchored to `file:line`.
+**Evidence.** `components/settings/McpConfigModal.tsx:171-205` — the bearer token is stored via `writePersistedConfig` → plain `localStorage.setItem('bi:mcp_config', JSON.stringify(...))` (`lib/mcp/config.ts:134`). The modal itself surfaces the warning in the UI (`:192-203`), but the *default* still stores plaintext.
 
-### 1 — the streaming trace is invisible to assistive tech
+**User-visible consequence.** Any XSS on the origin exfiltrates the bearer. The comparison bar is the existing `bi_auth` cookie — AES-256-GCM encrypted, HttpOnly, SameSite=None — which XSS can't read. The modal is honest about the gap; the gap remains.
 
-**No `aria-live` region on any surface that streams new content.** The reasoning trace, tool calls, status log, and the streaming Q&A response all mount new DOM nodes as NDJSON events arrive. A screen-reader user gets nothing — no announcement, no polite update.
+**Cross-link.** Full trust-boundary discussion → `study-security`. This lens flags it as a frontend risk because the UI is what stores the token; the deeper analysis belongs there.
 
-Evidence: `StatusLog.tsx:36-84` (sticky aside, no `aria-live`), `ReasoningTrace.tsx:52-108` (the trace list, no `role="log"`), `StreamingResponse.tsx:121-252` (the free-form Q&A response, no live region). `grep -rc "aria-live\|role=\"log\"" components/ app/` returns zero.
+### R3 — the streaming hooks re-run every setState down the whole tree
 
-`ProcessStepper` has `role="group"` (line 74) and `Sparkline` / `GapChart` have `role="img"` (lines 27 / 49) — that's the extent of ARIA. Nothing that announces changes.
+**Evidence.** `lib/hooks/useBriefingStream.ts:220-273` — every NDJSON event triggers one of `setInsights` / `setCoverage` / `setTraceItems` / `setStepStatus` / `setStatus`. On a fast live briefing that's 30-50 setState calls per second. The hook returns 9 pieces, all in one object (`:313-323`), so `app/page.tsx:120-132` destructures them and every value change re-renders the page tree — which then re-renders CoverageGrid, ProcessStepper, and ReasoningTrace even if their specific inputs didn't change.
 
-Consequence: the "shows its work" pitch — the entire selling point — is silently invisible to a category of user. This is a user-facing correctness bug, not a nice-to-have.
+**User-visible consequence.** Currently: none visible — the app is small enough that reconciler cost is trivial. Latent: if the trace grew to hundreds of items or CoverageGrid grew to N=100+ categories, jank would appear during streaming. No `React.memo`, no `useMemo` on the returned object, no split hooks.
 
-Fix: `role="log" aria-live="polite" aria-relevant="additions"` on the `StatusLog` inner container (the `<div>` at `StatusLog.tsx:68`). Same on `StreamingResponse`'s answer wrapper. Test with VoiceOver: each new line should announce.
+**Fix worth naming.** Split `useBriefingStream` into a stream-consumer + a state-selector split, or `React.memo` the leaf components with stable-prop discipline. Not urgent — currently well within budget.
 
-### 2 — every child component re-renders on every NDJSON event
+### R4 — StrictMode double-mount was hit, worked around by a `startedRef` guard
 
-`useBriefingStream` accumulates state via multiple `setState` calls per event (e.g. `case 'tool_call_start'` at `useBriefingStream.ts:218-224` calls `setQueryCount` then `setTraceItems`). Each `setState` triggers a re-render of `HomePage`, which cascades to `CoverageGrid`, `InsightCard`s, and `StatusLog` on every event.
+**Evidence.** `lib/hooks/useInvestigation.ts:38, 44-50` — a `startedRef` prevents a second run. The comment at `:36-38` explains why: cancelling the fetch on the first cleanup left the logs empty in dev. The chosen tradeoff is *"the in-flight run simply completes; setState after unmount is a safe no-op"*.
 
-Evidence: no `React.memo` on any component (`grep "React.memo" components/` returns nothing). No `useMemo` for the arrays passed as props (`coverage`, `insights`, `traceItems`). Under React 19's default reconciliation each re-render is a full diff of the entire tree.
+**User-visible consequence.** None in production. In dev, previous versions showed empty trace on remount; the guard fixed it. Latent risk: if React ever tightens the "setState after unmount" warning into a hard error, this needs revisiting.
 
-Consequence: at 20–40 events per live briefing, the feed re-renders 20–40 times. Today's payload is small enough that the human eye doesn't see jank (the animations mask it), but the moment the trace hits ~200 items — a longer investigation, or a chattier agent — the `ReasoningTrace` map over all trace items on every event becomes a measurable cost.
+**Fix.** Live with it; the note in-repo (`:32-38`) is the load-bearing artifact.
 
-Fix (when it becomes measurable, not now): `React.memo` on `InsightCard`, `CoverageGrid` tile children, and `TraceItem` rows keyed by `id`. Prefer `useMemo` on the derived counts in `CoverageGrid.tsx:70-73`. Real measurement belongs in `study-performance-engineering`.
+### R5 — the mode toggle relies on `bi:mode` reads across two places that must agree
 
-### 3 — pre-existing lint errors in hook effects (known follow-up)
+**Evidence.** `app/page.tsx:78-100` reads `localStorage.getItem('bi:mode')` and migrates legacy values in one place. `lib/hooks/useInvestigation.ts:158-171` reads the same key and does the same legacy migration — separately. Two sites, one contract, no shared reader.
 
-Five known lint violations documented in the project context. `next lint` flags them; the code works because React 19 tolerates the pattern, but each is a real hazard:
+**User-visible consequence.** If one migration rule drifts from the other, the feed's mode and the investigation's mode can disagree. The tests catch the current shape; a new legacy value added to only one site would slip.
 
-- `app/page.tsx:70` — `setState` inside `useEffect` synchronously (the `setMode('demo')` when `forcedDemo` is true)
-- `components/investigation/InvestigationSubject.tsx:18` — same shape
-- `lib/hooks/useBriefingStream.ts:125` — mutating a ref during render (`callbacksRef.current = callbacks`)
-- `lib/hooks/useBriefingStream.ts:139` — `setState` in effect (part of the reset block)
-- `lib/hooks/useInvestigation.ts:56` — `setState` in effect (the hydrate branch)
-- `lib/hooks/useDemoCapture.ts:143` — `useCallback` missing a dep
+**Fix.** Extract a `readBriefingMode()` helper into `lib/state/mode.ts` (or reuse the existing state layer) and have both call sites use it. Small refactor, one file.
 
-These pre-existed the Week 3-4 hardening; documented as a follow-up. Not runtime bugs today; every one of them is a code-smell that will bite the next person who edits the hook.
+### R6 — inline `style` everywhere; CSS custom properties do the theming work
 
-### 4 — `bi:mode` legacy migration is silently write-once
+**Evidence.** Every component reads tokens via inline `style={{ color: 'var(--…)'}}`. Grep across `components/` finds hundreds of usages. `app/globals.css` defines the tokens; there is no Tailwind theme extension that binds them to utility class names beyond the `@theme inline` block at `:17-23`.
 
-`page.tsx:75-77` migrates legacy `live` / `live-sql` values to `live-bloomreach` on read — but doesn't write the migrated value back. Every mount pays the migration cost and every mount re-reads the same legacy value. Cheap, but a code smell.
+**User-visible consequence.** None today. As the app grows, replacing every inline `style` with a themed class name would be a mechanical refactor (~200+ sites). Named as a **latent scaling cost**, not a current defect.
 
-Fix: after the migration branch, call `localStorage.setItem('bi:mode', 'live-bloomreach')`. Two lines.
+**Fix.** Delay until a second theme (light mode, brand skin) actually earns its place. Until then, the inline-style pattern reads clearly and is fine.
 
-### 5 — inline `style={{...}}` everywhere is going to bite at scale
+### R7 — routes are all `'use client'` at the leaf; no server components in the tree
 
-Every component uses inline `style` for tokens (`page.tsx:127-134`, `CoverageGrid.tsx:126-140`, etc.). React re-creates the style object on every render, defeating browser-level style caching. Tailwind + CSS custom properties could carry more of the weight — `bg-[var(--bg-elevated)]` and Tailwind arbitrary values would let the JIT hoist the styles.
+**Evidence.** `app/page.tsx:1`, `app/investigate/[id]/page.tsx:1` both open with `'use client'`. `app/layout.tsx:14-27` is a plain wrapper with fonts and the `dark` class — the only server component in the tree, and it renders no data.
 
-Not a bug today, but the trend (`components/` totals 2,746 LOC with a ton of inline-style boilerplate) is real. A single utility like `<Card>` / `<MonoLabel>` with the token application inlined once would remove ~200 LOC of style-prop repetition. Small win; deferrable.
+**User-visible consequence.** No SSR HTML with data — the initial paint is the client shell + loading skeleton, and the streaming fetch happens after hydration. For a portfolio piece this is fine; for a real product the first-view content would come after the first fetch round-trip, not with the initial HTML.
 
-### Not-red-flags I checked and left alone
+**Fix.** Not urgent. When SEO or FCP actually matter, hoist the workspace-header data into a server-fetched page shell, keep the streaming below the fold client-side.
 
-- **`<html lang="en">`** — present at `layout.tsx:22`. Good.
-- **Font-loading FOUT/FOIT** — `display: 'swap'` at `layout.tsx:5-7`. Good.
-- **Reduced motion** — respected at `globals.css:42,77-79`. Good.
-- **Focus visible** — Tailwind's Preflight ships a `:focus-visible` outline reset; the app doesn't override it. Acceptable.
-- **Keyboard trap in `<details>`** — used at `EvidencePanel.tsx:215`, native disclosure element, keyboard-accessible by default. Good.
+### R8 — the trace scrolls but there's no scroll-to-latest as items arrive
 
-Cross-link: XSS surface on the agent-produced `TraceContent` / `answer` fields → `study-security`. Contrast ratio on `--text-tertiary` (#5a6878) on `--bg-base` (#0f1923) → `study-frontend-a11y` (dedicated a11y audit runs there, not here).
+**Evidence.** `app/page.tsx:443-508` — the aside is `overflowY: 'auto'` with a fixed `maxHeight`. `components/investigation/ReasoningTrace.tsx:52-63` renders items in mount order. No `useEffect` that scrolls the container to the last item on new arrivals; no `scrollIntoView`; no `ref` on the last item.
+
+**User-visible consequence.** As the trace grows past the viewport, new items appear below the fold silently. The user has to scroll manually to see the agent's latest work. Contradicts the "shows its work" pitch.
+
+**Fix.** One effect: on `traceItems.length` change, `scrollRef.current?.scrollTo({ top: scrollHeight, behavior: 'smooth' })` — guarded by a "user scrolled up manually? then don't auto-scroll" check.
+
+---
+
+**Cross-links.** Security-owned findings (R2 in detail) → `study-security`. Performance-measurement findings → `study-performance-engineering`. This audit names the frontend risks; the deeper "why" for security and performance sits with those generators.

@@ -1,431 +1,258 @@
 # 11 · Meta-prompting
 
-**Meta-prompting / prompt from data / prompt generation — Industry standard**
+**Industry name:** *meta-prompting* / *prompt-generating prompts* / *prompts-for-prompts* · Language-agnostic
 
-## Zoom out, then zoom in
+## Zoom out — where meta-prompting sits
 
-Meta-prompting is when you write code that generates a prompt from data instead of hand-crafting the prompt as a static string. In this codebase there are two real examples: (a) `renderPromptTemplate` fills `{schema}` and `{anomaly}` variables into a template at runtime — light meta-prompting, essentially string interpolation; and (b) `buildRubricJudgeSystemPrompt` walks a `RubricDefinition` object and assembles a full judge system prompt from its dimensions, verdicts, and checks — heavy meta-prompting, where the prompt's *structure* comes from the data. The second is the shape worth learning.
-
-```
-  Zoom out — where meta-prompting sits
-
-  ┌─ Data (source of truth) ─────────────────────────────────┐
-  │  diagnosisQualityRubric = {                              │
-  │    dimensions: [{id, label, description, scale:[…]}, …], │
-  │    verdicts: [{verdict, description}, …],                 │
-  │    checks: […],                                           │
-  │    task: '…'                                              │
-  │  }                                                        │
-  └────────────────────────┬────────────────────────────────┘
-                           │  input to a prompt-builder function
-  ┌─ Prompt builder ───────▼────────────────────────────────┐
-  │  buildRubricJudgeSystemPrompt(rubric)                    │
-  │  concatenates: task + dimensions text + verdicts + …     │
-  └────────────────────────┬────────────────────────────────┘
-                           │  output: a system prompt string
-  ┌─ ★ META-PROMPTING SEAM ★ ▼─────────────────────────────┐
-  │  the LLM receives a prompt whose STRUCTURE was          │  ← we are here
-  │  determined by data, not by a human writing string       │
-  └─────────────────────────────────────────────────────────┘
-```
-
-**Zoom in.** Meta-prompting is not "use an LLM to write your prompts for you" (that's the internet-thread version). The production version is: **the prompt is a function of data, and the data is the source of truth.** Change the rubric object, the judge's system prompt changes deterministically. Change one dimension's description, the judge's system prompt reflects it on the next call without a human editing a string.
-
-## Structure pass
-
-### Axes — the dimension we're tracing
-
-**Where does the source of truth live — in the prompt string or in the data?** For rubrics, the source of truth is the rubric object (typed, in a `.ts` file, code-reviewed). For agent prompts, the source of truth is the prompt template string (also a `.ts` file, but hand-written prose with `{}` slots). Meta-prompting is what moves the source of truth from string to data.
-
-### Seams — where meta-prompting flips
-
-Two seams:
-
-- **String source of truth vs data source of truth** — when the prompt is a hand-written string with `{}` slots, the string owns the structure and the data fills the slots. When the prompt is generated from data, the data owns the structure and the builder function is a serializer.
-- **Author-time vs load-time vs call-time** — a prompt built at author-time is a static string. Built at load-time from data is meta-prompting. Built at call-time from per-call data is dynamic prompting (this codebase uses this too — `renderPromptTemplate({schema, anomaly})` at call time).
-
-### Layered decomposition
-
-"Where does the prompt come from?" — traced across altitudes:
+Meta-prompting is when you use an LLM to write or improve prompts that then drive other LLM calls. In this codebase, it doesn't appear on the *live* path — but it lives adjacent to the codebase in `aipe`, Rein's meta-tooling project that this repo's `.aipe/` folder is a client of.
 
 ```
-  "Where does the prompt come from?" — same question, three altitudes
+  Zoom out — meta-prompting as an authoring layer
 
-  ┌────────────────────────────────────────────────┐
-  │ outer: the code artifact                        │  → a .ts file
-  │        (what's in the repo)                     │
-  └────────────────────────────────────────────────┘
-      ┌────────────────────────────────────────────┐
-      │ middle: the shape                           │  → a template with {}
-      │                                             │    OR a builder function
-      └────────────────────────────────────────────┘
-          ┌────────────────────────────────────────┐
-          │ inner: the source of truth              │  → a string (hand)
-          │                                          │    OR a data object
-          │                                          │    (meta-prompting)
-          └────────────────────────────────────────┘
+  ┌─ author (human) ───────────────────────────┐
+  │  wants a rubric, a new prompt, a new spec   │
+  └────────────────────┬────────────────────────┘
+                       │  describes goal
+                       ▼
+  ┌─ meta-prompt ──────────────────────────────┐
+  │  "given this codebase + this goal, draft    │
+  │   a prompt that does X"                     │
+  │  (this is the aipe spec pattern)            │
+  └────────────────────┬────────────────────────┘
+                       │  LLM drafts
+                       ▼
+  ┌─ draft prompt / rubric ────────────────────┐
+  │  markdown file, ready for human review      │
+  └────────────────────┬────────────────────────┘
+                       │  human edits + commits
+                       ▼
+  ┌─ committed prompt (concept 03) ────────────┐
+  │  lives in git, PR-reviewable                 │
+  │  now drives real LLM calls                   │
+  └────────────────────────────────────────────┘
 ```
+
+## Zoom in — the two shapes of meta-prompting
+
+Two related but distinct patterns:
+
+1. **Authoring meta-prompting** — you use an LLM to *draft* a prompt or rubric. The output is a file. A human reviews it, edits it, commits it. This is a one-time cost per prompt.
+
+2. **Runtime meta-prompting** — you use an LLM to *modify* the prompt for the next LLM call, in the same session. The output is a runtime string. This is a per-call cost.
+
+The `aipe` project is #1 industrialized. Every spec file (like the one that generated this guide) is an authoring meta-prompt. This codebase doesn't use #2 on the live path — no runtime prompt-rewriting.
+
+## Structure pass — layers, axis, seams
+
+Trace one axis: *when in the lifecycle does prompt authoring happen*.
+
+- **Layer 1 — design time (authoring meta-prompt).** Human describes intent to an LLM; LLM drafts a prompt file; human reviews and commits. Happens once per prompt. `aipe` specs are this layer.
+- **Layer 2 — build time (compilation).** Not used here — some codebases template prompts from typed configs at build.
+- **Layer 3 — runtime (per-call prompt selection).** This codebase does *use* runtime prompt selection — the intent classifier picks between three flows — but not runtime prompt *rewriting*.
+
+**The seam:** between design-time authoring (human-in-the-loop) and runtime rewriting (no human). Authoring is safe — a human reviews the draft. Runtime is risky — the model's prompt is now emergent from another model's output, and you have no chance to sanity-check it before it runs.
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — the shape
 
-You know how a template engine (Handlebars, JSX, EJS) is just "here's a template with slots, here's the data, glue them together"? Light meta-prompting is exactly that — `renderPromptTemplate('… {schema} …', { schema: 'value' })`. Heavy meta-prompting is one step deeper: the *structure* of the prompt is also derived from the data, not just the slot values.
-
-```
-  Light meta-prompting vs heavy meta-prompting
-
-  ┌── light (template with slots) ────────────────────────┐
-  │  template = "You are ... {schema} ... {anomaly} ..."  │
-  │  data      = { schema: '…', anomaly: '…' }             │
-  │  output    = interpolated string                       │
-  │  structure is fixed in the template                   │
-  └───────────────────────────────────────────────────────┘
-
-  ┌── heavy (structure from data) ────────────────────────┐
-  │  data = { dimensions: [ ... ], verdicts: [ ... ], … }  │
-  │  builder(data) = walks data, assembles prompt          │
-  │  output = a prompt whose sections and content are      │
-  │           BOTH derived from the data                   │
-  └───────────────────────────────────────────────────────┘
-```
-
-### Move 2 — the step-by-step walkthrough
-
-**Step 1 — the data is typed and code-reviewed.**
-
-`eval/rubrics/diagnosis-quality.ts:15-108`:
-
-```ts
-export const diagnosisQualityRubric: RubricDefinition = {
-  id: 'blooming-diagnosis-quality-v1',
-  title: 'Diagnosis quality',
-  task: `Judge a diagnosis produced by an AI analyst investigating an ecommerce anomaly...`,
-  dimensions: [
-    {
-      id: 'root_cause_plausibility',
-      label: 'Root-cause plausibility',
-      description: 'Does the conclusion name a plausible mechanism...',
-      scale: [
-        { score: 1, description: 'Restates the symptom; no mechanism named.' },
-        // ...
-        { score: 5, description: 'Specific mechanism, evidence directly supports it, and rival mechanisms are considered.' },
-      ],
-    },
-    // ...more dimensions
-  ],
-  verdicts: [
-    { verdict: 'pass', description: 'All four dimensions at ≥4...' },
-    // ...
-  ],
-  checks: [
-    'cites at least one number from the tool results',
-    // ...
-  ],
-};
-```
-
-Two things worth noting. First, this is `RubricDefinition` (a type from `@aptkit/core`). The compiler knows the shape. Adding a new dimension is adding an object to the array — the type system yells if the new object misses `id`, `label`, `description`, or `scale`. Second, this file is code-reviewed like any other — the PR that added dimensions to the rubric went through the same review as a PR that adds a new function.
-
-**Step 2 — the builder walks the data.**
-
-`@aptkit/core/node_modules/@aptkit/evals/dist/src/rubric-judge.js:31-77`:
-
-```js
-export function buildRubricJudgeSystemPrompt(rubric) {
-    const dimensions = rubric.dimensions
-        .map((dimension) => {
-            const scale = dimension.scale
-                .map((level) => `  ${level.score} = ${level.description}`)
-                .join('\n');
-            return `${dimension.id} ${dimension.label}: ${dimension.description}\n${scale}`;
-        })
-        .join('\n\n');
-    const verdicts = rubric.verdicts
-        .map((rule) => `- ${rule.verdict}: ${rule.description}`)
-        .join('\n');
-    const checks = rubric.checks?.length
-        ? `\nChecks to return as booleans:\n${rubric.checks.map((check) => `- ${check}`).join('\n')}\n`
-        : '';
-    // ...builds the JSON output shape from dimensions and checks
-    return [
-        `You are a rubric judge for: ${rubric.title}.`,
-        rubric.task,
-        '',
-        'Score the subject against the rubric...',
-        'Never rewrite the subject. Return one highest-leverage fix, not a list.',
-        '',
-        'Rubric dimensions:',
-        dimensions,
-        '',
-        'Allowed verdicts:',
-        verdicts,
-        checks.trimEnd(),
-        examples.trimEnd(),
-        '',
-        'Output JSON only. No prose. No markdown fences. Use exactly this shape:',
-        JSON.stringify(outputShape),
-    ].filter(Boolean).join('\n');
-}
-```
-
-Three moves inside the builder. **First**: walk `rubric.dimensions` and format each as `id label: description\n scale`. **Second**: walk `rubric.verdicts` and format each as `- verdict: description`. **Third**: assemble the whole system prompt as a bounded array of strings and join. The whole builder is a pure function of the rubric object.
+You've done this before with code generation. Codegen tools — TypeScript from OpenAPI specs, GraphQL codegen, ORM migrations — are the same shape. Human writes the intent (the schema). Tool generates the boilerplate. Human commits the generated code. The generated code becomes part of the source tree; you don't regenerate it at runtime. Meta-prompting is codegen for prompts.
 
 ```
-  Builder — the meta-prompting kernel
+  Pattern — meta-prompting as prompt codegen
 
-  ┌── input: RubricDefinition ─────────────────────────────┐
-  │  { title, task, dimensions[], verdicts[], checks[] }   │
-  └──────────────────────┬─────────────────────────────────┘
-                         │
-  ┌── walk dimensions ───▼─────────────────────────────────┐
-  │  for each dim: format id + label + description +       │
-  │                       scale as text                    │
-  │  join with \n\n                                         │
-  └──────────────────────┬─────────────────────────────────┘
-                         │
-  ┌── walk verdicts ─────▼─────────────────────────────────┐
-  │  for each verdict: format as "- verdict: description"  │
-  │  join with \n                                           │
-  └──────────────────────┬─────────────────────────────────┘
-                         │
-  ┌── walk checks ───────▼─────────────────────────────────┐
-  │  for each check: format as "- check"                    │
-  │  join with \n, wrap in "Checks to return as booleans:"  │
-  └──────────────────────┬─────────────────────────────────┘
-                         │
-  ┌── build output shape ▼─────────────────────────────────┐
-  │  Object.fromEntries(dimensions.map(d => [d.id, ...]))   │
-  │  JSON.stringify(outputShape) → literal example in prompt│
-  └──────────────────────┬─────────────────────────────────┘
-                         │
-  ┌── concatenate final ─▼─────────────────────────────────┐
-  │  [task, dimensions text, verdicts text, checks text,   │
-  │   output shape] joined by \n                            │
-  └────────────────────────────────────────────────────────┘
+  intent          generator          artifact          consumer
+  ┌─────────┐    ┌─────────┐        ┌──────────┐     ┌─────────┐
+  │ spec of │ ─► │ LLM     │ ─drafts│ prompt.md│ ─►  │ agent   │
+  │ what the│    │ drafts  │        │  (checked│     │ (uses at│
+  │ prompt  │    │ prompt  │        │  in)     │     │ runtime)│
+  │ should  │    └─────────┘        └──────────┘     └─────────┘
+  │ do      │                            ▲
+  └─────────┘                            │
+                                    human reviews
+                                    + edits + commits
 ```
 
-**Step 3 — the output shape is meta-generated too.**
+The critical bit is the human review step in the middle. Without it, meta-prompting is a lottery — the LLM's draft may look plausible but bury a subtle bug, and you have no chance to catch it before it goes live. With it, the LLM is a fast drafter and the human is the final line of defense.
 
-Look at lines 51-59 of `rubric-judge.js`:
+### Move 2 — walking the aipe pattern
 
-```js
-const dimensionShape = Object.fromEntries(rubric.dimensions.map((dimension) => [dimension.id, { score: 0, reason: '' }]));
-const checkShape = Object.fromEntries((rubric.checks ?? []).map((check) => [check, true]));
-const outputShape = {
-    dimensions: dimensionShape,
-    ...(rubric.checks?.length ? { checks: checkShape } : {}),
-    verdict: rubric.verdicts[0]?.verdict ?? 'pass',
-    fix: '',
-    reasoning: '',
-};
-```
+#### The aipe spec model
 
-This is the "here's the exact JSON to emit" example (few-shot; see `08-few-shot.md`). Its shape is derived from the rubric's dimensions and checks arrays. Add a dimension, the example JSON gets a new field; add a check, the example gets a new boolean. The prompt's few-shot example is *itself* generated by data.
+`aipe` (Rein's meta-tooling project) works like this:
 
-```
-  Few-shot example — generated from data
+1. **A spec file** describes what a generator produces. Example: `study-prompt-engineering.md` (the spec that generated *this* guide) describes the persona, the concepts, the folder structure, and the calibration rules.
 
-  dimensions.map → dimensionShape
-      ┌────────────────────────────────────┐
-      │ { root_cause_plausibility:          │
-      │   { score: 0, reason: '' },         │
-      │   evidence_grounding:               │
-      │   { score: 0, reason: '' }, … }     │
-      └────────────────────────────────────┘
+2. **A slash command** (`/aipe:study-prompt-engineering`) invokes the spec. The command is really a meta-prompt: "here's the spec; here's the codebase; go generate the study guide."
 
-  checks.map → checkShape
-      ┌────────────────────────────────────┐
-      │ { "cites at least one number …":   │
-      │   true, … }                         │
-      └────────────────────────────────────┘
+3. **The LLM drafts** the study guide — 13 concept files, a README, an overview. This is meta-prompting in action: an LLM is drafting content that will guide *my* study, informed by another LLM-authored input (the spec).
 
-  outputShape = { dimensions, checks, verdict, fix }
-      ↓
-  JSON.stringify → literal example in the prompt
+4. **The output lands as files** in `.aipe/study-prompt-engineering/`. A human (Rein) reads them. If a concept file is wrong, the human edits it or re-runs the command with a different context.
 
-  add a dimension to the rubric → example JSON adds the field
-  add a check → example JSON adds the boolean
-  no human touches the prompt string
-```
+The spec plays the role of the "codegen schema." The generated study guide plays the role of "generated code." Both are meta-prompting artifacts.
 
-**Step 4 — the same discipline in the agent prompts, at lower depth.**
+Where meta-prompting *would* show up on this codebase's live path if we wanted it:
 
-The monitoring / diagnostic / recommendation prompts use *light* meta-prompting — templates with `{schema}` and `{anomaly}` slots that `renderPromptTemplate` fills:
+- **The categories list.** `lib/agents/categories.ts` defines the anomaly categories the monitor agent checks against. Each category has a `whyItMatters` and a `queryRecipe`. These could be drafted by an LLM given a workspace schema, human-reviewed, then committed. This is the classic "use AI to write the seed data" pattern.
 
-```js
-// from @aptkit/agent-anomaly-monitoring/dist/src/monitoring-agent.js:42-45
-const system = renderPromptTemplate(this.prompt, {
-    schema: schemaSummary(this.options.workspace),
-    categories: formatCategoryChecklist(categories),
-});
-```
+- **The `known_correct_shape` field per golden case.** In `eval/goldens/types.ts`, each golden has a `knownCorrect` object — human-authored notes on what a correct diagnosis for this case would look like. Drafting these with an LLM (given the golden's anomaly + a description of the correct handling) would speed up adding new goldens.
 
-The template is a static string with `{schema}` and `{categories}` slots. The values are computed by `schemaSummary()` (see `04-token-budgeting.md`) and `formatCategoryChecklist()`. Both value-generators are pure functions of workspace data, so the whole `{schema}` and `{categories}` interpolation is meta-prompting at the value level — but not at the structure level (the surrounding template is hand-written prose).
+- **The rubrics.** `eval/rubrics/diagnosis-quality.ts` is 108 lines of dimensions × scale-descriptions. An LLM given a description of "what makes a good diagnosis" could draft the same rubric. In fact, that's likely how it was authored initially, with heavy human editing after.
+
+None of these show up as runtime meta-prompting. They're all authoring meta-prompting — LLM drafts, human commits.
+
+#### Runtime meta-prompting — why not here
+
+The pattern this codebase deliberately avoids:
 
 ```
-  Light vs heavy meta-prompting — where each is used
-
-  ┌── agent prompts (light) ────────────────────────────────┐
-  │  monitoring / diagnostic / recommendation                │
-  │  template: hand-written string with {schema} slots       │
-  │  values: schemaSummary(workspace), etc.                  │
-  │  structure = string (author-time)                        │
-  │  values = data (call-time)                                │
-  └─────────────────────────────────────────────────────────┘
-
-  ┌── judge prompt (heavy) ─────────────────────────────────┐
-  │  RubricJudge system prompt                              │
-  │  structure: derived from rubric.dimensions.length,       │
-  │            rubric.verdicts.length, rubric.checks.length  │
-  │  values: derived from rubric.dimensions[i].description,  │
-  │          etc.                                            │
-  │  structure = data (load-time)                            │
-  │  values = data (load-time)                                │
-  └─────────────────────────────────────────────────────────┘
+   step 1  ask model to draft a system prompt for step 2
+   step 2  run the drafted prompt on the actual task
 ```
 
-**Step 5 — the risk this pattern carries.**
+Two problems:
 
-Meta-prompted prompts can drift from being human-readable. If the builder concatenates 40 dimensions and 12 verdicts, the resulting system prompt is a wall of text nobody can code-review as prose — you review the *data* instead. That's fine when the data is well-typed and the shape is stable. It's risky when the builder's output is the actual thing you'd want to sanity-check but nobody looks at it. Mitigation in this codebase: the rubrics are small (four dimensions each) and the builder is simple enough to reason about.
+1. **The step-1 prompt is now unbounded.** The model may draft a prompt that reveals information you didn't want revealed, contradicts a hard rule, or crashes the parser downstream. There's no human review layer.
 
-The other risk is prompts that "read like LLM output" — the meta version of that is prompts that read like *generated code*. Repetitive, mechanical, without the human polish a prompt author brings. Fine for judge prompts (their job is mechanical scoring). Wrong for agent prompts where the role paragraph, negations, and edge-case examples require author judgment.
+2. **Debuggability collapses.** When step 2 does something weird, you have to reverse-engineer step 1's output to understand what happened. Every debug session is now two-hop.
+
+Where it *would* land: if we were building an agent that adapts its instructions per-user (a chat companion, a coach). Then the "step 1 drafts a prompt for step 2" pattern is unavoidable. In that case, the discipline is: constrain step 1's output shape hard (schema-enforced), log every drafted prompt, retain the ability to freeze the prompt and inspect it. This codebase doesn't have that use case.
 
 ```
-  Where meta-prompting fits
+  Comparison — authoring vs runtime meta-prompting
 
-  data is well-typed?           yes → meta-prompting works
-                                 no  → hand-written prompt
+  ┌─ authoring (safe) ───────────────────────────────┐
+  │  human describes intent                           │
+  │       ↓                                            │
+  │  LLM drafts prompt                                 │
+  │       ↓                                            │
+  │  human reviews + edits + commits                   │
+  │       ↓                                            │
+  │  prompt goes live via version-controlled file      │
+  └────────────────────────────────────────────────────┘
 
-  output is mechanical?          yes → meta-prompting fits
-                                 no  → hand-written prompt
+  ┌─ runtime (risky) ────────────────────────────────┐
+  │  agent state at time T                            │
+  │       ↓                                            │
+  │  LLM #1 drafts a prompt for LLM #2                 │
+  │       ↓                                            │
+  │  LLM #2 runs the drafted prompt on the task        │
+  │       ↓                                            │
+  │  output goes to user — no human review of prompt   │
+  └────────────────────────────────────────────────────┘
 
-  data has 40+ dims?             yes → sanity-check the data,
-                                        not the built prompt
-                                 no  → both work
+  authoring: costs zero at runtime, one review at design.
+  runtime:   costs one extra call per turn, no review.
 ```
+
+#### When authoring meta-prompting pays
+
+Three cases where drafting via LLM speeds you up:
+
+- **Initial drafting of complex prompts.** A new agent role, a new rubric, a complex output schema. Zero-to-first-draft is where LLMs shine. Human editing after is fast.
+
+- **Prompt migration across models.** When Sonnet 4.6 replaces Sonnet 4, a prompt that worked before may need tuning. Drafting the tuned version with an LLM (given the old prompt + the failure symptoms + the model's known behavior changes) is faster than re-authoring from scratch.
+
+- **Rubric extension.** Adding a new dimension to a rubric. Given the existing 4 dimensions + a description of the new one, the LLM drafts the scale descriptions in the same voice as the existing ones.
+
+Three cases where it *doesn't*:
+
+- **Small tweaks.** Fixing a typo, tightening one rule. Human editing is faster than round-tripping through an LLM.
+
+- **Prompts under high iteration pressure.** When you're eval-driving a prompt and changing 5 things per hour, the LLM's turnaround is a bottleneck.
+
+- **Prompts that read like LLM output.** LLM-drafted prompts often have a specific voice — verbose, hedge-y, over-structured. If you don't edit heavily, your production prompts start sounding generic, which the model then imitates in its outputs. The compounding drift is real.
 
 ### Move 2 variant — the load-bearing skeleton
 
-The kernel of meta-prompting is three moves:
+Kernel of "meta-prompting done right":
 
-```
-  typed data → deterministic builder → prompt string as function output
-```
+1. **Human-in-the-loop review.** Drop this and generated prompts go live untested.
+2. **Draft outputs are files, not runtime strings.** Drop this and you lose diff-ability + PR review.
+3. **The drafting prompt is itself version-controlled.** Drop this and meta-prompt drift is invisible.
+4. **The drafted output is spec-conformant.** Drop this and the human has to review structure, not just content.
 
-What breaks if you skip each:
-
-- **Skip "typed data"** — the data is a plain object. Adding a dimension without the required fields breaks the builder at runtime, not compile time. Debugging becomes "which dimension is missing which field?"
-- **Skip "deterministic builder"** — the builder has branching or random-order iteration. Same data produces different prompts on different runs. Cache breaks, evals become non-reproducible.
-- **Skip "prompt string as function output"** — you build the prompt at author-time and paste it in as a string. Now the data and the prompt are two sources of truth; they drift.
-
-Hardening layered on top: builder tests (the builder is a pure function, easy to unit-test), snapshot tests of the built prompt (catch drift when the data structure changes), separate rubric versions per iteration (`id: 'blooming-diagnosis-quality-v1'` — the `-v1` is the version-bump seam).
+Hardening on top: iterative drafting (LLM drafts, human edits, LLM re-drafts based on edits), automated conformance checks (does the drafted rubric have exactly 4 dimensions?), voice guides for the LLM to imitate a specific writing style. None of that is the skeleton.
 
 ### Move 3 — the principle
 
-**When the source of truth is data, the prompt is a serialization.** Meta-prompting is the discipline of moving prompt structure from string to typed object, so changes to the "prompt" become changes to code-reviewed, compiler-checked data. The prompt-string is then a rendered artifact, not a hand-written one — and the rendering function's determinism is what makes the whole discipline honest.
+**Use meta-prompting to save the first hour of drafting, not to replace the review.** The LLM is a good drafter, not a good editor. Its drafts land at 70% quality — the last 30% is human. Skipping the human step is where meta-prompting reputationally fails — someone ships an LLM-drafted prompt, it works fine in demos, breaks in production, and the whole discipline gets a bad name. It's not the drafting that's wrong; it's the missing review.
 
 ## Primary diagram
 
 ```
-  Meta-prompting in this codebase — two depths
+  Meta-prompting — the full recap
 
-  ┌── heavy meta-prompting: RubricJudge ────────────────────┐
-  │                                                          │
-  │  ┌── rubric data (source of truth) ────────────────┐    │
-  │  │  eval/rubrics/diagnosis-quality.ts               │    │
-  │  │  { title, task, dimensions[4], verdicts[3],      │    │
-  │  │    checks[4] }                                   │    │
-  │  └────────────────────┬────────────────────────────┘    │
-  │                       │                                  │
-  │  ┌── builder ─────────▼────────────────────────────┐    │
-  │  │  buildRubricJudgeSystemPrompt(rubric)            │    │
-  │  │  concatenates: task + dims text + verdicts text +│    │
-  │  │                checks text + output-shape example│    │
-  │  │  @aptkit/evals/dist/src/rubric-judge.js:31-77     │    │
-  │  └────────────────────┬────────────────────────────┘    │
-  │                       │                                  │
-  │  ┌── judge system prompt ▼─────────────────────────┐    │
-  │  │  "You are a rubric judge for: Diagnosis quality. │    │
-  │  │   … dimensions text …                            │    │
-  │  │   … verdicts text …                              │    │
-  │  │   … checks text …                                │    │
-  │  │   Use exactly this shape: {dimensions:…}"         │    │
-  │  └─────────────────────────────────────────────────┘    │
-  └─────────────────────────────────────────────────────────┘
+  ┌─ authoring (safe pattern, used in aipe) ────────────────────┐
+  │                                                              │
+  │  human intent                                                │
+  │      ↓                                                        │
+  │  spec.md  (also LLM-drafted, iteratively refined)             │
+  │      ↓                                                        │
+  │  slash command invokes generator                              │
+  │      ↓                                                        │
+  │  LLM drafts N files                                           │
+  │      ↓                                                        │
+  │  human reviews + edits                                        │
+  │      ↓                                                        │
+  │  files committed  ──►  now source-of-truth                    │
+  │                                                               │
+  │  in this codebase:  none directly (aipe is the substrate)     │
+  │  in aipe:           every spec generates its target folder    │
+  │                                                               │
+  └───────────────────────────────────────────────────────────────┘
 
-  ┌── light meta-prompting: agent prompts ──────────────────┐
-  │                                                          │
-  │  ┌── static template ──────────────────────────────┐    │
-  │  │  MONITORING_PROMPT = "You are …                 │    │
-  │  │                        {schema}                  │    │
-  │  │                        {categories}"             │    │
-  │  └────────────────────┬────────────────────────────┘    │
-  │                       │                                  │
-  │  ┌── value computers ─▼────────────────────────────┐    │
-  │  │  schemaSummary(workspace)                        │    │
-  │  │  formatCategoryChecklist(categories)             │    │
-  │  └────────────────────┬────────────────────────────┘    │
-  │                       │                                  │
-  │  ┌── renderPromptTemplate ▼───────────────────────┐    │
-  │  │  substring replacement: {schema} → schemaText   │    │
-  │  │  no structure change; slot values only          │    │
-  │  └─────────────────────────────────────────────────┘    │
-  └─────────────────────────────────────────────────────────┘
+  ┌─ runtime (NOT used here) ───────────────────────────────────┐
+  │                                                              │
+  │  agent state                                                 │
+  │      ↓                                                        │
+  │  LLM #1 drafts prompt for LLM #2                              │
+  │      ↓                                                        │
+  │  LLM #2 runs                                                  │
+  │      ↓                                                        │
+  │  no human in the loop                                         │
+  │                                                               │
+  │  when appropriate: adaptive agents, per-user prompts.         │
+  │  when NOT appropriate: everywhere else.                       │
+  │                                                               │
+  └───────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The internet-thread version of "meta-prompting" is "use an LLM to help you write your prompts." That's meta-prompting at the *author* stage — a productivity aid for humans, not a runtime discipline. This concept file is about the runtime version: the prompt is built by code from data every time the LLM is called, so the data is where changes land.
+The related concept from `aipe`'s design: *markdown-as-source-of-truth*. Prompts, specs, and generated study guides all live as markdown files in git. Because they're markdown, they're diffable, PR-reviewable, human-editable. Because they're in git, they have version history. Because they're generated by a spec + slash command + LLM, they're fast to draft. That's the meta-prompting discipline productized — the generator is heavy machinery; the artifact is a file.
 
-There's a spectrum. On the light end: template interpolation with `{name}` slots. On the heavy end: a fully-derived prompt where sections, ordering, and content all come from data. This codebase sits in both places — light for agents (the template is stable, slots vary), heavy for the judge (the whole prompt is derived from the rubric object). The heavy shape earns tokens when the "prompt" is really a translation of a data shape into text the LLM can read.
+The failure mode I've hit in production with runtime meta-prompting: an agent that constructs its own system prompt per user based on the user's stated preferences ("I want an assistant that's terse and formal"). The first-turn user says "I want you to be helpful but a little playful." The model constructs a system prompt containing the word "playful." Two turns later, the model is emitting emoji, using slang, and dropping the JSON output shape "because playful and JSON don't mix." Everything downstream breaks. The fix was: constrain the meta-prompt to only vary the *tone-adjective* field of a fixed template, not the whole prompt. Runtime meta-prompting is safe when the surface area is small; it's unsafe when the whole prompt is up for grabs.
 
-The specific gain from meta-prompting the judge: when you add a rubric dimension, you edit *one* place (the rubric object). The judge's system prompt, the JSON validator (`createRubricJudgmentValidator` at `rubric-judge.js:85-137`), and the output shape example all update automatically. Without meta-prompting, adding a dimension is a three-edit change with the risk of drift. The single-source-of-truth-in-data pattern is what makes rubric evolution safe.
+The reference: Anthropic's own meta-prompter (in the Claude console) drafts system prompts given a task description. Worth trying — you'll see the drafting quality landing around 70%, and you'll feel the pull to just ship the draft. Don't. Edit it. The Anthropic prompt engineering guide is explicit that the console's meta-prompter is a starting point, not a finished artifact.
 
-Anthropic and OpenAI both offer "prompt libraries" that generate prompts from higher-level specs (Anthropic's Metaprompt tool, OpenAI's function-calling schema-driven prompts). Those are useful for one-off drafting. What this codebase does — data as source of truth, deterministic builder, code-reviewed data changes — is the production-runtime version of the same idea.
-
-Related concepts:
-- **Prompts as code** (`03-prompts-as-code.md`) — meta-prompted prompts are still versioned artifacts; the source-of-truth is just shifted to data.
-- **Structured outputs** (`02-structured-outputs.md`) — the meta-generated output shape example is few-shot for structured output.
-- **Self-critique** (`10-self-critique.md`) — the judge's system prompt is meta-prompted.
-- **Eval-driven iteration** (`05-eval-driven-iteration.md`) — the rubric object drives both the judge prompt and the eval infrastructure.
+The interaction with concept 03 (prompts as code): meta-prompting *only works cleanly* when the artifact is a file. If your prompts are runtime strings assembled from templates + config, meta-prompting bolts on awkwardly — where does the drafted prompt land? A JSON config? A code constant? The friction is high. With markdown-as-source-of-truth (aipe's pattern, this repo's `legacy-prompts/`), meta-prompting fits naturally — the draft is a new .md file, ready for review.
 
 ## Interview defense
 
-**Q: Walk me through the meta-prompting in this codebase. What's derived from data, what's still hand-written?**
+**Q: Where does meta-prompting fit in a production LLM system?**
 
-Two depths. **Light** meta-prompting in the agent prompts: `MONITORING_PROMPT` is a hand-written template with `{schema}` and `{categories}` slots, and `renderPromptTemplate` fills them from `schemaSummary(workspace)` and `formatCategoryChecklist(categories)`. The structure is author-time; the values are call-time. **Heavy** meta-prompting for the judge: `buildRubricJudgeSystemPrompt(rubric)` walks the rubric's dimensions, verdicts, and checks arrays and assembles the whole system prompt from that data. Adding a rubric dimension means editing one typed object; the judge's prompt, output-shape example, and validator all update from that one edit. The choice of light vs heavy: agent prompts need author judgment for the role paragraph and edge-case examples; judge prompts are mechanical scoring where the data-driven shape works.
-
-Anchors: `renderPromptTemplate` used at `@aptkit/agent-anomaly-monitoring/dist/src/monitoring-agent.js:42-45`; `buildRubricJudgeSystemPrompt` at `@aptkit/core/node_modules/@aptkit/evals/dist/src/rubric-judge.js:31-77`.
+Almost always at authoring time, not runtime. Use an LLM to *draft* a prompt, rubric, or spec. Human reviews. Human edits. Human commits. The drafted artifact goes into version control and drives real LLM calls the same way any other prompt would. In this codebase's ecosystem, that's the `aipe` pattern — every generator spec produces a markdown folder. Runtime meta-prompting (letting an LLM rewrite another LLM's prompt at request time) is what I avoid — the debug story collapses, and there's no human review layer between the drafting step and the going-live step.
 
 ```
-  Two depths of meta-prompting
-
-  agent prompt:    template + slots     ← light (values from data)
-  judge prompt:    builder(rubric)      ← heavy (structure from data)
+  design time     LLM drafts → human reviews → git commit → live
+  runtime         LLM drafts → LLM runs → user   [no review layer]
 ```
 
-**Q: What's the risk of meta-prompting?**
+Anchor: `aipe` project ecosystem (the meta-tool that generated the folder you're reading now).
 
-Two risks. First, the built prompt becomes unreadable — 40 dimensions concatenated is a wall of text nobody code-reviews as prose. Mitigation: keep the data small (this codebase's rubrics have four dimensions), and code-review the *data*, not the built prompt. Second, meta-prompted prompts read like generated code — mechanical, repetitive, no author polish. Fine for a judge whose job is mechanical. Wrong for an agent role paragraph, negations, or edge-case examples where hand-crafted judgment is what earns tokens. The rule: meta-prompt when the shape is data-shaped (rubrics, schemas, catalogs). Hand-write when the shape needs authorial voice (agent roles).
+**Q: What's the specific runtime meta-prompting failure you've seen?**
+
+The tone-drift failure. An agent that adapts its system prompt to user-stated preferences. First turn, user says "be playful." Model constructs a system prompt containing "playful." Two turns later, the model is dropping the required JSON output shape because "playful and JSON don't mix." Downstream parsers break. The pattern of failure: whenever a runtime-generated prompt is not schema-constrained, the model's next output is unbounded. The fix I shipped was to constrain the runtime-meta-prompt to only vary a specific tone-adjective field of a fixed template — the surface area for drift shrunk from "the whole system prompt" to "one adjective."
 
 ```
-  When to meta-prompt vs hand-write
-
-  data-shaped, mechanical scoring   → meta-prompt (RubricJudge)
-  authorial voice, negations, edge  → hand-write (agent role paragraphs)
-  slot values from computed data    → light meta-prompting (renderPromptTemplate)
+  before:  runtime prompt = anything the model drafts
+  after:   runtime prompt = fixed template + { toneAdjective: "playful" }
 ```
-
-**Q: What's the load-bearing part people forget?**
-
-The determinism of the builder. If the builder walks `Object.keys(rubric.dimensions)` and the object key ordering isn't stable, the built prompt varies between runs. Two callers, same rubric, different prompts. Prompt caching (see `04-token-budgeting.md`) breaks because the cached prefix doesn't match the current call. Reproducibility of the judge's scoring collapses. The fix is trivial (use arrays, use `.map` with an explicit order) but the failure mode is silent — you don't notice the cache miss unless you check the logs. The builder in this codebase iterates arrays, not object keys, so ordering is deterministic. But this is one of the specific gotchas of the shape.
-
-Anchor: `rubric.dimensions.map(...)` at `@aptkit/core/node_modules/@aptkit/evals/dist/src/rubric-judge.js:32-38` — array, not object-keys iteration.
 
 ## See also
 
-- `03-prompts-as-code.md` — meta-prompted prompts are still versioned.
-- `05-eval-driven-iteration.md` — the rubric-as-data pattern.
-- `08-few-shot.md` — the output-shape example is meta-generated few-shot.
-- `10-self-critique.md` — the LLM-as-judge whose prompt is meta-generated.
+- 03 · prompts as code — meta-prompting only fits when the artifact is a file.
+- 05 · eval-driven iteration — LLM-drafted rubrics are still measured by eval outcomes.
+- 06 · single-purpose chains — the drafting chain is one job; the target agent is another.
+- 12 · prompt injection defense — runtime meta-prompting expands the injection surface.

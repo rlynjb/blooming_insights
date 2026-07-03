@@ -1,361 +1,292 @@
 # 06 · Single-purpose chains
 
-**Single-purpose agent chain / pipeline pattern / one job per chain — Industry standard**
+**Industry name:** *single-purpose chains* / *pipeline pattern* / *one job per prompt* · Industry standard
 
-## Zoom out, then zoom in
+## Zoom out — the three-chain pipeline
 
-Give one agent four jobs and every job it does badly. Give four agents one job each and compose them into a pipeline and you have a system where each stage debugs in isolation, each stage picks the model that fits, and each stage can be swapped without rewriting the others. In this codebase the split is real: monitoring finds anomalies, diagnostic investigates them, recommendation acts on them, query answers free-form user questions. Four agents, four prompts, four eval surfaces.
+The pipeline in this repo is monitor → diagnose → recommend. Three chains, three jobs, composed. The output of one is the input to the next.
 
 ```
-  Zoom out — where single-purpose chains sit
+  Zoom out — the three-chain pipeline
 
-  ┌─ User surface ───────────────────────────────────────────┐
-  │  Feed page + Investigate pages + QueryBox                │
-  └────────────────────────┬─────────────────────────────────┘
+  ┌─ Trigger (briefing route) ─────────────────────────────────┐
+  │  fetch('/api/briefing') → NDJSON stream                     │
+  └────────────────────────┬────────────────────────────────────┘
                            │
-  ┌─ Coordinator / route ──▼─────────────────────────────────┐
-  │  /api/briefing        → MonitoringAgent                   │
-  │  /api/agent (step=…)  → DiagnosticAgent | RecommAgent    │
-  │  /api/agent (query)   → classifyIntent → one of the three │
-  └────────────────────────┬─────────────────────────────────┘
+  ┌─ MonitoringAgent ──────▼────────────────────────────────────┐
+  │  one job: FIND anomalies                                     │
+  │  in: workspace, categories                                   │
+  │  out: Anomaly[]                                              │
+  └────────────────────────┬────────────────────────────────────┘
+                           │  for each anomaly:
+  ┌─ DiagnosticAgent ──────▼────────────────────────────────────┐
+  │  one job: EXPLAIN why                                        │
+  │  in: Anomaly                                                 │
+  │  out: Diagnosis { conclusion, evidence, hypotheses }         │
+  └────────────────────────┬────────────────────────────────────┘
                            │
-  ┌─ ★ FOUR SINGLE-PURPOSE AGENTS ★ ─▼──────────────────────┐
-  │  MonitoringAgent — anomalies, no diagnosis, no actions   │  ← we are here
-  │  DiagnosticAgent — one anomaly's cause, no actions       │
-  │  RecommendAgent  — actions from a diagnosis, no analysis │
-  │  QueryAgent      — free-form Q&A, no anomaly scanning    │
-  └──────────────────────────────────────────────────────────┘
+  ┌─ RecommendationAgent ──▼────────────────────────────────────┐
+  │  one job: PROPOSE actions                                    │
+  │  in: Anomaly + Diagnosis                                     │
+  │  out: Recommendation[]                                       │
+  └─────────────────────────────────────────────────────────────┘
 ```
 
-**Zoom in.** Each agent has one job named in its role paragraph and one negation naming what it does *not* do. Monitoring says "Do not diagnose causes. Do not propose actions." Diagnostic says "You do not propose remediation." Recommendation says "you do NOT execute anything." The negations are what keep the pipeline from collapsing into one over-eager agent that tries to do all four jobs at once.
+## Zoom in — one job, one prompt, one output shape
 
-## Structure pass
+Each chain has:
 
-### Axes — the dimension we're tracing
+- **One job.** Verbally nameable in five words.
+- **One prompt.** Sized to that job, not to the whole pipeline.
+- **One output shape.** Downstream can parse it without knowing what the chain did internally.
 
-**Where a failure lands.** In a monolith agent that tries to detect + diagnose + recommend, a bad output could originate anywhere in the reasoning chain. In four single-purpose agents composed, a bad diagnosis is *diagnostic's* fault, a bad recommendation is *recommendation's* fault, and the two are debuggable in isolation. Trace this axis and the split shape justifies itself.
+The composition is *code* (TypeScript orchestrator), not more prompt. The next chain doesn't need to see the previous chain's tool calls or reasoning — it only needs the structured output.
 
-### Seams — where failure isolation flips
+## Structure pass — layers, axis, seams
 
-Three seams:
+Trace one axis: *who decides what happens next*, across the three chains.
 
-- **Detection → investigation** — monitoring hands an `Anomaly` to diagnostic. If the anomaly is wrong (e.g. bogus baseline), that's monitoring's bug regardless of what diagnostic does with it. If the anomaly is right and the diagnosis is nonsense, that's diagnostic's bug.
-- **Investigation → action** — diagnostic hands a `Diagnosis` to recommendation. Same isolation: bad diagnosis = diagnostic's problem; good diagnosis followed by irrelevant recommendation = recommendation's problem.
-- **Intent classification → agent selection** — for the free-form query surface, the classifier picks one of {monitoring, diagnostic, recommendation}. Classifier wrong = a diagnostic-flavored query goes to the recommendation agent = wrong-lever answer that looks superficially plausible.
+- **Chain 1 (monitor) — code decides.** The categories list is a fixed input; the monitoring agent walks it.
+- **Chain 2 (diagnose) — model decides (bounded).** The agent generates 2-3 hypotheses and queries to test each. The ReAct loop is model-driven within a 6-tool-call budget.
+- **Chain 3 (recommend) — model decides (bounded).** The agent picks 2-3 actions from the diagnosis.
 
-### Layered decomposition
-
-"Whose fault is a bad output?" traced down:
-
-```
-  "Whose fault is this bad output?" — same question, three altitudes
-
-  ┌───────────────────────────────────────────────────┐
-  │ outer: end-user complaint                          │  → "the recommendation
-  │                                                    │    is wrong"
-  └───────────────────────────────────────────────────┘
-      ┌───────────────────────────────────────────────┐
-      │ middle: which agent produced it?               │  → RecommendationAgent
-      │                                                │    OR upstream
-      │                                                │    (diagnosis was wrong)
-      └───────────────────────────────────────────────┘
-          ┌──────────────────────────────────────────┐
-          │ inner: which reasoning step?              │  → tool choice? feature
-          │        (available in the ReAct trace)     │    fit? impact estimate?
-          └──────────────────────────────────────────┘
-```
-
-The single-purpose split lets you answer the middle question in seconds instead of "somewhere in the 6-step chain that also did classification."
+**The seam:** between chains. Every seam has a typed contract — `Anomaly`, `Diagnosis`, `Recommendation` in `lib/mcp/types.ts`. When chain N returns a `Diagnosis`, chain N+1 knows what to expect at compile time. When a chain's output shape changes, the compiler catches every callsite. This is why the composition is code, not prompt.
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — the shape
 
-You know how a Unix pipeline is `grep | awk | sort` — each command does one thing, reads stdin, writes stdout, composes with the next — and if you want to know why the final output is wrong, you comment out the last command, then the second-to-last, until you find the stage that broke? Single-purpose LLM chains are that discipline. Each agent reads a typed input, writes a typed output, and composes with the next through the type system.
-
-```
-  Single-purpose chain — the pipeline
-
-  ┌── monitoring ──┐   ┌── diagnostic ──┐   ┌── recommendation ──┐
-  │  workspace →   │   │  anomaly →      │   │  diagnosis →        │
-  │  Anomaly[]     │──▶│  Diagnosis      │──▶│  Recommendation[]   │
-  │                │   │                │   │                     │
-  │  find changes  │   │  investigate    │   │  propose actions    │
-  │  in the data   │   │  one anomaly    │   │  for one diagnosis  │
-  │                │   │                │   │                     │
-  │  no diagnosis  │   │  no actions     │   │  no re-diagnosis    │
-  │  no actions    │   │                │   │                     │
-  └────────────────┘   └────────────────┘   └─────────────────────┘
-
-  each stage: one prompt, one job, one output type, one negation
-```
-
-The typed hand-off is the load-bearing part. `Anomaly` → `Diagnosis` → `Recommendation` — the TypeScript types (`lib/mcp/types.ts`) are the contract between stages. Change the contract on one side, the other side stops compiling.
-
-### Move 2 — the step-by-step walkthrough
-
-**Step 1 — each agent's role paragraph names its one job.**
-
-Diagnostic (`@aptkit/prompts/dist/src/diagnostic.js:1-4`):
+You've written a Unix pipe. `find | grep | wc -l`. Each program does one job; the composition is the shell. Nobody writes a single super-program that does find-and-grep-and-wc in one binary, because the moment you need one of those jobs in a different context you're re-implementing it. Same shape here. Chain each thing to its narrow job; compose the chain in code.
 
 ```
-You are a diagnostic investigation agent for an analytics workspace.
+  Pattern — pipes as the mental model
 
-Your job is to investigate why one specific anomaly occurred. You generate 2-3 competing hypotheses, query the available tools to test them, and return the best-supported explanation with evidence. You do not propose remediation.
+  monitor(workspace)             ──►  Anomaly[]
+                                        │
+  diagnose(anomaly)              ◄──────┘
+                                 ──►  Diagnosis
+                                        │
+  recommend(anomaly, diagnosis)  ◄──────┘
+                                 ──►  Recommendation[]
+
+  each stage: one job, one prompt, one output shape.
+  the composition is code — briefing/route.ts — not a bigger prompt.
 ```
 
-Monitoring (`@aptkit/prompts/dist/src/monitoring.js:1-4`):
+The alternative — one giant "you are the analyst; find anomalies, explain them, and recommend actions" prompt — sounds simpler until you try to debug it, iterate on any one step, model-route (small model for classification, big model for generation), or run three copies in parallel. Then you'd wish you had it decomposed.
+
+### Move 2 — walking the chain
+
+#### Chain 1 — `MonitoringAgent`
+
+`lib/agents/monitoring.ts:73-93`:
 
 ```
-You are an anomaly-monitoring agent for an analytics workspace.
+export class MonitoringAgent {
+  constructor(
+    private anthropic: Anthropic,
+    private dataSource: McpCaller,
+    private schema: WorkspaceSchema,
+    private allTools: McpToolDef[],
+    private sessionId?: string,
+  ) {}
 
-Your job is to detect measurable anomalies only. Do not diagnose causes. Do not propose actions.
-```
+  async scan(hooks?: MonitorHooks, categories: AnomalyCategory[] = []): Promise<Anomaly[]> {
+    const toolRegistry = new BloomingToolRegistryAdapter(this.dataSource, this.allTools);
+    const agent = new AptKitAnomalyMonitoringAgent({
+      model: new AnthropicModelProviderAdapter(this.anthropic, 'monitoring', this.sessionId),
+      tools: toolRegistry,
+      workspace: this.schema,
+      trace: new BloomingTraceSinkAdapter(hooks ?? {}, 'monitoring'),
+      categories: categories.length ? toAptKitCategories(categories, this.schema.projectId) : [],
+    });
 
-Recommendation (`@aptkit/prompts/dist/src/recommendation.js:1-2`):
-
-```
-You are a recommendation agent for an ecommerce workspace. You are read-only: you do NOT execute anything.
-```
-
-Three prompts, three negations. Each one is the fence keeping the agent inside its lane.
-
-```
-  Role + negation — the fence per agent
-
-  ┌── monitoring ──────────────────┐
-  │  "Detect anomalies only.        │
-  │   Do NOT diagnose causes.       │
-  │   Do NOT propose actions."      │
-  └────────────────────────────────┘
-  ┌── diagnostic ──────────────────┐
-  │  "Investigate ONE anomaly.      │
-  │   You do NOT propose            │
-  │   remediation."                 │
-  └────────────────────────────────┘
-  ┌── recommendation ──────────────┐
-  │  "Read-only. You do NOT         │
-  │   execute anything."            │
-  └────────────────────────────────┘
-```
-
-Strip any negation and the agent starts to bleed. Diagnostic without "does not propose remediation" starts appending "and here's what to do next" to every diagnosis. Recommendation without "does not execute" starts saying "I've set up the segment for you" as if it took the action.
-
-**Step 2 — the coordinator composes them.**
-
-For the pre-planned three-stage flow (feed → investigate → recommend), the composition is UI-driven — the user clicks through stages, each step's route handler runs one agent. For free-form Q&A, `classifyIntent` picks which agent to run.
-
-`lib/agents/intent.ts:21-38`:
-
-```ts
-export async function classifyIntent(
-  anthropic: Anthropic,
-  query: string,
-  sessionId?: string,
-  signal?: AbortSignal,
-): Promise<Intent> {
-  return classifyAptKitIntent(
-    new AnthropicModelProviderAdapter(anthropic, 'coordinator', sessionId, CLASSIFIER_MODEL, 'agents/intent:classifyIntent'),
-    query,
-    { signal },
-  );
+    return (await agent.scan({ signal: hooks?.signal })).map(toBloomingAnomaly);
+  }
 }
 ```
 
-The classifier is its *own* single-purpose chain — one job (classify into one of three), one model (Haiku 4.5, cheap), one output (`Intent`). It doesn't diagnose or recommend; it routes. This is the pipeline pattern recursing: even the coordinator's decision is itself a single-purpose chain.
+Job: `.scan()` returns `Anomaly[]`. Nothing else. It doesn't explain. It doesn't recommend. If the workspace has no anomalies, `[]`. If it finds five, five.
+
+The retired prompt at `lib/agents/legacy-prompts/monitoring.md:5-7` says this explicitly:
+
+> "You do not diagnose causes or propose actions — you detect, measure, and report."
+
+That "you do not do X" scoping is characteristic of single-purpose prompts. Cross-cutting instructions ("also, whenever you notice X, also do Y") are what erode the single-purpose discipline. The monitoring prompt refuses.
+
+#### Chain 2 — `DiagnosticAgent`
+
+`lib/agents/diagnostic.ts:46-63`:
 
 ```
-  Composition — for free-form query
+async investigate(anomaly: Anomaly, hooks: AgentHooks = {}): Promise<Diagnosis> {
+  const agent = new AptKitDiagnosticInvestigationAgent({
+    model: new AnthropicModelProviderAdapter(this.anthropic, 'diagnostic', ...),
+    tools: new BloomingToolRegistryAdapter(this.dataSource, this.allTools),
+    workspace: this.schema,
+    trace: new BloomingTraceSinkAdapter(hooks, 'diagnostic'),
+  });
 
-  user query
-      │
-      ▼
-  ┌── classifyIntent ─────────┐   Haiku, one word out
-  │   'monitoring'             │
-  │   'diagnostic'             │
-  │   'recommendation'         │
-  └────────┬──────────────────┘
-           │
-           ▼  switch on intent
-  ┌── one of three agents ────┐
-  │  Monitoring | Diagnostic  │  Sonnet, full loop
-  │  | Recommendation          │
-  └───────────────────────────┘
+  return toBloomingDiagnosis(await agent.investigate(anomaly, { signal: hooks.signal }));
+}
 ```
 
-**Step 3 — the model choice per chain.**
+Job: `.investigate(anomaly)` returns a `Diagnosis`. From `lib/agents/legacy-prompts/diagnostic.md:5-7`:
 
-`lib/agents/base.ts:7`:
+> "You do not propose remediation — you diagnose causes only."
 
-```ts
-export const AGENT_MODEL = 'claude-sonnet-4-6';
-```
+Same discipline. Explicit non-scope. The agent generates 2-3 hypotheses, tests each with tool calls (6-call budget), then concludes. It does not propose actions.
 
-`lib/agents/intent.ts:16`:
-
-```ts
-const CLASSIFIER_MODEL = 'claude-haiku-4-5-20251001';
-```
-
-Two models, two roles. The classifier is a cheap fast model because the job is simple (single-word classification) and the volume is high. The three main agents share Sonnet 4.6 because their job is complex (multi-step tool-use investigation) and the volume is low per user. This is the model-routing benefit of single-purpose chains — each chain picks the model that fits its cost/quality point. In a monolith agent you'd have to pick one model for all four jobs; whatever you pick is wrong for at least one.
-
-**Step 4 — the tool policy per chain.**
-
-Each chain has its own tool allowlist. `@aptkit/agent-anomaly-monitoring` (`monitoring-agent.js:9-17`):
-
-```js
-export const anomalyMonitoringToolPolicy = {
-    capabilityId: ANOMALY_MONITORING_CAPABILITY_ID,
-    allowedTools: [
-        'execute_analytics_eql',
-        'get_metric_timeseries',
-        'get_segments',
-        'get_anomaly_context',
-    ],
-};
-```
-
-Monitoring gets four tools — the analytics queries. Recommendation gets a *different* allowlist — the feature-discovery tools (`list_scenarios`, `list_segmentations`, etc). The MCP server exposes ~50 tools; each single-purpose agent sees only the subset that matches its job. This is least-privilege at the LLM boundary: the agent literally cannot call a tool that's outside its lane.
+The Diagnosis shape from `lib/agents/legacy-prompts/diagnostic.md:60-82`:
 
 ```
-  Tool allowlist per chain — least privilege at the LLM boundary
-
-  monitoring    →  execute_analytics_eql, get_metric_timeseries,
-                    get_segments, get_anomaly_context
-  diagnostic    →  same analytics tools + get_anomaly_context
-  recommendation →  list_scenarios, list_segmentations,
-                    list_email_campaigns, list_voucher_pools, ...
-  query         →  wider (whatever the intent demands)
+{
+  "conclusion": "string",
+  "evidence": ["string"],
+  "hypothesesConsidered": [{ "hypothesis": "string", "supported": true, "reasoning": "string" }],
+  "affectedCustomers": { … },
+  "timeSeries": [ … ]
+}
 ```
 
-**Step 5 — the debugging benefit realized.**
+That's the seam. The next chain reads these fields. It doesn't need to know how the diagnostic agent got here.
 
-`eval/run.eval.ts` runs each stage separately and captures each stage's tool calls, usage, and judgment separately. If case #01's diagnosis judgment fails, you look at `receipt.diagnosisToolCalls` and `receipt.diagnosis` and `receipt.diagnosisJudgment`. If the recommendation judgment fails but the diagnosis judgment passed, you look at `receipt.recommendationToolCalls` and `receipt.recommendations` and `receipt.recommendationJudgments`. Two independent debugging surfaces.
+#### Chain 3 — `RecommendationAgent`
 
-The alternative — a monolith agent that does all three — would have one long trace and no way to say "the reasoning went sideways between the diagnosis step and the recommendation step." That's a real production bug I've watched teams debug for days on monolith chains.
+`lib/agents/recommendation.ts:26-46`:
+
+```
+async propose(
+  anomaly: Anomaly,
+  diagnosis: Diagnosis,
+  hooks: AgentHooks = {},
+): Promise<Recommendation[]> {
+  const agent = new AptKitRecommendationAgent({
+    model: new AnthropicModelProviderAdapter(this.anthropic, 'recommendation', ...),
+    tools: new BloomingToolRegistryAdapter(this.dataSource, this.allTools),
+    workspace: this.schema,
+    trace: new BloomingTraceSinkAdapter(hooks, 'recommendation'),
+  });
+
+  return agent.propose(anomaly, diagnosis, { signal: hooks.signal });
+}
+```
+
+Job: takes an `Anomaly` and a `Diagnosis`, returns `Recommendation[]`. From `lib/agents/legacy-prompts/recommendation.md:1`:
+
+> "You are read-only: you do NOT execute anything — your recommendations are suggestions for a human to act on."
+
+Third discipline layer: the chain doesn't just have a scoped job, it has a scoped *permission model*. Recommend only. Never execute.
+
+#### The composition — briefing route
+
+```
+  Layers-and-hops — the pipeline as composed in code
+
+  ┌─ briefing route ─────────────────────────────────────┐
+  │                                                       │
+  │  const anomalies = await monitor.scan()               │
+  │                                                       │
+  │  for (const anomaly of anomalies) {                   │
+  │    const diagnosis = await diag.investigate(anomaly)  │
+  │    const recs = await rec.propose(anomaly, diagnosis) │
+  │    stream({ anomaly, diagnosis, recs })               │
+  │  }                                                    │
+  │                                                       │
+  └───────────────────────────────────────────────────────┘
+
+  the loop is code. each stage is one prompt. the composition
+  is not a prompt.
+```
+
+The eval harness at `eval/run.eval.ts:199-269` uses the same composition — for each golden case, `diagnose` then `recommend`, sharing a `BudgetTracker` across both. Same pipeline as production. That's the payoff of decomposition: the eval can test each stage independently *and* the composition end-to-end, because the stages are typed and small.
 
 ### Move 2 variant — the load-bearing skeleton
 
-The kernel of single-purpose chains is four moves:
+Kernel of single-purpose chains:
 
-```
-  one job per prompt → typed hand-off → per-chain tool allowlist → per-chain eval
-```
+1. **Each chain has one job, statable in one sentence.** Drop this and prompts start "and also" growing.
+2. **Each chain returns a typed shape.** Drop this and the composition has to parse loose strings between stages.
+3. **The composition is code, not prompt.** Drop this and you've re-created the giant super-prompt in a different form.
+4. **The prompt explicitly names its non-scope.** Drop this and the model happily starts freelancing into adjacent jobs.
 
-What breaks if you skip each:
-
-- **Skip "one job per prompt"** — you have one Big Prompt™ that does everything. Each iteration risks regressing all four jobs. Eval scores become impossible to interpret ("did the change improve monitoring or hurt recommendation?").
-- **Skip "typed hand-off"** — chains pass strings between each other. Chain B parses chain A's output ad-hoc. Every emission drift breaks the next stage. Instead of Anomaly / Diagnosis / Recommendation types, you pass free-form text.
-- **Skip "per-chain tool allowlist"** — every agent sees every tool. Monitoring can call `list_email_campaigns` for no reason and burn tokens on irrelevant results. The role paragraph is your only defense, and it's soft.
-- **Skip "per-chain eval"** — you eval end-to-end. Regression on one stage looks like generic drift. You can't attribute a failure to a specific chain, so you can't fix it.
-
-Hardening layered on top: model routing (already in this codebase — Haiku for classifier), retry per chain (chain-specific back-off), per-chain observability (already in this codebase — `logSite = agents/<chain>:aptkit-model`).
+Hardening on top: retry policies per stage, per-stage timeouts, per-stage budget, different models per stage (smaller for classifiers, bigger for generation). None of that is the skeleton — the skeleton is: one job per chain, typed hand-off, code composition, explicit non-scope.
 
 ### Move 3 — the principle
 
-**Composition is what makes complex LLM systems debuggable.** Each chain does one job, and the type of its output is a contract the next chain reads. You don't get to skip the composition step; the alternative is one prompt that does four things badly and no way to tell which of the four is failing on any given output.
+**Decomposition is the debug-ability move.** When the pipeline breaks, decomposed chains let you point at which chain broke. Was the anomaly wrong? Monitor failed. Was the diagnosis wrong? Diagnose failed. Was the recommendation wrong given a correct diagnosis? Recommend failed. One-giant-prompt architectures make this diagnosis impossible — the whole thing works or the whole thing doesn't. And the moment production breaks, you'll wish you could point at a stage.
 
 ## Primary diagram
 
 ```
-  Single-purpose chains — the full pipeline
+  Single-purpose chains — the full recap
 
-  ┌── Coordinator ─────────────────────────────────────────────┐
-  │  /api/briefing → MonitoringAgent                            │
-  │  /api/agent    → DiagnosticAgent | RecommendationAgent      │
-  │  /api/agent q  → classifyIntent → one of the three          │
-  └──────────────────────────┬─────────────────────────────────┘
-                             │
-   ┌─────────────────────────┴─────────────────────────┐
-   ▼                         ▼                         ▼
-  MonitoringAgent          DiagnosticAgent          RecommendationAgent
-  ─────────────           ────────────────          ────────────────────
-  workspace →              anomaly →                diagnosis →
-  Anomaly[]                Diagnosis                 Recommendation[]
+  ┌─ MonitoringAgent ──────────────────────────────────────┐
+  │  job: FIND                                              │
+  │  prompt says: "you do NOT diagnose or propose"          │
+  │  in:  workspace, categories                             │
+  │  out: Anomaly[]                                         │
+  └────────────────────────┬───────────────────────────────┘
+                           │  typed hand-off
+  ┌─ DiagnosticAgent ──────▼───────────────────────────────┐
+  │  job: EXPLAIN why                                       │
+  │  prompt says: "you do NOT propose remediation"          │
+  │  in:  Anomaly                                           │
+  │  out: Diagnosis { conclusion, evidence, hypotheses }    │
+  └────────────────────────┬───────────────────────────────┘
+                           │  typed hand-off
+  ┌─ RecommendationAgent ──▼───────────────────────────────┐
+  │  job: PROPOSE actions                                   │
+  │  prompt says: "you are read-only; do NOT execute"       │
+  │  in:  Anomaly + Diagnosis                               │
+  │  out: Recommendation[]                                  │
+  └─────────────────────────────────────────────────────────┘
 
-  model: Sonnet 4.6        model: Sonnet 4.6         model: Sonnet 4.6
-  tools: [analytics ×4]    tools: [analytics ×4]     tools: [feature-
-                                                             discovery ×N]
-  role: detect only        role: investigate ONE     role: read-only
-        no diagnosis             one anomaly               no execute
-        no actions               no remediation
-       ─────────────           ────────────────          ───────────────
-
-  ┌── each writes to per-chain eval ──────────────────────────┐
-  │  receipt.diagnosisToolCalls | recommendationToolCalls      │
-  │  receipt.diagnosisJudgment  | recommendationJudgments      │
-  │  regression on one stage → attributable to that stage      │
-  └────────────────────────────────────────────────────────────┘
-
-  ┌── classifier is its OWN single-purpose chain ─────────────┐
-  │  model: Haiku 4.5 (cheap)                                  │
-  │  tools: none                                                │
-  │  role: classify query into monitoring | diagnostic |        │
-  │        recommendation. Reply with ONLY the one word.        │
-  └────────────────────────────────────────────────────────────┘
+  composition: briefing route (production) + run.eval.ts (test)
+  both compose stages with typed hand-offs; neither wraps them
+  in a bigger prompt.
 ```
 
 ## Elaborate
 
-The pipeline pattern is old — Unix pipes are its physical-world instance. In LLM systems it became a discipline around 2023 as production teams learned that "one long chain that does everything" was where every incident originated. The counterexample — where a single agent with tool use *is* the right shape — is when the reasoning has to interleave across what would otherwise be separate stages. Blooming's diagnostic agent is such an interleaved shape internally: it hypothesizes, queries, revises, queries again. Within one job (investigate one anomaly), the interleaving is a single agent's ReAct loop. Across jobs (investigate one anomaly, then propose actions), the split is worth it.
+The model-routing benefit is real and this repo hasn't fully exploited it yet. Right now every stage runs the same model (`claude-sonnet-4-6`, see `AGENT_MODEL` in `lib/agents/base.ts`). A monitoring pass that walks a category checklist doesn't need Sonnet — a Haiku-class model would classify anomalies just as well at a fraction of the cost. The reason for uniformity right now is developer ergonomics (one API key, one pricing model to track). If cost pressure grew, the natural first move would be: swap monitoring to Haiku, keep diagnose + recommend on Sonnet. The decomposition is what makes that a one-line change per stage.
 
-The tradeoff single-purpose chains don't get to skip: latency. Four agents composed = four full ReAct loops = 30-60 seconds of end-to-end wall time in Blooming. A monolith agent might finish in 20-30 seconds because it doesn't pay the round-trip between stages. This codebase's answer: stream every stage's reasoning as it happens (NDJSON `AgentEvent` events), so the user sees progress across the whole pipeline instead of a blank screen for 60 seconds. Streaming is what makes the pipeline latency acceptable at the UX layer.
+The related pattern from other repos in Rein's portfolio: `loopd` runs 5 single-purpose chains (intent classifier, caption generator, tag extractor, memory writer, memory reader) with different models per stage. Same discipline. Same payoff — small models for classifiers, big for generation.
 
-Where I've watched this pattern get abused: too-fine slicing. Someone splits monitoring into "detect", "categorize", and "prioritize" as three separate chains — now you have three prompts to maintain, three eval sets, and the three chains together do the same job as one well-shaped monitoring agent. The heuristic: split when the sub-jobs would use different models, different tools, or would want different eval rubrics. Otherwise the split is ceremony.
+The counter-argument some engineers make: "but latency stacks up if you have 3 sequential model calls." True. It's a real cost, and for user-facing chatbot flows it can be prohibitive. The counter-move: parallelize where you can, and accept the trade-off where you can't. The briefing pipeline is not latency-sensitive (it runs on schedule, streams progress to the UI). If the query route needed sub-second responses, you'd fold multiple jobs into one prompt and eat the debug-ability cost — because you have no choice.
 
-Related concepts:
-- **Anatomy** (`01-anatomy.md`) — each chain's role paragraph and negation.
-- **Output mode mismatch** (`07-output-mode-mismatch.md`) — the specific bug at the typed hand-off.
-- **Eval-driven iteration** (`05-eval-driven-iteration.md`) — per-chain eval surfaces.
-- **Prompts as code** (`03-prompts-as-code.md`) — each chain's prompt is its own package.
+The failure mode single-purpose chains prevent: when a "one giant prompt" chain fails, you can't tell which sub-task failed. The output is a JSON blob that's supposed to contain 4 fields (anomaly + diagnosis + rec + confidence). One field is wrong. Was it the anomaly detection that was wrong? The diagnostic reasoning? The recommendation? You have to reverse-engineer the model's internal reasoning from output text, and the model itself doesn't necessarily know. With decomposed chains, each intermediate is on disk — you have `receipts/*` files that show the diagnosis as its own artifact, separate from the recommendation. Debug is a one-hop lookup.
 
 ## Interview defense
 
-**Q: Walk me through the four chains in this codebase. Why these four and not three, or five?**
+**Q: Why not one prompt that does everything?**
 
-Four because the domain has four distinct jobs the user cares about: **detect** what changed (monitoring), **explain** why one thing changed (diagnostic), **decide** what to do (recommendation), and **answer** free-form questions (query). Each is a job a human analyst would do in a distinct sitting. Not three because collapsing detect + explain leaves you with one agent doing two jobs — either the detect step becomes shallow because the explain reasoning drags it long, or the explain step becomes wide because the detect step's scope isn't narrow enough. Not five because the sub-jobs within each of these are interleaved reasoning, not separable pipeline stages. Diagnostic's hypothesize → query → revise loop is one job's internal shape; splitting it would just add ceremony.
-
-```
-  Four chains — why this split
-
-  detect  ── monitoring   ── volume: 1 per session, all metrics
-  explain ── diagnostic   ── volume: 1 per anomaly, one metric
-  decide  ── recommendation ── volume: 1 per diagnosis, ~3 recs
-  answer  ── query        ── volume: 1 per user question
-
-  each has its own tool allowlist, its own rubric,
-  its own model policy (all Sonnet 4.6 currently; the
-  classifier that routes to them uses Haiku 4.5).
-```
-
-**Q: The recommendation agent starts hallucinating diagnoses instead of using the one it was passed. What's the fix?**
-
-Look at the role paragraph and the input hand-off first. The role says "read-only, no execute" but doesn't say "do not re-diagnose." That's a negation gap. Add "The diagnosis is provided as context. Do not re-analyze; act on it." The other place to check is how the diagnosis is passed in. If the recommendation prompt says something like "here's what happened: {diagnosis}" without a clear delimiter, the model reads it as a suggestion and might override it. Wrapping the diagnosis in a delimiter block or a labeled section (`## The diagnosis to act on`) makes the boundary explicit. This codebase does exactly that at `@aptkit/prompts/dist/src/recommendation.js:35-37`: "## The diagnosis to act on / {diagnosis}".
+Three reasons. One, debug-ability — when the pipeline breaks, decomposed chains tell you *which* chain broke. One-giant-prompt architectures make this impossible; the whole thing is a black box. Two, model-routing — small models for classifiers, big models for generation. You can't route inside a giant prompt. Three, iteration — a single-purpose prompt fits in a paragraph and iterates in an afternoon. A giant prompt is a maintenance albatross. Anchor: `lib/agents/monitoring.ts`, `lib/agents/diagnostic.ts`, `lib/agents/recommendation.ts` — three chains, three sub-100-line files, composed in briefing route.
 
 ```
-  Role bleed — how to spot it
-
-  agent's actual output ─── contains reasoning that
-                            belongs to a neighboring
-                            chain's job
-              │
-              ▼
-  fix 1: add a negation to the role paragraph
-         ("Do not re-analyze; act on the diagnosis provided")
-  fix 2: wrap the passed-in artifact in a labeled section
-         so the model reads it as data, not free-form context
+   monitor  ──►  Anomaly[]
+   diagnose ──►  Diagnosis     ← each stage debuggable in isolation
+   recommend──►  Recommendation[]
 ```
 
-**Q: What's the load-bearing part people forget?**
+**Q: What does "explicit non-scope" look like in a prompt?**
 
-The negations. Everyone writes a role paragraph that says "you are a monitoring agent, you detect anomalies." Fine. Then production drift: the monitoring agent starts saying "and I'd recommend investigating this in more depth" at the end of each anomaly. That's a soft recommendation, produced by an agent whose role paragraph *didn't tell it not to*. The negations — "Do not diagnose causes. Do not propose actions." — are what keep each chain in its lane. Every multi-agent system I've shipped has needed at least one negation per role; every one where I forgot had a bleed-through bug within a month.
+Every single-purpose prompt in this repo explicitly names what it does *not* do. Monitoring prompt says "you do not diagnose causes or propose actions." Diagnostic says "you do not propose remediation." Recommendation says "you are read-only; you do NOT execute anything." Those "do NOT" clauses are load-bearing. Without them, models drift into adjacent jobs — a diagnostic agent starts proposing fixes, a recommendation agent starts asking for confirmation to execute. The explicit non-scope is what keeps the seam clean.
 
-Anchor: monitoring prompt at `@aptkit/prompts/dist/src/monitoring.js:3-4`.
+```
+   monitor:   "you do NOT diagnose or propose"
+   diagnose:  "you do NOT propose remediation"
+   recommend: "you do NOT execute"
+                    ▲
+              the whole permission model of the pipeline
+              lives in these three clauses
+```
+
+Anchor: `lib/agents/legacy-prompts/{monitoring,diagnostic,recommendation}.md`.
 
 ## See also
 
-- `01-anatomy.md` — the role paragraph and negations.
-- `03-prompts-as-code.md` — each chain's prompt as a package.
-- `05-eval-driven-iteration.md` — per-chain eval surfaces.
-- `07-output-mode-mismatch.md` — the failure at the typed hand-off between chains.
-- `12-prompt-injection-defense.md` — least-privilege tool allowlist is a defense-in-depth layer.
+- 01 · anatomy — the four sections of each single-purpose prompt.
+- 07 · output mode mismatch — typed hand-offs are how single-purpose chains stay compatible.
+- 02 · structured outputs — the typed hand-off is exactly the structured-output shape.
+- 05 · eval-driven iteration — the eval harness uses the same composition as production because both are code.

@@ -1,362 +1,292 @@
-# 09 · Chain-of-thought (CoT)
+# 09 · Chain-of-thought
 
-**Chain-of-thought / step-by-step reasoning / hypothesize-then-answer — Industry standard**
+**Industry name:** *chain-of-thought* / *CoT* / *step-by-step reasoning* · Industry standard
 
-## Zoom out, then zoom in
+## Zoom out — where CoT lives in this repo
 
-The classic 2022-era instruction "let's think step by step" is largely subsumed by modern models doing chain-of-thought internally. What's left is the specific case where the reasoning shape has to be *explicit and traceable* — where you want the model to hypothesize before concluding, cite evidence before asserting, or consider rivals before picking. This codebase's diagnostic prompt uses exactly that shape: "Generate 2-3 hypotheses before the first tool call. Query to falsify each hypothesis. Conclude with the hypothesis that best fits the evidence." That's structured CoT, and it earns its tokens because the hypothesesConsidered array is part of the downstream artifact.
-
-```
-  Zoom out — where CoT sits
-
-  ┌─ Chain-of-thought applied ──────────────────────────────┐
-  │  diagnostic prompt: "generate 2-3 hypotheses before…"    │
-  │  → emissions have hypothesesConsidered[] array           │
-  │  → each hypothesis has supported flag + reasoning        │
-  └────────────────────────┬────────────────────────────────┘
-                           │
-  ┌─ Chain-of-thought absent ─▼─────────────────────────────┐
-  │  intent classifier: "reply with ONLY the one word"       │
-  │  → CoT would burn tokens for a single-word output        │
-  │  → this codebase correctly skips it                      │
-  └─────────────────────────────────────────────────────────┘
-
-  ┌─ Modern internal CoT (Sonnet 4.6) ──────────────────────┐
-  │  the model does chain-of-thought internally without     │
-  │  being asked. Frontier models don't need "let's think    │
-  │  step by step" as a magic incantation.                   │
-  └─────────────────────────────────────────────────────────┘
-```
-
-**Zoom in.** CoT has two forms. **Internal CoT** — the model does step-by-step reasoning implicitly and emits the answer. This is what modern models do by default. **Structured CoT** — the prompt requires the reasoning to be explicit as an emitted artifact (a `hypothesesConsidered` array, a `reasoning` field, a "thinking" scratchpad). This is what earns tokens in production. In this codebase, structured CoT is *the* diagnostic method — the hypotheses are outputs, not just internal steps.
-
-## Structure pass
-
-### Axes — the dimension we're tracing
-
-**Is the reasoning an artifact or a scratchpad?** For a classifier, reasoning is a scratchpad the user never sees, and asking for it is pure token cost. For a diagnostic investigation where the user reads the hypotheses and their rationales, the reasoning IS the artifact and asking for it explicitly is required.
-
-### Seams — where CoT flips utility
-
-Three seams:
-
-- **Simple lookup vs multi-step reasoning** — for the classifier, one word out, no CoT. For the diagnosis, multi-hypothesis reasoning, structured CoT.
-- **Free-form CoT vs structured CoT** — free-form CoT ("let's think step by step" + then the answer) wastes tokens on prose the parser has to strip. Structured CoT (reasoning as a named field in the output shape) is parseable and downstream-usable.
-- **Internal CoT vs elicited CoT** — modern models do CoT internally; asking them to CoT explicitly is redundant *unless* you want the reasoning as an artifact.
-
-### Layered decomposition
-
-"Why does the reasoning exist?" — traced across altitudes:
+CoT lives *inside* the structured output, not adjacent to it. That's the load-bearing move. Every serious agent that wants both reasoning and a shape gets it by putting reasoning in a named field.
 
 ```
-  "Why does the reasoning exist here?" — same question, three altitudes
+  Zoom out — CoT as a field, not a section
 
-  ┌────────────────────────────────────────────────┐
-  │ outer: the user's need                          │  → user wants to see
-  │                                                 │    WHY the agent
-  │                                                 │    concluded what it did
-  └────────────────────────────────────────────────┘
-      ┌────────────────────────────────────────────┐
-      │ middle: the artifact shape                  │  → Diagnosis.hypothesesConsidered
-      │                                             │    is a first-class field
-      └────────────────────────────────────────────┘
-          ┌────────────────────────────────────────┐
-          │ inner: the prompt's method              │  → "Generate 2-3 hypotheses
-          │                                          │    before the first tool call"
-          └────────────────────────────────────────┘
+  ┌─ Diagnosis JSON (the output of DiagnosticAgent) ────────────┐
+  │                                                              │
+  │  conclusion: "..."                                           │
+  │  evidence:   [...]                                           │
+  │  hypothesesConsidered: [                                     │
+  │    { hypothesis: "...",                                      │
+  │      supported: true,                                        │
+  │      reasoning: "..."   ← ★ CoT lives here ★                │
+  │    },                                                        │
+  │    { … }                                                     │
+  │  ]                                                           │
+  │                                                              │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-The user need drives the artifact shape, which drives the prompt's CoT requirement. If the user need was "one word answer," the whole CoT chain evaporates.
+The `hypothesesConsidered` array is the CoT. Each item names one hypothesis, whether the evidence supported it, and *why*. That's structured reasoning — one paragraph per hypothesis, inside the JSON, parseable by downstream code.
+
+## Zoom in — three CoT patterns, one used here
+
+Three ways CoT shows up in real prompts:
+
+1. **Free-form CoT** — "think step by step, then give me your answer." Prose reasoning followed by the answer. Reader has to parse the answer out.
+
+2. **Structured CoT** — reasoning goes in a named field of the structured output. Downstream code reads both.
+
+3. **Provider-managed thinking** — Anthropic's `thinking: { type: 'enabled' }`, OpenAI's `reasoning` on `o1`-class models. Provider returns a separate reasoning trace that doesn't count against your response schema.
+
+This codebase uses #2 — reasoning in `hypothesesConsidered[].reasoning`. #1 shows up in the query prompt indirectly (prose responses can be long-form). #3 isn't used yet.
+
+## Structure pass — layers, axis, seams
+
+Trace one axis: *where does the reasoning live*, and *who reads it*.
+
+- **Layer 1 — the model's internal reasoning.** Not directly observable, whatever the model does before emitting tokens.
+- **Layer 2 — the `hypothesesConsidered[].reasoning` field.** Structured, parseable, part of the JSON output.
+- **Layer 3 — the tool trace.** The 6-tool-call budget's actual queries and results. Reasoning-adjacent — the tool trace shows *what the model chose to check*.
+- **Layer 4 — the judge's context.** `tool_calls_trace` is passed to the RubricJudge so it can grade the reasoning-supported claims against real data.
+
+**The seam:** between free-form reasoning (Layer 1's shadow) and structured reasoning (Layer 2). The seam is *what's parseable*. Free-form reasoning is expressive; structured reasoning is queryable. This codebase picks queryable.
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — the shape
 
-You know how a code review comment "why did you pick this approach?" is more useful when you can see the alternatives the author considered — because reading the rejected options is what makes the chosen one credible? Structured CoT is that discipline for LLM outputs. The `hypothesesConsidered` array is the "alternatives considered" section of a diagnosis; without it, the conclusion is just a claim.
-
-```
-  Structured CoT — the pattern
-
-  ┌── prompt shape ─────────────────────────────────────────┐
-  │  "Generate 2-3 hypotheses before the first tool call.   │
-  │   Query to falsify each hypothesis.                     │
-  │   Conclude with the hypothesis that best fits."          │
-  └────────────────────────┬────────────────────────────────┘
-                           │
-  ┌── model reasons ───────▼────────────────────────────────┐
-  │  1. hypothesize (2-3 candidates)                        │
-  │  2. query tools to test each                             │
-  │  3. update hypotheses with evidence                      │
-  │  4. pick the best-supported one                          │
-  │  5. emit ALL hypotheses in the output                    │
-  └────────────────────────┬────────────────────────────────┘
-                           │
-  ┌── output shape ────────▼────────────────────────────────┐
-  │  {                                                       │
-  │    "conclusion": "…",                                    │
-  │    "evidence": ["…"],                                    │
-  │    "hypothesesConsidered": [                             │
-  │      { "hypothesis": "…", "supported": true,  "reasoning": "…" },│
-  │      { "hypothesis": "…", "supported": false, "reasoning": "…" },│
-  │    ]                                                     │
-  │  }                                                       │
-  └─────────────────────────────────────────────────────────┘
-
-  the CoT is IN THE ARTIFACT, not just in the model's head
-```
-
-### Move 2 — the step-by-step walkthrough
-
-**Step 1 — the prompt names the reasoning method.**
-
-`@aptkit/prompts/dist/src/diagnostic.js:14-19`:
+You've written a function that computes an answer and returns `{ result, workingSet }`, where `workingSet` is the intermediate state you'd want to log if the result looked wrong. Same pattern here. Instead of "the model outputs an answer plus its reasoning," the model outputs an answer plus a structured working set — one hypothesis per array entry, with the reasoning for each.
 
 ```
-Recommended approach:
-1. Generate 2-3 hypotheses before the first tool call.
-2. Query to falsify each hypothesis.
-3. Spend one call locating when the change happened with a time-series query when such a tool exists.
-4. Conclude with the hypothesis that best fits the evidence.
+  Pattern — CoT as a structured working set
+
+  ┌─ model output ──────────────────────────┐
+  │  conclusion: "the answer"                │
+  │  hypothesesConsidered:                   │
+  │    [ { hypothesis: A, supported, why },  │
+  │      { hypothesis: B, supported, why },  │
+  │      { hypothesis: C, supported, why } ] │
+  └──────────────────────────────────────────┘
+
+  the "how did the model get there" is the array.
+  the "what did it decide" is the conclusion.
+  both are queryable JSON.
 ```
 
-Four steps. Note the ordering: hypothesize *before* querying. That's the key discipline — a model that queries first and hypothesizes later ends up justifying whatever it happened to find. A model that hypothesizes first and queries to falsify each candidate is doing science. In interview terms, this is the difference between confirmation bias and hypothesis testing.
+This is CoT the way it should look in 2026. The old prompt-engineering advice was "add 'let's think step by step' to your prompt and let the model reason freely." That works. It also makes the output unparseable and hides the reasoning behind prose. The modern move is: keep the reasoning field, drop the "let's think" instruction, let the schema do the work.
 
-The "falsify" verb is deliberate. "Confirm" would let the model gather selective evidence for its favorite hypothesis. "Falsify" pushes it to try to *disprove* candidates, and whichever survives is the best-supported.
+### Move 2 — walking the mechanism
 
-**Step 2 — the output schema embeds the CoT as an emitted artifact.**
+#### The diagnostic prompt's CoT declaration
 
-Same file, lines 26-38:
+`lib/agents/legacy-prompts/diagnostic.md:18-23`:
 
 ```
-Return ONLY a JSON object in a \`\`\`json fenced block with this shape:
+## Investigation approach
 
+1. **Generate 2–3 hypotheses** before your first tool call. Examples: device-specific regression, country/region shift, campaign traffic change, product category collapse, data collection gap.
+2. **Design queries to falsify each hypothesis.** …
+3. **Locate WHEN the change happened** …
+4. **Conclude** once you have data supporting or ruling out each hypothesis. State which hypothesis best fits the evidence, or honestly say no clear cause was found.
+```
+
+The prompt names the reasoning pattern. Generate hypotheses. Test each. Conclude. This is CoT-by-instruction. It doesn't say "think step by step" in those words — it says "generate 2-3 hypotheses" as a specific step, "design queries to falsify each" as a specific step, and so on. The reasoning structure is baked into the instructions.
+
+Then § 4 (the output shape) declares where the reasoning goes:
+
+`lib/agents/legacy-prompts/diagnostic.md:65-72`:
+
+```
+"hypothesesConsidered": [
+  {
+    "hypothesis": "string — what you tested",
+    "supported": true,
+    "reasoning": "string — why the data supports or rules this out"
+  }
+]
+```
+
+`hypothesis` names the CoT step. `supported` is the boolean outcome. `reasoning` is the free-form justification. The schema captures the *structure* of reasoning; the reasoning content itself is free text inside a bounded field.
+
+#### The judge reading the CoT
+
+The RubricJudge's `evidence_grounding` dimension at `eval/rubrics/diagnosis-quality.ts:41-55` explicitly grades whether the reasoning is grounded in real evidence:
+
+```
 {
-  "conclusion": "string",
-  "evidence": ["string"],
-  "hypothesesConsidered": [
-    { "hypothesis": "string", "supported": true, "reasoning": "string" }
+  id: 'evidence_grounding',
+  label: 'Evidence grounding',
+  description:
+    'Does the diagnosis cite the actual signals the substrate exposed? Bonus if it names the co-occurring signals (…). Penalty for invented numbers or claims not derivable from the tool results.',
+  scale: [
+    { score: 1, description: 'Numbers or claims that contradict the evidence.' },
+    { score: 2, description: 'Vague evidence references; no specific numbers cited.' },
+    { score: 3, description: 'Cites at least one specific number from the evidence.' },
+    { score: 4, description: 'Cites multiple specific signals; notes at least one co-occurring signal.' },
+    { score: 5, description: 'Cites the primary and co-occurring signals; every claim is traceable to a tool result.' },
   ],
-  ...
 }
 ```
 
-`hypothesesConsidered` is a first-class field. Each hypothesis has three parts: the claim, whether it was supported, and the reasoning. The `supported: true` field is the *falsification result* — the model's answer to "did the evidence support or contradict this hypothesis?" The `reasoning` field is the *rationale* — the evidence-anchored argument.
+The judge cross-references reasoning claims against the tool trace. This is only possible because the reasoning is in a queryable field — the judge reads `hypothesesConsidered[].reasoning`, then reads the actual tool results in the trace, then compares. If the reasoning had been free-form prose, the judge could still grade it, but with more noise.
+
+#### The wrong shape — free-form CoT next to structured output
+
+The failure mode this repo avoids:
 
 ```
-  hypothesis object — three parts, three purposes
+   PROMPT (wrong shape): "think step by step, then return JSON"
 
-  ┌── hypothesis: "string" ────────┐  → the claim the agent tested
-  ├── supported: true | false ────┤  → the falsification verdict
-  └── reasoning: "string" ─────────┘  → the evidence-anchored rationale
+   MODEL OUTPUT:
+   Let me analyze this step by step.
+
+   First, I need to consider what could cause a conversion drop
+   in mobile checkout. Possible causes include...
+
+   Looking at the tool results, I see that payment_failure spiked
+   31.2% during the anomaly window...
+
+   ```json
+   { "conclusion": "...", "evidence": [...] }
+   ```
 ```
 
-**Step 3 — the ReAct loop makes this real.**
+Three problems:
 
-`@aptkit/core`'s DiagnosticInvestigationAgent runs a ReAct loop (Reason-Act-Observe). Each turn: the model reasons, calls a tool, observes the result, updates hypotheses. The prompt's "recommended approach" is what makes the reasoning follow the hypothesize → falsify → conclude shape rather than the querying-guided-by-vibes shape.
+1. **The parser has to skip the prose.** `parseAgentJson` in `lib/mcp/validate.ts:3-13` handles this (fence extraction + substring fallback), but it's fragile — a `{` character in the prose ("the config {") starts the substring scan at the wrong place.
 
-```
-  ReAct loop with structured CoT
+2. **The reasoning is not queryable.** Downstream code can only get to the prose reasoning by re-reading it as a string. It's not indexed. The judge can't easily grade specific claims.
 
-  turn 1  reason:  "I have 3 candidate hypotheses: (a) payment,
-                    (b) UX regression, (c) upstream traffic."
-          act:     get_metric_timeseries('payment_failure_rate', 'mobile SP')
-          observe: payment_failure_rate rose 31.2%
+3. **Token cost.** Free-form CoT is expensive. A structured `hypothesesConsidered` array with 3 items runs ~300-500 tokens. Free-form reasoning on the same problem runs 1500-3000. Baseline diagnose output average is 1,858 tokens — most of that is the array + `conclusion` + `evidence`. Freeing it up would balloon that number.
 
-  turn 2  reason:  "(a) is supported. Test (b): check checkout_step drop
-                    location."
-          act:     get_event_segmentation('checkout', ['checkout_step'])
-          observe: checkout_step distribution unchanged
-
-  turn 3  reason:  "(b) not supported. Test (c): upstream funnel."
-          act:     get_event_segmentation('view_item', …)
-          observe: view_item unchanged
-
-  turn 4  conclude: "Payment processor issue on mobile-SP-credit_card."
-          emit:    { conclusion, evidence, hypothesesConsidered:[…3…] }
-```
-
-The evidence for each hypothesis lives in the tool_calls; the emitted `hypothesesConsidered` array is the summary of what the loop tested. This is CoT as an artifact — the reasoning trace is preserved for the user (and for the eval rubric — see step 5).
-
-**Step 4 — the rubric scores the reasoning explicitly.**
-
-`eval/rubrics/diagnosis-quality.ts:25-38`:
-
-```ts
-{
-  id: 'root_cause_plausibility',
-  label: 'Root-cause plausibility',
-  description: 'Does the conclusion name a plausible mechanism (not just a symptom restatement)? A conclusion that says "conversion dropped because conversion dropped" is a 1. A conclusion that names a specific mechanism supported by the evidence is a 5.',
-  scale: [
-    { score: 1, description: 'Restates the symptom; no mechanism named.' },
-    { score: 2, description: 'Vague mechanism, no evidence link.' },
-    { score: 3, description: 'Plausible mechanism, weakly evidenced.' },
-    { score: 4, description: 'Specific mechanism, evidence supports it.' },
-    { score: 5, description: 'Specific mechanism, evidence directly supports it, and rival mechanisms are considered.' },
-  ],
-},
-```
-
-The rubric's top score (5) explicitly rewards "rival mechanisms are considered." That reward loop is what closes the CoT discipline: the model is prompted to hypothesize, the output schema demands the hypotheses, and the eval rubric rewards showing that rival hypotheses were considered. All three layers pull in the same direction.
-
-**Step 5 — where CoT is deliberately absent.**
-
-The intent classifier (`@aptkit/agent-query/dist/src/intent.js:13`):
+Structured reasoning is a token discipline as much as a parsing discipline. Bounded fields limit how much reasoning the model can produce, which is the *whole point* — force it to make each hypothesis contribute a well-scoped paragraph, not run on.
 
 ```
-'Classify the user query as exactly one word: monitoring, diagnostic, or recommendation. Reply with ONLY the one word.'
+  Comparison — free-form CoT vs structured CoT
+
+  free-form:
+    "Let me think through this...
+     [1500-3000 tokens of reasoning]
+     ```json
+     { "conclusion": "..." }
+     ```
+     Hope this helps!"
+
+  structured:
+    { "conclusion": "...",
+      "hypothesesConsidered": [
+        { "hypothesis": "...", "supported": true,  "reasoning": "..." },
+        { "hypothesis": "...", "supported": false, "reasoning": "..." },
+        { "hypothesis": "...", "supported": false, "reasoning": "..." }
+      ]
+    }
+    ~500 tokens, queryable, judge-friendly, no parse gymnastics.
 ```
 
-No CoT. Not "let's think step by step about which category this falls into." Just the instruction and the three allowed outputs. Why? Because the classifier's output is one word, and asking for reasoning would (a) add tokens the parser has to strip, (b) risk the model emitting the reasoning *without* the word, (c) not improve the classification accuracy on a task that's already well-specified. Modern Haiku does the reasoning internally; asking it to emit the reasoning would be a token tax with no signal benefit.
+#### When CoT hurts
 
-```
-  When CoT is a token tax
+The 2026 caveat: frontier models do CoT internally now. Sonnet 4.6, GPT-5, Gemini 2.5 all reason before emitting. Explicitly asking for step-by-step in the prompt is *less necessary* than it was two years ago — and on simple lookups or structured classifiers, asking for CoT just wastes tokens.
 
-  simple lookup / single-word output   →  no CoT, model handles internally
-  structured classifier                 →  no CoT, output is the classification
-  arithmetic / logic puzzle              →  YES CoT, complex intermediate steps
-  multi-hypothesis reasoning            →  YES structured CoT, hypotheses are output
-```
+Two specific anti-patterns:
 
-**Step 6 — the interaction with structured output.**
+- **Simple classifier with CoT.** "Classify this intent as monitoring/diagnostic/recommendation. Think step by step." Adding "think step by step" makes the model produce 200 tokens of prose about why it's monitoring before emitting the answer. The classifier's job is one token. CoT is wasted.
 
-If you want both **reasoning** and **a structured answer**, the reasoning goes in a field of the structured output — not in free-form prose before the JSON. Free-form prose before JSON breaks the parser (see `02-structured-outputs.md`) and is the classic "the model was courteous and prefaced its JSON" bug. Structured CoT lives *inside* the JSON as a named field, so the parser reads the whole thing as one artifact.
+- **Structured output with CoT-in-prose.** "Reason step by step, then output JSON." The model emits both. The parser has to fight the prose. Structured CoT (reasoning inside the JSON field) is the right shape here.
 
-```
-  WRONG — CoT as prose before JSON:                RIGHT — CoT as field in JSON:
-
-  Let me think step by step. First,                {
-  I'll consider payment processor issues.           "reasoning": "First consider payment
-  Then UX regressions. Then upstream               processor. Then UX regressions. …",
-  traffic. Payment failures rose 31.2%             "conclusion": "Payment processor issue",
-  in the same window, so (a) is supported.          "hypothesesConsidered": [ … ]
-                                                    }
-  ```json
-  { "conclusion": "…", … }
-  ```
-
-  parser has to strip the prose;                   parser reads the whole JSON
-  courteous drift breaks parsing                    reasoning is a first-class field
-```
+Where CoT still earns its tokens: multi-step problems (this repo's diagnostic agent, which explicitly generates 2-3 hypotheses), long-context reasoning (RAG synthesis over multiple docs), and low-parameter models that still benefit from the explicit reasoning nudge.
 
 ### Move 2 variant — the load-bearing skeleton
 
-The kernel of structured CoT is four moves:
+The kernel of "CoT done right":
 
-```
-  hypothesize before act → falsify each → emit reasoning in schema → reward in rubric
-```
+1. **Reasoning lives inside the structured output.** Drop this and you have free-form prose adjacent to JSON — parseable but fragile.
+2. **The prompt names the reasoning structure explicitly.** "Generate 2-3 hypotheses" not "think step by step." The structure comes from the instruction, the content from the model.
+3. **Judge / consumer reads the reasoning field, not the prose.** Drop this and you have reasoning nobody actually verifies.
+4. **Reasoning length is bounded by the field's role.** Drop this and one hypothesis's reasoning balloons to 5000 tokens.
 
-What breaks if you skip each:
-
-- **Skip "hypothesize before act"** — the model queries first and reasons after. The reasoning becomes post-hoc justification of whatever was found.
-- **Skip "falsify each"** — the model confirms its favorite hypothesis with selective evidence. Rival hypotheses get lip service.
-- **Skip "emit reasoning in schema"** — the CoT stays in the model's head. The user sees the conclusion but not the reasoning; the eval can't score the reasoning; the audit trail is missing the "why."
-- **Skip "reward in rubric"** — the model finds shortcuts. Emitting one plausible-sounding hypothesis and calling it a day scores as well as considering three. The rubric's "rival mechanisms are considered" scale level is what makes the reward loop close.
-
-Hardening layered on top: explicit falsification prompts per hypothesis, self-critique loops (see `10-self-critique.md`), CoT-in-the-open (Anthropic's `thinking` blocks that stream reasoning to the user in real time).
+Hardening on top: provider-managed thinking (Anthropic's `thinking` block, OpenAI's `reasoning`), reasoning trace visualization for debugging, per-hypothesis eval scoring. None of that is the skeleton — the skeleton is: put reasoning in the schema, name the structure in the prompt, verify against a trace.
 
 ### Move 3 — the principle
 
-**CoT earns its tokens when the reasoning is an artifact the user, the eval, or the next stage reads.** If nobody reads the reasoning, you're paying for it and getting nothing. Modern models do CoT internally by default; the choice is whether to emit that reasoning as a first-class output. Emit when the audit trail matters; skip when the output is a single answer.
+**Reasoning inside the structured output is queryable; reasoning next to the structured output is folklore.** The old CoT advice was born in the pre-JSON-mode era, when models emitted text and you asked them to think out loud before answering. In 2026 the model can think structurally — you name the reasoning fields (hypothesis, supported, reasoning), and the model fills them in. Both the model and your parser are happier.
 
 ## Primary diagram
 
 ```
-  Structured CoT in the diagnostic agent — the full loop
+  CoT — the full recap
 
-  ┌── prompt method ────────────────────────────────────────┐
-  │  "Generate 2-3 hypotheses before the first tool call.   │
-  │   Query to falsify each hypothesis.                     │
-  │   Conclude with the hypothesis that best fits."          │
-  └────────────────────┬────────────────────────────────────┘
-                       │
-  ┌── ReAct loop ──────▼────────────────────────────────────┐
-  │  turn 1: reason (hypothesize) → act (query) → observe   │
-  │  turn 2: reason (falsify h1)  → act (query) → observe   │
-  │  turn 3: reason (falsify h2)  → act (query) → observe   │
-  │  turn 4: conclude (pick supported h) → emit             │
-  └────────────────────┬────────────────────────────────────┘
-                       │
-  ┌── output schema ───▼────────────────────────────────────┐
-  │  {                                                       │
-  │    "conclusion": "…",                                    │
-  │    "evidence": ["…"],                                    │
-  │    "hypothesesConsidered": [                             │
-  │      {"hypothesis":"…","supported":true, "reasoning":"…"},│
-  │      {"hypothesis":"…","supported":false,"reasoning":"…"},│
-  │      {"hypothesis":"…","supported":false,"reasoning":"…"} │
-  │    ]                                                     │
-  │  }                                                       │
-  └────────────────────┬────────────────────────────────────┘
-                       │
-  ┌── consumer ────────▼────────────────────────────────────┐
-  │  UI:   EvidencePanel renders hypotheses as collapsible  │
-  │  Eval: rubric scores "rival mechanisms considered" → 5   │
-  │  Next: RecommendationAgent reads the supported h        │
-  └─────────────────────────────────────────────────────────┘
+  prompt (§ 2 investigation approach)
+  ┌────────────────────────────────────────────────────┐
+  │  "1. Generate 2-3 hypotheses.                       │
+  │   2. Design queries to falsify each.                │
+  │   3. Locate when the change happened.               │
+  │   4. Conclude which hypothesis best fits."          │
+  └────────────────────────────────────────────────────┘
+                          │
+                          ▼
+  prompt (§ 4 output shape)
+  ┌────────────────────────────────────────────────────┐
+  │  hypothesesConsidered: [                            │
+  │    { hypothesis, supported, reasoning }             │
+  │  ]                                                  │
+  └────────────────────────────────────────────────────┘
+                          │
+                          ▼
+  model output (JSON with reasoning in the shape)
+  ┌────────────────────────────────────────────────────┐
+  │  conclusion: "..."                                  │
+  │  evidence:   [...]                                  │
+  │  hypothesesConsidered:                              │
+  │    [ { hypothesis: A, supported: true,  reasoning }, │
+  │      { hypothesis: B, supported: false, reasoning }, │
+  │      { hypothesis: C, supported: false, reasoning } ]│
+  └────────────────────────────────────────────────────┘
+                          │
+                          ▼
+  judge reads reasoning + tool_calls_trace
+  ┌────────────────────────────────────────────────────┐
+  │  evidence_grounding score cross-references          │
+  │  hypothesesConsidered[].reasoning against actual    │
+  │  tool results captured in tool_calls_trace          │
+  └────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The classic Wei et al. 2022 paper "Chain-of-Thought Prompting Elicits Reasoning" is what named the technique. What that paper measured was a real effect on GPT-3-era models where explicit CoT lifted accuracy on multi-step reasoning tasks by 10-30 points. Modern models (Sonnet 4.6, GPT-4.5, Gemini 2) have absorbed that discipline into their pretraining and post-training — they CoT internally by default. The residue of the technique is (a) structured CoT for artifact-shaped outputs, and (b) explicit CoT for cheaper/older models where internal reasoning is weaker.
+The Anthropic "extended thinking" mode is the modern alternative to structured CoT in the app-layer output. Enable it, and the model returns a separate `thinking` block on the response object — provider-managed, not counted against your JSON schema, billable at reasoning-token rates. This codebase doesn't use it yet, and the trade-off if it did: less prompt-side work (no need for `hypothesesConsidered`), but the reasoning trace lives in the API response, not in the JSON output. Downstream code (the judge) would have to be re-wired to pull reasoning from a different place.
 
-Anthropic's `thinking` blocks (introduced 2025) are the vendor-side answer to CoT: the model streams its internal reasoning as a special block that the API surfaces separately from the final answer. This is a middle ground between "reasoning in the model's head" (no observability) and "reasoning in the output JSON" (parseable but not real-time). This codebase does not currently use `thinking` blocks — the reasoning is emitted in `hypothesesConsidered` after the loop concludes, not streamed live during it.
+The OpenAI o1 / o3 / GPT-5 reasoning models take a similar approach — reasoning tokens are separate from response tokens, and you're billed for both. The prompt engineering discipline shifts: instead of asking the model to reason, you enable the reasoning mode and let the provider handle it. The catch: reasoning tokens are more expensive per token than input tokens, so it's a cost / quality trade-off, not a free upgrade.
 
-Two failure modes I've watched:
+The classic paper that gets cited for CoT is "Chain-of-Thought Prompting Elicits Reasoning in Large Language Models" (Wei et al., 2022). Worth reading. Worth noting that the paper's baseline models were text-only completion models — the reasoning improvement it measured is much smaller on modern chat models that already reason internally. The technique still works; the effect size has shrunk.
 
-- **The "reasoning-only" bug.** The prompt asks for reasoning and then the answer. The model emits paragraphs of reasoning and forgets the answer entirely, or runs out of `max_tokens` mid-thought. Fix: structured CoT with the reasoning as a *bounded* field (`reasoning: string`, not "explain your reasoning in detail").
-- **The "confidence-inflating" bug.** The model's reasoning includes phrases like "I am highly confident that..." and every conclusion is inflated. Fix: don't let the model emit its own confidence in prose. Give it a `confidence: high | medium | low` enum and constrain the choice.
-
-Related concepts:
-- **Few-shot** (`08-few-shot.md`) — few-shot of *reasoning* is a related pattern (show the model an example of the reasoning shape).
-- **Self-critique** (`10-self-critique.md`) — the natural extension when reasoning quality matters even more.
-- **Structured outputs** (`02-structured-outputs.md`) — reasoning-as-a-schema-field is structured output for reasoning.
-- **Eval-driven iteration** (`05-eval-driven-iteration.md`) — how you know CoT is earning its tokens.
+The self-consistency variant — run the same CoT prompt N times, take the majority vote — is real and expensive. It shows up in `10-self-critique.md`. This codebase doesn't use it for the agents (the eval harness runs each case once) but does use single-shot RubricJudge output (which is why judge variance shows up in receipt comparisons).
 
 ## Interview defense
 
-**Q: When does chain-of-thought earn its tokens in a production system, and when doesn't it?**
+**Q: Where does chain-of-thought live in your prompts?**
 
-Earns its tokens when the reasoning IS an artifact — read by the user, scored by an eval, consumed by the next stage. This codebase's diagnostic agent emits `hypothesesConsidered` as a first-class array; the UI renders it as collapsible hypothesis cards, the eval rubric scores whether rival mechanisms were considered, the audit trail preserves the reasoning. Doesn't earn its tokens when the output is a single answer (classifier) or when the reasoning is scratchpad the caller throws away. In this codebase the intent classifier deliberately has no CoT — the output is one word, and asking for reasoning would burn tokens for no downstream benefit.
-
-```
-  Decision — CoT yes/no
-
-  is the reasoning read downstream?
-   ├── yes (user, eval, next stage) → structured CoT
-   └── no (scratchpad thrown away)  → skip, model does it internally
-```
-
-Anchor: diagnostic prompt at `@aptkit/prompts/dist/src/diagnostic.js:14-19`; intent classifier at `@aptkit/agent-query/dist/src/intent.js:13`.
-
-**Q: Free-form CoT before a JSON output — what breaks?**
-
-The parser. The model emits reasoning as prose, then the JSON in a fence. If the parser looks for the fence first (as `parseAgentJson` does at `lib/mcp/validate.ts:3-13`), it recovers. If the parser is stricter — say "start of body must be JSON" — the reasoning prose breaks it. The fix is structured CoT: put the reasoning in a `reasoning` field *inside* the JSON. Then the whole output is one artifact, parseable and readable. This codebase does exactly that — the diagnostic emits `hypothesesConsidered[i].reasoning` as a string inside the JSON.
+Inside the structured output, not adjacent to it. The DiagnosticAgent's output schema at `lib/agents/legacy-prompts/diagnostic.md:65-72` includes a `hypothesesConsidered` array — each item names one hypothesis, whether the evidence supported it, and the reasoning. That's structured CoT. The prompt itself names the reasoning steps ("generate 2-3 hypotheses, test each") but doesn't say "think step by step" — the schema shapes the reasoning. Downstream (the RubricJudge) reads the reasoning field directly and grades it against the tool trace. Free-form CoT would be prose next to JSON, which the parser has to fight and the judge has to re-tokenize to grade.
 
 ```
-  Free-form CoT vs structured CoT — where the parser lives
-
-  free-form CoT:                        structured CoT:
-    "Let me think step by step…"          {
-    "First consider payment…"               "hypothesesConsidered": [
-    "Then UX…"                                {"reasoning":"consider payment…"},
-    ```json                                   {"reasoning":"consider UX…"}
-    { "conclusion": "…" }                    ],
-    ```                                     "conclusion": "…"
-                                            }
-  parser: strip prose then parse         parser: parse the whole thing
-                                          reasoning is a field, not a preface
+   free-form CoT:   prose reasoning + JSON  ── parser fights, judge re-reads
+   structured CoT:  reasoning field IN JSON ── one parse, judge queries field
 ```
 
-**Q: What's the load-bearing part people forget?**
+Anchor: `lib/agents/legacy-prompts/diagnostic.md:65-72` and `eval/rubrics/diagnosis-quality.ts:41-55`.
 
-The falsification framing. "Consider three hypotheses" gets you three hypotheses of which one is confirmed with cherry-picked evidence. "Falsify each hypothesis" gets you three hypotheses each tested to fail, and whichever survives is genuinely supported. The verb matters. Every production diagnostic prompt I've shipped has needed the falsification framing, and every one where I said "consider" instead of "falsify" produced confirmation-bias-flavored outputs.
+**Q: Frontier models reason internally now. Is explicit CoT dead?**
 
-Anchor: diagnostic prompt at `@aptkit/prompts/dist/src/diagnostic.js:16` — the exact phrasing is "Query to falsify each hypothesis." The falsify verb is doing the work.
+Less necessary, not dead. On simple lookups and structured classifiers, explicit "think step by step" wastes tokens — Sonnet 4.6 and GPT-5 reason internally before emitting. On multi-step reasoning tasks (this repo's diagnostic, which walks 2-3 competing hypotheses), a *structural* CoT still earns its tokens because the structure is queryable. On cheaper models — Haiku-class, GPT-4o-mini — explicit CoT still helps because their internal reasoning is weaker. The rule: measure. Run the eval with and without the CoT scaffolding; keep whichever wins on your rubric.
+
+```
+  frontier model + simple task:      skip CoT
+  frontier model + multi-step task:  structured CoT (reasoning field)
+  cheap model + any task:            explicit CoT still helps
+```
+
+Anchor: `lib/agents/legacy-prompts/diagnostic.md:18-23` — the prompt names the reasoning steps but doesn't say "think step by step."
 
 ## See also
 
-- `05-eval-driven-iteration.md` — how the rubric closes the CoT reward loop.
-- `08-few-shot.md` — few-shot of reasoning as a related pattern.
-- `10-self-critique.md` — the natural extension when reasoning quality matters more.
-- `02-structured-outputs.md` — reasoning-as-schema-field.
+- 02 · structured outputs — reasoning goes in a field of the schema, not next to it.
+- 05 · eval-driven iteration — the judge reads the reasoning fields directly against the tool trace.
+- 10 · self-critique — the vote-N-times variant of CoT.
+- 04 · token budgeting — structured CoT is bounded by field roles; free-form CoT balloons.

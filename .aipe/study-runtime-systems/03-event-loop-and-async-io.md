@@ -1,234 +1,250 @@
 # Event loop and async I/O
 
-*Event loop, microtasks, non-blocking I/O · Language-agnostic*
+**Industry:** event loop, microtasks and macrotasks, asynchronous I/O · Language-agnostic
 
 ## Zoom out — where this concept lives
 
-The event loop is the heartbeat of both server and client. Every async operation in this codebase either enqueues a task on the loop or awaits one that's already there. Understanding what's queued *where* is how you predict when work will actually run.
+Same single-threaded model as the last file, but now zoom in to the queue that decides what runs next. Everything the app does — reading a request, awaiting an MCP call, encoding an NDJSON line, checking a persisted config — is a task on one of two queues.
 
 ```
-Zoom out — the loop, on both sides
+  Zoom out — where the event loop sits
 
-┌─ Browser event loop (per tab) ────────────────────────────┐
-│  ★ React renders (macrotask via scheduler)                 │
-│  ★ fetch reader (microtask on .read() resolve)             │
-│  ★ setState → render commit (batched microtask)           │
-└─────────────────────────────────────────────────────────────┘
-
-┌─ Node event loop (per Vercel instance) ────────────────────┐
-│  ★ each route handler = one big Promise chain              │
-│  ★ every await ─►  hand control back to the loop           │
-│  ★ setTimeout(fn, ms) ─►  macrotask, ms later               │
-│  ★ Promise.resolve().then() ─►  microtask, this tick        │
-└─────────────────────────────────────────────────────────────┘
+  ┌─ Browser / Node ────────────────────────────┐
+  │                                             │
+  │  your code (async functions, event handlers)│
+  │       │                                     │
+  │       ▼                                     │
+  │  ★ event loop ★  ← THIS FILE                 │
+  │       │                                     │
+  │       ▼                                     │
+  │  runtime primitives (fetch, timers, fs, …)  │
+  │                                             │
+  └─────────────────────────────────────────────┘
 ```
 
-## Structure pass — one axis, two altitudes
+The concept: **a scheduler that alternates between draining a microtask queue and picking one macrotask at a time**. Async I/O (fetch, fs, network) yields to the loop when it starts, and the loop wakes up the awaiter when the I/O completes. Blocking the loop = freezing everything.
 
-Trace the axis *"is the loop making progress?"* down the abstraction levels.
+## Structure pass — layers, axis, seams
+
+Pick one axis — **when does control return to the loop?** — and trace it.
 
 ```
-"Is the loop making progress?" — trace it down
+  One axis (when does control return?) down the layers
 
-┌─ higher: awaited async operation ────────────────────┐
-│  await fetch(url) — the loop moves on to other work   │
-│    → YES, the loop makes progress                     │
-└──────────────────┬───────────────────────────────────┘
-                   │
-                   ▼
-┌─ lower: sync work between awaits ─────────────────────┐
-│  JSON.stringify(largeObject) — blocks the loop        │
-│    → NO, everything else waits                        │
-└────────────────────────────────────────────────────────┘
+  ┌─ your JS ────────────────────────────────┐
+  │  synchronous statement    → NOT until you │
+  │                             finish        │
+  │  await                    → IMMEDIATELY   │
+  └──────────────────────────────────────────┘
+      ↓
+  ┌─ V8's promise machinery ────────────────┐
+  │  microtask queue drains before the loop │
+  │  moves on                                │
+  └──────────────────────────────────────────┘
+      ↓
+  ┌─ Node's event loop phases ──────────────┐
+  │  timers · pending I/O · poll · check    │
+  │  each phase pulls from its own queue    │
+  └──────────────────────────────────────────┘
+
+  seam that matters: sync vs async. Below sync, no yields.
 ```
 
-The seam that carries a load: **sync ↔ async transition points.** Every `await` is a seam. Between two awaits, the loop is stuck on whatever synchronous code sits there. Blooming avoids blocking by keeping sync sections small (parse a truncated tool result, format a status line) — no CPU-heavy loops, no synchronous file reads inside request handling (except at module load, which happens once per instance and doesn't affect requests).
+**The seam:** synchronous code = zero yields until you return. Async code = yields at every `await`. Between the two lies every blocking-hazard bug ever written.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know how `Array.forEach` runs its callback synchronously and blocks the current stack frame? The event loop is what schedules code *between* stack frames. When your stack empties (the current sync work finishes), the loop picks the next thing to run: first microtasks (Promise callbacks), then one macrotask (a `setTimeout` callback, an I/O completion), and back to microtasks.
+You know how `Array.prototype.map` runs synchronously and blocks — you can't have a `.map(async (x) => await …)` and expect it to await? The reason is the loop: `.map` returns immediately with a list of promises; nothing awaited them. That gap between "started the work" and "waited for the work" is the entire event loop model.
 
 ```
-The tick — what happens between two lines of your code
+  Pattern — the event loop's inner cycle
 
-  sync code runs        ───┐
-    ─►  awaited value       │  current stack
-        resolves             ▼
-  ┌──────────────────────────────────────┐
-  │  stack empties                        │
-  └─────────────────┬────────────────────┘
-                    ▼
-  ┌──────────────────────────────────────┐
-  │  drain the microtask queue           │  ← all of it, before anything else
-  │  (Promise .then, queueMicrotask)     │
-  └─────────────────┬────────────────────┘
-                    ▼
-  ┌──────────────────────────────────────┐
-  │  pick ONE macrotask                  │  ← one at a time
-  │  (setTimeout, I/O completion, etc.)  │
-  └─────────────────┬────────────────────┘
-                    ▼
-  ┌──────────────────────────────────────┐
-  │  drain the microtask queue AGAIN     │  ← the loop is microtask-first
-  └──────────────────────────────────────┘
+  ┌── pick next macrotask (from queue) ──┐
+  │                                      │
+  │   ┌────────────────────────────┐    │
+  │   │ run macrotask synchronously │    │
+  │   │ (until it returns or awaits)│    │
+  │   └────────────┬───────────────┘    │
+  │                │                     │
+  │                ▼                     │
+  │   ┌────────────────────────────┐    │
+  │   │ drain ALL microtasks       │    │
+  │   │ (resolved promises, .then) │    │
+  │   └────────────┬───────────────┘    │
+  │                │                     │
+  │                ▼                     │
+  │   ┌────────────────────────────┐    │
+  │   │ poll for I/O completions    │    │
+  │   │ (fetch resolved, fs done)   │    │
+  │   └────────────┬───────────────┘    │
+  │                │                     │
+  └────────────────┴─────────────────────┘
+
+  drain microtasks between EVERY macrotask
 ```
 
-Practical consequence: a Promise chain runs to completion before any `setTimeout` fires. If you write `Promise.resolve().then(a).then(b)` and also `setTimeout(c, 0)`, order is `a → b → c`, not `a → c → b`.
+The two queues (microtask + macrotask) is the trap. If you enqueue a new microtask *inside* the microtask drain, it gets drained too. An infinite chain of `.then().then()...` blocks the loop forever without ever running a timer or I/O callback. That's "microtask starvation."
 
-### Move 2 — how the codebase actually uses this
+### Move 2 — the pieces that matter here
 
-#### Non-blocking I/O everywhere in the request path
+#### Async fetch and NDJSON streaming
 
-Every server-side I/O in this codebase is async. Grep for `fs.readFileSync` in request-time code and you find only two categories:
+The heaviest async work in the repo is the NDJSON stream from `app/api/agent/route.ts` back to the browser. The server writes chunks into a `ReadableStream` (`app/api/agent/route.ts:189-193`); the browser reads with `readNdjson` in `useInvestigation`. Both sides are await-driven — no blocking.
 
-  → **Module-load reads** — `lib/agents/monitoring-legacy.ts:13`, `lib/agents/diagnostic-legacy.ts:14`, `lib/agents/recommendation-legacy.ts:14`, `lib/agents/query-legacy.ts:13`. These run once when the module is first imported, on the cold-start path. After that, the strings live in module scope.
-
-  → **Request-time reads of small JSON files** — `lib/state/investigations.ts:15`, `lib/mcp/auth.ts:118` (dev only), `app/api/briefing/route.ts:89`, `app/api/agent/route.ts:52`. These read small files (demo snapshots, dev-only auth cache, dev-only investigation cache) synchronously. They block the loop for a millisecond or two — fine for their scale, but the pattern is worth calling out: in production the auth cache is a cookie (no blocking read) and the investigation cache is in-memory.
-
-Everything else is `await`ed:
+Server side, one investigation event produces one enqueue:
 
 ```
-The server-side I/O ledger — everything the loop waits on
-
-request path (per HTTP request):
-  await bootstrap(schema)             ← MCP list_cloud_organizations + list_projects
-  await dataSource.listTools(signal)  ← MCP list_tools
-  await agent.investigate(...)        ← Anthropic + N × MCP tool calls
-  await controller.enqueue(...)       ← Web Stream backpressure (implicit)
-
-background of every await:
-  the loop is FREE — other requests' awaits can resolve,
-  their handlers get a turn to run
+  // app/api/agent/route.ts:192-195 — send is the enqueue path
+  const send = (e: AgentEvent) => {
+    collected.push(e);
+    controller.enqueue(encoder.encode(encodeEvent(e)));
+  };
 ```
 
-#### The one place where "microtask vs macrotask" order matters
+Each `send()` runs synchronously — no await — so many events can go out in one macrotask if they're generated back-to-back. Between agent-loop turns (which do await the model), the loop yields, the browser reads the buffered chunk, and the next macrotask runs.
 
-In practice, the codebase doesn't lean on that distinction. Every `await` and every `.then()` runs as a microtask; every `setTimeout(r, ms)` runs as a macrotask. The two never race against each other because there's no case where the order matters:
+Client side, `readNdjson` reads bytes → splits on `\n` → calls a handler per line. Because the handler is synchronous (`lib/hooks/useInvestigation.ts:99-153` is a big `switch` with `setState` calls) and React 19 batches `setState`, one chunk becoming many events becomes one render pass, not many.
 
-  → **`sleep(ms)`** at `lib/data-source/bloomreach-data-source.ts:73-75` — used for backoff, order doesn't matter, just the delay.
-  → **`REPLAY_DELAY_MS`** at `app/api/briefing/route.ts:25` and `app/api/agent/route.ts:103` — used to pace the demo replay so it *feels* animated. Order doesn't matter.
+#### The 30s per-call MCP timeout is a race between promises
 
-If a future feature needed to coordinate "run this thing after the current promise chain but before the next timer," the microtask/macrotask distinction would matter. It doesn't today.
+`lib/mcp/transport.ts:131` composes signals — the client's cancel signal OR a 30s `AbortSignal.timeout` — with `AbortSignal.any`. The MCP SDK internally does `fetch(url, { signal })`. When either signal fires, the fetch rejects with `AbortError`.
 
-#### The Web Streams reader loop — where the loop gets its steadiest tick
+The key subtlety: `AbortSignal.timeout(30_000)` isn't a `setTimeout` you have to clean up. It's the runtime's timeout primitive that automatically aborts the signal when the timer fires. Under the hood, that IS a macrotask on the timer queue — the event loop's `timers` phase picks it up and dispatches. If the main thread is blocked (a synchronous loop that never yields), the timer fires late and the timeout is effectively longer than 30s. Not a problem here because we don't block; worth knowing as the failure mode.
 
 ```
-readNdjson — the client's tightest await loop
+  Layers-and-hops — how a 30s timeout actually fires
 
-// lib/streaming/ndjson.ts:32-51
-while (true) {
-  if (opts?.cancelOn?.()) {           ← polled synchronously between reads
-    await reader.cancel();
-    return;
+  ┌─ transport.ts ─────────────┐   compose signal (route + 30s timeout)
+  │  callTool()                │   ─────────────────►
+  └────────────┬───────────────┘
+               │
+               ▼
+  ┌─ MCP SDK client ───────────┐   hop: pass signal into fetch
+  │  client.callTool()         │   ─────────────────►
+  └────────────┬───────────────┘
+               │
+               ▼
+  ┌─ Node fetch (undici) ──────┐   hop: reject with AbortError
+  │  waits on socket / signal  │   ◄────────── first signal to fire wins
+  └────────────┬───────────────┘
+               │
+               ▼
+  ┌─ V8 timer queue ───────────┐
+  │  AbortSignal.timeout(30s)  │  ← lives here as a macrotask
+  │  fires only when this      │
+  │  phase of the loop runs    │
+  └────────────────────────────┘
+```
+
+#### Runtime detection for browser-only APIs
+
+`lib/mcp/config.ts:80` uses runtime detection instead of environment flags:
+
+```
+  // lib/mcp/config.ts:77-82 — btoa/Buffer runtime split
+  export function encodeConfigHeader(config: McpConfigOverride): string {
+    const json = JSON.stringify(normalizeConfig(config));
+    // btoa is available in browsers; Node has Buffer. Runtime detection.
+    if (typeof btoa === 'function') return btoa(json);
+    return Buffer.from(json, 'utf8').toString('base64');
   }
-  const { value, done } = await reader.read();   ← the await that dominates the loop time
-  if (done) break;
-  buf += decoder.decode(value, { stream: true });
-  const lines = buf.split('\n');
-  buf = lines.pop() ?? '';
-  for (const raw of lines) {
-    const line = raw.trim();
-    if (!line) continue;
-    try {
-      onEvent(JSON.parse(line) as E);   ← sync work per line: parse + dispatch
-    } catch (err) {
-      opts?.onMalformed?.(line, err);
-    }
-  }
-}
 ```
 
-Every `await reader.read()` yields to the browser's event loop. Between reads, React can render, other timers can fire, other handlers can run. This is why streaming NDJSON *feels* animated on the client even though the browser is single-threaded — the reader loop pauses at `await`, lets the render commit, and picks up when the next chunk arrives.
+This is not about the event loop directly, but about *which* runtime you're on. The reason it matters here: if the config module were imported into a browser bundle with `Buffer` at the module top level, the bundler would inline all of `node:buffer` into the client bundle — hundreds of KB of code that will never run. Runtime detection avoids the import at module load, avoids the bundle bloat, and works in both bands. Same idea for `atob` on decode (`lib/mcp/config.ts:91`).
 
-The sync work per chunk (decode → split → forEach parse) is bounded: a chunk is typically a few KB, split into 1–20 lines, each line ≤ 4KB after route-side truncation. No line-parse loop blocks the browser meaningfully.
+Same shape: SSR-safety guards on localStorage. `lib/mcp/config.ts:107`, `:122`, `:143` all check `typeof localStorage === 'undefined'` first. Node has no `localStorage`; touching it would throw. The pattern is: **detect the API before you use it, don't assume the environment**.
 
-#### The server-side ReadableStream writer — implicit backpressure
+#### Blocking hazards — where they could show up
 
-Web Streams have a backpressure signal: if the consumer is slow, `controller.enqueue` returns eventually but the internal buffer bloats. In practice, blooming insights writes at the pace agents produce events (~one per second), and consumers (the browser) read as fast as they arrive, so backpressure never triggers. The codebase doesn't handle backpressure explicitly — if a browser tab throttled reads to zero, the route would happily fill an unbounded buffer until `maxDuration` kicked in.
+Two synchronous operations in the repo would matter if they scaled:
+
+1. **`readFileSync(CACHE_FILE, 'utf8')` in dev auth cache** — `lib/mcp/auth.ts:118`. In dev only (`process.env.NODE_ENV === 'development'`), the auth store reads/writes a JSON file synchronously on every provider method call. That would block the loop; dev doesn't care because there's one user. In production the ALS store replaces this path.
+
+2. **`JSON.parse` on the cached investigation demo file** — `app/api/agent/route.ts:53`. Same story: a synchronous read of a small file. Not a hot path.
+
+Both are marked as dev-only paths in comments. The production path is entirely async I/O.
+
+#### Where microtask starvation would bite
+
+The chain `.then().then().then()` never yields to the timer or I/O queue. Fortunately, no code in the repo builds a Promise chain that recursively enqueues microtasks. The agent loop awaits real I/O (fetch to Anthropic, fetch to MCP), so every turn goes through a macrotask boundary. If someone wrote a "for-each-of-1000 items do await Promise.resolve()" loop, that would starve the timer queue until it finished; it doesn't exist today.
 
 ### Move 3 — the principle
 
-**The event loop is fair *between* awaits, brutal *inside* them.** Async in JavaScript is cooperative: every `await` is a yield point, and the loop redistributes CPU accordingly. The moment your code stops yielding — a sync loop, a big JSON.stringify, a synchronous file read — every other request on the instance stops making progress until you finish. Non-blocking I/O isn't a nice-to-have; it's the load-bearing property that keeps a single-loop runtime honest.
+Async I/O and the event loop are one machine: I/O calls hand a callback to the loop, the loop wakes up the awaiter when the I/O is done. Every millisecond of blocking synchronous work is a millisecond nothing else runs — not another request, not a timer, not the next chunk of the same stream. On a serverless function that's fine (one user, one thread, mostly waiting on network). On a browser tab it's the difference between smooth scroll and jank. The design pattern that falls out: **do CPU work in short bursts, do I/O eagerly, prefer await over synchronous polling**.
 
-The corollary: to reason about throughput and latency, count `await`s. Every `await` is a scheduling boundary. Every sync section between them is a potential stall.
-
-## Primary diagram — the full async surface
+## Primary diagram
 
 ```
-Event loop + async I/O across both bands
+  Event loop and async I/O — full picture
 
-BROWSER LOOP
-┌───────────────────────────────────────────────────────────────┐
-│  readNdjson: await reader.read()  ─►  yields to loop           │
-│    │                                                           │
-│    ├─►  React render commits (microtask)                       │
-│    ├─►  other fetch handlers (their own microtasks)            │
-│    └─►  next reader.read() resolves, sync parse loop runs      │
-│                                                                 │
-│  every setState → microtask → re-render                        │
-└───────────────────────────────────────────────────────────────┘
-                             │  HTTPS
-                             ▼
-NODE LOOP (Vercel instance)
-┌───────────────────────────────────────────────────────────────┐
-│  ROUTE HANDLER = one big async function                       │
-│    ├── module-load reads (once per instance)                  │
-│    ├── await bootstrap(signal)             ─►  yields         │
-│    ├── await listTools(signal)             ─►  yields         │
-│    ├── await agent.investigate({signal})   ─►  yields many    │
-│    │      │                                    times inside   │
-│    │      └── await dataSource.callTool()      the agent loop │
-│    │            └── await sleep(minInterval)  ─►  yields      │
-│    │            └── await transport.callTool ─►  yields       │
-│    ├── send(event) ─► controller.enqueue                      │
-│    │      (sync write into a bounded stream buffer)           │
-│    └── send({type:'done'}) ─► controller.close()               │
-│                                                                 │
-│  What's not here: no sync CPU loops, no fs.readFileSync of     │
-│  request-scoped data, no blocking work between awaits.        │
-└───────────────────────────────────────────────────────────────┘
+  ┌─ your code (route handler, hook, agent) ─────────────────────┐
+  │                                                              │
+  │   sync stmt   sync stmt   await ─┐   sync stmt   await ─┐    │
+  │      │           │              │      │              │    │
+  │      └─── run to completion ────┘      └── yields ────┘    │
+  │                                                              │
+  └──────────────────────────────────────┬───────────────────────┘
+                                         │
+                                         ▼
+  ┌─ V8 promise + microtask machinery ───────────────────────────┐
+  │                                                              │
+  │   microtask queue                                            │
+  │     .then callbacks · queueMicrotask · MutationObserver       │
+  │   drains COMPLETELY between every macrotask                  │
+  │                                                              │
+  └──────────────────────────────────────┬───────────────────────┘
+                                         │
+                                         ▼
+  ┌─ event loop phases (Node's model) ───────────────────────────┐
+  │                                                              │
+  │   ┌─ timers ─┐  ┌─ I/O ─┐  ┌─ poll ─┐  ┌─ check ─┐          │
+  │   │ setTimeout│  │ fs / │  │ waits │  │ setImmediate│         │
+  │   │ signal   │  │ net  │  │ for I/O│  │            │          │
+  │   │ .timeout │  │      │  │       │  │            │          │
+  │   └──────────┘  └──────┘  └──────┘  └────────────┘          │
+  │                                                              │
+  │   microtask drain runs between every phase transition        │
+  └──────────────────────────────────────────────────────────────┘
+
+  hazards this design avoids:
+    · sync file/net reads (except tiny dev-only paths)
+    · long promise chains that starve timers
+    · Buffer.from at module top level (bundle bloat)
+    · touching localStorage on the server (SSR crash)
 ```
 
-## Elaborate — why non-blocking I/O is load-bearing on Vercel
+## Elaborate
 
-Vercel's serverless model gives you one Node process per warm instance. That instance may serve dozens of requests concurrently (Vercel routes based on capacity). If any one handler blocks the loop for even a second, every other in-flight handler stalls for that second. Because the platform can spin up new instances under load, a blocked-loop bug doesn't kill availability — but it wrecks p95/p99 latency invisibly.
+The two-queue model (microtasks + macrotasks) is a compromise. Microtasks let you handle "the promise just resolved, do the next thing" without a full loop turn; macrotasks let real I/O and timers get their say. If everything were a microtask, the loop would never breathe. If nothing were, promises would feel laggy.
 
-The codebase's discipline of `await`-everything-that-can-await is what keeps p95 bounded. The `finally` block log at `app/api/briefing/route.ts:317-324` records per-phase timings so a regression on this discipline would show up in Vercel logs immediately.
+Node's phased loop (timers → pending → poll → check → close) is Node-specific; browsers have a simpler "tasks and microtasks" model driven by the HTML spec. For the purposes of writing app code, treating them as "microtasks first, then one macrotask" is close enough. The difference matters when you're debugging why a `setImmediate` runs before or after a `setTimeout(fn, 0)` — a rabbit hole `blooming_insights` never goes down.
+
+Read `04-shared-state-races-and-synchronization.md` next: it takes the "every await is a yield point" fact from this file and turns it into a design pattern (ALS per-request scoping). Then `05-memory-stack-heap-gc-and-lifetimes.md` walks how allocations across many async task chains interact with the GC.
 
 ## Interview defense
 
-**Q: Explain the microtask vs macrotask distinction using a concrete function in this codebase.**
+**Q: What actually happens when I write `await someFetch()`?**
 
-```
-readNdjson at lib/streaming/ndjson.ts:17
+The `await` desugars to a `.then` on the promise. Your function *pauses* — its remaining lines become a callback registered on the promise. Control returns to the event loop. The loop picks the next task. When the fetch's underlying I/O completes (usually via libuv on Node, the network stack on the browser), the runtime resolves the promise. That resolution enqueues your callback on the microtask queue. On the next microtask drain — which happens between every macrotask — your remaining code runs.
 
-  await reader.read()      ← the promise this returns resolves as a MICROTASK
-                              when the next chunk arrives
+*Diagram to sketch: two horizontal timelines — "your code" and "event loop" — with an arrow from `await` down into a "microtask queue" box, then back up to "your code resumes" after the I/O box.*
 
-  setTimeout(r, REPLAY_DELAY_MS)  ← the callback here fires as a MACROTASK
-                                     140ms later (briefing demo replay)
-```
+**Q: What blocks the event loop in `blooming_insights`?**
 
-The reader's next-chunk callback runs in the same tick that the read completes; the demo replay's pacing runs in a later tick. Microtasks drain fully between macrotasks, so if the reader had pending Promises resolving faster than 140ms, they'd all run before the replay's next `setTimeout` fired.
+Nothing in production, by design. In dev, `lib/mcp/auth.ts:118` does `readFileSync` for the auth cache — but that's guarded by `NODE_ENV === 'development'` and never runs on Vercel. In production the same code path goes through the ALS-scoped cookie store, which is all sync-but-tiny reads (dict lookups on a small object). The agent loop awaits real network I/O, so the loop breathes on every turn. The one *theoretical* blocker would be a runaway synchronous loop in an agent tool's result-processing — we truncate results at 4000 bytes (`TRUNC = 4000`) partly to keep JSON.parse cheap.
 
-**Q: Where in this codebase could you accidentally block the event loop?**
+*Diagram to sketch: the loop-cycle diagram with red X marks on "sync file read" and "long JSON.parse" and green checks on "await fetch," "await callTool," "await messages.create."*
 
-Two spots:
+**Q: The load-bearing part people forget about the event loop?**
 
-  → **Module load**, the `readFileSync` calls in `lib/agents/*-legacy.ts` (only the legacy adapters; the current AptKit-backed agents don't). These run once per instance during cold start; they block cold-start latency but not request latency after that.
+Microtasks drain to *completion* before the loop moves on. If you build a chain of `Promise.resolve().then().then()...` that keeps enqueuing new microtasks, the loop never gets to run timers or I/O completions. The load harness never triggers this because the worker pool awaits real network I/O on every turn — but it's the failure mode you'd hit if you wrote a "synchronously batch 10000 things" helper that pretended to be async.
 
-  → **`JSON.parse` / `JSON.stringify` of large tool results.** `app/api/briefing/route.ts:71-75` truncates results to 4KB before parsing (`trunc`), which caps the sync work. Without that truncation, a multi-MB EQL response would freeze the loop for the parse duration.
-
-Anchor: `TRUNC = 4000` at `lib/state/insights.ts`-adjacent route code; the truncation function is the load-bearing part.
-
-**Q: What happens if the browser stops reading the NDJSON stream mid-briefing?**
-
-Web Streams' backpressure kicks in on the *client* — `reader.read()` blocks until the internal buffer drains. On the *server*, `controller.enqueue` would keep filling the buffer up to whatever bound Node's stream layer chose. In practice: nothing does this in the app. If it did, the route would hit `maxDuration = 300` and Vercel would kill the function; the browser would see the connection close.
+*Diagram to sketch: the loop-cycle with the microtask box growing indefinitely, arrows from the box back into itself, and the timer phase greyed out and starving.*
 
 ## See also
 
-  → `02-processes-threads-and-tasks.md` — the single-loop assumption that makes this whole model work.
-  → `06-filesystem-streams-and-resource-lifecycle.md` — the `ReadableStream` mechanics and the NDJSON reader kernel in detail.
-  → `07-backpressure-bounded-work-and-cancellation.md` — how the loop's timers combine with AbortSignal to bound work.
+- `02-processes-threads-and-tasks.md` — the single-thread rule this file builds on
+- `04-shared-state-races-and-synchronization.md` — what "every await is a yield" means for shared state
+- `07-backpressure-bounded-work-and-cancellation.md` — how AbortSignal composes with the event loop's timer phase

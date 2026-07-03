@@ -1,36 +1,92 @@
-# study-system-design — blooming insights
+# Study — System Design (applied)
 
-Where components live in this repo, how data and work move, and where the boundaries carry weight. Two passes, one folder.
+The system-design guide for **blooming insights** — a Next.js 16 SPA that
+runs a multi-agent AI analyst against an MCP server (Bloomreach is the
+default preset), streams the reasoning to the browser as NDJSON, and now
+lets a visitor swap in their own MCP server + auth strategy from the UI.
+
+This is a per-repo study. The lens inventory in `audit.md` is walked
+against the code that's actually here. The pattern files in `01-…` to
+`08-…` name only patterns the repo actually exercises — the file list
+itself is a teaching artifact.
 
 ## Reading order
 
-```
-  1. 00-overview.md              the whole system in one diagram + legend
-  2. audit.md                    the 8-lens walk of what the repo does
-  3. 01-*.md through 07-*.md     one file per load-bearing pattern
-```
+1. **`00-overview.md`** — one-page orientation: full-system ASCII
+   diagram + legend. Skim this and you have the whole map.
+2. **`audit.md`** — the 8-lens audit, Pass 1. Every lens named,
+   every finding grounded in `file:line`.
+3. **Pattern files, in order:**
 
-Start at `00-overview.md`, skim `audit.md`, then read the pattern files that light up something you want to reason about.
-
-## The pattern files
-
-Named after what the repo actually does — not after the lens they were found under.
-
-- `01-datasource-seam.md` — the port (`DataSource`) + three adapters + one decorator; **four shipments through the same seam, zero caller changes**. The load-bearing receipt of the whole codebase.
-- `02-aptkit-boundary.md` — three-class bridge (`AnthropicModelProviderAdapter`, `BloomingToolRegistryAdapter`, `BloomingTraceSinkAdapter`) between Blooming's app and `@aptkit/core`'s provider-neutral primitives.
-- `03-ndjson-streaming.md` — one `readNdjson` kernel + one `AgentEvent` contract; four surfaces (briefing, agent, capture, chat) all speak it.
-- `04-oauth-boundary.md` — PKCE + Dynamic Client Registration through `OAuthClientProvider`; the encrypted-cookie vs dev-file split lives at the trust boundary.
-- `05-demo-vs-live-mode.md` — three-mode runtime toggle (`demo | live-bloomreach | live-synthetic`) picked at the route with `bi:mode`; demo replays a committed snapshot, live-synthetic swaps the DataSource adapter.
-- `06-budget-and-observability.md` — `BudgetTracker` threaded through `AgentHooks` gates model dispatch; `onCapabilityEvent` forwards the trace to the eval + ledger.
-- `07-eval-regression-gate.md` — golden cases + rubric judge + baseline.json + a CI-invocable gate that blocks PRs on per-dimension regression.
+   1. `01-request-flow.md` — browser → route → agents →
+      DataSource, with the per-request MCP config header decode step.
+   2. `02-auth-boundary-and-swappable-mcp.md` — three
+      `OAuthClientProvider` implementations (Bloomreach OAuth /
+      bearer / anonymous), the precedence chain, the trust
+      boundary at the MCP URL.
+   3. `03-provider-abstraction-and-datasource-seam.md` — the port
+      (`DataSource`), the 5 uses receipt, why the abstraction has
+      shipped without a caller-surface change.
+   4. `04-aptkit-agent-primitive-boundary.md` — where in-house
+      Blooming code stops and the AptKit primitive begins; the
+      three bridging adapters; how the budget ceiling and
+      capability trace ride this seam.
+   5. `05-streaming-ndjson.md` — one kernel, four consumers, one
+      producer contract (`AgentEvent`).
+   6. `06-per-request-config-transport.md` — the UI settings modal
+      → localStorage → base64 header → route decode → env fallback
+      transport.
+   7. `07-demo-replay-as-reliability.md` — the committed snapshot
+      path, now hidden from the UI toggle but still functional as
+      the presentation-reliability escape hatch and the regression
+      baseline.
+   8. `08-schema-gated-coverage.md` — how the monitoring agent
+      refuses to spend EQL budget on categories the workspace
+      doesn't support.
 
 ## Cross-links to neighboring foundation guides
 
-System-design owns architectural boundaries and tradeoffs. Mechanism-level teaching belongs to the neighboring generators:
+- `study-database-systems` — storage-engine internals (transactions,
+  indexes, MVCC). This repo has no database engine of its own; state
+  lives in in-memory maps + `sessionStorage` + localStorage + committed
+  JSON. `study-database-systems` may still be worth reading for the
+  vocabulary; it doesn't exercise this repo.
+- `study-data-modeling` — the *shape* of `Insight` / `Anomaly` /
+  `Diagnosis` / `Recommendation` and the `AgentEvent` NDJSON
+  discriminated union.
+- `study-distributed-systems` — coordination-under-partial-failure
+  vocabulary (retries, idempotency, rate limits). The Bloomreach
+  rate-limit retry ladder and the OAuth session cookie flow live at
+  that seam.
+- `study-runtime-systems` — Next.js 16 App Router execution model,
+  the `AsyncLocalStorage` cookie plumbing, `ReadableStream` back-
+  pressure, `AbortSignal` propagation.
+- `study-networking` — HTTP semantics (streaming responses, chunked
+  transfer, `x-forwarded-host` at Vercel's edge), the OAuth 2.1 +
+  PKCE + DCR flow the Bloomreach preset uses.
+- `study-software-design` — pattern vocabulary (port, adapter,
+  client, seam, factory, dependency injection, decorator). The
+  DataSource seam and the AuthProvider factory pattern both live at
+  that altitude.
+- `study-agent-architecture` — the ReAct-style agent loop, tool
+  registries, budget threading — those internals now live inside
+  `@aptkit/core@0.3.0`, bridged into this repo through the three
+  adapters in `lib/agents/aptkit-adapters.ts`.
 
-- `study-database-systems` — engine internals of any datastore. Blooming has none today (in-memory `Map`s keyed by session id, gitignored JSON in dev), so the database guide is thin here.
-- `study-data-modeling` — the shape of the `Insight` / `Anomaly` / `Diagnosis` / `Recommendation` / `AgentEvent` types. When you want to know *why the schema looks like this*, that guide has it.
-- `study-distributed-systems` — coordination correctness across processes. Blooming runs single-process on Vercel with session-scoped in-memory state; the distributed guide notes what would need to change if the state grew a network hop.
-- `study-runtime-systems` — the Vercel edge runtime, `AsyncLocalStorage`, `AbortSignal`, `ReadableStream`. That guide covers *how* those primitives execute; this one covers *where* they are used and what boundary they sit behind.
-- `study-networking` — HTTP semantics, streaming transports, the MCP `StreamableHTTPClientTransport`. That guide covers wire behavior; this one covers which components exchange bytes across the wire.
-- `study-software-design` — code-level patterns (deep modules, layering, information hiding). System-design points at the boundaries; software-design walks how the code on each side is shaped.
+## The load-bearing finding
+
+The **DataSource seam has now shipped in FIVE uses without a caller-
+facing interface change:**
+
+1. Olist adapter added (Phase 2 exploration)
+2. Olist adapter removed (PR #8)
+3. `SyntheticDataSource` added
+4. `FaultInjectingDataSource` decorator (Week 4B offline chaos)
+5. **`McpDataSource` + `AuthProvider` generalization (Session B)** —
+   Bloomreach reduced from baked-in default to one preset among many;
+   user-visible config now picks any MCP server
+
+Five different pressures on the same boundary, and the agents +
+route handlers never noticed. That's the senior-signal receipt for
+the port (`DataSource`) pattern in this repo. See
+`03-provider-abstraction-and-datasource-seam.md`.

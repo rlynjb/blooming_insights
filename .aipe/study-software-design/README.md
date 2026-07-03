@@ -1,82 +1,90 @@
-# Software design — this repo, through the AOSD lens
+# Study — Software Design (blooming insights)
 
-Applied audit of **blooming_insights** through John Ousterhout's
-*A Philosophy of Software Design* (AOSD). Deep modules, information
-hiding, complexity, layering, readability — grounded in real files,
-line ranges, and named fixes.
+The AOSD primitives from John Ousterhout's *A Philosophy of Software Design*, applied to this repo. Complexity is the enemy; deep modules are the weapon. Every finding here points at a real file.
 
-The book supplies the ideas. Every claim below cites your code.
+## Source & attribution
 
-## The through-line
+This guide teaches Ousterhout's ideas in original words and anchors them to your code. For the full book-length treatment of any primitive (deep modules, information hiding, layering, error definition), read *A Philosophy of Software Design*. Nothing here reproduces the book; the value here is in the findings about your codebase.
 
-**Complexity is the enemy. Deep modules are the weapon.**
-A deep module is one where a small interface hides a large body of
-work: `DataSource` is 71 LOC of interface hiding ~740 LOC of adapter
-work (Bloomreach + Synthetic + FaultInjecting). Shallow modules —
-where the interface is nearly as complex as the body — accumulate.
-The nine `*-legacy.ts` files under `lib/agents/` are the biggest
-shallowness surface in this repo today.
+Companion generator: `.aipe/read-aposd/` teaches the primitives abstractly; this guide applies them to your files.
 
-Every module you write in this codebase should be pushed toward
-depth: hide more, expose less. Every leaked decision (a fact that
-must be edited in two places to stay consistent) should be pulled
-into one owner.
+## Through-line
+
+```
+  Complexity is the enemy — deep modules are the weapon
+
+  ┌──────────────────────────────────────────────────────────────┐
+  │  the more a module hides, the less its callers must know     │
+  │  the less its callers must know, the fewer places a change   │
+  │  amplifies to — that is what "less complex" means            │
+  └──────────────────────────────────────────────────────────────┘
+
+  the two shapes to recognize on any pull request:
+
+     deep                                  shallow
+     ────                                  ───────
+     small interface, big body             wide interface, small body
+     hides many decisions                  exposes the internals
+     callers stay simple                   callers replicate the mechanism
+     one change stays local                one change amplifies
+
+  every finding in this guide is a bet on which shape a piece of
+  your code is closest to — and, when it's the wrong one, the
+  specific move that would flip it
+```
 
 ## Reading order
 
-1. `audit.md` — the 8-lens walk. **Read first.** Names every finding
-   with `file:line`; cross-links to the pattern files where the deep
-   walk lives.
-2. `01-datasource-port.md` — deep module: the port / adapter seam.
-3. `02-aptkit-bridge.md` — information hiding: the three-class
-   adapter bundle that fences the aptkit dependency inside one file.
-4. `03-fault-injecting-decorator.md` — decorator: same interface,
-   extended behavior. The seam's third live use.
-5. `04-optional-hooks.md` — additive extensibility: `onCapabilityEvent`
-   and `budget` as optional hooks that keep existing callers unchanged.
-6. `05-fallback-chain.md` — nullish-coalesce composition:
-   `estimateCost(...) ?? estimateAnthropicCost(...)` as the primary+
-   fallback shape.
-7. `06-ndjson-kernel.md` — pulled complexity downward: one 64-LOC
-   kernel absorbs the fetch → reader → decoder → split → parse loop
-   from three call sites.
+```
+  1.  audit.md              start here — 8 lenses across your repo
+                            (complexity → deep-vs-shallow → info hiding
+                            → layers → pull-down → errors → readability
+                            → red-flags checklist)
 
-## Top three fixes, ranked
+  2.  01-port-adapter-decorator-preset-factory.md
+                            the DataSource seam: five roles in one
+                            300-LOC directory. the load-bearing win
+                            (5 uses without a caller-surface change)
 
-1. **Delete `lib/agents/*-legacy.ts` (9 files, ~1000 LOC).** Only two
-   test files import from `base-legacy.ts`; nothing production
-   references any of the seven others. The rollback receipt has
-   outlived its usefulness. See audit.md → lens 2, lens 8.
-2. **Fold aptkit's per-call arg count down from 6.**
-   `AnthropicModelProviderAdapter` takes `(anthropic, agent,
-   sessionId, model, logSite, budget)` — the two agent call sites
-   pass `undefined, undefined, hooks.budget` positionally. Convert to
-   a named-options object. See audit.md → lens 7 (obviousness).
-3. **Name the `unwrap<T>()` seam explicitly on the `DataSource`
-   port.** `ToolResult.[key: string]: unknown` (types.ts:32) is the
-   most permissive part of the interface — it exists so
-   `structuredContent` rides through, but the port doesn't tell you
-   that. Documenting the escape hatch on the type itself would fold
-   a fact currently spread across `unwrap()` and the adapter into
-   one place. See audit.md → lens 3.
+  3.  02-auth-strategy-injection.md
+                            three wildly different auth flows behind
+                            one 10-method interface. the deepest module
+                            in the repo per LOC hidden
+
+  4.  03-rename-via-reexport.md
+                            how you sunset a misnomer without moving
+                            290 LOC and 15 import sites
+
+  5.  04-client-server-contract-module.md
+                            one file owns the shape of a header —
+                            client encodes, server decodes, env still wins
+                            when the header is absent
+```
+
+## What you'll learn about this repo
+
+The top finding is **not** a bug — it's a **rank-order call**:
+
+1. **The load-bearing win (tier-2 story):** the DataSource port has 5 uses of the seam without a caller-surface change (Olist add / Olist remove / Synthetic add / FaultInjecting decorator / McpDataSource rename). Textbook deep-module payoff, receipts included.
+
+2. **The load-bearing legacy:** 9 files (~1000 LOC) in `lib/agents/*-legacy.ts` are still on disk, imported only by 2 test files. Rollback receipt while the AptKit migration bedded in — now due to leave. Same finding as the previous audit; still the #1 fix.
+
+The rest of the audit lenses (leakage, layers, error handling, readability) find small stuff — this codebase is honest about its shape.
 
 ## Cross-links
 
-- `.aipe/read-aposd/` — the book itself, chapter by chapter. Every
-  primitive named below is defined there.
-- `.aipe/study-system-design/` — service-level architecture at the
-  next altitude up (auth boundary, provider abstraction, streaming
-  NDJSON). Module/interface moves live here; service boundaries live
-  there.
-- `.aipe/audits/refactors/design-*.md` — the action-shaped companion.
-  Same eight lenses, but the output is per-finding refactor specs
-  instead of teaching. Run `/aipe:audit-software-design` when you
-  want to *act* on what's below; run this to *understand* it.
+- `.aipe/read-aposd/` — the book, taught abstractly. Use it when the concept lead-in isn't enough.
+- `.aipe/study-system-design/` — architecture altitude (services, boundaries, scaling). This guide stops at module/interface level.
+- `.aipe/study-dsa-foundations/` — reusable algorithm curriculum. Not covered here.
+- `.aipe/audits/refactors/design-*.md` — the action-shaped companion. Same 8 lenses, per-finding refactor specs instead of teaching.
 
-## Source
+## About this generator
 
-The primitives (deep module, information hiding, pulled complexity
-downward, red flags, etc.) come from *A Philosophy of Software
-Design* by John Ousterhout. This guide teaches the ideas in
-original words and never reproduces the book's prose. Read the
-book. It's short and it's the best thing written on this topic.
+Two passes:
+
+- **Pass 1** — `audit.md`: fixed shape, 8 lenses, one section per lens. Every repo gets this.
+- **Pass 2** — the numbered pattern files: repo-specific. Named after design moves this codebase actually exercises. Different repo → different file list.
+
+Pattern files use the `format.md` template: Subtitle → Zoom out → Structure pass → How it works → Primary diagram → Elaborate → Interview defense → See also.
+
+Both passes reconcile against the code, not against this guide's template. When the code changes and this guide doesn't, re-run the generator.

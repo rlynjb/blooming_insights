@@ -1,288 +1,188 @@
-# distributed-systems-red-flags-audit
+# Distributed Systems — Red Flags Audit
 
-*Ranked risks · Present + future · Coordination hazards*
+*Ranked risks grounded in the codebase, worst first.*
 
-## Zoom out — where this file sits
+This is the audit file. Each risk is named, evidenced with file paths, ranked by consequence, and paired with a move to make. No hedging; if it's a risk, say why. If it's mitigated, name the mitigation. If it's fine as-is, say so.
 
-This is the final file in the guide. Everything above walked how the
-system COORDINATES ACROSS partial failure; this file walks WHERE it's
-still exposed. Ranked by consequence — the top items are what a real
-production incident would come from; the bottom items are noted for
-completeness or for when the product grows into them.
+## The ranking
 
-```
-  Zoom out — where the risks live
+| # | Risk | Where | Consequence | Mitigation status |
+|---|------|-------|-------------|-------------------|
+| 1 | Per-instance cache is not a durability story | `bloomreach-data-source.ts:122` | Cold instance = every call round-trips; retry ladder must hold | Ladder holds; cache is opportunistic. Fine at current scale. |
+| 2 | Read-only tool invariant is unenforced | `types.ts:63` | Adding a write tool silently breaks retry correctness | No enforcement in types or lint. Documented in this guide only. |
+| 3 | `JSON.stringify` cache key assumes key order | `bloomreach-data-source.ts:144` | Different arg orders miss cache; wastes calls | Not a bug today; single-producer assumption. Would bite on multi-client. |
+| 4 | Malformed JSON fault gets cached | `bloomreach-data-source.ts:178` + `fault-injecting.ts:148` | `isError: false` + broken content is cached for 60 s | The agent parses downstream and rejects; but cache poisoning persists until TTL. |
+| 5 | No jitter on retry ladder | `bloomreach-data-source.ts:157` | Multi-instance thundering herd against Bloomreach | Rate limit gate + parsed retry window is loose defense. |
+| 6 | Auth cookie is only cross-instance state | `auth.ts:86` | Cookie rotation / secret rotation requires a re-auth for all users | Documented; acceptable for a portfolio app. |
+| 7 | `AUTH_SECRET` misconfiguration is a hard fail in prod | `auth.ts:52` | Unset → all auth fails at first request | Startup validation exists (throws in `aesKey()`). Would benefit from earlier boot check. |
+| 8 | Retry ladder sleeps don't respect `req.signal` | `bloomreach-data-source.ts:167` | Client cancel doesn't interrupt a 20 s wait | Rare (only during retry); next `liveCall` sees the signal. |
+| 9 | Investigations Map has no eviction | `state/investigations.ts:11` | Long-running instance grows memory; unlikely on Vercel serverless | Vercel instances recycle often; effectively self-clearing. |
+| 10 | No dead-letter for tool errors | route handler | Errors ride through as `is_error: true`; model must handle | Working as designed — agent reasons around; monitored via fault-injection receipt. |
 
-  ┌─ Client layer ────────────────────────────────────┐
-  │  RISK: browser tab closes = investigation lost    │
-  │  RISK: cross-tab dedup does not exist             │
-  └───────────────────────┬───────────────────────────┘
-                          │
-  ┌─ Service layer ───────▼───────────────────────────┐
-  │  RISK: fault-injection subsystem is real (asset)  │
-  │  RISK: single external system, alpha-quality      │
-  │  RISK: no shared cache across warm instances      │
-  │  RISK: step-3 hard error on missing diagnosis     │
-  │  RISK: split-step runs don't persist              │
-  └───────────────────────┬───────────────────────────┘
-                          │
-  ┌─ Provider layer ────────────────────────────────────┐
-  │  RISK: alpha token revocation (minutes)             │
-  │  RISK: no idempotency protocol on Bloomreach        │
-  │  RISK: Anthropic cost blowout on runaway loops      │
-  └────────────────────────────────────────────────────┘
+## Risk detail
+
+### 1. Per-instance cache is not a durability story
+
+**Evidence**: `lib/data-source/bloomreach-data-source.ts:122`
+
+```ts
+private cache = new Map<string, { result: unknown; expiresAt: number }>();
 ```
 
-The findings are ranked by consequence, with the load-bearing test
-applied to each: **if this fired in production tomorrow, what
-specifically would the system lose?**
+**The consequence**: on Vercel's autoscaling model, each cold-started instance has an empty cache. The retry ladder + spacing gate are what actually protect against Bloomreach 429s — the cache is a bonus for warm instances. If someone reads the code as "we have a cache so we won't hit rate limits," they'd be wrong.
 
-## Ranked findings
+**Why it stays**: the cache still absorbs duplicates within one investigation (all runs on one instance for its 300 s life). That's most of the value.
 
-### #1 — Fault-injection subsystem is real (ASSET, not risk)
+**The move (if scale demands)**: swap the Map for a shared KV client behind the same interface. Vercel KV or Upstash Redis; keep the 60 s TTL, share it across instances. See file 04's "Phase B" section.
 
-Lead with the good news. The Week-4B fault-injection subsystem at
-`lib/data-source/fault-injecting.ts` is a genuine distributed-systems
-asset. Four canonical failure modes, deterministic when seeded,
-proven to exercise graceful degradation via the tool_result
-`is_error: true` path. Receipt at
-`eval/load-receipts/load-2026-07-03T05-21-12-237Z.json` shows 9 faults
-injected across 3 investigations, 0 failures.
+### 2. Read-only tool invariant is unenforced
 
-**Why it's the top finding**: because most codebases in this shape
-claim "we handle failures gracefully" and can't prove it. This one
-proved it. The `FaultInjectingDataSource` decorator sits on the
-`DataSource` seam and wraps ANY concrete adapter. Reproducing a specific
-failure mode is `FAULT_TIMEOUT=0.2 FAULT_SEED=42` — one env-var pair.
+**Evidence**: `lib/data-source/types.ts:63`
 
-**Verdict**: strength. Cross-link: file 02, band 4.
-
-### #2 — Single external system, alpha-quality (LIVE RISK)
-
-The whole product depends on the Bloomreach `loomi-mcp-alpha` server.
-Documented failure modes:
-
-- rate-limits per user globally (~1 req/s, "1 per 10 second" observed
-  windows)
-- revokes tokens after minutes (per `.aipe/project/context.md` line 44)
-- occasionally times out (why the 30s ceiling exists at
-  `lib/mcp/transport.ts:38`)
-
-**Load-bearing test**: if `loomi-mcp-alpha` is down for an hour, the
-live path is dead. Users see auth errors, timeouts, or empty briefings.
-The demo path still works (replays from committed
-`lib/state/demo-*.json`), which is the correct fallback for a "reliable
-presentation surface."
-
-**Verdict**: fundamental to the product; not fixable without adding a
-second data source. The DataSource seam is what makes that
-architecturally possible (see finding #1). Cross-link: file 01.
-
-### #3 — No shared cache across warm instances (MODERATE RISK)
-
-Every warm Vercel instance has its own
-`BloomreachDataSource.cache` Map at
-`bloomreach-data-source.ts:122`. Two instances serving the same user
-each pay full cost for the same tool call. In practice this is fine —
-one request opens one stream lives on one instance — but under
-concurrent multi-instance traffic patterns (say, if the user opens
-two tabs), Bloomreach's rate-limit budget is burned twice on the
-same call.
-
-**Load-bearing test**: user opens two tabs and clicks briefing on
-both simultaneously. Both hit Bloomreach with the same calls. The
-instance-local caches don't help. Both pay ~1 req/s.
-
-**Fix path**: Vercel KV shared cache. Not implemented today; wouldn't
-be hard to add behind a `SharedCacheDataSource` decorator on the same
-seam.
-
-**Verdict**: moderate. Cross-link: files 03, 04.
-
-### #4 — Alpha token revocation forces re-auth flow as core UX (LIVE RISK)
-
-Because the alpha revokes tokens after minutes, the app must handle
-mid-investigation auth failures as a first-class UI feature. This is
-done via the "reconnect" button on auth errors (feed page,
-per `.aipe/project/context.md` line 45) and the auto-reconnect logic
-that resets auth and reloads once (guarded).
-
-**Load-bearing test**: user starts an investigation, waits 90 seconds
-(intermediate agent turn), Bloomreach revokes the token. Next tool
-call 401s. The route surfaces `HTTP 401: <invalid_token body>` as a
-McpToolError. The client detects the invalid-token pattern and resets
-auth.
-
-**What's brittle**: the detection is text-pattern-based on the error
-body. If Bloomreach changes their error envelope, the auto-reconnect
-stops working silently. Named as a future-proofing risk.
-
-**Verdict**: moderate; the fix is defensive parsing that recognizes
-multiple envelope shapes. Cross-link: file 07.
-
-### #5 — Runaway model loops burn budget (MODERATE RISK, MITIGATED)
-
-The agent loop is bounded by:
-
-- `BudgetTracker` per-investigation (`lib/agents/budget.ts`, checked at
-  `aptkit-adapters.ts:63-66`) — throws `BudgetExceededError` before
-  each model dispatch if the ceiling is hit; default $2.0/investigation
-  per `eval/load.eval.ts:91`
-- Vercel `maxDuration=300` — hard 5-minute ceiling per request
-- Anthropic's built-in retry-on-5xx and model-level limits
-- The 30s per-call MCP timeout (files 02, transport)
-
-**Load-bearing test**: model gets stuck in a loop calling the same
-tool with variations. Budget tracker catches it at ~$2.00. Route
-emits graceful `{type: "error"}` NDJSON event. User sees an error, not
-a blown budget.
-
-**What's brittle**: the budget checks INPUT+OUTPUT tokens, not
-cache-read tokens (per comment at `aptkit-adapters.ts:104-106`), so
-the tracker is slightly conservative with caching on. Named for
-transparency; not a real problem.
-
-**Verdict**: moderate risk, well-mitigated. The budget tracker is the
-correct escape hatch.
-
-### #6 — No cross-user coordination anywhere (BY DESIGN, becomes RISK if product grows)
-
-There is no shared state, no leader election, no distributed locking.
-Every user's investigation is independent. This is correct for the
-current product shape (one user, one workspace, one analysis).
-
-**When it becomes a risk**: any of these product changes:
-
-- **Team workspace view** — multiple users see shared analysis. Needs
-  shared state and cross-user consistency.
-- **Scheduled reconciliation** — nightly refresh of every user's
-  briefing. Needs a job scheduler with leader election.
-- **Bloomreach webhook receiver** — real-time events into our system.
-  Needs a durable queue and consumer group.
-
-**Verdict**: named honestly. Cross-link: files 05, 06, 07.
-
-### #7 — Step-3 hard error on missing diagnosis (LOW RISK, ROUGH EDGE)
-
-If a user navigates directly to `/investigate/[id]/recommend` cold
-(no step 2 run), the server throws:
-`"no diagnosis was handed over — open the diagnosis step first"`
-(at `app/api/agent/route.ts:271`).
-
-**Load-bearing test**: user bookmarks a step-3 URL and returns to it
-the next day. Step 3 fails hard. User has to click back to the feed
-and start over.
-
-**Fix path**: detect missing diagnosis client-side and redirect to
-step 2, or auto-run the combined path.
-
-**Verdict**: low; a one-day fix. Cross-link: file 08.
-
-### #8 — Split-step runs don't persist (LOW RISK, ROUGH EDGE)
-
-Only the combined-run path (`step === null`, used by the demo-capture
-script) writes to `saveInvestigation` at
-`app/api/agent/route.ts:302`. Split-step runs stash to sessionStorage
-client-side only.
-
-**Load-bearing test**: user runs split-step investigation, closes
-tab. Server has no record. Re-opening `/investigate/[id]` runs
-step 2 again from scratch.
-
-**Verdict**: low; probably the right behavior for now (persistence
-without a real store is contrived). If we grew "history of every
-investigation" as a feature, we'd revisit.
-
-### #9 — Cache key uses `JSON.stringify(args)` — key-order fragility (LOW RISK)
-
-The cache key at `bloomreach-data-source.ts:144` is
-`${name}:${JSON.stringify(args)}`. If the model produces args in a
-different key order across turns (unlikely but possible), the cache
-misses. This is a latent bug that manifests as "why is the cache
-never hitting" rather than a hard failure.
-
-**Fix path**: canonical stringification (sort keys). Small change.
-
-**Verdict**: low; hypothetical today.
-
-### #10 — Malformed JSON path only tested via fault injection (LOW RISK)
-
-Real Bloomreach almost never returns malformed JSON — the fault
-injection subsystem was built to test THAT path specifically. If it
-did happen in production, the `unwrap` helper at
-`lib/mcp/schema.ts:36-43` calls `JSON.parse(text)` and throws on
-error. The throw propagates to the transport layer, gets wrapped as
-`McpToolError`, and reaches the agent loop where it becomes
-`tool_result` `is_error: true`.
-
-**Load-bearing test**: fault-injection Week-4B smoke test proved 5
-malformed_json injections were absorbed without failing an
-investigation.
-
-**Verdict**: low; the fault-injection subsystem IS the mitigation
-receipt.
-
-## Absent-and-honest — mechanisms not present, ranked by when they matter
-
-Ranked from "matters soon" to "matters if scale changes drastically":
-
-  1. **Shared cache across instances (Vercel KV / Redis)** — matters as
-     soon as multi-tab or multi-user concurrent traffic is common
-  2. **Idempotency keys on mutating tools** — matters the day a mutating
-     tool ships (voucher issue, campaign send, segment update)
-  3. **Durable inbound queue** — matters if we receive Bloomreach
-     webhooks or add background jobs
-  4. **Leader election for scheduled tasks** — matters if we ship
-     scheduled reconciliation
-  5. **Cross-instance sticky routing** — matters if we grew persistent
-     per-user state that must live on one instance
-  6. **Replicated log / event sourcing** — matters if we ship "history
-     of every investigation" as a first-class feature
-  7. **Distributed transaction coordinator** — matters if we spanned
-     two mutating providers (unlikely in this product)
-
-Named here so future audit updates can promote items as the product
-grows.
-
-## Verdicts, one line each
-
-```
-  #1  fault-injection subsystem      ASSET       — receipt proves it
-  #2  single external system         LIVE RISK   — fundamental; DataSource seam limits blast
-  #3  no shared cache                 MODERATE    — Vercel KV is the fix
-  #4  alpha token revocation          LIVE RISK   — re-auth UI works; envelope parsing brittle
-  #5  runaway model budget            MODERATE    — BudgetTracker is the escape hatch
-  #6  no cross-user coordination      BY DESIGN   — becomes risk on product growth
-  #7  step-3 hard error on cold nav   LOW         — one-day fix
-  #8  split-step non-persistence      LOW         — deferred to future feature
-  #9  cache-key JSON.stringify order  LOW         — canonical stringify is trivial
-  #10 malformed JSON in production    LOW         — fault-injection is the mitigation receipt
+```ts
+export interface DataSource {
+  callTool(name, args, opts?): Promise<DataSourceCallResult>;
+  listTools(opts?): Promise<unknown>;
+}
 ```
 
-## What kept me up before writing this file — and doesn't now
+**The consequence**: the retry ladder retries rate-limited results, the cache memoizes non-error results. Both are safe only because MCP tools are read-only. If a write tool got added — a `create_campaign`, an `update_segment` — the ladder would double-execute the write on a 429, and the cache would memoize the response of a mutation.
 
-Writing this audit against the four bands + fault-injection receipt
-was clarifying. The pre-Week-4B version of the code had all the
-mechanisms EXCEPT the receipt. Now the receipt is a JSON file with a
-seed you can re-run. The confidence that "we handle failures
-gracefully" is not a claim anymore; it's a measurement.
+**Why it stays unenforced**: the current tool set is all reads (`list_*`, `get_*`, `run_query`, `list_cloud_organizations`, etc.). The invariant is documented in files 02 and 03 of this guide, but the type system doesn't distinguish. AptKit's `ToolDefinition` shape (in `node_modules/@aptkit/core`) doesn't carry a "safe to retry" annotation either.
 
-The remaining live risks (#2, #4) are structural: the alpha server is
-alpha; there's one of them. Neither is fixable without adding a second
-data source or leaving the alpha, both of which are product-scope
-decisions. The DataSource seam makes both future moves architecturally
-possible without breaking the agents.
+**The move**: tag tools with a `safeToRetry: boolean` in their schema. The retry ladder honors the tag; the cache honors the tag. Write tools would need an idempotency key + downstream dedup.
 
-The rough edges (#7, #8, #9) are naming exercises. Each is a
-follow-up ticket, not a fire.
+### 3. `JSON.stringify` cache key assumes single-producer key order
+
+**Evidence**: `lib/data-source/bloomreach-data-source.ts:144`
+
+```ts
+const cacheKey = `${name}:${JSON.stringify(args)}`;
+```
+
+**The consequence**: `JSON.stringify({a: 1, b: 2})` and `JSON.stringify({b: 2, a: 1})` produce different strings, so they'd cache-miss for logically-identical calls.
+
+**Why it doesn't matter today**: the model is the only producer of tool_use args. Anthropic's SDK produces stable-order JSON, and the AptKit adapter passes it through. No multi-client scenario exists.
+
+**Why it could bite later**: if a second call site (e.g. a UI-triggered "re-run" that reconstructs args from user input) hit the same cache, it might cache-miss depending on key order.
+
+**The move**: canonicalize the args before stringify — sort keys, normalize whitespace. `import stableStringify from 'json-stable-stringify'` and swap the one line. Low cost; deferred until it matters.
+
+### 4. Malformed JSON fault gets cached
+
+**Evidence**: `lib/data-source/fault-injecting.ts:148` + `bloomreach-data-source.ts:178`
+
+The fault returns `isError: false` with content `{"broken":"unclosed`. The cache write is gated on `!result.isError`, so this DOES get cached (for 60 s).
+
+**The consequence**: in a real production scenario where a genuine partial JSON payload came back, subsequent identical calls would hit the poisoned cache instead of retrying. The agent's `unwrap()` parse in `lib/mcp/schema.ts` would fail the same way each time.
+
+**Why it stays**: `unwrap()` rejects the garbage; the model sees a failed parse and picks a different tool. The retry ladder is bypassed (because `isError: false`), but the *effect* is the same: the caller gets a signal something's wrong.
+
+**The move**: extend the no-cache-on-error gate to include "content that doesn't parse as expected." Would require a schema check inside McpDataSource, which is a layering decision — right now the schema lives above (`lib/mcp/schema.ts`). Deferred; not urgent because real malformed payloads are rare and cache TTL is 60 s.
+
+### 5. No jitter on retry ladder
+
+**Evidence**: `lib/data-source/bloomreach-data-source.ts:157`
+
+The retry wait is `Math.min(hint + 500 || 10s × 2^n, 20_000)` — deterministic given the input.
+
+**The consequence**: two Vercel instances that both hit a 429 at the same time would wait the same duration and re-fire simultaneously — a mini thundering herd.
+
+**Why it's a low risk**: the spacing gate at each instance keeps their steady-state rate < 1 req/s. The synchronized retry is a short-lived burst, and Bloomreach's 429 response ("1 per 10 second") would just re-fire — the ladder handles it.
+
+**The move**: add ±20% jitter to the sleep. `waitMs *= 0.8 + Math.random() * 0.4`. Two-line change; low priority.
+
+### 6. Auth cookie is the only cross-instance state
+
+**Evidence**: `lib/mcp/auth.ts:86` `withAuthCookies`
+
+The cookie is encrypted under `AUTH_SECRET`. Any Vercel instance can decrypt it. That's the entire cross-instance coordination story.
+
+**The consequence**: `AUTH_SECRET` rotation requires a re-auth for every user (all old cookies become undecryptable). No key rotation grace period. If the secret is ever compromised, rotation is a hard cut.
+
+**Why it stays acceptable**: for a portfolio-scale app, a hard-cut re-auth is fine. Users click "authorize with Bloomreach" again; done in seconds. A production-scale app with millions of users would need a dual-key rotation window.
+
+**The move**: dual-key `AUTH_SECRET_CURRENT` + `AUTH_SECRET_PREVIOUS`. Try current first, fall back to previous. Rotate periodically. Two-value env config; can be added when needed.
+
+### 7. `AUTH_SECRET` misconfiguration is a hard fail
+
+**Evidence**: `lib/mcp/auth.ts:52`
+
+```ts
+function aesKey(): Buffer {
+  const secret = process.env.AUTH_SECRET;
+  if (!secret) {
+    throw new Error(
+      'AUTH_SECRET is required in production to encrypt the auth cookie…',
+    );
+  }
+  return createHash('sha256').update(secret).digest();
+}
+```
+
+**The consequence**: if deployed to production without `AUTH_SECRET`, every OAuth attempt throws immediately at the first `saveTokens` call. The error message is clear, but the deploy passes health checks (nothing checks env at boot).
+
+**Why it's mitigated**: the throw message is explicit; anyone reading Vercel logs finds it in seconds.
+
+**The move**: a startup env check that fails the build if `AUTH_SECRET` is unset in production. `next.config.ts` or a Vercel build hook. Small addition; would surface earlier than first-request failure.
+
+### 8. Retry ladder sleeps don't respect `req.signal`
+
+**Evidence**: `lib/data-source/bloomreach-data-source.ts:167`
+
+```ts
+await sleep(waitMs);
+```
+
+`sleep` is a `setTimeout` promise — no signal awareness. If a client cancels during a 20 s retry wait, the wait completes before the next `liveCall` sees the cancel.
+
+**The consequence**: after a client cancel, up to 20 s of function time is burned on a sleep that will never be used. The next `liveCall` throws `AbortError` and unwinds, but the sleep already ran.
+
+**Why it's rare**: retries are only triggered by 429s. In steady state (after the spacing gate is warm), 429s are uncommon. The window where this matters is small.
+
+**The move**: swap `sleep(ms)` for `sleep(ms, signal)` that races the timeout against the signal's abort event. Ten-line change; adds correctness under cancel.
+
+### 9. Investigations Map has no eviction
+
+**Evidence**: `lib/state/investigations.ts:11`
+
+```ts
+const mem = new Map<string, AgentEvent[]>();
+```
+
+Top-level Map, no LRU, no size cap. Every `saveInvestigation` grows it.
+
+**The consequence**: on a long-running Vercel instance (uncommon), memory grows unboundedly.
+
+**Why it's a low risk**: Vercel instances recycle regularly — cold start, cold cache, empty Map. Effectively self-clearing.
+
+**The move**: LRU cap at N entries. `Map` with a size check on set. Would earn its place if instances stayed alive longer or if investigations grew larger. Not urgent.
+
+### 10. No dead-letter for tool errors
+
+**Evidence**: `app/api/agent/route.ts:200-215`
+
+Tool errors ride into the stream as `tool_call_end` events with an `error` field. The model sees them, reasons around them (or fails). There's no dead-letter queue, no error aggregation, no alerting.
+
+**The consequence**: a systemic error mode (e.g. every `run_query` returns `HTTP 500`) would silently degrade the investigation quality — the model would keep trying, hit the retry budget, and produce a shallow diagnosis.
+
+**Why it's working as designed**: the fault-injection receipt (9 injected faults / 3 investigations / 0 failed) is exactly this: the model reasons around tool failures, and the investigation still completes. The AptKit agent loop treats `is_error: true` as a signal, not a stop condition.
+
+**The move for production**: log tool error rates to Vercel's log ingest; alert on rates > 10%. Or emit an OpenTelemetry span per tool call. Would enable observability without changing the resilience story.
+
+## The takeaway
+
+**Rank 1 (the top finding, restated from 00-overview.md):** the per-instance cache is not a durability guarantee. The retry ladder does the heavy lifting; the cache is opportunistic. Any story that reads "we have a cache so we're safe from rate limits" is wrong. The story that reads "we have a spacing gate + retry ladder + no-cache-on-error + 30 s per-call timeout, and the cache is a bonus" is right.
+
+**Rank 2 (the invariant to protect):** every MCP tool must be read-only. This invariant is documented in this guide but not enforced by the type system. Adding a write tool without adding the retry safety analysis is a straight-line bug.
+
+**Everything else** is either low-frequency (ranks 3, 4, 5, 8), scale-dependent (ranks 6, 7, 9), or working as designed (rank 10). None of them are urgent. All of them are known.
+
+The honest framing: **this is a small distributed surface, and the small size is the design.** One hop out, one shared secret for cross-instance state, no writes anywhere. Every risk in this audit is a known consequence of that shape. The mitigations that exist are proportional to the risks that exist.
 
 ## See also
 
-- 01-distributed-system-map.md — the picture every finding above
-  hangs off
-- 02-partial-failure-timeouts-and-retries.md — the mechanisms that
-  make the LIVE RISK findings survivable
-- 08-sagas-outbox-and-cross-boundary-workflows.md — #7 and #8 in
-  detail
-- `../study-system-design/audit.md` — same repo, architecture lens
-  rather than coordination lens
+- `00-overview.md` — the top finding is a compressed version of Rank 1 here.
+- `02-partial-failure-timeouts-and-retries.md` — the ladder that Rank 1 relies on.
+- `03-idempotency-deduplication-and-delivery-semantics.md` — the invariant that Rank 2 is about.
+- `04-consistency-models-and-staleness.md` — the per-instance staleness that Rank 1 lives in.

@@ -1,346 +1,257 @@
 # 07 · Output mode mismatch
 
-**Output format contract / schema mismatch at chain boundary — Industry standard**
+**Industry name:** *output mode mismatch* / *output format drift* / *contract break at the seam* · Language-agnostic
 
-## Zoom out, then zoom in
+## Zoom out — where output modes live
 
-Every chain emits *something*. Every consumer downstream reads it as *some shape*. The bug this concept covers is the silent case where the emitter's shape and the consumer's shape disagree — and neither the model nor the compiler catches it because the JSON parses cleanly, the fields the consumer reads happen to exist, and the mismatch only surfaces when a specific optional field turns out to be structured differently than the consumer assumed. This is the "we shipped it, works in staging, fails on the tenth production case" bug.
-
-```
-  Zoom out — where output mode mismatch lives
-
-  ┌─ Chain A (emitter) ─────────────────────────────┐
-  │  RecommendationAgent emits estimatedImpact       │
-  │  as EITHER a string OR                            │
-  │  { range, rangeUsd?, assumption } object          │
-  └─────────────────────┬───────────────────────────┘
-                        │
-  ┌─ ★ THE MISMATCH SEAM ★ ─▼──────────────────────┐
-  │  what shape does the consumer expect?           │  ← we are here
-  │  a string? an object? tolerant of both?         │
-  └─────────────────────┬───────────────────────────┘
-                        │
-  ┌─ Chain B / UI (consumer) ─▼─────────────────────┐
-  │  RecommendationCard reads r.estimatedImpact      │
-  │  as { rangeUsd?.low, ... }                        │
-  │  breaks silently if it's a string                 │
-  └─────────────────────────────────────────────────┘
-```
-
-**Zoom in.** Output mode has three dimensions: **format** (JSON vs prose vs tool_use), **shape** (which fields, which types), and **envelope** (fenced in ```json vs raw vs wrapped in a tool_use block). A mismatch on any dimension breaks the consumer. This codebase has one interesting real-world example — `estimatedImpact` is deliberately polymorphic (string OR structured object) because the schema evolved and older data still validates — and that polymorphism is itself a controlled output-mode mismatch that the consumer must handle.
-
-## Structure pass
-
-### Axes — the dimension we're tracing
-
-**Contract sharpness at the boundary.** For every chain-to-chain hand-off, ask: is the output type sharp enough that a mismatch is caught by the compiler, the validator, or the parser? Or is it soft enough that a mismatch only shows up as a runtime NaN, undefined lookup, or wrong-shape render?
-
-### Seams — where mismatches happen
-
-Three seams:
-
-- **Format seam** — emitter says "JSON in a fence"; consumer reads as raw JSON without fence handling. Or emitter emits a tool_use block; consumer parses text.
-- **Shape seam** — emitter emits `{ conclusion, evidence, hypothesesConsidered }`; consumer reads `.rootCause` instead of `.conclusion`. Type system catches this if the type is used; runtime crash if the consumer used `any`.
-- **Envelope seam** — emitter's output is one item; consumer expects an array. Or emitter's array is empty; consumer assumes `[0]` exists.
-
-### Layered decomposition
-
-"What guarantees this chain's output matches what the next stage reads?" — traced across layers:
+Every chain declares an output mode. The composition layer expects that mode. When one chain quietly changes what it emits, the composition breaks *downstream* of the change, not at the change itself. That's the whole failure surface.
 
 ```
-  "Who enforces the output shape?" — same question, three altitudes
+  Zoom out — the output mode contract per stage
 
-  ┌────────────────────────────────────────────────┐
-  │ outer: the TypeScript type                      │  → Recommendation type
-  │        (compile-time)                           │    in lib/mcp/types.ts
-  └────────────────────────────────────────────────┘
-      ┌────────────────────────────────────────────┐
-      │ middle: the runtime validator               │  → isRecommendationArray
-      │        (post-parse)                         │    in lib/mcp/validate.ts
-      └────────────────────────────────────────────┘
-          ┌────────────────────────────────────────┐
-          │ inner: the model's prompt               │  → the ## Output section
-          │        (pre-generation shape)           │    of recommendation.md
-          └────────────────────────────────────────┘
+  ┌─ MonitoringAgent.scan() ────────────────────────────┐
+  │  declared mode: Anomaly[] (JSON, validated at        │
+  │                  lib/mcp/validate.ts:isAnomalyArray)  │
+  └────────────────┬────────────────────────────────────┘
+                   │  contract: array of anomaly objects
+                   ▼
+  ┌─ DiagnosticAgent.investigate(anomaly) ──────────────┐
+  │  declared mode: Diagnosis (JSON, validated at        │
+  │                  lib/mcp/validate.ts:isDiagnosis)     │
+  └────────────────┬────────────────────────────────────┘
+                   │  contract: object with three fields
+                   ▼
+  ┌─ RecommendationAgent.propose(anomaly, diagnosis) ───┐
+  │  declared mode: Recommendation[] (JSON, validated at │
+  │                  lib/mcp/validate.ts:isRecommenda…)   │
+  └─────────────────────────────────────────────────────┘
+
+  ┌─ Query route (/api/agent) ──────────────────────────┐
+  │  declared mode: PROSE (markdown-flavored text)       │
+  │  legacy-prompts/query.md:46-48: "no JSON shape is    │
+  │  required — just the answer text"                    │
+  └─────────────────────────────────────────────────────┘
 ```
 
-The three layers overlap; each catches different mismatches. Type system: catches "consumer read the wrong field name." Validator: catches "model returned wrong-shape JSON." Prompt: reduces the rate of wrong-shape JSON at the source.
+## Zoom in — one contract per chain, and one glaring exception
+
+Four chains, three modes:
+
+- Monitor → `Anomaly[]` JSON.
+- Diagnose → `Diagnosis` JSON.
+- Recommend → `Recommendation[]` JSON.
+- Query → **prose**.
+
+Every chain has a validator on the parse boundary. Every chain except query emits structured JSON. Query emits free text and the caller (the UI) treats it as markdown. This is the seam where output mode mismatch bites — if the query chain suddenly returned JSON, the UI would render `{ "answer": "..." }` verbatim. If the diagnose chain suddenly returned prose, the parser would throw.
+
+## Structure pass — layers, axis, seams
+
+Trace one axis: *who is the reader of each chain's output*, and *what shape does that reader expect*.
+
+- **Monitor's reader:** the briefing route iterator + the diagnostic agent's input. Both expect `Anomaly[]`.
+- **Diagnose's reader:** the recommendation agent (expects `Diagnosis`) + the UI (expects `Diagnosis`).
+- **Recommend's reader:** the UI (expects `Recommendation[]`).
+- **Query's reader:** the UI (expects prose text, rendered as markdown).
+
+**The seam:** the boundary where a chain's output is consumed. Every seam has an implicit *and* explicit contract. Explicit = the TypeScript type + the validator. Implicit = "the model actually returns something matching that type." Mismatches happen when the implicit drifts away from the explicit.
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — the shape
 
-You know how a `fetch()` returns `Response` and if the consumer calls `.json()` on a text-only response you get a parse error at runtime, not compile time — because the `Response` type is intentionally loose? Output mode is the same: the LLM boundary is loose by default (text-in, text-out), and every layer you add (fence delimiter, JSON parse, shape validator, type guard) is a step toward sharpening the contract.
-
-```
-  Output mode mismatch — the shape
-
-  ┌── chain A output ──┐            ┌── chain B input ──┐
-  │  actually emits:    │            │  expects:          │
-  │  { conclusion,      │            │  { conclusion,     │
-  │    evidence: [...], │  ★ MATCH ★ │    evidence: [...],│
-  │    hypotheses… }    │            │    hypotheses… }   │
-  └────────────────────┘            └───────────────────┘
-
-  vs mismatch:
-
-  ┌── chain A output ──┐            ┌── chain B input ──┐
-  │  { conclusion,      │            │  { rootCause,      │
-  │    evidence: [...], │   MISMATCH │    supportingData, │
-  │    hypotheses… }    │─────────▶  │    ...}            │
-  └────────────────────┘            └───────────────────┘
-
-  → JSON.parse succeeds
-  → consumer reads .rootCause → undefined
-  → downstream crash or wrong render
-```
-
-### Move 2 — the step-by-step walkthrough
-
-**Step 1 — the model's prompt declares the emission format.**
-
-`@aptkit/prompts/dist/src/recommendation.js:52-70`:
+You've built REST endpoints. You know this failure: your `/api/orders` returns JSON. One day the endpoint starts returning HTML (server error rendered as a 500 page), the frontend does `res.json()`, throws `SyntaxError: Unexpected token '<' in JSON`. The mismatch is at the mode level — the caller wanted one thing, got another. LLM chains have the same failure surface. The prompt says "return JSON." The model returns markdown with a code fence and a signoff. The parser breaks.
 
 ```
-## Output
+  Pattern — output mode as a typed contract
 
-Return ONLY a JSON array in a json fenced block of at most 3 objects. Do NOT include an id field. The system assigns ids after validation.
+  producer                               consumer
+  ┌──────────────┐  contract: JSON      ┌──────────────┐
+  │ chain A       │ ────────────────►  │ chain B       │
+  │  emits JSON   │                    │  parses JSON  │
+  └──────────────┘                    └──────────────┘
 
-Each object must have:
-
-- title: string
-- rationale: string
-- bloomreachFeature: scenario | segment | campaign | voucher | experiment
-- steps: string[]
-- estimatedImpact: string OR { range: string, rangeUsd?: { low: number, high: number }, assumption: string }
-- confidence: high | medium | low
-- effort?: low | medium | high
-- timeToSetUpMinutes?: number
-- readResultInDays?: number
-- prerequisites?: { label: string, satisfied: boolean }[]
-- successMetric?: string
-
-If you cannot propose grounded actions, return [].
+  the contract is:
+    · shape (what fields)
+    · encoding (JSON vs markdown vs plain text)
+    · wrapper (fenced code block vs bare)
+    · trailing prose (allowed vs not)
 ```
 
-Two things worth noting. First, the prompt is explicit about **format** (JSON array), **envelope** (in a `json` fenced block), and **shape** (the per-object schema). Nothing is left to inference. Second, `estimatedImpact` is *deliberately polymorphic* — string OR structured object. That polymorphism is a controlled output-mode allowance, and it's a bug-source-in-waiting if the consumer doesn't handle both shapes.
+Every one of those four is a way the contract can break. Shape drift: field renamed. Encoding drift: JSON becomes markdown. Wrapper drift: fence added or removed. Trailing prose: model adds "Hope this helps!" at the end.
 
-**Step 2 — the parser strips the envelope.**
+### Move 2 — walking the modes
 
-`lib/mcp/validate.ts:3-13`:
+#### JSON mode chains — three of the four
 
-```ts
-export function parseAgentJson(text: string): unknown {
-  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  const candidate = (fence ? fence[1] : text).trim();
-  try { return JSON.parse(candidate); } catch { /* fall through to substring scan */ }
-  const start = candidate.search(/[[{]/);
-  const end = Math.max(candidate.lastIndexOf(']'), candidate.lastIndexOf('}'));
-  if (start >= 0 && end > start) {
-    return JSON.parse(candidate.slice(start, end + 1));
-  }
-  throw new Error('no parseable json in agent output');
+Monitor, diagnose, and recommend all emit fenced JSON. Their validators live at `lib/mcp/validate.ts`:
+
+`isAnomalyArray()` at `:17-27`:
+```
+export function isAnomalyArray(v: unknown): v is Anomaly[] {
+  return Array.isArray(v) && v.every((a) =>
+    !!a && typeof a === 'object' &&
+    typeof (a as any).metric === 'string' &&
+    Array.isArray((a as any).scope) &&
+    !!(a as any).change && typeof (a as any).change.value === 'number' &&
+    ((a as any).change.direction === 'up' || (a as any).change.direction === 'down') &&
+    typeof (a as any).change.baseline === 'string' &&
+    SEVERITIES.includes((a as any).severity)
+  );
 }
 ```
 
-Fence-first parser (see `02-structured-outputs.md` for the full walkthrough). This catches the envelope-mismatch case where the model wraps the JSON in a fence or preface. If the parser succeeds, the result is `unknown` — no shape guarantees yet.
-
-**Step 3 — the shape validator narrows.**
-
-`lib/mcp/validate.ts:42-57`:
-
-```ts
-export function isRecommendationArray(v: unknown): v is Omit<Recommendation, 'id'>[] {
-  return Array.isArray(v) && v.every((r) => {
-    const x = r as any;
-    // estimatedImpact may be the legacy string OR the richer { range, ... } shape
-    const impactOk =
-      typeof x.estimatedImpact === 'string' ||
-      (!!x.estimatedImpact && typeof x.estimatedImpact === 'object' && typeof x.estimatedImpact.range === 'string');
-    return !!x && typeof x === 'object'
-      && typeof x.title === 'string'
-      && typeof x.rationale === 'string'
-      && FEATURES.includes(x.bloomreachFeature)
-      && Array.isArray(x.steps)
-      && impactOk
-      && CONFIDENCE.includes(x.confidence);
-  });
+`isDiagnosis()` at `:29-35`:
+```
+export function isDiagnosis(v: unknown): v is Diagnosis {
+  if (!v || typeof v !== 'object') return false;
+  const d = v as any;
+  return typeof d.conclusion === 'string'
+    && Array.isArray(d.evidence)
+    && Array.isArray(d.hypothesesConsidered);
 }
 ```
 
-The comment on line 46 is the honest note: `estimatedImpact` accepts either shape. This is *both* the fix for the polymorphism *and* the seam where the bug moves downstream. The validator says "yes, this is a valid Recommendation." The consumer must still handle both cases.
+`isRecommendationArray()` at `:42-57` — stricter, checks the enum values, checks the impact union shape.
+
+The three guards decompose the contract. Each guard is small — the diagnosis guard only checks three fields. Everything else on `Diagnosis` (`affectedCustomers`, `timeSeries`) is optional. The strictness gradient is intentional: highest for recommendations (they drive marketer action; the shape has to be right), medium for anomalies (they drive downstream diagnosis; broken shape halts the pipeline), lowest for diagnoses (they're consumed by another prompt + rendered as prose; some tolerance helps).
+
+#### Prose mode — the one exception
+
+`lib/agents/legacy-prompts/query.md:46-48`:
+
+> "Give a clear, concise answer in plain prose — a few sentences; you may use short markdown bullets. Cite the key numbers you found. If you couldn't get the data, say so plainly. No JSON shape is required — just the answer text."
+
+That's the whole declared mode: prose, allowed markdown, no wrapper, no schema. The caller (`/api/agent` route) streams the assistant text tokens straight to the UI, which renders them as markdown.
+
+The gotcha: if a future edit added "and also return a JSON summary" to this prompt, the model would happily emit prose followed by fenced JSON. The UI would render the JSON as literal markdown code block. The user would see raw JSON in their answer. This is exactly the mode-mismatch failure surface — the prompt drifted, no validator caught it, the UI's markdown renderer treated the JSON as text to be displayed.
+
+#### Where mismatches surface in real code
+
+The three specific failure modes I've hit in production:
+
+**Model adds a courtesy signoff.**
+```
+   here's your analysis:
+   ```json
+   { "conclusion": "..." }
+   ```
+   let me know if you'd like me to elaborate!
+```
+Fence extraction at `lib/mcp/validate.ts:5` catches the fenced block. The trailing prose is discarded. But if the model puts the signoff *inside* the fence, or drops the fence entirely, you fall through to the substring-scan fallback at `:7-12`.
+
+**Two fenced blocks.**
+```
+   thinking:
+   ```json
+   { "hypothesis": "..." }
+   ```
+   answer:
+   ```json
+   { "conclusion": "..." }
+   ```
+```
+The regex at `:5` is non-greedy — it grabs the first fenced block. Which may or may not be the answer. This is a real bug we hit; the fix in production would be a rule in § 4 of the prompt: "return exactly one fenced JSON block." (This repo's diagnostic prompt does say "return ONLY a JSON object" at `legacy-prompts/diagnostic.md:60`, which the model usually honors.)
+
+**Encoding shift on model upgrade.**
+
+Sonnet 3 emitted diagnoses with plain-text field values. Sonnet 4 sometimes emits diagnoses with markdown-formatted `conclusion` fields — bullet points inside a JSON string. Parsing succeeds. The UI renders the string. The user sees markdown-inside-JSON-inside-markdown, which the outer markdown renderer flattens weirdly. The fix isn't the parser; it's the § 4 output shape: "the `conclusion` field must be plain prose, no markdown formatting."
 
 ```
-  Comparison — validator handles polymorphism, consumer must too
+  Flow — mode mismatch as a downstream failure
 
-  validator's job:                  consumer's job:
-  "is this a valid Recommendation?" "render this Recommendation"
+  chain A "returns JSON"          consumer "parses JSON"
+     │                                  │
+     │      contract intact             │
+     ▼                                  ▼
+  { "conclusion": "..." }  ─────►  JSON.parse ─────► ✓
 
-  handles: string OR object          must handle: string OR object
-                                     via type-narrowing at render
+     │                                  │
+     │      contract drifts             │
+     ▼                                  ▼
+  Here's your analysis:            JSON.parse ─────► ✗
+  ```json                          throws SyntaxError
+  { "conclusion": "..." }
+  ```                              the failure surfaces
+                                   at the parser, not
+                                   at the chain that drifted.
 ```
 
-**Step 4 — the consumer must handle polymorphism explicitly.**
-
-`components/investigation/RecommendationCard.tsx` (representative snippet — real component has richer rendering):
-
-```tsx
-{typeof recommendation.estimatedImpact === 'string' ? (
-  <span>{recommendation.estimatedImpact}</span>
-) : (
-  <span>
-    {recommendation.estimatedImpact.range}
-    {recommendation.estimatedImpact.rangeUsd && (
-      <> (${recommendation.estimatedImpact.rangeUsd.low.toLocaleString()}
-       – ${recommendation.estimatedImpact.rangeUsd.high.toLocaleString()})</>
-    )}
-  </span>
-)}
-```
-
-The `typeof x === 'string'` check is the type-narrowing gate. Miss it — say a junior refactors and writes `recommendation.estimatedImpact.range` unconditionally — and the string case crashes at render with "cannot read property 'range' of undefined." This is exactly the output-mode-mismatch bug in production shape: schema drift over time (the original shape was string; the new shape is structured), consumer forgot to handle the legacy shape, boom.
-
-**Step 5 — the specific bug in this codebase.**
-
-Look at `parseAgentJson`'s fallback: substring-scan for `[` or `{`. If the model emits recommendations as a JSON *object* wrapped around an array (e.g. `{"recommendations": [...]}`) instead of a bare array, the substring scan returns the object, `isRecommendationArray` returns false, and the whole thing throws. This is one of the load-bearing tightness points — the prompt says "Return ONLY a JSON array," but under model drift (or a smart user injection), the model might return a wrapping object. The fix is either (a) tighten the prompt (already done), or (b) make the validator tolerant of the wrapping shape and unwrap it.
-
-```
-  The failure case at parseAgentJson
-
-  model emits:      { "recommendations": [ ... ] }
-      ↓
-  parseAgentJson:   returns the object
-      ↓
-  isRecommendationArray:   Array.isArray(obj) → false
-      ↓
-  validator rejects → thrown error at boundary
-```
-
-Not a bug in this codebase's live use (the prompt discipline holds), but a real class of mismatch and a real reason validators exist.
-
-**Step 6 — the eval catches drift.**
-
-Every eval case's receipt writes the `recommendations` array. If the model starts emitting a wrapping object, the receipt's `recommendations` field ends up wrong-shape or throws at write time. Regression is visible immediately in the next eval run's summary block. This is the concrete mechanism by which output-mode mismatches are caught before production: the eval boundary reads the output the same way production does, so any output-mode drift shows up there first.
+The failure lands one hop downstream of the mistake. That's the diagnostic difficulty. In this repo the fallback substring scan absorbs most of it, but the underlying discipline is: prompt declares the mode, validator checks the mode, mismatches surface as validator throws rather than propagating silently.
 
 ### Move 2 variant — the load-bearing skeleton
 
-The kernel of preventing output mode mismatch is three moves:
+Kernel of "output mode as contract":
 
-```
-  declare shape in prompt → validate at parse → narrow at consume
-```
+1. **Every chain declares a mode explicitly in its prompt.** Drop this and the model picks one per call.
+2. **A validator narrows the parsed output to the typed shape.** Drop this and shape drift propagates.
+3. **Downstream code depends on the type, not the raw text.** Drop this and every consumer re-parses.
+4. **The parser is lenient about wrappers.** Drop this and one courtesy signoff halts the whole pipeline.
 
-What breaks if you skip each:
-
-- **Skip "declare shape in prompt"** — the model emits whatever feels natural for the last five tokens of prior context. Sometimes JSON, sometimes prose, sometimes JSON with a preface, sometimes an object with a `"result"` wrapper. The consumer catches one of these; the others crash.
-- **Skip "validate at parse"** — the parser returns `unknown`; the consumer treats it as `Recommendation[]`. TypeScript is happy (you cast), runtime is not (you crash on `.forEach` of undefined).
-- **Skip "narrow at consume"** — the validator accepts polymorphism (string OR object), and the consumer reads `.range` unconditionally. Crashes on the string case.
-
-Hardening layered on top: exhaustive validation with something like Zod (catches nested shape mismatches), fuzz-testing the parser with malformed model outputs, adding output-mode assertions to the eval receipts.
+Hardening on top: retry with a stricter prompt on validation fail, a schema-diff dashboard that alerts on new field shapes appearing in production, per-chain test cases in the eval that specifically look at mode compliance. None of that is the skeleton — the skeleton is: declare + validate + typed hand-off + lenient parse.
 
 ### Move 3 — the principle
 
-**The compiler is not defending your LLM boundary; the validator is.** Every field the model emits is text until proven otherwise, and "proven otherwise" is a runtime check. Mismatches are silent by default because JSON parsing succeeds on shape you didn't intend. The three-move discipline (prompt-declare, parse-validate, consume-narrow) is what makes the mismatches loud.
+**A chain's output mode is a contract with everyone downstream.** The prompt is only half the contract — the model has to actually honor it, and models drift. The other half is the validator, which is what makes drift *loud* instead of silent. Every serious pipeline has a validator on every seam. The absence of one is not "trust in the model" — it's a delayed bug.
 
 ## Primary diagram
 
 ```
-  Output mode mismatch — where each layer catches what
+  Output mode mismatch — the full recap
 
-  ┌── the prompt ─────────────────────────────────────────────┐
-  │  "Return ONLY a JSON array in a json fenced block"        │
-  │  "estimatedImpact: string OR { range, rangeUsd?, ... }"    │
-  │       ↑                                                   │
-  │       reduces mismatch rate at the source                 │
-  └────────────────────────┬──────────────────────────────────┘
-                           │
-  ┌── model emits ─────────▼──────────────────────────────────┐
-  │  text (could be JSON, could be JSON-in-fence, could be    │
-  │        preface + JSON, could be object-wrapping-array)    │
-  └────────────────────────┬──────────────────────────────────┘
-                           │
-  ┌── parseAgentJson ──────▼──────────────────────────────────┐
-  │  1. try fence match                                        │
-  │  2. fallback: substring [ or { scan                        │
-  │  3. throw on neither                                       │
-  │       catches: envelope mismatch                          │
-  │       misses: shape wrapping (object → array expected)    │
-  └────────────────────────┬──────────────────────────────────┘
-                           │ unknown
-  ┌── isRecommendationArray ▼─────────────────────────────────┐
-  │  Array.isArray(v) + per-item field checks                 │
-  │  handles: polymorphic estimatedImpact (string OR object)  │
-  │       catches: shape mismatch (wrong fields, wrong types) │
-  │       misses: nothing beyond the fields it checks         │
-  └────────────────────────┬──────────────────────────────────┘
-                           │ Omit<Recommendation, 'id'>[]
-  ┌── consumer narrows ────▼──────────────────────────────────┐
-  │  typeof rec.estimatedImpact === 'string' ? ... : ...      │
-  │       catches: the polymorphism the validator accepted    │
-  │       misses: only what you forget to narrow              │
-  └───────────────────────────────────────────────────────────┘
+  chain          declared mode        validator                       consumer
+  ─────────────────────────────────────────────────────────────────────────────
+  monitor    →   Anomaly[] JSON       isAnomalyArray                  diagnose + UI
+  diagnose   →   Diagnosis JSON       isDiagnosis                     recommend + UI
+  recommend  →   Recommendation[]     isRecommendationArray           UI
+  query      →   PROSE (markdown)     (none — direct stream to UI)    UI
+
+  failure modes at the seam:
+    1  shape drift          — field renamed
+    2  encoding drift       — JSON becomes prose
+    3  wrapper drift        — fenced block added/removed
+    4  courtesy prose       — signoff inside or outside the JSON
+
+  defense at every seam:
+    lib/mcp/validate.ts:parseAgentJson  ← 3 fallback layers
+    lib/mcp/validate.ts:is*             ← shape guards, narrowest possible
 ```
 
 ## Elaborate
 
-Output mode mismatch is the specific class of bug that killed my confidence in "just cast the JSON as `any`" as a shortcut. It's the bug most likely to survive local testing (works on the three cases you tried), get caught in staging (fails on the tenth case), and slip into production (fails on a case you didn't anticipate). Every production LLM system has some version of this in its scar tissue.
+The chain-of-thought interaction with output mode is the one most engineers get wrong. If you want the model to reason *and* return JSON, the reasoning has to live inside the JSON — a `thinking` field on the structured output. The wrong shape is: "think through this, then return JSON." What you get: prose thinking followed by JSON. The parser has to skip the prose. The substring-scan fallback catches this, but it's fragile — if the prose contains a `{` character (say the model wrote about "the config {"), the scan starts there and everything breaks. The right shape is: return JSON with a `thinking` string field that contains the reasoning. Now the reasoning is inside the mode, not adjacent to it. Full walk in `09-chain-of-thought.md`.
 
-The polymorphic `estimatedImpact` in this codebase is a good example of a *deliberate* mismatch — the schema evolved (string → structured), older data is still valid, the validator accepts both, and the consumer handles both. That's the healthy shape of schema evolution at the LLM boundary. The unhealthy shape is when nobody noticed the schema drifted and half the consumers still read `.estimatedImpact` as a string — which is what happens when the change ships without an eval that renders the field.
+The 2026 version of this: providers now support "extended thinking" or "reasoning tokens" as a first-class response mode. Anthropic's Claude models can emit a `thinking` block that's structurally separate from the main response — you can enable it via `thinking: { type: 'enabled' }` and get the reasoning trace on the API response object, not in your JSON output. This codebase doesn't use that yet (the diagnostic prompt still asks for `hypothesesConsidered` as part of the output shape). If it did, the trade-off would be: less prompt engineering, more API surface to manage, thinking trace tokens billed separately.
 
-The Anthropic and OpenAI docs both hedge on this specifically: model outputs "should" be well-formed, but "may include additional whitespace or formatting." The docs are being polite. What actually happens: models drift emission style across versions, courteous models add prefaces, and Sonnet 4.6 today emits a slightly different shape than Sonnet 4.6 did last month. The only defense is the three-layer sandwich: prompt declares the shape, validator rejects malformed, consumer narrows what got through.
-
-Related concepts:
-- **Structured outputs** (`02-structured-outputs.md`) — the discipline this concept prevents the collapse of.
-- **Single-purpose chains** (`06-single-purpose-chains.md`) — the boundaries where mismatches live.
-- **Eval-driven iteration** (`05-eval-driven-iteration.md`) — how you catch drift before production.
+The related pattern from concept 06 (single-purpose chains): when each chain has one mode and the composition is code, mode mismatches are localized to seams. When chains are combined into a super-prompt, mode drift can happen internally to the super-prompt in a way no validator catches. The decomposition is what makes output modes checkable.
 
 ## Interview defense
 
-**Q: Someone changed the recommendation schema — `estimatedImpact` went from string to a structured object. What breaks and where?**
+**Q: A chain in your pipeline suddenly starts returning bad output. Where do you look first?**
 
-Anywhere in the codebase that reads `recommendation.estimatedImpact` as a string. If TypeScript is honest (the type is `string | { range, ...}`), the compiler catches it — the reader has to narrow via typeof or destructure. If someone cast to `any` or the type was inferred loosely, the code compiles fine and crashes at runtime when `.range` is undefined on a string. The fix in this codebase is at three layers simultaneously: the prompt says "string OR {range,...}", the validator (`isRecommendationArray` at `lib/mcp/validate.ts:42-57`) accepts either, and the consumer (`RecommendationCard`) narrows with a typeof check. Miss any layer and drift breaks something.
-
-```
-  Migration seam — schema change lands at three layers
-
-  prompt:     "estimatedImpact: string OR { range, ...}"
-       │
-       ▼  validator accepts both
-  isRecommendationArray → tolerates both shapes
-       │
-       ▼  consumer narrows
-  RecommendationCard → typeof check → renders per shape
-       │
-       ▼  eval catches regressions across model versions
-  eval/receipts/*.json → next run shows shape drift
-```
-
-Anchor: `isRecommendationArray` at `lib/mcp/validate.ts:42-57`, specifically the `impactOk` block on line 46.
-
-**Q: The model started wrapping its recommendations in `{"recommendations": [...]}` instead of a bare array. Do you fix the prompt or the validator?**
-
-Both, with priority on the prompt. The prompt is what shaped the model's emission and can shape it back — one clear line ("Return the bare array, not wrapped in an object") often fixes it. The validator fix is secondary: I'd make it tolerant of the wrapping shape (unwrap if the object has a `.recommendations` key) so future drift doesn't crash. Prompt-fixes are cheap but slow to verify (need an eval run). Validator-fixes are the safety net. Ship both.
+The validator on the parse boundary. In this codebase that's `lib/mcp/validate.ts`. Each chain's output is narrowed by a shape guard (`isAnomalyArray`, `isDiagnosis`, `isRecommendationArray`). If a validator suddenly starts throwing, the mode has drifted. Common causes: a prompt edit changed § 4 (the output shape section), a model upgrade made the model politer (added a signoff outside the JSON fence), or a downstream consumer changed its field expectations without updating the guard. The receipts in `eval/receipts/*.json` capture raw model output per case, so bisecting is possible.
 
 ```
-  Two layers of fix — prompt tightens, validator tolerates
-
-  prompt fix: "Return the bare array, not wrapped"
-       reduces mismatch rate at the source
-       needs eval to verify
-
-  validator fix: unwrap { recommendations: [...] } if present
-       tolerates the drift that the prompt doesn't stop
-       ships as a safety net
+  drift lands at:  validator
+  bisect via:      eval/receipts/*.json
 ```
 
-**Q: What's the load-bearing part people forget?**
+Anchor: `lib/mcp/validate.ts:29-57`.
 
-The polymorphism. Everyone remembers to write a validator. What people forget: the validator can accept multiple shapes for the same field, and the consumer must handle every shape the validator accepts. If the validator's decision tree is broader than the consumer's decision tree, you have a validated-but-still-broken output. The fix: whenever the validator adds a polymorphism (the `estimatedImpact: string | {range,...}` in this codebase), audit every consumer that reads that field and add the narrowing.
+**Q: You have JSON chains and one prose chain in the same repo. What's the discipline?**
 
-Anchor: the `estimatedImpact` handling — validator at `lib/mcp/validate.ts:46`, consumer's typeof check at `components/investigation/RecommendationCard.tsx`.
+Explicit mode declaration in every prompt, plus one validator per JSON chain, plus zero validator on the prose chain (the UI renders it directly). The failure surface is when someone edits the prose chain to *also* return JSON — the model will happily emit prose followed by JSON, the UI markdown-renders the JSON as a code block, users see raw JSON. The way you catch this is: the prompt says exactly one mode, and any edit that adds "also return X" is a red flag in review. In this codebase the query prompt at `lib/agents/legacy-prompts/query.md:46-48` explicitly says "no JSON shape is required — just the answer text." That negative declaration is load-bearing.
+
+```
+  three JSON chains: prompt says JSON + validator catches drift
+  one prose chain:   prompt says prose  + explicit "no JSON"
+                              ▲
+                    the negative declaration is what prevents future drift
+```
+
+Anchor: `lib/agents/legacy-prompts/query.md:46-48`.
 
 ## See also
 
-- `02-structured-outputs.md` — the contract this concept enforces.
-- `05-eval-driven-iteration.md` — how you catch mismatches before production.
-- `06-single-purpose-chains.md` — the boundaries between chains where mismatches happen.
+- 02 · structured outputs — the mechanism for making mode contracts enforceable at the provider boundary.
+- 06 · single-purpose chains — decomposition is what makes seams (and their modes) checkable.
+- 01 · anatomy — § 4 (output shape) is where the mode is declared per chain.

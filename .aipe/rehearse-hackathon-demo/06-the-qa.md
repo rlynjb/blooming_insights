@@ -4,14 +4,14 @@ The buzzer went off. The room is polite-clapping. A judge raises a hand. This is
 
 The Q&A rules are different from the demo. In the demo you were choreographing a room; here you're one-on-one with a judge who has one probe and about 45 seconds of patience. The answers are short. They point at receipts. They own the rough edges. They never hedge.
 
-Six probes come up almost every time. You rehearse the verbatim answer to each. When a variant of a probe lands, you recognize the shape and use the answer. If a probe is genuinely off-script, you have a fallback move: "the honest answer is I don't know — here's what I'd need to find out." That answer beats a fabricated one, always.
+Nine probes come up almost every time. You rehearse the verbatim answer to each. When a variant of a probe lands, you recognize the shape and use the answer. If a probe is genuinely off-script, you have a fallback move: "the honest answer is I don't know — here's what I'd need to find out." That answer beats a fabricated one, always.
 
-  ## The Q&A shape — six anticipated probes
+  ## The Q&A shape — nine anticipated probes
 
   Each probe has a category. Recognizing the category is 80% of answering well.
 
 ```
-  The six probes — what judges ask after a hackathon demo
+  The nine probes — what judges ask after a hackathon demo
 
   ┌── probe ──────────────────────┬── category ─────────────────┐
   │ 1. isn't synthetic just fake?  │ credibility of the demo     │
@@ -28,6 +28,15 @@ Six probes come up almost every time. You rehearse the verbatim answer to each. 
   ├────────────────────────────────┼─────────────────────────────┤
   │ 6. why NOT route monitoring    │ cost / model choice         │
   │    to a cheaper model?         │                             │
+  ├────────────────────────────────┼─────────────────────────────┤
+  │ 7. so this isn't just for      │ scope / product framing     │
+  │    Bloomreach?                 │                             │
+  ├────────────────────────────────┼─────────────────────────────┤
+  │ 8. how much of this was        │ AI-assist honesty           │
+  │    AI-generated?               │                             │
+  ├────────────────────────────────┼─────────────────────────────┤
+  │ 9. is the eval harness         │ receipts realness           │
+  │    actually real?              │                             │
   └────────────────────────────────┴─────────────────────────────┘
 ```
 
@@ -104,7 +113,7 @@ Six probes come up almost every time. You rehearse the verbatim answer to each. 
 
   This is the deployment probe. A judge is checking whether "demo" and "shippable" are the same thing.
 
-  ┃ "Demo is the default for reliability. Live-bloomreach when there's a real workspace plus OAuth tokens. Live-synthetic is the dev / test / judge-friendly path — no creds, no upstream dependency. Deployed to Vercel Pro; maxDuration 300 on the streaming routes. Auto-reconnect when the alpha server revokes tokens mid-session."
+  ┃ "Live-synthetic is the default at page load — real agents, no creds, no upstream dependency. Live-mcp is the production path: any HTTPS MCP server, three auth providers (bloomreach oauth / bearer / anonymous), and a per-visitor override via the settings modal. Demo mode replays committed snapshots for a bulletproof fallback. Deployed to Vercel Pro; maxDuration 300 on the streaming routes. Auto-reconnect when the alpha server revokes tokens mid-session."
 
   The move: **name the three modes and what each is for**. The judge is expecting a hedge; instead, name the specific runtime posture for each mode.
 
@@ -170,6 +179,77 @@ Six probes come up almost every time. You rehearse the verbatim answer to each. 
      that layer is on the roadmap."
 ```
 
+  ## Probe 7 — "wait, so this isn't just for Bloomreach?"
+
+  This is the scope / product-framing probe. A judge saw the settings-modal swap (or heard you mention it) and is checking whether the pitch was misleading — the product name looks Bloomreach-specific, but you just pointed at any-MCP.
+
+  ┃ "Correct — Bloomreach is the default MCP preset in MCP_URL, not the product's identity. The product is a multi-agent analyst that speaks MCP. Any HTTPS MCP server works — you saw the settings-modal swap. Three auth flows: bloomreach oauth PKCE, bearer token, anonymous. The name reflects where it was built and tested first, not where it's constrained to run."
+
+  The move: **name the default vs the identity**. Do not defensively insist it was always framed that way — say plainly that Bloomreach was the first-party target, and the seam that makes any-MCP possible is the same seam that made the fault-injection receipt possible.
+
+  Follow-up decision tree:
+
+```
+  If judge asks "why is it named after Bloomreach then?" →
+    "Because it was built against Bloomreach Engagement first —
+     that's where the loomi connect MCP server exists, that's the
+     workspace i had access to. Refactoring the name isn't the
+     priority; refactoring the assumption is, and the seam already
+     did that."
+
+  If judge asks "have you tested it against another MCP server?" →
+    "The synthetic adapter is a different data source through the
+     same port, which is the strongest confirmation the seam is
+     honest. A second real MCP server is on the list — the settings
+     modal made it a five-minute task instead of a rebuild."
+```
+
+  ## Probe 8 — "how much of this was AI-generated?"
+
+  This is the AI-assist honesty probe. It comes up in every 2026 hackathon. Do not flinch, do not overclaim, do not undersell.
+
+  ┃ "AI-assisted heavily — Claude Code as a pair programmer. What i own: the architecture (agent loop, DataSource seam, three-adapter split, per-request UI override via base64 header), the eval design, retiring the wrong substrate in phase 3, the decision to make live-synthetic the default. What the tools did: a lot of the typing, a lot of the tests. Both matter. If you want to see the decision receipts, the seam is at lib/data-source/ and Sessions A–D are in the commit history."
+
+  The move: **name what you own and what the tools did without flinching, then point at a receipt**. The receipt is the seam and the session commits — verifiable in the repo.
+
+  Follow-up decision tree:
+
+```
+  If judge asks "what would you have gotten wrong without AI?" →
+    "The typing speed, mostly. The wrong-substrate call in phase 3
+     was mine — the AI would have kept helping me build on it. The
+     retirement decision cost a chunk of the timeline; recovering
+     the receipts cost more. That's the kind of judgment call the
+     tools do not make for you."
+
+  If judge asks "could you have shipped this without AI?" →
+    "In the hackathon window? no. In three months? probably yes.
+     The tools compress calendar time, not decision-making."
+```
+
+  ## Probe 9 — "what about the eval harness — is that actually real?"
+
+  This is the receipts-realness probe. A judge has heard "shipped, measured, gated" and wants to know if there's actual code behind the words.
+
+  ┃ "Yes — 10 golden cases in eval/cases/, 2 rubrics (diagnosis-quality, recommendation-quality) at 4 dimensions × 5-point scale, committed baseline at eval/baseline.json (baseline runId 2026-07-03T04-08-28-644Z). Per-case cost is about nine cents; per-phase p50 is around 50 seconds for diagnose and 51 for recommend. Regression gate blocks the PR at >10pp on any dimension. All wired into .github/workflows/eval.yml. Receipts live in eval/receipts/."
+
+  The move: **name the file paths and the numbers**. Specificity is the receipt. Judges do not fact-check baseline runIds live — they respect that you can produce one.
+
+  Follow-up decision tree:
+
+```
+  If judge asks "why 10 goldens? isn't that thin?" →
+    "For a hackathon window, yes. It's enough to gate against
+     obvious regressions and to earn the CI wiring. Scaling to 50
+     is a corpus problem, not a design problem — the harness runs
+     the same way at 10 or 50."
+
+  If judge asks "how much does one full eval run cost?" →
+    "About $1.30 wall clock; ~46 minutes on a warm connection.
+     The eval:report table you saw at the end of the demo is the
+     receipt from the latest committed run."
+```
+
   ## The off-script fallback — the "i don't know" move
 
   When a probe genuinely surprises you, do not fabricate. The strongest recovery move in a hackathon Q&A is naming the gap honestly.
@@ -202,11 +282,9 @@ Six probes come up almost every time. You rehearse the verbatim answer to each. 
 
   ## On owning AI-assisted development
 
-  Judges in 2026 assume heavy AI use in a hackathon build. Defensiveness reads worse than candor. If the question comes up:
+  Probe 8 above is the primary answer. Keep the sentence tight; the hackathon-Q&A version is shorter than the interview-defense version (Chapter 08 of the interview-defense book carries the long form).
 
-  ┃ "AI-assisted, absolutely. I use Claude Code as a pair programmer — the agent loop, the DataSource seam, the eval flywheel, all shipped with heavy AI assistance. What I own: the architecture decisions, the seam choice, the eval design, the retirement of the wrong substrate in phase 3. What the tools did: a lot of the typing. Both matter."
-
-  The move: **name what you own and what the tools did, without flinching**. This is the sentence that separates someone who used AI to ship from someone who used AI to hide.
+  The one-line default if a variant hits: **"AI-assisted heavily; the architecture, the seam choice, and the substrate retirement are mine — the typing was the tool's."** Do not extend without a follow-up prompt.
 
   ## One-page run sheet — the Q&A
 
@@ -219,7 +297,8 @@ Six probes come up almost every time. You rehearse the verbatim answer to each. 
   │  Posture:    short answers, point at receipts, own rough  │
   │              edges, never hedge                           │
   │                                                           │
-  │  The six probes — recognize the category, pick the answer:│
+  │  The nine probes — recognize the category, pick the      │
+  │  answer:                                                  │
   │                                                           │
   │  1. "isn't synthetic fake?"                               │
   │     → name what's fake + fault receipt (9/3/0)            │
@@ -232,9 +311,11 @@ Six probes come up almost every time. You rehearse the verbatim answer to each. 
   │     → npm run eval:gate; blocks PR at >10pp regression;   │
   │        CI-wired                                            │
   │                                                           │
-  │  4. "production deployment?"                               │
-  │     → three modes: demo / live-bloomreach / live-         │
-  │        synthetic; Vercel Pro; auto-reconnect               │
+  │  4. "production deployment?"                              │
+  │     → live-synthetic (default) / live-mcp (any HTTPS      │
+  │        MCP, 3 auth providers, settings-modal override)   │
+  │        / demo (snapshot fallback); Vercel Pro;           │
+  │        auto-reconnect                                     │
   │                                                           │
   │  5. "what about scale?"                                   │
   │     → session state = bottleneck; N=20 K=3 ~ 28min        │
@@ -245,17 +326,26 @@ Six probes come up almost every time. You rehearse the verbatim answer to each. 
   │     → eval doesn't measure monitoring cost; blind         │
   │        routing = anti-pattern eval exists to prevent      │
   │                                                           │
+  │  7. "isn't this just for Bloomreach?"                     │
+  │     → Bloomreach is the DEFAULT MCP preset, not the      │
+  │        identity; any HTTPS MCP works; 3 auth flows;       │
+  │        you saw the swap on stage                          │
+  │                                                           │
+  │  8. "how much was AI-generated?"                          │
+  │     → heavily AI-assisted; you own architecture / seam /  │
+  │        substrate-retirement; tools did the typing;        │
+  │        Sessions A–D in commit history                     │
+  │                                                           │
+  │  9. "is the eval harness actually real?"                  │
+  │     → 10 goldens, 2 rubrics × 4 dims, baseline.json       │
+  │        (runId 2026-07-03T04-08-28-644Z), ~$0.09/case,    │
+  │        p50 diagnose 50s / recommend 51s, CI wired         │
+  │                                                           │
   │  Off-script fallback:                                     │
   │    → name the file/module                                 │
   │    → ask a clarifying question back                       │
   │    → "the honest answer is i don't know — here's what     │
   │       i'd need to find out"                                │
-  │                                                           │
-  │  On AI use:                                               │
-  │    → matter-of-fact. name what you own (architecture,     │
-  │       seam choice, eval design, phase-3 retirement) and   │
-  │       what the tools did (a lot of the typing). both      │
-  │       matter.                                              │
   │                                                           │
   ╰──────────────────────────────────────────────────────────╯
 ```

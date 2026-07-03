@@ -17,7 +17,7 @@ The confidence map — regions of the codebase annotated by how confidently you 
 
   ┌─ CAN DEFEND WITH RECEIPTS ─────────────────────────────────┐
   │                                                            │
-  │  ★ DataSource port (71 LOC, 4 uses, 0 caller changes)      │
+  │  ★ DataSource port (71 LOC, 5 uses, 0 caller changes)      │
   │  ★ AptKit adapter boundary (263 LOC, legacy preserved)     │
   │  ★ readNdjson kernel (64 LOC, 4 streaming consumers)       │
   │  ★ FaultInjectingDataSource decorator (9/3/0 receipt)      │
@@ -90,7 +90,7 @@ Say this, as one continuous story:
 >
 > *I found it in a code read. I was working on the session-storage story for `useInvestigation` and read `insights.ts` for a different reason. When I saw `Map<insightId, Insight>` at the module scope, I stopped and asked myself: what happens with two users? The bug crystallized in about ten seconds.*
 >
-> *The fix was a `Map<sessionId, SessionFeed>` — session-keyed, not id-keyed. Each session gets its own feed of insights. The 24-test suite passed on the change; I added a concurrent-user test that would have caught the original bug. Shipped.*
+> *The fix was a `Map<sessionId, SessionFeed>` — session-keyed, not id-keyed. Each session gets its own feed of insights. The test suite passed on the change — now at 261 tests — and I added a concurrent-user test that would have caught the original bug. Shipped.*
 >
 > *The lesson I keep from that bug is that reviewing AI-generated code with a systems lens is different from reviewing it for correctness. The AI wrote code that was correct for one user. It took a systems question — 'what if there are two users?' — to see the problem. That question isn't in most code review checklists. It has to come from me."*
 

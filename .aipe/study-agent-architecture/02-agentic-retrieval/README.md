@@ -1,22 +1,15 @@
-# Section B — Agentic retrieval
+# 02 — Agentic retrieval
 
-**Anchor:** single-agent (primary).
-**Cross-references:** `.aipe/study-ai-engineering/03-retrieval-and-rag/` for all retrieval mechanics (embeddings, chunking, vector DBs, dense/sparse, RRF, reranking, RAG, GraphRAG). Not re-taught here.
+Anchor: **single-agent** (primary)
 
-This sub-section covers the shift from retrieval as a *one-shot pipeline step* to retrieval as a *control loop the agent drives*. Pure agent-architecture concern.
+Retrieval as a control loop the agent drives, not as a one-shot pipeline step. This is the shift from static RAG to a loop that decomposes queries, evaluates results, and re-retrieves.
 
-## Honest note on this codebase
+**This section does not re-teach retrieval mechanics.** Embeddings, chunking, vector stores, dense/sparse retrieval, RRF, reranking, RAG basics, GraphRAG — all covered in `.aipe/study-ai-engineering/03-retrieval-and-rag/`. This section is purely about the *control loop* around retrieval, which is an agent-architecture concern.
 
-blooming_insights does not exercise any of the agentic-retrieval patterns in this sub-section. The DiagnosticAgent's data-gathering is *tool-driven*, not retrieval-driven — `execute_analytics_eql` runs analytical queries against a workspace, not semantic search against a document corpus. There's no vector store, no embedding pipeline, no chunk index.
-
-The reason to still cover these patterns: (a) they're the standard escalation path if the product grew to include unstructured data (playbooks, historical incident writeups, Bloomreach docs); (b) recognizing the *shape* of the tool-calling loop as "retrieval as a control loop" is a valid reframe.
-
-## Files
-
-1. **`01-agentic-rag.md`** — the loop version of RAG. Not yet implemented. Where it would land if unstructured knowledge got added.
-2. **`02-self-corrective-rag.md`** — relevance grading + fallback. Not yet implemented.
-3. **`03-retrieval-routing.md`** — routing across multiple stores. This is the closest to what this repo *would* need — routing between EQL queries, catalog lookups, and (hypothetically) doc retrieval.
+**Important framing for this repo.** blooming insights does not do vector retrieval. It does *tool-driven retrieval* — the agent picks which EQL query (via the MCP `execute_analytics_eql` tool) to run, and every answer is grounded in the returned rows. There is no vector store, no embedding, no reranker. The three concepts in this section still apply: agentic RAG maps onto "the agent picks its next EQL based on what the last one returned," self-corrective RAG maps onto "if the EQL returned garbage, rewrite it and retry," retrieval routing maps onto "which MCP tool for this question — analytics EQL vs segment definitions vs catalog lookup."
 
 ## Reading order
 
-Read `01-agentic-rag.md` first for the loop shape; the others are refinements of the same loop.
+1. **[01-agentic-rag.md](./01-agentic-rag.md)** — retrieval as a loop, and how tool-driven retrieval is the same pattern.
+2. **[02-self-corrective-rag.md](./02-self-corrective-rag.md)** — grading retrieved chunks (or query results) before generation.
+3. **[03-retrieval-routing.md](./03-retrieval-routing.md)** — routing to the right knowledge source; in this repo, the right MCP tool.

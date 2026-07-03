@@ -18,7 +18,8 @@ The frame this file uses is the **evaluated-and-accepted decision mode**: you lo
   │  DataSource seam                         │
   │  · Olist add  · Olist remove             │
   │  · Synthetic add  · Fault-injecting      │
-  │  4 uses, zero caller-surface changes    │
+  │  · McpDataSource / AuthProvider generalization │
+  │  5 uses, zero caller-surface changes    │
   └──────────────────────────────────────────┘
 
   ┌─ 3. STREAMING TRANSPORT ────────────────┐
@@ -64,7 +65,7 @@ Opportunity cost of *migrating*:
 **This is the option that pays back hardest.** Here's the receipt shape you can put on a whiteboard.
 
 ```
-  DataSource seam — 4 shipped uses, zero caller-surface changes
+  DataSource seam — 5 shipped uses, zero caller-surface changes
 
   ┌─ AGENTS ─────────────────────────────────┐
   │  DiagnosticAgent · RecommendationAgent   │
@@ -74,14 +75,14 @@ Opportunity cost of *migrating*:
   │      DataSource (the port)                │
   └──────────────────┬───────────────────────┘
                      │
-     ┌───────────────┼───────────────┬─────────────┐
-     ▼               ▼               ▼             ▼
-  Bloomreach    Olist MCP       Synthetic     Fault-injecting
-   MCP adapter   adapter         adapter       decorator
-                                                (wraps another)
-  · used 1        · added 1       · used 3      · used 4
-    live prod       proved seam    demo mode      offline drill
-    briefings                      + eval
+     ┌───────────────┼───────────────┬─────────────┬────────────────┐
+     ▼               ▼               ▼             ▼                ▼
+  Bloomreach    Olist MCP       Synthetic     Fault-injecting   McpDataSource
+   MCP adapter   adapter         adapter       decorator         + AuthProvider
+                                                (wraps another)  generalization
+  · used 1        · added 1       · used 3      · used 4          · used 5
+    live prod       proved seam    live-syn +    offline drill      swappable-MCP
+    briefings       (retired)      eval + demo                      via UI modal
 ```
 
 **The alternative — direct MCP client calls.**
@@ -92,16 +93,19 @@ Opportunity cost of *not* having the port:
 - Testing without hitting a live MCP server means mocking the MCP client — noisy, fragile.
 - Demo mode has to fork the whole agent path instead of swapping one dependency.
 
-**The evaluated evidence — 4 uses, zero caller-surface changes.** This is the receipt that makes the seam defensible in an interview. The port was proved not by *arguing* it was clean, but by *using* it four different ways without changing the code that depends on it:
+**The evaluated evidence — 5 uses, zero caller-surface changes.** This is the receipt that makes the seam defensible in an interview. The port was proved not by *arguing* it was clean, but by *using* it five different ways without changing the code that depends on it:
 
 1. **Olist MCP adapter — added.** A second, third-party MCP server (Olist, ecommerce dataset) was wired up as an alternate DataSource. Agents worked against it unchanged. This was the *first* proof the port wasn't a same-shape-different-name — the adapter did real translation.
 2. **Olist MCP adapter — removed.** Once the seam was proved, the Olist adapter was retired in favor of the cleaner Synthetic path. Removal without caller changes = the seam works in both directions.
-3. **SyntheticDataSource — added.** In-process data generator that fabricates workspace-shaped responses for demo mode. No network. No auth. Used by the eval and by the demo path.
+3. **SyntheticDataSource — added.** In-process data generator that fabricates workspace-shaped responses. No network. No auth. It's what backs the default `live-synthetic` UX (real agent loop, in-process data) and the eval; the committed `demo` snapshot path uses it too.
 4. **FaultInjectingDataSource decorator — added.** Wraps any other DataSource and injects failures at the port boundary. Used for the fault-tolerance drill (Ch 02, un-cut fault tolerance).
+5. **McpDataSource + AuthProvider generalization — added.** Sessions A–D. The auth stopped being "the Bloomreach OAuth flow" and became an `OAuthClientProvider` interface with three shipped providers — `BloomreachAuthProvider` (PKCE + Dynamic Client Registration, still the default preset), `BearerAuthProvider` (user-supplied token for MCPs that expose one), `AnonymousAuthProvider` (no auth). `McpDataSource` accepts any provider, and `components/settings/McpConfigModal.tsx` lets the user point the whole app at any MCP URL with any provider — no code change, no env change. **This is the strongest problem-selection defense in the whole guide.** The abstraction survived five real pressures — not just four; the fifth one was the widest (identity, not just data shape), and no caller changed.
 
-Four shipped uses, no agent code changed. That's the port/adapter pattern earning its keep.
+Five shipped uses, no agent code changed. That's the port/adapter pattern earning its keep. And use #5 turned the seam from "we can swap the data source" into "we can swap the entire MCP identity of the app from the UI" — the abstraction covered a category of change (auth) it wasn't originally scoped for.
 
-**The interview line.** *"The DataSource seam looked speculative until it earned 4 uses without changing caller code: Olist add, Olist remove, Synthetic add, Fault-injecting decorator. That's the abstraction receipt — a seam nobody uses isn't a seam."*
+**The receipt-density on use #5, specifically.** The swappable-MCP work was itself a real choice — hardcoding Bloomreach forever would have been faster in the moment, and defensible up until the day an interviewer asks "can this hit my company's MCP server?" The un-hardcoded version cost roughly one day of work (Sessions A–D), preserved backward compatibility (the default preset is still Bloomreach with the existing PKCE + DCR flow untouched), and shipped three concrete providers behind one interface. The fact that ~1 day of work covered that surface — with the existing agents, existing tools, existing eval unchanged — is the receipt for the abstraction *quality*. A rougher seam would have cost a week to generalize; this one cost a day, because the port was already load-bearing everywhere it needed to be.
+
+**The interview line.** *"The DataSource seam looked speculative until it earned 5 uses without changing caller code: Olist add, Olist remove, Synthetic add, Fault-injecting decorator, and the McpDataSource + AuthProvider generalization that made the whole app swappable-MCP from a UI modal. That last one is the receipt I'd stake it on — an abstraction that survives a category of change it wasn't originally scoped for (auth, not just data) is the abstraction you keep."*
 
 ## Option 3 — NDJSON over fetch stream
 
@@ -163,7 +167,7 @@ Opportunity cost of *reactive hardening*:
                  │
   ┌─ Phase 4: FAULT TOLERANCE ──────────────┐
   │  FaultInjectingDataSource decorator      │
-  │  → unlocks: 3rd use of the seam          │
+  │  → unlocks: 4th shipped use of the seam  │
   └──────────────┬───────────────────────────┘
                  │
   ┌─ Phase 5: REGRESSION GATE ──────────────┐
@@ -192,6 +196,6 @@ The move that works in the review room:
 1. **Name the option you picked.** Direct.
 2. **Name the alternative you rejected.** Specific — not "some other approach," but *the* alternative.
 3. **Name the opportunity cost of BOTH.** Yours *and* theirs. Owning your cost is the credibility move.
-4. **Name the evidence that closes the loop.** For each pick above, the closing evidence is a *shipped receipt* — 4 uses of the seam, 4 consumers of the parser, 6 phases with their gate to CI, aptkit + legacy files both in the tree.
+4. **Name the evidence that closes the loop.** For each pick above, the closing evidence is a *shipped receipt* — 5 uses of the seam, 4 consumers of the parser, 6 phases with their gate to CI, aptkit + legacy files both in the tree.
 
 Every option in this file follows that shape. Every option you'll be asked about should.

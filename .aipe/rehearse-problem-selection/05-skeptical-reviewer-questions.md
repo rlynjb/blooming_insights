@@ -1,6 +1,6 @@
 # Skeptical reviewer questions
 
-**The memorize-this file.** Six probes you *will* get in a senior loop, each with the answer that holds under follow-up. Coach voice — this is what you say in the room, not what you think.
+**The memorize-this file.** Seven probes you *will* get in a senior loop, each with the answer that holds under follow-up. Coach voice — this is what you say in the room, not what you think.
 
 For each probe: the question as they'll actually ask it, the answer in the shape you should deliver it (verdict first, then the receipt), and one follow-up you should preempt so they don't get to it first.
 
@@ -52,13 +52,27 @@ This is the interviewer testing whether you understand what an abstraction is *f
 
 *"The DataSource seam was speculative until I used it. Adding the Olist adapter — a real, third-party MCP server — was the first proof the port wasn't same-shape-different-name; the adapter did real translation. Once the seam was proved, SyntheticDataSource was a cleaner shape for the same job: in-process, no network, no auth, no rate limit."*
 
-*"And crucially — the fault-injecting decorator became the 3rd offline use of the seam. So the seam has now shipped 4 uses with zero caller-surface changes: Olist add, Olist remove, Synthetic add, Fault-injecting decorator. That's the shipped abstraction receipt. A seam nobody uses isn't a seam."*
+*"And crucially — the seam has now shipped 5 uses with zero caller-surface changes: Olist add, Olist remove, Synthetic add, Fault-injecting decorator, and the McpDataSource + AuthProvider generalization that made the whole app swappable-MCP from a UI modal. That's the shipped abstraction receipt. A seam nobody uses isn't a seam — and this seam survived a category of change (auth, not just data) it wasn't originally scoped for."*
 
-**The move.** You reframed the question from "why remove Olist" to "how the seam earned its keep." You gave them the 4-uses receipt without them asking. You made the retirement a *step* in the seam's proof, not an admission of failure.
+**The move.** You reframed the question from "why remove Olist" to "how the seam earned its keep." You gave them the 5-uses receipt without them asking, including the strongest one (the auth generalization). You made the retirement a *step* in the seam's proof, not an admission of failure.
 
-**The follow-up you preempt.** *"If a real second Bloomreach-alternative MCP server ever ships, the seam is ready. But shipping-scope is Bloomreach — see Ch 01 outside-scope list."*
+**The follow-up you preempt.** *"And if the interviewer asks whether a real second MCP server has been proved, the answer is yes — Bloomreach is the default preset, but the config modal points the app at any conforming MCP with `BloomreachAuthProvider` / `BearerAuthProvider` / `AnonymousAuthProvider`. Backward-compat preserved. No env change needed."*
 
-## Probe 5 — "What's the eval gap now?"
+## Probe 5 — "Isn't a settings modal for pointing at any MCP server overkill for a demo?"
+
+This is the trap that catches candidates who over-engineered. If you argue "well the abstraction is beautiful," you lose — the interviewer is asking whether you shipped scope you didn't need. The right move is to reframe: the settings modal isn't for the demo. It's for the interviewer *asking that exact question*.
+
+**The answer.**
+
+*"The modal isn't for the demo — the default UX is `live-synthetic`, a real agent loop against the in-process `SyntheticDataSource`, and it never touches the modal. `demo` (replay committed snapshots) is the hidden reliability path. The modal is for the interviewer who says 'can this hit my company's MCP server?' The answer is yes, in the UI, in 30 seconds, no code change, no env change. That's a different value proposition from the demo."*
+
+*"And the cost of shipping it was ~1 day (Sessions A–D), because the DataSource seam was already load-bearing. Generalizing auth into `BloomreachAuthProvider` / `BearerAuthProvider` / `AnonymousAuthProvider` behind one `OAuthClientProvider` interface didn't touch the agents, didn't touch the tools, didn't touch the eval. That's the receipt on the abstraction quality — a rougher seam would have cost a week."*
+
+**The move.** You (a) named who the modal is actually for (a real interviewer question, not a demo user), (b) gave a concrete time cost (~1 day) to show it wasn't a rabbit hole, (c) named what didn't have to change to prove the seam paid back. You reframed "overkill" as "leverage."
+
+**The follow-up you preempt.** *"Trust surface note: the user-typed URL is a new trust boundary. The UI shows a visible warning about connecting to unknown MCP servers before the config takes effect. That's the security-review answer — the surface is exposed intentionally, with the mitigation in the UI."*
+
+## Probe 6 — "What's the eval gap now?"
 
 They're testing whether you know your own weakness. If you say "no gaps, it's shipped" you're done. The move is to name the exact gap, name the size of the fix, and name why it's not fixed yet.
 
@@ -72,7 +86,7 @@ They're testing whether you know your own weakness. If you say "no gaps, it's sh
 
 **The follow-up you preempt.** *"The mechanic itself is shipped — Session D pilot proved the loop works end-to-end. What's missing is the number, not the loop."*
 
-## Probe 6 — "What's the routing decision on monitoring?"
+## Probe 7 — "What's the routing decision on monitoring?"
 
 This one's about whether you'll optimize without evidence. The obvious move is to route the monitoring agent to Haiku — it's the simplest task, Haiku's cheaper, why hasn't this shipped? The right answer is that routing it *blind* is the exact anti-pattern the eval flywheel exists to prevent.
 
@@ -86,7 +100,7 @@ This one's about whether you'll optimize without evidence. The obvious move is t
 
 **The follow-up you preempt.** *"The intent classifier is already on Haiku 4.5 — see `lib/agents/intent.ts`. So it's not a Haiku-avoidance thing; it's a measure-before-you-route thing."*
 
-## The pattern across all six
+## The pattern across all seven
 
 Notice what every answer does:
 
@@ -99,4 +113,4 @@ Notice what every answer does:
 
 If they ask "what should I take away from this project?" — one line:
 
-*"I shipped an AI analyst that runs the human-analyst loop on Bloomreach, and then spent 4 weeks building the eval + observability + cost + fault-tolerance + regression-gate flywheel around it. Every claim in the portfolio traces to a committed receipt. That's the receipt density I'd bring to production work."*
+*"I shipped a swappable-MCP AI analyst that runs the human-analyst loop — with Bloomreach as the default preset and the same seam proved five ways, including the auth-provider generalization that lets a user point it at any MCP from a UI modal. Then I spent 4 weeks building the eval + observability + cost + fault-tolerance + regression-gate flywheel around it. Every claim in the portfolio traces to a committed receipt. That's the receipt density I'd bring to production work."*

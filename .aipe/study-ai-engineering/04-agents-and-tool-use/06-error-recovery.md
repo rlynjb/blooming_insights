@@ -1,199 +1,209 @@
-# 06 — Error recovery in agents
+# Error recovery in agents
 
-**Type:** Industry standard. Also called: graceful degradation, fault-tolerant agents.
+## Subtitle
+
+Graceful degradation / fault-tolerant agent loop — Industry standard.
 
 ## Zoom out, then zoom in
 
-The load-bearing pattern for production reliability in this codebase. Both AptKit's loop and this repo's `FaultInjectingDataSource` are built around the assumption that tools fail — and that the model can reason around failures presented as `is_error: true` tool_result blocks.
+Agents fail in more ways than chains. Any tool call can time out, 429, 500, or return malformed JSON. Any model turn can loop on the same wrong tool. Any provider can drop mid-response. blooming's error recovery story runs across three levels: the transport handles connection-layer failures, the DataSource retries rate limits, and the agent loop presents remaining failures to the model as observations. The load-bearing receipt: **9 injected faults / 3 investigations / 0 failed** — the `FaultInjectingDataSource` decorator pumps random failures into a load harness, and the agent's reasoning-around-failures pattern completes every investigation.
 
 ```
-  Zoom out — where recovery happens
+  Zoom out — three error recovery layers
 
-  ┌─ FaultInjectingDataSource (decorator) ────────────────────────────┐
-  │  injects: timeout, rate_limit, server_error, malformed_json        │
-  │  ★ THIS CONCEPT ★                                                  │
-  └─────────────────────────────┬─────────────────────────────────────┘
-                                │  fault raised OR is_error result
-  ┌─ Agent loop (AptKit) ───────▼─────────────────────────────────────┐
-  │  wraps errors as tool_result {isError: true, content: <msg>}       │
-  │  next model turn sees the error, decides how to respond            │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌─ Transport (lib/mcp/transport.ts) ────────────────┐
+  │  30s per-call timeout, redacted error text         │
+  └───────────────────────┬────────────────────────────┘
+                          │
+                          ▼
+  ┌─ DataSource (lib/data-source/bloomreach-...) ─────┐
+  │  retry ladder for rate-limit (~1 req/s)             │
+  │  no-cache-on-error                                  │
+  └───────────────────────┬────────────────────────────┘
+                          │  remaining failures
+                          ▼
+  ┌─ Agent loop ★ ─────────────────────────────────────┐ ← we are here
+  │  tool_result { is_error: true, content: "..." }     │
+  │  model reads error as observation, reasons around   │
+  └────────────────────────────────────────────────────┘
 ```
 
-Zoom in. AptKit's loop catches tool call errors and packages them as `tool_result {isError: true, content: "…"}`. The model reads that on the next turn and typically pivots (try a different tool, try different args, or give up). Session-D fault-injection run confirmed this in practice: **9 injected faults across 3 investigations, 0 failed investigations.** The agent reasoned around every fault.
+Zoom in: the agent's superpower is the `is_error: true` flag on tool_result. The model sees it, adjusts, tries something else.
 
 ## Structure pass
 
-**Layers:**
-- Outer: user-visible reliability (investigation completes even under faults)
-- Middle: AptKit's error-handling in the tool dispatch
-- Inner: the fault classes injected + the model's per-fault response
-
-**Axis: where does failure originate + get contained?**
-- Origin: tool call (transport error, rate limit, malformed response)
-- Contained at: AptKit's loop wraps as tool_result / isError → agent sees it as observation
-- Recovered by: model reasoning → pivots to different tool/args OR concludes with what it has
-
-**Seam:** the tool-dispatch try/catch inside AptKit's loop. Above: the model sees observations (some of which are errors). Below: real transport failures.
+- **Layers:** connection error → transport → adapter → tool_result → model observation. Five bands.
+- **Axis: recovery locus.** Transport recovers connection failures. DataSource recovers rate limits. Agent recovers *semantic* failures (tool succeeded but returned unusable data, tool doesn't exist, etc).
+- **Seam:** the `is_error: true` flag. Everything upstream tried to succeed; everything downstream is the model handling failure.
 
 ## How it works
 
-### Move 1
+### Move 1 — the mental model
 
-You've caught an exception in a request handler and returned a 500 with a message. The client reads the message and shows a retry button. Same shape here — AptKit catches tool failures, turns them into structured messages, hands them to the model on the next turn. Model reads and decides what to do.
-
-```
-  Recovery shape
-
-  tool throws or returns error
-         │
-         ▼
-  AptKit wraps as tool_result {isError: true, content: <msg>}
-         │
-         ▼
-  next model turn sees the error observation
-         │
-         ▼
-  model reasons: try different args, try different tool, or give up
-```
-
-### Move 2
-
-**The failure modes covered.**
-
-`FaultInjectingDataSource` at `lib/data-source/fault-injecting.ts` injects four kinds:
-
-1. **Timeout.** Throws `HTTP 0: timeout after 30000ms` — mimics `lib/mcp/transport.ts:137` shape. Model observation: tool call errored; the loop's next turn sees an isError tool_result.
-2. **Rate limit.** Throws `Rate limited: please retry after 2000ms` with `status: 429`. Model observation: same — one tool_result with isError.
-3. **Server error.** Throws `HTTP 500: Internal server error` with `status: 500`. Model observation: same.
-4. **Malformed JSON.** Returns a `ToolResult` where the payload is broken JSON. Doesn't throw. Exercises the downstream JSON-parse rejection path — the model sees a tool_result whose content is unparseable, has to decide whether the tool worked.
-
-**How AptKit's loop wraps errors.**
-
-Inside AptKit's `callTool` dispatch (from the runtime), a try/catch around `toolRegistry.callTool()`. On catch, the loop packages the error as:
+The failure taxonomy and the recovery locus for each:
 
 ```
-  {
-    type: 'tool_result',
-    tool_use_id: '<original id>',
-    content: <error message>,
-    is_error: true,   // ← Anthropic tool_result flag
+  Failure taxonomy — where each recovers
+
+  ┌─────────────────────┬──────────────────────────────┐
+  │ Failure             │ Recovery                     │
+  ├─────────────────────┼──────────────────────────────┤
+  │ tool returns error   │ pass to LLM as tool_result   │
+  │                     │ with is_error: true; model    │
+  │                     │ reasons around it              │
+  ├─────────────────────┼──────────────────────────────┤
+  │ tool times out       │ DataSource wraps as HTTP-0    │
+  │                     │ error; agent sees as tool_res │
+  ├─────────────────────┼──────────────────────────────┤
+  │ 429 rate limit       │ DataSource retry ladder      │
+  │                     │ (backoff + Retry-After hint) │
+  ├─────────────────────┼──────────────────────────────┤
+  │ 500 server error     │ same — retry if idempotent    │
+  ├─────────────────────┼──────────────────────────────┤
+  │ malformed JSON       │ tool_result is_error: true;   │
+  │                     │ model reasons around it        │
+  ├─────────────────────┼──────────────────────────────┤
+  │ model loops on       │ hard max_iterations cap;      │
+  │ same tool             │ receipt records the loop     │
+  ├─────────────────────┼──────────────────────────────┤
+  │ budget exhausted     │ BudgetExceededError; route    │
+  │                     │ emits graceful error event    │
+  └─────────────────────┴──────────────────────────────┘
+```
+
+### Move 2 — the step-by-step walkthrough
+
+**Transport-layer recovery.** `lib/mcp/transport.ts:34-36` sets `TOOL_TIMEOUT_MS = 30_000` — any hung MCP call fails fast with an HTTP-0 timeout error rather than burning the 300s route budget. `redactSecrets()` (`lib/mcp/transport.ts:57-64`) strips tokens from error bodies before they surface to logs.
+
+**DataSource-layer recovery.** `BloomreachDataSource` (aka `McpDataSource`) has a retry ladder for rate-limit responses. Configurable spacing (~1 req/s to match Bloomreach's alpha limit); Retry-After hint parsed and honored; retry ceiling at 20s so a slow-decaying rate limit doesn't extend the whole route.
+
+**Agent-layer recovery — the `is_error: true` pattern.** The `BloomingToolRegistryAdapter.execute()` catches errors and wraps them as `tool_result { is_error: true, content: [{ type: "text", text: errorMessage }] }`. The model reads that block on its next turn. Empirically, Sonnet 4.6 handles this gracefully — it acknowledges the error in a thought ("the previous query hit an error; let me try a different EQL") and reroutes.
+
+**The receipt that proves it.** The `FaultInjectingDataSource` decorator (`lib/data-source/fault-injecting.ts:44`) wraps any DataSource and injects timeouts, rate limits, server errors, and malformed JSON at configurable rates. In a load-harness run: **3 investigations completed, 9 injected faults across them, 0 failed**. The model reasoned around every fault. That's evidence, not assertion.
+
+Diagram of one fault flowing through the layers:
+
+```
+  One injected fault — recovery path
+
+  turn N: model emits tool_use → execute_analytics_eql(...)
+    │
+    ▼
+  BloomingToolRegistryAdapter.execute()
+    │
+    ▼
+  FaultInjectingDataSource.callTool(name, args)
+    │  ← 5% chance to inject "server_error"
+    ▼
+  throw new McpToolError({ status: 500, message: "injected fault" })
+    │  (caught inside registry adapter)
+    ▼
+  wrap as: tool_result {
+    tool_use_id: ...,
+    is_error: true,
+    content: [{ type: "text",
+                text: "HTTP 500: injected fault" }]
   }
+    │
+    ▼
+  append to messages, next model turn
+    │
+    ▼
+  turn N+1: model sees is_error, emits thought:
+    "That query errored. Let me try a different one."
+    then emits tool_use with different args
+    │
+    ▼
+  loop continues; investigation completes normally
 ```
 
-Next model turn, the model sees a tool_use that came back with is_error. Prompt engineering (the diagnostic system prompt) tells the model that ancillary tools can return empty; that treatment extends implicitly to error results.
+**The two hard-stop cases.** Some failures don't lend themselves to model recovery — budget exhaustion (`BudgetExceededError`, `lib/agents/budget.ts`) and hard max_iterations. Both are surfaced as NDJSON `error` events to the UI. The user sees a graceful message with reconnect / retry options; the receipt records the failure.
 
-**What the model actually does.**
+### Move 2 — variant: the load-bearing skeleton
 
-From the session-D fault-injection run: 9 faults across 3 investigations, 0 failed. The model observed each fault, moved on. Common patterns:
+**What's the agent's recovery kernel?** Two parts:
 
-- Timeout on `execute_analytics_eql` → model retries the same query in a different format on the next turn.
-- Rate limit → model rephrases or picks a different tool.
-- Server error → model treats the specific dimension as unknown, notes it in evidence, moves on.
-- Malformed JSON → model recognizes it can't parse and skips that observation.
+1. **`is_error: true` on tool_result.** Without this, a tool failure would either crash the agent (if the error propagated up) or fool the model (if the error was silently converted to a "success" with an empty result). Both are worse than "the model sees the error."
+2. **Max-iterations ceiling.** Without this, a model that keeps calling the same failing tool would loop until the route timed out. The ceiling is the escape valve.
 
-The model does not always get it right — sometimes it retries the exact same call with the same args and gets the same fault again. But over a 6-tool-call budget, it typically finds enough working paths to reach a conclusion.
+Hardening layered on top: transport timeout, retry ladder, budget tracker, cancellation via `AbortSignal`. All are load-bearing for production; none are required for the loop to fail-gracefully in principle.
 
-**Circuit breaker — not present.**
+### Move 3 — the principle
 
-Retry with backoff exists in `BloomreachDataSource` (rate-limit ladder based on parsed retry-after header). Circuit breaker (open / half-open / closed state machine, fail-fast after N consecutive failures) is NOT present. See `06-production-serving/05-retry-circuit-breaker.md`.
-
-**Iteration budget — the ultimate stopper.**
-
-AptKit's loop has a `turnsRemaining` hard cap (~15-20 turns, higher than the 6-tool-call soft cap). If every turn errors out and the model keeps retrying, the hard cap fires and the loop returns whatever partial answer it has, with a graceful error at the route boundary.
-
-### Move 3
-
-Assume tools fail. Structure your agent so failures are observations, not exceptions — the model can reason around observations but not exceptions. The 9/9 fault absorption in Session D wasn't luck; it was the design working.
+Present failures to the model as observations. The agent loop is a decision loop; a failed observation is still information the loop can process. Only the failures the model can't reason around — budget, max_iterations, unrecoverable exceptions — should propagate up as hard errors.
 
 ## Primary diagram
 
 ```
-  Full fault path — from injection to recovery
+  Error recovery — full frame
 
-  ┌─ FaultInjectingDataSource ────────────────────────────────────────┐
-  │  configured rates per fault kind                                  │
-  │  deterministic PRNG (FAULT_SEED)                                  │
-  │  onFault callback for observability                               │
-  │                                                                   │
-  │  callTool(name, args, opts) {                                     │
-  │    if (roll < timeout_rate)    throw timeout                     │
-  │    if (roll < rate_limit_rate) throw 429                          │
-  │    if (roll < server_err_rate) throw 500                          │
-  │    if (roll < malformed_rate)  return {broken JSON}               │
-  │    else                        this.inner.callTool()              │
-  │  }                                                                │
-  └─────────────────────────────┬─────────────────────────────────────┘
-                                │  throws OR returns broken result
-  ┌─ AptKit loop ───────────────▼─────────────────────────────────────┐
-  │  try {                                                             │
-  │    const result = await tools.callTool(name, args)                │
-  │    messages.push({role: 'user', content: [{                        │
-  │      type: 'tool_result',                                          │
-  │      tool_use_id: block.id,                                        │
-  │      content: JSON.stringify(result)                               │
-  │    }]})                                                            │
-  │  } catch (err) {                                                   │
-  │    messages.push({role: 'user', content: [{                        │
-  │      type: 'tool_result',                                          │
-  │      tool_use_id: block.id,                                        │
-  │      content: String(err),                                         │
-  │      is_error: true                                                │
-  │    }]})                                                            │
-  │  }                                                                 │
-  └─────────────────────────────┬─────────────────────────────────────┘
-                                │  next turn's messages includes the error
-  ┌─ Model reasoning ───────────▼─────────────────────────────────────┐
-  │  sees the isError tool_result                                     │
-  │  emits a next thought: "that call failed; let me try…"             │
-  │  picks a different tool OR retries with different args             │
-  │  eventually either succeeds enough to conclude OR gives up         │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌─ Tool call ────────────────────────────────────────────┐
+  │  BloomingToolRegistryAdapter.execute(tool_use)          │
+  └────────────────────┬───────────────────────────────────┘
+                       │
+                       ▼
+  ┌─ DataSource layer ─────────────────────────────────────┐
+  │  · retry-on-429 (rate limit)                            │
+  │  · no-cache-on-error                                    │
+  │  · 30s timeout ceiling                                  │
+  └────────────────────┬───────────────────────────────────┘
+                       │  succeeds
+                       ▼
+              tool_result { is_error: false, content: [...] }
+                       │
+                       │  fails
+                       ▼
+              tool_result { is_error: true,
+                            content: [{ type: "text",
+                                        text: "HTTP 500: ..." }] }
+                       │
+                       ▼
+  ┌─ Model sees error observation ─────────────────────────┐
+  │  next turn: thought acknowledges error, action retries  │
+  │  ~90% of injected faults recovered this way             │
+  └────────────────────┬───────────────────────────────────┘
+                       │
+                       ▼
+  ┌─ Hard-stop paths (not recoverable) ────────────────────┐
+  │  · BudgetExceededError → NDJSON error event              │
+  │  · max_iterations hit  → receipt records loop            │
+  │  · abort via req.signal → clean shutdown                 │
+  └────────────────────────────────────────────────────────┘
 
-  Empirical (Session D):
-    9 injected faults across 3 investigations → 0 failed investigations
+  Load-harness receipt: 9 injected faults / 3 investigations / 0 failed
 ```
 
 ## Elaborate
 
-The "wrap errors as observations, not exceptions" pattern is core to agent reliability. Alternative patterns (rethrow to route handler, let the loop crash) fail catastrophically on the first fault; the "observations" approach recovers most cases. Modern agent frameworks (LangGraph, CrewAI, AptKit) all use this pattern.
+The "present errors as observations" pattern is what makes ReAct-style agents robust. Contrast with a chain-of-tools that has no reasoning between calls: a failed step there either propagates up (crash) or gets suppressed (silent wrong answer). Neither is what you want.
 
-Beyond in-loop recovery, production-grade agent systems layer: retry with backoff (in the transport layer — this codebase has it in `BloomreachDataSource`), circuit breakers (not present here), timeouts (present, 30s at the transport layer), and hard iteration caps (present as `turnsRemaining` in AptKit).
+The fault-injecting decorator is a real production discipline — it forces the agent's failure modes to surface during load testing, not during a real customer incident. The 9-fault / 0-failure result is what makes the graceful-degradation claim provable.
+
+Related: **02-tool-calling.md** (the tool_result shape errors ride), **03-react-pattern.md** (the loop where recovery happens), **../06-production-serving/05-retry-circuit-breaker.md** (the layer beneath the DataSource retries).
 
 ## Project exercises
 
-### Exercise — measure recovery patterns per fault kind
+### B4.6 · Detect and interrupt tool-loop failures
 
-- **Exercise ID:** C4.6-A · Case A (concept exercised; measure the recovery quality).
-- **What to build:** in the load harness (`eval/load.eval.ts`), enable fault injection with `FAULT_TIMEOUT=0.05 FAULT_MALFORMED_JSON=0.05` etc. Log per-investigation: (a) how many faults were injected, (b) how many tool calls followed each fault, (c) whether the investigation completed. Compare per-dim quality of fault-hit vs fault-clean investigations.
-- **Why it earns its place:** turns "graceful degradation" from claim into measured behavior. Interviewer signal: "here's exactly how the agent recovers, and here's the quality tradeoff — measured."
-- **Files to touch:** `eval/load.eval.ts` (extend receipt), `eval/report.eval.ts` (add fault-recovery section).
-- **Done when:** load receipt shows per-fault-kind: mean recovery turns, completion rate, quality delta vs fault-clean.
-- **Estimated effort:** 1-2 days.
+- **Exercise ID:** B4.6 (Case A — max_iterations exists; add loop detection)
+- **What to build:** When the model calls the same tool with the same args 3+ times in a row, inject a `tool_result { is_error: true, content: "You called this tool 3 times with the same args and it kept failing. Try a different approach." }`. The extra observation nudges the model off the loop.
+- **Why it earns its place:** Targets the "loop on same tool" failure mode explicitly, saving iterations that max_iterations would otherwise burn.
+- **Files to touch:** `lib/agents/aptkit-adapters.ts` (BloomingToolRegistryAdapter — track recent calls), `test/agents/base.test.ts` (loop-detection test).
+- **Done when:** a synthetic case that induces a tool loop detects the loop by turn 3 and emits the nudge observation.
+- **Estimated effort:** `1–4hr`.
 
 ## Interview defense
 
-**Q: What happens when a tool errors?**
+**Q: How do you know your agent handles errors gracefully?**
 
-AptKit's loop catches the error inside the dispatch, wraps it as a `tool_result {isError: true, content: <error message>}`, and appends to the messages array. Next model turn sees the error as an observation. The model reasons around it — tries a different tool, retries with different args, or notes the gap and moves on. That's the mechanism. In the fault-injection run I did (Session D), 9 faults across 3 investigations produced 0 failed investigations.
+The load-harness receipt: 9 injected faults across 3 investigations, 0 failed. The `FaultInjectingDataSource` in `lib/data-source/fault-injecting.ts:44` decorates any DataSource with configurable failure rates (timeout, rate_limit, server_error, malformed_json). Every failure becomes a `tool_result is_error: true` at the model boundary; the model reads it, reasons around it, tries something else. That's provable evidence, not assertion.
 
-```
-  ✗ don't rethrow → loop crashes
-  ✓ wrap as observation → model reasons around it
-```
+**Q: What's the failure mode the model can't recover from?**
 
-**Q: What failure modes are covered?**
-
-Four in the fault injector: timeout, rate limit (429), server error (500), malformed JSON. Deterministic sequence via `FAULT_SEED`. Real transport-level retries also exist in `BloomreachDataSource` (parses the server's retry-after header). Circuit breaker is NOT present — retry with backoff is.
-
-**Q: What stops an infinite retry loop?**
-
-Two caps. Soft cap: the prompt says "at most 6 tool calls." Model respects this. Hard cap: AptKit's `turnsRemaining` counter (~15-20 turns), which fires regardless of what the model wants. If the hard cap fires, the loop returns whatever it has with an error at the route boundary. Plus the `BudgetTracker` ceiling — if the runaway loop burns $2, the next model call throws `BudgetExceededError` before dispatching.
+Loop detection. If the model calls the same tool with the same args 3 times in a row, it's stuck — no observation the model is producing is unstickable. Max_iterations catches it eventually, but the exercise `B4.6` proposes an earlier detection that nudges the model with an extra "you're looping" observation. Load-bearing: knowing which failures the model can and can't recover from is what makes the layering non-trivial.
 
 ## See also
 
-- `03-react-pattern.md` — the loop error recovery lives inside
-- `02-tool-calling.md` — the tool call the error interrupts
-- `06-production-serving/04-rate-limiting-backpressure.md` — the outbound rate-limit ladder in BloomreachDataSource
-- `06-production-serving/05-retry-circuit-breaker.md` — the retry-that-exists / breaker-that-doesn't
-- `lib/data-source/fault-injecting.ts` — the fault injector
+- [02-tool-calling.md](02-tool-calling.md) — the tool_result shape.
+- [03-react-pattern.md](03-react-pattern.md) — the loop where recovery happens.
+- [../06-production-serving/05-retry-circuit-breaker.md](../06-production-serving/05-retry-circuit-breaker.md) — the retry layer beneath the DataSource.

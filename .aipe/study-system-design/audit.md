@@ -1,125 +1,319 @@
-# audit.md — the 8-lens walk
+# audit.md — Pass 1
 
-One `##` section per lens. Each finding is grounded in `file:line`. When a finding is load-bearing enough to earn its own concept file, the audit links to it rather than restating it.
+The 8-lens architectural audit. Each lens gets one `##` section
+grounded in `file:line` evidence. Lenses that don't apply are
+named honestly. Cross-links point at the Pass-2 pattern files
+where the finding earns a full walkthrough.
+
+The load-bearing story for this repo, up front: the port
+(`DataSource`) has now shipped in **five uses** without a caller-
+facing interface change — Olist added, Olist removed, Synthetic
+added, FaultInjecting decorator, and now `McpDataSource` +
+swappable `AuthProvider` (Sessions A–D). That's the receipt the
+audit keeps coming back to.
+
+---
 
 ## 1. system-map-and-boundaries
 
-The system is a single Next.js 16 App Router deployment on Vercel Pro plus two external dependencies (Anthropic, Bloomreach loomi connect MCP). There is no database, no queue, no worker. All state lives in per-session in-memory `Map`s and per-user cookies.
+**One SPA, four significant runtime boundaries.**
 
-Six trust boundaries:
+The system is a Next.js 16 SPA (`app/` router, React 19) deployed
+to Vercel, with a Node runtime for the four streaming/OAuth
+routes. The client is the browser; the "server" is a handful of
+route handlers that stream NDJSON. No database, no queue, no
+worker pool. Every boundary that matters is a hop between three
+layers: browser · Next route handler · external MCP server.
 
-- **browser ↔ Next server** — session cookie (`bi_auth`, AES-256-GCM) established server-side (`lib/mcp/auth.ts:73-77`); no API keys or OAuth tokens ever cross to the browser.
-- **Next server ↔ Anthropic** — `ANTHROPIC_API_KEY` in env, never in an env var prefixed `NEXT_PUBLIC_` (checked in every route: `app/api/briefing/route.ts:155`, `app/api/agent/route.ts:153`).
-- **Next server ↔ Bloomreach MCP** — OAuth 2.1 with PKCE + Dynamic Client Registration, one client per session, tokens live in the encrypted cookie (prod) or a gitignored file (dev). Details: `04-oauth-boundary.md`.
-- **route handler ↔ agent** — the `DataSource` interface (`lib/data-source/types.ts:63-71`) is the only surface between them. Details: `01-datasource-seam.md`.
-- **Blooming agent ↔ AptKit runtime** — three-class bridge (`lib/agents/aptkit-adapters.ts`, 260 LOC). Details: `02-aptkit-boundary.md`.
-- **live path ↔ offline eval** — the eval harness (`eval/`) only imports from `lib/`, never the reverse (documented in `eval/README.md:52`); production has no idea evals exist.
+The four boundaries the design actually turns on:
+
+- **Browser ↔ route** — HTTPS, `POST /api/briefing` and
+  `/api/agent` return `Content-Type: application/x-ndjson`. Two
+  transports ride this hop: a session cookie (see auth, below) and
+  the new **per-request MCP config override header**
+  (`BI_MCP_CONFIG_HEADER = 'x-bi-mcp-config'`, base64-encoded JSON,
+  `lib/mcp/config.ts:37`). The route decodes both, threads them
+  into `makeDataSource`, and starts streaming.
+  → see `01-request-flow.md` and `06-per-request-config-transport.md`
+- **Route ↔ MCP server** — WHATWG-standard `fetch` under an MCP
+  SDK `StreamableHTTPClientTransport` (`lib/mcp/connect.ts:100`).
+  Rate-limited at ~1 req/s per user; the client (`BloomreachDataSource`,
+  which `McpDataSource` re-exports at `lib/data-source/mcp-data-source.ts`)
+  adds proactive spacing, a retry ladder that parses the server's
+  stated penalty window, and a 60s TTL cache.
+  → see `03-provider-abstraction-and-datasource-seam.md`
+- **Trust boundary at the MCP URL** — everything before this
+  boundary is code the deploy owns; everything after it is a
+  server the user has to trust. The bearer token (for
+  `authType='bearer'`) rides plaintext to whatever URL the config
+  resolves to. The URL itself is user-configurable via the
+  settings modal. `components/settings/McpConfigModal.tsx` names
+  this in the UI copy.
+  → see `02-auth-boundary-and-swappable-mcp.md`
+- **Route ↔ agents ↔ AptKit primitive** — the four agent files
+  (`monitoring.ts`, `diagnostic.ts`, `recommendation.ts`,
+  `query.ts`) are thin wrappers over `@aptkit/core@0.3.0`
+  primitives. The three-class bridge lives in
+  `lib/agents/aptkit-adapters.ts` (263 LOC). This seam is where
+  the reusable ReAct loop stops and Blooming-specific concerns
+  (Anthropic SDK, Bloomreach tool defs, `AgentEvent` NDJSON) start.
+  → see `04-aptkit-agent-primitive-boundary.md`
+
+External dependencies (both under the trust boundary named
+above): the Anthropic API (`@anthropic-ai/sdk`, calling
+`claude-sonnet-4-6` for the four agents plus
+`claude-haiku-4-5-20251001` for `classifyIntent`), and whichever
+MCP server the config resolves to (default preset:
+`https://loomi-mcp-alpha.bloomreach.com/mcp/`).
 
 ## 2. request-response-and-data-flow
 
-Three important end-to-end flows.
+**Three end-to-end flows, one shared kernel.**
 
-**Feed flow** (`GET /api/briefing`, streams NDJSON):
-
-```
-  bootstrap schema → coverage gate → listTools → MonitoringAgent.scan
-    → per-category tool loop → anomalies → anomalyToInsight → session store
-```
-
-Per-phase timings recorded in `phases[]` and dumped once per request in the route's `finally` block (`app/api/briefing/route.ts:317-324`). Real baseline p50 (Sonnet 4.6, 10 goldens): `schema_bootstrap` 50s, `list_tools` 38s, `monitoring_scan` 51s, `investigation` 90s.
-
-**Investigation flow** (`GET /api/agent?step=diagnose|recommend`, streams NDJSON):
+The three flows the product actually runs (feed briefing,
+investigation step 2 / step 3, free-form query) all share the
+same shape:
 
 ```
-  resolveAnomaly (client → session → demo) → bootstrap → listTools →
-    if step=diagnose: DiagnosticAgent.investigate → emit diagnosis, done
-    if step=recommend: parse handed-over diagnosis → RecommendationAgent.propose
+  client fetch → route decodes mode + config header →
+  makeDataSource → bootstrapSchema (once per process) →
+  agent.run() → NDJSON events stream back → readNdjson kernel
+  parses each line → UI dispatches per event.type
 ```
 
-Client hands the diagnosis between steps via `sessionStorage` (`bi:diag:<id>`), not via server state — the Vercel per-instance memory can't be trusted across a page navigation.
+Load-bearing details:
 
-**Demo replay** (`?demo=cached` or cached investigation): reads `lib/state/demo-*.json`, emits the same NDJSON events with a `REPLAY_DELAY_MS = 140/180` between them so the UI reveals at a human pace (`app/api/briefing/route.ts:25`, `app/api/agent/route.ts:103`). Same UI code, same event contract — details: `03-ndjson-streaming.md`.
+- **The mode branch happens at the route.** `?mode=` is parsed
+  by `parseLiveMode(raw)` (`lib/data-source/index.ts:64`). Demo
+  is served as static JSON (never gets to `makeDataSource`);
+  `live-mcp` and `live-synthetic` both go through the factory.
+- **The config header is decoded before commit-to-stream.**
+  `decodeConfigHeader(req.headers.get(BI_MCP_CONFIG_HEADER))` at
+  `app/api/briefing/route.ts:167` and
+  `app/api/agent/route.ts:165`. A missing / malformed header
+  returns `null` and the route falls through to env config —
+  never a 400; a bad header can't crash the request.
+- **Cancellation propagates end-to-end.** `req.signal` from the
+  Next.js route is threaded through `bootstrap(signal)` →
+  `dataSource.callTool(name, args, { signal })` → the transport
+  fetch. When the browser cancels, in-flight tool calls abort.
+  → see `01-request-flow.md`
+
+The client-side kernel is `readNdjson` at
+`lib/streaming/ndjson.ts:17` — one function, four callers
+(`useBriefingStream`, `useInvestigation`, `/api/mcp/capture`,
+free-form query). It handles the trailing buffer flush at
+end-of-stream and polls `cancelOn` between reads so unmounted
+consumers exit cleanly.
+→ see `05-streaming-ndjson.md`
 
 ## 3. state-ownership-and-source-of-truth
 
-State is split across five owners; the split is deliberate.
+**Four state homes, each with a clear owner.**
 
-- **Runtime toggle** — `localStorage['bi:mode']`, owned by the browser. Read once on mount (`app/page.tsx:68-84`), migrates legacy `'live'`/`'live-sql'` values to `'live-bloomreach'` inline. Details: `05-demo-vs-live-mode.md`.
-- **OAuth session** — encrypted cookie (`bi_auth`, prod) or `.auth-cache.json` (dev), keyed by session id. `AsyncLocalStorage` scopes the read/write per-request so concurrent requests on one instance don't cross-contaminate (`lib/mcp/auth.ts:41-46`).
-- **Insights + investigations** — per-session `Map`s in `lib/state/insights.ts:14`. Outer `Map<sessionId, SessionFeed>` never cleared; `putInsights` clears only the inner maps (`lib/state/insights.ts:64-71`) — this is the load-bearing detail that keeps a warm instance from wiping another user's feed.
-- **Client-side investigation stash** — `sessionStorage['bi:inv:<step>:<id>']`, populated at stream-complete; back-nav hydrates from it instead of re-running the agents (`lib/hooks/useInvestigation.ts:19-21`, `50-63`).
-- **Cached combined investigation** — dev only, on disk (`.investigation-cache.json`), only for the null-step combined capture run (`app/api/agent/route.ts:300-302`).
+There's no database. State lives in four places, each with a
+distinct scope and lifetime:
 
-There is no shared server state across Vercel instances. The system explicitly accepts the "each instance sees its own memory" tradeoff — details: `05-demo-vs-live-mode.md` explains why the client stashes the diagnosis instead of trusting server memory.
+- **`localStorage` (browser, cross-session)** — user
+  preferences: `bi:mode` (`'demo' | 'live-mcp' | 'live-synthetic'`,
+  read at `lib/hooks/useInvestigation.ts:159` and `useBriefingStream`),
+  and `bi:mcp_config` (the `McpConfigOverride`,
+  `lib/mcp/config.ts:34`). Persisted across tabs and reloads.
+- **`sessionStorage` (browser, tab-scoped)** — the current
+  investigation trace + result. `useInvestigation` writes it
+  after the stream ends; step 3 and back-navigation hydrate from
+  it instantly. Survives StrictMode remounts because the hook
+  does NOT cancel the in-flight fetch on cleanup.
+- **In-memory maps (route process, request-scoped)** —
+  `lib/state/insights.ts` and `lib/state/investigations.ts`.
+  Session-keyed, ephemeral. Vercel's cold-start rebuilds them.
+- **Encrypted cookie (browser ↔ route, session-scoped)** —
+  `bi_auth`. AES-256-GCM store carrying the Bloomreach OAuth
+  tokens, PKCE verifier, and DCR client info. Managed by
+  `AsyncLocalStorage` in production (`lib/mcp/auth.ts`
+  `withAuthCookies`). File-backed in dev.
+
+The **single source of truth** for the workspace data itself is
+the configured MCP server. Nothing here caches workspace state
+durably. The 60s TTL cache in `BloomreachDataSource` is a
+per-process request coalescer, not a store.
+
+**The demo replay path** owns its own tiny world: `lib/state/
+demo-insights.json` and `lib/state/demo-investigations.json` are
+committed to the repo as the presentation-reliability artifact.
+→ see `07-demo-replay-as-reliability.md`
 
 ## 4. caching-and-invalidation
 
-Two caches in the live path plus one on-disk cache in dev.
+**Three cache layers, two of them per-process.**
 
-- **BloomreachDataSource response cache** (60s TTL, `lib/data-source/bloomreach-data-source.ts`): absorbs repeated tool calls within a single investigation. Not invalidated — TTL is the whole invalidation strategy. Freshness matters less than budget: monitoring re-queries the same window if agents ask twice, and eating a repeat is worse than a 60s stale result.
-- **Anthropic prompt cache** on the system prompt (`lib/agents/aptkit-adapters.ts:83-89`): the system prompt is stable across every model turn in an investigation. Wrapping it in `cache_control: { type: 'ephemeral' }` makes the first turn a cache_creation (~1.25×) and every subsequent turn within 5 min a cache_read (~0.1×). For a ~10-turn diagnostic this is roughly an 80% reduction on system-prompt cost. Invalidation is Anthropic's 5-minute TTL; no code path invalidates it.
-- **`.investigation-cache.json`** (dev only, gitignored): on-disk cache of the last combined-capture run. Never trusted across sessions in prod; `?live=1` bypasses it.
+- **`BloomreachDataSource` per-tool TTL cache** — 60s, keyed on
+  `(toolName, args)`. Purpose: absorb the ReAct loop's tendency
+  to re-ask the same question on adjacent turns. Invalidation
+  is time-based; there's no explicit purge. Set
+  `{ skipCache: true }` in the call options to bypass (Bloomreach-
+  specific — not on the abstract surface; the 4 short MCP
+  routes at `/api/mcp/{call,tools,tools/check,capture}` use it
+  directly).
+- **`bootstrapSchema` module-scope cache** —
+  `lib/mcp/schema.ts:138`. A single `WorkspaceSchema` per
+  process. Rationale: the schema doesn't change during a
+  request; there's no reason to re-bootstrap. Cleared with
+  `_resetSchemaCache()` in tests. In production this is
+  effectively long-lived — Vercel's function stays warm.
+- **Anthropic prompt-cache (ephemeral)** — set at
+  `lib/agents/aptkit-adapters.ts:87`. Ephemeral cache breakpoint
+  on the system prompt; the tools ride along transparently. First
+  turn is cache_creation (~1.25× cost); subsequent turns within
+  ~5 minutes are cache_read (~0.1×). For a diagnostic run's
+  ~10 turns, this is roughly an 80% reduction on the system-
+  prompt token cost.
 
-No CDN cache is set for the streaming routes — both routes emit `Cache-Control: no-store, no-transform` (`app/api/briefing/route.ts:149`, `app/api/agent/route.ts:107`).
+The `demo=cached` path bypasses all three caches — it doesn't
+go through the factory at all.
 
 ## 5. storage-choice-and-durability-boundaries
 
-The honest answer: **there is no persistent datastore**. Three tiers of ephemerality:
+**Not exercised in the traditional sense.**
 
-- **Runtime memory** — `Map<sessionId, SessionFeed>` (`lib/state/insights.ts:14`). Lost on every cold start / deploy / instance rotation. Acceptable because the client stashes what it needs for back-nav.
-- **Cookies** — the encrypted auth cookie is durable across requests but not across users, and never carries business data (only OAuth tokens).
-- **Committed JSON** (`lib/state/demo-*.json`) — the demo snapshot. Not a database — a *fixture* that the demo path replays. Version-controlled, updated by dev-only capture tooling.
+There is no database, no persistent user-owned store, no
+migration. Every piece of durable state lives in one of:
 
-For the schema shape of `Insight` / `Anomaly` / `Diagnosis` / `Recommendation` see `study-data-modeling` — that's what those types owe callers regardless of where they eventually persist. For the "what would need to change if we actually did add a database" analysis see lens 7 below.
+- git (the committed demo snapshots + the code itself)
+- localStorage / sessionStorage (user's browser)
+- the encrypted cookie (browser, but the plaintext lives in
+  request scope on the server side via `AsyncLocalStorage`)
+- the MCP server (the actual workspace data — owned by the
+  target the config resolves to)
+
+Two consequences worth naming:
+
+- **`sessionStorage` as durability substitute** —
+  `useInvestigation` hydrates step 3 from `sessionStorage` so
+  the user can navigate back to step 2 without re-running the
+  agents. This trades cross-tab persistence for near-instant
+  in-tab persistence, which is the correct call for a session-
+  scoped investigation.
+- **The demo snapshots as a durability substitute for
+  presentation reliability** — committed JSON, replayed
+  identically every time. `demo-insights.json` +
+  `demo-investigations.json`. The reliable path for portfolio
+  presentations where the alpha MCP server is likely to be
+  down.
+  → see `07-demo-replay-as-reliability.md`
+
+Schema shape and data model details belong to
+`study-data-modeling`. Storage-engine internals (MVCC,
+transactions, indexes) belong to `study-database-systems` —
+neither is exercised here.
 
 ## 6. failure-handling-and-reliability
 
-Three graceful-degradation paths, all wired to real failure modes seen against the alpha Bloomreach server.
+**Four failure classes, each with an owner.**
 
-- **Token revoke → auto-reconnect.** Bloomreach's alpha revokes tokens after minutes. `lib/hooks/useReconnectPolicy.ts` reacts to an `invalid_token` error message by calling `/api/mcp/reset` and reloading once, guarded by a session-scoped flag so a redirect loop is impossible.
-- **Rate limit → retry ladder.** `BloomreachDataSource` parses the server-stated retry window from the error text and sleeps `parsed + 500ms buffer` (`lib/data-source/bloomreach-data-source.ts:49`, `65-71`). Falls back to bounded backoff when no hint is parseable.
-- **Budget exceeded → NDJSON error.** `BudgetTracker` checks the accumulated spend *before* each model turn (`lib/agents/aptkit-adapters.ts:63-66`); throws `BudgetExceededError`; caught in the route's try/catch (`app/api/agent/route.ts:303-316`); emitted as a graceful `{ type: 'error', message }` NDJSON event the UI already knows how to render. Details: `06-budget-and-observability.md`.
+- **MCP rate-limiting (~1 req/s per user, global).** Owned by
+  `BloomreachDataSource` at `lib/data-source/bloomreach-data-source.ts`.
+  Proactive spacing (`minIntervalMs = 1100`) + a retry ladder
+  that parses the stated penalty window from the 429 body
+  (`retryDelayMs = 10_000`, `retryCeilingMs = 20_000`, up to 3
+  retries). The 60s cache absorbs repeats.
+- **OAuth token revocation.** The Bloomreach alpha server
+  revokes tokens after minutes. Owned partly by
+  `BloomreachAuthProvider` (`lib/mcp/auth.ts`) and partly by
+  the client — the feed page auto-reconnects on an
+  `invalid_token` error, guarded so the reload only fires once
+  per session.
+- **Budget overrun.** `BudgetTracker` at `lib/agents/budget.ts`
+  checks before every model turn; `BudgetExceededError` throws
+  out of `AnthropicModelProviderAdapter.complete`, propagates
+  through AptKit's loop, gets caught by the route's error
+  handler, and emits a graceful NDJSON `{ type: 'error' }` event.
+- **Injected faults (offline).** `FaultInjectingDataSource` at
+  `lib/data-source/fault-injecting.ts` decorates any DataSource
+  and forces timeout / 429 / 500 / malformed-JSON at
+  configurable rates. Used by the load harness to exercise the
+  degradation paths without hitting a live server. Tier-2
+  receipt: 9 injected faults across 3 investigations, 0 failed
+  investigations.
 
-The route handlers' `finally` blocks are the incident-signal path: `phases[]` + `aborted` + `totalMs` logged as one JSON line per request, so a Vercel filter (`phases.phase = "schema_bootstrap"`) reads across both routes uniformly. Fires even on error, so an OOM/timeout at 299 seconds still leaves a receipt of how much budget was burned.
-
-Offline, the fault-injection decorator (`lib/data-source/fault-injecting.ts`) forces those same failure modes at configurable rates against the synthetic adapter so the load harness exercises the recovery paths deterministically. The four fault kinds — timeout, rate_limit, server_error, malformed_json — are shaped to match Bloomreach's real error envelopes byte-for-byte (`lib/data-source/fault-injecting.ts:112-155`).
-
-Cross-link to `study-distributed-systems` for coordination correctness across the OAuth boundary (the `AsyncLocalStorage` pattern in `lib/mcp/auth.ts` is the local-only mechanism that keeps concurrent requests on one instance from seeing each other's OAuth state; that's a single-process concurrency concern, not distributed).
+The reliability path for presentation is the demo replay
+(committed snapshot). Cross-link to
+`study-distributed-systems` for retry/idempotency vocabulary at
+the mechanism level.
 
 ## 7. scale-bottlenecks-and-evolution
 
-What breaks first at 10× and what stays stable.
+**The bottleneck at 10x is the MCP server, not this system.**
 
-**Breaks first at 10× traffic (concurrent users):**
+At 10x current concurrency (say 10 simultaneous investigations),
+the MCP server's ~1 req/s per-user global limit becomes the hot
+floor. Each investigation runs ~6 tool calls; ceiling at 10s per
+call gives ~60s per investigation minimum. The 300s route
+`maxDuration` swallows this, but the p90 walk grows linearly with
+concurrency at the server side.
 
-- **Bloomreach rate limit** (~1 req/s per session). Ten concurrent live briefings = ten sessions, so the per-session limit doesn't add up — the rate ladder already handles it per-session. This scales.
-- **Vercel Pro 300s max duration.** A single live investigation runs ~100-115s under the rate limit; ten concurrent are still within the budget. Not the bottleneck.
-- **In-memory `Map<sessionId, ...>` per instance.** At 100 concurrent users, memory is fine; at 10,000, this becomes the pressure point *if* users start returning to warm instances expecting their state to still be there. Today the client stashes what it needs (`useInvestigation.ts:50-63`), so this scales further than it looks.
+What changes at 10x:
 
-**Breaks first at the feature axis, not the traffic axis:**
+- **Per-user MCP servers become the pressure release.** The
+  swappable-MCP work (Sessions A–D) is what makes this possible
+  — a visitor plugs in their own MCP server via the settings
+  modal, bypassing the shared alpha entirely.
+  → see `06-per-request-config-transport.md`
+- **The in-memory maps in `lib/state/`** stop working at
+  serverless scale. They already don't work across a cold start;
+  they'd need a Redis or KV move.
+- **Prompt cache hit rate is the dominant cost knob.** At 10x,
+  the ~80% reduction on the system-prompt token cost is the
+  difference between $0.09/investigation and something painful.
 
-- **Adding a real database.** Would need to sit behind a new port (`lib/state/insights.ts`'s `putInsights` / `listInsights` signature is the natural boundary). The pattern for how to add it without a caller change is already exercised by the DataSource seam (`01-datasource-seam.md`).
-- **Multi-region + shared state.** Would break the "session-scoped in-memory" assumption. The cookie-based OAuth already survives instance rotation; the insights map does not. Session store (Redis) or per-user KV would be the move.
-- **Long-running background monitoring.** Today monitoring is on-demand per browser hit. A "scan every workspace overnight" job would need a scheduler (Vercel Cron), a queue for fan-out, and a real store for the resulting feed. This is the biggest gap between "the shape today" and "an actual analyst product."
+What stays stable:
 
-**Stays stable at 100×:** The `DataSource` seam (four adapters swapped without a caller change is the empirical proof), the AptKit boundary (any provider could be plugged in behind `ModelProvider`), the NDJSON contract (four surfaces speak it; adding a fifth is additive), the demo-mode fallback (a snapshot never gets faster or slower with load).
+- The `AgentEvent` NDJSON contract survives every scale story
+  because it doesn't cross state.
+- The DataSource seam survives adapter swaps (already proven
+  five times).
+- The demo replay path survives everything (it's static JSON).
 
-Cross-link to `study-distributed-systems` for what the multi-region shift specifically would need (coordination, invalidation, consistency).
+What would force rearchitecture:
+
+- Multi-tenant durable state (users saving investigations,
+  sharing findings). Right now everything is session-scoped;
+  this would need real storage and a real auth boundary between
+  users, not a session cookie.
 
 ## 8. system-design-red-flags-audit
 
-Ranked by real risk to the running system, not by architectural taste.
+**Ranked, worst first.**
 
-**1. No persistent store; a warm serverless instance is the only source of "your recent feed."** Rated: acceptable today because the demo path is the primary presentation surface and the live path is recovery-oriented. Rated: unacceptable the moment a customer expects "my briefing from this morning." Move: sit a KV/session store behind `putInsights`/`listInsights` in `lib/state/insights.ts`.
-
-**2. Bloomreach's alpha token revoke is a load-bearing UX assumption.** The reconnect policy is well-hardened, but every live session eats a UX event within minutes. Rated: known, mitigated. Move: when Bloomreach ships GA with longer tokens, delete the guard.
-
-**3. Legacy `-legacy.ts` duplicates in `lib/agents/`.** `base-legacy.ts`, `diagnostic-legacy.ts`, `monitoring-legacy.ts`, `recommendation-legacy.ts`, `intent-legacy.ts`, `query-legacy.ts`, `categories-legacy.ts`, `legacy-validate.ts`, `legacy-prompts/` — pre-AptKit implementations kept in-tree during the migration. Rated: dead code shipping in the deploy bundle. Move: schedule removal after the eval baseline confirms the AptKit paths lead by ≥5pp on every rubric dimension.
-
-**4. `page.tsx` at 461 LOC.** Well-organized (three hooks pulled out: `useBriefingStream`, `useReconnectPolicy`, `useDemoCapture`), but this file is the single one every engineer touches when the feed layout changes. Rated: acceptable now; watch for growth. Move: extract the mode toggle + header once a second header customer surface exists.
-
-**5. `SyntheticDataSource` at 516 LOC.** Large because it re-implements the response shapes of ~15 Bloomreach tools. Rated: intentional — this is a test double masquerading as a real adapter, and shrinking it means faking less. Move: none; treat it as fixture code.
-
-**6. Eval `judge_error` count of 6/10 on `root_cause_plausibility` in the current baseline.** (`eval/baseline.json:44-46`) — six cases the judge itself couldn't score. Rated: the baseline captures reality, but the reality is that the judge is fragile on this dimension. Move: tighten the rubric prompt or add a second-pass judge; regeneration gate stays honest either way.
-
-**7. No `lint` step in CI** (documented in `ci.yml:33-38`). Twenty-eight pre-existing errors. Rated: known-and-noted, not a red flag until the number stops shrinking. Move: dedicated cleanup PR.
+1. **`bi_auth` cookie carries the bearer token in localStorage,
+   not in an encrypted cookie.** For `authType='bearer'`, the
+   token rides in localStorage (`bi:mcp_config`) and gets sent
+   plaintext in the config header on every fetch. The modal
+   surfaces this warning (`components/settings/McpConfigModal.tsx`
+   trust-boundaries section), but the mitigation is only "don't
+   paste production credentials." A future move is to encrypt
+   the token into a short-lived cookie server-side. Flagged in
+   `lib/mcp/config.ts:22-23` as future work.
+2. **In-memory state maps.** `lib/state/insights.ts` and
+   `investigations.ts` do not survive a cold start. This is fine
+   for a portfolio demo but is the first thing that breaks at
+   any real concurrency.
+3. **The `BloomreachAuthProvider` name outlives its identity.**
+   The class is generic OAuth 2.1 + PKCE + DCR; it works
+   against any OAuth-enabled MCP server. The name is preserved
+   for import stability; the honest rename would be
+   `SessionPersistedOAuthProvider`. Called out at
+   `lib/mcp/auth-providers/bloomreach.ts:12-15`.
+4. **`bootstrapSchema`'s module-scope cache** — `lib/mcp/schema.ts:138`.
+   Works fine when one route process serves one MCP server; if
+   the user switches config mid-session, the cached schema is
+   from the old target. The switch triggers a page reload
+   (`writePersistedConfig` in the modal), which restarts the
+   process for the browser, but the route-side memory doesn't
+   flush per-request.
+5. **Silent malformed-header fallback.** A bad
+   `x-bi-mcp-config` header decodes to `null` and the route
+   falls through to env config with no error surfaced. Deliberate
+   ("a bad header shouldn't crash the request",
+   `lib/mcp/config.ts:86-87`), but a debugging visitor sees
+   "why isn't my config taking effect?" with no signal.

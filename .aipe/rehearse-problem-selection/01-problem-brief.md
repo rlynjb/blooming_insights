@@ -4,7 +4,7 @@
 
 ## The user — one person, one workflow
 
-The person you're building for: **a marketer or analyst working inside a Bloomreach Engagement ecommerce workspace**. Not a data scientist. Not a BI engineer. Someone whose job title says "growth" or "lifecycle marketer" and whose day includes a Bloomreach tab.
+The person you're building for: **a marketer or analyst working inside an ecommerce workspace, exposed through an analytics MCP server** — Bloomreach Engagement is the default preset the product ships against, but the same agents point at any MCP the user configures in the UI. Not a data scientist. Not a BI engineer. Someone whose job title says "growth" or "lifecycle marketer" and whose day includes a Bloomreach tab (or an equivalent MCP-fronted analytics tab).
 
 The specific workflow they run manually today — the one this product replaces:
 
@@ -62,36 +62,37 @@ This is the part where you distinguish evidence from inference. The repo proves 
 
 Two things converged that make this problem tractable *now* in a way it wasn't 18 months ago.
 
-- **Bloomreach shipped an MCP server.** `loomi-mcp-alpha.bloomreach.com/mcp` (see `lib/mcp/connect.ts`). Before this existed, an AI agent talking to Bloomreach meant scraping the UI or reverse-engineering an internal API. The MCP server is the *supply-side* enablement — it makes the "AI reads Bloomreach data" step technically possible without vendor cooperation on custom integrations.
+- **MCP is the analytics-vendor interop pattern.** Bloomreach shipped `loomi-mcp-alpha.bloomreach.com/mcp` (see `lib/mcp/connect.ts`) as the reference server this product ships against, and the broader MCP ecosystem gives other analytics vendors the same seam. Before this existed, an AI agent talking to an analytics platform meant scraping the UI or reverse-engineering an internal API. MCP is the *supply-side* enablement — it makes the "AI reads workspace data" step technically possible without per-vendor bespoke integrations, and the swappable-MCP work in this repo (`components/settings/McpConfigModal.tsx` + `lib/mcp/auth-providers/` with Bloomreach / Bearer / Anonymous providers behind one `OAuthClientProvider` interface) exercises exactly that generality.
 - **Sonnet 4.6 is good enough at multi-turn tool use to run this loop.** `lib/agents/base.ts` uses `claude-sonnet-4-6` inside the agent loop; the diagnostic agent typically runs 6–12 tool calls per case. A model that stalls or loops after 3–4 tool calls can't do this workflow. Sonnet 4.6 can. That's the *demand-side* enablement.
 
-Cost that compounds if the problem isn't solved: **every workspace where the marketer stops at stage 1 or stage 2**. The manual loop is skippable — you can look at a chart, decide it's fine, and move on. The action-taking stage (which Bloomreach feature to reach for) is exactly where the value lives, and it's the stage most likely to get abandoned. The longer the workspace sits without an analyst-loop closer, the more revenue-relevant anomalies go undiagnosed.
+Cost that compounds if the problem isn't solved: **every workspace where the marketer stops at stage 1 or stage 2**. The manual loop is skippable — you can look at a chart, decide it's fine, and move on. The action-taking stage (which product feature to reach for) is exactly where the value lives, and it's the stage most likely to get abandoned. The longer the workspace sits without an analyst-loop closer, the more revenue-relevant anomalies go undiagnosed.
 
 ## Who's inside scope, who's outside
 
 **Inside scope:**
-- A single Bloomreach ecommerce workspace (`wobbly-ukulele` is the reference).
+- A single ecommerce workspace at a time, with Bloomreach Engagement (`wobbly-ukulele`) as the default preset and reference server.
 - The three-stage loop as it applies to *ecommerce metrics* — revenue, funnel, traffic, customer segments by country. Data model in `lib/mcp/types.ts` (`Anomaly`, `Diagnosis`, `Recommendation`).
-- Bloomreach action recommendations across all five feature surfaces: scenario, segment, campaign, voucher, experiment. See `lib/agents/prompts/recommendation.md`.
+- Bloomreach action recommendations across all five feature surfaces: scenario, segment, campaign, voucher, experiment. See `lib/agents/prompts/recommendation.md`. (Non-Bloomreach MCP servers get the same agent loop; recommendation-target vocabulary is Bloomreach-shaped.)
+- **User-configurable MCP endpoint.** `components/settings/McpConfigModal.tsx` lets the user point at any MCP server URL, picking a `BloomreachAuthProvider` / `BearerAuthProvider` / `AnonymousAuthProvider` under the shared `OAuthClientProvider` interface. Trust surface: the user-typed URL. UI shows a visible warning about connecting to unknown MCP servers.
 - One user at a time, session-keyed. See the in-memory Map for insights in `lib/state/insights.ts` and investigations in `lib/state/investigations.ts`.
 
 **Outside scope — deliberately:**
-- **Not a multi-tenant SaaS.** No user accounts, no team collaboration, no shared workspaces. The product runs against one Bloomreach OAuth connection at a time. This is Ch 02 material — the DB cut lives there.
-- **Not a Bloomreach replacement.** The product runs *inside* the marketer's Bloomreach workflow, reading the same data they'd read in Bloomreach's UI. It's a loop on top, not a rebuild underneath.
+- **Not a multi-tenant SaaS.** No user accounts, no team collaboration, no shared workspaces. The product runs against one MCP connection at a time. This is Ch 02 material — the DB cut lives there.
+- **Not a Bloomreach replacement.** The product runs *inside* the marketer's analytics workflow, reading the same data they'd read in the platform's UI. It's a loop on top, not a rebuild underneath.
 - **Not other Bloomreach modules.** Content, discovery, recommendations-as-a-service — none of those. This is Engagement (the event/customer/campaign product) only.
-- **Not other analytics platforms.** No Segment adapter, no Amplitude adapter, no GA. The `DataSource` seam (`lib/mcp/tools.ts` + Synthetic adapter) exists partly so this *could* extend, but shipping-scope is Bloomreach.
+- **Not other-vendor bespoke adapters.** No Segment adapter, no Amplitude adapter, no GA. The `DataSource` seam (`lib/mcp/tools.ts` + Synthetic adapter) plus the swappable-MCP work make cross-vendor use *possible* through the config modal against any conforming MCP, but shipped presets are Bloomreach / Anonymous / Bearer.
 
 ## Constraints — what actually pins the shape
 
 The constraints that show up in the code, not the ones on the whiteboard:
 
-- **The MCP server rate-limits at ~1 req/s and revokes tokens after minutes.** `lib/mcp/client.ts` has the retry + rate-limit logic; `app/page.tsx` has the auto-reconnect-once-on-`invalid_token` guard. This is why demo mode exists at all — a live demo against the alpha server is not reliable for a 15-min presentation window. The presentation reliability constraint pinned the demo/live toggle in `app/page.tsx` (persisted in `localStorage` `bi:mode`).
+- **The MCP server rate-limits at ~1 req/s and revokes tokens after minutes.** `lib/mcp/client.ts` has the retry + rate-limit logic; `app/page.tsx` has the auto-reconnect-once-on-`invalid_token` guard. This is why `live-synthetic` — a real agent loop against the in-process `SyntheticDataSource` — is the default UX: it exercises real agent code without carrying the alpha server's reliability tail. `demo` (replay committed snapshots) is the hidden reliability path preserved for a demo window where even the local model call is off the table.
 - **The workspace has no pre-built reports.** Everything through `execute_analytics_eql`. The agent has to *decide* which EQL to run. This is why an LLM-in-the-loop makes sense at all — if there were a `getRevenueDashboard()` API, this would be a scripted ETL, not an agent.
 - **Vercel Pro function timeout: 300s.** `maxDuration = 300` on `/api/briefing` and `/api/agent`. That's the streaming envelope. Anything requiring longer than 5 minutes of continuous streaming has to be redesigned (which is why the recommend step runs as a separate request after diagnose).
-- **Presentation-first delivery.** The primary consumers of this product right now are you (for interview loops) and interviewers (for evaluating you). "Reliable demo path" is a first-class requirement, not a nice-to-have. It pinned the committed `lib/state/demo-*.json` snapshots and the demo/live toggle.
+- **Presentation-first delivery.** The primary consumers of this product right now are you (for interview loops) and interviewers (for evaluating you). "Reliable demo path" is a first-class requirement, not a nice-to-have. It pinned the committed `lib/state/demo-*.json` snapshots and the `live-synthetic` / `demo` mode gradient. It's also what pinned the swappable-MCP UI — an interviewer who asks "can this hit *my* company's MCP server?" gets a yes, in the UI, in 30 seconds, no code change.
 
 ## What kind of problem this is
 
-Name it directly for the interviewer's mental model: this is an **AI product problem, not an AI research problem**. You're not proving a novel technique. You're taking a well-understood pattern — LLM + tool use + streaming — and applying it to a workflow that currently doesn't have an AI-native version, in a way that respects the reality of the underlying data platform (Bloomreach MCP alpha), the model (Claude Sonnet 4.6), and the interface (web browser, streamed sidebar).
+Name it directly for the interviewer's mental model: this is an **AI product problem, not an AI research problem**. You're not proving a novel technique. You're taking a well-understood pattern — LLM + tool use + streaming — and applying it to a workflow that currently doesn't have an AI-native version, in a way that respects the reality of the underlying data platform (any MCP server, with Bloomreach alpha as the default preset), the model (Claude Sonnet 4.6), and the interface (web browser, streamed sidebar).
 
 The interviewer bar for AI product work is *judgment*, not *invention*. This book is the receipts on judgment.

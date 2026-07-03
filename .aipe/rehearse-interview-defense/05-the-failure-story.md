@@ -44,6 +44,11 @@ The failure-mode map. Each surface is a box. Each box names what the system does
   │  Session validation failure                                 │
   │    → return 401, client resets auth, single retry           │
   │    → auto-reconnect guarded against retry loop              │
+  │                                                             │
+  │  Malformed McpConfigOverride header (x-bi-mcp-config)       │
+  │    → decodeConfigHeader returns null (fail-safe, no throw)  │
+  │    → route falls through to env defaults                    │
+  │    → isMcpConfigOverride validates shape server-side        │
   └────────────────────────┬────────────────────────────────────┘
                            │
   ┌─ Agent layer faults ───▼────────────────────────────────────┐
@@ -77,6 +82,13 @@ The failure-mode map. Each surface is a box. Each box names what the system does
   │  OAuth token revoked mid-request                            │
   │    → capturing fetch catches raw response body              │
   │    → auth flow triggers re-auth (guarded, once)             │
+  │                                                             │
+  │  User-chosen MCP URL points at a lying target               │
+  │    → isMcpConfigOverride validates shape server-side        │
+  │    → UI names the boundary: "only enter URLs you trust"     │
+  │    → bearer token in localStorage (plaintext) vs bi_auth    │
+  │      cookie (AES-256-GCM) — difference surfaced in UI       │
+  │    → honest gap: no SSRF outbound allow-list yet            │
   │                                                             │
   │  FaultInjectingDataSource decorator (test-only)             │
   │    → 4 modes: timeout · error · slow · malformed_response   │
@@ -187,6 +199,36 @@ Say this:
 > *When it fires: `SdkTransport`'s capturing fetch catches the raw error body (that's why I need capturing fetch — the SDK swallows response bodies on errors otherwise). The transport surfaces `invalid_token`. The route emits an NDJSON error event with a specific error code. The client — the feed page — sees that code, resets auth in `lib/mcp/auth.ts`, and reloads the request once. Guarded — one reload, not a loop.*
 >
 > *This is a case where the failure mode drove the design. If loomi-connect had stable tokens I wouldn't have needed the capturing fetch or the auto-reconnect. The receipt is that auth revocations are a routine occurrence in dev and the reconnect path handles them without user intervention."*
+
+  ### User-chosen MCP URL — a NEW trust boundary
+
+┌─────────────────────────────────────────────────┐
+│ THEY ASK                                        │
+│   "You let visitors plug in their own MCP        │
+│   server URL. What stops them from pointing it   │
+│   at something malicious?"                      │
+│                                                 │
+│ WHAT THEY'RE TESTING                            │
+│   Do you know where the trust boundary moved    │
+│   when you made the MCP server swappable? Did   │
+│   you actually validate what comes in, or do    │
+│   you trust the client?                         │
+└─────────────────────────────────────────────────┘
+
+Say this:
+
+> *"Making the MCP server swappable moved a trust boundary. Before Session B, the target MCP server was env-controlled — only I could change it. After Session B, a portfolio visitor can enter a URL and bearer token in the settings modal and the server sees every tool call go to that URL.*
+>
+> *That means the visitor CAN enter a URL that lies. My server-side guard is `isMcpConfigOverride` in `lib/mcp/config.ts` — a type guard that rejects unknown auth types and malformed shapes. On top of that, `decodeConfigHeader` is fail-safe: any malformed base64, any invalid JSON, any shape that fails the guard returns `null` rather than throwing. The route falls through to env defaults. A bad header cannot crash the request.*
+>
+> *The UI names the boundary explicitly. The settings modal carries the warning 'only enter MCP server URLs you trust — the server sees every tool call.' The auth section calls out that a bearer token pasted into the modal is stored in `localStorage` — plaintext, no AES-256-GCM — unlike the `bi_auth` cookie the Bloomreach OAuth path uses. That difference is surfaced so the user knows to use test tokens, not production credentials.*
+>
+> *What I don't do is allow-list target URLs or block internal ranges server-side. That's the honest gap. On a real product I'd add an SSRF-style outbound allow-list. Right now the receipt is 'the boundary is named, the shape is validated, the UI warns.' That's tier-2 discipline, not tier-1 hardened."*
+
+┃ "Making the MCP server swappable moved a trust
+┃  boundary. The visitor CAN enter a URL that lies —
+┃  isMcpConfigOverride is the guard, the UI names
+┃  the boundary out loud."
 
   ### Concurrent user wipe — the fixed one
 
@@ -319,6 +361,7 @@ The rest of the failure story stays. Composed timeouts, model-reasons-around-fau
   → "How do you know error handling works?" → FaultInjectingDataSource decorator, 9 faults / 3 investigations / 0 failures.
   → "What if MCP hangs?" → 30s per-call timeout at transport.ts:38+131, composed with 300s route budget.
   → "What if the OAuth token revokes?" → capturing fetch surfaces invalid_token, client resets auth, guarded one-reload.
+  → "What stops a visitor from pointing MCP at a malicious server?" → isMcpConfigOverride server-side guard, fail-safe decodeConfigHeader (null on malformed, not throw), UI warns "only enter URLs you trust." Honest gap: no SSRF-style allow-list yet.
   → "What's your retry strategy?" → McpClient exponential backoff with jitter, no cache-on-error, gives up on budget.
   → "Any circuit breakers?" → not formally. Would add one to McpClient if I were doing it again.
 

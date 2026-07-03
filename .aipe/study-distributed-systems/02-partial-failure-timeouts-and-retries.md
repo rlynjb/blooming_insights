@@ -1,604 +1,454 @@
-# partial-failure-timeouts-and-retries
+# Partial Failure, Timeouts, and Retries
 
-*Timeout composition · Retry ladder · Circuit-breaker-adjacent · Fault injection · Industry standard*
+*Industry name: bounded retry with backoff · timeout composition · Type: Industry standard*
 
 ## Zoom out — where this concept lives
 
-Partial failure is the whole point of distributed systems. This is the file
-where the actual mechanisms live — timeout composition, the retry ladder,
-the no-cache-on-error rule, and the fault-injection subsystem that lets you
-prove they work without waiting for Bloomreach to actually break.
+This is the load-bearing distributed-systems block in the repo. Every other file in this guide is either upstream (the map that says which arrow to defend) or downstream (the auth cookie that lets the retry ladder even reach the server). Here's where the correctness under partial failure actually lives:
 
 ```
-  Zoom out — partial-failure mechanisms in the service layer
+  Zoom out — the retry + timeout stack
 
-  ┌─ Client layer ────────────────────────────────────┐
-  │  fetch(...) — sees NDJSON `{type:"error"}` or     │
-  │  a truncated stream on total collapse             │
-  └───────────────────┬───────────────────────────────┘
-                      │
-  ┌─ Service layer ───▼───────────────────────────────┐
-  │  ★ WHERE PARTIAL-FAILURE MECHANISMS LIVE ★         │ ← we are here
-  │                                                    │
-  │  ┌─ FaultInjectingDataSource ─┐  (offline chaos)   │
-  │  ├─ BloomreachDataSource      │                    │
-  │  │  · minIntervalMs spacing   │                    │
-  │  │  · retry ladder (parsed)   │                    │
-  │  │  · no-cache-on-error       │                    │
-  │  └─ SdkTransport ──────────────┘                   │
-  │     · composeSignals(30s + req.signal)             │
-  │                                                    │
-  │  AptKit agent loop                                 │
-  │     · catches throws → tool_result is_error:true   │
-  │     · model reasons about failed call              │
-  └────────────────────┬───────────────────────────────┘
-                       │  hop B (Bloomreach)
-                       ▼
-  ┌─ Provider layer ────────────────────────────────────┐
-  │  loomi-mcp-alpha — the thing that fails             │
-  └─────────────────────────────────────────────────────┘
+  ┌─ Client band ──────────────────────────────────────────┐
+  │  browser · fetch('/api/agent') · req.signal            │
+  └─────────────────────────┬──────────────────────────────┘
+                            │  HTTPS
+  ┌─ Server band ───────────▼──────────────────────────────┐
+  │  route.ts   req.signal.throwIfAborted() at each phase  │
+  │             │                                          │
+  │             ▼                                          │
+  │  ┌─ agent loop ─────────────────────────────────────┐  │
+  │  │  dataSource.callTool(name, args, {signal})       │  │
+  │  └───────────────────┬──────────────────────────────┘  │
+  │                      │                                 │
+  │  ┌─ McpDataSource ★ THIS FILE ★ ────────────────────┐  │
+  │  │  · spacing gate: sleep(1100 - elapsed)           │  │
+  │  │  · retry ladder: max 3, cap 20 s                 │  │
+  │  │  · no-cache-on-error                             │  │
+  │  └───────────────────┬──────────────────────────────┘  │
+  │                      │                                 │
+  │  ┌─ SdkTransport ───▼──────────────────────────────┐   │
+  │  │  composeSignals(routeSig, timeout(30_000))      │   │
+  │  │  → HTTP 0: timeout / HTTP 429 / HTTP 500 / …    │   │
+  │  └──────────────────┬──────────────────────────────┘   │
+  └─────────────────────┼───────────────────────────────────┘
+                        │  HTTPS
+                        ▼
+                    ┌──────────┐
+                    │MCP server│  ← the participant that can fail
+                    └──────────┘
 ```
 
-Every mechanism is inside the service layer. Some of them (timeout,
-spacing) fire on the OUTBOUND leg to Bloomreach; the retry ladder
-fires on the INBOUND result; graceful degradation fires when neither
-of the first two saved you.
+The whole stack collapses into one guarantee at the top: **every tool call either succeeds within some bounded time, or fails with a typed error that the caller can act on.** No infinite hangs, no silent drops.
+
+## Zoom in — narrow to the concept
+
+Partial failure is what makes distributed systems *distributed*. Your `fetch()` succeeded when you were in-process; the moment it crosses a network, any of these can happen:
+
+- the request went out but the response never came back (timeout)
+- the server got it, refused with 429, and told you when to try again
+- the server threw 500 and told you nothing useful
+- the response came back but the JSON is unclosed
+
+Each one needs a different response. The concept this file walks is **the ladder**: what you do about each of those cases, in what order, with what bounds.
 
 ## Structure pass
 
-### Layers of defense — four bands
+The mechanism is a stack of independent moves. Reading the skeleton before the mechanics is the whole point.
+
+### Layers
+
+- **Route** (`app/api/agent/route.ts`) — owns the outer 300 s wall-clock and threads `req.signal` down. When the browser closes the tab, this signal fires.
+- **Agent loop** (AptKit, in `node_modules`) — passes the signal down to each `callTool`. Doesn't retry itself.
+- **McpDataSource** (`lib/data-source/bloomreach-data-source.ts`) — spacing gate + retry ladder + no-cache-on-error. This is the coordination brain.
+- **Transport** (`lib/mcp/transport.ts`) — per-call `AbortSignal.timeout(30_000)` composed with the route signal. Timeout is a floor, not a ceiling.
+
+### One axis held constant — "when does control return to the caller?"
 
 ```
-  Four bands, outermost to innermost — what fires first, then next
+  Axis: "when does control return with an outcome?"
+        traced from outermost to innermost
 
-  ┌─ 1. Proactive spacing  (minIntervalMs=1100) ────────────┐
-  │   Fires BEFORE the call. Belts.                          │
-  └──────────────────────────┬───────────────────────────────┘
-                             │
-  ┌─ 2. Per-call timeout  (AbortSignal.timeout=30_000) ─────┐
-  │   Fires DURING the call. Bounds any single call.         │
-  └──────────────────────────┬───────────────────────────────┘
-                             │
-  ┌─ 3. Retry ladder  (parse server hint, cap 20s, max 3) ──┐
-  │   Fires AFTER the call, if isError && rate-limited.      │
-  └──────────────────────────┬───────────────────────────────┘
-                             │
-  ┌─ 4. Graceful degradation  (tool_result is_error:true) ──┐
-  │   Fires AFTER all above give up. Model reasons about it. │
-  └──────────────────────────────────────────────────────────┘
+  route         →   returns whenever agent loop returns,
+                    bounded by req.signal or 300 s
+                    → caller decides the outer bound
+
+  agent loop    →   returns when the model says stop OR
+                    when a tool call throws
+                    → the agent doesn't set a timer
+
+  McpDataSource →   returns after ≤ 3 retries × (up to 20 s wait) + call time
+                    → this layer sets the retry ceiling
+
+  SdkTransport  →   returns within 30 s per call (AbortSignal.timeout)
+                    → this layer sets the per-call ceiling
 ```
 
-### One axis — trace "who catches this failure?"
+The answer flips at every layer. That's the lesson: **no single layer knows the whole time budget.** Each layer bounds one thing, and the composition is the guarantee.
 
-```
-  "who catches this failure?" — held constant across layers
+### Seams — where the axis flips
 
-  ┌───────────────────────────────────────────────┐
-  │ transport layer (SdkTransport)                 │
-  │   catches: AbortError, TimeoutError, HTTP N    │ ← reshapes into
-  │   catches at lib/mcp/transport.ts:134           │   `HTTP 0:...` throw
-  └───────────────────────────────────────────────┘
-      ┌───────────────────────────────────────────────┐
-      │ adapter layer (BloomreachDataSource)          │
-      │   catches: everything above → McpToolError    │ ← tags with tool name
-      │   catches at bloomreach-data-source.ts:199    │   re-throws
-      └───────────────────────────────────────────────┘
-          ┌────────────────────────────────────────────────┐
-          │ agent loop (AptKit run-agent-loop.js)          │
-          │   catches: every throw → tool_result is_error  │ ← LOAD-BEARING
-          │   catches at run-agent-loop.js:81-86           │   SILENT SAVE
-          └────────────────────────────────────────────────┘
-              ┌──────────────────────────────────────────┐
-              │ route handler (/api/agent)               │
-              │   catches: BudgetExceeded, AbortError    │
-              │   catches at route.ts:303-316            │
-              └──────────────────────────────────────────┘
-```
-
-The answer flips at every layer. And the answer at the third layer — the
-agent loop — is the one that matters most, because it turns "this call
-threw" into "the model can reason about it and decide what to do next."
-
-### Seams
-
-- **`opts.signal` seam** — `SdkTransport.callTool` composes it with the
-  30s timeout via `composeSignals` at `lib/mcp/transport.ts:131`. This is
-  where "cancellable" becomes "always bounded."
-- **`isRateLimited(result)` seam** — the retry ladder is guarded by this
-  predicate at `bloomreach-data-source.ts:164`. It reads the result text
-  for `/rate limit|too many requests/i`. If the shape of Bloomreach's
-  error envelope changes, this predicate is the single point of failure.
-- **`fromCache: boolean` seam** — every DataSource result carries whether
-  it hit cache. The route hooks read this and surface it in the UI's
-  "how it was gathered" panel. Downstream code doesn't distinguish
-  fresh from cached, which is correct — but the surface is honest.
+- **route ↔ agent loop**: the outer `req.signal` becomes the cancellation contract. `req.signal.throwIfAborted()` is called at each phase boundary (`route.ts:231`).
+- **agent loop ↔ McpDataSource**: the abstract `signal` option on `DataSource.callTool` (`types.ts:39`). The agent loop passes it through; the adapter decides whether to add its own timeouts.
+- **McpDataSource ↔ SdkTransport**: `composeSignals(opts?.signal, AbortSignal.timeout(TOOL_TIMEOUT_MS))` (`transport.ts:131`). This is where the per-call 30 s hard ceiling attaches. **First signal to fire wins.**
 
 ## How it works
 
-### Move 1 — the mental model: four bands, first-fires-wins
+### Move 1 — the mental model
 
-You know how a `try { fetch(...) } catch (e) { retry() }` looks in one
-function? Take that shape and split it across four layers, each with a
-different concern:
+You've written retry logic before, probably as `for (let i = 0; i < 3; i++) { try { … } catch { await sleep(1000 * 2**i); } }`. This is that same skeleton, hardened for one participant with known behavior. Two hardenings matter: **honor the server's stated window** (not blind backoff), and **compose your timeout with the client's cancel** (not a lone timer).
 
 ```
-  The pattern — a call passing through four defenses
+  The pattern — the retry ladder as a state machine
 
-    request ──► [ 1. spacing ] ──► [ 2. per-call timeout ] ──► [ Bloomreach ]
-                                                                    │
-                                                                    ▼
-    response ◄─ [ 4. graceful ] ◄─ [ 3. retry-on-429 ] ◄─────── result / err
-
-           each defense has ONE job:
-           1. prevent 429s   (spacing)
-           2. bound duration (timeout)
-           3. absorb 429s    (retry)
-           4. survive rest   (tool_result is_error)
+    start
+      │
+      ▼
+   ┌─────────────┐
+   │ spacing gate│  ← wait 1100 - elapsed ms
+   └──────┬──────┘
+          │
+          ▼
+   ┌─────────────┐
+   │ liveCall    │  ← AbortSignal.timeout(30_000) inside
+   └──────┬──────┘
+          │
+          ▼
+     ┌────┴────┐
+     │ result? │
+     └────┬────┘
+     ok?  │  rate-limited?          error?
+     yes ─┤  yes ↓                  throws
+          │  ┌──────────────┐       ↑
+          │  │ parse retry- │       │
+          │  │ after hint   │       │
+          │  └──────┬───────┘       │
+          │         │               │
+          │         ▼               │
+          │  ┌──────────────┐       │
+          │  │ sleep(min(   │       │
+          │  │  hint,       │       │
+          │  │  ceiling))   │       │
+          │  └──────┬───────┘       │
+          │         │               │
+          │         └───► retry ────┘
+          │             (max 3)
+          ▼
+     cache? no if error
+     return {result, durationMs, fromCache}
 ```
 
-Band 1 fires optimistically (before you know you'd 429). Band 2 fires
-protectively (bounds any single call). Band 3 fires reactively (parse the
-server's hint, wait, retry). Band 4 fires when all three above give up.
+The kernel: **spacing gate + timed call + bounded retry that honors the server's window**. Strip any of these and something breaks (see the load-bearing skeleton below).
 
-### Move 2 — walk the mechanism one band at a time
+### Move 2 — the walkthrough
 
-#### Band 1 — the proactive spacing gate
+Walk it one moving part at a time. Each part is a sub-heading; each part gets a diagram.
 
-The Bloomreach alpha rate-limits per-user globally. If you send back-to-back
-calls, the second one gets a 429. Instead of eating that 429 every time,
-`BloomreachDataSource` remembers when its last call finished and sleeps
-before the next one:
+#### The spacing gate — proactive rate limiting
 
-```typescript
-// lib/data-source/bloomreach-data-source.ts:190-197 — liveCall spacing
-private async liveCall(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
+Bloomreach's rate limit is *per user, global* — 1 req/second, with the window stated in the error text ("1 per 10 second"). Reactively hitting the limit and backing off costs you a real 10 s wait plus a wasted round-trip. Proactively spacing calls at ~1.1 s means you rarely hit the limit at all.
+
+```
+  Spacing gate — the sleep before every liveCall
+
+  callTool #1:  elapsed=0        no wait      lastCallAt = now
+                                 fires
+
+  callTool #2:  elapsed=200ms    sleep 900ms  lastCallAt = now
+                                 fires
+
+  callTool #3:  elapsed=2000ms   no wait      lastCallAt = now
+                                 fires
+                                 (already past minInterval)
+```
+
+Here's the code, verbatim, from `lib/data-source/bloomreach-data-source.ts:190`:
+
+```ts
+// lib/data-source/bloomreach-data-source.ts:190
+private async liveCall(name, args, signal?): Promise<unknown> {
   const elapsed = Date.now() - this.lastCallAt;
-  if (elapsed < this.minIntervalMs) {
+  if (elapsed < this.minIntervalMs) {                                // ← 1100 ms
     await new Promise((r) => setTimeout(r, this.minIntervalMs - elapsed));
   }
-  // ... transport.callTool
-  this.lastCallAt = Date.now();
-```
-
-Bridge from what you know: this is a client-side "leaky bucket" of size 1.
-You've seen this shape when a UI debounces button clicks — same primitive,
-different failure mode being defended against.
-
-**Load-bearing part: `this.lastCallAt = Date.now()` in BOTH branches
-(`:197` on success, `:200` on error).** Skip the error-branch update and a
-failed call doesn't reset the spacing clock, so the retry lands inside the
-window it was supposed to space out. This is the boundary condition —
-easy to miss because the "happy path" version works fine in tests.
-
-Why `1100` and not `10000` (the observed pessimistic window)? At the
-pessimistic window a 6-call investigation costs 60s just in spacing,
-blowing the 60s Hobby-tier budget. `connectMcp` documents this trade
-explicitly at `lib/mcp/connect.ts:87-93`:
-
-> Proactive spacing stays at ~1.1s on purpose: spacing at the full 10s
-> window would cost ~60s for a 6-call investigation and blow the route's
-> 60s budget (app/api/agent). Instead, BloomreachDataSource parses the
-> stated window from each 429 and waits it out on retry.
-
-The trade: pay the 429 penalty when it fires (via band 3), don't pay it
-preemptively (via band 1).
-
-#### Band 2 — the per-call timeout, composed with cancellation
-
-Every MCP call is bounded by a 30s ceiling. If it takes longer, the signal
-fires and the call aborts:
-
-```typescript
-// lib/mcp/transport.ts:131-137 — the composition
-async callTool(name: string, args: Record<string, unknown>, opts?: CallToolOpts): Promise<unknown> {
-  if (this.httpErrors) this.httpErrors.last = null;
-  const signal = composeSignals(opts?.signal, AbortSignal.timeout(TOOL_TIMEOUT_MS));
   try {
-    return await this.client.callTool({ name, arguments: args }, undefined, { signal });
+    const result = await this.transport.callTool(name, args, { signal });
+    this.lastCallAt = Date.now();                                    // ← success updates
+    return result;
   } catch (err) {
-    if (isTimeoutError(err)) {
-      throw new Error(`HTTP 0: timeout after ${TOOL_TIMEOUT_MS}ms`, { cause: err });
-    }
-```
-
-Two signals in, one signal out — whichever fires first wins:
-
-```
-  Signal composition — first-fires-wins
-
-     req.signal              AbortSignal.timeout(30_000)
-     (client cancelled)      (per-call ceiling)
-           │                          │
-           └────────┬─────────────────┘
-                    ▼
-              composeSignals(...)   ← lib/mcp/transport.ts:173
-                    │                 uses AbortSignal.any() on Node 20+
-                    ▼
-              single AbortSignal
-                    │
-                    ▼
-         client.callTool({ signal })
-
-  fires when: client aborted OR 30 seconds elapsed OR both
-```
-
-**Load-bearing part: `AbortSignal.any([...])` at
-`lib/mcp/transport.ts:177-178`.** The manual `AbortController` fallback
-below it is belt-and-braces for older runtimes — on modern Node it never
-runs. If `AbortSignal.any` weren't available and the fallback also
-misfired, a client-cancelled request could keep burning 30s waiting for
-the timeout because nothing forwarded the abort.
-
-**Why re-throw as `HTTP 0: timeout after 30000ms` and not the original
-`AbortError`?** Because downstream callers pattern-match on `HTTP N:`
-prefixes to identify failure classes. `HTTP 0` is a distinct tag callers
-recognize as timeout-vs-transport-error-vs-server-error. Look at the
-fault injector at `lib/data-source/fault-injecting.ts:115`:
-
-```typescript
-// mimics the real transport's timeout shape exactly
-throw new Error(`HTTP 0: timeout after 30000ms`, {
-  cause: new Error('injected fault: timeout'),
-});
-```
-
-The fault injector reproduces the transport's error shape so downstream
-handlers can't tell an injected timeout from a real one. That's the point.
-
-#### Band 3 — the retry ladder, parsed from the server's error text
-
-This is where the interesting distributed-systems reading happens: the
-server tells you how long to wait, and you honor it. Bloomreach's 429
-envelopes have been observed in two shapes:
-
-```
-  "Retry after ~12 second(s)"           → parseRetryAfterMs → 12_000
-  "rate limit reached (1 per 10 second)" → parseRetryAfterMs → 10_000
-```
-
-The parser at `bloomreach-data-source.ts:64-71`:
-
-```typescript
-function parseRetryAfterMs(result: unknown): number | null {
-  const text = JSON.stringify((result as any)?.content ?? result);
-  const after = text.match(/retry[\s-]*after[^0-9]*(\d+)\s*second/i);
-  if (after) return parseInt(after[1], 10) * 1000;
-  const perWindow = text.match(/per\s*(\d+)\s*second/i);
-  if (perWindow) return parseInt(perWindow[1], 10) * 1000;
-  return null;
+    this.lastCallAt = Date.now();                                    // ← so does failure
+    throw new McpToolError(name, errorDetail(err), { cause: err });
+  }
 }
 ```
 
-Two shapes, two regexes. Neither matches → fall back to backoff (`retryDelayMs`).
+Two design decisions worth naming:
 
-The ladder itself at `bloomreach-data-source.ts:163-174`:
+- The gate updates `lastCallAt` **on both success and failure** (lines 197, 200). If it only updated on success, a burst of errors would burn straight through the gate.
+- The default `minIntervalMs = 1100` (constructor default 200, overridden to 1100 at `connect.ts:121`). The 1.1 s picks a value just above the 1 req/s window — enough headroom for clock jitter without eating into the 60 s route budget.
 
-```typescript
+**Failure mode this fixes**: without the gate, six rapid calls to Bloomreach return 429 six times, each triggering a ~10 s retry wait — that's a full minute burned on one investigation. The gate keeps calls under the window in the first place.
+
+#### The retry ladder — reactive rate limiting
+
+The gate is proactive; the ladder is what happens when Bloomreach 429s anyway (because two Vercel instances share one Bloomreach account — the gate is per-instance).
+
+```
+  Retry ladder — respect the server's stated window
+
+  call → result   is result a 429? ──no──► return
+
+                       │
+                      yes
+                       ▼
+              parse retry-after hint
+              from the error text
+                       │
+              hint = null? ── yes ──► backoff = 10s × 2^(retries-1)
+                       │
+                      no                          │
+                       ▼                          │
+              wait = hint + 500ms buffer          │
+                       │                          │
+                       └──► min(wait, 20_000ms) ──┘
+                                     │
+                                     ▼
+                                  sleep, retry
+                                  (max 3 attempts)
+```
+
+Code side by side (`bloomreach-data-source.ts:157`):
+
+```ts
+// lib/data-source/bloomreach-data-source.ts:157
 let retries = 0;
 while (isRateLimited(result) && retries < this.maxRetries) {
   retries++;
-  const hintMs = parseRetryAfterMs(result);
-  const backoffMs = this.retryDelayMs * 2 ** (retries - 1);
+  const hintMs = parseRetryAfterMs(result);                         // ← parses "1 per 10 second"
+  const backoffMs = this.retryDelayMs * 2 ** (retries - 1);         // ← fallback exponential
   const waitMs = Math.min(
-    hintMs != null ? hintMs + RETRY_BUFFER_MS : backoffMs,
-    this.retryCeilingMs,
+    hintMs != null ? hintMs + RETRY_BUFFER_MS : backoffMs,          // ← +500 ms cushion
+    this.retryCeilingMs,                                            // ← 20_000 ms ceiling
   );
   await sleep(waitMs);
   result = await this.liveCall(name, args, options.signal);
 }
 ```
 
-Trace the execution for a rate-limited call:
+Read line by line:
 
-```
-  Execution trace — retry ladder for a 429 result
+- Line 3 `retries < this.maxRetries` — bounded. Max 3 total attempts (config from `connect.ts:124`).
+- Line 4 `parseRetryAfterMs(result)` — reads the server's stated penalty window. Two shapes are supported: `"retry-after 12 seconds"` and `"1 per 10 second"` (`bloomreach-data-source.ts:64`).
+- Line 5 `backoffMs` — if the hint is unparseable, fall back to exponential (10 s, 20 s, 40 s at defaults).
+- Line 6-9 `Math.min(hint + buffer, ceiling)` — the ceiling caps the wait at 20 s. Without it, a parsed 60 s window would blow the 60 s route budget on one call.
+- Line 10 `sleep(waitMs)` — synchronous wait. The route's cancel signal is NOT respected inside this sleep, which is a known gap; the next `liveCall` sees it.
 
-  state before          retries  hintMs  backoffMs  waitMs (min of hint+500 or backoff, capped 20_000)
-  ─────────────────     ───────  ──────  ─────────  ──────
-  result = 429 ("per 10 second")   0     10_000    —         (loop entry)
-    → retries=1, hint=10_000, waitMs=min(10_500, 20_000)=10_500 → sleep, retry
-  result = 429 (still)              1     10_000    20_000    (retryDelayMs * 2^0 = 10_000; but we prefer hint)
-    → retries=2, waitMs=min(10_500, 20_000)=10_500 → sleep, retry
-  result = 429 (still)              2     10_000    —
-    → retries=3, waitMs=10_500 → sleep, retry
-  result = 429 (still)              3     —         —         (retries == maxRetries, exit loop)
-    → return result (isError=true) to caller UNCACHED
-```
+**Failure mode this fixes**: without the parsed hint, blind backoff at 1 s / 2 s / 4 s would burn 3 attempts against a 10 s window and fail all three. The parsed hint means the *first* retry lands just after the window clears.
 
-**Load-bearing part: the `+ RETRY_BUFFER_MS` cushion at
-`bloomreach-data-source.ts:169` (RETRY_BUFFER_MS = 500 at `:49`).**
+#### The per-call 30 s timeout — the floor
 
-Retrying exactly on the boundary of the server's stated window lands
-inside the window and burns another attempt. The 500ms buffer lands the
-retry just AFTER the penalty clears. Skip it and every retry costs an
-attempt for nothing.
+Every tool call has a hard ceiling composed at the transport layer:
 
-**Also load-bearing: the retry ladder ONLY retries `isError && rateLimited`
-results.** Timeouts throw (band 2's `HTTP 0`), and the ladder only sees
-returned envelopes. This is deliberate — as the transport comment at
-`lib/mcp/transport.ts:34-37` says:
-
-> The retry ladder in McpClient.callTool only retries successful-but-rate-
-> limited results, so the timeout error fails fast — exactly what we want,
-> since a retry would just risk another 30s wait inside the same route
-> budget.
-
-#### Band 4 — graceful degradation via `tool_result` `is_error: true`
-
-This is the load-bearing find of the whole file. When all three defenses
-above give up, the AptKit agent loop catches the throw and hands the model
-a `tool_result` block with `is_error: true` — and the model reasons about
-it and decides whether to retry or move on.
-
-```javascript
-// node_modules/@aptkit/core/node_modules/@aptkit/runtime/dist/src/run-agent-loop.js:73-102
-let isError = false;
-let resultContent;
-try {
-  const { result, durationMs } = await tools.callTool(toolUse.name, toolUse.input, { signal });
-  toolCall.result = result;
-  toolCall.durationMs = durationMs;
-  resultContent = truncate(JSON.stringify(result));
-}
-catch (error) {
-  isError = true;
-  const message = error instanceof Error ? error.message : String(error);
-  toolCall.error = message;
-  resultContent = truncate(JSON.stringify({ error: message }));
-}
-// ...
-toolResults.push({
-  type: 'tool_result',
-  toolUseId: toolUse.id,
-  content: resultContent,
-  ...(isError ? { isError: true } : {}),
-});
-```
-
-The catch at line 81 is the whole thing. The throw doesn't propagate; the
-model gets a `tool_result` back with `isError: true` and can:
-
-- **retry** — call the same tool again with the same or different args
-- **try a different tool** — reach for a fallback
-- **conclude without it** — write a diagnosis based on what it does have
-- **give up** — emit a final text response saying it couldn't proceed
-
-Which one it picks is determined by the system prompt, the failure
-message, and the model's own reasoning. **You do not write control flow
-for this.**
-
-The receipt from the Week 4B smoke test:
-
-```json
-// eval/load-receipts/load-2026-07-03T05-21-12-237Z.json (excerpt)
-{
-  "config": { "N": 3, "faultRates": { "timeout": 0.2, "malformedJson": 0.2 }, "faultSeed": 42 },
-  "succeeded": 3,
-  "failed": 0,
-  "faultTotals": { "malformed_json": 5, "timeout": 4 }
+```ts
+// lib/mcp/transport.ts:131
+async callTool(name, args, opts?): Promise<unknown> {
+  if (this.httpErrors) this.httpErrors.last = null;
+  const signal = composeSignals(opts?.signal, AbortSignal.timeout(TOOL_TIMEOUT_MS));  // ← 30_000
+  try {
+    return await this.client.callTool({ name, arguments: args }, undefined, { signal });
+  } catch (err) {
+    if (isTimeoutError(err)) {
+      throw new Error(`HTTP 0: timeout after ${TOOL_TIMEOUT_MS}ms`, { cause: err });   // ← typed
+    }
+    …
+  }
 }
 ```
 
-Nine faults across three investigations. Zero failures. **The model
-absorbed the injected failures the same way it absorbs real ones.**
+The interesting move is `composeSignals(routeSig, AbortSignal.timeout(30_000))` — first signal to fire wins. If the browser closes the tab, `routeSig` fires and cancels the in-flight fetch immediately. If Bloomreach hangs, the timeout fires at 30 s and produces a typed `HTTP 0: timeout` error.
 
-### The skeleton — what breaks when a band is missing
+```
+  composeSignals — OR of any-fires-cancels
 
-Isolate the kernel. The pattern is: "a call passes through four
-defensive bands, and if any band fires it produces a specific side
-effect the next band can consume." What breaks without each part:
+  routeSig ────────abort────────►┐
+                                 │
+                                 ├──► composed signal
+                                 │    fires on FIRST
+                                 │    of either source
+  AbortSignal.timeout(30_000) ──►┘
 
-- **Drop band 1 (spacing)** — every call hits the alpha's 1 req/s ceiling
-  and 429s. Band 3 fires on every single call. Investigation latency
-  triples (each call costs ~10s of retry wait). Never breaks
-  correctness; kills the budget.
-- **Drop band 2 (timeout)** — a hung call at the alpha ties up the
-  entire 300s route. One user's stuck request denies the warm instance
-  to every other user until Vercel kills the function. Breaks
-  correctness (denial-of-availability).
-- **Drop band 3 (retry ladder)** — every rate-limit error propagates
-  as a tool failure. Band 4 fires more often; the model gives up on
-  more investigations. Doesn't break correctness (model can still
-  reason), degrades quality.
-- **Drop band 4 (agent-loop catch)** — every failure throws out of
-  the agent, up through the route, and lands on the client as
-  `{type: "error"}`. The whole investigation fails on one bad tool
-  call. Breaks the "analyst that shows its work" pitch entirely.
+  → uses AbortSignal.any([...]) when available (Node 20+)
+  → fallback manual glue otherwise (transport.ts:180)
+```
 
-Band 4 is the LOAD-BEARING one. Everyone talks about retry logic; the
-part they forget is that the model itself is the recovery mechanism, and
-it only works because the runtime catches the throw. Look at that
-one try/catch in a library you don't own — that's the safety net.
+**Failure mode this fixes**: without the per-call timeout, a hung TCP connection to Bloomreach would burn the entire 300 s route budget on ONE call, and the user sees a spinner for five minutes. With it, a hung call fails at 30 s, the model sees `HTTP 0: timeout`, and the agent decides what to do next (usually: try a different tool).
 
-### Optional hardening layered on top
+**Why not retry timeouts inside the ladder?** Deliberately: the retry ladder only retries *successful-but-rate-limited* results (`isRateLimited(result)` at line 164, not thrown errors). A 30 s timeout retried 3 times = 90 s guaranteed, half the route budget on one dead call. Better to fail fast and let the model decide.
 
-- **The 60s cache** at `bloomreach-data-source.ts:147-152` — absorbs
-  repeats of successful calls. Not defense against failure; defense
-  against latency. Skips the whole four-band stack when it hits.
-- **`no-cache-on-error`** at `:179-181` — the caching's failure sibling.
-  Error envelopes are returned but not cached, so a transient 401 doesn't
-  poison a minute of subsequent calls. This is circuit-breaker-adjacent
-  — it doesn't close the circuit, but it doesn't let a bad state
-  memoize either.
-- **`skipCache: true`** at `:147` — the `/debug` panel's "force fresh"
-  path. Bypasses the cache but still writes on success (write-through).
+#### no-cache-on-error — the correctness knob
+
+If the tool call succeeds but returns `isError: true` (a Bloomreach validation error, a permissions error, a rate-limited-and-exhausted-retries envelope), the cache doesn't take it:
+
+```ts
+// lib/data-source/bloomreach-data-source.ts:178
+// Don't cache error results — they should not poison the cache.
+if ((result as any)?.isError === true) {
+  return { result: result as T, durationMs, fromCache: false };
+}
+// ... only NON-error results reach the cache.set() below
+this.cache.set(cacheKey, { result, expiresAt: now + ttl });
+```
+
+This is a **circuit-breaker-adjacent** decision, not a full breaker. A real breaker tracks failure rate and opens after a threshold. This just refuses to cache errors, so the next identical call actually re-tries the server instead of returning a stale error for 60 s.
+
+```
+  Cache decision table
+
+  result state       │ cached? │ next call same args
+  ───────────────────┼─────────┼───────────────────────
+  ok                 │  yes    │  cache hit (60 s TTL)
+  rate-limited       │  no*    │  hits server, retry ladder runs
+  isError:true       │  no     │  hits server, may succeed this time
+  throws (timeout)   │  no     │  propagates; caller sees typed error
+
+  * ladder retries first; only the FINAL result is subject to caching
+```
+
+**Failure mode this fixes**: without no-cache-on-error, a transient permissions blip would cache "you can't read this event" for 60 s. Every retry from the model would return the stale error instantly, and the investigation stalls without an obvious cause.
+
+### Move 2 variant — the load-bearing skeleton
+
+Strip everything down to what MUST be present for this pattern to still be itself:
+
+```
+  Kernel:
+    1. spacing gate (proactive rate limit)
+    2. bounded call with a per-call timeout
+    3. bounded retry with server-stated window
+    4. no-cache-on-error
+
+  What breaks if you remove each:
+
+    1. Drop the gate           → 429 storm; each retry costs 10 s;
+                                  investigation blows the 60 s budget
+    2. Drop the per-call cap   → one hung TCP burns 300 s; user
+                                  stares at a spinner for 5 min
+    3. Drop the retry ladder   → any transient 429 is a hard failure;
+                                  the tool result gets `isError: true`
+                                  and the model has to reason around it
+    4. Drop no-cache-on-error  → transient errors cached for 60 s;
+                                  stale error returned to every retry
+```
+
+**Hardening layered on top** (not the kernel):
+- FaultInjectingDataSource decorator — offline chaos testing, not required for correctness.
+- Response cache (60 s TTL) — an optimization that reduces load; the kernel works without it.
+- `RETRY_BUFFER_MS = 500` — a cushion, not load-bearing.
+- Exponential fallback when the hint is unparseable — hardening; the parsed hint is the load-bearing case.
+
+The interview payoff is naming what people forget: **the spacing gate updates `lastCallAt` on failure too.** Without that one line, a burst of errors defeats the gate entirely.
 
 ### Move 3 — the principle
 
-**A single external system with real partial failure teaches you
-distributed systems better than five services with none.** The
-temptation is to build the elaborate machinery because "that's what
-distributed systems look like." The lesson from this repo: the retry
-ladder that parses the server's own error text is worth more than a
-generic exponential backoff, and the graceful-degradation-via-tool-result
-mechanism is worth more than any circuit breaker you'd build by hand.
-The mechanism sits at the RIGHT layer for the failure: at the transport
-for shape, at the adapter for retry, at the agent loop for reasoning.
+**Bound every wait, at every layer, with a signal that composes upward.** A retry loop with no per-call timeout is a hang waiting to happen. A per-call timeout with no client-cancel composition ignores the user closing the tab. A retry ladder that doesn't respect the server's stated window is guessing. This repo's stack shows the composition: `req.signal → agent.callTool.signal → composeSignals → AbortSignal.timeout(30_000)`. Every layer bounds one thing; the whole thing is bounded because they compose.
 
-## Primary diagram — recap
+## Primary diagram
+
+Everything Move 2 walked, one frame:
 
 ```
-  One call, four bands, first-fires-wins
+  The full retry + timeout stack, one investigation
 
-  agent → dataSource.callTool('execute_analytics_eql', { eql }, { signal: req.signal })
-                                    │
-                                    ▼
-   ┌─────────────────────────────────────────────────────────────────────┐
-   │ BAND 0: cache check (60s, name+args key)                            │
-   │   HIT → return { result, durationMs: 0, fromCache: true }           │
-   │   MISS → continue                                                   │
-   └───────────────────────────┬─────────────────────────────────────────┘
-                               ▼
-   ┌─────────────────────────────────────────────────────────────────────┐
-   │ BAND 1: proactive spacing (minIntervalMs=1100)                      │
-   │   elapsed = Date.now() - lastCallAt                                 │
-   │   if elapsed < 1100: sleep(1100 - elapsed)                          │
-   └───────────────────────────┬─────────────────────────────────────────┘
-                               ▼
-   ┌─────────────────────────────────────────────────────────────────────┐
-   │ BAND 2: per-call timeout (AbortSignal.timeout=30_000)               │
-   │   signal = composeSignals(req.signal, timeout(30_000))              │
-   │   try { client.callTool(..., { signal }) }                          │
-   │   catch AbortError|TimeoutError → throw `HTTP 0: timeout after 30s` │
-   │   catch other → throw `HTTP N: <server body>`                       │
-   └───────────────────────────┬─────────────────────────────────────────┘
-                               ▼
-   ┌─────────────────────────────────────────────────────────────────────┐
-   │ BAND 3: retry ladder (maxRetries=3, ceiling=20s, buffer=500ms)      │
-   │   while isRateLimited(result) && retries < 3:                       │
-   │     retries++                                                        │
-   │     waitMs = min(hint + 500 OR retryDelayMs * 2^(retries-1), 20_000)│
-   │     sleep(waitMs); retry                                             │
-   └───────────────────────────┬─────────────────────────────────────────┘
-                               ▼
-   ┌─────────────────────────────────────────────────────────────────────┐
-   │ CACHE WRITE-THROUGH: only if !isError                               │
-   │   isError → return uncached (no poison)                             │
-   │   !isError → cache.set(key, { result, expiresAt: now + 60_000 })    │
-   └───────────────────────────┬─────────────────────────────────────────┘
-                               ▼
-                    { result, durationMs, fromCache: false }
-                                        │
-                                        ▼
-                           ┌─ throws propagate here ─┐
-                           │   AptKit agent loop     │
-                           │   catches at :81, wraps │
-                           │   as tool_result        │
-                           │   { is_error: true }    │
-                           │   → BAND 4: model       │
-                           │     reasons about it    │
-                           └─────────────────────────┘
+  browser closes tab
+       │
+       ▼ req.signal aborts
+  ┌──────────────────────────────────────────────────┐
+  │ app/api/agent/route.ts   maxDuration=300s         │
+  │  · req.signal.throwIfAborted() at each phase      │
+  │  · finally block records phases even on throw     │
+  └───────────────────────────┬──────────────────────┘
+                              │ signal
+                              ▼
+  ┌──────────────────────────────────────────────────┐
+  │ AptKit agent loop                                 │
+  │  · passes signal to every callTool                │
+  │  · does NOT retry at invocation level             │
+  └───────────────────────────┬──────────────────────┘
+                              │ signal
+                              ▼
+  ┌──────────────────────────────────────────────────┐
+  │ McpDataSource.callTool   ★ retry ladder here ★    │
+  │                                                   │
+  │  cache hit?  yes ──► return {fromCache: true}     │
+  │  no  ↓                                            │
+  │  spacing gate: sleep(1100 - elapsed)              │
+  │  result = liveCall(...)                           │
+  │                                                   │
+  │  while (isRateLimited(result) && retries < 3):    │
+  │    hint = parseRetryAfterMs(result)               │
+  │    wait = min(hint + 500 || 10s × 2^n, 20_000)    │
+  │    sleep(wait); result = liveCall(...)            │
+  │                                                   │
+  │  isError? yes ──► skip cache; return              │
+  │  no       ──► cache 60 s; return                  │
+  └───────────────────────────┬──────────────────────┘
+                              │ signal
+                              ▼
+  ┌──────────────────────────────────────────────────┐
+  │ SdkTransport.callTool   ★ per-call timeout here ★ │
+  │                                                   │
+  │  signal = composeSignals(routeSig, timeout(30s))  │
+  │  try: return await client.callTool(...)           │
+  │  catch:                                           │
+  │    timeout ──► throw `HTTP 0: timeout after 30s`  │
+  │    HTTP    ──► throw `HTTP {status}: {body}`      │
+  │    (body redacted for secrets first)              │
+  └───────────────────────────┬──────────────────────┘
+                              │  HTTPS
+                              ▼
+                     ┌─────────────────┐
+                     │  MCP server     │
+                     └─────────────────┘
 ```
 
 ## Elaborate
 
-The four-band pattern is a canonical shape in production
-service-to-service calls. The specific names vary — "resilience patterns"
-in .NET's Polly library, "resilience4j" in JVM, "hystrix" historically
-(circuit-breaker origin), Netflix's `Bulkhead` — but the shape is the
-same: proactive rate control, per-call bounding, retry-with-parsed-hint,
-graceful degradation.
+The literature calls this pattern **bounded retry with backoff** (Jitter is best-practice; this repo doesn't add jitter because the retries are already gated by the server's stated window, so jitter would slightly *hurt* by desyncing from the window). The AbortSignal composition is a lift of the newer web-platform pattern (`AbortSignal.any`, Node 20+, Chrome 116+) — before that landed, everyone rolled their own OR-glue. The transport keeps the fallback (`transport.ts:180`) for belt-and-braces.
 
-What this repo doesn't have that a larger system would:
+The circuit-breaker literature would want more than no-cache-on-error: track failure rate per-endpoint, open the breaker after a threshold, return fast-fails while it's open, half-open probes to close it. This repo doesn't need that yet because there's ONE endpoint and the retry ladder already bounds the exposure. If a second MCP server came online, or if Bloomreach outages became common, that's when a real breaker earns its complexity budget.
 
-- **Circuit breaker with state machine** (closed/open/half-open) — the
-  no-cache-on-error rule is a small piece of this but not the whole
-  machine. A real circuit breaker counts failures and opens the circuit
-  after a threshold, refusing calls without even trying. Not needed here
-  because there's ONE upstream and ONE consumer per session — the
-  humans provide the "stop trying" signal by not clicking.
-- **Bulkhead pattern** (thread pool isolation) — Node's single event
-  loop makes this less relevant, but a real production system with
-  multiple upstreams would want per-upstream concurrency limits so a
-  slow one can't starve a fast one.
-- **Retry budget** across an investigation — right now `maxRetries=3` is
-  per-call; a single investigation can burn 6 × 3 = 18 total retries.
-  Not a problem at current scale.
+**Phase-4 fault injection** turns this ladder into a test surface. The decorator forces `HTTP 0`, `429`, `500`, or malformed JSON at configurable rates (`fault-injecting.ts:65`). The receipt: 9 injected faults across 3 investigations, zero investigations failed. That's the ladder holding: the retries absorbed the 429s, the model reasoned around the timeouts (they surface as `is_error: true` on tool results), and the malformed JSON was rejected downstream by the schema guard.
 
-The fault-injection subsystem at `lib/data-source/fault-injecting.ts`
-turns this from "we think it works" into "we've measured it working."
-That receipt at `eval/load-receipts/load-2026-07-03T05-21-12-237Z.json`
-is the artifact — reproducible via `FAULT_SEED=42`, so a regression is
-detectable.
+Related reading: `03-idempotency-deduplication-and-delivery-semantics.md` — this ladder makes retries safe only because the tool calls are read-only. The moment a tool has a side effect, the ladder needs an idempotency key.
 
 ## Interview defense
 
-### Q: "How does the app survive when Bloomreach times out?"
+**Q: "Walk me through what happens when the MCP server returns a 429."**
 
-Sketch this as you speak:
-
-```
-  4 bands, ranked from cheapest to most-drastic
-
-  spacing (1100ms) → timeout (30s) → retry (parse hint, cap 20s)
-                                              │
-                                              ▼
-                          agent loop catches → tool_result is_error:true
-                                              │
-                                              ▼
-                          model reasons: retry / try different tool / conclude
-```
-
-"Four layers of defense. Proactive spacing at 1100ms prevents most 429s.
-The 30s per-call timeout bounds any single stuck call. If Bloomreach
-returns a rate-limit envelope, the retry ladder parses the stated
-window from the error text (`Retry after ~N second(s)`) and waits it
-out, capped at 20s per attempt, max 3 attempts. If all of that gives up,
-AptKit's agent loop catches the throw and hands the model a
-`tool_result` block with `is_error: true` — the model then reasons
-about the failed call and decides whether to retry, try a different
-tool, or write the diagnosis without it. That last part is the
-load-bearing one: **there is no invocation-level catch-and-retry
-anywhere in our code**. The model is the recovery mechanism."
-
-Anchors: `lib/data-source/bloomreach-data-source.ts:190-197` (spacing),
-`lib/mcp/transport.ts:131-137` (timeout composition),
-`bloomreach-data-source.ts:163-174` (retry ladder), AptKit
-`run-agent-loop.js:81-86` (the catch).
-
-### Q: "What's the part everyone forgets?"
-
-"The `+ RETRY_BUFFER_MS` cushion. Retrying exactly on the server's
-stated window lands inside the window and burns another attempt. It's
-500ms at `bloomreach-data-source.ts:169`. Feels like nothing; it's the
-difference between the retry succeeding on attempt 2 and the retry
-using all three attempts."
-
-### Q: "How did you prove any of this works?"
-
-"`FaultInjectingDataSource` at `lib/data-source/fault-injecting.ts` is a
-`DataSource` decorator with four canonical failure modes — timeout,
-rate_limit, server_error, malformed_json — each with an independent
-per-call probability. Seeded xorshift32 for reproducibility. The Week
-4B smoke test at `FAULT_TIMEOUT=0.2 FAULT_MALFORMED_JSON=0.2
-FAULT_SEED=42`, LOAD_N=3 injected 9 faults across 3 investigations and
-0 investigations failed. Receipt lives at
-`eval/load-receipts/load-2026-07-03T05-21-12-237Z.json`. The
-`malformed_json` fault specifically tests band 4 — the model gets a
-`tool_result` with unclosed JSON in a text block, and it decides what
-to do."
-
-Sketch this:
+A: The response comes back with `isError: true` and rate-limit text in the content. `isRateLimited(result)` returns true. The ladder parses the stated window from the text — either `"retry-after 12 seconds"` or `"1 per 10 second"` — adds a 500 ms buffer, caps at 20 s, sleeps, and re-fires the call. Up to 3 retries. If they all 429, the final result comes back with `isError: true` and the model sees it as a tool_result with `is_error: true`.
 
 ```
-                  9 faults injected
-                  ─────────────────
-                     ▼
-   diag agent ──► tool_result is_error:true (5×)
-                  tool_result with garbled text (4×)
-                     │
-                     ▼
-                  model reasons about each
-                     │
-                     ▼
-                  3 completed investigations, 0 failed
+   [call] → 429 (1 per 10s) → sleep 10.5 s → [call] → ok
+                                    │
+                              (parsed hint,
+                              not blind backoff)
 ```
+
+**Anchor**: `lib/data-source/bloomreach-data-source.ts:157` — the ladder.
+
+**Q: "Why 30 seconds for the per-call timeout, and why don't you retry timeouts?"**
+
+A: 30 s is a floor: any single MCP call that takes longer than 30 s is dead — the SDK doesn't stream, so a slow call is a stuck call. Retrying timeouts is a trap because three retries × 30 s = 90 s guaranteed against a 300 s route budget, on ONE dead call. Better to fail fast with `HTTP 0: timeout` and let the model reason around it — usually by picking a different tool. The retry ladder only retries *successful-but-rate-limited* results, not thrown errors.
+
+**Load-bearing gotcha**: `composeSignals(routeSig, AbortSignal.timeout(30_000))` — the OR-composition means the browser closing the tab cancels the in-flight MCP call immediately, not at the next 30 s boundary. Without the compose, the timeout would eat the cancel.
+
+**Q: "What happens if the server returns an isError result — do you cache it?"**
+
+A: No. `bloomreach-data-source.ts:178` — the cache write is gated on `!result.isError`. If we cached errors, a transient permissions blip would poison the cache for 60 s and every retry from the model would return the stale error instantly. That's a "circuit-breaker-adjacent" decision — not a full breaker, but the same instinct: don't propagate a bad state as if it were good.
 
 ## See also
 
-- 03-idempotency-deduplication-and-delivery-semantics.md — the 60s cache
-  and what "retry" means for tool calls that mutate nothing
-- 06-queues-streams-ordering-and-backpressure.md — the spacing gate is
-  backpressure, teased apart there
-- 09-distributed-systems-red-flags-audit.md — the risks the four bands
-  don't defend against
+- `01-distributed-system-map.md` — the map that says which arrow this ladder defends.
+- `03-idempotency-deduplication-and-delivery-semantics.md` — why retries are safe here (read-only tools).
+- `04-consistency-models-and-staleness.md` — the cache TTL, which the ladder's no-cache-on-error interacts with.
+- `09-distributed-systems-red-flags-audit.md` — what this ladder doesn't defend against.

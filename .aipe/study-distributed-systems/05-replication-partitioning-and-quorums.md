@@ -1,433 +1,237 @@
-# replication-partitioning-and-quorums
+# Replication, Partitioning, and Quorums
 
-*Data replication · Sharding · Quorum reads · Leader failover · Industry standard*
+*Industry name: replicas · shards · quorum reads · Type: Industry standard*
 
 ## Zoom out — where this concept lives
 
-This is where honest calls-outs matter more than manufactured findings.
-**Almost every concept in this file is `not yet exercised` in this repo.**
-There is no data store you own, no replicas, no partition keys, no quorum
-reads, no leader failover. What DOES exist that touches this territory:
-Vercel's warm-instance model (which behaves like an unreplicated
-partition-of-one that can vanish), and the session-id key (which is a
-partition boundary in the tenant sense, not the storage sense).
-
-The value of this file is naming what's absent, WHY it's absent, and WHEN
-each concept becomes load-bearing enough to build.
+Not yet exercised in this repo. That's the honest answer, and this file explains why and when it becomes relevant.
 
 ```
-  Zoom out — where storage lives (or doesn't)
+  Zoom out — the replication surface in this repo
 
-  ┌─ Client layer ────────────────────────────────────┐
-  │  sessionStorage / localStorage / cookies          │
-  │  (owned by browser; not replicated anywhere)      │
-  └───────────────────────┬───────────────────────────┘
-                          │
-  ┌─ Service layer ───────▼───────────────────────────┐
-  │  in-memory Map<sessionId, SessionFeed>            │
-  │  in-memory BloomreachDataSource.cache             │
-  │  ★ ONE COPY PER WARM INSTANCE ★                   │ ← we are here
-  │  ★ NO REPLICATION, NO QUORUM ★                    │
-  └───────────────────────┬───────────────────────────┘
-                          │
-  ┌─ Provider layer ────────────────────────────────────┐
-  │  Bloomreach is our source-of-truth; its              │
-  │  internal replication is not our concern.            │
-  └──────────────────────────────────────────────────────┘
+  ┌─ Client band ──────────────────────────────────────────┐
+  │  browser (single per user, no replicas)                │
+  └─────────────────────────┬──────────────────────────────┘
+                            │
+  ┌─ Server band ───────────▼──────────────────────────────┐
+  │  Vercel functions — auto-scaled but NOT replicated for  │
+  │  consistency. Each function instance is independent;    │
+  │  no leader, no follower, no quorum.                     │
+  └─────────────────────────┬──────────────────────────────┘
+                            │
+  ┌─ External ──────────────▼──────────────────────────────┐
+  │  MCP server (Bloomreach) — from our vantage point, one │
+  │  URL. Its internal replication is out of scope.        │
+  └────────────────────────────────────────────────────────┘
+
+  ★ NOT YET EXERCISED ★ — no replicas, no shards, no quorum
 ```
+
+## Zoom in — narrow to the concept
+
+Replication means running N copies of the same data or the same service, so a failure of any single copy doesn't stop the whole. Partitioning (sharding) means splitting data across N nodes so no single node holds the full set. Quorums are the rule about how many of the N have to agree before a write commits or a read is trusted.
+
+**None of that applies to this repo right now.** The reasons are worth walking through, because they explain what would trigger a change.
 
 ## Structure pass
 
-### Layers of "what does replication mean here?"
+### Layers — where replication *could* live if it mattered
+
+- **Server layer**: Vercel functions are already run in multiple instances by the platform, but purely for scale — they don't coordinate. That's not replication in the CAP-theorem sense; it's independent stateless workers.
+- **Cache layer**: the 60 s response cache is per-instance, unshared. Not replicated. Not partitioned.
+- **State layer**: no database. Insight/investigation state is in-memory (per instance) or in a committed demo JSON (read-only, no writes).
+- **External**: whatever the MCP server does internally — we don't participate.
+
+### One axis held constant — "how many copies are there?"
 
 ```
-  "how many copies exist of this data, and how do they agree?"
+  Axis: number of copies at each layer
 
-  ┌───────────────────────────────────────────────┐
-  │ committed demo snapshots                       │
-  │   lib/state/demo-insights.json                 │  1 copy, in git
-  │   lib/state/demo-investigations.json           │  agreement: git
-  │   (source of truth for demo mode)              │  version control
-  └───────────────────────────────────────────────┘
-      ┌───────────────────────────────────────────────┐
-      │ per-warm-instance in-memory Maps              │
-      │   N copies exist iff N warm instances exist   │  N copies, no
-      │   agreement: NONE (each instance has its own) │  reconciliation
-      └───────────────────────────────────────────────┘
-          ┌───────────────────────────────────────────┐
-          │ browser sessionStorage                    │
-          │   1 copy per tab                          │  N × M copies where
-          │   agreement: NONE across tabs/browsers    │  N=tabs, M=browsers
-          └───────────────────────────────────────────┘
-              ┌───────────────────────────────────────┐
-              │ Bloomreach (source of truth)           │
-              │   internal replication is OUT OF SCOPE │  (their problem)
-              └───────────────────────────────────────┘
+  browser         →  ONE per user
+  Vercel function →  many, but independent stateless workers
+  response cache  →  ONE per instance (many total, unshared)
+  investigations  →  ONE per instance (many total, unshared)
+  auth cookie     →  ONE per browser (crypto-shared read across
+                     ALL instances → effectively N replicas)
+  MCP server      →  ONE URL (opaque; may be N behind a load balancer)
 ```
 
-Every layer either has ONE copy or has MULTIPLE copies with NO
-reconciliation. Nowhere is there "N copies, reconciled." Which means
-there is no quorum machinery to teach. That's the honest map.
-
-### One axis — "what happens when the storage owner dies?"
-
-```
-  "when the storage layer dies, what recovers?"
-
-  ┌───────────────────────────────────────────────┐
-  │ committed demo snapshots                       │
-  │   dies: git repo lost                          │  recovery: restore
-  │                                                │  from backup / origin
-  └───────────────────────────────────────────────┘
-      ┌───────────────────────────────────────────────┐
-      │ warm instance                                 │
-      │   dies: instance evicted / cold-drained       │  recovery: reissue
-      │                                                │  the request; server
-      │                                                │  reads client-forward
-      │                                                │  payload (see file 04)
-      └───────────────────────────────────────────────┘
-          ┌───────────────────────────────────────────┐
-          │ browser sessionStorage                    │
-          │   dies: user closes tab                   │  recovery: NONE
-          │                                                │  (redo the whole
-          │                                                │   investigation)
-          └───────────────────────────────────────────┘
-```
-
-The interesting thing this file teaches: **the client-forward payload
-IS this system's replication story.** Every request carries the state
-forward that the server can't guarantee to have. That is not "N-way
-replication with quorum reads." It is "the request itself carries a
-copy of the state." Different mechanism, similar goal (survive a
-storage layer death).
+The auth cookie is the interesting entry. It IS replicated across all Vercel instances — but the replication happens by *cryptographic shared secret*, not by protocol. That's a corner case worth naming: **encryption under a shared key is a replication substitute for read-mostly, browser-authoritative state.**
 
 ### Seams
 
-- **The session-id key** at `getOrCreateSessionId()` in
-  `lib/mcp/session.ts` — is a partition boundary in the multi-tenant
-  sense (partition by tenant), NOT in the storage sense (partition data
-  by key hash across nodes). Naming it a "partition" without this
-  distinction would be misleading.
-
-- **`lib/state/insights.ts:14` outer Map** — a single-shard tenant
-  register. Every session lives on the same warm instance's Map; there
-  is no "session X hashes to instance A, session Y hashes to instance
-  B" logic. Vercel's routing picks an instance per request without
-  guaranteeing stickiness.
-
-- **The DataSource seam again** — because the seam abstracts "who
-  fetches Bloomreach data," a future replication scheme (e.g. fanning
-  reads across two Bloomreach projects) could ship as a decorator or
-  a new adapter without touching the agent layer.
+No load-bearing seams for replication in this repo, because replication doesn't exist here yet. The seam that *would* be load-bearing if it did: the cache. Right now `bloomreach-data-source.ts:122` — `private cache = new Map<string, {...}>()` — is a local Map. A future replication story would swap the Map for a shared KV client behind the same interface.
 
 ## How it works
 
-### Move 1 — the mental model: single-shard, unreplicated, client-forward
+### Move 1 — the mental model
 
-You know how a Redis instance without a replica has one copy of the
-data, and if the instance dies the data is gone? That's the
-consistency picture of this app's server-side state — one copy per
-warm instance, gone when the instance is evicted. The "replication" is
-that **every request carries the state forward from the client**, so
-the loss of any single instance is recoverable by re-issuing the
-request.
+You've written a redundant fetch fallback: primary API, fallback URL if it fails. That's the informal shape of "two replicas with primary-secondary." A real replication protocol goes further: multiple copies stay in sync via a write path (leader propagates to followers, or all peers gossip), and reads pick from any live copy.
 
 ```
-  The pattern — request-carries-state as poor-man's replication
+  The pattern — a replicated read, informally
 
-     client (has copy)
-         │
-         ▼
-     request (carries copy in ?insight= or ?diagnosis=)
-         │
-         ▼
-     warm instance A               warm instance B
-         │                              │
-         │   (each holds a copy, no     │
-         │    coordination between      │
-         │    them; instance A dying    │
-         │    doesn't lose the state    │
-         │    because instance B can    │
-         │    still read the client's   │
-         │    copy on the next request) │
+  read request
+       │
+       ▼
+   ┌───────────────────────┐
+   │  replica selector     │  round-robin? closest? healthy?
+   └───────┬───────────────┘
+           │
+           ▼
+   ┌───────────────────────┐
+   │  replica N (of {1..M})│
+   │  serves the read      │
+   └───────────────────────┘
+
+   correctness rule (quorum):
+     writes go to ≥ W replicas
+     reads pull from ≥ R replicas
+     R + W > M  → linearizable
+     R + W ≤ M  → eventual
 ```
 
-This is what "eventual consistency without replicas" looks like in
-practice for a stateless-runtime architecture. It works because the
-data is small enough to ride in a request, and because the read pattern
-is user-scoped (one user, one browser, one authority).
+**None of this exists in this codebase.** Not a critique — the product doesn't need it yet. Naming the shape lets you spot where it would slot in later.
 
-### Move 2 — walk what's present and what's absent
+### Move 2 — the walkthrough
 
-#### Present: session-id as tenant partition
+This section explains what would trigger each pattern to become relevant.
 
-`lib/mcp/session.ts:16` creates a session-id cookie per browser. Every
-piece of server-side state is keyed by this. Reads and writes for
-different sessions never touch each other's data:
+#### Replication — when it matters
 
-```typescript
-// lib/state/insights.ts:14-23 (excerpt)
-const state = new Map<string, SessionFeed>();
+Replication earns its complexity budget when:
 
-function sessionState(sessionId: string): SessionFeed {
-  let s = state.get(sessionId);
-  if (!s) {
-    s = { insights: new Map(), investigations: new Map(), anomalies: new Map() };
-    state.set(sessionId, s);
-  }
-  return s;
-}
+1. **Availability under single-node failure** is a hard requirement. Right now Vercel handles this at the function level — if instance A dies mid-request, the browser retries and gets instance B. No app-level replication needed.
+
+2. **Read-heavy workloads** exceed what one node can serve. Not the case here — every user runs at most one investigation at a time, at ~1 req/s to MCP.
+
+3. **Geographic distribution** requires local reads. Not the case here — one region, one MCP endpoint.
+
+**What would flip this**: a persistent app-owned database (Postgres, etc.) that stored investigation history, user preferences, or shared state. That database would need replication for HA. Vercel Postgres + replicas is the standard shape.
+
+#### Partitioning — when it matters
+
+Sharding earns its budget when a single node can't hold or serve the whole dataset. Two variants:
+
+- **Data partitioning**: rows split by key across nodes (user_id % 4 → shard).
+- **Compute partitioning**: work split across workers (job_id → queue).
+
+This repo has neither. The investigation Map has ~10 entries in demo mode; the response cache holds at most a few dozen keys per instance. Below any threshold.
+
+**What would flip this**: multi-tenant investigations where each tenant's cache is large. Partition by session id or by tenant id, key the cache with a prefix, route reads to the right shard.
+
+#### Quorums — when they matter
+
+Quorum reads/writes matter when you have multiple replicas AND you need a stronger consistency than "eventual." R + W > M gives you linearizability across N replicas. See Dynamo, Cassandra, Riak.
+
+This repo has no replicas, so no quorum. If it grew to a shared cache with replicas, and if there were multiple writers, quorum would enter the vocabulary — but a single-writer read-mostly cache doesn't need quorum reads.
+
+#### Failover — the poor-cousin of replication
+
+Failover — "primary fails, promote secondary" — is a lightweight replication story. This repo has one variant of it: the DataSource port lets you fall back from `live-mcp` to `live-synthetic` by URL param (`?mode=live-synthetic`). That's a manual failover, not automatic:
+
+```
+  Manual failover via the DataSource port
+
+  URL: ?mode=live-mcp           URL: ?mode=live-synthetic
+          │                              │
+          ▼                              ▼
+   makeDataSource(...)          makeDataSource(...)
+          │                              │
+   McpDataSource            SyntheticDataSource
+   (live network hop)        (in-process fake)
+
+   same interface behind both; agent loop indifferent
 ```
 
-Bridge from what you know: this is the same shape as multi-tenant
-partition-by-tenant-id in a real DB — the tenant key IS the isolation
-boundary. Here it happens in memory, but the pattern is identical.
+Not a distributed-systems failover in the coordination sense, but a real substitution seam. See `lib/data-source/index.ts:84`.
 
-**What this ISN'T: horizontal sharding.** It doesn't distribute
-sessions across nodes. All sessions on a warm instance share that
-instance's memory. If Vercel spins up more instances, each instance
-serves whatever sessions land on it — the routing is at Vercel's
-layer, not ours.
+#### The auth cookie — a replication substitute
 
-#### Present: BloomreachDataSource.cache as instance-local shard
+Called out in the map and consistency files, but worth restating: the auth cookie IS effectively replicated across every Vercel instance, because the browser holds it and every instance can decrypt it. That's not "replication" in the protocol sense; it's **the browser as a source of truth, with a shared cryptographic key.**
 
-Same instance-locality. Two warm instances serving the same session-id
-each cache tool results independently. Section 03 walked this from the
-delivery-semantics angle; the consistency angle is: **you have as
-many cache copies as warm instances, and they never reconcile.**
+```
+  Cross-instance state without a coordination protocol
 
-Why it's fine: 60s TTL bounds the staleness, and the underlying calls
-are read-only so a stale copy is an older number, not a wrong write.
+  Browser holds cookie ─┐
+                        │
+                        │  every request rides the cookie
+                        │
+   ┌────────────────────┼────────────────────┐
+   │                    │                    │
+   ▼                    ▼                    ▼
+ Instance A         Instance B          Instance C
+ aesKey(SECRET)     aesKey(SECRET)      aesKey(SECRET)
+       ↓                 ↓                    ↓
+ decrypts             decrypts            decrypts
+ same view            same view           same view
 
-#### Absent: horizontal sharding by data key
+ no gossip. no consensus. no election.
+ shared secret = shared truth.
+```
 
-There is no sharding logic. No consistent hashing. No shard registry.
-Nothing computes `shard = hash(key) % N` anywhere. This is the correct
-choice for the current scale — one user at a time, one investigation
-at a time, no shared data across users.
-
-When it becomes load-bearing: as soon as you introduce a persistent
-data store that outgrows one node (say, storing every historical
-investigation in a Postgres table that grows past what one primary
-can serve). At that point you'd shard by session-id or user-id and
-this file would grow real content.
-
-#### Absent: replication with quorum reads / writes
-
-Zero. There is no N-way replication. There is no quorum. There is no
-leader with followers. The client-forward pattern in file 04 is the
-closest analog, and it's not the same mechanism — it's "the request
-carries a copy" not "the store has N copies."
-
-When it becomes load-bearing: any owned data store that must survive
-a single-node failure. The moment you write data you can't tolerate
-losing, you need a replicated log or a replicated data store, and the
-quorum conversation starts. `not yet exercised` today; would be if
-this app grew a "history of every investigation this user has ever
-run" feature backed by persistent storage.
-
-#### Absent: leader election / failover
-
-There is no leader. Nothing votes. Nothing has a term. The only
-"leadership" concept in the system is the single Anthropic model call
-per turn, which is not distributed at all — it's sequential.
-
-When it becomes load-bearing: any coordinator role that must be
-singleton (a job scheduler, a background reconciler, a single
-consumer for an event stream). Common pattern: use Postgres SKIP
-LOCKED or Redis SETNX as poor-man's leader election. Not needed here
-because there's nothing that must be a singleton beyond "the one
-person using the app right now."
-
-#### The demo snapshot — the closest thing to a replica
-
-`lib/state/demo-insights.json` and `lib/state/demo-investigations.json`
-are committed files. Every deployment has an identical copy. In the
-loosest sense, this is "replicated" — the file is in git, so every
-Vercel instance's filesystem has the same bytes. But this isn't
-replication in the distributed-systems sense; it's just deployment.
-The file is read-only at runtime. There is no reconciliation, no
-version vector, no write path.
-
-Where it looks like consistency: the demo path at
-`/api/briefing?demo=cached` replays this snapshot as an NDJSON stream
-(`app/api/briefing/route.ts:78-152`), so every user in demo mode sees
-the identical replay. That IS "consistent across users" but only
-because the source of truth is a static file in git.
-
-### The skeleton — what a shipped replication story would need
-
-Because most concepts are absent, the interview move is to name what
-WOULD be needed if any of them shipped. The kernel of a real
-replication story:
-
-1. **A durable log** — writes are appended to an ordered log before
-   they're considered committed. WAL, Kafka topic, event stream.
-2. **N replicas of the log** — followers apply entries in the same
-   order the leader wrote them. Same log → same state.
-3. **A quorum rule** — reads see committed data (majority-read) or
-   accept staleness (single-replica read). Writes ack after N/2+1
-   replicas confirm.
-4. **A leader election** — one replica is the writer at a time;
-   failover elects a new one when it dies.
-
-Named by what breaks if missing:
-- **no log** → writes can be interleaved differently across replicas;
-  no consistent history to reconcile
-- **no replicas** → single-node failure loses the data
-- **no quorum** → readers see stale replicas without knowing it
-- **no leader** → split-brain: two nodes both accept writes,
-  histories diverge
-
-Naming these — even in absentia — is the value of this file.
-Recognizing them the day you need them is worth more than pretending
-they're here now.
+This is a design choice worth studying: **encryption under a shared key can substitute for a replication protocol when the state is browser-authoritative and read-mostly.** Stripe uses similar tricks (encrypted session tokens); Rails uses `signed_cookies`. Read `lib/mcp/auth.ts:38-46` for the comment on why.
 
 ### Move 3 — the principle
 
-**Don't manufacture distributed-systems findings to fill a template.**
-The honest map of THIS repo is "one warm instance, no replicas, the
-client is the durable copy." That's a legitimate architecture for a
-one-user-per-investigation product, and it earns its place by
-matching the scale. The lesson isn't "you should build sharding
-now." The lesson is: **know which line you're on**, know what each
-missing concept would cost to add, and add it the day the scale
-demands it — not before.
+**Not building replication is a valid answer when the product doesn't demand it.** Replication is expensive: a consensus protocol (Raft, Paxos), a coordinator, failover logic, split-brain protection. Any of those cost weeks. If the failure modes your product cares about are already handled by simpler mechanisms — Vercel's platform-level function retries, a per-call timeout, an encrypted cookie for cross-instance state — you don't need distributed-systems machinery. The skill is recognizing when you *would*.
 
-## Primary diagram — what's present, what's absent
+## Primary diagram
+
+The negative space, one frame:
 
 ```
-  Replication + partitioning, one honest frame
+  What ISN'T here — the replication surface, drawn to scale
 
-  ┌─ Committed to git (deployment-time "replication") ──────────────────┐
-  │  lib/state/demo-insights.json           read-only, identical         │
-  │  lib/state/demo-investigations.json     across every Vercel instance │
-  └──────────────────────────────────────────────────────────────────────┘
+  ┌─ what IS here ─────────────────────────────────────────┐
+  │  browser owns durable state                             │
+  │  Vercel instances (stateless workers, platform-scaled)  │
+  │  60s response cache PER instance (unshared)             │
+  │  encrypted auth cookie (shared-key read across insts)   │
+  │  one MCP server URL (opaque; may be N behind LB)        │
+  └────────────────────────────────────────────────────────┘
 
-  ┌─ Client-side (per-browser copy) ────────────────────────────────────┐
-  │  sessionStorage — per-tab                                            │
-  │  localStorage    — per-domain                                        │
-  │  cookies         — sent with each request                            │
-  │  (N users × M tabs = N × M copies, no reconciliation)                │
-  └──────────────────────────────────────────────────────────────────────┘
-
-  ┌─ Warm instances (per-instance in-memory copy) ──────────────────────┐
-  │                                                                      │
-  │   instance A                    instance B                           │
-  │   ├─ state<sid, feed>           ├─ state<sid, feed>                  │
-  │   ├─ BloomreachDataSource       ├─ BloomreachDataSource              │
-  │   │  .cache                     │  .cache                            │
-  │   │                             │                                    │
-  │   │  ← independent copies →                                          │
-  │   │  ← no reconciliation →                                           │
-  │   │  ← 60s TTL bounds staleness →                                    │
-  │                                                                      │
-  │  partitioning: sessions are keyed by cookie sid                      │
-  │  sharding:     NONE (all sessions live on whichever instance         │
-  │                Vercel routes them to)                                │
-  │  replication:  NONE (no shared store; instances don't sync)          │
-  │  quorum:       NONE (no votes; no consensus)                         │
-  │  leader:       NONE (nothing has a term)                             │
-  │                                                                      │
-  └──────────────────────────────────────────────────────────────────────┘
-
-  ┌─ Bloomreach (source of truth) ──────────────────────────────────────┐
-  │  Internal replication is Bloomreach's concern, not ours.             │
-  └──────────────────────────────────────────────────────────────────────┘
+  ┌─ what would earn a replication story ──────────────────┐
+  │  ★ app-owned database (currently: none)                 │
+  │      would need: replicas for HA, WAL streaming         │
+  │                                                         │
+  │  ★ shared cross-instance cache (currently: none)        │
+  │      would need: shared KV (Vercel KV, Redis)           │
+  │      quorum only if multi-writer                        │
+  │                                                         │
+  │  ★ multi-region deploy (currently: single region)       │
+  │      would need: geo-replicated data, tail-latency LB   │
+  │                                                         │
+  │  ★ background job queue (currently: none)               │
+  │      would need: durable queue with at-least-once       │
+  │      + idempotency keys                                 │
+  └────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The pattern of "no shared store, request-carries-state" is a specific
-architectural choice. It works when:
+The vocabulary this file names — replication, partitioning, quorums, failover, split-brain — is the whole heart of the CAP theorem and its descendants (PACELC). Cassandra, DynamoDB, Kafka, etcd, CockroachDB all trade off replicas vs latency vs consistency along these axes.
 
-- **the data is small** enough to fit in a request or a cookie
-- **the read pattern is user-scoped** — no cross-user reads that need
-  fresh shared state
-- **the write pattern is user-owned** — the user's own actions produce
-  the data; no background writer
+The reason this repo doesn't have any of it: **the state that matters lives in the browser or in the tenant's MCP server**, neither of which is our replication problem. The app is stateless in the strict sense. Vercel handles scale, the browser handles durability, the MCP server handles its own consistency.
 
-When any of these breaks, you need a real shared store. This app has
-never crossed the line. If it did — say, added a "team view" where
-multiple users see a shared workspace analysis — the natural first
-move would be:
-
-1. Vercel KV or Upstash Redis for the shared state (managed,
-   serverless-friendly, no replication for you to manage)
-2. Read from the shared store instead of the in-memory Map
-3. Accept eventual consistency; the KV product handles the
-   replication and quorum internally
-
-That's a "buy replication as a service" move rather than "build a
-replicated log." Which is the correct move for a team of one shipping
-a product, not building a database.
-
-Where this file gets rewritten:
-- when persistent storage ships (whether it's a Postgres investigation
-  history, a Vercel KV, or a Bloomreach webhook receiver that must
-  durably capture events)
-- when the app grows fan-out to multiple upstream systems (a second
-  MCP server, a comparison-analytics API), which introduces
-  partition-per-upstream and possibly cross-upstream quorum reads
+**When this becomes relevant**: the moment the app owns a datastore. Investigation history stored per-user for search, team-level shared insights, saved queries — any of those adds a database, and a production database needs a replica for HA. Then partitioning (by tenant), then quorums (if multi-writer). See `study-database-systems` for the storage-side vocabulary.
 
 ## Interview defense
 
-### Q: "How does this app handle replication?"
+**Q: "Does your system have replicas?"**
 
-Direct answer:
+A: Not in the coordination sense. Vercel runs my functions in multiple instances for scale, but they're independent stateless workers — no leader-follower, no gossip, no quorum. The only cross-instance state is the encrypted auth cookie, which achieves consistency by construction (shared AES key, browser-durable value) rather than by protocol.
 
-"It doesn't. There is no data store I own, so there's nothing to
-replicate. The closest analog is that every request carries the state
-forward from the client — the insight object rides `?insight=<JSON>`,
-the diagnosis rides `?diagnosis=<JSON>`. That's not replication in
-the storage sense; it's request-carries-state, which works because
-the data is small and the read pattern is user-scoped. The moment I
-ship persistent per-user history, the natural move is Vercel KV or
-Upstash Redis — buy replication as a service rather than build it."
+**Q: "Why not?"**
 
-Sketch:
+A: The product doesn't hold any app-owned durable state yet. Investigation history is either per-instance in-memory (opportunistic, lost on cold start) or in a committed demo snapshot (read-only). There's nothing worth replicating. When the app grows a database — for user history, saved insights, team sharing — replicas become the first HA move, and I'd reach for Vercel Postgres with a read replica or a hosted Postgres with WAL streaming.
 
-```
-     no shared store
-          │
-          ▼
-     each request carries a copy from client
-          │
-          ▼
-     server reads client-forward payload
-          │
-          ▼
-     falls back to in-memory Map (this instance)
-     falls back to committed demo snapshot
-```
+**Q: "What about the MCP server itself — is it replicated?"**
 
-### Q: "What happens if a warm instance dies mid-investigation?"
-
-"The client re-issues the request; the server reconstructs from the
-client-forward payload. If the investigation is caught by
-`useInvestigation` deliberately NOT cancelling the in-flight fetch on
-StrictMode cleanup, the ongoing stream continues on whichever instance
-served it. If that instance dies, the stream ends abruptly and the
-client sees a truncated NDJSON — the UI shows an error, the user
-retries, and the fresh request lands on a new instance which reads
-the client's stashed insight from `?insight=<JSON>`. No data loss;
-one lost investigation-attempt of wall-clock time."
-
-### Q: "When would you add sharding?"
-
-"When one warm instance's memory can't hold the working set. Concretely:
-if I shipped a 'history of every investigation this user has ever run'
-feature backed by persistent storage, and that history grew past what
-one Postgres primary could serve. I'd shard by user id — same hash,
-same shard for a given user's data. Session-scoped writes stay on
-one shard. Cross-user reads (team view) need a fan-out. Not needed
-today."
+A: From our vantage point, we see one URL. The Bloomreach team may run it behind a load balancer with multiple backends, but that's transparent to us. What we *do* handle is the failure profile that any single-URL endpoint exposes: timeouts, rate limits, 5xx. The retry ladder is our answer to "one endpoint can fail" without needing our own replication story.
 
 ## See also
 
-- 04-consistency-models-and-staleness.md — the client-forward pattern
-  from the consistency angle
-- 07-clocks-coordination-and-leadership.md — no leader election here,
-  named honestly
-- 09-distributed-systems-red-flags-audit.md — "no shared store" as a
-  future risk conditional on product growth
+- `01-distributed-system-map.md` — the map that shows why replication isn't needed here.
+- `04-consistency-models-and-staleness.md` — the auth cookie's cross-instance consistency.
+- `study-database-systems` — where replication would live if the app grew a datastore.

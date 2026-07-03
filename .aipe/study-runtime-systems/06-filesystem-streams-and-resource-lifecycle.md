@@ -1,347 +1,355 @@
 # Filesystem, streams, and resource lifecycle
 
-*Resource ownership · Language-agnostic (with Node/Web-Streams specifics)*
+**Industry:** file descriptors, streams, and resource lifecycle · Language-agnostic
 
 ## Zoom out — where this concept lives
 
-Two very different resource kinds show up in this codebase: filesystem handles (small, mostly for dev-time state and module load) and HTTP streams (the main artefact — every route response). Both share a lifecycle question: *who owns the resource, and who closes it?*
+The interesting I/O in `blooming_insights` is *streaming NDJSON* between the server and the browser, and *SSR-guarded* browser storage access. Filesystem is a smaller story: a dev-only cache file, a demo snapshot, an eval receipts directory. Every I/O handle has an owner and a cleanup path — even the ones that look "just there."
 
 ```
-Zoom out — resources by kind
+  Zoom out — where I/O lives
 
-┌─ Filesystem ─────────────────────────────────────────────────────┐
-│                                                                    │
-│  MODULE LOAD (once per Node process)                              │
-│  · legacy prompt files (readFileSync at top of module)            │
-│    lib/agents/monitoring-legacy.ts:13 etc.                        │
-│                                                                    │
-│  REQUEST-TIME reads (all sync, all small)                         │
-│  · demo snapshots (production replay path)                        │
-│    app/api/briefing/route.ts:89, /agent/route.ts:52               │
-│  · dev-only caches (auth, investigations)                         │
-│    lib/mcp/auth.ts:118 (dev), lib/state/investigations.ts:24 (dev)│
-│                                                                    │
-│  WRITES                                                            │
-│  · dev-only caches (auth + investigations), writeFileSync         │
-│  · production writes: NONE (serverless FS is effectively R/O)     │
-└──────────────────────────────────────────────────────────────────┘
-
-┌─ Streams (Web Streams API, not node:stream) ──────────────────────┐
-│                                                                    │
-│  SERVER: new ReadableStream<Uint8Array>({ start(controller) {…} })│
-│    → controller.enqueue(bytes)      ← per NDJSON event             │
-│    → controller.close()             ← in the finally block         │
-│                                                                    │
-│  CLIENT: response.body.getReader() → readNdjson kernel            │
-│    → reader.read()                  ← in a while(true) loop       │
-│    → reader.cancel()                ← on cancelOn=true             │
-│    → reader.releaseLock()           ← in a finally block           │
-└──────────────────────────────────────────────────────────────────┘
+  ┌─ Browser ──────────────────────────────────────────┐
+  │  localStorage / sessionStorage (synchronous)       │
+  │  fetch() body → ReadableStream reader              │
+  │  no direct FS access                               │
+  └────────────────────────┬───────────────────────────┘
+                           │  streaming NDJSON
+  ┌─ Vercel serverless ───▼────────────────────────────┐
+  │  ★ THIS CONCEPT ★                                   │
+  │  ReadableStream response body · fetch to upstream  │
+  │  dev-only .auth-cache.json · demo-insights.json    │
+  │  eval receipts (long-lived process only)           │
+  └────────────────────────┬───────────────────────────┘
+                           │
+  ┌─ Upstream ────────────▼────────────────────────────┐
+  │  their sockets, their state                        │
+  └────────────────────────────────────────────────────┘
 ```
 
-## Structure pass — one axis, two altitudes
+The concept: **every resource (fd, socket, stream, storage key) has a lifetime that must be closed or released**. The default lifetime — do nothing — is fine on serverless because process death cleans up everything. In dev or in the eval harness, do-nothing leaks.
 
-Trace *"who closes this resource on cancellation?"* across the two resource kinds.
+## Structure pass — layers, axis, seams
+
+Pick one axis — **who closes this resource?** — and trace it.
 
 ```
-"Who closes the resource on cancel?" — one question, two answers
+  One axis (who closes it?) down the layers
 
-┌─ Filesystem (in this codebase) ────────────────────┐
-│  → NO ONE — every fs call is sync (readFileSync,   │
-│    writeFileSync), so there's no half-open handle  │
-│    to close on cancel                              │
-└──────────────────┬────────────────────────────────┘
-                   ▼
-┌─ Streams (the real resource lifecycle) ────────────┐
-│  → the finally block on the server                 │
-│    controller.close() ALWAYS runs                  │
-│                                                      │
-│  → the reader.releaseLock() finally on the client  │
-│    even if handle() throws                         │
-└────────────────────────────────────────────────────┘
+  ┌─ your code ────────────────────────────────┐
+  │  fetch() body                → CALLER      │
+  │                                (must read  │
+  │                                or cancel)  │
+  │  readFileSync                → NO-OP       │
+  │                                (auto-closed│
+  │                                on return)  │
+  │  writeFileSync               → NO-OP       │
+  │                                (auto-closed│
+  │                                on return)  │
+  └────────────────────────────────────────────┘
+      ↓
+  ┌─ Node / browser runtime ───────────────────┐
+  │  ReadableStream controller  → runtime      │
+  │  closes when stream ends                    │
+  │  underlying socket           → runtime      │
+  │  releases with GC of client                 │
+  └────────────────────────────────────────────┘
+      ↓
+  ┌─ OS / process ─────────────────────────────┐
+  │  everything gets closed on process exit    │
+  │  (Vercel kills the instance eventually)    │
+  └────────────────────────────────────────────┘
+
+  seam that matters: request-lifetime vs process-lifetime
 ```
 
-The seam that matters: **synchronous atomic reads ↔ long-lived streams.** The codebase deliberately uses `readFileSync` for filesystem access — the read either completes or throws, no in-flight handle. The interesting lifecycle mechanism is entirely on the streaming side.
+**The load-bearing seam:** anything with a per-request lifetime needs an explicit close/dispose path. Anything with a process-lifetime relies on process death for cleanup, which is fine on serverless and *not fine* in the eval harness (long-running vitest process) if the resource were held module-level.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You know how `fetch()` returns a `Response` with a `.body` that's a `ReadableStream`? Server-side, this codebase constructs the same thing — a `new ReadableStream` — and returns it as the response body. The `start(controller)` callback is where the server-side async work happens; `controller.enqueue(bytes)` writes to the stream, and `controller.close()` signals end-of-stream to the client.
+You know how a `fetch()` in the browser returns a `Response` whose `.body` is a `ReadableStream`? If you don't read that body (or explicitly `body.cancel()`), the underlying socket stays open until GC eventually closes it. The stream is a *pipe* — one end has a producer, the other end has a consumer, and if the consumer never pulls, the producer eventually blocks or drops. That's every stream, in every runtime.
 
 ```
-The Web Stream lifecycle — same shape both sides
+  Pattern — a stream's lifecycle
 
-  SERVER                              CLIENT
-  ──────                              ──────
+  ┌── construct ─────────────────────────────────────┐
+  │  new ReadableStream({ start(controller) {…} })   │
+  │  producer registers with the controller          │
+  └────────────────┬─────────────────────────────────┘
+                   │
+                   ▼
+  ┌── produce ───────────────────────────────────────┐
+  │  controller.enqueue(chunk)                       │
+  │  ...                                             │
+  │  controller.enqueue(chunk)                       │
+  └────────────────┬─────────────────────────────────┘
+                   │
+                   ▼
+  ┌── close ─────────────────────────────────────────┐
+  │  controller.close()                              │
+  │  reader sees stream end                          │
+  └──────────────────────────────────────────────────┘
 
-  new ReadableStream({                fetch(url).then(res => {
-    start(controller) {                 const reader = res.body.getReader()
-      // async work here                 while(true) {
-      controller.enqueue(bytes)          const {value, done} = await reader.read()
-      controller.enqueue(bytes)          if (done) break
-      controller.close()   ────────►    handle(decode(value))
-    }                                   }
-  })                                    reader.releaseLock()
-                                      })
+  cancellation: reader can also call cancel() at any point,
+  which propagates to producer as an "aborted" signal
 ```
 
-Web Streams' end-of-stream signal is `controller.close()`; the reader observes it as `{done: true}`. Any bytes still in the buffer when `close()` is called are drained before the reader sees `done`.
+Get the close wrong and one of two things happens: the reader hangs forever (producer never closed), or the writer throws (writing to an already-closed stream). Neither happens in `blooming_insights` because the design is disciplined about it.
 
-### Move 2 — the mechanisms
+### Move 2 — the pieces
 
-#### Filesystem: sync-only, dev-only writes
+#### The NDJSON server-side stream
 
-Every filesystem call in this codebase is synchronous. There is no `fs.promises`, no `stream.Readable.from(fs.createReadStream())`, no half-open file handles to leak. Reads either complete or throw — atomic.
+`app/api/agent/route.ts:189-193` constructs a `ReadableStream` for the NDJSON response body:
 
 ```
-Every fs call in the codebase, categorized
-
-  MODULE-LOAD READS (once per process, on the cold-start path)
-  ┌────────────────────────────────────────────────────────────┐
-  │ lib/agents/monitoring-legacy.ts:13                          │
-  │ lib/agents/diagnostic-legacy.ts:14                          │
-  │ lib/agents/recommendation-legacy.ts:14                      │
-  │ lib/agents/query-legacy.ts:13                               │
-  │   → const PROMPT = readFileSync(join(cwd, 'prompt.md'))     │
-  └────────────────────────────────────────────────────────────┘
-
-  REQUEST-TIME READS (sync, small files)
-  ┌────────────────────────────────────────────────────────────┐
-  │ app/api/briefing/route.ts:89   (demo snapshot)              │
-  │ app/api/agent/route.ts:52      (demo snapshot)              │
-  │ lib/mcp/auth.ts:118            (dev-only auth cache)        │
-  │ lib/state/investigations.ts:24 (dev-only inv cache)         │
-  └────────────────────────────────────────────────────────────┘
-
-  WRITES (dev-only; skipped in production)
-  ┌────────────────────────────────────────────────────────────┐
-  │ lib/mcp/auth.ts:138            (const PERSIST = dev-only)   │
-  │ lib/state/investigations.ts:36 (const PERSIST = dev-only)   │
-  └────────────────────────────────────────────────────────────┘
+  // app/api/agent/route.ts:189-195 — the streaming response body
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const collected: AgentEvent[] = [];
+      const send = (e: AgentEvent) => {
+        collected.push(e);
+        controller.enqueue(encoder.encode(encodeEvent(e)));
+      };
+      // … agent loop calls send() … finally { controller.close() }
+    },
+  });
 ```
 
-The dev-only guard pattern:
+**Who closes it:** the `async start` function returns eventually (either normally or via a thrown error caught in a `try/finally`). When it returns, `controller.close()` is called in the `finally` block. That signals end-of-stream to the browser.
 
-```ts
-// lib/state/investigations.ts:7
-const PERSIST = process.env.NODE_ENV === 'development';
+**What happens on client abort:** `req.signal.aborted` is checked at coarse phase boundaries inside the async agent chain (`app/api/agent/route.ts:135, :231, :242, :253, :279`). If the client closes the tab or navigates away, `req.signal` aborts, `throwIfAborted()` throws, and the `catch/finally` releases resources (DataSource dispose, upstream cancellation via the composed AbortSignal).
 
-// lib/state/investigations.ts:32-40
-export function saveInvestigation(insightId: string, events: AgentEvent[]): void {
-  mem.set(insightId, events);
-  if (PERSIST) {                                     // ★ SKIP in production
-    const all = readJson(CACHE_FILE);
-    all[insightId] = events;
+**What happens if the agent throws:** the error is caught, sent as an `{ type: 'error' }` NDJSON event, and the stream is closed cleanly. The browser sees "one error event, then EOF" instead of a hung stream.
+
+#### The NDJSON client-side reader
+
+`lib/hooks/useInvestigation.ts:205` calls `readNdjson<AgentEvent>(res.body, handle)`. Under the hood, `readNdjson` (in `lib/streaming/ndjson.ts`) reads bytes from the `ReadableStream`, splits on `\n`, calls the handler per line, and resolves when the stream ends.
+
+**Who closes it:** the server closes when the agent finishes. The client's `readNdjson` awaits `reader.read()` in a loop until `done: true`. When the server closes the stream, the `done` flag flips and `readNdjson` resolves.
+
+**Deliberate no-cleanup on unmount:** the comment at `lib/hooks/useInvestigation.ts:34-38` explains it — under React StrictMode dev, the effect mounts, cleans up, remounts. If we cancelled the stream on cleanup, the started-guard would block the remount, leaving the trace empty. The chosen tradeoff: don't cancel, let the in-flight run complete. `setState` after unmount is a safe no-op in React 19.
+
+```
+  Layers-and-hops — NDJSON stream lifecycle
+
+  ┌─ browser tab ──────────────┐
+  │  fetch(url)                │
+  │     ↓                      │
+  │  res.body → readNdjson()   │  ← consumer
+  │     │  read chunks         │
+  │     │  split on \n         │
+  │     │  handle(event)       │
+  │     ▼                      │
+  │  reader.read() done → true │
+  └──────────┬─────────────────┘
+             │  socket closed by server
+             ▲  chunks flow this way
+             │
+  ┌─ Vercel instance ──────────┐
+  │  new ReadableStream({      │
+  │    async start(controller) │  ← producer
+  │      const send = (e) =>   │
+  │        controller.enqueue()│
+  │      … agent loop …        │
+  │      controller.close()    │
+  │  })                        │
+  └────────────────────────────┘
+
+  reader ends when producer closes.
+  producer ends via normal path, exception path, or abort path.
+```
+
+#### The dev-only auth cache file
+
+`lib/mcp/auth.ts:34-38` picks a backend based on env. In dev, that's a JSON file:
+
+```
+  // lib/mcp/auth.ts:117-142 — synchronous file I/O
+  function readAll(): Store {
+    const ctx = requestStore.getStore();
+    if (ctx) return ctx.store;
+    if (!PERSIST) return Object.fromEntries(memStore);
     try {
-      writeFileSync(CACHE_FILE, JSON.stringify(all));
+      if (existsSync(CACHE_FILE)) return JSON.parse(readFileSync(CACHE_FILE, 'utf8')) as Store;
+    } catch { /* corrupt/unreadable — treat as empty */ }
+    return {};
+  }
+
+  function writeAll(store: Store): void {
+    // …
+    if (!PERSIST) { memStore… ; return; }
+    try {
+      writeFileSync(CACHE_FILE, JSON.stringify(store));
+    } catch { /* best-effort */ }
+  }
+```
+
+**Why sync in dev:** Next's dev server hot-reloads modules on file change, which would wipe an in-memory Map mid-OAuth-flow (the DCR client info + PKCE verifier saved during `connect` must survive until the `callback` exchanges the code). A file persists across reloads. The sync API is fine because dev serves one user at a time.
+
+**Resource lifecycle:** `readFileSync` and `writeFileSync` open, read/write, and close the fd all in one call. There's no lingering handle to clean up. If the FS is read-only (some edge cases), the write silently fails — persistence is best-effort.
+
+**Not the production path:** `PERSIST = process.env.NODE_ENV === 'development'`. In production the whole file path is skipped; the ALS-scoped cookie store handles everything.
+
+#### The demo snapshot file
+
+`app/api/agent/route.ts:52-53` reads the demo file (`lib/state/demo-insights.json`):
+
+```
+  if (existsSync(DEMO_FILE)) {
+    const snap = JSON.parse(readFileSync(DEMO_FILE, 'utf8')) as { insights?: Insight[] };
+```
+
+**Resource:** one sync read per request that hits the demo fallback path. The file is tiny (a snapshot of ~10 insights); the sync-blocking cost is negligible.
+
+**Why sync here:** it's a fallback path hit rarely, and the alternative (async `readFile`) doesn't buy anything meaningful. The design accepts the tiny blocking cost for simpler code.
+
+#### Client-side storage: localStorage and sessionStorage
+
+Both are synchronous, per-origin, per-runtime APIs. The interesting resource-lifecycle aspect: **you must not touch them during SSR**. Node has no `localStorage`, and a bare reference throws `ReferenceError`. Every helper in `lib/mcp/config.ts` guards:
+
+```
+  // lib/mcp/config.ts:106-117 — SSR-safe read
+  export function readPersistedConfig(): McpConfigOverride | null {
+    if (typeof localStorage === 'undefined') return null;
+    try {
+      const raw = localStorage.getItem(BI_MCP_CONFIG_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (!isMcpConfigOverride(parsed)) return null;
+      return normalizeConfig(parsed);
     } catch {
-      /* best effort */
+      return null;
     }
   }
-}
 ```
 
-The `PERSIST` gate is load-bearing: Vercel's serverless filesystem is effectively read-only (any write dies with the instance). The dev-only path uses the filesystem for developer convenience (survives hot-reload). Production uses in-memory + cookies.
+Same shape in `writePersistedConfig` (`:122`) and `persistedConfigHeader` (`:143`). Pattern: **check before use, never assume the browser is present**.
 
-#### The stream lifecycle — the actual load-bearing mechanism
+**Why the try/catch:** localStorage can throw. Safari Private Mode used to throw on `setItem`. Some enterprise browsers block storage entirely. The try/catch turns any throw into a silent no-op — the persisted config just doesn't get read/written. The app falls back to env-driven config; nothing crashes.
 
-Every streaming route has the same shape. Look at `/api/briefing` at `app/api/briefing/route.ts:190-336`:
+**The other client-side pattern that matters here:** the `useInvestigation` hook checks `typeof window !== 'undefined'` before reading `localStorage.getItem('bi:mode')` (`lib/hooks/useInvestigation.ts:159`). Belt-and-braces — the file has `'use client'` at the top so it should never SSR, but the guard is there in case someone imports something from it into a server component.
 
-```ts
-// annotated skeleton
-const stream = new ReadableStream<Uint8Array>({
-  async start(controller) {
-    const send = (e: BriefingEvent) =>
-      controller.enqueue(encoder.encode(JSON.stringify(e) + '\n'));
-    const t0 = performance.now();                     // start timing
-    const phases: Array<{phase, durationMs}> = [];
-    try {
-      req.signal.throwIfAborted();                    // ★ ABORT CHECK at each phase
-      // schema bootstrap
-      // coverage gate
-      // list tools
-      // monitoring scan
-      // emit insights
-      send({ type: 'done' });
-    } catch (e) {
-      if (e instanceof DOMException && e.name === 'AbortError') {
-        return;                                        // ★ CLIENT CANCELLED — no error event
-      }
-      console.error('[briefing] error:', redactSecrets(formatError(e)));
-      send({ type: 'error', message: … });            // ★ error event on wire
-    } finally {
-      try {
-        await disposeDataSource();                    // ★ RELEASE: DataSource teardown
-      } catch (disposeErr) {
-        console.error('[briefing] dispose error:', …); // ★ but never mask the route error
-      }
-      console.log(JSON.stringify({ route, phases, aborted }));  // observability
-      controller.close();                              // ★ ALWAYS close the stream
-    }
-  },
-});
-return new Response(stream, { headers: NDJSON_HEADERS });
-```
+#### The MCP SDK Client's underlying transport
 
-The load-bearing skeleton — what breaks if each part is removed:
+The MCP SDK holds an HTTP connection to the Bloomreach server. That connection is *not* one-request-and-close — the SDK pools connections for efficiency (Node's `undici` pools by default). We don't manage that lifecycle directly; the SDK does. `dsResult.dispose` (`app/api/agent/route.ts:186`) is the cleanup handle called in the route's `finally` — it releases the SDK's Client, which releases the transport, which returns the socket to the pool.
 
-  → Drop **the `try` block** and errors bubble uncaught out of the async start callback; the runtime error is a lot less useful than a `{type: 'error'}` event on the wire.
-  → Drop **the AbortError early return** and a client-cancel produces an error event nobody reads (the connection's already closed on their end).
-  → Drop **`controller.close()` in the finally** and the client-side reader hangs on `reader.read()` waiting for `done`.
-  → Drop **the `disposeDataSource()` call** and the per-request DataSource's resources aren't torn down (currently a no-op for Bloomreach, but the seam is there for future adapters).
-  → Drop **the `finally` altogether** and the `console.log(phases)` never fires; you can't tell how much of the 300s budget got burned before the failure.
+**Failure mode this hedges against:** a route that returns without calling `dispose` would leave one connection dangling per request. Over a warm instance's lifetime that would eventually exhaust the pool. Called in the `finally` block, `dispose` runs on both normal completion and error paths.
 
-The `finally` is where the resource lifecycle actually lives. Every ephemeral thing in the request path gets released here: the DataSource, the stream, the observability log.
+#### The eval receipts directory
 
-#### The client-side reader lifecycle — mirror pattern
+`eval/load.eval.ts:135, :147` writes receipts to `eval/load-receipts/*.json`:
 
 ```
-readNdjson — the client's mirror of the finally pattern
-
-// lib/streaming/ndjson.ts:28-63
-const reader = body.getReader();                    // ★ ACQUIRE
-const decoder = new TextDecoder();
-let buf = '';
-try {
-  while (true) {
-    if (opts?.cancelOn?.()) {
-      await reader.cancel();                        // ★ EARLY RELEASE
-      return;
-    }
-    const { value, done } = await reader.read();
-    if (done) break;                                // ★ NORMAL RELEASE
-    buf += decoder.decode(value, { stream: true });
-    // …split lines, parse, dispatch…
-  }
-  // flush trailing buffer
-  const tail = buf.trim();
-  if (tail) {
-    try { onEvent(JSON.parse(tail) as E); }
-    catch (err) { opts?.onMalformed?.(tail, err); }
-  }
-} finally {
-  reader.releaseLock();                             // ★ ALWAYS release, even on throw
-}
+  mkdirSync(RECEIPTS_DIR, { recursive: true });
+  // …
+  writeFileSync(outPath, JSON.stringify(receipt, null, 2) + '\n', 'utf8');
 ```
 
-The `reader.releaseLock()` in `finally` matters because a `ReadableStream` allows only one active reader at a time. If a caller doesn't release, subsequent attempts to read the same stream throw *"ReadableStream is already locked to a reader."* The `try/finally` guarantees release even if the `handle(event)` callback throws.
+**Resource:** one file per run. Sync writes because the eval harness has no wall-clock budget and blocking on a tiny JSON write is fine. The directory grows over time; nothing prunes it (the equivalent of `receipts/` for the model eval also grows).
 
-The `cancelOn` poll before every `reader.read()` (line 33) lets an outer consumer cancel cooperatively. `useBriefingStream` sets `cancelledRef.current = true` on effect cleanup at `lib/hooks/useBriefingStream.ts:298`; the next iteration of the reader loop notices, cancels the reader, and returns.
-
-Note the deliberate asymmetry vs `useInvestigation`: that hook does NOT use `cancelOn` at all (it doesn't pass one). The comment at `lib/hooks/useInvestigation.ts:33-37` explains: React 19 StrictMode's mount → unmount → re-mount pattern combined with a started-guard aborted the stream and left logs empty. So `useInvestigation` lets the fetch complete even after unmount — `setState after unmount is a safe no-op` — and only guards against double-fetch via the ref latch.
-
-#### The demo replay: `sleep`-between-enqueues
-
-```
-Demo replay — using sleep to pace the stream
-
-// app/api/briefing/route.ts:99-142 (extract)
-const stream = new ReadableStream<Uint8Array>({
-  async start(controller) {
-    const emit = async (e: BriefingEvent) => {
-      controller.enqueue(encoder.encode(JSON.stringify(e) + '\n'));
-      await new Promise((r) => setTimeout(r, REPLAY_DELAY_MS));   // ★ pace = 140ms
-    };
-    try {
-      // …emit workspace, coverage, trace, insights…
-      await emit({ type: 'done' });
-    } finally {
-      controller.close();                                          // ★ SAME finally pattern
-    }
-  },
-});
-```
-
-The demo path doesn't need auth, doesn't call agents, doesn't hit MCP. It's a pure enqueue + sleep loop. But the same `finally { controller.close() }` pattern shows up — the resource lifecycle contract is uniform across the codebase.
+**Not a leak in the runtime-systems sense:** disk space, not memory. But it's the same discipline: name where the file lives, and know that nothing reclaims it automatically.
 
 ### Move 3 — the principle
 
-**Every resource acquisition needs a matching release, and `finally` is where releases live.** The codebase is disciplined about this at both ends of the stream: the server always calls `controller.close()` in `finally`, the client always calls `reader.releaseLock()` in `finally`. That discipline is what keeps a client cancellation clean — no orphaned streams, no leaked reader locks, no missing observability logs.
+Every open handle — a socket, a stream, a file descriptor, even a `localStorage` key — has a lifetime. The runtime helps by closing things at process death, but between "open" and "process death" you're on the hook. Serverless makes this look easy (short lifetimes, generous cleanup); dev servers and long-running processes make the same code look leaky. The discipline is: **construct in the try, release in the finally, and never assume the process will die soon**.
 
-The corollary: whenever you write async code that opens a resource, ask what the release is and where it goes. If the answer isn't "in a finally block near where I acquired it," you're setting up a leak.
-
-## Primary diagram — the full resource lifecycle
+## Primary diagram
 
 ```
-Resource lifecycle — server side ↔ client side
+  Filesystem, streams, and resource lifecycle — full picture
 
-SERVER (route.ts)
-┌────────────────────────────────────────────────────────────────┐
-│  new ReadableStream({                                           │
-│    async start(controller) {         ★ ACQUIRE stream           │
-│      const send = e => controller.enqueue(...)                  │
-│      try {                                                       │
-│        req.signal.throwIfAborted()                              │
-│        // schema bootstrap                                       │
-│        // list tools                                             │
-│        // run agents (each threading req.signal)                 │
-│        send({type: 'done'})                                     │
-│      } catch (e) {                                              │
-│        if (AbortError) return                                    │
-│        send({type: 'error'})                                    │
-│      } finally {         ★ ALWAYS runs, even on abort           │
-│        await disposeDataSource()   ★ RELEASE data source        │
-│        console.log(phases)         ★ observability log          │
-│        controller.close()          ★ RELEASE stream             │
-│      }                                                           │
-│    }                                                             │
-│  })                                                              │
-└────────────────────────────────────────────────────────────────┘
-              │  bytes ────►
-              ▼
-CLIENT (lib/streaming/ndjson.ts)
-┌────────────────────────────────────────────────────────────────┐
-│  const reader = body.getReader()   ★ ACQUIRE reader            │
-│  try {                                                          │
-│    while (true) {                                               │
-│      if (cancelOn?.()) {                                        │
-│        await reader.cancel()       ★ EARLY release               │
-│        return                                                    │
-│      }                                                           │
-│      const {value, done} = await reader.read()                  │
-│      if (done) break               ★ normal end of stream       │
-│      // decode + split + dispatch                               │
-│    }                                                             │
-│  } finally {                                                    │
-│    reader.releaseLock()            ★ ALWAYS release             │
-│  }                                                              │
-└────────────────────────────────────────────────────────────────┘
+  ┌─ Browser ────────────────────────────────────────────────────┐
+  │                                                              │
+  │  fetch(url).body                                             │
+  │      │                                                       │
+  │      ▼                                                       │
+  │  readNdjson(body, handle)   ← reads until server closes      │
+  │      │                                                       │
+  │      ▼                                                       │
+  │  handle(event) — one call per NDJSON line                   │
+  │                                                              │
+  │  storage APIs (guarded):                                    │
+  │    if (typeof localStorage !== 'undefined') { … }           │
+  │    try { localStorage.setItem(…) } catch { silent }         │
+  │                                                              │
+  │  no direct FS access                                        │
+  └──────────────────────────────────────────────────────────────┘
+
+  ┌─ Vercel serverless (Node 20) ────────────────────────────────┐
+  │                                                              │
+  │  new ReadableStream({                                        │
+  │    async start(controller) {                                 │
+  │      try {                                                   │
+  │        // agent loop calls send(event) → controller.enqueue  │
+  │      } catch (e) {                                           │
+  │        send({ type: 'error', message: e.message })           │
+  │      } finally {                                             │
+  │        controller.close()  ← always closes                   │
+  │        recordPhase('done', t0)                               │
+  │        await disposeDataSource()  ← release MCP transport    │
+  │      }                                                       │
+  │    }                                                         │
+  │  })                                                          │
+  │                                                              │
+  │  dev-only file I/O (sync, best-effort):                     │
+  │    readFileSync(CACHE_FILE, 'utf8')  ← auth cache            │
+  │    writeFileSync(CACHE_FILE, …)      ← auth cache            │
+  │    readFileSync(DEMO_FILE, 'utf8')   ← demo snapshot         │
+  │                                                              │
+  │  MCP SDK transport pool (managed by SDK):                   │
+  │    connectMcp() returns a Client                            │
+  │    dispose() releases the Client                            │
+  │                                                              │
+  └──────────────────────────────────────────────────────────────┘
+
+  ┌─ vitest process (eval only) ─────────────────────────────────┐
+  │  mkdirSync(RECEIPTS_DIR, { recursive: true })                │
+  │  writeFileSync(outPath, JSON.stringify(receipt))             │
+  │  grows over time — not pruned                                │
+  └──────────────────────────────────────────────────────────────┘
+
+  discipline:
+    · every producer closes its stream (finally block)
+    · every consumer reads until done OR cancels explicitly
+    · every SSR-unsafe API is guarded (typeof X === 'undefined')
+    · every dispose() is called in a finally, not a happy path
 ```
 
-## Elaborate — why Web Streams instead of `node:stream`
+## Elaborate
 
-Web Streams are the platform-neutral streaming primitive: they work identically in the browser, in Node, in Deno, in Bun. Node's `node:stream` module is older, has its own semantics (pipes, `.pipe()`, `Readable.from`), and doesn't natively cross into the browser. For a codebase where the same NDJSON kernel needs to run on both sides (`lib/streaming/ndjson.ts` is shared), Web Streams are the obvious choice.
+The `ReadableStream` API (from the WHATWG Streams spec) is browser-first; Node adopted it in v18. It replaces the older Node-style `Readable` (`.on('data')`, `.on('end')`) with a promise-native reader. The migration is more than cosmetic: WHATWG streams support automatic backpressure (the producer's `enqueue` waits when the consumer is slow) and standardized cancellation via the reader. Older Node streams needed manual pause/resume.
 
-The Next.js App Router returns a `Response` whose body is a Web `ReadableStream`. That's the interface Vercel expects; using `node:stream` would require adapters at the response boundary and lose the client-side portability.
+In this codebase, backpressure is theoretical — the NDJSON events are small (a hundred bytes each) and the consumer (the browser) reads them fast enough. But the API's shape (`controller.enqueue` returns a promise you can await if pressure matters) is there when it's needed.
 
-The tradeoff: Web Streams' backpressure semantics are less explicit than `node:stream`'s (`.pipe()` handles backpressure automatically). In practice, blooming insights doesn't push enough data per second to trigger backpressure — an agent event every ~1s is well below any stream's throughput limit. If the codebase later grew a high-throughput streaming path (millions of events per second, arbitrary file uploads), the choice would deserve revisiting.
+The other important idea in this file — SSR guards — comes out of the Next.js reality. Server components run on Node; client components run in the browser. A module imported by both needs to be defensive about which APIs it touches at what time. `typeof localStorage === 'undefined'` is the standard shibboleth. Some codebases skip it (rely on `'use client'` markers), but the defense-in-depth pays off the day someone accidentally imports the config module into a server component.
+
+Read `07-backpressure-bounded-work-and-cancellation.md` next — it walks how AbortSignal composes through the stream lifecycle. Then `08-runtime-systems-red-flags-audit.md` ranks the runtime risks with evidence.
 
 ## Interview defense
 
-**Q: What happens to the server-side stream when a client closes their tab mid-briefing?**
+**Q: How does the NDJSON stream get cleaned up if the user closes their tab mid-investigation?**
 
-Four steps:
+The tab close aborts the browser's `fetch` — which propagates through the HTTP connection to the server — which fires `req.signal`. The route handler checks `req.signal.aborted` at coarse phase boundaries and calls `throwIfAborted()` before starting the next phase. That throws inside the async `start` function of the ReadableStream, which lands in the `catch/finally`. The `finally` calls `controller.close()` and `disposeDataSource()` — releasing the upstream MCP transport back to the pool. On the way out, the composed AbortSignal in `transport.ts` fires, so any in-flight MCP call also aborts within 30s (or immediately if it was waiting on the socket).
 
-  1. The TCP connection closes; Vercel's runtime aborts `req.signal`.
-  2. The next `req.signal.throwIfAborted()` throws `DOMException: AbortError`. If the throw happens between phases, that's where it lands; if it happens deep inside `dataSource.callTool` (via the composed signal), the transport throws with the AbortError as cause.
-  3. The `catch` block at `app/api/briefing/route.ts:294-296` detects `AbortError` and returns without emitting an error event (no consumer to read it).
-  4. The `finally` block runs: `disposeDataSource()`, `console.log(phases)`, `controller.close()`. The observability log records exactly how much of the 300s budget was burned before the cancel.
+*Diagram to sketch: two boxes — browser and server — with an X on the browser side, an arrow across labeled "TCP RST → req.signal abort," then a chain of arrows on the server side: throwIfAborted → catch → finally → controller.close + dispose.*
 
-The load-bearing part: even on abort, the finally runs. Without that, the phase log would be missing exactly the cases where you most want to know what happened.
+**Q: Why is `readFileSync` used in `lib/mcp/auth.ts`? Doesn't that block the event loop?**
 
-**Q: Why is `reader.releaseLock()` in a `finally` block?**
+It does, but only in dev, and only on OAuth-flow requests (which are rare during dev). The reason: Next's dev server hot-reloads modules when files change, which would wipe an in-memory Map mid-OAuth flow — the client info and PKCE verifier saved during `connect` must survive until `callback` exchanges the code, and those two calls span a hot-reload if you touch any file in between. A file persists across reloads. In production, `NODE_ENV === 'development'` is false, so this whole path is skipped; the ALS-scoped cookie store handles everything and there's no sync I/O.
 
-Web `ReadableStream` allows only one active reader at a time. If `handle(event)` throws — say, a malformed JSON line that JSON.parse rejects and no `onMalformed` handler catches — the reader is still locked. Any subsequent attempt to consume the same stream throws *"ReadableStream is already locked to a reader."* Putting `releaseLock()` in `finally` guarantees the lock releases even on the error path. Anchor: `lib/streaming/ndjson.ts:61-63`.
+*Diagram to sketch: a switch labeled NODE_ENV — dev branch goes to `readFileSync` box, production branch goes to `AsyncLocalStorage.getStore()` box, with a comment "one path is blocking-but-fine, the other is async-and-required-for-scale."*
 
-**Q: How does the codebase avoid stale reads of the dev auth cache?**
+**Q: The load-bearing part people forget about client-side storage?**
 
-It doesn't — deliberately. `lib/mcp/auth.ts:117-122` calls `readFileSync` on every `readAll()`. That's O(one small file read) per provider method call. In dev, hot-reload wipes in-memory maps between requests, so the file is the source of truth. In production, the ALS+cookie path bypasses the file entirely (`process.env.NODE_ENV === 'development'` guard at line 34).
+That it can throw. Everyone remembers "guard for SSR" (`typeof localStorage === 'undefined'`), but skips the try/catch inside. Safari Private Mode used to throw on `setItem`. Some enterprise browsers block storage entirely. `lib/mcp/config.ts` wraps every access in a try/catch that turns the throw into a silent no-op. The app falls back to env-driven defaults; nothing crashes. Skip the try/catch and the modal will fail to save for a subset of users you can't easily identify.
 
-The cost is a synchronous file read per method call in dev. Fine for developer machines; would be unacceptable in production (which is exactly why prod uses the cookie path).
+*Diagram to sketch: a decision tree — `typeof localStorage undefined?` → yes → return null; no → try setItem → catches: quota exceeded, private mode, blocked — all fall to silent no-op.*
 
 ## See also
 
-  → `03-event-loop-and-async-io.md` — the reader loop and how `await reader.read()` interleaves with React renders.
-  → `07-backpressure-bounded-work-and-cancellation.md` — how `req.signal` composes with `AbortSignal.timeout` to cancel in-flight work at every layer.
-  → `study-networking` — the HTTP semantics beneath the stream (connection reuse, TLS, chunked transfer).
+- `03-event-loop-and-async-io.md` — the async I/O primitives the streams build on
+- `04-shared-state-races-and-synchronization.md` — the cross-instance state that survives via the encrypted cookie
+- `07-backpressure-bounded-work-and-cancellation.md` — how AbortSignal composes through stream lifecycles

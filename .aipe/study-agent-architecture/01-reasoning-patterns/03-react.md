@@ -1,159 +1,216 @@
-# ReAct
+# ReAct — the baseline this repo uses
 
-_Industry standard._
+*Industry name: ReAct (Reasoning + Acting) · Language-agnostic*
 
-## Zoom out, then zoom in
-
-ReAct (Reason + Act) is the default single-agent pattern — interleave reasoning tokens and tool calls in one flat message stream. Every worker in this repo runs ReAct. This file's job is *placement in the family*: why start here, when to escalate, and why this repo hasn't.
+## Zoom out
 
 ```
-  Zoom out — every worker runs ReAct on top of the kernel
+  Zoom out — ReAct is one shape of step()
 
-  ┌─ Worker agents (thin wrappers) ────────────────────────────┐
-  │  MonitoringAgent · DiagnosticAgent · RecommendationAgent   │
-  │  QueryAgent — each = one prompt + one runAgentLoop call    │
-  └────────────────────────────┬───────────────────────────────┘
-                               │
-  ┌─ AptKit runtime ───────────▼───────────────────────────────┐
-  │  ★ runAgentLoop (the ReAct kernel — see 02) ★              │
-  └────────────────────────────────────────────────────────────┘
+  ┌─ agent loop skeleton (kernel) ───────────────┐
+  │  step + execute + accumulate + terminate     │
+  │        │                                     │
+  │        ▼                                     │
+  │  step() shapes:                              │
+  │    ★ ReAct (default — this repo) ★           │ ← we are here
+  │    plan-and-execute                          │
+  │    reflexion (adds critic on top)            │
+  │    tree of thoughts (branches step())        │
+  └──────────────────────────────────────────────┘
 ```
 
-Zoom in: this file names ReAct as the *baseline*. It's what you build first. Escalation to plan-and-execute or multi-agent is not a default; it's a response to a specific measured failure.
+## Zoom in
+
+ReAct interleaves reasoning and action in one loop: the model thinks aloud, calls a tool, observes the result, thinks again. It's the default single-agent pattern — the strong prior is to start here before any fancier pattern. Every worker in this repo (Monitoring, Diagnostic, Recommendation, Query) is a ReAct loop.
+
+Mechanics of the Thought-Action-Observation exchange are covered in `.aipe/study-ai-engineering/04-agents-and-tool-use/03-react-pattern.md`. This file's job is placement: where ReAct sits in the family and when you'd escalate past it.
 
 ## Structure pass
 
-**Layers:** prompt (system instructions) · loop (kernel from `02-agent-loop-skeleton.md`) · tool policy (allowlist) · parse (schema validation).
-**Axis:** *what does the model do per turn?*
-**Seam:** the interleave — text and tool_use blocks come back in the same content array; the loop routes each.
+Layers: **route** — **agent instance** — **step function (ReAct-shaped)** — **tool**.
 
-Reasoning and action share one message stream, not two:
+Axis to hold constant: **who decides the next tool?**
 
 ```
-  ReAct interleave — one turn's response
+  One question, held constant — where the LLM's freedom lives
 
-  content: [
-    { type: 'text',     text: "Let me check purchase revenue trend..." },  ← reason
-    { type: 'tool_use', name: 'execute_analytics_eql', input: {...} },     ← act
-  ]
+  "who chooses the next tool call?"
 
-  next turn:
-  content: [
-    { type: 'tool_result', tool_use_id: '...', content: '{...}' },        ← observe
-  ]
-  → LLM continues (reason + act again, or return final text)
+  ┌────────────────────────────────────────────────┐
+  │ outer route: pipeline                          │  → CODE decides stage
+  └────────────────────────────────────────────────┘
+      ┌──────────────────────────────────────────┐
+      │ inside stage: aptkit ReAct loop           │  → LLM decides tool
+      └──────────────────────────────────────────┘
+          ┌────────────────────────────────────┐
+          │ inside tool: EQL execution         │  → data-source runs it
+          └────────────────────────────────────┘
 ```
+
+The LLM's freedom is scoped to a single altitude — "which of these MCP tools next, with what args." Everything above and below is deterministic.
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — the shape
 
-You've built forms with mixed inputs before — one form emits both text and file uploads in a single submit. ReAct is the same: one model response contains both *thought* (text) and *action* (tool_use) blocks; the harness inspects the content array, streams the text as reasoning to the UI, and executes each tool_use.
+You've written a `while` loop with a `switch` inside — each iteration reads state, picks a branch, does the branch, loops. ReAct is that pattern where the `switch` is an LLM call and the branches are tool names.
 
 ```
-  Pattern: ReAct interleave
+  ReAct — the Thought-Action-Observation loop
 
-  turn 1 → LLM emits: "I should check <tool_use A>"
-  turn 2 (harness) → run A, feed result back
-  turn 3 → LLM emits: "Now check <tool_use B>"
-  turn 4 (harness) → run B, feed result back
-  turn 5 → LLM emits: final text (no tool_use) — DONE
+  ┌──────────────────────────────────────────────────┐
+  │  turn 1: Thought  "let me check X"               │
+  │          Action   → execute_analytics_eql(…)     │
+  │          Obs      ← 42.3% down                   │
+  │                                                  │
+  │  turn 2: Thought  "so it might be Y"             │
+  │          Action   → execute_analytics_eql(…)     │
+  │          Obs      ← isolated to USA              │
+  │                                                  │
+  │  turn 3: Thought  "confident enough"             │
+  │          Final    → Diagnosis JSON               │
+  └──────────────────────────────────────────────────┘
 ```
 
-### Move 2 — the walkthrough
+### Move 2 — the specific instance in this repo
 
-**How Blooming builds a ReAct worker.** Each worker is 40-80 lines of adapter — one system prompt, one AptKit agent class, one call. `DiagnosticAgent`:
+**Where the loop lives.** `lib/agents/diagnostic.ts:36-67` constructs an `AptKitDiagnosticInvestigationAgent` and calls `agent.investigate(anomaly)`. The aptkit class owns the actual while-loop; the DiagnosticAgent class is a compatibility wrapper that binds the three adapters.
+
+**The three adapters that make ReAct work.** aptkit knows about "a model provider," "a tool registry," "a trace sink" — it does not know about Anthropic, MCP, or the Blooming NDJSON format. The bridge is `lib/agents/aptkit-adapters.ts`:
 
 ```ts
-// lib/agents/diagnostic.ts:37-67
-export class DiagnosticAgent {
-  constructor(private anthropic, private dataSource, private schema, private allTools, private sessionId?) {}
-
-  async investigate(anomaly, hooks = {}) {
-    const agent = new AptKitDiagnosticInvestigationAgent({
-      model: new AnthropicModelProviderAdapter(...),
-      tools: new BloomingToolRegistryAdapter(this.dataSource, this.allTools),
-      workspace: this.schema,
-      trace: new BloomingTraceSinkAdapter(hooks, 'diagnostic'),
-    });
-    return agent.investigate(anomaly, { signal: hooks.signal });
+// lib/agents/aptkit-adapters.ts (roles)
+class AnthropicModelProviderAdapter implements ModelProvider {
+  async complete(request: ModelRequest): Promise<ModelResponse> {
+    if (this.budget?.exceeded()) throw new BudgetExceededError(...);
+    // dispatch anthropic.messages.create with cache_control on the system prompt
+    // return { content, stopReason, usage }
+  }
+}
+class BloomingToolRegistryAdapter implements ToolRegistry {
+  async executeToolCall(name, args, signal) {
+    return this.dataSource.callTool(name, args, { signal });
+  }
+}
+class BloomingTraceSinkAdapter implements CapabilityTraceSink {
+  onEvent(event: CapabilityEvent) {
+    // translate to Blooming AgentEvent + fire hooks.onToolCall/onText/onCapabilityEvent
   }
 }
 ```
 
-Line-by-line: Blooming owns the *bridging* (SDK adapter, tool registry adapter, trace sink); AptKit owns the loop and the prompt. The prompt is in `@aptkit/prompts` and gets rendered with `schemaSummary` + the anomaly JSON injected. That prompt is a ReAct prompt — it tells the model to "Investigate the anomaly and return the diagnosis JSON object."
+Each adapter is one of the four skeleton parts from `02-agent-loop-skeleton.md`: model → the step function, tool registry → execute, trace sink → observability on top of accumulate. Terminate is inside aptkit itself (iteration cap) plus the budget adapter check.
 
-**The interleave in the wire.** `runAgentLoop.js:29-52`:
+**The escalation gate — why start with ReAct.** Every worker in this repo defaulted to ReAct. That was a decision, not an accident. The rule:
 
-```js
-const response = await model.complete({ system, messages, tools: toolSchemas, ... });
-messages.push({ role: 'assistant', content: response.content });
-const text = textFromContent(response.content);
-if (text) { trace?.emit({ type: 'step', role: 'assistant', content: text, ... }); }
-const toolUses = toolUsesFromContent(response.content);
-if (toolUses.length === 0) { finalText = text; break; }
+```
+  ReAct is the default. Escalate only when a specific failure names itself.
+
+  Default to ReAct.
+    │
+    ├─ measure: success rate, tool-call accuracy, latency, cost
+    │
+    └─ only escalate when a SPECIFIC failure mode is identified
+       that ReAct cannot address:
+         → plan-and-execute if you need a global plan (structured tasks)
+         → reflexion if output quality is uneven (add critic)
+         → multi-agent if the failure is genuinely decomposable
 ```
 
-Line-by-line: one call returns one `response.content` array. `textFromContent` extracts the reasoning text and streams it as a `step` event (this is what shows up in the `StatusLog` panel). `toolUsesFromContent` extracts the actions; the loop runs each. Reason + Act, same turn, one call.
+For diagnostic investigations, ReAct is the right pick because the path is genuinely dynamic — the next hypothesis to test depends on what the last EQL returned. A plan-and-execute here would build a stale plan on turn 1 and burn budget re-planning as observations came in.
 
-**Why "baseline" is load-bearing.** In `escalate to X` interview answers, ReAct is where you started — measured — and moved past. In this repo, the honest claim is: ReAct + a well-shaped prompt + a strict `filterToolsForPolicy` allowlist (see `diagnostic-agent.js:8-23`) has been enough. Plan-and-execute (see `04-plan-and-execute.md`) would add a 30-40% latency hit at the top with no measured accuracy win for a *single-hypothesis* investigation flow.
+**What the ReAct loop looks like on a real diagnostic run** (from a captured trace):
+
+```
+  Real trace — diagnosing "USA purchase_revenue · -38.4%"
+
+  turn 1: agent reads anomaly + schema summary
+          → execute_analytics_eql: "sum event purchase.total_price"
+            group by customer.state, current 90d vs prior 90d
+          ← Texas down 82%, California down 12%, others flat
+
+  turn 2: agent hypothesizes: "concentrated in one state"
+          → execute_analytics_eql: "count event checkout by state"
+            with checkout_step=payment
+          ← Texas checkouts halved at payment step
+
+  turn 3: agent hypothesizes: "payment failure spike in TX"
+          → execute_analytics_eql: "count event payment_failure by state"
+          ← Texas payment_failure up 340%, others flat
+
+  turn 4: agent emits final Diagnosis:
+          conclusion: "payment failure spike concentrated in Texas"
+          evidence: [3 EQL queries + raw counts]
+          affectedCustomers: ~4,200 in TX
+```
+
+Four turns, three tool calls, one final structured output. Nothing else in the code named "check Texas payment_failures" — the model chose that path by reading its own turn-2 observation.
 
 ### Move 3 — the principle
 
-Start with ReAct. Measure success rate, tool-call accuracy, latency, cost. Escalate only when a *specific* failure mode is identified that ReAct can't address by prompt shaping or tool-policy tightening. The interview-grade version: "I built a ReAct baseline, measured N cases, tool-call accuracy was M%, and the failures were <specific> — that's when I reached for plan-and-execute / self-critique / multi-agent."
+Most teams jump past ReAct prematurely. Naming "I built a ReAct baseline, measured it, and escalated only when [specific failure]" is a stronger signal than reaching for multi-agent first. The pattern's real power is its ordinariness — it's the simplest thing that works, and most tasks don't need anything more.
 
 ## Primary diagram
 
 ```
-  Recap — ReAct in a Blooming worker
+  ReAct — the load-bearing shape in this repo
 
-  ┌─ prompt (from @aptkit/prompts + rendered with schema) ─────┐
-  │  system: "You are a diagnostic investigator..."            │
-  │  user:   "Investigate the anomaly and return the           │
-  │           diagnosis JSON object."                          │
-  └─────────────────────────────┬──────────────────────────────┘
-                                │  runAgentLoop
-                                ▼
-  ┌─ turn 1 ───────────────────────────────────────────────────┐
-  │  Sonnet emits: text (reason) + tool_use(execute_analytics_eql)│
-  └────────────────────────────┬───────────────────────────────┘
-                               │  execute
-                               ▼
-  ┌─ turn 2 ─ (tool_result appended, model runs again) ────────┐
-  │  Sonnet emits: text + tool_use(execute_analytics_eql)      │
-  └────────────────────────────┬───────────────────────────────┘
-                               │  ... up to 5-8 turns typical
-                               ▼
-  ┌─ final turn ───────────────────────────────────────────────┐
-  │  Sonnet emits: text ONLY (JSON fence with Diagnosis)       │
-  │  → tryParseDiagnosis → return                              │
-  └────────────────────────────────────────────────────────────┘
+  ┌─ DiagnosticAgent (compatibility wrapper) ────────────────────┐
+  │  new AptKitDiagnosticInvestigationAgent({                   │
+  │    model:  AnthropicModelProviderAdapter (Sonnet 4.6)       │
+  │    tools:  BloomingToolRegistryAdapter    (DataSource)       │
+  │    trace:  BloomingTraceSinkAdapter        (NDJSON hooks)    │
+  │  }).investigate(anomaly)                                     │
+  └──────────────────────┬──────────────────────────────────────┘
+                         │ aptkit runs the loop:
+                         ▼
+  ┌────────────────────────────────────────────────────────────┐
+  │  while not done:                                            │
+  │    ┌────────────────┐  content: [text, tool_use]            │
+  │    │ Thought (text) │◄─────────────────────────────┐        │
+  │    └────────┬───────┘                              │        │
+  │             ▼ tool_use                             │         │
+  │    ┌────────────────┐                              │         │
+  │    │ Action         │  DataSource.callTool         │         │
+  │    │ (tool_use)     │  (via BloomingToolRegistry)  │         │
+  │    └────────┬───────┘                              │         │
+  │             ▼ result                               │         │
+  │    ┌────────────────┐                              │         │
+  │    │ Observation    │  append tool_result block ───┘         │
+  │    │ (tool_result)  │                                        │
+  │    └────────────────┘                                        │
+  │                                                              │
+  │  final → Diagnosis (structured JSON output)                  │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-ReAct came from Yao et al. 2022, but the more useful reference for a production reader is Anthropic's "Building Effective Agents" (2024), which named the pattern-family cleanly: **augmented LLM** (prompt + tools) is the base, **workflows** (chain / router / parallel / etc.) are code-driven compositions, **agents** are ReAct loops. The recommended production posture is "workflows outside, agents inside" — which is exactly the shape this repo runs.
+ReAct was named by Yao et al. (Google Brain / Princeton, Oct 2022) — the paper showed that interleaving reasoning traces with actions beat pure chain-of-thought on HotpotQA and beat pure action-taking on ALFWorld. The interleaving is the whole point: reasoning grounds action (fewer bad tool calls), action grounds reasoning (fewer hallucinated facts).
 
-The failure mode that pushes past ReAct in some codebases: **long-horizon planning** where the model loses the thread after 4-5 tool calls. Blooming's diagnostic loop is short-horizon (3-5 tool calls typical, cap at 6), so this doesn't bite. If the investigation grew to require nested sub-questions (which country segment → which acquisition channel → which campaign), the answer would be *not* plan-and-execute, but a sub-agent (supervisor-worker in Section C).
+The Anthropic + OpenAI tool-calling APIs make ReAct almost invisible — the model emits `tool_use` blocks natively, the harness runs them, the reasoning traces are the text that comes back interleaved. You often don't see the "Thought/Action/Observation" scaffolding because it's implicit in the message shape. That's why teams sometimes think they're not using ReAct when they are.
+
+**What comes after ReAct.** When ReAct hits a ceiling, the two most common escalations are plan-and-execute (for tasks with a clear global plan — see `04-plan-and-execute.md`) and reflexion (add a critic loop on top — see `05-reflexion-self-critique.md`). Both keep the ReAct kernel; both add structure around it.
 
 ## Interview defense
 
-**Q: Why ReAct and not something fancier?**
-A: Because I measured. The diagnostic loop converges in 3-5 tool calls with Sonnet 4.6; the failure modes I see are (1) EQL syntax errors from the model, mitigated by the tight allowlist + prompt examples, and (2) the model asking "should I run another query?" when the answer is clearly there, mitigated by the `maxToolCalls=6` budget-exit + synthesis prompt. Plan-and-execute would add a separate planning turn at the top — 40% more latency, no accuracy gain in the measured cases. Multi-agent would add coordination overhead. I named the specific failure that would push me past ReAct: cross-segment nested investigations, which I don't have yet.
+**Q: Why did you pick ReAct for the diagnostic agent?**
 
-Diagram: the ReAct interleave, then a "when to escalate" arrow pointing sideways to plan-and-execute / multi-agent with the trigger conditions labelled.
-Anchor: `lib/agents/diagnostic.ts:37-67` + `run-agent-loop.js:25-105`.
+The diagnostic path is dynamic — the next hypothesis to test depends on what the last EQL returned. A plan-and-execute here would build a plan on turn 1 (before seeing any data) and burn budget re-planning as observations came in. ReAct's per-turn reasoning is a better fit for the exploratory shape.
 
-**Q: How is reasoning surfaced to the UI?**
-A: ReAct's advantage over structured intermediate representations is that the reasoning text IS the interleave. Every model turn's text block gets streamed as a `step` event through the trace sink (`BloomingTraceSinkAdapter.emit`), which hooks into the route's `send({ type: 'reasoning_step', ... })`, which the browser reads as NDJSON and renders in `StatusLog`. The user sees the model's reasoning live — which is the product's whole "shows its work" pitch. That surface is *free* with ReAct; you'd have to synthesize it for other patterns.
+I also treat ReAct as the default across all four agents in the repo (monitoring, diagnostic, recommendation, query) — the escalation rule is "measure ReAct first, escalate only when a specific failure mode names itself." None of them has hit that ceiling yet.
 
-Diagram: content array → text extraction → NDJSON → StatusLog line.
-Anchor: `lib/agents/aptkit-adapters.ts:157-166` (the trace sink's step routing).
+*Anchor visual:* the three-adapter diagram above.
+
+**Q: What tells you it's time to escalate past ReAct?**
+
+Two signals. First, the model burns budget without converging — same shape as a bad tool call, but repeated. That's when plan-and-execute helps (commit to a plan up front, execute cheaply). Second, output quality is uneven — some diagnoses good, some sloppy. That's when reflexion helps (critic scores, loop on low-confidence).
+
+I haven't hit either yet in this repo. The baseline is p50 50s / ~$0.09 per case, and quality passes the LLM-as-judge rubric. If either drifted, escalation would be the next move.
 
 ## See also
 
-- `02-agent-loop-skeleton.md` — the kernel ReAct runs on.
-- `04-plan-and-execute.md` — the escalation from ReAct.
-- `07-routing.md` — the router in front of the ReAct loop.
-- `03-multi-agent-orchestration/02-supervisor-worker.md` — the other escalation direction.
-- Cross-reference: `.aipe/study-ai-engineering/04-agents-and-tool-use/03-react-pattern.md` for the Thought-Action-Observation mechanics.
+- **`02-agent-loop-skeleton.md`** — the kernel this pattern instantiates.
+- **`04-plan-and-execute.md`** — the escalation for structured tasks.
+- **`05-reflexion-self-critique.md`** — the critic-loop escalation.
+- **`.aipe/study-ai-engineering/04-agents-and-tool-use/03-react-pattern.md`** — Thought/Action/Observation mechanics.

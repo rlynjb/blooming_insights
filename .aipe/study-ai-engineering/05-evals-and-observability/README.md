@@ -1,27 +1,29 @@
-# 05 — Evals and observability (LLM side)
+# 05 · Evals and observability
 
-The tier-2 story. The eval harness in `eval/` is the connective tissue of this repo's portfolio hardening — 10 goldens × 2 rubrics × 4 dims × 3 verdicts, per-case receipt, judge-error resilience, signal-class-aware gate, load harness, fault-injection decorator, regression gate.
+The harness that keeps the agents honest. Live in this codebase, with real numbers and a committed baseline.
 
-## Files
+- [01-eval-set-types.md](01-eval-set-types.md) — 10 goldens across 4 signal classes.
+- [02-eval-methods.md](02-eval-methods.md) — LLM-as-judge with two rubrics × 4 dimensions × 5-scale × 3 verdicts.
+- [03-llm-as-judge-bias.md](03-llm-as-judge-bias.md) — position, verbosity, self-preference; blind calibration protocol (6/6 verdict, 24/24 within-1).
+- [04-llm-observability.md](04-llm-observability.md) — `AgentHooks.onCapabilityEvent` + receipts pipeline; p50/p95/p99 + $ per case.
 
-- `01-eval-set-types.md` — golden / adversarial / regression sets. This repo has goldens; adversarial is Case B; regression is baseline.json.
-- `02-eval-methods.md` — from exact-match to LLM-as-judge. This repo uses rubric-based LLM-as-judge.
-- `03-llm-as-judge-bias.md` — position, verbosity, self-preference. Session-D calibration pilot measured Sonnet-vs-Haiku agreement.
-- `04-llm-observability.md` — receipts, report, budget, calibration. What the eval harness surfaces.
+## The load-bearing files in this sub-section
 
-## Anchor shape
+- `eval/goldens/*.ts` — 10 golden cases (4 signal classes).
+- `eval/rubrics/diagnosis-quality.ts` · `eval/rubrics/recommendation-quality.ts` — 4 dimensions each.
+- `eval/run.eval.ts` — the harness.
+- `eval/report.eval.ts` — observability report (p50/p95/p99 + cost).
+- `eval/baseline.json` — committed reference for the regression gate.
+- `eval/gate.eval.ts` — the regression gate (blocks if any dim drops >10pp).
+- `lib/agents/aptkit-adapters.ts` — `BloomingTraceSinkAdapter` + `onCapabilityEvent` hook.
 
-LLM application engineering. Everything here is directly exercised in this codebase (Phase 1 eval harness through Phase 5 regression gate, shipped Weeks 2-4).
+## The real numbers
 
-## Curriculum
+Baseline runId `2026-07-03T04-08-28-644Z`:
 
-Phase 3 — concepts C3.1-C3.12.
+- Per-phase p50 latency: diagnose 50s · diagnose-judge 38s · recommend 51s · recommend-judge 90s · total 225s
+- Per-case cost: ~$0.09 agent-side (with caching) · ~$1.30 total for 10 cases
+- Diagnosis pass rates: root_cause_plausibility 75% · evidence_grounding 50% · scope_coherence 75% · actionable_next_step 0%
+- Recommendation pass rates: diagnosis_response 48% · feature_choice_fit 62% · step_actionability 100% · impact_realism 43%
 
-## Key numbers to anchor against
-
-From committed `eval/baseline.json` (runId `2026-07-03T04-08-28-644Z`):
-- 10 goldens across 4 signal classes (has-signal, partial-signal, no-signal, positive)
-- Per-case ~$0.09 agent-side (cached), ~$1.30 for the full 10-case run
-- Diagnosis dim pass rates: root_cause_plausibility 75%, evidence_grounding 50%, scope_coherence 75%, actionable_next_step 0%
-- Recommendation dim pass rates: diagnosis_response 48%, feature_choice_fit 62%, step_actionability 100%, impact_realism 43%
-- Session D pilot: verdict agreement 6/6 (100%), exact-match 13/24 (54%), within-1 24/24 (100%)
+The known-broken thing: cases 01 and 08 both propose "pause the A/B experiment" when the primary root cause is a payment processor. Failed by `diagnosis_response` (score 2).

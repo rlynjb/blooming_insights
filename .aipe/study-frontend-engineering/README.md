@@ -1,56 +1,33 @@
-# study — frontend engineering (blooming insights)
+# study — frontend engineering
 
-Per-repo guide to the framework-and-platform layer of this Next.js 16 + React 19 codebase: how the client is rendered, where state lives, how the UI reads NDJSON off a `fetch()` body, how the streaming trace and coverage grid compose, and what platform APIs the app touches. The mechanics behind the box — request pool semantics, the event loop, FCP/LCP measurement, XSS/CSP, agent orchestration — live in their own guides (cross-linked below).
+The framework-and-platform layer of blooming_insights: how Next.js 16 + React 19 turn agent output into pixels, where the state graph lives, how the streaming NDJSON seam is consumed, and what design system the components actually share.
+
+Reader posture: you've shipped 7+ years of Vue and React. This guide skips the "what's a hook" on-ramp and goes straight to what THIS repo does.
 
 ## Reading order
 
-```
-  START HERE
-     │
-     ▼
-  ┌─────────────────────┐
-  │ 00-overview.md      │   one page — the rendering mode,
-  │                     │   the state graph, the three
-  │                     │   load-bearing patterns
-  └──────────┬──────────┘
-             │
-             ▼
-  ┌─────────────────────┐
-  │ audit.md            │   Pass 1 — 8 lens sections against
-  │                     │   file:line evidence, one lens
-  │                     │   ranks the red flags
-  └──────────┬──────────┘
-             │
-             ▼
-  ┌─────────────────────┐
-  │ 01-ndjson-stream-   │   Pass 2 — the load-bearing kernel:
-  │ reader-hook.md      │   fetch → getReader → decode → split
-  │                     │   → JSON.parse → dispatch, in ONE
-  │                     │   function reused four surfaces deep
-  └──────────┬──────────┘
-             │
-             ▼
-  ┌─────────────────────┐
-  │ 02-progressive-     │   Pass 2 — the perceived-instant
-  │ skeleton-with-      │   composition: 4 tiers of feedback
-  │ stepper.md          │   (skeleton · stepper · coverage
-  │                     │   grid · status log) shipped from
-  │                     │   the same NDJSON stream
-  └─────────────────────┘
-```
+  1. `00-overview.md` — one-page orientation. Rendering mode in a sentence, state graph in a diagram, network seam in a diagram, the three highest-leverage patterns named with file paths.
+  2. `audit.md` — Pass 1. The 8-lens audit walked against real evidence. `not yet exercised` where the repo doesn't touch the lens.
+  3. Pattern files (Pass 2) — one per load-bearing frontend pattern this repo actually exercises. Each uses the full `format.md` template.
 
-## Cross-links — neighboring guides that own adjacent mechanisms
+## Discovered pattern files
 
-- **`study-runtime-systems`** — the event loop and microtask queue behind the async NDJSON reader; ReadableStream backpressure and how `await reader.read()` yields.
-- **`study-networking`** — the wire semantics for the NDJSON contract, keep-alive, response streaming vs `EventSource`, and why this repo does NOT use SSE.
-- **`study-performance-engineering`** — measurement (FCP / LCP / TTI / bundle size) of the progressive-composition pattern this guide describes as *what* renders when.
-- **`study-security`** — XSS surface (the trace content is user-controlled agent output), CSP posture, and how `sessionStorage` / `localStorage` handle client-carried state.
-- **`study-software-design`** — module depth: `readNdjson` (64 LOC, one exported function) is the textbook deep module this guide names as a pattern.
-- **`study-system-design`** — system-level state ownership: which store owns each piece of state (in-memory, sessionStorage, dev-file, demo snapshot), why the browser carries the insight across Vercel instances.
-- **`study-testing`** — the test seams around `readNdjson`, the briefing NDJSON contract integration tests, and the hook-testing gap.
+Named after the pattern, not the lens. A senior reader skimming this list should recognize what the repo does.
 
-## What this guide does NOT cover
+  - `01-ndjson-stream-reader-hook.md` — one kernel (`readNdjson`) shared across every streaming surface. Fetch + reader + decoder + split-on-newline + JSON.parse + dispatch. The seam that lets 4 different consumers share the same 64 LOC.
+  - `02-progressive-skeleton-with-stepper.md` — 4-tier progressive composition on the feed. ProcessStepper + CoverageGrid + Skeleton stack + StatusLog trace fill in from stubs to loaded as the stream reports each level of detail.
+  - `03-settings-modal-with-localstorage-persistence.md` — new in Session D. Modal writes a config override to localStorage; streaming hooks pick it up on the next fetch as an HTTP header; unset falls through to env. Zero server state, zero React context.
 
-- The agent loop, tool dispatch, or Anthropic API integration — that's `study-agent-architecture` and `study-ai-engineering`.
-- Bloomreach MCP OAuth, PKCE, or the encrypted-cookie auth store — that's `study-security` / `study-system-design`.
-- Anomaly detection logic, EQL, or period-over-period math — that's the data layer, not the frontend.
+## Cross-links to neighbor guides
+
+Frontend-engineering owns the framework-and-platform layer only. Adjacent generators own their own seams:
+
+  - Rendering-pipeline event loop → `study-runtime-systems`
+  - Wire format (NDJSON, SSE, streaming semantics) → `study-networking`
+  - FCP / LCP / bundle-size measurement → `study-performance-engineering`
+  - XSS / CSP / token-storage trust boundaries → `study-security`
+  - Deep modules vs shallow, information hiding → `study-software-design`
+  - System-level state ownership and boundaries → `study-system-design`
+  - Test isolation, MSW seams, eval harness → `study-testing`
+
+If a finding is about "which layer decides X" or "what should the seam contract be," it lives in one of those. If it's about "how does React turn a stream into progressive UI in this repo," it lives here.

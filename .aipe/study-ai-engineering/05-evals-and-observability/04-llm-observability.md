@@ -1,199 +1,204 @@
-# 04 — LLM observability
+# LLM observability
 
-**Type:** Industry standard. Also called: LLM telemetry, agent tracing, eval infrastructure.
+## Subtitle
+
+Traces + spans + replay / capability-event telemetry — Industry standard.
 
 ## Zoom out, then zoom in
 
-Three pillars — traces, spans, replay. This codebase has all three, home-rolled around the eval receipt shape rather than Langfuse / LangSmith.
+blooming's observability is built on **capability events** flowing through `AgentHooks.onCapabilityEvent` (`lib/agents/aptkit-adapters.ts`). Every model turn fires a `model_usage` event with per-turn token counts; every tool call fires `tool_call_start` and `tool_call_end`. These flow into per-case receipts. The receipts feed two consumers: `eval/report.eval.ts` (prints p50/p95/p99 latency + tokens + cost per case) and `eval/gate.eval.ts` (blocks on regression vs baseline).
 
 ```
-  Zoom out — the three pillars in this repo
+  Zoom out — the observability pipeline
 
-  ┌─ Traces (per model call) ─────────────────────────────────────────┐
-  │  every complete() logs {site, sessionId, usage}                    │
-  │  CapabilityEvent 'model_usage' captured in eval trace              │
-  └───────────────────────────────────────────────────────────────────┘
-
-  ┌─ Spans (per turn / tool call) ────────────────────────────────────┐
-  │  CapabilityEvent stream: step, tool_call_start, tool_call_end     │
-  │  BloomingTraceSinkAdapter forwards each event                      │
-  │  onCapabilityEvent hook captures all for receipts                  │
-  └───────────────────────────────────────────────────────────────────┘
-
-  ┌─ Replay ──────────────────────────────────────────────────────────┐
-  │  Committed demo snapshots (lib/state/demo-*.json)                  │
-  │  Replay same NDJSON events on every load                           │
-  │  Eval receipts replay for report generation                        │
-  │  ★ THIS CONCEPT ★                                                  │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌─ aptkit agent loop ──────────────────────────────────┐
+  │  fires CapabilityEvent per turn:                     │
+  │    model_started, model_finished, model_usage,       │
+  │    tool_call_start, tool_call_end, text              │
+  └───────────────────────┬──────────────────────────────┘
+                          │
+                          ▼
+  ┌─ BloomingTraceSinkAdapter ★ ────────────────────────┐ ← we are here
+  │  lib/agents/aptkit-adapters.ts                       │
+  │  · forwards to AgentHooks.onCapabilityEvent           │
+  │  · routes to onToolCall, onText, onToolResult         │
+  └───────────────────────┬──────────────────────────────┘
+                          │
+      ┌───────────────────┼──────────────────────┐
+      ▼                   ▼                      ▼
+  UI stream          Eval receipts          Budget tracker
+  (NDJSON events)    (json per case)         (lib/agents/budget)
 ```
 
-Zoom in. The eval receipt is the load-bearing artifact — one JSON file per (case, run) with usage, cost, tool calls, judgments, budget snapshot. The report (`eval/report.eval.ts`) reads receipts on disk and prints percentile latency + tokens/cost per phase.
+Zoom in: one hook, three consumers, all fed by the same event stream.
 
 ## Structure pass
 
-**Layers:**
-- Outer: a run — 10 cases, one runId
-- Middle: per-case receipts + per-phase timing
-- Inner: per-turn CapabilityEvents
-
-**Axis: what's persisted, what's ephemeral?**
-- Persisted: receipts, baseline.json, calibration, demo snapshot
-- Ephemeral: the running trace during an investigation
-
-**Seam:** the CapabilityEvent stream. Above: consumers (eval, report, live UI). Below: AptKit's trace sink.
+- **Layers:** agent event → hook → three consumers (UI, receipts, budget). Four bands.
+- **Axis: consumer purpose.** UI: live visibility. Receipts: post-hoc analysis. Budget: pre-dispatch gate.
+- **Seam:** the `onCapabilityEvent` hook — one function boundary, three uses.
 
 ## How it works
 
-### Move 1
+### Move 1 — the mental model
 
-You've written per-request telemetry (latency, status code, size). LLM observability is that, but the "request" is one full ReAct investigation and the "unit" is per-turn + per-tool.
+The three pillars of LLM telemetry, applied to blooming:
 
 ```
-  Three pillars (Langfuse et al.'s vocabulary)
+  Three pillars — how they map
 
-  traces  — the per-request record: input, output, model, latency, cost
-  spans   — sub-steps within a request: tool calls, reasoning steps
-  replay  — re-running a saved trace with different code / prompts
+  ┌─ Traces (per-request) ─────────────────────────────┐
+  │  · which agent ran                                  │
+  │  · total duration                                   │
+  │  · total tokens / cost                              │
+  │  · verdict per rubric                               │
+  │  Lives in: eval/receipts/<runId>-<caseId>.json      │
+  └────────────────────────────────────────────────────┘
+
+  ┌─ Spans (per-turn) ─────────────────────────────────┐
+  │  · one span per model_usage event                  │
+  │  · one span per tool_call_end event                │
+  │  Lives in: same receipt, indexed by turn            │
+  └────────────────────────────────────────────────────┘
+
+  ┌─ Replay (re-run with different prompt) ────────────┐
+  │  goldens files are the deterministic input          │
+  │  → same anomaly → new prompt → different diagnosis   │
+  └────────────────────────────────────────────────────┘
 ```
 
-### Move 2
+### Move 2 — the step-by-step walkthrough
 
-**Trace capture — every model call.**
+**The trace sink adapter.** `BloomingTraceSinkAdapter` in `lib/agents/aptkit-adapters.ts` — implements aptkit's `CapabilityTraceSink` port. On every event:
 
-`AnthropicModelProviderAdapter.complete()` at `lib/agents/aptkit-adapters.ts:97-101`:
+- Fires `hooks.onCapabilityEvent?.(event)` (the additive hook, added in Phase 2).
+- Routes to `hooks.onText`, `hooks.onToolCall`, `hooks.onToolResult` for the UI stream.
+- Feeds usage back into the `BudgetTracker` for the pre-dispatch gate.
 
-```typescript
-console.log(JSON.stringify({
-  site: this.logSite,
-  sessionId: this.sessionId,
-  usage: response.usage,
-}));
+**The eval receipt.** `eval/run.eval.ts` collects all `model_usage` events per phase (investigate, recommend), sums them with `summarizeUsage()` from aptkit, computes cost with `estimateAnthropicCost()` from `lib/agents/pricing.ts`, and writes a receipt like:
+
+```
+  eval/receipts/2026-07-03T04-08-28-644Z-01.json  (sketch)
+
+  {
+    "runId": "2026-07-03T04-08-28-644Z",
+    "case": "01-conversion-drop-mobile-checkout",
+    "signalClass": "has-signal",
+    "durationMs": {
+      "investigate": 49200,
+      "diagnosisJudge": 37800,
+      "recommend": 51100,
+      "recommendationJudge": 91400,
+      "total": 229500
+    },
+    "usage": {
+      "diagnose": { "inputTokens": 47200, "outputTokens": 6100, "cost": 0.0334 },
+      "recommend": { "inputTokens": 52800, "outputTokens": 7300, "cost": 0.0454 }
+    },
+    "diagnosisJudgment": { "verdict": "pass", "dimensions": {...} },
+    "recommendationJudgments": [ {...}, {...}, {...} ]
+  }
 ```
 
-Fires once per turn. Plus AptKit emits `CapabilityEvent 'model_usage'` on the same call, which flows through the trace sink to the eval receipt.
+**The report.** `eval/report.eval.ts` reads all receipts for a run and prints:
 
-**Span capture — every reasoning step + tool call.**
+```
+  per-phase latency: diagnose 50s / d-judge 38s / recommend 51s
+                     / r-judge 90s / total 225s (p50)
+  per-case cost:     $0.09 agent-side (with caching)
+  per-dim pass rates: root_cause_plausibility 75%, ...
+```
 
-`BloomingTraceSinkAdapter.emit()` at `lib/agents/aptkit-adapters.ts:157-184`. Handles three event types: `step` (reasoning), `tool_call_start`, `tool_call_end`. Fires hooks (`onText`, `onToolCall`, `onToolResult`) into the route/eval layer. **New in Phase 2**: also forwards every event via the `onCapabilityEvent` hook — no filtering, full raw stream.
+**The gate.** `eval/gate.eval.ts` reads `eval/baseline.json` + the latest run's receipts, computes per-dim pass rate diffs, exits non-zero if any dim regressed > `GATE_MAX_REGRESSION` (default 10pp). Wired into CI as `npm run eval:gate` after `npm run eval`.
 
-**The eval receipt shape.**
+**The commited baseline.** `eval/baseline.json` — the reference run. RunId `2026-07-03T04-08-28-644Z`. Every future run compares against this. When a refactor legitimately improves quality, the baseline is updated intentionally, not silently.
 
-`eval/run.eval.ts:341-395`. One JSON per (case, run):
-- `runId`, `case`, `signalClass`, `intent`
-- `durationMs`: per-phase (investigate, diagnosisJudge, recommend, recommendationJudge, total) + p50/p95/p99
-- `model`: which model per stage
-- `anomaly`: the input
-- `diagnosisToolCalls` / `recommendationToolCalls`: what tools ran
-- `usage`: per-phase `{inputTokens, outputTokens, turns, costUsd}` from `summarizeUsage` + `estimateAnthropicCost`
-- `budget`: snapshot at the end + limit + `exceeded` flag
-- `diagnosis`: the output
-- `diagnosisJudgment`: the rubric result
-- `recommendations` + `recommendationJudgments`: each rec's judgment
+Diagram of the observability pipeline:
 
-**The report — reads receipts, no model calls.**
+```
+  Observability — full pipeline
 
-`eval/report.eval.ts`. Zero cost (no LLM invocations). Reads all receipts for a runId, computes:
-- Per-phase p50 / p95 / p99 / max
-- Per-case cost breakdown
-- Run totals (tokens, cost, aggregate time)
-- Per-tool-call latency stats
+  ┌─ aptkit agent loop (per turn) ─────────────────────────┐
+  │  fires: model_usage { inputTokens, outputTokens, ... }  │
+  │         tool_call_start, tool_call_end                  │
+  │         text                                             │
+  └────────────────────────┬───────────────────────────────┘
+                           │
+                           ▼
+  ┌─ BloomingTraceSinkAdapter ─────────────────────────────┐
+  │  onCapabilityEvent(event) → hook.onCapabilityEvent?     │
+  │  routes to onText / onToolCall / onToolResult           │
+  └────────────────────────┬───────────────────────────────┘
+                           │
+      ┌────────────────────┼─────────────────────────┐
+      ▼                    ▼                         ▼
+  UI stream           Eval receipt              Budget tracker
+  (via route          (eval/receipts/*.json)    (lib/agents/budget.ts)
+   NDJSON encoder)                              (pre-dispatch check)
+      │
+      ▼
+  StatusLog live
+```
 
-Baseline numbers from `eval/baseline.json` (runId `2026-07-03T04-08-28-644Z`):
-- Per-phase p50: diag 50s · d-judge 38s · rec 51s · r-judge 90s · total 225s
-- Per-case cost: ~$0.09 agent-side (cached)
-- Run total: $0.913 agent + ~$0.40 judge = ~$1.30
+### Move 3 — the principle
 
-**Replay in two shapes.**
-
-1. **Product demo replay.** `?demo=cached` serves the committed `lib/state/demo-insights.json` + `demo-investigations.json` as NDJSON, same events the live path emits. Instant, no auth.
-2. **Eval receipt replay.** `eval/report.eval.ts` reads receipts and re-derives report metrics without re-running the agents. Zero cost.
-
-Both replay the STREAMED EVENT contract (`AgentEvent` in `lib/mcp/events.ts`), which is why "the AgentEvent NDJSON contract must not change" (from project context).
-
-### Move 3
-
-Observability is trace + span + replay. This codebase built all three around one shape — the `CapabilityEvent` stream from AptKit's trace sink — and layered receipts / demo snapshots / report on top. No SaaS. No Langfuse. The build cost was one adapter (263 LOC in `aptkit-adapters.ts`) and one receipt schema; the ongoing operational cost is a `mkdir eval/receipts` and a `git commit`.
+Telemetry is a first-class product surface, not an afterthought. One hook, one event stream, three consumers. When the same event pipeline feeds the UI, the receipts, and the budget gate, you get consistency for free — the number the user sees, the number the report shows, and the number the gate enforces are all the same number.
 
 ## Primary diagram
 
-Full observability stack in this codebase.
-
 ```
-  LLM observability — the pipeline
+  LLM observability in blooming — full frame
 
-  ┌─ AptKit agent loop ───────────────────────────────────────────────┐
-  │  emits CapabilityEvents:                                          │
-  │    step, tool_call_start, tool_call_end, model_usage              │
-  └─────────────────────────────┬─────────────────────────────────────┘
-                                │
-  ┌─ BloomingTraceSinkAdapter ──▼─────────────────────────────────────┐
-  │  · forwards to hooks (onText, onToolCall, onToolResult)           │
-  │  · forwards raw stream via onCapabilityEvent (Phase 2)             │
-  └─────────────────────────────┬─────────────────────────────────────┘
-                                │
-        ┌───────────────────────┼───────────────────────┐
-        ▼                       ▼                       ▼
-  ┌─ Route hook ─┐   ┌─ Eval runner ─────┐   ┌─ Budget tracker ──┐
-  │ writes NDJSON│   │ captures full     │   │ accumulates       │
-  │ to stream    │   │ trace for receipt │   │ inputTokens etc.  │
-  └──────┬───────┘   └──────┬────────────┘   └───────────────────┘
-         │                  │
-         ▼                  ▼
-  ┌─ StatusLog ──┐   ┌─ receipt.json ──────────────────────────────┐
-  │ live UI       │   │ per (case, run)                            │
-  │ trace display │   │ · durationMs by phase                       │
-  └───────────────┘   │ · usage.{diagnose,recommend}.costUsd        │
-                      │ · toolCalls[]                               │
-                      │ · diagnosis + judgment                      │
-                      │ · budget snapshot                           │
-                      └──────────┬──────────────────────────────────┘
-                                 │
-                    ┌────────────┼────────────┐
-                    ▼            ▼            ▼
-              eval/report   eval/baseline  eval/gate
-              (p50/95/99)   (per-dim %)    (regression)
+  ┌─ Event source: aptkit agent loop ──────────────────────┐
+  │  model_usage per turn, tool_call_* per tool call        │
+  └────────────────────┬───────────────────────────────────┘
+                       │
+                       ▼
+  ┌─ BloomingTraceSinkAdapter (one seam) ──────────────────┐
+  │  lib/agents/aptkit-adapters.ts                          │
+  │  fires AgentHooks.onCapabilityEvent + granular hooks    │
+  └────────────────────┬───────────────────────────────────┘
+                       │
+      ┌────────────────┼────────────────┬─────────────────┐
+      ▼                ▼                ▼                 ▼
+  Live UI          Eval receipt     Budget check     Cost report
+  (route stream)   (per case)       (pre-dispatch)   (aggregate)
+
+  Baseline: eval/baseline.json (runId 2026-07-03T04-08-28-644Z)
+  Gate:     eval/gate.eval.ts (blocks on any dim regressing >10pp)
 ```
 
 ## Elaborate
 
-The SaaS options (Langfuse, LangSmith, Braintrust, Phoenix/Arize, Helicone) offer this stack + cloud storage + dashboards + team collaboration. This codebase's home-rolled version is enough for a solo demo — receipts on disk, report on stdout, `git commit` for persistence. It scales to the point where multiple engineers or a small team need a shared dashboard; then adopting a SaaS is a straight port because the shape (traces + spans + replay) is standard.
+The three-pillars framing (traces, spans, replay) comes from OpenTelemetry adapted to LLM concerns. Traditional APM tools (Datadog, New Relic) don't natively understand tokens or model IDs; LLM-specific tools (Langfuse, LangSmith, Phoenix/Arize, Helicone) do.
+
+blooming chose to build in-house rather than depend on a hosted observability service because the receipts are the golden-set inputs — they need to be committable, replayable, and diffable in git. A hosted service would fragment ownership between "the eval" and "the observability."
+
+Related: **02-eval-methods.md** (the judgments that land in receipts), **../01-llm-foundations/06-token-economics.md** (the cost math derived from receipt tokens).
 
 ## Project exercises
 
-### Exercise — per-tool-call error rate dashboard
+### B5.4 · Add a live cost dashboard reading from receipts
 
-- **Exercise ID:** C3.4-A · Case A (concept exercised; extend).
-- **What to build:** in `eval/report.eval.ts`, add a section: per-tool error rate over the last N runs. Reveals which tools fail most often — informs where to add retry logic or reshape the prompt.
-- **Why it earns its place:** turns a raw stream into an operational surface. Interviewer signal: "I can tell you which tool is my weakest link in production."
-- **Files to touch:** `eval/report.eval.ts` (add per-tool section, read multiple runs).
-- **Done when:** report shows tool_name / total_calls / error_count / error_rate over the last 5 runs.
-- **Estimated effort:** 1-4hr.
+- **Exercise ID:** B5.4 (Case A — receipts are live; add a live UI)
+- **What to build:** A page under `app/eval/` that reads `eval/baseline.json` and recent receipts and renders p50/p95/p99 latency + $ per case + per-dim pass rates.
+- **Why it earns its place:** Turns markdown-file eval reports into a queryable surface. Same data, different consumer.
+- **Files to touch:** New `app/eval/page.tsx`, new `app/api/eval/route.ts`, reuses `lib/agents/pricing.ts`.
+- **Done when:** the page renders the current baseline's numbers and a small chart of pass-rate trend if multiple runs are available.
+- **Estimated effort:** `1–2 days`.
 
 ## Interview defense
 
-**Q: How do you observe agent behavior?**
+**Q: How do you know your agent's latency is stable?**
 
-Three layers. First, per-call logging in the model provider adapter — every `complete()` logs usage. Second, `CapabilityEvent` stream from AptKit's trace sink — captured in eval receipts and streamed as NDJSON to the UI. Third, per-run receipts on disk (`eval/receipts/`), aggregated in `eval/report.eval.ts` for p50/p95/p99 latency and cost. Home-rolled, no SaaS.
+`eval/baseline.json` records per-phase p50/p95/p99 for the reference run. `eval/gate.eval.ts` compares the latest run to baseline and blocks if any dim regresses >10pp. Latency isn't gated on the same threshold (a slow model turn isn't a quality regression), but it *is* in the report. The load-bearing part: the observability pipeline is one hook, one event stream, three consumers — same numbers everywhere.
 
-**Q: Why not use Langfuse or LangSmith?**
+**Q: What if the judge fails mid-response?**
 
-Home-rolled hits the demo scale I need. Receipts on disk, report on stdout, `git commit` for persistence — that's enough for one person. If a team formed I'd port to Langfuse; the shape (traces + spans + replay) is standard, so the port is straight-forward.
-
-**Q: What's the replay for?**
-
-Two shapes. Product demo replay — `?demo=cached` serves committed NDJSON events without live agent runs. Eval report replay — `eval/report.eval.ts` reads receipts on disk and re-derives metrics without re-invoking the LLM. Both are zero-cost re-computations against captured state.
-
-```
-  replay use cases:
-    · demo mode: instant "look at the agent working" without auth
-    · eval report: recompute metrics without spending judge $
-```
+`judge_error` placeholder in the receipt. `eval/run.eval.ts` catches the parse error, records the failure, keeps going. The receipt is well-formed; the aggregate report shows the judge_error count as a signal. Empirically, `max_tokens = 4096` keeps the rate under 1%. If it climbed, I'd bump the cap.
 
 ## See also
 
-- `01-eval-set-types.md` — what feeds the receipts
-- `02-eval-methods.md` — the rubric structure receipts persist
-- `03-llm-as-judge-bias.md` — the calibration slice
-- `eval/report.eval.ts` — the reader
-- `lib/agents/aptkit-adapters.ts:149-184` — the trace sink adapter
+- [02-eval-methods.md](02-eval-methods.md) — the judgments that produce receipt content.
+- [../01-llm-foundations/06-token-economics.md](../01-llm-foundations/06-token-economics.md) — the cost math.
+- [../06-production-serving/01-llm-caching.md](../06-production-serving/01-llm-caching.md) — where the cache_read count that saves money shows up.

@@ -1,204 +1,195 @@
-# Parallel fan-out / fan-in
+# Parallel / fan-out-fan-in
 
-_Industry standard._
+*Industry names: parallel fan-out / scatter-gather / map-reduce · Language-agnostic*
 
-## Zoom out, then zoom in
-
-Independent subtasks run simultaneously; a merger combines the results. In this repo the pattern is *partial* — monitoring fans out over ~10 anomaly categories concurrently (fan-out over queries), but not over multiple worker *agents*. This file covers the shape as it exists and what the "fan out over agents" upgrade would require.
+## Zoom out
 
 ```
-  Zoom out — the fan-out that currently lives here
+  Zoom out — the latency lever this repo doesn't use (yet)
 
-  ┌─ /api/briefing ──────────────────────────────────────────────┐
-  │  new MonitoringAgent(...).scan(hooks, runnableCategories)    │
-  └──────────────────────┬───────────────────────────────────────┘
-                         ▼
-  ┌─ AptKit's AnomalyMonitoringAgent (inside node_modules) ──────┐
-  │  fans out over ~10 categories concurrently                   │
-  │  each category = one prompt shape + one EQL recipe           │
-  │  merges results into Anomaly[]                               │
-  └──────────────────────┬───────────────────────────────────────┘
-                         ▼
-                     ~10 anomalies
+  ┌─ SECTION C topologies ──────────────────────┐
+  │  supervisor-worker  (this repo)              │
+  │  sequential pipeline (sub-shape here)        │
+  │  ★ parallel fan-out (NOT used here) ★        │ ← we are here
+  │  …                                           │
+  └──────────────────────────────────────────────┘
 ```
 
-Zoom in: this is fan-out over *category queries within a single agent*, not fan-out over separate agents. The distinction matters — full multi-agent fan-out means N worker agents each running their own ReAct loop, which this repo does not do today. If diagnostic sub-questions grew (e.g. "check funnel AND check traffic AND check segment mix in parallel"), fan-out over agents would earn its overhead.
+## Zoom in
+
+Independent subtasks run simultaneously, a merger combines. `Promise.all()` applied to agents. The win is latency — three agents in parallel cost the time of the slowest, not the sum. The constraint is that the subtasks must be genuinely independent. Not currently used in this repo; the diagnostic path is a natural candidate for a future refactor.
 
 ## Structure pass
 
-**Layers:** decompose · dispatch (concurrent) · limit (concurrency cap) · merge.
-**Axis:** *are the subtasks genuinely independent, or does one depend on another's output?*
-**Seam:** the concurrency cap. Without it, fan-out becomes an unbounded queue that hammers the rate limit.
+Layers: **split** (task → N independent subtasks) — **workers** (N in parallel) — **merge** (combine results).
+
+Axis to hold constant: **are the subtasks genuinely independent?**
 
 ```
-  Fan-out vs pipeline — the decision
+  The independence test
 
-  Fan-out (independent):        Pipeline (dependent):
-  A ─┐                          A ─► B ─► C
-  B ─┼─► merge                  (must run in order)
-  C ─┘
-
-  latency: max(A,B,C)           latency: sum(A,B,C)
-  fails if merge can't combine  fails if any stage errors
+  Independent   → fan-out works. Each worker can complete
+                  without waiting for the others.
+  Dependent     → NOT a fan-out. It's a pipeline in disguise;
+                  you'd hit the DAG the moment one worker
+                  needs another's output.
+  Partial       → the honest case. Some subtasks independent,
+                  some dependent. Pick which to parallelize;
+                  keep the rest sequential.
 ```
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — the shape
 
-You've written `await Promise.all([fetchA(), fetchB(), fetchC()])` before, then merged the three responses into one view. Fan-out is that shape at the agent layer. The load harness (`eval/load.eval.ts`) uses this shape at the eval layer — N investigations, K concurrent workers.
+You've written `Promise.all([fetchA(), fetchB(), fetchC()])` before. Same instinct, higher altitude — each fetch is a full agent run.
 
 ```
-  Pattern: fan-out / fan-in
+  Parallel fan-out — split, run concurrently, merge
 
-           ┌────── decompose ──────┐
+           ┌──────── split ────────┐
            ▼          ▼            ▼
       ┌────────┐ ┌────────┐  ┌────────┐
-      │ task 1 │ │ task 2 │  │ task 3 │   ← concurrent
+      │agent 1 │ │agent 2 │  │agent 3 │   (concurrent)
       └────┬───┘ └────┬───┘  └────┬───┘
            └──────────┼───────────┘
                       ▼
               ┌──────────────┐
-              │  merge       │
+              │ merge agent  │  synthesizes
               └──────────────┘
 ```
 
-### Move 2 — the walkthrough
+### Move 2 — where fan-out would fit here (not yet implemented)
 
-**Fan-out that IS implemented — monitoring over categories.** The monitoring agent runs 10 category checks concurrently. The fan-out lives inside AptKit's `AnomalyMonitoringAgent`, not in blooming code. Blooming's job is to build the category list and pass it in:
-
-```ts
-// lib/agents/monitoring.ts:82-93
-async scan(hooks?: MonitorHooks, categories: AnomalyCategory[] = []): Promise<Anomaly[]> {
-  const agent = new AptKitAnomalyMonitoringAgent({
-    model: new AnthropicModelProviderAdapter(this.anthropic, 'monitoring', this.sessionId),
-    tools: toolRegistry,
-    workspace: this.schema,
-    trace: new BloomingTraceSinkAdapter(hooks ?? {}, 'monitoring'),
-    categories: categories.length ? toAptKitCategories(categories, this.schema.projectId) : [],
-  });
-  return (await agent.scan({ signal: hooks?.signal })).map(toBloomingAnomaly);
-}
-```
-
-Line-by-line:
-
-- **`categories`** — up to 10 runnable categories (funnel conversion, revenue trend, purchase volume, etc.), filtered against the workspace schema by `runnableCategories(available)`.
-- **`agent.scan(...)`** — AptKit fans out one query per category. Each category is an independent EQL, no cross-category dependency.
-- **The 1 req/s throttle inside `BloomreachDataSource`** — bounds the actual concurrency downstream. Even if AptKit fires 10 category queries at once, `minIntervalMs=1100` in `bloomreach-data-source.ts:135-137` serializes them to ~1/sec. This is de-facto backpressure — the rate limiter shapes the fan-out even when the caller doesn't cap it.
-
-**Fan-out at the eval layer — load harness.** `eval/load.eval.ts:171-211` is the canonical fan-out-with-concurrency-cap in this repo:
-
-```ts
-// eval/load.eval.ts:171-211 — semaphore-based fan-out
-const indices = Array.from({ length: LOAD_N }, (_, i) => i);
-const queue = [...indices];
-
-async function worker(workerId: number): Promise<void> {
-  while (queue.length > 0) {
-    const index = queue.shift();
-    if (index == null) return;
-    const golden = goldens[index % goldens.length];
-    try {
-      const inv = await runOneInvestigation(index, golden.caseId, ...);
-      results.push(inv);
-    } catch (err) {
-      results.push({ ...failedShape });
-    }
-  }
-}
-
-const workers = Array.from({ length: LOAD_CONCURRENCY }, (_, i) => worker(i));
-await Promise.all(workers);
-```
-
-Line-by-line:
-
-- **`queue = [...indices]`** — the shared work queue. Every worker pulls from the same array.
-- **`while (queue.length > 0)`** — the worker keeps pulling until nothing's left. Errors on one task don't stop other workers (the `try/catch` swallows and pushes a failed-shape result).
-- **`Array.from({ length: LOAD_CONCURRENCY }, ...)`** — spawn K workers, each an independent async task. K is the concurrency cap — the semaphore is *implicit in the worker count*.
-- **`await Promise.all(workers)`** — the fan-in. Waits for every worker to drain. Return order is not guaranteed; the results are sorted by `.index` at the end.
-
-The receipt from the recent run: N=3 at K=1 (sequential), `totalMs=283170`, `p50 total=92707ms`, cost `p50=$0.070`. Cranking K to 3 would cut wall-clock ~3x if the provider's rate limit allows.
-
-**Why fan-out over AGENTS isn't here (yet).** The diagnostic loop runs one worker at a time. If diagnostic broke into sub-questions ("check funnel", "check traffic", "check segment mix"), each could run as a parallel worker agent. Today the diagnostic prompt asks the model to consider all of them within one loop. The shape earns its overhead when: (a) the sub-questions are genuinely independent, (b) the total sub-question latency is high enough that parallelism buys meaningful time, and (c) the merge is simple (concatenate evidence, not resolve conflicts).
+**The natural candidate.** The DiagnosticAgent tests hypotheses sequentially today. If it's investigating "revenue drop in USA":
 
 ```
-  Layers-and-hops — where the fan-out lives today
+  Today (sequential inside diagnostic ReAct):
 
-  ┌─ /api/briefing (route handler) ──────────┐
-  │  MonitoringAgent.scan(runnableCategories)│
-  └──────────────────┬───────────────────────┘
-                     ▼
-  ┌─ AptKit (node_modules) ─────────────────┐
-  │  10 concurrent category queries          │  ← fan-out here
-  └──────────────────┬───────────────────────┘
-                     ▼
-  ┌─ BloomreachDataSource ───────────────────┐
-  │  minIntervalMs=1100 → serializes to ~1/s │  ← backpressure here
-  └──────────────────┬───────────────────────┘
-                     ▼
-  ┌─ Bloomreach MCP server ──────────────────┐
+  turn 1: test hypothesis A (state concentration)
+  turn 2: test hypothesis B (product category)
+  turn 3: test hypothesis C (payment failure)
+  turn 4: emit Diagnosis
+
+  Latency ≈ 4 × (model call + EQL round-trip) ≈ 50s
 ```
+
+Fan-out version:
+
+```
+  Fan-out (hypothetical refactor):
+
+  turn 1: generate hypotheses A, B, C
+    │
+    ▼
+  ┌──── Promise.allSettled ────┐
+  │                              │
+  │  worker-A tests A            │  in parallel
+  │  worker-B tests B            │  (three EQLs concurrent)
+  │  worker-C tests C            │
+  │                              │
+  └────────┬───────────────────┘
+           ▼
+  merge agent: synthesize findings, emit Diagnosis
+
+  Latency ≈ 1 × turn (generate) + max(A, B, C) + 1 × turn (merge) ≈ 20s
+```
+
+**Why it's not implemented yet.**
+
+1. **Baseline p50 (50s) is inside budget.** Vercel Pro maxDuration is 300s; the current pipeline (diag 50s + rec 50s + judges) runs comfortably. Fan-out is a latency lever without a latency problem.
+2. **The ~1 req/s MCP spacing limits real parallelism.** Bloomreach's alpha server rate-limits per user globally. Three concurrent EQLs would hit the limiter and serialize anyway. Parallelism only helps once the rate limit is lifted or the DataSource is a faster provider.
+3. **aptkit's DiagnosticInvestigationAgent doesn't expose a branching hook.** Adding parallel hypothesis testing would either wrap aptkit at the outer level (multiple aptkit agents, one per hypothesis, merged by a route-level supervisor) or fork the aptkit class. Fork cost is real.
+
+**The concrete refactor spec.**
+
+```
+  Fan-out refactor — files, work, risks
+
+  New files:
+    lib/agents/hypothesis-worker.ts    (single-hypothesis agent)
+    lib/agents/diagnosis-merger.ts     (synthesis agent)
+
+  Changed files:
+    lib/agents/diagnostic.ts   — becomes an orchestrator that:
+                                  1. generates hypothesis list
+                                  2. spawns hypothesis-worker per
+                                  3. Promise.allSettled, merges
+    app/api/agent/route.ts     — passes budget tracker to each worker
+                                  (shared ceiling still enforced)
+
+  Risks:
+    - concurrent budget accounting: each worker adds to the shared
+      tracker; a fast worker could push the total over before others
+      finish. Mitigation: check exceeded() in the mid-loop guard.
+    - fan-out concurrency cap: without one, N hypotheses = N concurrent
+      MCP calls, blows rate limit. See 05-production-serving/
+      02-fan-out-backpressure.md.
+    - merge failure: one worker returns malformed output; merger has to
+      degrade gracefully (partial synthesis).
+```
+
+**The upward-backpressure discipline.** A supervisor spawning workers can fan out faster than the provider's rate limit allows. When the worker queue grows past a threshold, the supervisor should stop decomposing further rather than queue unbounded work. This is covered in `05-production-serving/02-fan-out-backpressure.md` — the runaway-supervisor pattern is the multi-agent version of an unbounded queue.
 
 ### Move 3 — the principle
 
-Fan-out is `Promise.all` with a concurrency cap. The cap is not optional — an uncapped fan-out becomes an unbounded queue the moment the underlying service rate-limits. Two questions decide whether the shape earns its overhead: (a) are the subtasks truly independent, and (b) is the merge simple? If either answer is no, a sequential pipeline is the safer default. Blooming does fan-out at the *query* layer (categories inside monitoring) and at the *eval* layer (load harness), but not at the *agent* layer — that upgrade waits for a workload where diagnostic naturally decomposes into parallel sub-questions.
+Fan-out is the multi-agent version of `Promise.all()` — the win is latency (max instead of sum), the constraint is independence. When your task genuinely splits into independent subtasks, it's a strong lever; when it doesn't, the fan-out becomes a pipeline in disguise (each worker waits on another's output) and you've paid the complexity without the latency win.
 
 ## Primary diagram
 
 ```
-  Recap — the two fan-outs that exist, and the one that doesn't
+  Parallel fan-out — the pattern + the guards it needs
 
-  Fan-out A: monitoring categories (query-level)
-  ┌─────────────────────────────────────────────┐
-  │  MonitoringAgent — one agent, N EQL queries │
-  │  ~10 categories concurrent → merged anomaly │
-  │  Concurrency: bounded by MCP 1 req/s        │
-  └─────────────────────────────────────────────┘
+  ┌─ Supervisor ────────────────────────────────────────────────┐
+  │  decompose task into N independent subtasks                 │
+  │  spawn workers up to concurrency cap (see backpressure)     │
+  └──────────┬──────────┬──────────┬──────────┬─────────────────┘
+             ▼          ▼          ▼          ▼
+        ┌────────┐┌────────┐┌────────┐  ...  (up to N workers)
+        │worker 1││worker 2││worker 3│       Each is one agent
+        │(hypo A)││(hypo B)││(hypo C)│       loop (ReAct)
+        └────┬───┘└────┬───┘└────┬───┘
+             │         │         │
+             └─────────┴─────────┘
+                       │ Promise.allSettled
+                       ▼
+        ┌───────────────────────────────────┐
+        │  Merger agent                     │
+        │  synthesizes N results             │
+        │  handles partial / failed workers  │
+        └────────────┬──────────────────────┘
+                     ▼
+              final structured output
 
-  Fan-out B: eval load harness (case-level)
-  ┌─────────────────────────────────────────────┐
-  │  eval/load.eval.ts — N cases, K workers      │
-  │  semaphore cap = K; queue drains             │
-  │  Concurrency: LOAD_CONCURRENCY env var       │
-  └─────────────────────────────────────────────┘
-
-  Not implemented: fan-out over agents
-  ┌─────────────────────────────────────────────┐
-  │  Would look like: DiagnosticAgent split into │
-  │  parallel sub-question workers, results       │
-  │  merged into one Diagnosis                   │
-  │  Adopt when: sub-questions genuinely          │
-  │  independent AND merge is simple             │
-  └─────────────────────────────────────────────┘
+  Guards to remember (in Section 05):
+    - concurrency cap (semaphore, N=4 typical)
+    - upward backpressure (stop decomposing if queue grows)
+    - shared BudgetTracker across all workers
 ```
 
 ## Elaborate
 
-The reason blooming does query-level fan-out but not agent-level fan-out is a coverage-versus-depth call. Monitoring needs to scan ~10 categories every briefing — that's inherently many independent queries, so fan-out is free wall-clock. Diagnostic needs to go deep on one question — that's inherently sequential (each turn's evidence shapes the next turn's query), so fan-out doesn't apply within one investigation.
+Parallel fan-out is the oldest concurrency pattern in software (Actor model, map-reduce, `Promise.all`). The LLM incarnation surfaced with the AutoGen `GroupChat` broadcast pattern (2023) and matured through LangGraph's `parallel_state` (2024). The interesting recent work is around **structured fan-out with confidence weighting** — workers return not just results but per-result confidence, so the merger weights inputs rather than treating them as equal.
 
-The eval-layer fan-out in `load.eval.ts` is where blooming's concurrency discipline actually shows. The load harness is where the tier-2 story of "graceful degradation under fault injection" gets exercised — N cases, K workers, fault rates configured, receipts written. The receipt lists per-investigation cost and fault totals so you can see how degradation compounds under load without failing the run.
-
-The bound on effective concurrency is the provider's rate limit divided by per-call duration (`05-production-serving/01-rate-limit-compliance.md`). Fan-out past that ceiling doesn't buy speed — it buys 429s and retry ladders.
+The pattern's most famous production example is Anthropic's own agent evaluation harness — parallel eval agents scoring the same output on different rubrics, merged into a composite score. Same shape as this repo's hypothetical parallel diagnostic.
 
 ## Interview defense
 
-**Q: Where does this codebase fan out, and where does it stay sequential?**
-A: Fan-out at the query layer inside monitoring — AptKit's `AnomalyMonitoringAgent` runs ~10 category EQL queries concurrently, with the `BloomreachDataSource` rate limiter (`minIntervalMs=1100`) providing implicit backpressure. Fan-out at the eval layer in `load.eval.ts` — a semaphore-based worker pool draining a shared queue. Sequential at the agent layer for diagnose → recommend, because recommend has a hard data dependency on diagnosis. The agent-layer fan-out would earn its keep only if diagnostic decomposed into independent sub-questions, which it currently doesn't.
+**Q: Do you parallelize inside investigations?**
 
-Diagram: the three-tier picture — monitoring fan-out, eval fan-out, sequential agent pipeline.
-Anchor: `lib/agents/monitoring.ts:82-93` + `eval/load.eval.ts:171-211`.
+Not yet. Baseline p50 is 50s for diagnostic; Vercel Pro's 300s cap has plenty of headroom, and the ~1 req/s MCP spacing at the DataSource means three concurrent EQLs would hit the limiter and serialize anyway. So fan-out is a latency lever without a latency problem to solve.
 
-**Q: What bounds the fan-out concurrency?**
-A: Two ceilings, in order. The explicit one is the worker count (K workers pulling from the shared queue in the eval harness, or the category count inside monitoring). The implicit one that actually dominates in production is the `BloomreachDataSource` rate limiter — `minIntervalMs=1100` serializes tool calls to ~1/sec regardless of how many the fan-out issued. The lesson: caller-side concurrency caps are for early bounding; the downstream limiter is what the system *actually* runs at. If you crank LOAD_CONCURRENCY past the rate limit divided by per-call duration, you get 429s and the retry ladder eats the parallelism you were trying to buy.
+Where I'd add it: when latency budget matters (production traffic pressure) or the DataSource becomes a faster provider without rate limits. The refactor is well-scoped — split hypothesis testing into `hypothesis-worker.ts` agents, spawn via `Promise.allSettled`, merge via `diagnosis-merger.ts`. Estimated latency: 50s → 20s. Estimated cost: roughly flat (same tokens, different distribution). The guards I'd need: concurrency cap, shared budget tracker checked mid-loop, upward backpressure so the supervisor doesn't spawn unbounded workers.
 
-Diagram: the caller-cap and the transport-cap as two gates the request must pass through.
-Anchor: `lib/data-source/bloomreach-data-source.ts:135-137` (the `minIntervalMs`).
+*Anchor visual:* the today-vs-fan-out comparison diagram above.
+
+**Q: What if two of the parallel workers depended on each other?**
+
+Then it's not a fan-out. It's a pipeline in disguise, and the "parallel" run would silently serialize on the dependency. The independence test is the first check — if subtasks share intermediate state, keep them sequential or restructure into a proper DAG.
 
 ## See also
 
-- `03-sequential-pipeline.md` — the other shape (and why diagnose → recommend fits it).
-- `05-production-serving/02-fan-out-backpressure.md` — the eval harness in detail.
-- `05-production-serving/01-rate-limit-compliance.md` — the ceiling that bounds actual fan-out.
-- `09-coordination-failure-modes.md` — synthesis failures at the merge point.
+- **`02-supervisor-worker.md`** — fan-out is one of the supervisor's decomposition options.
+- **`08-shared-state-and-message-passing.md`** — how workers see shared context vs pass messages.
+- **`09-coordination-failure-modes.md`** — synthesis failure (contradictory worker results) is a fan-out-specific failure.
+- **`05-production-serving/02-fan-out-backpressure.md`** — the concurrency cap and upward backpressure fan-out needs.

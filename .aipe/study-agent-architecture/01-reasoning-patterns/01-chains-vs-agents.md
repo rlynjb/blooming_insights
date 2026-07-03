@@ -1,179 +1,182 @@
-# Chains vs agents (the boundary)
+# Chains vs agents — the boundary
 
-_Industry standard._
+*Industry names: workflow / chain vs autonomous agent · Language-agnostic*
 
-## Zoom out, then zoom in
-
-Every LLM-integration decision starts here. Where does the *engineer* write the control flow, and where does the *model* write it?
+## Zoom out — where this concept lives
 
 ```
-  Zoom out — where the boundary sits in this repo
+  Zoom out — reasoning patterns sit inside "the worker"
 
-  ┌─ UI ──────────────────────────────────────────────────────┐
-  │  feed · investigate/[id] · investigate/[id]/recommend      │
-  └─────────────────────────────┬─────────────────────────────┘
-                                │
-  ┌─ Service (route.ts) ────────▼─────────────────────────────┐
-  │  ★ THE OUTER LAYER IS A CHAIN ★                           │
-  │  supervisor is TypeScript code: classifyIntent            │
-  │  → route to worker → sequential diagnose → recommend      │
-  └─────────────────────────────┬─────────────────────────────┘
-                                │
-  ┌─ Worker agents ─────────────▼─────────────────────────────┐
-  │  ★ THE INNER LOOP IS AN AGENT ★                           │
-  │  AptKit runAgentLoop: model picks the next tool per turn  │
-  └─────────────────────────────┬─────────────────────────────┘
-                                │
-  ┌─ Data source ───────────────▼─────────────────────────────┐
-  │  BloomreachDataSource / SyntheticDataSource               │
-  └───────────────────────────────────────────────────────────┘
+  ┌─ UI layer ────────────────────────────────────┐
+  │  useInvestigation streams NDJSON               │
+  └───────────────────────┬───────────────────────┘
+                          │
+  ┌─ Route (supervisor) ──▼───────────────────────┐
+  │  app/api/agent/route.ts — CODE routes         │
+  └───────────────────────┬───────────────────────┘
+                          │ constructs worker
+  ┌─ Worker (agent) ──────▼───────────────────────┐
+  │  ★ CHAIN vs AGENT — is there a loop? ★        │ ← we are here
+  │  DiagnosticAgent runs an autonomous loop      │
+  └───────────────────────┬───────────────────────┘
+                          │ tool calls
+  ┌─ Provider ────────────▼───────────────────────┐
+  │  Bloomreach MCP (or other preset)             │
+  └───────────────────────────────────────────────┘
 ```
 
-Zoom in: this file is about the boundary itself. The rest of Section A lives *inside* the agent side of that boundary. Section C's supervisor-worker file lives at the *seam* itself — a code-written supervisor coordinating agent-shaped workers.
+## Zoom in
+
+Two ways to organize LLM work. A **chain** is a set of steps you wrote down: the LLM fills in each slot, you decide what comes next. An **agent** is a loop where the LLM picks the next step at runtime. The question is who owns control flow.
 
 ## Structure pass
 
-**Layers:** outer pipeline (code) → inner loop (agent) → tool (deterministic).
-**Axis to trace:** *who decides control flow?*
-**Seams:** the axis flips at every layer boundary.
+Layers: **the route** (outer, code) — **the worker** (inner, LLM or LLM-loop) — **the tool** (innermost, deterministic).
+
+Axis to hold constant: **who decides control flow?**
 
 ```
-  Trace one question down: "who decides control flow?"
+  One question, held down the layers — chain vs agent
 
-  ┌────────────────────────────────┐
-  │ outer: route.ts                │  → CODE decides
-  │   diagnose then recommend       │    (written sequence)
-  └────────────────────────────────┘
-      ┌──────────────────────────────┐
-      │ inner: AptKit runAgentLoop   │  → LLM decides
-      │   pick next tool per turn    │    (autonomous loop)
-      └──────────────────────────────┘
-          ┌────────────────────────────┐
-          │ tool: execute_analytics_eql│  → TOOL runs
-          │   deterministic query      │    (no choice)
-          └────────────────────────────┘
+  "who decides what happens next?"  trace it downward
 
-  Answer flips at each altitude — that contrast IS the lesson.
+  ┌───────────────────────────────────────────┐
+  │ route.ts sequences step 2 → step 3        │  → CODE decides
+  └───────────────────────────────────────────┘
+      ┌─────────────────────────────────────────┐
+      │ inside step 2: DiagnosticAgent          │  → agent path: LLM decides
+      │  (chain path: engineer's steps decide)  │  → chain path: CODE decides
+      └─────────────────────────────────────────┘
+          ┌───────────────────────────────────┐
+          │ innermost: MCP tool call          │  → tool runs (deterministic)
+          └───────────────────────────────────┘
 ```
 
-The seams that matter: `route.ts` → `DiagnosticAgent` (code hands to loop), and `runAgentLoop` → `dataSource.callTool` (loop hands to tool).
+The seam this repo carries: **the outer layer is a chain of stages** (monitor → diagnose → recommend, written in the route), **the inner layer is an agent per stage** (each is a ReAct loop). Both patterns coexist. That's the whole trick — you don't pick one for the whole system; you pick per layer.
 
 ## How it works
 
-### Move 1 — the mental model
+### Move 1 — the shape
 
-You've written a `.then()` chain of async functions before — `fetch(url).then(json).then(render)`. That's a chain: *you* wrote the sequence; each step just fills a slot. Now imagine one of those steps is a `while` loop where the *body* calls the model, and the model returns which function to call next. That's an agent.
+You've written a `.then()` chain of functions before: `parseInput().then(validate).then(transform).then(save)`. Each function fills a slot; the pipeline decides the order. That's a chain.
+
+Now imagine one of those functions is instead a `while` loop that asks "what next?" every turn and only exits when it says "done." Same pipeline outside, autonomous decision inside. That's the boundary.
 
 ```
-  Pattern: chain vs agent
+  Two structural shapes
 
-  Chain:                          Agent:
-  ┌────────┐  ┌────────┐          ┌───────────────────────┐
-  │ step 1 │→ │ step 2 │→ output  │  while not done:      │
-  │  LLM   │  │  LLM   │          │    action = LLM(state)│
-  └────────┘  └────────┘          │    if final: return    │
-   engineer picks order            │    result = execute()  │
-                                   │    state.append(result)│
-                                   └───────────────────────┘
-                                   model picks each action
+  CHAIN — engineer wrote the steps
+    Input ─► Step 1 ─► Step 2 ─► Step 3 ─► Output
+             (LLM fills each slot; doesn't pick what comes next)
+
+  AGENT — model picks the steps at runtime
+    ┌────────────────────────────────────────┐
+    │              agent loop                 │
+    │  ┌────────┐                             │
+    │  │ reason │ ← model chooses next action │
+    │  └───┬────┘                             │
+    │      ▼                                  │
+    │  ┌────────┐                             │
+    │  │  act   │ ← tool call                 │
+    │  └───┬────┘                             │
+    │      ▼                                  │
+    │  ┌────────┐                             │
+    │  │observe │ ← read result               │
+    │  └───┬────┘                             │
+    │      └─── loop or stop                  │
+    └────────────────────────────────────────┘
 ```
 
-### Move 2 — the walkthrough
+### Move 2 — walk each side, then find both in this repo
 
-**The chain half — `app/api/agent/route.ts`.** The outer sequence is written by hand. You can point at the exact lines that decide the order:
+**The chain half of this repo.** Open `app/api/agent/route.ts`. The route reads `?step=diagnose|recommend` and routes accordingly:
 
 ```ts
-// app/api/agent/route.ts:230
-const leadAgent: AgentName =
-  q && !insightId ? 'coordinator' : step === 'recommend' ? 'recommendation' : 'diagnostic';
-// app/api/agent/route.ts:266-297 (paraphrased)
-if (step === 'recommend') { diagnosis = parseDiagnosis(diagnosisParam); }
-else { diagnosis = await diagAgent.investigate(inv, ...); }
-if (step !== 'diagnose') {
-  const recommendations = await recAgent.propose(inv, diagnosis!, ...);
+// app/api/agent/route.ts:285 (chain shape — steps are code)
+if (step === 'diagnose' || !step) {
+  const diagAgent = new DiagnosticAgent(anthropic, dataSource, schema, allTools, sid);
+  const diagnosis = await diagAgent.investigate(anomaly, hooks);
+  send({ type: 'diagnosis', diagnosis });
+}
+if (step === 'recommend' || !step) {
+  const recAgent = new RecommendationAgent(anthropic, dataSource, schema, allTools, sid);
+  const recs = await recAgent.propose(anomaly, diagnosis, hooks);
 }
 ```
 
-Line-by-line: the branch chooses which agent to construct; the sequence "diagnose, then maybe recommend" is a TypeScript `if`, not a router LLM. If diagnostic fails, recommend never runs — the chain shape *enforces* that ordering. This is the outer supervisor's whole trick: predictable order at zero token cost.
+Nothing here is autonomous. The engineer wrote `if step === diagnose`. If you wanted "diagnose then maybe re-monitor," you'd add another `if`. That's a workflow — a chain of stages with well-known transitions.
 
-**The agent half — `lib/agents/diagnostic.ts` → AptKit's `runAgentLoop`.** Once code hands off to `agent.investigate(anomaly)`, control transfers to the loop. See `node_modules/@aptkit/core/node_modules/@aptkit/runtime/dist/src/run-agent-loop.js:25-105`:
+**The agent half of this repo.** Open `lib/agents/diagnostic.ts`. Inside `investigate()`, `AptKitDiagnosticInvestigationAgent` runs a ReAct loop. Each iteration:
 
-```js
-for (let turn = 0; turn < maxTurns; turn += 1) {
-  const response = await model.complete({...});
-  const toolUses = toolUsesFromContent(response.content);
-  if (toolUses.length === 0) { finalText = text; break; }
-  for (const toolUse of toolUses) {
-    const { result } = await tools.callTool(toolUse.name, toolUse.input, ...);
-    // append tool_result to messages
-  }
-}
+```
+  What happens inside investigate()
+
+  turn 1:  model reads anomaly + schema
+           → picks execute_analytics_eql to test hypothesis A
+           → observes result
+
+  turn 2:  model reads result
+           → picks execute_analytics_eql to test hypothesis B
+           → observes result
+
+  turn 3:  model has enough evidence
+           → emits final Diagnosis (JSON)
+           → loop exits
 ```
 
-Line-by-line: the `for` loops up to `maxTurns=8` (bounded). The model returns either text (done — break) or `tool_use` blocks (call the tool, feed the result back, loop). *The model picks the tool every iteration.* The engineer wrote the loop; the model wrote the sequence of steps inside it.
+Nothing in the codebase said "run hypothesis A then B." The model chose. If the workspace is different tomorrow, the model chooses a different sequence. That's an agent.
 
-**The seam.** `route.ts:280-283` is where the code side ends and the agent side begins:
+**The decision rule.** Use a chain when you know the steps in advance. Use an agent when the steps depend on what the model finds. This repo does both — three chain stages outside, one agent per stage inside.
 
-```ts
-const diagAgent = new DiagnosticAgent(anthropic, dataSource, schema, allTools, sid);
-diagnosis = await diagAgent.investigate(inv, { ...hooksFor('diagnostic'), signal: req.signal });
-```
-
-Before `await`: code control. After: agent control. The `await` hides ~50s of ReAct-loop iterations picking EQL queries.
+**The cost of picking wrong.** Reaching for an agent when a chain would do costs: variable step count (unpredictable latency), variable cost (unpredictable spend), harder debugging (you now debug decisions the model made, not code you wrote). Reaching for a chain when an agent is needed costs quality — you'd have to enumerate every possible investigation path in code and pick one, and you'd hit the ones you didn't enumerate.
 
 ### Move 3 — the principle
 
-Use a chain when you know the steps in advance. Use an agent when the steps depend on what the model finds. This repo picks both, at the right altitudes: the flow diagnose→recommend is knowable (it's the product), so it's a chain. Which EQL queries to run to explain a metric change is *not* knowable (it's what the analyst discovers), so it's an agent. **Never one for the sake of consistency** — pick per axis.
+Chains and agents are not two products — they are two ways of allocating control. Every non-trivial LLM system nests them: an agent inside a workflow stage, a workflow inside an agent's plan, agents calling agents. The reader-grade move is to pick the boundary per layer, not per system.
 
 ## Primary diagram
 
 ```
-  Recap — the boundary in this repo
+  Chains vs agents — the boundary in this repo
 
-  ┌─ /api/agent (route.ts) ────────────────────────────────────┐
-  │  classifyIntent  →  branch  →  diagnose  →  recommend      │
-  │  ─────── code ────────────    │                            │
-  │                               ▼                            │
-  │                     new DiagnosticAgent(...)               │
-  │                     agent.investigate(anomaly)             │
-  │                                       │                    │
-  │                              ┌────────▼─────────┐          │
-  │                              │  runAgentLoop:   │          │
-  │                              │  model picks     │          │
-  │                              │  each tool call  │          │
-  │                              │  up to maxTurns  │          │
-  │                              └──────────────────┘          │
-  │                                       │                    │
-  │                              (returns diagnosis)           │
+  ┌─ CHAIN (route decides) ───────────────────────────────────┐
   │                                                            │
-  │  ────────── code takes over again ─────────                │
-  │  new RecommendationAgent(...).propose(anomaly, diagnosis)  │
+  │  Step 1 monitor  ─►  Step 2 diagnose  ─►  Step 3 recommend │
+  │  (briefing)          (agent inside)       (agent inside)   │
+  │                                                            │
+  └────────────────────────┬───────────────────────────────────┘
+                           │ inside each stage
+                           ▼
+  ┌─ AGENT (model decides) ────────────────────────────────────┐
+  │                                                            │
+  │        ┌───► reason ───► act ───► observe ────┐            │
+  │        └──────────────────────────────────────┘            │
+  │                          │                                 │
+  │                          ▼ done                            │
+  │                     final output                           │
   └────────────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The boundary was named by Anthropic and popularized in "Building Effective Agents" (2024). The industry converged on the framing because it drew the right decision line: chains for predictable pipelines, agents for open-ended tasks. Blooming's design predates AptKit's split but landed on the same shape — the older `lib/agents/base-legacy.ts` had this pattern hand-written; the AptKit migration formalized it.
+The vocabulary is settling: LangChain calls the chain half "runnables" (pipe-style composition) and the agent half "agents"; LlamaIndex calls them "query pipelines" vs "agents"; the underlying distinction is the same across frameworks. The name "agent" comes from RL/AI research where an agent is "an entity that perceives and acts autonomously in an environment" — the LLM playing that role is a recent stretch of the term, and it's why some prefer the more precise "tool-using LLM" or "reasoning loop."
 
-The interesting failure mode is *agents where you should have written a chain*. A team that lets the model pick every step ends up with a system that occasionally does the wrong thing in unpredictable ways, at 5x the token cost. The `route.ts` supervisor is the *hardened* version — deterministic where predictable, autonomous only where genuinely needed.
+The tradeoff isn't chain vs agent as an eitheror. Real production systems are *nested*: an outer workflow of well-known stages (monitor → diagnose → recommend), each stage an agent inside. This repo is that shape. Anthropic's "Building Effective Agents" essay (Dec 2024) codifies the same layering — start with prompts, escalate to workflows, only reach for agent loops when the task is genuinely open-ended.
 
 ## Interview defense
 
-**Q: Is blooming_insights a single-agent or multi-agent system?**
-A: Hybrid. The outer supervisor is a deterministic pipeline written in `app/api/agent/route.ts` — TypeScript picks the next agent, not an LLM. The inner workers (Diagnostic, Recommendation, Monitoring, Query) are each single-agent ReAct loops running through AptKit's `runAgentLoop`. Anthropic calls this a *deterministic-supervisor multi-agent system*, and it's the recommended production shape.
+**Q: Is your system an agent or a workflow?**
 
-Diagram sketched: two boxes stacked — outer "code decides", inner "LLM decides".
-Anchor: `app/api/agent/route.ts:266-297`.
+Both — nested. Outer layer is a chain of three stages written into the route handler (`monitor → diagnose → recommend`); each stage is an agent (a ReAct loop) inside. That layering means I get predictable latency at the top (three stages, in that order) and adaptive behavior at the bottom (each stage picks its own tools based on what it finds).
 
-**Q: When does the boundary belong at each altitude?**
-A: Push code up as high as you can. If you can enumerate the sequence, code it. Every place the model picks the next step, you're paying for it in tokens, latency, and debugging surface. This repo pushes code all the way to the *pair* of agents (diagnose, then recommend) and only hands over inside each phase.
+*Anchor visual:* the chain-with-agents-inside diagram above.
 
-Diagram sketched: same two-layer picture with a dashed line labelled "push this line down as far as necessary, never further."
-Anchor: same file.
+**Q: When would you make the whole thing an agent?**
+
+If the three-stage journey stopped being reliable — e.g., if some anomalies needed diagnose → monitor-again → diagnose loops. Right now the sequence is stable, so a supervisor LLM to pick it would add cost with no quality gain. That's the load-bearing rule: the escalation to autonomy is warranted only when specific failure modes prove the current control flow can't fix them.
 
 ## See also
 
-- `02-agent-loop-skeleton.md` — what's inside the inner loop.
-- `07-routing.md` — the classifyIntent router at the top of the chain.
-- `03-multi-agent-orchestration/02-supervisor-worker.md` — the outer chain generalized to a supervisor topology.
-- Cross-reference: `.aipe/study-ai-engineering/04-agents-and-tool-use/01-agents-vs-chains.md` for the mechanics.
+- **`02-agent-loop-skeleton.md`** — the kernel every autonomous loop instantiates (the four load-bearing parts).
+- **`03-react.md`** — the specific baseline this repo picked, and where it sits in the reasoning family.
+- **`.aipe/study-ai-engineering/04-agents-and-tool-use/01-agents-vs-chains.md`** — mechanics walkthrough.

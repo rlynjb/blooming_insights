@@ -1,129 +1,145 @@
-# 04 — Vector databases
+# Vector databases
 
-**Type:** Industry standard. Also called: vector stores, ANN indexes, embedding databases.
+## Subtitle
+
+Approximate nearest neighbor storage / vector index — Industry standard.
 
 ## Zoom out, then zoom in
 
-**Not exercised in this codebase.** If RAG were added at this repo's scale (~10K items), the answer would be flat JSON or SQLite — not Pinecone.
+This codebase has no database at all — state lives in in-memory maps, with gitignored JSON files (`.auth-cache.json`, `.investigation-cache.json`) as dev-persistence. If retrieval landed, the vector-DB question would be a real choice; today it's a preview.
 
 ```
-  Zoom out — where storage sits
+  Zoom out — where the vector store would sit
 
-  chunks + vectors ─► ★ vector store ★ ─► top-k cosine on query
+  ┌─ Agent ─────────────────────────────────────────────┐
+  │  needs "find similar diagnoses to this anomaly"      │
+  └───────────────────────┬──────────────────────────────┘
+                          │  query(vec, k=3)
+                          ▼
+  ┌─ Vector store (new) ★ ──────────────────────────────┐
+  │  candidate #1: sqlite-vec (local, file-backed)       │
+  │  candidate #2: pgvector (if Postgres added)          │
+  │  candidate #3: in-memory JSON + brute force          │
+  └──────────────────────────────────────────────────────┘
 ```
-
-Zoom in. The choice depends on scale. Under ~100K vectors, in-memory or SQLite with brute-force cosine is fast enough. Above that, ANN (approximate nearest neighbor) indexes matter. Managed vector DBs (Pinecone, Weaviate, Qdrant, Chroma) buy horizontal scale + zero ops, at the cost of a network hop and monthly fees.
 
 ## Structure pass
 
-**Layers:**
-- Outer: retrieval latency + recall
-- Middle: index structure (flat, HNSW, IVF)
-- Inner: storage backing (memory, SQLite, Postgres, dedicated DB)
-
-**Axis: scale threshold.**
-- < 10K vectors: brute-force in memory, ~1ms
-- 10K-1M: SQLite / pgvector, still often brute-force
-- 1M+: HNSW / IVF index required for sub-100ms queries
-
-**Seam:** the query function — `search(queryVector, k)` returns top-k. Above: retrieval logic. Below: whichever store.
+- **Layers:** vector → index → distance function → top-k → results. Five bands.
+- **Axis: scale.** Under ~1k vectors: brute force is fine. 1k–100k: local index (sqlite-vec, in-process HNSW). 100k+: dedicated vector DB.
+- **Seam:** the storage boundary. Where the vectors live decides everything downstream about latency, cost, and ops.
 
 ## How it works
 
 ### Move 1 — the mental model
 
-You've picked between SQLite, Postgres, and a managed DB before. Same axes: scale, ops burden, features. Vector DBs add one more: is the index in-memory (fast, memory-bound) or on-disk (slower, unlimited)?
+The comparison table:
 
 ```
-  Options at typical scales
+  Vector storage options — where each wins
 
-  <1K       flat JSON, load into memory        <— this repo's would-be scale
-  <100K     pgvector or sqlite-vec              
-  <10M      Pinecone / Weaviate / Qdrant / pgvector w/ HNSW
-  >10M      dedicated infra + sharding
+  ┌───────────────────┬──────────────────────────────┐
+  │ storage           │ when it wins                 │
+  ├───────────────────┼──────────────────────────────┤
+  │ In-memory + JSON  │ <1000 vectors; prototype     │
+  │                   │ scale; no infra              │
+  ├───────────────────┼──────────────────────────────┤
+  │ sqlite-vec        │ Local-first apps; file-      │
+  │  (SQLite ext)     │ backed; no server            │
+  ├───────────────────┼──────────────────────────────┤
+  │ pgvector          │ Already on Postgres; unifies │
+  │  (Postgres ext)   │ relational + vector queries  │
+  ├───────────────────┼──────────────────────────────┤
+  │ Pinecone / Qdrant │ Massive scale; dedicated     │
+  │ Weaviate / Chroma │ vector infra; multi-tenant   │
+  └───────────────────┴──────────────────────────────┘
 ```
 
-### Move 2 — walk the mechanism
+### Move 2 — the step-by-step walkthrough
 
-**Options at each scale.**
+**For blooming today.** In-memory brute force. The state layer is already in-memory with JSON dev-persistence (`lib/state/*.ts`); adding a `Map<id, { vec, inv }>` is one file. Brute force over 10k vectors is <10ms cosine similarity — well under any user-visible latency budget.
 
-- **In-memory + JSON.** The simplest. Load all vectors on boot, brute-force cosine on query. Fine up to ~10K vectors on typical hardware. Zero ops. Restart loses nothing (rebuild from source of truth).
-- **SQLite + `sqlite-vec` extension.** Local-first, no server. Great for CLI tools and offline apps. Reasonable for ~100K vectors.
-- **Postgres + `pgvector`.** Postgres already in your stack? Add the extension and unify relational + vector queries. HNSW index for sub-linear queries at scale. Best all-around answer for most production apps.
-- **Managed vector DBs (Pinecone, Weaviate, Qdrant, Chroma).** Zero ops, hosted, multi-tenant. Extra network hop. Costs.
+**When to upgrade to sqlite-vec.** When investigation-memory volume crosses ~10k rows *and* the dev/prod state model shifts from JSON to SQLite. sqlite-vec adds an HNSW index and vector functions to standard SQLite. No new infrastructure.
 
-**For this codebase's would-be corpus.**
+**When to upgrade to a hosted DB.** If blooming ever added multi-tenant hosted deployments where each tenant has their own investigation history and query latency matters at scale. Not on the near-term roadmap.
 
-Past diagnoses at ~10K items with ~5 chunks each = 50K vectors, ~1536 floats each = ~300MB in memory (as Float32). Loadable, brute-force is fine, zero infra. A JSON file at `lib/state/embeddings.json` alongside `demo-*.json` is the boring right answer.
+**How the in-memory brute-force version would look.** Pseudocode:
 
-If the corpus grew past 100K vectors, SQLite + `sqlite-vec` would be the next step. Both are local, no server, no ops.
+```
+  index = Map<id, { vec: Float32Array, inv: Investigation }>
 
-**What ANN buys.**
+  add(inv):
+    vec = embed(text(inv))
+    index.set(inv.id, { vec, inv })
 
-At scale, exhaustive cosine over millions of vectors is slow (100ms+ per query). ANN indexes (HNSW = hierarchical navigable small world, IVF = inverted file) give approximate top-k in ~1-10ms. Trade: some recall loss (0.5-2% typically) for order-of-magnitude speedup. Not needed at this repo's scale.
+  query(text, k=3):
+    q = embed(text)
+    scored = []
+    for [id, { vec, inv }] of index:
+      score = cosine(q, vec)
+      scored.push({ id, score, inv })
+    scored.sort(by score desc)
+    return scored.slice(0, k)
+```
+
+10k vectors × 1536 dims × 4 bytes = ~60 MB. Fits in memory. Full-scan cosine at 10k rows: a few ms.
+
+### Move 2.5 — current state vs future state
+
+Today: no vector store. Not a gap — no retrieval feature yet needs one.
+
+Future (if past-investigation memory lands per `B3.1`): in-memory Map + JSON persistence, following the same pattern as `lib/state/investigations.ts`. If volume grows past 10k rows or persistence becomes multi-instance (Vercel deploy), sqlite-vec would be the upgrade.
 
 ### Move 3 — the principle
 
-Start with brute force. Add an index when brute force stops meeting your latency target. Don't reach for Pinecone at 10K vectors — you're adding a network hop, monthly cost, and vendor lock-in for zero speed benefit.
+Storage is a solved problem when the vector count is small. Don't over-engineer the vector store; pick the smallest thing that fits and upgrade when volume or latency demands it.
 
 ## Primary diagram
 
 ```
-  Storage options — pick by scale
+  Vector storage decision — full frame
 
-  ┌─ this repo's scale (~10K vectors) ────────────────────────────────┐
-  │  in-memory JSON, brute-force cosine                                │
-  │  · latency: ~1-5ms per query                                       │
-  │  · ops: zero (rebuild on boot)                                     │
-  │  · cost: zero                                                      │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌─ Vector count ─────────────────────────────────────┐
+  │  <1k          → in-memory Map, brute force          │
+  │  1k-100k      → sqlite-vec (local, HNSW)            │
+  │  100k+        → pgvector (if PG present)            │
+  │  1M+          → hosted (Pinecone / Qdrant / etc)    │
+  └────────────────────────────────────────────────────┘
 
-  ┌─ scale-up path (~100K-1M) ────────────────────────────────────────┐
-  │  SQLite + sqlite-vec  OR  Postgres + pgvector                      │
-  │  · latency: ~10-50ms                                               │
-  │  · ops: schema + index                                             │
-  │  · cost: (whatever DB you already have)                           │
-  └───────────────────────────────────────────────────────────────────┘
-
-  ┌─ enterprise scale (~1M+) ─────────────────────────────────────────┐
-  │  Pinecone / Weaviate / Qdrant                                      │
-  │  · latency: ~10-100ms + network                                    │
-  │  · ops: managed by vendor                                          │
-  │  · cost: $$$/month                                                 │
-  └───────────────────────────────────────────────────────────────────┘
+  Blooming today: 0 vectors → no store needed
+  Blooming w/ investigation memory: 10k projected → sqlite-vec
+  Blooming w/ catalog retrieval: 10k-100k → sqlite-vec still fits
 ```
 
 ## Elaborate
 
-The vector DB market grew fast (Pinecone, Weaviate, Chroma, Qdrant, LanceDB, etc.) and is consolidating. The pragmatic move is often to skip dedicated vector DBs and use pgvector — you already have Postgres in your stack. Costs less, no new vendor, and pgvector's HNSW is competitive at typical scales.
+Vector databases were a category that didn't exist in 2020 and dominated infra discussions in 2023. Most of the hype has settled: for corpora under ~100k vectors, local storage is fine; for larger corpora with high query rate, hosted or embedded HNSW (via `hnswlib`) is the standard.
+
+Related: **11-rag.md** (the store feeds retrieval), **10-incremental-indexing.md** (how the store gets updated).
 
 ## Project exercises
 
-### Exercise — in-memory brute-force vector store
+### B3.4 · Add in-memory + JSON-persisted investigation index
 
-- **Exercise ID:** C2.7-B · Case B (RAG not exercised).
-- **What to build:** `lib/rag/store.ts` — loads `lib/state/embeddings.json` on init, exposes `search(queryVector, k)` doing brute-force cosine. No index, no server.
-- **Why it earns its place:** the right choice for this repo's scale; proves you don't over-engineer. Interviewer signal: "I picked the simplest thing that works at my scale."
-- **Files to touch:** `lib/rag/store.ts` (new), `lib/state/embeddings.json` (populated by the embed step).
-- **Done when:** `search(queryVec, 3)` returns 3 top matches with cosine scores in < 5ms for a 500-vector corpus.
-- **Estimated effort:** <1hr.
+- **Exercise ID:** B3.4 (Case B — not yet implemented)
+- **What to build:** Implement the vector store per the pseudocode above: `Map<id, { vec, inv }>` + JSON file dev-persistence + in-memory prod. Cosine similarity brute force. Follows `lib/state/investigations.ts`'s exact pattern.
+- **Why it earns its place:** Smallest thing that works. Ships in ~200 LOC. Interview payoff: "I know exactly when to upgrade to sqlite-vec (10k+ rows or multi-instance persistence)."
+- **Files to touch:** New `lib/state/investigation-index.ts`, dev-only `.investigation-index.json` (gitignored).
+- **Done when:** cosine similarity search returns top-3 in <10ms for 10k vectors; JSON file survives dev restarts.
+- **Estimated effort:** `1–2 days`.
 
 ## Interview defense
 
-**Q: Why not Pinecone?**
+**Q: You'd start with in-memory? Isn't that obviously wrong?**
 
-Because at 10K vectors, brute-force cosine in memory is 1-5ms. Pinecone would add ~50-100ms network hop + a monthly bill + a vendor lock-in for zero speedup. Pinecone earns its keep at millions of vectors, not thousands.
+For 10k rows on a single Node.js process, no — brute-force cosine is milliseconds and memory is ~60 MB. The load-bearing part: recognize when the "obvious" infrastructure (a whole vector DB) is over-engineering for the actual volume. I'd upgrade to sqlite-vec at 100k rows or when the deploy model becomes multi-instance.
 
-**Q: What's HNSW?**
+**Q: What about Pinecone?**
 
-Approximate-nearest-neighbor index. Builds a graph of vectors, traverses it hierarchically to find approximate top-k without scanning everything. Sub-linear query time. Standard at scale — pgvector supports it, all managed vector DBs use variants. Small recall cost (0.5-2%) for order-of-magnitude speedup.
-
-**Q: When would you move off in-memory JSON?**
-
-When it stops fitting in RAM (~1M+ vectors of 1536-dim = ~6GB, still fits on a modern node), or when you need to serve from multiple processes and can't share memory. That's SQLite / pgvector territory. Managed DB only when horizontal scale-out matters.
+Not for this codebase's scale. Pinecone starts making sense at 1M+ vectors and multi-tenant. Blooming's corpus, even at maximum growth, is 3–4 orders of magnitude below that. Load-bearing: pick the tool that matches the load.
 
 ## See also
 
-- `01-embeddings.md` — the vectors this stores
-- `03-chunking-strategies.md` — what gets stored
-- `10-incremental-indexing.md` — the ongoing maintenance
+- [11-rag.md](11-rag.md) — the store powers the whole pipeline.
+- [10-incremental-indexing.md](10-incremental-indexing.md) — how updates flow.
+- [../06-production-serving/04-rate-limiting-backpressure.md](../06-production-serving/04-rate-limiting-backpressure.md) — the ops discipline that also decides when to upgrade.

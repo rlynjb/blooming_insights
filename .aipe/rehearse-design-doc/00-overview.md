@@ -30,7 +30,8 @@ The whole system — where each RFC lives
                               │
   ┌─ Data layer (lib/data-source) ▼──────────────────────────────────┐
   │  DataSource port (RFC-05)                                         │
-  │   ├── BloomreachDataSource (MCP over the loomi connect server)    │
+  │   ├── McpDataSource (Bloomreach the default preset, not identity) │
+  │   │    + AuthProvider strategy: oauth-bloomreach / bearer / anon  │
   │   ├── SyntheticDataSource (offline evals)                         │
   │   └── FaultInjectingDataSource (RFC-08, decorator)                │
   └───────────────────────────┬──────────────────────────────────────┘
@@ -64,7 +65,7 @@ Reconsiderability — how likely you'd flip this call in the next quarter
 | 02 | NDJSON over `fetch` stream, not SSE | one `readNdjson` kernel (64 LOC) at `lib/streaming/ndjson.ts` — 4 client surfaces consume it |
 | 03 | Deterministic supervisor, not LLM router | pipeline + intent classifier as ROUTE code · no LLM chooses which agent runs |
 | 04 | Next.js as runtime only, no data primitives | no Server Components, no `use(promise)`, no React Query — the stream **is** the state machine |
-| 05 | DataSource seam + adapter pattern | port at `lib/data-source/types.ts` · 3 adapters shipped (Bloomreach + Synthetic + FaultInjecting) |
+| 05 | DataSource seam + adapter pattern | port at `lib/data-source/types.ts` · **5 uses without a caller-surface change** (Olist add/remove · Synthetic · FaultInjecting · McpDataSource + AuthProvider strategy) |
 | 06 | AptKit primitives + Blooming adapter boundary | `lib/agents/aptkit-adapters.ts` (263 LOC) · library owns the loop, Blooming owns the boundary |
 | 07 | Per-investigation budget ceiling | `BudgetTracker` check-before-dispatch · shared across DiagnosticAgent + RecommendationAgent |
 | 08 | Fault-injection DataSource decorator | 9 injected faults / 3 investigations / 0 failures — receipt for graceful degradation |

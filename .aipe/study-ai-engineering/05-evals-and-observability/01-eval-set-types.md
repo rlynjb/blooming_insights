@@ -1,166 +1,191 @@
-# 01 — Eval set types
+# Eval set types
 
-**Type:** Industry standard. Also called: golden set, adversarial set, regression set.
+## Subtitle
+
+Golden / adversarial / regression set — Industry standard.
 
 ## Zoom out, then zoom in
 
-Three eval set types, each catching a different failure mode. This repo has one type (golden) fully built; the other two are Case B / partially exercised.
+blooming's eval set is 10 hand-curated golden cases in `eval/goldens/01-*.ts` through `10-*.ts`. Four signal classes: `has-signal` (canonical happy path), `no-signal` (agent should say "I don't know"), `multi-scope` (compound anomaly), `positive` (an *up* anomaly — surge, not drop). The known-failure cases (01 + 08) are effectively a regression set now — any refactor that reintroduces the "pause the A/B" recommendation on those cases will fail the gate.
 
 ```
-  Zoom out — the three eval sets
+  Zoom out — three eval-set roles, one file layout
 
-  ┌─ Golden set (this repo — 10 cases in eval/goldens/) ──────────────┐
-  │  hand-curated "right" cases; measures baseline quality             │
-  │  ★ THIS CONCEPT — the goldens ★                                    │
-  └───────────────────────────────────────────────────────────────────┘
-
-  ┌─ Adversarial set (Case B) ────────────────────────────────────────┐
-  │  designed to break; edge cases, prompt injection, ambiguous        │
-  └───────────────────────────────────────────────────────────────────┘
-
-  ┌─ Regression set (partial — eval/baseline.json) ───────────────────┐
-  │  frozen production failures; prevents re-introducing bugs          │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌─ eval/goldens/ ────────────────────────────────────┐
+  │  10 files, each one golden case                     │
+  │  hand-curated, "this is the right answer"           │
+  └───────────────────────┬────────────────────────────┘
+                          │  each has signalClass
+                          ▼
+  ┌─ Signal classes (4) ★ ─────────────────────────────┐ ← we are here
+  │  has-signal, no-signal, multi-scope, positive       │
+  └───────────────────────┬────────────────────────────┘
+                          │  known-failure cases
+                          ▼
+  ┌─ De-facto regression set ──────────────────────────┐
+  │  cases 01 + 08 (A/B experiment failure)             │
+  │  eval/gate.eval.ts blocks on any dim regressing >10pp│
+  └────────────────────────────────────────────────────┘
 ```
-
-Zoom in. The 10 goldens in `eval/goldens/` cover four signal classes: `has-signal` (substrate supports diagnosis), `partial-signal` (some data missing), `no-signal` (should refuse), `positive` (upward anomaly, rare in training). Adversarial + regression are Case B.
 
 ## Structure pass
 
-Axis: what failure mode does the set catch?
-- Golden: does the agent produce the right answer on canonical cases?
-- Adversarial: does the agent break on edge cases / attacks?
-- Regression: does a past failure re-appear?
-
-**Seam:** the eval receipt. All three sets read into the same receipt shape (`eval/receipts/*.json`), aggregated by `baseline.eval.ts`.
+- **Layers:** eval case → signal class → judged output → aggregate. Four bands.
+- **Axis: coverage.** Each signal class covers one shape of failure. Uneven distribution is fine — the point is to have one exemplar of each shape.
+- **Seam:** the golden case type (`eval/goldens/types.ts`). It's the contract every case implements.
 
 ## How it works
 
-### Move 1
+### Move 1 — the mental model
 
-You've written unit tests, integration tests, load tests — each catches different bugs. Eval sets are the same, three-tier structure at the LLM boundary.
+Three set types, each with a purpose:
 
 ```
-  Three sets, three failure modes
+  Three eval sets — role and shape
 
-  golden         → happy path fails silently          → measures baseline
-  adversarial    → attacker or edge case exposes flaw → measures robustness
-  regression     → known bug creeps back in           → prevents re-intro
+  ┌─ Golden ──────────────────────────────────────────┐
+  │  hand-curated "this is the right answer"           │
+  │  purpose: measure baseline quality                 │
+  │  size: 10-100 items, high signal per item          │
+  └────────────────────────────────────────────────────┘
+
+  ┌─ Adversarial ─────────────────────────────────────┐
+  │  designed to break — edge cases, injection attempts│
+  │  purpose: measure robustness                       │
+  │  size: 20-50 items                                 │
+  └────────────────────────────────────────────────────┘
+
+  ┌─ Regression ──────────────────────────────────────┐
+  │  bugs you caught in production, frozen             │
+  │  purpose: prevent re-introduction                  │
+  │  size: grows over time                             │
+  └────────────────────────────────────────────────────┘
 ```
 
-### Move 2
+### Move 2 — the step-by-step walkthrough
 
-**Golden set — this repo's 10 cases.**
+**The blooming golden set.** 10 cases, one per file (`eval/goldens/01-*.ts` through `10-*.ts`). Each defines:
 
-`eval/goldens/index.ts` collects 10 golden cases:
-- `01-conversion-drop-mobile-checkout` (has-signal) — canonical happy path
-- `02-fraud-payment-failure-credit-card` (has-signal) — fraud detection
-- `03-session-drop-organic-mobile` (has-signal) — traffic drop
-- `04-cart-abandonment-mobile-broad` (has-signal) — broad-scope funnel
-- `05-no-signal-retention-subscribers` (no-signal) — should refuse
-- `06-no-signal-price-sensitivity-luxury` (no-signal) — should refuse
-- `07-positive-conversion-surge-mobile` (positive) — upward anomaly
-- `08-checkout-collapse-multi-scope` (has-signal) — multi-scope
-- `09-engagement-drop-email-campaign` (partial-signal) — campaign metric missing
-- `10-no-signal-seo-organic` (no-signal) — should refuse
+- An `Anomaly` — what the monitoring scan handed off.
+- A `signalClass` — one of `has-signal`, `no-signal`, `multi-scope`, `positive`.
+- An `intent` — English description of what a good diagnosis should look like.
+- `knownCorrect` — hand-curated expected root cause, co-occurring signals, red herrings to avoid.
 
-Each case has `{caseId, signalClass, intent, anomaly, knownCorrect}` (`eval/goldens/types.ts`). The `knownCorrect` field is free-form guidance for the LLM judge about what the diagnosis SHOULD reflect.
+Example (case 01, `eval/goldens/01-conversion-drop-mobile-checkout.ts`):
 
-**Signal-class-aware gating.**
+```ts
+export const goldenCase: GoldenCase = {
+  caseId: '01-conversion-drop-mobile-checkout',
+  signalClass: 'has-signal',
+  intent: 'The canonical happy path — clear anomaly, ...',
+  anomaly: { metric: 'conversion_rate', scope: ['mobile', 'checkout', 'SP'], ...},
+  knownCorrect: {
+    primary_signal: 'checkout → purchase step is where the funnel breaks; ...',
+    co_occurring_signal: 'payment_failure_rate rose 31.2%',
+    most_likely_root_cause_candidates: ['payment processor issue ...'],
+    scope_should_stay_within: ['mobile', 'checkout', 'SP', 'credit_card'],
+    red_herrings_to_avoid: ['desktop conversion', 'top-of-funnel', ...],
+  },
+};
+```
 
-`eval/run.eval.ts:406-424` treats gated (has-signal, partial-signal) and measured (no-signal, positive) cases differently. Gated: the test FAILS if the judge verdict is `fail`. Measured: the test always passes, and the verdict is a data point. This is what lets no-signal cases test hallucination resistance without turning a "correct refusal" into a test failure.
+**Why 4 signal classes.** Different failure modes surface on different anomaly shapes. `no-signal` cases (05, 06, 10) test "does the agent admit ignorance?" — a wrongly-confident diagnosis on a null anomaly is a specific bug. `multi-scope` (08) tests "does it stay coherent across multiple simultaneous drops?" — a specific compound-shape bug. `positive` (07) tests "does it treat a *surge* as its own kind of anomaly?" — often the model reflexively frames a positive change as a problem.
 
-**Adversarial set — Case B.**
+**The regression set that's implicit.** blooming doesn't have a separate `eval/regressions/` folder because the known-failure modes are already encoded in the 10 goldens. Cases 01 + 08 both have the "pause the A/B experiment" failure baked into the eval — if a refactor makes them worse (dropping the `diagnosis_response` pass rate), the gate blocks (see **02-eval-methods.md**).
 
-Not built today. Candidates for adversarial cases:
-- Prompt injection: an anomaly whose text contains "ignore previous instructions" attacks
-- Ambiguous scope: an anomaly with contradictory scope tags
-- Data poisoning: an anomaly whose evidence has NaN / null / malformed values
-- Lost-in-the-middle: an anomaly whose critical detail is buried mid-context (see `02-context-and-prompts/02-lost-in-the-middle.md`)
+**Adversarial set that's not there yet.** No dedicated adversarial set today. Would target: prompt-injection payloads in the anomaly's `impact` text, EQL query hallucinations, out-of-scope questions. Named as a gap; see the exercise below.
 
-**Regression set — partial (via baseline.json).**
+Diagram of the 4 signal classes:
 
-`eval/baseline.eval.ts` computes per-dim pass rates from a run's receipts and writes `eval/baseline.json`. `eval/gate.eval.ts` compares a candidate run against baseline and fails if any dim regresses by > `GATE_MAX_REGRESSION` (default 0.10). This is regression detection at the DIMENSION level, not the case level.
+```
+  Signal-class coverage — one exemplar of each
 
-A per-case regression set would grow over time as production failures are added. Not built today because production traffic is nil, but the shape is there.
+  ┌──────────────┬────────────────────────┬───────────────┐
+  │ signalClass  │ what it tests           │ case IDs      │
+  ├──────────────┼────────────────────────┼───────────────┤
+  │ has-signal   │ canonical diagnosis path│ 01, 02, 03, 04│
+  │              │ · substrate has evidence│ 09             │
+  │              │ · agent should find it  │               │
+  ├──────────────┼────────────────────────┼───────────────┤
+  │ no-signal    │ null anomaly            │ 05, 06, 10    │
+  │              │ · agent should admit    │               │
+  │              │   "I don't know"        │               │
+  ├──────────────┼────────────────────────┼───────────────┤
+  │ multi-scope  │ compound anomaly across │ 08            │
+  │              │ multiple segments       │               │
+  ├──────────────┼────────────────────────┼───────────────┤
+  │ positive     │ metric surged (not      │ 07            │
+  │              │ dropped)                │               │
+  └──────────────┴────────────────────────┴───────────────┘
+```
 
-### Move 3
+### Move 3 — the principle
 
-Three sets, three purposes. Golden measures baseline quality; adversarial measures robustness; regression prevents re-introduction. Each is a distinct discipline — building only goldens (this repo's state) catches baseline drift but misses attack-shaped and known-bug-shaped failures.
+The set is the contract. Coverage per signal-class matters more than raw case count. 10 well-shaped cases spanning 4 classes is stronger evidence than 100 cases all of one shape.
 
 ## Primary diagram
 
 ```
-  Eval sets in this codebase
+  blooming eval sets — full frame
 
-  ┌─ eval/goldens/ ───────────────────────────────────────────────────┐
-  │  01-conversion-drop-mobile-checkout      (has-signal)              │
-  │  02-fraud-payment-failure-credit-card    (has-signal)              │
-  │  03-session-drop-organic-mobile          (has-signal)              │
-  │  04-cart-abandonment-mobile-broad        (has-signal)              │
-  │  05-no-signal-retention-subscribers      (no-signal)  ← gated skip │
-  │  06-no-signal-price-sensitivity-luxury   (no-signal)  ← gated skip │
-  │  07-positive-conversion-surge-mobile     (positive)   ← measure    │
-  │  08-checkout-collapse-multi-scope        (has-signal)              │
-  │  09-engagement-drop-email-campaign       (partial-signal)          │
-  │  10-no-signal-seo-organic                (no-signal)  ← gated skip │
-  │                                                                   │
-  │  → run.eval.ts iterates via it.each()                             │
-  │  → receipt per case in eval/receipts/                              │
-  │  → aggregated in baseline.json                                     │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌─ eval/goldens/ (LIVE, 10 files) ────────────────────┐
+  │                                                      │
+  │  ┌─ has-signal (5) ─┬─ no-signal (3) ─┐              │
+  │  │  01, 02, 03, 04, │ 05, 06, 10       │              │
+  │  │  09              │                  │              │
+  │  └──────────────────┴──────────────────┘              │
+  │  ┌─ multi-scope (1) ┬─ positive (1) ──┐              │
+  │  │  08              │ 07               │              │
+  │  └──────────────────┴──────────────────┘              │
+  │                                                      │
+  │  each case: Anomaly + signalClass + intent +          │
+  │             knownCorrect                              │
+  └─────────────────────────────────────────────────────┘
 
-  ┌─ eval/baseline.json (regression reference) ───────────────────────┐
-  │  per-dim pass rates, per-verdict distribution                     │
-  │  → gate.eval.ts compares candidate vs baseline                    │
-  │  → fails if any dim regresses by > GATE_MAX_REGRESSION            │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌─ eval/baseline.json (LIVE) ─────────────────────────┐
+  │  runId 2026-07-03T04-08-28-644Z                      │
+  │  per-dim pass rates, per-case receipts               │
+  │  → regression gate reads this                        │
+  └─────────────────────────────────────────────────────┘
 
-  ┌─ adversarial set (Case B — not built) ────────────────────────────┐
-  │  prompt injection, ambiguous scope, malformed evidence            │
-  └───────────────────────────────────────────────────────────────────┘
+  ┌─ eval/adversarial/ (not yet) ───────────────────────┐
+  │  · prompt-injection payloads                         │
+  │  · EQL hallucinations                                │
+  │  · out-of-scope QueryBox inputs                      │
+  └─────────────────────────────────────────────────────┘
 ```
 
 ## Elaborate
 
-The golden/adversarial/regression triad is standard in ML engineering. In LLM eval it maps directly: golden = canonical cases, adversarial = red-team, regression = frozen production failures. Modern LLM eval frameworks (Braintrust, Weights & Biases, Langfuse) support all three natively.
+Golden sets are the load-bearing eval type. Adversarial and regression sets add coverage for specific concerns but don't replace the "hand-curated correctness" of goldens. blooming's specific choice — small (10) but signal-class-diverse — is deliberate: each class exercises a distinct failure shape, so the receipts tell you *what* broke, not just *whether* something broke.
 
-Beyond the triad, some teams add: **stability set** (same case run N times to measure output variance) and **A/B set** (candidate vs baseline on the same case with pairwise comparison). Neither is built here.
+The regression-through-goldens pattern (where known-failure cases live in the golden set with an accepted low score) is one option; a separate regressions folder is another. Both let the gate catch reintroductions.
+
+Related: **02-eval-methods.md** (how the golden set is scored), **04-llm-observability.md** (how the results become a receipt).
 
 ## Project exercises
 
-### Exercise — adversarial set with 5 prompt-injection variants
+### B5.1 · Add an adversarial set
 
-- **Exercise ID:** C3.1-B · Case B (adversarial not built).
-- **What to build:** add `eval/goldens/adversarial/` with 5 cases: (1) anomaly text contains "ignore previous instructions"; (2) anomaly evidence includes contradictory numbers; (3) anomaly scope has an out-of-schema value; (4) anomaly with no impact context; (5) anomaly whose severity contradicts the change magnitude. Extend `eval/run.eval.ts` to iterate the adversarial set separately. Rubric: agent should refuse or note the anomaly is malformed, not confabulate.
-- **Why it earns its place:** measures robustness explicitly. Interviewer signal: "my agents survive attempts to break them; here's the measured proof."
-- **Files to touch:** `eval/goldens/adversarial/*.ts`, `eval/goldens/index.ts` (add adversarial re-export), `eval/run.eval.ts` (add adversarial iteration).
-- **Done when:** running eval prints a separate "adversarial pass rate" section; 5 cases show whether the agent refuses / notes / confabulates.
-- **Estimated effort:** 1-2 days.
+- **Exercise ID:** B5.1 (Case B — not yet implemented)
+- **What to build:** 5–10 adversarial cases in `eval/adversarial/`. Types: (a) prompt-injection payloads in `anomaly.impact` text; (b) EQL-hallucination temptations (anomaly evidence that mentions non-existent event names); (c) out-of-scope inputs (QueryBox text unrelated to analytics).
+- **Why it earns its place:** Closes a real gap. Adversarial coverage catches failure modes the golden set doesn't exercise.
+- **Files to touch:** New `eval/adversarial/*.ts`, extend `eval/run.eval.ts` to score adversarial cases with a pass/fail (not rubric — pass = "agent refused / handled gracefully").
+- **Done when:** the adversarial suite runs in CI alongside the golden set; results feed a separate baseline row.
+- **Estimated effort:** `1–2 days`.
 
 ## Interview defense
 
-**Q: What eval sets do you have?**
+**Q: Why 10 cases — isn't that small?**
 
-Golden set (10 cases in `eval/goldens/`), signal-class-tagged. Regression detection via `eval/baseline.json` + `eval/gate.eval.ts`. Adversarial set is Case B — I know the shape and haven't built it because I've focused on the tier-2 story of "hardening what exists" first.
+Deliberate. Ten hand-curated cases across four signal classes gives me one exemplar per failure shape. Adding a 50th `has-signal` case doesn't teach me anything new; adding an adversarial suite would (see `B5.1`). The load-bearing part: the coverage per class matters more than raw case count. Each case's `intent` + `knownCorrect` is a 30-minute investment per case — 10 is where I could keep quality high; 100 would degrade to noise.
 
-**Q: What's a signal class?**
+**Q: You said cases 01 and 08 both failed. Why keep them at all?**
 
-A tag on each golden case describing what the substrate can support. Four values: `has-signal`, `partial-signal`, `no-signal`, `positive`. Gates in the harness treat them differently — has-signal/partial-signal cases FAIL the test on judge=fail. No-signal/positive cases are measured but never gate the test. This lets me test hallucination resistance (no-signal → agent should refuse) without turning a correct refusal into a test failure.
-
-```
-  gated:     has-signal, partial-signal  → judge=fail → test fails
-  measured:  no-signal, positive         → judge=fail → data point
-```
-
-**Q: Why not more goldens?**
-
-Because 10 is enough to detect the failure modes at this stage — coverage of the four signal classes, coverage of different metric shapes (revenue, conversion, session count, cart), coverage of scope granularity (mobile-only vs multi-scope). The tier-2 constraint isn't case count; it's rubric quality and observability.
+They're the regression set. Their known failure is baked in — the recommendation-quality rubric's `diagnosis_response` dimension scores 2 on both, and the baseline records the failure explicitly. If a refactor makes them worse (say the score drops to 1), the gate blocks. If a refactor fixes them (score 3+), the baseline updates. Load-bearing: known failures documented in the eval are stronger than known failures documented in a comment.
 
 ## See also
 
-- `02-eval-methods.md` — how each case is scored
-- `03-llm-as-judge-bias.md` — what the judge can get wrong
-- `04-llm-observability.md` — the receipt each case produces
-- `eval/goldens/` — the goldens
-- `eval/baseline.json` — the regression reference
+- [02-eval-methods.md](02-eval-methods.md) — the rubrics that score these cases.
+- [04-llm-observability.md](04-llm-observability.md) — how results become receipts.
+- [../04-agents-and-tool-use/06-error-recovery.md](../04-agents-and-tool-use/06-error-recovery.md) — the graceful-degradation receipt.
