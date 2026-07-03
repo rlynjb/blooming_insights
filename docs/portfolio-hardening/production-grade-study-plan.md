@@ -55,10 +55,17 @@ slice. Both drive real choices that were parked at the end of Week 1
       quirk (`get_event_segmentation` returns identical geo-breakdowns
       regardless of `event` arg) — the eval surfaces the substrate
       limitation as scoring pressure.
-- [ ] **B — Recommendation rubric**
-      Add `eval/rubrics/recommendation-quality.ts` + `RecommendationAgent`
-      invocation. Receipt gains `recommendationJudgment`. Both rubrics
-      run per case.
+- [x] **B — Recommendation rubric** ✅ *implemented (`a2efe57`)*
+      Added `eval/rubrics/recommendation-quality.ts` (4 dims: diagnosis_response,
+      feature_choice_fit, step_actionability, impact_realism). Runner does
+      two-phase judging: diagnose → judge diagnosis; recommend → judge each
+      rec independently. Recommendation judge also gets the recommendation
+      agent's own tool-call trace as context. Session B's run: 3 recs, all
+      `pass_with_notes`; judge caught rec 3 (win-back campaign)
+      re-engaging abandoners without addressing the payment-processor
+      root cause. Side observation for Session D: root_cause_plausibility
+      came back 5 here but 4 on Session A — same anomaly, same substrate.
+      Conclusion-stability variance is real and measurable.
 - [ ] **C — Expand goldens to 10**
       Vary category / scope / severity + 2–3 no-signal cases. Aggregate
       per-criterion pass rates across all cases. Escape-hatch = ≥3 distinct
