@@ -66,10 +66,14 @@ describe('makeDataSource synthetic mode', () => {
     });
   });
 
-  it('parses only the explicit synthetic mode and defaults all legacy values to Bloomreach', () => {
+  it('parses only the explicit live-bloomreach mode; everything else defaults to live-synthetic', () => {
+    // Post-Session-A (synthetic-first plan): live-synthetic is the fresh-visitor
+    // default. Explicit 'live-bloomreach' still routes there; unknown / legacy /
+    // null values now land on the synthetic path so a fresh visitor sees the
+    // product working without OAuth.
     expect(parseLiveMode('live-synthetic')).toBe('live-synthetic');
     expect(parseLiveMode('live-bloomreach')).toBe('live-bloomreach');
-    expect(parseLiveMode('live-sql')).toBe('live-bloomreach');
-    expect(parseLiveMode(null)).toBe('live-bloomreach');
+    expect(parseLiveMode('live-sql')).toBe('live-synthetic');
+    expect(parseLiveMode(null)).toBe('live-synthetic');
   });
 });

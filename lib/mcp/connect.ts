@@ -14,9 +14,16 @@
 //       (KV/Redis) is the likely production fix.
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import type { OAuthClientProvider } from '@modelcontextprotocol/sdk/client/auth.js';
 import { SdkTransport, makeCapturingFetch, type HttpErrorHolder } from './transport';
 import { BloomreachDataSource } from '../data-source/bloomreach-data-source';
-import { BloomreachAuthProvider, withAuthCookies } from './auth';
+import { withAuthCookies } from './auth';
+import {
+  makeAuthProvider,
+  readAuthEnv,
+  BloomreachAuthProvider,
+  type McpAuthType,
+} from './auth-providers';
 
 /** ConnectResult.mcp is the concrete BloomreachDataSource (not just
  *  `DataSource`) so the 4 short MCP routes — /api/mcp/{call,tools,tools/check,capture}
@@ -28,8 +35,14 @@ export type ConnectResult =
   | { ok: false; authUrl: string };
 
 function mcpUrl(): URL {
+  // Prefer generic MCP_URL; fall back to BLOOMREACH_MCP_URL for backward
+  // compat with pre-swappable configs. Final default is the Bloomreach alpha
+  // endpoint so an unset env still yields a working example config out of the
+  // box (Bloomreach as the "default preset").
   const raw =
-    process.env.BLOOMREACH_MCP_URL ?? 'https://loomi-mcp-alpha.bloomreach.com/mcp/';
+    process.env.MCP_URL ??
+    process.env.BLOOMREACH_MCP_URL ??
+    'https://loomi-mcp-alpha.bloomreach.com/mcp/';
   return new URL(raw.replace(/\/+$/, '')); // strip trailing slash(es) — avoids a 307
 }
 
@@ -69,7 +82,7 @@ export async function connectMcp(sessionId: string): Promise<ConnectResult> {
 }
 
 async function connectMcpInner(sessionId: string): Promise<ConnectResult> {
-  const provider = new BloomreachAuthProvider(sessionId, await redirectUri());
+  const provider = await buildAuthProvider(sessionId);
   // Capture the raw body of any non-OK HTTP response so tool failures can report
   // the real server error (e.g. the `invalid_token` JSON behind a 401).
   const httpErrors: HttpErrorHolder = { last: null };
@@ -102,21 +115,47 @@ async function connectMcpInner(sessionId: string): Promise<ConnectResult> {
     };
   } catch (err) {
     // The SDK throws (UnauthorizedError) after calling redirectToAuthorization when
-    // no valid token exists. If we captured an authorize URL, surface it for the
-    // browser instead of bubbling the error.
-    if (provider.lastAuthorizeUrl) {
+    // no valid token exists. Only OAuth providers capture an authorize URL;
+    // bearer/anonymous providers throw on OAuth entry (correctly — they should
+    // never end up here).
+    if (
+      provider instanceof BloomreachAuthProvider &&
+      provider.lastAuthorizeUrl
+    ) {
       return { ok: false, authUrl: provider.lastAuthorizeUrl.toString() };
     }
     throw err;
   }
 }
 
+/** Build an AuthProvider for a session per env-configured MCP_AUTH_TYPE.
+ *  Default is oauth-bloomreach for backward compat. */
+async function buildAuthProvider(sessionId: string): Promise<OAuthClientProvider> {
+  const env = readAuthEnv();
+  return makeAuthProvider({
+    type: env.type,
+    sessionId,
+    redirectUri: env.type === 'oauth-bloomreach' ? await redirectUri() : undefined,
+    bearerToken: env.bearerToken,
+  });
+}
+
 /**
  * Complete the OAuth code exchange in the callback. Reconstructs the provider for the
  * same session (so it reads the PKCE verifier + client info persisted during connect),
  * then finishes auth, which persists tokens via the provider's saveTokens.
+ *
+ * The OAuth callback only makes sense for the oauth-bloomreach provider —
+ * bearer and anonymous providers don't have an OAuth flow, so if the callback
+ * fires against those, something is wrong upstream. Guarded here.
  */
 export async function completeAuth(sessionId: string, code: string): Promise<void> {
+  const env = readAuthEnv();
+  if (env.type !== 'oauth-bloomreach') {
+    throw new Error(
+      `OAuth callback fired but MCP_AUTH_TYPE=${env.type} — the callback route is only reachable for oauth-bloomreach.`,
+    );
+  }
   await withAuthCookies(async () => {
     const provider = new BloomreachAuthProvider(sessionId, await redirectUri());
     const transport = new StreamableHTTPClientTransport(mcpUrl(), {
