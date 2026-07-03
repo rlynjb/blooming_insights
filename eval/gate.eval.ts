@@ -22,7 +22,7 @@ import { readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { computeBaseline, type Baseline, type DimensionAggregate } from './baseline.eval';
+import { computeBaseline, type Baseline } from './baseline.eval';
 
 const RECEIPTS_DIR = resolve(dirname(fileURLToPath(import.meta.url)), 'receipts');
 const EVAL_DIR = dirname(fileURLToPath(import.meta.url));

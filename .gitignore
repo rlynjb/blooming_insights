@@ -57,3 +57,5 @@ next-env.d.ts
 # eval receipts — one JSON per run; cost + non-determinism, never committed
 /eval/receipts
 /eval/load-receipts
+# gate result files — one per candidate compare; ephemeral
+/eval/gate-*.json

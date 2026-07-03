@@ -35,7 +35,7 @@ import { DiagnosticAgent } from '../lib/agents/diagnostic';
 import { RecommendationAgent } from '../lib/agents/recommendation';
 import { AnthropicModelProviderAdapter } from '../lib/agents/aptkit-adapters';
 import { estimateAnthropicCost } from '../lib/agents/pricing';
-import { BudgetExceededError, BudgetTracker } from '../lib/agents/budget';
+import { BudgetTracker } from '../lib/agents/budget';
 import {
   SyntheticDataSource,
   syntheticWorkspaceSchema,

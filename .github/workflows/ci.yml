@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit --project tsconfig.json
+
+      # Lint deliberately omitted for now. `npm run lint` currently reports
+      # ~28 pre-existing errors (React setState-in-effect flags, `any` in
+      # BloomreachDataSource, unescaped-entities in the /docs prototype).
+      # None block correctness; all pre-date the Week-3/4 hardening. Add
+      # lint here after a dedicated cleanup pass (Phase 6 follow-up).
+
+      - name: Unit + integration tests
+        run: npm test
+        env:
+          # Placeholder for any tests that need a fake key — the real
+          # suite uses injected fakes and doesn't call Anthropic.
+          ANTHROPIC_API_KEY: sk-fake-key-for-ci
+
+      - name: Next build (verifies bundler + server routes compile)
+        run: npm run build
+        env:
+          # Provide dummy env at build time so Next's build step succeeds
+          # for pages that reference these at module-load. All real values
+          # come from the deployment environment.
+          AUTH_SECRET: ci-fake-auth-secret-32-chars-minimum-length
+          ANTHROPIC_API_KEY: sk-fake-key-for-ci
