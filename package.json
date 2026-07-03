@@ -12,7 +12,9 @@
     "eval:worksheet": "RUN_WORKSHEET=1 vitest run --config vitest.eval.config.ts eval/generate-worksheet.eval.ts",
     "eval:agreement": "RUN_AGREEMENT=1 vitest run --config vitest.eval.config.ts eval/compute-agreement.eval.ts",
     "eval:report": "RUN_REPORT=1 vitest run --config vitest.eval.config.ts eval/report.eval.ts",
-    "eval:load": "RUN_LOAD=1 vitest run --config vitest.eval.config.ts eval/load.eval.ts"
+    "eval:load": "RUN_LOAD=1 vitest run --config vitest.eval.config.ts eval/load.eval.ts",
+    "eval:baseline": "RUN_BASELINE=1 vitest run --config vitest.eval.config.ts eval/baseline.eval.ts",
+    "eval:gate": "RUN_GATE=1 vitest run --config vitest.eval.config.ts eval/gate.eval.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.99.0",
