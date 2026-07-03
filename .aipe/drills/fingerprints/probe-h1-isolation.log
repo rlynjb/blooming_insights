@@ -1,0 +1,11 @@
+=== H1 probe started 2026-07-03T10:12:20-07:00 ===
+
+ RUN  v4.1.7 /Users/rein/Public/blooming_insights
+
+
+ Test Files  1 passed (1)
+      Tests  3 passed (3)
+   Start at  10:12:20
+   Duration  148.34s (transform 55ms, setup 0ms, import 91ms, tests 148.19s, environment 0ms)
+
+=== H1 probe complete 2026-07-03T10:14:48-07:00 (exit 0) ===

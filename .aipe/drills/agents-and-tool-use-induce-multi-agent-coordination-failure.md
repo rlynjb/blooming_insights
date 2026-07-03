@@ -9,7 +9,9 @@ study ref:    .aipe/study-agent-architecture/03-multi-agent-orchestration/09-coo
 
 ---
 
-> **Coach posture, verdict first.** You have a shipped multi-agent supervisor (deterministic route handler at `app/api/agent/route.ts:222–345`) that hands `Diagnosis` from the DiagnosticAgent to the RecommendationAgent as a strongly-typed object. The interview signal you don't yet have — the L3 war story — is a **coordination-failure receipt**: proof that the handoff itself can silently degrade agent output even when both agents are working correctly in isolation. Your baseline `eval/baseline.json` (runId `2026-07-03T04-08-28-644Z`) already contains the smoking gun: `diagnosis_response` passes at **48%** on the recommendation rubric — cases where the diagnosis is grounded but the rec addresses the wrong hypothesis. That 48% is the coordination failure sitting in your repo right now, unnamed as such. This drill is to **name it, force it on demand, fix it, and prove the fix moves the number**. The failure to induce is "primary hypothesis silently downweighted at the handoff." If you can't reproduce it against a specific golden case with a specific prompt/data change, the drill is faked — pick a different case until one breaks.
+> **Coach posture, verdict first.** You have a shipped multi-agent supervisor (deterministic route handler at `app/api/agent/route.ts:222–345`) that hands `Diagnosis` from the DiagnosticAgent to the RecommendationAgent as a strongly-typed object. The interview signal you don't yet have — the L3 war story — is a **coordination-failure receipt**: proof that the handoff itself can silently degrade agent output even when both agents are working correctly in isolation. Your baseline `eval/baseline.json` (runId `2026-07-03T04-08-28-644Z`) already contains the smoking gun: `diagnosis_response` passes at **48%** on the recommendation rubric — cases where the diagnosis is grounded but the rec addresses the wrong hypothesis. That 48% is the coordination failure sitting in your repo right now, unnamed as such. This drill is to **name it, force it on demand, fix it, and prove the fix moves the number**. The failure to induce is **"a hypothesis explicitly marked `supported: false` in the diagnosis still produces a recommendation."** If you can't reproduce it against a specific golden case, the drill is faked — pick a different case until one breaks.
+>
+> **Fingerprint from the triple-run** (2026-07-03, six runs across cases 01 + 08, receipts at `eval/receipts/`): **4 of 6 runs produced a rec[2] targeting the CTA-experiment hypothesis that the diagnosis explicitly marked `supported: false`.** All 4 failed `diagnosis_response` with score 2 or 3. Judge language, verbatim: *"it pursues the one hypothesis the diagnosis rejected for lack of evidence."* The receipt is real, reproducible, and specific. Fingerprint runIds: case 01 → `T16-40-43-219Z`, `T16-44-18-992Z`, `T16-47-56-906Z`; case 08 → `T16-51-11-453Z`, `T16-55-10-578Z`, `T16-58-48-164Z`.
 
 ---
 
@@ -69,18 +71,38 @@ Also read the **shape drift** already flagged by your fresh `.aipe/study-data-mo
 
 **What the shape guard actually protects against** — `parseDiagnosis` + `isDiagnosis` (`lib/mcp/validate.ts:37–43`) check that `conclusion` is a string and `hypothesesConsidered` is an array with the right field shape. They do **NOT** check that the diagnosis is *correct*, *primary-emphasized*, or *from the current investigation* (a stale diagnosis from a prior anomaly would pass shape validation cleanly).
 
-Failure surface, ranked by war-story weight:
-1. **Primary-hypothesis silent downweight** — `conclusion` names cause A as primary; `hypothesesConsidered[]` has A supported + B supported + C rejected. Recommendation agent picks a lever targeting B (the "safer" hypothesis, or the one with more supporting-language weight in the prose). Baseline says this happens **48% of the time** on the recommendation rubric's `diagnosis_response` dimension.
-2. **Shape-drift handoff** — an old-format `Investigation` object gets deserialized and its `hypothesesConsidered: string[]` reaches the recommendation agent. Zero rejection signal.
-3. **Stale diagnosis re-carry** — sessionStorage's `bi:diag:<id>` is keyed by investigation id, but if a user navigates in an unexpected order (or if the `bi:diag:<X>` key survives a bug in the id derivation), a *different investigation's* diagnosis could hand off cleanly.
+Failure surface, ranked by war-story weight (**revised after the 2026-07-03 fingerprint**):
+1. **Rejected-hypothesis leakage** ← THE CONFIRMED MECHANISM. `conclusion` names cause A as primary; `hypothesesConsidered[]` has A `supported: true` + C `supported: false`. Rec agent produces a rec targeting C anyway. The rejection signal (`supported: false`) doesn't propagate as a hard exclusion — the rec agent apparently reads the array as "here are three concerns worth addressing" and gives each a rec, disregarding the `supported` flag. **4/6 runs reproduce this on the CTA-experiment hypothesis specifically.**
+2. **Primary-hypothesis silent downweight** — *not* observed in the fingerprint. Rec[0] correctly targets payment in all 6 runs. The primary is getting through; it's the negative signal (`supported: false`) that isn't.
+3. **Shape-drift handoff** — an old-format `Investigation` object gets deserialized and its `hypothesesConsidered: string[]` reaches the recommendation agent. Deterministic to reproduce but requires a data-migration setup; deferred as a Move-4-adjacent drill.
+4. **Stale diagnosis re-carry** — sessionStorage's `bi:diag:<id>` is keyed by investigation id, but if a user navigates in an unexpected order (or if the `bi:diag:<X>` key survives a bug in the id derivation), a *different investigation's* diagnosis could hand off cleanly.
 
 ---
 
 ## 2. INDUCE — the failure you must cause on demand
 
-**The failure:** at least ONE golden case where, with the DiagnosticAgent producing a correctly-emphasized diagnosis (primary hypothesis = the labeled root cause per `eval/goldens/*.json`), the RecommendationAgent's output receives `diagnosis_response: fail` from the shipped rubric (`eval/rubrics/recommendation-quality.ts`) because at least one recommendation targets a secondary (or explicitly rejected) hypothesis. **AND** you can reproduce it on demand — same golden case, same seed, same prompts, ≥2 of 3 runs fail identically. Reproducibility separates "flaky model" from "coordination-failure receipt."
+**The failure:** at least ONE golden case where, with the DiagnosticAgent producing a correctly-emphasized diagnosis (primary hypothesis = the labeled root cause per `eval/goldens/*.json`), the RecommendationAgent's output receives `diagnosis_response: fail` from the shipped rubric (`eval/rubrics/recommendation-quality.ts`) because at least one recommendation targets an **explicitly rejected** hypothesis (marked `supported: false` in the diagnosis handoff). **AND** you can reproduce it on demand.
 
-If you cannot induce reproducibility, the drill is faked — either pick a harder case, or attack the shape-drift surface (Failure #2 above) instead, which is deterministic.
+### Fingerprint receipt (2026-07-03)
+
+Six runs — case 01 × 3 + case 08 × 3, all `signalClass: has-signal`, all diagnoses correctly named payment failure as primary. Rec-set shape and `diagnosis_response` verdict per run:
+
+| Run | rec[0] target | rec[1] target | rec[2] target | dr scores | verdicts |
+|---|---|---|---|---|---|
+| 01/1 (`T16-40-43`) | ✓ recovery scenario | ⚠ CTA experiment | ⚠ retention | 4 / — / — | pass / judge_error / judge_error |
+| 01/2 (`T16-44-18`) | ✓ recovery sequence | ✓ recovery campaign | ⚠ PIX A/B experiment | — / 4 / **3** | judge_error / pass / **fail** |
+| 01/3 (`T16-47-56`) | ✓ recovery scenario | ⚠ retention | ⚠ **pause CTA test** | 5 / 3 / **2** | pass / pass_with_notes / **fail** |
+| 08/1 (`T16-51-11`) | ✓ recovery scenario | ⚠ retention | ⚠ payment A/B | 5 / 4 / 3 | pass / pass_with_notes / pass_with_notes |
+| 08/2 (`T16-55-10`) | ✓ recovery scenario | ⚠ voucher campaign | ⚠ **pause CTA test** | — / — / **2** | judge_error / judge_error / **fail** |
+| 08/3 (`T16-58-48`) | ✓ recovery scenario | ⚠ voucher campaign | ⚠ **pause CTA test** | 3 / — / **2** | pass_with_notes / judge_error / **fail** |
+
+**Signal: 4/6 runs (01/1, 01/3, 08/2, 08/3) produce a rec[2] targeting the CTA-experiment hypothesis that the diagnosis marked `supported: false`.** All 4 fail `diagnosis_response`. Judge language identical across runs: *"pursues the one hypothesis the diagnosis rejected."* Case 08 is the cleaner fingerprint (2 of 3 runs reproduce identical shape).
+
+### Bonus observability finding (out of drill scope but worth logging)
+
+Judge error rate across the 18 rec-judge invocations: **6 / 18 = 33 %.** The `maxTokens=4096` fix from Week 2C isn't enough for these longer recs — judge responses truncate before the structured JSON closes. Separate `console.error` scan of the log confirms `Judge model failed to produce parseable structured output` on all 6. Worth bumping to `maxTokens=8192` on the rec judge or investigating why these specific recs (voucher + retention + CTA-experiment) blow past 4k tokens on the judge side.
+
+### Step-by-step to induce it (if you want to re-run)
 
 ### Step-by-step to induce it
 
@@ -112,12 +134,32 @@ If it still fails, the coordination-failure hypothesis is wrong — it's a recom
 
 **Symptom** (fill from your run): the primary hypothesis in `Diagnosis.conclusion` is `_______`. The recommendation targets `_______`. The two are `_______` (aligned / adjacent / orthogonal / opposed).
 
-**Hypotheses to test in order:**
-- **H1 — Handoff shape dilution.** The recommendation agent's inference weight over `hypothesesConsidered[]` treats all `supported: true` entries roughly equally. Primary-emphasis lives only in `conclusion` prose. *Test:* single-entry `hypothesesConsidered` — see Step 2.4.
-- **H2 — Recommendation prompt gap.** The rec agent's system prompt (owned by AptKit's `RecommendationAgent`, not this repo) does not instruct the agent to hard-anchor to the primary hypothesis. Even a perfect handoff wouldn't fix it. *Test:* skip — AptKit-internal, you can't easily patch. Rule H2 in or out via H1 alone.
-- **H3 — Category confusion.** The rec agent has a systemic bias toward experiment-pause / feature-flag recs regardless of diagnosis. *Test:* pick a golden case where the primary hypothesis is NOT experiment-related — does the rec still trend toward experiment-pause? If yes, H3 is real and this is a bigger drill than one handoff.
+**Hypotheses to test in order (revised after fingerprint):**
+- **H1 — Rejected-hypothesis leakage.** The rec agent reads `hypothesesConsidered[]` as "a list of concerns to cover," ignoring the `supported` flag. A `supported: false` hypothesis still generates a rec. *Test — the isolation probe:* build a synthetic diagnosis with `hypothesesConsidered = [only the primary, supported: true]`, feed to `recAgent.propose()` × 3 against case 08's anomaly, check whether rec[2] still targets a rejected concern. Probe file: `eval/probe-h1-isolation.eval.ts`. Probe log: `.aipe/drills/fingerprints/probe-h1-isolation.log`.
+- **H2 — Rec-agent prompt gap.** Even with only primary hypotheses in the handoff, the rec agent produces N recs regardless (padding to 3 with adjacent concerns). *Test:* skip if H1 isolation shows clean primary-only recs. If H1 refuted, H2 is next — but AptKit's `RecommendationAgent` internal prompt isn't yours to patch, so H2 rules out as a shippable fix.
+- **H3 — Category confusion.** The rec agent has a systemic bias toward experiment-pause / feature-flag recs regardless of diagnosis. *Test:* pick a golden case where NO hypothesis involves an experiment; does the rec still trend to experiment-pause? Deferred; H1 fingerprint is already reproducible so this is second-priority.
 
-**Isolated cause** (fill from what H1–H3 actually show): `_______`. State it in one sentence. If more than one hypothesis is contributing, name the ranking.
+**Isolated cause (post-probe, 2026-07-03 T17-13 UTC):** rejected-hypothesis leakage confirmed. The rec agent's respect for `supported: false` is zero. Remove the temptation at the handoff boundary.
+
+### Probe result (H1 isolation, 3 runs against synthetic single-entry Diagnosis)
+
+Same anomaly (case 08). Same synthetic `Diagnosis` where `hypothesesConsidered = [only the primary payment-failure entry, supported: true]`. Recs produced:
+
+| Run | rec[0] | rec[1] | rec[2] |
+|---|---|---|---|
+| Probe 1 | ✓ recovery scenario | ✓ PIX/voucher campaign for SP mobile | ✓ A/B experiment: alt payment method prominence |
+| Probe 2 | ✓ recovery scenario | ✓ targeted campaign SP mobile | ✓ A/B experiment: voucher vs payment-method prompt (recovery flow) |
+| Probe 3 | ✓ voucher-backed recovery campaign | ✓ activate recovery scenario | ✓ A/B experiment: voucher vs no-voucher (recovery flow) |
+
+Persisted at `.aipe/drills/fingerprints/probe-h1-run-{1,2,3}.json`.
+
+**Zero rec targets `exp-checkout-copy` across all 3 probe runs.** Vs the baseline fingerprint where 4/6 runs targeted it. **H1 CONFIRMED.**
+
+### Bonus finding: H3 also present (structural bias)
+
+Every probe run produces an **A/B experiment as rec[2]**. Rec[0] = act on the problem, rec[1] = spread the fix wider, rec[2] = experiment on the fix. That shape is invariant across the diagnosis payload — the rec agent brings it regardless of content. When there's a rejected hypothesis to grab onto (baseline), the "always produce an experiment rec" bias latches on and fails judgment. When the rejected hypothesis is absent (probe), the bias pivots to experimenting on the *fix* itself — diagnosis-aligned and passes.
+
+**Consequence for Option A:** filtering `supported: false` at the handoff neutralizes the observable failure by removing the temptation, not by fixing the underlying rec-agent bias. That distinction is L3-signal on its own — Option A ships the working fix; the structural bias is documented as known and out-of-scope for this drill (would require access to AptKit's internal RecommendationAgent prompt).
 
 ---
 
@@ -125,16 +167,20 @@ If it still fails, the coordination-failure hypothesis is wrong — it's a recom
 
 *(You write this. Coach names the option matrix; you pick, justify, ship.)*
 
-Option matrix — pick ONE, defend it in one line each for the others:
+Option matrix (**revised for the confirmed mechanism: rejected-hypothesis leakage**) — pick ONE, defend it in one line each for the others:
 
 | Option | Where it lives | Cost | What it fixes | What it doesn't |
 |---|---|---|---|---|
-| **A — Add `primaryHypothesis: string` field to `Diagnosis`** | `lib/mcp/types.ts:95–104` + `lib/mcp/validate.ts:37–43` + DiagnosticAgent output shape | LOW (~1 hr): type change, migration on old receipts, guard on isDiagnosis | Explicit rank at the handoff — no more inference | Depends on the DiagnosticAgent being asked to fill it correctly. Prompt change on top. |
-| **B — Rank the `hypothesesConsidered[]` by primaryness in the DiagnosticAgent's prompt** | `lib/agents/legacy-prompts/diagnostic.md` (or AptKit's internal prompt if reachable) | MEDIUM (~2 hr, plus a re-eval): prompt edit + measure delta | Keeps the shape stable, exploits array order | Order-carries-meaning is a weak signal; rec agent may not respect it |
-| **C — Reject: pass the full DiagnosticAgent trace to the RecommendationAgent** | recommendation.ts:29–46 | HIGH (token budget blowup, cost regression against Week 3 caching win) | Would give rec agent perfect context | Undoes the shipped cost story — you'd need to defend the regression at interview |
-| **D — Reject: rewrite the recommendation prompt to require primary-hypothesis-alignment** | AptKit's `RecommendationAgent` internal prompt | UNKNOWN (owned by `@aptkit/core`) | Would fix at the receiver | You don't own the prompt — this is a request-upstream, not a ship |
+| **A — Filter rejected hypotheses at the handoff boundary.** In the route (`app/api/agent/route.ts:298–299`), pass `{...diagnosis, hypothesesConsidered: diagnosis.hypothesesConsidered.filter(h => h.supported)}` to `recAgent.propose()`. | route.ts:298 + one test in test/agents/recommendation.test.ts | LOW (~30 min): one-line change + a test that the rec agent never receives `supported: false` entries | Removes the leakage surface entirely — rec agent literally cannot see rejected hypotheses | Loses the "we considered this and ruled it out" context for the rec agent. Alternative: keep the entry but strip the reasoning + tag with `[REJECTED]` in-place |
+| **B — Add `primaryHypothesis: string` field to `Diagnosis`** | `lib/mcp/types.ts:95–104` + `lib/mcp/validate.ts:37–43` + DiagnosticAgent output shape | MEDIUM (~1 hr): type change, migration on old receipts, guard on isDiagnosis | Explicit rank at the handoff | Doesn't solve leakage — rejected entries still travel; the rec agent still might act on them |
+| **C — Reject: rewrite the recommendation prompt to require primary-hypothesis-alignment** | AptKit's `RecommendationAgent` internal prompt | UNKNOWN (owned by `@aptkit/core`) | Would fix at the receiver | You don't own the prompt — this is a request-upstream, not a ship |
+| **D — Reject: pass the full DiagnosticAgent trace to the RecommendationAgent** | recommendation.ts:29–46 | HIGH (token budget blowup, cost regression against Week 3 caching win) | Would give rec agent more context | Doesn't address leakage — the rec agent's problem is respect, not information |
 
-**Recommended (you decide, but coach's read):** ship **A** because it makes the primary explicit at the type level — the handoff carries structured intent, not inferred intent. Reject C on the cost receipt. Reject D on ownership. Keep B as a follow-up if A alone doesn't move the number enough.
+**Recommended (you decide, but coach's read):** ship **A** — the fingerprint proved the rec agent won't respect `supported: false`, so remove the temptation at the source. It's a 30-minute fix. Reject C on ownership; reject D on cost + it doesn't address the diagnosed mechanism; keep B as a follow-up if you want explicit primaryness for a *different* reason later.
+
+**Shipped (2026-07-03 T17-18 UTC):** Option A landed at `lib/agents/recommendation.ts:33-45` as the exported `filterSupportedHypotheses(diagnosis: Diagnosis): Diagnosis` helper, called from `RecommendationAgent.propose()` before handing to AptKit's internal agent. Five new tests at `test/agents/recommendation.test.ts:298-378` (drops-false / pure-copy / preserves-others / degenerate-all-false / all-supported-unchanged). Full suite: 273/273 pass (was 268). Chose to filter inside `propose()` (not at the route boundary) so every caller — route, direct test, eval, future direct invocation — benefits from the same guarantee.
+
+**Design decision to log alongside the fix:** filter-at-handoff sacrifices the "we ruled this out" context that a competent rec agent could theoretically use to avoid overlap with prior thinking. In practice, the fingerprint shows the rec agent isn't using that context correctly anyway — so removing it is the honest read. If a future rec-agent version becomes capable of respecting rejection, this filter is a one-line revert.
 
 Whatever you pick, name what you rejected and *why in one sentence each*. That's the L3 signal.
 
@@ -162,9 +208,9 @@ Whatever you pick, name what you rejected and *why in one sentence each*. That's
 
 *(Write this last, once Steps 1–5 have actually been lived. Coach cannot write this for you — it must be in your voice, past-tense, specific, and short.)*
 
-Shape to fill:
+Shape to fill (**post-fingerprint version — leans on the confirmed rejected-hypothesis-leakage mechanism**):
 
-> "We were shipping recs that addressed the wrong root cause because `_______` at the handoff between the diagnostic and recommendation agents. Our eval harness caught it — `diagnosis_response` was passing at 48% and we didn't know why. I traced it to `_______`, fixed the shape by `_______`, and the pass rate moved to `_______%`. The lesson: a strongly-typed handoff can still lose emphasis if the type doesn't carry rank."
+> "We were shipping recommendations that targeted hypotheses our own diagnosis had already rejected. Our eval harness caught it — `diagnosis_response` was passing at 48% and we didn't know why. I traced it to `_______` (the specific step 2 finding), fixed it by `_______` (probably: filtering `supported: false` entries at the route boundary before handoff), and the pass rate moved to `_______%`. The lesson: a strongly-typed handoff can still lose *negative* signal if the receiver doesn't respect it — sometimes the right fix isn't a better type, it's not sending the data at all."
 
 Anti-patterns to avoid in the war story:
 - "We used a rubric-based LLM-as-judge to evaluate…" — this is jargon, not story. Say *what broke and what it cost*, then how you found it.

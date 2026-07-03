@@ -1,0 +1,35 @@
+{
+  "runIdx": 2,
+  "timestamp": "2026-07-03T17:13:54.349Z",
+  "diagnosisHandedIn": {
+    "conclusion": "The 15.8% site-wide checkout completion rate drop is driven by a 31.2% spike in payment failure rate on mobile credit-card transactions, concentrated in SP (São Paulo) mobile sessions, affecting ~1,180 customers and causing ~$18,900 in directly attributable lost revenue. This is the sole confirmed causal driver.",
+    "hypothesesConsidered": [
+      {
+        "hypothesis": "Mobile credit-card payment failure rate spike (0.035 → 0.046) is the primary and only confirmed driver of the checkout completion rate drop",
+        "supported": true,
+        "reasoning": "The 31.2% payment failure spike is precisely scoped to credit_card + mobile, matching the concentration of the conversion drop. ~1,180 customers directly blocked, ~$18,900 in blocked revenue. No competing hypothesis is supported."
+      }
+    ],
+    "affectedCustomers": {
+      "count": 1180
+    },
+    "suggestedInvestigation": "Confirm with payment processor whether an issuer-level or gateway-level degradation is affecting mobile credit-card auth in SP; also verify whether any recent SDK or provider change coincides."
+  },
+  "recommendations": [
+    {
+      "title": "Reactivate & target the Checkout Recovery scenario at SP mobile credit-card failures",
+      "rationale": "The existing 'Checkout recovery sequence' (scn-checkout-recovery) is paused, meaning the ~1,180 customers blocked by the mobile credit-card payment failure in SP are receiving zero recovery communication. Reactivating it — enriched with a payment-retry nudge and an alternative payment method prompt (e.g., PIX or debit) — directly addresses the sole confirmed causal driver and can recover a portion of the ~$18,900 in lost revenue while the technical fix is underway.",
+      "bloomreachFeature": "scenario"
+    },
+    {
+      "title": "Launch a targeted campaign to the SP Mobile segment with alternative payment incentive",
+      "rationale": "The existing 'Mobile shoppers in Sao Paulo' segment (seg-mobile-sp, 13,980 customers) covers the full at-risk population — far beyond the 1,180 already blocked. A broadcast campaign proactively informing this segment of the payment issue and promoting PIX/debit as alternatives prevents further revenue leakage while the root cause is investigated with the payment processor. This acts as a bridge communication until the technical fix is deployed.",
+      "bloomreachFeature": "campaign"
+    },
+    {
+      "title": "Run an A/B experiment: friction-reducing voucher vs. payment-method prompt for SP mobile recoveries",
+      "rationale": "Once the scenario is reactivated (recommendation 1), it is unknown whether a monetary incentive (voucher) or a simple payment-method switch prompt is more effective at recovering blocked checkouts. Running a controlled experiment now — while the incident is live and the cohort is large enough (~1,180 affected, 13,980 at-risk) — will produce statistically valid learning that improves all future recovery flows and avoids permanently training customers to expect discounts after payment failures.",
+      "bloomreachFeature": "experiment"
+    }
+  ]
+}

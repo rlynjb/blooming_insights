@@ -24,3 +24,447 @@
 
  RUN  v4.1.7 /Users/rein/Public/blooming_insights
 
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 01-conversion-drop-mobile-checkout
+
+[case 01-conversion-drop-mobile-checkout] (has-signal) investigating…
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 01-conversion-drop-mobile-checkout
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T16-44-18-992Z-01-conversion-drop-mobile-checkout","usage":{"input_tokens":335,"cache_creation_input_tokens":0,"cache_read_input_tokens":1989,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":666,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 01-conversion-drop-mobile-checkout
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T16-44-18-992Z-01-conversion-drop-mobile-checkout","usage":{"input_tokens":2119,"cache_creation_input_tokens":0,"cache_read_input_tokens":1989,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":314,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 01-conversion-drop-mobile-checkout
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T16-44-18-992Z-01-conversion-drop-mobile-checkout","usage":{"input_tokens":3466,"cache_creation_input_tokens":0,"cache_read_input_tokens":1989,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":269,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 01-conversion-drop-mobile-checkout
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T16-44-18-992Z-01-conversion-drop-mobile-checkout","usage":{"input_tokens":4013,"cache_creation_input_tokens":0,"cache_read_input_tokens":1274,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":1751,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 01-conversion-drop-mobile-checkout
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T16-44-18-992Z-01-conversion-drop-mobile-checkout","usage":{"input_tokens":5242,"cache_creation_input_tokens":0,"cache_read_input_tokens":1034,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":729,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 01-conversion-drop-mobile-checkout
+{"site":"agents/recommendation:aptkit-model","sessionId":"eval-2026-07-03T16-44-18-992Z-01-conversion-drop-mobile-checkout","usage":{"input_tokens":335,"cache_creation_input_tokens":3241,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":3241,"ephemeral_1h_input_tokens":0},"output_tokens":124,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 01-conversion-drop-mobile-checkout
+{"site":"agents/recommendation:aptkit-model","sessionId":"eval-2026-07-03T16-44-18-992Z-01-conversion-drop-mobile-checkout","usage":{"input_tokens":992,"cache_creation_input_tokens":0,"cache_read_input_tokens":3241,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":2559,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 01-conversion-drop-mobile-checkout
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T16-44-18-992Z-01-conversion-drop-mobile-checkout","usage":{"input_tokens":3385,"cache_creation_input_tokens":0,"cache_read_input_tokens":1221,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":664,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 01-conversion-drop-mobile-checkout
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T16-44-18-992Z-01-conversion-drop-mobile-checkout","usage":{"input_tokens":3400,"cache_creation_input_tokens":0,"cache_read_input_tokens":1221,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":702,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 01-conversion-drop-mobile-checkout
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T16-44-18-992Z-01-conversion-drop-mobile-checkout","usage":{"input_tokens":3450,"cache_creation_input_tokens":0,"cache_read_input_tokens":1221,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":909,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 01-conversion-drop-mobile-checkout
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T16-44-18-992Z-01-conversion-drop-mobile-checkout","usage":{"input_tokens":3344,"cache_creation_input_tokens":0,"cache_read_input_tokens":1221,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":965,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 01-conversion-drop-mobile-checkout
+[case 01-conversion-drop-mobile-checkout] done in 217s · diagnosis: pass_with_notes · recs: [judge_error, pass, fail]
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality
+
+[eval] runId: 2026-07-03T16-44-18-992Z
+[eval] cases:  10
+
+stderr | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║ Week 2C · 10 goldens · per-case verdicts                                    ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║ case                                          class         diag    recs    ║
+╟──────────────────────────────────────────────────────────────────────────────╢
+║ 01-conversion-drop-mobile-checkout            has-signal    pass_with_notes 1/3     ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+DIAGNOSIS pass rate (score ≥ 4)
+──────────────────────────────────────────────────────────────────────────────
+  root_cause_plausibility           1/1    (100%)   dist [1:0 2:0 3:0 4:0 5:1]
+  evidence_grounding                1/1    (100%)   dist [1:0 2:0 3:0 4:0 5:1]
+  scope_coherence                   1/1    (100%)   dist [1:0 2:0 3:0 4:0 5:1]
+  actionable_next_step              1/1    (100%)   dist [1:0 2:0 3:0 4:1 5:0]
+
+RECOMMENDATION pass rate (score ≥ 4)
+──────────────────────────────────────────────────────────────────────────────
+  diagnosis_response                1/2    ( 50%)   dist [1:0 2:0 3:1 4:1 5:0]
+  feature_choice_fit                1/2    ( 50%)   dist [1:0 2:1 3:0 4:1 5:0]
+  step_actionability                2/2    (100%)   dist [1:0 2:0 3:0 4:2 5:0]
+  impact_realism                    1/2    ( 50%)   dist [1:0 2:0 3:1 4:1 5:0]
+
+Escape-hatch check (≥3 distinct pass/fail patterns per dimension)
+──────────────────────────────────────────────────────────────────────────────
+  root_cause_plausibility         1 distinct scores  ✗ substrate too homogeneous
+  evidence_grounding              1 distinct scores  ✗ substrate too homogeneous
+  scope_coherence                 1 distinct scores  ✗ substrate too homogeneous
+  actionable_next_step            1 distinct scores  ✗ substrate too homogeneous
+
+
+ ❯ eval/run.eval.ts (10 tests | 1 failed | 9 skipped) 217498ms
+     × case 01-conversion-drop-mobile-checkout 217493ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 01-conversion-drop-mobile-checkout
+AssertionError: case 01-conversion-drop-mobile-checkout rec "A/B experiment: PIX vs. credit-card retry CTA on the mobile checkout payment-failure screen": expected 'fail' not to be 'fail' // Object.is equality
+ ❯ eval/run.eval.ts:422:17
+    420|             rj.judgment.verdict,
+    421|             `case ${goldenCase.caseId} rec "${rj.recommendationTitle}"…
+    422|           ).not.toBe('fail');
+       |                 ^
+    423|         }
+    424|       }
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  1 failed | 9 skipped (10)
+   Start at  09:44:18
+   Duration  217.66s (transform 54ms, setup 0ms, import 90ms, tests 217.50s, environment 0ms)
+
+=== 01-conversion-drop-mobile-checkout run 2 — end 2026-07-03T09:47:56-07:00 (exit 1) ===
+
+=== 01-conversion-drop-mobile-checkout run 3 — start 2026-07-03T09:47:56-07:00 ===
+
+> app-scaffold@0.1.0 eval
+> vitest run --config vitest.eval.config.ts eval/run.eval.ts -t 01-conversion-drop-mobile-checkout
+
+
+ RUN  v4.1.7 /Users/rein/Public/blooming_insights
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 01-conversion-drop-mobile-checkout
+
+[case 01-conversion-drop-mobile-checkout] (has-signal) investigating…
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 01-conversion-drop-mobile-checkout
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T16-47-56-906Z-01-conversion-drop-mobile-checkout","usage":{"input_tokens":335,"cache_creation_input_tokens":0,"cache_read_input_tokens":1989,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":642,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 01-conversion-drop-mobile-checkout
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T16-47-56-906Z-01-conversion-drop-mobile-checkout","usage":{"input_tokens":2149,"cache_creation_input_tokens":0,"cache_read_input_tokens":1989,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":542,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 01-conversion-drop-mobile-checkout
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T16-47-56-906Z-01-conversion-drop-mobile-checkout","usage":{"input_tokens":3790,"cache_creation_input_tokens":0,"cache_read_input_tokens":1989,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":233,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 01-conversion-drop-mobile-checkout
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T16-47-56-906Z-01-conversion-drop-mobile-checkout","usage":{"input_tokens":4301,"cache_creation_input_tokens":0,"cache_read_input_tokens":1274,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":1491,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 01-conversion-drop-mobile-checkout
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T16-47-56-906Z-01-conversion-drop-mobile-checkout","usage":{"input_tokens":5310,"cache_creation_input_tokens":0,"cache_read_input_tokens":1034,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":732,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 01-conversion-drop-mobile-checkout
+{"site":"agents/recommendation:aptkit-model","sessionId":"eval-2026-07-03T16-47-56-906Z-01-conversion-drop-mobile-checkout","usage":{"input_tokens":335,"cache_creation_input_tokens":3054,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":3054,"ephemeral_1h_input_tokens":0},"output_tokens":126,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 01-conversion-drop-mobile-checkout
+{"site":"agents/recommendation:aptkit-model","sessionId":"eval-2026-07-03T16-47-56-906Z-01-conversion-drop-mobile-checkout","usage":{"input_tokens":1053,"cache_creation_input_tokens":0,"cache_read_input_tokens":3054,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":2420,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 01-conversion-drop-mobile-checkout
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T16-47-56-906Z-01-conversion-drop-mobile-checkout","usage":{"input_tokens":3199,"cache_creation_input_tokens":0,"cache_read_input_tokens":1221,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":779,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 01-conversion-drop-mobile-checkout
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T16-47-56-906Z-01-conversion-drop-mobile-checkout","usage":{"input_tokens":3253,"cache_creation_input_tokens":0,"cache_read_input_tokens":1221,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":905,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 01-conversion-drop-mobile-checkout
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T16-47-56-906Z-01-conversion-drop-mobile-checkout","usage":{"input_tokens":3187,"cache_creation_input_tokens":0,"cache_read_input_tokens":1221,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":903,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 01-conversion-drop-mobile-checkout
+[case 01-conversion-drop-mobile-checkout] done in 194s · diagnosis: pass_with_notes · recs: [pass, pass_with_notes, fail]
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality
+
+[eval] runId: 2026-07-03T16-47-56-906Z
+[eval] cases:  10
+
+stderr | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║ Week 2C · 10 goldens · per-case verdicts                                    ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║ case                                          class         diag    recs    ║
+╟──────────────────────────────────────────────────────────────────────────────╢
+║ 01-conversion-drop-mobile-checkout            has-signal    pass_with_notes 2/3     ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+DIAGNOSIS pass rate (score ≥ 4)
+──────────────────────────────────────────────────────────────────────────────
+  root_cause_plausibility           1/1    (100%)   dist [1:0 2:0 3:0 4:0 5:1]
+  evidence_grounding                1/1    (100%)   dist [1:0 2:0 3:0 4:0 5:1]
+  scope_coherence                   1/1    (100%)   dist [1:0 2:0 3:0 4:0 5:1]
+  actionable_next_step              0/1    (  0%)   dist [1:0 2:0 3:1 4:0 5:0]
+
+RECOMMENDATION pass rate (score ≥ 4)
+──────────────────────────────────────────────────────────────────────────────
+  diagnosis_response                1/3    ( 33%)   dist [1:0 2:1 3:1 4:0 5:1]
+  feature_choice_fit                1/3    ( 33%)   dist [1:0 2:0 3:2 4:0 5:1]
+  step_actionability                3/3    (100%)   dist [1:0 2:0 3:0 4:2 5:1]
+  impact_realism                    1/3    ( 33%)   dist [1:0 2:0 3:2 4:1 5:0]
+
+Escape-hatch check (≥3 distinct pass/fail patterns per dimension)
+──────────────────────────────────────────────────────────────────────────────
+  root_cause_plausibility         1 distinct scores  ✗ substrate too homogeneous
+  evidence_grounding              1 distinct scores  ✗ substrate too homogeneous
+  scope_coherence                 1 distinct scores  ✗ substrate too homogeneous
+  actionable_next_step            1 distinct scores  ✗ substrate too homogeneous
+
+
+ ❯ eval/run.eval.ts (10 tests | 1 failed | 9 skipped) 194141ms
+     × case 01-conversion-drop-mobile-checkout 194135ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 01-conversion-drop-mobile-checkout
+AssertionError: case 01-conversion-drop-mobile-checkout rec "Pause or isolate 'Checkout CTA copy test' experiment for SP mobile traffic": expected 'fail' not to be 'fail' // Object.is equality
+ ❯ eval/run.eval.ts:422:17
+    420|             rj.judgment.verdict,
+    421|             `case ${goldenCase.caseId} rec "${rj.recommendationTitle}"…
+    422|           ).not.toBe('fail');
+       |                 ^
+    423|         }
+    424|       }
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  1 failed | 9 skipped (10)
+   Start at  09:47:56
+   Duration  194.30s (transform 47ms, setup 0ms, import 84ms, tests 194.14s, environment 0ms)
+
+=== 01-conversion-drop-mobile-checkout run 3 — end 2026-07-03T09:51:11-07:00 (exit 1) ===
+
+=== 08-checkout-collapse-multi-scope run 1 — start 2026-07-03T09:51:11-07:00 ===
+
+> app-scaffold@0.1.0 eval
+> vitest run --config vitest.eval.config.ts eval/run.eval.ts -t 08-checkout-collapse-multi-scope
+
+
+ RUN  v4.1.7 /Users/rein/Public/blooming_insights
+
+
+ Test Files  1 passed (1)
+      Tests  1 passed | 9 skipped (10)
+   Start at  09:51:11
+   Duration  238.83s (transform 52ms, setup 0ms, import 87ms, tests 238.68s, environment 0ms)
+
+=== 08-checkout-collapse-multi-scope run 1 — end 2026-07-03T09:55:10-07:00 (exit 0) ===
+
+=== 08-checkout-collapse-multi-scope run 2 — start 2026-07-03T09:55:10-07:00 ===
+
+> app-scaffold@0.1.0 eval
+> vitest run --config vitest.eval.config.ts eval/run.eval.ts -t 08-checkout-collapse-multi-scope
+
+
+ RUN  v4.1.7 /Users/rein/Public/blooming_insights
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 08-checkout-collapse-multi-scope
+
+[case 08-checkout-collapse-multi-scope] (has-signal) investigating…
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 08-checkout-collapse-multi-scope
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T16-55-10-578Z-08-checkout-collapse-multi-scope","usage":{"input_tokens":335,"cache_creation_input_tokens":0,"cache_read_input_tokens":1877,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":567,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 08-checkout-collapse-multi-scope
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T16-55-10-578Z-08-checkout-collapse-multi-scope","usage":{"input_tokens":1502,"cache_creation_input_tokens":0,"cache_read_input_tokens":1877,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":434,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 08-checkout-collapse-multi-scope
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T16-55-10-578Z-08-checkout-collapse-multi-scope","usage":{"input_tokens":3479,"cache_creation_input_tokens":0,"cache_read_input_tokens":1877,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":185,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 08-checkout-collapse-multi-scope
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T16-55-10-578Z-08-checkout-collapse-multi-scope","usage":{"input_tokens":3647,"cache_creation_input_tokens":0,"cache_read_input_tokens":1162,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":1349,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 08-checkout-collapse-multi-scope
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T16-55-10-578Z-08-checkout-collapse-multi-scope","usage":{"input_tokens":4671,"cache_creation_input_tokens":0,"cache_read_input_tokens":1034,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":726,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 08-checkout-collapse-multi-scope
+{"site":"agents/recommendation:aptkit-model","sessionId":"eval-2026-07-03T16-55-10-578Z-08-checkout-collapse-multi-scope","usage":{"input_tokens":335,"cache_creation_input_tokens":3180,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":3180,"ephemeral_1h_input_tokens":0},"output_tokens":128,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 08-checkout-collapse-multi-scope
+{"site":"agents/recommendation:aptkit-model","sessionId":"eval-2026-07-03T16-55-10-578Z-08-checkout-collapse-multi-scope","usage":{"input_tokens":1055,"cache_creation_input_tokens":0,"cache_read_input_tokens":3180,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":2361,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 08-checkout-collapse-multi-scope
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T16-55-10-578Z-08-checkout-collapse-multi-scope","usage":{"input_tokens":3109,"cache_creation_input_tokens":0,"cache_read_input_tokens":1221,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":770,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 08-checkout-collapse-multi-scope
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T16-55-10-578Z-08-checkout-collapse-multi-scope","usage":{"input_tokens":3124,"cache_creation_input_tokens":0,"cache_read_input_tokens":1221,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":594,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 08-checkout-collapse-multi-scope
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T16-55-10-578Z-08-checkout-collapse-multi-scope","usage":{"input_tokens":3162,"cache_creation_input_tokens":0,"cache_read_input_tokens":1221,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":1023,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 08-checkout-collapse-multi-scope
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T16-55-10-578Z-08-checkout-collapse-multi-scope","usage":{"input_tokens":3177,"cache_creation_input_tokens":0,"cache_read_input_tokens":1221,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":703,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 08-checkout-collapse-multi-scope
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T16-55-10-578Z-08-checkout-collapse-multi-scope","usage":{"input_tokens":3138,"cache_creation_input_tokens":0,"cache_read_input_tokens":1221,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":783,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 08-checkout-collapse-multi-scope
+[case 08-checkout-collapse-multi-scope] done in 217s · diagnosis: pass_with_notes · recs: [judge_error, judge_error, fail]
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality
+
+[eval] runId: 2026-07-03T16-55-10-578Z
+[eval] cases:  10
+
+stderr | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║ Week 2C · 10 goldens · per-case verdicts                                    ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║ case                                          class         diag    recs    ║
+╟──────────────────────────────────────────────────────────────────────────────╢
+║ 08-checkout-collapse-multi-scope              has-signal    pass_with_notes 0/3     ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+DIAGNOSIS pass rate (score ≥ 4)
+──────────────────────────────────────────────────────────────────────────────
+  root_cause_plausibility           1/1    (100%)   dist [1:0 2:0 3:0 4:1 5:0]
+  evidence_grounding                1/1    (100%)   dist [1:0 2:0 3:0 4:0 5:1]
+  scope_coherence                   1/1    (100%)   dist [1:0 2:0 3:0 4:1 5:0]
+  actionable_next_step              0/1    (  0%)   dist [1:0 2:0 3:1 4:0 5:0]
+
+RECOMMENDATION pass rate (score ≥ 4)
+──────────────────────────────────────────────────────────────────────────────
+  diagnosis_response                0/1    (  0%)   dist [1:0 2:1 3:0 4:0 5:0]
+  feature_choice_fit                0/1    (  0%)   dist [1:0 2:0 3:1 4:0 5:0]
+  step_actionability                1/1    (100%)   dist [1:0 2:0 3:0 4:1 5:0]
+  impact_realism                    0/1    (  0%)   dist [1:0 2:0 3:1 4:0 5:0]
+
+Escape-hatch check (≥3 distinct pass/fail patterns per dimension)
+──────────────────────────────────────────────────────────────────────────────
+  root_cause_plausibility         1 distinct scores  ✗ substrate too homogeneous
+  evidence_grounding              1 distinct scores  ✗ substrate too homogeneous
+  scope_coherence                 1 distinct scores  ✗ substrate too homogeneous
+  actionable_next_step            1 distinct scores  ✗ substrate too homogeneous
+
+
+ ❯ eval/run.eval.ts (10 tests | 1 failed | 9 skipped) 217192ms
+     × case 08-checkout-collapse-multi-scope 217186ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 08-checkout-collapse-multi-scope
+AssertionError: case 08-checkout-collapse-multi-scope rec "Run A/B Experiment to Pause or Isolate the Active Checkout CTA Test in SP": expected 'fail' not to be 'fail' // Object.is equality
+ ❯ eval/run.eval.ts:422:17
+    420|             rj.judgment.verdict,
+    421|             `case ${goldenCase.caseId} rec "${rj.recommendationTitle}"…
+    422|           ).not.toBe('fail');
+       |                 ^
+    423|         }
+    424|       }
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  1 failed | 9 skipped (10)
+   Start at  09:55:10
+   Duration  217.35s (transform 51ms, setup 0ms, import 88ms, tests 217.19s, environment 0ms)
+
+=== 08-checkout-collapse-multi-scope run 2 — end 2026-07-03T09:58:47-07:00 (exit 1) ===
+
+=== 08-checkout-collapse-multi-scope run 3 — start 2026-07-03T09:58:47-07:00 ===
+
+> app-scaffold@0.1.0 eval
+> vitest run --config vitest.eval.config.ts eval/run.eval.ts -t 08-checkout-collapse-multi-scope
+
+
+ RUN  v4.1.7 /Users/rein/Public/blooming_insights
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 08-checkout-collapse-multi-scope
+
+[case 08-checkout-collapse-multi-scope] (has-signal) investigating…
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 08-checkout-collapse-multi-scope
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T16-58-48-164Z-08-checkout-collapse-multi-scope","usage":{"input_tokens":335,"cache_creation_input_tokens":0,"cache_read_input_tokens":1877,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":589,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 08-checkout-collapse-multi-scope
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T16-58-48-164Z-08-checkout-collapse-multi-scope","usage":{"input_tokens":2056,"cache_creation_input_tokens":0,"cache_read_input_tokens":1877,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":544,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 08-checkout-collapse-multi-scope
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T16-58-48-164Z-08-checkout-collapse-multi-scope","usage":{"input_tokens":3615,"cache_creation_input_tokens":0,"cache_read_input_tokens":1162,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":35,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 08-checkout-collapse-multi-scope
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T16-58-48-164Z-08-checkout-collapse-multi-scope","usage":{"input_tokens":2106,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":1116,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 08-checkout-collapse-multi-scope
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T16-58-48-164Z-08-checkout-collapse-multi-scope","usage":{"input_tokens":4440,"cache_creation_input_tokens":0,"cache_read_input_tokens":1034,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":688,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 08-checkout-collapse-multi-scope
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T16-58-48-164Z-08-checkout-collapse-multi-scope","usage":{"input_tokens":4455,"cache_creation_input_tokens":0,"cache_read_input_tokens":1034,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":698,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 08-checkout-collapse-multi-scope
+{"site":"agents/recommendation:aptkit-model","sessionId":"eval-2026-07-03T16-58-48-164Z-08-checkout-collapse-multi-scope","usage":{"input_tokens":335,"cache_creation_input_tokens":3022,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":3022,"ephemeral_1h_input_tokens":0},"output_tokens":126,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 08-checkout-collapse-multi-scope
+{"site":"agents/recommendation:aptkit-model","sessionId":"eval-2026-07-03T16-58-48-164Z-08-checkout-collapse-multi-scope","usage":{"input_tokens":1053,"cache_creation_input_tokens":0,"cache_read_input_tokens":3022,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":2304,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 08-checkout-collapse-multi-scope
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T16-58-48-164Z-08-checkout-collapse-multi-scope","usage":{"input_tokens":2857,"cache_creation_input_tokens":0,"cache_read_input_tokens":1221,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":913,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 08-checkout-collapse-multi-scope
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T16-58-48-164Z-08-checkout-collapse-multi-scope","usage":{"input_tokens":2933,"cache_creation_input_tokens":0,"cache_read_input_tokens":1221,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":914,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 08-checkout-collapse-multi-scope
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T16-58-48-164Z-08-checkout-collapse-multi-scope","usage":{"input_tokens":2948,"cache_creation_input_tokens":0,"cache_read_input_tokens":1221,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":927,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 08-checkout-collapse-multi-scope
+{"site":"agents/diagnostic:aptkit-model","sessionId":"eval-2026-07-03T16-58-48-164Z-08-checkout-collapse-multi-scope","usage":{"input_tokens":2846,"cache_creation_input_tokens":0,"cache_read_input_tokens":1221,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":842,"service_tier":"standard","inference_geo":"global"}}
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 08-checkout-collapse-multi-scope
+[case 08-checkout-collapse-multi-scope] done in 217s · diagnosis: judge_error · recs: [pass_with_notes, judge_error, fail]
+
+stdout | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality
+
+[eval] runId: 2026-07-03T16-58-48-164Z
+[eval] cases:  10
+
+stderr | eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║ Week 2C · 10 goldens · per-case verdicts                                    ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║ case                                          class         diag    recs    ║
+╟──────────────────────────────────────────────────────────────────────────────╢
+║ 08-checkout-collapse-multi-scope              has-signal    judge_error 1/3     ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+DIAGNOSIS pass rate (score ≥ 4)
+──────────────────────────────────────────────────────────────────────────────
+
+RECOMMENDATION pass rate (score ≥ 4)
+──────────────────────────────────────────────────────────────────────────────
+  diagnosis_response                0/2    (  0%)   dist [1:0 2:1 3:1 4:0 5:0]
+  feature_choice_fit                0/2    (  0%)   dist [1:0 2:0 3:2 4:0 5:0]
+  step_actionability                2/2    (100%)   dist [1:0 2:0 3:0 4:2 5:0]
+  impact_realism                    0/2    (  0%)   dist [1:0 2:1 3:1 4:0 5:0]
+
+Escape-hatch check (≥3 distinct pass/fail patterns per dimension)
+──────────────────────────────────────────────────────────────────────────────
+
+
+ ❯ eval/run.eval.ts (10 tests | 1 failed | 9 skipped) 217109ms
+     × case 08-checkout-collapse-multi-scope 217104ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  eval/run.eval.ts > eval · Week 2C — 10 goldens · diagnosis + recommendation quality > case 08-checkout-collapse-multi-scope
+AssertionError: case 08-checkout-collapse-multi-scope rec "Run an experiment to pause or isolate the 'Checkout CTA copy test' on mobile SP traffic": expected 'fail' not to be 'fail' // Object.is equality
+ ❯ eval/run.eval.ts:422:17
+    420|             rj.judgment.verdict,
+    421|             `case ${goldenCase.caseId} rec "${rj.recommendationTitle}"…
+    422|           ).not.toBe('fail');
+       |                 ^
+    423|         }
+    424|       }
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  1 failed | 9 skipped (10)
+   Start at  09:58:48
+   Duration  217.26s (transform 50ms, setup 0ms, import 85ms, tests 217.11s, environment 0ms)
+
+=== 08-checkout-collapse-multi-scope run 3 — end 2026-07-03T10:02:25-07:00 (exit 1) ===
+
+=== fingerprint run complete 2026-07-03T10:02:25-07:00 ===

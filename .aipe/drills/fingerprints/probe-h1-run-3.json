@@ -1,0 +1,35 @@
+{
+  "runIdx": 3,
+  "timestamp": "2026-07-03T17:14:48.931Z",
+  "diagnosisHandedIn": {
+    "conclusion": "The 15.8% site-wide checkout completion rate drop is driven by a 31.2% spike in payment failure rate on mobile credit-card transactions, concentrated in SP (São Paulo) mobile sessions, affecting ~1,180 customers and causing ~$18,900 in directly attributable lost revenue. This is the sole confirmed causal driver.",
+    "hypothesesConsidered": [
+      {
+        "hypothesis": "Mobile credit-card payment failure rate spike (0.035 → 0.046) is the primary and only confirmed driver of the checkout completion rate drop",
+        "supported": true,
+        "reasoning": "The 31.2% payment failure spike is precisely scoped to credit_card + mobile, matching the concentration of the conversion drop. ~1,180 customers directly blocked, ~$18,900 in blocked revenue. No competing hypothesis is supported."
+      }
+    ],
+    "affectedCustomers": {
+      "count": 1180
+    },
+    "suggestedInvestigation": "Confirm with payment processor whether an issuer-level or gateway-level degradation is affecting mobile credit-card auth in SP; also verify whether any recent SDK or provider change coincides."
+  },
+  "recommendations": [
+    {
+      "title": "Reactivate & retarget the ~1,180 blocked SP mobile credit-card customers with a voucher-backed recovery campaign",
+      "rationale": "~1,180 customers hit a payment failure on mobile credit-card in SP during the degradation window, leaving ~$18,900 in revenue on the table. A one-off broadcast to this precise cohort — offering a small voucher as an apology/incentive — can recover a significant share of those carts before intent cools. The existing 'Mobile shoppers in Sao Paulo' segment (seg-mobile-sp, 13,980) must be narrowed to customers who fired a payment_failure event in the affected period to avoid over-messaging.",
+      "bloomreachFeature": "campaign"
+    },
+    {
+      "title": "Activate the paused Checkout Recovery Scenario with a mobile credit-card payment-failure trigger",
+      "rationale": "The existing 'Checkout recovery sequence' scenario (scn-checkout-recovery) is currently paused and fires 2 hours after checkout without purchase. The diagnosis confirms the payment failure is mobile + credit_card specific. Reactivating this scenario — augmented with a payment_failure event trigger scoped to mobile/credit_card — means any future gateway degradation or issuer-level failure auto-triggers recovery outreach without manual intervention. This converts a reactive one-off fix into a permanent safety net.",
+      "bloomreachFeature": "scenario"
+    },
+    {
+      "title": "Run an A/B experiment: voucher vs. no-voucher in the SP mobile recovery flow to calibrate incentive cost",
+      "rationale": "The diagnosis does not indicate customers abandoned due to price sensitivity — they were blocked by a technical failure. A voucher may accelerate return-to-checkout but is not strictly necessary, meaning an untested blanket voucher offer could erode margins unnecessarily. A rapid A/B experiment on the ~1,180-customer recovery campaign (or on the reactivated scenario going forward) will reveal whether the voucher meaningfully lifts conversion versus a plain 'your payment failed, try again' message, allowing the merchant to make a data-driven call on incentive spend.",
+      "bloomreachFeature": "experiment"
+    }
+  ]
+}

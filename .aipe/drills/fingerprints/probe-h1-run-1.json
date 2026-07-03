@@ -1,0 +1,35 @@
+{
+  "runIdx": 1,
+  "timestamp": "2026-07-03T17:13:07.657Z",
+  "diagnosisHandedIn": {
+    "conclusion": "The 15.8% site-wide checkout completion rate drop is driven by a 31.2% spike in payment failure rate on mobile credit-card transactions, concentrated in SP (São Paulo) mobile sessions, affecting ~1,180 customers and causing ~$18,900 in directly attributable lost revenue. This is the sole confirmed causal driver.",
+    "hypothesesConsidered": [
+      {
+        "hypothesis": "Mobile credit-card payment failure rate spike (0.035 → 0.046) is the primary and only confirmed driver of the checkout completion rate drop",
+        "supported": true,
+        "reasoning": "The 31.2% payment failure spike is precisely scoped to credit_card + mobile, matching the concentration of the conversion drop. ~1,180 customers directly blocked, ~$18,900 in blocked revenue. No competing hypothesis is supported."
+      }
+    ],
+    "affectedCustomers": {
+      "count": 1180
+    },
+    "suggestedInvestigation": "Confirm with payment processor whether an issuer-level or gateway-level degradation is affecting mobile credit-card auth in SP; also verify whether any recent SDK or provider change coincides."
+  },
+  "recommendations": [
+    {
+      "title": "Reactivate & retarget checkout recovery scenario for SP mobile payment-failure customers",
+      "rationale": "The 'Checkout recovery sequence' scenario is currently paused, meaning ~1,180 customers who hit a mobile credit-card payment failure in SP received no follow-up. Reactivating it with an enriched trigger (payment_failure event on device_type=mobile AND state=SP) and adding an alternative payment method prompt (e.g. Pix, boleto) directly addresses the confirmed causal driver and can recover a portion of the ~$18,900 in blocked revenue.",
+      "bloomreachFeature": "scenario"
+    },
+    {
+      "title": "Broadcast a one-off campaign to SP mobile shoppers with a Pix/alternative payment incentive voucher",
+      "rationale": "The existing 'Mobile shoppers in Sao Paulo' segment (seg-mobile-sp, 13,980 customers) covers the exact population at risk. A targeted broadcast campaign proactively communicating that credit-card issues are known and offering a small incentive to pay via Pix or boleto can prevent further revenue leakage while the underlying payment gateway issue is being resolved.",
+      "bloomreachFeature": "campaign"
+    },
+    {
+      "title": "A/B experiment: alternative payment method prominence on mobile checkout for SP users",
+      "rationale": "Even after the immediate payment failure is resolved, surfacing alternative payment methods (Pix, boleto) more prominently in the mobile checkout UI for SP users could permanently improve resilience against future gateway disruptions and lift overall mobile conversion. An experiment now — while the issue is live — provides a clean before/after baseline and validates whether UI-level changes can absorb gateway-level risk.",
+      "bloomreachFeature": "experiment"
+    }
+  ]
+}
