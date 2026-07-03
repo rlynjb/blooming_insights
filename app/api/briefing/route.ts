@@ -12,6 +12,7 @@ import { MonitoringAgent } from '@/lib/agents/monitoring';
 import { schemaCapabilities, coverageReport, runnableCategories } from '@/lib/agents/categories';
 import type { McpToolDef } from '@/lib/agents/tool-schemas';
 import { anomalyToInsight, putInsights, listInsights } from '@/lib/state/insights';
+import { tryAcquireBriefing } from '@/lib/state/in-flight-briefings';
 import type { CoverageItem, CoverageReport, Insight, ToolCall } from '@/lib/mcp/types';
 import type { AgentEvent } from '@/lib/mcp/events';
 
@@ -185,6 +186,27 @@ export async function GET(req: NextRequest) {
   if (!dsResult.ok) {
     return NextResponse.json({ needsAuth: true, authUrl: dsResult.authUrl }, { status: 401 });
   }
+
+  // In-flight gate: prevent concurrent same-session briefings from clobbering
+  // each other's putInsights call at the end of the pipeline. See:
+  //   .aipe/drills/l1-correctness-induce-concurrent-briefing-race.md
+  // Concurrent 409s are RELEASED (below in the finally); the caller can retry
+  // after the in-flight one completes (~30-90s typical).
+  const acquisition = tryAcquireBriefing(sid);
+  if (!acquisition.acquired) {
+    // Best-effort teardown of the datasource we just built; a rejected
+    // request shouldn't leak MCP state.
+    await dsResult.dispose().catch(() => {});
+    return NextResponse.json(
+      {
+        error: 'briefing_in_flight',
+        message: 'a briefing for this session is already in progress',
+        retry_after_ms: 30_000,
+      },
+      { status: 409 },
+    );
+  }
+
   // The abstract DataSource surface is what agents + bootstrapSchema consume.
   // The 4 short MCP routes still use the Bloomreach adapter directly for the
   // skipCache option (cache-bypass is Bloomreach-specific).
@@ -315,6 +337,9 @@ export async function GET(req: NextRequest) {
         } catch (disposeErr) {
           console.error('[briefing] dispose error:', redactSecrets(formatError(disposeErr)));
         }
+        // Release the in-flight gate so future briefings for this session
+        // can start. Idempotent by design — see `tryAcquireBriefing`.
+        acquisition.release();
         // One summary line per request — shared shape with /api/agent so a
         // single Vercel filter (e.g. phases.phase = "schema_bootstrap") reads
         // across both routes. Fires even on error so we can see how much of the
