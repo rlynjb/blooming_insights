@@ -54,7 +54,22 @@ export class AnthropicModelProviderAdapter implements ModelProvider {
       messages: request.messages.map(toAnthropicMessage),
     };
 
-    if (request.system) params.system = request.system;
+    // Phase-3 prompt caching. The system prompt is stable across every call
+    // within an investigation (all ~5-15 ReAct-loop iterations reuse it) and
+    // is the largest fixed prefix in the payload. Wrapping it in an ephemeral
+    // cache breakpoint makes the first call a cache_creation (~1.25× normal
+    // input cost) and every subsequent call within 5 min a cache_read
+    // (~0.1× normal). For a diagnostic run's ~10 model turns this is roughly
+    // an 80% reduction on the system-prompt token cost.
+    //
+    // Tools are also stable across the loop but the Anthropic API caches
+    // tools transparently when the SAME breakpoint is set on the system
+    // prompt — so this one addition covers both prefixes.
+    if (request.system) {
+      params.system = [
+        { type: 'text', text: request.system, cache_control: { type: 'ephemeral' } },
+      ];
+    }
     if (request.tools?.length) params.tools = request.tools.map(toAnthropicTool);
 
     const response = await this.anthropic.messages.create(
